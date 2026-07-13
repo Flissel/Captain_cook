@@ -6,14 +6,23 @@ the total-subproblem cap is reserved atomically inside the Ledger
 Recorder's serialized write (agenten/ledger_bridge/recorder.py, unit U8) to
 avoid a check-then-act race between concurrent decomposition batches under
 the same root problem.
+
+DecompositionBudget is a Pydantic model, not a plain dataclass, because it
+is embedded in ProblemSubmitted (agenten/events/schemas.py) and published
+as an AutoGen Core message: autogen_core's default serializer rejects
+nested plain dataclasses ("use a Pydantic model" — discovered by unit U1
+while building the real runtime adapter), so every type reachable from an
+event's fields has to be Pydantic-native.
 """
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import Optional
 
+from pydantic import BaseModel, ConfigDict
 
-@dataclass(frozen=True)
-class DecompositionBudget:
+
+class DecompositionBudget(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     max_depth: int = 4
     max_total_subproblems: int = 200
     max_fanout_per_node: int = 6
