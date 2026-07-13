@@ -1,57 +1,109 @@
-import plotly.graph_objects as go
-import json
+"""Generic hash-chained ledger for tracking arbitrary records.
+
+Block carries an opaque ``block_type`` + ``data`` payload instead of
+hardcoded task fields, so new record kinds (tasks, decisions, research
+results, ...) never require changing Block or Blockchain — callers just
+pick a new ``block_type`` and shape ``data`` however they need.
+"""
 import hashlib
-import os
+from typing import Any, Dict, List, Optional
+
+from .storage import LedgerStorage, JSONFileStorage
+
 
 class Block:
-    def __init__(self, index, task, assigned_agents, status, previous_hash, parent_index=None, children=None, hash=None):
+    def __init__(
+        self,
+        index: int,
+        block_type: str,
+        data: Dict[str, Any],
+        status: str,
+        previous_hash: str,
+        parent_index: Optional[int] = None,
+        children: Optional[List[int]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        hash: Optional[str] = None,
+    ):
         self.index = index
-        self.task = task
-        self.assigned_agents = assigned_agents
+        self.block_type = block_type
+        self.data = data
         self.status = status
         self.previous_hash = previous_hash
         self.parent_index = parent_index
         self.children = children or []  # List of child block indices
+        self.metadata = metadata or {}
         self.hash = hash or self.compute_hash()
 
-    def compute_hash(self):
-        block_string = f"{self.index}{self.task}{self.assigned_agents}{self.status}{self.previous_hash}{self.parent_index}{self.children}"
+    def compute_hash(self) -> str:
+        block_string = (
+            f"{self.index}{self.block_type}{self.data}{self.status}"
+            f"{self.previous_hash}{self.parent_index}{self.children}"
+        )
         return hashlib.sha256(block_string.encode()).hexdigest()
 
+    def to_dict(self) -> Dict[str, Any]:
+        return dict(self.__dict__)
+
+    # --- Backward-compatible accessors for the original task-shaped payload ---
+    @property
+    def task(self) -> Optional[str]:
+        return self.data.get("task") if self.block_type == "task" else None
+
+    @property
+    def assigned_agents(self) -> List[str]:
+        return self.data.get("assigned_agents", []) if self.block_type == "task" else []
+
+
 class Blockchain:
-    def __init__(self, file_path="blockchain.json", reset_file=False):
-        """
-        Initialize the blockchain. Optionally reset the blockchain file.
-        
-        Args:
-            file_path (str): Path to the blockchain file.
-            reset_file (bool): If True, clears the file at the start.
-        """
-        self.file_path = file_path
-        self.chain = []
-        
-        if reset_file:
-            self.clear_file()  # Clear the file before initializing
-        
-        if os.path.exists(self.file_path) and not reset_file:
-            self.load_from_file()
+    """Hash-chained ledger.
+
+    Both persistence (via ``storage``) and record shape (via ``block_type`` /
+    ``data`` on ``add_block``) are pluggable — extending what the ledger
+    tracks or where it lives never requires editing this class.
+    """
+
+    def __init__(
+        self,
+        storage: Optional[LedgerStorage] = None,
+        file_path: str = "blockchain.json",
+        reset: bool = False,
+    ):
+        self.storage = storage or JSONFileStorage(file_path)
+        self.chain: List[Block] = []
+
+        if reset:
+            self.storage.clear()
+
+        records = self.storage.load()
+        if records:
+            self.chain = [Block(**record) for record in records]
         else:
-            self.create_genesis_block()
+            self._create_genesis_block()
 
-    def clear_file(self):
-        """Clear the blockchain file by overwriting it with an empty JSON array."""
-        with open(self.file_path, "w") as f:
-            f.write("[]")  # Write an empty JSON array
+    def _create_genesis_block(self):
+        genesis_block = Block(0, "genesis", {}, "completed", "0")
+        self.chain = [genesis_block]
+        self._save()
 
-    def create_genesis_block(self):
-        genesis_block = Block(0, "Genesis Block", [], "completed", "0")
-        self.chain.append(genesis_block)
-        self.save_to_file()
-
-    def add_block(self, task, assigned_agents, status="pending", parent_index=None):
+    def add_block(
+        self,
+        block_type: str,
+        data: Dict[str, Any],
+        status: str = "pending",
+        parent_index: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Block:
         previous_hash = self.chain[-1].hash
-        new_block = Block(len(self.chain), task, assigned_agents, status, previous_hash, parent_index=parent_index)
-        
+        new_block = Block(
+            index=len(self.chain),
+            block_type=block_type,
+            data=data,
+            status=status,
+            previous_hash=previous_hash,
+            parent_index=parent_index,
+            metadata=metadata,
+        )
+
         # Update parent block with child reference
         if parent_index is not None:
             parent_block = self.chain[parent_index]
@@ -59,25 +111,38 @@ class Blockchain:
             parent_block.hash = parent_block.compute_hash()  # Recompute parent hash
 
         self.chain.append(new_block)
-        self.save_to_file()
+        self._save()
         return new_block
 
-    def save_to_file(self):
-        temp_file_path = f"{self.file_path}.tmp"
-        with open(temp_file_path, "w") as f:
-            json.dump([block.__dict__ for block in self.chain], f, indent=4)
-        os.replace(temp_file_path, self.file_path)
+    def add_task_block(
+        self,
+        task: str,
+        assigned_agents: Optional[List[str]] = None,
+        status: str = "pending",
+        parent_index: Optional[int] = None,
+    ) -> Block:
+        """Convenience wrapper preserving the original task-block shape."""
+        return self.add_block(
+            block_type="task",
+            data={"task": task, "assigned_agents": assigned_agents or []},
+            status=status,
+            parent_index=parent_index,
+        )
 
-    def load_from_file(self):
-        try:
-            with open(self.file_path, "r") as f:
-                data = json.load(f)
-                self.chain = [Block(**block) for block in data]
-        except (json.JSONDecodeError, FileNotFoundError):
-            print(f"Blockchain file '{self.file_path}' is invalid or empty. Initializing with genesis block.")
-            self.create_genesis_block()
+    def update_task_status(self, index: int, status: str) -> Block:
+        block = self.get_block(index)
+        if block is None:
+            raise IndexError(f"No block at index {index}")
+        block.status = status
+        block.hash = block.compute_hash()
+        self._save()
+        return block
 
-    def get_block(self, index):
+    def get_block(self, index: int) -> Optional[Block]:
         return self.chain[index] if 0 <= index < len(self.chain) else None
 
-    
+    def get_blocks_by_type(self, block_type: str) -> List[Block]:
+        return [block for block in self.chain if block.block_type == block_type]
+
+    def _save(self) -> None:
+        self.storage.save([block.to_dict() for block in self.chain])
