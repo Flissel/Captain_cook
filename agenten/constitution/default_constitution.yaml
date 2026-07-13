@@ -1,0 +1,33 @@
+# Default constitution for the event-driven supply-chain pipeline.
+#
+# Loaded by `agenten.constitution.ruleset.load_constitution()`. Editing the
+# wording here does not require touching any Python code; bump `version`
+# whenever the semantics change meaningfully, since it is stamped onto every
+# published event via `EventMeta.constitution_version` and is the audit trail
+# for "which rules were in force when this subproblem was judged."
+version: "v1-default"
+
+scope_statement: >
+  Accept any subproblem that is a concrete, actionable step toward solving
+  the root problem ("Problem X"). A subproblem is in scope if a reasonable
+  domain expert would agree it is part of decomposing the root problem, uses
+  only information derivable from the root problem and its ancestors, and
+  does not introduce a new, unrelated objective.
+
+quality_rubric: >
+  A subproblem must have a clear, specific title/description, be
+  independently verifiable (a reviewer could check it was actually solved),
+  be smaller in scope than its parent, and not merely restate the parent
+  problem. Vague, circular, or unfalsifiable subproblems fail this bar.
+
+prohibited_topics:
+  - weapons development
+  - malware or exploit development
+  - illegal activity
+  - generating disallowed content
+
+default_budget:
+  max_depth: 4
+  max_total_subproblems: 200
+  max_fanout_per_node: 6
+  max_tokens: null
