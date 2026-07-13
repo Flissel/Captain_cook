@@ -296,7 +296,15 @@ def test_subproblem_failed_from_terminal_stage_is_surfaced_loudly():
     run(scenario())
 
 
-def test_lease_expired_transitions_in_progress_to_failed():
+def test_lease_expired_transitions_in_progress_to_retrying():
+    """A lease expiring almost always means transient infra failure (worker
+    crashed, host restarted) — LeaseExpired carries no `retriable` field, so
+    the Recorder treats it as retriable by default and routes to RETRYING,
+    not the terminal FAILED. Whether to eventually give up is the
+    Supervisor's (U6) retry-count/backoff decision, not this unit's — see
+    the module docstring's "Stage-machine note".
+    """
+
     async def scenario():
         bus, blockchain, budget_ledger, recorder = make_recorder()
         await recorder.start()
@@ -320,11 +328,237 @@ def test_lease_expired_transitions_in_progress_to_failed():
 
         idx = recorder._subproblem_index["s1"]
         block = blockchain.get_block(idx)
-        assert block.status == Stage.FAILED.value
-        assert "lease_expired" in block.metadata["failure_reason"]
+        assert block.status == Stage.RETRYING.value
+        assert "lease_expired" in block.metadata["last_error"]
+        assert block.metadata["retriable"] is True
         assert recorder.errors == []
 
     run(scenario())
+
+
+def test_subproblem_failed_retriable_transitions_to_retrying_not_failed():
+    """SubproblemFailed(retriable=True) must land in the non-terminal
+    RETRYING stage, not FAILED — Stage.FAILED is reserved for genuinely
+    terminal (retriable=False) failures. This is the ownership fix: only
+    this Recorder (the sole ledger writer) can legally make this call, so
+    it belongs here rather than deferred to U6/U9.
+    """
+
+    async def scenario():
+        bus, blockchain, budget_ledger, recorder = make_recorder()
+        await recorder.start()
+
+        await submit_problem(bus, "root-1")
+        await propose(bus, "s1")
+        await accept(bus, "s1")
+        await assign(bus, "s1")
+        await heartbeat(bus, "s1")  # -> IN_PROGRESS
+
+        await bus.publish(
+            topic_for(SubproblemFailed),
+            SubproblemFailed(
+                meta=make_meta(correlation_id="s1", root_problem_id="root-1"),
+                subproblem_id="s1",
+                error="worker raised a transient exception",
+                retriable=True,
+            ),
+        )
+        await recorder.stop()
+
+        idx = recorder._subproblem_index["s1"]
+        block = blockchain.get_block(idx)
+        assert block.status == Stage.RETRYING.value
+        assert block.metadata["last_error"] == "worker raised a transient exception"
+        assert block.metadata["retriable"] is True
+        assert "failure_reason" not in block.metadata
+        assert recorder.errors == []
+
+    run(scenario())
+
+
+def test_subproblem_failed_non_retriable_still_transitions_to_failed():
+    """retriable=False is genuinely terminal — this path is unchanged."""
+
+    async def scenario():
+        bus, blockchain, budget_ledger, recorder = make_recorder()
+        await recorder.start()
+
+        await submit_problem(bus, "root-1")
+        await propose(bus, "s1")
+        await accept(bus, "s1")
+        await assign(bus, "s1")
+        await heartbeat(bus, "s1")  # -> IN_PROGRESS
+
+        await bus.publish(
+            topic_for(SubproblemFailed),
+            SubproblemFailed(
+                meta=make_meta(correlation_id="s1", root_problem_id="root-1"),
+                subproblem_id="s1",
+                error="worker raised a fatal, non-retriable exception",
+                retriable=False,
+            ),
+        )
+        await recorder.stop()
+
+        idx = recorder._subproblem_index["s1"]
+        block = blockchain.get_block(idx)
+        assert block.status == Stage.FAILED.value
+        assert block.metadata["failure_reason"] == "worker raised a fatal, non-retriable exception"
+        assert block.metadata["retriable"] is False
+        assert "last_error" not in block.metadata
+        assert recorder.errors == []
+
+    run(scenario())
+
+
+def test_retrying_block_moves_back_to_assigned_via_existing_handler():
+    """Once a block lands in RETRYING (via a retriable SubproblemFailed or
+    a LeaseExpired), no new `handle_retry_requested` handler is needed to
+    get it re-assigned: RETRYING -> ASSIGNED is already a legal transition
+    (ALLOWED_TRANSITIONS[Stage.RETRYING] includes Stage.ASSIGNED), and the
+    existing `_apply_subproblem_assigned` handler already applies it the
+    moment the Coordinator re-publishes SubproblemAssigned after a
+    RetryRequested-driven backoff.
+    """
+
+    async def scenario():
+        bus, blockchain, budget_ledger, recorder = make_recorder()
+        await recorder.start()
+
+        await submit_problem(bus, "root-1")
+        await propose(bus, "s1")
+        await accept(bus, "s1")
+        await assign(bus, "s1")
+        await heartbeat(bus, "s1")  # -> IN_PROGRESS
+
+        await bus.publish(
+            topic_for(SubproblemFailed),
+            SubproblemFailed(
+                meta=make_meta(correlation_id="s1", root_problem_id="root-1"),
+                subproblem_id="s1",
+                error="transient",
+                retriable=True,
+            ),
+        )
+        # Drain (without stopping) to confirm it actually landed in
+        # RETRYING before re-assigning.
+        await recorder._inbox.join()
+        idx = recorder._subproblem_index["s1"]
+        retrying_status = blockchain.get_block(idx).status
+
+        # Re-assign, as the Coordinator would after a RetryRequested backoff.
+        await assign(bus, "s1", agent_type="worker", agent_key="w-2")
+        await recorder.stop()
+
+        block = blockchain.get_block(idx)
+        return retrying_status, block, recorder.errors
+
+    retrying_status, block, errors = run(scenario())
+    assert retrying_status == Stage.RETRYING.value
+    assert block.status == Stage.ASSIGNED.value
+    assert block.data["agent_type"] == "worker"
+    assert block.data["agent_key"] == "w-2"
+    # The stale retry-tracking fields from the resolved RETRYING detour
+    # must not linger once the block is actively (re)assigned again — see
+    # test_successful_retry_clears_stale_retry_metadata below for the full
+    # DONE-after-retry case.
+    assert "last_error" not in block.metadata
+    assert "retriable" not in block.metadata
+    assert block.metadata["retry_history"] == [{"error": "transient", "source": "subproblem_failed"}]
+    assert errors == []
+
+
+def test_successful_retry_clears_stale_retry_metadata():
+    """Regression test: once a block retries (RETRYING) and then goes on
+    to actually finish (DONE), `last_error`/`retriable` from the resolved
+    retry must not still be sitting on the block — a reader checking
+    `metadata.get("retriable")`/`"last_error" in metadata` to find blocks
+    currently in trouble would otherwise misreport a fully successful DONE
+    block as failed. The full retry history is still preserved, just in
+    the append-only `retry_history` list instead of the "current status"
+    fields.
+    """
+
+    async def scenario():
+        bus, blockchain, budget_ledger, recorder = make_recorder()
+        await recorder.start()
+
+        await submit_problem(bus, "root-1")
+        await propose(bus, "s1")
+        await accept(bus, "s1")
+        await assign(bus, "s1")
+        await heartbeat(bus, "s1")  # -> IN_PROGRESS
+
+        await bus.publish(
+            topic_for(SubproblemFailed),
+            SubproblemFailed(
+                meta=make_meta(correlation_id="s1", root_problem_id="root-1"),
+                subproblem_id="s1",
+                error="transient",
+                retriable=True,
+            ),
+        )  # -> RETRYING
+        await assign(bus, "s1", agent_type="worker", agent_key="w-2")  # -> ASSIGNED
+        await heartbeat(bus, "s1", agent_type="worker", agent_key="w-2")  # -> IN_PROGRESS
+        await complete(bus, "s1", result={"answer": 7})  # -> DONE
+        await recorder.stop()
+
+        idx = recorder._subproblem_index["s1"]
+        return blockchain.get_block(idx), recorder.errors
+
+    block, errors = run(scenario())
+    assert block.status == Stage.DONE.value
+    assert block.data["result"] == {"answer": 7}
+    assert "last_error" not in block.metadata
+    assert "retriable" not in block.metadata
+    assert block.metadata["retry_history"] == [{"error": "transient", "source": "subproblem_failed"}]
+    assert errors == []
+
+
+def test_repeated_lease_expired_while_already_retrying_is_not_an_error():
+    """A second LeaseExpired for the same subproblem while it's still
+    sitting in RETRYING (awaiting Coordinator reassignment) is expected,
+    normal traffic during the retry-backoff window, not corruption —
+    RETRYING -> RETRYING must not be logged as an illegal transition.
+    """
+
+    async def scenario():
+        bus, blockchain, budget_ledger, recorder = make_recorder()
+        await recorder.start()
+
+        await submit_problem(bus, "root-1")
+        await propose(bus, "s1")
+        await accept(bus, "s1")
+        await assign(bus, "s1")
+        await heartbeat(bus, "s1")  # -> IN_PROGRESS
+
+        await bus.publish(
+            topic_for(LeaseExpired),
+            LeaseExpired(
+                meta=make_meta(correlation_id="s1", root_problem_id="root-1"),
+                subproblem_id="s1",
+                agent_type="worker",
+                agent_key="w-1",
+            ),
+        )  # -> RETRYING
+        await bus.publish(
+            topic_for(LeaseExpired),
+            LeaseExpired(
+                meta=make_meta(correlation_id="s1", root_problem_id="root-1"),
+                subproblem_id="s1",
+                agent_type="worker",
+                agent_key="w-1",
+            ),
+        )  # still RETRYING — must be a graceful no-op, not an error
+        await recorder.stop()
+
+        idx = recorder._subproblem_index["s1"]
+        return blockchain.get_block(idx), recorder.errors
+
+    block, errors = run(scenario())
+    assert block.status == Stage.RETRYING.value
+    assert len(block.metadata["retry_history"]) == 2
+    assert errors == []
 
 
 # ----------------------------------------------------------------------

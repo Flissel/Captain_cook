@@ -35,26 +35,34 @@ concurrently upstream. This is also exactly why `InProcessBudgetLedger`
 (query.py) can get away with an unlocked in-memory counter: `try_reserve`
 is only ever called from inside this same writer-loop turn.
 
-Stage-machine note (RetryRequested)
-------------------------------------
-The class contract below intentionally has no `handle_retry_requested`.
-The shared spec prose describes a `FAILED -> RETRYING` "bookkeeping"
-transition the Recorder would apply, but `Stage.FAILED` is a *terminal*
-stage in the frozen `agenten.ledger_bridge.stage_machine` state machine
-(`TERMINAL_STAGES` includes it, and `ALLOWED_TRANSITIONS[Stage.FAILED]` is
-the empty set) — `validate_transition` raises unconditionally the moment
-`current` is terminal, regardless of `target`. Implementing a literal
-`FAILED -> RETRYING` transition would mean either silently special-casing
-around `validate_transition` (which the state machine deliberately does
-not allow anyone to do) or corrupting the shared invariant that terminal
-stages never move again. Rather than guess at an undocumented amendment
-to a state machine this unit does not own, U8 sticks to the class
-contract's literal 9 handlers and flags this as a cross-unit follow-up
-(see the PR description) for whichever unit ends up owning retry
-re-assignment (U6 supervisor / U9 recovery) to resolve — e.g. by having
-`SubproblemFailed(retriable=True)` route to `Stage.RETRYING` directly
-(which *is* legal from `ASSIGNED`/`IN_PROGRESS`) instead of `Stage.FAILED`,
-so `Stage.FAILED` is reserved for genuinely terminal failures.
+Stage-machine note (retriable failures route to RETRYING, not FAILED)
+----------------------------------------------------------------------
+`Stage.FAILED` is *terminal* in the frozen `agenten.ledger_bridge.stage_machine`
+state machine (`TERMINAL_STAGES` includes it, `ALLOWED_TRANSITIONS[Stage.FAILED]`
+is empty), while `Stage.RETRYING` is not: `ALLOWED_TRANSITIONS[Stage.ASSIGNED]`
+and `ALLOWED_TRANSITIONS[Stage.IN_PROGRESS]` both already include
+`Stage.RETRYING` as a legal target alongside `Stage.FAILED`, and
+`ALLOWED_TRANSITIONS[Stage.RETRYING]` permits `Stage.ASSIGNED` — the state
+machine was designed with exactly this "retriable failure" path in mind.
+
+Because this Recorder is the *sole* ledger writer (see above), it is also
+the only unit that can legally make the FAILED-vs-RETRYING call — no other
+unit is allowed to touch `.status` at all. So `_apply_subproblem_failed`
+routes `SubproblemFailed(retriable=True)` to `Stage.RETRYING` (reserving
+`Stage.FAILED` for `retriable=False`, genuinely terminal failures), and
+`_apply_lease_expired` treats a lease expiry as inherently retriable by
+default and also routes to `Stage.RETRYING` (a lease expiring almost
+always means transient infra failure — worker crashed, host restarted —
+and `LeaseExpired` carries no `retriable` field to say otherwise; see
+`agenten.events.schemas.LeaseExpired`). Once a block is in `RETRYING`, no
+new handler is needed to get it re-assigned: the existing
+`handle_subproblem_assigned` / `_apply_subproblem_assigned` path already
+performs `RETRYING -> ASSIGNED` (a transition `validate_transition`
+already permits) the moment the Coordinator re-publishes
+`SubproblemAssigned` after a `RetryRequested`-driven backoff. Deciding
+*when* to give up retrying (retry-count/backoff policy, publishing
+`EscalateToRedecompose`) is the Supervisor's (U6) job, not this unit's —
+this unit only records what happened.
 
 Robustness note
 ----------------
@@ -679,6 +687,19 @@ class LedgerRecorderAgent:
         block.data["agent_type"] = event.agent_type
         block.data["agent_key"] = event.agent_key
         block.metadata["lease_expires_at"] = event.lease_expires_at
+        # A (re)assignment — including the RETRYING -> ASSIGNED case after
+        # a retriable SubproblemFailed/LeaseExpired — means whatever
+        # `last_error`/`retriable` said about the *previous* attempt no
+        # longer describes the block's current state. Pop them (rather
+        # than leave them sitting on a block that goes on to reach DONE,
+        # or fails again for a genuinely different reason) so a reader
+        # checking `metadata.get("retriable")`/`"last_error" in metadata`
+        # to find blocks currently in trouble is never misled by a
+        # resolved, historical retry. The full history isn't lost — it's
+        # already preserved append-only in `metadata["retry_history"]`
+        # (see `_apply_retry_transition`).
+        block.metadata.pop("last_error", None)
+        block.metadata.pop("retriable", None)
         self._transition(idx, Stage.ASSIGNED)
 
     async def _apply_worker_heartbeat(self, event: WorkerHeartbeat) -> None:
@@ -743,41 +764,96 @@ class LedgerRecorderAgent:
         if self._transition(idx, Stage.VERIFYING):
             self._transition(idx, Stage.DONE)
 
+    def _apply_retry_transition(self, idx: int, error: str, source: str) -> None:
+        """Shared RETRYING-path handling for a retriable `SubproblemFailed`
+        or a `LeaseExpired` (both route here — see module docstring).
+
+        Appends `error` to the block's append-only `metadata["retry_history"]`
+        forensic list (nothing about a retry is ever lost, mirroring
+        `_record_late_event`'s append-only philosophy), and sets
+        `last_error`/`retriable` as convenience "most recent attempt"
+        fields — cleared by `_apply_subproblem_assigned` the moment the
+        block is actually reassigned, so they never linger as stale
+        current-state on a block that goes on to reach DONE or a later,
+        different FAILED.
+
+        A second retriable report arriving while the block is *already*
+        RETRYING (e.g. two LeaseExpired events for the same still-
+        unassigned lease before the Coordinator gets to it) is a graceful
+        no-op status-wise: RETRYING -> RETRYING isn't an edge
+        `ALLOWED_TRANSITIONS` defines, so routing it through
+        `_can_transition` would log a spurious "illegal transition" error
+        for what is actually a normal part of the retry-backoff window,
+        not corruption. The report is still appended to `retry_history`
+        (and `last_error` refreshed) — it's only the self.errors entry
+        that's skipped.
+        """
+        block = self._blockchain.get_block(idx)
+        if block is None:  # pragma: no cover - defensive
+            return
+        if Stage(block.status) == Stage.RETRYING:
+            logger.debug(
+                "LedgerRecorder: %s for %s while already RETRYING (awaiting reassignment); "
+                "recording to retry_history without filing an error",
+                source,
+                idx,
+            )
+            block.metadata.setdefault("retry_history", []).append({"error": error, "source": source})
+            block.metadata["last_error"] = error
+            self._touch(idx)
+            return
+        validated = self._can_transition(idx, Stage.RETRYING)
+        if validated is None:
+            self._record_late_event(idx, source, {"error": error, "retriable": True})
+            return
+        validated.metadata.setdefault("retry_history", []).append({"error": error, "source": source})
+        validated.metadata["last_error"] = error
+        validated.metadata["retriable"] = True
+        self._transition(idx, Stage.RETRYING)
+
     async def _apply_subproblem_failed(self, event: SubproblemFailed) -> None:
         found = self._require_block(event.subproblem_id, "SubproblemFailed")
         if found is None:
             return
         idx, _block = found
-        # Per the shared spec: transition to FAILED from whatever
-        # non-terminal stage the block is currently in. Validate BEFORE
+        # Retriable failures go to RETRYING (non-terminal — the block can
+        # legally come back via RETRYING -> ASSIGNED once the Coordinator
+        # re-publishes SubproblemAssigned after backoff, see
+        # `_apply_retry_transition`); only genuinely terminal
+        # (retriable=False) failures go to FAILED, unchanged from before.
+        # Both targets are legal from ASSIGNED/IN_PROGRESS per
+        # ALLOWED_TRANSITIONS — see the module docstring. Validate BEFORE
         # writing `failure_reason`/`retriable` (see _can_transition's
         # docstring / _record_late_event): a stale/duplicate failure
-        # report arriving after the block is already terminal (e.g.
-        # DONE) must not overwrite those fields and make a successfully
+        # report arriving after the block is already terminal (e.g. DONE)
+        # must not overwrite those fields and make a successfully
         # completed block look like it failed — it's recorded as a late
         # event instead. Either way this is surfaced loudly via
         # self.errors, never silently swallowed.
-        block = self._can_transition(idx, Stage.FAILED)
-        if block is None:
-            self._record_late_event(idx, "subproblem_failed", {"error": event.error, "retriable": event.retriable})
+        if not event.retriable:
+            block = self._can_transition(idx, Stage.FAILED)
+            if block is None:
+                self._record_late_event(idx, "subproblem_failed", {"error": event.error, "retriable": False})
+                return
+            block.metadata["failure_reason"] = event.error
+            block.metadata["retriable"] = False
+            self._transition(idx, Stage.FAILED)
             return
-        block.metadata["failure_reason"] = event.error
-        block.metadata["retriable"] = event.retriable
-        self._transition(idx, Stage.FAILED)
+        self._apply_retry_transition(idx, event.error, "subproblem_failed")
 
     async def _apply_lease_expired(self, event: LeaseExpired) -> None:
         found = self._require_block(event.subproblem_id, "LeaseExpired")
         if found is None:
             return
         idx, _block = found
+        # LeaseExpired carries no `retriable` field (unlike SubproblemFailed)
+        # — a lease expiring almost always means transient infra failure
+        # (worker crashed, host restarted), so treat it as retriable by
+        # default and route to RETRYING, not FAILED. Deciding when to give
+        # up retrying (retry-count/backoff, EscalateToRedecompose) is the
+        # Supervisor's (U6) job, not this unit's — see module docstring.
         failure_reason = f"lease_expired (agent_type={event.agent_type}, agent_key={event.agent_key})"
-        block = self._can_transition(idx, Stage.FAILED)
-        if block is None:
-            self._record_late_event(idx, "lease_expired", {"error": failure_reason, "retriable": True})
-            return
-        block.metadata["failure_reason"] = failure_reason
-        block.metadata["retriable"] = True
-        self._transition(idx, Stage.FAILED)
+        self._apply_retry_transition(idx, failure_reason, "lease_expired")
 
 
 # ----------------------------------------------------------------------
