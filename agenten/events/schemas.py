@@ -1,4 +1,4 @@
-"""Frozen event dataclasses for the supply-chain pipeline.
+"""Pydantic event models for the supply-chain pipeline.
 
 Every lifecycle transition (problem submitted, subproblem proposed/
 accepted/rejected/assigned/completed/failed, retries, circuit-breaker
@@ -6,13 +6,25 @@ state) is one of these. All of them carry a `meta: EventMeta` for
 idempotency/tracing, since neither AutoGen's pub/sub nor our own
 restart-replay recovery guarantees exactly-once delivery.
 
+These are Pydantic models (frozen, i.e. immutable, same as the plain
+dataclasses this module started as) rather than stdlib dataclasses:
+autogen_core's default message serializer rejects dataclasses that have
+Optional/Union fields or nested dataclass fields ("...not supported. To
+use a union/nested types, use a Pydantic model") — every event here nests
+EventMeta and most have Optional fields, so plain dataclasses are not
+usable verbatim as AutoGen Core message types. This was discovered by
+unit U1 while wiring the real runtime adapter; DecompositionBudget
+(agenten/decomposition/budget.py), the one non-EventMeta nested type,
+was converted to Pydantic for the same reason.
+
 This module has no AutoGen import — it's the contract every other unit
 (U1-U11) builds against without needing autogen-core installed.
 """
-from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional
 import time
 import uuid
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from agenten.decomposition.budget import DecompositionBudget
 
@@ -21,8 +33,9 @@ def new_event_id() -> str:
     return str(uuid.uuid4())
 
 
-@dataclass(frozen=True)
-class EventMeta:
+class EventMeta(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     event_id: str
     correlation_id: str  # stable id of the thing this event is about (subproblem_id / block index)
     root_problem_id: str
@@ -59,8 +72,9 @@ RejectionReason = Literal[
 CircuitState = Literal["closed", "open", "half_open"]
 
 
-@dataclass(frozen=True)
-class ProblemSubmitted:
+class ProblemSubmitted(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     meta: EventMeta
     problem_id: str
     description: str
@@ -68,34 +82,38 @@ class ProblemSubmitted:
     budget: Optional[DecompositionBudget] = None
 
 
-@dataclass(frozen=True)
-class SubproblemProposed:
+class SubproblemProposed(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     meta: EventMeta
     subproblem_id: str
     parent_id: Optional[str]
     depth: int
     description: str
-    capability_tags: List[str] = field(default_factory=list)
+    capability_tags: List[str] = Field(default_factory=list)
     atomic: bool = False
 
 
-@dataclass(frozen=True)
-class SubproblemAccepted:
+class SubproblemAccepted(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     meta: EventMeta
     subproblem_id: str
     block_index: Optional[int] = None
 
 
-@dataclass(frozen=True)
-class SubproblemRejected:
+class SubproblemRejected(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     meta: EventMeta
     subproblem_id: str
     reason: RejectionReason
     detail: str = ""
 
 
-@dataclass(frozen=True)
-class SubproblemAssigned:
+class SubproblemAssigned(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     meta: EventMeta
     subproblem_id: str
     agent_type: str
@@ -103,8 +121,9 @@ class SubproblemAssigned:
     lease_expires_at: float
 
 
-@dataclass(frozen=True)
-class WorkerHeartbeat:
+class WorkerHeartbeat(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     meta: EventMeta
     subproblem_id: str
     agent_type: str
@@ -112,45 +131,51 @@ class WorkerHeartbeat:
     progress_note: str = ""
 
 
-@dataclass(frozen=True)
-class SubproblemCompleted:
+class SubproblemCompleted(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     meta: EventMeta
     subproblem_id: str
-    result: Dict[str, Any] = field(default_factory=dict)
+    result: Dict[str, Any] = Field(default_factory=dict)
 
 
-@dataclass(frozen=True)
-class SubproblemFailed:
+class SubproblemFailed(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     meta: EventMeta
     subproblem_id: str
     error: str
     retriable: bool = True
 
 
-@dataclass(frozen=True)
-class LeaseExpired:
+class LeaseExpired(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     meta: EventMeta
     subproblem_id: str
     agent_type: str
     agent_key: str
 
 
-@dataclass(frozen=True)
-class RetryRequested:
+class RetryRequested(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     meta: EventMeta
     subproblem_id: str
     delay_seconds: float = 0.0
 
 
-@dataclass(frozen=True)
-class EscalateToRedecompose:
+class EscalateToRedecompose(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     meta: EventMeta
     subproblem_id: str
     reason: str = ""
 
 
-@dataclass(frozen=True)
-class CircuitStateChanged:
+class CircuitStateChanged(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     meta: EventMeta
     agent_type: str
     state: CircuitState
