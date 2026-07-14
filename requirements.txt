@@ -5,7 +5,11 @@
 # agenten/ledger_bridge, ...) is built on AutoGen 0.4's Core API:
 autogen-core==0.7.5
 autogen-agentchat==0.7.5
-autogen-ext==0.7.5
+# `[openai]` extra pulls in `openai`, `tiktoken`, `aiofiles` -- required by
+# `autogen_ext.models.openai.OpenAIChatCompletionClient`, used by
+# `agenten/llm/model_client.py::build_model_client` (unit: real LLM-backed
+# decompose/judge implementations).
+autogen-ext[openai]==0.7.5
 
 # Existing agenten/ and blockchain/ dependencies (previously unpinned).
 pydantic==2.13.4
