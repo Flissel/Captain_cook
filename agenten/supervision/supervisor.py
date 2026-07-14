@@ -40,6 +40,7 @@ from agenten.events.schemas import (
     LeaseExpired,
     RetryRequested,
     SubproblemAssigned,
+    SubproblemCompleted,
     SubproblemFailed,
     make_meta,
     topic_for,
@@ -89,7 +90,8 @@ class SupervisorAgent:
         self,
         bus: EventBus,
         max_retries: Optional[int] = None,
-        backoff_base: float = 2.0,
+        backoff_base: Optional[float] = None,
+        backoff_initial_delay_seconds: Optional[float] = None,
         circuit_failure_threshold: float = 0.5,
         circuit_window: int = 20,
         circuit_half_open_after_seconds: float = 60.0,
@@ -99,7 +101,19 @@ class SupervisorAgent:
         self._max_retries = (
             max_retries if max_retries is not None else RETRY_POLICY["max_retries"]
         )
-        self._backoff_base = backoff_base
+        self._backoff_base = (
+            backoff_base if backoff_base is not None else RETRY_POLICY["backoff_base"]
+        )
+        # Absolute scale for the exponential backoff: delay for attempt N is
+        # backoff_initial_delay_seconds * backoff_base ** N. Kept as its own
+        # knob because backoff_base alone can only change the *growth rate*
+        # (base ** 0 == 1.0 for every base), never the first delay -- tests
+        # and latency-sensitive deployments need to scale the whole curve.
+        self._backoff_initial_delay_seconds = (
+            backoff_initial_delay_seconds
+            if backoff_initial_delay_seconds is not None
+            else RETRY_POLICY["backoff_initial_delay_seconds"]
+        )
         self._circuit_failure_threshold = circuit_failure_threshold
         self._circuit_window = circuit_window
         self._circuit_half_open_after_seconds = circuit_half_open_after_seconds
@@ -158,7 +172,7 @@ class SupervisorAgent:
             await self._bus.publish(topic_for(EscalateToRedecompose), escalate)
             return
 
-        delay = self._backoff_base ** attempt
+        delay = self._backoff_initial_delay_seconds * self._backoff_base ** attempt
         self._attempts[subproblem_id] = attempt + 1
         retry = RetryRequested(
             meta=child_meta(attempt + 1),
@@ -179,30 +193,63 @@ class SupervisorAgent:
         a circuit failure outcome for the agent_type last seen assigned to
         this subproblem (best-effort: no-op if no assignment was observed —
         see module docstring).
+
+        Ordering matters: the circuit failure outcome is recorded BEFORE
+        the retry is requested. Under an inline-delivery bus
+        (`InMemoryEventBus`), publishing `RetryRequested` can run the
+        ENTIRE retry chain — reassignment, re-execution, success,
+        `handle_completed` -> `record_success` — before
+        `_handle_retriable_outcome` returns. Recording the failure last
+        would let the retry's *success* land in the circuit window first:
+        a half_open circuit would publish a spurious "closed" (the probe
+        looked successful) and then immediately re-open when the original
+        failure finally landed in the freshly-cleared window — a
+        closed->open flap for an agent type that never actually recovered.
         """
-        # Look the assignment up BEFORE retry handling: escalation evicts it.
         agent_type = self._assigned_agent_type.get(event.subproblem_id)
+        if agent_type is not None:
+            await self._record_circuit_outcome(agent_type, failure=True)
         await self._handle_retriable_outcome(
             subproblem_id=event.subproblem_id,
             retriable=event.retriable,
             error=event.error,
             meta=event.meta,
         )
-        if agent_type is not None:
-            await self._record_circuit_outcome(agent_type, failure=True)
 
     async def handle_lease_expired(self, event: LeaseExpired) -> None:
         """A lease expiry is treated exactly like a retriable
         `SubproblemFailed` for retry/backoff/escalation purposes, and it
         carries `agent_type` directly, so it always drives circuit state.
+        The circuit outcome is recorded before the retry is requested for
+        the same inline-delivery reason as `handle_failed`.
         """
+        await self._record_circuit_outcome(event.agent_type, failure=True)
         await self._handle_retriable_outcome(
             subproblem_id=event.subproblem_id,
             retriable=True,
             error=f"lease expired for agent_type={event.agent_type} agent_key={event.agent_key}",
             meta=event.meta,
         )
-        await self._record_circuit_outcome(event.agent_type, failure=True)
+
+    async def handle_completed(self, event: SubproblemCompleted) -> None:
+        """Success bookkeeping for a completed subproblem.
+
+        `SubproblemCompleted` carries no `agent_type` field, so — exactly
+        like `handle_failed` — attribution goes through the assignment map
+        `handle_assigned` maintains (best-effort: no circuit outcome if no
+        assignment was observed). Completion is terminal for this
+        supervisor, so per-subproblem state is evicted the same way
+        escalation evicts it — without this, a long-lived process would
+        leak one attempts/assignment entry per subproblem that ever
+        succeeded.
+
+        This is the `SubproblemCompleted` -> `record_success` wiring point
+        the integration unit (U11) subscribes onto the bus.
+        """
+        agent_type = self._assigned_agent_type.pop(event.subproblem_id, None)
+        self._attempts.pop(event.subproblem_id, None)
+        if agent_type is not None:
+            await self.record_success(agent_type)
 
     # ------------------------------------------------------------------
     # Circuit breaker.
@@ -213,11 +260,11 @@ class SupervisorAgent:
         success while the circuit is half_open closes it (publishing
         `CircuitStateChanged(state="closed")`).
 
-        This is a plain method, not an event handler: `SupervisorAgent`
-        does not subscribe to `SubproblemCompleted` in this unit's scope.
-        Wiring `record_success` to fire on `SubproblemCompleted` is the
-        integration unit's (U11's) job. It is async because closing the
-        circuit publishes an event.
+        This is a plain method, not an event handler: it takes the
+        already-attributed `agent_type`. The event-facing wrapper is
+        `handle_completed` above, which the integration unit (U11)
+        subscribes to `SubproblemCompleted`. It is async because closing
+        the circuit publishes an event.
         """
         await self._record_circuit_outcome(agent_type, failure=False)
 
@@ -326,6 +373,12 @@ if autogen_core is not None:  # pragma: no cover - requires autogen_core install
         @message_handler
         async def on_lease_expired(self, message: LeaseExpired, ctx: MessageContext) -> None:
             await self._supervisor.handle_lease_expired(message)
+
+        @message_handler
+        async def on_subproblem_completed(
+            self, message: SubproblemCompleted, ctx: MessageContext
+        ) -> None:
+            await self._supervisor.handle_completed(message)
 
 else:
     SupervisorRoutedAgent = None

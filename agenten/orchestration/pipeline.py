@@ -1,6 +1,6 @@
 """build_pipeline(): the unit-U11 integration point.
 
-Wires every already-merged unit (U2-U5, U7, U8, U10) onto a single shared
+Wires every already-merged unit (U2-U8, U10) onto a single shared
 ``EventBus`` and a single real ``Blockchain``, and returns a
 ``SupplyChainPipeline`` handle a caller (``CaptainAgent``,
 ``examples/armada_demo.py``, ``tests/test_e2e_smoke.py``) can submit a
@@ -56,10 +56,13 @@ from agenten.decomposition.decomposer import DecomposerAgent, DescribeSubproblem
 from agenten.events.schemas import (
     CircuitStateChanged,
     EscalateToRedecompose,
+    LeaseExpired,
     ProblemSubmitted,
     RetryRequested,
     SubproblemAccepted,
     SubproblemAssigned,
+    SubproblemCompleted,
+    SubproblemFailed,
     SubproblemProposed,
     SubproblemRejected,
     make_meta,
@@ -72,6 +75,7 @@ from agenten.runtime.event_bus import EventBus, InMemoryEventBus
 from agenten.spawning.capability_registry import CapabilityRegistry
 from agenten.spawning.coordinator import SpawnCoordinatorAgent
 from agenten.supervision.reaper import ReaperAgent
+from agenten.supervision.supervisor import SupervisorAgent
 from agenten.tools.base import ToolRegistry
 from agenten.workers.base import WorkerAgent
 from agenten.workers.echo_worker import DEFAULT_ECHO_DELAY_SECONDS, EchoWorker
@@ -98,11 +102,11 @@ def _make_ledger_describe_subproblem(ledger_query: LedgerQueryImpl) -> DescribeS
     for ``handle_escalate_to_redecompose`` (a subproblem_id -> (description,
     depth) lookup), backed by the ledger read-side.
 
-    Not exercised by the happy-path smoke test (nothing publishes
-    ``EscalateToRedecompose`` yet -- that is the Supervisor's, unit U6's,
-    job), but wiring it now means U6 has a real callable to fire against on
-    day one instead of a `None` that raises ``RuntimeError`` the first time
-    anyone tries.
+    Not exercised by the happy-path smoke test, but the Supervisor (unit
+    U6, wired in ``build_pipeline``) publishes ``EscalateToRedecompose``
+    once a subproblem exhausts its retries, and this callable is what lets
+    the Decomposer act on that instead of a ``None`` that raises
+    ``RuntimeError`` the first time it fires.
     """
 
     async def describe_subproblem(subproblem_id: str) -> Tuple[str, int]:
@@ -138,6 +142,7 @@ class SupplyChainPipeline:
     tools: ToolRegistry
     workers: Dict[str, WorkerAgent]
     reaper: ReaperAgent
+    supervisor: SupervisorAgent
     default_budget: DecompositionBudget
     # Count of subproblems rejected for budget exhaustion. These are the
     # one terminal outcome with NO ledger block (the Recorder deliberately
@@ -271,6 +276,7 @@ def build_pipeline(
     lease_duration_seconds: float = 120.0,
     reaper_poll_interval_seconds: float = 15.0,
     llm_timeout_seconds: float = 15.0,
+    supervisor: Optional[SupervisorAgent] = None,
 ) -> SupplyChainPipeline:
     """Construct and wire up the full supply-chain pipeline.
 
@@ -324,6 +330,34 @@ def build_pipeline(
     )
     bus.subscribe(topic_for(SubproblemProposed), gatekeeper.handle_subproblem_proposed)
 
+    # --- Supervisor (U6) — retry/backoff/escalation policy plus per-
+    # agent_type circuit breaking. SubproblemFailed/LeaseExpired drive its
+    # retry-vs-escalate decision; the RetryRequested it publishes feeds the
+    # Coordinator's handle_retry_requested and the EscalateToRedecompose it
+    # publishes feeds the Decomposer's handle_escalate_to_redecompose (both
+    # subscribed below). handle_assigned/handle_completed maintain the
+    # subproblem_id -> agent_type attribution that circuit accounting needs
+    # (SubproblemFailed/SubproblemCompleted carry no agent_type field).
+    #
+    # Subscription-order note: InMemoryEventBus delivers to handlers
+    # sequentially in subscription order, and a worker's
+    # handle_subproblem_assigned runs the whole execution inline -- so
+    # handle_assigned MUST be subscribed before any worker's
+    # SubproblemAssigned handler (i.e. before the worker-fleet section
+    # below), or a failure published from inside the very first delivery
+    # would reach handle_failed before the assignment was ever recorded.
+    #
+    # An injected `supervisor` (for non-default retry/backoff/circuit
+    # policy) must have been constructed against this same `bus` -- pass
+    # `bus` explicitly alongside it. Defaults come from
+    # config.app_settings.RETRY_POLICY plus SupervisorAgent's own circuit
+    # defaults.
+    supervisor = supervisor if supervisor is not None else SupervisorAgent(bus)
+    bus.subscribe(topic_for(SubproblemAssigned), supervisor.handle_assigned)
+    bus.subscribe(topic_for(SubproblemFailed), supervisor.handle_failed)
+    bus.subscribe(topic_for(LeaseExpired), supervisor.handle_lease_expired)
+    bus.subscribe(topic_for(SubproblemCompleted), supervisor.handle_completed)
+
     # --- Capability registry + worker fleet (U4 registry, U5 workers).
     # EchoWorker has no external dependencies (no Selenium/LLM) so it's the
     # one used for the smoke test; register both of its capability_tags
@@ -364,11 +398,9 @@ def build_pipeline(
     )
     bus.subscribe(topic_for(SubproblemAccepted), coordinator.handle_subproblem_accepted)
     bus.subscribe(topic_for(RetryRequested), coordinator.handle_retry_requested)
-    # TODO(U6): once agenten/supervision/supervisor.py lands, the Supervisor
-    # is what actually publishes CircuitStateChanged based on failure-rate
-    # tracking per agent_type; the Coordinator already has a handler ready
-    # to consume it. Wired here now so no additional subscription needs to
-    # be added later.
+    # CircuitStateChanged is published by the Supervisor (wired above) from
+    # its per-agent_type failure-rate tracking; the Coordinator consumes it
+    # to defer assignments to an open-circuited agent type.
     bus.subscribe(topic_for(CircuitStateChanged), coordinator.handle_circuit_state_changed)
 
     # --- Decomposer (U3) — turns ProblemSubmitted / EscalateToRedecompose
@@ -380,11 +412,9 @@ def build_pipeline(
         bus, resolved_default_budget, llm_decompose, describe_subproblem=resolved_describe_subproblem
     )
     bus.subscribe(topic_for(ProblemSubmitted), decomposer.handle_problem_submitted)
-    # TODO(U6): once agenten/supervision/supervisor.py lands, subscribe a
-    # SupervisorAgent to SubproblemFailed/LeaseExpired here (it decides
-    # retry-vs-escalate policy) and wire its RetryRequested back onto the
-    # Coordinator (already subscribed above) and its EscalateToRedecompose
-    # onto this handler:
+    # EscalateToRedecompose is published by the Supervisor (wired above)
+    # when a subproblem is non-retriable or exhausts max_retries; this
+    # handler re-plans it via the ledger-backed describe_subproblem lookup.
     bus.subscribe(topic_for(EscalateToRedecompose), decomposer.handle_escalate_to_redecompose)
 
     # --- Reaper (U7) — lease/heartbeat watchdog. Poll-based, not
@@ -394,11 +424,10 @@ def build_pipeline(
     # `asyncio.create_task(reaper.run_forever())` as a background task in a
     # long-lived process. LeaseExpired events it publishes feed the same
     # retry path SubproblemFailed(retriable=True) does (see recorder.py's
-    # module docstring) -- again a U6 concern once retry-count/backoff
-    # policy exists; today an expired lease routes a block to
-    # Stage.RETRYING and simply waits there for a reassignment that (until
-    # U6 lands) will never come. That's fine for the happy-path smoke test,
-    # which never produces an expired lease.
+    # module docstring): the Supervisor (wired above) is subscribed to
+    # LeaseExpired and answers with RetryRequested (backoff, then the
+    # Coordinator reassigns) or EscalateToRedecompose once retries are
+    # exhausted.
     reaper = ReaperAgent(bus, ledger_query, poll_interval_seconds=reaper_poll_interval_seconds)
 
     _validate_capability_registry_at_boot(capability_registry, subscribed_worker_types)
@@ -417,6 +446,7 @@ def build_pipeline(
         tools=tool_registry,
         workers=workers,
         reaper=reaper,
+        supervisor=supervisor,
         default_budget=resolved_default_budget,
     )
     # Budget-exhaustion rejections are terminal but blockless (the Recorder

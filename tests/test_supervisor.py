@@ -13,6 +13,7 @@ from agenten.events.schemas import (
     LeaseExpired,
     RetryRequested,
     SubproblemAssigned,
+    SubproblemCompleted,
     SubproblemFailed,
     make_meta,
     topic_for,
@@ -63,6 +64,14 @@ def assigned_event(subproblem_id="sp-1", agent_type="researcher", agent_key="w-1
         agent_type=agent_type,
         agent_key=agent_key,
         lease_expires_at=10_000.0,
+    )
+
+
+def completed_event(subproblem_id="sp-1"):
+    return SubproblemCompleted(
+        meta=make_meta(correlation_id=subproblem_id, root_problem_id="root-1"),
+        subproblem_id=subproblem_id,
+        result={"ok": True},
     )
 
 
@@ -386,6 +395,94 @@ async def test_circuit_state_is_per_agent_type():
 
     assert await supervisor.circuit_state("researcher") == "open"
     assert await supervisor.circuit_state("writer") == "closed"
+
+
+@pytest.mark.asyncio
+async def test_completed_event_drives_record_success_via_assignment_mapping():
+    """handle_completed is the event-facing wrapper around record_success:
+    it attributes the completion to the last-assigned agent_type (a success
+    while half_open closes the circuit) and evicts per-subproblem state.
+    """
+    bus, recorded = make_bus_with_recorder(*CIRCUIT_EVENTS)
+    clock = FakeClock()
+    supervisor = SupervisorAgent(
+        bus,
+        max_retries=100,
+        circuit_failure_threshold=0.5,
+        circuit_half_open_after_seconds=60.0,
+        now=clock,
+    )
+
+    await supervisor.handle_lease_expired(
+        lease_expired_event(subproblem_id="sp-old", agent_type="researcher")
+    )
+    clock.advance(61.0)
+    assert await supervisor.circuit_state("researcher") == "half_open"
+
+    await supervisor.handle_assigned(assigned_event(subproblem_id="sp-1", agent_type="researcher"))
+    await supervisor.handle_completed(completed_event(subproblem_id="sp-1"))
+    assert await supervisor.circuit_state("researcher") == "closed"
+
+    # Per-subproblem state was evicted: a later failure of the same
+    # subproblem_id has no assignment to attribute, so it moves no circuit.
+    await supervisor.handle_failed(failed_event(subproblem_id="sp-1"))
+    assert await supervisor.circuit_state("researcher") == "closed"
+
+
+@pytest.mark.asyncio
+async def test_half_open_probe_failure_records_before_inline_retry_success():
+    """Regression test for the failure-vs-retry bookkeeping order.
+
+    Under an inline-delivery bus (InMemoryEventBus — exactly what
+    build_pipeline wires), publishing RetryRequested from handle_failed can
+    run the ENTIRE retry chain (reassign, re-execute, succeed,
+    handle_completed -> record_success) before handle_failed returns. The
+    circuit failure outcome must therefore be recorded BEFORE the retry is
+    requested. If it were recorded after, the retry's success would land in
+    the window first: a half_open circuit would publish a spurious "closed"
+    (the probe looked successful) and then immediately re-open when the
+    original failure finally landed — a closed->open flap, misleading every
+    CircuitStateChanged consumer (e.g. the spawn coordinator) about an
+    agent type that never actually recovered.
+    """
+    bus, recorded = make_bus_with_recorder(*CIRCUIT_EVENTS)
+    clock = FakeClock()
+    supervisor = SupervisorAgent(
+        bus,
+        max_retries=100,
+        circuit_failure_threshold=0.5,
+        circuit_half_open_after_seconds=60.0,
+        now=clock,
+    )
+
+    # Open the circuit, then move it to half_open (probation).
+    await supervisor.handle_lease_expired(
+        lease_expired_event(subproblem_id="sp-old", agent_type="researcher")
+    )
+    clock.advance(61.0)
+    assert await supervisor.circuit_state("researcher") == "half_open"
+
+    # Simulate the pipeline's inline retry chain: every RetryRequested is
+    # answered synchronously (still inside handle_failed's publish) with a
+    # reassignment and an immediately successful second attempt.
+    async def simulate_successful_inline_retry(event):
+        await supervisor.handle_assigned(
+            assigned_event(subproblem_id=event.subproblem_id, agent_type="researcher")
+        )
+        await supervisor.handle_completed(completed_event(subproblem_id=event.subproblem_id))
+
+    bus.subscribe(topic_for(RetryRequested), simulate_successful_inline_retry)
+
+    # The probe: a retriable failure attributed to the half_open agent type.
+    await supervisor.handle_assigned(assigned_event(subproblem_id="sp-probe", agent_type="researcher"))
+    await supervisor.handle_failed(failed_event(subproblem_id="sp-probe"))
+
+    # The failed probe re-opened the circuit — and stayed open: the retry's
+    # success arrived while the circuit was already open again, so it must
+    # NOT have produced a spurious intermediate "closed".
+    states = [event.state for event in recorded[CircuitStateChanged]]
+    assert states == ["open", "half_open", "open"]
+    assert await supervisor.circuit_state("researcher") == "open"
 
 
 def test_import_without_autogen_core(monkeypatch):

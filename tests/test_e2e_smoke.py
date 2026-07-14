@@ -1,7 +1,7 @@
 """End-to-end smoke test for the unit-U11 integration
 (agenten.orchestration.pipeline.build_pipeline): submits a synthetic
-"Problem X" through the REAL wiring of every already-merged unit (U2-U5,
-U7, U8, U10) over InMemoryEventBus + a real Blockchain, and asserts the
+"Problem X" through the REAL wiring of every already-merged unit (U2-U8,
+U10) over InMemoryEventBus + a real Blockchain, and asserts the
 whole chain settles into a correct, fully-terminal ledger state.
 
 Also covers the crash-recovery story (U9): a "crashed" first process that
@@ -13,23 +13,25 @@ recovery integrates with the full wired-up pipeline, not just its own
 isolated unit tests (see tests/ledger_bridge/test_recovery.py, which uses a
 hand-rolled FakeLedgerQuery instead of a real Blockchain/pipeline).
 
-Note on what recovery scenario this covers without unit U6 (Supervisor):
-recover_on_startup's QUEUED/VALIDATING and ACCEPTED branches re-publish
-SubproblemProposed/SubproblemAccepted, both of which the already-wired
-Gatekeeper -> Coordinator -> Worker -> Recorder chain can carry all the way
-to Stage.DONE on its own. Its ASSIGNED/IN_PROGRESS (LeaseExpired) branch
-cannot be driven all the way to DONE without a SupervisorAgent deciding
-retry-vs-escalate policy (see recorder.py's module docstring: "Deciding
-*when* to give up retrying ... is the Supervisor's (U6) job") -- that half
-is intentionally left as the TODO(U6) follow-up described in
-agenten/orchestration/pipeline.py, not exercised here.
+The failure path (Supervisor, unit U6: retriable failure -> Stage.RETRYING
+-> RetryRequested -> reassignment -> Stage.DONE, and escalation to the
+Decomposer once retries are exhausted) is covered by the two
+test_failure_path_* tests at the bottom of this module, against the same
+full build_pipeline() wiring.
 """
 import pytest
 
 from blockchain.Blockchain_modell import Blockchain
 from blockchain.storage import InMemoryStorage
 
-from agenten.events.schemas import SubproblemProposed, make_meta, topic_for
+from agenten.events.schemas import (
+    EscalateToRedecompose,
+    RetryRequested,
+    SubproblemAssigned,
+    SubproblemProposed,
+    make_meta,
+    topic_for,
+)
 from agenten.ledger_bridge.query import InProcessBudgetLedger
 from agenten.ledger_bridge.recorder import LedgerRecorderAgent
 from agenten.ledger_bridge.recovery import recover_on_startup
@@ -41,6 +43,8 @@ from agenten.orchestration.pipeline import (
 )
 from agenten.runtime.event_bus import InMemoryEventBus
 from agenten.spawning.capability_registry import CapabilityRegistry
+from agenten.supervision.supervisor import SupervisorAgent
+from agenten.workers.base import WorkerAgent, WorkerExecutionError
 
 pytestmark = pytest.mark.asyncio
 
@@ -383,37 +387,225 @@ async def test_crash_recovery_completes_block_stuck_at_queued_mid_handler():
 
 
 # ----------------------------------------------------------------------
-# Failure path (waiting on U6 Supervisor)
+# Failure path (U6 Supervisor, wired into build_pipeline)
 # ----------------------------------------------------------------------
-@pytest.mark.skip(reason="waiting on U6 Supervisor (agenten/supervision/supervisor.py)")
-async def test_failure_path_retriable_failure_is_retried_to_done_via_supervisor():
-    """Sketch of the failure-path smoke test to enable once unit U6 lands.
-
-    Wiring to add in this test (mirroring the TODO(U6) markers in
-    agenten/orchestration/pipeline.py's build_pipeline):
-      supervisor = SupervisorAgent(bus, ledger_query, ...)
-      bus.subscribe(topic_for(SubproblemFailed), supervisor.handle_subproblem_failed)
-      bus.subscribe(topic_for(LeaseExpired), supervisor.handle_lease_expired)
-    (its RetryRequested output feeds the already-subscribed
-    coordinator.handle_retry_requested; its EscalateToRedecompose output
-    feeds the already-subscribed decomposer.handle_escalate_to_redecompose.)
-
-    Scenario to assert:
-    1. Build the pipeline with a flaky worker whose execute() raises
-       WorkerExecutionError(retriable=True) on the first call and succeeds
-       on the second (register its capability tag in the registry and
-       subscribe it to SubproblemAssigned, same as EchoWorker in
-       build_pipeline).
-    2. Submit a problem decomposed into 1 subproblem routed to that worker.
-    3. Assert the block transitions ASSIGNED/IN_PROGRESS -> RETRYING on the
-       first failure (recorder routes retriable failures to Stage.RETRYING,
-       see recorder.py), the Supervisor publishes RetryRequested with its
-       backoff, the Coordinator re-publishes SubproblemAssigned
-       (RETRYING -> ASSIGNED), and the second attempt reaches Stage.DONE.
-    4. Assert metadata["retry_history"] on the block records the first
-       failure, and that last_error/retriable were cleared on reassignment.
-    5. Separately: a worker that always fails should, after the
-       Supervisor's max-retry policy, produce EscalateToRedecompose and
-       drive the Decomposer's handle_escalate_to_redecompose (already wired
-       with a real describe_subproblem lookup in build_pipeline).
+class FlakyWorker(WorkerAgent):
+    """Raises WorkerExecutionError(retriable=True) for the first
+    ``fail_times`` execute() calls, then succeeds -- the failure-path
+    counterpart of EchoWorker. Test-local on purpose: no production module
+    needs a deliberately failing worker.
     """
+
+    agent_type = "flaky_worker"
+    capability_tags = ["flaky"]
+
+    def __init__(self, *args, fail_times: int = 1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fail_times = fail_times
+        self.calls = 0
+
+    async def execute(self, subproblem_id, description):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise WorkerExecutionError(f"transient flake #{self.calls}", retriable=True)
+        return {"flaky": description}
+
+
+def install_flaky_worker(pipeline, fail_times: int) -> FlakyWorker:
+    """Register a FlakyWorker on an already-built pipeline, the same way
+    build_pipeline registers EchoWorker: capability tag in the registry +
+    a SubproblemAssigned subscription. Subscribing after build_pipeline is
+    what keeps the Supervisor's handle_assigned ahead of the worker in
+    InMemoryEventBus's delivery order (see build_pipeline's
+    subscription-order note).
+    """
+    worker = FlakyWorker(pipeline.bus, pipeline.tools, fail_times=fail_times)
+    pipeline.capability_registry.register("flaky", worker.agent_type)
+    pipeline.bus.subscribe(topic_for(SubproblemAssigned), worker.handle_subproblem_assigned)
+    pipeline.workers[worker.agent_type] = worker
+    return worker
+
+
+def subscribe_recording(pipeline, event_type):
+    """Record every event of ``event_type`` published on the pipeline bus."""
+    events = []
+
+    async def record(event):
+        events.append(event)
+
+    pipeline.bus.subscribe(topic_for(event_type), record)
+    return events
+
+
+async def flaky_decompose(description, depth):
+    if depth != 0:
+        return []
+    return [
+        {
+            "description": f"Flaky phase for: {description}",
+            "capability_tags": ["flaky"],
+            "atomic": True,
+        }
+    ]
+
+
+def make_failure_supervisor(bus, **kwargs):
+    """Supervisor tuned for the failure-path tests, constructed against the
+    same bus the pipeline will use (build_pipeline requires that for an
+    injected supervisor):
+
+    - backoff_initial_delay_seconds=0.01: the Coordinator really does
+      asyncio.sleep(delay_seconds) before reassigning, and the first-retry
+      delay equals the initial delay (base ** 0 == 1.0), so scale the
+      whole backoff curve down to keep the tests fast.
+    - circuit_failure_threshold=1.0: a single failure in an empty rolling
+      window is failure fraction 1.0, which would trip the default 0.5
+      breaker and turn our deliberate one-off failures into the
+      Coordinator's 30-second circuit-open deferral. Circuit behavior has
+      its own unit tests (tests/test_supervisor.py); these tests are about
+      the retry/escalation path.
+    """
+    kwargs.setdefault("backoff_initial_delay_seconds", 0.01)
+    kwargs.setdefault("circuit_failure_threshold", 1.0)
+    return SupervisorAgent(bus, **kwargs)
+
+
+async def test_failure_path_retriable_failure_is_retried_to_done_via_supervisor():
+    """One retriable failure, then success: the Supervisor (wired in
+    build_pipeline) answers the SubproblemFailed with RetryRequested, the
+    Coordinator reassigns after the backoff, and the second attempt reaches
+    Stage.DONE -- with the first failure preserved in retry_history and the
+    last_error/retriable convenience fields cleared on reassignment.
+    """
+    chain = Blockchain(storage=InMemoryStorage())
+    bus = InMemoryEventBus()
+    pipeline = make_pipeline(
+        blockchain=chain,
+        llm_decompose=flaky_decompose,
+        bus=bus,
+        supervisor=make_failure_supervisor(bus),
+    )
+    worker = install_flaky_worker(pipeline, fail_times=1)
+    retry_events = subscribe_recording(pipeline, RetryRequested)
+    escalate_events = subscribe_recording(pipeline, EscalateToRedecompose)
+
+    await pipeline.start()
+    await pipeline.submit_problem("Problem F: needs one retry to land")
+    converged = await pipeline.wait_until_terminal(expected_subproblem_count=1, timeout=5.0)
+    await pipeline.stop()
+
+    assert converged, "retried subproblem did not reach a terminal ledger state within the timeout"
+    assert pipeline.recorder.errors == []
+    assert worker.calls == 2  # first attempt failed, second succeeded
+    assert escalate_events == []
+
+    # The Supervisor answered the failure with exactly one RetryRequested,
+    # carrying its (scaled) first-attempt backoff delay.
+    assert len(retry_events) == 1
+    assert retry_events[0].delay_seconds == pytest.approx(0.01)
+
+    # Second attempt ended at DONE...
+    done_blocks = pipeline.ledger_query.blocks_in_stage(Stage.DONE)
+    assert len(done_blocks) == 1
+    block = done_blocks[0]
+    assert block.data["agent_type"] == "flaky_worker"
+    assert block.data["result"] == {"flaky": block.data["subproblem_id"]}
+    assert retry_events[0].subproblem_id == block.data["subproblem_id"]
+
+    # ...via RETRYING: retry_history is only ever written on the recorder's
+    # RETRYING path (_apply_retry_transition), and recorder.errors == []
+    # above rules out any illegal-transition shortcut around it
+    # (ASSIGNED -> ASSIGNED without the RETRYING hop would have errored).
+    history = block.metadata["retry_history"]
+    assert len(history) == 1
+    assert history[0]["source"] == "subproblem_failed"
+    assert "transient flake #1" in history[0]["error"]
+    # The reassignment cleared the "current trouble" convenience fields --
+    # a block that went on to reach DONE no longer advertises a last_error.
+    assert "last_error" not in block.metadata
+    assert "retriable" not in block.metadata
+
+
+async def test_failure_path_exhausted_retries_escalate_to_redecompose():
+    """A worker that always fails: after max_retries the Supervisor gives
+    up and publishes EscalateToRedecompose, which drives the Decomposer's
+    handle_escalate_to_redecompose through build_pipeline's ledger-backed
+    describe_subproblem lookup -- the replacement subproblem (routed to the
+    always-healthy echo worker) then reaches DONE.
+    """
+    decompose_calls = []
+
+    async def flaky_then_echo_decompose(description, depth):
+        decompose_calls.append((description, depth))
+        if depth == 0:
+            return [
+                {
+                    "description": f"Flaky phase for: {description}",
+                    "capability_tags": ["flaky"],
+                    "atomic": True,
+                }
+            ]
+        # Re-decomposition of the escalated subproblem: hand the work to
+        # the echo worker instead. Kept SHORTER than the parent flaky
+        # subproblem's description -- the Gatekeeper rejects a child longer
+        # than its parent as "not a minimal decomposition".
+        return [
+            {
+                "description": "Replacement echo step for problem G",
+                "capability_tags": ["echo"],
+                "atomic": True,
+            }
+        ]
+
+    chain = Blockchain(storage=InMemoryStorage())
+    bus = InMemoryEventBus()
+    pipeline = make_pipeline(
+        blockchain=chain,
+        llm_decompose=flaky_then_echo_decompose,
+        bus=bus,
+        supervisor=make_failure_supervisor(bus, max_retries=1),
+    )
+    worker = install_flaky_worker(pipeline, fail_times=10_000)  # never succeeds
+    retry_events = subscribe_recording(pipeline, RetryRequested)
+    escalate_events = subscribe_recording(pipeline, EscalateToRedecompose)
+
+    await pipeline.start()
+    await pipeline.submit_problem("Problem G: flaky work that needs re-planning")
+    # Terminal outcomes: only the replacement (echo) subproblem reaches
+    # DONE. The escalated flaky block itself deliberately stays at
+    # Stage.RETRYING -- see below.
+    converged = await pipeline.wait_until_terminal(expected_subproblem_count=1, timeout=5.0)
+    await pipeline.stop()
+
+    assert converged, "replacement subproblem did not reach a terminal ledger state within the timeout"
+    assert pipeline.recorder.errors == []
+    assert worker.calls == 2  # initial attempt + exactly max_retries=1 retry
+    assert len(retry_events) == 1
+
+    # The Supervisor escalated exactly once, for the flaky subproblem.
+    assert len(escalate_events) == 1
+    assert "exceeded max_retries" in escalate_events[0].reason
+
+    # The Decomposer was re-driven via the ledger-backed describe_subproblem
+    # lookup: its second call got the flaky subproblem's own description at
+    # its recorded depth (children of a root problem sit at depth 1).
+    flaky_description = "Flaky phase for: Problem G: flaky work that needs re-planning"
+    assert decompose_calls[0] == ("Problem G: flaky work that needs re-planning", 0)
+    assert (flaky_description, 1) in decompose_calls
+
+    # The replacement subproblem reached DONE via the echo worker...
+    done_blocks = pipeline.ledger_query.blocks_in_stage(Stage.DONE)
+    assert len(done_blocks) == 1
+    assert done_blocks[0].data["agent_type"] == "echo_worker"
+    assert done_blocks[0].data["description"] == "Replacement echo step for problem G"
+
+    # ...while the escalated flaky block stays parked at Stage.RETRYING
+    # with its full failure forensics: escalation is terminal for the
+    # Supervisor (the Decomposer re-plans), but the Recorder has no
+    # EscalateToRedecompose handler, so nothing further touches the block.
+    retrying_blocks = pipeline.ledger_query.blocks_in_stage(Stage.RETRYING)
+    assert len(retrying_blocks) == 1
+    flaky_block = retrying_blocks[0]
+    assert flaky_block.data["description"] == flaky_description
+    assert escalate_events[0].subproblem_id == flaky_block.data["subproblem_id"]
+    assert len(flaky_block.metadata["retry_history"]) == 2  # both failed attempts
