@@ -115,6 +115,20 @@ async def recover_on_startup(
 
         elif stage in _ASSIGNED_OR_IN_PROGRESS:
             for block in blocks:
+                if block.block_type != "subproblem":
+                    # The root "problem" block itself is written at
+                    # Stage.IN_PROGRESS and, by the Ledger Recorder's own
+                    # design (see recorder.py's _write_problem_block), never
+                    # transitions again -- it sits at IN_PROGRESS for the
+                    # entire lifetime of the ledger, on purpose, and never
+                    # carries a lease. Without this guard every recovery
+                    # pass against any ledger that has ever seen a
+                    # ProblemSubmitted would permanently flag it as
+                    # "lease_missing" (see the branch below), which isn't a
+                    # real anomaly and would drown out genuine signal.
+                    # Only actual subproblem blocks are lease-bearing work
+                    # this routine needs to reason about here.
+                    continue
                 lease_expires_at = block.metadata.get("lease_expires_at")
                 if lease_expires_at is None:
                     # A block genuinely shouldn't reach ASSIGNED/IN_PROGRESS

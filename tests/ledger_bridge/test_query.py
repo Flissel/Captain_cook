@@ -2,8 +2,11 @@
 (`LedgerQueryImpl`) and the crash-safe `InProcessBudgetLedger`.
 """
 import importlib
+import importlib.util
 import sys
 import types
+
+import pytest
 
 from blockchain.Blockchain_modell import Blockchain
 from blockchain.storage import InMemoryStorage
@@ -109,12 +112,18 @@ def test_budget_ledger_try_reserve_n_zero_or_negative_is_a_noop():
 # ----------------------------------------------------------------------
 # Import-cleanliness of the optional AutoGen Core adapter in recorder.py
 # ----------------------------------------------------------------------
+@pytest.mark.skipif(
+    importlib.util.find_spec("autogen_core") is not None,
+    reason="autogen_core IS installed (requirements.txt pins it); the no-autogen "
+    "degradation path can't be exercised in-process in this environment",
+)
 def test_recorder_module_imports_cleanly_without_autogen_core():
-    """The environment this test suite runs in has no autogen_core
-    installed (see the module's `try: import autogen_core / except
-    ImportError: autogen_core = None` guard). Confirms the module import
-    itself doesn't blow up, and that the RoutedAgent adapter degrades to
-    None instead of a half-defined class.
+    """When autogen_core is NOT installed (see the module's `try: import
+    autogen_core / except ImportError: autogen_core = None` guard), the
+    module import itself must not blow up, and the RoutedAgent adapter must
+    degrade to None instead of a half-defined class. Skipped when the real
+    package is present -- the environment-conditional twin of
+    tests/test_autogen_bus_integration.py's importorskip.
     """
     assert "autogen_core" not in sys.modules or sys.modules["autogen_core"] is None
 
@@ -171,4 +180,13 @@ def test_recorder_module_wires_routed_agent_adapter_when_autogen_core_present(mo
     finally:
         monkeypatch.delitem(sys.modules, "autogen_core", raising=False)
         importlib.reload(recorder_module)
-        assert recorder_module.autogen_core is None
+        # Restore-and-verify must match whatever this environment actually
+        # has: with the real autogen_core installed (requirements.txt pins
+        # it) the reload re-imports it and the adapter is a real class;
+        # without it, both degrade to None.
+        if importlib.util.find_spec("autogen_core") is not None:
+            assert recorder_module.autogen_core is not None
+            assert recorder_module.LedgerRecorderRoutedAgent is not None
+        else:
+            assert recorder_module.autogen_core is None
+            assert recorder_module.LedgerRecorderRoutedAgent is None

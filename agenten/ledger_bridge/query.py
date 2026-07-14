@@ -63,9 +63,43 @@ class LedgerQueryImpl(LedgerQuery):
     disagree about what stage a block is "really" in.
     """
 
-    def __init__(self, blockchain: Blockchain, status_index: Dict[Stage, Set[int]]):
+    def __init__(
+        self,
+        blockchain: Blockchain,
+        status_index: Dict[Stage, Set[int]],
+        subproblem_index: Optional[Dict[str, int]] = None,
+    ):
         self._blockchain = blockchain
         self._status_index = status_index
+        # subproblem_id -> block index. Like `status_index`, owned and
+        # mutated by the Ledger Recorder (it shares its own
+        # `_subproblem_index` dict by reference at construction time) —
+        # this class only reads it. Optional so a standalone
+        # LedgerQueryImpl (tests, ad-hoc read-side use) still works: in
+        # that case `find_block_by_subproblem_id` falls back to a linear
+        # chain scan instead of the O(1) lookup.
+        self._subproblem_index = subproblem_index
+
+    def find_block_by_subproblem_id(self, subproblem_id: str) -> Optional[Block]:
+        """Look up the ledger block for a subproblem_id.
+
+        O(1) via the Recorder-maintained `subproblem_index` when this
+        instance was constructed with one (the normal, Recorder-owned
+        case); otherwise a linear scan of the chain. Centralizes the
+        "find the block for this subproblem" lookup that would otherwise
+        be re-implemented as an O(all-blocks) stage-by-stage scan at every
+        call site (unit U11's pipeline helpers use this; note that
+        `SpawnCoordinatorAgent._find_block_for_subproblem`, merged before
+        this method existed, still carries its own scan and can migrate
+        here as a follow-up).
+        """
+        if self._subproblem_index is not None:
+            idx = self._subproblem_index.get(subproblem_id)
+            return self._blockchain.get_block(idx) if idx is not None else None
+        for block in self._blockchain.chain:
+            if block.block_type == "subproblem" and block.data.get("subproblem_id") == subproblem_id:
+                return block
+        return None
 
     def count_in_stage(self, stage: Stage) -> int:
         return len(self._status_index.get(stage, ()))
