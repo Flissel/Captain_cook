@@ -231,11 +231,19 @@ async def test_duplicate_event_delivery_is_a_no_op():
 
 
 @pytest.mark.asyncio
-async def test_import_without_autogen_core():
-    """RoutedSpawnCoordinatorAgent must be None (not raise) when autogen_core
-    is not installed, and the module must still import cleanly.
+async def test_import_with_or_without_autogen_core():
+    """The module must import cleanly either way, and its soft-import
+    degradation must be self-consistent: RoutedSpawnCoordinatorAgent is a
+    real adapter class exactly when autogen_core resolved, and None (not a
+    half-defined class, not an ImportError) when it didn't.
     """
+    import importlib.util
+
     from agenten.spawning import coordinator as coordinator_module
 
-    assert coordinator_module.autogen_core is None
-    assert coordinator_module.RoutedSpawnCoordinatorAgent is None
+    if importlib.util.find_spec("autogen_core") is not None:
+        assert coordinator_module.autogen_core is not None
+        assert coordinator_module.RoutedSpawnCoordinatorAgent is not None
+    else:
+        assert coordinator_module.autogen_core is None
+        assert coordinator_module.RoutedSpawnCoordinatorAgent is None

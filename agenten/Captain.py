@@ -5,9 +5,15 @@ from .tools.internet_search import InternetSearchTool
 from .workflows.registry import get_workflow
 from blockchain.Blockchain_modell import Blockchain
 from blockchain.visualisation import restructure_for_tree, plot_project_tree
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from .functions.Caiptain_functions.task_models import Task, Department
 from .functions.Caiptain_functions.clean_json_string import clean_json_string
+from .decomposition.budget import DecompositionBudget
+
+if TYPE_CHECKING:  # import only for the type annotation; the real import
+    # happens lazily inside build_default_supply_chain_pipeline so this
+    # module keeps working when the new-subsystem deps aren't installed.
+    from .orchestration.pipeline import SupplyChainPipeline
 
 
 class CaptainAgent:
@@ -194,3 +200,77 @@ class CaptainAgent:
             departments.append(department)
 
         return departments
+
+    # --- Event-driven supply-chain pipeline (unit U11 integration) --------
+    #
+    # Additive only: nothing above this point is touched. These two methods
+    # are a thin bridge from the existing pyautogen-0.2-based CaptainAgent
+    # onto the new event-driven, AutoGen-0.4-oriented supply-chain pipeline
+    # assembled by agenten.orchestration.pipeline.build_pipeline() (units
+    # U0-U5, U7-U10). The two subsystems are intentionally NOT merged into
+    # one object graph -- CaptainAgent keeps its own `self.blockchain`/
+    # `self.tools` for its existing methods untouched, and the pipeline
+    # gets its own real Blockchain instance, exactly as build_pipeline()
+    # does when called standalone (see examples/armada_demo.py).
+
+    def build_default_supply_chain_pipeline(self, **pipeline_kwargs) -> "SupplyChainPipeline":
+        """Thin wrapper around agenten.orchestration.pipeline.build_pipeline():
+        builds the event-driven supply-chain pipeline and stores the result
+        on self.supply_chain_pipeline.
+
+        `llm_decompose` (required by build_pipeline) and, if wanted,
+        `llm_judge` must be supplied via `pipeline_kwargs` -- this
+        CaptainAgent's own `self.llm_config` is a pyautogen-0.2-style
+        config dict, not directly usable as the plain async callables the
+        new pipeline expects. Real LLM-backed implementations live in
+        `agenten.llm` (make_llm_decompose/make_llm_judge); see
+        examples/armada_demo.py for canned (non-LLM) examples.
+
+        Ledger sharing: when the caller does not name a ledger explicitly
+        (no `blockchain`, `storage`, or `blockchain_file_path` kwarg), the
+        pipeline REUSES this Captain's own `self.blockchain` instance.
+        This is deliberate: build_pipeline's standalone default file path
+        ("blockchain.json") is the same file CaptainAgent's own default
+        `blockchain_path` points at, and two independent Blockchain
+        objects backed by the same file silently overwrite each other's
+        blocks on every save (JSONFileStorage.save rewrites the whole
+        file) -- sharing the single instance makes that collision
+        impossible by default while keeping every explicit override
+        honored verbatim.
+
+        NOTE: the returned pipeline is NOT started. Callers must `await
+        pipeline.start()` before submitting problems (see
+        SupplyChainPipeline.start/submit_problem), and `await
+        pipeline.stop()` when done.
+        """
+        from .orchestration.pipeline import build_pipeline
+
+        if not any(k in pipeline_kwargs for k in ("blockchain", "storage", "blockchain_file_path")):
+            pipeline_kwargs["blockchain"] = self.blockchain
+        self.supply_chain_pipeline = build_pipeline(**pipeline_kwargs)
+        return self.supply_chain_pipeline
+
+    async def submit_problem_to_supply_chain(
+        self, description: str, budget: Optional[DecompositionBudget] = None
+    ) -> str:
+        """Publish a ProblemSubmitted event onto the supply-chain pipeline's
+        bus and return the generated problem_id.
+
+        Requires build_default_supply_chain_pipeline() to have been called
+        first (raises RuntimeError otherwise), AND the pipeline to have
+        been started via `await self.supply_chain_pipeline.start()` --
+        submit_problem itself raises RuntimeError on an unstarted pipeline,
+        because publishing into one enqueues ledger writes that nothing
+        ever drains (a problem_id would come back for work that silently
+        never happens). Does not itself wait for the submitted problem to
+        reach a terminal ledger stage -- callers poll
+        `self.supply_chain_pipeline.wait_until_terminal(...)` /
+        `self.supply_chain_pipeline.ledger_query` for that, same as
+        examples/armada_demo.py and tests/test_e2e_smoke.py do.
+        """
+        pipeline = getattr(self, "supply_chain_pipeline", None)
+        if pipeline is None:
+            raise RuntimeError(
+                "submit_problem_to_supply_chain: call build_default_supply_chain_pipeline() first"
+            )
+        return await pipeline.submit_problem(description, budget=budget)

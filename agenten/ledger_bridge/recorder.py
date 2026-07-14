@@ -171,7 +171,15 @@ class LedgerRecorderAgent:
         # (e.g. this process is starting up on top of a ledger a previous
         # process crashed while writing) instead of only ever reflecting
         # blocks written during this process's lifetime.
-        self.query = LedgerQueryImpl(blockchain, status_index=build_status_index(blockchain))
+        # `_subproblem_index` is shared by reference: `_rehydrate()` below
+        # (and every later write inside the writer loop) fills the same
+        # dict the query object reads, so `find_block_by_subproblem_id`
+        # stays O(1) and always in lockstep with the writes.
+        self.query = LedgerQueryImpl(
+            blockchain,
+            status_index=build_status_index(blockchain),
+            subproblem_index=self._subproblem_index,
+        )
         self._rehydrate()
 
         self._subscribe()
@@ -566,6 +574,49 @@ class LedgerRecorderAgent:
         return self._default_budget
 
     async def _apply_subproblem_proposed(self, event: SubproblemProposed) -> None:
+        existing_idx = self._subproblem_index.get(event.subproblem_id)
+        if existing_idx is not None:
+            # Idempotent re-delivery / crash-recovery replay: a block for
+            # this subproblem_id already exists -- most notably,
+            # agenten.ledger_bridge.recovery.recover_on_startup re-publishes
+            # SubproblemProposed for every block it finds still stuck at
+            # QUEUED/VALIDATING after a restart, specifically so a second,
+            # independent subscriber on this same topic (ConstitutionGatekeeper)
+            # gets a chance to (re-)derive a verdict for it. Writing a brand
+            # new block here every time would silently duplicate it (a
+            # second add_block call orphaning the original, still-stuck
+            # one) instead of being a no-op the way the equivalent
+            # `_apply_problem_submitted` dedup check already is for
+            # ProblemSubmitted -- this mirrors that same pattern. The event
+            # itself still reaches every other subscriber of this topic via
+            # the bus; this method only owns the ledger-write side.
+            #
+            # One piece of the original handler must still be completed
+            # here, though, not skipped: if the previous process crashed
+            # AFTER add_block (status=QUEUED persisted) but BEFORE the
+            # QUEUED -> VALIDATING transition below, the rehydrated block
+            # is stuck at QUEUED -- and since a Gatekeeper verdict only
+            # applies to a VALIDATING block (`_require_validating_block`),
+            # a plain early-return here would leave it stuck at QUEUED
+            # *forever*: every future recovery pass would republish this
+            # same event, hit this guard, and no-op again. Finishing the
+            # interrupted transition is the idempotent completion of this
+            # handler, exactly what a replayed at-least-once event is for.
+            block = self._blockchain.get_block(existing_idx)
+            if block is not None and Stage(block.status) == Stage.QUEUED:
+                logger.info(
+                    "LedgerRecorder: re-delivered SubproblemProposed for %s found its block still "
+                    "QUEUED (previous process crashed mid-handler); completing QUEUED -> VALIDATING",
+                    event.subproblem_id,
+                )
+                self._transition(existing_idx, Stage.VALIDATING)
+                return
+            logger.debug(
+                "LedgerRecorder: duplicate SubproblemProposed for subproblem_id=%s, ignoring "
+                "(block already exists)",
+                event.subproblem_id,
+            )
+            return
         root_problem_id = event.meta.root_problem_id
         budget = self._ensure_problem_block(root_problem_id)
 
