@@ -499,7 +499,68 @@ mock-CRM sink (observable), stated in the description.
 | Ledger corruption | single-owner + lock + corrupt-rename; archive per run |
 | Timeline slip | cut-lines (section 17); gates force the decision early |
 
-## 20. Out of scope (this week)
+## 20. Agent, prompt & tool inventory
+
+Who speaks with which model, from which prompt file, with which tools, invoked
+by whom — the operational map the architecture sections assume.
+
+### 20.1 LLM touchpoints
+
+| # | role | model | system-prompt source | in → out | invoked by / when |
+|---|---|---|---|---|---|
+| 1 | project_definition (generator / critic / structured_output) | GPT-5.6 | `agenten/workflows/project_definition.py` (existing registry workflow; step texts get a cleanup pass — several are garbled/typo'd and submission-visible) | `{project_description}` → refined description (text) | `captain_pipeline` stage 1 |
+| 2 | decompose | GPT-5.6 | `agenten/llm/decompose.py::_build_system_message` (existing; we inject our own capability tag set, e.g. `["n8n_workflow"]`) | refined description → `DecomposeResponse{subproblems}` | pipeline stage 2 |
+| 3 | align_batches | GPT-5.6 | NEW `agenten/llm/align.py` (prompt colocated, decompose.py pattern) | subtask list → `AlignResponse{batches: [{batch_id, title, subtask_ids}]}` | pipeline stage 3 |
+| 4 | align judge | GPT-5.6 | NEW `agenten/llm/align_judge.py` (pattern of `judge.py`, NOT constitution-bound) | grouping + description → `JudgeVerdict{accept, reason}` | stage-3 loop, ≤ 2 rounds, only after deterministic checks pass |
+| 5 | enrich_batch | GPT-5.6 | NEW `agenten/llm/enrich.py` | batch + description → `ContextBundle` (goal, constraints, interfaces, assertions, golden + holdout cases) | pipeline stage 4, per batch |
+| 6 | Hermes worker agent | GPT-5.6 via direct OpenAI API (profile `config.yaml`: `model.provider: custom`, `base_url: https://api.openai.com/v1`, `default: gpt-5.6`; key in profile `.env`; hermes auto-selects the Responses API for GPT-5.x) | Hermes 3-tier prompt: worker persona in profile `SOUL.md` + skills index (stable) · workdir `AGENTS.md` (context) · `captain-worker` SKILL.md attached per cron job via its `skills` param | cron wake → batch processed | internal hermes cron (~60s) + terminal completion notifications |
+| 7 | Codex | Codex CLI's own model | rendered `templates/codex_task.md` + workspace `AGENTS.md` (layered instructions) | build task → workflow via n8n MCP | worker step 4: `terminal(command="codex exec …", background=true, notify_on_complete=true)` — completion wakes the agent; NO foreground call (600s hard cap) |
+| 8 | soft-check judge | GPT-5.6 | rubric v1 in the shared assertion module; called from `scripts/validate.py` via the OpenAI SDK directly (deterministic harness, NOT an agent) | observations per case → per-sub-criterion pass/fail + reason | validation step, per case with soft assertions |
+
+### 20.2 Tool provenance
+
+| runtime | tools | source / registration |
+|---|---|---|
+| Captain pipeline | model client only (existing `Tool` registry incl. `InternetSearchTool` stays unused this week) | `agenten/llm/model_client.py` |
+| Ledger-Gateway | none (no LLM) | — |
+| Hermes worker | built-ins: `terminal`+`process`, `read_file`/`write_file`/`patch`/`search_files`, `cronjob`; cron jobs pinned to `enabled_toolsets: [terminal, file]`; **no HTTP tool exists** — every gateway/n8n/Mailpit REST call is `terminal(curl …)`, stated explicitly with literal call shapes in SKILL.md | hermes tool registry; skill + helper scripts in the worker profile's `skills/captain-worker/` |
+| Codex | n8n MCP tools (`get_sdk_reference`, `search_nodes`, `get_node_types`, `validate_workflow`, `create_workflow_from_code`, `update_workflow`, `publish_workflow`, `test_workflow`, …) + sandboxed shell/files in the workspace | global `codex mcp add n8n …` + workspace `.codex/config.toml` (§9) |
+| Minibook | none — the mirror is gateway-side HTTP, no agent involved | — |
+
+### 20.3 Prompt & instruction artifacts (all files, all English)
+
+| artifact | path | owner / rendered when |
+|---|---|---|
+| existing workflow prompts | `agenten/workflows/project_definition.py` | prior work; cleanup pass Day 3 |
+| decompose / align / align-judge / enrich prompts | `agenten/llm/{decompose,align,align_judge,enrich}.py` | align/judge/enrich are NEW (Codex-authored) |
+| assertion enum + rubric v1 | `agenten/validation/assertions.py` (shared Captain ↔ adapter module) | frozen Day 2 |
+| codex build prompt template | `templates/codex_task.md` | rendered per batch by the worker (step 3) |
+| workspace build contract | `templates/AGENTS.md` → copied into each batch workspace | rendered per batch; content per §9 |
+| failure report template | `templates/failure_report.md` | rendered per red validation run |
+| worker persona | worker profile `SOUL.md` (identity incl. Minibook display name) | written by `provision-worker.ps1` |
+| worker procedure | `skills/captain-worker/SKILL.md` (+ `scripts/`) — YAML frontmatter (`name`, `description`) + literal tool-call shapes | registered via `skills.external_dirs`; attached per cron job |
+| cron prompt | one bland self-contained sentence inside `provision-worker.ps1` (create-time injection scanner rejects curl/token content) | per worker at provisioning |
+| demo project description | `demo/project_description.md` | tested artifact, Day 3 |
+
+### 20.4 Invocation map (end-to-end)
+
+1. Operator runs `python -m agenten.pipeline.captain_pipeline` (own process).
+2. Pipeline: stage 1 → 2 → 3 (+ deterministic checks + judge loop) → 4 per
+   batch; each LLM call is a fresh `AssistantAgent` with structured output.
+3. Stage 5 releases `work_batch` + `holdout_cases` blocks via
+   `GatewayHTTPClient` → gateway persists + mirrors to Minibook.
+4. Hermes cron fires (per worker): bland prompt + `skills: [captain-worker]`
+   + `workdir` → agent claims a batch via `terminal(curl POST …/claim)`.
+5. Worker step 3 renders `codex_task.md` from the bundle; step 4 launches
+   codex in background; the completion notification wakes the agent.
+6. Worker deploys (adapter, per-path §10), fetches holdout cases, validates
+   (`scripts/validate.py` incl. soft-check judge), writes blocks via curl —
+   every write fenced by the claim token.
+7. Red → failure report → `codex exec resume` (≤ 3 iterations); green or
+   exhausted → `batch_done` → gateway mirrors the outcome; Minibook thread
+   shows the full build conversation.
+
+## 21. Out of scope (this week)
 
 Chain verification; recorder/CQRS integration for the new block types; any
 Minibook write-back; Jira/code adapters (interface only); human-gate UI;
