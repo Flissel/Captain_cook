@@ -323,8 +323,11 @@ hardcoding the literal-sniff backstop misses.
   in a distinguishable observable (mail template / no action / sink call);
   webhook response echoes `{case_id, route}`; mail subjects carry `[case:<id>]`;
   use existing credential `mailpit-smtp` — NEVER create SMTP credentials or set
-  SMTP hosts; no external side effects except the provided sink URL; sink POSTs
-  echo `case_id`.
+  SMTP hosts; LLM nodes (e.g. personalized mail drafting) use ONLY the
+  pre-provisioned `openai-gpt` credential (GPT-5.6) — never inline API keys;
+  node prompts must be derived from the batch context bundle (goal/constraints),
+  no invented business rules; no external side effects except the provided sink
+  URL; sink POSTs echo `case_id`.
 
 ## 10. n8n + Mailpit deployment
 
@@ -335,7 +338,9 @@ hardcoding the literal-sniff backstop misses.
   via env (`N8N_MCP_MANAGED_BY_ENV=true`, `N8N_MCP_ACCESS_ENABLED=true`).
   Remaining manual (once, Day 1): create the API key + copy the MCP access
   token from the UI. Persist the docker volume — **never delete it** (the API
-  key dies with it). Pre-provision the `mailpit-smtp` credential in n8n.
+  key dies with it). Pre-provision two n8n credentials: `mailpit-smtp` (mail)
+  and `openai-gpt` (GPT-5.6, for LLM nodes in built workflows — the built
+  artifact itself runs on GPT-5.6).
 - **Adapter `deploy()` is per-build-path** (resolves an ambiguity found in
   verification):
   - **MCP path (primary):** Codex itself creates + publishes via
@@ -425,7 +430,7 @@ mock-CRM sink (observable), stated in the description.
 
 - **Day 1 (Wed 15., today):** credits requested; model→gpt-5.6 + smoke test; baseline
   tag + PRIOR_WORK.md + submodule fix; docker-compose up + n8n bootstrap +
-  mailpit-smtp credential; **GATE A (binary, scripted):** fresh workspace →
+  `mailpit-smtp` and `openai-gpt` credentials; **GATE A (binary, scripted):** fresh workspace →
   codex exec builds the trivial workflow (MCP path; n8n tool names visible in
   the JSON event stream) → deployed → webhook POST → mail visible in Mailpit —
   **twice in a row**. MCP experiments timeboxed to the morning, 15:00 go/no-go
@@ -559,6 +564,22 @@ by whom — the operational map the architecture sections assume.
 7. Red → failure report → `codex exec resume` (≤ 3 iterations); green or
    exhausted → `batch_done` → gateway mirrors the outcome; Minibook thread
    shows the full build conversation.
+
+### 20.5 Provenance of the BUILT agents (what the pipeline produces)
+
+The built artifact (n8n workflow; later: agent teams via other adapters) gets
+its prompts/tools/context through one auditable chain — no step is ad hoc:
+
+| aspect | source | enforced by |
+|---|---|---|
+| system prompts (LLM nodes) | authored by Codex, derived from the context bundle's goal/constraints — Captain prescribes BEHAVIOR (acceptance criteria), not prompt text | validation loop: a prompt that misses a criterion gets a fix iteration; prompts live inside the workflow definition → referenced by the `deploy` block, auditable |
+| user prompt / runtime input | the webhook payload ONLY (test: golden/holdout cases; prod: real leads) | context-bundle rule extends to the artifact: no hidden data sources; AGENTS.md forbids other inputs |
+| tools (= n8n nodes) | node set constrained by the AGENTS.md contract: mail via `mailpit-smtp`, LLM via `openai-gpt` (GPT-5.6), HTTP only to the sink URL | credentials referenced by NAME, pre-provisioned Day 1; Codex may never create credentials or inline keys |
+| context / memory | stateless per execution | persistence (e.g. lead history) would be an n8n data table — out of scope this week |
+
+Net effect for the submission story: the pipeline is GPT-5.6 end to end —
+GPT-5.6 plans (Captain), GPT-5.6 orchestrates (Hermes workers), Codex builds,
+and the built artifact itself runs its LLM nodes on GPT-5.6.
 
 ## 21. Out of scope (this week)
 
