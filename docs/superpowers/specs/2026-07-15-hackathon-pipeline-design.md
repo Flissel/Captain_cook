@@ -7,7 +7,9 @@ builds each batch by driving Codex CLI, and the result is validated against
 measurable outcomes — every step recorded in the append-only ledger.
 
 **Status:** Approved design (brainstormed 2026-07-14/15, hardened by a 30-agent
-adversarial review — 24 confirmed findings + 19 notes, all folded in).
+adversarial review — 24 confirmed findings + 19 notes — plus a 24-agent
+completeness sweep — 15 confirmed gaps, incl. the mandatory `/feedback`
+Session-ID form field; all folded in).
 
 ---
 
@@ -43,11 +45,15 @@ ledger block; the whole build history is auditable and watchable in Minibook.
 
 ## 2. Hackathon compliance (do FIRST, Day 0/1)
 
-- **Baseline tag:** verify the official cutoff wording in the rules, then commit the
-  current tree and tag it `pre-codex-baseline`. The tag — not a date — is the sole
-  prior-work boundary. `PRIOR_WORK.md` lists what predates the hackathon work
-  (incl. decompose/judge from cf50e87) and discloses honestly that the foundation
-  was built with Claude Code on 13–14.07.
+- **Prior-work bands (official cutoff = Submission Period start, 2026-07-13
+  09:00 PT — verified in the rules):** commit the current tree and tag it
+  `pre-codex-baseline`; the tag marks where Codex-authored hackathon work
+  begins. `PRIOR_WORK.md` documents THREE timestamped bands: (1) commits
+  before 2026-07-13 09:00 PT = prior work, not judged; (2) the 13–14.07
+  Claude Code foundation (incl. decompose/judge from cf50e87) = in-period but
+  non-Codex, disclosed honestly with commit timestamps; (3) everything after
+  the tag = the Codex-authored work judges evaluate. Judges rate only
+  in-period work — the Codex delta must carry the submission on its own.
 - **Embedded repos:** `hermes-agent/` and `Autogen_AgentFarm/` are currently bare
   gitlinks with no `.gitmodules` — a judge cloning the repo gets EMPTY dirs. Fix:
   proper submodules with pinned SHAs (`git rm --cached` + `git submodule add`;
@@ -56,11 +62,27 @@ ledger block; the whole build history is auditable and watchable in Minibook.
   are non-empty — the fix isn't done until the clone proves it.
   Minibook stays behind the submodule pointer → its AGPL-3.0 stays isolated
   (HTTP-only integration, no linking); one README sentence notes this.
-- **Codex session capture (dev-time):** a shell wrapper logs every dev
-  `codex exec` session ID + date + intent to `docs/codex-sessions.md`; commits
-  carry a `Codex-Session: <id>` trailer. Recovery: harvest `~/.codex/sessions/`
-  rollout files. README leads with dev sessions; runtime thread_ids are the
-  novelty layer on top. One honest sentence covers Claude Code's planning role.
+- **Codex session capture (dev-time):** a shell wrapper (~20 lines, written as
+  the FIRST Day-1 item, BEFORE the first Gate A `codex exec`) logs every dev
+  session ID + date + intent to `docs/codex-sessions.md`; commits carry a
+  `Codex-Session: <id>` trailer. Runtime sessions need no wrapper — they are
+  captured as `codex_session` ledger blocks. Recovery: harvest
+  `~/.codex/sessions/` rollout files (back this dir up daily). README leads
+  with dev sessions; runtime thread_ids are the novelty layer on top. One
+  honest sentence covers Claude Code's planning role.
+- **Primary Codex thread (`/feedback` Session ID — MANDATORY form field):**
+  the Devpost form requires the singular `/feedback` Codex Session ID of the
+  thread "where the majority of core functionality was built". Therefore:
+  designate ONE primary thread and `codex exec resume` it for the core
+  gateway + pipeline implementation (Days 2–3) instead of fresh sessions per
+  task; verify on Day 1 how `/feedback` is run against it (resume the thread
+  in interactive Codex); record its ID in `docs/codex-sessions.md` the day it
+  is created.
+- **Devpost registration + draft (Day 1):** register the account, join the
+  hackathon (prerequisite for the Resources-tab credits request), create a
+  DRAFT submission immediately and copy every required form field into §18 —
+  Day 6 becomes field-filling, not field-discovery. Note the entrant type
+  (solo).
 - **All new core implementation is authored in Codex sessions.** Claude Code
   plans/reviews; Codex writes the submitted code.
 - **Model claim:** `config/llm_config.py` currently pins `gpt-4o`. Switch to
@@ -110,7 +132,10 @@ via `parent_index`.
 ### Claim fencing (review finding: double-execution was guaranteed without this)
 
 - `POST /batches/{id}/claim` returns a **claim_token**; initial expiry **90 min**.
-- Every child-block write must carry the current token → else **409**.
+- Every WORKER-written child block (`codex_task`, `codex_session`, `deploy`,
+  `validation_run`, `batch_done`) must carry the current token → else **409**.
+  Captain's pre-claim writes (`work_batch`, `holdout_cases`) are explicitly
+  unfenced — no claim exists yet.
 - `POST /batches/{id}/claim/heartbeat` sets expiry = now + 30 min; the worker
   heartbeats between steps (a single codex step can block ~15 min, so +30 min
   per heartbeat keeps a margin above the longest step).
@@ -160,12 +185,19 @@ verification work this week.
 **Endpoints:**
 
 ```
-GET  /batches?status=pending            list claimable batches
+GET  /batches?status=pending            → [{batch_id, title}] (ids only)
 POST /batches/{id}/claim                → claim_token | 409
 POST /batches/{id}/claim/heartbeat      extend expiry
 POST /batches/{id}/approve              pending_review → pending (flag-gated)
-POST /blocks                            schema-validated write (fenced by token)
-GET  /batches/{id}/blocks               batch subtree
+POST /blocks                            schema-validated write (worker block
+                                        types fenced by claim token)
+GET  /batches/{id}/bundle               work_batch payload — holdout EXCLUDED
+GET  /batches/{id}/blocks               batch subtree — holdout EXCLUDED
+GET  /batches/{id}/holdout              claim-token-fenced; served ONLY after a
+                                        codex_session block exists for the
+                                        current iteration → holdout isolation
+                                        is API-enforced, not merely
+                                        SKILL.md-discouraged
 POST /sink/crm                          mock-CRM sink: stores {case_id, tag, ...}
 GET  /sink/crm?case_id=...              validator reads observed sink calls
 ```
@@ -291,6 +323,19 @@ hardcoding the literal-sniff backstop misses.
 - Target adapter interface (universality seam): `deploy(artifact)`,
   `execute(test_case)`, `observe()` — n8n adapter this week; interface
   documented for jira/code adapters. Stretch only: trivial `code` adapter.
+- **Worker runtime environment contract:** `provision-worker.ps1` writes a
+  per-profile `worker.env` (WORKER_ID, GATEWAY_URL=http://localhost:8090,
+  N8N_URL, N8N_API_KEY, N8N_MCP_TOKEN, MAILPIT_URL, OPENAI_API_KEY for the
+  soft-check judge). Every helper script in `skills/captain-worker/scripts/`
+  sources it via ABSOLUTE path as its first line — no reliance on hermes
+  inheriting profile `.env` into terminal subprocesses — and the codex launch
+  line explicitly exports `N8N_MCP_TOKEN` before `codex exec`. A skill
+  preflight fails fast with a clear message if any var is unset (otherwise
+  MCP failures masquerade as behavioral failures and burn codex iterations).
+  SKILL.md curl examples are written for Git-Bash-on-Windows quoting; where
+  quoting gets hairy, helper scripts use Python instead. Note: the per-worker
+  "gateway process" in provisioning refers to the HERMES gateway daemon — not
+  the (singleton) Ledger-Gateway.
 
 ## 9. Codex integration
 
@@ -328,6 +373,14 @@ hardcoding the literal-sniff backstop misses.
   node prompts must be derived from the batch context bundle (goal/constraints),
   no invented business rules; no external side effects except the provided sink
   URL; sink POSTs echo `case_id`.
+- **Identity & derived names (single source of truth):** `batch_id` is the
+  `AlignResponse.batch_id` slug, validated `^[a-z0-9-]{1,32}$` at release.
+  Literal derivations live ONCE in the shared constants module: workflow name
+  `captain-batch-{batch_id}`, webhook path `hook/{batch_id}`, workspace
+  `workspaces/{batch_id}`. The worker renders the PRE-COMPUTED literals into
+  AGENTS.md — Codex copies strings, it never implements a derivation.
+  Workflows without branching echo a fixed `route: "processed"` (the
+  `{case_id, route}` echo stays uniform across all three demo workflows).
 
 ## 10. n8n + Mailpit deployment
 
@@ -361,11 +414,13 @@ hardcoding the literal-sniff backstop misses.
 
 ## 11. Validation loop (per iteration)
 
-1. Adapter `deploy()` (upsert) → publish gate passed.
+1. Adapter `deploy()` (per-path, §10) → publish gate passed.
 2. For each holdout case (sequential): `execute()` = POST payload (with
    `case_id`, per-case recipient) to `/hook/{batch_id}` webhook.
 3. `observe()`: webhook response fields; executions API (correlated by
    `case_id`); Mailpit search (`to:` per-case recipient); mock-CRM sink query.
+   Mail assertions poll Mailpit with backoff up to 30 s per case; `no_mail`
+   is evaluated only after that window closes.
 4. Evaluate assertions (enum) + LLM-judge soft checks → `validation_run` block
    with full evidence.
 5. Classify failures: **infra** (connection/credential errors) → abort batch as
@@ -390,7 +445,8 @@ hardcoding the literal-sniff backstop misses.
 |---|---|---|
 | `OPENAI_API_KEY` (GPT-5.6 Captain) | `.env` → Captain process env | ledger, Minibook, codex workspace |
 | n8n API key | `.env` → gateway + adapter env | ledger, Minibook, codex workspace, cron prompts |
-| n8n MCP access token (`N8N_MCP_TOKEN`) | codex env (global MCP config) | ledger, Minibook, cron prompts |
+| n8n MCP access token (`N8N_MCP_TOKEN`) | persisted Day 1 as user-level env var (`setx`) for dev shells; per-profile `worker.env` for workers; codex reads it via `bearer_token_env_var` indirection | ledger, Minibook, cron prompts |
+| `OPENAI_API_KEY` (soft-check judge, `validate.py`) | per-profile `worker.env`, sourced by helper scripts via absolute path | ledger, Minibook, codex workspace |
 | Minibook agent API keys | gateway env | ledger, codex workspace |
 | Mailpit | none (open, local) | — |
 
@@ -407,10 +463,21 @@ Worker vs gateway outage: retry with backoff (3 attempts) then abort the CYCLE
 (not the batch) — claim expiry frees the batch later. n8n outage during
 validation → infra classification → `aborted_infra`.
 
-**Reset script** (Day 2, ~20 lines): stop workers → archive `blockchain.json`
-to `runs/<ts>/` → start fresh → delete all n8n workflows via API → wipe Mailpit
-(`DELETE /api/v1/messages`) → optionally wipe `minibook.db`. Run before every
-E2E and before filming. Never touches the n8n docker volume.
+**Reset script** (Day 2, ~30 lines): disable all worker crons → stop workers →
+archive `blockchain.json` AND `workspaces/` to `runs/<ts>/` → start fresh →
+delete all n8n workflows via API → wipe Mailpit (`DELETE /api/v1/messages`) →
+optionally wipe `minibook.db`. Run before every E2E and before filming. Never
+touches the n8n docker volume.
+
+**Workspace lifecycle:** on a FRESH claim the worker deletes and recreates
+`workspaces/<batch-id>` before copying AGENTS.md in; iterations within the
+same claim reuse it (`codex exec resume` needs the artifacts). `.gitignore`
+gains `workspaces/` and `runs/` on Day 1.
+
+**Idle-burn rule:** worker crons run ONLY during E2E/filming windows — outside
+them they stay disabled (a 60s GPT-5.6 polling fleet is real money);
+`provision-worker.ps1` gets an enable/disable switch and the reset script
+disables all crons as its first step.
 
 ## 15. Demo scenario (tested artifact, not ad-lib input)
 
@@ -428,30 +495,50 @@ mock-CRM sink (observable), stated in the description.
 
 ## 16. Week plan & gates
 
-- **Day 1 (Wed 15., today):** credits requested; model→gpt-5.6 + smoke test; baseline
-  tag + PRIOR_WORK.md + submodule fix; docker-compose up + n8n bootstrap +
-  `mailpit-smtp` and `openai-gpt` credentials; **GATE A (binary, scripted):** fresh workspace →
-  codex exec builds the trivial workflow (MCP path; n8n tool names visible in
-  the JSON event stream) → deployed → webhook POST → mail visible in Mailpit —
-  **twice in a row**. MCP experiments timeboxed to the morning, 15:00 go/no-go
-  → else switch to the JSON+REST fallback path (Gate A also exercises the
-  REST deploy once via curl so the fallback is proven, not assumed). Verify
-  `codex exec resume` + a 12-min codex run under hermes cron (background
-  mode). Confirm ChatGPT-plan rate limits cover ~50–100 exec turns for the
-  week, else flip codex auth to the API key. Hermes single instance installed
-  in parallel.
+- **Day 1 (Wed 15., today):** FIRST: session-capture wrapper +
+  `docs/codex-sessions.md` + `Codex-Session` trailer adopted — BEFORE the
+  first `codex exec`. Devpost: register, join hackathon, create draft
+  submission, copy form fields into §18; credits requested. Model→gpt-5.6 +
+  smoke test; baseline tag + PRIOR_WORK.md (three bands, §2) + submodule fix
+  (+ `clone --recursive` proof); `.gitignore` += `workspaces/`, `runs/`;
+  author repo `docker-compose.yml` (n8n + Mailpit) + up + n8n bootstrap +
+  `mailpit-smtp`/`openai-gpt` credentials + `setx N8N_MCP_TOKEN`; minimal
+  `templates/AGENTS.md` (credential + webhook rules only) for Gate A
+  workspaces. **GATE A (binary, scripted):** fresh workspace → codex exec
+  builds the trivial workflow (MCP path; n8n tool names visible in the JSON
+  event stream) → deployed → webhook POST → mail visible in Mailpit —
+  **twice in a row**. MCP experiments timeboxed to the morning, 15:00
+  go/no-go → else switch to the JSON+REST fallback path (Gate A also
+  exercises the REST deploy once via curl so the fallback is proven, not
+  assumed). Verify `codex exec resume`, the `/feedback` flow (§2), and a
+  12-min codex run under hermes cron (background mode). Budget check covers
+  BOTH codex (~50–100 exec turns; else flip auth to the API key) AND the API
+  key's tier vs. the fleet's idle GPT-5.6 polling. Hermes single instance
+  installed + manually provisioned (profile, config.yaml, .env — the Day-3
+  script automates what Day 1 does by hand).
 - **Day 2 (Thu 16.):** gateway (single-owner enforcement, fencing, sink,
   schemas, tests) — direct `Blockchain` writes, `async def` + lock; pin
   fastapi/uvicorn in requirements.txt; hash stability fix; LedgerClient seam
   in Captain; assertion-enum module frozen; reset script.
-- **Day 3 (Fri 17.):** ⚠ credits deadline 12:00 PT. captain-worker skill + n8n adapter on ONE hermes
-  instance; Captain align/enrich + pipeline driver; demo description tested →
-  3 batches; write `provision-worker.ps1` (used Day 4). **GATE B:**
-  single-worker E2E green by evening — else fleet is cut to 1 worker +
-  narrated architecture (story mode).
-- **Day 4 (Sat 18.):** fleet ×3 via provision-worker.ps1; Minibook mirror +
-  account provisioning; hardening (heartbeats, expiry warnings, terminal-state
-  rejects).
+- **Day 3 (Fri 17.):** ⚠ credits deadline 12:00 PT. captain-worker skill +
+  n8n adapter + full `templates/` trio (`AGENTS.md` contract per §9,
+  `codex_task.md`, `failure_report.md`) + `scripts/validate.py` (correlation
+  polling, Mailpit/sink observation, soft-check judge, literal-sniff) on ONE
+  hermes instance; smoke-verify `N8N_MCP_TOKEN` reaches codex from inside a
+  worker terminal call; Captain align/enrich + pipeline driver (documented
+  run command:
+  `python -m agenten.pipeline.captain_pipeline demo/project_description.md`);
+  demo description tested → 3 batches; write `provision-worker.ps1` (used
+  Day 4). **GATE B:** single-worker E2E green by evening — else fleet is cut
+  to 1 worker + narrated architecture (story mode).
+- **Day 4 (Sat 18.):** Minibook native install + start (`python run.py` +
+  frontend build, port 8080); fleet ×3 via provision-worker.ps1; Minibook
+  mirror + account provisioning; hardening (heartbeats, expiry warnings,
+  terminal-state rejects). **GATE C (evening, unattended full dress):**
+  reset → committed demo description → fleet ×3 → all three `batch_done` +
+  complete Minibook thread with zero operator input. Red → Day 5 films the
+  Gate-B single-worker configuration instead of debugging the fleet under
+  time pressure.
 - **Day 5 (Sun 19.):** footage-capture runs (codex terminal, Minibook, n8n
   canvas, Mailpit) — screen-record everything; README (English, quickstart for
   judges, session table, tooling honesty, AGPL note, license section);
@@ -459,9 +546,20 @@ mock-CRM sink (observable), stated in the description.
   real title); video script written in the evening — leads with the
   "Captain writes the spec AND the exam" loop; cut from the script:
   hash-chain internals, CQRS, recovery, fleet mechanics (README screenshots
-  instead). Forum footage is always of a COMPLETED run.
-- **Day 6 (Mon 20.):** edit + upload video (<3 min, YouTube public); Devpost
-  form draft complete.
+  instead). Forum footage is always of a COMPLETED run. **Judge sandbox
+  committed:** one completed run's archived ledger (`runs/<ts>/`), exported
+  workflow JSONs, Mailpit export, Minibook DB snapshot + a tiny read-only
+  viewer command — judges inspect a real end-to-end run in 2 minutes, zero
+  keys, zero Docker (Dev-Tools track requires testability WITHOUT
+  rebuilding). Repo goes public; LICENSE file + judge-facing `.env.example`
+  committed; README states "Supported platforms: Windows 11 (tested); Docker
+  required for full run".
+- **Day 6 (Mon 20.):** edit + upload video (<3 min, YouTube public). Video
+  RULES: spoken narration MUST state how Codex and GPT-5.6 were used (§20.5
+  is the ready-made script); no background music unless royalty-free/owned;
+  no third-party logos beyond functional app UI. Devpost form draft complete.
+  After submission the repo stays public and FROZEN until judging ends
+  (Aug 5) — judges clone what was submitted.
 - **Buffer (Tue 21.):** re-record slack if Day-5 footage is unusable; **submit
   hours before the 17:00 PT deadline**, not at the wire.
 - Demo-run caps: codex ≤8 min, ≤2 iterations for filmed runs.
@@ -481,14 +579,23 @@ mock-CRM sink (observable), stated in the description.
 
 ## 18. Devpost submission checklist
 
+- [ ] Devpost: registered, hackathon joined, DRAFT submission created Day 1
 - [ ] Category: Developer Tools; project name matches README title
 - [ ] Text description (English): features + how Codex and GPT-5.6 were used
-- [ ] Video: <3 min, public YouTube, clear audio, shows the built project
-- [ ] Repo public; README quickstart lets judges run it (compose + env template
-      + one command per component); testing access instructions
+- [ ] **`/feedback` Codex Session ID** of the primary core-implementation
+      thread → its own MANDATORY form field (thread strategy in §2)
+- [ ] Video: <3 min, public YouTube, clear audio, shows the project working;
+      spoken narration explicitly covers Codex + GPT-5.6 usage; no
+      third-party copyrighted content (music/logos)
+- [ ] Repo public through judging (Aug 5), then frozen; README quickstart lets
+      judges run it (compose + `.env.example` + one command per component)
+- [ ] Judge sandbox: committed evidence of a completed run (archived ledger,
+      workflow JSONs, Mailpit export, Minibook snapshot + viewer) — testable
+      WITHOUT rebuilding; supported platforms stated
 - [ ] Codex Session IDs: dev-session table in README + `docs/codex-sessions.md`
       + commit trailers; runtime thread_ids shown as ledger blocks
-- [ ] PRIOR_WORK.md + `pre-codex-baseline` tag referenced in README
+- [ ] PRIOR_WORK.md (three bands, §2) + `pre-codex-baseline` tag referenced in
+      README
 - [ ] License section: repo license + third-party notes (hermes MIT, minibook
       AGPL-3.0 via submodule, HTTP-only)
 - [ ] All materials English; `$100` credits used before 31.07
