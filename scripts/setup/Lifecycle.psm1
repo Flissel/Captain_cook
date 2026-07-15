@@ -227,6 +227,8 @@ function Start-CaptainSystem {
     [CmdletBinding()]
     param([string] $Root)
     $config = Read-DotEnv -Path (Join-Path $Root '.env')
+    $captain = Install-Captain -Root $Root
+    if ($captain.Status -ne 'Ready') { return $captain }
     Start-MinibookProcesses -Root $Root -Configuration $config
     Start-CaptainServices -Root $Root -N8nMode $(if ($config.N8N_MODE -eq 'external') {'External'} else {'Owned'})
 }

@@ -83,6 +83,10 @@ Describe 'Lifecycle entry points' {
             Test-Path (Join-Path $root $scriptName) | Should -BeTrue
         }
     }
+
+    It 'prepares the Captain demo before starting dependent services' {
+        (Get-Command Start-CaptainSystem).Definition | Should -Match 'Install-Captain'
+    }
 }
 
 Describe 'Onboarding documentation' {
