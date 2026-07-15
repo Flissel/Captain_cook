@@ -5,6 +5,8 @@ def test_modular_workstream_plan_defines_the_household_roles():
     plan = Path("docs/WORKSTREAMS.md").read_text(encoding="utf-8")
 
     assert "feat/ledger-gateway" in plan
+    assert "feat/householder-runtime-contract" in plan
+    assert "feat/householder-runtime" in plan
     assert "feat/captain-pipeline" in plan
     assert "feat/n8n-delivery" in plan
     assert "feat/worker-fleet" in plan

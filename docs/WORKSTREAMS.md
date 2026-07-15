@@ -14,13 +14,17 @@ not commit feature work directly to `main`.
 ```text
 feat/devpost-demo-readiness
         │
-        ├── feat/ledger-gateway ──┐
-        ├── feat/captain-pipeline ├── feat/n8n-delivery ── feat/worker-fleet
-        └── feat/release-evidence ┘                                │
-                                                                  feat/demo-polish
+        ├── feat/householder-runtime-contract ── feat/householder-runtime
+        │                                                    │
+        ├── feat/ledger-gateway ── feat/captain-pipeline ────┼── feat/n8n-delivery ── feat/worker-fleet
+        └── feat/release-evidence ───────────────────────────┘                                │
+                                                                                          feat/demo-polish
 ```
 
-`feat/captain-pipeline` consumes the gateway schemas but can use a fake
+`feat/householder-runtime-contract` defines typed role manifests and the
+executor seam without an external model. `feat/householder-runtime` proves the
+four roles in the real in-memory event/ledger lifecycle with deterministic
+executors. `feat/captain-pipeline` consumes gateway schemas but can use a fake
 `LedgerClient` in unit tests. `feat/n8n-delivery` consumes the assertion
 vocabulary and adapter contracts. `feat/worker-fleet` begins only after one
 gateway-backed, single-worker end-to-end run is green.
@@ -29,6 +33,8 @@ gateway-backed, single-worker end-to-end run is green.
 
 | Branch | Owner role | Produces | Must prove before merge |
 | --- | --- | --- | --- |
+| `feat/householder-runtime-contract` | Architect | Typed role manifest, permitted-tool policy, executor protocol, and role-result schema | Every role definition maps to exactly one constrained runtime contract and unregistered tags fail at boot |
+| `feat/householder-runtime` | Delivery Builder | `HouseholderWorker`, factory injection into the existing pipeline, and deterministic offline executors | Four tagged subproblems complete through the real recorder without live model, MCP, or deployment claims |
 | `feat/ledger-gateway` | Ledger Steward | MariaDB storage, FastAPI sole-writer gateway, claim fencing, validation schemas | Concurrent claim fencing and terminal-state rejection against a MariaDB test container |
 | `feat/captain-pipeline` | Architect | `LedgerClient`, aligned/enriched batches, deterministic capability reuse | Every subtask belongs to exactly one batch and emitted bundles validate against the gateway contract |
 | `feat/n8n-delivery` | Delivery Builder | n8n adapter, templates, deployment/observation and validation harness | One workflow deploys idempotently, runs a case, and returns evidence from a live local n8n/Mailpit stack |
@@ -65,6 +71,9 @@ feature branch after their interface and tests exist.
 
 ## Current next branch
 
-Start `feat/ledger-gateway` after a local MariaDB test container is available.
-Until then, preserve the offline demo as the judge-facing fallback and focus
-on interfaces, tests, docs, and non-secret local configuration.
+Start `feat/householder-runtime-contract` now. It is deliberately offline and
+does not depend on MariaDB, n8n, Hermes, Codex CLI, or a real API key. Create
+`feat/householder-runtime` only after its manifest/executor contract is
+reviewed. Start `feat/ledger-gateway` after a local MariaDB test container is
+available. Until those branches are integrated, preserve the offline demo as
+the judge-facing fallback.
