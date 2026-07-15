@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
+from collections.abc import Iterator
 from typing import Any, Dict, List
 from urllib.parse import unquote, urlparse
 
@@ -41,6 +43,19 @@ class MariaDBStorage(LedgerStorage):
     def _connect(self) -> Connection:
         return pymysql.connect(**self._connection_options)
 
+    @contextmanager
+    def transaction(self) -> Iterator[Connection]:
+        """Yield a DB transaction and commit or roll it back atomically."""
+        connection = self._connect()
+        try:
+            yield connection
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def _ensure_schema(self) -> None:
         statement = """
             CREATE TABLE IF NOT EXISTS blocks (
@@ -57,7 +72,7 @@ class MariaDBStorage(LedgerStorage):
                 INDEX idx_blocks_status (status),
                 INDEX idx_blocks_parent (parent_index),
                 CONSTRAINT fk_blocks_parent
-                    FOREIGN KEY (parent_index) REFERENCES blocks (`index`)
+                    FOREIGN KEY (parent_index) REFERENCES blocks (`index`) ON DELETE CASCADE
             ) ENGINE=InnoDB
         """
         with self._connect() as connection:
