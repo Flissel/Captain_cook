@@ -28,6 +28,14 @@
 The task numbers preserve the design-workstream grouping. Implement them in
 these dependency waves:
 
+- [ ] **Integration prerequisite:** start implementation from a branch that
+  contains both the latest local `main` and this plan's tip. At planning time,
+  `main` and `docs/system-gap-remediation-plan` had diverged after common commit
+  `8986bc4`; a read-only path-overlap and `merge-tree` audit found no shared
+  changed file and no conflict marker. Re-run that audit immediately before an
+  explicitly approved merge or fresh implementation branch; do not implement
+  from a stale plan-only baseline.
+
 1. **Evidence foundation:** Task 0, then Task 6. Establish the clean Python
    environment, isolated `captain_test` guard, real MariaDB/Gateway execution,
    and CI before changing lifecycle behavior.
