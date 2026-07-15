@@ -565,9 +565,13 @@ mock-CRM sink (observable), stated in the description.
   workflow JSONs, Mailpit export, Minibook DB snapshot + a tiny read-only
   viewer command — judges inspect a real end-to-end run in 2 minutes, zero
   keys, zero Docker (Dev-Tools track requires testability WITHOUT
-  rebuilding). Repo goes public; LICENSE file + judge-facing `.env.example`
-  committed; README states "Supported platforms: Windows 11 (tested); Docker
-  required for full run".
+  rebuilding). Submission repo is `github.com/Flissel/Captain_cook` (ALREADY
+  public — no secrets may ever be committed, all week); `main` is the
+  submission branch (judges clone the default branch), hackathon work merges
+  in via PRs, `pre-codex-baseline` is pushed explicitly
+  (`git push origin pre-codex-baseline`). LICENSE file + judge-facing
+  `.env.example` committed; README states "Supported platforms: Windows 11
+  (tested); Docker required for full run".
 - **Day 6 (Mon 20.):** edit + upload video (<3 min, YouTube public). Video
   RULES: spoken narration MUST state how Codex and GPT-5.6 were used (§20.5
   is the ready-made script); no background music unless royalty-free/owned;
