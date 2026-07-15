@@ -17,9 +17,22 @@ if (-not (Test-Path -LiteralPath $VibeMindCompose)) {
 }
 
 Write-Host "Starting the existing VibeMind n8n instance..."
-docker compose -f $VibeMindCompose up -d --build
+$n8nContainerId = docker ps -aq --filter name=^/vibemind-n8n$
+if ($n8nContainerId) {
+    docker start vibemind-n8n *> $null
+}
+else {
+    docker compose -f $VibeMindCompose up -d --no-build n8n
+    if ($LASTEXITCODE -ne 0) {
+        $n8nContainerId = docker ps -aq --filter name=^/vibemind-n8n$
+        if (-not $n8nContainerId) {
+            throw "VibeMind n8n failed to start."
+        }
+        docker start vibemind-n8n *> $null
+    }
+}
 if ($LASTEXITCODE -ne 0) {
-    throw "VibeMind n8n failed to start."
+    throw "VibeMind n8n container exists but could not be started."
 }
 
 $n8nHealthy = $false

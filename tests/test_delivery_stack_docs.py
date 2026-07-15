@@ -37,6 +37,10 @@ def test_delivery_scripts_start_the_expected_stacks_safely() -> None:
     assert "Vibemind_V1\\vibemind-os\\voice\\docker-compose.n8n.yml" in start
     assert "docker compose" in start
     assert "up -d" in start
+    assert "up -d --no-build n8n" in start
+    assert "--build" not in start
+    assert "docker ps -aq --filter name=^/vibemind-n8n$" in start
+    assert "docker start vibemind-n8n" in start
     assert "verify_delivery_stack.ps1" in start
 
     combined = f"{start}\n{verify}".lower()
@@ -53,8 +57,10 @@ def test_verification_checks_all_service_boundaries() -> None:
         "/healthz",
         "/api/v1/info",
         "Test-NetConnection",
+        "MYSQL_PWD",
         "SELECT 1",
         "host.docker.internal:15678",
+        "cmd /c",
     ):
         assert expected in verify
 

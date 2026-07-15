@@ -54,7 +54,7 @@ foreach ($required in ("MARIADB_DATABASE", "MARIADB_USER", "MARIADB_PASSWORD")) 
 Write-Host "Checking authenticated MariaDB query..."
 Push-Location $RepoRoot
 try {
-    docker compose exec -T -e "MARIADB_PWD=$($config.MARIADB_PASSWORD)" mariadb mariadb `
+    docker compose exec -T -e "MYSQL_PWD=$($config.MARIADB_PASSWORD)" mariadb mariadb `
         --user=$($config.MARIADB_USER) --database=$($config.MARIADB_DATABASE) `
         --batch --skip-column-names --execute="SELECT 1" *> $null
     if ($LASTEXITCODE -ne 0) {
@@ -62,8 +62,7 @@ try {
     }
 
     Write-Host "Checking container-to-host n8n access via host.docker.internal:15678..."
-    docker run --rm --network captain-cook_default curlimages/curl:8.16.0 `
-        --fail --silent --show-error http://host.docker.internal:15678/healthz *> $null
+    cmd /c "docker run --rm --network captain-cook_default curlimages/curl:8.16.0 --fail --silent http://host.docker.internal:15678/healthz >nul 2>&1"
     if ($LASTEXITCODE -ne 0) {
         throw "Container-to-host n8n check failed."
     }
