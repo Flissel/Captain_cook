@@ -44,7 +44,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 from blockchain.Blockchain_modell import Blockchain
 from blockchain.storage import LedgerStorage
@@ -77,7 +77,7 @@ from agenten.spawning.coordinator import SpawnCoordinatorAgent
 from agenten.supervision.reaper import ReaperAgent
 from agenten.supervision.supervisor import SupervisorAgent
 from agenten.tools.base import ToolRegistry
-from agenten.workers.base import WorkerAgent
+from agenten.workers.base import WorkerAgent, WorkerFactory
 from agenten.workers.echo_worker import DEFAULT_ECHO_DELAY_SECONDS, EchoWorker
 
 logger = logging.getLogger(__name__)
@@ -277,6 +277,7 @@ def build_pipeline(
     reaper_poll_interval_seconds: float = 15.0,
     llm_timeout_seconds: float = 15.0,
     supervisor: Optional[SupervisorAgent] = None,
+    worker_factories: Sequence[WorkerFactory] = (),
 ) -> SupplyChainPipeline:
     """Construct and wire up the full supply-chain pipeline.
 
@@ -366,16 +367,15 @@ def build_pipeline(
     capability_registry = CapabilityRegistry()
     tool_registry = tools if tools is not None else ToolRegistry()
 
+    description_resolver = _make_ledger_description_resolver(ledger_query)
     echo_worker = EchoWorker(
         bus,
         tool_registry,
         heartbeat_interval_seconds=heartbeat_interval_seconds,
-        description_resolver=_make_ledger_description_resolver(ledger_query),
+        description_resolver=description_resolver,
         echo_delay_seconds=echo_delay_seconds,
     )
-    workers: Dict[str, WorkerAgent] = {echo_worker.agent_type: echo_worker}
-    for tag in echo_worker.capability_tags:
-        capability_registry.register(tag, echo_worker.agent_type)
+    workers: Dict[str, WorkerAgent] = {}
     # `subscribed_worker_types` records which worker agent_types actually
     # got a bus.subscribe(...) for SubproblemAssigned -- the set boot
     # validation checks the CapabilityRegistry against (see
@@ -383,9 +383,33 @@ def build_pipeline(
     # set (rather than re-using `workers`' keys) so the validation is
     # anchored to the subscription actually happening, not to a dict entry
     # that could be added without one.
-    subscribed_worker_types: set = set()
-    bus.subscribe(topic_for(SubproblemAssigned), echo_worker.handle_subproblem_assigned)
-    subscribed_worker_types.add(echo_worker.agent_type)
+    subscribed_worker_types: set[str] = set()
+
+    def register_worker(worker: WorkerAgent) -> None:
+        if worker.agent_type in workers:
+            raise PipelineBootError(f"Worker agent type {worker.agent_type!r} is registered more than once")
+        overlapping_tags = sorted(set(worker.capability_tags).intersection(capability_registry.known_tags()))
+        if overlapping_tags:
+            raise PipelineBootError(
+                f"Worker {worker.agent_type!r} declares capability tag(s) {overlapping_tags!r} already registered "
+                "by another worker; capability routing must have one owner per tag."
+            )
+        for tag in worker.capability_tags:
+            capability_registry.register(tag, worker.agent_type)
+        bus.subscribe(topic_for(SubproblemAssigned), worker.handle_subproblem_assigned)
+        subscribed_worker_types.add(worker.agent_type)
+        workers[worker.agent_type] = worker
+
+    register_worker(echo_worker)
+    for factory in worker_factories:
+        register_worker(
+            factory(
+                bus=bus,
+                tools=tool_registry,
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+                description_resolver=description_resolver,
+            )
+        )
 
     # --- Spawn Coordinator (U4) — turns a ledger-finalized SubproblemAccepted
     # into a SubproblemAssigned addressed to a resolved worker agent type.

@@ -40,6 +40,40 @@ The command writes [artifacts/demo-run.json](artifacts/demo-run.json), a compact
 - A sole-writer ledger recorder and state-machine transitions for an auditable run.
 - An offline CLI demo and committed run evidence.
 
+## Run the standalone Captain planner
+
+The Captain can turn a UTF-8 project description into executor-neutral,
+versioned work contracts without starting Hermes, n8n, or another delivery
+runtime. Configure the capability vocabulary explicitly; the model may group
+and enrich work but cannot choose the target or invent capability tags.
+
+```powershell
+python -m agenten.planning.cli docs/superpowers/specs/2026-07-15-hackathon-pipeline-design.md `
+  --capability planning `
+  --capability delivery `
+  --target external `
+  --output artifacts/captain-release
+```
+
+The command uses `CAPTAIN_MODEL` (default `gpt-5.6`) and `OPENAI_API_KEY`.
+It writes build-visible contracts to `batches/<batch-id>.json` and hidden
+evaluation inputs to `holdouts/<batch-id>.json`. Releases are idempotent:
+re-running identical output succeeds, while conflicting content for an
+existing batch id fails instead of overwriting the contract.
+
+Captain planning enforces these rules deterministically after every model
+response:
+
+- every decomposed subtask appears in exactly one batch;
+- batch ids and dependency references are valid;
+- the dependency graph is acyclic and released in topological order;
+- acceptance criteria use a closed, observable assertion vocabulary;
+- golden examples and holdout cases remain separate.
+
+External executors integrate by implementing the small `BatchReleaseClient`
+protocol in `agenten/planning/captain_pipeline.py`. The Captain repository does
+not implement or operate those external systems.
+
 ## Roadmap boundary
 
 The submission demo does **not** yet include a FastAPI/MariaDB ledger gateway, Hermes workers that drive Codex CLI, n8n deployment, Mailpit validation, or Minibook mirroring. Those integrations are designed in [the delivery-fleet specification](docs/superpowers/specs/2026-07-15-hackathon-pipeline-design.md) and deliberately kept separate from claims about the runnable demo.
