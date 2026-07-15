@@ -3,6 +3,41 @@ BeforeAll {
     if (Test-Path "$PSScriptRoot/Preflight.psm1") {
         Import-Module "$PSScriptRoot/Preflight.psm1" -Force
     }
+    if (Test-Path "$PSScriptRoot/Configuration.psm1") {
+        Import-Module "$PSScriptRoot/Configuration.psm1" -Force
+    }
+}
+
+Describe 'Configuration' {
+    It 'preserves existing values and round-trips special characters' {
+        $path = Join-Path $TestDrive '.env'
+        Set-Content -LiteralPath $path -Value 'EXISTING=keep'
+
+        Write-DotEnv -Path $path -Values @{ EXISTING = 'keep'; DB_PASSWORD = "a# b`"c" }
+
+        $values = Read-DotEnv -Path $path
+        $values.EXISTING | Should -Be 'keep'
+        $values.DB_PASSWORD | Should -Be "a# b`"c"
+    }
+
+    It 'rejects a secret path tracked by Git' {
+        $result = Test-TrackedSecretPath -Path '.env' -GitRunner { param($arguments) [pscustomobject]@{ ExitCode = 0; Output = '.env' } }
+
+        $result | Should -BeFalse
+    }
+
+    It 'never adopts an external n8n endpoint without consent' {
+        $mode = Resolve-N8nMode -Url 'http://localhost:15678' -Probe { $true } -ConfirmAdoption { $false }
+
+        $mode | Should -Be 'Owned'
+    }
+
+    It 'generates a strong URL-safe secret' {
+        $secret = New-SetupSecret
+
+        $secret.Length | Should -BeGreaterOrEqual 40
+        $secret | Should -Match '^[A-Za-z0-9_-]+$'
+    }
 }
 
 Describe 'Preflight' {
