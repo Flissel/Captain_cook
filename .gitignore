@@ -5,3 +5,7 @@ __pycache__/
 .venv/
 graphify-out/
 test_claude_output.txt
+
+# Selenium/driver binaries (removed 2026-07-15)
+*.exe
+chromedriver*
