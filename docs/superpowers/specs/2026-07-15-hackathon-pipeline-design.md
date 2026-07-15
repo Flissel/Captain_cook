@@ -9,7 +9,11 @@ measurable outcomes — every step recorded in the append-only ledger.
 **Status:** Approved design (brainstormed 2026-07-14/15, hardened by a 30-agent
 adversarial review — 24 confirmed findings + 19 notes — plus a 24-agent
 completeness sweep — 15 confirmed gaps, incl. the mandatory `/feedback`
-Session-ID form field; all folded in).
+Session-ID form field; all folded in). Extended with the two-layer architecture
+(§22: autogen-core 0.7.5 orchestrators over n8n tools), the autogen build
+target (verified against installed 0.7.5 by a 6-agent panel — tool
+serialization caveat included), the Hermes learning-loop stabilization (§22.3),
+and MariaDB as the ledger store (§23).
 
 ---
 
@@ -116,7 +120,7 @@ ledger block; the whole build history is auditable and watchable in Minibook.
 | type | writer | payload (all Pydantic-validated at the gateway) |
 |---|---|---|
 | `project` | Captain | refined description; metadata: resolved model name |
-| `work_batch` | Captain | context bundle: goal, subtask ids, constraints, interfaces, `target` (enum, only `"n8n"` this week), acceptance criteria (assertion enum), **build-visible** golden cases |
+| `work_batch` | Captain | context bundle: goal, subtask ids, constraints, interfaces (dependency edges, §22), `target` (enum: `"n8n"` tool \| `"autogen"` orchestrator), acceptance criteria (assertion enum), **build-visible** golden cases |
 | `holdout_cases` | Captain | validation-only cases; fetched by workers AFTER codex exec; never written into the workspace |
 | `batch_claim` | Gateway | worker id, claim_token, expiry |
 | `codex_task` | Hermes | verbatim prompt sent to codex |
@@ -171,6 +175,16 @@ ledger with per-block hashes"** — never "tamper-proof blockchain". No chain
 verification work this week.
 
 ## 5. Ledger-Gateway (FastAPI)
+
+> **Superseded by the MariaDB decision (§23):** the ledger is a MariaDB store,
+> not a JSON file. The file-based mitigations below (exclusive lock file,
+> corrupt-rename, "only one process opens the file") are therefore UNNECESSARY
+> — transactional writes and row-locking replace them. What survives: the
+> gateway is the sole WRITER (readers connect directly), claim fencing is an
+> atomic transactional compare-and-set, and `CaptainAgent` still takes an
+> injected `LedgerClient` (HTTP) rather than constructing its own store. Read
+> the rest of this section as the rationale for single-writer discipline; the
+> mechanism is now the DB, not a lock file.
 
 **Single-owner rule (review finding: two processes corrupt the ledger file):**
 
@@ -398,8 +412,9 @@ hardcoding the literal-sniff backstop misses.
 
 ## 10. n8n + Mailpit deployment
 
-- docker-compose: n8n pinned 2.29.x + Mailpit only (Minibook runs natively —
-  no Dockerfile exists and none will be written this week).
+- docker-compose: n8n pinned 2.29.x + Mailpit + **MariaDB** (§23, the ledger
+  store) only (Minibook runs natively — no Dockerfile exists and none will be
+  written this week). n8n keeps its own SQLite volume (it can't use MariaDB).
 - **Bootstrap:** owner account provisioned via env
   (`N8N_INSTANCE_OWNER_MANAGED_BY_ENV` + email/name/password-hash), MCP enabled
   via env (`N8N_MCP_MANAGED_BY_ENV=true`, `N8N_MCP_ACCESS_ENABLED=true`).
@@ -542,7 +557,12 @@ mock-CRM sink (observable), stated in the description.
   submission, copy form fields into §18; credits requested. Model→gpt-5.6 +
   smoke test; baseline tag + PRIOR_WORK.md (three bands, §2) + submodule fix
   (+ `clone --recursive` proof); `.gitignore` += `workspaces/`, `runs/`;
-  author repo `docker-compose.yml` (n8n + Mailpit) + up + n8n bootstrap +
+  author repo `docker-compose.yml` (n8n + Mailpit + MariaDB) + up + `MariaDBStorage`
+  behind LedgerStorage + `PyMySQL` pin; autogen spike: dump a team with a
+  FunctionTool, confirm where tools serialize (`config.workbench`) and whether a
+  round-trip executes them, and that a keyless `OpenAIChatCompletionClient`
+  dumps `api_key: null` (§22.2) — freezes the autogen schema decision; n8n
+  bootstrap +
   `mailpit-smtp`/`openai-gpt` credentials + `setx N8N_MCP_TOKEN`; minimal
   `templates/AGENTS.md` (credential + webhook rules only) for Gate A
   workspaces. **GATE A (binary, scripted):** fresh workspace → codex exec
@@ -730,11 +750,208 @@ its prompts/tools/context through one auditable chain — no step is ad hoc:
 | context / memory | stateless per execution | persistence (e.g. lead history) would be an n8n data table — out of scope this week |
 
 Net effect for the submission story: the pipeline is GPT-5.6 end to end —
-GPT-5.6 plans (Captain), GPT-5.6 orchestrates (Hermes workers), Codex builds,
-and the built artifact itself runs its LLM nodes on GPT-5.6.
+GPT-5.6 plans (Captain), GPT-5.6 drives the build (Hermes workers), Codex
+builds, and the built artifact is itself a GPT-5.6 autogen agent team that
+ORCHESTRATES n8n tools (the two-layer architecture, §22 — autogen thinks, n8n
+acts). n8n hosts no LLM logic; the reasoning lives in the built autogen team.
 
-## 21. Out of scope (this week)
+## 22. Layered architecture: autogen orchestrators over n8n tools
+
+This is the load-bearing architecture the demo realizes. Two layers, cleanly
+split (user directive):
+
+- **Brain = autogen-core 0.7.5 agent teams.** All reasoning/orchestration lives
+  here. Built by Codex against autogen-agentchat 0.7.5.
+- **Hands = n8n workflows exposed as tool calls.** n8n provides its integration
+  library as callable tools; it hosts NO agent/LLM logic ("only if absolutely
+  necessary"). Built by Codex via the n8n MCP.
+
+```
+Task X → Captain decomposes →
+   n8n-tool batches (target:"n8n")     autogen batch (target:"autogen")
+   Codex builds workflows via n8n-MCP  Codex builds the team via autogen SDK
+        │ exposed as tool calls               │ has the n8n tools wired in
+        └──────────────►  orchestrated by  ◄──┘
+                    the autogen team to solve Task X
+```
+
+**Two build targets, one seam.** The `target` enum (§6) now has two members:
+`"n8n"` (build a workflow-tool) and `"autogen"` (build the orchestrator). Both
+run the identical worker cycle (§8), ledger protocol (§4), claim fencing,
+holdout isolation, and tree-rollup validation — only the adapter
+(deploy/execute/observe) and the assertion subset differ.
+
+**Dependency wiring (align becomes load-bearing).** The autogen orchestrator
+batch DEPENDS ON its n8n-tool batches — the tools must exist and be validated
+before the orchestrator is. The `interfaces`/dependency fields the align stage
+already emits (§6) now drive real ordering: n8n-tool batches build and validate
+first; the autogen batch's context bundle names the validated tools it may
+wire. A worker will not claim the autogen batch until its dependency batches
+show `batch_done: succeeded` (gateway check on claim).
+
+### 22.1 n8n workflow-as-tool exposure
+
+How a built n8n workflow reaches an autogen team as a callable tool — decided
+at a Day-1 spike (mirrors the §9 Gate A go/no-go):
+- **Primary: n8n MCP Server Trigger → autogen MCP workbench.** The n8n workflow
+  is built with an MCP Server Trigger so n8n exposes it as an MCP tool;
+  autogen consumes it via `autogen_ext.tools.mcp` (`mcp_server_tools` /
+  `McpWorkbench` with `SseServerParams`/`StreamableHttpServerParams`). The
+  agent calls the n8n workflow as a native tool.
+- **Fallback: webhook-as-FunctionTool.** Wrap the workflow's webhook in a
+  trusted `FunctionTool` (HTTP POST to `/hook/{batch_id}`) provided via
+  `captain_tools.py`. Simpler, always works, no MCP dependency.
+Either way the tool set handed to the built team is CONTRACT-CONSTRAINED (only
+the validated n8n tools named in the bundle), never Codex-invented.
+
+### 22.2 autogen build target (artifact, adapter, assertions)
+
+**Artifact.** Codex authors `workspaces/{batch_id}/team.py` — a pure factory
+`build_team() -> BaseGroupChat` (no import side effects), team `label =
+captain-team-{batch_id}`. `team.json` (`team.dump_component().model_dump()`,
+a `ComponentModel`) is the **diff/audit artifact of record** the `deploy` block
+points at (hashed, secret-free).
+
+**CRITICAL framework correction (verified against installed autogen 0.7.5 by
+the review panel — three independent verifiers converged):** tool
+serialization through `dump_component()`/`load_component()` is NOT reliably
+supported in 0.7.5. Agent configs emit tools under `config.workbench`
+(a `StaticStreamWorkbench`, whose `config.tools[].config` carry FunctionTool
+`source_code`), NOT an agent-level `config.tools` list — and the official docs
+note "serializing tools is not yet supported" (emit `"tools": []`). Consequence
+for the design:
+- **Execution substrate is `team.py`, not `team.json`.** The trusted
+  `run_team.py` harness EXECUTES by importing `build_team()` in an isolated
+  subprocess (tools are live Python objects) — it does NOT run a rehydrated
+  `team.json`. `team.json` stays the audit/record artifact only.
+- The deploy-gate schema reads tool provenance at
+  `config.participants[i].config.workbench[j].config.tools[k].config.name`
+  (and validates `provider==FunctionTool` + source against trusted
+  `captain_tools.py`), never an agent-level tools list — else the gate finds
+  zero tools and the provenance guarantee silently no-ops.
+- **Day-1 spike proves this before the schema freezes:** dump a team with a
+  FunctionTool, inspect where tools land and whether a round-trip executes
+  them; also confirm `OpenAIChatCompletionClient` built without an api_key
+  serializes `api_key: null` (not a placeholder or the env value).
+
+**Adapter (deploy/execute/observe):**
+- `deploy()`: assert `team.py` present; in a SUBPROCESS (never in-process —
+  Codex code is untrusted), `build_team()` → `dump_component()` → validate
+  against the `AutogenTeamConfig` Pydantic schema (component_type=team, model
+  `gpt-5.6`, api_key null, no `sk-`, tools ⊆ trusted set at the workbench path
+  above) → write `team.json`. Record team label, participants, tool names,
+  model in the `deploy` block. Idempotent: one canonical `team.json` per batch.
+- `execute(test_case)`: `terminal("python run_team.py --case case.json")` —
+  `run_team.py` imports `build_team()` FRESH per case (teams are stateful
+  across `.run()`), then `result = await asyncio.wait_for(team.run(task=...),
+  CASE_TIMEOUT)`, dumps the observation to stdout as JSON. Stays inside the
+  worker's terminal-only tool surface (§20.2); no in-process import of Codex
+  code by the worker/gateway.
+- `observe()`: off the `TaskResult` — `final_json` (last message parsed),
+  `stop_reason`, `tool_calls` (from `ToolCallRequestEvent`/
+  `ToolCallExecutionEvent`/`ToolCallSummaryMessage` in `result.messages`),
+  `speakers` (ordered `source`), `message_count` — plus the shared
+  `GET /sink/crm?case_id=` (§5). (Exact event classes/fields confirmed by one
+  recorded run dumped to JSON, Day 3.)
+
+**Assertion vocabulary (autogen subset, each bound 1:1 to an observation
+channel — §7 rule):**
+```
+final_output{json_path_equals}        → final_json     (∥ webhook_response)
+tool_called{name, args_json_path?}    → tool_calls      (∥ mail_sent)
+tool_not_called{name}                 → tool_calls       (∥ no_mail)
+termination_reason{value}             → stop_reason      (∥ execution_status)
+speaker_participated{agent} / handoff → speakers         (autogen-native topology)
+sink_called{json_path_equals}         → sink             (SHARED with n8n)
+```
+Correlation, holdout isolation, failure classification, thresholds, and
+tree-rollup are all INHERITED unchanged from §4/§5/§7/§11. A team that won't
+serialize/validate fails `deploy()` before any case runs.
+
+**What of the old Captain build capability** (verified: it already targets
+0.7.5 runtime objects, NOT pyautogen 0.2 — the only 0.2 vestige is the
+`{"config_list":[...]}` shim in `_get_model_client`):
+- MODERNIZE: drop the `config_list` shim → inject/serialize a
+  `ChatCompletionClient` directly; the built team's model client becomes a
+  Component sub-config `{provider: OpenAIChatCompletionClient, config:{model:
+  "gpt-5.6"}}`. Keep `create_agent_assistant` as the Captain's INTERNAL helper
+  for its own planning agents (it stops being the "build target").
+- DROP from the build vocabulary: `make_system_prompt` as a deliverable
+  (system prompts now live inside `team.py`, authored by Codex from the bundle,
+  validated behaviorally); `create_agent_user_proxy` (no UserProxyAgent in
+  0.7.5; runtime input is the task payload); the bespoke `register_tool`/
+  `ToolRegistry` (never wired to `AssistantAgent(tools=)` anyway) → built-team
+  tools are autogen-core `FunctionTool`s / MCP tools from the contract.
+
+### 22.3 Stabilization via the Hermes learning loop
+
+Hermes' built-in closed learning loop (skill creation from experience, skill
+self-improvement during use, agent-curated memory, FTS5 cross-session recall)
+is what makes the build FLEET improve over time — the "stabilizes over time"
+property (user insight).
+- **Mechanism:** across batch builds the worker accumulates skills ("how to
+  build/validate an n8n Slack integration", "how to wire n8n MCP tools into a
+  RoundRobinGroupChat", "what this Codex failure means") and memory (which
+  prompts / node configs / team shapes pass) → fewer fix iterations, higher
+  first-pass rate on similar later batches.
+- **Measured by the ledger — not asserted:** iteration-count-to-green per batch
+  is already recorded (`validation_run` count before `batch_done`). The
+  stabilization is a plottable trend (iterations ↓, first-pass ↑ across similar
+  batches) read straight from the ledger. This is the evidence layer for the
+  "self-improving" claim.
+- **Fleet learning:** shared skills dir via `skills.external_dirs` (all workers
+  read one learned-skills location) → collective compounding; per-worker
+  memory stays independent. Default: shared skills, separate memory.
+- **Honest scope:** the mechanism is real and config-enabled; a 3-batch demo
+  shows EARLY signal (a few similar batches, iteration count dropping), framed
+  as the capability with the ledger as instrument — NOT a full learning curve.
+  The video does not overclaim.
+- **Reset interaction (critical):** the reset script (§14) must PRESERVE Hermes
+  memory + the shared skills dir. It wipes work-products (ledger, n8n
+  workflows, Mailpit), never the learned brain — else every "clean" run resets
+  learning and nothing compounds.
+
+## 23. Data stores
+
+Most "state" is derived and lives in the ledger; only a few independent stores
+exist.
+
+| store | backend | who | notes |
+|---|---|---|---|
+| **Ledger** (authoritative write-model) | **MariaDB** | we operate | see decision below |
+| Minibook (read-model) | SQLite | submodule, untouched | don't fork its DB init |
+| n8n (workflows/executions/credentials) | SQLite volume | persist | n8n can't use MariaDB (MySQL/MariaDB support dropped — SQLite/Postgres only) |
+| Hermes (memory/sessions/FTS5) | SQLite per profile | persist, **never wipe** | the learning substrate (§22.3) |
+| Mailpit, gateway status index, mock-CRM sink | in-memory | — | ephemeral, reset per run |
+
+Files, not DBs: shared skills dir, Codex sessions (`~/.codex/sessions/`), batch
+workspaces, `team.py`/`team.json`, built n8n workflow exports.
+
+**Decision: the ledger moves from JSON file to MariaDB.** Rationale beyond
+durability — it DISSOLVES two review blockers by construction:
+- Ledger corruption (the last-writer-wins snapshot / `os.replace` Windows race
+  / silent genesis-wipe) → gone; transactional writes. The §5 lock-file and
+  corrupt-rename mitigations become UNNECESSARY.
+- Claim fencing race → an atomic transactional compare-and-set
+  (`UPDATE ... WHERE status='pending'` / `SELECT ... FOR UPDATE`); MariaDB
+  row-locking replaces the `asyncio.Lock` gymnastics. "Single-owner process"
+  relaxes to "gateway is the sole WRITER"; readers connect directly.
+
+Schema: a `blocks` table (`index` PK, `parent_index` FK, `block_type`, `data`
+/`metadata` native JSON, `hash`, `previous_hash`, `created_at`); subtree/status
+queries become indexed SQL. Implemented as a new `MariaDBStorage` behind the
+existing pluggable `LedgerStorage` seam — no core change. Cost: +1 docker
+service (`mariadb` image) + creds in `.env` + `PyMySQL` driver (pure-Python,
+Windows-friendly) + MariaDB in the startup order (healthy → gateway). Honest
+note: MariaDB is heavier than a demo strictly needs (SQLite/WAL would suffice),
+but it buys definitively-correct concurrency and fits the "real system that
+compounds" framing. Minibook stays on its own SQLite (submodule — not forked).
+
+## 24. Out of scope (this week)
 
 Chain verification; recorder/CQRS integration for the new block types; any
 Minibook write-back; Jira/code adapters (interface only); human-gate UI;
-dynamic target selection by the LLM; packaging/`src/` migration.
+dynamic target selection by the LLM; packaging/`src/` migration. The `autogen`
+target is IN scope as the second adapter proving generality, but its filmed
+demo remains COULD — n8n stays the primary filmed demo unless the autogen
+path proves solid by Gate C.
