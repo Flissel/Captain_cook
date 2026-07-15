@@ -41,20 +41,27 @@ def client(storage: MariaDBStorage) -> TestClient:
     return TestClient(create_app(storage=storage, mirror=RecordingMirror(), approval_enabled=True))
 
 
+def batch_payload(batch_id: str = "batch-1", title: str = "Build the notification workflow") -> dict[str, Any]:
+    return {
+        "batch_id": batch_id,
+        "title": title,
+        "goal": "Deliver a tested workflow",
+        "subtask_ids": [f"subtask-{batch_id}"],
+        "target": "n8n",
+        "capability_tags": ["notifications", "email"],
+        "depends_on": [],
+        "constraints": [],
+        "acceptance_criteria": [
+            {"assertion_id": "status-ok", "kind": "status_equals", "expected": "succeeded"}
+        ],
+        "golden_cases": [],
+    }
+
+
 def create_batch(client: TestClient, batch_id: str = "batch-1", status: str = "pending") -> int:
     response = client.post(
         "/blocks",
-        json={
-            "block_type": "work_batch",
-            "status": status,
-            "data": {
-                "batch_id": batch_id,
-                "title": "Build the notification workflow",
-                "goal": "Deliver a tested workflow",
-                "capability_tags": ["notifications", "email"],
-                "holdout": {"must": "never leak"},
-            },
-        },
+        json={"block_type": "work_batch", "status": status, "data": batch_payload(batch_id)},
     )
     assert response.status_code == 201, response.text
     return response.json()["index"]
@@ -101,10 +108,34 @@ def test_duplicate_batch_ids_are_rejected(client: TestClient) -> None:
 
     response = client.post(
         "/blocks",
-        json={"block_type": "work_batch", "data": {"batch_id": "batch-1", "title": "Duplicate"}},
+        json={"block_type": "work_batch", "data": batch_payload(title="Duplicate")},
     )
 
     assert response.status_code == 409
+
+
+def test_work_batch_must_satisfy_the_captain_contract(client: TestClient) -> None:
+    response = client.post(
+        "/blocks",
+        json={"block_type": "work_batch", "data": {"batch_id": "batch-1", "title": "Incomplete"}},
+    )
+
+    assert response.status_code == 422
+
+
+def test_holdout_must_satisfy_the_captain_contract(client: TestClient) -> None:
+    parent = create_batch(client)
+
+    response = client.post(
+        "/blocks",
+        json={
+            "block_type": "holdout",
+            "parent_index": parent,
+            "data": {"batch_id": "batch-1", "cases": [{"case_id": "missing-input"}]},
+        },
+    )
+
+    assert response.status_code == 422
 
 
 def test_worker_blocks_require_the_current_fencing_token(client: TestClient) -> None:
@@ -153,7 +184,7 @@ def test_holdout_is_hidden_until_a_codex_session_exists(client: TestClient) -> N
         json={
             "block_type": "holdout",
             "parent_index": parent_index,
-            "data": {"batch_id": "batch-1", "cases": [{"case_id": "secret-1"}]},
+            "data": {"batch_id": "batch-1", "cases": [{"case_id": "secret-1", "input": {"lead": 1}}]},
         },
     )
     assert holdout.status_code == 201
@@ -165,7 +196,9 @@ def test_holdout_is_hidden_until_a_codex_session_exists(client: TestClient) -> N
 
     response = client.get("/batches/batch-1/holdout", headers=headers)
     assert response.status_code == 200
-    assert response.json()["cases"] == [{"case_id": "secret-1"}]
+    assert response.json()["cases"] == [
+        {"case_id": "secret-1", "input": {"lead": 1}, "expected_observations": {}}
+    ]
 
 
 def test_bundle_and_blocks_never_leak_holdout(client: TestClient) -> None:
@@ -175,7 +208,7 @@ def test_bundle_and_blocks_never_leak_holdout(client: TestClient) -> None:
         json={
             "block_type": "holdout",
             "parent_index": parent_index,
-            "data": {"batch_id": "batch-1", "cases": [{"case_id": "secret-1"}]},
+            "data": {"batch_id": "batch-1", "cases": [{"case_id": "secret-1", "input": {"lead": 1}}]},
         },
     )
 
@@ -230,7 +263,7 @@ def test_mirror_failure_never_fails_a_ledger_write(storage: MariaDBStorage) -> N
 
     response = client.post(
         "/blocks",
-        json={"block_type": "work_batch", "data": {"batch_id": "batch-1", "title": "T"}},
+        json={"block_type": "work_batch", "data": batch_payload(title="T")},
     )
 
     assert response.status_code == 201

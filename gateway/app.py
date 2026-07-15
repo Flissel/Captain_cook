@@ -13,8 +13,9 @@ from threading import Lock
 from typing import Any, Protocol
 
 from fastapi import FastAPI, Header, HTTPException, Query, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from agenten.validation.contracts import HoldoutSuite, WorkBatch
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.mirror import MirrorQueue
 from gateway.registry_feed import mirror_validated_batch
@@ -141,6 +142,17 @@ class GatewayStore:
         )
 
     def append(self, request: BlockRequest, claim_token: str | None) -> dict[str, Any]:
+        try:
+            if request.block_type == "work_batch":
+                request = request.model_copy(
+                    update={"data": WorkBatch.model_validate(request.data).model_dump(mode="json")}
+                )
+            elif request.block_type == "holdout":
+                request = request.model_copy(
+                    update={"data": HoldoutSuite.model_validate(request.data).model_dump(mode="json")}
+                )
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.errors()) from exc
         batch_id = request.data.get("batch_id")
         if not isinstance(batch_id, str) or not batch_id:
             raise HTTPException(status_code=422, detail="data.batch_id is required")
