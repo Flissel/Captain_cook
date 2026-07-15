@@ -8,11 +8,12 @@ from pathlib import Path
 from blockchain.Blockchain_modell import Blockchain
 from blockchain.storage import InMemoryStorage
 
+from agenten.household.worker import create_householder_worker_factories
 from agenten.ledger_bridge.stage_machine import Stage, TERMINAL_STAGES
 from agenten.orchestration.pipeline import build_pipeline
 
 DEMO_PROBLEM = "Prepare a small engineering brief for a new workflow automation."
-EXPECTED_SUBPROBLEM_COUNT = 2
+EXPECTED_SUBPROBLEM_COUNT = 4
 
 
 @dataclass(frozen=True)
@@ -34,13 +35,23 @@ async def _deterministic_decompose(description: str, depth: int) -> list[dict[st
         return []
     return [
         {
-            "description": f"Collect implementation constraints for: {description}",
-            "capability_tags": ["echo"],
+            "description": f"Review the architecture boundary for: {description}",
+            "capability_tags": ["architecture_review"],
             "atomic": True,
         },
         {
-            "description": f"Draft an execution brief for: {description}",
-            "capability_tags": ["echo"],
+            "description": f"Review ledger evidence needs for: {description}",
+            "capability_tags": ["ledger_review"],
+            "atomic": True,
+        },
+        {
+            "description": f"Create a delivery plan for: {description}",
+            "capability_tags": ["delivery_plan"],
+            "atomic": True,
+        },
+        {
+            "description": f"Audit release evidence for: {description}",
+            "capability_tags": ["quality_review"],
             "atomic": True,
         },
     ]
@@ -78,6 +89,7 @@ async def run_demo(output_path: Path | None = None) -> DemoSummary:
         llm_decompose=_deterministic_decompose,
         llm_judge=_accept_all,
         blockchain=blockchain,
+        worker_factories=create_householder_worker_factories(),
     )
 
     await pipeline.start()

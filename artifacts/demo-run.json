@@ -1,8 +1,8 @@
 {
   "success": true,
-  "problem_id": "b2efb2da-bef5-4131-a2e3-c105d6afd3cb",
-  "terminal_count": 2,
-  "done_count": 2,
+  "problem_id": "5c7225b0-73bd-45c4-a3ff-5d7f4ee7a86c",
+  "terminal_count": 4,
+  "done_count": 4,
   "blocks": [
     {
       "index": 0,
@@ -19,18 +19,80 @@
       "index": 2,
       "block_type": "subproblem",
       "status": "done",
-      "description": "Collect implementation constraints for: Prepare a small engineering brief for a new workflow automation.",
+      "description": "Review the architecture boundary for: Prepare a small engineering brief for a new workflow automation.",
       "result": {
-        "echo": "Collect implementation constraints for: Prepare a small engineering brief for a new workflow automation."
+        "role": "architect",
+        "decision": "offline_review_completed",
+        "artifacts": [
+          "agents/household/architect.md"
+        ],
+        "evidence": [
+          "deterministic offline executor",
+          "subproblem:28debc39-d4e8-439a-933f-4d9e741bdb63"
+        ],
+        "limitations": [
+          "No LLM, MCP server, browser, or deployment was invoked."
+        ]
       }
     },
     {
       "index": 3,
       "block_type": "subproblem",
       "status": "done",
-      "description": "Draft an execution brief for: Prepare a small engineering brief for a new workflow automation.",
+      "description": "Review ledger evidence needs for: Prepare a small engineering brief for a new workflow automation.",
       "result": {
-        "echo": "Draft an execution brief for: Prepare a small engineering brief for a new workflow automation."
+        "role": "ledger-steward",
+        "decision": "offline_review_completed",
+        "artifacts": [
+          "agents/household/ledger-steward.md"
+        ],
+        "evidence": [
+          "deterministic offline executor",
+          "subproblem:07c4df45-c33a-46d0-a2d9-911adf9607ed"
+        ],
+        "limitations": [
+          "No LLM, MCP server, browser, or deployment was invoked."
+        ]
+      }
+    },
+    {
+      "index": 4,
+      "block_type": "subproblem",
+      "status": "done",
+      "description": "Create a delivery plan for: Prepare a small engineering brief for a new workflow automation.",
+      "result": {
+        "role": "delivery-builder",
+        "decision": "offline_review_completed",
+        "artifacts": [
+          "agents/household/delivery-builder.md"
+        ],
+        "evidence": [
+          "deterministic offline executor",
+          "subproblem:ef46c277-fef6-42ff-981f-4e62e635f490"
+        ],
+        "limitations": [
+          "No LLM, MCP server, browser, or deployment was invoked."
+        ]
+      }
+    },
+    {
+      "index": 5,
+      "block_type": "subproblem",
+      "status": "done",
+      "description": "Audit release evidence for: Prepare a small engineering brief for a new workflow automation.",
+      "result": {
+        "role": "quality-warden",
+        "decision": "offline_review_completed",
+        "artifacts": [
+          "agents/household/quality-warden.md"
+        ],
+        "evidence": [
+          "deterministic offline executor",
+          "subproblem:11902297-57fc-4410-a595-c70384ede234"
+        ],
+        "limitations": [
+          "No LLM, MCP server, browser, or deployment was invoked."
+        ]
       }
     }
   ]

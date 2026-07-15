@@ -12,7 +12,7 @@ async def test_run_demo_writes_an_inspectable_success_artifact(tmp_path):
     summary = await run_demo(output)
 
     assert summary.success is True
-    assert summary.done_count == 2
+    assert summary.done_count == 4
     assert output.exists()
     assert json.loads(output.read_text(encoding="utf-8"))["success"] is True
 
@@ -25,3 +25,9 @@ async def test_run_demo_contains_only_terminal_subproblems():
 
     assert {block["status"] for block in subproblems} == {"done"}
     assert all("description" in block for block in subproblems)
+    assert {block["result"]["role"] for block in subproblems} == {
+        "architect",
+        "ledger-steward",
+        "delivery-builder",
+        "quality-warden",
+    }
