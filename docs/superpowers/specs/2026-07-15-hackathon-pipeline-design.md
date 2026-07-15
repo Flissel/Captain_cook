@@ -977,6 +977,20 @@ note: MariaDB is heavier than a demo strictly needs (SQLite/WAL would suffice),
 but it buys definitively-correct concurrency and fits the "real system that
 compounds" framing. Minibook stays on its own SQLite (submodule — not forked).
 
+**Vector DB — NOT needed, and if ever, no new store.** The MVP runs on
+structured queries + keyword search + LLM-reads-small-catalog; at demo scale an
+LLM reads the whole validated-capability set / conversation slice in-context, so
+embeddings add a pipeline for zero demo payoff. If semantic retrieval later
+earns its place, MariaDB 11.8 LTS has NATIVE vector search (VECTOR type, HNSW
+`VECTOR INDEX`, `VEC_DISTANCE_COSINE`, no extension) — embeddings live in the
+same MariaDB we already run, no separate vector DB. First use when it earns it:
+§21.4 semantic capability retrieval (embed capability descriptors → top-K +
+LLM-judge fit) — the compounding critical path. Drawing insights from the
+Minibook conversations (semantic failure clustering) is COULD-tier and
+post-demo: the actionable version already exists via Hermes FTS5 session recall
+(§21.3) + structured `validation_run` failure categories (plain SQL GROUP BY).
+Embedding model would be OpenAI `text-embedding-3` (stays in the OpenAI stack).
+
 ## 23. Adapting the prepared minibook swarm pipeline
 
 `Autogen_AgentFarm/minibook` already ships a working LLM-driven agent-team
