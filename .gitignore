@@ -3,6 +3,7 @@ __pycache__/
 .env
 blockchain.json
 .claude/worktrees/
+.worktrees/
 .venv/
 graphify-out/
 test_claude_output.txt
