@@ -29,5 +29,5 @@ def build() -> NestedChatWorkflow:
         entry_role="generator",
         trigger_role="user_proxy",
         kickoff_message="Please decompose the following system prompt into smaller subtasks: {system_prompt}.",
-        result_index=-2,
+        result_index=-1,
     )

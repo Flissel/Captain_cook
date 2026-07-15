@@ -36,14 +36,15 @@ are provided; to back the ledger with a database, implement `LedgerStorage`
 (`load`/`save`/`clear`) and pass it to `Blockchain(storage=...)` — no other
 code needs to change.
 
-## Agent logic: adding a new nested-chat workflow
+## Agent logic: adding a new AgentChat workflow
 
 Every existing "Generator critiques with a Critic, refines, and produces a
 Structured output" pipeline (project definition, project structuring,
-system-prompt generation, subtask decomposition) used to be a hand-rolled
-copy of the same ~80 lines. That pattern is now captured once in
-`agenten/workflows/base.py` as `NestedChatWorkflow`, and existing workflows
-are declarative registrations under `agenten/workflows/`.
+system-prompt generation, subtask decomposition) is described once in
+`agenten/workflows/base.py` as `NestedChatWorkflow`. The name remains for
+compatibility, but execution is now sequential `AssistantAgent.run` calls
+from AutoGen 0.7 AgentChat rather than the removed `pyautogen` nested-chat
+API.
 
 To add a new workflow:
 
@@ -93,12 +94,10 @@ example, wrapping `InternetSearcher`.
 
 ## Known gaps (not touched by this refactor)
 
-- `blockchain/web_scamler.py` imports a nonexistent `new_struct.*` package
-  and does not run. It's a candidate for reimplementation as a `Tool` once
-  someone needs URL-relevance evaluation again.
-- `chats/project_maker.py` and `chats/Job_scramler.py` are standalone,
-  unused modules kept as-is; `project_maker.py`'s logic is now superseded
-  by `agenten/workflows/project_definition.py`.
-- There is still no `requirements.txt`/`pyproject.toml`, so dependency
-  versions (autogen, pydantic, plotly, networkx, sentence-transformers,
-  beautifulsoup4, aiohttp, selenium) are unpinned.
+- `blockchain/web_scamler.py` is a standalone URL-relevance service and is
+  not wired into the event-driven runtime yet.
+- `chats/project_maker.py` is a compatibility wrapper; the canonical project
+  definition workflow is `agenten/workflows/project_definition.py`.
+- Root dependencies are pinned in `requirements.txt`. The next packaging
+  step is moving the root modules under an installable `src/` package without
+  changing the domain/event interfaces.
