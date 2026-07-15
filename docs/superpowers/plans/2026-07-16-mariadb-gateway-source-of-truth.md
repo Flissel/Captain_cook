@@ -2,6 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Program routing:** Do not dispatch this plan standalone. Follow
+> `2026-07-16-remediation-program-orchestration.md`. Gateway Tasks 2-5 remain
+> canonical; shared baseline, CI, health, and documentation work is consolidated
+> into program packets owned by the orchestrator.
+
 **Goal:** Make the MariaDB-backed FastAPI gateway the only production writer and source of delivery lifecycle truth, while preserving the deterministic JSON offline demo.
 
 **Architecture:** Captain planning and delivery code use typed HTTP ports; only `gateway/` opens a MariaDB connection. A work batch remains immutable after creation. Claims, heartbeats, worker evidence, and terminal outcomes are append-only child blocks, and gateway queries derive the current batch projection from those events. The existing SQLite delivery ledger is migrated behind a gateway client and is no longer started or documented as a production control plane.
@@ -45,7 +50,7 @@
 - Consumes: the current local `main`, the `gateway/` service, and `MariaDBStorage`.
 - Produces: a machine-checked rule that only the gateway package may construct `MariaDBStorage`, plus the fixed merge order for this plan.
 
-- [ ] **Step 1: Write the failing boundary and workstream assertions**
+- [x] **Step 1: Write the failing boundary and workstream assertions**
 
 ```python
 def test_only_gateway_may_construct_mariadb_storage() -> None:
@@ -63,13 +68,13 @@ def test_workstreams_name_mariadb_gateway_as_delivery_truth() -> None:
     assert "SQLite delivery ledger is a production control plane" not in plan
 ```
 
-- [ ] **Step 2: Verify the assertions fail against the current documents/rules**
+- [x] **Step 2: Verify the assertions fail against the current documents/rules**
 
 Run: `python -m pytest -q tests/test_architecture_fitness.py tests/test_workstream_docs.py`
 
 Expected: FAIL because no symbol-level `MariaDBStorage` ownership rule and no canonical source-of-truth statement exist.
 
-- [ ] **Step 3: Add the documented ownership and integration sequence**
+- [x] **Step 3: Add the documented ownership and integration sequence**
 
 Add this exact rule to `docs/WORKSTREAMS.md`:
 
@@ -84,7 +89,7 @@ migration and operations → MariaDB CI gate → public documentation.
 
 Add a symbol-reference helper in `tests/architecture_fitness.py` that parses `ast.Name` and `ast.Attribute` nodes, and make the new architecture test allow only `gateway/`, `tests/`, and the one migration script named above.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 Run: `python -m pytest -q tests/test_architecture_fitness.py tests/test_workstream_docs.py`
 

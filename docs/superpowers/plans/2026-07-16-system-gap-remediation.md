@@ -2,6 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Program routing:** Do not dispatch this plan standalone. Follow
+> `2026-07-16-remediation-program-orchestration.md` for packet IDs,
+> prerequisites, file locks, supersessions, and integration gates. Only the
+> orchestrator updates this plan's checkboxes and Session Insights.
+
 **Goal:** Close all seven audited system gaps so a clean Windows 11 checkout installs, starts, validates, repairs, and documents the complete Captain Cook system with mandatory real integration evidence.
 
 **Architecture:** Treat checkpoints as cached observations backed by stage validators, preserve the selected external VibeMind n8n boundary, and route setup/start/status through shared health contracts. Add an isolated MariaDB integration gate, then align documentation and split the remaining runtime hotspots behind their existing public facades.

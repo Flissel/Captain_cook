@@ -15,3 +15,10 @@ def test_modular_workstream_plan_defines_the_household_roles():
     assert Path("agents/household/ledger-steward.md").is_file()
     assert Path("agents/household/delivery-builder.md").is_file()
     assert Path("agents/household/quality-warden.md").is_file()
+
+
+def test_workstreams_name_mariadb_gateway_as_delivery_truth():
+    plan = Path("docs/WORKSTREAMS.md").read_text(encoding="utf-8")
+
+    assert "MariaDB gateway is the sole production delivery source of truth" in plan
+    assert "SQLite delivery ledger is a production control plane" not in plan

@@ -35,6 +35,16 @@ class BoundaryViolation:
         )
 
 
+@dataclass(frozen=True)
+class SymbolReference:
+    source: Path
+    line: int
+    symbol: str
+
+    def __str__(self) -> str:
+        return f"{self.source.as_posix()}:{self.line} references {self.symbol}"
+
+
 def imports_in_file(path: Path) -> list[ImportedModule]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     imports: list[ImportedModule] = []
@@ -127,6 +137,52 @@ def find_import_cycles(
     return sorted(cycles)
 
 
+def find_symbol_references(
+    root: Path,
+    *,
+    symbol: str,
+    allowed_paths: tuple[str, ...] = (),
+) -> list[SymbolReference]:
+    references: list[SymbolReference] = []
+    ignored_parts = {
+        ".captain-cook",
+        ".git",
+        ".venv",
+        ".worktrees",
+        "__pycache__",
+        "hermes-agent",
+        "minibook",
+        "node_modules",
+        "venv",
+    }
+
+    for path in sorted(root.rglob("*.py")):
+        source = path.relative_to(root)
+        if any(part in ignored_parts for part in source.parts):
+            continue
+        if _path_is_allowed(source, allowed_paths):
+            continue
+
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            is_reference = (
+                isinstance(node, ast.Name) and node.id == symbol
+            ) or (
+                isinstance(node, ast.Attribute) and node.attr == symbol
+            ) or (
+                isinstance(node, ast.alias) and node.name == symbol
+            )
+            if is_reference:
+                references.append(
+                    SymbolReference(source=source, line=node.lineno, symbol=symbol)
+                )
+
+    return sorted(
+        references,
+        key=lambda item: (item.source.as_posix(), item.line),
+    )
+
+
 def _module_name(root: Path, path: Path) -> str:
     relative = path.relative_to(root).with_suffix("")
     parts = list(relative.parts)
@@ -137,6 +193,14 @@ def _module_name(root: Path, path: Path) -> str:
 
 def _matches_any(module: str, prefixes: tuple[str, ...]) -> bool:
     return any(module == prefix or module.startswith(f"{prefix}.") for prefix in prefixes)
+
+
+def _path_is_allowed(path: Path, allowed_paths: tuple[str, ...]) -> bool:
+    source = path.as_posix()
+    return any(
+        source.startswith(allowed) if allowed.endswith("/") else source == allowed
+        for allowed in allowed_paths
+    )
 
 
 def _canonical_cycle(cycle_body: list[str]) -> tuple[str, ...]:

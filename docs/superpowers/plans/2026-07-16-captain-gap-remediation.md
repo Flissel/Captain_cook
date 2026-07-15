@@ -2,6 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Program routing:** Do not dispatch this plan standalone. Follow
+> `2026-07-16-remediation-program-orchestration.md`. Captain Tasks 1, 3, 6, 7,
+> and the shared-document part of Task 8 are absorbed by canonical program
+> packets; only the orchestrator updates source-plan checkboxes.
+
 **Goal:** Make the Captain planning path production-ready by enforcing deterministic policy after every LLM stage, releasing through the sole-writer gateway, resuming partial project releases, and proving live persistence and runtime contracts.
 
 **Architecture:** Keep the deterministic `CaptainPipeline` independent of transports and databases. Add typed policy, release, capability, run-store, and event-publication ports; wire JSON implementations for offline operation and HTTP/MariaDB-backed implementations for production. Hermes and n8n remain external consumers and are not implemented here.
