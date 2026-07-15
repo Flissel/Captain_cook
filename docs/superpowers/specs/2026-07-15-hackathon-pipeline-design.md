@@ -977,7 +977,80 @@ note: MariaDB is heavier than a demo strictly needs (SQLite/WAL would suffice),
 but it buys definitively-correct concurrency and fits the "real system that
 compounds" framing. Minibook stays on its own SQLite (submodule — not forked).
 
-## 23. Out of scope (this week)
+## 23. Adapting the prepared minibook swarm pipeline
+
+`Autogen_AgentFarm/minibook` already ships a working LLM-driven agent-team
+FACTORY (`swarm/pipeline.py::SwarmPipeline`, driven by `autogen_swarm.py`): an
+11-role swarm coordinating via Minibook forum posts, generating
+autogen-agentchat team SOURCE with an LLM (`swarm/llm.py::call_gpt4o`, default
+`claude-sonnet-4-6`; plus Claude Code CLI), scaffolding YAML + a static
+`GENERIC_MAIN_PY` loader + `src/tools.py` + Dockerfile, building/running each
+team in per-team Docker, scoring the live run with a single builder-visible LLM
+verdict (`is_pass = verdict==PASS and score>=6`), and self-registering validated
+teams into `/api/v1/registry` (HTTP 422 unless `eval_score>=6`).
+
+**It independently reached our architecture's shape** — generate a validated
+agent artifact, then register it, on autogen-agentchat `>=0.4` (NOT pyautogen
+0.2). That is validation that the design is right. But it is a DIFFERENT
+orchestrator with none of our invariants (no ledger, no claim fencing, no
+holdout, no Codex, mutable status, forum coupling). **Adoption principle: keep
+the registry tail, replace the whole head, and — per the review panel — write
+the build gates fresh rather than salvage swarm code.**
+
+- **GENUINE REUSE (narrow):** Minibook's `/api/v1/registry` + its `eval_score>=6`
+  422 guard, kept running UNTOUCHED on Minibook SQLite (§22) — this IS the
+  §21.4 validated-capability catalog. On `batch_done: succeeded` the **gateway**
+  (not the built team, not a swarm agent) mirrors the validated batch via
+  `swarm/api_client.py::register_agent_in_registry`. CRITICAL (verifier): that
+  function is NOT a clean HTTP client — called with a `registry_agent_api_key`
+  it ALSO fires forum join/post calls (the "head" we drop), and the endpoint is
+  UNAUTHENTICATED, auto-creates an Agent, and mutates prior rows. So the gateway
+  calls it with `registry_agent_api_key=None` (gates off the forum branch) OR
+  vendors a trimmed HTTP-only POST; treats `/api/v1/registry` as a
+  gateway-only writer; and only ever writes `status='validated'` derived from
+  `batch_done:succeeded` (never the mutable `candidate` phase — that would
+  contradict the append-only ledger story).
+- **STEAL AS PATTERN (idea, not code):** the execute-artifact-then-read-output
+  harness shape (`step_output_eval`); the bounded fix loop (`implement_todos`,
+  max-2 retries) → our `codex exec resume` loop (max 3); the `ask_user`
+  timeout-auto-approve discipline → our `--review` gate; the `docker info`
+  preflight + build-timeout → our compose health-gating (§14).
+- **WRITE FRESH — do NOT vendor (verifier correction):** the `team.py` deploy
+  gate. `code_processing.py::test_generated_code` / `todo_implementer.py::
+  validate_implementation` LOOK reusable but importing them drags
+  `GENERIC_MAIN_PY`, and ~85% of their checks are dead against a single
+  `team.py` factory (they hunt for `messages.py`/`host.py`/`worker.py`, a
+  separate `tools.py`, distributed-grpc shapes; the "isolated import test" is
+  gated on `find_file("messages.py")` and never runs). Vendoring-then-gutting
+  is MORE work than a fresh ~30-line gate: `ast.parse` + `build_team() ->
+  BaseGroupChat` presence + a real secret regex + `python -c "import team"` in
+  a tempdir. Build it fresh against our clean seam.
+- **DROP (conflicts with our invariants):** the Minibook-forum swarm
+  orchestrator (replaced by Captain → ledger → Hermes → Codex); the in-pipe LLM
+  builder `call_gpt4o`/`_call_claude_code` (the builder MUST be Codex — §2);
+  per-team Docker + `docker_ops.py` (our autogen artifact runs via the
+  `run_team.py` subprocess, §21.2); the YAML + `GENERIC_MAIN_PY` team format
+  (we use `team.py` + `team.json` ComponentModel); the free-form LLM 1-10 score
+  (replaced by the closed assertion enum + holdout, §7/§21.2 — the pipe has
+  ZERO holdout, exactly the reward-hacking hole we close); and
+  `GENERIC_MAIN_PY`'s runtime self-healing (`self_implement_tool`,
+  `request_api_key`) which violates the secret-free, contract-constrained
+  posture (§13).
+
+**Open items before Day 2** (freeze with the gate schema): map the
+gateway→registry payload fields (`tools_py_path`→workspace, `mcp_servers`→
+validated n8n tool names, `run_id`, `output_dir`); confirm `src/main.py`'s
+registry routes serve independently of `SwarmPipeline` (so we host the registry
+without starting the forge runner); confirm no kept path transitively imports
+`swarm/llm.py` (which would demand an Anthropic/OpenAI key at import time).
+
+**Net:** the prepared pipeline gives us the registry (our capability catalog)
+and confirms the architecture — but Captain + ledger + Hermes + Codex + the
+assertion enum + holdout replace its head; only the registry service is real
+reuse, and even it is called carefully to avoid dragging the forum coupling
+back in.
+
+## 24. Out of scope (this week)
 
 Chain verification; recorder/CQRS integration for the new block types; any
 Minibook write-back; Jira/code adapters (interface only); human-gate UI;
