@@ -1,0 +1,37 @@
+{
+  "success": true,
+  "problem_id": "b2efb2da-bef5-4131-a2e3-c105d6afd3cb",
+  "terminal_count": 2,
+  "done_count": 2,
+  "blocks": [
+    {
+      "index": 0,
+      "block_type": "genesis",
+      "status": "completed"
+    },
+    {
+      "index": 1,
+      "block_type": "problem",
+      "status": "in_progress",
+      "description": "Prepare a small engineering brief for a new workflow automation."
+    },
+    {
+      "index": 2,
+      "block_type": "subproblem",
+      "status": "done",
+      "description": "Collect implementation constraints for: Prepare a small engineering brief for a new workflow automation.",
+      "result": {
+        "echo": "Collect implementation constraints for: Prepare a small engineering brief for a new workflow automation."
+      }
+    },
+    {
+      "index": 3,
+      "block_type": "subproblem",
+      "status": "done",
+      "description": "Draft an execution brief for: Prepare a small engineering brief for a new workflow automation.",
+      "result": {
+        "echo": "Draft an execution brief for: Prepare a small engineering brief for a new workflow automation."
+      }
+    }
+  ]
+}

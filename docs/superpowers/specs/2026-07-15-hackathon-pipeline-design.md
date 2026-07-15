@@ -381,7 +381,7 @@ hardcoding the literal-sniff backstop misses.
   `danger-full-access` — acceptable: isolated workspaces, local-only targets,
   no secrets in codex env. The shipped posture is documented in the README.
 - **MCP config:** registered globally (`codex mcp add n8n --url
-  http://localhost:5678/mcp-server/http --bearer-token-env-var N8N_MCP_TOKEN`)
+  http://localhost:15678/mcp-server/http --bearer-token-env-var N8N_MCP_TOKEN`)
   AND mirrored in workspace `.codex/config.toml`. `default_tools_approval_mode
   = "auto"` per server.
 - **Build path (primary):** official n8n instance-level MCP; artifact = n8n

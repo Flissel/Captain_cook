@@ -1,5 +1,10 @@
-"""Configuration for LLMs."""
+"""Configuration for LLM-backed workflows."""
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(dotenv_path=Path.cwd() / ".env")
 
 API_KEY = os.environ.get("OPENAI_API_KEY")
-MODEL = "gpt-4o"#"gpt-3.5-turbo-0125"
+MODEL = os.environ.get("CAPTAIN_MODEL", "gpt-5.6")

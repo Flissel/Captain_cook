@@ -13,7 +13,7 @@ from abc import ABC, abstractmethod
 import asyncio
 import inspect
 import logging
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Union
 
 from agenten.events.schemas import (
     EventMeta,
@@ -204,6 +204,25 @@ class WorkerAgent(ABC):
             retriable=retriable,
         )
         await self.bus.publish(topic_for(SubproblemFailed), failed)
+
+
+class WorkerFactory(Protocol):
+    """Construct one worker with pipeline-owned runtime dependencies.
+
+    The pipeline owns the bus, shared tool registry, heartbeat interval, and
+    ledger-backed description resolver.  Factories own only their specific
+    worker type and external executor configuration.
+    """
+
+    def __call__(
+        self,
+        *,
+        bus: EventBus,
+        tools: ToolRegistry,
+        heartbeat_interval_seconds: float,
+        description_resolver: DescriptionResolver,
+    ) -> WorkerAgent:
+        """Create an unsubscribed worker instance."""
 
 
 # --- Optional AutoGen Core adapter ------------------------------------------

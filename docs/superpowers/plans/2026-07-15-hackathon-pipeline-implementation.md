@@ -68,7 +68,7 @@ Deliverable: a green Gate-A spike (Codex builds a trivial n8n workflow → deplo
 - [ ] **Step 3: Bring up + healthcheck** — `docker info` preflight; `docker compose up -d`; wait for n8n + Mailpit + MariaDB healthy. (§14)
 - [ ] **Step 4: n8n one-time bootstrap** — create the n8n API key + copy the MCP access token from the UI; `setx N8N_MCP_TOKEN <token>` (user-level, for dev + workers). Pre-provision two n8n credentials: `mailpit-smtp` and `openai-gpt` (GPT-5.6). Persist the volume — never delete it. (§10)
 - [ ] **Step 5: Minimal `templates/AGENTS.md`** — credential rules (`mailpit-smtp` only, never create SMTP) + webhook path `/hook/{batch_id}` — enough for the Gate-A trivial build. (§9)
-- [ ] **Step 6: Register MCP servers on Codex** — `codex mcp add n8n --url http://localhost:5678/mcp-server/http --bearer-token-env-var N8N_MCP_TOKEN`; add Context7 for the autogen path. `default_tools_approval_mode="auto"`. (§9, MCP-provisioning assessment)
+- [ ] **Step 6: Register MCP servers on Codex** — `codex mcp add n8n --url http://localhost:15678/mcp-server/http --bearer-token-env-var N8N_MCP_TOKEN`; add Context7 for the autogen path. `default_tools_approval_mode="auto"`. (§9, MCP-provisioning assessment)
 - [ ] **Step 7: Commit** — docker-compose + env template (NOT `.env`).
 
 ### Task 4: GATE A (binary, scripted) — the go/no-go
