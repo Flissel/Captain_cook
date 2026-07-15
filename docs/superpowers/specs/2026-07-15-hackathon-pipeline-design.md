@@ -63,10 +63,11 @@ ledger block; the whole build history is auditable and watchable in Minibook.
   the main tree, so a clone gets it directly. The redundant `Autogen_AgentFarm`
   gitlink was dropped. Minibook is AGPL-3.0: its own `minibook/LICENSE` is
   kept, it is documented as a third-party component, and integration stays
-  HTTP-only (no linking) — the README's license section states this. STILL
-  OPEN: `hermes-agent/` is a bare gitlink with no `.gitmodules` (a clone gets
-  an EMPTY dir) — decide vendor vs. proper submodule before submission
-  (Day-1 task); `git clone --recursive` smoke test proves whichever fix.
+  HTTP-only (no linking) — the README's license section states this.
+  `hermes-agent/` is natively integrated as a PROPER submodule (`.gitmodules`
+  → `github.com/NousResearch/hermes-agent.git`, pinned `77d5b2d`, tracks
+  upstream, pullable) — `git clone --recursive` populates it. Fremd-code stays
+  visibly external (MIT). Both embedded-repo issues are now RESOLVED.
 - **Codex session capture (dev-time):** a shell wrapper (~20 lines, written as
   the FIRST Day-1 item, BEFORE the first Gate A `codex exec`) logs every dev
   session ID + date + intent to `docs/codex-sessions.md`; commits carry a

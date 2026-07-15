@@ -44,8 +44,8 @@ Deliverable: a green Gate-A spike (Codex builds a trivial n8n workflow → deplo
 
 - [ ] **Step 1: Write the Codex session-capture wrapper** — `scripts/codex-session.sh`: wraps `codex exec`, parses `thread_id` from the `thread.started` JSONL event, appends `<id> | <date> | <intent>` to `docs/codex-sessions.md`. Written BEFORE any `codex exec`. (§2)
 - [ ] **Step 2: Baseline tag + PRIOR_WORK.md** — verify the official cutoff (2026-07-13 09:00 PT) in the rules; commit the current tree; `git tag pre-codex-baseline`; `git push origin pre-codex-baseline`. `PRIOR_WORK.md` documents the three bands (pre-13.07 / 13–14.07 Claude foundation / post-tag Codex work). (§2)
-- [ ] **Step 3: Resolve the last embedded repo** — DONE for minibook (vendored at `./minibook`, PR #15; `Autogen_AgentFarm` gitlink dropped). REMAINING: `hermes-agent/` is a bare gitlink with no `.gitmodules` → decide vendor vs. proper submodule (`git submodule add https://github.com/NousResearch/hermes-agent.git hermes-agent`, pin 77d5b2d). (§2, §23)
-- [ ] **Step 4: Clone smoke test** — `git clone --recursive` into a temp dir; confirm `minibook/` is populated and `hermes-agent/` resolves (once Step 3's hermes decision lands). The fix is not done until the clone proves it. (§2)
+- [x] **Step 3: Embedded repos — DONE.** minibook vendored at `./minibook` (PR #15); `Autogen_AgentFarm` gitlink dropped (#20); `hermes-agent` is a native submodule (`.gitmodules` → NousResearch upstream, pin 77d5b2d, pullable). (§2, §23)
+- [ ] **Step 4: Clone smoke test** — `git clone --recursive` into a temp dir; confirm `minibook/` is populated and `hermes-agent/` resolves. The fix is not done until the clone proves it. (§2)
 - [ ] **Step 5: `.gitignore` append** — add `workspaces/`, `runs/`, `worker.env`, `.env`, `*.local`. (§14)
 - [ ] **Step 6: Model → gpt-5.6** — `config/llm_config.py` `MODEL = os.getenv("CAPTAIN_MODEL", "gpt-5.6")`. Authored in the primary Codex thread (touches prior-work file). Re-run decompose/judge smoke tests. (§2)
 - [ ] **Step 7: Freeze the in-flight refactor** — add a FROZEN banner to `docs/superpowers/plans/2026-07-14-autogen-runtime-boundary-refactor.md`. (§2)
