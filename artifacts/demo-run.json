@@ -1,6 +1,6 @@
 {
   "success": true,
-  "problem_id": "2c573005-a2c8-40ab-b021-5b74604c42ef",
+  "problem_id": "5c7225b0-73bd-45c4-a3ff-5d7f4ee7a86c",
   "terminal_count": 4,
   "done_count": 4,
   "blocks": [
@@ -28,7 +28,7 @@
         ],
         "evidence": [
           "deterministic offline executor",
-          "subproblem:77139bd9-a836-429a-b539-6c5bc9af5b07"
+          "subproblem:28debc39-d4e8-439a-933f-4d9e741bdb63"
         ],
         "limitations": [
           "No LLM, MCP server, browser, or deployment was invoked."
@@ -48,7 +48,7 @@
         ],
         "evidence": [
           "deterministic offline executor",
-          "subproblem:2892c54a-10e5-4acd-bdaf-f875bcc24a9e"
+          "subproblem:07c4df45-c33a-46d0-a2d9-911adf9607ed"
         ],
         "limitations": [
           "No LLM, MCP server, browser, or deployment was invoked."
@@ -68,7 +68,7 @@
         ],
         "evidence": [
           "deterministic offline executor",
-          "subproblem:f34580b1-f2eb-4418-8d35-3ea3c9c546a8"
+          "subproblem:ef46c277-fef6-42ff-981f-4e62e635f490"
         ],
         "limitations": [
           "No LLM, MCP server, browser, or deployment was invoked."
@@ -88,7 +88,7 @@
         ],
         "evidence": [
           "deterministic offline executor",
-          "subproblem:e616433a-5218-4523-b111-1e35c635d8d8"
+          "subproblem:11902297-57fc-4410-a595-c70384ede234"
         ],
         "limitations": [
           "No LLM, MCP server, browser, or deployment was invoked."
