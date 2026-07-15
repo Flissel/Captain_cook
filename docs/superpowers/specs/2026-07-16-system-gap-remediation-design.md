@@ -7,8 +7,8 @@
 ## Goal
 
 Turn the merged Captain Cook system into an honest, repeatable Windows setup
-whose lifecycle commands revalidate reality, whose default installation is
-self-contained, whose integration contracts run in the required test gate,
+whose lifecycle commands revalidate reality, whose selected external n8n
+boundary is preserved, whose integration contracts run in the required test gate,
 and whose documentation describes the code that is actually shipped.
 
 The work is managed through one master TODO plan. Each implementation session
@@ -20,9 +20,9 @@ same plan.
 
 1. **Observed state beats checkpoints.** Checkpoints optimize resumability but
    never prove that an installed component is still healthy.
-2. **The default path is self-contained.** A new user can install the complete
-   supported stack without an existing VibeMind checkout. External n8n adoption
-   remains an explicit opt-in mode.
+2. **The default path preserves the selected external n8n boundary.** Captain
+   installs and owns Mailpit and MariaDB, validates the configured VibeMind n8n
+   endpoint, and never adopts, migrates, or deletes its containers or volumes.
 3. **Status means end-to-end health.** A green system status covers every
    component promised by the setup documentation, not only a representative
    subset.
@@ -56,11 +56,13 @@ Invalidation is downstream-only. A broken Minibook stage reruns Minibook,
 Services, and Verification without reinstalling a healthy Captain or Hermes.
 Checkpoint writes remain atomic and contain no secrets.
 
-### 2. Self-contained n8n and submodule bootstrap
+### 2. External n8n validation and submodule bootstrap
 
-The default `.env.example` selects `N8N_MODE=owned` and the Compose
-`owned-n8n` profile. External mode remains supported only when a reachable URL
-is supplied and the user explicitly chooses adoption.
+The default `.env.example` selects `N8N_MODE=external` and the known local
+VibeMind endpoint. Setup verifies that the endpoint is reachable and reports a
+precise remediation without starting, stopping, or adopting that deployment.
+The optional `owned-n8n` profile remains isolated and is never selected
+implicitly.
 
 Before installing Hermes, setup initializes the repository's declared
 submodules using non-destructive Git commands. It verifies that
@@ -116,8 +118,8 @@ gate.
 `README.md` describes two distinct supported paths:
 
 - offline demo, requiring only Python;
-- complete local system, installed by `setup.ps1` and using owned n8n by
-  default.
+- complete local system, installed by `setup.ps1` and using the explicitly
+  configured external VibeMind n8n endpoint by default.
 
 `docs/ARCHITECTURE.md` is rewritten around the actual event-driven path, with
 legacy AgentChat extension points retained as a compatibility section.
@@ -195,7 +197,7 @@ of `None`, `Install`, `Configure`, `Retry`, or `Manual`.
 
 Failures must identify the component, preserve completed independent work,
 write a non-secret checkpoint, and return a non-zero process exit. Commands do
-not silently fall back from owned to external infrastructure or from real to
+not silently switch infrastructure ownership modes or fall back from real to
 mock integration evidence.
 
 ## Verification strategy
@@ -231,8 +233,8 @@ The remediation is complete only when all of the following are proven:
 
 1. A stale completed checkpoint detects and repairs a deliberately removed
    component.
-2. A recursive-clean checkout can complete setup with owned n8n and without a
-   VibeMind checkout.
+2. A recursive-clean checkout can complete setup against a reachable,
+   explicitly configured external n8n endpoint without adopting its volumes.
 3. Unsupported versions and unknown port owners fail before installation.
 4. Status detects failure of each promised component independently.
 5. All MariaDB and gateway contracts execute with zero skips.

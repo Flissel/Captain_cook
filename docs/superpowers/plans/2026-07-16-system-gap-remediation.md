@@ -4,7 +4,7 @@
 
 **Goal:** Close all seven audited system gaps so a clean Windows 11 checkout installs, starts, validates, repairs, and documents the complete Captain Cook system with mandatory real integration evidence.
 
-**Architecture:** Treat checkpoints as cached observations backed by stage validators, make owned n8n the default, and route setup/start/status through shared health contracts. Add an isolated MariaDB integration gate, then align documentation and split the remaining runtime hotspots behind their existing public facades.
+**Architecture:** Treat checkpoints as cached observations backed by stage validators, preserve the selected external VibeMind n8n boundary, and route setup/start/status through shared health contracts. Add an isolated MariaDB integration gate, then align documentation and split the remaining runtime hotspots behind their existing public facades.
 
 **Tech Stack:** PowerShell 7, Pester 5, Python 3.11–3.13, pytest, FastAPI, MariaDB 11.8, Docker Compose v2, AutoGen Core, GitHub Actions.
 
@@ -15,8 +15,8 @@
 - Never delete Docker volumes or adopt/migrate VibeMind volumes.
 - Never stop a process unless its PID and start time match Captain-owned metadata.
 - Never print or commit `.env`, API keys, database passwords, MCP tokens, or Minibook credentials.
-- Owned n8n is the default; external n8n is explicit opt-in and must be reachable before adoption.
-- Preserve `Invoke-GuidedSetup`, `Start-CaptainSystem`, `Stop-CaptainSystem`, `Get-CaptainSystemStatus`, `build_pipeline`, and `LedgerEventRecorder` as public facades.
+- External VibeMind n8n is the configured default; Captain validates it but never starts, stops, adopts, migrates, or deletes its containers or volumes.
+- Preserve `Invoke-GuidedSetup`, `Start-CaptainSystem`, `Stop-CaptainSystem`, `Get-CaptainSystemStatus`, `build_pipeline`, and `LedgerRecorderAgent` as public facades.
 - A required MariaDB or gateway test that is skipped fails the integration gate.
 - Update checkboxes immediately after the named verification passes.
 - Record each implementation session in `Session Insights` and consolidate every actionable insight into an exact task step or acceptance criterion.
@@ -234,7 +234,7 @@ git commit -m "fix: repair invalid setup stages"
 
 ---
 
-### Task 3: Bootstrap submodules and default to owned n8n
+### Task 3: Bootstrap submodules and validate external n8n ownership
 
 **Files:**
 - Create: `scripts/setup/Repository.psm1`
@@ -248,13 +248,13 @@ git commit -m "fix: repair invalid setup stages"
 - Consumes: project root and `Common\Invoke-SetupCommand`.
 - Produces: `Initialize-SetupSubmodules -Root string`, returning a setup result without resetting local changes.
 
-- [ ] **Step 1: Add failing owned-default and submodule tests**
+- [ ] **Step 1: Add failing external-default and submodule tests**
 
 ```powershell
-It 'defaults a new configuration to owned n8n' {
-    Set-Content (Join-Path $TestDrive '.env.example') 'N8N_MODE=owned'
+It 'defaults a new configuration to external n8n' {
+    Set-Content (Join-Path $TestDrive '.env.example') 'N8N_MODE=external'
     $result = Initialize-SetupConfiguration -Root $TestDrive -SecretPathValidator { $true }
-    $result.Data.Values.N8N_MODE | Should -Be 'owned'
+    $result.Data.Values.N8N_MODE | Should -Be 'external'
 }
 
 It 'initializes declared submodules without reset or clean' {
@@ -275,7 +275,7 @@ It 'initializes declared submodules without reset or clean' {
 
 Run: `Invoke-Pester scripts/setup/Setup.Tests.ps1 -Output Detailed`
 
-Expected: owned-default assertion or missing `Initialize-SetupSubmodules` fails.
+Expected: external-default assertion or missing `Initialize-SetupSubmodules` fails.
 
 - [ ] **Step 3: Implement safe repository bootstrap**
 
@@ -284,12 +284,12 @@ Create `Repository.psm1` with an injectable command runner. If `hermes-agent/pyp
 Change `.env.example` to:
 
 ```dotenv
-N8N_MODE=owned
-N8N_URL=http://localhost:5678
-N8N_CONTAINER_URL=http://n8n:5678
+N8N_MODE=external
+N8N_URL=http://localhost:15678
+N8N_CONTAINER_URL=http://host.docker.internal:15678
 ```
 
-Import `Repository.psm1` in `Lifecycle.psm1` and call `Initialize-SetupSubmodules` immediately before `Install-Hermes`. Preserve external mode when an existing `.env` explicitly sets it.
+Import `Repository.psm1` in `Lifecycle.psm1` and call `Initialize-SetupSubmodules` immediately before `Install-Hermes`. Validate the configured external n8n health endpoint without invoking Compose for n8n.
 
 - [ ] **Step 4: Verify both Compose modes**
 
@@ -310,7 +310,7 @@ Expected: both Compose renders and all Pester tests pass.
 
 ```powershell
 git add .env.example docker-compose.yml scripts/setup/Repository.psm1 scripts/setup/Lifecycle.psm1 scripts/setup/Components.psm1 scripts/setup/Setup.Tests.ps1
-git commit -m "feat: bootstrap a self-contained local stack"
+git commit -m "feat: bootstrap local dependencies safely"
 ```
 
 ---
@@ -687,7 +687,7 @@ git commit -m "refactor: move URL relevance behind adapter boundary"
 
 **Interfaces:**
 - Consumes: existing event schemas, stage machine, ledger storage, event bus.
-- Produces: unchanged `LedgerEventRecorder` constructor and handler methods; internal `LedgerTransitionApplier`, `LedgerProjectionIndex`, and `build_autogen_recorder_adapter`.
+- Produces: unchanged `LedgerRecorderAgent` constructor and handler methods; internal `LedgerTransitionApplier`, `LedgerProjectionIndex`, and `build_autogen_recorder_adapter`.
 
 - [ ] **Step 1: Freeze the public recorder facade with contract tests**
 
@@ -695,7 +695,7 @@ Add tests that inspect the constructor signature, register the same event topics
 
 ```python
 def test_recorder_facade_keeps_public_constructor() -> None:
-    parameters = inspect.signature(LedgerEventRecorder).parameters
+    parameters = inspect.signature(LedgerRecorderAgent).parameters
     assert tuple(parameters)[:3] == ("bus", "blockchain", "clock")
 ```
 
@@ -707,7 +707,7 @@ Expected: existing behavior passes; the new restart/replay case fails if exact-o
 
 - [ ] **Step 3: Extract projections without changing behavior**
 
-Move projection/index state and query-update methods into `LedgerProjectionIndex`. Inject one instance into `LedgerEventRecorder`. Run the focused suite and commit only after it remains green:
+Move projection/index state and query-update methods into `LedgerProjectionIndex`. Inject one instance into `LedgerRecorderAgent`. Run the focused suite and commit only after it remains green:
 
 ```powershell
 git add agenten/ledger_bridge/projections.py agenten/ledger_bridge/recorder.py tests/ledger_bridge
@@ -823,9 +823,9 @@ Assert all of the following:
 def test_docs_name_main_as_integration_baseline() -> None:
     assert "`main` is the current integration baseline" in WORKSTREAMS
 
-def test_readme_defaults_to_owned_n8n() -> None:
-    assert "owned n8n" in README
-    assert "requires an existing VibeMind checkout" not in README
+def test_readme_preserves_external_n8n_ownership() -> None:
+    assert "Existing VibeMind Compose project" in README
+    assert "never delete or adopt either existing n8n volume" in README
 
 def test_agent_guide_does_not_list_closed_unroutable_gap() -> None:
     assert "Permanently unroutable work lacks" not in AGENT_GUIDE
@@ -837,7 +837,7 @@ Extend `verify_submission.py` to reject the obsolete roadmap sentence that says 
 
 Run: `python -m pytest -q tests/test_workstream_docs.py tests/test_architecture_fitness.py`
 
-Expected: FAIL on the old baseline, external-only setup wording, or stale gap statement.
+Expected: FAIL on the old baseline, incorrect n8n ownership wording, or stale gap statement.
 
 - [ ] **Step 3: Rewrite documentation to match proven behavior**
 
@@ -848,7 +848,7 @@ events → decomposition → constitution → spawn coordinator → workers
        → supervisor/reaper → sole-writer recorder → query/projections
 ```
 
-Name `main` as the baseline, mark historical feature branches merged without deleting them, document owned/external n8n ownership, and check only backlog items whose named tests passed.
+Name `main` as the baseline, mark historical feature branches merged without deleting them, document external VibeMind n8n ownership, and check only backlog items whose named tests passed.
 
 - [ ] **Step 4: Run the full static and regression gate**
 
@@ -884,7 +884,7 @@ pwsh -NoProfile -File repair.ps1
 pwsh -NoProfile -File scripts/acceptance/setup-smoke.ps1
 ```
 
-Expected: setup completes with `N8N_MODE=owned`, nine health rows are ready, repair is idempotent, and all acceptance items pass without a VibeMind checkout. Record only command, commit, timestamps, exit codes, and non-secret run identifiers in the Session Insights entry.
+Expected: setup completes with `N8N_MODE=external` against the explicitly configured reachable endpoint, nine health rows are ready, repair is idempotent, and no command starts, stops, or adopts VibeMind n8n. Record only command, commit, timestamps, exit codes, and non-secret run identifiers in the Session Insights entry.
 
 - [ ] **Step 6: Audit every completion criterion and consolidate insights**
 
@@ -906,7 +906,7 @@ Populate this table only with fresh evidence from Task 11.
 | Criterion | Evidence command or artifact | Result |
 | --- | --- | --- |
 | Stale checkpoint repairs a removed component | `Invoke-Pester ... -Filter *revalidates*` | Not run |
-| Clean checkout installs owned n8n without VibeMind | clean-clone acceptance manifest | Not run |
+| Clean checkout validates configured external n8n without adopting it | clean-clone acceptance manifest | Not run |
 | Invalid versions and unknown ports fail preflight | Pester preflight cases | Not run |
 | Every promised component can independently fail status | Pester table-driven health cases | Not run |
 | MariaDB and gateway contracts execute with zero skips | `scripts/test_gateway.ps1` | Not run |
