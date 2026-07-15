@@ -21,10 +21,11 @@ feat/devpost-demo-readiness
                                                                                           feat/demo-polish
 ```
 
-`feat/householder-runtime-contract` defines typed role manifests and the
-executor seam without an external model. `feat/householder-runtime` proves the
-four roles in the real in-memory event/ledger lifecycle with deterministic
-executors. `feat/captain-pipeline` consumes gateway schemas but can use a fake
+`feat/householder-runtime-contract` defines typed role manifests, the executor
+seam, and factory injection without an external model.
+`feat/householder-runtime` proves the four roles in the real in-memory
+event/ledger lifecycle with deterministic executors and makes that lifecycle
+the offline demo. `feat/captain-pipeline` consumes gateway schemas but can use a fake
 `LedgerClient` in unit tests. `feat/n8n-delivery` consumes the assertion
 vocabulary and adapter contracts. `feat/worker-fleet` begins only after one
 gateway-backed, single-worker end-to-end run is green.
@@ -44,11 +45,13 @@ gateway-backed, single-worker end-to-end run is green.
 
 ## Householder model
 
-The role definitions in `agents/household/` are portable sub-agent prompts.
-They are not magically registered runtime workers: each is an accountable
-engineering role that can be invoked by a Codex/Claude-compatible agent host
-or copied into an agent task. Runtime workers are added only by their owning
-feature branch after their interface and tests exist.
+The role definitions in `agents/household/` are portable sub-agent prompts and
+the source for constrained runtime manifests. On
+`feat/householder-runtime`, each is represented by a deterministic,
+in-memory `HouseholderWorker`; their reports say explicitly that no LLM, MCP
+server, browser, or deployment ran. A future live executor must implement the
+existing executor port and cannot silently gain routing capability from a
+prompt file.
 
 | Role | Owns | May not do |
 | --- | --- | --- |
@@ -71,9 +74,10 @@ feature branch after their interface and tests exist.
 
 ## Current next branch
 
-Start `feat/householder-runtime-contract` now. It is deliberately offline and
-does not depend on MariaDB, n8n, Hermes, Codex CLI, or a real API key. Create
-`feat/householder-runtime` only after its manifest/executor contract is
-reviewed. Start `feat/ledger-gateway` after a local MariaDB test container is
-available. Until those branches are integrated, preserve the offline demo as
-the judge-facing fallback.
+`feat/householder-runtime-contract` is complete and provides the reviewed
+manifest/executor/factory boundary. `feat/householder-runtime` is the active
+implementation branch; it remains deliberately offline and does not depend on
+MariaDB, n8n, Hermes, Codex CLI, or a real API key. Start
+`feat/ledger-gateway` after a local MariaDB test container is available.
+Preserve the offline demo as the judge-facing fallback until a live integration
+has separate evidence.

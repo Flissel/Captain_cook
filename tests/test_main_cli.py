@@ -14,5 +14,5 @@ def test_demo_command_writes_successful_evidence(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "Demo complete: 2 subproblems reached done" in result.stdout
+    assert "Demo complete: 4 subproblems reached done" in result.stdout
     assert json.loads(output.read_text(encoding="utf-8"))["success"] is True

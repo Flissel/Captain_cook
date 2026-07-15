@@ -10,9 +10,9 @@ This repository contains a working, offline vertical slice for the OpenAI Build 
 problem
   │
   ▼
-decomposer → constitution gate → capability coordinator → echo worker
-  │                                                       │
-  └─────────────── append-only lifecycle ledger ◀─────────┘
+decomposer → constitution gate → capability coordinator → householder fleet
+  │                                                            │
+  └──────────────── append-only lifecycle ledger ◀────────────┘
 ```
 
 Run the demo without an API key, network access, Docker, or a browser:
@@ -27,7 +27,7 @@ python main.py demo --output artifacts/demo-run.json
 Expected output:
 
 ```text
-Demo complete: 2 subproblems reached done
+Demo complete: 4 subproblems reached done
 ```
 
 The command writes [artifacts/demo-run.json](artifacts/demo-run.json), a compact evidence artifact containing the generated problem ID, terminal counts, and every ledger block in the run. See [docs/DEMO.md](docs/DEMO.md) for the schema and inspection steps.
@@ -37,12 +37,13 @@ The command writes [artifacts/demo-run.json](artifacts/demo-run.json), a compact
 - Deterministic problem decomposition into atomic, capability-tagged tasks.
 - Constitution gatekeeping before work reaches a worker.
 - Capability-based assignment, worker heartbeats, retries, circuit breaking, lease reaping, and recovery primitives.
+- Four constrained Householder workers (Architect, Ledger Steward, Delivery Builder, and Quality Warden) that emit structured, explicitly offline audit reports.
 - A sole-writer ledger recorder and state-machine transitions for an auditable run.
 - An offline CLI demo and committed run evidence.
 
 ## Roadmap boundary
 
-The submission demo does **not** yet include a FastAPI/MariaDB ledger gateway, Hermes workers that drive Codex CLI, n8n deployment, Mailpit validation, or Minibook mirroring. Those integrations are designed in [the delivery-fleet specification](docs/superpowers/specs/2026-07-15-hackathon-pipeline-design.md) and deliberately kept separate from claims about the runnable demo.
+The submission demo does **not** yet include a FastAPI/MariaDB ledger gateway, Hermes workers that drive Codex CLI, n8n deployment, Mailpit validation, Minibook mirroring, or a live LLM/MCP-backed Householder executor. Those integrations are designed in [the delivery-fleet specification](docs/superpowers/specs/2026-07-15-hackathon-pipeline-design.md) and deliberately kept separate from claims about the runnable demo.
 
 ## Test it
 
