@@ -33,7 +33,7 @@
 | `scripts/setup/Lifecycle.psm1` | Orchestrate stages and preserve the existing public lifecycle facade. |
 | `scripts/test_gateway.ps1` | Run the isolated MariaDB/gateway contract gate and reject skips. |
 | `docker-compose.test.yml` | Define the disposable MariaDB test service on a dedicated port and volume. |
-| `agenten/runtime/capabilities.py` | Represent and validate event-bus capabilities at boot. |
+| `agenten/runtime/event_bus.py` | Separate publish-only and locally subscribable event-bus capabilities. |
 | `agenten/adapters/url_relevance.py` | Host URL extraction/relevance behavior outside the ledger package. |
 | `agenten/ledger_bridge/handlers.py` | Translate events into recorder application commands. |
 | `agenten/ledger_bridge/transitions.py` | Apply ledger lifecycle transitions. |
@@ -42,6 +42,64 @@
 | `agenten/orchestration/configuration.py` | Validate pipeline configuration and defaults. |
 | `agenten/orchestration/components.py` | Construct injected runtime adapters and workers. |
 | `agenten/orchestration/pipeline.py` | Keep `build_pipeline` as the thin public composition root. |
+
+---
+
+### Task 0: Establish a reproducible development and test environment
+
+**Files:**
+- Create: `requirements-dev.txt`
+- Modify: `requirements.txt`
+- Modify: `pytest.ini`
+- Modify: `tests/test_import_boundaries.py`
+- Modify: `AGENTS.md`
+
+**Interfaces:**
+- Consumes: the pinned runtime manifest and Python 3.11.
+- Produces: a clean development install with pytest and a measured coverage
+  floor; no global Python package is part of the test contract.
+
+- [ ] **Step 1: Add failing manifest tests**
+
+Parse non-comment requirement lines and assert normalized runtime package names
+are unique. Assert `requirements-dev.txt` includes `-r requirements.txt`,
+`pytest==9.0.2`, `pytest-asyncio==1.4.0`, and `pytest-cov==4.1.0`.
+
+Run: `python -m pytest -q tests/test_import_boundaries.py`
+
+Expected: FAIL because `fastapi==0.139.0` occurs twice and the development
+manifest does not exist.
+
+- [ ] **Step 2: Create the development manifest and coverage floor**
+
+Remove only the duplicate FastAPI line. Create the development manifest with
+the four exact lines above. Configure pytest-cov for `agenten`, `blockchain`,
+and `gateway`, terminal missing-line output, and `--cov-fail-under=70`. The
+audited service-independent baseline is 75%, so this prevents a five-point
+regression without claiming complete legacy coverage.
+
+- [ ] **Step 3: Prove a disposable clean install**
+
+```powershell
+python -m venv .captain-cook/verification-venv
+.\.captain-cook\verification-venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.captain-cook\verification-venv\Scripts\python.exe -m pip check
+.\.captain-cook\verification-venv\Scripts\python.exe -m pytest -q -rs
+```
+
+Expected: `pip check` reports no broken requirements; tests pass. Record all
+service-dependent skips. Task 6 must later execute every MariaDB/gateway test
+with zero skips.
+
+- [ ] **Step 4: Update contributor commands and commit**
+
+Point `AGENTS.md` at the project venv and development manifest while keeping
+runtime setup on `requirements.txt`.
+
+```powershell
+git add requirements.txt requirements-dev.txt pytest.ini tests/test_import_boundaries.py AGENTS.md
+git commit -m "build: add reproducible test environment"
+```
 
 ---
 
@@ -382,6 +440,10 @@ git commit -m "fix: enforce the complete setup preflight"
 **Files:**
 - Create: `scripts/setup/Health.psm1`
 - Modify: `scripts/setup/Lifecycle.psm1`
+- Modify: `scripts/setup/Configuration.psm1`
+- Modify: `gateway/app.py`
+- Modify: `tests/gateway/test_gateway.py`
+- Modify: `.env.example`
 - Modify: `status.ps1`
 - Modify: `scripts/acceptance/setup-smoke.ps1`
 - Modify: `scripts/setup/Setup.Tests.ps1`
@@ -395,7 +457,7 @@ git commit -m "fix: enforce the complete setup preflight"
 ```powershell
 It 'reports every promised component and fails when any one is unhealthy' {
     $components = @('Captain','Hermes CLI','Hermes Identity','Minibook Backend',
-        'Minibook Frontend','Mailpit HTTP','Mailpit SMTP','MariaDB','n8n')
+        'Minibook Frontend','Mailpit HTTP','Mailpit SMTP','MariaDB','Gateway','n8n')
     $probes = @{}
     foreach ($name in $components) {
         $probes[$name] = { New-SetupResult component Ready healthy None }
@@ -418,7 +480,27 @@ Expected: FAIL because `Get-CaptainHealthReport` is undefined.
 
 - [ ] **Step 3: Implement complete health reporting**
 
-Create `Health.psm1`. Each component probe returns one stable setup result. Captain validation runs the demo verifier rather than checking only file existence. Hermes CLI executes `hermes --help`; identity calls `/api/v1/agents/me`; Minibook checks backend `/health` and frontend `/api/v1/version`; Mailpit checks HTTP and SMTP; MariaDB uses `Test-MariaDbService`; n8n checks the configured `/healthz`.
+Create `Health.psm1`. Each component probe returns one stable setup result.
+Captain validation runs the demo verifier rather than checking only file
+existence. Hermes CLI executes `hermes --help`; identity calls
+`/api/v1/agents/me`; Minibook checks backend `/health` and frontend
+`/api/v1/version`; Mailpit checks HTTP and SMTP; MariaDB uses
+`Test-MariaDbService`; Gateway checks its database-backed `/healthz`; n8n
+checks the configured `/healthz`.
+
+Before wiring the Gateway probe, add an injected-store route test and implement
+`GET /healthz` in `gateway/app.py`. It returns `{"status": "ready"}` only after
+a `SELECT 1` through `GatewayStore`; storage failure returns 503 without DSN or
+exception details. Add the real-MariaDB variant to the existing Gateway test
+module; Task 6 is its mandatory execution gate. Add
+`GATEWAY_URL=http://localhost:8090` to `.env.example`.
+
+Add `New-CaptainLedgerDsn` to `Configuration.psm1`; percent-encode credentials
+and keep the DSN in memory. Start Gateway through `Start-ManagedProcess` with
+root `.venv/Scripts/python.exe -m gateway.app` after MariaDB is authenticated,
+passing `LEDGER_DSN` only in the child environment. Store only PID, start time,
+and process name. Stop it through the same PID/start-time ownership check used
+for Minibook.
 
 `Wait-CaptainSystemReady` polls the same report until all results are `Ready` or timeout expires. It returns the last report without swallowing component messages.
 
@@ -438,12 +520,13 @@ if ($result.FailedCount -gt 0) { exit 1 }
 pwsh -NoProfile -File scripts/acceptance/setup-smoke.ps1
 ```
 
-Expected: all Pester and live acceptance items pass; the detailed table lists nine components.
+Expected: all Pester and live acceptance items pass; the detailed table lists
+ten components, including a Gateway row backed by MariaDB.
 
 - [ ] **Step 6: Commit the shared health contract**
 
 ```powershell
-git add scripts/setup/Health.psm1 scripts/setup/Lifecycle.psm1 scripts/setup/Setup.Tests.ps1 scripts/acceptance/setup-smoke.ps1 status.ps1
+git add scripts/setup/Health.psm1 scripts/setup/Lifecycle.psm1 scripts/setup/Configuration.psm1 gateway/app.py tests/gateway/test_gateway.py .env.example scripts/setup/Setup.Tests.ps1 scripts/acceptance/setup-smoke.ps1 status.ps1
 git commit -m "feat: validate complete system health"
 ```
 
@@ -455,6 +538,9 @@ git commit -m "feat: validate complete system health"
 - Create: `docker-compose.test.yml`
 - Create: `scripts/test_gateway.ps1`
 - Create: `.github/workflows/integration.yml`
+- Create: `tests/support/__init__.py`
+- Create: `tests/support/mariadb.py`
+- Create: `tests/test_mariadb_test_guard.py`
 - Modify: `tests/gateway/test_gateway.py`
 - Modify: `tests/blockchain/test_mariadb_storage.py`
 - Modify: `README.md`
@@ -475,10 +561,10 @@ services:
     environment:
       MARIADB_DATABASE: captain_test
       MARIADB_USER: captain_test
-      MARIADB_PASSWORD: captain_test_password
-      MARIADB_ROOT_PASSWORD: captain_test_root_password
+      MARIADB_PASSWORD: "${MARIADB_TEST_PASSWORD:?required}"
+      MARIADB_ROOT_PASSWORD: "${MARIADB_TEST_ROOT_PASSWORD:?required}"
     ports:
-      - "127.0.0.1:33306:3306"
+      - "127.0.0.1:${MARIADB_TEST_PORT:-33306}:3306"
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 2s
@@ -490,16 +576,33 @@ services:
 
 The tmpfs makes teardown disposable without touching Captain's `ledger_data` volume.
 
+Before the script, add `tests/support/mariadb.py` with
+`assert_isolated_test_database(dsn)`. Both destructive fixtures must call it
+before `storage.clear()`. Accept only the exact database name `captain_test`;
+reject `ledger`, `captain_ledger`, an empty path, and malformed DSNs. When
+`REQUIRE_MARIADB_TESTS=1`, a missing DSN is a collection error instead of a
+skip. Cover the guard in `tests/test_mariadb_test_guard.py`.
+
 - [ ] **Step 2: Write the gate script and initially verify it detects skips**
 
 Implement `scripts/test_gateway.ps1` to:
 
-1. run `docker compose -f docker-compose.test.yml up -d --wait`;
-2. set `TEST_MARIADB_DSN=mysql+pymysql://captain_test:captain_test_password@127.0.0.1:33306/captain_test` only in the child environment;
-3. run `python -m pytest -q tests/blockchain/test_mariadb_storage.py tests/gateway/test_gateway.py -rs`;
-4. fail if output contains `SKIPPED` or `skipped` with a count greater than zero;
-5. always run `docker compose -f docker-compose.test.yml down --remove-orphans` in `finally`;
-6. never pass `-v` or `--volumes` to `down`.
+1. generate process-local test and root passwords with a cryptographic random
+   generator and set the Compose interpolation variables without writing
+   `.env`;
+2. run `docker compose -f docker-compose.test.yml up -d --wait`;
+3. construct a URL-encoded `TEST_MARIADB_DSN` only in the process environment
+   and set `REQUIRE_MARIADB_TESTS=1`;
+4. run `python -m pytest -q tests/blockchain/test_mariadb_storage.py tests/gateway/test_gateway.py -rs` and fail on any skip;
+5. while the same isolated database and DSN are still active, run the complete
+   pytest/coverage suite so its database tests execute rather than skip; only
+   explicitly classified non-database degradation skips may remain;
+6. fail on any test or coverage failure;
+7. restore all previous environment values and always run
+   `docker compose -f docker-compose.test.yml down --remove-orphans` in
+   `finally`;
+8. never pass `-v` or `--volumes` to `down` and never reference the production
+   Compose file or `ledger_data`.
 
 Run before setting the DSN inside the script once and confirm the script rejects the 22 skips. Then enable the DSN assignment.
 
@@ -515,15 +618,27 @@ Expected: 22 database/gateway tests execute, zero fail, zero skip, and the `capt
 
 - [ ] **Step 4: Add the CI integration job**
 
-Create `.github/workflows/integration.yml` for `pull_request` and pushes to `main`. Use `windows-latest`, Python 3.11, PowerShell 7, install `requirements.txt`, run setup Pester tests, run `scripts/test_gateway.ps1`, then run `python -m pytest -q`. Add a final step that fails if the full suite reports required database skips.
+Create `.github/workflows/integration.yml` for `pull_request` and pushes to
+`main`, with `contents: read` only and concurrency cancellation. Use two jobs:
+
+- `python-integration` on `ubuntu-latest`: Python 3.11, install
+  `requirements-dev.txt`, run `pip check`, the cross-platform PowerShell
+  gateway script against the Linux MariaDB image (including the full
+  pytest/coverage gate before teardown), then run `compileall`, Compose config,
+  and submission verification.
+- `windows-setup` on `windows-latest`: install Pester 6.0.0 and run
+  `scripts/setup/Setup.Tests.ps1`, exiting non-zero on `FailedCount`.
+
+Do not attempt to start the Linux MariaDB image on the Windows runner. Neither
+job reads repository secrets.
 
 - [ ] **Step 5: Verify workflow syntax and complete gate**
 
 Run:
 
 ```powershell
-$env:MARIADB_PASSWORD='validation-only'
-$env:MARIADB_ROOT_PASSWORD='validation-root-only'
+$env:MARIADB_TEST_PASSWORD='validation-only'
+$env:MARIADB_TEST_ROOT_PASSWORD='validation-root-only'
 docker compose -f docker-compose.test.yml config --quiet
 pwsh -NoProfile -File scripts/test_gateway.ps1
 python -m pytest -q
@@ -534,85 +649,119 @@ Expected: Compose validates, database gate has zero skips, full suite passes.
 - [ ] **Step 6: Commit the mandatory integration gate**
 
 ```powershell
-git add docker-compose.test.yml scripts/test_gateway.ps1 .github/workflows/integration.yml tests/gateway/test_gateway.py tests/blockchain/test_mariadb_storage.py README.md
+git add docker-compose.test.yml scripts/test_gateway.ps1 .github/workflows/integration.yml tests/support tests/test_mariadb_test_guard.py tests/gateway/test_gateway.py tests/blockchain/test_mariadb_storage.py README.md
 git commit -m "test: require real gateway integration evidence"
 ```
 
 ---
 
-### Task 7: Make AutoGen capability failure explicit at boot
+### Task 7: Segregate publish and local-subscription event-bus capabilities
 
 **Files:**
-- Create: `agenten/runtime/capabilities.py`
 - Modify: `agenten/runtime/event_bus.py`
 - Modify: `agenten/runtime/autogen_bus.py`
+- Modify: `agenten/ledger_bridge/recorder.py`
 - Modify: `agenten/orchestration/pipeline.py`
 - Modify: `tests/test_autogen_bus_integration.py`
+- Modify: `tests/test_pipeline_autogen_subscription.py`
+- Modify: `tests/ledger_bridge/test_recorder.py`
+- Modify: `tests/test_e2e_smoke.py`
+- Modify: `tests/test_architecture_fitness.py`
 
 **Interfaces:**
-- Consumes: runtime adapter construction in `build_pipeline`.
-- Produces: immutable `EventBusCapabilities(local_subscriptions: bool)` and `require_event_bus_capabilities(bus, required)`.
+- Consumes: the approved contract in
+  `docs/superpowers/specs/2026-07-16-event-bus-capability-segregation-design.md`.
+- Produces: publish-only `EventBus`, `SubscribableEventBus`, explicit
+  `subscribe_recorder(...)`, and boot-time validation in `build_pipeline`.
 
-- [ ] **Step 1: Add a failing boot-time capability test**
+- [ ] **Step 1: Add failing capability and composition tests**
 
 ```python
-def test_pipeline_rejects_autogen_bus_when_local_subscriptions_are_required() -> None:
+def test_autogen_bus_is_publish_only() -> None:
     bus = AutoGenEventBus(runtime=FakeRuntime())
+    assert isinstance(bus, EventBus)
+    assert not hasattr(bus, "subscribe")
 
-    with pytest.raises(RuntimeError, match="local_subscriptions"):
-        build_pipeline(event_bus=bus, require_local_subscriptions=True)
+def test_pipeline_rejects_publish_only_bus_before_wiring() -> None:
+    with pytest.raises(TypeError, match="SubscribableEventBus"):
+        build_pipeline(llm_decompose=fake_decompose, bus=PublishOnlyBus())
 ```
 
-Keep the existing test that `subscribe` itself raises, but change its purpose to defensive misuse rather than primary capability discovery.
+Also prove `InMemoryEventBus` is a `SubscribableEventBus`, explicit recorder
+wiring covers every `RECORDER_TOPICS` entry, and no handler was registered when
+the composition error is raised.
 
-- [ ] **Step 2: Run the focused test and verify late failure**
-
-Run: `python -m pytest -q tests/test_autogen_bus_integration.py -k capabilities`
-
-Expected: FAIL because the capability model or `require_local_subscriptions` configuration does not exist.
-
-- [ ] **Step 3: Implement capability declaration and boot validation**
-
-Create:
-
-```python
-from dataclasses import dataclass
-from typing import Protocol
-
-@dataclass(frozen=True, slots=True)
-class EventBusCapabilities:
-    local_subscriptions: bool
-
-class CapabilityAwareEventBus(Protocol):
-    @property
-    def capabilities(self) -> EventBusCapabilities: ...
-
-def require_event_bus_capabilities(
-    bus: CapabilityAwareEventBus,
-    *,
-    local_subscriptions: bool,
-) -> None:
-    if local_subscriptions and not bus.capabilities.local_subscriptions:
-        raise RuntimeError("event bus capability missing: local_subscriptions")
-```
-
-Return `local_subscriptions=True` from `InMemoryEventBus` and `False` from `AutoGenEventBus`. Validate the requirement in `build_pipeline` before constructing subscribers.
-
-- [ ] **Step 4: Verify runtime and architecture tests**
+- [ ] **Step 2: Run the focused tests and verify the current contract mismatch**
 
 Run:
 
 ```powershell
-python -m pytest -q tests/test_autogen_bus_integration.py tests/test_architecture_fitness.py tests/test_import_boundaries.py
+python -m pytest -q tests/test_autogen_bus_integration.py tests/test_pipeline_autogen_subscription.py tests/ledger_bridge/test_recorder.py -k "bus or subscrib"
 ```
 
-Expected: all tests pass and unsupported adapter use fails during pipeline construction.
+Expected: FAIL because `EventBus` still requires `subscribe`,
+`AutoGenEventBus.subscribe` still exists, and the recorder self-subscribes.
 
-- [ ] **Step 5: Commit explicit bus capabilities**
+- [ ] **Step 3: Split the event-bus interfaces**
+
+Implement the approved interface shape:
+
+```python
+class EventBus(ABC):
+    @abstractmethod
+    async def publish(self, topic: str, event: Any) -> None: ...
+
+
+class SubscribableEventBus(EventBus, ABC):
+    @abstractmethod
+    def subscribe(self, topic: str, handler: Handler) -> None: ...
+```
+
+Derive `InMemoryEventBus` from `SubscribableEventBus`. Derive
+`AutoGenEventBus` only from `EventBus` and remove its unsupported `subscribe`
+method entirely. AutoGen topic registration remains in `subscribe_type` using
+`TypeSubscription`.
+
+- [ ] **Step 4: Extract recorder subscription ownership**
+
+Rename `_SUBSCRIPTION_SPEC` to public `RECORDER_SUBSCRIPTION_SPEC`, derive
+`RECORDER_TOPICS` from it, remove subscription calls from
+`LedgerRecorderAgent.__init__`, and add:
+
+```python
+def subscribe_recorder(
+    bus: SubscribableEventBus,
+    recorder: LedgerRecorderAgent,
+) -> None: ...
+```
+
+The helper rejects a publish-only bus with `TypeError`. The in-memory pipeline
+calls it explicitly; `LedgerRecorderRoutedAgent` does not.
+
+- [ ] **Step 5: Tighten the composition boundary**
+
+Type `build_pipeline(..., bus: SubscribableEventBus | None = None)` and validate
+an injected object before constructing any agent. Business agents that only
+publish remain typed to `EventBus`. Add an AST fitness rule limiting production
+callable `.subscribe()` usage to the in-memory composition/runtime boundary.
+
+- [ ] **Step 6: Verify runtime, recorder, pipeline, and architecture tests**
+
+Run:
 
 ```powershell
-git add agenten/runtime/capabilities.py agenten/runtime/event_bus.py agenten/runtime/autogen_bus.py agenten/orchestration/pipeline.py tests/test_autogen_bus_integration.py
-git commit -m "feat: validate event bus capabilities at boot"
+python -m pytest -q tests/test_autogen_bus_integration.py tests/test_pipeline_autogen_subscription.py tests/ledger_bridge/test_recorder.py tests/test_e2e_smoke.py tests/test_architecture_fitness.py tests/test_import_boundaries.py
+python -m compileall -q agenten
+```
+
+Expected: all tests pass; unsupported composition fails before partial wiring;
+real AutoGen `TypeSubscription` delivery remains green.
+
+- [ ] **Step 7: Commit the capability segregation**
+
+```powershell
+git add agenten/runtime/event_bus.py agenten/runtime/autogen_bus.py agenten/ledger_bridge/recorder.py agenten/orchestration/pipeline.py tests/test_autogen_bus_integration.py tests/test_pipeline_autogen_subscription.py tests/ledger_bridge/test_recorder.py tests/test_e2e_smoke.py tests/test_architecture_fitness.py
+git commit -m "refactor: segregate event bus capabilities"
 ```
 
 ---
@@ -622,27 +771,45 @@ git commit -m "feat: validate event bus capabilities at boot"
 **Files:**
 - Create: `agenten/adapters/__init__.py`
 - Create: `agenten/adapters/url_relevance.py`
-- Modify: `blockchain/web_scamler.py`
+- Delete: `blockchain/web_scamler.py`
 - Modify: `tests/test_architecture_fitness.py`
 - Modify: `tests/architecture_fitness.py`
 - Create: `tests/adapters/test_url_relevance.py`
 
 **Interfaces:**
-- Consumes: `agenten.functions.relevance_scoring.score_relevance`, `agenten.functions.extract_content_from_url.extract_text_from_url`.
-- Produces: `score_url_relevance(url: str, query: str) -> float` in the adapter package; legacy module re-exports it without ledger-owned implementation.
+- Consumes: injected async content extraction, relevance scoring, and logging.
+- Produces: typed `UrlRelevanceEvaluator` and `UrlEvaluationResult` in the
+  adapter package. The legacy ledger module is removed after proving it has no
+  active caller; no reverse-dependency shim remains under `blockchain/`.
 
-- [ ] **Step 1: Add a failing forbidden-import and adapter contract test**
+- [ ] **Step 1: Prove there is no active legacy caller, then add red tests**
+
+Run:
+
+```powershell
+rg -n "web_scamler|NestedChatForURLEvaluation" --glob "!docs/**" .
+```
+
+Expected before the move: only `blockchain/web_scamler.py` and boundary tests
+match. If a real caller appears, add its explicit import migration to this task
+before deleting the module.
 
 ```python
 def test_blockchain_does_not_import_agenten() -> None:
-    violations = find_forbidden_imports(ROOT)
+    violations = find_boundary_violations(ROOT, rules_without_legacy_exception)
     assert not [v for v in violations if v.source.parts[0] == "blockchain"]
 
-def test_url_relevance_adapter_extracts_then_scores(monkeypatch) -> None:
-    monkeypatch.setattr(url_relevance, "extract_text_from_url", lambda url: "body")
-    monkeypatch.setattr(url_relevance, "score_relevance", lambda query, body: 0.75)
-    assert url_relevance.score_url_relevance("https://example.test", "query") == 0.75
+async def test_url_relevance_adapter_extracts_then_scores() -> None:
+    async def extract(url: str) -> str:
+        return "body"
+
+    evaluator = UrlRelevanceEvaluator(extract=extract, score=lambda query, body: 0.75)
+    result = await evaluator.evaluate_one("https://example.test", "query")
+    assert result.score == 0.75
 ```
+
+Also cover deterministic descending order, empty content, one failed URL not
+aborting the batch, and use of the project logger instead of `print`.
 
 - [ ] **Step 2: Run tests and verify the current reversed import fails**
 
@@ -650,9 +817,12 @@ Run: `python -m pytest -q tests/adapters/test_url_relevance.py tests/test_archit
 
 Expected: FAIL because `blockchain/web_scamler.py` imports `agenten.functions`.
 
-- [ ] **Step 3: Move implementation behind the adapter boundary**
+- [ ] **Step 3: Move implementation and remove the reverse dependency**
 
-Implement `agenten/adapters/url_relevance.py` and replace `blockchain/web_scamler.py` with a deprecation shim that imports only from a neutral compatibility module if needed. If any active caller imports `blockchain.web_scamler`, update it to import `agenten.adapters.url_relevance`. Add a removal checkpoint dated 2026-08-16 to the architecture backlog for the shim.
+Implement `agenten/adapters/url_relevance.py`, delete
+`blockchain/web_scamler.py`, remove that file from the legacy import-source list
+in `tests/test_import_boundaries.py`, and remove the architecture-rule
+exception. Keep extraction/scoring dependencies injectable and typed.
 
 - [ ] **Step 4: Verify dependency direction and behavior**
 
@@ -667,7 +837,8 @@ Expected: all tests pass and no `blockchain` module imports `agenten`.
 - [ ] **Step 5: Commit the adapter boundary**
 
 ```powershell
-git add agenten/adapters blockchain/web_scamler.py tests/adapters tests/architecture_fitness.py tests/test_architecture_fitness.py docs/superpowers/plans/2026-07-15-architecture-gap-todos.md
+git add agenten/adapters tests/adapters tests/architecture_fitness.py tests/test_architecture_fitness.py tests/test_import_boundaries.py docs/superpowers/plans/2026-07-15-architecture-gap-todos.md
+git add -u blockchain/web_scamler.py
 git commit -m "refactor: move URL relevance behind adapter boundary"
 ```
 
@@ -696,14 +867,16 @@ Add tests that inspect the constructor signature, register the same event topics
 ```python
 def test_recorder_facade_keeps_public_constructor() -> None:
     parameters = inspect.signature(LedgerRecorderAgent).parameters
-    assert tuple(parameters)[:3] == ("bus", "blockchain", "clock")
+    assert tuple(parameters)[:3] == ("bus", "blockchain", "budget_ledger")
 ```
 
 - [ ] **Step 2: Run the facade and existing recorder tests**
 
 Run: `python -m pytest -q tests/ledger_bridge/test_recorder.py tests/ledger_bridge/test_query.py tests/ledger_bridge/test_recorder_facade.py`
 
-Expected: existing behavior passes; the new restart/replay case fails if exact-once recovery is not already complete. Fix that behavior before moving code.
+Expected: existing behavior passes. The facade tests freeze current
+at-least-once deduplication and recovery behavior; this refactor must not add a
+new delivery guarantee.
 
 - [ ] **Step 3: Extract projections without changing behavior**
 
@@ -749,7 +922,10 @@ git commit -m "refactor: isolate ledger recorder adapters"
 - Create: `agenten/orchestration/configuration.py`
 - Create: `agenten/orchestration/components.py`
 - Modify: `agenten/orchestration/pipeline.py`
-- Modify: `tests/test_pipeline.py`
+- Modify: `tests/test_e2e_smoke.py`
+- Modify: `tests/test_worker_factories.py`
+- Modify: `tests/test_householder_runtime.py`
+- Modify: `tests/test_architecture_fitness.py`
 - Modify: `tests/test_import_boundaries.py`
 
 **Interfaces:**
@@ -765,7 +941,7 @@ Add tests that build the deterministic offline pipeline using injected fakes, ve
 Run:
 
 ```powershell
-python -m pytest -q tests/test_pipeline.py tests/test_demo_pipeline.py tests/test_import_boundaries.py
+python -m pytest -q tests/test_e2e_smoke.py tests/test_worker_factories.py tests/test_householder_runtime.py tests/test_architecture_fitness.py tests/test_import_boundaries.py
 ```
 
 Expected: existing tests pass; the fail-before-construction assertion fails until configuration extraction exists.
@@ -783,7 +959,7 @@ Move concrete coordinator, worker, supervisor, reaper, recorder, and adapter cre
 Run:
 
 ```powershell
-python -m pytest -q tests/test_pipeline.py tests/test_demo_pipeline.py tests/agenten tests/spawning tests/workers tests/supervision tests/ledger_bridge
+python -m pytest -q tests/test_e2e_smoke.py tests/test_worker_factories.py tests/test_householder_runtime.py tests/agenten tests/spawning tests/workers tests/ledger_bridge
 python -m compileall -q agenten/orchestration
 ```
 
@@ -792,7 +968,7 @@ Expected: all tests pass; `build_pipeline` remains the public entry and invalid 
 - [ ] **Step 6: Commit the pipeline split**
 
 ```powershell
-git add agenten/orchestration/configuration.py agenten/orchestration/components.py agenten/orchestration/pipeline.py tests/test_pipeline.py tests/test_import_boundaries.py
+git add agenten/orchestration/configuration.py agenten/orchestration/components.py agenten/orchestration/pipeline.py tests/test_e2e_smoke.py tests/test_worker_factories.py tests/test_householder_runtime.py tests/test_architecture_fitness.py tests/test_import_boundaries.py
 git commit -m "refactor: separate pipeline configuration and construction"
 ```
 
@@ -805,9 +981,11 @@ git commit -m "refactor: separate pipeline configuration and construction"
 - Modify: `AGENTS.md`
 - Modify: `docs/ARCHITECTURE.md`
 - Modify: `docs/WORKSTREAMS.md`
+- Modify: `docs/DEVPOST_CHECKLIST.md`
 - Modify: `docs/superpowers/plans/2026-07-15-architecture-gap-todos.md`
 - Modify: `docs/superpowers/plans/2026-07-16-system-gap-remediation.md`
 - Modify: `tests/test_workstream_docs.py`
+- Modify: `tests/test_submission_docs.py`
 - Modify: `tests/test_architecture_fitness.py`
 - Modify: `scripts/verify_submission.py`
 
@@ -850,6 +1028,12 @@ events → decomposition → constitution → spawn coordinator → workers
 
 Name `main` as the baseline, mark historical feature branches merged without deleting them, document external VibeMind n8n ownership, and check only backlog items whose named tests passed.
 
+Refresh `docs/DEVPOST_CHECKLIST.md` with the current commit, dated commands,
+and skip classification instead of treating old pass totals as permanent.
+Keep root-license selection, repository publication, public video, Devpost
+form submission, and `/feedback` session ID as explicit unchecked owner
+actions. Do not select a license or claim publication in this branch.
+
 - [ ] **Step 4: Run the full static and regression gate**
 
 Run:
@@ -874,8 +1058,9 @@ From a new temporary directory outside all existing worktrees:
 
 ```powershell
 $sourceRepository = git rev-parse --show-toplevel
+$sourceBranch = git branch --show-current
 $cleanRoot = Join-Path $env:TEMP ("captain-cook-clean-" + [guid]::NewGuid())
-git clone --recurse-submodules $sourceRepository $cleanRoot
+git clone --recurse-submodules --branch $sourceBranch $sourceRepository $cleanRoot
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Set-Location $cleanRoot
 pwsh -NoProfile -File setup.ps1
@@ -884,7 +1069,11 @@ pwsh -NoProfile -File repair.ps1
 pwsh -NoProfile -File scripts/acceptance/setup-smoke.ps1
 ```
 
-Expected: setup completes with `N8N_MODE=external` against the explicitly configured reachable endpoint, nine health rows are ready, repair is idempotent, and no command starts, stops, or adopts VibeMind n8n. Record only command, commit, timestamps, exit codes, and non-secret run identifiers in the Session Insights entry.
+Expected: setup completes with `N8N_MODE=external` against the explicitly
+configured reachable endpoint, ten health rows including Gateway are ready,
+repair is idempotent, and no command starts, stops, or adopts VibeMind n8n.
+Record only command, commit, timestamps, exit codes, and non-secret run
+identifiers in the Session Insights entry.
 
 - [ ] **Step 6: Audit every completion criterion and consolidate insights**
 
@@ -893,7 +1082,7 @@ For each of the eight design completion criteria, add its exact evidence under `
 - [ ] **Step 7: Commit synchronized documentation and final evidence**
 
 ```powershell
-git add README.md AGENTS.md docs/ARCHITECTURE.md docs/WORKSTREAMS.md docs/superpowers/plans/2026-07-15-architecture-gap-todos.md docs/superpowers/plans/2026-07-16-system-gap-remediation.md tests/test_workstream_docs.py tests/test_architecture_fitness.py scripts/verify_submission.py
+git add README.md AGENTS.md docs/ARCHITECTURE.md docs/WORKSTREAMS.md docs/DEVPOST_CHECKLIST.md docs/superpowers/plans/2026-07-15-architecture-gap-todos.md docs/superpowers/plans/2026-07-16-system-gap-remediation.md tests/test_workstream_docs.py tests/test_submission_docs.py tests/test_architecture_fitness.py scripts/verify_submission.py
 git commit -m "docs: align system claims with verified behavior"
 ```
 
@@ -905,6 +1094,7 @@ Populate this table only with fresh evidence from Task 11.
 
 | Criterion | Evidence command or artifact | Result |
 | --- | --- | --- |
+| Clean development install is internally consistent | disposable venv `pip check` and pytest/coverage | Not run |
 | Stale checkpoint repairs a removed component | `Invoke-Pester ... -Filter *revalidates*` | Not run |
 | Clean checkout validates configured external n8n without adopting it | clean-clone acceptance manifest | Not run |
 | Invalid versions and unknown ports fail preflight | Pester preflight cases | Not run |
