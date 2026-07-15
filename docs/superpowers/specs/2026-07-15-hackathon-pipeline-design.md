@@ -10,10 +10,10 @@ measurable outcomes — every step recorded in the append-only ledger.
 adversarial review — 24 confirmed findings + 19 notes — plus a 24-agent
 completeness sweep — 15 confirmed gaps, incl. the mandatory `/feedback`
 Session-ID form field; all folded in). Extended with the two-layer architecture
-(§22: autogen-core 0.7.5 orchestrators over n8n tools), the autogen build
+(§21: autogen-core 0.7.5 orchestrators over n8n tools), the autogen build
 target (verified against installed 0.7.5 by a 6-agent panel — tool
-serialization caveat included), the Hermes learning-loop stabilization (§22.3),
-and MariaDB as the ledger store (§23).
+serialization caveat included), the Hermes learning-loop stabilization (§21.3),
+and MariaDB as the ledger store (§22).
 
 ---
 
@@ -120,7 +120,7 @@ ledger block; the whole build history is auditable and watchable in Minibook.
 | type | writer | payload (all Pydantic-validated at the gateway) |
 |---|---|---|
 | `project` | Captain | refined description; metadata: resolved model name |
-| `work_batch` | Captain | context bundle: goal, subtask ids, constraints, interfaces (dependency edges, §22), `target` (enum: `"n8n"` tool \| `"autogen"` orchestrator), acceptance criteria (assertion enum), **build-visible** golden cases |
+| `work_batch` | Captain | context bundle: goal, subtask ids, constraints, interfaces (dependency edges, §21), `target` (enum: `"n8n"` tool \| `"autogen"` orchestrator), acceptance criteria (assertion enum), **build-visible** golden cases |
 | `holdout_cases` | Captain | validation-only cases; fetched by workers AFTER codex exec; never written into the workspace |
 | `batch_claim` | Gateway | worker id, claim_token, expiry |
 | `codex_task` | Hermes | verbatim prompt sent to codex |
@@ -176,7 +176,7 @@ verification work this week.
 
 ## 5. Ledger-Gateway (FastAPI)
 
-> **Superseded by the MariaDB decision (§23):** the ledger is a MariaDB store,
+> **Superseded by the MariaDB decision (§22):** the ledger is a MariaDB store,
 > not a JSON file. The file-based mitigations below (exclusive lock file,
 > corrupt-rename, "only one process opens the file") are therefore UNNECESSARY
 > — transactional writes and row-locking replace them. What survives: the
@@ -412,7 +412,7 @@ hardcoding the literal-sniff backstop misses.
 
 ## 10. n8n + Mailpit deployment
 
-- docker-compose: n8n pinned 2.29.x + Mailpit + **MariaDB** (§23, the ledger
+- docker-compose: n8n pinned 2.29.x + Mailpit + **MariaDB** (§22, the ledger
   store) only (Minibook runs natively — no Dockerfile exists and none will be
   written this week). n8n keeps its own SQLite volume (it can't use MariaDB).
 - **Bootstrap:** owner account provisioned via env
@@ -561,7 +561,7 @@ mock-CRM sink (observable), stated in the description.
   behind LedgerStorage + `PyMySQL` pin; autogen spike: dump a team with a
   FunctionTool, confirm where tools serialize (`config.workbench`) and whether a
   round-trip executes them, and that a keyless `OpenAIChatCompletionClient`
-  dumps `api_key: null` (§22.2) — freezes the autogen schema decision; n8n
+  dumps `api_key: null` (§21.2) — freezes the autogen schema decision; n8n
   bootstrap +
   `mailpit-smtp`/`openai-gpt` credentials + `setx N8N_MCP_TOKEN`; minimal
   `templates/AGENTS.md` (credential + webhook rules only) for Gate A
@@ -752,10 +752,10 @@ its prompts/tools/context through one auditable chain — no step is ad hoc:
 Net effect for the submission story: the pipeline is GPT-5.6 end to end —
 GPT-5.6 plans (Captain), GPT-5.6 drives the build (Hermes workers), Codex
 builds, and the built artifact is itself a GPT-5.6 autogen agent team that
-ORCHESTRATES n8n tools (the two-layer architecture, §22 — autogen thinks, n8n
+ORCHESTRATES n8n tools (the two-layer architecture, §21 — autogen thinks, n8n
 acts). n8n hosts no LLM logic; the reasoning lives in the built autogen team.
 
-## 22. Layered architecture: autogen orchestrators over n8n tools
+## 21. Layered architecture: autogen orchestrators over n8n tools
 
 This is the load-bearing architecture the demo realizes. Two layers, cleanly
 split (user directive):
@@ -789,7 +789,7 @@ first; the autogen batch's context bundle names the validated tools it may
 wire. A worker will not claim the autogen batch until its dependency batches
 show `batch_done: succeeded` (gateway check on claim).
 
-### 22.1 n8n workflow-as-tool exposure
+### 21.1 n8n workflow-as-tool exposure
 
 How a built n8n workflow reaches an autogen team as a callable tool — decided
 at a Day-1 spike (mirrors the §9 Gate A go/no-go):
@@ -804,7 +804,7 @@ at a Day-1 spike (mirrors the §9 Gate A go/no-go):
 Either way the tool set handed to the built team is CONTRACT-CONSTRAINED (only
 the validated n8n tools named in the bundle), never Codex-invented.
 
-### 22.2 autogen build target (artifact, adapter, assertions)
+### 21.2 autogen build target (artifact, adapter, assertions)
 
 **Artifact.** Codex authors `workspaces/{batch_id}/team.py` — a pure factory
 `build_team() -> BaseGroupChat` (no import side effects), team `label =
@@ -883,7 +883,7 @@ serialize/validate fails `deploy()` before any case runs.
   `ToolRegistry` (never wired to `AssistantAgent(tools=)` anyway) → built-team
   tools are autogen-core `FunctionTool`s / MCP tools from the contract.
 
-### 22.3 Stabilization via the Hermes learning loop
+### 21.3 Stabilization via the Hermes learning loop
 
 Hermes' built-in closed learning loop (skill creation from experience, skill
 self-improvement during use, agent-curated memory, FTS5 cross-session recall)
@@ -911,7 +911,37 @@ property (user insight).
   workflows, Mailpit), never the learned brain — else every "clean" run resets
   learning and nothing compounds.
 
-## 23. Data stores
+### 21.4 Validated-capability reuse (Captain-level compounding)
+
+The third compounding layer (user directive): passed tests aren't just history —
+they are a queryable catalog the Captain reuses, so it rebuilds ONLY what is
+missing or doesn't fit.
+
+- **Every `batch_done: succeeded` is a validated capability:** goal + interface +
+  the acceptance assertions it passed + an artifact reference (n8n workflow id or
+  `team.json` hash). Recorded in the ledger (MariaDB) and mirrored to minibook's
+  `/api/v1/registry` (whose fields — capabilities, tools_py_path/artifact ref,
+  eval_score, status=validated — already fit).
+- **Gateway read endpoint** `GET /capabilities?need=<descriptor>` searches the
+  validated set over MariaDB (indexed query — cheap at any scale).
+- **Captain enrich, per needed capability, queries the validated set:**
+  - **fits** (semantic + interface match against the passed assertions) → REFERENCE
+    the existing validated artifact; the batch is marked `satisfied_by: <ref>`,
+    NO build dispatched.
+  - **missing / mismatch** → emit a build `work_batch` (the normal Codex
+    build-validate loop). This is the "retry if something is missing / doesn't
+    fit" path; "fits → okay" is the reuse path.
+- **Payoff:** over runs the validated-capability library grows; new tasks compose
+  existing validated tools/agents; a task may need ZERO new n8n-tool builds and
+  only the orchestrator wiring. Rebuilds shrink. This is PLANNING-level compounding,
+  complementing the BUILD-level Hermes learning loop (§21.3) — the two stack. Both
+  are measurable in the ledger (reuse-rate ↑, new-build count ↓).
+- **Invariant:** Captain queries via the gateway read API and never writes the
+  ledger except via release; the `satisfied_by` reference keeps the tree edge
+  visible — resolved to an existing validated node instead of a fresh build subtree,
+  so tree-rollup validation (§4) still holds.
+
+## 22. Data stores
 
 Most "state" is derived and lives in the ledger; only a few independent stores
 exist.
@@ -921,7 +951,7 @@ exist.
 | **Ledger** (authoritative write-model) | **MariaDB** | we operate | see decision below |
 | Minibook (read-model) | SQLite | submodule, untouched | don't fork its DB init |
 | n8n (workflows/executions/credentials) | SQLite volume | persist | n8n can't use MariaDB (MySQL/MariaDB support dropped — SQLite/Postgres only) |
-| Hermes (memory/sessions/FTS5) | SQLite per profile | persist, **never wipe** | the learning substrate (§22.3) |
+| Hermes (memory/sessions/FTS5) | SQLite per profile | persist, **never wipe** | the learning substrate (§21.3) |
 | Mailpit, gateway status index, mock-CRM sink | in-memory | — | ephemeral, reset per run |
 
 Files, not DBs: shared skills dir, Codex sessions (`~/.codex/sessions/`), batch
@@ -947,7 +977,7 @@ note: MariaDB is heavier than a demo strictly needs (SQLite/WAL would suffice),
 but it buys definitively-correct concurrency and fits the "real system that
 compounds" framing. Minibook stays on its own SQLite (submodule — not forked).
 
-## 24. Out of scope (this week)
+## 23. Out of scope (this week)
 
 Chain verification; recorder/CQRS integration for the new block types; any
 Minibook write-back; Jira/code adapters (interface only); human-gate UI;
