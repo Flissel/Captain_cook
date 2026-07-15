@@ -58,14 +58,15 @@ ledger block; the whole build history is auditable and watchable in Minibook.
   non-Codex, disclosed honestly with commit timestamps; (3) everything after
   the tag = the Codex-authored work judges evaluate. Judges rate only
   in-period work — the Codex delta must carry the submission on its own.
-- **Embedded repos:** `hermes-agent/` and `Autogen_AgentFarm/` are currently bare
-  gitlinks with no `.gitmodules` — a judge cloning the repo gets EMPTY dirs. Fix:
-  proper submodules with pinned SHAs (`git rm --cached` + `git submodule add`;
-  hermes pinned to 77d5b2d; Autogen_AgentFarm is pushed to github.com/Flissel).
-  Smoke test: `git clone --recursive` into a temp dir and confirm both dirs
-  are non-empty — the fix isn't done until the clone proves it.
-  Minibook stays behind the submodule pointer → its AGPL-3.0 stays isolated
-  (HTTP-only integration, no linking); one README sentence notes this.
+- **Embedded repos (RESOLVED 2026-07-15):** minibook is now VENDORED at
+  `./minibook` (PR #15 merged) — its full backend + frontend + swarm live in
+  the main tree, so a clone gets it directly. The redundant `Autogen_AgentFarm`
+  gitlink was dropped. Minibook is AGPL-3.0: its own `minibook/LICENSE` is
+  kept, it is documented as a third-party component, and integration stays
+  HTTP-only (no linking) — the README's license section states this. STILL
+  OPEN: `hermes-agent/` is a bare gitlink with no `.gitmodules` (a clone gets
+  an EMPTY dir) — decide vendor vs. proper submodule before submission
+  (Day-1 task); `git clone --recursive` smoke test proves whichever fix.
 - **Codex session capture (dev-time):** a shell wrapper (~20 lines, written as
   the FIRST Day-1 item, BEFORE the first Gate A `codex exec`) logs every dev
   session ID + date + intent to `docs/codex-sessions.md`; commits carry a
@@ -484,10 +485,9 @@ hardcoding the literal-sniff backstop misses.
   (§4) rides on `Post.status` per batch; the actual TREE visual is a separate
   Graphviz render of the ledger (COULD — matches the branch's intent),
   not a minibook feature.
-- **Delivery must be reconciled:** minibook ships via the `Autogen_AgentFarm`
-  submodule (gitlink `9ac6fe9`, pinned per §2). The open PR #15
-  (`claude/add-minibook`) is a PARALLEL path — pick ONE (submodule preferred)
-  and close/repoint the other so the tree is unambiguous.
+- **Delivery — RESOLVED 2026-07-15:** minibook is VENDORED at `./minibook`
+  (PR #15 merged); the redundant `Autogen_AgentFarm` gitlink was dropped. All
+  paths below are `minibook/...` (not `Autogen_AgentFarm/minibook/...`).
 - **`require_admin` returns `True` (TODO stub):** harmless on localhost, but
   the repo is public — one README line notes admin auth is demo-disabled.
 - **Reuse bonus (optional):** minibook already has `/api/v1/registry`
@@ -993,7 +993,7 @@ Embedding model would be OpenAI `text-embedding-3` (stays in the OpenAI stack).
 
 ## 23. Adapting the prepared minibook swarm pipeline
 
-`Autogen_AgentFarm/minibook` already ships a working LLM-driven agent-team
+`minibook` already ships a working LLM-driven agent-team
 FACTORY (`swarm/pipeline.py::SwarmPipeline`, driven by `autogen_swarm.py`): an
 11-role swarm coordinating via Minibook forum posts, generating
 autogen-agentchat team SOURCE with an LLM (`swarm/llm.py::call_gpt4o`, default

@@ -9,3 +9,6 @@ test_claude_output.txt
 # Selenium/driver binaries (removed 2026-07-15)
 *.exe
 chromedriver*
+
+# Autogen_AgentFarm dropped — minibook vendored at ./minibook (2026-07-15)
+Autogen_AgentFarm/
