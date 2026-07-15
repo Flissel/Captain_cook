@@ -94,6 +94,7 @@ from agenten.events.schemas import (
     SubproblemFailed,
     SubproblemProposed,
     SubproblemRejected,
+    SubproblemUnroutable,
     WorkerHeartbeat,
     make_meta,
     topic_for,
@@ -123,6 +124,7 @@ _SUBSCRIPTION_SPEC: List[Tuple[type, str]] = [
     (WorkerHeartbeat, "handle_worker_heartbeat"),
     (SubproblemCompleted, "handle_subproblem_completed"),
     (SubproblemFailed, "handle_subproblem_failed"),
+    (SubproblemUnroutable, "handle_subproblem_unroutable"),
     (LeaseExpired, "handle_lease_expired"),
 ]
 
@@ -319,6 +321,9 @@ class LedgerRecorderAgent:
 
     async def handle_subproblem_failed(self, event: SubproblemFailed) -> None:
         await self._inbox.put((self._apply_subproblem_failed, event))
+
+    async def handle_subproblem_unroutable(self, event: SubproblemUnroutable) -> None:
+        await self._inbox.put((self._apply_subproblem_unroutable, event))
 
     async def handle_lease_expired(self, event: LeaseExpired) -> None:
         await self._inbox.put((self._apply_lease_expired, event))
@@ -892,6 +897,24 @@ class LedgerRecorderAgent:
             return
         self._apply_retry_transition(idx, event.error, "subproblem_failed")
 
+    async def _apply_subproblem_unroutable(self, event: SubproblemUnroutable) -> None:
+        found = self._require_block(event.subproblem_id, "SubproblemUnroutable")
+        if found is None:
+            return
+        idx, _block = found
+        block = self._can_transition(idx, Stage.FAILED)
+        if block is None:
+            self._record_late_event(
+                idx,
+                "subproblem_unroutable",
+                {"error": event.error, "capability_tags": list(event.capability_tags)},
+            )
+            return
+        block.metadata["failure_reason"] = event.error
+        block.metadata["unroutable_capability_tags"] = list(event.capability_tags)
+        block.metadata["retriable"] = False
+        self._transition(idx, Stage.FAILED)
+
     async def _apply_lease_expired(self, event: LeaseExpired) -> None:
         found = self._require_block(event.subproblem_id, "LeaseExpired")
         if found is None:
@@ -992,6 +1015,10 @@ if autogen_core is not None:
         @message_handler
         async def on_subproblem_failed(self, message: SubproblemFailed, ctx: MessageContext) -> None:
             await self._inner.handle_subproblem_failed(message)
+
+        @message_handler
+        async def on_subproblem_unroutable(self, message: SubproblemUnroutable, ctx: MessageContext) -> None:
+            await self._inner.handle_subproblem_unroutable(message)
 
         @message_handler
         async def on_lease_expired(self, message: LeaseExpired, ctx: MessageContext) -> None:

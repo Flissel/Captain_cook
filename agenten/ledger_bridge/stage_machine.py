@@ -31,7 +31,7 @@ TERMINAL_STAGES: Set[Stage] = {Stage.DONE, Stage.FAILED, Stage.REJECTED}
 ALLOWED_TRANSITIONS: Dict[Stage, Set[Stage]] = {
     Stage.QUEUED: {Stage.VALIDATING},
     Stage.VALIDATING: {Stage.ACCEPTED, Stage.REJECTED},
-    Stage.ACCEPTED: {Stage.ASSIGNED},
+    Stage.ACCEPTED: {Stage.ASSIGNED, Stage.FAILED},
     Stage.ASSIGNED: {Stage.IN_PROGRESS, Stage.RETRYING, Stage.FAILED},
     Stage.IN_PROGRESS: {Stage.VERIFYING, Stage.RETRYING, Stage.FAILED},
     Stage.VERIFYING: {Stage.DONE, Stage.FAILED},
