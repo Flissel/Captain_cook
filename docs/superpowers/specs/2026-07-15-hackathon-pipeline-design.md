@@ -447,11 +447,38 @@ hardcoding the literal-sniff backstop misses.
 - Provisioning script (Day 4): register agent accounts (Captain,
   hermes-worker-N), store API keys in gateway env, create the demo project.
 - Mapping: `project` → project creation + intro post by Captain; `work_batch`
-  → post; claim/codex_task (prompt summary)/codex_session/deploy/
-  validation_run/batch_done → comments by the acting agent's account with
-  @mentions; `holdout_cases` is NOT mirrored (exam stays private). Posts
-  reference block **index + type + stable hash**.
+  → post (`Post.status` carries the batch's derived validation state:
+  in_progress → validated/failed, giving the "tree turns green" signal);
+  claim/codex_task (prompt summary)/codex_session/deploy/validation_run/
+  batch_done → comments by the acting agent's account with @mentions;
+  `holdout_cases` is NOT mirrored (exam stays private). Posts reference block
+  **index + type + stable hash**.
 - Demo footage films the forum of a COMPLETED run (never live).
+
+**Gap assessment (minibook is feature-complete for the mirror; gaps are glue
++ ops + one visualization decision — verified against `src/main.py`,
+`ratelimit.py`):**
+- **Config required:** no `config.yaml` exists → author one Day 4 with RAISED
+  rate limits (defaults are 60 comments/min, 10 posts/min PER AGENT; a burst
+  mirror would otherwise 429 and, being fire-and-forget, silently DROP
+  comments → an incomplete filmed forum), port 8080, no external exposure.
+- **One frontend only:** use the backend-served simple UI on 8080 — do NOT
+  build the Next.js `frontend/` (README's 3456/3457 stack) unless the simple
+  UI proves un-filmable. This overrides the earlier "frontend build" wording.
+- **Tree/roll-up view:** minibook is a forum, not a tree. The green roll-up
+  (§4) rides on `Post.status` per batch; the actual TREE visual is a separate
+  Graphviz render of the ledger (COULD — matches the branch's intent),
+  not a minibook feature.
+- **Delivery must be reconciled:** minibook ships via the `Autogen_AgentFarm`
+  submodule (gitlink `9ac6fe9`, pinned per §2). The open PR #15
+  (`claude/add-minibook`) is a PARALLEL path — pick ONE (submodule preferred)
+  and close/repoint the other so the tree is unambiguous.
+- **`require_admin` returns `True` (TODO stub):** harmless on localhost, but
+  the repo is public — one README line notes admin auth is demo-disabled.
+- **Reuse bonus (optional):** minibook already has `/api/v1/registry`
+  (validated agent teams, `eval_score >= 6` gate, capabilities/mcp_servers).
+  Mirroring `batch_done: succeeded` there too strengthens the
+  "agents self-register once validated" story — COULD, not required.
 
 ## 13. Secrets
 
