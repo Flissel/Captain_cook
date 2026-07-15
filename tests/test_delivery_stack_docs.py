@@ -57,3 +57,17 @@ def test_verification_checks_all_service_boundaries() -> None:
         "host.docker.internal:15678",
     ):
         assert expected in verify
+
+
+def test_readme_documents_delivery_stack_operation_and_data_safety() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    for expected in (
+        "scripts/start_delivery_stack.ps1",
+        "http://localhost:15678",
+        "http://localhost:8025",
+        "localhost:3306",
+        "docker compose down",
+        "docker compose down -v",
+    ):
+        assert expected in readme

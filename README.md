@@ -53,6 +53,38 @@ python scripts/verify_submission.py
 
 The first command runs the engineering regression suite. The second verifies that the judge-facing documentation and committed evidence artifact are present and well-formed. See [docs/MCP_SETUP.md](docs/MCP_SETUP.md) for the development-time Playwright, Context7, and n8n MCP boundaries.
 
+## Local delivery services
+
+Captain Cook reuses the existing VibeMind n8n instance and owns only Mailpit
+and MariaDB. This keeps VibeMind's workflows, credentials, encryption key, and
+`voice_vibemind-n8n-data` volume under the VibeMind project's control.
+
+Prerequisites are Docker Desktop and the existing VibeMind checkout at
+`C:\Users\User\Desktop\Vibemind_V1\vibemind-os\voice`. Copy the delivery
+values from `.env.example` into the gitignored `.env` and replace both MariaDB
+password placeholders with different random values. Then start and verify the
+complete local stack:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/start_delivery_stack.ps1
+```
+
+| Service | Local endpoint | Ownership |
+| --- | --- | --- |
+| n8n | http://localhost:15678 | Existing VibeMind Compose project |
+| Mailpit | http://localhost:8025 (SMTP `localhost:1025`) | Captain Cook |
+| MariaDB | `localhost:3306`, database `ledger` | Captain Cook |
+
+Run the non-destructive checks again at any time with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/verify_delivery_stack.ps1
+```
+
+Stop Captain Cook's services with `docker compose down`. Do not run
+`docker compose down -v`: it deletes the Captain ledger volume. Captain Cook's
+scripts never delete or adopt either existing n8n volume.
+
 ## How Codex and GPT-5.6 fit
 
 Codex is used to build, test, and document the Devpost-ready vertical slice; the implementation history is recorded in this repository's Devpost feature branch and [docs/codex-sessions.md](docs/codex-sessions.md) records the primary submission session ID once captured. The LLM-backed production path is intentionally separate from the offline demo; its target model is configured as GPT-5.6 before the Devpost run. The video must show the working demo and explain both uses, as scripted in [docs/VIDEO_SCRIPT.md](docs/VIDEO_SCRIPT.md).
