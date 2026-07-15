@@ -141,17 +141,17 @@ git commit -m "feat: add durable delivery todo ledger"
 - Produces: HTTP endpoints for TODO commands, evidence, heartbeats, and event polling
 - Produces: in-process `DeliveryEventPublisher` called only after commit
 
-- [ ] **Step 1: Write API lifecycle tests against a real temporary SQLite database**
+- [x] **Step 1: Write API lifecycle tests against a real temporary SQLite database**
 
 Use FastAPI `TestClient` only as an HTTP transport around the real service and real SQLite file; do not replace the ledger or publisher with mocks. Prove create, assign, start, heartbeat, testing, reviewing, redo, and passed responses plus stale-version `409`.
 
-- [ ] **Step 2: Run the focused test and verify failure**
+- [x] **Step 2: Run the focused test and verify failure**
 
 Run: `python -m pytest tests/delivery/test_delivery_api.py -v`
 
 Expected: FAIL because `agenten.delivery.api` does not exist.
 
-- [ ] **Step 3: Implement the control-plane endpoints**
+- [x] **Step 3: Implement the control-plane endpoints**
 
 ```text
 POST /delivery/todos
@@ -166,11 +166,11 @@ GET  /delivery/events?after=
 
 Commands require `event_id`, `expected_version`, and `actor`. Heartbeats renew a ten-minute lease only for the current assignee. Return committed state before publishing a notification. Log identifiers, never prompt bodies or credentials.
 
-- [ ] **Step 4: Prove commit-before-publish and idempotency without a mock publisher**
+- [x] **Step 4: Prove commit-before-publish and idempotency without a mock publisher**
 
 Use a real `InMemoryEventBus` subscriber plus the real SQLite ledger. Subscriber reloads the TODO during delivery and asserts the committed version is already visible. Publish the same command twice and assert one event row.
 
-- [ ] **Step 5: Run focused and full tests**
+- [x] **Step 5: Run focused and full tests**
 
 Run: `python -m pytest tests/delivery/test_delivery_api.py tests/delivery/test_delivery_ledger.py -v`
 

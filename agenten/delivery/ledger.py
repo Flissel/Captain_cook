@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Iterator
 from uuid import uuid4
@@ -184,6 +185,8 @@ class SqliteDeliveryLedger:
                 "SELECT todo_id FROM delivery_events WHERE event_id = ?", (event_id,)
             ).fetchone()
             if duplicate is not None:
+                if duplicate["todo_id"] != todo_id:
+                    raise DeliveryTransitionError("event_id belongs to another TODO")
                 return self._get_todo_in(connection, todo_id)
             current = self._get_todo_in(connection, todo_id)
             if current.version != expected_version:
@@ -207,6 +210,46 @@ class SqliteDeliveryLedger:
             )
             return updated
 
+    def renew_lease(
+        self,
+        todo_id: str,
+        event_id: str,
+        expected_version: int,
+        actor: str,
+        *,
+        lease_minutes: int = 10,
+    ) -> DeliveryTodo:
+        with self._transaction() as connection:
+            duplicate = connection.execute(
+                "SELECT todo_id FROM delivery_events WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            if duplicate is not None:
+                if duplicate["todo_id"] != todo_id:
+                    raise DeliveryTransitionError("event_id belongs to another TODO")
+                return self._get_todo_in(connection, todo_id)
+            current = self._get_todo_in(connection, todo_id)
+            if current.version != expected_version:
+                raise DeliveryTransitionError("stale version")
+            if current.assignee is None or actor != current.assignee.value:
+                raise DeliveryTransitionError("only the assigned role may renew the lease")
+            now = utc_now()
+            updated = current.model_copy(
+                update={
+                    "lease_expires_at": now + timedelta(minutes=lease_minutes),
+                    "version": current.version + 1,
+                    "updated_at": now,
+                }
+            )
+            connection.execute(
+                "UPDATE delivery_todos SET document = ? WHERE todo_id = ?",
+                (updated.model_dump_json(), todo_id),
+            )
+            self._insert_event(
+                connection, event_id, todo_id, actor, "lease_renewed",
+                {"lease_expires_at": updated.lease_expires_at.isoformat(), "version": updated.version},
+            )
+            return updated
+
     def events_after(self, sequence: int) -> tuple[DeliveryEvent, ...]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -225,6 +268,13 @@ class SqliteDeliveryLedger:
             )
             for row in rows
         )
+
+    def has_event(self, event_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM delivery_events WHERE event_id = ?", (event_id,)
+            ).fetchone()
+        return row is not None
 
     def _get_todo_in(
         self, connection: sqlite3.Connection, todo_id: str
