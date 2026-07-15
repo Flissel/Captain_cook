@@ -12,6 +12,77 @@ BeforeAll {
     if (Test-Path "$PSScriptRoot/Components.psm1") {
         Import-Module "$PSScriptRoot/Components.psm1" -Force
     }
+    if (Test-Path "$PSScriptRoot/Lifecycle.psm1") {
+        Import-Module "$PSScriptRoot/Lifecycle.psm1" -Force
+    }
+}
+
+Describe 'Guided orchestration' {
+    It 'resumes at the first incomplete stage' {
+        $visited = [Collections.Generic.List[string]]::new()
+
+        $result = Invoke-GuidedSetup -Root $TestDrive -Checkpoint @{ Preflight = 'Complete'; Configuration = 'Incomplete' } -StageRunner {
+            param($stage, $context)
+            $visited.Add($stage)
+            [pscustomobject]@{ Status = 'Complete'; Message = "$stage complete" }
+        }
+
+        $result.Status | Should -Be 'Ready'
+        $visited[0] | Should -Be 'Configuration'
+        $visited | Should -Not -Contain 'Preflight'
+    }
+
+    It 'does not report success when verification fails' {
+        $result = Invoke-GuidedSetup -Root $TestDrive -Checkpoint @{} -StageRunner {
+            param($stage, $context)
+            if ($stage -eq 'Verification') { return [pscustomobject]@{ Status = 'Failed'; Message = 'verification failed' } }
+            [pscustomobject]@{ Status = 'Complete'; Message = "$stage complete" }
+        }
+
+        $result.Status | Should -Be 'Failed'
+        $result.Remediation | Should -Be 'Retry'
+    }
+
+    It 'uses the exact stable stage order' {
+        Get-SetupStages | Should -Be @('Preflight', 'Configuration', 'Captain', 'Hermes', 'Minibook', 'Services', 'Verification')
+    }
+
+    It 'initializes missing local secrets without replacing existing values' {
+        Set-Content -LiteralPath (Join-Path $TestDrive '.env.example') -Value @(
+            'CAPTAIN_TIMEZONE=Europe/Berlin'
+            'MARIADB_PASSWORD='
+            'MARIADB_ROOT_PASSWORD='
+            'N8N_MODE=owned'
+        )
+        Set-Content -LiteralPath (Join-Path $TestDrive '.env') -Value 'MARIADB_PASSWORD="keep-me"'
+
+        $result = Initialize-SetupConfiguration -Root $TestDrive -SecretPathValidator { $true }
+
+        $result.Status | Should -Be 'Ready'
+        $values = Read-DotEnv -Path (Join-Path $TestDrive '.env')
+        $values.MARIADB_PASSWORD | Should -Be 'keep-me'
+        $values.MARIADB_ROOT_PASSWORD.Length | Should -BeGreaterOrEqual 40
+    }
+
+    It 'reports incomplete when any supplied health probe fails' {
+        $result = Get-CaptainSystemStatus -Root $TestDrive -HealthProbes @(
+            { New-SetupResult -Component 'Captain' -Status 'Ready' -Message 'ok' -Remediation 'None' },
+            { New-SetupResult -Component 'Minibook' -Status 'Failed' -Message 'down' -Remediation 'Retry' }
+        )
+
+        $result.Status | Should -Be 'Failed'
+        $result.Data.Results.Count | Should -Be 2
+    }
+}
+
+Describe 'Lifecycle entry points' {
+    It 'provides every root command' {
+        $root = Resolve-Path "$PSScriptRoot/../.."
+
+        foreach ($scriptName in @('setup.ps1', 'start.ps1', 'stop.ps1', 'status.ps1', 'repair.ps1')) {
+            Test-Path (Join-Path $root $scriptName) | Should -BeTrue
+        }
+    }
 }
 
 Describe 'Components' {
