@@ -129,6 +129,20 @@ Lifecycle: `work_batch` → `batch_claim` → (`codex_task` → `codex_session` 
 `deploy` → `validation_run`) ×1..3 → `batch_done`. Children hang off the batch
 via `parent_index`.
 
+### Validation semantics (derived, tree-rollup)
+
+The ledger is a TREE over the chain: `project` → N `work_batch` branch points
+(one per built agent) → each branch carries that agent's full build + test
+history. "Validated" is a DERIVED predicate, never a mutated field (hash
+stability): an agent's branch is validated ⇔ its subtree contains a
+`batch_done: succeeded` whose `validation_run` shows all holdout E2E cases
+green. Roll-up rule, applied recursively: **a parent node is validated ⇔ all
+its child branches are validated** — this week that is one level (project
+validated ⇔ all 3 batches succeeded, derived by the gateway, shown in
+Minibook as the tree turning green bottom-up); deeper agent hierarchies
+(agents building sub-agents) attach as further branch levels under the same
+rule, with `decompose`'s existing depth/`atomic` output as the natural seam.
+
 ### Claim fencing (review finding: double-execution was guaranteed without this)
 
 - `POST /batches/{id}/claim` returns a **claim_token**; initial expiry **90 min**.
