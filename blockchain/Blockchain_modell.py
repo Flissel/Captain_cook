@@ -6,6 +6,7 @@ results, ...) never require changing Block or Blockchain — callers just
 pick a new ``block_type`` and shape ``data`` however they need.
 """
 import hashlib
+import json
 from typing import Any, Dict, List, Optional
 
 from .storage import LedgerStorage, JSONFileStorage
@@ -35,11 +36,20 @@ class Block:
         self.hash = hash or self.compute_hash()
 
     def compute_hash(self) -> str:
-        block_string = (
-            f"{self.index}{self.block_type}{self.data}{self.status}"
-            f"{self.previous_hash}{self.parent_index}{self.children}"
+        immutable_payload = {
+            "index": self.index,
+            "block_type": self.block_type,
+            "data": self.data,
+            "previous_hash": self.previous_hash,
+            "parent_index": self.parent_index,
+        }
+        block_string = json.dumps(
+            immutable_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
         )
-        return hashlib.sha256(block_string.encode()).hexdigest()
+        return hashlib.sha256(block_string.encode("utf-8")).hexdigest()
 
     def to_dict(self) -> Dict[str, Any]:
         return dict(self.__dict__)
@@ -108,7 +118,6 @@ class Blockchain:
         if parent_index is not None:
             parent_block = self.chain[parent_index]
             parent_block.children.append(new_block.index)
-            parent_block.hash = parent_block.compute_hash()  # Recompute parent hash
 
         self.chain.append(new_block)
         self._save()
@@ -134,7 +143,6 @@ class Blockchain:
         if block is None:
             raise IndexError(f"No block at index {index}")
         block.status = status
-        block.hash = block.compute_hash()
         self._save()
         return block
 
