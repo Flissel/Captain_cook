@@ -26,8 +26,9 @@ $hermesConfig = Read-DotEnv -Path (Join-Path $hermesHome '.env')
 
 Test-AcceptanceItem 'Captain Offline-Demo' {
     $python = Join-Path $root '.venv/Scripts/python.exe'
-    & $python (Join-Path $root 'main.py') demo --output (Join-Path $root 'artifacts/demo-run.json') *> $null
-    $LASTEXITCODE -eq 0 -and (Test-Path (Join-Path $root 'artifacts/demo-run.json'))
+    $output = Join-Path $root '.captain-cook/acceptance-demo-run.json'
+    & $python (Join-Path $root 'main.py') demo --output $output *> $null
+    $LASTEXITCODE -eq 0 -and (Test-Path $output)
 }
 Test-AcceptanceItem 'Hermes CLI' {
     & (Join-Path $root '.captain-cook/hermes/Scripts/hermes.exe') --help *> $null

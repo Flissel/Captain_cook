@@ -211,7 +211,7 @@ function Get-CaptainSystemStatus {
     if ($null -eq $HealthProbes) {
         $config = Read-DotEnv -Path (Join-Path $Root '.env')
         $HealthProbes = @(
-            { if (Test-Path (Join-Path $Root 'artifacts/demo-run.json')) { New-SetupResult 'Captain' Ready 'Offline-Demo verifiziert.' None } else { New-SetupResult 'Captain' Failed 'Offline-Demo fehlt.' Retry } },
+            { if (Test-Path (Join-Path $Root '.captain-cook/demo-run.json')) { New-SetupResult 'Captain' Ready 'Offline-Demo verifiziert.' None } else { New-SetupResult 'Captain' Failed 'Offline-Demo fehlt.' Retry } },
             { Test-HttpService -Name 'Minibook' -Uri "$($config.MINIBOOK_BACKEND_URL)/health" },
             { Test-HttpService -Name 'Mailpit' -Uri "http://localhost:$($config.MAILPIT_WEB_PORT)/api/v1/info" },
             { Test-HttpService -Name 'n8n' -Uri "$([string]$config.N8N_URL.TrimEnd('/'))/healthz" }

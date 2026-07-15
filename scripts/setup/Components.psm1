@@ -19,7 +19,7 @@ function Install-Captain {
         [scriptblock] $HealthCheck = {
             param($candidateRoot)
             (Test-Path (Join-Path $candidateRoot '.venv/Scripts/python.exe')) -and
-            (Test-Path (Join-Path $candidateRoot 'artifacts/demo-run.json'))
+            (Test-Path (Join-Path $candidateRoot '.captain-cook/demo-run.json'))
         },
         [scriptblock] $CommandRunner = { param($commandPath, $commandArguments, $commandDirectory) Common\Invoke-SetupCommand -FilePath $commandPath -ArgumentList $commandArguments -WorkingDirectory $commandDirectory }
     )
@@ -29,7 +29,7 @@ function Install-Captain {
     $commands = @(
         @('python', @('-m', 'venv', (Join-Path $Root '.venv'))),
         @($venvPython, @('-m', 'pip', 'install', '-r', (Join-Path $Root 'requirements.txt'))),
-        @($venvPython, @((Join-Path $Root 'main.py'), 'demo', '--output', (Join-Path $Root 'artifacts/demo-run.json')))
+        @($venvPython, @((Join-Path $Root 'main.py'), 'demo', '--output', (Join-Path $Root '.captain-cook/demo-run.json')))
     )
     foreach ($command in $commands) {
         $result = Invoke-ComponentCommand $CommandRunner $command[0] $command[1] $Root
