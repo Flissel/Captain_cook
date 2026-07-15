@@ -5,9 +5,9 @@ Import-Module (Join-Path $PSScriptRoot 'Common.psm1')
 Import-Module (Join-Path $PSScriptRoot 'Configuration.psm1')
 
 function Invoke-ComponentCommand {
-    param([scriptblock] $CommandRunner, [string] $FilePath, [string[]] $ArgumentList, [string] $WorkingDirectory)
+    param([scriptblock] $Runner, [string] $Executable, [string[]] $Arguments, [string] $Directory)
 
-    $result = & $CommandRunner $FilePath $ArgumentList $WorkingDirectory
+    $result = & $Runner $Executable $Arguments $Directory
     if ($null -eq $result) { return [pscustomobject]@{ ExitCode = 0; Output = '' } }
     $result
 }
@@ -16,8 +16,12 @@ function Install-Captain {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string] $Root,
-        [scriptblock] $HealthCheck = { param($candidateRoot) Test-Path (Join-Path $candidateRoot 'artifacts/demo-run.json') },
-        [scriptblock] $CommandRunner = { param($filePath, $argumentList, $workingDirectory) Invoke-SetupCommand -FilePath $filePath -ArgumentList $argumentList -WorkingDirectory $workingDirectory }
+        [scriptblock] $HealthCheck = {
+            param($candidateRoot)
+            (Test-Path (Join-Path $candidateRoot '.venv/Scripts/python.exe')) -and
+            (Test-Path (Join-Path $candidateRoot 'artifacts/demo-run.json'))
+        },
+        [scriptblock] $CommandRunner = { param($commandPath, $commandArguments, $commandDirectory) Common\Invoke-SetupCommand -FilePath $commandPath -ArgumentList $commandArguments -WorkingDirectory $commandDirectory }
     )
 
     if (& $HealthCheck $Root) { return New-SetupResult -Component 'Captain Cook' -Status 'Ready' -Message 'Captain Cook ist bereits verifiziert.' -Remediation 'None' }
@@ -39,7 +43,7 @@ function Install-Hermes {
     param(
         [Parameter(Mandatory)][string] $Root,
         [scriptblock] $HealthCheck = { param($candidateRoot) Test-Path (Join-Path $candidateRoot '.captain-cook/hermes/Scripts/hermes.exe') },
-        [scriptblock] $CommandRunner = { param($filePath, $argumentList, $workingDirectory) Invoke-SetupCommand -FilePath $filePath -ArgumentList $argumentList -WorkingDirectory $workingDirectory }
+        [scriptblock] $CommandRunner = { param($commandPath, $commandArguments, $commandDirectory) Common\Invoke-SetupCommand -FilePath $commandPath -ArgumentList $commandArguments -WorkingDirectory $commandDirectory }
     )
 
     if (& $HealthCheck $Root) { return New-SetupResult -Component 'Hermes' -Status 'Ready' -Message 'Hermes ist bereits installiert.' -Remediation 'None' }
@@ -64,8 +68,12 @@ function Install-Minibook {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string] $Root,
-        [scriptblock] $HealthCheck = { $false },
-        [scriptblock] $CommandRunner = { param($filePath, $argumentList, $workingDirectory) Invoke-SetupCommand -FilePath $filePath -ArgumentList $argumentList -WorkingDirectory $workingDirectory }
+        [scriptblock] $HealthCheck = {
+            param($candidateRoot)
+            (Test-Path (Join-Path $candidateRoot 'minibook/.venv/Scripts/python.exe')) -and
+            (Test-Path (Join-Path $candidateRoot 'minibook/frontend/.next'))
+        },
+        [scriptblock] $CommandRunner = { param($commandPath, $commandArguments, $commandDirectory) Common\Invoke-SetupCommand -FilePath $commandPath -ArgumentList $commandArguments -WorkingDirectory $commandDirectory }
     )
 
     if (& $HealthCheck $Root) { return New-SetupResult -Component 'Minibook' -Status 'Ready' -Message 'Minibook ist bereits verifiziert.' -Remediation 'None' }
@@ -77,8 +85,8 @@ function Install-Minibook {
     $commands = @(
         @('python', @('-m', 'venv', $venv), $source),
         @($python, @('-m', 'pip', 'install', '-r', (Join-Path $source 'requirements.txt')), $source),
-        @('npm', @($npmVerb), $frontend),
-        @('npm', @('run', 'build'), $frontend)
+        @('npm.cmd', @($npmVerb), $frontend),
+        @('npm.cmd', @('run', 'build'), $frontend)
     )
     foreach ($command in $commands) {
         $result = Invoke-ComponentCommand $CommandRunner $command[0] $command[1] $command[2]
@@ -100,6 +108,25 @@ function Install-MinibookSkill {
     New-SetupResult -Component 'Minibook Skill' -Status 'Ready' -Message 'Der Minibook Skill ist im Hermes-Profil installiert.' -Remediation 'None'
 }
 
+function Initialize-MinibookConfiguration {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $Root,
+        [Parameter(Mandatory)][uri] $BackendUrl,
+        [Parameter(Mandatory)][uri] $PublicUrl
+    )
+
+    $port = if ($BackendUrl.IsDefaultPort) { if ($BackendUrl.Scheme -eq 'https') { 443 } else { 80 } } else { $BackendUrl.Port }
+    $directory = Join-Path $Root 'minibook'
+    New-Item -ItemType Directory -Force -Path (Join-Path $directory 'data') | Out-Null
+    @(
+        "public_url: `"$($PublicUrl.AbsoluteUri.TrimEnd('/'))`""
+        "port: $port"
+        'database: "data/minibook.db"'
+    ) | Set-Content -LiteralPath (Join-Path $directory 'config.yaml') -Encoding utf8
+    New-SetupResult -Component 'Minibook Configuration' -Status 'Ready' -Message 'Minibook ist für die lokalen Setup-Ports konfiguriert.' -Remediation 'None'
+}
+
 function Register-HermesIdentity {
     [CmdletBinding()]
     param(
@@ -112,6 +139,40 @@ function Register-HermesIdentity {
     catch { return New-SetupResult -Component 'Hermes Identity' -Status 'Failed' -Message 'Hermes konnte nicht bei Minibook registriert werden.' -Remediation 'Retry' }
     if ($null -eq $identity -or [string]::IsNullOrWhiteSpace([string]$identity.api_key)) { return New-SetupResult -Component 'Hermes Identity' -Status 'Failed' -Message 'Minibook hat keinen API-Key geliefert.' -Remediation 'Retry' }
     New-SetupResult -Component 'Hermes Identity' -Status 'Ready' -Message 'Hermes wurde bei Minibook registriert.' -Remediation 'None' -Data @{ ApiKey = $identity.api_key }
+}
+
+function Get-AvailableMinibookAgentName {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][uri] $BaseUrl,
+        [string] $PreferredName = 'Hermes',
+        [scriptblock] $AgentListProvider = { param($url) Invoke-RestMethod -Uri "$url/api/v1/agents" -TimeoutSec 10 },
+        [scriptblock] $AlternateNameProvider = {
+            $machine = ($env:COMPUTERNAME -replace '[^A-Za-z0-9_-]', '-')
+            $defaultName = "Hermes-Captain-$machine"
+            if (Test-InteractiveSession) {
+                $answer = Read-Host "Der Name 'Hermes' ist bereits vergeben. Alternativer Name [$defaultName]"
+                if ($answer) { return $answer }
+            }
+            $defaultName
+        }
+    )
+
+    $agents = & $AgentListProvider $BaseUrl.AbsoluteUri.TrimEnd('/')
+    $taken = [Collections.Generic.List[string]]::new()
+    foreach ($agent in [object[]]$agents) {
+        if ($null -ne $agent -and -not [string]::IsNullOrWhiteSpace([string]$agent.name)) {
+            $taken.Add([string]$agent.name)
+        }
+    }
+    if ($PreferredName -notin $taken) { return $PreferredName }
+    $candidate = [string](& $AlternateNameProvider)
+    $candidate = ($candidate.Trim() -replace '[^A-Za-z0-9 _-]', '-')
+    if ([string]::IsNullOrWhiteSpace($candidate)) { $candidate = 'Hermes-Captain' }
+    $base = $candidate
+    $suffix = 2
+    while ($candidate -in $taken) { $candidate = "$base-$suffix"; $suffix++ }
+    $candidate
 }
 
 function Save-HermesMinibookCredential {
@@ -131,6 +192,8 @@ Export-ModuleMember -Function @(
     'Install-Hermes',
     'Install-Minibook',
     'Install-MinibookSkill',
+    'Initialize-MinibookConfiguration',
     'Register-HermesIdentity',
+    'Get-AvailableMinibookAgentName',
     'Save-HermesMinibookCredential'
 )

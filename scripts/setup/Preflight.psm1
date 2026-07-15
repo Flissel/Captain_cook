@@ -108,7 +108,7 @@ function Test-SetupNetwork {
 function Test-DockerRuntime {
     [CmdletBinding()]
     param(
-        [scriptblock] $CommandRunner = { param($filePath, $argumentList) Invoke-SetupCommand -FilePath $filePath -ArgumentList $argumentList }
+        [scriptblock] $CommandRunner = { param($commandPath, $commandArguments) Common\Invoke-SetupCommand -FilePath $commandPath -ArgumentList $commandArguments }
     )
 
     $engine = & $CommandRunner 'docker' @('info')
@@ -130,7 +130,7 @@ function Install-SetupPrerequisite {
     param(
         [Parameter(Mandatory)][string] $Name,
         [Parameter(Mandatory)][scriptblock] $ConfirmInstall,
-        [scriptblock] $CommandRunner = { param($filePath, $argumentList) Invoke-SetupCommand -FilePath $filePath -ArgumentList $argumentList }
+        [scriptblock] $CommandRunner = { param($commandPath, $commandArguments) Common\Invoke-SetupCommand -FilePath $commandPath -ArgumentList $commandArguments }
     )
 
     if (-not $script:ApprovedPackages.ContainsKey($Name)) {

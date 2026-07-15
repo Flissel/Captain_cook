@@ -85,6 +85,26 @@ Describe 'Lifecycle entry points' {
     }
 }
 
+Describe 'Onboarding documentation' {
+    It 'documents the only setup command and all lifecycle commands' {
+        $readme = Get-Content "$PSScriptRoot/../../README.md" -Raw
+
+        foreach ($command in @('.\setup.ps1', '.\start.ps1', '.\stop.ps1', '.\status.ps1', '.\repair.ps1')) {
+            $readme | Should -Match ([regex]::Escape($command))
+        }
+    }
+
+    It 'warns that lifecycle commands never delete Docker volumes' {
+        $readme = Get-Content "$PSScriptRoot/../../README.md" -Raw
+
+        $readme | Should -Match 'Docker-Volumes.*nie.*gelöscht'
+    }
+
+    It 'ships an executable acceptance script' {
+        Test-Path "$PSScriptRoot/../acceptance/setup-smoke.ps1" | Should -BeTrue
+    }
+}
+
 Describe 'Components' {
     It 'skips Captain dependency installation after a healthy check' {
         $calls = [Collections.Generic.List[object]]::new()
@@ -96,6 +116,20 @@ Describe 'Components' {
 
         $result.Status | Should -Be 'Ready'
         $calls.Count | Should -Be 0
+    }
+
+    It 'does not treat a committed demo artifact as an installed Captain runtime' {
+        New-Item -ItemType Directory -Force -Path (Join-Path $TestDrive 'artifacts') | Out-Null
+        Set-Content -LiteralPath (Join-Path $TestDrive 'artifacts/demo-run.json') -Value '{}'
+        $calls = [Collections.Generic.List[string]]::new()
+
+        Install-Captain -Root $TestDrive -CommandRunner {
+            param($commandPath, $commandArguments, $commandDirectory)
+            $calls.Add($commandPath)
+            [pscustomobject]@{ ExitCode = 0; Output = 'ok' }
+        } | Out-Null
+
+        $calls.Count | Should -BeGreaterThan 0
     }
 
     It 'installs Hermes from the checked-out local source' {
@@ -136,6 +170,54 @@ Describe 'Components' {
         $result.Status | Should -Be 'Ready'
         (Get-Content (Join-Path $destination 'SKILL.md') -Raw) | Should -Match 'Minibook'
     }
+
+    It 'uses the Windows npm command shim for Minibook' {
+        New-Item -ItemType Directory -Force -Path (Join-Path $TestDrive 'minibook/frontend') | Out-Null
+        Set-Content -LiteralPath (Join-Path $TestDrive 'minibook/requirements.txt') -Value 'fastapi'
+        Set-Content -LiteralPath (Join-Path $TestDrive 'minibook/frontend/package-lock.json') -Value '{}'
+        $calls = [Collections.Generic.List[object]]::new()
+
+        Install-Minibook -Root $TestDrive -CommandRunner {
+            param($commandPath, $commandArguments, $commandDirectory)
+            $calls.Add([pscustomobject]@{ FilePath = $commandPath; Arguments = $commandArguments })
+            [pscustomobject]@{ ExitCode = 0; Output = 'ok' }
+        } | Out-Null
+
+        @($calls.FilePath | Where-Object { $_ -like 'npm*' } | Select-Object -Unique) | Should -Be @('npm.cmd')
+    }
+
+    It 'skips an already built Minibook installation by default' {
+        New-Item -ItemType Directory -Force -Path (Join-Path $TestDrive 'minibook/.venv/Scripts') | Out-Null
+        New-Item -ItemType Directory -Force -Path (Join-Path $TestDrive 'minibook/frontend/.next') | Out-Null
+        New-Item -ItemType File -Force -Path (Join-Path $TestDrive 'minibook/.venv/Scripts/python.exe') | Out-Null
+        $calls = [Collections.Generic.List[string]]::new()
+
+        $result = Install-Minibook -Root $TestDrive -CommandRunner {
+            param($commandPath, $commandArguments, $commandDirectory)
+            $calls.Add($commandPath)
+            [pscustomobject]@{ ExitCode = 0; Output = 'ok' }
+        }
+
+        $result.Status | Should -Be 'Ready'
+        $calls.Count | Should -Be 0
+    }
+
+    It 'writes the Minibook backend configuration from setup values' {
+        $result = Initialize-MinibookConfiguration -Root $TestDrive -BackendUrl 'http://localhost:3456' -PublicUrl 'http://localhost:3457'
+
+        $result.Status | Should -Be 'Ready'
+        $content = Get-Content (Join-Path $TestDrive 'minibook/config.yaml') -Raw
+        $content | Should -Match 'port: 3456'
+        $content | Should -Match 'public_url: "http://localhost:3457"'
+    }
+
+    It 'offers a safe alternate Minibook agent name when Hermes is taken' {
+        $name = Get-AvailableMinibookAgentName -BaseUrl 'http://localhost:3457' -PreferredName 'Hermes' -AgentListProvider {
+            Write-Output -NoEnumerate @([pscustomobject]@{ name = 'Hermes' })
+        } -AlternateNameProvider { 'Hermes-Captain-PC' }
+
+        $name | Should -Be 'Hermes-Captain-PC'
+    }
 }
 
 Describe 'Services' {
@@ -167,10 +249,34 @@ Describe 'Services' {
     }
 
     It 'reports an unhealthy public endpoint as retryable' {
-        $result = Test-HttpService -Name 'Mailpit' -Uri 'http://localhost:8025/api/v1/info' -Probe { $false }
+        $result = Test-HttpService -Name 'Mailpit' -Uri 'http://localhost:8025/api/v1/info' -AttemptCount 1 -Probe { $false }
 
         $result.Status | Should -Be 'Failed'
         $result.Remediation | Should -Be 'Retry'
+    }
+
+    It 'retries a transient public endpoint failure' {
+        $state = [pscustomobject]@{ Attempts = 0 }
+
+        $result = Test-HttpService -Name 'Mailpit' -Uri 'http://localhost:8025/api/v1/info' -AttemptCount 3 -DelayMilliseconds 0 -Probe {
+            $state.Attempts++
+            $state.Attempts -ge 2
+        }
+
+        $result.Status | Should -Be 'Ready'
+        $state.Attempts | Should -Be 2
+    }
+
+    It 'does not expose the database password in process arguments' {
+        $calls = [Collections.Generic.List[object]]::new()
+
+        Test-MariaDbService -Root $TestDrive -User 'captain' -Password 'top-secret-value' -CommandRunner {
+            param($filePath, $argumentList)
+            $calls.Add([pscustomobject]@{ ArgumentList = $argumentList })
+            [pscustomobject]@{ ExitCode = 0; Output = '1' }
+        } | Out-Null
+
+        $calls[0].ArgumentList -join ' ' | Should -Not -Match 'top-secret-value'
     }
 }
 

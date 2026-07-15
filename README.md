@@ -4,6 +4,64 @@
 
 This repository contains a working, offline vertical slice for the OpenAI Build Week **Developer Tools** track. It is intentionally honest about the boundary: the deterministic orchestration demo works today; the larger Captain → Hermes → Codex delivery fleet is a documented roadmap, not a claim about the current runtime.
 
+## Einfache Einrichtung unter Windows 11
+
+Öffne PowerShell 7 im Projektordner und starte genau einen Befehl:
+
+```powershell
+.\setup.ps1
+```
+
+Der Assistent prüft Windows, Git, Python, Node.js und Docker. Falls etwas
+fehlt, erklärt er den Grund und fragt vor jeder Installation nach. Danach
+richtet er Captain Cook, Hermes Agent, Minibook, Mailpit, MariaDB und n8n ein,
+startet die lokalen Dienste und prüft ihre öffentlichen Schnittstellen. Ein
+abgebrochener Lauf wird gespeichert; derselbe Befehl setzt beim ersten
+unvollständigen Schritt fort.
+
+API-Keys werden nur abgefragt, wenn die jeweilige optionale Integration sie
+benötigt. Passwörter werden verborgen eingegeben oder sicher erzeugt und nur
+in der von Git ignorierten `.env` beziehungsweise im lokalen Hermes-Profil
+gespeichert. Sie erscheinen nicht in den Setup-Logs.
+
+Nach der Einrichtung verwendest du:
+
+```powershell
+.\start.ps1
+.\status.ps1
+.\status.ps1 -Detailed
+.\repair.ps1
+.\stop.ps1
+```
+
+- Minibook: `http://localhost:3457`
+- Mailpit: `http://localhost:8025`
+- n8n: standardmäßig `http://localhost:5678`; bei einer übernommenen externen
+  Instanz steht die Adresse in `.env`.
+
+`start.ps1` und `stop.ps1` steuern ausschließlich Captain-eigene Prozesse und
+Container. Eine übernommene n8n-Instanz wird weder gestartet noch gestoppt.
+Docker-Volumes werden durch die Lifecycle-Befehle nie gelöscht.
+
+### Wenn etwas nicht funktioniert
+
+Starte zunächst:
+
+```powershell
+.\status.ps1 -Detailed
+.\repair.ps1
+```
+
+`Missing` bedeutet, dass ein benötigtes Programm fehlt. `Configure` weist auf
+eine fehlende oder abgelehnte lokale Einstellung hin. `Retry` bedeutet, dass
+ein Dienst noch nicht erreichbar ist und erneut geprüft werden kann. Logs und
+Fortschritt liegen in `.captain-cook/`; der Ordner wird nicht committed und
+enthält keine Zugangsdaten. Das Setup beendet keine fremden Prozesse bei einem
+Portkonflikt, sondern zeigt den belegten Port zur manuellen Klärung an.
+
+Fortgeschrittene Nutzer können die bisherigen manuellen Schritte weiterhin
+verwenden. Für neue Nutzer ist `.\setup.ps1` der unterstützte Einstieg.
+
 ## See it work in 90 seconds
 
 ```text

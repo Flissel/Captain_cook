@@ -34,16 +34,19 @@ function Invoke-SetupCommand {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [string] $FilePath,
+        [Alias('FilePath')]
+        [string] $Executable,
 
-        [string[]] $ArgumentList = @(),
+        [Alias('ArgumentList')]
+        [string[]] $Arguments = @(),
 
-        [string] $WorkingDirectory = $PWD.Path
+        [Alias('WorkingDirectory')]
+        [string] $Directory = $PWD.Path
     )
 
-    Push-Location $WorkingDirectory
+    Push-Location $Directory
     try {
-        $output = & $FilePath @ArgumentList 2>&1
+        $output = & $Executable @Arguments 2>&1
         [pscustomobject]@{
             ExitCode = $LASTEXITCODE
             Output   = $output -join [Environment]::NewLine

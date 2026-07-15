@@ -110,6 +110,10 @@ function Start-ManagedProcess {
 
 function Start-MinibookProcesses {
     param([string] $Root, [hashtable] $Configuration)
+    if ((Wait-SetupEndpoint -Uri "$($Configuration.MINIBOOK_BACKEND_URL)/health" -TimeoutSeconds 2) -and
+        (Wait-SetupEndpoint -Uri "$($Configuration.MINIBOOK_PUBLIC_URL)/api/v1/version" -TimeoutSeconds 2)) {
+        return
+    }
     $runtime = Join-Path $Root '.captain-cook/runtime'
     $minibook = Join-Path $Root 'minibook'
     Start-ManagedProcess -Name 'minibook-backend' -FilePath (Join-Path $minibook '.venv/Scripts/python.exe') -Arguments @('run.py') -WorkingDirectory $minibook -RuntimeDirectory $runtime
@@ -148,9 +152,10 @@ function Initialize-MinibookIdentity {
     $hermesEnv = Read-DotEnv -Path (Join-Path $hermesHome '.env')
     $existingKey = if ($hermesEnv.ContainsKey('MINIBOOK_API_KEY')) { [string]$hermesEnv.MINIBOOK_API_KEY } else { '' }
     $headers = if ($existingKey) { @{ Authorization = "Bearer $existingKey" } } else { @{} }
-    $isValid = try { (Invoke-RestMethod -Uri "$baseUrl/api/v1/agents/me" -Headers $headers -TimeoutSec 10).name -eq 'Hermes' } catch { $false }
+    $isValid = try { -not [string]::IsNullOrWhiteSpace([string](Invoke-RestMethod -Uri "$baseUrl/api/v1/agents/me" -Headers $headers -TimeoutSec 10).name) } catch { $false }
     if (-not $isValid) {
-        try { $identity = Invoke-RestMethod -Method Post -Uri "$baseUrl/api/v1/agents" -ContentType 'application/json' -Body (@{name='Hermes'} | ConvertTo-Json) -TimeoutSec 10 }
+        $agentName = Get-AvailableMinibookAgentName -BaseUrl $baseUrl
+        try { $identity = Invoke-RestMethod -Method Post -Uri "$baseUrl/api/v1/agents" -ContentType 'application/json' -Body (@{name=$agentName} | ConvertTo-Json) -TimeoutSec 10 }
         catch { return New-SetupResult -Component 'Hermes Identity' -Status 'Failed' -Message "Hermes konnte nicht bei Minibook registriert werden: $($_.Exception.Message)" -Remediation 'Retry' }
         Save-HermesMinibookCredential -HermesHome $hermesHome -BaseUrl $baseUrl -ApiKey $identity.api_key | Out-Null
     }
@@ -180,8 +185,9 @@ function Invoke-DefaultSetupStage {
             $result = Install-Minibook -Root $root
             if ($result.Status -ne 'Ready') { return [pscustomobject]@{Status='Failed';Message=$result.Message} }
             $config = Read-DotEnv -Path (Join-Path $root '.env')
+            Initialize-MinibookConfiguration -Root $root -BackendUrl $config.MINIBOOK_BACKEND_URL -PublicUrl $config.MINIBOOK_PUBLIC_URL | Out-Null
             Start-MinibookProcesses -Root $root -Configuration $config
-            if (-not (Wait-SetupEndpoint -Uri "$($config.MINIBOOK_PUBLIC_URL)/health")) { return [pscustomobject]@{Status='Failed';Message='Minibook wurde gestartet, antwortet aber nicht.'} }
+            if (-not (Wait-SetupEndpoint -Uri "$($config.MINIBOOK_BACKEND_URL)/health")) { return [pscustomobject]@{Status='Failed';Message='Minibook wurde gestartet, antwortet aber nicht.'} }
             $identity = Initialize-MinibookIdentity -Root $root -Configuration $config
             if ($identity.Status -ne 'Ready') { return [pscustomobject]@{Status='Failed';Message=$identity.Message} }
         }
@@ -206,9 +212,9 @@ function Get-CaptainSystemStatus {
         $config = Read-DotEnv -Path (Join-Path $Root '.env')
         $HealthProbes = @(
             { if (Test-Path (Join-Path $Root 'artifacts/demo-run.json')) { New-SetupResult 'Captain' Ready 'Offline-Demo verifiziert.' None } else { New-SetupResult 'Captain' Failed 'Offline-Demo fehlt.' Retry } },
-            { Test-HttpService -Name 'Minibook' -Uri "$($config.MINIBOOK_PUBLIC_URL)/health" },
+            { Test-HttpService -Name 'Minibook' -Uri "$($config.MINIBOOK_BACKEND_URL)/health" },
             { Test-HttpService -Name 'Mailpit' -Uri "http://localhost:$($config.MAILPIT_WEB_PORT)/api/v1/info" },
-            { Test-HttpService -Name 'n8n' -Uri $config.N8N_URL }
+            { Test-HttpService -Name 'n8n' -Uri "$([string]$config.N8N_URL.TrimEnd('/'))/healthz" }
         )
     }
     $results = @($HealthProbes | ForEach-Object { & $_ })
