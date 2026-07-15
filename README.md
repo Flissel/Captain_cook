@@ -40,6 +40,40 @@ The command writes [artifacts/demo-run.json](artifacts/demo-run.json), a compact
 - A sole-writer ledger recorder and state-machine transitions for an auditable run.
 - An offline CLI demo and committed run evidence.
 
+## Run the standalone Captain planner
+
+The Captain can turn a UTF-8 project description into executor-neutral,
+versioned work contracts without starting Hermes, n8n, or another delivery
+runtime. Configure the capability vocabulary explicitly; the model may group
+and enrich work but cannot choose the target or invent capability tags.
+
+```powershell
+python -m agenten.planning.cli docs/superpowers/specs/2026-07-15-hackathon-pipeline-design.md `
+  --capability planning `
+  --capability delivery `
+  --target external `
+  --output artifacts/captain-release
+```
+
+The command uses `CAPTAIN_MODEL` (default `gpt-5.6`) and `OPENAI_API_KEY`.
+It writes build-visible contracts to `batches/<batch-id>.json` and hidden
+evaluation inputs to `holdouts/<batch-id>.json`. Releases are idempotent:
+re-running identical output succeeds, while conflicting content for an
+existing batch id fails instead of overwriting the contract.
+
+Captain planning enforces these rules deterministically after every model
+response:
+
+- every decomposed subtask appears in exactly one batch;
+- batch ids and dependency references are valid;
+- the dependency graph is acyclic and released in topological order;
+- acceptance criteria use a closed, observable assertion vocabulary;
+- golden examples and holdout cases remain separate.
+
+External executors integrate by implementing the small `BatchReleaseClient`
+protocol in `agenten/planning/captain_pipeline.py`. The Captain repository does
+not implement or operate those external systems.
+
 ## Roadmap boundary
 
 The submission demo does **not** yet include a FastAPI/MariaDB ledger gateway, Hermes workers that drive Codex CLI, n8n deployment, Mailpit validation, or Minibook mirroring. Those integrations are designed in [the delivery-fleet specification](docs/superpowers/specs/2026-07-15-hackathon-pipeline-design.md) and deliberately kept separate from claims about the runnable demo.
@@ -52,6 +86,38 @@ python scripts/verify_submission.py
 ```
 
 The first command runs the engineering regression suite. The second verifies that the judge-facing documentation and committed evidence artifact are present and well-formed. See [docs/MCP_SETUP.md](docs/MCP_SETUP.md) for the development-time Playwright, Context7, and n8n MCP boundaries.
+
+## Local delivery services
+
+Captain Cook reuses the existing VibeMind n8n instance and owns only Mailpit
+and MariaDB. This keeps VibeMind's workflows, credentials, encryption key, and
+`voice_vibemind-n8n-data` volume under the VibeMind project's control.
+
+Prerequisites are Docker Desktop and the existing VibeMind checkout at
+`C:\Users\User\Desktop\Vibemind_V1\vibemind-os\voice`. Copy the delivery
+values from `.env.example` into the gitignored `.env` and replace both MariaDB
+password placeholders with different random values. Then start and verify the
+complete local stack:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/start_delivery_stack.ps1
+```
+
+| Service | Local endpoint | Ownership |
+| --- | --- | --- |
+| n8n | http://localhost:15678 | Existing VibeMind Compose project |
+| Mailpit | http://localhost:8025 (SMTP `localhost:1025`) | Captain Cook |
+| MariaDB | `localhost:3306`, database `ledger` | Captain Cook |
+
+Run the non-destructive checks again at any time with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/verify_delivery_stack.ps1
+```
+
+Stop Captain Cook's services with `docker compose down`. Do not run
+`docker compose down -v`: it deletes the Captain ledger volume. Captain Cook's
+scripts never delete or adopt either existing n8n volume.
 
 ## How Codex and GPT-5.6 fit
 
