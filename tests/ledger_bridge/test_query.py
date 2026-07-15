@@ -12,6 +12,7 @@ from blockchain.Blockchain_modell import Blockchain
 from blockchain.storage import InMemoryStorage
 
 from agenten.decomposition.budget import DecompositionBudget
+from agenten.events.schemas import SubproblemUnroutable, topic_for
 from agenten.ledger_bridge.query import (
     InProcessBudgetLedger,
     LedgerQueryImpl,
@@ -134,7 +135,8 @@ def test_recorder_module_imports_cleanly_without_autogen_core():
     assert recorder_module.LedgerRecorderRoutedAgent is None
     # And the core class + RECORDER_TOPICS are still fully usable.
     assert recorder_module.LedgerRecorderAgent is not None
-    assert len(recorder_module.RECORDER_TOPICS) == 9
+    assert len(recorder_module.RECORDER_TOPICS) == 10
+    assert topic_for(SubproblemUnroutable) in recorder_module.RECORDER_TOPICS
 
 
 def test_recorder_module_wires_routed_agent_adapter_when_autogen_core_present(monkeypatch):

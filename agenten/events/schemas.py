@@ -148,6 +148,15 @@ class SubproblemFailed(BaseModel):
     retriable: bool = True
 
 
+class SubproblemUnroutable(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    meta: EventMeta
+    subproblem_id: str
+    capability_tags: List[str] = Field(default_factory=list)
+    error: str
+
+
 class LeaseExpired(BaseModel):
     model_config = ConfigDict(frozen=True)
 

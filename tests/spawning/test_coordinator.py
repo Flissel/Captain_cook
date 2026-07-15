@@ -14,6 +14,7 @@ from agenten.events.schemas import (
     RetryRequested,
     SubproblemAccepted,
     SubproblemAssigned,
+    SubproblemUnroutable,
     make_meta,
     topic_for,
 )
@@ -120,16 +121,21 @@ async def test_block_index_none_is_ignored():
 
 
 @pytest.mark.asyncio
-async def test_unroutable_capability_logs_and_does_not_crash(caplog):
+async def test_unroutable_capability_publishes_durable_outcome(caplog):
     ledger = FakeLedgerQuery()
     ledger.add(1, Stage.ACCEPTED, {"subproblem_id": "sp-1", "capability_tags": ["no-such-capability"]})
     coordinator, assigned, retried = make_coordinator(ledger)
+    unroutable = Collector(coordinator._bus, topic_for(SubproblemUnroutable))
 
     with caplog.at_level("ERROR"):
         await coordinator.handle_subproblem_accepted(make_accepted_event("sp-1", block_index=1))
 
     assert assigned.events == []
     assert retried.events == []
+    assert len(unroutable.events) == 1
+    assert unroutable.events[0].subproblem_id == "sp-1"
+    assert unroutable.events[0].capability_tags == ["no-such-capability"]
+    assert "No capable agent type" in unroutable.events[0].error
     assert any("No capable agent type" in rec.message for rec in caplog.records)
 
 

@@ -30,6 +30,7 @@ from agenten.events.schemas import (
     RetryRequested,
     SubproblemAccepted,
     SubproblemAssigned,
+    SubproblemUnroutable,
     make_meta,
     topic_for,
 )
@@ -185,18 +186,24 @@ class SpawnCoordinatorAgent:
         try:
             agent_type = self._registry.resolve(capability_tags)
         except NoCapableAgentType as exc:
-            # TODO: schemas.py has no event for "permanently unroutable
-            # subproblem" (e.g. a SubproblemFailed-shaped outcome), and
-            # inventing a new event type is out of scope for this unit.
-            # A human/Captain-level fallback for unroutable subproblems is
-            # a known gap — for now we log loudly and drop it rather than
-            # retry-looping forever against a capability that will never
-            # resolve.
             logger.error(
                 "No capable agent type for subproblem_id=%s capability_tags=%s: %s",
                 subproblem_id,
                 capability_tags,
                 exc,
+            )
+            await self._bus.publish(
+                topic_for(SubproblemUnroutable),
+                SubproblemUnroutable(
+                    meta=make_meta(
+                        correlation_id=subproblem_id,
+                        root_problem_id=root_problem_id,
+                        attempt=attempt,
+                    ),
+                    subproblem_id=subproblem_id,
+                    capability_tags=capability_tags,
+                    error=f"No capable agent type: {exc}",
+                ),
             )
             return
 

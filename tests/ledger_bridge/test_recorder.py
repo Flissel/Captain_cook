@@ -28,6 +28,7 @@ from agenten.events.schemas import (
     SubproblemFailed,
     SubproblemProposed,
     SubproblemRejected,
+    SubproblemUnroutable,
     WorkerHeartbeat,
     make_meta,
     topic_for,
@@ -126,6 +127,24 @@ async def complete(bus, subproblem_id, root_problem_id="root-1", result=None):
     )
 
 
+async def mark_unroutable(
+    bus,
+    subproblem_id,
+    root_problem_id="root-1",
+    capability_tags=None,
+    error="No capable agent type",
+):
+    await bus.publish(
+        topic_for(SubproblemUnroutable),
+        SubproblemUnroutable(
+            meta=make_meta(correlation_id=subproblem_id, root_problem_id=root_problem_id),
+            subproblem_id=subproblem_id,
+            capability_tags=capability_tags or ["missing-capability"],
+            error=error,
+        ),
+    )
+
+
 # ----------------------------------------------------------------------
 # Happy path
 # ----------------------------------------------------------------------
@@ -154,6 +173,31 @@ def test_happy_path_reaches_done():
         assert recorder.errors == []
 
     run(scenario())
+
+
+def test_unroutable_subproblem_is_persisted_as_terminal_failure():
+    async def scenario():
+        bus, blockchain, _budget_ledger, recorder = make_recorder()
+        await recorder.start()
+        await submit_problem(bus, "root-1")
+        await propose(bus, "s1")
+        await accept(bus, "s1")
+        await mark_unroutable(
+            bus,
+            "s1",
+            capability_tags=["missing-capability"],
+            error="No capable agent type for ['missing-capability']",
+        )
+        await recorder.stop()
+        return blockchain, recorder
+
+    blockchain, recorder = run(scenario())
+    block = blockchain.get_block(recorder._subproblem_index["s1"])
+    assert block.status == Stage.FAILED.value
+    assert block.metadata["failure_reason"] == "No capable agent type for ['missing-capability']"
+    assert block.metadata["unroutable_capability_tags"] == ["missing-capability"]
+    assert block.metadata["retriable"] is False
+    assert recorder.errors == []
 
 
 def test_subproblem_accepted_is_republished_with_real_block_index():

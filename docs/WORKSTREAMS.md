@@ -75,9 +75,9 @@ prompt file.
 ## Current next branch
 
 `feat/householder-runtime-contract` is complete and provides the reviewed
-manifest/executor/factory boundary. `feat/householder-runtime` is the active
-implementation branch; it remains deliberately offline and does not depend on
-MariaDB, n8n, Hermes, Codex CLI, or a real API key. Start
-`feat/ledger-gateway` after a local MariaDB test container is available.
-Preserve the offline demo as the judge-facing fallback until a live integration
-has separate evidence.
+manifest/executor/factory boundary. `feat/householder-runtime` remains the
+deterministic fallback path. `feat/ledger-gateway` now contains transactional
+MariaDB storage; its next owned contract is the FastAPI sole-writer surface,
+validation schemas, claim fencing, and terminal-state rejection against the
+local MariaDB test container. Preserve the offline demo as the judge-facing
+fallback until a live integration has separate evidence.
