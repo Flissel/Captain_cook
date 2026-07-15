@@ -1,6 +1,5 @@
-from autogen import ConversableAgent
-from new_struct.agenten.functions.relevance_scoring import score_relevance  # Relevanzbewertung
-from new_struct.agenten.functions.extract_content_from_url import extract_text_from_url  # Text-Extraktion aus URLs
+from agenten.functions.relevance_scoring import score_relevance  # Relevanzbewertung
+from agenten.functions.extract_content_from_url import extract_text_from_url  # Text-Extraktion aus URLs
 
 
 class NestedChatForURLEvaluation:
@@ -12,24 +11,12 @@ class NestedChatForURLEvaluation:
         self.captain = None
 
     def setup_agents(self):
-        # Setup der Captain-Agenten
-        self.captain = ConversableAgent(
-            name="URLCaptain",
-            llm_config=self.llm_config,
-            system_message="You coordinate the evaluation of URLs for relevance to a specific goal."
-        )
-        
-        self.agents["URLProcessor"] = ConversableAgent(
-            name="URLProcessor",
-            llm_config=self.llm_config,
-            system_message="You evaluate the relevance of content extracted from URLs to the given goal. Use semantic understanding."
-        )
-        
-        self.agents["Coordinator"] = ConversableAgent(
-            name="Coordinator",
-            llm_config=self.llm_config,
-            system_message="You prioritize the evaluation of URLs, ensuring the most relevant results are highlighted."
-        )
+        """Describe evaluation roles without constructing unused LLM agents."""
+        self.captain = "URLCaptain"
+        self.agents = {
+            "URLProcessor": "Evaluate extracted URL content for relevance.",
+            "Coordinator": "Prioritize the most relevant URL results.",
+        }
 
     async def evaluate_urls(self):
         """
@@ -43,6 +30,7 @@ class NestedChatForURLEvaluation:
             try:
                 # Extrahiere Inhalt aus der URL
                 content = await extract_text_from_url(url)  # Asynchron für große Websites
+                content = content or ""
                 relevance_score = score_relevance(self.target_goal, content)
                 
                 # Ergebnisse sammeln

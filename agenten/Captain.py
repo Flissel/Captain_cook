@@ -1,7 +1,7 @@
-from autogen import UserProxyAgent, AssistantAgent
-from .Internet_searcher import InternetSearcher
+from autogen_agentchat.agents import AssistantAgent
+from autogen_core.models import ChatCompletionClient
+from .llm.model_client import build_model_client
 from .tools.base import Tool, ToolRegistry
-from .tools.internet_search import InternetSearchTool
 from .workflows.registry import get_workflow
 from blockchain.Blockchain_modell import Blockchain
 from blockchain.visualisation import restructure_for_tree, plot_project_tree
@@ -17,13 +17,21 @@ if TYPE_CHECKING:  # import only for the type annotation; the real import
 
 
 class CaptainAgent:
-    def __init__(self, name, llm_config, system_message="None for yet", blockchain_path="blockchain.json"):
+    def __init__(
+        self,
+        name: str,
+        llm_config: Optional[Dict[str, Any]] = None,
+        system_message: str = "None for yet",
+        blockchain_path: str = "blockchain.json",
+        model_client: Optional[ChatCompletionClient] = None,
+    ):
         self.name = name
-        self.llm_config = llm_config
+        self.llm_config = llm_config or {}
         self.system_message = system_message
-        self.agents = {}
+        self.agents: Dict[str, AssistantAgent] = {}
         self.tools = ToolRegistry()
         self.blockchain = Blockchain(file_path=blockchain_path)
+        self._model_client = model_client
 
     # --- Blockchain -----------------------------------------------------
 
@@ -35,27 +43,34 @@ class CaptainAgent:
 
     # --- Agent creation ---------------------------------------------------
 
+    def _get_model_client(self) -> ChatCompletionClient:
+        if self._model_client is None:
+            config_list = self.llm_config.get("config_list", [])
+            config = config_list[0] if config_list else {}
+            self._model_client = build_model_client(
+                api_key=config.get("api_key"),
+                model=config.get("model"),
+            )
+        return self._model_client
+
     def create_agent_assistant(self, agent_name, system_message):
-        """
-        Create an agent with the specified name and system message.
-        """
+        """Create an AutoGen 0.7 AgentChat assistant."""
         agent = AssistantAgent(
             name=agent_name,
-            llm_config=self.llm_config,
+            model_client=self._get_model_client(),
             system_message=system_message,
-            is_termination_msg=lambda msg: "approve" in msg["content"].lower(),
         )
         self.agents[agent_name] = agent
         return agent
 
     def create_agent_user_proxy(self, agent_name, system_message):
-        agent = UserProxyAgent(
-            name=agent_name,
-            code_execution_config=False,
-            is_termination_msg=lambda msg: "terminate" in msg["content"].lower() or "approve" in msg["content"].lower(),
-        )
-        self.agents[agent_name] = agent
-        return agent
+        """Compatibility alias for old user-proxy workflow roles.
+
+        AutoGen 0.7 AgentChat has no ``UserProxyAgent`` equivalent.  The
+        workflow runner only needs a role label, so a regular assistant is a
+        safer and explicit replacement.
+        """
+        return self.create_agent_assistant(agent_name, system_message)
 
     # --- Tools --------------------------------------------------------------
 
@@ -72,6 +87,9 @@ class CaptainAgent:
         Returns:
             callable: An async function that runs the search-and-score tool.
         """
+        from .Internet_searcher import InternetSearcher
+        from .tools.internet_search import InternetSearchTool
+
         tool = self.register_tool(InternetSearchTool(InternetSearcher()), name=tool_name)
 
         async def internet_search(query):

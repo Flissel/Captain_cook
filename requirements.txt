@@ -2,7 +2,7 @@
 #
 # Event-driven supply-chain subsystem (agenten/events, agenten/runtime,
 # agenten/decomposition, agenten/constitution, agenten/spawning,
-# agenten/ledger_bridge, ...) is built on AutoGen 0.4's Core API:
+# agenten/ledger_bridge, ...) targets AutoGen 0.7.5:
 autogen-core==0.7.5
 autogen-agentchat==0.7.5
 # `[openai]` extra pulls in `openai`, `tiktoken`, `aiofiles` -- required by
@@ -20,14 +20,6 @@ beautifulsoup4==4.15.0
 aiohttp==3.14.1
 selenium==4.46.0
 
-# NOTE: the legacy pyautogen 0.2 API (`from autogen import ...`, used today
-# by agenten/Captain.py, agenten/critic.py, blockchain/web_scamler.py) is
-# intentionally NOT listed here. That's the `pyautogen` PyPI package (import
-# name `autogen`), a different distribution from `autogen-core` /
-# `autogen-agentchat` / `autogen-ext` (import names `autogen_core` /
-# `autogen_agentchat` / `autogen_ext`) pinned above -- the old and new
-# subsystems coexist in the source tree during this migration without one
-# subsuming the other's dependency. If old-subsystem code still needs to run
-# in this environment, add `pyautogen==<version>` separately and verify it
-# resolves cleanly alongside the pins above. See docs/ARCHITECTURE.md and
-# the unit U0 commit for the migration plan.
+# The legacy `pyautogen` 0.2 distribution is intentionally not supported.
+# Compatibility entry points use current AgentChat classes or plain Python
+# services, so a clean install has one AutoGen API surface.

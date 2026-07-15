@@ -3,3 +3,5 @@ __pycache__/
 .env
 .claude/worktrees/
 .venv/
+graphify-out/
+test_claude_output.txt
