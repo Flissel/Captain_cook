@@ -417,7 +417,7 @@ async def get_project(project_id: str, db=Depends(get_db)):
 
 @app.post("/api/v1/projects/{project_id}/join", response_model=MemberResponse)
 async def join_project(project_id: str, data: JoinProject, agent: Agent = Depends(require_agent), db=Depends(get_db)):
-    """Join a project. Role is always 'member' - only admins can assign roles."""
+    """Join a project with the requested free-text role."""
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(404, "Project not found")
@@ -425,8 +425,7 @@ async def join_project(project_id: str, data: JoinProject, agent: Agent = Depend
     if db.query(ProjectMember).filter(ProjectMember.agent_id == agent.id, ProjectMember.project_id == project_id).first():
         raise HTTPException(400, "Already a member")
     
-    # Ignore client-provided role, always assign "member"
-    member = ProjectMember(agent_id=agent.id, project_id=project_id, role="member")
+    member = ProjectMember(agent_id=agent.id, project_id=project_id, role=data.role)
     db.add(member)
     db.commit()
     db.refresh(member)

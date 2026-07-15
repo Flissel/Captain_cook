@@ -178,7 +178,7 @@ Run: `python -m pytest -q`
 
 Expected: delivery tests PASS; if a pre-existing unrelated failure remains, record it before proceeding and do not call the branch green.
 
-- [ ] **Step 6: Commit the control plane**
+- [x] **Step 6: Commit the control plane**
 
 ```powershell
 git add agenten/delivery/api.py agenten/delivery/service.py agenten/delivery/events.py tests/delivery/test_delivery_api.py requirements.txt
@@ -199,21 +199,21 @@ git commit -m "feat: expose captain delivery control plane"
 - Consumes: `MINIBOOK_URL`, Hermes API key from the Hermes profile, committed delivery events, and a plan Markdown path
 - Produces: one Captain Cook Minibook project, one pinned plan post, assignment posts/comments, iteration updates, and terminal status updates
 
-- [ ] **Step 1: Write a live Minibook preflight test**
+- [x] **Step 1: Write a live Minibook preflight test**
 
 The test calls `/health`, registers or resolves the three named Hermes identities, creates or resolves project `Captain Cook`, posts a uniquely correlated test plan, reads it back, comments with an assignment, and deletes or closes only artifacts bearing the test run ID. It skips nothing: unreachable Minibook is FAIL.
 
-- [ ] **Step 2: Run preflight against the running local Minibook**
+- [x] **Step 2: Run preflight against the running local Minibook**
 
 Run: `python -m pytest tests/live/test_minibook_projection_live.py -v -m live`
 
 Expected before implementation: FAIL because the client/projector is absent.
 
-- [ ] **Step 3: Implement idempotent HTTP client and projector**
+- [x] **Step 3: Implement idempotent HTTP client and projector**
 
 Use `httpx` with explicit timeouts. Search before creating posts. Never place API keys, hidden holdout cases, raw model context, or complete failure logs in Minibook. Store Minibook IDs in delivery-event metadata so replay updates existing content rather than duplicating posts.
 
-- [ ] **Step 4: Implement the plan-posting command**
+- [x] **Step 4: Implement the plan-posting command**
 
 ```powershell
 python scripts/post_delivery_plan.py `
@@ -223,11 +223,11 @@ python scripts/post_delivery_plan.py `
 
 The command prints project and post IDs, not credentials. It exits nonzero if read-back differs from the file hash.
 
-- [ ] **Step 5: Reconcile the already-posted implementation plan with the projector**
+- [x] **Step 5: Reconcile the already-posted implementation plan with the projector**
 
 Run the command above against `http://127.0.0.1:3457`. It must find and update the plan post created before Task 1 rather than creating a duplicate. Read the post back through the API and record its URL/ID in the execution handoff.
 
-- [ ] **Step 6: Run live projection and regression tests**
+- [x] **Step 6: Run live projection and regression tests**
 
 Run: `python -m pytest tests/live/test_minibook_projection_live.py -v -m live`
 
@@ -235,7 +235,7 @@ Run: `python -m pytest minibook/tests -q`
 
 Expected: live projection PASS. Any existing Minibook role-join failure must be fixed or explicitly isolated before claiming the Minibook suite green.
 
-- [ ] **Step 7: Commit Minibook integration**
+- [x] **Step 7: Commit Minibook integration**
 
 ```powershell
 git add agenten/delivery/minibook_client.py agenten/delivery/projector.py scripts/post_delivery_plan.py tests/live/test_minibook_projection_live.py
