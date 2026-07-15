@@ -10,7 +10,6 @@ from .captain_pipeline import (
     PlannedSubtask,
 )
 from .release import JsonDirectoryReleaseClient, ReleaseConflictError
-from .factory import build_captain_pipeline
 
 __all__ = [
     "AlignmentError",
@@ -24,6 +23,5 @@ __all__ = [
     "PlannedSubtask",
     "JsonDirectoryReleaseClient",
     "ReleaseConflictError",
-    "build_captain_pipeline",
     "validate_alignment",
 ]
