@@ -942,6 +942,29 @@ missing or doesn't fit.
   visible — resolved to an existing validated node instead of a fresh build subtree,
   so tree-rollup validation (§4) still holds.
 
+### 21.5 Three compounding axes (why it gets better over time)
+
+The application improves along three independent axes — whether WE act or the
+ECOSYSTEM does:
+
+1. **Runtime learning (§21.3):** the Hermes build fleet accumulates skills +
+   memory → fewer fix iterations on similar batches. Self-driven; measured by
+   the ledger iteration-to-green trend.
+2. **Capability reuse (§21.4):** the Captain references validated tools/agents
+   instead of rebuilding → new tasks compose existing validated work.
+   Self-driven; measured by reuse-rate.
+3. **Upstream dependency gains:** the foundations are independently-improving
+   projects, pinned as tracked dependencies — `hermes-agent` (native submodule,
+   upstream-pullable, §2), GPT-5.6 (model upgrades), Codex, n8n, autogen-core.
+   When any upstream improves, the whole app inherits the gain by bumping the
+   pin — DELIBERATELY (`git submodule update --remote` → re-pin → test → adopt),
+   never silently. Zero work by us; the app rides external improvement curves.
+
+Net: the app compounds whether we do anything or not. This is why `hermes-agent`
+is a **native submodule, not vendored** (§2) — vendored code freezes; a pinned
+submodule stays alive and pullable, making axis 3 concrete AND safe (upstream
+gains on our terms, no surprise breakage).
+
 ## 22. Data stores
 
 Most "state" is derived and lives in the ledger; only a few independent stores
