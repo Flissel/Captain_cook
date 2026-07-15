@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .env
+blockchain.json
 .claude/worktrees/
 .venv/
 graphify-out/

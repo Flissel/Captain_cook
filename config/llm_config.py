@@ -2,4 +2,4 @@
 import os
 
 API_KEY = os.environ.get("OPENAI_API_KEY")
-MODEL = "gpt-4o"#"gpt-3.5-turbo-0125"
+MODEL = os.environ.get("CAPTAIN_MODEL", "gpt-5.6")
