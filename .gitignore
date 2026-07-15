@@ -4,6 +4,7 @@ __pycache__/
 blockchain.json
 .claude/worktrees/
 .worktrees/
+.captain-cook/
 .venv/
 graphify-out/
 test_claude_output.txt
