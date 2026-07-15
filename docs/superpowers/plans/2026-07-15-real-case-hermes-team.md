@@ -37,7 +37,7 @@
 - Produces: `create_todo()`, `get_todo()`, `list_todos()`, `transition()`, `append_evidence()`, and `events_after()`
 - Consumes: filesystem path to a real SQLite database
 
-- [ ] **Step 1: Write contract tests for durable creation and reload**
+- [x] **Step 1: Write contract tests for durable creation and reload**
 
 ```python
 def test_sqlite_ledger_persists_todo_across_instances(tmp_path):
@@ -57,17 +57,17 @@ def test_sqlite_ledger_persists_todo_across_instances(tmp_path):
     assert loaded.max_iterations == 5
 ```
 
-- [ ] **Step 2: Run the test and verify the contract is absent**
+- [x] **Step 2: Run the test and verify the contract is absent**
 
 Run: `python -m pytest tests/delivery/test_delivery_ledger.py::test_sqlite_ledger_persists_todo_across_instances -v`
 
 Expected: FAIL because `agenten.delivery` does not exist.
 
-- [ ] **Step 3: Implement frozen Pydantic models and SQLite schema**
+- [x] **Step 3: Implement frozen Pydantic models and SQLite schema**
 
 Create `DeliveryRole` values `architect_builder`, `real_case_tester`, and `quality_warden`. Create `DeliveryStatus` values from the approved design. Store one append-only `delivery_events` row per accepted command and one transactionally updated `delivery_todos` projection row. Use `sqlite3`, WAL mode, foreign keys, explicit transactions, JSON arrays, UTC timestamps, and a unique index on `event_id`.
 
-- [ ] **Step 4: Add legal-transition and ownership tests**
+- [x] **Step 4: Add legal-transition and ownership tests**
 
 ```python
 def test_only_expected_role_can_advance_working_state(real_ledger, planned_todo):
@@ -106,11 +106,11 @@ def test_duplicate_event_is_idempotent(real_ledger, assigned_todo):
     assert second == first
 ```
 
-- [ ] **Step 5: Implement optimistic transitions and five-iteration enforcement**
+- [x] **Step 5: Implement optimistic transitions and five-iteration enforcement**
 
 Legal flow is `planned → assigned → in_progress → testing → reviewing → passed`, with `reviewing → redo → in_progress`. `redo` increments once. A rejected review at iteration five becomes `escalated`. Reject stale versions, unauthorized actors, changed acceptance criteria, builder-set `passed`, and any transition out of terminal state.
 
-- [ ] **Step 6: Run focused and regression tests**
+- [x] **Step 6: Run focused and regression tests**
 
 Run: `python -m pytest tests/delivery/test_delivery_ledger.py -v`
 
@@ -118,7 +118,7 @@ Run: `python -m pytest tests/ledger_bridge tests/test_householder_runtime.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit the contract**
+- [x] **Step 7: Commit the contract**
 
 ```powershell
 git add agenten/delivery tests/delivery/test_delivery_ledger.py
