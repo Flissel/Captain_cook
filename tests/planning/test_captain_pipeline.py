@@ -26,6 +26,13 @@ class RecordingReleaseClient:
         self.releases.append((batch, holdouts))
 
 
+class MatchingCapabilityResolver:
+    async def find_match(self, target: str, capability_tags: List[str]) -> str | None:
+        assert target == "external"
+        assert capability_tags == ["delivery"]
+        return "validated-capability:delivery-v2"
+
+
 def enrichment_for(draft: BatchDraft) -> BatchEnrichment:
     return BatchEnrichment(
         goal=f"Deliver {draft.title}",
@@ -134,3 +141,33 @@ async def test_pipeline_stops_before_enrichment_when_alignment_never_covers_all_
 
     assert enrich_calls == []
     assert releases.releases == []
+
+
+@pytest.mark.asyncio
+async def test_pipeline_derives_capability_reuse_from_resolver_not_the_llm() -> None:
+    async def decompose(_: str) -> List[PlannedSubtask]:
+        return [PlannedSubtask(subtask_id="s1", description="Delivery")]
+
+    async def align(_: str, __: List[PlannedSubtask], ___: str) -> AlignmentPlan:
+        return AlignmentPlan(
+            batches=[BatchDraft(batch_id="delivery", title="Delivery", subtask_ids=["s1"])]
+        )
+
+    async def enrich(
+        _: str, draft: BatchDraft, __: List[PlannedSubtask]
+    ) -> BatchEnrichment:
+        return enrichment_for(draft)
+
+    releases = RecordingReleaseClient()
+    pipeline = CaptainPipeline(
+        decompose=decompose,
+        align=align,
+        enrich=enrich,
+        release_client=releases,
+        capability_resolver=MatchingCapabilityResolver(),
+        target="external",
+    )
+
+    result = await pipeline.run("Reuse a validated delivery capability")
+
+    assert result.batches[0].satisfied_by == "validated-capability:delivery-v2"

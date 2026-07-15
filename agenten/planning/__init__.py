@@ -4,6 +4,7 @@ from .alignment import AlignmentError, AlignmentPlan, BatchDraft, validate_align
 from .captain_pipeline import (
     BatchEnrichment,
     BatchReleaseClient,
+    CapabilityResolver,
     CaptainPipeline,
     CaptainPlanningError,
     CaptainRunResult,
@@ -17,6 +18,7 @@ __all__ = [
     "BatchDraft",
     "BatchEnrichment",
     "BatchReleaseClient",
+    "CapabilityResolver",
     "CaptainPipeline",
     "CaptainPlanningError",
     "CaptainRunResult",

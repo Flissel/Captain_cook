@@ -39,7 +39,6 @@ class BatchEnrichment(BaseModel):
     acceptance_criteria: List[AcceptanceAssertion] = Field(min_length=1)
     golden_cases: List[ExampleCase] = Field(default_factory=list)
     holdout_cases: List[ExampleCase] = Field(min_length=1)
-    satisfied_by: str | None = None
 
     @model_validator(mode="after")
     def ensure_test_case_isolation(self) -> "BatchEnrichment":
@@ -63,6 +62,10 @@ class BatchReleaseClient(Protocol):
     async def release(self, batch: WorkBatch, holdouts: HoldoutSuite) -> None: ...
 
 
+class CapabilityResolver(Protocol):
+    async def find_match(self, target: str, capability_tags: List[str]) -> str | None: ...
+
+
 Decompose = Callable[[str], Awaitable[List[PlannedSubtask]]]
 Align = Callable[[str, List[PlannedSubtask], str], Awaitable[AlignmentPlan]]
 Enrich = Callable[[str, BatchDraft, List[PlannedSubtask]], Awaitable[BatchEnrichment]]
@@ -78,6 +81,7 @@ class CaptainPipeline:
         align: Align,
         enrich: Enrich,
         release_client: BatchReleaseClient,
+        capability_resolver: CapabilityResolver | None = None,
         target: str,
         max_alignment_attempts: int = 2,
     ) -> None:
@@ -87,6 +91,7 @@ class CaptainPipeline:
         self._align = align
         self._enrich = enrich
         self._release_client = release_client
+        self._capability_resolver = capability_resolver
         self._target = target
         self._max_alignment_attempts = max_alignment_attempts
 
@@ -120,6 +125,12 @@ class CaptainPipeline:
         for draft in ordered_drafts:
             selected_subtasks = [subtasks_by_id[subtask_id] for subtask_id in draft.subtask_ids]
             enrichment = await self._enrich(project_description, draft, selected_subtasks)
+            satisfied_by = None
+            if self._capability_resolver is not None:
+                satisfied_by = await self._capability_resolver.find_match(
+                    self._target,
+                    enrichment.capability_tags,
+                )
             batch = WorkBatch(
                 batch_id=draft.batch_id,
                 title=draft.title,
@@ -131,7 +142,7 @@ class CaptainPipeline:
                 constraints=enrichment.constraints,
                 acceptance_criteria=enrichment.acceptance_criteria,
                 golden_cases=enrichment.golden_cases,
-                satisfied_by=enrichment.satisfied_by,
+                satisfied_by=satisfied_by,
             )
             holdouts = HoldoutSuite(batch_id=draft.batch_id, cases=enrichment.holdout_cases)
             await self._release_client.release(batch, holdouts)
