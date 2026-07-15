@@ -9,3 +9,5 @@ def test_judge_documents_link_demo_and_evidence():
     assert Path("docs/DEVPOST_CHECKLIST.md").exists()
     assert Path("docs/VIDEO_SCRIPT.md").exists()
     assert Path("docs/THIRD_PARTY_NOTICES.md").exists()
+    assert Path("docs/MCP_SETUP.md").exists()
+    assert Path("docs/codex-sessions.md").exists()
