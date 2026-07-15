@@ -1,52 +1,70 @@
-from agenten.Captain import CaptainAgent
-from config.llm_config import API_KEY, MODEL
-from agenten.subtaskGenerator import SubtaskGenerator
-from agenten.project_definer import execute_project_definition
+"""Command-line entry points for Captain Cook."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+from pathlib import Path
+from typing import Sequence
+
+from agenten.demo import run_demo
 
 
-def main():
-    # Define LLM configuration
-    llm_config = {
-        "config_list": [{"model": MODEL, "api_key": API_KEY}]
-    }
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Captain Cook demos")
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # Initialize CaptainAgent
+    demo_parser = subparsers.add_parser("demo", help="Run the offline audited pipeline demo")
+    demo_parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("artifacts/demo-run.json"),
+        help="Path for the generated JSON evidence artifact",
+    )
+    subparsers.add_parser("legacy", help="Run the API-key-backed legacy prototype")
+    return parser.parse_args(argv)
+
+
+def run_legacy() -> int:
+    """Preserve the original exploratory workflow behind an explicit command."""
+    from agenten.Captain import CaptainAgent
+    from agenten.project_definer import execute_project_definition
+    from agenten.subtaskGenerator import SubtaskGenerator
+    from config.llm_config import API_KEY, MODEL
+
+    llm_config = {"config_list": [{"model": MODEL, "api_key": API_KEY}]}
     captain = CaptainAgent(name="CaptainAgent", llm_config=llm_config)
-
-    # Project Description
-    project_description = """
-    Develop a Multi-agent-system which can craft and execute a whole Project in context of a given project description.
-    There is no limit to the number of agents, but the number of agents should be as small as possible.
-    """
-
-    # Refine the project description
+    project_description = (
+        "Develop a multi-agent system which can craft and execute a whole project "
+        "from a given project description."
+    )
     project_description = execute_project_definition(project_description, captain)
-
-    # Split into departments/sections and record the project as the root blockchain block
-    project_split, sections = captain.automate_project_split(project_description)
-    departments = captain.build_departments(project_split)
-    # TODO: assign teams/individuals to departments once a "team_assignment"
-    # workflow is registered (see docs/ARCHITECTURE.md for how to add one).
+    project_split, _sections = captain.automate_project_split(project_description)
+    captain.build_departments(project_split)
     project_block = captain.add_task_to_blockchain(
         task=project_description,
         assigned_agents=[],
         status="in_progress",
     )
-
-    # Generate a system prompt for executing the project, and decompose it into subtasks
     system_prompt = captain.make_system_prompt(project_description)
-    subtask_generator = SubtaskGenerator(system_prompt=system_prompt)
-    subtasks = subtask_generator.generate_prompts(project_description, captain)
-
-    # Record each subtask as a child block of the project block
+    subtasks = SubtaskGenerator(system_prompt=system_prompt).generate_prompts(project_description, captain)
     for subtask in subtasks:
         captain.add_task_to_blockchain(
             task=subtask["title"],
-            assigned_agents=["Agent1", "Agent2"],  # Replace with dynamic agent assignment
+            assigned_agents=["Agent1", "Agent2"],
             status="pending",
             parent_index=project_block.index,
         )
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.command == "demo":
+        summary = asyncio.run(run_demo(args.output))
+        print(f"Demo complete: {summary.done_count} subproblems reached done")
+        return 0
+    return run_legacy()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
