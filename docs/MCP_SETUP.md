@@ -22,7 +22,7 @@ content in an issue, artifact, screenshot, video, prompt, or commit.
 | --- | --- | --- | --- |
 | Playwright | Installed as `@playwright/mcp` | Browser automation for local UI acceptance checks and Devpost page inspection | Use only against intended URLs; do not expose browser profiles or credentials in captures |
 | Context7 | Installed as `@upstash/context7-mcp` | Current primary-library documentation while implementing dependencies | Treat retrieved docs as reference material, then verify behavior locally |
-| n8n MCP | Registered at `http://localhost:5678/mcp-server/http` | Build, inspect, test, and run workflows once the local n8n instance enables instance-level MCP access | It is unavailable until n8n runs and authentication is configured; never assume registration proves connectivity |
+| n8n MCP | Registered at `http://localhost:15678/mcp-server/http` | Build, inspect, test, and run workflows once the existing local VibeMind n8n instance enables instance-level MCP access | It is unavailable until n8n runs and authentication is configured; never assume registration proves connectivity |
 
 Inspect the user-level setup at any time:
 
@@ -69,14 +69,14 @@ n8n's first-party instance-level MCP can search, create, edit, trigger, and
 test enabled workflows. The default local endpoint is:
 
 ```text
-http://localhost:5678/mcp-server/http
+http://localhost:15678/mcp-server/http
 ```
 
 The preferred setup is OAuth after n8n is running and instance-level MCP
 access is enabled:
 
 ```powershell
-codex mcp add n8n-mcp --url http://localhost:5678/mcp-server/http
+codex mcp add n8n-mcp --url http://localhost:15678/mcp-server/http
 ```
 
 If the n8n instance uses a token instead, use a user-level Codex configuration

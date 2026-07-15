@@ -18,7 +18,7 @@ Repository evidence available now:
 - `python -m pytest -q` → 157 passed, 1 skipped.
 - `python main.py demo --output artifacts/demo-run.json` → 2 subproblems reached `done`.
 - `python scripts/verify_submission.py` → `Submission evidence check passed.`
-- `codex mcp get n8n-mcp` → local instance-level endpoint registered at `http://localhost:5678/mcp-server/http`; connectivity remains conditional on a running n8n instance and authentication.
+- `codex mcp get n8n-mcp` → local instance-level endpoint registered at `http://localhost:15678/mcp-server/http`; connectivity remains conditional on a running n8n instance and authentication.
 
 Owner actions before submission:
 
