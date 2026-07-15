@@ -9,6 +9,62 @@ BeforeAll {
     if (Test-Path "$PSScriptRoot/Services.psm1") {
         Import-Module "$PSScriptRoot/Services.psm1" -Force
     }
+    if (Test-Path "$PSScriptRoot/Components.psm1") {
+        Import-Module "$PSScriptRoot/Components.psm1" -Force
+    }
+}
+
+Describe 'Components' {
+    It 'skips Captain dependency installation after a healthy check' {
+        $calls = [Collections.Generic.List[object]]::new()
+
+        $result = Install-Captain -Root $TestDrive -HealthCheck { $true } -CommandRunner {
+            param($filePath, $argumentList, $workingDirectory)
+            $calls.Add($filePath)
+        }
+
+        $result.Status | Should -Be 'Ready'
+        $calls.Count | Should -Be 0
+    }
+
+    It 'installs Hermes from the checked-out local source' {
+        New-Item -ItemType Directory -Path (Join-Path $TestDrive 'hermes-agent') | Out-Null
+        Set-Content -LiteralPath (Join-Path $TestDrive 'hermes-agent/pyproject.toml') -Value '[project]'
+        $calls = [Collections.Generic.List[object]]::new()
+
+        $result = Install-Hermes -Root $TestDrive -HealthCheck { $false } -CommandRunner {
+            param($filePath, $argumentList, $workingDirectory)
+            $calls.Add([pscustomobject]@{ FilePath = $filePath; ArgumentList = $argumentList })
+            [pscustomobject]@{ ExitCode = 0; Output = 'ok' }
+        }
+
+        $result.Status | Should -Be 'Ready'
+        $allArguments = ($calls.ArgumentList | ForEach-Object { $_ -join ' ' }) -join "`n"
+        $allArguments | Should -Match '--editable'
+        $allArguments | Should -Match 'hermes-agent'
+        $allArguments | Should -Not -Match 'https?://'
+    }
+
+    It 'registers Hermes only when no valid Minibook identity exists' {
+        $registrations = 0
+
+        $result = Register-HermesIdentity -CurrentIdentityProbe { $true } -RegistrationRequest { $script:registrations++ }
+
+        $result.Status | Should -Be 'Ready'
+        $registrations | Should -Be 0
+    }
+
+    It 'copies the Minibook skill to the user profile' {
+        $source = Join-Path $TestDrive 'source/SKILL.md'
+        $destination = Join-Path $TestDrive 'profile/skills/minibook'
+        New-Item -ItemType Directory -Path (Split-Path $source -Parent) | Out-Null
+        Set-Content -LiteralPath $source -Value '# Minibook'
+
+        $result = Install-MinibookSkill -Source $source -DestinationDirectory $destination
+
+        $result.Status | Should -Be 'Ready'
+        (Get-Content (Join-Path $destination 'SKILL.md') -Raw) | Should -Match 'Minibook'
+    }
 }
 
 Describe 'Services' {
