@@ -92,8 +92,13 @@ reports `RestartRequired` if the current PowerShell process cannot see it.
 
 `status.ps1 -Detailed` reports Captain demo integrity, Hermes CLI, Hermes
 Minibook identity, Minibook backend, Minibook frontend, Mailpit HTTP, Mailpit
-SMTP, MariaDB authentication, and n8n health. Each row includes status,
-endpoint or local artifact, message, and remediation.
+SMTP, MariaDB authentication, database-backed Gateway health, and n8n health.
+Each row includes status, endpoint or local artifact, message, and remediation.
+
+The Gateway is a Captain-owned managed process. Setup derives `LEDGER_DSN` in
+memory from the local MariaDB configuration, starts the Gateway only after
+MariaDB authentication succeeds, and probes `/healthz`. Process metadata never
+contains the DSN or credentials.
 
 `start.ps1` waits for all owned processes and services, then calls the same
 status contract. It returns success only when every required component is
