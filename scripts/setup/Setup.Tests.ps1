@@ -6,6 +6,45 @@ BeforeAll {
     if (Test-Path "$PSScriptRoot/Configuration.psm1") {
         Import-Module "$PSScriptRoot/Configuration.psm1" -Force
     }
+    if (Test-Path "$PSScriptRoot/Services.psm1") {
+        Import-Module "$PSScriptRoot/Services.psm1" -Force
+    }
+}
+
+Describe 'Services' {
+    It 'does not activate owned n8n in external mode' {
+        $calls = [Collections.Generic.List[object]]::new()
+
+        $result = Start-CaptainServices -Root $TestDrive -N8nMode 'External' -CommandRunner {
+            param($filePath, $argumentList)
+            $calls.Add([pscustomobject]@{ FilePath = $filePath; ArgumentList = $argumentList })
+            [pscustomobject]@{ ExitCode = 0; Output = 'ok' }
+        }
+
+        $result.Status | Should -Be 'Ready'
+        $calls[0].ArgumentList -join ' ' | Should -Not -Match 'owned-n8n'
+    }
+
+    It 'never adds a destructive Docker volume argument when stopping' {
+        $calls = [Collections.Generic.List[object]]::new()
+
+        Stop-CaptainServices -Root $TestDrive -N8nMode 'Owned' -CommandRunner {
+            param($filePath, $argumentList)
+            $calls.Add([pscustomobject]@{ FilePath = $filePath; ArgumentList = $argumentList })
+            [pscustomobject]@{ ExitCode = 0; Output = 'ok' }
+        } | Out-Null
+
+        $arguments = $calls[0].ArgumentList -join ' '
+        $arguments | Should -Match 'stop'
+        $arguments | Should -Not -Match 'down|-v|volume|rm'
+    }
+
+    It 'reports an unhealthy public endpoint as retryable' {
+        $result = Test-HttpService -Name 'Mailpit' -Uri 'http://localhost:8025/api/v1/info' -Probe { $false }
+
+        $result.Status | Should -Be 'Failed'
+        $result.Remediation | Should -Be 'Retry'
+    }
 }
 
 Describe 'Configuration' {
