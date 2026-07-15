@@ -23,6 +23,27 @@
 
 ---
 
+## Execution order
+
+The task numbers preserve the design-workstream grouping. Implement them in
+these dependency waves:
+
+1. **Evidence foundation:** Task 0, then Task 6. Establish the clean Python
+   environment, isolated `captain_test` guard, real MariaDB/Gateway execution,
+   and CI before changing lifecycle behavior.
+2. **Windows lifecycle:** Tasks 1–4, then Task 5. Revalidation, repair,
+   submodule/external-n8n handling, and preflight feed the shared ten-component
+   health contract.
+3. **Runtime modularity:** Tasks 7–10 in order. Capability segregation lands
+   before recorder and pipeline decomposition.
+4. **Truthful handoff:** Task 11 only after every preceding named gate is
+   green.
+
+Do not begin a later wave merely because an earlier code edit exists; its
+verification and commit checkbox must also be complete.
+
+---
+
 ## File and interface map
 
 | File | Responsibility |
