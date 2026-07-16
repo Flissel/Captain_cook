@@ -309,11 +309,16 @@ SHAs before either worker begins.
   - Branch: `feat/captain-llm-resilience`; source: Captain Task 5; requires
     P09; gate: LLM and factory E2E suites.
 
-- [ ] **P11 — Authenticated gateway HTTP clients**
+- [x] **P11 — Authenticated gateway HTTP clients**
   - Branch: `feat/gateway-http-clients`; source: Gateway Task 3; requires P08
     and P10; replaces Captain Task 3.
   - Output: planning and delivery clients, JSON default for offline mode, and
     no direct production database access.
+  - Integrated output additionally requires exact target/runtime/version/
+    interface/capability compatibility before a registry match can set
+    `satisfied_by`; natural-language search rank alone is never release proof.
+  - Gate: 92 planning/delivery/architecture tests, `compileall`, and the full
+    non-live regression suite.
 
 - [ ] **P12 — Atomic Captain run resume**
   - Branch: `feat/captain-run-resume`; source: Captain Task 4; requires P11.
@@ -323,6 +328,10 @@ SHAs before either worker begins.
   - Branch: `refactor/sqlite-legacy-import`; source: Gateway Task 4; requires
     P11.
   - Gate: dry-run, idempotent replay, legacy-ledger, and boundary tests.
+  - [ ] Mark the existing `create_delivery_app(SqliteDeliveryLedger(...))`
+    surface explicitly legacy and prove no production composition imports it;
+    P11 added the gateway-native client/service boundary but intentionally did
+    not delete the migration source before the importer exists.
 
 - [ ] **P14 — Unified system health contract**
   - Branch: `feat/system-health-contract`; source: System Task 5 plus the
@@ -577,3 +586,16 @@ For every packet, the orchestrator must:
   gate passed 94 tests plus compileall; the default non-live suite passed 386
   with 59 explicit service/environment skips, one live deselection, one known
   warning, and 76.87% coverage. P11 is now unlocked.
+- P11 integrated candidate chain `534679e` + `5ba6678` + `8ddb096` through
+  merge commits `eddf054`, `b6fcb96`, and `341adec`. Captain gateway mode now
+  fails before model/HTTP construction when its token is missing, owns one
+  authenticated HTTP client, keeps JSON as the offline default, and publishes
+  immutable batches plus hidden holdouts without reading holdouts back.
+  Delivery exposes typed claim, heartbeat, closed evidence, validation, and
+  completion contracts; claim tokens appear only on fenced writes and all
+  client failures are sanitized. Capability reuse now requires exact target,
+  runtime, runtime version, interface schema, and requested capability tags.
+  The integrated focused gate passed 92 tests plus `compileall`; the full
+  non-live suite passed 402 tests with 58 explicit service/environment skips,
+  one live deselection, one known warning, and 77.78% coverage. P12 and P13 are
+  now unlocked; SC11 remains open until live release projection is proven.

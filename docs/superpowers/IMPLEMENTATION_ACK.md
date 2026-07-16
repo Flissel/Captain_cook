@@ -13,7 +13,7 @@ SCHEDULE_STATE: PENDING_USER_CONFIRMATION_AND_NATIVE_UI
 PROPOSED_SCHEDULE: EVERY_30_MINUTES_WHILE_ACTIVE
 INTEGRATION_WORKTREE: C:\Users\User\Desktop\Captain_cook-main-integration
 INTEGRATION_BRANCH: feat/system-remediation-orchestration
-  LAST_INTEGRATED_IMPLEMENTATION_SHA: df79012
+  LAST_INTEGRATED_IMPLEMENTATION_SHA: 341adec
 CONTROL_DISPATCH_SHA: 4601806
 PRIMARY_WORKTREE_POLICY: PRESERVE_AND_DO_NOT_USE_FOR_INTEGRATION
 ACK_OWNER: ORCHESTRATOR_ONLY
@@ -36,6 +36,7 @@ may advance the base only after recording a new explicit dispatch SHA here.
 | P07A | `46dfc80` | `e951549` | spec/quality PASS, 47 focused tests |
 | P15 | `e688177` | `61b1858` | spec/quality PASS, 54 integrated tests, compileall PASS |
 | P09 | `51cfb69` | `df79012` | spec/quality PASS, explicit AF01 reconciliation, 123 combined tests |
+| P11 | `534679e` + `5ba6678` + `8ddb096` | `341adec` | authenticated planning/delivery clients, 92 focused and 402 full tests |
 
 P05 closed all known fail-open bootstrap result-shape gaps. P06 is unblocked.
 
@@ -68,6 +69,12 @@ P10 candidate chain `dfd8983` + `4575d18` is integrated as `e8754ea` after
 specification and quality PASS. P11 is now the next critical-path packet. P14
 still waits for P06 and owns the remaining health startup-versus-readiness
 boundary.
+
+P11 candidate chain `534679e` + `5ba6678` + `8ddb096` is integrated through
+`341adec`. Its direct source-contract and security review passed after adding
+the missing closed `append_evidence` API and rejecting heuristic capability
+reuse. P12 and P13 are unlocked. The legacy SQLite FastAPI surface remains
+explicit P13 work; no production caller was introduced by P11.
 
 ### Autonomous Captain process candidate
 
@@ -162,6 +169,20 @@ QUALITY_REVIEW: PASS after closing 2 Important findings
 INTEGRATION_SHA: e8754ea81edc51ff6491ff3d94e5a1bda5740472
 INTEGRATED_GATE: 94 LLM/planning passed; compileall passed; default full 386 passed, 59 explicit skips, 1 deselected, 1 warning; 76.87% coverage
 FOLLOWUP_GAP: P20 owns SDK pinning and reviewed backoff/Retry-After plus soft-deadline claim discipline
+
+HANDOFF TO ORCHESTRATOR: P11
+STATE: INTEGRATED
+LOCKS: LOCK_PLANNING plus LOCK_DELIVERY
+BRANCH: feat/gateway-http-clients
+WORKTREE: C:\Users\User\Desktop\Captain_cook\.worktrees\gateway-http-clients
+CANDIDATE_SHAS: 534679e, 5ba6678, 8ddb096
+RED_GATE: missing client modules; missing CLI composition; missing closed evidence API; incompatible registry match selected
+GREEN_GATE: 13 client/CLI tests and 92 combined planning/delivery/architecture tests passed; compileall passed
+SPEC_REVIEW: PASS after direct source-contract audit and two contract hardening increments
+QUALITY_REVIEW: PASS after token-sanitization, fencing, exact compatibility, and merge-overlap audit
+INTEGRATION_SHAS: eddf054, b6fcb96, 341adec
+INTEGRATED_GATE: 92 focused passed; full 402 passed, 58 explicit service/environment skips, 1 live deselected, 1 warning; 77.78% coverage
+FOLLOWUP_GAP: P13 must retire the legacy SQLite API composition; SC11 still requires live release-projection evidence
 
 HANDOFF TO WORKER 2: P06
 STATE: REPAIR_ATTEMPT_1_IN_PROGRESS
