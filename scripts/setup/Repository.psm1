@@ -5,27 +5,56 @@ Import-Module (Join-Path $PSScriptRoot 'Common.psm1')
 
 function Invoke-HermesRepositoryProbe {
     param(
-        [Parameter(Mandatory)][scriptblock] $Probe,
+        [AllowNull()][object] $Probe,
         [Parameter(Mandatory)][string] $Root
     )
 
-    try {
-        [pscustomobject]@{
-            Succeeded = $true
-            Present = [bool](& $Probe $Root)
-        }
-    }
-    catch {
-        [pscustomobject]@{
+    if ($Probe -isnot [scriptblock]) {
+        return [pscustomobject]@{
             Succeeded = $false
             Present = $false
         }
+    }
+
+    try {
+        $probeOutput = @(& $Probe $Root)
+    }
+    catch {
+        return [pscustomobject]@{
+            Succeeded = $false
+            Present = $false
+        }
+    }
+
+    if ($probeOutput.Count -ne 1 -or $probeOutput[0] -isnot [bool]) {
+        return [pscustomobject]@{
+            Succeeded = $false
+            Present = $false
+        }
+    }
+
+    [pscustomobject]@{
+        Succeeded = $true
+        Present = $probeOutput[0]
     }
 }
 
 function New-HermesRepositoryProbeFailure {
     New-SetupResult -Component 'Repository' -Status 'Failed' `
         -Message 'Das Hermes-Submodul konnte nicht sicher geprüft werden.' -Remediation 'Retry'
+}
+
+function Test-SetupIntegerScalar {
+    param([AllowNull()][object] $Value)
+
+    $Value -is [sbyte] -or
+    $Value -is [byte] -or
+    $Value -is [int16] -or
+    $Value -is [uint16] -or
+    $Value -is [int32] -or
+    $Value -is [uint32] -or
+    $Value -is [int64] -or
+    $Value -is [uint64]
 }
 
 function Initialize-SetupSubmodules {
@@ -36,7 +65,7 @@ function Initialize-SetupSubmodules {
             param($filePath, $argumentList, $workingDirectory)
             Common\Invoke-SetupCommand -FilePath $filePath -ArgumentList $argumentList -WorkingDirectory $workingDirectory
         },
-        [scriptblock] $HermesProbe = {
+        [AllowNull()][object] $HermesProbe = {
             param($candidateRoot)
             Test-Path -LiteralPath (Join-Path $candidateRoot 'hermes-agent/pyproject.toml')
         }
@@ -52,10 +81,17 @@ function Initialize-SetupSubmodules {
     }
 
     try {
-        $commandResult = & $CommandRunner 'git' @('submodule', 'update', '--init', '--recursive') $Root
-        if ($null -eq $commandResult -or
-            $null -eq $commandResult.PSObject.Properties['ExitCode'] -or
-            [int]$commandResult.ExitCode -ne 0) {
+        $commandOutput = @(& $CommandRunner 'git' @('submodule', 'update', '--init', '--recursive') $Root)
+        $commandResult = if ($commandOutput.Count -eq 1) { $commandOutput[0] } else { $null }
+        $exitCodeProperty = if ($null -eq $commandResult) {
+            $null
+        }
+        else {
+            $commandResult.PSObject.Properties['ExitCode']
+        }
+        if ($null -eq $exitCodeProperty -or
+            -not (Test-SetupIntegerScalar -Value $exitCodeProperty.Value) -or
+            $exitCodeProperty.Value -ne 0) {
             return New-SetupResult -Component 'Repository' -Status 'Failed' `
                 -Message 'Die Git-Submodule konnten nicht initialisiert werden.' -Remediation 'Retry'
         }

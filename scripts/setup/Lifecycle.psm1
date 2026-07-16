@@ -116,14 +116,31 @@ function Invoke-StableSetupStageAction {
     }
 
     try {
-        $result = & $Action $Root
+        $actionOutput = @(& $Action $Root)
     }
     catch {
         return [pscustomobject]@{ Status = 'Failed'; Message = $FailureMessage }
     }
 
-    $propertyNames = if ($null -eq $result) { @() } else { @($result.PSObject.Properties.Name) }
-    if ('Status' -notin $propertyNames -or 'Message' -notin $propertyNames) {
+    if ($actionOutput.Count -ne 1) {
+        return [pscustomobject]@{ Status = 'Failed'; Message = $FailureMessage }
+    }
+    $result = $actionOutput[0]
+    if ($null -eq $result) {
+        return [pscustomobject]@{ Status = 'Failed'; Message = $FailureMessage }
+    }
+    $statusProperty = $result.PSObject.Properties['Status']
+    $messageProperty = $result.PSObject.Properties['Message']
+    if ($null -eq $statusProperty -or $null -eq $messageProperty) {
+        return [pscustomobject]@{ Status = 'Failed'; Message = $FailureMessage }
+    }
+
+    $status = $statusProperty.Value
+    $message = $messageProperty.Value
+    $allowedStatuses = @('Ready', 'Missing', 'Invalid', 'Failed', 'Skipped', 'RestartRequired')
+    if ($status -isnot [string] -or [string]::IsNullOrWhiteSpace($status) -or
+        $status -cnotin $allowedStatuses -or
+        $message -isnot [string] -or [string]::IsNullOrWhiteSpace($message)) {
         return [pscustomobject]@{ Status = 'Failed'; Message = $FailureMessage }
     }
     $result
@@ -353,10 +370,10 @@ function Invoke-DefaultSetupStage {
 
             $result = Invoke-StableSetupStageAction -Action $submoduleInitializer -Root $root `
                 -FailureMessage 'Die Repository-Initialisierung hat kein gültiges Ergebnis geliefert.'
-            if ($result.Status -ne 'Ready') { return [pscustomobject]@{Status='Failed';Message=$result.Message} }
+            if ($result.Status -cne 'Ready') { return [pscustomobject]@{Status='Failed';Message=$result.Message} }
             $result = Invoke-StableSetupStageAction -Action $hermesInstaller -Root $root `
                 -FailureMessage 'Die Hermes-Installation hat kein gültiges Ergebnis geliefert.'
-            if ($result.Status -ne 'Ready') { return [pscustomobject]@{Status='Failed';Message=$result.Message} }
+            if ($result.Status -cne 'Ready') { return [pscustomobject]@{Status='Failed';Message=$result.Message} }
         }
         'Minibook' {
             $result = Install-Minibook -Root $root
