@@ -650,6 +650,11 @@ pwsh -NoProfile -File scripts/test_gateway.ps1
 
 Expected: 22 database/gateway tests execute, zero fail, zero skip, and the `captain-cook-test` Compose project is stopped.
 
+Program follow-up P03A treats these 22 tests as the proven minimum baseline,
+not a permanent exact count. Later gateway packets add tests to the same two
+modules; the gate must accept that growth while still failing on any selected
+skip, a count below 22, or a missing/malformed pytest summary.
+
 - [ ] **Step 4: Add the CI integration job**
 
 Create `.github/workflows/integration.yml` for `pull_request` and pushes to

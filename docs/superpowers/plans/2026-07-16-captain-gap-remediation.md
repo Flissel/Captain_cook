@@ -189,6 +189,10 @@ git commit -m "feat: enforce captain planning policy"
 
 ### Task 3: Add gateway release and capability adapters
 
+> **Program routing:** P07C owns Step 4's gateway-side idempotency after the
+> append-only store is integrated. P11 later owns Steps 1-3 and 5-6 plus the
+> planning HTTP adapter. Do not let either worker edit the other's allowlist.
+
 **Files:**
 - Create: `agenten/planning/gateway_client.py`
 - Modify: `agenten/planning/factory.py`

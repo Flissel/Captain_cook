@@ -56,7 +56,9 @@ describes SQLite as an authoritative production command log or control plane.
 ```text
 P00 Baseline -> P01 Dev environment
                     |-> P02 Minibook auth
-                    |-> P03 DB harness -> P07 Gateway events -> P08 Gateway auth
+                    |-> P03 DB harness -> P03A Scalable gate
+                                           -> P07A Projection -> P07B Event store
+                                           -> P07C Replay -> P08 Gateway auth
                     |-> P04 Checkpoint/repair -> P05 Bootstrap -> P06 Preflight
                     |-> P09 Captain policy -> P10 LLM resilience
                     `-> P15 Event bus -+-> P16 URL adapter --+
@@ -83,7 +85,7 @@ fresh reviewer after every packet.
 | `LOCK_PROGRAM` | This master plan, all source-plan checkboxes, `.superpowers/sdd/` reports | Orchestrator only |
 | `LOCK_ENV_CI` | `requirements*.txt`, `pytest.ini`, `.github/workflows/**`, CI contract tests | P01 -> P20 -> P21 |
 | `LOCK_LIFECYCLE` | `scripts/setup/**`, `setup.ps1`, `repair.ps1`, `status.ps1`, setup acceptance tests | P04 -> P05 -> P06 -> P14 |
-| `LOCK_GATEWAY` | `gateway/**`, gateway/storage tests, isolated DB harness | P03 -> P07 -> P08 -> P14 -> P20 |
+| `LOCK_GATEWAY` | `gateway/**`, gateway/storage tests, isolated DB harness | P03 -> P03A -> P07A -> P07B -> P07C -> P08 -> P14 -> P20 |
 | `LOCK_PLANNING` | `agenten/planning/**`, `agenten/llm/**`, planning/LLM tests, `main.py` | P09 -> P10 -> P11 -> P12 -> P19 |
 | `LOCK_RUNTIME_CORE` | Runtime buses, pipeline, shared runtime/E2E tests | P15 -> P18 |
 | `LOCK_ADAPTER_FITNESS` | URL adapter, `blockchain/web_scamler.py`, architecture/import tests | P15 -> P16 -> P18 |
@@ -149,6 +151,17 @@ SHAs before either worker begins.
     known non-database compatibility or degradation skips; every new or unknown
     skip fails the gate.
 
+- [ ] **P03A — Make the MariaDB/gateway gate extensible**
+  - Branch: `fix/scalable-gateway-test-count`; requires P03.
+  - Owns exactly: `scripts/test_gateway.ps1` and
+    `tests/test_mariadb_test_guard.py`.
+  - Output: parse the selected pytest summary as an integer, require at least
+    the established 22-test baseline, permit later gateway-test growth, and
+    continue to reject every selected skip or missing/malformed summary. The
+    full-suite skip allowlist and all Compose safety behavior remain unchanged.
+  - Gate: focused parser regression tests followed by
+    `pwsh -NoProfile -File scripts/test_gateway.ps1`.
+
 - [ ] **P04 — Checkpoint revalidation and targeted repair**
   - Branch: `fix/setup-checkpoint-repair`; source: System Tasks 1-2; requires
     P01.
@@ -179,14 +192,43 @@ SHAs before either worker begins.
   - Branch: `fix/setup-preflight-contract`; source: System Task 4; requires
     P05; gate: Pester with version, port, and restart-required cases.
 
-- [ ] **P07 — Append-only gateway lifecycle contract**
-  - Branch: `feat/gateway-append-only-contract`; source: Gateway Task 2 plus
-    Captain's idempotent-release rule; requires P03.
-  - Gate: gateway and MariaDB storage suites through P03 with zero skips.
+- [ ] **P07A — Pure append-only lifecycle projection contracts**
+  - Branch: `feat/gateway-event-contracts`; source: Gateway Task 2 Step 3;
+    requires P03A.
+  - Owns exactly: `gateway/contracts.py` and
+    `tests/gateway/test_contracts.py`.
+  - Output: deterministic event projection with an injectable clock,
+    `pending_review` approval, lazy expired-claim recovery, current-iteration
+    fencing/evidence state, all existing and delivery-native terminal states,
+    and ordering/batch-id validation. No database or FastAPI dependency.
+  - Gate: `python -m pytest -q --no-cov tests/gateway/test_contracts.py`.
+
+- [ ] **P07B — Persist gateway lifecycle as append-only child events**
+  - Branch: `refactor/gateway-append-only-store`; source: Gateway Task 2
+    Steps 1, 2, 4, and 5; requires P07A.
+  - Owns exactly: `gateway/app.py`, `tests/gateway/test_gateway.py`, and
+    `tests/blockchain/test_mariadb_storage.py`.
+  - Output: no post-insert mutation of work-batch `status`, `metadata`, or
+    `children`; every lifecycle read and fence uses the P07A projection.
+    `batch_done:succeeded` requires a preceding `validation_run` event; D04
+    remains responsible for proving the evidence payload means all holdouts
+    are green.
+  - Gate: `pwsh -NoProfile -File scripts/test_gateway.ps1` with zero selected
+    skips and no exact-count ceiling.
+
+- [ ] **P07C — Make Captain batch and holdout release idempotent**
+  - Branch: `feat/gateway-idempotent-release`; source: Captain Task 3 Step 4;
+    requires P07B.
+  - Owns exactly: `gateway/app.py` and `tests/gateway/test_gateway.py`.
+  - Output: identical canonical `work_batch` and its one `holdout` replay
+    return the existing immutable block; different content, parent mismatch,
+    or a second distinct holdout remains `409`.
+  - Gate: `pwsh -NoProfile -File scripts/test_gateway.ps1` with zero selected
+    skips.
 
 - [ ] **P08 — Gateway authentication and settings**
   - Branch: `feat/gateway-auth-settings`; source: Gateway Task 5 steps 1-3;
-    requires P07.
+    requires P07C.
   - Gate: auth, settings, gateway, and database-backed health tests.
 
 - [ ] **P10 — Typed LLM resilience**
@@ -364,3 +406,9 @@ For every packet, the orchestrator must:
   skips, one live deselection, one pre-existing Starlette warning, and 80.54%
   coverage. The `captain-cook-test` resources were removed, while Captain's
   MariaDB/Mailpit and external VibeMind n8n retained their start times.
+- The P07 pre-dispatch audit found that P03's exact `22 passed` equality would
+  reject every legitimate new gateway test. It also found that the source
+  projection omitted the existing `pending_review` approval state and the
+  delivery design's validation ordering and terminal outcomes. P03A removes
+  the brittle ceiling; P07A-P07C split pure projection, event persistence, and
+  idempotent release behind one serial gateway lock.

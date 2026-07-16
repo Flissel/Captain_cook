@@ -102,8 +102,14 @@ git commit -m "docs: declare gateway delivery source of truth"
 
 ## Task 2: Replace mutable gateway lifecycle state with append-only events
 
+> **Program routing:** Execute this task as P07A (pure contracts/projection)
+> followed by P07B (MariaDB-backed event-only store). P07C separately absorbs
+> Captain Task 3 Step 4's idempotent release rule. Do not dispatch this task as
+> one shared-file session.
+
 **Files:**
 - Create: `gateway/contracts.py`
+- Create: `tests/gateway/test_contracts.py`
 - Modify: `gateway/app.py`
 - Modify: `tests/gateway/test_gateway.py`
 - Modify: `tests/blockchain/test_mariadb_storage.py`
@@ -140,6 +146,14 @@ def test_gateway_does_not_issue_lifecycle_update_sql() -> None:
     assert "UPDATE blocks SET children" not in source
 ```
 
+Also add acceptance cases proving all of these existing contracts survive the
+refactor: `pending_review` remains unclaimable until `batch_approved`; an
+expired claim projects and lists as `pending`; a current-iteration
+`codex_session` controls holdout release; `batch_done:succeeded` is rejected
+without an earlier `validation_run`; and `failed_after_max_iterations` plus
+`aborted_infra` are terminal. P07B proves evidence ordering only; D04 owns the
+later semantic proof that a validation payload represents all holdouts green.
+
 - [ ] **Step 2: Verify the acceptance tests fail**
 
 Run: `python -m pytest -q tests/gateway/test_gateway.py -k 'append_events or lifecycle_update_sql'`
@@ -154,9 +168,15 @@ Create `gateway/contracts.py` with the following public shapes:
 class BatchProjection(BaseModel):
     batch_id: str
     parent_index: int
-    status: Literal["pending", "claimed", "succeeded", "failed", "rejected", "cancelled"]
+    status: Literal[
+        "pending_review", "pending", "claimed", "succeeded", "failed",
+        "rejected", "cancelled", "failed_after_max_iterations", "aborted_infra",
+    ]
+    claim_token_sha256: str | None = None
     claim_expires_at: datetime | None = None
+    claim_iteration: int = 0
     codex_session_recorded: bool = False
+    validation_run_recorded: bool = False
 
 
 class ClaimEvent(BaseModel):
@@ -165,11 +185,49 @@ class ClaimEvent(BaseModel):
     claim_expires_at: datetime
 
 
-def project_batch(blocks: Sequence[dict[str, Any]], batch_id: str) -> BatchProjection:
+class HeartbeatEvent(BaseModel):
+    batch_id: str
+    claim_expires_at: datetime
+
+
+class EvidenceEvent(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    batch_id: str
+    iteration: int = Field(ge=1)
+
+
+class BatchDoneEvent(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    batch_id: str
+    outcome: Literal[
+        "succeeded", "failed", "rejected", "cancelled",
+        "failed_after_max_iterations", "aborted_infra",
+    ]
+
+
+def project_batch(
+    blocks: Sequence[dict[str, Any]],
+    batch_id: str,
+    *,
+    now: datetime | None = None,
+) -> BatchProjection:
     """Derive the current state from a work_batch and ordered child events."""
 ```
 
-`project_batch` starts at `pending`, takes the newest unexpired `batch_claimed` or `batch_heartbeat`, marks `codex_session_recorded` after a `codex_session`, and maps the first valid `batch_done` to a terminal state. It raises `ValueError` when a child event names a different `batch_id` or a terminal event appears before a claim.
+`project_batch` starts from the immutable parent's `pending` or
+`pending_review` status. `batch_approved` moves only `pending_review` to
+`pending`. It counts claim events as fencing iterations, takes the newest
+unexpired `batch_claimed` plus subsequent `batch_heartbeat`, and treats an
+expired non-terminal lease as `pending`. `codex_session_recorded` and
+`validation_run_recorded` describe only the current claim iteration. The first
+valid `batch_done` maps to a terminal state; `succeeded` additionally requires
+an earlier current-iteration `validation_run`. It raises `ValueError` for a
+mismatched child `batch_id`, heartbeat or terminal event before a claim,
+invalid approval ordering, or lifecycle events after the first terminal event.
+The optional clock defaults to current UTC and exists only for deterministic
+projection tests.
 
 - [ ] **Step 4: Make `GatewayStore` event-only**
 
