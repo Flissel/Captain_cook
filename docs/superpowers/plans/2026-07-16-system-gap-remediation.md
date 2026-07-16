@@ -382,6 +382,14 @@ Expected: external-default assertion or missing `Initialize-SetupSubmodules` fai
 
 Create `Repository.psm1` with an injectable command runner. If `hermes-agent/pyproject.toml` exists, return `Ready` without Git mutation. Otherwise run exactly `git submodule update --init --recursive` in the repository root, then probe again. Return `Failed/Retry` for Git failure and `Missing/Manual` when the command succeeds but Hermes remains absent.
 
+Treat every injected bootstrap boundary as a strict scalar contract. The
+Hermes probe must emit exactly one `[bool]`; the command runner must return
+exactly one object with a non-null integer `ExitCode`; and each Hermes stage
+action must return exactly one result whose `Status` and `Message` are
+non-empty scalar strings. Null, string, collection, and multi-output shapes
+must return stable `Failed/Retry` results before invoking Git or the next
+installer action.
+
 Change `.env.example` to:
 
 ```dotenv

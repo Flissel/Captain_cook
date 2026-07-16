@@ -190,6 +190,9 @@ SHAs before either worker begins.
   - Submodule acceptance uses an explicit absent-then-present probe for the
     single allowed Git call and a separate already-present fast path that
     proves zero Git calls.
+  - Injected repository probes, command results, and Hermes stage results are
+    strict scalar contracts. Null, string, collection, or multi-output shapes
+    fail closed before Git or installer actions.
 
 - [ ] **P06 — Aggregate Windows preflight**
   - Branch: `fix/setup-preflight-contract`; source: System Task 4; requires
