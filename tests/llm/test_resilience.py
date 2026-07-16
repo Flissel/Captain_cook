@@ -68,6 +68,31 @@ async def test_invalid_policy_is_rejected_before_invocation(
     assert calls == 0
 
 
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    (float("inf"), float("-inf"), float("nan")),
+)
+@pytest.mark.asyncio
+async def test_non_finite_timeout_is_rejected_before_invocation(
+    timeout_seconds: float,
+) -> None:
+    calls = 0
+
+    async def operation() -> str:
+        nonlocal calls
+        calls += 1
+        return "unexpected"
+
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        await run_llm_stage(
+            LlmStage.DECOMPOSE,
+            operation,
+            timeout_seconds=timeout_seconds,
+        )
+
+    assert calls == 0
+
+
 @pytest.mark.asyncio
 async def test_stage_timeout_cleans_up_each_attempt_and_preserves_cause() -> None:
     calls = 0
@@ -146,6 +171,36 @@ async def test_schema_error_is_not_retried() -> None:
     assert failure.value is schema_error
     assert failure.value.stage is LlmStage.ALIGN
     assert failure.value.attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_schema_error_after_transient_retry_reports_current_attempt() -> None:
+    calls = 0
+    request = httpx.Request("POST", "https://provider.invalid/v1/chat")
+    transient_error = openai.APIConnectionError(request=request)
+    schema_error = LlmSchemaError(LlmStage.ALIGN, "invalid structured output")
+
+    async def operation() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise transient_error
+        raise schema_error
+
+    with pytest.raises(LlmSchemaError) as failure:
+        await run_llm_stage(
+            LlmStage.ALIGN,
+            operation,
+            timeout_seconds=1.0,
+            max_attempts=2,
+        )
+
+    assert calls == 2
+    assert failure.value.stage is LlmStage.ALIGN
+    assert failure.value.attempts == 2
+    assert failure.value.reason == "schema"
+    assert failure.value.detail == "invalid structured output"
+    assert failure.value.__cause__ is schema_error
 
 
 @pytest.mark.asyncio

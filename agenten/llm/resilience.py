@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Awaitable, Callable
 from enum import Enum
 from typing import TypeVar
@@ -50,8 +51,14 @@ class LlmTimeoutError(LlmStageError):
 class LlmSchemaError(LlmStageError):
     """A structured LLM adapter returned missing or invalid content."""
 
-    def __init__(self, stage: LlmStage, detail: str) -> None:
-        super().__init__(stage, 1, "schema", detail=detail)
+    def __init__(
+        self,
+        stage: LlmStage,
+        detail: str,
+        *,
+        attempts: int = 1,
+    ) -> None:
+        super().__init__(stage, attempts, "schema", detail=detail)
 
 
 _TRANSIENT_PROVIDER_ERRORS = (
@@ -71,16 +78,22 @@ async def run_llm_stage(
 ) -> T:
     """Run one LLM operation with one explicit bounded retry owner."""
 
-    if not timeout_seconds > 0:
-        raise ValueError("timeout_seconds must be greater than zero")
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be finite and greater than zero")
     if max_attempts < 1:
         raise ValueError("max_attempts must be greater than zero")
 
     for attempt in range(1, max_attempts + 1):
         try:
             return await asyncio.wait_for(operation(), timeout=timeout_seconds)
-        except LlmSchemaError:
-            raise
+        except LlmSchemaError as exc:
+            if exc.stage is stage and exc.attempts == attempt:
+                raise
+            raise LlmSchemaError(
+                stage,
+                exc.detail or "invalid structured output",
+                attempts=attempt,
+            ) from exc
         except TimeoutError as exc:
             if attempt == max_attempts:
                 raise LlmTimeoutError(stage, attempt) from exc
