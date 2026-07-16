@@ -35,7 +35,7 @@ def test_orchestrator_ack_and_worker_handoff_protocol_are_tracked():
 
     assert "ACK_OWNER: ORCHESTRATOR_ONLY" in ack
     assert "MAX_PARALLEL_WORKERS: 3" in ack
-    assert "SCHEDULE_STATE: PENDING_USER_CONFIRMATION" in ack
+    assert "SCHEDULE_STATE: PENDING_USER_CONFIRMATION_AND_NATIVE_UI" in ack
     assert "HANDOFF TO WORKER 1" in workers
     assert "HANDOFF FROM WORKER 1" in workers
     assert "HANDOFF TO WORKER <ID>" in orchestrator
