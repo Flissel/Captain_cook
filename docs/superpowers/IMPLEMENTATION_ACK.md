@@ -64,10 +64,10 @@ resolution of all four overlapping paths. Specification and quality reviews
 are PASS; the combined 123-test gate and `compileall` passed. The planning lane
 is unlocked for P10.
 
-P08 candidate chain `e5449d1` + `1e6defb` is integrated as `cfa4123` after
-specification and quality PASS. P10 is the next implementable packet; P11 now
-waits only for P10. P14 still waits for P06 and owns the remaining health
-startup-versus-readiness boundary.
+P10 candidate chain `dfd8983` + `4575d18` is integrated as `e8754ea` after
+specification and quality PASS. P11 is now the next critical-path packet. P14
+still waits for P06 and owns the remaining health startup-versus-readiness
+boundary.
 
 ### Autonomous Captain process candidate
 
@@ -146,6 +146,22 @@ QUALITY_REVIEW: PASS
 INTEGRATION_SHA: cfa4123193066387ea6530760e803c4ed05b47a8
 INTEGRATED_GATE: 49 selected passed, zero skips; full 413 passed, 2 explicit skips, 1 deselected, 1 warning; 84% coverage
 FOLLOWUP_GAP: P14 must move lazy schema initialization out of the readiness request
+
+HANDOFF TO WORKER 7: P10
+STATE: INTEGRATED
+LOCK: LOCK_PLANNING
+BRANCH: feat/captain-llm-resilience
+WORKTREE: C:\Users\User\Desktop\Captain_cook\.worktrees\captain-llm-resilience
+CANDIDATE_SHA: dfd8983b434fdaaf1715d11acdd8b26de2c3db95
+REPAIR_SHA: 4575d1878bfb2132efa4ad8412d82a2e65cb2631
+RED_GATE: missing resilience module plus SDK retry ownership; then 2 metadata/finite-timeout failures
+GREEN_GATE: 42 LLM/factory and 60 planning tests passed
+WORKER_GATE: full 390 passed, 58 skipped, 1 deselected; 77.10% coverage
+SPEC_REVIEW: PASS after closing 2 Important findings
+QUALITY_REVIEW: PASS after closing 2 Important findings
+INTEGRATION_SHA: e8754ea81edc51ff6491ff3d94e5a1bda5740472
+INTEGRATED_GATE: 94 LLM/planning passed; compileall passed; default full 386 passed, 59 explicit skips, 1 deselected, 1 warning; 76.87% coverage
+FOLLOWUP_GAP: P20 owns SDK pinning and reviewed backoff/Retry-After plus soft-deadline claim discipline
 
 HANDOFF TO WORKER 2: P06
 STATE: REPAIR_ATTEMPT_1_IN_PROGRESS

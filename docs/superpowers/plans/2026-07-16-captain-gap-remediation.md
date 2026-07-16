@@ -409,7 +409,7 @@ git commit -m "feat: resume partial captain planning runs"
 - Produces: `LlmStage`, `LlmStageError`, `LlmTimeoutError`, `LlmSchemaError`, and `run_llm_stage`.
 - Policy: two attempts per stage, 30-second timeout per attempt, retry only timeout/transient provider failures, never retry deterministic planning-policy failures.
 
-- [ ] **Step 1: Write failing timeout and retry tests**
+- [x] **Step 1: Write failing timeout and retry tests**
 
 ```python
 @pytest.mark.asyncio
@@ -433,13 +433,13 @@ async def test_schema_error_is_not_retried() -> None:
     assert calls == 1
 ```
 
-- [ ] **Step 2: Verify failures**
+- [x] **Step 2: Verify failures**
 
 Run: `python -m pytest -q tests/llm/test_resilience.py`
 
 Expected: collection failure because resilience types do not exist.
 
-- [ ] **Step 3: Implement the bounded wrapper**
+- [x] **Step 3: Implement the bounded wrapper**
 
 ```python
 async def run_llm_stage(
@@ -469,11 +469,11 @@ async def run_llm_stage(
     raise AssertionError("unreachable")
 ```
 
-- [ ] **Step 4: Apply it to decomposition, alignment, and enrichment**
+- [x] **Step 4: Apply it to decomposition, alignment, and enrichment**
 
 Wrap each injected callable in the factory. Convert missing/wrong structured content in `plan_batches.py` to `LlmSchemaError` with the correct stage. Keep alignment-policy retries separate from provider retries.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run: `python -m pytest -q tests/llm tests/planning/test_factory_e2e.py`
 

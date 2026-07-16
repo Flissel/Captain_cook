@@ -305,7 +305,7 @@ SHAs before either worker begins.
     requires P07C.
   - Gate: auth, settings, gateway, and database-backed health tests.
 
-- [ ] **P10 — Typed LLM resilience**
+- [x] **P10 — Typed LLM resilience**
   - Branch: `feat/captain-llm-resilience`; source: Captain Task 5; requires
     P09; gate: LLM and factory E2E suites.
 
@@ -363,6 +363,10 @@ SHAs before either worker begins.
     globally silencing them.
   - Every external-service test is selected explicitly with `-m live` in its
     owning job; the ordinary unit/coverage job remains non-live.
+  - [ ] Pin the supported OpenAI SDK version and add a reviewed rate-limit
+    policy for bounded backoff/`Retry-After`; document that the current
+    in-process `asyncio.wait_for` timeout requires cooperative cancellation
+    and is a soft deadline rather than a process-level kill boundary.
   - Gate: isolated DB script, live verifier, Pester, full pytest, `compileall`,
     Compose validation, and submission verification.
 
@@ -564,3 +568,12 @@ For every packet, the orchestrator must:
   gate passed 49 selected tests with zero skips; its full gate passed 413 tests
   with two explicit skips, one live deselection, one known warning, and 84%
   coverage. P11 now waits only for P10; P14 also requires P06.
+- P10 integrated candidate chain `dfd8983` + `4575d18` as merge commit
+  `e8754ea`. Pre-dispatch review expanded the exact packet by
+  `agenten/llm/model_client.py` and its test so P10 is the sole retry owner and
+  the OpenAI SDK uses `max_retries=0`. The first spec/quality reviews rejected
+  inaccurate mixed-failure attempt metadata and non-finite timeouts; RED
+  repairs closed both and fresh reviews passed. The integrated LLM/planning
+  gate passed 94 tests plus compileall; the default non-live suite passed 386
+  with 59 explicit service/environment skips, one live deselection, one known
+  warning, and 76.87% coverage. P11 is now unlocked.
