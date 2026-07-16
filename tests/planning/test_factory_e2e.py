@@ -9,6 +9,7 @@ from agenten.llm.model_client import build_replay_model_client
 from agenten.llm.resilience import LlmSchemaError, LlmStage, LlmStageError
 from agenten.planning.alignment import AlignmentPlan, BatchDraft
 from agenten.planning.captain_pipeline import BatchEnrichment
+from agenten.planning.captain_pipeline import CapabilityResolver
 from agenten.planning.factory import build_captain_pipeline
 from agenten.planning.policy import PlanningPolicyError
 from agenten.validation.contracts import (
@@ -16,6 +17,21 @@ from agenten.validation.contracts import (
     AssertionKind,
     ExampleCase,
 )
+
+
+class RecordingReleaseClient:
+    def __init__(self) -> None:
+        self.batch_ids: list[str] = []
+
+    async def release(self, batch, holdouts) -> None:
+        assert batch.batch_id == holdouts.batch_id
+        self.batch_ids.append(batch.batch_id)
+
+
+class NoMatchResolver(CapabilityResolver):
+    async def find_match(self, target: str, capability_tags) -> None:
+        del target, capability_tags
+        return None
 
 
 @pytest.mark.asyncio
@@ -64,6 +80,31 @@ async def test_factory_runs_captain_from_description_to_released_contracts(tmp_p
     assert [batch.batch_id for batch in result.batches] == ["delivery"]
     assert (tmp_path / "batches" / "delivery.json").exists()
     assert (tmp_path / "holdouts" / "delivery.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_factory_uses_injected_release_and_capability_ports(tmp_path: Path) -> None:
+    release = RecordingReleaseClient()
+    client = build_replay_model_client(
+        [
+            valid_decomposition().model_dump_json(),
+            valid_alignment().model_dump_json(),
+            valid_enrichment().model_dump_json(),
+        ]
+    )
+    pipeline = build_captain_pipeline(
+        model_client=client,
+        output_dir=tmp_path / "must-not-be-used",
+        target="external",
+        known_capability_tags=["delivery"],
+        release_client=release,
+        capability_resolver=NoMatchResolver(),
+    )
+
+    await pipeline.run("Build something useful")
+
+    assert release.batch_ids == ["delivery"]
+    assert not (tmp_path / "must-not-be-used").exists()
 
 
 def valid_decomposition(*, capability_tag: str = "delivery") -> DecomposeResponse:

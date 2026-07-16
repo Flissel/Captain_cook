@@ -1,3 +1,10 @@
+from .gateway_client import (
+    GatewayBatchProjection,
+    GatewayClaim,
+    GatewayDeliveryClient,
+    GatewayDeliveryConflictError,
+    GatewayDeliveryError,
+)
 from .ledger import SqliteDeliveryLedger
 from .models import (
     DeliveryEvent,
@@ -15,5 +22,10 @@ __all__ = [
     "DeliveryStatus",
     "DeliveryTodo",
     "DeliveryTransitionError",
+    "GatewayBatchProjection",
+    "GatewayClaim",
+    "GatewayDeliveryClient",
+    "GatewayDeliveryConflictError",
+    "GatewayDeliveryError",
     "SqliteDeliveryLedger",
 ]
