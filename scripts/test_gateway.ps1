@@ -49,6 +49,37 @@ function Invoke-Pytest {
     return ,$outputLines
 }
 
+function Assert-SelectedPytestSummary {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string[]]$SelectedOutput
+    )
+
+    $selectedText = $SelectedOutput -join "`n"
+    if ($selectedText -match "(?m)^SKIPPED \[" -or $selectedText -match "\b\d+ skipped\b") {
+        throw "Selected MariaDB/gateway tests reported a skip"
+    }
+
+    $passSummaries = [regex]::Matches(
+        $selectedText,
+        "(?m)^(?<count>[0-9]+) passed(?:,| in )"
+    )
+    if ($passSummaries.Count -ne 1) {
+        throw "Selected MariaDB/gateway tests must report exactly one well-formed pass summary"
+    }
+
+    $passedCount = 0
+    if (-not [int]::TryParse($passSummaries[0].Groups["count"].Value, [ref]$passedCount)) {
+        throw "Selected MariaDB/gateway pass count is not a valid integer"
+    }
+    if ($passedCount -lt 22) {
+        throw "Selected MariaDB/gateway tests reported $passedCount passed; at least 22 are required"
+    }
+
+    return $passedCount
+}
+
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $composeFile = [System.IO.Path]::GetFullPath((Join-Path $repoRoot "docker-compose.test.yml"))
 $dockerCommand = (Get-Command docker -ErrorAction Stop).Source
@@ -111,13 +142,7 @@ try {
         "-rs"
     )
     $selectedOutput = Invoke-Pytest -Python $pythonCommand -Arguments $selectedArguments -Label "Selected MariaDB/gateway tests"
-    $selectedText = $selectedOutput -join "`n"
-    if ($selectedText -match "(?m)^SKIPPED \[" -or $selectedText -match "\b\d+ skipped\b") {
-        throw "Selected MariaDB/gateway tests reported a skip"
-    }
-    if ($selectedText -notmatch "(?m)^22 passed(?:,| in )") {
-        throw "Selected MariaDB/gateway tests did not report exactly 22 passed"
-    }
+    $null = Assert-SelectedPytestSummary -SelectedOutput $selectedOutput
 
     $fullArguments = @("-m", "pytest", "-q", "-rs", "-m", "not live")
     $fullOutput = Invoke-Pytest -Python $pythonCommand -Arguments $fullArguments -Label "Full coverage suite"
