@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from typing import List
 
 import pytest
@@ -232,6 +233,54 @@ async def test_pipeline_derives_capability_reuse_from_resolver_not_the_llm() -> 
     result = await pipeline.run("Reuse a validated delivery capability")
 
     assert result.batches[0].satisfied_by == "validated-capability:delivery-v2"
+
+
+@pytest.mark.asyncio
+async def test_mutating_resolver_cannot_change_canonical_batch_tags() -> None:
+    class MutatingCapabilityResolver:
+        def __init__(self) -> None:
+            self.received: list[str] | None = None
+
+        async def find_match(
+            self,
+            target: str,
+            capability_tags: Sequence[str],
+        ) -> str | None:
+            assert isinstance(capability_tags, list)
+            capability_tags.append("invented")
+            self.received = capability_tags
+            return None
+
+    async def decompose(_: str) -> List[PlannedSubtask]:
+        return [PlannedSubtask(subtask_id="s1", description="Delivery")]
+
+    async def align(_: str, __: List[PlannedSubtask], ___: str) -> AlignmentPlan:
+        return AlignmentPlan(
+            batches=[BatchDraft(batch_id="delivery", title="Delivery", subtask_ids=["s1"])]
+        )
+
+    async def enrich(
+        _: str, draft: BatchDraft, __: List[PlannedSubtask]
+    ) -> BatchEnrichment:
+        return enrichment_for(draft)
+
+    releases = RecordingReleaseClient()
+    resolver = MutatingCapabilityResolver()
+    pipeline = CaptainPipeline(
+        decompose=decompose,
+        align=align,
+        enrich=enrich,
+        release_client=releases,
+        policy=PlanningPolicy(frozenset({"delivery"})),
+        capability_resolver=resolver,
+        target="external",
+    )
+
+    result = await pipeline.run("Protect canonical capability tags")
+
+    assert resolver.received == ["delivery", "invented"]
+    assert result.batches[0].capability_tags == ["delivery"]
+    assert releases.releases[0][0].capability_tags == ["delivery"]
 
 
 @pytest.mark.asyncio

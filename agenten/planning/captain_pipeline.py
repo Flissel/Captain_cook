@@ -1,5 +1,6 @@
 """Captain-owned project planning and batch release pipeline."""
 
+from collections.abc import Sequence
 from typing import Awaitable, Callable, List, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -64,7 +65,11 @@ class BatchReleaseClient(Protocol):
 
 
 class CapabilityResolver(Protocol):
-    async def find_match(self, target: str, capability_tags: List[str]) -> str | None: ...
+    async def find_match(
+        self,
+        target: str,
+        capability_tags: Sequence[str],
+    ) -> str | None: ...
 
 
 Decompose = Callable[[str], Awaitable[List[PlannedSubtask]]]
@@ -144,7 +149,7 @@ class CaptainPipeline:
             if self._capability_resolver is not None:
                 satisfied_by = await self._capability_resolver.find_match(
                     self._target,
-                    capability_tags,
+                    list(capability_tags),
                 )
             batch = WorkBatch(
                 batch_id=draft.batch_id,
@@ -152,7 +157,7 @@ class CaptainPipeline:
                 goal=enrichment.goal,
                 subtask_ids=draft.subtask_ids,
                 target=self._target,
-                capability_tags=capability_tags,
+                capability_tags=list(capability_tags),
                 depends_on=draft.depends_on,
                 constraints=enrichment.constraints,
                 acceptance_criteria=enrichment.acceptance_criteria,
