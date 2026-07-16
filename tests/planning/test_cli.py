@@ -9,6 +9,7 @@ from agenten.llm.model_client import build_replay_model_client
 from agenten.planning.alignment import AlignmentPlan, BatchDraft
 from agenten.planning.captain_pipeline import BatchEnrichment
 from agenten.planning.cli import GatewayPlanningConfigurationError, async_main
+from agenten.planning.run_models import CaptainRunState, CaptainRunStatus
 from agenten.validation.contracts import (
     AcceptanceAssertion,
     AssertionKind,
@@ -203,6 +204,7 @@ async def test_gateway_mode_releases_compiled_contracts_over_one_client(
     project = tmp_path / "project.md"
     project.write_text("Build the delivery", encoding="utf-8")
     output = tmp_path / "release"
+    run_dir = tmp_path / "runs"
     monkeypatch.setenv("CAPTAIN_GATEWAY_TOKEN", "captain-secret")
     gateway_requests: list[httpx.Request] = []
 
@@ -253,6 +255,10 @@ async def test_gateway_mode_releases_compiled_contracts_over_one_client(
                 "gateway",
                 "--gateway-url",
                 "http://gateway",
+                "--run-id",
+                "run-1",
+                "--run-dir",
+                str(run_dir),
                 "--capability",
                 "delivery",
             ],
@@ -271,3 +277,37 @@ async def test_gateway_mode_releases_compiled_contracts_over_one_client(
         for request in gateway_requests
     )
     assert (output / "contracts" / "batches" / "delivery.json").exists()
+    checkpoint = CaptainRunState.model_validate_json(
+        (run_dir / "run-1.json").read_text(encoding="utf-8")
+    )
+    assert checkpoint.status is CaptainRunStatus.RELEASED
+
+
+@pytest.mark.asyncio
+async def test_run_id_requires_gateway_mode_before_model_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project.md"
+    project.write_text("Build the delivery", encoding="utf-8")
+    model_was_built = False
+
+    def unexpected_model(*args, **kwargs):
+        nonlocal model_was_built
+        model_was_built = True
+        raise AssertionError("model client must not be built")
+
+    monkeypatch.setattr("agenten.planning.cli.build_model_client", unexpected_model)
+
+    with pytest.raises(GatewayPlanningConfigurationError, match="gateway release mode"):
+        await async_main(
+            [
+                str(project),
+                "--run-id",
+                "run-1",
+                "--capability",
+                "delivery",
+            ]
+        )
+
+    assert model_was_built is False

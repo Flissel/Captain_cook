@@ -44,15 +44,29 @@ class AutonomousCaptainPlanner:
         *,
         source_reference: str | None = None,
         release_compiled: bool = False,
+        run_id: str | None = None,
     ) -> AutonomousPlanningResult:
         project_input = self._parser.parse(
             source_path,
             source_reference=source_reference,
         )
-        compiled = await self._pipeline.compile(project_input.planning_context())
+        planning_context = project_input.planning_context()
+        if release_compiled and run_id is not None:
+            compiled = await self._pipeline.compile_checkpoint(
+                planning_context,
+                run_id=run_id,
+            )
+        else:
+            compiled = await self._pipeline.compile(planning_context)
         plan = self._compiler.compile(project_input, compiled.batches, compiled.holdouts)
         if release_compiled:
-            await self._pipeline.release(compiled)
+            if run_id is None:
+                await self._pipeline.release(compiled)
+            else:
+                await self._pipeline.release_checkpoint(
+                    planning_context,
+                    run_id=run_id,
+                )
         CanonicalPlanPublisher(self._output_dir).publish(
             project_input,
             plan,
