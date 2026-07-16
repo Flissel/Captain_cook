@@ -13,7 +13,7 @@ SCHEDULE_STATE: PENDING_USER_CONFIRMATION_AND_NATIVE_UI
 PROPOSED_SCHEDULE: EVERY_30_MINUTES_WHILE_ACTIVE
 INTEGRATION_WORKTREE: C:\Users\User\Desktop\Captain_cook-main-integration
 INTEGRATION_BRANCH: feat/system-remediation-orchestration
-LAST_INTEGRATED_IMPLEMENTATION_SHA: 11febc37
+  LAST_INTEGRATED_IMPLEMENTATION_SHA: df79012
 CONTROL_DISPATCH_SHA: 4601806
 PRIMARY_WORKTREE_POLICY: PRESERVE_AND_DO_NOT_USE_FOR_INTEGRATION
 ACK_OWNER: ORCHESTRATOR_ONLY
@@ -35,6 +35,7 @@ may advance the base only after recording a new explicit dispatch SHA here.
 | P05 | `4a2ee1f` | `11febc37` | spec PASS, quality PASS, 64 Pester, both Compose renders, parser PASS |
 | P07A | `46dfc80` | `e951549` | spec/quality PASS, 47 focused tests |
 | P15 | `e688177` | `61b1858` | spec/quality PASS, 54 integrated tests, compileall PASS |
+| P09 | `51cfb69` | `df79012` | spec/quality PASS, explicit AF01 reconciliation, 123 combined tests |
 
 P05 closed all known fail-open bootstrap result-shape gaps. P06 is unblocked.
 
@@ -57,34 +58,32 @@ P06 candidate `5db62f8` is specification FAIL: the real preflight ignores its
 configuration and treats every occupied fixed port as foreign, breaking healthy
 reruns and external-n8n mode. Repair attempt 1/3 is active.
 
-P09 repair candidate `51cfb69` adds atomic contract compilation, a defensive
-resolver boundary, and deep release-boundary copies. Its repair-4 RED/GREEN
-regression proves a mutating release adapter no longer corrupts the canonical
-result. Fresh specification and quality reviews are PASS. Four P09 paths
-overlap the local AF01 candidate, so integration now requires an explicit
-conflict resolution followed by combined gates; no blind merge or cherry-pick.
+P09 candidate `51cfb69` is integrated with AF01 as `df79012` after explicit
+resolution of all four overlapping paths. Specification and quality reviews
+are PASS; the combined 123-test gate and `compileall` passed. The planning lane
+is unlocked for P10.
 
-P07C remains blocked by P07B. P08 remains blocked by P07C. P10 remains blocked
-by P09.
+P07C remains blocked by P07B. P08 remains blocked by P07C. P10 is unlocked by
+the completed P09 packet.
 
 ### Autonomous Captain process candidate
 
 ```text
 PACKET: AF01-PROCESS-BOUNDARIES
-STATE: LOCAL_CANDIDATE_REVIEW_REQUIRED
+STATE: INTEGRATED_CONTRACT_EVIDENCE_ONLY
 WORKTREE: C:\Users\User\Desktop\Captain_cook-main-integration
 SOURCE_INPUT: C:\Users\User\Desktop\Captain_cook\Autogen_AgentFarm\input.md
 SOURCE_SHA256: e55e667474a3b6a3d1a1dc6f927fec9ea67a247ea30ea61141c5b994495623ac
 WORKERS_USED: 6
-FOCUSED_GATE: 69 passed plus agenten compileall
+FOCUSED_GATE: 123 combined AF01/P09/P15 tests plus agenten compileall
 DEFAULT_FULL_GATE: BLOCKED - duplicate test_contracts module basename (P07B-owned)
-DIAGNOSTIC_FULL_GATE: 328 passed, 24 skipped, 1 deselected, 1 warning, 77.82% coverage
-SKIPS: 1 missing legacy autogen package; 22 TEST_MARIADB_DSN (4 storage, 18 gateway); 1 no-autogen degradation path
+DIAGNOSTIC_FULL_GATE: 349 passed, 23 skipped, 1 deselected, 1 warning, 78.12% coverage
+SKIPS: 22 TEST_MARIADB_DSN (4 storage, 18 gateway); 1 no-autogen degradation path
 WARNING: Starlette/httpx deprecation
 SUBMISSION_VERIFIER: passed
 OFFLINE_DEMO: 4 subproblems reached done; temporary output only
 LIVE_INTEGRATION_EVIDENCE: none
-INTEGRATION_PERFORMED: no
+INTEGRATION_PERFORMED: yes - df790121061e181edd220ab6e3d8380d60ca4bee
 FINAL_DIFF_REVIEW: no Critical/Important findings in the implemented local scope; gateway authority and OS sandbox remain explicit production gates
 ```
 
@@ -124,7 +123,7 @@ WORKER_LIMIT: live winget/PATH acceptance intentionally not claimed
 SPEC_REVIEW: FAIL - production preflight is configuration/ownership blind
 
 HANDOFF TO WORKER 3: P09
-STATE: READY_FOR_AF01_RECONCILIATION
+STATE: INTEGRATED
 LOCK: LOCK_PLANNING
 BRANCH: feat/captain-planning-policy
 WORKTREE: C:\Users\User\Desktop\Captain_cook\.worktrees\captain-planning-policy
@@ -134,6 +133,8 @@ WORKER_GATE: 17 focused plus 15 architecture/import/workstream tests passed; com
 WORKER_LIMIT: integrated full suite must rerun after the P07B basename-collision fix lands
 SPEC_REVIEW: PASS
 QUALITY_REVIEW: PASS
+INTEGRATION_SHA: df790121061e181edd220ab6e3d8380d60ca4bee
+INTEGRATED_GATE: 123 passed; agenten compileall passed
 
 HANDOFF TO WORKER 4: P15
 STATE: INTEGRATED

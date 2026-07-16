@@ -117,7 +117,7 @@ git commit -m "docs: establish canonical integration baseline"
 - Consumes: configured `allowed_capability_tags: frozenset[str]`, `BatchEnrichment`, and `WorkBatch`.
 - Produces: `PlanningPolicy.validate_enrichment(enrichment) -> None` and deterministic content fingerprints for golden/holdout isolation.
 
-- [ ] **Step 1: Write failing policy tests**
+- [x] **Step 1: Write failing policy tests**
 
 ```python
 def test_policy_rejects_enrichment_capability_outside_vocabulary() -> None:
@@ -137,13 +137,13 @@ def test_policy_rejects_same_case_content_under_different_ids() -> None:
         policy.validate_enrichment(enrichment)
 ```
 
-- [ ] **Step 2: Verify both tests fail**
+- [x] **Step 2: Verify both tests fail**
 
 Run: `python -m pytest -q tests/planning/test_policy.py`
 
 Expected: collection failure because `PlanningPolicy` does not exist.
 
-- [ ] **Step 3: Implement canonical fingerprints and validation**
+- [x] **Step 3: Implement canonical fingerprints and validation**
 
 ```python
 class PlanningPolicyError(ValueError):
@@ -170,11 +170,11 @@ class PlanningPolicy:
             raise PlanningPolicyError("holdout content overlaps build-visible golden content")
 ```
 
-- [ ] **Step 4: Inject policy into the pipeline and factory**
+- [x] **Step 4: Inject policy into the pipeline and factory**
 
 Add `policy: PlanningPolicy` to `CaptainPipeline.__init__`, call `self._policy.validate_enrichment(enrichment)` immediately after each enrichment, and construct it in `build_captain_pipeline` from `known_capability_tags`.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run: `python -m pytest -q tests/planning/test_policy.py tests/planning/test_captain_pipeline.py tests/planning/test_factory_e2e.py`
 

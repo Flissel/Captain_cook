@@ -86,7 +86,7 @@ uncommitted local files, or an offline-only demo.
 
 - [ ] **SC01 — Versioned source input:** the concrete lead-processing use case
   and exact interfaces are committed and reproducibly hashed.
-- [ ] **SC02 — Canonical immutable DAG:** every batch has exactly one derived
+- [x] **SC02 — Canonical immutable DAG:** every batch has exactly one derived
   status and deterministic dependency order in integrated code.
 - [ ] **SC03 — Two real n8n tools:** Hermes/Codex builds, imports, publishes,
   and invokes at least two target workflows against the authorized instance.
@@ -125,10 +125,11 @@ Live gates remain independently blocking:
 - [ ] **Gate E — acceptance:** three E2E runs, failure suite, evidence archive,
   clean-clone reproduction, and judge sandbox.
 
-Current strict audit: `0/13` success criteria and `0/5` live gates are complete.
-SC02 and SC07 have uncommitted local contract evidence only. This counter must
-be recomputed after every integrated packet and may advance only from fresh
-evidence.
+Current strict audit: `1/13` success criteria and `0/5` live gates are complete.
+SC02 is integrated with deterministic contract evidence. SC07 has integrated
+planning-policy evidence but still lacks the required Hermes/Codex sandbox
+proof. This counter must be recomputed after every integrated packet and may
+advance only from fresh evidence.
 
 ## Exclusive file locks
 
@@ -220,7 +221,7 @@ SHAs before either worker begins.
   - Output: downstream-only invalidation and `Repair-CaptainSystem`.
   - Gate: full Pester setup suite.
 
-- [ ] **P09 — Deterministic Captain planning policy**
+- [x] **P09 — Deterministic Captain planning policy**
   - Branch: `feat/captain-planning-policy`; source: Captain Task 2; requires
     P01.
   - Output: canonical capabilities and isolated content fingerprints.
@@ -521,6 +522,12 @@ For every packet, the orchestrator must:
   `SubscribableEventBus`, recorder wiring is explicit, and publish-only buses
   fail before partial pipeline construction. P16 and P17 are unlocked in their
   respective serial lock lanes.
+- P09 integrated candidate `51cfb69` together with AF01 as merge commit
+  `df79012` after explicit four-path conflict resolution. Four review cycles
+  closed partial publication, resolver-list mutation, and release-boundary
+  aliasing. The combined gate passed 123 tests and `compileall`; the diagnostic
+  full suite passed 349 tests with 23 explicit skips, one live deselection, one
+  known warning, and 78.12% coverage. P10 is unlocked.
 - P05 pre-dispatch review found a contradictory source example that supplied an
   always-true Hermes probe while expecting a Git call. The source now proves
   the absent-to-present initialization path separately from the already-present
