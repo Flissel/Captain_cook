@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 from threading import Lock
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -48,6 +48,15 @@ class SinkCall(BaseModel):
 
     case_id: str = Field(min_length=1, max_length=128)
     tag: str = Field(min_length=1, max_length=128)
+
+
+class LegacyDeliveryImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    legacy_record_id: str = Field(min_length=1, max_length=256)
+    batch_id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,31}$")
+    record_type: Literal["todo", "event"]
+    data: dict[str, Any]
 
 
 CAPTAIN_WRITE_BLOCK_TYPES = frozenset({"problem", "work_batch", "holdout"})
@@ -223,6 +232,14 @@ def create_app(
         _: GatewayRole = Depends(require_reader),
     ) -> list[dict[str, Any]]:
         return get_store().capabilities(need)
+
+    @app.post("/imports/legacy-delivery", status_code=status.HTTP_201_CREATED)
+    async def import_legacy_delivery(
+        request: LegacyDeliveryImportRequest,
+        _: GatewayRole = Depends(require_captain),
+    ) -> dict[str, Any]:
+        block, created = get_store().import_legacy_record(request)
+        return {"created": created, "block": block}
 
     return app
 

@@ -67,7 +67,9 @@ def test_development_dependency_manifest_includes_test_tooling():
     assert "pytest-cov==4.1.0" in requirement_lines
 
 
-def test_default_pytest_gate_excludes_explicit_live_tests():
+def test_default_pytest_gate_excludes_explicit_live_and_legacy_tests():
     pytest_config = (ROOT / "pytest.ini").read_text(encoding="utf-8")
 
-    assert '-m "not live"' in pytest_config
+    assert '-m "not live and not legacy"' in pytest_config
+    assert "live:" in pytest_config
+    assert "legacy:" in pytest_config

@@ -6,7 +6,6 @@ from .gateway_client import (
     GatewayDeliveryError,
     GatewayEvidence,
 )
-from .ledger import SqliteDeliveryLedger
 from .models import (
     DeliveryEvent,
     DeliveryEvidence,
@@ -29,5 +28,4 @@ __all__ = [
     "GatewayDeliveryConflictError",
     "GatewayDeliveryError",
     "GatewayEvidence",
-    "SqliteDeliveryLedger",
 ]
