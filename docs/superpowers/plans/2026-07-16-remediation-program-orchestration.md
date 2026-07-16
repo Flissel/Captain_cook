@@ -151,7 +151,7 @@ SHAs before either worker begins.
     known non-database compatibility or degradation skips; every new or unknown
     skip fails the gate.
 
-- [ ] **P03A — Make the MariaDB/gateway gate extensible**
+- [x] **P03A — Make the MariaDB/gateway gate extensible**
   - Branch: `fix/scalable-gateway-test-count`; requires P03.
   - Owns exactly: `scripts/test_gateway.ps1` and
     `tests/test_mariadb_test_guard.py`.
@@ -417,3 +417,12 @@ For every packet, the orchestrator must:
   idempotent release behind one serial gateway lock. P07B extracts
   `GatewayStore` into `gateway/store.py`, preventing lifecycle persistence from
   remaining coupled to FastAPI routing.
+- P03A integrated candidate `854c7e1` as merge commit `ed7c977` after a
+  disjoint-path audit, conflict-free `merge-tree` preview, specification PASS,
+  and code-quality PASS. The integrated gate accepted the established 22-test
+  minimum with zero selected skips, then passed 262 non-live tests with two
+  explicitly allowed degradation skips, one live deselection, one pre-existing
+  Starlette warning, and 80.54% coverage. Its disposable Compose resources
+  were removed; Captain MariaDB/Mailpit, the observed Captain n8n container,
+  and external VibeMind n8n remained healthy with unchanged start times. P07A
+  is therefore unlocked on the serial gateway lane.

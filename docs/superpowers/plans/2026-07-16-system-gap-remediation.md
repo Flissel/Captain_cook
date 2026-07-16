@@ -1161,6 +1161,14 @@ Populate this table only with fresh evidence from Task 11.
 - Consolidated into: `Task 6, Steps 1–3`; `Final acceptance evidence`.
 - Supersedes: the prior service-skipped database baseline for local P03 evidence; P20 still owns CI and final live-gate refresh.
 
+### 2026-07-16 09:39 Europe/Berlin — Scalable MariaDB/gateway gate
+
+- Evidence: candidate `854c7e1` passed fresh specification and code-quality reviews; integration merge `ed7c977` ran `pwsh -NoProfile -File scripts/test_gateway.ps1`, which passed the 22-test database/gateway minimum with zero selected skips and then passed 262 non-live tests with two classified degradation skips, one live deselection, and 80.54% coverage.
+- Insight: an exact `22 passed` equality was a false ceiling; parsing a single integer summary preserves the proven floor while allowing later gateway packets to add tests and still rejects skips, malformed output, duplicate summaries, and counts below 22.
+- Decision: retain 22 only as Task 6's minimum baseline and unlock the pure P07A projection packet. The isolated Compose project was removed, and the observed protected services retained their start times.
+- Consolidated into: `Task 6, Step 3`; program packet `P03A`; `Final acceptance evidence`.
+- Supersedes: the exact-count interpretation of the original Task 6 local gate; P20 still owns CI and final live-gate refresh.
+
 ### Example for the next implementation session
 
 Copy the structure and replace its concrete evidence with the new session's
