@@ -8,9 +8,12 @@ from pymysql.cursors import DictCursor
 from urllib.parse import unquote, urlparse
 
 from blockchain.mariadb_storage import MariaDBStorage
+from tests.support.mariadb import assert_isolated_test_database
 
 
 TEST_DSN = os.getenv("TEST_MARIADB_DSN")
+if os.getenv("REQUIRE_MARIADB_TESTS") == "1":
+    assert_isolated_test_database(TEST_DSN)
 pytestmark = pytest.mark.skipif(not TEST_DSN, reason="TEST_MARIADB_DSN is not configured")
 
 
@@ -48,9 +51,12 @@ def make_block(index: int, previous_hash: str) -> dict[str, Any]:
 @pytest.fixture
 def storage() -> MariaDBStorage:
     assert TEST_DSN is not None
+    assert_isolated_test_database(TEST_DSN)
     result = MariaDBStorage(TEST_DSN)
+    assert_isolated_test_database(TEST_DSN)
     result.clear()
     yield result
+    assert_isolated_test_database(TEST_DSN)
     result.clear()
 
 
