@@ -148,13 +148,50 @@ function Install-SetupPrerequisite {
     New-SetupResult -Component $Name -Status 'Ready' -Message "$Name wurde installiert." -Remediation 'None'
 }
 
+function Confirm-InstalledPrerequisite {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $Name,
+        [scriptblock] $Resolver = { param($commandName) Get-Command $commandName -ErrorAction SilentlyContinue }
+    )
+
+    try {
+        $resolvedCommands = @(& $Resolver $Name)
+    }
+    catch {
+        $resolvedCommands = @()
+    }
+
+    if ($resolvedCommands.Count -ne 1 -or $null -eq $resolvedCommands[0]) {
+        return New-SetupResult -Component $Name -Status 'RestartRequired' `
+            -Message "$Name wurde installiert, ist in dieser PowerShell-Sitzung aber noch nicht sichtbar." `
+            -Remediation 'Restart'
+    }
+
+    $command = $resolvedCommands[0]
+    $pathProperty = $command.PSObject.Properties['Source']
+    if ($null -eq $pathProperty -or $pathProperty.Value -isnot [string] -or
+        [string]::IsNullOrWhiteSpace($pathProperty.Value)) {
+        return New-SetupResult -Component $Name -Status 'RestartRequired' `
+            -Message "$Name wurde installiert, ist in dieser PowerShell-Sitzung aber noch nicht sichtbar." `
+            -Remediation 'Restart'
+    }
+
+    New-SetupResult -Component $Name -Status 'Ready' `
+        -Message "$Name ist nach der Installation verfügbar." -Remediation 'None' `
+        -Data @{ Path = [string]$pathProperty.Value }
+}
+
 function Get-PreflightResults {
     [CmdletBinding()]
-    param()
+    param(
+        [string] $Root = (Get-Location).Path,
+        [hashtable] $Configuration = @{}
+    )
 
     $results = [Collections.Generic.List[object]]::new()
     $results.Add((Test-SetupPlatform))
-    $results.Add((Test-SetupDiskSpace -Path (Get-Location).Path))
+    $results.Add((Test-SetupDiskSpace -Path $Root))
     $results.Add((Test-SetupNetwork))
     $results.Add((Test-SetupExecutable -Name 'git' -MinimumVersion '2.0'))
     $results.Add((Test-SetupExecutable -Name 'python' -MinimumVersion '3.11' -MaximumVersion '3.14'))
@@ -167,6 +204,66 @@ function Get-PreflightResults {
     $results.ToArray()
 }
 
+function Test-SetupPreflight {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $Root,
+        [hashtable] $Configuration = @{},
+        [scriptblock] $ResultProvider = {
+            param($candidateRoot, $candidateConfiguration)
+            Get-PreflightResults -Root $candidateRoot -Configuration $candidateConfiguration
+        }
+    )
+
+    try {
+        $results = @(& $ResultProvider $Root $Configuration)
+    }
+    catch {
+        $results = @()
+    }
+
+    $allowedStatuses = @('Ready', 'Missing', 'Invalid', 'Failed', 'Skipped', 'RestartRequired')
+    $allowedRemediations = @('None', 'Install', 'Configure', 'Retry', 'Restart', 'Manual')
+    $requiredProperties = @('Component', 'Status', 'Message', 'Remediation', 'Data')
+    $validResults = [Collections.Generic.List[object]]::new()
+    foreach ($result in $results) {
+        if ($null -eq $result) { continue }
+        $propertyNames = @($result.PSObject.Properties.Name)
+        $hasRequiredProperties = -not @($requiredProperties | Where-Object { $_ -notin $propertyNames }).Count
+        if (-not $hasRequiredProperties -or
+            $result.Component -isnot [string] -or [string]::IsNullOrWhiteSpace($result.Component) -or
+            $result.Status -isnot [string] -or $result.Status -cnotin $allowedStatuses -or
+            $result.Message -isnot [string] -or [string]::IsNullOrWhiteSpace($result.Message) -or
+            $result.Remediation -isnot [string] -or $result.Remediation -cnotin $allowedRemediations -or
+            $result.Data -isnot [Collections.IDictionary]) {
+            continue
+        }
+        $validResults.Add($result)
+    }
+
+    if ($results.Count -eq 0 -or $validResults.Count -ne $results.Count) {
+        return New-SetupResult -Component 'Preflight' -Status 'Failed' `
+            -Message 'Die Preflight-Prüfung hat kein gültiges vollständiges Ergebnis geliefert.' `
+            -Remediation 'Retry' -Data @{ Results = [object[]]@() }
+    }
+
+    $stableResults = [object[]]$validResults.ToArray()
+    $nonReady = @($stableResults | Where-Object Status -cne 'Ready')
+    if ($nonReady.Count -eq 0) {
+        return New-SetupResult -Component 'Preflight' -Status 'Ready' `
+            -Message 'Alle Voraussetzungen sind bereit.' -Remediation 'None' `
+            -Data @{ Results = $stableResults }
+    }
+
+    $aggregateStatus = @('RestartRequired', 'Missing', 'Invalid', 'Failed', 'Skipped') |
+        Where-Object { $_ -cin $nonReady.Status } |
+        Select-Object -First 1
+    $primaryResult = $nonReady | Where-Object Status -CEQ $aggregateStatus | Select-Object -First 1
+    New-SetupResult -Component 'Preflight' -Status $aggregateStatus `
+        -Message ($nonReady.Message -join ' ') -Remediation $primaryResult.Remediation `
+        -Data @{ Results = $stableResults }
+}
+
 Export-ModuleMember -Function @(
     'Test-SetupPlatform',
     'Test-SetupExecutable',
@@ -175,5 +272,7 @@ Export-ModuleMember -Function @(
     'Test-SetupNetwork',
     'Test-DockerRuntime',
     'Install-SetupPrerequisite',
-    'Get-PreflightResults'
+    'Confirm-InstalledPrerequisite',
+    'Get-PreflightResults',
+    'Test-SetupPreflight'
 )

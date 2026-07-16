@@ -341,13 +341,20 @@ function Invoke-DefaultSetupStage {
     $root = [string]$Context.Root
     switch ($Stage) {
         'Preflight' {
-            $checks = @((Test-SetupPlatform), (Test-SetupDiskSpace -Path $root), (Test-SetupNetwork))
-            foreach ($name in @('git','python','node','docker')) {
-                if (-not (Get-Command $name -ErrorAction SilentlyContinue)) { return [pscustomobject]@{Status='Failed';Message="$name fehlt. Starte setup.ps1 interaktiv, um es zu installieren."} }
+            $configuration = if ($Context.ContainsKey('Configuration') -and $Context.Configuration -is [hashtable]) {
+                $Context.Configuration
             }
-            $checks += Test-DockerRuntime
-            $failed = @($checks | Where-Object Status -ne 'Ready')
-            if ($failed.Count) { return [pscustomobject]@{Status='Failed';Message=($failed.Message -join ' ')} }
+            else {
+                @{}
+            }
+            $parameters = @{ Root = $root; Configuration = $configuration }
+            if ($Context.ContainsKey('PreflightResultProvider')) {
+                $parameters.ResultProvider = $Context.PreflightResultProvider
+            }
+            $result = Test-SetupPreflight @parameters
+            if ($result.Status -cne 'Ready') {
+                return [pscustomobject]@{ Status = 'Failed'; Message = $result.Message }
+            }
         }
         'Configuration' {
             $result = Initialize-SetupConfiguration -Root $root

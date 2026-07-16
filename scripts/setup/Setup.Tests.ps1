@@ -986,6 +986,113 @@ Describe 'Preflight' {
         $result.Status | Should -Be 'Invalid'
         $result.Remediation | Should -Be 'Install'
     }
+
+    It 'rejects an executable below its minimum version' {
+        $command = [pscustomobject]@{ Source = 'C:\\tools\\python.exe' }
+
+        $result = Test-SetupExecutable -Name 'Python' -MinimumVersion '3.11' `
+            -Resolver { $command } -VersionProvider { [version]'3.10' }
+
+        $result.Status | Should -Be 'Invalid'
+        $result.Remediation | Should -Be 'Install'
+        $result.Data.Version | Should -Be '3.10'
+    }
+
+    It 'aggregates every preflight result using the planned severity order' {
+        $results = @(
+            New-SetupResult -Component 'Network' -Status 'Failed' -Message 'network unavailable' -Remediation 'Retry'
+            New-SetupResult -Component 'Port 3456' -Status 'Invalid' -Message 'port occupied' -Remediation 'Manual'
+            New-SetupResult -Component 'Python' -Status 'Missing' -Message 'python missing' -Remediation 'Install'
+            New-SetupResult -Component 'Node' -Status 'RestartRequired' -Message 'restart shell' -Remediation 'Restart'
+            New-SetupResult -Component 'Docker' -Status 'Skipped' -Message 'docker skipped' -Remediation 'Manual'
+        )
+
+        $result = Test-SetupPreflight -Root $TestDrive -Configuration @{} `
+            -ResultProvider { param($root, $configuration) $results }
+
+        $result.Status | Should -Be 'RestartRequired'
+        $result.Remediation | Should -Be 'Restart'
+        $result.Data.Results.Count | Should -Be 5
+        $result.Data.Results.Component | Should -Be @('Network', 'Port 3456', 'Python', 'Node', 'Docker')
+    }
+
+    It 'selects Missing ahead of lower-impact aggregate failures' {
+        $results = @(
+            New-SetupResult -Component 'Network' -Status 'Failed' -Message 'network unavailable' -Remediation 'Retry'
+            New-SetupResult -Component 'Port 3456' -Status 'Invalid' -Message 'port occupied' -Remediation 'Manual'
+            New-SetupResult -Component 'Python' -Status 'Missing' -Message 'python missing' -Remediation 'Install'
+        )
+
+        $result = Test-SetupPreflight -Root $TestDrive -Configuration @{} `
+            -ResultProvider { param($root, $configuration) $results }
+
+        $result.Status | Should -Be 'Missing'
+        $result.Remediation | Should -Be 'Install'
+    }
+
+    It 'fails closed when the aggregate provider returns a malformed result' {
+        $result = Test-SetupPreflight -Root $TestDrive -Configuration @{} `
+            -ResultProvider { [pscustomobject]@{ Status = 'Ready'; Message = 'incomplete' } }
+
+        $result.PSObject.Properties.Name | Should -Be @('Component', 'Status', 'Message', 'Remediation', 'Data')
+        $result.Status | Should -Be 'Failed'
+        $result.Remediation | Should -Be 'Retry'
+        $result.Data.Results.Count | Should -Be 0
+    }
+
+    It 'returns Ready only when every aggregate preflight result is ready' {
+        $results = @(
+            New-SetupResult -Component 'Python' -Status 'Ready' -Message 'python ready' -Remediation 'None'
+            New-SetupResult -Component 'Port 3456' -Status 'Ready' -Message 'port free' -Remediation 'None'
+        )
+
+        $result = Test-SetupPreflight -Root $TestDrive -Configuration @{} `
+            -ResultProvider { param($root, $configuration) $results }
+
+        $result.Status | Should -Be 'Ready'
+        $result.Remediation | Should -Be 'None'
+        $result.Data.Results.Count | Should -Be 2
+    }
+
+    It 'returns RestartRequired when a newly installed executable is not visible' {
+        $result = Confirm-InstalledPrerequisite -Name 'Python' -Resolver { $null }
+
+        $result.Status | Should -Be 'RestartRequired'
+        $result.Remediation | Should -Be 'Restart'
+    }
+
+    It 'confirms a newly installed executable that is visible' {
+        $result = Confirm-InstalledPrerequisite -Name 'Python' `
+            -Resolver { [pscustomobject]@{ Source = 'C:\\tools\\python.exe' } }
+
+        $result.Status | Should -Be 'Ready'
+        $result.Data.Path | Should -Be 'C:\\tools\\python.exe'
+    }
+
+    It 'uses the aggregate contract in the real Preflight stage' {
+        $results = @(
+            New-SetupResult -Component 'Python' -Status 'Invalid' -Message 'wrong version' -Remediation 'Install'
+            New-SetupResult -Component 'Port 3456' -Status 'Invalid' -Message 'port occupied' -Remediation 'Manual'
+        )
+
+        $result = Invoke-DefaultSetupStage -Stage 'Preflight' -Context @{
+            Root = $TestDrive
+            Configuration = @{}
+            PreflightResultProvider = { param($root, $configuration) $results }
+        }
+
+        $result.Status | Should -Be 'Failed'
+        $result.Message | Should -Match 'wrong version'
+        $result.Message | Should -Match 'port occupied'
+    }
+
+    It 'confirms installed prerequisites in the root setup entry point' {
+        $source = Get-Content "$PSScriptRoot/../../setup.ps1" -Raw
+
+        $source | Should -Match 'Confirm-InstalledPrerequisite\s+-Name\s+\$item\.Key'
+        $source | Should -Match 'Write-Host\s+\$confirmation\.Remediation'
+        $source | Should -Match '\$confirmation\.Status\s+-eq\s+''RestartRequired''.*exit\s+1'
+    }
 }
 
 Describe 'Common setup contracts' {
