@@ -10,6 +10,7 @@ from agenten.planning.alignment import (
     BatchDraft,
     validate_alignment,
 )
+from agenten.planning.policy import PlanningPolicy
 from agenten.validation.contracts import (
     AcceptanceAssertion,
     ExampleCase,
@@ -81,6 +82,7 @@ class CaptainPipeline:
         align: Align,
         enrich: Enrich,
         release_client: BatchReleaseClient,
+        policy: PlanningPolicy,
         capability_resolver: CapabilityResolver | None = None,
         target: str,
         max_alignment_attempts: int = 2,
@@ -91,6 +93,7 @@ class CaptainPipeline:
         self._align = align
         self._enrich = enrich
         self._release_client = release_client
+        self._policy = policy
         self._capability_resolver = capability_resolver
         self._target = target
         self._max_alignment_attempts = max_alignment_attempts
@@ -125,6 +128,7 @@ class CaptainPipeline:
         for draft in ordered_drafts:
             selected_subtasks = [subtasks_by_id[subtask_id] for subtask_id in draft.subtask_ids]
             enrichment = await self._enrich(project_description, draft, selected_subtasks)
+            self._policy.validate_enrichment(enrichment)
             satisfied_by = None
             if self._capability_resolver is not None:
                 satisfied_by = await self._capability_resolver.find_match(

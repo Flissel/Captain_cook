@@ -9,6 +9,7 @@ from agenten.planning.captain_pipeline import (
     CaptainPlanningError,
     PlannedSubtask,
 )
+from agenten.planning.policy import PlanningPolicy, PlanningPolicyError
 from agenten.validation.contracts import (
     AcceptanceAssertion,
     AssertionKind,
@@ -92,6 +93,7 @@ async def test_pipeline_retries_invalid_alignment_and_releases_dependency_ordere
         align=align,
         enrich=enrich,
         release_client=releases,
+        policy=PlanningPolicy(frozenset({"delivery"})),
         target="external",
         max_alignment_attempts=2,
     )
@@ -132,6 +134,7 @@ async def test_pipeline_stops_before_enrichment_when_alignment_never_covers_all_
         align=align,
         enrich=enrich,
         release_client=releases,
+        policy=PlanningPolicy(frozenset({"delivery"})),
         target="external",
         max_alignment_attempts=2,
     )
@@ -164,6 +167,7 @@ async def test_pipeline_derives_capability_reuse_from_resolver_not_the_llm() -> 
         align=align,
         enrich=enrich,
         release_client=releases,
+        policy=PlanningPolicy(frozenset({"delivery"})),
         capability_resolver=MatchingCapabilityResolver(),
         target="external",
     )
@@ -171,3 +175,41 @@ async def test_pipeline_derives_capability_reuse_from_resolver_not_the_llm() -> 
     result = await pipeline.run("Reuse a validated delivery capability")
 
     assert result.batches[0].satisfied_by == "validated-capability:delivery-v2"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_validates_enrichment_before_capability_lookup_and_release() -> None:
+    class UnexpectedResolver:
+        async def find_match(self, target: str, capability_tags: List[str]) -> str | None:
+            raise AssertionError("capability lookup must not run for invalid enrichment")
+
+    async def decompose(_: str) -> List[PlannedSubtask]:
+        return [PlannedSubtask(subtask_id="s1", description="Delivery")]
+
+    async def align(_: str, __: List[PlannedSubtask], ___: str) -> AlignmentPlan:
+        return AlignmentPlan(
+            batches=[BatchDraft(batch_id="delivery", title="Delivery", subtask_ids=["s1"])]
+        )
+
+    async def enrich(
+        _: str, draft: BatchDraft, __: List[PlannedSubtask]
+    ) -> BatchEnrichment:
+        return enrichment_for(draft).model_copy(
+            update={"capability_tags": ["invented"]}
+        )
+
+    releases = RecordingReleaseClient()
+    pipeline = CaptainPipeline(
+        decompose=decompose,
+        align=align,
+        enrich=enrich,
+        release_client=releases,
+        capability_resolver=UnexpectedResolver(),
+        policy=PlanningPolicy(frozenset({"delivery"})),
+        target="external",
+    )
+
+    with pytest.raises(PlanningPolicyError, match="unknown capability tags"):
+        await pipeline.run("Reject invented capabilities")
+
+    assert releases.releases == []
