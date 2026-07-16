@@ -10,13 +10,17 @@ from threading import Event
 from typing import Any
 
 import pytest
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from pymysql.cursors import DictCursor
 from pymysql.err import OperationalError
 
 from blockchain.Blockchain_modell import Block
 from blockchain.mariadb_storage import MariaDBStorage
-from gateway.app import BlockRequest, create_app
+from gateway.app import CAPTAIN_WRITE_BLOCK_TYPES, BlockRequest, create_app
+from gateway.auth import GatewayRole, require_actor
+from gateway.settings import GatewaySettings
 from gateway.store import GatewayStore
 from tests.support.mariadb import assert_isolated_test_database
 
@@ -61,7 +65,36 @@ def storage() -> MariaDBStorage:
 
 @pytest.fixture
 def client(storage: MariaDBStorage) -> TestClient:
-    return TestClient(create_app(storage=storage, mirror=RecordingMirror(), approval_enabled=True))
+    return TestClient(legacy_application(storage=storage, mirror=RecordingMirror()))
+
+
+async def legacy_test_actor(request: Request) -> GatewayRole:
+    if request.url.path == "/blocks":
+        payload = await request.json()
+        if isinstance(payload, dict) and payload.get("block_type") in CAPTAIN_WRITE_BLOCK_TYPES:
+            return GatewayRole.CAPTAIN
+        return GatewayRole.WORKER
+    if "/claim" in request.url.path or request.url.path == "/sink/crm":
+        return GatewayRole.WORKER
+    return GatewayRole.CAPTAIN
+
+
+def legacy_application(
+    *,
+    storage: MariaDBStorage,
+    mirror: RecordingMirror,
+    approval_enabled: bool = True,
+) -> FastAPI:
+    assert TEST_DSN is not None
+    settings = GatewaySettings(
+        ledger_dsn=SecretStr(TEST_DSN),
+        captain_gateway_token=SecretStr("legacy-captain-token"),
+        worker_gateway_token=SecretStr("legacy-worker-token"),
+        approval_enabled=approval_enabled,
+    )
+    application = create_app(storage=storage, mirror=mirror, settings=settings)
+    application.dependency_overrides[require_actor] = legacy_test_actor
+    return application
 
 
 def batch_payload(batch_id: str = "batch-1", title: str = "Build the notification workflow") -> dict[str, Any]:
@@ -180,7 +213,8 @@ def test_gateway_store_is_extracted_from_the_fastapi_module() -> None:
     app_source = Path("gateway/app.py").read_text(encoding="utf-8")
 
     assert "class GatewayStore" not in app_source
-    assert "cursor.execute" not in app_source
+    assert app_source.count("cursor.execute") == 1
+    assert 'cursor.execute("SELECT 1")' in app_source
     assert Path("gateway/store.py").exists()
 
 
@@ -228,7 +262,7 @@ def test_gateway_executes_no_lifecycle_update_sql(
 
 
 def test_two_workers_cannot_claim_the_same_batch(storage: MariaDBStorage) -> None:
-    client = TestClient(create_app(storage=storage, mirror=RecordingMirror()))
+    client = TestClient(legacy_application(storage=storage, mirror=RecordingMirror()))
     create_batch(client)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -283,7 +317,7 @@ def test_identical_canonical_work_batch_replay_returns_existing_block(
 def test_concurrent_duplicate_batch_creation_persists_exactly_one_root(
     storage: MariaDBStorage,
 ) -> None:
-    client = TestClient(create_app(storage=storage, mirror=RecordingMirror()))
+    client = TestClient(legacy_application(storage=storage, mirror=RecordingMirror()))
 
     def create(_: int) -> Any:
         return client.post(
@@ -303,7 +337,7 @@ def test_concurrent_duplicate_batch_creation_persists_exactly_one_root(
 def test_parallel_gateway_writes_preserve_immediate_hash_adjacency(
     storage: MariaDBStorage,
 ) -> None:
-    client = TestClient(create_app(storage=storage, mirror=RecordingMirror()))
+    client = TestClient(legacy_application(storage=storage, mirror=RecordingMirror()))
     create_batch(client, "batch-1")
     create_batch(client, "batch-2")
     tokens = {batch_id: claim(client, batch_id) for batch_id in ("batch-1", "batch-2")}
@@ -331,7 +365,7 @@ def test_concurrent_claim_and_first_holdout_share_global_lock_order(
     storage: MariaDBStorage,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = TestClient(create_app(storage=storage, mirror=RecordingMirror()))
+    client = TestClient(legacy_application(storage=storage, mirror=RecordingMirror()))
     parent_index = create_batch(client)
     parent_before = storage.load()[0]
     claim_first_lock = Event()
@@ -994,7 +1028,7 @@ def test_batch_done_status_must_match_its_outcome(client: TestClient) -> None:
 
 
 def test_mirror_failure_never_fails_a_ledger_write(storage: MariaDBStorage) -> None:
-    client = TestClient(create_app(storage=storage, mirror=RecordingMirror(fail=True)))
+    client = TestClient(legacy_application(storage=storage, mirror=RecordingMirror(fail=True)))
 
     response = client.post(
         "/blocks",
@@ -1056,12 +1090,16 @@ def test_expired_claim_is_lazily_reclaimable_and_lists_as_pending(
 
 
 def test_approve_is_flag_gated_and_transitions_pending_review(storage: MariaDBStorage) -> None:
-    disabled = TestClient(create_app(storage=storage, mirror=RecordingMirror(), approval_enabled=False))
+    disabled = TestClient(
+        legacy_application(storage=storage, mirror=RecordingMirror(), approval_enabled=False)
+    )
     create_batch(disabled, status="pending_review")
     assert disabled.post("/batches/batch-1/claim").status_code == 409
     assert disabled.post("/batches/batch-1/approve").status_code == 404
 
-    enabled = TestClient(create_app(storage=storage, mirror=RecordingMirror(), approval_enabled=True))
+    enabled = TestClient(
+        legacy_application(storage=storage, mirror=RecordingMirror(), approval_enabled=True)
+    )
     assert enabled.post("/batches/batch-1/approve").status_code == 200
     assert enabled.get("/batches", params={"status": "pending"}).json() == [
         {"batch_id": "batch-1", "title": "Build the notification workflow"}
