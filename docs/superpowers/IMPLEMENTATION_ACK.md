@@ -13,7 +13,7 @@ SCHEDULE_STATE: PENDING_USER_CONFIRMATION_AND_NATIVE_UI
 PROPOSED_SCHEDULE: EVERY_30_MINUTES_WHILE_ACTIVE
 INTEGRATION_WORKTREE: C:\Users\User\Desktop\Captain_cook-main-integration
 INTEGRATION_BRANCH: feat/system-remediation-orchestration
-  LAST_INTEGRATED_IMPLEMENTATION_SHA: 88a7a86
+LAST_INTEGRATED_IMPLEMENTATION_SHA: e6bb9da
 CONTROL_DISPATCH_SHA: 4601806
 PRIMARY_WORKTREE_POLICY: PRESERVE_AND_DO_NOT_USE_FOR_INTEGRATION
 ACK_OWNER: ORCHESTRATOR_ONLY
@@ -38,6 +38,7 @@ may advance the base only after recording a new explicit dispatch SHA here.
 | P09 | `51cfb69` | `df79012` | spec/quality PASS, explicit AF01 reconciliation, 123 combined tests |
 | P11 | `534679e` + `5ba6678` + `8ddb096` | `341adec` | authenticated planning/delivery clients, 92 focused and 402 full tests |
 | P12 | `6362f48` + `f902186` | `88a7a86` | atomic resumable Captain runs, 93 focused and 411 full tests |
+| P13 | `012ca6a` | `e6bb9da` | read-only SQLite import, captain-only archive writes, 50 DB and 477 full tests |
 
 P05 closed all known fail-open bootstrap result-shape gaps. P06 is unblocked.
 
@@ -82,6 +83,15 @@ Review first rejected releasing a checkpoint before canonical-plan validation
 and then identified missing cross-process serialization. Both were closed with
 RED regressions. P19 is unblocked; P13 remains next on the production storage
 lane.
+
+P13 candidate `012ca6a` is integrated through `e6bb9da`. The source SQLite file
+is opened read-only, confirmed imports are idempotent, production composition
+cannot construct the retired SQLite API, and captain authentication protects
+the archive route. Historical records use non-claimable legacy block types
+instead of operational work batches. The disposable-MariaDB gate passed 50
+selected tests with zero skips; the full integrated gate passed 477 tests with
+one explicit environment skip, one live deselection, one known warning, and
+84.95% coverage. D01 is now dispatchable; live Agent Factory gates remain open.
 
 ### Autonomous Captain process candidate
 

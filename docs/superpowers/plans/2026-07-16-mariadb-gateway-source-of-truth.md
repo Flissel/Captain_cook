@@ -370,7 +370,7 @@ git commit -m "feat: route captain delivery through gateway clients"
 - Produces: `python scripts/migrate_sqlite_delivery_ledger.py --sqlite-path <path> --gateway-url <url> --dry-run` and a JSON migration report.
 - Consumes: legacy `delivery_todos` and `delivery_events` records; creates idempotent immutable gateway events keyed by legacy `event_id`.
 
-- [ ] **Step 1: Write failing dry-run and replay tests**
+- [x] **Step 1: Write failing dry-run and replay tests**
 
 ```python
 def test_migration_dry_run_writes_nothing(tmp_path: Path, gateway_client: RecordingGatewayClient) -> None:
@@ -388,13 +388,13 @@ def test_migration_replay_is_idempotent(tmp_path: Path, gateway_client: Recordin
     assert second.already_present_events == 4
 ```
 
-- [ ] **Step 2: Verify the migration tests fail**
+- [x] **Step 2: Verify the migration tests fail**
 
 Run: `python -m pytest -q tests/delivery/test_sqlite_delivery_migration.py`
 
 Expected: FAIL because the migration module and `migrate` function do not exist.
 
-- [ ] **Step 3: Implement a read-only, idempotent importer**
+- [x] **Step 3: Implement a read-only, idempotent importer**
 
 Open SQLite with `sqlite3.connect(f"file:{path}?mode=ro", uri=True)`. Read events ordered by `sequence`; map each legacy TODO to one deterministic `work_batch` ID `legacy-<todo_id>` and map each legacy event to a gateway child block containing:
 
@@ -411,7 +411,13 @@ Open SQLite with `sqlite3.connect(f"file:{path}?mode=ro", uri=True)`. Read event
 
 `--dry-run` emits the report and sends no request. A non-dry run requires `--confirm-import`; every request is idempotent on `legacy_event_id`. The script must never delete, alter, or vacuum the SQLite file.
 
-- [ ] **Step 4: Remove SQLite from the production API**
+Integrated safety refinement: imported history is stored as captain-only,
+archived `legacy_delivery_todo` and `legacy_delivery_event` blocks rather than
+operational `work_batch` roots. This preserves the immutable audit chain while
+making it impossible for historical TODOs to enter the claim queue. Batch IDs
+use a deterministic SHA-256-derived suffix to prevent normalization collisions.
+
+- [x] **Step 4: Remove SQLite from the production API**
 
 Delete the `SqliteDeliveryLedger` import from `agenten/delivery/api.py` and reject construction with it using:
 
@@ -421,7 +427,7 @@ raise RuntimeError("SQLite delivery ledger is legacy-import only; use GatewayDel
 
 Keep the class definition only while tests and the migration script need it. Move its direct tests under a `legacy` marker and remove it from the default documented execution path.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run: `python -m pytest -q tests/delivery/test_sqlite_delivery_migration.py tests/delivery/test_delivery_ledger.py`
 

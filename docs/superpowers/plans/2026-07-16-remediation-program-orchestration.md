@@ -328,11 +328,16 @@ SHAs before either worker begins.
   - Gate: 93 planning/architecture tests, `compileall`, and the full non-live
     regression suite.
 
-- [ ] **P13 — SQLite legacy import and production retirement**
+- [x] **P13 — SQLite legacy import and production retirement**
   - Branch: `refactor/sqlite-legacy-import`; source: Gateway Task 4; requires
     P11.
-  - Gate: dry-run, idempotent replay, legacy-ledger, and boundary tests.
-  - [ ] Mark the existing `create_delivery_app(SqliteDeliveryLedger(...))`
+  - Output: a read-only and confirmation-gated SQLite importer, authenticated
+    captain-only archive writes, deterministic collision-resistant legacy IDs,
+    idempotent replay/conflict detection, and an explicit legacy-only API.
+  - Gate: 12 focused importer/boundary tests, 8 explicit legacy tests, 50
+    disposable-MariaDB gateway tests, `compileall`, and the 477-test integrated
+    suite.
+  - [x] Mark the existing `create_delivery_app(SqliteDeliveryLedger(...))`
     surface explicitly legacy and prove no production composition imports it;
     P11 added the gateway-native client/service boundary but intentionally did
     not delete the migration source before the importer exists.
@@ -615,3 +620,15 @@ For every packet, the orchestrator must:
   tests with 58 explicit service/environment skips, one live deselection, one
   known warning, and 78.37% coverage. P19 is now unblocked by P12; P13 remains
   the next production-authority packet.
+- P13 integrated candidate `012ca6a` through merge commit `e6bb9da`. SQLite is
+  now a read-only migration source and its FastAPI control plane is reachable
+  only through the explicitly named legacy module; production delivery exports
+  the authenticated Gateway client instead. The importer requires explicit
+  confirmation for writes, preserves the source file, uses captain-only archive
+  blocks that can never become claimable work, and rejects immutable replay
+  drift. This deliberately tightens the source plan's proposed `work_batch`
+  mapping: historical records are archived as `legacy_delivery_todo` and
+  `legacy_delivery_event` blocks so migration cannot re-enqueue old work. The
+  integrated disposable-MariaDB gate passed 50 selected tests with zero skips;
+  the complete gate passed 477 tests with one explicit environment skip, one
+  live deselection, one known warning, and 84.95% coverage. D01 is now unlocked.
