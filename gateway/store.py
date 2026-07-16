@@ -6,7 +6,7 @@ import hashlib
 import json
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol, TypeVar
 
 from fastapi import HTTPException
 from pydantic import ValidationError
@@ -25,8 +25,12 @@ from gateway.contracts import (
 
 
 CAPTAIN_BLOCK_TYPES = frozenset({"problem", "work_batch", "holdout"})
+GATEWAY_OWNED_EVENT_TYPES = frozenset(
+    {"batch_claimed", "batch_heartbeat", "batch_approved"}
+)
 TRANSIENT_TRANSACTION_ERRORS = frozenset({1020, 1213})
 TRANSACTION_ATTEMPTS = 3
+WriteResult = TypeVar("WriteResult")
 
 
 class BlockWrite(Protocol):
@@ -89,31 +93,16 @@ class GatewayStore:
         *,
         for_update: bool = False,
     ) -> dict[str, Any] | None:
+        sql = """
+            SELECT `index`, parent_index, block_type, data, status, children,
+                   metadata, hash, previous_hash
+            FROM blocks
+            WHERE block_type = 'work_batch'
+              AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.batch_id')) = %s
+            ORDER BY `index` DESC LIMIT 1
+        """
         if for_update:
-            sql = """
-                SELECT parent.`index`, parent.parent_index, parent.block_type,
-                       parent.data, parent.status, parent.children,
-                       parent.metadata, parent.hash, parent.previous_hash
-                FROM blocks AS parent
-                WHERE parent.`index` = (
-                    SELECT MAX(candidate.`index`)
-                    FROM blocks AS candidate
-                    WHERE candidate.block_type = 'work_batch'
-                      AND JSON_UNQUOTE(
-                          JSON_EXTRACT(candidate.data, '$.batch_id')
-                      ) = %s
-                )
-                FOR UPDATE
-            """
-        else:
-            sql = """
-                SELECT `index`, parent_index, block_type, data, status, children,
-                       metadata, hash, previous_hash
-                FROM blocks
-                WHERE block_type = 'work_batch'
-                  AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.batch_id')) = %s
-                ORDER BY `index` DESC LIMIT 1
-            """
+            sql += " FOR UPDATE"
         cursor.execute(sql, (batch_id,))
         row = cursor.fetchone()
         return self.storage._decode_row(row) if row is not None else None
@@ -198,14 +187,14 @@ class GatewayStore:
         self,
         cursor: Any,
         *,
+        index: int,
         block_type: str,
         data: dict[str, Any],
         status: str,
         parent_index: int | None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        index = self._next_index(cursor)
-        cursor.execute("SELECT hash FROM blocks ORDER BY `index` DESC LIMIT 1")
+        cursor.execute("SELECT hash FROM blocks ORDER BY `index` DESC LIMIT 1 FOR UPDATE")
         previous = cursor.fetchone()
         return Block(
             index=index,
@@ -250,8 +239,30 @@ class GatewayStore:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @staticmethod
+    def _retry_write(operation: Callable[[], WriteResult]) -> WriteResult:
+        for attempt in range(TRANSACTION_ATTEMPTS):
+            try:
+                return operation()
+            except OperationalError as exc:
+                error_code = exc.args[0] if exc.args else None
+                if (
+                    error_code not in TRANSIENT_TRANSACTION_ERRORS
+                    or attempt == TRANSACTION_ATTEMPTS - 1
+                ):
+                    raise
+        raise RuntimeError("unreachable transaction retry state")
+
     def append(self, request: BlockWrite, claim_token: str | None) -> dict[str, Any]:
+        return self._retry_write(lambda: self._append_once(request, claim_token))
+
+    def _append_once(self, request: BlockWrite, claim_token: str | None) -> dict[str, Any]:
         block_type = request.block_type
+        if block_type in GATEWAY_OWNED_EVENT_TYPES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{block_type} must use its dedicated gateway route",
+            )
         data = dict(request.data)
         try:
             if block_type == "work_batch":
@@ -267,6 +278,7 @@ class GatewayStore:
 
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
+                index = self._next_index(cursor)
                 parent_index = request.parent_index
                 parent: dict[str, Any] | None = None
                 children: list[dict[str, Any]] = []
@@ -288,20 +300,29 @@ class GatewayStore:
                 if block_type == "work_batch":
                     if parent_index is not None:
                         raise HTTPException(status_code=422, detail="work_batch must be a root block")
-                    if self._batch_row(cursor, batch_id) is not None:
+                    if self._batch_row(cursor, batch_id, for_update=True) is not None:
                         raise HTTPException(status_code=409, detail="batch_id already exists")
 
                 if block_type == "holdout" and parent_index is None:
                     raise HTTPException(status_code=422, detail="holdout requires its work_batch parent")
 
-                if parent_index is not None and block_type in CAPTAIN_BLOCK_TYPES - {"work_batch"}:
+                if block_type == "holdout":
+                    parent, children, _ = self._batch_context(
+                        cursor,
+                        batch_id,
+                        for_update=True,
+                        now=now,
+                    )
+                    if parent_index != parent["index"]:
+                        raise HTTPException(status_code=409, detail="holdout parent must be its work_batch")
+                    if any(child["block_type"] == "holdout" for child in children):
+                        raise HTTPException(status_code=409, detail="holdout suite already exists")
+                elif parent_index is not None and block_type in CAPTAIN_BLOCK_TYPES - {"work_batch"}:
                     referenced_parent = self._row_by_index(cursor, parent_index)
                     if referenced_parent is None:
                         raise HTTPException(status_code=404, detail="parent block not found")
                     if referenced_parent["data"].get("batch_id") != batch_id:
                         raise HTTPException(status_code=409, detail="parent belongs to another batch")
-                    if block_type == "holdout" and referenced_parent["block_type"] != "work_batch":
-                        raise HTTPException(status_code=409, detail="holdout parent must be a work_batch")
 
                 if block_type == "batch_done":
                     try:
@@ -313,13 +334,19 @@ class GatewayStore:
 
                 block = self._new_block(
                     cursor,
+                    index=index,
                     block_type=block_type,
                     data=data,
                     status=request.status,
                     parent_index=parent_index,
                     metadata=dict(request.metadata),
                 )
-                if parent is not None:
+                if block_type == "work_batch":
+                    try:
+                        project_batch([block], batch_id, now=now)
+                    except ValueError as exc:
+                        raise HTTPException(status_code=422, detail=str(exc)) from exc
+                elif parent is not None:
                     self._validate_candidate(parent, children, block, batch_id, now=now)
                 self._insert(cursor, block)
                 if block_type == "batch_done" and data["outcome"] == "succeeded":
@@ -334,22 +361,13 @@ class GatewayStore:
         return projection
 
     def claim(self, batch_id: str) -> dict[str, str]:
-        for attempt in range(TRANSACTION_ATTEMPTS):
-            try:
-                return self._claim_once(batch_id)
-            except OperationalError as exc:
-                error_code = exc.args[0] if exc.args else None
-                if (
-                    error_code not in TRANSIENT_TRANSACTION_ERRORS
-                    or attempt == TRANSACTION_ATTEMPTS - 1
-                ):
-                    raise
-        raise RuntimeError("unreachable claim retry state")
+        return self._retry_write(lambda: self._claim_once(batch_id))
 
     def _claim_once(self, batch_id: str) -> dict[str, str]:
         now = _utcnow()
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
+                index = self._next_index(cursor)
                 parent, children, projection = self._batch_context(
                     cursor,
                     batch_id,
@@ -367,6 +385,7 @@ class GatewayStore:
                 )
                 block = self._new_block(
                     cursor,
+                    index=index,
                     block_type="batch_claimed",
                     data=event.model_dump(mode="json"),
                     status="recorded",
@@ -377,9 +396,13 @@ class GatewayStore:
         return {"claim_token": token, "claim_expires_at": expiry.isoformat()}
 
     def heartbeat(self, batch_id: str, token: str | None) -> dict[str, str]:
+        return self._retry_write(lambda: self._heartbeat_once(batch_id, token))
+
+    def _heartbeat_once(self, batch_id: str, token: str | None) -> dict[str, str]:
         now = _utcnow()
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
+                index = self._next_index(cursor)
                 parent, children, projection = self._batch_context(
                     cursor,
                     batch_id,
@@ -391,6 +414,7 @@ class GatewayStore:
                 event = HeartbeatEvent(batch_id=batch_id, claim_expires_at=expiry)
                 block = self._new_block(
                     cursor,
+                    index=index,
                     block_type="batch_heartbeat",
                     data=event.model_dump(mode="json"),
                     status="recorded",
@@ -401,9 +425,13 @@ class GatewayStore:
         return {"claim_expires_at": expiry.isoformat()}
 
     def approve(self, batch_id: str) -> None:
+        self._retry_write(lambda: self._approve_once(batch_id))
+
+    def _approve_once(self, batch_id: str) -> None:
         now = _utcnow()
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
+                index = self._next_index(cursor)
                 parent, children, projection = self._batch_context(
                     cursor,
                     batch_id,
@@ -414,6 +442,7 @@ class GatewayStore:
                     raise HTTPException(status_code=409, detail="batch is not pending review")
                 block = self._new_block(
                     cursor,
+                    index=index,
                     block_type="batch_approved",
                     data={"batch_id": batch_id},
                     status="recorded",

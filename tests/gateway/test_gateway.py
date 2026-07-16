@@ -11,9 +11,11 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 from pymysql.cursors import DictCursor
+from pymysql.err import OperationalError
 
 from blockchain.mariadb_storage import MariaDBStorage
-from gateway.app import create_app
+from gateway.app import BlockRequest, create_app
+from gateway.store import GatewayStore
 from tests.support.mariadb import assert_isolated_test_database
 
 
@@ -242,6 +244,216 @@ def test_duplicate_batch_ids_are_rejected(client: TestClient) -> None:
     )
 
     assert response.status_code == 409
+
+
+def test_concurrent_duplicate_batch_creation_persists_exactly_one_root(
+    storage: MariaDBStorage,
+) -> None:
+    client = TestClient(create_app(storage=storage, mirror=RecordingMirror()))
+
+    def create(_: int) -> Any:
+        return client.post(
+            "/blocks",
+            json={"block_type": "work_batch", "data": batch_payload()},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(create, range(2)))
+
+    assert sorted(response.status_code for response in responses) == [201, 409]
+    roots = [block for block in storage.load() if block["block_type"] == "work_batch"]
+    assert len(roots) == 1
+
+
+def test_parallel_gateway_writes_preserve_immediate_hash_adjacency(
+    storage: MariaDBStorage,
+) -> None:
+    client = TestClient(create_app(storage=storage, mirror=RecordingMirror()))
+    create_batch(client, "batch-1")
+    create_batch(client, "batch-2")
+    tokens = {batch_id: claim(client, batch_id) for batch_id in ("batch-1", "batch-2")}
+
+    def append_session(batch_id: str) -> Any:
+        return worker_block(
+            client,
+            tokens[batch_id],
+            data={"batch_id": batch_id, "iteration": 1},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(append_session, ("batch-1", "batch-2")))
+
+    assert [response.status_code for response in responses] == [201, 201]
+    blocks = storage.load()
+    assert blocks[0]["previous_hash"] == "0"
+    assert all(
+        current["previous_hash"] == previous["hash"]
+        for previous, current in zip(blocks, blocks[1:])
+    )
+
+
+def test_append_retries_only_documented_transaction_errors(
+    storage: MariaDBStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = GatewayStore(storage)
+    request = BlockRequest(block_type="work_batch", data=batch_payload())
+    original = store._append_once
+    attempts = 0
+
+    def transient_then_success(request: BlockRequest, claim_token: str | None) -> dict[str, Any]:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise OperationalError(1213, "deadlock victim")
+        return original(request, claim_token)
+
+    monkeypatch.setattr(store, "_append_once", transient_then_success)
+    assert store.append(request, None)["block_type"] == "work_batch"
+    assert attempts == 3
+
+    monkeypatch.setattr(
+        store,
+        "_append_once",
+        lambda request, claim_token: (_ for _ in ()).throw(OperationalError(9999, "other")),
+    )
+    with pytest.raises(OperationalError) as error:
+        store.append(BlockRequest(block_type="work_batch", data=batch_payload("batch-2")), None)
+    assert error.value.args[0] == 9999
+
+    exhausted_attempts = 0
+
+    def always_transient(request: BlockRequest, claim_token: str | None) -> dict[str, Any]:
+        nonlocal exhausted_attempts
+        exhausted_attempts += 1
+        raise OperationalError(1213, "persistent deadlock")
+
+    monkeypatch.setattr(store, "_append_once", always_transient)
+    with pytest.raises(OperationalError) as exhausted:
+        store.append(BlockRequest(block_type="work_batch", data=batch_payload("batch-3")), None)
+    assert exhausted.value.args[0] == 1213
+    assert exhausted_attempts == 3
+
+
+def test_claim_heartbeat_and_approval_share_bounded_transaction_retry(
+    storage: MariaDBStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = GatewayStore(storage)
+
+    def probe(result: Any) -> tuple[list[int], Any]:
+        attempts: list[int] = []
+
+        def operation(*_: Any) -> Any:
+            attempts.append(len(attempts) + 1)
+            if len(attempts) == 1:
+                raise OperationalError(1020, "stale transaction read")
+            return result
+
+        return attempts, operation
+
+    claim_attempts, claim_once = probe({"claim_token": "token", "claim_expires_at": "later"})
+    monkeypatch.setattr(store, "_claim_once", claim_once)
+    assert store.claim("batch-1")["claim_token"] == "token"
+    assert claim_attempts == [1, 2]
+
+    heartbeat_attempts, heartbeat_once = probe({"claim_expires_at": "later"})
+    monkeypatch.setattr(store, "_heartbeat_once", heartbeat_once)
+    assert store.heartbeat("batch-1", "token") == {"claim_expires_at": "later"}
+    assert heartbeat_attempts == [1, 2]
+
+    approval_attempts, approval_once = probe(None)
+    monkeypatch.setattr(store, "_approve_once", approval_once)
+    assert store.approve("batch-1") is None
+    assert approval_attempts == [1, 2]
+
+
+@pytest.mark.parametrize(
+    ("block_type", "data"),
+    [
+        (
+            "batch_claimed",
+            {
+                "batch_id": "batch-1",
+                "claim_token_sha256": "0" * 64,
+                "claim_expires_at": "2026-07-17T00:00:00Z",
+            },
+        ),
+        (
+            "batch_heartbeat",
+            {"batch_id": "batch-1", "claim_expires_at": "2026-07-17T00:00:00Z"},
+        ),
+        ("batch_approved", {"batch_id": "batch-1"}),
+    ],
+)
+def test_generic_blocks_reject_gateway_owned_lifecycle_events(
+    client: TestClient,
+    storage: MariaDBStorage,
+    block_type: str,
+    data: dict[str, Any],
+) -> None:
+    response = client.post(
+        "/blocks",
+        json={
+            "block_type": block_type,
+            "status": "recorded",
+            "data": data,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == f"{block_type} must use its dedicated gateway route"
+    assert storage.load() == []
+
+
+def test_invalid_initial_work_batch_status_is_rejected_before_insert(
+    client: TestClient,
+    storage: MariaDBStorage,
+) -> None:
+    response = client.post(
+        "/blocks",
+        json={
+            "block_type": "work_batch",
+            "status": "succeeded",
+            "data": batch_payload(),
+        },
+    )
+
+    assert response.status_code == 422
+    assert storage.load() == []
+
+
+def test_second_holdout_cannot_replace_the_immutable_suite(client: TestClient) -> None:
+    parent = create_batch(client)
+    first = client.post(
+        "/blocks",
+        json={
+            "block_type": "holdout",
+            "parent_index": parent,
+            "data": {
+                "batch_id": "batch-1",
+                "cases": [{"case_id": "secret-1", "input": {"version": 1}}],
+            },
+        },
+    )
+    second = client.post(
+        "/blocks",
+        json={
+            "block_type": "holdout",
+            "parent_index": parent,
+            "data": {
+                "batch_id": "batch-1",
+                "cases": [{"case_id": "secret-2", "input": {"version": 2}}],
+            },
+        },
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 409
+    token = claim(client)
+    assert worker_block(client, token).status_code == 201
+    released = client.get("/batches/batch-1/holdout", headers={"X-Claim-Token": token})
+    assert released.json()["cases"][0]["case_id"] == "secret-1"
 
 
 def test_work_batch_must_satisfy_the_captain_contract(client: TestClient) -> None:
