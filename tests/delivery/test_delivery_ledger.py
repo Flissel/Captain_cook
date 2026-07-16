@@ -6,8 +6,11 @@ from agenten.delivery import (
     DeliveryRole,
     DeliveryStatus,
     DeliveryTransitionError,
-    SqliteDeliveryLedger,
 )
+from agenten.delivery.ledger import SqliteDeliveryLedger
+
+
+pytestmark = pytest.mark.legacy
 
 
 @pytest.fixture

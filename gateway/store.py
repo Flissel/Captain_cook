@@ -41,6 +41,13 @@ class BlockWrite(Protocol):
     metadata: dict[str, Any]
 
 
+class LegacyImportWrite(Protocol):
+    legacy_record_id: str
+    batch_id: str
+    record_type: str
+    data: dict[str, Any]
+
+
 class _IdempotentReplay(Exception):
     def __init__(self, block: dict[str, Any]):
         super().__init__("identical Captain block replay")
@@ -617,3 +624,87 @@ class GatewayStore:
                         }
                     )
         return result
+
+    def import_legacy_record(
+        self,
+        request: LegacyImportWrite,
+    ) -> tuple[dict[str, Any], bool]:
+        try:
+            block = self._retry_write(lambda: self._import_legacy_record_once(request))
+            return block, True
+        except _IdempotentReplay as replay:
+            return replay.block, False
+
+    def _import_legacy_record_once(self, request: LegacyImportWrite) -> dict[str, Any]:
+        data = dict(request.data)
+        if data.get("batch_id") != request.batch_id:
+            raise HTTPException(status_code=422, detail="legacy data.batch_id must match batch_id")
+        supplied_record_id = data.get("legacy_record_id")
+        if supplied_record_id not in {None, request.legacy_record_id}:
+            raise HTTPException(status_code=422, detail="legacy_record_id is reserved")
+        data["legacy_record_id"] = request.legacy_record_id
+        block_type = (
+            "legacy_delivery_todo"
+            if request.record_type == "todo"
+            else "legacy_delivery_event"
+        )
+
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                index = self._next_index(cursor)
+                cursor.execute(
+                    """
+                    SELECT `index`, parent_index, block_type, data, status, children,
+                           metadata, hash, previous_hash
+                    FROM blocks
+                    WHERE block_type IN ('legacy_delivery_todo', 'legacy_delivery_event')
+                      AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.legacy_record_id')) = %s
+                    ORDER BY `index` LIMIT 1 FOR UPDATE
+                    """,
+                    (request.legacy_record_id,),
+                )
+                existing_row = cursor.fetchone()
+                if existing_row is not None:
+                    existing = self.storage._decode_row(existing_row)
+                    if existing["block_type"] == block_type and existing["data"] == data:
+                        raise _IdempotentReplay(existing)
+                    raise HTTPException(
+                        status_code=409,
+                        detail="legacy_record_id already exists with different content",
+                    )
+
+                cursor.execute(
+                    """
+                    SELECT `index`, parent_index, block_type, data, status, children,
+                           metadata, hash, previous_hash
+                    FROM blocks
+                    WHERE block_type = 'legacy_delivery_todo'
+                      AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.batch_id')) = %s
+                    ORDER BY `index` LIMIT 1 FOR UPDATE
+                    """,
+                    (request.batch_id,),
+                )
+                root_row = cursor.fetchone()
+                root = self.storage._decode_row(root_row) if root_row is not None else None
+                if request.record_type == "todo" and root is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="legacy batch already belongs to another todo record",
+                    )
+                if request.record_type == "event" and root is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="legacy todo must be imported before its events",
+                    )
+
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type=block_type,
+                    data=data,
+                    status="archived",
+                    parent_index=root["index"] if root is not None else None,
+                    metadata={"source": "sqlite-delivery-legacy-import/v1"},
+                )
+                self._insert(cursor, block)
+        return block

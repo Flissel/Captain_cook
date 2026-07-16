@@ -66,6 +66,29 @@ def authorization(token: str, *, claim_token: str | None = None) -> dict[str, st
     return headers
 
 
+def test_legacy_delivery_import_is_captain_only(client: TestClient) -> None:
+    request = {
+        "legacy_record_id": "todo:legacy-1",
+        "batch_id": "legacy-1",
+        "record_type": "todo",
+        "data": {"batch_id": "legacy-1", "title": "Archived delivery item"},
+    }
+
+    assert client.post("/imports/legacy-delivery", json=request).status_code == 401
+    assert client.post(
+        "/imports/legacy-delivery",
+        json=request,
+        headers=authorization(WORKER_TOKEN),
+    ).status_code == 403
+    imported = client.post(
+        "/imports/legacy-delivery",
+        json=request,
+        headers=authorization(CAPTAIN_TOKEN),
+    )
+    assert imported.status_code == 201
+    assert imported.json()["created"] is True
+
+
 def batch_payload() -> dict[str, Any]:
     return {
         "batch_id": "batch-1",

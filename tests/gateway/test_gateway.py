@@ -149,6 +149,50 @@ def worker_block(
     )
 
 
+def test_legacy_import_route_is_idempotent_and_conflict_safe(client: TestClient) -> None:
+    todo = {
+        "legacy_record_id": "todo:todo-1",
+        "batch_id": "legacy-todo1",
+        "record_type": "todo",
+        "data": {
+            "batch_id": "legacy-todo1",
+            "legacy_todo_id": "todo-1",
+            "todo": {"title": "Historical delivery"},
+        },
+    }
+    event = {
+        "legacy_record_id": "event:event-1",
+        "batch_id": "legacy-todo1",
+        "record_type": "event",
+        "data": {
+            "batch_id": "legacy-todo1",
+            "legacy_todo_id": "todo-1",
+            "legacy_event_id": "event-1",
+            "actor": "captain",
+            "event_type": "todo_created",
+            "payload": {"version": 1},
+            "created_at": "2026-07-16T12:00:00Z",
+            "legacy_sequence": 1,
+        },
+    }
+
+    first_todo = client.post("/imports/legacy-delivery", json=todo)
+    first_event = client.post("/imports/legacy-delivery", json=event)
+    replay_event = client.post("/imports/legacy-delivery", json=event)
+
+    assert first_todo.status_code == 201, first_todo.text
+    assert first_todo.json()["created"] is True
+    assert first_event.status_code == 201, first_event.text
+    assert first_event.json()["created"] is True
+    assert replay_event.status_code == 201, replay_event.text
+    assert replay_event.json()["created"] is False
+    assert first_event.json()["block"] == replay_event.json()["block"]
+
+    conflicting = event | {"data": event["data"] | {"actor": "other"}}
+    response = client.post("/imports/legacy-delivery", json=conflicting)
+    assert response.status_code == 409
+
+
 def test_claim_and_completion_append_events_without_mutating_work_batch(
     client: TestClient,
     storage: MariaDBStorage,
