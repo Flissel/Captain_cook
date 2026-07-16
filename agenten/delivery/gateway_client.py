@@ -224,15 +224,39 @@ class GatewayDeliveryClient:
         outcome: TerminalOutcome,
         capabilities: Sequence[str] = (),
         artifact_ref: str | None = None,
+        target: str | None = None,
+        runtime: str | None = None,
+        runtime_version: str | None = None,
+        interface_schema: str | None = None,
     ) -> None:
         canonical_capabilities = sorted(set(capabilities))
         if any(not capability for capability in canonical_capabilities):
             raise ValueError("capabilities must not contain empty values")
         if artifact_ref == "":
             raise ValueError("artifact_ref must not be empty")
+        compatibility = (
+            artifact_ref,
+            target,
+            runtime,
+            runtime_version,
+            interface_schema,
+        )
+        publishes_capability = bool(canonical_capabilities) or any(
+            value is not None for value in compatibility
+        )
+        if publishes_capability and (
+            not canonical_capabilities or any(not value for value in compatibility)
+        ):
+            raise ValueError(
+                "validated artifact publication requires complete compatibility metadata"
+            )
         data: dict[str, Any] = {"batch_id": batch_id, "outcome": outcome}
-        if canonical_capabilities:
+        if publishes_capability:
             data["capabilities"] = canonical_capabilities
+            data["target"] = target
+            data["runtime"] = runtime
+            data["runtime_version"] = runtime_version
+            data["interface_schema"] = interface_schema
         if artifact_ref is not None:
             data["artifact_ref"] = artifact_ref
         await self._append_event(
