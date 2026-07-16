@@ -198,8 +198,10 @@ SHAs before either worker begins.
 - [x] **P07A — Pure append-only lifecycle projection contracts**
   - Branch: `feat/gateway-event-contracts`; source: Gateway Task 2 Step 3;
     requires P03A.
-  - Owns exactly: `gateway/contracts.py` and
-    `tests/gateway/test_contracts.py`.
+  - Owns exactly: `gateway/contracts.py` and the gateway projection test module.
+    It initially landed as `tests/gateway/test_contracts.py`; P07B performs the
+    canonical no-content rename to `tests/gateway/test_gateway_contracts.py`
+    after the full gate exposed a top-level pytest basename collision.
   - Output: deterministic event projection with an injectable clock,
     `pending_review` approval, lazy expired-claim recovery, current-iteration
     fencing/evidence state, all existing and delivery-native terminal states,
@@ -211,7 +213,9 @@ SHAs before either worker begins.
     Steps 1, 2, 4, and 5; requires P07A.
   - Owns exactly: `gateway/store.py`, `gateway/app.py`,
     `tests/gateway/test_gateway.py`, and
-    `tests/blockchain/test_mariadb_storage.py`.
+    `tests/blockchain/test_mariadb_storage.py`, plus the exact test-only rename
+    `tests/gateway/test_contracts.py` ->
+    `tests/gateway/test_gateway_contracts.py`.
   - Output: extract `GatewayStore` into the MariaDB adapter module so
     `gateway/app.py` remains routing/composition only. There is no post-insert
     mutation of work-batch `status`, `metadata`, or `children`; every
@@ -451,3 +455,9 @@ For every packet, the orchestrator must:
   always-true Hermes probe while expecting a Git call. The source now proves
   the absent-to-present initialization path separately from the already-present
   zero-mutation path, matching the packet brief and repository-safety contract.
+- P07B's real selected gate passed 36 MariaDB/gateway tests, but its first full
+  gate exposed that `tests/gateway/test_contracts.py` and
+  `tests/validation/test_contracts.py` import as the same top-level module.
+  P07B owns only a no-content rename of the newer gateway file to
+  `test_gateway_contracts.py`; the gate and global collection semantics remain
+  unchanged, so collection cannot be hidden by a command-line workaround.

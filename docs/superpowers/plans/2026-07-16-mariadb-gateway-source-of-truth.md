@@ -110,7 +110,7 @@ git commit -m "docs: declare gateway delivery source of truth"
 **Files:**
 - Create: `gateway/contracts.py`
 - Create: `gateway/store.py`
-- Create: `tests/gateway/test_contracts.py`
+- Create: `tests/gateway/test_gateway_contracts.py`
 - Modify: `gateway/app.py`
 - Modify: `tests/gateway/test_gateway.py`
 - Modify: `tests/blockchain/test_mariadb_storage.py`
@@ -230,11 +230,13 @@ invalid approval ordering, or lifecycle events after the first terminal event.
 The optional clock defaults to current UTC and exists only for deterministic
 projection tests.
 
-P07A verifies and commits only the pure boundary:
+P07A verifies and commits only the pure boundary. The file initially landed as
+`tests/gateway/test_contracts.py`; P07B renames it without content changes to
+avoid a full-suite import collision with `tests/validation/test_contracts.py`:
 
 ```powershell
-python -m pytest -q --no-cov tests/gateway/test_contracts.py
-git add gateway/contracts.py tests/gateway/test_contracts.py
+python -m pytest -q --no-cov tests/gateway/test_gateway_contracts.py
+git add gateway/contracts.py tests/gateway/test_gateway_contracts.py
 git commit -m "feat: define gateway lifecycle projection"
 ```
 
