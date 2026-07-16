@@ -448,7 +448,7 @@ git commit -m "refactor: retire sqlite delivery control plane"
 - Produces: `GatewaySettings`, `require_captain`, `require_worker`, and a compose service named `gateway` listening only on `127.0.0.1:${GATEWAY_PORT:-8090}`.
 - Consumes: `LEDGER_DSN`, `CAPTAIN_GATEWAY_TOKEN`, `WORKER_GATEWAY_TOKEN`, `GATEWAY_APPROVAL_ENABLED`, and `GATEWAY_PORT` from gitignored environment configuration.
 
-- [ ] **Step 1: Write failing authorization and settings tests**
+- [x] **Step 1: Write failing authorization and settings tests**
 
 ```python
 def test_captain_write_requires_captain_bearer_token(client: TestClient) -> None:
@@ -462,13 +462,13 @@ def test_worker_cannot_create_captain_batch(client: TestClient) -> None:
     assert response.status_code == 403
 ```
 
-- [ ] **Step 2: Verify the tests fail**
+- [x] **Step 2: Verify the tests fail**
 
 Run: `python -m pytest -q tests/gateway/test_gateway_auth.py tests/gateway/test_gateway_settings.py`
 
 Expected: FAIL because gateway routes do not authenticate actors and configuration is read ad hoc from `os.getenv`.
 
-- [ ] **Step 3: Implement fail-closed settings and route dependencies**
+- [x] **Step 3: Implement fail-closed settings and route dependencies**
 
 Use a frozen settings model:
 

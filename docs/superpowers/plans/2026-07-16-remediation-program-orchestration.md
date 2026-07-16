@@ -300,7 +300,7 @@ SHAs before either worker begins.
   - Gate: `pwsh -NoProfile -File scripts/test_gateway.ps1` with zero selected
     skips.
 
-- [ ] **P08 — Gateway authentication and settings**
+- [x] **P08 — Gateway authentication and settings**
   - Branch: `feat/gateway-auth-settings`; source: Gateway Task 5 steps 1-3;
     requires P07C.
   - Gate: auth, settings, gateway, and database-backed health tests.
@@ -331,6 +331,9 @@ SHAs before either worker begins.
     Replace P04's transitional private Minibook/service validation adapters
     with calls into `Health.psm1`; no duplicate path, HTTP, TCP, or aggregate
     service-health implementation may remain in `StageValidation.psm1`.
+  - [ ] Move gateway schema initialization to explicit process startup so
+    `/healthz` remains a read-only `SELECT 1` probe and never performs lazy
+    DDL or migration work on the first readiness request.
 
 - [ ] **P16 — URL relevance adapter boundary**
   - Branch: `refactor/url-relevance-adapter`; source: System Task 8; requires
@@ -553,3 +556,11 @@ For every packet, the orchestrator must:
   skips, one live deselection, one known warning, and 83% coverage. Replays
   return the immutable stored block without consuming an index or breaking
   hash adjacency. P08 is now unlocked on `LOCK_GATEWAY`.
+- P08 integrated candidate chain `e5449d1` + `1e6defb` as merge commit
+  `cfa4123` after the first specification review rejected a remotely
+  overridable bind host and unauthenticated slash redirects. RED repairs then
+  fixed the host to `127.0.0.1` and disabled redirect slashes; fresh
+  specification and quality reviews passed. The integrated disposable-MariaDB
+  gate passed 49 selected tests with zero skips; its full gate passed 413 tests
+  with two explicit skips, one live deselection, one known warning, and 84%
+  coverage. P11 now waits only for P10; P14 also requires P06.

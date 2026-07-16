@@ -64,9 +64,10 @@ resolution of all four overlapping paths. Specification and quality reviews
 are PASS; the combined 123-test gate and `compileall` passed. The planning lane
 is unlocked for P10.
 
-P07C candidate `2f66ae3` is integrated as `c277c3b` after specification and
-quality PASS. P08 is now unlocked and is the next `LOCK_GATEWAY` packet. P10 is
-independently unlocked by the completed P09 packet.
+P08 candidate chain `e5449d1` + `1e6defb` is integrated as `cfa4123` after
+specification and quality PASS. P10 is the next implementable packet; P11 now
+waits only for P10. P14 still waits for P06 and owns the remaining health
+startup-versus-readiness boundary.
 
 ### Autonomous Captain process candidate
 
@@ -129,6 +130,22 @@ QUALITY_REVIEW: PASS
 INTEGRATION_SHA: c277c3b07b381d4f8ad81c81602b23a4fd21f07b
 INTEGRATED_GATE: 49 selected passed, zero skips; full 394 passed, 2 explicit skips, 1 deselected, 1 warning; 83% coverage
 KNOWN_LOW_RISK: injected mirrors receive a duplicate replay notification; the production mirror ignores work_batch and holdout
+
+HANDOFF TO WORKER 6: P08
+STATE: INTEGRATED
+LOCK: LOCK_GATEWAY
+BRANCH: feat/gateway-auth-settings
+WORKTREE: C:\Users\User\Desktop\Captain_cook\.worktrees\gateway-auth-settings
+CANDIDATE_SHA: e5449d1dde1ea5f266e988299ee7f3b7f59c1e8d
+REPAIR_SHA: 1e6defbe6354e8b208f46ca76ffff734d301e828
+RED_GATE: missing settings/auth contract; then 2 host failures and 1 slash-redirect failure
+GREEN_GATE: 64 focused auth/settings/legacy tests passed
+WORKER_GATE: 49 selected passed, zero skips; full 417 passed, 1 skip, 1 deselected; 83.84% coverage
+SPEC_REVIEW: PASS after closing 2 Important findings
+QUALITY_REVIEW: PASS
+INTEGRATION_SHA: cfa4123193066387ea6530760e803c4ed05b47a8
+INTEGRATED_GATE: 49 selected passed, zero skips; full 413 passed, 2 explicit skips, 1 deselected, 1 warning; 84% coverage
+FOLLOWUP_GAP: P14 must move lazy schema initialization out of the readiness request
 
 HANDOFF TO WORKER 2: P06
 STATE: REPAIR_ATTEMPT_1_IN_PROGRESS
@@ -202,7 +219,7 @@ it as foreign state and preserve it unless the user explicitly assigns it.
 - Use only disposable `captain-cook-test` resources for database gates.
 - Never run `docker compose down -v` or touch VibeMind n8n/volumes.
 - The P05 gate rendered Compose without starting or stopping services.
-- The last P07C gate left no test containers or `.coverage` artifact and
+- The last P08 gate left no test containers or `.coverage` artifact and
   preserved protected-service start times.
 - Requests and Starlette/httpx warnings are known P20 work, not silent passes.
 - Live LLM, browser, MCP, deployment, and clean-clone claims require their own
