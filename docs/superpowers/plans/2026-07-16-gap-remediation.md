@@ -2,6 +2,12 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Program routing:** Do not dispatch this plan standalone. Follow
+> `2026-07-16-remediation-program-orchestration.md`. Task 1 remains
+> dispatchable. Tasks 2-3 are superseded by the MariaDB gateway source of truth;
+> Tasks 5-8 are blocked until a gateway-native delivery-runtime design replaces
+> their authoritative-SQLite assumptions.
+
 **Goal:** Close the security, durability, live-evidence, recovery, Codex/Second-Brain, AutoGen, CI, and documentation gaps that prevent Captain Cook from operating as a crash-resumable real agent delivery team.
 
 **Architecture:** Keep the existing deterministic Householder pipeline as the offline fallback. Promote the SQLite delivery ledger into the authoritative Captain command log with a transactional outbox; connect it to authenticated HTTP composition, Hermes/Minibook projections, supervised Codex processes, durable reasoning slices, and a fail-closed Quality Warden. MariaDB remains the separately owned sole-writer gateway for production lifecycle records and must be proven with a real container gate.

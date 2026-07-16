@@ -5,7 +5,9 @@ Import-Module (Join-Path $PSScriptRoot 'Common.psm1')
 Import-Module (Join-Path $PSScriptRoot 'Configuration.psm1')
 Import-Module (Join-Path $PSScriptRoot 'Preflight.psm1')
 Import-Module (Join-Path $PSScriptRoot 'Components.psm1')
+Import-Module (Join-Path $PSScriptRoot 'Repository.psm1')
 Import-Module (Join-Path $PSScriptRoot 'Services.psm1')
+Import-Module (Join-Path $PSScriptRoot 'StageValidation.psm1')
 
 function Get-SetupStages {
     @('Preflight', 'Configuration', 'Captain', 'Hermes', 'Minibook', 'Services', 'Verification')
@@ -24,23 +26,159 @@ function ConvertTo-CheckpointTable {
     $table
 }
 
+function Get-InvalidatedCompletedSetupStages {
+    param(
+        [Parameter(Mandatory)][hashtable] $State,
+        [Parameter(Mandatory)][string[]] $Stages,
+        [Parameter(Mandatory)][scriptblock] $StageValidator,
+        [Parameter(Mandatory)][hashtable] $Context
+    )
+
+    foreach ($stage in $Stages) {
+        if (-not $State.ContainsKey($stage) -or $State[$stage] -ne 'Complete') { continue }
+        if (-not [bool](& $StageValidator $stage $Context)) {
+            return @(Get-InvalidatedSetupStages -Stages $Stages -FirstInvalidStage $stage)
+        }
+    }
+    @()
+}
+
+function Remove-InvalidatedSetupStages {
+    param(
+        [Parameter(Mandatory)][hashtable] $State,
+        [Parameter(Mandatory)][string[]] $InvalidatedStages
+    )
+
+    foreach ($stage in $InvalidatedStages) {
+        [void]$State.Remove($stage)
+    }
+}
+
+function New-InvalidSetupRunnerResult {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]] $InvalidatedStages
+    )
+
+    New-SetupResult -Component 'Setup' -Status 'Failed' `
+        -Message 'Der Setup-Runner hat kein gültiges Ergebnis geliefert.' `
+        -Remediation 'Retry' `
+        -Data @{ InvalidatedStages = [string[]]@($InvalidatedStages) }
+}
+
+function ConvertTo-StableRepairResult {
+    param(
+        [AllowNull()][object] $SetupResult,
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]] $InvalidatedStages
+    )
+
+    $requiredProperties = @('Component', 'Status', 'Message', 'Remediation', 'Data')
+    $propertyNames = if ($null -eq $SetupResult) { @() } else { @($SetupResult.PSObject.Properties.Name) }
+    foreach ($requiredProperty in $requiredProperties) {
+        if ($requiredProperty -notin $propertyNames) {
+            return New-InvalidSetupRunnerResult -InvalidatedStages $InvalidatedStages
+        }
+    }
+    if ($SetupResult.Data -isnot [Collections.IDictionary]) {
+        return New-InvalidSetupRunnerResult -InvalidatedStages $InvalidatedStages
+    }
+
+    $data = @{}
+    foreach ($key in $SetupResult.Data.Keys) {
+        $data[[string]$key] = $SetupResult.Data[$key]
+    }
+    $data.InvalidatedStages = [string[]]@($InvalidatedStages)
+
+    try {
+        New-SetupResult -Component ([string]$SetupResult.Component) `
+            -Status ([string]$SetupResult.Status) `
+            -Message ([string]$SetupResult.Message) `
+            -Remediation ([string]$SetupResult.Remediation) `
+            -Data $data
+    }
+    catch {
+        New-InvalidSetupRunnerResult -InvalidatedStages $InvalidatedStages
+    }
+}
+
+function Invoke-StableSetupStageAction {
+    param(
+        [AllowNull()][object] $Action,
+        [Parameter(Mandatory)][string] $Root,
+        [Parameter(Mandatory)][string] $FailureMessage
+    )
+
+    if ($Action -isnot [scriptblock]) {
+        return [pscustomobject]@{ Status = 'Failed'; Message = $FailureMessage }
+    }
+
+    try {
+        $actionOutput = @(& $Action $Root)
+    }
+    catch {
+        return [pscustomobject]@{ Status = 'Failed'; Message = $FailureMessage }
+    }
+
+    if ($actionOutput.Count -ne 1) {
+        return [pscustomobject]@{ Status = 'Failed'; Message = $FailureMessage }
+    }
+    $result = $actionOutput[0]
+    if ($null -eq $result) {
+        return [pscustomobject]@{ Status = 'Failed'; Message = $FailureMessage }
+    }
+    $statusProperty = $result.PSObject.Properties['Status']
+    $messageProperty = $result.PSObject.Properties['Message']
+    if ($null -eq $statusProperty -or $null -eq $messageProperty) {
+        return [pscustomobject]@{ Status = 'Failed'; Message = $FailureMessage }
+    }
+
+    $status = $statusProperty.Value
+    $message = $messageProperty.Value
+    $allowedStatuses = @('Ready', 'Missing', 'Invalid', 'Failed', 'Skipped', 'RestartRequired')
+    if ($status -isnot [string] -or [string]::IsNullOrWhiteSpace($status) -or
+        $status -cnotin $allowedStatuses -or
+        $message -isnot [string] -or [string]::IsNullOrWhiteSpace($message)) {
+        return [pscustomobject]@{ Status = 'Failed'; Message = $FailureMessage }
+    }
+    $result
+}
+
 function Invoke-GuidedSetup {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string] $Root,
         [object] $Checkpoint = @{},
-        [scriptblock] $StageRunner
+        [scriptblock] $StageRunner,
+        [scriptblock] $StageValidator
     )
 
     $state = ConvertTo-CheckpointTable $Checkpoint
+    $stages = @(Get-SetupStages)
     $checkpointPath = Join-Path $Root '.captain-cook/checkpoint.json'
+    $context = @{
+        Root = $Root
+        Checkpoint = $state
+        SystemStatusProvider = { param($candidateRoot) Get-CaptainSystemStatus -Root $candidateRoot }
+    }
+    if ($null -eq $StageValidator) {
+        $StageValidator = { param($stage, $stageContext) Test-SetupStage -Stage $stage -Context $stageContext }
+    }
     if ($null -eq $StageRunner) {
         $StageRunner = { param($stage, $context) Invoke-DefaultSetupStage -Stage $stage -Context $context }
     }
 
-    foreach ($stage in Get-SetupStages) {
+    $invalidatedStages = @(Get-InvalidatedCompletedSetupStages -State $state -Stages $stages -StageValidator $StageValidator -Context $context)
+    if ($invalidatedStages.Count -gt 0) {
+        Remove-InvalidatedSetupStages -State $state -InvalidatedStages $invalidatedStages
+        Save-SetupCheckpoint -Path $checkpointPath -Stages $state
+    }
+
+    foreach ($stage in $stages) {
         if ($state.ContainsKey($stage) -and $state[$stage] -eq 'Complete') { continue }
-        $stageResult = & $StageRunner $stage @{ Root = $Root; Checkpoint = $state }
+        $stageResult = & $StageRunner $stage $context
         if ($null -eq $stageResult -or $stageResult.Status -ne 'Complete') {
             $state[$stage] = if ($null -eq $stageResult) { 'Failed' } else { [string]$stageResult.Status }
             Save-SetupCheckpoint -Path $checkpointPath -Stages $state
@@ -51,6 +189,42 @@ function Invoke-GuidedSetup {
         Save-SetupCheckpoint -Path $checkpointPath -Stages $state
     }
     New-SetupResult -Component 'Setup' -Status 'Ready' -Message 'Captain Cook ist vollständig eingerichtet und verifiziert.' -Remediation 'None'
+}
+
+function Repair-CaptainSystem {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $Root,
+        [scriptblock] $StageValidator,
+        [scriptblock] $SetupRunner
+    )
+
+    $checkpointPath = Join-Path $Root '.captain-cook/checkpoint.json'
+    $state = ConvertTo-CheckpointTable (Get-SetupCheckpoint -Path $checkpointPath)
+    $stages = @(Get-SetupStages)
+    $context = @{
+        Root = $Root
+        Checkpoint = $state
+        SystemStatusProvider = { param($candidateRoot) Get-CaptainSystemStatus -Root $candidateRoot }
+    }
+    if ($null -eq $StageValidator) {
+        $StageValidator = { param($stage, $stageContext) Test-SetupStage -Stage $stage -Context $stageContext }
+    }
+
+    $invalidatedStages = @(Get-InvalidatedCompletedSetupStages -State $state -Stages $stages -StageValidator $StageValidator -Context $context)
+    if ($invalidatedStages.Count -gt 0) {
+        Remove-InvalidatedSetupStages -State $state -InvalidatedStages $invalidatedStages
+        Save-SetupCheckpoint -Path $checkpointPath -Stages $state
+    }
+
+    if ($null -eq $SetupRunner) {
+        $SetupRunner = {
+            param($candidateRoot, $candidateCheckpoint)
+            Invoke-GuidedSetup -Root $candidateRoot -Checkpoint $candidateCheckpoint -StageValidator { $true }
+        }
+    }
+    $setupResult = & $SetupRunner $Root $state
+    ConvertTo-StableRepairResult -SetupResult $setupResult -InvalidatedStages $invalidatedStages
 }
 
 function Initialize-SetupConfiguration {
@@ -180,7 +354,27 @@ function Invoke-DefaultSetupStage {
             if ($result.Status -ne 'Ready') { return [pscustomobject]@{Status='Failed';Message=$result.Message} }
         }
         'Captain' { $result = Install-Captain -Root $root; if ($result.Status -ne 'Ready') { return [pscustomobject]@{Status='Failed';Message=$result.Message} } }
-        'Hermes' { $result = Install-Hermes -Root $root; if ($result.Status -ne 'Ready') { return [pscustomobject]@{Status='Failed';Message=$result.Message} } }
+        'Hermes' {
+            $submoduleInitializer = if ($Context.ContainsKey('SubmoduleInitializer')) {
+                $Context.SubmoduleInitializer
+            }
+            else {
+                { param($candidateRoot) Initialize-SetupSubmodules -Root $candidateRoot }
+            }
+            $hermesInstaller = if ($Context.ContainsKey('HermesInstaller')) {
+                $Context.HermesInstaller
+            }
+            else {
+                { param($candidateRoot) Install-Hermes -Root $candidateRoot }
+            }
+
+            $result = Invoke-StableSetupStageAction -Action $submoduleInitializer -Root $root `
+                -FailureMessage 'Die Repository-Initialisierung hat kein gültiges Ergebnis geliefert.'
+            if ($result.Status -cne 'Ready') { return [pscustomobject]@{Status='Failed';Message=$result.Message} }
+            $result = Invoke-StableSetupStageAction -Action $hermesInstaller -Root $root `
+                -FailureMessage 'Die Hermes-Installation hat kein gültiges Ergebnis geliefert.'
+            if ($result.Status -cne 'Ready') { return [pscustomobject]@{Status='Failed';Message=$result.Message} }
+        }
         'Minibook' {
             $result = Install-Minibook -Root $root
             if ($result.Status -ne 'Ready') { return [pscustomobject]@{Status='Failed';Message=$result.Message} }
@@ -241,4 +435,4 @@ function Stop-CaptainSystem {
     Stop-CaptainServices -Root $Root -N8nMode $(if ($config.N8N_MODE -eq 'external') {'External'} else {'Owned'})
 }
 
-Export-ModuleMember -Function @('Get-SetupStages','Invoke-GuidedSetup','Invoke-DefaultSetupStage','Initialize-SetupConfiguration','Get-CaptainSystemStatus','Start-CaptainSystem','Stop-CaptainSystem')
+Export-ModuleMember -Function @('Get-SetupStages','Invoke-GuidedSetup','Repair-CaptainSystem','Invoke-DefaultSetupStage','Initialize-SetupConfiguration','Get-CaptainSystemStatus','Start-CaptainSystem','Stop-CaptainSystem')

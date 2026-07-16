@@ -10,9 +10,12 @@ from fastapi.testclient import TestClient
 
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.app import create_app
+from tests.support.mariadb import assert_isolated_test_database
 
 
 TEST_DSN = os.getenv("TEST_MARIADB_DSN")
+if os.getenv("REQUIRE_MARIADB_TESTS") == "1":
+    assert_isolated_test_database(TEST_DSN)
 pytestmark = pytest.mark.skipif(not TEST_DSN, reason="TEST_MARIADB_DSN is not configured")
 
 
@@ -30,9 +33,12 @@ class RecordingMirror:
 @pytest.fixture
 def storage() -> MariaDBStorage:
     assert TEST_DSN is not None
+    assert_isolated_test_database(TEST_DSN)
     result = MariaDBStorage(TEST_DSN)
+    assert_isolated_test_database(TEST_DSN)
     result.clear()
     yield result
+    assert_isolated_test_database(TEST_DSN)
     result.clear()
 
 

@@ -2,6 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Program routing:** Do not dispatch this plan standalone. Follow
+> `2026-07-16-remediation-program-orchestration.md`. Captain Tasks 1, 3, 6, 7,
+> and the shared-document part of Task 8 are absorbed by canonical program
+> packets; only the orchestrator updates source-plan checkboxes.
+
 **Goal:** Make the Captain planning path production-ready by enforcing deterministic policy after every LLM stage, releasing through the sole-writer gateway, resuming partial project releases, and proving live persistence and runtime contracts.
 
 **Architecture:** Keep the deterministic `CaptainPipeline` independent of transports and databases. Add typed policy, release, capability, run-store, and event-publication ports; wire JSON implementations for offline operation and HTTP/MariaDB-backed implementations for production. Hermes and n8n remain external consumers and are not implemented here.
@@ -184,11 +189,15 @@ git commit -m "feat: enforce captain planning policy"
 
 ### Task 3: Add gateway release and capability adapters
 
+> **Program routing:** P07C owns Step 4's gateway-side idempotency after the
+> append-only store is integrated. P11 later owns Steps 1-3 and 5-6 plus the
+> planning HTTP adapter. Do not let either worker edit the other's allowlist.
+
 **Files:**
 - Create: `agenten/planning/gateway_client.py`
 - Modify: `agenten/planning/factory.py`
 - Modify: `agenten/planning/cli.py`
-- Modify: `gateway/app.py`
+- Modify for P07C only: `gateway/store.py`
 - Test: `tests/planning/test_gateway_client.py`
 - Test: `tests/gateway/test_gateway.py`
 
@@ -280,18 +289,27 @@ class GatewayPlanningClient(BatchReleaseClient, CapabilityResolver):
 
 Before returning `409` for an existing `work_batch`, compare the stored canonical data to the validated request. Return the existing block when identical; retain `409` for different content. Apply the same rule to one `holdout` child per batch.
 
+P07C verifies this rule through the isolated MariaDB gate and commits only its
+store boundary:
+
+```powershell
+pwsh -NoProfile -File scripts/test_gateway.ps1
+git add gateway/store.py tests/gateway/test_gateway.py
+git commit -m "feat: make gateway releases idempotent"
+```
+
 - [ ] **Step 5: Add explicit composition flags**
 
 Extend the CLI with `--release-mode {json,gateway}` and `--gateway-url`. `json` remains the default. `gateway` constructs one `httpx.AsyncClient`, uses `GatewayPlanningClient` as both release client and capability resolver, and closes the client after the run.
 
 - [ ] **Step 6: Verify and commit**
 
-Run: `python -m pytest -q tests/planning/test_gateway_client.py tests/gateway/test_gateway.py -k 'not mariadb'`
+Run: `python -m pytest -q --no-cov tests/planning/test_gateway_client.py tests/planning/test_factory_e2e.py tests/planning/test_cli.py`
 
 Commit:
 
 ```powershell
-git add agenten/planning/gateway_client.py agenten/planning/factory.py agenten/planning/cli.py gateway/app.py tests/planning/test_gateway_client.py tests/gateway/test_gateway.py
+git add agenten/planning/gateway_client.py agenten/planning/factory.py agenten/planning/cli.py tests/planning/test_gateway_client.py tests/planning/test_factory_e2e.py tests/planning/test_cli.py
 git commit -m "feat: connect captain planning to ledger gateway"
 ```
 
