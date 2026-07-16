@@ -14,13 +14,14 @@ PROPOSED_SCHEDULE: EVERY_30_MINUTES_WHILE_ACTIVE
 INTEGRATION_WORKTREE: C:\Users\User\Desktop\Captain_cook-main-integration
 INTEGRATION_BRANCH: feat/system-remediation-orchestration
 LAST_INTEGRATED_IMPLEMENTATION_SHA: 11febc37
+CONTROL_DISPATCH_SHA: 4601806
 PRIMARY_WORKTREE_POLICY: PRESERVE_AND_DO_NOT_USE_FOR_INTEGRATION
 ACK_OWNER: ORCHESTRATOR_ONLY
 ```
 
-The commit containing this ACK and the current master-plan TODOs becomes the
-next exact dispatch SHA for new P06/P09/P15 worktrees. Resolve it with Git at
-dispatch time; do not copy `11febc37` as their base automatically.
+`4601806` contains this ACK, the worker prompts, and the current master-plan
+TODOs. It is the exact base for the current P06/P09 wave. A later orchestrator
+may advance the base only after recording a new explicit dispatch SHA here.
 
 ## Completed packets
 
@@ -55,18 +56,24 @@ P07C remains blocked by P07B. P08 remains blocked by P07C.
 
 ```text
 HANDOFF TO WORKER 1: P07B-FIX
-STATE: READY
+STATE: DISPATCHED
 LOCK: LOCK_GATEWAY
+BRANCH: refactor/gateway-append-only-store
+WORKTREE: C:\Users\User\Desktop\Captain_cook\.worktrees\gateway-append-only-store
 PROMPT: docs/superpowers/prompts/2026-07-16-worker-goals.md#handoff-to-worker-1--p07b-fix
 
 HANDOFF TO WORKER 2: P06
-STATE: READY_AFTER_CONTROL_COMMIT
+STATE: DISPATCHED
 LOCK: LOCK_LIFECYCLE
+BRANCH: fix/setup-preflight-contract
+WORKTREE: C:\Users\User\Desktop\Captain_cook\.worktrees\setup-preflight-contract
 PROMPT: docs/superpowers/prompts/2026-07-16-worker-goals.md#handoff-to-worker-2--p06
 
 HANDOFF TO WORKER 3: P09
-STATE: READY_AFTER_CONTROL_COMMIT
+STATE: DISPATCHED
 LOCK: LOCK_PLANNING
+BRANCH: feat/captain-planning-policy
+WORKTREE: C:\Users\User\Desktop\Captain_cook\.worktrees\captain-planning-policy
 PROMPT: docs/superpowers/prompts/2026-07-16-worker-goals.md#handoff-to-worker-3--p09
 
 QUEUE: P15
@@ -76,6 +83,10 @@ LOCKS: LOCK_RUNTIME_CORE plus the P15-owned recorder/adapter paths
 
 P02 is technically ready but belongs to the adjacent Minibook product and is
 not part of the recommended three-worker Captain-Core wave.
+
+The worktree `.worktrees/remediation-integration` on
+`integration/remediation-commits` is observed but not owned by this loop. Treat
+it as foreign state and preserve it unless the user explicitly assigns it.
 
 ## Orchestrator loop protocol
 
