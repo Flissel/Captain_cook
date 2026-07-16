@@ -104,6 +104,12 @@ def test_event_models_reject_invalid_iterations_and_terminal_outcomes() -> None:
         BatchDoneEvent(batch_id=BATCH_ID, outcome="timed_out")
 
 
+@pytest.mark.parametrize("iteration", [True, "1"])
+def test_evidence_iteration_requires_a_strict_integer(iteration: Any) -> None:
+    with pytest.raises(ValidationError):
+        EvidenceEvent(batch_id=BATCH_ID, iteration=iteration)
+
+
 def test_pending_parent_projects_without_lifecycle_events() -> None:
     projection = project_batch([work_batch()], BATCH_ID, now=NOW)
 
@@ -161,6 +167,21 @@ def test_projection_requires_strictly_increasing_block_indexes() -> None:
 def test_projection_rejects_mismatched_child_batch_or_parent(bad_child: dict[str, Any]) -> None:
     with pytest.raises(ValueError, match="child relationship"):
         project_batch([work_batch(), bad_child], BATCH_ID, now=NOW)
+
+
+def test_foreign_work_batch_cannot_attach_to_the_target_parent() -> None:
+    foreign_child = work_batch(index=11, batch_id="batch-other", parent_index=PARENT_INDEX)
+
+    with pytest.raises(ValueError, match="child relationship"):
+        project_batch([work_batch(), foreign_child], BATCH_ID, now=NOW)
+
+
+def test_boolean_parent_reference_cannot_match_integer_parent_index() -> None:
+    target = work_batch(index=1)
+    boolean_parent = child(2, "holdout", parent_index=True)
+
+    with pytest.raises(ValueError, match="child relationship"):
+        project_batch([target, boolean_parent], BATCH_ID, now=NOW)
 
 
 def test_pending_review_requires_one_ordered_approval() -> None:
@@ -308,6 +329,20 @@ def test_succeeded_requires_prior_current_iteration_validation_evidence() -> Non
     with pytest.raises(ValueError, match="validation_run"):
         project_batch(
             [work_batch(), claim(11), child(12, "batch_done", outcome="succeeded")],
+            BATCH_ID,
+            now=NOW,
+        )
+
+
+def test_boolean_iteration_cannot_authorize_success() -> None:
+    with pytest.raises(ValueError, match="invalid validation_run data"):
+        project_batch(
+            [
+                work_batch(),
+                claim(11),
+                child(12, "validation_run", iteration=True),
+                child(13, "batch_done", outcome="succeeded"),
+            ],
             BATCH_ID,
             now=NOW,
         )

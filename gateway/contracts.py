@@ -55,7 +55,7 @@ class EvidenceEvent(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     batch_id: str
-    iteration: int = Field(ge=1)
+    iteration: int = Field(ge=1, strict=True)
 
 
 class BatchDoneEvent(BaseModel):
@@ -148,12 +148,13 @@ def _batch_children(
     parent_index = parent["index"]
     children: list[dict[str, Any]] = []
     for block in blocks:
-        if block is parent or block.get("block_type") == "work_batch":
+        if block is parent:
             continue
 
         data = block.get("data")
         data_batch_id = data.get("batch_id") if isinstance(data, dict) else None
-        points_to_parent = block.get("parent_index") == parent_index
+        child_parent_index = block.get("parent_index")
+        points_to_parent = type(child_parent_index) is int and child_parent_index == parent_index
         belongs_to_batch = data_batch_id == batch_id
         if not points_to_parent and not belongs_to_batch:
             continue
