@@ -10,6 +10,7 @@ from agenten.delivery.gateway_client import (
     GatewayDeliveryClient,
     GatewayDeliveryConflictError,
     GatewayDeliveryError,
+    GatewayEvidence,
 )
 
 
@@ -78,7 +79,13 @@ async def test_fenced_writes_send_claim_token_and_typed_payloads() -> None:
         await client.record_validation(
             "batch-1", "claim-secret", iteration=2, artifact_ref="artifact://run/1"
         )
-        await client.complete("batch-1", "claim-secret", outcome="succeeded")
+        await client.complete(
+            "batch-1",
+            "claim-secret",
+            outcome="succeeded",
+            capabilities=["crm", "delivery"],
+            artifact_ref="artifact://validated/1",
+        )
 
     assert expiry == datetime(2026, 7, 16, 12, 30, tzinfo=timezone.utc)
     assert all(request.headers["x-claim-token"] == "claim-secret" for request in requests)
@@ -95,7 +102,50 @@ async def test_fenced_writes_send_claim_token_and_typed_payloads() -> None:
     }
     assert payloads[1]["data"]["artifact_ref"] == "artifact://run/1"
     assert payloads[2]["status"] == "succeeded"
-    assert payloads[2]["data"] == {"batch_id": "batch-1", "outcome": "succeeded"}
+    assert payloads[2]["data"] == {
+        "batch_id": "batch-1",
+        "outcome": "succeeded",
+        "capabilities": ["crm", "delivery"],
+        "artifact_ref": "artifact://validated/1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_append_evidence_accepts_only_typed_lifecycle_evidence() -> None:
+    captured: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(201, json={"index": 43}, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = GatewayDeliveryClient("http://gateway", "worker-secret", http)
+        await client.append_evidence(
+            "batch-1",
+            "claim-secret",
+            GatewayEvidence(
+                kind="codex_session",
+                iteration=2,
+                session_id="thread-123",
+            ),
+        )
+
+    assert captured == [
+        {
+            "block_type": "codex_session",
+            "data": {
+                "batch_id": "batch-1",
+                "iteration": 2,
+                "session_id": "thread-123",
+            },
+            "status": "recorded",
+        }
+    ]
+
+    with pytest.raises(ValueError, match="session_id"):
+        GatewayEvidence(kind="codex_session", iteration=2)
+    with pytest.raises(ValueError, match="artifact_ref"):
+        GatewayEvidence(kind="validation_run", iteration=2)
 
 
 @pytest.mark.asyncio
