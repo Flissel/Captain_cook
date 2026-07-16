@@ -12,6 +12,9 @@ BeforeAll {
     if (Test-Path "$PSScriptRoot/Components.psm1") {
         Import-Module "$PSScriptRoot/Components.psm1" -Force
     }
+    if (Test-Path "$PSScriptRoot/StageValidation.psm1") {
+        Import-Module "$PSScriptRoot/StageValidation.psm1" -Force
+    }
     if (Test-Path "$PSScriptRoot/Lifecycle.psm1") {
         Import-Module "$PSScriptRoot/Lifecycle.psm1" -Force
     }
@@ -21,7 +24,7 @@ Describe 'Guided orchestration' {
     It 'resumes at the first incomplete stage' {
         $visited = [Collections.Generic.List[string]]::new()
 
-        $result = Invoke-GuidedSetup -Root $TestDrive -Checkpoint @{ Preflight = 'Complete'; Configuration = 'Incomplete' } -StageRunner {
+        $result = Invoke-GuidedSetup -Root $TestDrive -Checkpoint @{ Preflight = 'Complete'; Configuration = 'Incomplete' } -StageValidator { $true } -StageRunner {
             param($stage, $context)
             $visited.Add($stage)
             [pscustomobject]@{ Status = 'Complete'; Message = "$stage complete" }
@@ -72,6 +75,261 @@ Describe 'Guided orchestration' {
 
         $result.Status | Should -Be 'Failed'
         $result.Data.Results.Count | Should -Be 2
+    }
+}
+
+Describe 'Checkpoint revalidation and targeted repair' {
+    It 'returns the first invalid stage and every successor' {
+        Get-InvalidatedSetupStages -Stages (Get-SetupStages) -FirstInvalidStage 'Hermes' |
+            Should -Be @('Hermes', 'Minibook', 'Services', 'Verification')
+    }
+
+    It 'rejects an unknown invalid stage' {
+        { Get-InvalidatedSetupStages -Stages (Get-SetupStages) -FirstInvalidStage 'Unknown' } |
+            Should -Throw '*Unbekannte Setup-Stage: Unknown*'
+    }
+
+    It 'validates file-backed stages inside the supplied root' {
+        New-Item -ItemType File -Force -Path (Join-Path $TestDrive '.env') | Out-Null
+        New-Item -ItemType File -Force -Path (Join-Path $TestDrive '.captain-cook/demo-run.json') | Out-Null
+        $hermes = Join-Path $TestDrive '.captain-cook/hermes/Scripts/hermes.exe'
+        New-Item -ItemType File -Force -Path $hermes | Out-Null
+        $minibookPython = Join-Path $TestDrive 'minibook/.venv/Scripts/python.exe'
+        $minibookBuild = Join-Path $TestDrive 'minibook/frontend/.next'
+        New-Item -ItemType File -Force -Path $minibookPython | Out-Null
+        New-Item -ItemType Directory -Force -Path $minibookBuild | Out-Null
+        $context = @{ Root = $TestDrive }
+
+        Test-SetupStage -Stage 'Configuration' -Context $context | Should -BeTrue
+        Test-SetupStage -Stage 'Captain' -Context $context | Should -BeTrue
+        Test-SetupStage -Stage 'Hermes' -Context $context | Should -BeTrue
+        Test-SetupStage -Stage 'Minibook' -Context $context | Should -BeTrue
+
+        Remove-Item -LiteralPath $hermes
+        Test-SetupStage -Stage 'Hermes' -Context $context | Should -BeFalse
+        Remove-Item -LiteralPath $minibookBuild
+        Test-SetupStage -Stage 'Minibook' -Context $context | Should -BeFalse
+    }
+
+    It 'exports only the public stage-validation contract' {
+        @((Get-Command -Module StageValidation).Name | Sort-Object) |
+            Should -Be @('Get-InvalidatedSetupStages', 'Test-SetupStage')
+        { Test-SetupStage -Stage 'Unknown' -Context @{ Root = $TestDrive } } |
+            Should -Throw '*Unbekannte Setup-Stage: Unknown*'
+    }
+
+    It 'fails closed when standalone verification has no status provider' {
+        $modulePath = (Resolve-Path "$PSScriptRoot/StageValidation.psm1").Path.Replace("'", "''")
+        $probe = @"
+`$ErrorActionPreference = 'Stop'
+Import-Module '$modulePath' -Force
+`$result = Test-SetupStage -Stage 'Verification' -Context @{ Root = 'unused' }
+if (`$result -ne `$false) { exit 11 }
+`$invalidProviderResult = Test-SetupStage -Stage 'Verification' -Context @{ Root = 'unused'; SystemStatusProvider = 'not-a-scriptblock' }
+if (`$invalidProviderResult -ne `$false) { exit 12 }
+"@
+
+        $output = & pwsh -NoProfile -Command $probe 2>&1
+        $exitCode = $LASTEXITCODE
+
+        $exitCode | Should -Be 0
+        $output -join "`n" | Should -Not -Match 'Get-CaptainSystemStatus|CommandNotFoundException'
+    }
+
+    It 'aggregates existing service-health results without starting services' {
+        InModuleScope StageValidation -Parameters @{ CandidateRoot = $TestDrive } {
+            Mock Read-DotEnv { @{ MAILPIT_WEB_PORT = '8025'; MAILPIT_SMTP_PORT = '1025'; N8N_URL = 'http://localhost:5678' } }
+            Mock Get-ServiceHealth {
+                @(
+                    New-SetupResult -Component 'Mailpit' -Status 'Ready' -Message 'ok' -Remediation 'None'
+                    New-SetupResult -Component 'n8n' -Status 'Failed' -Message 'down' -Remediation 'Retry'
+                )
+            }
+
+            $result = Get-CaptainServiceHealth -Root $CandidateRoot
+
+            $result.Status | Should -Be 'Failed'
+            $result.Data.Results.Count | Should -Be 2
+            $result.Message | Should -Be 'down'
+            Test-SetupStage -Stage 'Services' -Context @{ Root = $CandidateRoot } |
+                Should -BeFalse
+            Should -Invoke Get-ServiceHealth -Times 2 -Exactly
+
+            $providerState = [pscustomobject]@{ Calls = 0 }
+            $systemStatusProvider = {
+                param($root)
+                $providerState.Calls++
+                New-SetupResult -Component 'System' -Status 'Ready' -Message 'ok' -Remediation 'None'
+            }
+            Test-SetupStage -Stage 'Verification' -Context @{
+                Root = $CandidateRoot
+                SystemStatusProvider = $systemStatusProvider
+            } |
+                Should -BeTrue
+            $providerState.Calls | Should -Be 1
+        }
+    }
+
+    It 'revalidates completed stages and persists invalidation before rerunning successors' {
+        $called = [Collections.Generic.List[string]]::new()
+        $validated = [Collections.Generic.List[string]]::new()
+        $observed = [pscustomobject]@{ Checkpoint = $null }
+        $checkpoint = @{}
+        Get-SetupStages | ForEach-Object { $checkpoint[$_] = 'Complete' }
+        $checkpointPath = Join-Path $TestDrive '.captain-cook/checkpoint.json'
+        Save-SetupCheckpoint -Path $checkpointPath -Stages $checkpoint
+
+        $result = Invoke-GuidedSetup -Root $TestDrive -Checkpoint $checkpoint `
+            -StageValidator {
+                param($stage, $context)
+                [void]$validated.Add($stage)
+                $stage -ne 'Minibook'
+            } `
+            -StageRunner {
+                param($stage, $context)
+                if ($null -eq $observed.Checkpoint) {
+                    $observed.Checkpoint = Get-SetupCheckpoint -Path $checkpointPath
+                }
+                [void]$called.Add($stage)
+                [pscustomobject]@{ Status = 'Complete'; Message = 'ok' }
+            }
+
+        $result.Status | Should -Be 'Ready'
+        $validated | Should -Be @('Preflight', 'Configuration', 'Captain', 'Hermes', 'Minibook')
+        $called | Should -Be @('Minibook', 'Services', 'Verification')
+        $observed.Checkpoint.Captain | Should -Be 'Complete'
+        @($observed.Checkpoint.PSObject.Properties.Name) | Should -Not -Contain 'Minibook'
+        @($observed.Checkpoint.PSObject.Properties.Name) | Should -Not -Contain 'Verification'
+    }
+
+    It 'does not rerun completed stages when every validator succeeds' {
+        $validated = [Collections.Generic.List[string]]::new()
+        $checkpoint = @{}
+        Get-SetupStages | ForEach-Object { $checkpoint[$_] = 'Complete' }
+
+        $result = Invoke-GuidedSetup -Root $TestDrive -Checkpoint $checkpoint `
+            -StageValidator {
+                param($stage, $context)
+                [void]$validated.Add($stage)
+                $true
+            } `
+            -StageRunner { throw 'A healthy completed stage must not rerun.' }
+
+        $result.Status | Should -Be 'Ready'
+        $validated | Should -Be (Get-SetupStages)
+    }
+
+    It 'preserves the positional StageRunner facade' {
+        $stageRunnerPosition = @(
+            (Get-Command Invoke-GuidedSetup).Parameters.StageRunner.Attributes |
+                Where-Object { $_ -is [Management.Automation.ParameterAttribute] }
+        )[0].Position
+        $called = [Collections.Generic.List[string]]::new()
+        $runner = {
+            param($stage, $context)
+            [void]$called.Add($stage)
+            [pscustomobject]@{ Status = 'Complete'; Message = 'ok' }
+        }
+
+        $result = Invoke-GuidedSetup $TestDrive @{} $runner -StageValidator { $true }
+
+        $stageRunnerPosition | Should -Be 2
+        $result.Status | Should -Be 'Ready'
+        $called | Should -Be (Get-SetupStages)
+    }
+
+    It 'repairs from the first broken completed stage and preserves stable result data' {
+        $checkpoint = @{}
+        Get-SetupStages | ForEach-Object { $checkpoint[$_] = 'Complete' }
+        $checkpointPath = Join-Path $TestDrive '.captain-cook/checkpoint.json'
+        Save-SetupCheckpoint -Path $checkpointPath -Stages $checkpoint
+        $observed = [pscustomobject]@{ Checkpoint = $null; RunnerCalls = 0 }
+
+        $result = Repair-CaptainSystem -Root $TestDrive -StageValidator {
+            param($stage, $context)
+            $stage -ne 'Hermes'
+        } -SetupRunner {
+            $observed.RunnerCalls++
+            $observed.Checkpoint = Get-SetupCheckpoint -Path $checkpointPath
+            New-SetupResult -Component 'Setup' -Status 'Ready' -Message 'repaired' -Remediation 'None' -Data @{ Existing = 'kept' }
+        }
+
+        $result.PSObject.Properties.Name | Should -Be @('Component', 'Status', 'Message', 'Remediation', 'Data')
+        $result.Status | Should -Be 'Ready'
+        $result.Data.Existing | Should -Be 'kept'
+        $result.Data.InvalidatedStages | Should -Be @('Hermes', 'Minibook', 'Services', 'Verification')
+        $observed.RunnerCalls | Should -Be 1
+        $observed.Checkpoint.Captain | Should -Be 'Complete'
+        @($observed.Checkpoint.PSObject.Properties.Name) | Should -Not -Contain 'Hermes'
+        @($observed.Checkpoint.PSObject.Properties.Name) | Should -Not -Contain 'Verification'
+    }
+
+    It 'fails closed for null and malformed setup-runner results' {
+        $cases = @(
+            [pscustomobject]@{ Name = 'null'; Value = $null }
+            [pscustomobject]@{
+                Name = 'missing Data'
+                Value = [pscustomobject]@{
+                    Component = 'Setup'
+                    Status = 'Ready'
+                    Message = 'incomplete contract'
+                    Remediation = 'None'
+                }
+            }
+        )
+
+        for ($index = 0; $index -lt $cases.Count; $index++) {
+            $case = $cases[$index]
+            $caseRoot = Join-Path $TestDrive "runner-result-$index"
+            $checkpoint = @{}
+            Get-SetupStages | ForEach-Object { $checkpoint[$_] = 'Complete' }
+            Save-SetupCheckpoint -Path (Join-Path $caseRoot '.captain-cook/checkpoint.json') -Stages $checkpoint
+            $runnerValue = $case.Value
+            $observed = [pscustomobject]@{ Result = $null }
+
+            {
+                $observed.Result = Repair-CaptainSystem -Root $caseRoot `
+                    -StageValidator { param($stage, $context) $stage -ne 'Hermes' } `
+                    -SetupRunner { $runnerValue }
+            } | Should -Not -Throw -Because $case.Name
+
+            $observed.Result.PSObject.Properties.Name |
+                Should -Be @('Component', 'Status', 'Message', 'Remediation', 'Data')
+            $observed.Result.Component | Should -Be 'Setup'
+            $observed.Result.Status | Should -Be 'Failed'
+            $observed.Result.Remediation | Should -Be 'Retry'
+            $observed.Result.Message | Should -Match 'Setup-Runner'
+            $observed.Result.Data.InvalidatedStages |
+                Should -Be @('Hermes', 'Minibook', 'Services', 'Verification')
+        }
+    }
+
+    It 'is idempotent when every completed stage remains healthy' {
+        $checkpoint = @{}
+        Get-SetupStages | ForEach-Object { $checkpoint[$_] = 'Complete' }
+        $checkpointPath = Join-Path $TestDrive '.captain-cook/checkpoint.json'
+        Save-SetupCheckpoint -Path $checkpointPath -Stages $checkpoint
+        $before = Get-Content -LiteralPath $checkpointPath -Raw
+        $runnerState = [pscustomobject]@{ Calls = 0 }
+
+        $result = Repair-CaptainSystem -Root $TestDrive -StageValidator { $true } -SetupRunner {
+            $runnerState.Calls++
+            New-SetupResult -Component 'Setup' -Status 'Ready' -Message 'already healthy' -Remediation 'None'
+        }
+
+        $result.Status | Should -Be 'Ready'
+        @($result.Data.InvalidatedStages).Count | Should -Be 0
+        $runnerState.Calls | Should -Be 1
+        (Get-Content -LiteralPath $checkpointPath -Raw) | Should -BeExactly $before
+    }
+
+    It 'keeps repair.ps1 as a thin lifecycle facade' {
+        $source = Get-Content "$PSScriptRoot/../../repair.ps1" -Raw
+
+        $source | Should -Match 'Import-Module.*scripts/setup/Lifecycle\.psm1'
+        $source | Should -Match 'Repair-CaptainSystem\s+-Root\s+\$PSScriptRoot'
+        $source | Should -Match 'Write-Host\s+\$result\.Message'
+        $source | Should -Not -Match 'ConvertFrom-Json|Set-Content|\.Remove\('
     }
 }
 
