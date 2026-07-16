@@ -257,6 +257,9 @@ SHAs before either worker begins.
   - Branch: `feat/system-health-contract`; source: System Task 5 plus the
     gateway service portion of Gateway Task 5; requires P06 and P08.
   - Output: ten-component health with gateway as a Captain-managed process.
+    Replace P04's transitional private Minibook/service validation adapters
+    with calls into `Health.psm1`; no duplicate path, HTTP, TCP, or aggregate
+    service-health implementation may remain in `StageValidation.psm1`.
 
 - [ ] **P16 — URL relevance adapter boundary**
   - Branch: `refactor/url-relevance-adapter`; source: System Task 8; requires

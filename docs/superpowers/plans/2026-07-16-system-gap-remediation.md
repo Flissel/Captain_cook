@@ -540,6 +540,17 @@ for Minibook.
 
 Replace `Get-CaptainSystemStatus` internals with a call to this module. After starting Minibook and Compose, `Start-CaptainSystem` must return `Wait-CaptainSystemReady`, not the Compose command result.
 
+- [ ] **Step 3A: Retire transitional stage-validation health adapters**
+
+P04 discovered that the original Task 1 snippet referenced
+`Test-MinibookInstallation` and `Get-CaptainServiceHealth`, but neither function
+exists in the baseline. P04 may keep minimal private compatibility adapters in
+`StageValidation.psm1` so checkpoint repair is functional. This task must move
+their behavior behind `Get-CaptainHealthReport`, make `Test-SetupStage`
+delegate to the shared health module, and add a Pester/static assertion that no
+duplicate Minibook path, HTTP, TCP, or service aggregation logic remains in
+`StageValidation.psm1`.
+
 - [ ] **Step 4: Strengthen acceptance coverage**
 
 In `setup-smoke.ps1`, assert that detailed status contains every component name. Add a start failure test with an injected health report where Minibook frontend is down and assert a non-ready result.
