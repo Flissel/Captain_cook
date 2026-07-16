@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -67,6 +68,25 @@ async def test_json_run_store_rejects_unsafe_run_id_and_corrupt_state(tmp_path: 
     (runs / "broken.json").write_text("not-json", encoding="utf-8")
     with pytest.raises(CaptainRunStoreError, match="broken"):
         await store.load("broken")
+
+
+@pytest.mark.asyncio
+async def test_separate_store_instances_serialize_the_same_run_id(tmp_path: Path) -> None:
+    first = JsonCaptainRunStore(tmp_path / "runs")
+    second = JsonCaptainRunStore(tmp_path / "runs")
+    second_acquired = asyncio.Event()
+
+    async def acquire_second() -> None:
+        async with second.lock("run-1"):
+            second_acquired.set()
+
+    async with first.lock("run-1"):
+        contender = asyncio.create_task(acquire_second())
+        await asyncio.sleep(0.05)
+        assert not second_acquired.is_set()
+
+    await asyncio.wait_for(contender, timeout=2)
+    assert second_acquired.is_set()
 
 
 def test_run_state_rejects_batch_holdout_or_checkpoint_drift() -> None:

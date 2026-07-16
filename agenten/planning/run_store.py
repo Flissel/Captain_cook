@@ -8,7 +8,8 @@ from contextlib import asynccontextmanager
 import os
 from pathlib import Path
 import re
-from typing import AsyncContextManager, Protocol
+import time
+from typing import AsyncContextManager, BinaryIO, Protocol
 
 from pydantic import ValidationError
 
@@ -52,7 +53,12 @@ class JsonCaptainRunStore:
         path = self._path(run_id)
         lock = self._locks.setdefault(path, asyncio.Lock())
         async with lock:
-            yield
+            lock_path = self._root / ".locks" / f"{run_id}.lock"
+            handle = await asyncio.to_thread(self._acquire_file_lock, lock_path)
+            try:
+                yield
+            finally:
+                await asyncio.to_thread(self._release_file_lock, handle)
 
     def _path(self, run_id: str) -> Path:
         if not _SAFE_RUN_ID.fullmatch(run_id) or run_id in {".", ".."}:
@@ -85,3 +91,46 @@ class JsonCaptainRunStore:
         finally:
             if temporary.exists():
                 temporary.unlink()
+
+    @staticmethod
+    def _acquire_file_lock(path: Path) -> BinaryIO:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a+b")
+        try:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                while True:
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        time.sleep(0.05)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            return handle
+        except BaseException:
+            handle.close()
+            raise
+
+    @staticmethod
+    def _release_file_lock(handle: BinaryIO) -> None:
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
