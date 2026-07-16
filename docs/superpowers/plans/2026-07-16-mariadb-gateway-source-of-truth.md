@@ -29,7 +29,10 @@
 ## File Structure
 
 - `gateway/contracts.py` — request/event models and the pure projection functions used by the gateway.
-- `gateway/app.py` — authenticated HTTP boundary, append-only gateway store, and read projections; no mutable lifecycle `UPDATE` operations.
+- `gateway/app.py` — authenticated HTTP routing and composition boundary; no
+  lifecycle SQL or mutable lifecycle `UPDATE` operations.
+- `gateway/store.py` — append-only MariaDB gateway store and lifecycle read
+  projections behind the HTTP boundary.
 - `agenten/planning/gateway_client.py` — Captain release and capability adapters over the gateway HTTP contract.
 - `agenten/planning/factory.py` and `agenten/planning/cli.py` — explicit offline versus gateway composition.
 - `agenten/delivery/gateway_client.py` — delivery-state client over the same HTTP contract; it replaces production use of `SqliteDeliveryLedger`.
