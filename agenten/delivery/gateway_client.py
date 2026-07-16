@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime
+from collections.abc import Sequence
 from typing import Any, Literal, TypeAlias, TypeVar
 from urllib.parse import quote
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 
 BatchStatus: TypeAlias = Literal[
@@ -59,6 +60,39 @@ class GatewayClaim(BaseModel):
     token: str = Field(min_length=1)
     expires_at: datetime
     iteration: int = Field(ge=1, strict=True)
+
+
+class GatewayEvidence(BaseModel):
+    """Closed evidence union accepted by the current gateway projection."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["codex_session", "validation_run"]
+    iteration: int = Field(ge=1, strict=True)
+    session_id: str | None = Field(default=None, min_length=1)
+    artifact_ref: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def require_kind_payload(self) -> "GatewayEvidence":
+        if self.kind == "codex_session":
+            if self.session_id is None:
+                raise ValueError("codex_session evidence requires session_id")
+            if self.artifact_ref is not None:
+                raise ValueError("codex_session evidence must not include artifact_ref")
+        else:
+            if self.artifact_ref is None:
+                raise ValueError("validation_run evidence requires artifact_ref")
+            if self.session_id is not None:
+                raise ValueError("validation_run evidence must not include session_id")
+        return self
+
+    def event_data(self, batch_id: str) -> dict[str, Any]:
+        data: dict[str, Any] = {"batch_id": batch_id, "iteration": self.iteration}
+        if self.session_id is not None:
+            data["session_id"] = self.session_id
+        if self.artifact_ref is not None:
+            data["artifact_ref"] = self.artifact_ref
+        return data
 
 
 class _ClaimResponse(BaseModel):
@@ -141,15 +175,14 @@ class GatewayDeliveryClient:
         iteration: int,
         session_id: str,
     ) -> None:
-        if iteration < 1:
-            raise ValueError("iteration must be at least 1")
-        if not session_id:
-            raise ValueError("session_id must not be empty")
-        await self._append_event(
-            "codex_session",
+        await self.append_evidence(
             batch_id,
             claim_token,
-            {"batch_id": batch_id, "iteration": iteration, "session_id": session_id},
+            GatewayEvidence(
+                kind="codex_session",
+                iteration=iteration,
+                session_id=session_id,
+            ),
         )
 
     async def record_validation(
@@ -160,15 +193,27 @@ class GatewayDeliveryClient:
         iteration: int,
         artifact_ref: str,
     ) -> None:
-        if iteration < 1:
-            raise ValueError("iteration must be at least 1")
-        if not artifact_ref:
-            raise ValueError("artifact_ref must not be empty")
-        await self._append_event(
-            "validation_run",
+        await self.append_evidence(
             batch_id,
             claim_token,
-            {"batch_id": batch_id, "iteration": iteration, "artifact_ref": artifact_ref},
+            GatewayEvidence(
+                kind="validation_run",
+                iteration=iteration,
+                artifact_ref=artifact_ref,
+            ),
+        )
+
+    async def append_evidence(
+        self,
+        batch_id: str,
+        claim_token: str,
+        evidence: GatewayEvidence,
+    ) -> None:
+        await self._append_event(
+            evidence.kind,
+            batch_id,
+            claim_token,
+            evidence.event_data(batch_id),
         )
 
     async def complete(
@@ -177,12 +222,24 @@ class GatewayDeliveryClient:
         claim_token: str,
         *,
         outcome: TerminalOutcome,
+        capabilities: Sequence[str] = (),
+        artifact_ref: str | None = None,
     ) -> None:
+        canonical_capabilities = sorted(set(capabilities))
+        if any(not capability for capability in canonical_capabilities):
+            raise ValueError("capabilities must not contain empty values")
+        if artifact_ref == "":
+            raise ValueError("artifact_ref must not be empty")
+        data: dict[str, Any] = {"batch_id": batch_id, "outcome": outcome}
+        if canonical_capabilities:
+            data["capabilities"] = canonical_capabilities
+        if artifact_ref is not None:
+            data["artifact_ref"] = artifact_ref
         await self._append_event(
             "batch_done",
             batch_id,
             claim_token,
-            {"batch_id": batch_id, "outcome": outcome},
+            data,
             status=outcome,
         )
 
