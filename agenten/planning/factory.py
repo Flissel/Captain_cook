@@ -8,6 +8,7 @@ from autogen_core.models import ChatCompletionClient
 from agenten.llm.decompose import make_llm_decompose
 from agenten.llm.plan_batches import make_llm_align, make_llm_enrich
 from agenten.planning.captain_pipeline import CaptainPipeline, PlannedSubtask
+from agenten.planning.policy import PlanningPolicy
 from agenten.planning.release import JsonDirectoryReleaseClient
 
 
@@ -46,6 +47,7 @@ def build_captain_pipeline(
         align=make_llm_align(model_client),
         enrich=make_llm_enrich(model_client),
         release_client=JsonDirectoryReleaseClient(output_dir),
+        policy=PlanningPolicy(frozenset(known_capability_tags)),
         target=target,
         max_alignment_attempts=max_alignment_attempts,
     )
