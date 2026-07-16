@@ -6,7 +6,9 @@ Two entry points:
 - `build_model_client`: a real OpenAI-backed client
   (`autogen_ext.models.openai.OpenAIChatCompletionClient`), defaulting
   `api_key`/`model` from the existing `config.llm_config` module (`API_KEY`,
-  `MODEL`) so callers don't have to duplicate that env-var wiring.
+  `MODEL`) so callers don't have to duplicate that env-var wiring. SDK-level
+  retries are disabled so the Captain stage wrapper remains the sole retry
+  owner.
 - `build_replay_model_client`: a deterministic, offline client
   (`autogen_ext.models.replay.ReplayChatCompletionClient`) for tests — it
   replays a fixed list of responses instead of calling any API, and never
@@ -35,7 +37,7 @@ def build_model_client(api_key: Optional[str] = None, model: Optional[str] = Non
     resolved_model = model if model is not None else MODEL
     resolved_api_key = api_key if api_key is not None else API_KEY
 
-    kwargs = {"model": resolved_model}
+    kwargs = {"model": resolved_model, "max_retries": 0}
     if resolved_api_key is not None:
         kwargs["api_key"] = resolved_api_key
 
