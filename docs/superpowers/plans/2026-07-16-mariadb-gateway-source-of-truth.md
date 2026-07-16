@@ -161,7 +161,7 @@ Run: `python -m pytest -q tests/gateway/test_gateway.py -k 'append_events or lif
 
 Expected: FAIL because claims, heartbeats, terminal status, and `children` currently mutate the parent block.
 
-- [ ] **Step 3: Define immutable contracts and projection**
+- [x] **Step 3: Define immutable contracts and projection**
 
 Create `gateway/contracts.py` with the following public shapes:
 

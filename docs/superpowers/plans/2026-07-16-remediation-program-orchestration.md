@@ -192,7 +192,7 @@ SHAs before either worker begins.
   - Branch: `fix/setup-preflight-contract`; source: System Task 4; requires
     P05; gate: Pester with version, port, and restart-required cases.
 
-- [ ] **P07A — Pure append-only lifecycle projection contracts**
+- [x] **P07A — Pure append-only lifecycle projection contracts**
   - Branch: `feat/gateway-event-contracts`; source: Gateway Task 2 Step 3;
     requires P03A.
   - Owns exactly: `gateway/contracts.py` and
@@ -429,3 +429,10 @@ For every packet, the orchestrator must:
   were removed; Captain MariaDB/Mailpit, the observed Captain n8n container,
   and external VibeMind n8n remained healthy with unchanged start times. P07A
   is therefore unlocked on the serial gateway lane.
+- P07A integrated fixed candidate `46dfc80` as merge commit `e951549` after a
+  disjoint-path audit, specification PASS, and quality PASS. The first quality
+  review correctly rejected coercible boolean/string evidence iterations and
+  two loose parent-reference cases; five RED regressions then proved the fixes,
+  and the same reviewer confirmed them. The integrated projection/architecture
+  gate passed 59 tests and `compileall` succeeded without database, Docker, or
+  network access. P07B is now unlocked on `LOCK_GATEWAY`.
