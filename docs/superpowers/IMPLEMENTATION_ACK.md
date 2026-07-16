@@ -64,8 +64,9 @@ resolution of all four overlapping paths. Specification and quality reviews
 are PASS; the combined 123-test gate and `compileall` passed. The planning lane
 is unlocked for P10.
 
-P07C is unlocked by P07B and is the active `LOCK_GATEWAY` packet. P08 remains
-blocked by P07C. P10 is independently unlocked by the completed P09 packet.
+P07C candidate `2f66ae3` is integrated as `c277c3b` after specification and
+quality PASS. P08 is now unlocked and is the next `LOCK_GATEWAY` packet. P10 is
+independently unlocked by the completed P09 packet.
 
 ### Autonomous Captain process candidate
 
@@ -113,6 +114,21 @@ SPEC_REVIEW: PASS
 QUALITY_REVIEW: PASS
 INTEGRATION_SHA: 848c83f28e0c3292d159c78af1613aef6e5e38e8
 INTEGRATED_GATE: 46 selected passed, zero skips; full 391 passed, 2 explicit skips, 1 deselected, 1 warning; 81.79% coverage
+
+HANDOFF TO WORKER 5: P07C
+STATE: INTEGRATED
+LOCK: LOCK_GATEWAY
+BRANCH: feat/gateway-idempotent-release
+WORKTREE: C:\Users\User\Desktop\Captain_cook\.worktrees\gateway-idempotent-release
+CANDIDATE_SHA: 2f66ae30cdde998da030862fe548565525469d9a
+RED_GATE: 3 failed, 1 passed on missing canonical replay behavior
+GREEN_GATE: 6 focused passed
+WORKER_GATE: 49 selected passed, zero skips; full 398 passed, 1 allowlisted skip, 1 deselected, 1 warning; 83.56% coverage
+SPEC_REVIEW: PASS
+QUALITY_REVIEW: PASS
+INTEGRATION_SHA: c277c3b07b381d4f8ad81c81602b23a4fd21f07b
+INTEGRATED_GATE: 49 selected passed, zero skips; full 394 passed, 2 explicit skips, 1 deselected, 1 warning; 83% coverage
+KNOWN_LOW_RISK: injected mirrors receive a duplicate replay notification; the production mirror ignores work_batch and holdout
 
 HANDOFF TO WORKER 2: P06
 STATE: REPAIR_ATTEMPT_1_IN_PROGRESS
@@ -186,7 +202,7 @@ it as foreign state and preserve it unless the user explicitly assigns it.
 - Use only disposable `captain-cook-test` resources for database gates.
 - Never run `docker compose down -v` or touch VibeMind n8n/volumes.
 - The P05 gate rendered Compose without starting or stopping services.
-- The last P07B gate left no test containers or `.coverage` artifact and
+- The last P07C gate left no test containers or `.coverage` artifact and
   preserved protected-service start times.
 - Requests and Starlette/httpx warnings are known P20 work, not silent passes.
 - Live LLM, browser, MCP, deployment, and clean-clone claims require their own

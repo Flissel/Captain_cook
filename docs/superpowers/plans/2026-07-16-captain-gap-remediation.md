@@ -285,7 +285,7 @@ class GatewayPlanningClient(BatchReleaseClient, CapabilityResolver):
         return str(matches[0]["artifact_ref"]) if matches else None
 ```
 
-- [ ] **Step 4: Make Captain writes idempotent at the gateway**
+- [x] **Step 4: Make Captain writes idempotent at the gateway**
 
 Before returning `409` for an existing `work_batch`, compare the stored canonical data to the validated request. Return the existing block when identical; retain `409` for different content. Apply the same rule to one `holdout` child per batch.
 

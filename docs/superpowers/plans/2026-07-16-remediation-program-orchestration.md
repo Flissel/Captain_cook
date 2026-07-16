@@ -290,7 +290,7 @@ SHAs before either worker begins.
     - [x] invalid initial work-batch status is rejected before persistence;
     - [x] a second holdout cannot replace the effective immutable holdout.
 
-- [ ] **P07C — Make Captain batch and holdout release idempotent**
+- [x] **P07C — Make Captain batch and holdout release idempotent**
   - Branch: `feat/gateway-idempotent-release`; source: Captain Task 3 Step 4;
     requires P07B.
   - Owns exactly: `gateway/store.py` and `tests/gateway/test_gateway.py`.
@@ -545,3 +545,11 @@ For every packet, the orchestrator must:
   skips, one live deselection, one known warning, and 81.79% coverage. The
   no-content test rename restored default pytest collection, all disposable
   test containers were removed, and P07C is now unlocked on `LOCK_GATEWAY`.
+- P07C integrated candidate `2f66ae3` as merge commit `c277c3b` after
+  specification PASS and quality PASS with no Critical/Important findings.
+  RED evidence covered canonical batch and holdout replays plus concurrent
+  duplicate release. The integrated disposable-MariaDB gate passed 49 selected
+  tests with zero skips; its full gate passed 394 tests with two explicit
+  skips, one live deselection, one known warning, and 83% coverage. Replays
+  return the immutable stored block without consuming an index or breaking
+  hash adjacency. P08 is now unlocked on `LOCK_GATEWAY`.
