@@ -41,6 +41,12 @@ class BlockWrite(Protocol):
     metadata: dict[str, Any]
 
 
+class _IdempotentReplay(Exception):
+    def __init__(self, block: dict[str, Any]):
+        super().__init__("identical Captain block replay")
+        self.block = block
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -254,7 +260,17 @@ class GatewayStore:
         raise RuntimeError("unreachable transaction retry state")
 
     def append(self, request: BlockWrite, claim_token: str | None) -> dict[str, Any]:
-        return self._retry_write(lambda: self._append_once(request, claim_token))
+        try:
+            return self._retry_write(lambda: self._append_once(request, claim_token))
+        except _IdempotentReplay as replay:
+            return replay.block
+
+    @staticmethod
+    def _has_identical_canonical_data(
+        existing: dict[str, Any],
+        data: dict[str, Any],
+    ) -> bool:
+        return existing["data"] == data
 
     def _append_once(self, request: BlockWrite, claim_token: str | None) -> dict[str, Any]:
         block_type = request.block_type
@@ -300,7 +316,13 @@ class GatewayStore:
                 if block_type == "work_batch":
                     if parent_index is not None:
                         raise HTTPException(status_code=422, detail="work_batch must be a root block")
-                    if self._batch_row(cursor, batch_id, for_update=True) is not None:
+                    existing_batch = self._batch_row(cursor, batch_id, for_update=True)
+                    if existing_batch is not None and self._has_identical_canonical_data(
+                        existing_batch,
+                        data,
+                    ):
+                        raise _IdempotentReplay(existing_batch)
+                    if existing_batch is not None:
                         raise HTTPException(status_code=409, detail="batch_id already exists")
 
                 if block_type == "holdout" and parent_index is None:
@@ -315,7 +337,16 @@ class GatewayStore:
                     )
                     if parent_index != parent["index"]:
                         raise HTTPException(status_code=409, detail="holdout parent must be its work_batch")
-                    if any(child["block_type"] == "holdout" for child in children):
+                    existing_holdout = next(
+                        (child for child in children if child["block_type"] == "holdout"),
+                        None,
+                    )
+                    if existing_holdout is not None and self._has_identical_canonical_data(
+                        existing_holdout,
+                        data,
+                    ):
+                        raise _IdempotentReplay(existing_holdout)
+                    if existing_holdout is not None:
                         raise HTTPException(status_code=409, detail="holdout suite already exists")
                 elif parent_index is not None and block_type in CAPTAIN_BLOCK_TYPES - {"work_batch"}:
                     referenced_parent = self._row_by_index(cursor, parent_index)

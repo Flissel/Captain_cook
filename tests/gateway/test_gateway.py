@@ -248,6 +248,38 @@ def test_duplicate_batch_ids_are_rejected(client: TestClient) -> None:
     assert response.status_code == 409
 
 
+def test_identical_canonical_work_batch_replay_returns_existing_block(
+    client: TestClient,
+    storage: MariaDBStorage,
+) -> None:
+    first = client.post(
+        "/blocks",
+        json={"block_type": "work_batch", "data": batch_payload()},
+    )
+    assert first.status_code == 201
+    existing = first.json()
+    before_replay = storage.load()
+
+    replay = client.post(
+        "/blocks",
+        json={
+            "block_type": "work_batch",
+            "status": existing["status"],
+            "data": existing["data"],
+            "metadata": existing["metadata"],
+        },
+    )
+
+    assert replay.status_code == 201, replay.text
+    assert replay.json() == existing
+    assert storage.load() == before_replay
+
+    next_index = create_batch(client, "batch-2")
+    next_block = next(block for block in storage.load() if block["index"] == next_index)
+    assert next_block["index"] == existing["index"] + 1
+    assert next_block["previous_hash"] == existing["hash"]
+
+
 def test_concurrent_duplicate_batch_creation_persists_exactly_one_root(
     storage: MariaDBStorage,
 ) -> None:
@@ -262,7 +294,8 @@ def test_concurrent_duplicate_batch_creation_persists_exactly_one_root(
     with ThreadPoolExecutor(max_workers=2) as pool:
         responses = list(pool.map(create, range(2)))
 
-    assert sorted(response.status_code for response in responses) == [201, 409]
+    assert [response.status_code for response in responses] == [201, 201]
+    assert responses[0].json() == responses[1].json()
     roots = [block for block in storage.load() if block["block_type"] == "work_batch"]
     assert len(roots) == 1
 
@@ -579,6 +612,75 @@ def test_second_holdout_cannot_replace_the_immutable_suite(client: TestClient) -
     assert worker_block(client, token).status_code == 201
     released = client.get("/batches/batch-1/holdout", headers={"X-Claim-Token": token})
     assert released.json()["cases"][0]["case_id"] == "secret-1"
+
+
+def test_identical_canonical_holdout_replay_returns_existing_block(
+    client: TestClient,
+    storage: MariaDBStorage,
+) -> None:
+    parent = create_batch(client)
+    first = client.post(
+        "/blocks",
+        json={
+            "block_type": "holdout",
+            "parent_index": parent,
+            "data": {
+                "batch_id": "batch-1",
+                "cases": [{"case_id": "secret-1", "input": {"version": 1}}],
+            },
+        },
+    )
+    assert first.status_code == 201
+    existing = first.json()
+    before_replay = storage.load()
+
+    replay = client.post(
+        "/blocks",
+        json={
+            "block_type": "holdout",
+            "status": existing["status"],
+            "parent_index": parent,
+            "data": existing["data"],
+            "metadata": existing["metadata"],
+        },
+    )
+
+    assert replay.status_code == 201, replay.text
+    assert replay.json() == existing
+    assert storage.load() == before_replay
+
+
+def test_identical_holdout_replay_with_different_parent_remains_conflict(
+    client: TestClient,
+    storage: MariaDBStorage,
+) -> None:
+    parent = create_batch(client, "batch-1")
+    other_parent = create_batch(client, "batch-2")
+    first = client.post(
+        "/blocks",
+        json={
+            "block_type": "holdout",
+            "parent_index": parent,
+            "data": {
+                "batch_id": "batch-1",
+                "cases": [{"case_id": "secret-1", "input": {"version": 1}}],
+            },
+        },
+    )
+    assert first.status_code == 201
+    before_replay = storage.load()
+
+    replay = client.post(
+        "/blocks",
+        json={
+            "block_type": "holdout",
+            "parent_index": other_parent,
+            "data": first.json()["data"],
+        },
+    )
+
+    assert replay.status_code == 409
+    assert storage.load() == before_replay
 
 
 def test_work_batch_must_satisfy_the_captain_contract(client: TestClient) -> None:
