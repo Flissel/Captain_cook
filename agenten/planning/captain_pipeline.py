@@ -135,7 +135,7 @@ class CaptainPipeline:
             enrichment for _, enrichment in enriched_drafts
         )
 
-        released: List[WorkBatch] = []
+        compiled_contracts: List[tuple[WorkBatch, HoldoutSuite]] = []
         for draft, enrichment in enriched_drafts:
             capability_tags = self._policy.canonical_capability_tags(
                 enrichment.capability_tags
@@ -160,7 +160,11 @@ class CaptainPipeline:
                 satisfied_by=satisfied_by,
             )
             holdouts = HoldoutSuite(batch_id=draft.batch_id, cases=enrichment.holdout_cases)
-            await self._release_client.release(batch, holdouts)
-            released.append(batch)
+            compiled_contracts.append((batch, holdouts))
 
-        return CaptainRunResult(batches=released)
+        for batch, holdouts in compiled_contracts:
+            await self._release_client.release(batch, holdouts)
+
+        return CaptainRunResult(
+            batches=[batch for batch, _ in compiled_contracts]
+        )

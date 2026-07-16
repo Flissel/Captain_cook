@@ -117,6 +117,54 @@ async def test_pipeline_retries_invalid_alignment_and_releases_dependency_ordere
 
 
 @pytest.mark.asyncio
+async def test_pipeline_validates_every_contract_before_first_release() -> None:
+    subtasks = [
+        PlannedSubtask(subtask_id="s1", description="Foundation"),
+        PlannedSubtask(subtask_id="s2", description="Delivery"),
+    ]
+
+    async def decompose(_: str) -> List[PlannedSubtask]:
+        return subtasks
+
+    async def align(_: str, __: List[PlannedSubtask], ___: str) -> AlignmentPlan:
+        return AlignmentPlan(
+            batches=[
+                BatchDraft(
+                    batch_id="foundation",
+                    title="Foundation",
+                    subtask_ids=["s1"],
+                ),
+                BatchDraft(
+                    batch_id="delivery",
+                    title="Delivery",
+                    subtask_ids=["s2"],
+                    depends_on=["foundation", "foundation"],
+                ),
+            ]
+        )
+
+    async def enrich(
+        _: str, draft: BatchDraft, __: List[PlannedSubtask]
+    ) -> BatchEnrichment:
+        return enrichment_for(draft)
+
+    releases = RecordingReleaseClient()
+    pipeline = CaptainPipeline(
+        decompose=decompose,
+        align=align,
+        enrich=enrich,
+        release_client=releases,
+        policy=PlanningPolicy(frozenset({"delivery"})),
+        target="external",
+    )
+
+    with pytest.raises(ValueError, match="depends_on must not contain duplicates"):
+        await pipeline.run("Build an atomic delivery plan")
+
+    assert releases.releases == []
+
+
+@pytest.mark.asyncio
 async def test_pipeline_stops_before_enrichment_when_alignment_never_covers_all_subtasks() -> None:
     enrich_calls: List[str] = []
     releases = RecordingReleaseClient()
