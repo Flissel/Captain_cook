@@ -197,7 +197,7 @@ git commit -m "feat: enforce captain planning policy"
 - Create: `agenten/planning/gateway_client.py`
 - Modify: `agenten/planning/factory.py`
 - Modify: `agenten/planning/cli.py`
-- Modify: `gateway/app.py`
+- Modify for P07C only: `gateway/store.py`
 - Test: `tests/planning/test_gateway_client.py`
 - Test: `tests/gateway/test_gateway.py`
 
@@ -289,18 +289,27 @@ class GatewayPlanningClient(BatchReleaseClient, CapabilityResolver):
 
 Before returning `409` for an existing `work_batch`, compare the stored canonical data to the validated request. Return the existing block when identical; retain `409` for different content. Apply the same rule to one `holdout` child per batch.
 
+P07C verifies this rule through the isolated MariaDB gate and commits only its
+store boundary:
+
+```powershell
+pwsh -NoProfile -File scripts/test_gateway.ps1
+git add gateway/store.py tests/gateway/test_gateway.py
+git commit -m "feat: make gateway releases idempotent"
+```
+
 - [ ] **Step 5: Add explicit composition flags**
 
 Extend the CLI with `--release-mode {json,gateway}` and `--gateway-url`. `json` remains the default. `gateway` constructs one `httpx.AsyncClient`, uses `GatewayPlanningClient` as both release client and capability resolver, and closes the client after the run.
 
 - [ ] **Step 6: Verify and commit**
 
-Run: `python -m pytest -q tests/planning/test_gateway_client.py tests/gateway/test_gateway.py -k 'not mariadb'`
+Run: `python -m pytest -q --no-cov tests/planning/test_gateway_client.py tests/planning/test_factory_e2e.py tests/planning/test_cli.py`
 
 Commit:
 
 ```powershell
-git add agenten/planning/gateway_client.py agenten/planning/factory.py agenten/planning/cli.py gateway/app.py tests/planning/test_gateway_client.py tests/gateway/test_gateway.py
+git add agenten/planning/gateway_client.py agenten/planning/factory.py agenten/planning/cli.py tests/planning/test_gateway_client.py tests/planning/test_factory_e2e.py tests/planning/test_cli.py
 git commit -m "feat: connect captain planning to ledger gateway"
 ```
 

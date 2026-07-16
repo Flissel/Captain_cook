@@ -109,6 +109,7 @@ git commit -m "docs: declare gateway delivery source of truth"
 
 **Files:**
 - Create: `gateway/contracts.py`
+- Create: `gateway/store.py`
 - Create: `tests/gateway/test_contracts.py`
 - Modify: `gateway/app.py`
 - Modify: `tests/gateway/test_gateway.py`
@@ -229,9 +230,26 @@ invalid approval ordering, or lifecycle events after the first terminal event.
 The optional clock defaults to current UTC and exists only for deterministic
 projection tests.
 
-- [ ] **Step 4: Make `GatewayStore` event-only**
+P07A verifies and commits only the pure boundary:
 
-In `gateway/app.py`, replace parent updates in `append`, `claim`, `heartbeat`, and `approve` with `_insert` calls using these child block types: `batch_claimed`, `batch_heartbeat`, `batch_approved`, and `batch_done`. Query children with `WHERE parent_index=%s ORDER BY index`; never write the parent `status`, `metadata`, or `children` fields after its initial insert. Make `/batches`, `/batches/{batch_id}`, claim fencing, holdout access, and capability discovery call `project_batch`.
+```powershell
+python -m pytest -q --no-cov tests/gateway/test_contracts.py
+git add gateway/contracts.py tests/gateway/test_contracts.py
+git commit -m "feat: define gateway lifecycle projection"
+```
+
+- [ ] **Step 4: Extract `GatewayStore` and make it event-only**
+
+Move `GatewayStore` and its MariaDB queries from `gateway/app.py` into
+`gateway/store.py`; `gateway/app.py` keeps request routing, lifespan, mirror
+enqueueing, and process composition. In the extracted store, replace parent
+updates in `append`, `claim`, `heartbeat`, and `approve` with `_insert` calls
+using these child block types: `batch_claimed`, `batch_heartbeat`,
+`batch_approved`, and `batch_done`. Query children with
+`WHERE parent_index=%s ORDER BY index`; never write the parent `status`,
+`metadata`, or `children` fields after its initial insert. Make `/batches`,
+`/batches/{batch_id}`, claim fencing, holdout access, and capability discovery
+call `project_batch` through the store.
 
 The token response remains:
 
@@ -248,8 +266,8 @@ Run: `python -m pytest -q tests/gateway/test_gateway.py tests/blockchain/test_ma
 Expected: all selected tests PASS with `TEST_MARIADB_DSN`; output contains no `SKIPPED`.
 
 ```powershell
-git add gateway/contracts.py gateway/app.py tests/gateway/test_gateway.py tests/blockchain/test_mariadb_storage.py
-git commit -m "feat: persist gateway lifecycle as append-only events"
+git add gateway/store.py gateway/app.py tests/gateway/test_gateway.py tests/blockchain/test_mariadb_storage.py
+git commit -m "refactor: persist gateway lifecycle as events"
 ```
 
 ## Task 3: Connect Captain and delivery clients exclusively through gateway HTTP

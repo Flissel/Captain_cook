@@ -206,10 +206,13 @@ SHAs before either worker begins.
 - [ ] **P07B — Persist gateway lifecycle as append-only child events**
   - Branch: `refactor/gateway-append-only-store`; source: Gateway Task 2
     Steps 1, 2, 4, and 5; requires P07A.
-  - Owns exactly: `gateway/app.py`, `tests/gateway/test_gateway.py`, and
+  - Owns exactly: `gateway/store.py`, `gateway/app.py`,
+    `tests/gateway/test_gateway.py`, and
     `tests/blockchain/test_mariadb_storage.py`.
-  - Output: no post-insert mutation of work-batch `status`, `metadata`, or
-    `children`; every lifecycle read and fence uses the P07A projection.
+  - Output: extract `GatewayStore` into the MariaDB adapter module so
+    `gateway/app.py` remains routing/composition only. There is no post-insert
+    mutation of work-batch `status`, `metadata`, or `children`; every
+    lifecycle read and fence uses the P07A projection.
     `batch_done:succeeded` requires a preceding `validation_run` event; D04
     remains responsible for proving the evidence payload means all holdouts
     are green.
@@ -219,7 +222,7 @@ SHAs before either worker begins.
 - [ ] **P07C — Make Captain batch and holdout release idempotent**
   - Branch: `feat/gateway-idempotent-release`; source: Captain Task 3 Step 4;
     requires P07B.
-  - Owns exactly: `gateway/app.py` and `tests/gateway/test_gateway.py`.
+  - Owns exactly: `gateway/store.py` and `tests/gateway/test_gateway.py`.
   - Output: identical canonical `work_batch` and its one `holdout` replay
     return the existing immutable block; different content, parent mismatch,
     or a second distinct holdout remains `409`.
@@ -411,4 +414,6 @@ For every packet, the orchestrator must:
   projection omitted the existing `pending_review` approval state and the
   delivery design's validation ordering and terminal outcomes. P03A removes
   the brittle ceiling; P07A-P07C split pure projection, event persistence, and
-  idempotent release behind one serial gateway lock.
+  idempotent release behind one serial gateway lock. P07B extracts
+  `GatewayStore` into `gateway/store.py`, preventing lifecycle persistence from
+  remaining coupled to FastAPI routing.
