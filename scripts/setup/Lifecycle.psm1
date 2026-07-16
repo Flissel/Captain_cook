@@ -53,6 +53,56 @@ function Remove-InvalidatedSetupStages {
     }
 }
 
+function New-InvalidSetupRunnerResult {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]] $InvalidatedStages
+    )
+
+    New-SetupResult -Component 'Setup' -Status 'Failed' `
+        -Message 'Der Setup-Runner hat kein gültiges Ergebnis geliefert.' `
+        -Remediation 'Retry' `
+        -Data @{ InvalidatedStages = [string[]]@($InvalidatedStages) }
+}
+
+function ConvertTo-StableRepairResult {
+    param(
+        [AllowNull()][object] $SetupResult,
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]] $InvalidatedStages
+    )
+
+    $requiredProperties = @('Component', 'Status', 'Message', 'Remediation', 'Data')
+    $propertyNames = if ($null -eq $SetupResult) { @() } else { @($SetupResult.PSObject.Properties.Name) }
+    foreach ($requiredProperty in $requiredProperties) {
+        if ($requiredProperty -notin $propertyNames) {
+            return New-InvalidSetupRunnerResult -InvalidatedStages $InvalidatedStages
+        }
+    }
+    if ($SetupResult.Data -isnot [Collections.IDictionary]) {
+        return New-InvalidSetupRunnerResult -InvalidatedStages $InvalidatedStages
+    }
+
+    $data = @{}
+    foreach ($key in $SetupResult.Data.Keys) {
+        $data[[string]$key] = $SetupResult.Data[$key]
+    }
+    $data.InvalidatedStages = [string[]]@($InvalidatedStages)
+
+    try {
+        New-SetupResult -Component ([string]$SetupResult.Component) `
+            -Status ([string]$SetupResult.Status) `
+            -Message ([string]$SetupResult.Message) `
+            -Remediation ([string]$SetupResult.Remediation) `
+            -Data $data
+    }
+    catch {
+        New-InvalidSetupRunnerResult -InvalidatedStages $InvalidatedStages
+    }
+}
+
 function Invoke-GuidedSetup {
     [CmdletBinding()]
     param(
@@ -65,7 +115,11 @@ function Invoke-GuidedSetup {
     $state = ConvertTo-CheckpointTable $Checkpoint
     $stages = @(Get-SetupStages)
     $checkpointPath = Join-Path $Root '.captain-cook/checkpoint.json'
-    $context = @{ Root = $Root; Checkpoint = $state }
+    $context = @{
+        Root = $Root
+        Checkpoint = $state
+        SystemStatusProvider = { param($candidateRoot) Get-CaptainSystemStatus -Root $candidateRoot }
+    }
     if ($null -eq $StageValidator) {
         $StageValidator = { param($stage, $stageContext) Test-SetupStage -Stage $stage -Context $stageContext }
     }
@@ -105,7 +159,11 @@ function Repair-CaptainSystem {
     $checkpointPath = Join-Path $Root '.captain-cook/checkpoint.json'
     $state = ConvertTo-CheckpointTable (Get-SetupCheckpoint -Path $checkpointPath)
     $stages = @(Get-SetupStages)
-    $context = @{ Root = $Root; Checkpoint = $state }
+    $context = @{
+        Root = $Root
+        Checkpoint = $state
+        SystemStatusProvider = { param($candidateRoot) Get-CaptainSystemStatus -Root $candidateRoot }
+    }
     if ($null -eq $StageValidator) {
         $StageValidator = { param($stage, $stageContext) Test-SetupStage -Stage $stage -Context $stageContext }
     }
@@ -123,19 +181,7 @@ function Repair-CaptainSystem {
         }
     }
     $setupResult = & $SetupRunner $Root $state
-
-    $data = @{}
-    if ($null -ne $setupResult.Data) {
-        if ($setupResult.Data -is [Collections.IDictionary]) {
-            foreach ($key in $setupResult.Data.Keys) { $data[[string]$key] = $setupResult.Data[$key] }
-        }
-        else {
-            foreach ($property in $setupResult.Data.PSObject.Properties) { $data[$property.Name] = $property.Value }
-        }
-    }
-    $data.InvalidatedStages = [string[]]@($invalidatedStages)
-
-    New-SetupResult -Component ([string]$setupResult.Component) -Status ([string]$setupResult.Status) -Message ([string]$setupResult.Message) -Remediation ([string]$setupResult.Remediation) -Data $data
+    ConvertTo-StableRepairResult -SetupResult $setupResult -InvalidatedStages $invalidatedStages
 }
 
 function Initialize-SetupConfiguration {

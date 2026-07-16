@@ -51,7 +51,16 @@ function Test-SetupStage {
         'Hermes' { return Test-Path -LiteralPath (Join-Path $Context.Root '.captain-cook/hermes/Scripts/hermes.exe') }
         'Minibook' { return (Test-MinibookInstallation -Root $Context.Root) }
         'Services' { return (Get-CaptainServiceHealth -Root $Context.Root).Status -eq 'Ready' }
-        'Verification' { return (Get-CaptainSystemStatus -Root $Context.Root).Status -eq 'Ready' }
+        'Verification' {
+            if (-not $Context.ContainsKey('SystemStatusProvider') -or
+                $Context.SystemStatusProvider -isnot [scriptblock]) {
+                return $false
+            }
+            try {
+                return (& $Context.SystemStatusProvider $Context.Root).Status -eq 'Ready'
+            }
+            catch { return $false }
+        }
         default { throw "Unbekannte Setup-Stage: $Stage" }
     }
 }

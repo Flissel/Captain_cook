@@ -118,6 +118,24 @@ Describe 'Checkpoint revalidation and targeted repair' {
             Should -Throw '*Unbekannte Setup-Stage: Unknown*'
     }
 
+    It 'fails closed when standalone verification has no status provider' {
+        $modulePath = (Resolve-Path "$PSScriptRoot/StageValidation.psm1").Path.Replace("'", "''")
+        $probe = @"
+`$ErrorActionPreference = 'Stop'
+Import-Module '$modulePath' -Force
+`$result = Test-SetupStage -Stage 'Verification' -Context @{ Root = 'unused' }
+if (`$result -ne `$false) { exit 11 }
+`$invalidProviderResult = Test-SetupStage -Stage 'Verification' -Context @{ Root = 'unused'; SystemStatusProvider = 'not-a-scriptblock' }
+if (`$invalidProviderResult -ne `$false) { exit 12 }
+"@
+
+        $output = & pwsh -NoProfile -Command $probe 2>&1
+        $exitCode = $LASTEXITCODE
+
+        $exitCode | Should -Be 0
+        $output -join "`n" | Should -Not -Match 'Get-CaptainSystemStatus|CommandNotFoundException'
+    }
+
     It 'aggregates existing service-health results without starting services' {
         InModuleScope StageValidation -Parameters @{ CandidateRoot = $TestDrive } {
             Mock Read-DotEnv { @{ MAILPIT_WEB_PORT = '8025'; MAILPIT_SMTP_PORT = '1025'; N8N_URL = 'http://localhost:5678' } }
@@ -137,12 +155,18 @@ Describe 'Checkpoint revalidation and targeted repair' {
                 Should -BeFalse
             Should -Invoke Get-ServiceHealth -Times 2 -Exactly
 
-            Mock Get-CaptainSystemStatus {
+            $providerState = [pscustomobject]@{ Calls = 0 }
+            $systemStatusProvider = {
+                param($root)
+                $providerState.Calls++
                 New-SetupResult -Component 'System' -Status 'Ready' -Message 'ok' -Remediation 'None'
             }
-            Test-SetupStage -Stage 'Verification' -Context @{ Root = $CandidateRoot } |
+            Test-SetupStage -Stage 'Verification' -Context @{
+                Root = $CandidateRoot
+                SystemStatusProvider = $systemStatusProvider
+            } |
                 Should -BeTrue
-            Should -Invoke Get-CaptainSystemStatus -Times 1 -Exactly
+            $providerState.Calls | Should -Be 1
         }
     }
 
@@ -238,6 +262,46 @@ Describe 'Checkpoint revalidation and targeted repair' {
         $observed.Checkpoint.Captain | Should -Be 'Complete'
         @($observed.Checkpoint.PSObject.Properties.Name) | Should -Not -Contain 'Hermes'
         @($observed.Checkpoint.PSObject.Properties.Name) | Should -Not -Contain 'Verification'
+    }
+
+    It 'fails closed for null and malformed setup-runner results' {
+        $cases = @(
+            [pscustomobject]@{ Name = 'null'; Value = $null }
+            [pscustomobject]@{
+                Name = 'missing Data'
+                Value = [pscustomobject]@{
+                    Component = 'Setup'
+                    Status = 'Ready'
+                    Message = 'incomplete contract'
+                    Remediation = 'None'
+                }
+            }
+        )
+
+        for ($index = 0; $index -lt $cases.Count; $index++) {
+            $case = $cases[$index]
+            $caseRoot = Join-Path $TestDrive "runner-result-$index"
+            $checkpoint = @{}
+            Get-SetupStages | ForEach-Object { $checkpoint[$_] = 'Complete' }
+            Save-SetupCheckpoint -Path (Join-Path $caseRoot '.captain-cook/checkpoint.json') -Stages $checkpoint
+            $runnerValue = $case.Value
+            $observed = [pscustomobject]@{ Result = $null }
+
+            {
+                $observed.Result = Repair-CaptainSystem -Root $caseRoot `
+                    -StageValidator { param($stage, $context) $stage -ne 'Hermes' } `
+                    -SetupRunner { $runnerValue }
+            } | Should -Not -Throw -Because $case.Name
+
+            $observed.Result.PSObject.Properties.Name |
+                Should -Be @('Component', 'Status', 'Message', 'Remediation', 'Data')
+            $observed.Result.Component | Should -Be 'Setup'
+            $observed.Result.Status | Should -Be 'Failed'
+            $observed.Result.Remediation | Should -Be 'Retry'
+            $observed.Result.Message | Should -Match 'Setup-Runner'
+            $observed.Result.Data.InvalidatedStages |
+                Should -Be @('Hermes', 'Minibook', 'Services', 'Verification')
+        }
     }
 
     It 'is idempotent when every completed stage remains healthy' {
