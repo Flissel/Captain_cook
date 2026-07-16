@@ -131,9 +131,19 @@ SHAs before either worker begins.
 - [ ] **P03 — Isolated MariaDB/gateway test harness**
   - Branch: `test/isolated-mariadb-gateway`; source: System Task 6 steps 1-3;
     requires P01.
+  - Owns exactly: `docker-compose.test.yml`, `scripts/test_gateway.ps1`,
+    `tests/support/__init__.py`, `tests/support/mariadb.py`,
+    `tests/test_mariadb_test_guard.py`, `tests/gateway/test_gateway.py`, and
+    `tests/blockchain/test_mariadb_storage.py`.
+  - Explicitly excludes production Compose, `.env*`, `pytest.ini`, workflows,
+    gateway production code, README, shared docs, and plans.
   - Output: disposable `captain_test`, temporary credentials, no production
     volume, and zero database-test skips.
-  - Gate: `pwsh -NoProfile -File scripts/test_gateway.ps1`.
+  - Gate: `pwsh -NoProfile -File scripts/test_gateway.ps1`. Its focused 22-test
+    database/gateway run uses `--no-cov` and permits zero skips. It then runs
+    the full configured coverage suite, rejects every database/gateway skip,
+    and permits only an explicit allowlist of known non-database compatibility
+    or degradation skips; every new or unknown skip fails the gate.
 
 - [ ] **P04 — Checkpoint revalidation and targeted repair**
   - Branch: `fix/setup-checkpoint-repair`; source: System Tasks 1-2; requires
