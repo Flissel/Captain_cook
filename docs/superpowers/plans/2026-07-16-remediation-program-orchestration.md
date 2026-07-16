@@ -34,6 +34,9 @@ worktree is not an implementation workspace.
 7. P02 and P08 intentionally supersede the earlier system-design statement
    that production authentication was out of scope. Minibook admin routes fail
    closed, and gateway routes other than `/healthz` require role-scoped tokens.
+8. Ordinary pytest runs exclude the `live` marker. A packet may select
+   `-m live` only when its allowlist names the target service and its cleanup
+   contract; P20 owns the consolidated explicit live gates.
 
 ## Plan authority and supersession
 
@@ -141,9 +144,10 @@ SHAs before either worker begins.
     volume, and zero database-test skips.
   - Gate: `pwsh -NoProfile -File scripts/test_gateway.ps1`. Its focused 22-test
     database/gateway run uses `--no-cov` and permits zero skips. It then runs
-    the full configured coverage suite, rejects every database/gateway skip,
-    and permits only an explicit allowlist of known non-database compatibility
-    or degradation skips; every new or unknown skip fails the gate.
+    the full configured non-live coverage suite (`-m "not live"`), rejects
+    every database/gateway skip, and permits only an explicit allowlist of
+    known non-database compatibility or degradation skips; every new or unknown
+    skip fails the gate.
 
 - [ ] **P04 — Checkpoint revalidation and targeted repair**
   - Branch: `fix/setup-checkpoint-repair`; source: System Tasks 1-2; requires
@@ -235,6 +239,8 @@ SHAs before either worker begins.
     MariaDB/Pester/submission jobs, a real Captain-gateway verifier, and tracked
     checks for the `httpx`/Starlette and `requests` dependency warnings without
     globally silencing them.
+  - Every external-service test is selected explicitly with `-m live` in its
+    owning job; the ordinary unit/coverage job remains non-live.
   - Gate: isolated DB script, live verifier, Pester, full pytest, `compileall`,
     Compose validation, and submission verification.
 
@@ -347,3 +353,7 @@ For every packet, the orchestrator must:
   explicitly reported as service/compatibility skips, one Starlette warning
   remained visible, and measured coverage was 74.76% against the 70% floor.
   Specification and code-quality reviews both passed before integration.
+- A post-P01 audit found that the prior bare full-suite command also collected
+  a Minibook `live` test and wrote test records to a reachable local service.
+  No deletion was attempted. Default pytest now excludes `live`; P20 must
+  select each authorized live system explicitly and prove cleanup/isolation.

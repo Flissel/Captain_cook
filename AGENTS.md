@@ -67,7 +67,7 @@ must not be claimed from mocked evidence.
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m pytest -q -m "not live"
 .\.venv\Scripts\python.exe scripts/verify_submission.py
 .\.venv\Scripts\python.exe main.py demo --output artifacts/demo-run.json
 ```
@@ -82,6 +82,10 @@ For import or architecture work, also run:
 Do not rewrite `artifacts/demo-run.json` unless the task intentionally updates
 demo evidence. Report skipped tests and dependency warnings separately from
 failures.
+
+The default pytest configuration excludes tests marked `live`. Run a live gate
+only when its plan explicitly authorizes the target service and use `-m live`
+to opt in; never let an ordinary regression run mutate a reachable service.
 
 ## Secrets and local services
 
