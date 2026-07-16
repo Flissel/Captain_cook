@@ -1,6 +1,10 @@
+from types import SimpleNamespace
+
 import pytest
 
+from agenten.llm import plan_batches
 from agenten.llm.plan_batches import make_llm_align, make_llm_enrich
+from agenten.llm.resilience import LlmSchemaError, LlmStage
 from agenten.llm.model_client import build_replay_model_client
 from agenten.planning.alignment import AlignmentPlan, BatchDraft
 from agenten.planning.captain_pipeline import BatchEnrichment, PlannedSubtask
@@ -61,9 +65,65 @@ async def test_align_rejects_non_structured_model_output() -> None:
     client = build_replay_model_client(["not-json"])
     align = make_llm_align(client)
 
-    with pytest.raises(Exception):
+    with pytest.raises(LlmSchemaError) as failure:
         await align(
             "Build the project",
             [PlannedSubtask(subtask_id="s1", description="Deliver it")],
             "",
         )
+
+    assert failure.value.stage is LlmStage.ALIGN
+    assert failure.value.attempts == 1
+    assert isinstance(failure.value.__cause__, ValueError)
+
+
+@pytest.mark.asyncio
+async def test_align_types_missing_structured_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MissingOutputAgent:
+        async def run(self, *, task: str) -> SimpleNamespace:
+            del task
+            return SimpleNamespace(messages=[])
+
+    monkeypatch.setattr(
+        plan_batches,
+        "AssistantAgent",
+        lambda **kwargs: MissingOutputAgent(),
+    )
+    align = make_llm_align(build_replay_model_client([]))
+
+    with pytest.raises(LlmSchemaError) as failure:
+        await align(
+            "Build the project",
+            [PlannedSubtask(subtask_id="s1", description="Deliver it")],
+            "",
+        )
+
+    assert failure.value.stage is LlmStage.ALIGN
+
+
+@pytest.mark.asyncio
+async def test_enrich_types_wrong_structured_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class WrongOutputAgent:
+        async def run(self, *, task: str) -> SimpleNamespace:
+            del task
+            return SimpleNamespace(messages=[SimpleNamespace(content="not enrichment")])
+
+    monkeypatch.setattr(
+        plan_batches,
+        "AssistantAgent",
+        lambda **kwargs: WrongOutputAgent(),
+    )
+    enrich = make_llm_enrich(build_replay_model_client([]))
+
+    with pytest.raises(LlmSchemaError) as failure:
+        await enrich(
+            "Build the project",
+            BatchDraft(batch_id="delivery", title="Delivery", subtask_ids=["s1"]),
+            [PlannedSubtask(subtask_id="s1", description="Deliver it")],
+        )
+
+    assert failure.value.stage is LlmStage.ENRICH
