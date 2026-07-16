@@ -264,7 +264,7 @@ SHAs before either worker begins.
     and ordering/batch-id validation. No database or FastAPI dependency.
   - Gate: `python -m pytest -q --no-cov tests/gateway/test_contracts.py`.
 
-- [ ] **P07B — Persist gateway lifecycle as append-only child events**
+- [x] **P07B — Persist gateway lifecycle as append-only child events**
   - Branch: `refactor/gateway-append-only-store`; source: Gateway Task 2
     Steps 1, 2, 4, and 5; requires P07A.
   - Owns exactly: `gateway/store.py`, `gateway/app.py`,
@@ -282,13 +282,13 @@ SHAs before either worker begins.
   - Gate: `pwsh -NoProfile -File scripts/test_gateway.ps1` with zero selected
     skips and no exact-count ceiling.
   - Quality hardening required before integration:
-    - [ ] concurrent `work_batch` creation yields exactly one immutable root;
-    - [ ] parallel writes preserve immediate `previous_hash` adjacency;
-    - [ ] affected writers share one lock order and bounded transaction retry;
-    - [ ] generic `/blocks` rejects gateway-owned claim, heartbeat, and
+    - [x] concurrent `work_batch` creation yields exactly one immutable root;
+    - [x] parallel writes preserve immediate `previous_hash` adjacency;
+    - [x] affected writers share one lock order and bounded transaction retry;
+    - [x] generic `/blocks` rejects gateway-owned claim, heartbeat, and
       approval event types;
-    - [ ] invalid initial work-batch status is rejected before persistence;
-    - [ ] a second holdout cannot replace the effective immutable holdout.
+    - [x] invalid initial work-batch status is rejected before persistence;
+    - [x] a second holdout cannot replace the effective immutable holdout.
 
 - [ ] **P07C — Make Captain batch and holdout release idempotent**
   - Branch: `feat/gateway-idempotent-release`; source: Captain Task 3 Step 4;
@@ -538,3 +538,10 @@ For every packet, the orchestrator must:
   P07B owns only a no-content rename of the newer gateway file to
   `test_gateway_contracts.py`; the gate and global collection semantics remain
   unchanged, so collection cannot be hidden by a command-line workaround.
+- P07B integrated candidate `6acee13` as merge commit `848c83f` after a
+  disjoint-path audit, conflict-free merge-tree preview, specification PASS,
+  and quality PASS. The integrated disposable-MariaDB gate passed 46 selected
+  tests with zero skips; its full gate passed 391 tests with two explicit
+  skips, one live deselection, one known warning, and 81.79% coverage. The
+  no-content test rename restored default pytest collection, all disposable
+  test containers were removed, and P07C is now unlocked on `LOCK_GATEWAY`.

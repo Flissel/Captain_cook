@@ -41,11 +41,12 @@ P05 closed all known fail-open bootstrap result-shape gaps. P06 is unblocked.
 
 ## Active findings and stop gates
 
-P07B candidate `225bbe9` implements the six prior quality findings, but the
-fresh specification review is FAIL because the named Claim/Holdout lock-order
-regression has no real MariaDB concurrency test. Repair attempt 1/3 is active;
-the candidate must not integrate until the bounded deadlock/hash/immutability
-test and a fresh spec plus quality review pass.
+P07B candidate `6acee13` is integrated as merge commit `848c83f`. The focused
+real MariaDB gate passed 46 tests with zero skips and the complete integrated
+gate passed 391 tests with two explicit skips, one live deselection, one known
+warning, and 81.79% coverage. Fresh specification and quality reviews passed
+with no Critical/Important findings; the default pytest basename collision is
+closed by the canonical no-content gateway test rename.
 
 1. concurrent duplicate root batches;
 2. stale-snapshot `previous_hash` chain break;
@@ -63,8 +64,8 @@ resolution of all four overlapping paths. Specification and quality reviews
 are PASS; the combined 123-test gate and `compileall` passed. The planning lane
 is unlocked for P10.
 
-P07C remains blocked by P07B. P08 remains blocked by P07C. P10 is unlocked by
-the completed P09 packet.
+P07C is unlocked by P07B and is the active `LOCK_GATEWAY` packet. P08 remains
+blocked by P07C. P10 is independently unlocked by the completed P09 packet.
 
 ### Autonomous Captain process candidate
 
@@ -76,9 +77,8 @@ SOURCE_INPUT: C:\Users\User\Desktop\Captain_cook\Autogen_AgentFarm\input.md
 SOURCE_SHA256: e55e667474a3b6a3d1a1dc6f927fec9ea67a247ea30ea61141c5b994495623ac
 WORKERS_USED: 6
 FOCUSED_GATE: 123 combined AF01/P09/P15 tests plus agenten compileall
-DEFAULT_FULL_GATE: BLOCKED - duplicate test_contracts module basename (P07B-owned)
-DIAGNOSTIC_FULL_GATE: 349 passed, 23 skipped, 1 deselected, 1 warning, 78.12% coverage
-SKIPS: 22 TEST_MARIADB_DSN (4 storage, 18 gateway); 1 no-autogen degradation path
+DEFAULT_FULL_GATE: PASS - 391 passed, 2 skipped, 1 deselected, 1 warning, 81.79% coverage
+SKIPS: 1 no-autogen degradation path; 1 explicit ledger-query live marker
 WARNING: Starlette/httpx deprecation
 SUBMISSION_VERIFIER: passed
 OFFLINE_DEMO: 4 subproblems reached done; temporary output only
@@ -101,15 +101,18 @@ the orchestrator must reconcile it with P09 before any integration commit.
 
 ```text
 HANDOFF TO WORKER 1: P07B-FIX
-STATE: REPAIR_ATTEMPT_1_IN_PROGRESS
+STATE: INTEGRATED
 LOCK: LOCK_GATEWAY
 BRANCH: refactor/gateway-append-only-store
 WORKTREE: C:\Users\User\Desktop\Captain_cook\.worktrees\gateway-append-only-store
 PROMPT: docs/superpowers/prompts/2026-07-16-worker-goals.md#handoff-to-worker-1--p07b-fix
-CANDIDATE_SHA: 225bbe959b4cf5db311c9e45345d4b5b30b6e997
-WORKER_GATE: 45 focused passed; full gateway gate 336 passed, 1 allowlisted skip, 1 deselected
+CANDIDATE_SHA: 6acee13
+WORKER_GATE: 46 selected passed, zero skips; full 337 passed, 1 allowlisted skip, 1 deselected; 81.79% coverage
 WORKER_WARNING: Starlette/httpx compatibility warning remains P20-owned
-SPEC_REVIEW: FAIL - missing real Claim/Holdout concurrency regression evidence
+SPEC_REVIEW: PASS
+QUALITY_REVIEW: PASS
+INTEGRATION_SHA: 848c83f28e0c3292d159c78af1613aef6e5e38e8
+INTEGRATED_GATE: 46 selected passed, zero skips; full 391 passed, 2 explicit skips, 1 deselected, 1 warning; 81.79% coverage
 
 HANDOFF TO WORKER 2: P06
 STATE: REPAIR_ATTEMPT_1_IN_PROGRESS
