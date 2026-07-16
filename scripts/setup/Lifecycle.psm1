@@ -5,6 +5,7 @@ Import-Module (Join-Path $PSScriptRoot 'Common.psm1')
 Import-Module (Join-Path $PSScriptRoot 'Configuration.psm1')
 Import-Module (Join-Path $PSScriptRoot 'Preflight.psm1')
 Import-Module (Join-Path $PSScriptRoot 'Components.psm1')
+Import-Module (Join-Path $PSScriptRoot 'Repository.psm1')
 Import-Module (Join-Path $PSScriptRoot 'Services.psm1')
 Import-Module (Join-Path $PSScriptRoot 'StageValidation.psm1')
 
@@ -101,6 +102,31 @@ function ConvertTo-StableRepairResult {
     catch {
         New-InvalidSetupRunnerResult -InvalidatedStages $InvalidatedStages
     }
+}
+
+function Invoke-StableSetupStageAction {
+    param(
+        [AllowNull()][object] $Action,
+        [Parameter(Mandatory)][string] $Root,
+        [Parameter(Mandatory)][string] $FailureMessage
+    )
+
+    if ($Action -isnot [scriptblock]) {
+        return [pscustomobject]@{ Status = 'Failed'; Message = $FailureMessage }
+    }
+
+    try {
+        $result = & $Action $Root
+    }
+    catch {
+        return [pscustomobject]@{ Status = 'Failed'; Message = $FailureMessage }
+    }
+
+    $propertyNames = if ($null -eq $result) { @() } else { @($result.PSObject.Properties.Name) }
+    if ('Status' -notin $propertyNames -or 'Message' -notin $propertyNames) {
+        return [pscustomobject]@{ Status = 'Failed'; Message = $FailureMessage }
+    }
+    $result
 }
 
 function Invoke-GuidedSetup {
@@ -311,7 +337,27 @@ function Invoke-DefaultSetupStage {
             if ($result.Status -ne 'Ready') { return [pscustomobject]@{Status='Failed';Message=$result.Message} }
         }
         'Captain' { $result = Install-Captain -Root $root; if ($result.Status -ne 'Ready') { return [pscustomobject]@{Status='Failed';Message=$result.Message} } }
-        'Hermes' { $result = Install-Hermes -Root $root; if ($result.Status -ne 'Ready') { return [pscustomobject]@{Status='Failed';Message=$result.Message} } }
+        'Hermes' {
+            $submoduleInitializer = if ($Context.ContainsKey('SubmoduleInitializer')) {
+                $Context.SubmoduleInitializer
+            }
+            else {
+                { param($candidateRoot) Initialize-SetupSubmodules -Root $candidateRoot }
+            }
+            $hermesInstaller = if ($Context.ContainsKey('HermesInstaller')) {
+                $Context.HermesInstaller
+            }
+            else {
+                { param($candidateRoot) Install-Hermes -Root $candidateRoot }
+            }
+
+            $result = Invoke-StableSetupStageAction -Action $submoduleInitializer -Root $root `
+                -FailureMessage 'Die Repository-Initialisierung hat kein gültiges Ergebnis geliefert.'
+            if ($result.Status -ne 'Ready') { return [pscustomobject]@{Status='Failed';Message=$result.Message} }
+            $result = Invoke-StableSetupStageAction -Action $hermesInstaller -Root $root `
+                -FailureMessage 'Die Hermes-Installation hat kein gültiges Ergebnis geliefert.'
+            if ($result.Status -ne 'Ready') { return [pscustomobject]@{Status='Failed';Message=$result.Message} }
+        }
         'Minibook' {
             $result = Install-Minibook -Root $root
             if ($result.Status -ne 'Ready') { return [pscustomobject]@{Status='Failed';Message=$result.Message} }
