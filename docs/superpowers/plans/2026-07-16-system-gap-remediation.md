@@ -742,7 +742,7 @@ git commit -m "test: require real gateway integration evidence"
 - Produces: publish-only `EventBus`, `SubscribableEventBus`, explicit
   `subscribe_recorder(...)`, and boot-time validation in `build_pipeline`.
 
-- [ ] **Step 1: Add failing capability and composition tests**
+- [x] **Step 1: Add failing capability and composition tests**
 
 ```python
 def test_autogen_bus_is_publish_only() -> None:
@@ -759,7 +759,7 @@ Also prove `InMemoryEventBus` is a `SubscribableEventBus`, explicit recorder
 wiring covers every `RECORDER_TOPICS` entry, and no handler was registered when
 the composition error is raised.
 
-- [ ] **Step 2: Run the focused tests and verify the current contract mismatch**
+- [x] **Step 2: Run the focused tests and verify the current contract mismatch**
 
 Run:
 
@@ -770,7 +770,7 @@ python -m pytest -q tests/test_autogen_bus_integration.py tests/test_pipeline_au
 Expected: FAIL because `EventBus` still requires `subscribe`,
 `AutoGenEventBus.subscribe` still exists, and the recorder self-subscribes.
 
-- [ ] **Step 3: Split the event-bus interfaces**
+- [x] **Step 3: Split the event-bus interfaces**
 
 Implement the approved interface shape:
 
@@ -790,7 +790,7 @@ Derive `InMemoryEventBus` from `SubscribableEventBus`. Derive
 method entirely. AutoGen topic registration remains in `subscribe_type` using
 `TypeSubscription`.
 
-- [ ] **Step 4: Extract recorder subscription ownership**
+- [x] **Step 4: Extract recorder subscription ownership**
 
 Rename `_SUBSCRIPTION_SPEC` to public `RECORDER_SUBSCRIPTION_SPEC`, derive
 `RECORDER_TOPICS` from it, remove subscription calls from
@@ -806,14 +806,14 @@ def subscribe_recorder(
 The helper rejects a publish-only bus with `TypeError`. The in-memory pipeline
 calls it explicitly; `LedgerRecorderRoutedAgent` does not.
 
-- [ ] **Step 5: Tighten the composition boundary**
+- [x] **Step 5: Tighten the composition boundary**
 
 Type `build_pipeline(..., bus: SubscribableEventBus | None = None)` and validate
 an injected object before constructing any agent. Business agents that only
 publish remain typed to `EventBus`. Add an AST fitness rule limiting production
 callable `.subscribe()` usage to the in-memory composition/runtime boundary.
 
-- [ ] **Step 6: Verify runtime, recorder, pipeline, and architecture tests**
+- [x] **Step 6: Verify runtime, recorder, pipeline, and architecture tests**
 
 Run:
 
@@ -825,7 +825,7 @@ python -m compileall -q agenten
 Expected: all tests pass; unsupported composition fails before partial wiring;
 real AutoGen `TypeSubscription` delivery remains green.
 
-- [ ] **Step 7: Commit the capability segregation**
+- [x] **Step 7: Commit the capability segregation**
 
 ```powershell
 git add agenten/runtime/event_bus.py agenten/runtime/autogen_bus.py agenten/ledger_bridge/recorder.py agenten/orchestration/pipeline.py tests/test_autogen_bus_integration.py tests/test_pipeline_autogen_subscription.py tests/ledger_bridge/test_recorder.py tests/test_e2e_smoke.py tests/test_architecture_fitness.py

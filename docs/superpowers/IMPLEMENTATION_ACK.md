@@ -34,6 +34,7 @@ may advance the base only after recording a new explicit dispatch SHA here.
 | P04 | `1f09a30` | `4652fb8` | 50 Pester plus architecture/import gates |
 | P05 | `4a2ee1f` | `11febc37` | spec PASS, quality PASS, 64 Pester, both Compose renders, parser PASS |
 | P07A | `46dfc80` | `e951549` | spec/quality PASS, 47 focused tests |
+| P15 | `e688177` | `61b1858` | spec/quality PASS, 54 integrated tests, compileall PASS |
 
 P05 closed all known fail-open bootstrap result-shape gaps. P06 is unblocked.
 
@@ -56,13 +57,46 @@ P06 candidate `5db62f8` is specification FAIL: the real preflight ignores its
 configuration and treats every occupied fixed port as foreign, breaking healthy
 reruns and external-n8n mode. Repair attempt 1/3 is active.
 
-P09 candidate `dc332fb` is specification PASS and quality FAIL: holdout isolation
-is only batch-local, partial release can precede a later policy failure, and
-capability tags are not canonicalized before resolver/release. Repair attempt
-1/3 is active.
+P09 repair candidate `7fbd2c3` is clean and contains the requested run-wide
+holdout isolation and canonical-tag changes. Fresh specification review is
+FAIL: a later `WorkBatch` contract error can occur after an earlier batch was
+already released. The candidate needs a compile-all-before-release regression
+and repair. Four P09 paths overlap the local AF01 candidate, so neither
+candidate may be integrated by a blind merge or cherry-pick.
 
 P07C remains blocked by P07B. P08 remains blocked by P07C. P10 remains blocked
 by P09.
+
+### Autonomous Captain process candidate
+
+```text
+PACKET: AF01-PROCESS-BOUNDARIES
+STATE: LOCAL_CANDIDATE_REVIEW_REQUIRED
+WORKTREE: C:\Users\User\Desktop\Captain_cook-main-integration
+SOURCE_INPUT: C:\Users\User\Desktop\Captain_cook\Autogen_AgentFarm\input.md
+SOURCE_SHA256: e55e667474a3b6a3d1a1dc6f927fec9ea67a247ea30ea61141c5b994495623ac
+WORKERS_USED: 6
+FOCUSED_GATE: 69 passed plus agenten compileall
+DEFAULT_FULL_GATE: BLOCKED - duplicate test_contracts module basename (P07B-owned)
+DIAGNOSTIC_FULL_GATE: 328 passed, 24 skipped, 1 deselected, 1 warning, 77.82% coverage
+SKIPS: 1 missing legacy autogen package; 22 TEST_MARIADB_DSN (4 storage, 18 gateway); 1 no-autogen degradation path
+WARNING: Starlette/httpx deprecation
+SUBMISSION_VERIFIER: passed
+OFFLINE_DEMO: 4 subproblems reached done; temporary output only
+LIVE_INTEGRATION_EVIDENCE: none
+INTEGRATION_PERFORMED: no
+FINAL_DIFF_REVIEW: no Critical/Important findings in the implemented local scope; gateway authority and OS sandbox remain explicit production gates
+```
+
+The candidate separates Parser/Planning/Review/Execution contracts and is
+documented in
+`docs/superpowers/plans/2026-07-16-autonomous-captain-processes.md`. It must not
+be treated as complete v2 evidence: gateway-backed authority readers, separate
+review sandboxing, Hermes/Codex execution, real n8n/AutoGen runtime composition,
+and real E2E release gates remain open. The local compiler now accepts an
+allowlisted mixed `n8n`/`autogen` DAG, but that is contract evidence rather than
+live runtime proof. Because this work overlaps `LOCK_PLANNING`,
+the orchestrator must reconcile it with P09 before any integration commit.
 
 ## Current dispatch board
 
@@ -90,30 +124,42 @@ WORKER_LIMIT: live winget/PATH acceptance intentionally not claimed
 SPEC_REVIEW: FAIL - production preflight is configuration/ownership blind
 
 HANDOFF TO WORKER 3: P09
-STATE: REPAIR_ATTEMPT_1_IN_PROGRESS
+STATE: REPAIR_ATTEMPT_2_IN_PROGRESS
 LOCK: LOCK_PLANNING
 BRANCH: feat/captain-planning-policy
 WORKTREE: C:\Users\User\Desktop\Captain_cook\.worktrees\captain-planning-policy
 PROMPT: docs/superpowers/prompts/2026-07-16-worker-goals.md#handoff-to-worker-3--p09
-CANDIDATE_SHA: dc332fb40e89d7a8cf2bc41d95e80adee0cff7f8
+CANDIDATE_SHA: 7fbd2c3ec940109c543b1281bc84d06532820666
 WORKER_GATE: 9 focused plus 12 architecture/import tests passed; compileall passed
 WORKER_LIMIT: integrated full suite must rerun after the P07B basename-collision fix lands
-SPEC_REVIEW: PASS
-QUALITY_REVIEW: FAIL - run-wide holdout isolation and canonical tags required
+SPEC_REVIEW: FAIL - later contract validation can follow an earlier release
+QUALITY_REVIEW: PASS - no Critical/Important findings; 15 focused plus 15 architecture/import tests and compileall passed
 
-QUEUE: P15
-STATE: READY_WHEN_SLOT_RETURNS
+HANDOFF TO WORKER 4: P15
+STATE: INTEGRATED
 LOCKS: LOCK_RUNTIME_CORE plus the P15-owned recorder/adapter paths
+BRANCH: refactor/event-bus-capabilities
+WORKTREE: C:\Users\User\Desktop\Captain_cook\.worktrees\event-bus-capabilities
+DISPATCH_SHA: 3136d0d728ba77ee9467bf5cbb9da69af48c3436
+CANDIDATE_SHA: e6881774ad075d928517ff797c6acfb4f6944441
+RED_GATE: 4 failed, 2 passed, 25 deselected on the old capability mismatch
+GREEN_GATE: 54 focused passed; agenten compileall passed
+DIAGNOSTIC_FULL_GATE: 294 passed, 24 skipped, 1 deselected, 1 known warning
+SPEC_REVIEW: PASS
+QUALITY_REVIEW: PASS
+INTEGRATION_SHA: 61b1858a56dd570941c85bc996c2131cfaab44d3
+INTEGRATED_GATE: 54 passed, 0 skipped; compileall passed
 ```
 
 P02 is technically ready but belongs to the adjacent Minibook product and is
 not part of the recommended three-worker Captain-Core wave.
 
-The objective-required root `input.md` and `plans/index.md` were absent at the
-`4601806` dispatch baseline. They are now drafted with subordinate requirements,
-architecture, implementation, and test specs. Their presence closes the file
-gap only; AF00/AF01 review is still required before Agent-Factory implementation
-packets may be dispatched.
+The objective source `Autogen_AgentFarm/input.md` is committed on the clean
+sibling repository at `9ac6fe9` (blob `02ea2c8`, SHA-256 matching the AF01
+record). The root `input.md` and `plans/index.md` were absent at the `4601806`
+dispatch baseline and are now drafted with subordinate requirements,
+architecture, implementation, and test specs. This closes source tracking and
+local contract-file gaps only; it is not live Agent-Factory evidence.
 
 The worktree `.worktrees/remediation-integration` on
 `integration/remediation-commits` is observed but not owned by this loop. Treat

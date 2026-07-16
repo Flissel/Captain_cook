@@ -78,6 +78,58 @@ is dispatched. After P01, at most three independent external worker sessions
 may run concurrently. This orchestrator uses one implementer at a time and a
 fresh reviewer after every packet.
 
+## Agent Factory v2 completion board
+
+These checks are the terminal product definition. Packet completion is only
+enabling evidence; no item below may be checked from mocks, skipped live tests,
+uncommitted local files, or an offline-only demo.
+
+- [ ] **SC01 — Versioned source input:** the concrete lead-processing use case
+  and exact interfaces are committed and reproducibly hashed.
+- [ ] **SC02 — Canonical immutable DAG:** every batch has exactly one derived
+  status and deterministic dependency order in integrated code.
+- [ ] **SC03 — Two real n8n tools:** Hermes/Codex builds, imports, publishes,
+  and invokes at least two target workflows against the authorized instance.
+- [ ] **SC04 — Mixed AutoGen team:** at least one real AutoGen team uses both
+  n8n tools through typed adapters.
+- [ ] **SC05 — Process separation:** planning, n8n integration, AutoGen
+  reasoning, execution, and independent review remain separate authorities.
+- [ ] **SC06 — End-to-end trace chain:** `run_id`, `trace_id`, `batch_id`,
+  `worker_id`, real Codex session/thread ID, and artifact version survive every
+  gateway, worker, adapter, review, and Minibook boundary.
+- [ ] **SC07 — Golden/holdout isolation:** holdouts never enter worker prompts,
+  argv, environment, Codex logs, or MCP context before artifact sealing.
+- [ ] **SC08 — Artifact contracts:** each produced artifact is independently
+  validated before dependent batches are released.
+- [ ] **SC09 — Failure recovery:** happy path plus at least three distinct
+  failure paths prove repair, infrastructure retry, and terminal escalation.
+- [ ] **SC10 — Three clean E2E runs:** three consecutive isolated executions
+  pass without manual state repair or stale artifacts.
+- [ ] **SC11 — Release projection:** only release-gate-passed artifacts appear
+  as validated in Minibook; Minibook never becomes command authority.
+- [ ] **SC12 — Clean reproduction:** a clean Windows/Python 3.11 environment
+  can install, configure, run, and verify the v2 path from committed sources.
+- [ ] **SC13 — Judge demo:** the verified live path is demonstrable in under
+  three minutes without substituting offline evidence for required services.
+
+Live gates remain independently blocking:
+
+- [ ] **Gate A — n8n:** two real tools, primary MCP plus bounded REST fallback,
+  published once each and invoked twice with Mailpit/sink evidence.
+- [ ] **Gate B — Hermes/Codex:** claim, heartbeat, isolated workspace, real
+  session capture, static/secret gates, same-session repair, and completion.
+- [ ] **Gate C — AutoGen:** real team construction and typed use of both n8n
+  tools with complete correlation metadata.
+- [ ] **Gate D — Fleet/release:** unattended multi-worker execution, fencing,
+  recovery, release gate, and read-only Minibook projection.
+- [ ] **Gate E — acceptance:** three E2E runs, failure suite, evidence archive,
+  clean-clone reproduction, and judge sandbox.
+
+Current strict audit: `0/13` success criteria and `0/5` live gates are complete.
+SC02 and SC07 have uncommitted local contract evidence only. This counter must
+be recomputed after every integrated packet and may advance only from fresh
+evidence.
+
 ## Exclusive file locks
 
 | Lock | Owned paths | Required order |
@@ -174,7 +226,7 @@ SHAs before either worker begins.
   - Output: canonical capabilities and isolated content fingerprints.
   - Gate: planning policy, Captain pipeline, and factory E2E tests.
 
-- [ ] **P15 — Event-bus capability segregation**
+- [x] **P15 — Event-bus capability segregation**
   - Branch: `refactor/event-bus-capabilities`; source: System Task 7; requires
     P01; replaces Captain Task 6 and Broad Task 9.
   - Output: publish-only `EventBus`, `SubscribableEventBus`, explicit recorder
@@ -462,6 +514,13 @@ For every packet, the orchestrator must:
   integrated gate passed 50 Pester tests with zero skips plus 14 architecture/
   import/workstream tests. P05 is unlocked; P14 retains the explicit TODO to
   replace P04's private compatibility probes with the unified health contract.
+- P15 integrated candidate `e688177` as merge commit `61b1858` after exact
+  allowlist and merge-tree audits, specification PASS, and quality PASS. Its
+  integrated gate passed 54 tests with zero skips and `compileall` passed.
+  `EventBus` is now publish-only, local callbacks require
+  `SubscribableEventBus`, recorder wiring is explicit, and publish-only buses
+  fail before partial pipeline construction. P16 and P17 are unlocked in their
+  respective serial lock lanes.
 - P05 pre-dispatch review found a contradictory source example that supplied an
   always-true Hermes probe while expecting a Git call. The source now proves
   the absent-to-present initialization path separately from the already-present
