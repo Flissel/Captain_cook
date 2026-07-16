@@ -351,15 +351,24 @@ It 'defaults a new configuration to external n8n' {
 
 It 'initializes declared submodules without reset or clean' {
     $calls = [Collections.Generic.List[object]]::new()
+    $probeCalls = 0
     $result = Initialize-SetupSubmodules -Root $TestDrive -CommandRunner {
         param($file, $arguments, $directory)
         $calls.Add([pscustomobject]@{ File=$file; Arguments=@($arguments); Directory=$directory })
         [pscustomobject]@{ ExitCode=0; Output='' }
-    } -HermesProbe { $true }
+    } -HermesProbe { $probeCalls++; $probeCalls -gt 1 }
 
     $result.Status | Should -Be 'Ready'
     ($calls[0].Arguments -join ' ') | Should -Be 'submodule update --init --recursive'
     ($calls.Arguments -join ' ') | Should -Not -Match '(reset|clean|checkout)'
+}
+
+It 'does not invoke git when Hermes is already present' {
+    $result = Initialize-SetupSubmodules -Root $TestDrive `
+        -CommandRunner { throw 'Git must not run for an existing Hermes checkout.' } `
+        -HermesProbe { $true }
+
+    $result.Status | Should -Be 'Ready'
 }
 ```
 

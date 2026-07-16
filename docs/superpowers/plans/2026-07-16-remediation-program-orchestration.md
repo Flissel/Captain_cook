@@ -186,7 +186,10 @@ SHAs before either worker begins.
 
 - [ ] **P05 — Safe repository and external-n8n bootstrap**
   - Branch: `feat/setup-external-bootstrap`; source: System Task 3; requires
-    P04; gate: Pester and both Compose configurations.
+  P04; gate: Pester and both Compose configurations.
+  - Submodule acceptance uses an explicit absent-then-present probe for the
+    single allowed Git call and a separate already-present fast path that
+    proves zero Git calls.
 
 - [ ] **P06 — Aggregate Windows preflight**
   - Branch: `fix/setup-preflight-contract`; source: System Task 4; requires
@@ -444,3 +447,7 @@ For every packet, the orchestrator must:
   integrated gate passed 50 Pester tests with zero skips plus 14 architecture/
   import/workstream tests. P05 is unlocked; P14 retains the explicit TODO to
   replace P04's private compatibility probes with the unified health contract.
+- P05 pre-dispatch review found a contradictory source example that supplied an
+  always-true Hermes probe while expecting a Git call. The source now proves
+  the absent-to-present initialization path separately from the already-present
+  zero-mutation path, matching the packet brief and repository-safety contract.
