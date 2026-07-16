@@ -284,6 +284,59 @@ async def test_mutating_resolver_cannot_change_canonical_batch_tags() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mutating_release_client_cannot_change_canonical_result() -> None:
+    class MutatingReleaseClient:
+        def __init__(self) -> None:
+            self.received_batch: WorkBatch | None = None
+            self.received_holdouts: HoldoutSuite | None = None
+
+        async def release(self, batch: WorkBatch, holdouts: HoldoutSuite) -> None:
+            self.received_batch = batch
+            self.received_holdouts = holdouts
+            batch.capability_tags.append("invented")
+            batch.golden_cases[0].input["visible"] = "mutated"
+            holdouts.cases[0].input["hidden"] = "mutated"
+
+    async def decompose(_: str) -> List[PlannedSubtask]:
+        return [PlannedSubtask(subtask_id="s1", description="Delivery")]
+
+    async def align(_: str, __: List[PlannedSubtask], ___: str) -> AlignmentPlan:
+        return AlignmentPlan(
+            batches=[BatchDraft(batch_id="delivery", title="Delivery", subtask_ids=["s1"])]
+        )
+
+    canonical_enrichment = enrichment_for(
+        BatchDraft(batch_id="delivery", title="Delivery", subtask_ids=["s1"])
+    )
+
+    async def enrich(
+        _: str, __: BatchDraft, ___: List[PlannedSubtask]
+    ) -> BatchEnrichment:
+        return canonical_enrichment
+
+    releases = MutatingReleaseClient()
+    pipeline = CaptainPipeline(
+        decompose=decompose,
+        align=align,
+        enrich=enrich,
+        release_client=releases,
+        policy=PlanningPolicy(frozenset({"delivery"})),
+        target="external",
+    )
+
+    result = await pipeline.run("Protect canonical release contracts")
+
+    assert releases.received_batch is not None
+    assert releases.received_holdouts is not None
+    assert releases.received_batch.capability_tags == ["delivery", "invented"]
+    assert releases.received_batch.golden_cases[0].input == {"visible": "mutated"}
+    assert releases.received_holdouts.cases[0].input == {"hidden": "mutated"}
+    assert result.batches[0].capability_tags == ["delivery"]
+    assert result.batches[0].golden_cases[0].input == {"visible": True}
+    assert canonical_enrichment.holdout_cases[0].input == {"hidden": True}
+
+
+@pytest.mark.asyncio
 async def test_pipeline_validates_enrichment_before_capability_lookup_and_release() -> None:
     class UnexpectedResolver:
         async def find_match(self, target: str, capability_tags: List[str]) -> str | None:

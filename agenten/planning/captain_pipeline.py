@@ -168,7 +168,10 @@ class CaptainPipeline:
             compiled_contracts.append((batch, holdouts))
 
         for batch, holdouts in compiled_contracts:
-            await self._release_client.release(batch, holdouts)
+            await self._release_client.release(
+                batch.model_copy(deep=True),
+                holdouts.model_copy(deep=True),
+            )
 
         return CaptainRunResult(
             batches=[batch for batch, _ in compiled_contracts]
