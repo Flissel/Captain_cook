@@ -39,10 +39,33 @@ from agenten.events.schemas import (  # noqa: E402
     make_meta,
     topic_for,
 )
+from agenten.orchestration.pipeline import build_pipeline  # noqa: E402
+from agenten.runtime.event_bus import EventBus  # noqa: E402
 from agenten.runtime.bootstrap import build_runtime_and_bus, subscribe_type  # noqa: E402
 from agenten.tools.base import ToolRegistry  # noqa: E402
 from agenten.workers.base import make_routed_agent_class  # noqa: E402
 from agenten.workers.echo_worker import EchoWorker  # noqa: E402
+
+
+class PublishOnlyBus(EventBus):
+    def __init__(self) -> None:
+        self.handlers = []
+
+    async def publish(self, topic, event) -> None:
+        return None
+
+
+async def _empty_decompose(description, depth):
+    return []
+
+
+def test_pipeline_rejects_publish_only_bus_before_wiring():
+    bus = PublishOnlyBus()
+
+    with pytest.raises(TypeError, match="SubscribableEventBus"):
+        build_pipeline(llm_decompose=_empty_decompose, bus=bus)
+
+    assert bus.handlers == []
 
 
 class _RecordingAgent(RoutedAgent):

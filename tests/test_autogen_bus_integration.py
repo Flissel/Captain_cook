@@ -32,6 +32,7 @@ from agenten.decomposition.budget import DecompositionBudget  # noqa: E402
 from agenten.events.schemas import ProblemSubmitted, make_meta, topic_for  # noqa: E402
 from agenten.runtime.autogen_bus import DEFAULT_TOPIC_SOURCE  # noqa: E402
 from agenten.runtime.bootstrap import build_runtime_and_bus, subscribe_type  # noqa: E402
+from agenten.runtime import event_bus as event_bus_module  # noqa: E402
 
 
 def make_problem_submitted(problem_id="p1", root_problem_id=None, description="test problem"):
@@ -133,15 +134,25 @@ async def test_topic_source_derives_from_root_problem_id():
     assert published[-1].source == DEFAULT_TOPIC_SOURCE
 
 
-def test_subscribe_raises_not_implemented():
-    """AutoGenEventBus.subscribe() cannot be implemented faithfully (AutoGen
-    Core subscribes agent TYPES to topics, not callables) and must raise
-    NotImplementedError rather than silently no-op.
-    """
+def test_autogen_bus_is_publish_only():
+    """AutoGen uses TypeSubscription and exposes no callable subscription API."""
     _runtime, bus = build_runtime_and_bus()
 
-    async def handler(event):
-        pass
+    assert isinstance(bus, event_bus_module.EventBus)
+    assert not hasattr(bus, "subscribe")
 
-    with pytest.raises(NotImplementedError):
-        bus.subscribe("some.topic", handler)
+
+@pytest.mark.asyncio
+async def test_in_memory_bus_is_subscribable_and_delivers_handlers():
+    subscribable_bus_type = getattr(event_bus_module, "SubscribableEventBus", None)
+    assert subscribable_bus_type is not None
+    bus = event_bus_module.InMemoryEventBus()
+    received = []
+
+    async def handler(event):
+        received.append(event)
+
+    assert isinstance(bus, subscribable_bus_type)
+    bus.subscribe("some.topic", handler)
+    await bus.publish("some.topic", "payload")
+    assert received == ["payload"]

@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 
 from tests import architecture_fitness
@@ -11,6 +12,27 @@ from tests.architecture_fitness import (
 
 
 ROOT = Path(__file__).parents[1]
+
+
+def test_callable_subscribe_calls_stay_in_local_composition_boundaries():
+    allowed = {
+        "agenten/ledger_bridge/recorder.py",
+        "agenten/orchestration/pipeline.py",
+    }
+    violations = []
+    for path in sorted((ROOT / "agenten").rglob("*.py")):
+        relative = path.relative_to(ROOT).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "subscribe"
+                and relative not in allowed
+            ):
+                violations.append(f"{relative}:{node.lineno}")
+
+    assert violations == [], "callable subscribe used outside local composition: " + ", ".join(violations)
 
 
 def test_import_parser_handles_import_and_from_import(tmp_path: Path):
