@@ -18,6 +18,7 @@ from agenten.planning.captain_pipeline import (
 )
 from agenten.planning.policy import PlanningPolicy
 from agenten.planning.release import JsonDirectoryReleaseClient
+from agenten.planning.run_store import CaptainRunStore
 
 
 def build_captain_pipeline(
@@ -32,6 +33,7 @@ def build_captain_pipeline(
     llm_max_attempts: int = 2,
     release_client: BatchReleaseClient | None = None,
     capability_resolver: CapabilityResolver | None = None,
+    run_store: CaptainRunStore | None = None,
 ) -> CaptainPipeline:
     """Wire the Captain's LLM stages to its deterministic planning core."""
 
@@ -107,6 +109,7 @@ def build_captain_pipeline(
         release_client=release_client or JsonDirectoryReleaseClient(output_dir),
         policy=PlanningPolicy(frozenset(known_capability_tags)),
         capability_resolver=capability_resolver,
+        run_store=run_store,
         target=target,
         allowed_targets=target_allowlist,
         max_alignment_attempts=max_alignment_attempts,

@@ -15,6 +15,13 @@ from .captain_pipeline import (
 )
 from .gateway_client import GatewayPlanningClient, GatewayPlanningError
 from .release import JsonDirectoryReleaseClient, ReleaseConflictError
+from .run_models import (
+    CaptainRunConflictError,
+    CaptainRunState,
+    CaptainRunStatus,
+    PartialReleaseError,
+)
+from .run_store import CaptainRunStore, CaptainRunStoreError, JsonCaptainRunStore
 from .policy import PlanningPolicy, PlanningPolicyError
 
 __all__ = [
@@ -40,5 +47,12 @@ __all__ = [
     "PlanningPolicy",
     "PlanningPolicyError",
     "ReleaseConflictError",
+    "CaptainRunConflictError",
+    "CaptainRunState",
+    "CaptainRunStatus",
+    "PartialReleaseError",
+    "CaptainRunStore",
+    "CaptainRunStoreError",
+    "JsonCaptainRunStore",
     "validate_alignment",
 ]

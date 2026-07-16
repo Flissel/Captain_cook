@@ -15,6 +15,7 @@ from agenten.llm.model_client import build_model_client
 from agenten.planning.autonomous import AutonomousCaptainPlanner, AutonomousPlanningResult
 from agenten.planning.factory import build_captain_pipeline
 from agenten.planning.gateway_client import GatewayPlanningClient
+from agenten.planning.run_store import JsonCaptainRunStore
 
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="http://127.0.0.1:8000",
         help="Captain ledger gateway base URL used only in gateway mode",
     )
+    parser.add_argument(
+        "--run-id",
+        help="durable id used to resume an interrupted gateway release",
+    )
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=Path("artifacts/captain-runs"),
+        help="directory containing atomic Captain run checkpoints",
+    )
     return parser
 
 
@@ -76,6 +87,10 @@ async def async_main(
     http_client: httpx.AsyncClient | None = None,
 ) -> int:
     args = build_parser().parse_args(argv)
+    if args.run_id is not None and args.release_mode != "gateway":
+        raise GatewayPlanningConfigurationError(
+            "--run-id requires gateway release mode"
+        )
     gateway_token: str | None = None
     if args.release_mode == "gateway":
         gateway_token = os.getenv("CAPTAIN_GATEWAY_TOKEN")
@@ -100,6 +115,11 @@ async def async_main(
             known_capability_tags=list(args.capabilities),
             release_client=gateway,
             capability_resolver=gateway,
+            run_store=(
+                JsonCaptainRunStore(args.run_dir)
+                if gateway is not None and args.run_id is not None
+                else None
+            ),
         )
         return await AutonomousCaptainPlanner(
             pipeline=pipeline,
@@ -108,6 +128,7 @@ async def async_main(
             args.project,
             source_reference=args.project.name,
             release_compiled=gateway is not None,
+            run_id=args.run_id,
         )
 
     if args.release_mode == "gateway" and http_client is None:

@@ -106,3 +106,57 @@ async def test_parser_provenance_and_outline_are_available_to_captain(tmp_path: 
     assert "Qualification Agent" in pipeline.context
     assert "Qualifies leads." in pipeline.context
     assert "Input SHA-256:" in pipeline.context
+
+
+@pytest.mark.asyncio
+async def test_resume_checkpoint_is_not_released_before_canonical_plan_validation(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "input.md"
+    source.write_text("# Goal\n\nBuild safely.\n", encoding="utf-8")
+    batch = WorkBatch(
+        batch_id="safe",
+        title="Safe",
+        goal="Build safely",
+        subtask_ids=["sub-1"],
+        target="external",
+        acceptance_criteria=[
+            AcceptanceAssertion(
+                assertion_id="done",
+                kind=AssertionKind.STATUS_EQUALS,
+                expected="succeeded",
+            )
+        ],
+    )
+    holdout = HoldoutSuite(
+        batch_id="safe",
+        cases=[ExampleCase(case_id="hidden", input={"value": 2})],
+    )
+
+    class RecordingResumePipeline:
+        release_calls = 0
+
+        async def compile_checkpoint(self, project_description: str, *, run_id: str):
+            del project_description, run_id
+            return CaptainCompiledPlan(batches=(batch,), holdouts=(holdout,))
+
+        async def release_checkpoint(self, project_description: str, *, run_id: str):
+            del project_description, run_id
+            self.release_calls += 1
+
+    class RejectingCompiler:
+        def compile(self, *args, **kwargs):
+            del args, kwargs
+            raise ValueError("canonical plan rejected")
+
+    pipeline = RecordingResumePipeline()
+    planner = AutonomousCaptainPlanner(
+        pipeline=pipeline,
+        output_dir=tmp_path / "run",
+        compiler=RejectingCompiler(),
+    )
+
+    with pytest.raises(ValueError, match="canonical plan rejected"):
+        await planner.run(source, release_compiled=True, run_id="run-1")
+
+    assert pipeline.release_calls == 0
