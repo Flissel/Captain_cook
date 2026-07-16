@@ -34,7 +34,8 @@ from agenten.events.schemas import (
     topic_for,
 )
 from agenten.ledger_bridge.query import InProcessBudgetLedger
-from agenten.ledger_bridge.recorder import LedgerRecorderAgent
+from agenten.ledger_bridge import recorder as recorder_module
+from agenten.ledger_bridge.recorder import LedgerRecorderAgent, RECORDER_TOPICS
 from agenten.ledger_bridge.stage_machine import Stage
 from agenten.runtime.event_bus import InMemoryEventBus
 
@@ -51,7 +52,42 @@ def make_recorder(blockchain=None, budget_ledger=None, default_budget=None):
     if default_budget is not None:
         kwargs["default_budget"] = default_budget
     recorder = LedgerRecorderAgent(bus, blockchain, budget_ledger, **kwargs)
+    recorder_module.subscribe_recorder(bus, recorder)
     return bus, blockchain, budget_ledger, recorder
+
+
+def test_recorder_subscription_is_explicit_and_complete():
+    blockchain = Blockchain(storage=InMemoryStorage())
+    budget_ledger = InProcessBudgetLedger(blockchain)
+    bus = InMemoryEventBus()
+
+    recorder = LedgerRecorderAgent(bus, blockchain, budget_ledger)
+
+    assert dict(bus._handlers) == {}
+    subscribe_recorder = getattr(recorder_module, "subscribe_recorder", None)
+    assert subscribe_recorder is not None
+    subscribe_recorder(bus, recorder)
+    assert set(bus._handlers) == set(RECORDER_TOPICS)
+    assert all(len(handlers) == 1 for handlers in bus._handlers.values())
+
+
+def test_subscribe_recorder_rejects_publish_only_bus():
+    class PublishOnlyBus:
+        async def publish(self, topic, event):
+            return None
+
+    blockchain = Blockchain(storage=InMemoryStorage())
+    budget_ledger = InProcessBudgetLedger(blockchain)
+    recorder = LedgerRecorderAgent(InMemoryEventBus(), blockchain, budget_ledger)
+    subscribe_recorder = getattr(recorder_module, "subscribe_recorder", None)
+    assert subscribe_recorder is not None
+
+    try:
+        subscribe_recorder(PublishOnlyBus(), recorder)
+    except TypeError as exc:
+        assert "SubscribableEventBus" in str(exc)
+    else:
+        raise AssertionError("publish-only bus was accepted")
 
 
 async def submit_problem(bus, problem_id="root-1", budget=None):
@@ -638,6 +674,7 @@ def test_json_file_storage_round_trip():
         budget_ledger = InProcessBudgetLedger(blockchain)
         bus = InMemoryEventBus()
         recorder = LedgerRecorderAgent(bus, blockchain, budget_ledger)
+        recorder_module.subscribe_recorder(bus, recorder)
         await recorder.start()
 
         await submit_problem(bus, "root-1")
@@ -833,6 +870,7 @@ def test_recorder_rehydrates_indices_from_preexisting_chain():
     budget_ledger = InProcessBudgetLedger(blockchain)
     bus = InMemoryEventBus()
     recorder = LedgerRecorderAgent(bus, blockchain, budget_ledger)
+    recorder_module.subscribe_recorder(bus, recorder)
 
     # The rehydrated indices must be usable immediately, with no events
     # replayed yet.
@@ -961,6 +999,7 @@ def test_budget_consumed_is_crash_safe_even_without_problem_submitted():
         recorder = LedgerRecorderAgent(
             bus, blockchain, budget_ledger, default_budget=DecompositionBudget(max_total_subproblems=5)
         )
+        recorder_module.subscribe_recorder(bus, recorder)
         await recorder.start()
         # No submit_problem() call at all.
         await propose(bus, "s1", root_problem_id="orphan-root")

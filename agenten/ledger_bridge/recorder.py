@@ -101,7 +101,7 @@ from agenten.events.schemas import (
 )
 from agenten.ledger_bridge.query import LedgerQueryImpl, build_status_index
 from agenten.ledger_bridge.stage_machine import TERMINAL_STAGES, Stage, validate_transition
-from agenten.runtime.event_bus import EventBus
+from agenten.runtime.event_bus import EventBus, SubscribableEventBus
 
 logger = logging.getLogger(__name__)
 
@@ -110,12 +110,12 @@ logger = logging.getLogger(__name__)
 _STOP = object()
 
 # Canonical (event_type, handle_method_name) pairs — the single source of
-# truth both `LedgerRecorderAgent._subscribe()` (real `EventBus` wiring)
-# and `RECORDER_TOPICS` (module-level list unit U11 uses to wire up the
+# truth both local callable wiring and `RECORDER_TOPICS` (module-level list
+# unit U11 uses to wire up the
 # AutoGen `TypeSubscription`s for `LedgerRecorderRoutedAgent`) are derived
 # from, so the two can never silently drift out of sync (e.g. a 10th event
 # type added to one list but not the other).
-_SUBSCRIPTION_SPEC: List[Tuple[type, str]] = [
+RECORDER_SUBSCRIPTION_SPEC: List[Tuple[type, str]] = [
     (ProblemSubmitted, "handle_problem_submitted"),
     (SubproblemProposed, "handle_subproblem_proposed"),
     (SubproblemAccepted, "handle_subproblem_accepted"),
@@ -128,7 +128,9 @@ _SUBSCRIPTION_SPEC: List[Tuple[type, str]] = [
     (LeaseExpired, "handle_lease_expired"),
 ]
 
-RECORDER_TOPICS: List[str] = [topic_for(event_type) for event_type, _ in _SUBSCRIPTION_SPEC]
+RECORDER_TOPICS: List[str] = [
+    topic_for(event_type) for event_type, _ in RECORDER_SUBSCRIPTION_SPEC
+]
 
 
 class LedgerRecorderAgent:
@@ -184,8 +186,6 @@ class LedgerRecorderAgent:
         )
         self._rehydrate()
 
-        self._subscribe()
-
     def _rehydrate(self) -> None:
         """Rebuild `_subproblem_index` / `_problem_index` / cached
         per-root budgets from an already-populated `blockchain` on
@@ -219,13 +219,6 @@ class LedgerRecorderAgent:
                 subproblem_id = block.data.get("subproblem_id")
                 if subproblem_id:
                     self._subproblem_index[subproblem_id] = block.index
-
-    # ------------------------------------------------------------------
-    # wiring
-    # ------------------------------------------------------------------
-    def _subscribe(self) -> None:
-        for event_type, handler_name in _SUBSCRIPTION_SPEC:
-            self._bus.subscribe(topic_for(event_type), getattr(self, handler_name))
 
     async def start(self) -> None:
         """Spawn the single writer-loop task, if not already running."""
@@ -930,6 +923,17 @@ class LedgerRecorderAgent:
         self._apply_retry_transition(idx, failure_reason, "lease_expired")
 
 
+def subscribe_recorder(
+    bus: SubscribableEventBus,
+    recorder: LedgerRecorderAgent,
+) -> None:
+    """Wire the recorder to a local callable-subscription bus."""
+    if not isinstance(bus, SubscribableEventBus):
+        raise TypeError("subscribe_recorder requires a SubscribableEventBus")
+    for event_type, handler_name in RECORDER_SUBSCRIPTION_SPEC:
+        bus.subscribe(topic_for(event_type), getattr(recorder, handler_name))
+
+
 # ----------------------------------------------------------------------
 # Optional AutoGen Core adapter. Must import cleanly with autogen_core
 # absent (agenten/events/schemas.py and friends have zero AutoGen
@@ -942,7 +946,7 @@ except ImportError:  # pragma: no cover - exercised by the "no autogen_core" imp
     autogen_core = None
 
 # RECORDER_TOPICS (the topics unit U11 needs to bind `TypeSubscription`s
-# for) is defined once, near `_SUBSCRIPTION_SPEC` at the top of this
+# for) is defined once, near `RECORDER_SUBSCRIPTION_SPEC` at the top of this
 # module — see there.
 
 
