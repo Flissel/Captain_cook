@@ -162,7 +162,7 @@ SHAs before either worker begins.
   - Gate: focused parser regression tests followed by
     `pwsh -NoProfile -File scripts/test_gateway.ps1`.
 
-- [ ] **P04 — Checkpoint revalidation and targeted repair**
+- [x] **P04 — Checkpoint revalidation and targeted repair**
   - Branch: `fix/setup-checkpoint-repair`; source: System Tasks 1-2; requires
     P01.
   - Output: downstream-only invalidation and `Repair-CaptainSystem`.
@@ -436,3 +436,11 @@ For every packet, the orchestrator must:
   and the same reviewer confirmed them. The integrated projection/architecture
   gate passed 59 tests and `compileall` succeeded without database, Docker, or
   network access. P07B is now unlocked on `LOCK_GATEWAY`.
+- P04 integrated fixed candidate `1f09a30` as merge commit `4652fb8` after
+  specification PASS and quality PASS. Quality review first exposed a hidden
+  `StageValidation -> Lifecycle` reverse dependency and an unstable null-runner
+  path; four RED/green increments replaced the dependency with an injected,
+  fail-closed status provider and normalized failed repair results. The
+  integrated gate passed 50 Pester tests with zero skips plus 14 architecture/
+  import/workstream tests. P05 is unlocked; P14 retains the explicit TODO to
+  replace P04's private compatibility probes with the unified health contract.

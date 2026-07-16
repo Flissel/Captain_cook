@@ -149,7 +149,7 @@ git commit -m "build: add reproducible test environment"
 - Consumes: `Get-SetupStages`, setup result objects from `Common.psm1`.
 - Produces: `Test-SetupStage -Stage string -Context hashtable`, `Get-InvalidatedSetupStages -Stages string[] -FirstInvalidStage string`.
 
-- [ ] **Step 1: Add failing checkpoint revalidation tests**
+- [x] **Step 1: Add failing checkpoint revalidation tests**
 
 Add Pester cases proving a completed valid stage is skipped, a completed invalid stage reruns, and every downstream stage reruns:
 
@@ -187,7 +187,7 @@ It 'does not rerun a completed stage whose validator succeeds' {
 }
 ```
 
-- [ ] **Step 2: Run the tests and verify the stale-checkpoint failure**
+- [x] **Step 2: Run the tests and verify the stale-checkpoint failure**
 
 Run:
 
@@ -198,7 +198,7 @@ if ($result.FailedCount -eq 0) { throw 'Expected checkpoint tests to fail before
 
 Expected: the first test fails because `Invoke-GuidedSetup` has no `StageValidator` parameter.
 
-- [ ] **Step 3: Implement stage validation and downstream invalidation**
+- [x] **Step 3: Implement stage validation and downstream invalidation**
 
 Create `StageValidation.psm1` with this public contract:
 
@@ -237,7 +237,7 @@ Export-ModuleMember -Function @('Get-InvalidatedSetupStages', 'Test-SetupStage')
 
 Update `Invoke-GuidedSetup` to accept `StageValidator`, validate completed stages in order, remove the first invalid stage and all successors from the in-memory checkpoint, persist the invalidated checkpoint, and execute the normal runner from that stage.
 
-- [ ] **Step 4: Verify checkpoint behavior**
+- [x] **Step 4: Verify checkpoint behavior**
 
 Run:
 
@@ -248,7 +248,7 @@ if ($result.FailedCount -gt 0) { exit 1 }
 
 Expected: all Pester tests pass, including both new checkpoint tests.
 
-- [ ] **Step 5: Commit the checkpoint contract**
+- [x] **Step 5: Commit the checkpoint contract**
 
 ```powershell
 git add scripts/setup/StageValidation.psm1 scripts/setup/Lifecycle.psm1 scripts/setup/Setup.Tests.ps1
@@ -268,7 +268,7 @@ git commit -m "fix: revalidate completed setup stages"
 - Consumes: `Test-SetupStage`, `Get-InvalidatedSetupStages` from Task 1.
 - Produces: `Repair-CaptainSystem -Root string` returning a stable setup result with `Data.InvalidatedStages`.
 
-- [ ] **Step 1: Add a failing repair test with a deliberately missing component**
+- [x] **Step 1: Add a failing repair test with a deliberately missing component**
 
 ```powershell
 It 'invalidates a broken stage and all successors but preserves healthy predecessors' {
@@ -289,13 +289,13 @@ It 'invalidates a broken stage and all successors but preserves healthy predeces
 }
 ```
 
-- [ ] **Step 2: Run the focused test and verify failure**
+- [x] **Step 2: Run the focused test and verify failure**
 
 Run: `Invoke-Pester scripts/setup/Setup.Tests.ps1 -Output Detailed`
 
 Expected: FAIL because `Repair-CaptainSystem` is undefined.
 
-- [ ] **Step 3: Implement `Repair-CaptainSystem` and simplify `repair.ps1`**
+- [x] **Step 3: Implement `Repair-CaptainSystem` and simplify `repair.ps1`**
 
 Add `Repair-CaptainSystem` to `Lifecycle.psm1`. It must load the checkpoint, find the first completed stage whose validator returns false, remove it and successors, persist the reduced checkpoint, invoke the injected or default setup runner, and return the invalidated stage list. Replace the mutation logic in `repair.ps1` with:
 
@@ -306,7 +306,7 @@ Write-Host $result.Message
 if ($result.Status -ne 'Ready') { exit 1 }
 ```
 
-- [ ] **Step 4: Verify repair and regression behavior**
+- [x] **Step 4: Verify repair and regression behavior**
 
 Run:
 
@@ -317,7 +317,7 @@ if ($result.FailedCount -gt 0) { exit 1 }
 
 Expected: all tests pass and the repair result lists exactly the invalid stage and successors.
 
-- [ ] **Step 5: Commit repair behavior**
+- [x] **Step 5: Commit repair behavior**
 
 ```powershell
 git add repair.ps1 scripts/setup/Lifecycle.psm1 scripts/setup/Setup.Tests.ps1
@@ -1179,6 +1179,14 @@ Populate this table only with fresh evidence from Task 11.
 - Decision: retain 22 only as Task 6's minimum baseline and unlock the pure P07A projection packet. The isolated Compose project was removed, and the observed protected services retained their start times.
 - Consolidated into: `Task 6, Step 3`; program packet `P03A`; `Final acceptance evidence`.
 - Supersedes: the exact-count interpretation of the original Task 6 local gate; P20 still owns CI and final live-gate refresh.
+
+### 2026-07-16 10:48 Europe/Berlin — Checkpoint revalidation and repair
+
+- Evidence: fixed candidate `1f09a30` passed specification and quality review; integration merge `4652fb8` passed 50 Pester tests with zero failures/skips and 14 architecture/import/workstream tests.
+- Insight: the source snippet referenced two absent health helpers, while its first implementation also hid a reverse dependency from standalone `StageValidation.psm1` back into Lifecycle and threw on a null setup runner.
+- Decision: keep only transitional private Minibook/service adapters, inject the Lifecycle status provider into the validation context, fail closed when composition is absent, and normalize empty repair results to stable `Failed/Retry` output with `Data.InvalidatedStages`.
+- Consolidated into: `Task 1, Steps 1–5`; `Task 2, Steps 1–5`; `Task 5, Step 3A`; program packets `P04` and `P14`.
+- Supersedes: permanent trust in completed checkpoints and the old repair script's broad checkpoint mutation.
 
 ### Example for the next implementation session
 
