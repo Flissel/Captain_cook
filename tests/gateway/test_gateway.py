@@ -6,6 +6,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 import pytest
@@ -13,6 +14,7 @@ from fastapi.testclient import TestClient
 from pymysql.cursors import DictCursor
 from pymysql.err import OperationalError
 
+from blockchain.Blockchain_modell import Block
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.app import BlockRequest, create_app
 from gateway.store import GatewayStore
@@ -290,6 +292,129 @@ def test_parallel_gateway_writes_preserve_immediate_hash_adjacency(
         current["previous_hash"] == previous["hash"]
         for previous, current in zip(blocks, blocks[1:])
     )
+
+
+def test_concurrent_claim_and_first_holdout_share_global_lock_order(
+    storage: MariaDBStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = TestClient(create_app(storage=storage, mirror=RecordingMirror()))
+    parent_index = create_batch(client)
+    parent_before = storage.load()[0]
+    claim_first_lock = Event()
+    holdout_lock_attempted = Event()
+    holdout_lock_acquired = Event()
+    release_claim = Event()
+    first_claim_lock: list[str] = []
+    deadlock_victims: list[str] = []
+    original_execute = DictCursor.execute
+
+    def lock_target(query: str) -> str | None:
+        normalized = re.sub(r"\s+", " ", query.lower()).strip()
+        if "select next_block_index from ledger_state where id = 1 for update" in normalized:
+            return "global-index"
+        if (
+            "from blocks" in normalized
+            and "block_type = 'work_batch'" in normalized
+            and normalized.endswith("for update")
+        ):
+            return "batch-parent"
+        return None
+
+    def coordinating_execute(self: DictCursor, query: str, args: Any = None) -> int:
+        stack_functions = {frame.function for frame in inspect.stack()}
+        operation = (
+            "claim"
+            if "_claim_once" in stack_functions
+            else "holdout"
+            if "_append_once" in stack_functions
+            else ""
+        )
+        target = lock_target(query)
+        first_holdout_lock = (
+            operation == "holdout"
+            and target is not None
+            and not holdout_lock_attempted.is_set()
+        )
+        if first_holdout_lock:
+            holdout_lock_attempted.set()
+        try:
+            result = original_execute(self, query, args)
+        except OperationalError as exc:
+            if exc.args and exc.args[0] == 1213:
+                deadlock_victims.append(operation)
+            raise
+        if operation == "claim" and target is not None and not claim_first_lock.is_set():
+            first_claim_lock.append(target)
+            claim_first_lock.set()
+            assert release_claim.wait(timeout=5), "claim transaction was not released"
+        if first_holdout_lock:
+            holdout_lock_acquired.set()
+        return result
+
+    monkeypatch.setattr(DictCursor, "execute", coordinating_execute)
+
+    def issue_claim() -> Any:
+        return client.post("/batches/batch-1/claim")
+
+    def insert_holdout() -> Any:
+        return client.post(
+            "/blocks",
+            json={
+                "block_type": "holdout",
+                "parent_index": parent_index,
+                "data": {
+                    "batch_id": "batch-1",
+                    "cases": [{"case_id": "secret-1", "input": {"lead": 1}}],
+                },
+            },
+        )
+
+    pool = ThreadPoolExecutor(max_workers=2)
+    try:
+        claim_future = pool.submit(issue_claim)
+        assert claim_first_lock.wait(timeout=5), "claim did not acquire its first database lock"
+        holdout_future = pool.submit(insert_holdout)
+        assert holdout_lock_attempted.wait(timeout=5), "holdout did not attempt its first database lock"
+        if first_claim_lock == ["batch-parent"]:
+            assert holdout_lock_acquired.wait(timeout=5), "holdout did not acquire the global index lock"
+        release_claim.set()
+        claim_response = claim_future.result(timeout=5)
+        holdout_response = holdout_future.result(timeout=5)
+    finally:
+        release_claim.set()
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    assert deadlock_victims == []
+    assert first_claim_lock == ["global-index"]
+    assert claim_response.status_code == 200, claim_response.text
+    assert holdout_response.status_code == 201, holdout_response.text
+
+    blocks = storage.load()
+    assert next(block for block in blocks if block["index"] == parent_index) == parent_before
+    claim_event = next(block for block in blocks if block["block_type"] == "batch_claimed")
+    first_holdout = next(block for block in blocks if block["block_type"] == "holdout")
+    assert first_holdout["index"] == claim_event["index"] + 1
+    assert first_holdout["previous_hash"] == claim_event["hash"]
+    assert all(block["hash"] == Block(**block).compute_hash() for block in blocks)
+    assert all(
+        current["previous_hash"] == previous["hash"]
+        for previous, current in zip(blocks, blocks[1:])
+    )
+
+    replacement = client.post(
+        "/blocks",
+        json={
+            "block_type": "holdout",
+            "parent_index": parent_index,
+            "data": {
+                "batch_id": "batch-1",
+                "cases": [{"case_id": "replacement", "input": {}}],
+            },
+        },
+    )
+    assert replacement.status_code == 409
+    assert next(block for block in storage.load() if block["block_type"] == "holdout") == first_holdout
 
 
 def test_append_retries_only_documented_transaction_errors(
