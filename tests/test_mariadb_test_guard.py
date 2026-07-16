@@ -18,6 +18,25 @@ DATABASE_TEST_MODULES = (
 )
 
 
+def _selected_summary_validator_source(source: str) -> str:
+    function_marker = "function Assert-SelectedPytestSummary"
+    if function_marker in source:
+        function_start = source.index(function_marker)
+        function_end = source.index("$repoRoot =", function_start)
+        return source[function_start:function_end]
+
+    legacy_start = source.index('$selectedText = $selectedOutput -join "`n"')
+    legacy_end = source.index("$fullArguments =", legacy_start)
+    legacy_body = source[legacy_start:legacy_end].replace(
+        "$selectedOutput", "$SelectedOutput"
+    )
+    return f'''function Assert-SelectedPytestSummary {{
+    param([string[]]$SelectedOutput)
+{legacy_body}
+}}
+'''
+
+
 def test_guard_accepts_only_the_isolated_database() -> None:
     from tests.support.mariadb import assert_isolated_test_database
 
@@ -186,6 +205,53 @@ try {
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_selected_summary_validator_accepts_growth_and_rejects_invalid_results() -> None:
+    source = (ROOT / "scripts/test_gateway.ps1").read_text(encoding="utf-8")
+    validator = _selected_summary_validator_source(source)
+    probe = validator + r'''
+$failures = [System.Collections.Generic.List[string]]::new()
+
+function Test-ValidatorCase {
+    param(
+        [string]$Name,
+        [string[]]$Output,
+        [bool]$ShouldAccept
+    )
+
+    $accepted = $true
+    try {
+        $null = Assert-SelectedPytestSummary -SelectedOutput $Output
+    } catch {
+        $accepted = $false
+    }
+    if ($accepted -ne $ShouldAccept) {
+        [void]$failures.Add("$Name expected accepted=$ShouldAccept but got accepted=$accepted")
+    }
+}
+
+Test-ValidatorCase -Name "baseline-with-blank-lines" -Output @("", "22 passed in 0.10s", "") -ShouldAccept $true
+Test-ValidatorCase -Name "growth" -Output @("37 passed, 1 warning in 0.20s") -ShouldAccept $true
+Test-ValidatorCase -Name "below-baseline" -Output @("21 passed in 0.10s") -ShouldAccept $false
+Test-ValidatorCase -Name "selected-skip" -Output @("22 passed, 1 skipped in 0.10s") -ShouldAccept $false
+Test-ValidatorCase -Name "missing-summary" -Output @("no tests ran in 0.10s") -ShouldAccept $false
+Test-ValidatorCase -Name "duplicate-summary" -Output @("22 passed in 0.10s", "23 passed in 0.11s") -ShouldAccept $false
+
+if ($failures.Count -gt 0) {
+    throw $failures -join "; "
+}
+'''
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", probe],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_gate_uses_only_the_absolute_isolated_compose_project() -> None:
     source = (ROOT / "scripts/test_gateway.ps1").read_text(encoding="utf-8")
 
@@ -228,11 +294,17 @@ def test_gate_enables_required_encoded_dsn_after_mariadb_is_healthy() -> None:
 
 def test_gate_enforces_selected_count_and_classified_full_suite_skips() -> None:
     source = (ROOT / "scripts/test_gateway.ps1").read_text(encoding="utf-8")
+    validator = _selected_summary_validator_source(source)
 
     assert "tests/blockchain/test_mariadb_storage.py" in source
     assert "tests/gateway/test_gateway.py" in source
     assert "--no-cov" in source
-    assert "22 passed" in source
+    assert "Assert-SelectedPytestSummary" in source
+    assert "[int]::TryParse" in validator
+    assert re.search(r"\$passedCount\s+-lt\s+22", validator, re.IGNORECASE)
+    assert not re.search(
+        r"\$passedCount\s+-(?:eq|ne|gt|ge|le)\s+22", validator, re.IGNORECASE
+    )
     assert re.search(r'["\']-m["\']\s*,\s*["\']not live["\']', source)
     assert "AllowedFullSuiteSkipPatterns" in source
     assert "tests/test_captain_supply_chain" in source
