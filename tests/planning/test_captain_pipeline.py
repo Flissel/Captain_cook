@@ -34,6 +34,15 @@ class MatchingCapabilityResolver:
         return "validated-capability:delivery-v2"
 
 
+class RecordingCapabilityResolver:
+    def __init__(self) -> None:
+        self.calls: List[tuple[str, List[str]]] = []
+
+    async def find_match(self, target: str, capability_tags: List[str]) -> str | None:
+        self.calls.append((target, capability_tags))
+        return None
+
+
 def enrichment_for(draft: BatchDraft) -> BatchEnrichment:
     return BatchEnrichment(
         goal=f"Deliver {draft.title}",
@@ -212,4 +221,136 @@ async def test_pipeline_validates_enrichment_before_capability_lookup_and_releas
     with pytest.raises(PlanningPolicyError, match="unknown capability tags"):
         await pipeline.run("Reject invented capabilities")
 
+    assert releases.releases == []
+
+
+@pytest.mark.asyncio
+async def test_pipeline_rejects_cross_batch_holdout_overlap_before_any_lookup_or_release() -> None:
+    async def decompose(_: str) -> List[PlannedSubtask]:
+        return [
+            PlannedSubtask(subtask_id="s1", description="Foundation"),
+            PlannedSubtask(subtask_id="s2", description="Delivery"),
+        ]
+
+    async def align(_: str, __: List[PlannedSubtask], ___: str) -> AlignmentPlan:
+        return AlignmentPlan(
+            batches=[
+                BatchDraft(batch_id="foundation", title="Foundation", subtask_ids=["s1"]),
+                BatchDraft(
+                    batch_id="delivery",
+                    title="Delivery",
+                    subtask_ids=["s2"],
+                    depends_on=["foundation"],
+                ),
+            ]
+        )
+
+    async def enrich(
+        _: str, draft: BatchDraft, __: List[PlannedSubtask]
+    ) -> BatchEnrichment:
+        enrichment = enrichment_for(draft)
+        if draft.batch_id == "delivery":
+            return enrichment.model_copy(
+                update={
+                    "golden_cases": [
+                        ExampleCase(case_id="later-visible", input={"hidden": True})
+                    ]
+                }
+            )
+        return enrichment
+
+    releases = RecordingReleaseClient()
+    resolver = RecordingCapabilityResolver()
+    pipeline = CaptainPipeline(
+        decompose=decompose,
+        align=align,
+        enrich=enrich,
+        release_client=releases,
+        policy=PlanningPolicy(frozenset({"delivery"})),
+        capability_resolver=resolver,
+        target="external",
+    )
+
+    with pytest.raises(PlanningPolicyError, match="holdout content overlaps"):
+        await pipeline.run("Reject cross-batch holdout disclosure")
+
+    assert resolver.calls == []
+    assert releases.releases == []
+
+
+@pytest.mark.asyncio
+async def test_pipeline_canonicalizes_capability_tags_for_deterministic_replay() -> None:
+    enrichments = iter((["quality", "delivery"], ["delivery", "quality"]))
+
+    async def decompose(_: str) -> List[PlannedSubtask]:
+        return [PlannedSubtask(subtask_id="s1", description="Delivery")]
+
+    async def align(_: str, __: List[PlannedSubtask], ___: str) -> AlignmentPlan:
+        return AlignmentPlan(
+            batches=[BatchDraft(batch_id="delivery", title="Delivery", subtask_ids=["s1"])]
+        )
+
+    async def enrich(
+        _: str, draft: BatchDraft, __: List[PlannedSubtask]
+    ) -> BatchEnrichment:
+        return enrichment_for(draft).model_copy(
+            update={"capability_tags": next(enrichments)}
+        )
+
+    releases = RecordingReleaseClient()
+    resolver = RecordingCapabilityResolver()
+    pipeline = CaptainPipeline(
+        decompose=decompose,
+        align=align,
+        enrich=enrich,
+        release_client=releases,
+        policy=PlanningPolicy(frozenset({"delivery", "quality"})),
+        capability_resolver=resolver,
+        target="external",
+    )
+
+    first = await pipeline.run("Deterministic planning")
+    second = await pipeline.run("Deterministic planning")
+
+    assert resolver.calls == [
+        ("external", ["delivery", "quality"]),
+        ("external", ["delivery", "quality"]),
+    ]
+    assert first.batches == second.batches
+    assert first.batches[0].capability_tags == ["delivery", "quality"]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_rejects_duplicate_capability_tags_before_lookup_or_release() -> None:
+    async def decompose(_: str) -> List[PlannedSubtask]:
+        return [PlannedSubtask(subtask_id="s1", description="Delivery")]
+
+    async def align(_: str, __: List[PlannedSubtask], ___: str) -> AlignmentPlan:
+        return AlignmentPlan(
+            batches=[BatchDraft(batch_id="delivery", title="Delivery", subtask_ids=["s1"])]
+        )
+
+    async def enrich(
+        _: str, draft: BatchDraft, __: List[PlannedSubtask]
+    ) -> BatchEnrichment:
+        return enrichment_for(draft).model_copy(
+            update={"capability_tags": ["delivery", "delivery"]}
+        )
+
+    releases = RecordingReleaseClient()
+    resolver = RecordingCapabilityResolver()
+    pipeline = CaptainPipeline(
+        decompose=decompose,
+        align=align,
+        enrich=enrich,
+        release_client=releases,
+        policy=PlanningPolicy(frozenset({"delivery"})),
+        capability_resolver=resolver,
+        target="external",
+    )
+
+    with pytest.raises(PlanningPolicyError, match="duplicate capability tags"):
+        await pipeline.run("Reject duplicate capability tags")
+
+    assert resolver.calls == []
     assert releases.releases == []

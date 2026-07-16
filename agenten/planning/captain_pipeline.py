@@ -124,16 +124,27 @@ class CaptainPipeline:
             )
 
         subtasks_by_id = {subtask.subtask_id: subtask for subtask in subtasks}
-        released: List[WorkBatch] = []
+        enriched_drafts: List[tuple[BatchDraft, BatchEnrichment]] = []
         for draft in ordered_drafts:
             selected_subtasks = [subtasks_by_id[subtask_id] for subtask_id in draft.subtask_ids]
             enrichment = await self._enrich(project_description, draft, selected_subtasks)
             self._policy.validate_enrichment(enrichment)
+            enriched_drafts.append((draft, enrichment))
+
+        self._policy.validate_run_isolation(
+            enrichment for _, enrichment in enriched_drafts
+        )
+
+        released: List[WorkBatch] = []
+        for draft, enrichment in enriched_drafts:
+            capability_tags = self._policy.canonical_capability_tags(
+                enrichment.capability_tags
+            )
             satisfied_by = None
             if self._capability_resolver is not None:
                 satisfied_by = await self._capability_resolver.find_match(
                     self._target,
-                    enrichment.capability_tags,
+                    capability_tags,
                 )
             batch = WorkBatch(
                 batch_id=draft.batch_id,
@@ -141,7 +152,7 @@ class CaptainPipeline:
                 goal=enrichment.goal,
                 subtask_ids=draft.subtask_ids,
                 target=self._target,
-                capability_tags=enrichment.capability_tags,
+                capability_tags=capability_tags,
                 depends_on=draft.depends_on,
                 constraints=enrichment.constraints,
                 acceptance_criteria=enrichment.acceptance_criteria,
