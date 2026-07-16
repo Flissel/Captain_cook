@@ -109,6 +109,23 @@ def test_healthz_is_the_only_public_route_and_executes_database_readiness(
     assert client.get("/batches", params={"status": "pending"}).status_code == 401
 
 
+def test_unauthenticated_slash_variant_does_not_redirect(client: TestClient) -> None:
+    canonical = client.get(
+        "/batches",
+        params={"status": "pending"},
+        follow_redirects=False,
+    )
+    slash_variant = client.get(
+        "/batches/",
+        params={"status": "pending"},
+        follow_redirects=False,
+    )
+
+    assert canonical.status_code == 401
+    assert not 300 <= slash_variant.status_code < 400
+    assert "location" not in slash_variant.headers
+
+
 def test_healthz_returns_generic_503_when_database_is_unavailable(
     client: TestClient,
     storage: MariaDBStorage,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import secrets
 from collections.abc import Mapping
+from typing import Literal
 
 from pydantic import (
     BaseModel,
@@ -30,7 +31,7 @@ class GatewaySettings(BaseModel):
     captain_gateway_token: SecretStr
     worker_gateway_token: SecretStr
     approval_enabled: bool = False
-    host: str = "127.0.0.1"
+    host: Literal["127.0.0.1"] = "127.0.0.1"
     port: int = Field(default=8090, ge=1, le=65535)
 
     @field_validator(
@@ -42,13 +43,6 @@ class GatewaySettings(BaseModel):
     def _secret_must_not_be_blank(cls, value: SecretStr) -> SecretStr:
         if not value.get_secret_value().strip():
             raise ValueError("secret settings must not be blank")
-        return value
-
-    @field_validator("host")
-    @classmethod
-    def _host_must_not_be_blank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("host must not be blank")
         return value
 
     @model_validator(mode="after")
@@ -103,7 +97,6 @@ class GatewaySettings(BaseModel):
                 captain_gateway_token=SecretStr(captain_token),
                 worker_gateway_token=SecretStr(worker_token),
                 approval_enabled=approval_enabled,
-                host=source.get("GATEWAY_HOST", "127.0.0.1"),
                 port=port,
             )
         except ValidationError:

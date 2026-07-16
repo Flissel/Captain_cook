@@ -95,6 +95,7 @@ def create_app(
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        redirect_slashes=False,
         lifespan=lifespan,
     )
     app.state.gateway_settings = settings

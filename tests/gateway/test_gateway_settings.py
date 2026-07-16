@@ -14,7 +14,6 @@ def valid_environment(**overrides: str) -> Mapping[str, str]:
         "CAPTAIN_GATEWAY_TOKEN": "captain-test-token",
         "WORKER_GATEWAY_TOKEN": "worker-test-token",
         "GATEWAY_APPROVAL_ENABLED": "true",
-        "GATEWAY_HOST": "127.0.0.1",
         "GATEWAY_PORT": "18090",
         "UNRELATED_PROCESS_VALUE": "ignored",
     }
@@ -36,6 +35,17 @@ def test_settings_load_explicit_environment_without_exposing_secrets() -> None:
     assert "database-secret" not in rendered
     assert "captain-test-token" not in rendered
     assert "worker-test-token" not in rendered
+
+
+@pytest.mark.parametrize("untrusted_host", ("0.0.0.0", "gateway.example.test"))
+def test_settings_keep_the_gateway_bound_to_fixed_loopback(
+    untrusted_host: str,
+) -> None:
+    settings = GatewaySettings.from_env(
+        valid_environment(GATEWAY_HOST=untrusted_host)
+    )
+
+    assert settings.host == "127.0.0.1"
 
 
 @pytest.mark.parametrize(
@@ -68,7 +78,6 @@ def test_settings_reject_ambiguous_role_tokens_without_echoing_them() -> None:
         ("GATEWAY_APPROVAL_ENABLED", "yes"),
         ("GATEWAY_PORT", "not-a-port"),
         ("GATEWAY_PORT", "70000"),
-        ("GATEWAY_HOST", "   "),
     ),
 )
 def test_settings_fail_closed_on_invalid_explicit_values(name: str, value: str) -> None:
