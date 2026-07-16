@@ -256,6 +256,13 @@ using these child block types: `batch_claimed`, `batch_heartbeat`,
 `/batches/{batch_id}`, claim fencing, holdout access, and capability discovery
 call `project_batch` through the store.
 
+Before this step can complete, close the concurrency and fail-closed checklist
+owned by P07B in `2026-07-16-remediation-program-orchestration.md`. P07C may
+later turn an identical batch/holdout replay into success, but P07B must first
+guarantee unique roots, one effective holdout, correct hash adjacency,
+canonical lock ordering, reserved internal lifecycle events, and valid root
+status.
+
 The token response remains:
 
 ```python

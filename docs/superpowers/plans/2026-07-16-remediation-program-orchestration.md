@@ -82,7 +82,7 @@ fresh reviewer after every packet.
 
 | Lock | Owned paths | Required order |
 |---|---|---|
-| `LOCK_PROGRAM` | This master plan, all source-plan checkboxes, `.superpowers/sdd/` reports | Orchestrator only |
+| `LOCK_PROGRAM` | This master plan, source-plan checkboxes, `docs/superpowers/IMPLEMENTATION_ACK.md`, `docs/superpowers/prompts/**`, `.superpowers/sdd/` reports | Orchestrator only |
 | `LOCK_ENV_CI` | `requirements*.txt`, `pytest.ini`, `.github/workflows/**`, CI contract tests | P01 -> P20 -> P21 |
 | `LOCK_LIFECYCLE` | `scripts/setup/**`, `setup.ps1`, `repair.ps1`, `status.ps1`, setup acceptance tests | P04 -> P05 -> P06 -> P14 |
 | `LOCK_GATEWAY` | `gateway/**`, gateway/storage tests, isolated DB harness | P03 -> P03A -> P07A -> P07B -> P07C -> P08 -> P14 -> P20 |
@@ -184,7 +184,7 @@ SHAs before either worker begins.
 
 ### Sequential setup, gateway, planning, and runtime lanes
 
-- [ ] **P05 — Safe repository and external-n8n bootstrap**
+- [x] **P05 — Safe repository and external-n8n bootstrap**
   - Branch: `feat/setup-external-bootstrap`; source: System Task 3; requires
   P04; gate: Pester and both Compose configurations.
   - Submodule acceptance uses an explicit absent-then-present probe for the
@@ -228,6 +228,14 @@ SHAs before either worker begins.
     are green.
   - Gate: `pwsh -NoProfile -File scripts/test_gateway.ps1` with zero selected
     skips and no exact-count ceiling.
+  - Quality hardening required before integration:
+    - [ ] concurrent `work_batch` creation yields exactly one immutable root;
+    - [ ] parallel writes preserve immediate `previous_hash` adjacency;
+    - [ ] affected writers share one lock order and bounded transaction retry;
+    - [ ] generic `/blocks` rejects gateway-owned claim, heartbeat, and
+      approval event types;
+    - [ ] invalid initial work-batch status is rejected before persistence;
+    - [ ] a second holdout cannot replace the effective immutable holdout.
 
 - [ ] **P07C — Make Captain batch and holdout release idempotent**
   - Branch: `feat/gateway-idempotent-release`; source: Captain Task 3 Step 4;

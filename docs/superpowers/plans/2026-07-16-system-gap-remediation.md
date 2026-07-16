@@ -340,7 +340,7 @@ git commit -m "fix: repair invalid setup stages"
 - Consumes: project root and `Common\Invoke-SetupCommand`.
 - Produces: `Initialize-SetupSubmodules -Root string`, returning a setup result without resetting local changes.
 
-- [ ] **Step 1: Add failing external-default and submodule tests**
+- [x] **Step 1: Add failing external-default and submodule tests**
 
 ```powershell
 It 'defaults a new configuration to external n8n' {
@@ -372,13 +372,13 @@ It 'does not invoke git when Hermes is already present' {
 }
 ```
 
-- [ ] **Step 2: Run tests and verify both contracts fail**
+- [x] **Step 2: Run tests and verify both contracts fail**
 
 Run: `Invoke-Pester scripts/setup/Setup.Tests.ps1 -Output Detailed`
 
 Expected: external-default assertion or missing `Initialize-SetupSubmodules` fails.
 
-- [ ] **Step 3: Implement safe repository bootstrap**
+- [x] **Step 3: Implement safe repository bootstrap**
 
 Create `Repository.psm1` with an injectable command runner. If `hermes-agent/pyproject.toml` exists, return `Ready` without Git mutation. Otherwise run exactly `git submodule update --init --recursive` in the repository root, then probe again. Return `Failed/Retry` for Git failure and `Missing/Manual` when the command succeeds but Hermes remains absent.
 
@@ -400,7 +400,7 @@ N8N_CONTAINER_URL=http://host.docker.internal:15678
 
 Import `Repository.psm1` in `Lifecycle.psm1` and call `Initialize-SetupSubmodules` immediately before `Install-Hermes`. Validate the configured external n8n health endpoint without invoking Compose for n8n.
 
-- [ ] **Step 4: Verify both Compose modes**
+- [x] **Step 4: Verify both Compose modes**
 
 Run:
 
@@ -415,7 +415,7 @@ if ($result.FailedCount -gt 0) { exit 1 }
 
 Expected: both Compose renders and all Pester tests pass.
 
-- [ ] **Step 5: Commit standalone bootstrap**
+- [x] **Step 5: Commit standalone bootstrap**
 
 ```powershell
 git add .env.example docker-compose.yml scripts/setup/Repository.psm1 scripts/setup/Lifecycle.psm1 scripts/setup/Components.psm1 scripts/setup/Setup.Tests.ps1
@@ -427,6 +427,7 @@ git commit -m "feat: bootstrap local dependencies safely"
 ### Task 4: Execute the complete preflight
 
 **Files:**
+- Modify: `setup.ps1`
 - Modify: `scripts/setup/Preflight.psm1`
 - Modify: `scripts/setup/Lifecycle.psm1:165-181`
 - Modify: `scripts/setup/Setup.Tests.ps1`
