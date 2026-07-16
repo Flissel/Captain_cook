@@ -13,7 +13,7 @@ SCHEDULE_STATE: PENDING_USER_CONFIRMATION_AND_NATIVE_UI
 PROPOSED_SCHEDULE: EVERY_30_MINUTES_WHILE_ACTIVE
 INTEGRATION_WORKTREE: C:\Users\User\Desktop\Captain_cook-main-integration
 INTEGRATION_BRANCH: feat/system-remediation-orchestration
-  LAST_INTEGRATED_IMPLEMENTATION_SHA: 341adec
+  LAST_INTEGRATED_IMPLEMENTATION_SHA: 88a7a86
 CONTROL_DISPATCH_SHA: 4601806
 PRIMARY_WORKTREE_POLICY: PRESERVE_AND_DO_NOT_USE_FOR_INTEGRATION
 ACK_OWNER: ORCHESTRATOR_ONLY
@@ -37,6 +37,7 @@ may advance the base only after recording a new explicit dispatch SHA here.
 | P15 | `e688177` | `61b1858` | spec/quality PASS, 54 integrated tests, compileall PASS |
 | P09 | `51cfb69` | `df79012` | spec/quality PASS, explicit AF01 reconciliation, 123 combined tests |
 | P11 | `534679e` + `5ba6678` + `8ddb096` | `341adec` | authenticated planning/delivery clients, 92 focused and 402 full tests |
+| P12 | `6362f48` + `f902186` | `88a7a86` | atomic resumable Captain runs, 93 focused and 411 full tests |
 
 P05 closed all known fail-open bootstrap result-shape gaps. P06 is unblocked.
 
@@ -75,6 +76,12 @@ P11 candidate chain `534679e` + `5ba6678` + `8ddb096` is integrated through
 the missing closed `append_evidence` API and rejecting heuristic capability
 reuse. P12 and P13 are unlocked. The legacy SQLite FastAPI surface remains
 explicit P13 work; no production caller was introduced by P11.
+
+P12 candidate chain `6362f48` + `f902186` is integrated through `88a7a86`.
+Review first rejected releasing a checkpoint before canonical-plan validation
+and then identified missing cross-process serialization. Both were closed with
+RED regressions. P19 is unblocked; P13 remains next on the production storage
+lane.
 
 ### Autonomous Captain process candidate
 
@@ -183,6 +190,20 @@ QUALITY_REVIEW: PASS after token-sanitization, fencing, exact compatibility, and
 INTEGRATION_SHAS: eddf054, b6fcb96, 341adec
 INTEGRATED_GATE: 92 focused passed; full 402 passed, 58 explicit service/environment skips, 1 live deselected, 1 warning; 77.78% coverage
 FOLLOWUP_GAP: P13 must retire the legacy SQLite API composition; SC11 still requires live release-projection evidence
+
+HANDOFF TO ORCHESTRATOR: P12
+STATE: INTEGRATED
+LOCK: LOCK_PLANNING
+BRANCH: feat/captain-run-resume
+WORKTREE: C:\Users\User\Desktop\Captain_cook\.worktrees\captain-run-resume
+CANDIDATE_SHAS: 6362f48, f902186
+RED_GATE: missing run models/store and resume API; canonical validation ordered after release; separate store instances acquired the same run concurrently
+GREEN_GATE: 76 planning tests and 93 combined planning/architecture tests passed; compileall passed
+SPEC_REVIEW: PASS after preserving full batch/holdout state and validation-before-write ordering
+QUALITY_REVIEW: PASS after digest fencing, sanitized checkpoint errors, atomic replace, and OS file locking
+INTEGRATION_SHAS: afe6620, 88a7a86
+INTEGRATED_GATE: 93 focused passed; full 411 passed, 58 explicit service/environment skips, 1 live deselected, 1 warning; 78.37% coverage
+FOLLOWUP_GAP: P20 clean-clone/live gates must exercise real process interruption; current evidence is deterministic local acceptance
 
 HANDOFF TO WORKER 2: P06
 STATE: REPAIR_ATTEMPT_1_IN_PROGRESS

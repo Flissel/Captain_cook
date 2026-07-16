@@ -329,7 +329,7 @@ git commit -m "feat: connect captain planning to ledger gateway"
 - Produces: `CaptainRunState`, `CaptainRunStatus`, `CaptainRunStore`, `JsonCaptainRunStore`, and `PartialReleaseError`.
 - Invariant: a retry with the same `run_id` never enriches or releases a completed batch again.
 
-- [ ] **Step 1: Write a failing crash/resume acceptance test**
+- [x] **Step 1: Write a failing crash/resume acceptance test**
 
 ```python
 @pytest.mark.asyncio
@@ -346,13 +346,13 @@ async def test_run_resumes_at_first_unreleased_batch(tmp_path: Path) -> None:
     assert release.calls == ["first", "second", "second"]
 ```
 
-- [ ] **Step 2: Verify it fails**
+- [x] **Step 2: Verify it fails**
 
 Run: `python -m pytest -q tests/planning/test_resume.py`
 
 Expected: `CaptainPipeline.run()` has no `run_id` or run-store support.
 
-- [ ] **Step 3: Define durable state**
+- [x] **Step 3: Define durable state**
 
 ```python
 class CaptainRunStatus(str, Enum):
@@ -375,15 +375,19 @@ class CaptainRunState(BaseModel):
     error_kind: str | None = None
 ```
 
-- [ ] **Step 4: Implement atomic JSON run persistence**
+- [x] **Step 4: Implement atomic JSON run persistence**
 
 `JsonCaptainRunStore.save()` writes canonical JSON to `<run_id>.tmp`, flushes it, and uses `os.replace`. `load()` validates with `CaptainRunState.model_validate_json`. Reject reuse of a `run_id` when the project digest differs.
 
-- [ ] **Step 5: Checkpoint before and after every release**
+- [x] **Step 5: Checkpoint before and after every release**
 
 Persist the planned immutable batches before releasing. On resume, load them instead of calling decomposition/alignment/enrichment again. After each successful release append the batch id and save. Raise `PartialReleaseError(run_id, released_batch_ids, failed_batch_id)` while retaining the checkpoint.
 
-- [ ] **Step 6: Verify and commit**
+The integrated implementation also persists the matching holdout suites, runs
+canonical-plan validation before the release phase, and holds a per-run OS file
+lock around resume so two Captain processes cannot duplicate a release.
+
+- [x] **Step 6: Verify and commit**
 
 Run: `python -m pytest -q tests/planning/test_run_store.py tests/planning/test_resume.py tests/planning/test_captain_pipeline.py`
 

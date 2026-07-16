@@ -320,9 +320,13 @@ SHAs before either worker begins.
   - Gate: 92 planning/delivery/architecture tests, `compileall`, and the full
     non-live regression suite.
 
-- [ ] **P12 — Atomic Captain run resume**
+- [x] **P12 — Atomic Captain run resume**
   - Branch: `feat/captain-run-resume`; source: Captain Task 4; requires P11.
-  - Gate: run-store, crash/resume, and pipeline suites.
+  - Output: immutable batch-plus-holdout checkpoints, input-digest fencing,
+    atomic replace, per-run OS file locking, monotonic release-prefix state,
+    and canonical-plan validation before any resumed external write.
+  - Gate: 93 planning/architecture tests, `compileall`, and the full non-live
+    regression suite.
 
 - [ ] **P13 — SQLite legacy import and production retirement**
   - Branch: `refactor/sqlite-legacy-import`; source: Gateway Task 4; requires
@@ -599,3 +603,15 @@ For every packet, the orchestrator must:
   non-live suite passed 402 tests with 58 explicit service/environment skips,
   one live deselection, one known warning, and 77.78% coverage. P12 and P13 are
   now unlocked; SC11 remains open until live release projection is proven.
+- P12 integrated candidate chain `6362f48` + `f902186` through merge commits
+  `afe6620` and `88a7a86`. The Captain checkpoints the complete immutable
+  batch/holdout plan before release, rejects `run_id` reuse for a different
+  input digest, resumes at the first unreleased batch without repeating LLM
+  stages, and returns completed runs without another Gateway write. Canonical
+  plan compilation remains before every external release. Atomic replacement
+  is reinforced with a per-run OS file lock, so separate Captain processes
+  cannot publish the same checkpoint concurrently. The integrated focused
+  gate passed 93 tests plus `compileall`; the full non-live suite passed 411
+  tests with 58 explicit service/environment skips, one live deselection, one
+  known warning, and 78.37% coverage. P19 is now unblocked by P12; P13 remains
+  the next production-authority packet.
