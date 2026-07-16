@@ -7,7 +7,7 @@ agent messaging. This avoids shared-file conflicts between worker branches.
 ## Control state
 
 ```text
-LOOP_STATE: READY_FOR_DISPATCH
+LOOP_STATE: REVIEWING_CANDIDATES
 MAX_PARALLEL_WORKERS: 3
 SCHEDULE_STATE: PENDING_USER_CONFIRMATION
 PROPOSED_SCHEDULE: EVERY_30_MINUTES_WHILE_ACTIVE
@@ -56,25 +56,34 @@ P07C remains blocked by P07B. P08 remains blocked by P07C.
 
 ```text
 HANDOFF TO WORKER 1: P07B-FIX
-STATE: DISPATCHED
+STATE: SPEC_REVIEW_IN_PROGRESS
 LOCK: LOCK_GATEWAY
 BRANCH: refactor/gateway-append-only-store
 WORKTREE: C:\Users\User\Desktop\Captain_cook\.worktrees\gateway-append-only-store
 PROMPT: docs/superpowers/prompts/2026-07-16-worker-goals.md#handoff-to-worker-1--p07b-fix
+CANDIDATE_SHA: 225bbe959b4cf5db311c9e45345d4b5b30b6e997
+WORKER_GATE: 45 focused passed; full gateway gate 336 passed, 1 allowlisted skip, 1 deselected
+WORKER_WARNING: Starlette/httpx compatibility warning remains P20-owned
 
 HANDOFF TO WORKER 2: P06
-STATE: DISPATCHED
+STATE: SPEC_REVIEW_IN_PROGRESS
 LOCK: LOCK_LIFECYCLE
 BRANCH: fix/setup-preflight-contract
 WORKTREE: C:\Users\User\Desktop\Captain_cook\.worktrees\setup-preflight-contract
 PROMPT: docs/superpowers/prompts/2026-07-16-worker-goals.md#handoff-to-worker-2--p06
+CANDIDATE_SHA: 5db62f82a2d6401db1b57a246e1c4e0fa78eba6c
+WORKER_GATE: 15 focused and 73 full Pester tests passed; parser and diff checks passed
+WORKER_LIMIT: live winget/PATH acceptance intentionally not claimed
 
 HANDOFF TO WORKER 3: P09
-STATE: DISPATCHED
+STATE: SPEC_REVIEW_IN_PROGRESS
 LOCK: LOCK_PLANNING
 BRANCH: feat/captain-planning-policy
 WORKTREE: C:\Users\User\Desktop\Captain_cook\.worktrees\captain-planning-policy
 PROMPT: docs/superpowers/prompts/2026-07-16-worker-goals.md#handoff-to-worker-3--p09
+CANDIDATE_SHA: dc332fb40e89d7a8cf2bc41d95e80adee0cff7f8
+WORKER_GATE: 9 focused plus 12 architecture/import tests passed; compileall passed
+WORKER_LIMIT: integrated full suite must rerun after the P07B basename-collision fix lands
 
 QUEUE: P15
 STATE: READY_WHEN_SLOT_RETURNS
@@ -83,6 +92,12 @@ LOCKS: LOCK_RUNTIME_CORE plus the P15-owned recorder/adapter paths
 
 P02 is technically ready but belongs to the adjacent Minibook product and is
 not part of the recommended three-worker Captain-Core wave.
+
+The objective-required root `input.md` and `plans/index.md` were absent at the
+`4601806` dispatch baseline. They are now drafted with subordinate requirements,
+architecture, implementation, and test specs. Their presence closes the file
+gap only; AF00/AF01 review is still required before Agent-Factory implementation
+packets may be dispatched.
 
 The worktree `.worktrees/remediation-integration` on
 `integration/remediation-commits` is observed but not owned by this loop. Treat

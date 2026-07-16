@@ -42,3 +42,23 @@ def test_orchestrator_ack_and_worker_handoff_protocol_are_tracked():
     assert "HANDOFF FROM WORKER <ID>" in orchestrator
     assert "concurrent duplicate root batches" in ack
     assert "previous_hash" in ack
+
+
+def test_agent_factory_program_has_a_canonical_input_and_spec_index():
+    input_document = Path("input.md").read_text(encoding="utf-8")
+    index = Path("plans/index.md").read_text(encoding="utf-8")
+
+    assert "AutoGen" in input_document
+    assert "n8n" in input_document
+    assert "Hermes" in input_document
+    assert "Minibook" in input_document
+    assert "three consecutive successful E2E runs" in input_document
+
+    for specification in (
+        "requirements.md",
+        "architecture.md",
+        "implementation.md",
+        "test-spec.md",
+    ):
+        assert Path("plans", specification).is_file()
+        assert f"({specification})" in index
