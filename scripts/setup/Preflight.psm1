@@ -51,16 +51,86 @@ function Test-SetupExecutable {
     New-SetupResult -Component $Name -Status 'Ready' -Message "$Name $version ist bereit." -Remediation 'None' -Data @{ Version = $version.ToString(); Path = $command.Source }
 }
 
+function Test-ExpectedSetupPortOwner {
+    param(
+        [Parameter(Mandatory)][string] $Root,
+        [Parameter(Mandatory)][string] $ExpectedOwner,
+        [Parameter(Mandatory)][int] $Port,
+        [Parameter(Mandatory)][object] $Connection,
+        [AllowNull()][uri] $Endpoint
+    )
+
+    if ($ExpectedOwner -in @('minibook-backend', 'minibook-frontend')) {
+        $metadataPath = Join-Path $Root ".captain-cook/runtime/$ExpectedOwner.json"
+        if (-not (Test-Path -LiteralPath $metadataPath)) { return $false }
+        try {
+            $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+            if ([int]$metadata.Id -ne [int]$Connection.OwningProcess) { return $false }
+            $process = Get-Process -Id ([int]$metadata.Id) -ErrorAction Stop
+            if ($process.StartTime.ToUniversalTime().Ticks -ne [long]$metadata.StartTimeUtcTicks) { return $false }
+            if ($null -ne $Endpoint) {
+                $response = Invoke-WebRequest -Uri $Endpoint -Method Get -TimeoutSec 5 -UseBasicParsing
+                if ($response.StatusCode -lt 200 -or $response.StatusCode -ge 400) { return $false }
+            }
+            return $true
+        }
+        catch { return $false }
+    }
+
+    if ($ExpectedOwner -notin @('mailpit', 'mariadb', 'n8n')) { return $false }
+    $arguments = @(
+        'compose', '--project-directory', $Root, '--env-file', (Join-Path $Root '.env'),
+        'ps', '--format', 'json', $ExpectedOwner
+    )
+    try {
+        $commandResult = Common\Invoke-SetupCommand -FilePath 'docker' -ArgumentList $arguments
+        if ($commandResult.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace([string]$commandResult.Output)) { return $false }
+        $records = @($commandResult.Output | ConvertFrom-Json)
+        foreach ($record in $records) {
+            $publishedPorts = @($record.Publishers | Where-Object {
+                [int]$_.PublishedPort -eq $Port -and [string]$_.Protocol -eq 'tcp'
+            })
+            if ([string]$record.Service -ceq $ExpectedOwner -and
+                [string]$record.State -ceq 'running' -and
+                [string]$record.Health -ceq 'healthy' -and
+                $publishedPorts.Count -gt 0) {
+                return $true
+            }
+        }
+    }
+    catch { return $false }
+    $false
+}
+
 function Test-SetupPort {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][ValidateRange(1, 65535)][int] $Port,
-        [scriptblock] $ConnectionProvider = { param($candidatePort) Get-NetTCPConnection -State Listen -LocalPort $candidatePort -ErrorAction SilentlyContinue | Select-Object -First 1 }
+        [string] $Root = (Get-Location).Path,
+        [string] $ExpectedOwner,
+        [AllowNull()][uri] $ExpectedEndpoint,
+        [scriptblock] $ConnectionProvider = { param($candidatePort) Get-NetTCPConnection -State Listen -LocalPort $candidatePort -ErrorAction SilentlyContinue | Select-Object -First 1 },
+        [scriptblock] $OwnershipProvider = {
+            param($candidateRoot, $candidateOwner, $connection, $endpoint, $candidatePort)
+            Test-ExpectedSetupPortOwner -Root $candidateRoot -ExpectedOwner $candidateOwner `
+                -Port $candidatePort -Connection $connection -Endpoint $endpoint
+        }
     )
 
     $connection = & $ConnectionProvider $Port
     if ($null -eq $connection) {
         return New-SetupResult -Component "Port $Port" -Status 'Ready' -Message "Port $Port ist frei." -Remediation 'None'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedOwner)) {
+        try {
+            $isExpectedOwner = [bool](& $OwnershipProvider $Root $ExpectedOwner $connection $ExpectedEndpoint $Port)
+        }
+        catch { $isExpectedOwner = $false }
+        if ($isExpectedOwner) {
+            return New-SetupResult -Component "Port $Port" -Status 'Ready' `
+                -Message "Port $Port wird vom erwarteten Captain-Dienst $ExpectedOwner verwendet." `
+                -Remediation 'None' -Data @{ OwningProcess = $connection.OwningProcess; ExpectedOwner = $ExpectedOwner }
+        }
     }
     New-SetupResult -Component "Port $Port" -Status 'Invalid' -Message "Port $Port wird bereits verwendet." -Remediation 'Manual' -Data @{ OwningProcess = $connection.OwningProcess }
 }
@@ -182,24 +252,115 @@ function Confirm-InstalledPrerequisite {
         -Data @{ Path = [string]$pathProperty.Value }
 }
 
+function Get-PreflightConfigurationValue {
+    param(
+        [Parameter(Mandatory)][hashtable] $Configuration,
+        [Parameter(Mandatory)][string] $Name,
+        [Parameter(Mandatory)][string] $DefaultValue
+    )
+
+    if ($Configuration.ContainsKey($Name) -and
+        -not [string]::IsNullOrWhiteSpace([string]$Configuration[$Name])) {
+        return [string]$Configuration[$Name]
+    }
+    $DefaultValue
+}
+
+function Get-ConfiguredPreflightPorts {
+    param([Parameter(Mandatory)][hashtable] $Configuration)
+
+    $ports = [Collections.Generic.List[object]]::new()
+    foreach ($definition in @(
+        [pscustomobject]@{
+            ConfigurationKey = 'MINIBOOK_BACKEND_URL'; DefaultValue = 'http://localhost:3456'
+            ExpectedOwner = 'minibook-backend'; HealthPath = '/health'
+        }
+        [pscustomobject]@{
+            ConfigurationKey = 'MINIBOOK_PUBLIC_URL'; DefaultValue = 'http://localhost:3457'
+            ExpectedOwner = 'minibook-frontend'; HealthPath = '/api/v1/version'
+        }
+    )) {
+        $value = Get-PreflightConfigurationValue -Configuration $Configuration `
+            -Name $definition.ConfigurationKey -DefaultValue $definition.DefaultValue
+        try { $uri = [uri]$value }
+        catch { throw "Ungültige Preflight-Konfiguration für $($definition.ConfigurationKey)." }
+        if (-not $uri.IsAbsoluteUri) { throw "Ungültige Preflight-Konfiguration für $($definition.ConfigurationKey)." }
+        if (-not $uri.IsLoopback) { continue }
+        $endpoint = [uri]($uri.AbsoluteUri.TrimEnd('/') + $definition.HealthPath)
+        $ports.Add([pscustomobject]@{
+            Port = $uri.Port; ExpectedOwner = $definition.ExpectedOwner; ExpectedEndpoint = $endpoint
+        })
+    }
+
+    foreach ($definition in @(
+        [pscustomobject]@{ ConfigurationKey = 'MAILPIT_WEB_PORT'; DefaultValue = '8025'; ExpectedOwner = 'mailpit'; HealthPath = '/api/v1/info' }
+        [pscustomobject]@{ ConfigurationKey = 'MAILPIT_SMTP_PORT'; DefaultValue = '1025'; ExpectedOwner = 'mailpit'; HealthPath = $null }
+        [pscustomobject]@{ ConfigurationKey = 'MARIADB_PORT'; DefaultValue = '3306'; ExpectedOwner = 'mariadb'; HealthPath = $null }
+    )) {
+        $value = Get-PreflightConfigurationValue -Configuration $Configuration `
+            -Name $definition.ConfigurationKey -DefaultValue $definition.DefaultValue
+        $port = 0
+        if (-not [int]::TryParse($value, [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
+            throw "Ungültige Preflight-Konfiguration für $($definition.ConfigurationKey)."
+        }
+        $endpoint = if ($null -eq $definition.HealthPath) {
+            $null
+        }
+        else {
+            [uri]"http://localhost:$port$($definition.HealthPath)"
+        }
+        $ports.Add([pscustomobject]@{
+            Port = $port; ExpectedOwner = $definition.ExpectedOwner; ExpectedEndpoint = $endpoint
+        })
+    }
+
+    $n8nMode = Get-PreflightConfigurationValue -Configuration $Configuration `
+        -Name 'N8N_MODE' -DefaultValue 'external'
+    if ($n8nMode -ceq 'owned') {
+        $ports.Add([pscustomobject]@{
+            Port = 5678; ExpectedOwner = 'n8n'; ExpectedEndpoint = [uri]'http://localhost:5678/healthz'
+        })
+    }
+    elseif ($n8nMode -cne 'external') {
+        throw 'Ungültige Preflight-Konfiguration für N8N_MODE.'
+    }
+    $ports.ToArray()
+}
+
 function Get-PreflightResults {
     [CmdletBinding()]
     param(
         [string] $Root = (Get-Location).Path,
-        [hashtable] $Configuration = @{}
+        [hashtable] $Configuration = @{},
+        [scriptblock] $RequirementResultProvider = {
+            param($candidateRoot)
+            @(
+                Test-SetupPlatform
+                Test-SetupDiskSpace -Path $candidateRoot
+                Test-SetupNetwork
+                Test-SetupExecutable -Name 'git' -MinimumVersion '2.0'
+                Test-SetupExecutable -Name 'python' -MinimumVersion '3.11' -MaximumVersion '3.14'
+                Test-SetupExecutable -Name 'node' -MinimumVersion '20.0'
+                Test-SetupExecutable -Name 'docker' -MinimumVersion '20.0'
+                Test-DockerRuntime
+            )
+        },
+        [scriptblock] $PortConnectionProvider = { param($candidatePort) Get-NetTCPConnection -State Listen -LocalPort $candidatePort -ErrorAction SilentlyContinue | Select-Object -First 1 },
+        [scriptblock] $PortOwnershipProvider
     )
 
     $results = [Collections.Generic.List[object]]::new()
-    $results.Add((Test-SetupPlatform))
-    $results.Add((Test-SetupDiskSpace -Path $Root))
-    $results.Add((Test-SetupNetwork))
-    $results.Add((Test-SetupExecutable -Name 'git' -MinimumVersion '2.0'))
-    $results.Add((Test-SetupExecutable -Name 'python' -MinimumVersion '3.11' -MaximumVersion '3.14'))
-    $results.Add((Test-SetupExecutable -Name 'node' -MinimumVersion '20.0'))
-    $results.Add((Test-SetupExecutable -Name 'docker' -MinimumVersion '20.0'))
-    $results.Add((Test-DockerRuntime))
-    foreach ($port in @(3456, 3457, 5678, 8025, 1025, 3306)) {
-        $results.Add((Test-SetupPort -Port $port))
+    foreach ($result in @(& $RequirementResultProvider $Root)) { $results.Add($result) }
+    foreach ($portDefinition in @(Get-ConfiguredPreflightPorts -Configuration $Configuration)) {
+        $parameters = @{
+            Port = $portDefinition.Port
+            Root = $Root
+            ExpectedOwner = $portDefinition.ExpectedOwner
+            ExpectedEndpoint = $portDefinition.ExpectedEndpoint
+            ConnectionProvider = $PortConnectionProvider
+        }
+        if ($null -ne $PortOwnershipProvider) { $parameters.OwnershipProvider = $PortOwnershipProvider }
+        $results.Add((Test-SetupPort @parameters))
     }
     $results.ToArray()
 }

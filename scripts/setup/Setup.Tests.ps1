@@ -946,6 +946,146 @@ Describe 'Preflight' {
         $result.Data.OwningProcess | Should -Be 4242
     }
 
+    It 'accepts a healthy configured Captain listener on an idempotent lifecycle rerun' {
+        Set-Content -LiteralPath (Join-Path $TestDrive '.env.example') -Value @(
+            'MINIBOOK_BACKEND_URL=http://localhost:3456'
+            'MINIBOOK_PUBLIC_URL=http://localhost:3457'
+            'MAILPIT_WEB_PORT=8025'
+            'MAILPIT_SMTP_PORT=1025'
+            'MARIADB_PORT=3306'
+            'N8N_MODE=owned'
+        )
+        Set-Content -LiteralPath (Join-Path $TestDrive '.env') -Value @(
+            'MINIBOOK_BACKEND_URL=http://localhost:4456'
+            'MINIBOOK_PUBLIC_URL=http://localhost:4457'
+            'N8N_MODE=external'
+            'MARIADB_PASSWORD=must-not-enter-preflight-results'
+        )
+        $observed = [pscustomobject]@{ Configuration = $null; Results = $null; OwnershipCalls = 0 }
+        $requirementProvider = {
+            New-SetupResult -Component 'Requirements' -Status 'Ready' -Message 'requirements ready' -Remediation 'None'
+        }
+        $connectionProvider = {
+            param($port)
+            if ($port -eq 4456) { [pscustomobject]@{ OwningProcess = 4242 } }
+        }
+        $ownershipProvider = {
+            param($root, $expectedOwner, $connection, $endpoint)
+            $observed.OwnershipCalls++
+            $expectedOwner -eq 'minibook-backend' -and
+                $connection.OwningProcess -eq 4242 -and
+                $endpoint.AbsoluteUri -eq 'http://localhost:4456/health'
+        }
+        $resultProvider = {
+            param($root, $configuration)
+            $observed.Configuration = $configuration
+            $observed.Results = @(Get-PreflightResults -Root $root -Configuration $configuration `
+                -RequirementResultProvider $requirementProvider `
+                -PortConnectionProvider $connectionProvider `
+                -PortOwnershipProvider $ownershipProvider)
+            $observed.Results
+        }
+
+        $result = Invoke-DefaultSetupStage -Stage 'Preflight' -Context @{
+            Root = $TestDrive
+            PreflightResultProvider = $resultProvider
+        }
+
+        $result.Status | Should -Be 'Complete'
+        $observed.Configuration.MINIBOOK_BACKEND_URL | Should -Be 'http://localhost:4456'
+        $observed.Configuration.ContainsKey('MARIADB_PASSWORD') | Should -BeFalse
+        $observed.Results.Component | Should -Contain 'Port 4456'
+        $observed.Results.Component | Should -Not -Contain 'Port 3456'
+        ($observed.Results | Where-Object Component -eq 'Port 4456').Status | Should -Be 'Ready'
+        $observed.OwnershipCalls | Should -Be 1
+    }
+
+    It 'ignores the owned n8n port when lifecycle selects external n8n' {
+        Set-Content -LiteralPath (Join-Path $TestDrive '.env.example') -Value @(
+            'MINIBOOK_BACKEND_URL=http://localhost:3456'
+            'MINIBOOK_PUBLIC_URL=http://localhost:3457'
+            'MAILPIT_WEB_PORT=8025'
+            'MAILPIT_SMTP_PORT=1025'
+            'MARIADB_PORT=3306'
+            'N8N_MODE=owned'
+            'N8N_URL=http://localhost:5678'
+        )
+        Set-Content -LiteralPath (Join-Path $TestDrive '.env') -Value @(
+            'N8N_MODE=external'
+            'N8N_URL=http://localhost:15678'
+            'MARIADB_ROOT_PASSWORD=must-not-enter-preflight-results'
+        )
+        $checkedPorts = [Collections.Generic.List[int]]::new()
+        $observed = [pscustomobject]@{ Configuration = $null; Results = $null }
+        $requirementProvider = {
+            New-SetupResult -Component 'Requirements' -Status 'Ready' -Message 'requirements ready' -Remediation 'None'
+        }
+        $connectionProvider = {
+            param($port)
+            $checkedPorts.Add($port)
+            if ($port -eq 5678) { [pscustomobject]@{ OwningProcess = 9191 } }
+        }
+        $resultProvider = {
+            param($root, $configuration)
+            $observed.Configuration = $configuration
+            $observed.Results = @(Get-PreflightResults -Root $root -Configuration $configuration `
+                -RequirementResultProvider $requirementProvider `
+                -PortConnectionProvider $connectionProvider `
+                -PortOwnershipProvider { throw 'No occupied relevant port should require ownership validation.' })
+            $observed.Results
+        }
+
+        $result = Invoke-DefaultSetupStage -Stage 'Preflight' -Context @{
+            Root = $TestDrive
+            PreflightResultProvider = $resultProvider
+        }
+
+        $result.Status | Should -Be 'Complete'
+        $observed.Configuration.N8N_MODE | Should -Be 'external'
+        $observed.Configuration.N8N_URL | Should -Be 'http://localhost:15678'
+        $observed.Configuration.ContainsKey('MARIADB_ROOT_PASSWORD') | Should -BeFalse
+        $checkedPorts | Should -Not -Contain 5678
+        $observed.Results.Component | Should -Not -Contain 'Port 5678'
+    }
+
+    It 'fails closed for a configured port listener with an unknown owner' {
+        Set-Content -LiteralPath (Join-Path $TestDrive '.env.example') -Value @(
+            'MINIBOOK_BACKEND_URL=http://localhost:3456'
+            'MINIBOOK_PUBLIC_URL=http://localhost:3457'
+            'MAILPIT_WEB_PORT=8025'
+            'MAILPIT_SMTP_PORT=1025'
+            'MARIADB_PORT=3306'
+            'N8N_MODE=external'
+        )
+        Set-Content -LiteralPath (Join-Path $TestDrive '.env') -Value 'MINIBOOK_BACKEND_URL=http://localhost:4456'
+        $observed = [pscustomobject]@{ Results = $null }
+        $requirementProvider = {
+            New-SetupResult -Component 'Requirements' -Status 'Ready' -Message 'requirements ready' -Remediation 'None'
+        }
+        $resultProvider = {
+            param($root, $configuration)
+            $observed.Results = @(Get-PreflightResults -Root $root -Configuration $configuration `
+                -RequirementResultProvider $requirementProvider `
+                -PortConnectionProvider {
+                    param($port)
+                    if ($port -eq 4456) { [pscustomobject]@{ OwningProcess = 4242 } }
+                } `
+                -PortOwnershipProvider { $false })
+            $observed.Results
+        }
+
+        $result = Invoke-DefaultSetupStage -Stage 'Preflight' -Context @{
+            Root = $TestDrive
+            PreflightResultProvider = $resultProvider
+        }
+
+        $result.Status | Should -Be 'Failed'
+        $portResult = $observed.Results | Where-Object Component -eq 'Port 4456'
+        $portResult.Status | Should -Be 'Invalid'
+        $portResult.Remediation | Should -Be 'Manual'
+        $portResult.Data.OwningProcess | Should -Be 4242
+    }
+
     It 'uses only approved winget package identifiers' {
         $calls = [Collections.Generic.List[object]]::new()
 
