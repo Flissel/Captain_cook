@@ -93,7 +93,7 @@ verification and commit checkbox must also be complete.
 - Produces: a clean development install with pytest and a measured coverage
   floor; no global Python package is part of the test contract.
 
-- [ ] **Step 1: Add failing manifest tests**
+- [x] **Step 1: Add failing manifest tests**
 
 Parse non-comment requirement lines and assert normalized runtime package names
 are unique. Assert `requirements-dev.txt` includes `-r requirements.txt`,
@@ -104,7 +104,7 @@ Run: `python -m pytest -q tests/test_import_boundaries.py`
 Expected: FAIL because `fastapi==0.139.0` occurs twice and the development
 manifest does not exist.
 
-- [ ] **Step 2: Create the development manifest and coverage floor**
+- [x] **Step 2: Create the development manifest and coverage floor**
 
 Remove only the duplicate FastAPI line. Create the development manifest with
 the four exact lines above. Configure pytest-cov for `agenten`, `blockchain`,
@@ -112,7 +112,7 @@ and `gateway`, terminal missing-line output, and `--cov-fail-under=70`. The
 audited service-independent baseline is 75%, so this prevents a five-point
 regression without claiming complete legacy coverage.
 
-- [ ] **Step 3: Prove a disposable clean install**
+- [x] **Step 3: Prove a disposable clean install**
 
 ```powershell
 python -m venv .captain-cook/verification-venv
@@ -125,7 +125,7 @@ Expected: `pip check` reports no broken requirements; tests pass. Record all
 service-dependent skips. Task 6 must later execute every MariaDB/gateway test
 with zero skips.
 
-- [ ] **Step 4: Update contributor commands and commit**
+- [x] **Step 4: Update contributor commands and commit**
 
 Point `AGENTS.md` at the project venv and development manifest while keeping
 runtime setup on `requirements.txt`.

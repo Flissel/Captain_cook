@@ -111,7 +111,7 @@ SHAs before either worker begins.
   - Gate: `git diff --check`, plan presence, architecture/workstream tests, and
     a clean worktree.
 
-- [ ] **P01 — Reproducible development environment**
+- [x] **P01 — Reproducible development environment**
   - Branch: `build/reproducible-test-env`
   - Source: System Task 0.
   - Owns: `requirements-dev.txt`, `requirements.txt`, `pytest.ini`,
@@ -332,3 +332,8 @@ For every packet, the orchestrator must:
 - P00 baseline evidence: 219 tests passed and 23 service-dependent tests
   skipped. P03 owns the zero-skip MariaDB/gateway proof; P20 owns the tracked
   Starlette/`httpx` and `requests` compatibility warnings.
+- P01 clean-environment evidence: Python 3.11.0 installed both manifests,
+  `pip check` reported no broken requirements, 217 tests passed, 24 were
+  explicitly reported as service/compatibility skips, one Starlette warning
+  remained visible, and measured coverage was 74.76% against the 70% floor.
+  Specification and code-quality reviews both passed before integration.
