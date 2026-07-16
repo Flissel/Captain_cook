@@ -1,7 +1,7 @@
 """Structured LLM adapters for Captain batch alignment and enrichment."""
 
 import json
-from typing import List
+from typing import List, Sequence
 
 from autogen_agentchat.agents import AssistantAgent
 from autogen_core.models import ChatCompletionClient
@@ -28,7 +28,18 @@ acceptance assertions. Produce useful build-visible golden examples and separate
 Golden and holdout case ids and values must not overlap. Do not mention or assume a particular executor."""
 
 
-def make_llm_align(model_client: ChatCompletionClient) -> Align:
+def make_llm_align(
+    model_client: ChatCompletionClient,
+    allowed_targets: Sequence[str] | None = None,
+) -> Align:
+    target_instruction = ""
+    if allowed_targets:
+        target_instruction = (
+            " Assign every batch exactly one target from this allowlist: "
+            + ", ".join(sorted(set(allowed_targets)))
+            + "."
+        )
+
     async def align(
         project_description: str,
         subtasks: List[PlannedSubtask],
@@ -37,7 +48,7 @@ def make_llm_align(model_client: ChatCompletionClient) -> Align:
         agent = AssistantAgent(
             name="batch_aligner",
             model_client=model_client,
-            system_message=_ALIGN_SYSTEM_MESSAGE,
+            system_message=_ALIGN_SYSTEM_MESSAGE + target_instruction,
             output_content_type=AlignmentPlan,
         )
         payload = {

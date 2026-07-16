@@ -10,6 +10,7 @@ from typing import List, Optional, Sequence
 from autogen_core.models import ChatCompletionClient
 
 from agenten.llm.model_client import build_model_client
+from agenten.planning.autonomous import AutonomousCaptainPlanner
 from agenten.planning.factory import build_captain_pipeline
 
 
@@ -31,7 +32,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--target",
         default="external",
-        help="configured executor target label; the LLM does not choose it",
+        help="default executor target label",
+    )
+    parser.add_argument(
+        "--allowed-target",
+        action="append",
+        dest="allowed_targets",
+        help="allowlisted executor target (repeat for a mixed-target DAG)",
     )
     parser.add_argument(
         "--capability",
@@ -50,20 +57,27 @@ async def async_main(
     model_client: Optional[ChatCompletionClient] = None,
 ) -> int:
     args = build_parser().parse_args(argv)
-    project_description = args.project.read_text(encoding="utf-8")
     client = model_client if model_client is not None else build_model_client(model=args.model)
     pipeline = build_captain_pipeline(
         model_client=client,
         output_dir=args.output,
         target=args.target,
+        allowed_targets=list(args.allowed_targets) if args.allowed_targets else None,
         known_capability_tags=list(args.capabilities),
     )
-    result = await pipeline.run(project_description)
+    result = await AutonomousCaptainPlanner(
+        pipeline=pipeline,
+        output_dir=args.output,
+    ).run(args.project, source_reference=args.project.name)
     print(
         json.dumps(
             {
                 "output": str(args.output.resolve()),
-                "released_batches": [batch.batch_id for batch in result.batches],
+                "canonical_plan_id": result.plan.plan_id,
+                "released_batches": [
+                    package.batch_id for package in result.plan.work_packages
+                ],
+                "worker_pool": list(result.plan.worker_pool),
             },
             ensure_ascii=False,
         )

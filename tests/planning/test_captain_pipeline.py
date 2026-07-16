@@ -171,3 +171,82 @@ async def test_pipeline_derives_capability_reuse_from_resolver_not_the_llm() -> 
     result = await pipeline.run("Reuse a validated delivery capability")
 
     assert result.batches[0].satisfied_by == "validated-capability:delivery-v2"
+
+
+@pytest.mark.asyncio
+async def test_compile_returns_complete_reviewable_contract_without_publishing() -> None:
+    async def decompose(_: str) -> List[PlannedSubtask]:
+        return [PlannedSubtask(subtask_id="s1", description="Delivery")]
+
+    async def align(_: str, __: List[PlannedSubtask], ___: str) -> AlignmentPlan:
+        return AlignmentPlan(
+            batches=[BatchDraft(batch_id="delivery", title="Delivery", subtask_ids=["s1"])]
+        )
+
+    async def enrich(
+        _: str, draft: BatchDraft, __: List[PlannedSubtask]
+    ) -> BatchEnrichment:
+        return enrichment_for(draft)
+
+    releases = RecordingReleaseClient()
+    pipeline = CaptainPipeline(
+        decompose=decompose,
+        align=align,
+        enrich=enrich,
+        release_client=releases,
+        target="external",
+    )
+
+    compiled = await pipeline.compile("Build a delivery system")
+
+    assert [batch.batch_id for batch in compiled.batches] == ["delivery"]
+    assert compiled.holdouts[0].batch_id == "delivery"
+    assert compiled.holdouts[0].cases[0].input == {"hidden": True}
+    assert releases.releases == []
+
+
+@pytest.mark.asyncio
+async def test_compile_supports_a_mixed_n8n_and_autogen_dependency_dag() -> None:
+    subtasks = [
+        PlannedSubtask(subtask_id="s1", description="Build the n8n tool"),
+        PlannedSubtask(subtask_id="s2", description="Build the AutoGen team"),
+    ]
+
+    async def decompose(_: str) -> List[PlannedSubtask]:
+        return subtasks
+
+    async def align(_: str, __: List[PlannedSubtask], ___: str) -> AlignmentPlan:
+        return AlignmentPlan(
+            batches=[
+                BatchDraft(
+                    batch_id="lead-tool",
+                    title="Lead Tool",
+                    subtask_ids=["s1"],
+                    target="n8n",
+                ),
+                BatchDraft(
+                    batch_id="sales-team",
+                    title="Sales Team",
+                    subtask_ids=["s2"],
+                    depends_on=["lead-tool"],
+                    target="autogen",
+                ),
+            ]
+        )
+
+    async def enrich(
+        _: str, draft: BatchDraft, __: List[PlannedSubtask]
+    ) -> BatchEnrichment:
+        return enrichment_for(draft)
+
+    compiled = await CaptainPipeline(
+        decompose=decompose,
+        align=align,
+        enrich=enrich,
+        release_client=RecordingReleaseClient(),
+        target="n8n",
+        allowed_targets=frozenset({"n8n", "autogen"}),
+    ).compile("Build two n8n tools and one dependent AutoGen team")
+
+    assert [batch.target for batch in compiled.batches] == ["n8n", "autogen"]
+    assert compiled.batches[1].depends_on == ["lead-tool"]

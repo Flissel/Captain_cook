@@ -57,12 +57,12 @@ P06 candidate `5db62f8` is specification FAIL: the real preflight ignores its
 configuration and treats every occupied fixed port as foreign, breaking healthy
 reruns and external-n8n mode. Repair attempt 1/3 is active.
 
-P09 repair candidate `7fbd2c3` is clean and contains the requested run-wide
-holdout isolation and canonical-tag changes. Fresh specification review is
-FAIL: a later `WorkBatch` contract error can occur after an earlier batch was
-already released. The candidate needs a compile-all-before-release regression
-and repair. Four P09 paths overlap the local AF01 candidate, so neither
-candidate may be integrated by a blind merge or cherry-pick.
+P09 repair candidate `51cfb69` adds atomic contract compilation, a defensive
+resolver boundary, and deep release-boundary copies. Its repair-4 RED/GREEN
+regression proves a mutating release adapter no longer corrupts the canonical
+result. Fresh specification and quality reviews are PASS. Four P09 paths
+overlap the local AF01 candidate, so integration now requires an explicit
+conflict resolution followed by combined gates; no blind merge or cherry-pick.
 
 P07C remains blocked by P07B. P08 remains blocked by P07C. P10 remains blocked
 by P09.
@@ -124,16 +124,16 @@ WORKER_LIMIT: live winget/PATH acceptance intentionally not claimed
 SPEC_REVIEW: FAIL - production preflight is configuration/ownership blind
 
 HANDOFF TO WORKER 3: P09
-STATE: REPAIR_ATTEMPT_2_IN_PROGRESS
+STATE: READY_FOR_AF01_RECONCILIATION
 LOCK: LOCK_PLANNING
 BRANCH: feat/captain-planning-policy
 WORKTREE: C:\Users\User\Desktop\Captain_cook\.worktrees\captain-planning-policy
 PROMPT: docs/superpowers/prompts/2026-07-16-worker-goals.md#handoff-to-worker-3--p09
-CANDIDATE_SHA: 7fbd2c3ec940109c543b1281bc84d06532820666
-WORKER_GATE: 9 focused plus 12 architecture/import tests passed; compileall passed
+CANDIDATE_SHA: 51cfb69cb92605412a0dc204b5092f0733836790
+WORKER_GATE: 17 focused plus 15 architecture/import/workstream tests passed; compileall passed
 WORKER_LIMIT: integrated full suite must rerun after the P07B basename-collision fix lands
-SPEC_REVIEW: FAIL - later contract validation can follow an earlier release
-QUALITY_REVIEW: PASS - no Critical/Important findings; 15 focused plus 15 architecture/import tests and compileall passed
+SPEC_REVIEW: PASS
+QUALITY_REVIEW: PASS
 
 HANDOFF TO WORKER 4: P15
 STATE: INTEGRATED

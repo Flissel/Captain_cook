@@ -1,5 +1,52 @@
 # Architecture: extension points
 
+## Agent-Factory process boundaries
+
+The Agent-Factory path is split into three independently composed process
+contracts. They exchange frozen, versioned data; none imports the next stage's
+implementation. The local candidate runs these stages in one Python runtime;
+production OS-process isolation remains a release gate below.
+
+```text
+UTF-8 input.md
+  -> MarkdownProjectInputParser
+     (exact bytes, SHA-256, safe logical source name, heading outline)
+  -> CaptainPipeline.compile
+     (decompose, align, enrich, policy-check; no publication)
+  -> CanonicalPlanCompiler
+     (stable topological order, one disposition, five-worker pool, handoffs)
+  -> CanonicalPlanPublisher
+     (one atomic source + plans + contracts + isolated holdouts bundle)
+  -> PlanReviewProcess
+     (immutable plan in, typed findings and review_id out)
+  -> trusted ReviewDecisionReader
+  -> ExecutionProcess
+     (review, capability, dependency, and validation projections required)
+  -> ArtifactReviewProcess
+     (content-addressed references only; no build workspace path)
+```
+
+Ownership is enforced as follows:
+
+- `agenten/planning/input_parser.py` performs deterministic input I/O and has
+  no LLM, Docker, gateway, Minibook, or execution dependency.
+- `agenten/planning/captain_pipeline.py` now exposes `compile()` separately
+  from its compatibility `run()` publisher path.
+- `agenten/planning/canonical_contracts.py` is the cross-process contract
+  module. Review and execution must not import the canonical publisher.
+- `agenten/review/` can produce decisions and content-addressed findings but
+  has no execution, release, delivery, gateway-write, or storage import.
+- `agenten/execution/` consumes a review through a trusted read port and only
+  unlocks dependencies after independent validation evidence. A static
+  `satisfied_by` value is insufficient without a validated capability
+  projection.
+
+The JSON publisher is an offline evidence adapter, not production authority.
+Production plan/review/capability/validation projections still have to be
+implemented through the sole-writer MariaDB Ledger Gateway. In-process review
+callbacks prove contract separation but do not yet prove OS-level sandboxing;
+the production reviewer must run in a restricted separate process.
+
 This project has two things that are meant to grow over time: the **ledger**
 (`blockchain/`) that records what tasks/decisions exist, and the **agent
 logic** (`agenten/`) that produces and refines them. Both were previously

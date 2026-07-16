@@ -1,7 +1,7 @@
 # Agent-Factory program index
 
-Status: **planning and architecture audit in progress; implementation release
-not authorized**.
+Status: **process-boundary implementation candidate present; integration and
+release not authorized**.
 
 This index is the canonical entry point for the Agent-Factory objective. The
 existing remediation program remains authoritative for shared runtime,
@@ -29,6 +29,11 @@ gateway, setup, branch, and integration work.
 
 ## Current evidence and gaps
 
+- The current candidate adds immutable input provenance, autonomous canonical
+  plan compilation/publication, exact five-worker handoffs, independent plan
+  and artifact review contracts, and fail-closed execution projections. Its
+  focused tests are recorded in the dated autonomous-process plan; it is not
+  yet an integrated or released packet.
 - The root `agenten/planning` pipeline can decompose, align, enrich, and release
   validated JSON work-batch and holdout contracts; it does not generate an
   AutoGen team.
@@ -47,8 +52,8 @@ gateway, setup, branch, and integration work.
 
 ## Immediate sequence
 
-1. Complete and review AF00/AF01 without changing Agent-Factory production
-   behavior.
+1. Independently review and integrate the autonomous-process candidate without
+   bypassing the active planning branch lock.
 2. Finish the already-dispatched remediation packets and integrate only after
    independent spec and quality reviews.
 3. Dispatch AF02 onward through isolated workers using the lock/dependency rules
