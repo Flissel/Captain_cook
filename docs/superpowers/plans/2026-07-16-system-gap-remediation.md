@@ -583,7 +583,7 @@ git commit -m "feat: validate complete system health"
 - Consumes: Docker Compose v2 and existing `TEST_MARIADB_DSN` pytest fixtures.
 - Produces: `pwsh -File scripts/test_gateway.ps1`, which exits non-zero on failures or skips.
 
-- [ ] **Step 1: Add the isolated Compose service**
+- [x] **Step 1: Add the isolated Compose service**
 
 Create `docker-compose.test.yml`:
 
@@ -617,7 +617,7 @@ reject `ledger`, `captain_ledger`, an empty path, and malformed DSNs. When
 `REQUIRE_MARIADB_TESTS=1`, a missing DSN is a collection error instead of a
 skip. Cover the guard in `tests/test_mariadb_test_guard.py`.
 
-- [ ] **Step 2: Write the gate script and initially verify it detects skips**
+- [x] **Step 2: Write the gate script and initially verify it detects skips**
 
 Implement `scripts/test_gateway.ps1` to:
 
@@ -640,7 +640,7 @@ Implement `scripts/test_gateway.ps1` to:
 
 Run before setting the DSN inside the script once and confirm the script rejects the 22 skips. Then enable the DSN assignment.
 
-- [ ] **Step 3: Run the real database contracts**
+- [x] **Step 3: Run the real database contracts**
 
 Run:
 
@@ -1147,6 +1147,14 @@ Populate this table only with fresh evidence from Task 11.
 - Decision: Revalidate completed stages, make the database gate mandatory, and manage all seven findings through this master plan.
 - Consolidated into: `Task 1, Steps 1–4`; `Task 6, Steps 1–5`; `Final acceptance evidence`.
 - Supersedes: none.
+
+### 2026-07-16 03:02 Europe/Berlin — Isolated MariaDB/gateway gate
+
+- Evidence: candidate `45ea024` passed independent specification and quality reviews; `pwsh -NoProfile -File scripts/test_gateway.ps1` on integration commit `d400d9e` reported 22 database/gateway tests passed with zero skips, then 261 non-live tests passed with two classified degradation skips, one live deselection, and 80.54% coverage.
+- Insight: the gate safely distinguishes required database evidence from known non-database degradation, and always removes its isolated Compose resources without restarting Captain MariaDB/Mailpit or external VibeMind n8n.
+- Decision: complete Task 6 Steps 1–3 only; CI, cross-platform execution, and final workflow evidence remain open in Steps 4–6 under P20.
+- Consolidated into: `Task 6, Steps 1–3`; `Final acceptance evidence`.
+- Supersedes: the prior service-skipped database baseline for local P03 evidence; P20 still owns CI and final live-gate refresh.
 
 ### Example for the next implementation session
 

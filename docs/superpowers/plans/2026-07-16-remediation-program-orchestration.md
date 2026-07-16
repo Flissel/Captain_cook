@@ -131,7 +131,7 @@ SHAs before either worker begins.
     `minibook/tests/test_admin_auth.py`.
   - Gate: Minibook authentication suite and root regression suite.
 
-- [ ] **P03 — Isolated MariaDB/gateway test harness**
+- [x] **P03 — Isolated MariaDB/gateway test harness**
   - Branch: `test/isolated-mariadb-gateway`; source: System Task 6 steps 1-3;
     requires P01.
   - Owns exactly: `docker-compose.test.yml`, `scripts/test_gateway.ps1`,
@@ -357,3 +357,10 @@ For every packet, the orchestrator must:
   a Minibook `live` test and wrote test records to a reachable local service.
   No deletion was attempted. Default pytest now excludes `live`; P20 must
   select each authorized live system explicitly and prove cleanup/isolation.
+- P03 integrated candidate `45ea024` after disjoint-path and conflict checks,
+  specification PASS, and code-quality PASS. The gate on integration commit
+  `d400d9e` executed all 22 MariaDB/gateway tests with zero skips; the complete
+  non-live suite passed 261 tests with two explicitly allowed degradation
+  skips, one live deselection, one pre-existing Starlette warning, and 80.54%
+  coverage. The `captain-cook-test` resources were removed, while Captain's
+  MariaDB/Mailpit and external VibeMind n8n retained their start times.
