@@ -57,8 +57,15 @@ def test_agent_factory_program_has_a_canonical_input_and_spec_index():
     for specification in (
         "requirements.md",
         "architecture.md",
+        "audit.md",
         "implementation.md",
         "test-spec.md",
     ):
         assert Path("plans", specification).is_file()
         assert f"({specification})" in index
+
+    audit = Path("plans/audit.md").read_text(encoding="utf-8")
+    assert "availableInMCP: false" in audit
+    assert "docker compose down -v" in audit
+    assert "Safe minimum" in audit
+    assert "User decision" in audit

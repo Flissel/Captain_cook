@@ -13,6 +13,7 @@ gateway, setup, branch, and integration work.
 |---|---|---|
 | [Requirements](requirements.md) | Functional and quality requirements | Drafted from `input.md` |
 | [Architecture](architecture.md) | Component authority, ports, data flow, current gaps | Evidence-based draft |
+| [Audit snapshot](audit.md) | Repository and connected-system evidence, blockers, decisions | In progress |
 | [Implementation](implementation.md) | Dependency-ordered work packages and acceptance criteria | Ready for review |
 | [Test specification](test-spec.md) | Unit, contract, integration, E2E, evaluation, and release gates | Ready for review |
 
@@ -40,6 +41,9 @@ gateway, setup, branch, and integration work.
   exposed through n8n MCP is not yet a proven end-to-end interface.
 - A common trace-ID contract, isolated generated-code validation gate, three-run
   E2E release proof, evaluation report, and sub-three-minute demo remain open.
+- The connected n8n instance exposes ten workflow cards, but every workflow has
+  MCP visibility disabled. The relevant active `captain-gate-a-mailpit`
+  workflow cannot yet be inspected for contract reuse.
 
 ## Immediate sequence
 
