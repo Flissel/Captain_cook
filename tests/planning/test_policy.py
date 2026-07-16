@@ -17,7 +17,7 @@ def enrichment_fixture(
 ) -> BatchEnrichment:
     return BatchEnrichment(
         goal="Deliver a verified result",
-        capability_tags=capability_tags or ["delivery"],
+        capability_tags=["delivery"] if capability_tags is None else capability_tags,
         acceptance_criteria=[
             AcceptanceAssertion(
                 assertion_id="done",
@@ -25,12 +25,16 @@ def enrichment_fixture(
                 expected="succeeded",
             )
         ],
-        golden_cases=golden_cases or [
-            ExampleCase(case_id="visible", input={"score": 82})
-        ],
-        holdout_cases=holdout_cases or [
-            ExampleCase(case_id="hidden", input={"score": 91})
-        ],
+        golden_cases=(
+            [ExampleCase(case_id="visible", input={"score": 82})]
+            if golden_cases is None
+            else golden_cases
+        ),
+        holdout_cases=(
+            [ExampleCase(case_id="hidden", input={"score": 91})]
+            if holdout_cases is None
+            else holdout_cases
+        ),
     )
 
 
@@ -51,6 +55,15 @@ def test_policy_rejects_same_case_content_under_different_ids() -> None:
 
     with pytest.raises(PlanningPolicyError, match="holdout content overlaps"):
         policy.validate_enrichment(enrichment)
+
+
+def test_policy_rejects_duplicate_capability_tags() -> None:
+    policy = PlanningPolicy(frozenset({"delivery"}))
+
+    with pytest.raises(PlanningPolicyError, match="duplicate capability tags.*delivery"):
+        policy.validate_enrichment(
+            enrichment_fixture(capability_tags=["delivery", "delivery"])
+        )
 
 
 def test_policy_fingerprint_is_canonical_for_nested_json_ordering() -> None:
