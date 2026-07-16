@@ -85,6 +85,10 @@ async def test_fenced_writes_send_claim_token_and_typed_payloads() -> None:
             outcome="succeeded",
             capabilities=["crm", "delivery"],
             artifact_ref="artifact://validated/1",
+            target="n8n",
+            runtime="n8n",
+            runtime_version="v1",
+            interface_schema="captain-n8n-artifact/v1",
         )
 
     assert expiry == datetime(2026, 7, 16, 12, 30, tzinfo=timezone.utc)
@@ -107,6 +111,10 @@ async def test_fenced_writes_send_claim_token_and_typed_payloads() -> None:
         "outcome": "succeeded",
         "capabilities": ["crm", "delivery"],
         "artifact_ref": "artifact://validated/1",
+        "target": "n8n",
+        "runtime": "n8n",
+        "runtime_version": "v1",
+        "interface_schema": "captain-n8n-artifact/v1",
     }
 
 
@@ -146,6 +154,20 @@ async def test_append_evidence_accepts_only_typed_lifecycle_evidence() -> None:
         GatewayEvidence(kind="codex_session", iteration=2)
     with pytest.raises(ValueError, match="artifact_ref"):
         GatewayEvidence(kind="validation_run", iteration=2)
+
+
+@pytest.mark.asyncio
+async def test_validated_artifact_requires_complete_compatibility_metadata() -> None:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: None)) as http:
+        client = GatewayDeliveryClient("http://gateway", "worker-secret", http)
+        with pytest.raises(ValueError, match="compatibility metadata"):
+            await client.complete(
+                "batch-1",
+                "claim-secret",
+                outcome="succeeded",
+                capabilities=["delivery"],
+                artifact_ref="artifact://validated/1",
+            )
 
 
 @pytest.mark.asyncio

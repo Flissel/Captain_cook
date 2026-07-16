@@ -26,6 +26,17 @@ class _CapabilityResponse(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     artifact_ref: str | None = None
+    data: "_CapabilityData"
+
+
+class _CapabilityData(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    target: str | None = None
+    runtime: str | None = None
+    runtime_version: str | None = None
+    interface_schema: str | None = None
+    capabilities: list[str] = Field(default_factory=list)
 
 
 _CAPABILITIES = TypeAdapter(list[_CapabilityResponse])
@@ -84,8 +95,17 @@ class GatewayPlanningClient:
             matches = _CAPABILITIES.validate_python(response.json())
         except (ValueError, ValidationError):
             raise GatewayPlanningError("query capabilities returned an invalid response") from None
+        expected_interface = f"captain-{target}-artifact/v1"
+        requested_capabilities = set(capability_tags)
         for match in matches:
-            if match.artifact_ref:
+            compatible = (
+                match.data.target == target
+                and match.data.runtime == target
+                and match.data.runtime_version == "v1"
+                and match.data.interface_schema == expected_interface
+                and requested_capabilities.issubset(match.data.capabilities)
+            )
+            if compatible and match.artifact_ref:
                 return match.artifact_ref
         return None
 

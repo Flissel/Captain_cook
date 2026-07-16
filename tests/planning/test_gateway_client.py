@@ -90,7 +90,30 @@ async def test_find_match_uses_authenticated_capability_query() -> None:
         observed.append(request)
         return httpx.Response(
             200,
-            json=[{"batch_id": "old", "artifact_ref": "artifact://validated/old", "data": {}}],
+            json=[
+                {
+                    "batch_id": "old",
+                    "artifact_ref": "artifact://wrong-target",
+                    "data": {
+                        "target": "autogen",
+                        "runtime": "autogen",
+                        "runtime_version": "v1",
+                        "interface_schema": "captain-autogen-artifact/v1",
+                        "capabilities": ["crm", "delivery"],
+                    },
+                },
+                {
+                    "batch_id": "compatible",
+                    "artifact_ref": "artifact://validated/old",
+                    "data": {
+                        "target": "n8n",
+                        "runtime": "n8n",
+                        "runtime_version": "v1",
+                        "interface_schema": "captain-n8n-artifact/v1",
+                        "capabilities": ["delivery", "crm"],
+                    },
+                },
+            ],
             request=request,
         )
 
