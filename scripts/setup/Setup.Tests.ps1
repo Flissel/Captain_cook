@@ -12,6 +12,9 @@ BeforeAll {
     if (Test-Path "$PSScriptRoot/Components.psm1") {
         Import-Module "$PSScriptRoot/Components.psm1" -Force
     }
+    if (Test-Path "$PSScriptRoot/Repository.psm1") {
+        Import-Module "$PSScriptRoot/Repository.psm1" -Force
+    }
     if (Test-Path "$PSScriptRoot/StageValidation.psm1") {
         Import-Module "$PSScriptRoot/StageValidation.psm1" -Force
     }
@@ -75,6 +78,360 @@ Describe 'Guided orchestration' {
 
         $result.Status | Should -Be 'Failed'
         $result.Data.Results.Count | Should -Be 2
+    }
+}
+
+Describe 'Repository bootstrap and external n8n ownership' {
+    It 'defaults a new configuration to the declared external n8n endpoints' {
+        Copy-Item -LiteralPath "$PSScriptRoot/../../.env.example" `
+            -Destination (Join-Path $TestDrive '.env.example')
+
+        $result = Initialize-SetupConfiguration -Root $TestDrive -SecretPathValidator { $true }
+
+        $result.Status | Should -Be 'Ready'
+        $result.Data.Values.N8N_MODE | Should -Be 'external'
+        $result.Data.Values.N8N_URL | Should -Be 'http://localhost:15678'
+        $result.Data.Values.N8N_CONTAINER_URL | Should -Be 'http://host.docker.internal:15678'
+    }
+
+    It 'skips Git when the Hermes submodule is already present' {
+        $calls = [Collections.Generic.List[object]]::new()
+
+        $result = Initialize-SetupSubmodules -Root $TestDrive -HermesProbe { $true } -CommandRunner {
+            param($filePath, $argumentList, $workingDirectory)
+            $calls.Add([pscustomobject]@{ FilePath = $filePath; Arguments = $argumentList; Directory = $workingDirectory })
+            [pscustomobject]@{ ExitCode = 0; Output = 'unused' }
+        }
+
+        $result.Status | Should -Be 'Ready'
+        $calls.Count | Should -Be 0
+    }
+
+    It 'initializes declared submodules exactly once without destructive Git verbs' {
+        $calls = [Collections.Generic.List[object]]::new()
+        $probeState = [pscustomobject]@{ Calls = 0 }
+
+        $result = Initialize-SetupSubmodules -Root $TestDrive -HermesProbe {
+            param($candidateRoot)
+            $probeState.Calls++
+            $probeState.Calls -gt 1
+        } -CommandRunner {
+            param($filePath, $argumentList, $workingDirectory)
+            $calls.Add([pscustomobject]@{ FilePath = $filePath; Arguments = @($argumentList); Directory = $workingDirectory })
+            [pscustomobject]@{ ExitCode = 0; Output = 'ok' }
+        }
+
+        $result.Status | Should -Be 'Ready'
+        $probeState.Calls | Should -Be 2
+        $calls.Count | Should -Be 1
+        $calls[0].FilePath | Should -Be 'git'
+        $calls[0].Arguments | Should -Be @('submodule', 'update', '--init', '--recursive')
+        $calls[0].Directory | Should -Be $TestDrive
+        $calls[0].Arguments -join ' ' | Should -Not -Match '(?i)\b(reset|clean|checkout|pull|merge|rebase|deinit)\b'
+    }
+
+    It 'returns Failed and Retry when Git initialization fails' {
+        $calls = [pscustomobject]@{ Count = 0 }
+
+        $result = Initialize-SetupSubmodules -Root $TestDrive -HermesProbe { $false } -CommandRunner {
+            param($filePath, $argumentList, $workingDirectory)
+            $calls.Count++
+            [pscustomobject]@{ ExitCode = 128; Output = 'git failed' }
+        }
+
+        $result.Status | Should -Be 'Failed'
+        $result.Remediation | Should -Be 'Retry'
+        $calls.Count | Should -Be 1
+    }
+
+    It 'fails closed for every invalid command-runner exit-code shape' {
+        $cases = @(
+            [pscustomobject]@{ Name = 'no result'; Run = { return } }
+            [pscustomobject]@{ Name = 'missing property'; Run = { [pscustomobject]@{ Output = 'none' } } }
+            [pscustomobject]@{ Name = 'null value'; Run = { [pscustomobject]@{ ExitCode = $null } } }
+            [pscustomobject]@{ Name = 'empty string'; Run = { [pscustomobject]@{ ExitCode = '' } } }
+            [pscustomobject]@{ Name = 'boolean'; Run = { [pscustomobject]@{ ExitCode = $false } } }
+            [pscustomobject]@{ Name = 'array'; Run = { [pscustomobject]@{ ExitCode = [object[]]@(0) } } }
+            [pscustomobject]@{ Name = 'numeric string'; Run = { [pscustomobject]@{ ExitCode = '0' } } }
+            [pscustomobject]@{ Name = 'decimal'; Run = { [pscustomobject]@{ ExitCode = [decimal]0 } } }
+            [pscustomobject]@{ Name = 'non-numeric string'; Run = { [pscustomobject]@{ ExitCode = 'invalid' } } }
+            [pscustomobject]@{
+                Name = 'multiple results'
+                Run = {
+                    [pscustomobject]@{ ExitCode = 0 }
+                    [pscustomobject]@{ ExitCode = 0 }
+                }
+            }
+        )
+        $observations = foreach ($case in $cases) {
+            $probeState = [pscustomobject]@{ Calls = 0 }
+            $runnerState = [pscustomobject]@{ Calls = 0 }
+            $caseRunner = $case.Run
+            $result = $null
+            $exception = $null
+            try {
+                $result = Initialize-SetupSubmodules -Root $TestDrive -HermesProbe {
+                    $probeState.Calls++
+                    $probeState.Calls -gt 1
+                } -CommandRunner {
+                    param($filePath, $argumentList, $workingDirectory)
+                    $runnerState.Calls++
+                    & $caseRunner
+                }
+            }
+            catch {
+                $exception = $_.Exception.Message
+            }
+            [pscustomobject]@{
+                Name = $case.Name
+                Status = if ($null -eq $result) { $null } else { $result.Status }
+                Remediation = if ($null -eq $result) { $null } else { $result.Remediation }
+                ProbeCalls = $probeState.Calls
+                RunnerCalls = $runnerState.Calls
+                Exception = $exception
+            }
+        }
+
+        @($observations | Where-Object {
+            $_.Status -ne 'Failed' -or $_.Remediation -ne 'Retry' -or
+            $_.ProbeCalls -ne 1 -or $_.RunnerCalls -ne 1 -or $null -ne $_.Exception
+        }).Name | Should -Be @()
+    }
+
+    It 'returns Missing and Manual when Hermes is absent after successful Git initialization' {
+        $probeState = [pscustomobject]@{ Calls = 0 }
+
+        $result = Initialize-SetupSubmodules -Root $TestDrive -HermesProbe {
+            param($candidateRoot)
+            $probeState.Calls++
+            $false
+        } -CommandRunner {
+            param($filePath, $argumentList, $workingDirectory)
+            [pscustomobject]@{ ExitCode = 0; Output = 'ok' }
+        }
+
+        $result.Status | Should -Be 'Missing'
+        $result.Remediation | Should -Be 'Manual'
+        $probeState.Calls | Should -Be 2
+    }
+
+    It 'does not mutate the repository when the initial Hermes probe fails' {
+        $calls = [pscustomobject]@{ Count = 0 }
+
+        $result = Initialize-SetupSubmodules -Root $TestDrive -HermesProbe {
+            throw 'probe failed'
+        } -CommandRunner {
+            param($filePath, $argumentList, $workingDirectory)
+            $calls.Count++
+            [pscustomobject]@{ ExitCode = 0; Output = 'unused' }
+        }
+
+        $result.Status | Should -Be 'Failed'
+        $result.Remediation | Should -Be 'Retry'
+        $calls.Count | Should -Be 0
+    }
+
+    It 'fails closed for every non-scalar-boolean Hermes probe result' {
+        $cases = @(
+            [pscustomobject]@{ Name = 'no output'; Probe = { return } }
+            [pscustomobject]@{ Name = 'explicit null output'; Probe = { $null } }
+            [pscustomobject]@{ Name = 'string false'; Probe = { 'false' } }
+            [pscustomobject]@{ Name = 'object output'; Probe = { [pscustomobject]@{ Present = $false } } }
+            [pscustomobject]@{ Name = 'multiple booleans'; Probe = { $false; $true } }
+            [pscustomobject]@{ Name = 'boolean array'; Probe = { Write-Output -NoEnumerate ([bool[]]@($false)) } }
+            [pscustomobject]@{ Name = 'null provider'; Probe = $null }
+            [pscustomobject]@{ Name = 'invalid provider'; Probe = 'not-a-scriptblock' }
+        )
+        $observations = foreach ($case in $cases) {
+            $calls = [pscustomobject]@{ Count = 0 }
+            $result = $null
+            $exception = $null
+            try {
+                $result = Initialize-SetupSubmodules -Root $TestDrive -HermesProbe $case.Probe -CommandRunner {
+                    param($filePath, $argumentList, $workingDirectory)
+                    $calls.Count++
+                    [pscustomobject]@{ ExitCode = 0; Output = 'unused' }
+                }
+            }
+            catch {
+                $exception = $_.Exception.Message
+            }
+            [pscustomobject]@{
+                Name = $case.Name
+                Status = if ($null -eq $result) { $null } else { $result.Status }
+                Remediation = if ($null -eq $result) { $null } else { $result.Remediation }
+                GitCalls = $calls.Count
+                Exception = $exception
+            }
+        }
+
+        @($observations | Where-Object {
+            $_.Status -ne 'Failed' -or $_.Remediation -ne 'Retry' -or
+            $_.GitCalls -ne 0 -or $null -ne $_.Exception
+        }).Name | Should -Be @()
+    }
+
+    It 'returns Failed and Retry when Hermes cannot be probed after Git succeeds' {
+        $probeState = [pscustomobject]@{ Calls = 0 }
+
+        $result = Initialize-SetupSubmodules -Root $TestDrive -HermesProbe {
+            $probeState.Calls++
+            if ($probeState.Calls -gt 1) { throw 'probe failed' }
+            $false
+        } -CommandRunner {
+            param($filePath, $argumentList, $workingDirectory)
+            [pscustomobject]@{ ExitCode = 0; Output = 'ok' }
+        }
+
+        $result.Status | Should -Be 'Failed'
+        $result.Remediation | Should -Be 'Retry'
+        $probeState.Calls | Should -Be 2
+    }
+
+    It 'initializes submodules immediately before installing Hermes' {
+        $order = [Collections.Generic.List[string]]::new()
+        $context = @{
+            Root = $TestDrive
+            SubmoduleInitializer = {
+                param($candidateRoot)
+                [void]$order.Add('Submodules')
+                New-SetupResult -Component 'Repository' -Status 'Ready' -Message 'ready' -Remediation 'None'
+            }
+            HermesInstaller = {
+                param($candidateRoot)
+                [void]$order.Add('Hermes')
+                New-SetupResult -Component 'Hermes' -Status 'Ready' -Message 'ready' -Remediation 'None'
+            }
+        }
+
+        $result = Invoke-DefaultSetupStage -Stage 'Hermes' -Context $context
+
+        $result.Status | Should -Be 'Complete'
+        $order | Should -Be @('Submodules', 'Hermes')
+    }
+
+    It 'does not install Hermes after repository initialization fails' {
+        $order = [Collections.Generic.List[string]]::new()
+        $context = @{
+            Root = $TestDrive
+            SubmoduleInitializer = {
+                param($candidateRoot)
+                [void]$order.Add('Submodules')
+                New-SetupResult -Component 'Repository' -Status 'Failed' -Message 'failed' -Remediation 'Retry'
+            }
+            HermesInstaller = {
+                param($candidateRoot)
+                [void]$order.Add('Hermes')
+                throw 'Hermes installation must not run.'
+            }
+        }
+
+        $result = Invoke-DefaultSetupStage -Stage 'Hermes' -Context $context
+
+        $result.Status | Should -Be 'Failed'
+        $result.Message | Should -Be 'failed'
+        $order | Should -Be @('Submodules')
+    }
+
+    It 'fails closed for invalid injected Hermes-stage actions' {
+        $cases = @(
+            @{ SubmoduleInitializer = $null; HermesInstaller = { throw 'must not run' } }
+            @{
+                SubmoduleInitializer = { New-SetupResult -Component 'Repository' -Status 'Ready' -Message 'ready' -Remediation 'None' }
+                HermesInstaller = 'not-a-scriptblock'
+            }
+        )
+
+        foreach ($case in $cases) {
+            $observed = [pscustomobject]@{ Result = $null }
+
+            {
+                $observed.Result = Invoke-DefaultSetupStage -Stage 'Hermes' -Context (@{ Root = $TestDrive } + $case)
+            } | Should -Not -Throw
+
+            $observed.Result.Status | Should -Be 'Failed'
+        }
+    }
+
+    It 'fails closed for malformed Hermes-stage results' {
+        $cases = @(
+            @{ SubmoduleInitializer = { $null }; HermesInstaller = { throw 'must not run' } }
+            @{
+                SubmoduleInitializer = { New-SetupResult -Component 'Repository' -Status 'Ready' -Message 'ready' -Remediation 'None' }
+                HermesInstaller = { [pscustomobject]@{ Status = 'Ready' } }
+            }
+        )
+
+        foreach ($case in $cases) {
+            $observed = [pscustomobject]@{ Result = $null }
+
+            {
+                $observed.Result = Invoke-DefaultSetupStage -Stage 'Hermes' -Context (@{ Root = $TestDrive } + $case)
+            } | Should -Not -Throw
+
+            $observed.Result.Status | Should -Be 'Failed'
+        }
+    }
+
+    It 'fails closed for every invalid Hermes-stage result value and output shape' {
+        $cases = @(
+            [pscustomobject]@{ Name = 'null status'; Action = { [pscustomobject]@{ Status = $null; Message = 'ok' } } }
+            [pscustomobject]@{ Name = 'empty status'; Action = { [pscustomobject]@{ Status = ''; Message = 'ok' } } }
+            [pscustomobject]@{ Name = 'blank status'; Action = { [pscustomobject]@{ Status = '   '; Message = 'ok' } } }
+            [pscustomobject]@{ Name = 'boolean status'; Action = { [pscustomobject]@{ Status = $true; Message = 'ok' } } }
+            [pscustomobject]@{ Name = 'array status'; Action = { [pscustomobject]@{ Status = [object[]]@('Ready'); Message = 'ok' } } }
+            [pscustomobject]@{ Name = 'empty array status'; Action = { [pscustomobject]@{ Status = [object[]]@(); Message = 'ok' } } }
+            [pscustomobject]@{ Name = 'non-canonical ready status'; Action = { [pscustomobject]@{ Status = 'ready'; Message = 'ok' } } }
+            [pscustomobject]@{ Name = 'unknown status'; Action = { [pscustomobject]@{ Status = 'Unknown'; Message = 'ok' } } }
+            [pscustomobject]@{ Name = 'null message'; Action = { [pscustomobject]@{ Status = 'Ready'; Message = $null } } }
+            [pscustomobject]@{ Name = 'empty message'; Action = { [pscustomobject]@{ Status = 'Ready'; Message = '' } } }
+            [pscustomobject]@{ Name = 'blank message'; Action = { [pscustomobject]@{ Status = 'Ready'; Message = '   ' } } }
+            [pscustomobject]@{ Name = 'boolean message'; Action = { [pscustomobject]@{ Status = 'Ready'; Message = $true } } }
+            [pscustomobject]@{ Name = 'array message'; Action = { [pscustomobject]@{ Status = 'Ready'; Message = [object[]]@('ok') } } }
+            [pscustomobject]@{
+                Name = 'multiple results'
+                Action = {
+                    [pscustomobject]@{ Status = 'Ready'; Message = 'one' }
+                    [pscustomobject]@{ Status = 'Ready'; Message = 'two' }
+                }
+            }
+            [pscustomobject]@{
+                Name = 'result array'
+                Action = {
+                    $items = [object[]]@([pscustomobject]@{ Status = 'Ready'; Message = 'ok' })
+                    Write-Output -NoEnumerate $items
+                }
+            }
+        )
+        $observations = foreach ($case in $cases) {
+            $installerState = [pscustomobject]@{ Calls = 0 }
+            $caseAction = $case.Action
+            $result = $null
+            $exception = $null
+            try {
+                $result = Invoke-DefaultSetupStage -Stage 'Hermes' -Context @{
+                    Root = $TestDrive
+                    SubmoduleInitializer = $caseAction
+                    HermesInstaller = {
+                        $installerState.Calls++
+                        New-SetupResult -Component 'Hermes' -Status 'Ready' -Message 'ready' -Remediation 'None'
+                    }
+                }
+            }
+            catch {
+                $exception = $_.Exception.Message
+            }
+            [pscustomobject]@{
+                Name = $case.Name
+                Status = if ($null -eq $result) { $null } else { $result.Status }
+                InstallerCalls = $installerState.Calls
+                Exception = $exception
+            }
+        }
+
+        @($observations | Where-Object {
+            $_.Status -ne 'Failed' -or $_.InstallerCalls -ne 0 -or $null -ne $_.Exception
+        }).Name | Should -Be @()
     }
 }
 
