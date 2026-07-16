@@ -13,6 +13,7 @@ from .captain_pipeline import (
     CaptainRunResult,
     PlannedSubtask,
 )
+from .gateway_client import GatewayPlanningClient, GatewayPlanningError
 from .release import JsonDirectoryReleaseClient, ReleaseConflictError
 from .policy import PlanningPolicy, PlanningPolicyError
 
@@ -28,6 +29,8 @@ __all__ = [
     "BatchEnrichment",
     "BatchReleaseClient",
     "CapabilityResolver",
+    "GatewayPlanningClient",
+    "GatewayPlanningError",
     "CaptainCompiledPlan",
     "CaptainPipeline",
     "CaptainPlanningError",

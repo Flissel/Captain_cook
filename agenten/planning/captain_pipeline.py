@@ -213,10 +213,14 @@ class CaptainPipeline:
         """Compatibility path: compile first, then publish each batch contract."""
 
         compiled = await self.compile(project_description)
+        await self.release(compiled)
+        return CaptainRunResult(batches=list(compiled.batches))
+
+    async def release(self, compiled: CaptainCompiledPlan) -> None:
+        """Publish one already-reviewed compiled plan through the injected port."""
+
         for batch, holdouts in zip(compiled.batches, compiled.holdouts):
             await self._release_client.release(
                 batch.model_copy(deep=True),
                 holdouts.model_copy(deep=True),
             )
-
-        return CaptainRunResult(batches=list(compiled.batches))

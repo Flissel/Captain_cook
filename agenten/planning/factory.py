@@ -11,7 +11,9 @@ from agenten.llm.resilience import LlmSchemaError, LlmStage, run_llm_stage
 from agenten.planning.alignment import AlignmentPlan, BatchDraft
 from agenten.planning.captain_pipeline import (
     BatchEnrichment,
+    BatchReleaseClient,
     CaptainPipeline,
+    CapabilityResolver,
     PlannedSubtask,
 )
 from agenten.planning.policy import PlanningPolicy
@@ -28,6 +30,8 @@ def build_captain_pipeline(
     max_alignment_attempts: int = 2,
     llm_timeout_seconds: float = 30.0,
     llm_max_attempts: int = 2,
+    release_client: BatchReleaseClient | None = None,
+    capability_resolver: CapabilityResolver | None = None,
 ) -> CaptainPipeline:
     """Wire the Captain's LLM stages to its deterministic planning core."""
 
@@ -100,8 +104,9 @@ def build_captain_pipeline(
         decompose=decompose,
         align=align,
         enrich=enrich,
-        release_client=JsonDirectoryReleaseClient(output_dir),
+        release_client=release_client or JsonDirectoryReleaseClient(output_dir),
         policy=PlanningPolicy(frozenset(known_capability_tags)),
+        capability_resolver=capability_resolver,
         target=target,
         allowed_targets=target_allowlist,
         max_alignment_attempts=max_alignment_attempts,

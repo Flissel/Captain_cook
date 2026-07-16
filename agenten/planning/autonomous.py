@@ -43,6 +43,7 @@ class AutonomousCaptainPlanner:
         source_path: Path | str,
         *,
         source_reference: str | None = None,
+        release_compiled: bool = False,
     ) -> AutonomousPlanningResult:
         project_input = self._parser.parse(
             source_path,
@@ -50,6 +51,8 @@ class AutonomousCaptainPlanner:
         )
         compiled = await self._pipeline.compile(project_input.planning_context())
         plan = self._compiler.compile(project_input, compiled.batches, compiled.holdouts)
+        if release_compiled:
+            await self._pipeline.release(compiled)
         CanonicalPlanPublisher(self._output_dir).publish(
             project_input,
             plan,

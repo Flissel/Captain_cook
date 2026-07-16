@@ -4,17 +4,24 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 from typing import List, Optional, Sequence
 
+import httpx
 from autogen_core.models import ChatCompletionClient
 
 from agenten.llm.model_client import build_model_client
-from agenten.planning.autonomous import AutonomousCaptainPlanner
+from agenten.planning.autonomous import AutonomousCaptainPlanner, AutonomousPlanningResult
 from agenten.planning.factory import build_captain_pipeline
+from agenten.planning.gateway_client import GatewayPlanningClient
 
 
 logger = logging.getLogger(__name__)
+
+
+class GatewayPlanningConfigurationError(RuntimeError):
+    """Gateway release mode is missing required non-secret configuration."""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,6 +55,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="allowed capability tag (repeat for multiple tags)",
     )
     parser.add_argument("--model", help="override CAPTAIN_MODEL for this run")
+    parser.add_argument(
+        "--release-mode",
+        choices=("json", "gateway"),
+        default="json",
+        help="publication boundary; json remains the deterministic offline default",
+    )
+    parser.add_argument(
+        "--gateway-url",
+        default="http://127.0.0.1:8000",
+        help="Captain ledger gateway base URL used only in gateway mode",
+    )
     return parser
 
 
@@ -55,20 +73,49 @@ async def async_main(
     argv: Optional[Sequence[str]] = None,
     *,
     model_client: Optional[ChatCompletionClient] = None,
+    http_client: httpx.AsyncClient | None = None,
 ) -> int:
     args = build_parser().parse_args(argv)
+    gateway_token: str | None = None
+    if args.release_mode == "gateway":
+        gateway_token = os.getenv("CAPTAIN_GATEWAY_TOKEN")
+        if not gateway_token:
+            raise GatewayPlanningConfigurationError(
+                "CAPTAIN_GATEWAY_TOKEN is required for gateway release mode"
+            )
+
     client = model_client if model_client is not None else build_model_client(model=args.model)
-    pipeline = build_captain_pipeline(
-        model_client=client,
-        output_dir=args.output,
-        target=args.target,
-        allowed_targets=list(args.allowed_targets) if args.allowed_targets else None,
-        known_capability_tags=list(args.capabilities),
-    )
-    result = await AutonomousCaptainPlanner(
-        pipeline=pipeline,
-        output_dir=args.output,
-    ).run(args.project, source_reference=args.project.name)
+
+    async def run(http: httpx.AsyncClient | None) -> AutonomousPlanningResult:
+        gateway = (
+            GatewayPlanningClient(args.gateway_url, gateway_token, http)
+            if args.release_mode == "gateway" and gateway_token is not None and http is not None
+            else None
+        )
+        pipeline = build_captain_pipeline(
+            model_client=client,
+            output_dir=args.output,
+            target=args.target,
+            allowed_targets=list(args.allowed_targets) if args.allowed_targets else None,
+            known_capability_tags=list(args.capabilities),
+            release_client=gateway,
+            capability_resolver=gateway,
+        )
+        return await AutonomousCaptainPlanner(
+            pipeline=pipeline,
+            output_dir=args.output,
+        ).run(
+            args.project,
+            source_reference=args.project.name,
+            release_compiled=gateway is not None,
+        )
+
+    if args.release_mode == "gateway" and http_client is None:
+        async with httpx.AsyncClient() as owned_http_client:
+            result = await run(owned_http_client)
+    else:
+        result = await run(http_client)
+
     print(
         json.dumps(
             {
