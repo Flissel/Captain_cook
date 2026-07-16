@@ -1,5 +1,6 @@
 """Captain-owned project planning and batch release pipeline."""
 
+from collections.abc import Sequence
 from typing import Awaitable, Callable, List, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -81,7 +82,11 @@ class BatchReleaseClient(Protocol):
 
 
 class CapabilityResolver(Protocol):
-    async def find_match(self, target: str, capability_tags: List[str]) -> str | None: ...
+    async def find_match(
+        self,
+        target: str,
+        capability_tags: Sequence[str],
+    ) -> str | None: ...
 
 
 Decompose = Callable[[str], Awaitable[List[PlannedSubtask]]]
@@ -171,13 +176,13 @@ class CaptainPipeline:
             capability_tags = (
                 self._policy.canonical_capability_tags(enrichment.capability_tags)
                 if self._policy is not None
-                else enrichment.capability_tags
+                else list(enrichment.capability_tags)
             )
             satisfied_by = None
             if self._capability_resolver is not None:
                 satisfied_by = await self._capability_resolver.find_match(
                     batch_target,
-                    capability_tags,
+                    list(capability_tags),
                 )
             batch = WorkBatch(
                 batch_id=draft.batch_id,
@@ -188,7 +193,7 @@ class CaptainPipeline:
                 runtime=batch_target,
                 runtime_version="v1",
                 interface_schema=f"captain-{batch_target}-artifact/v1",
-                capability_tags=capability_tags,
+                capability_tags=list(capability_tags),
                 depends_on=draft.depends_on,
                 constraints=enrichment.constraints,
                 acceptance_criteria=enrichment.acceptance_criteria,
@@ -209,6 +214,9 @@ class CaptainPipeline:
 
         compiled = await self.compile(project_description)
         for batch, holdouts in zip(compiled.batches, compiled.holdouts):
-            await self._release_client.release(batch, holdouts)
+            await self._release_client.release(
+                batch.model_copy(deep=True),
+                holdouts.model_copy(deep=True),
+            )
 
         return CaptainRunResult(batches=list(compiled.batches))
