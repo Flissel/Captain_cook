@@ -139,6 +139,7 @@ try {
         "-m", "pytest", "-q", "--no-cov",
         "tests/blockchain/test_mariadb_storage.py",
         "tests/gateway/test_gateway.py",
+        "tests/gateway/test_agent_runtime.py",
         "-rs"
     )
     $selectedOutput = Invoke-Pytest -Python $pythonCommand -Arguments $selectedArguments -Label "Selected MariaDB/gateway tests"

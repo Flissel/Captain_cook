@@ -8,12 +8,19 @@ import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Protocol, TypeVar
+from uuid import UUID
 
 from fastapi import HTTPException
 from pydantic import ValidationError
 from pymysql.err import OperationalError
 
 from agenten.validation.contracts import HoldoutSuite, WorkBatch
+from agenten.agent_runtime.capabilities import CapabilityDenied, validate_grant
+from agenten.agent_runtime.contracts import (
+    AgentRuntimeCommand,
+    AgentRuntimeResult,
+    CapabilityGrant,
+)
 from blockchain.Blockchain_modell import Block
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.contracts import (
@@ -27,6 +34,8 @@ from gateway.contracts import (
     ReasoningSliceEvent,
     RecoveryDecisionEvent,
     ReleaseProjection,
+    RuntimeOperationProjection,
+    RuntimeWriteReceipt,
     ReviewDecisionEvent,
     project_batch,
     project_release,
@@ -73,6 +82,12 @@ class _DeliveryEventReplay(Exception):
     def __init__(self, event: DeliveryEventEnvelope):
         super().__init__("identical delivery event replay")
         self.event = event
+
+
+class _RuntimeReplay(Exception):
+    def __init__(self, operation_id: UUID):
+        super().__init__("identical runtime write replay")
+        self.operation_id = operation_id
 
 
 def _utcnow() -> datetime:
@@ -255,6 +270,341 @@ class GatewayStore:
             )
             for row in rows
         )
+
+    def accept_runtime_command(
+        self,
+        command: AgentRuntimeCommand,
+    ) -> RuntimeWriteReceipt:
+        try:
+            self._retry_write(lambda: self._accept_runtime_command_once(command))
+        except _RuntimeReplay as replay:
+            return RuntimeWriteReceipt(operation_id=replay.operation_id, replayed=True)
+        return RuntimeWriteReceipt(operation_id=command.event_id, replayed=False)
+
+    def _accept_runtime_command_once(self, command: AgentRuntimeCommand) -> None:
+        canonical = command.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                index = self._next_index(cursor)
+                existing = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_command",
+                    field="event_id",
+                    value=str(command.event_id),
+                    for_update=True,
+                )
+                if existing is not None:
+                    if existing["data"] == canonical:
+                        raise _RuntimeReplay(command.event_id)
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime command event_id already has different content",
+                    )
+
+                cursor.execute(
+                    """
+                    SELECT MAX(
+                        CAST(JSON_UNQUOTE(JSON_EXTRACT(data, '$.subject_version')) AS UNSIGNED)
+                    ) AS max_version
+                    FROM blocks
+                    WHERE block_type = 'agent_runtime_command'
+                      AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.subject_id')) = %s
+                    FOR UPDATE
+                    """,
+                    (command.subject_id,),
+                )
+                row = cursor.fetchone()
+                max_version = row["max_version"] if row is not None else None
+                if max_version is not None and command.subject_version < int(max_version):
+                    raise HTTPException(status_code=409, detail="stale runtime subject version")
+
+                payload = command.payload
+                if payload.batch_id is not None:
+                    parent = self._batch_row(cursor, payload.batch_id, for_update=True)
+                    if parent is None:
+                        raise HTTPException(status_code=409, detail="released batch not found")
+                    batch = WorkBatch.model_validate(parent["data"])
+                    if payload.subtask_id not in batch.subtask_ids:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="runtime subtask was not released in the batch",
+                        )
+                    if payload.capability_profile.value not in batch.capability_tags:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="runtime capability profile was not released",
+                        )
+
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="agent_runtime_command",
+                    data=canonical,
+                    status="accepted",
+                    parent_index=None,
+                    metadata={"schema": "captain.agent-runtime-command.v1"},
+                )
+                self._insert(cursor, block)
+
+    def record_capability_grant(
+        self,
+        grant: CapabilityGrant,
+    ) -> RuntimeWriteReceipt:
+        try:
+            self._retry_write(lambda: self._record_capability_grant_once(grant))
+        except _RuntimeReplay as replay:
+            return RuntimeWriteReceipt(operation_id=replay.operation_id, replayed=True)
+        return RuntimeWriteReceipt(operation_id=grant.command_id, replayed=False)
+
+    def _record_capability_grant_once(self, grant: CapabilityGrant) -> None:
+        canonical = grant.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                index = self._next_index(cursor)
+                command_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_command",
+                    field="event_id",
+                    value=str(grant.command_id),
+                    for_update=True,
+                )
+                if command_block is None:
+                    raise HTTPException(status_code=409, detail="runtime command not found")
+                command = AgentRuntimeCommand.model_validate(command_block["data"])
+                try:
+                    validate_grant(grant, command, grant.issued_at)
+                except CapabilityDenied as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+                existing = self._runtime_grant_block(cursor, grant, for_update=True)
+                if existing is not None:
+                    if existing["data"] == canonical:
+                        raise _RuntimeReplay(grant.command_id)
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime command or grant already has different grant content",
+                    )
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="agent_runtime_grant",
+                    data=canonical,
+                    status="active",
+                    parent_index=command_block["index"],
+                    metadata={"schema": "captain.capability-grant.v1"},
+                )
+                self._insert(cursor, block)
+
+    def record_runtime_result(
+        self,
+        result: AgentRuntimeResult,
+    ) -> RuntimeWriteReceipt:
+        try:
+            self._retry_write(lambda: self._record_runtime_result_once(result))
+        except _RuntimeReplay as replay:
+            return RuntimeWriteReceipt(operation_id=replay.operation_id, replayed=True)
+        return RuntimeWriteReceipt(operation_id=result.command_id, replayed=False)
+
+    def _record_runtime_result_once(self, result: AgentRuntimeResult) -> None:
+        canonical = result.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                index = self._next_index(cursor)
+                command_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_command",
+                    field="event_id",
+                    value=str(result.command_id),
+                    for_update=True,
+                )
+                if command_block is None:
+                    raise HTTPException(status_code=409, detail="runtime command not found")
+                command = AgentRuntimeCommand.model_validate(command_block["data"])
+                self._assert_result_matches_command(result, command)
+
+                grant_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_grant",
+                    field="grant_id",
+                    value=result.grant_id,
+                    for_update=True,
+                )
+                if grant_block is None:
+                    raise HTTPException(status_code=409, detail="runtime grant not found")
+                grant = CapabilityGrant.model_validate(grant_block["data"])
+                if grant.command_id != command.event_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime grant belongs to a different command",
+                    )
+
+                existing = self._runtime_result_block(cursor, result, for_update=True)
+                if existing is not None:
+                    if existing["data"] == canonical:
+                        raise _RuntimeReplay(result.command_id)
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime command or result event already has different content",
+                    )
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="agent_runtime_result",
+                    data=canonical,
+                    status=result.status.value,
+                    parent_index=command_block["index"],
+                    metadata={"schema": "captain.agent-runtime-result.v1"},
+                )
+                self._insert(cursor, block)
+
+    def runtime_operation(self, operation_id: UUID) -> RuntimeOperationProjection:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                command_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_command",
+                    field="event_id",
+                    value=str(operation_id),
+                )
+                if command_block is None:
+                    raise HTTPException(status_code=404, detail="runtime operation not found")
+                grant_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_grant",
+                    field="command_id",
+                    value=str(operation_id),
+                )
+                result_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_result",
+                    field="command_id",
+                    value=str(operation_id),
+                )
+        return RuntimeOperationProjection(
+            operation_id=operation_id,
+            command=AgentRuntimeCommand.model_validate(command_block["data"]),
+            grant=(
+                CapabilityGrant.model_validate(grant_block["data"])
+                if grant_block is not None
+                else None
+            ),
+            result=(
+                AgentRuntimeResult.model_validate(result_block["data"])
+                if result_block is not None
+                else None
+            ),
+        )
+
+    def _runtime_grant_block(
+        self,
+        cursor: Any,
+        grant: CapabilityGrant,
+        *,
+        for_update: bool,
+    ) -> dict[str, Any] | None:
+        return self._runtime_block_by_two_json_values(
+            cursor,
+            block_type="agent_runtime_grant",
+            first_field="grant_id",
+            first_value=grant.grant_id,
+            second_field="command_id",
+            second_value=str(grant.command_id),
+            for_update=for_update,
+        )
+
+    def _runtime_result_block(
+        self,
+        cursor: Any,
+        result: AgentRuntimeResult,
+        *,
+        for_update: bool,
+    ) -> dict[str, Any] | None:
+        return self._runtime_block_by_two_json_values(
+            cursor,
+            block_type="agent_runtime_result",
+            first_field="event_id",
+            first_value=str(result.event_id),
+            second_field="command_id",
+            second_value=str(result.command_id),
+            for_update=for_update,
+        )
+
+    def _runtime_block_by_json_value(
+        self,
+        cursor: Any,
+        *,
+        block_type: str,
+        field: str,
+        value: str,
+        for_update: bool = False,
+    ) -> dict[str, Any] | None:
+        sql = """
+            SELECT `index`, parent_index, block_type, data, status, children,
+                   metadata, hash, previous_hash
+            FROM blocks
+            WHERE block_type = %s
+              AND JSON_UNQUOTE(JSON_EXTRACT(data, %s)) = %s
+            ORDER BY `index` LIMIT 1
+        """
+        if for_update:
+            sql += " FOR UPDATE"
+        cursor.execute(sql, (block_type, f"$.{field}", value))
+        row = cursor.fetchone()
+        return self.storage._decode_row(row) if row is not None else None
+
+    def _runtime_block_by_two_json_values(
+        self,
+        cursor: Any,
+        *,
+        block_type: str,
+        first_field: str,
+        first_value: str,
+        second_field: str,
+        second_value: str,
+        for_update: bool,
+    ) -> dict[str, Any] | None:
+        sql = """
+            SELECT `index`, parent_index, block_type, data, status, children,
+                   metadata, hash, previous_hash
+            FROM blocks
+            WHERE block_type = %s
+              AND (
+                JSON_UNQUOTE(JSON_EXTRACT(data, %s)) = %s
+                OR JSON_UNQUOTE(JSON_EXTRACT(data, %s)) = %s
+              )
+            ORDER BY `index` LIMIT 1
+        """
+        if for_update:
+            sql += " FOR UPDATE"
+        cursor.execute(
+            sql,
+            (
+                block_type,
+                f"$.{first_field}",
+                first_value,
+                f"$.{second_field}",
+                second_value,
+            ),
+        )
+        row = cursor.fetchone()
+        return self.storage._decode_row(row) if row is not None else None
+
+    @staticmethod
+    def _assert_result_matches_command(
+        result: AgentRuntimeResult,
+        command: AgentRuntimeCommand,
+    ) -> None:
+        if (
+            result.command_id != command.event_id
+            or result.correlation_id != command.correlation_id
+            or result.subject_id != command.subject_id
+            or result.subject_version != command.subject_version
+            or result.operation is not command.payload.operation
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="runtime result does not match its command",
+            )
 
     def release_projection(self, *, project_id: str, run_id: str) -> ReleaseProjection:
         return project_release(self.delivery_events(project_id=project_id, run_id=run_id))
@@ -734,7 +1084,7 @@ class GatewayStore:
                     self._insert(cursor, terminal)
         return block
 
-    def claim(self, batch_id: str) -> dict[str, str]:
+    def claim(self, batch_id: str) -> dict[str, str | int]:
         return self._retry_write(lambda: self._claim_once(batch_id))
 
     def _claim_once(self, batch_id: str) -> dict[str, str]:

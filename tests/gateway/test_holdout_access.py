@@ -127,6 +127,31 @@ def sealed_artifact_event() -> DeliveryEventEnvelope:
     )
 
 
+def claimed_artifact_write(
+    client: TestClient,
+) -> tuple[dict[str, str], DeliveryEventEnvelope]:
+    claimed = client.post(
+        "/batches/batch-1/claim",
+        headers=authorization(WORKER_TOKEN),
+    )
+    assert claimed.status_code == 200, claimed.text
+    claim = claimed.json()
+    event = sealed_artifact_event()
+    return (
+        authorization(WORKER_TOKEN, claim_token=claim["claim_token"]),
+        event.model_copy(
+            update={
+                "trace": event.trace.model_copy(
+                    update={
+                        "claim_id": claim["claim_id"],
+                        "fencing_token": claim["fencing_token"],
+                    }
+                )
+            }
+        ),
+    )
+
+
 @pytest.mark.parametrize(
     "gateway_token",
     [WORKER_TOKEN, CAPTAIN_TOKEN],
@@ -172,10 +197,11 @@ def test_builder_cannot_read_holdout_before_or_after_artifact_is_sealed(
     worker = authorization(WORKER_TOKEN)
 
     assert client.get(route, headers=worker).status_code == 403
+    claim_headers, event = claimed_artifact_write(client)
     appended = client.post(
         "/v1/delivery/events",
-        headers=worker,
-        json=sealed_artifact_event().model_dump(mode="json"),
+        headers=claim_headers,
+        json=event.model_dump(mode="json"),
     )
     assert appended.status_code == 201, appended.text
     assert client.get(route, headers=worker).status_code == 403
@@ -189,10 +215,11 @@ def test_validator_reads_only_matching_holdout_after_artifact_is_sealed(
     captain = authorization(CAPTAIN_TOKEN)
 
     assert client.get(route, headers=captain).status_code == 404
+    claim_headers, event = claimed_artifact_write(client)
     appended = client.post(
         "/v1/delivery/events",
-        headers=authorization(WORKER_TOKEN),
-        json=sealed_artifact_event().model_dump(mode="json"),
+        headers=claim_headers,
+        json=event.model_dump(mode="json"),
     )
     assert appended.status_code == 201, appended.text
 

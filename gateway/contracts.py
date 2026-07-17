@@ -16,6 +16,12 @@ from pydantic import (
     model_validator,
 )
 
+from agenten.agent_runtime.contracts import (
+    AgentRuntimeCommand,
+    AgentRuntimeResult,
+    CapabilityGrant,
+)
+
 
 DeliveryEventType: TypeAlias = Literal[
     "codex_task",
@@ -39,6 +45,18 @@ ReleaseStatus: TypeAlias = Literal["blocked", "ready"]
 
 class _FrozenContract(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class RuntimeWriteReceipt(_FrozenContract):
+    operation_id: UUID
+    replayed: bool
+
+
+class RuntimeOperationProjection(_FrozenContract):
+    operation_id: UUID
+    command: AgentRuntimeCommand
+    grant: CapabilityGrant | None = None
+    result: AgentRuntimeResult | None = None
 
 
 class TraceContext(_FrozenContract):

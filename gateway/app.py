@@ -6,6 +6,7 @@ import logging
 from contextlib import asynccontextmanager
 from threading import Lock
 from typing import Any, Literal, Protocol
+from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -14,6 +15,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from blockchain.mariadb_storage import MariaDBStorage
+from agenten.agent_runtime.contracts import (
+    AgentRuntimeCommand,
+    AgentRuntimeResult,
+    CapabilityGrant,
+)
 from gateway.auth import (
     GatewayRole,
     load_gateway_settings,
@@ -28,6 +34,8 @@ from gateway.contracts import (
     ReleaseProjection,
     RecoveryDecisionEvent,
     ReviewDecisionEvent,
+    RuntimeOperationProjection,
+    RuntimeWriteReceipt,
 )
 from gateway.mirror import MirrorQueue
 from gateway.registry_feed import mirror_validated_batch
@@ -171,6 +179,95 @@ def create_app(
     ) -> list[dict[str, str]]:
         return get_store().list_batches(status_filter)
 
+    def enqueue_runtime_projection(projection: dict[str, Any]) -> None:
+        try:
+            mirror.enqueue_nowait(projection)
+        except Exception:
+            logger.exception(
+                "Could not enqueue runtime event %s for Minibook mirroring",
+                projection.get("event_id"),
+            )
+
+    @app.post("/v1/runtime/commands", status_code=status.HTTP_202_ACCEPTED)
+    async def accept_runtime_command(
+        command: AgentRuntimeCommand,
+        _: GatewayRole = Depends(require_captain),
+    ) -> RuntimeWriteReceipt:
+        receipt = get_store().accept_runtime_command(command)
+        if not receipt.replayed:
+            payload = command.payload
+            enqueue_runtime_projection(
+                {
+                    "event_type": "runtime_command_accepted",
+                    "event_id": str(command.event_id),
+                    "correlation_id": str(command.correlation_id),
+                    "project_id": payload.project_id,
+                    "batch_id": payload.batch_id,
+                    "subtask_id": payload.subtask_id,
+                    "subject_version": command.subject_version,
+                    "operation": payload.operation.value,
+                    "status": "accepted",
+                }
+            )
+        return receipt
+
+    @app.post("/v1/runtime/grants", status_code=status.HTTP_201_CREATED)
+    async def record_runtime_grant(
+        grant: CapabilityGrant,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> RuntimeWriteReceipt:
+        receipt = get_store().record_capability_grant(grant)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        else:
+            enqueue_runtime_projection(
+                {
+                    "event_type": "runtime_capability_granted",
+                    "event_id": grant.grant_id,
+                    "operation_id": str(grant.command_id),
+                    "batch_id": grant.batch_id,
+                    "subtask_id": grant.subtask_id,
+                    "subject_version": grant.batch_version,
+                    "profile": grant.profile.value,
+                    "status": "active",
+                    "expires_at": grant.expires_at.isoformat(),
+                }
+            )
+        return receipt
+
+    @app.post("/v1/runtime/results", status_code=status.HTTP_201_CREATED)
+    async def record_runtime_result(
+        result: AgentRuntimeResult,
+        response: Response,
+        _: GatewayRole = Depends(require_actor),
+    ) -> RuntimeWriteReceipt:
+        receipt = get_store().record_runtime_result(result)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        else:
+            enqueue_runtime_projection(
+                {
+                    "event_type": "runtime_result_recorded",
+                    "event_id": str(result.event_id),
+                    "operation_id": str(result.command_id),
+                    "correlation_id": str(result.correlation_id),
+                    "subject_id": result.subject_id,
+                    "subject_version": result.subject_version,
+                    "operation": result.operation.value,
+                    "status": result.status.value,
+                    "session_id": result.session_id,
+                }
+            )
+        return receipt
+
+    @app.get("/v1/runtime/operations/{operation_id}")
+    async def get_runtime_operation(
+        operation_id: UUID,
+        _: GatewayRole = Depends(require_reader),
+    ) -> RuntimeOperationProjection:
+        return get_store().runtime_operation(operation_id)
+
     @app.post("/v1/delivery/events")
     async def append_delivery_event(
         event: DeliveryEventEnvelope,
@@ -217,7 +314,7 @@ def create_app(
     async def claim_batch(
         batch_id: str,
         _: GatewayRole = Depends(require_worker),
-    ) -> dict[str, str]:
+    ) -> dict[str, str | int]:
         return get_store().claim(batch_id)
 
     @app.post("/batches/{batch_id}/claim/heartbeat")

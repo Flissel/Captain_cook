@@ -265,7 +265,13 @@ def test_claim_and_completion_append_events_without_mutating_work_batch(
         "batch_done",
     ]
     claim_data = lifecycle[0]["data"]
-    assert set(claim_data) == {"batch_id", "claim_token_sha256", "claim_expires_at"}
+    assert set(claim_data) == {
+        "batch_id",
+        "claim_token_sha256",
+        "claim_expires_at",
+        "claim_id",
+        "fencing_token",
+    }
     assert claim_data["claim_token_sha256"] == hashlib.sha256(token.encode("utf-8")).hexdigest()
     assert token not in json.dumps(blocks, default=str)
 
@@ -855,7 +861,13 @@ def test_claim_token_is_not_persisted_or_exposed(client: TestClient, storage: Ma
     assert token not in str(persisted)
     assert token not in response.text
     assert '"claim_token":' not in response.text
-    assert set(claim_event["data"]) == {"batch_id", "claim_token_sha256", "claim_expires_at"}
+    assert set(claim_event["data"]) == {
+        "batch_id",
+        "claim_token_sha256",
+        "claim_expires_at",
+        "claim_id",
+        "fencing_token",
+    }
     assert claim_event["data"]["claim_token_sha256"] == hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
