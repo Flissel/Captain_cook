@@ -7,7 +7,12 @@ from autogen_core.models import ChatCompletionClient
 
 from agenten.llm.decompose import make_llm_decompose
 from agenten.llm.plan_batches import make_llm_align, make_llm_enrich
-from agenten.planning.captain_pipeline import CaptainPipeline, PlannedSubtask
+from agenten.planning.captain_pipeline import (
+    BatchReleaseClient,
+    CaptainPipeline,
+    CapabilityResolver,
+    PlannedSubtask,
+)
 from agenten.planning.policy import PlanningPolicy
 from agenten.planning.release import JsonDirectoryReleaseClient
 
@@ -19,6 +24,8 @@ def build_captain_pipeline(
     target: str,
     known_capability_tags: List[str],
     max_alignment_attempts: int = 2,
+    release_client: BatchReleaseClient | None = None,
+    capability_resolver: CapabilityResolver | None = None,
 ) -> CaptainPipeline:
     """Wire the Captain's LLM stages to its deterministic planning core."""
 
@@ -46,8 +53,9 @@ def build_captain_pipeline(
         decompose=decompose,
         align=make_llm_align(model_client),
         enrich=make_llm_enrich(model_client),
-        release_client=JsonDirectoryReleaseClient(output_dir),
+        release_client=release_client or JsonDirectoryReleaseClient(output_dir),
         policy=PlanningPolicy(frozenset(known_capability_tags)),
+        capability_resolver=capability_resolver,
         target=target,
         max_alignment_attempts=max_alignment_attempts,
     )
