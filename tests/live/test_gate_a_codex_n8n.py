@@ -418,24 +418,45 @@ async def test_gate_a_real_codex_n8n_gateway_trace() -> None:
                 }
             )
     finally:
+        primary_error = sys.exception()
+        cleanup_errors: list[str] = []
         if deployment is not None:
-            try:
-                with httpx.Client(
-                    base_url="http://localhost:15678",
-                    headers={"X-N8N-API-KEY": api_key},
-                    timeout=10,
-                ) as cleanup:
-                    cleanup.post(
-                        f"/api/v1/workflows/{deployment.workflow_id}/deactivate"
-                    )
-                    cleanup.delete(
-                        f"/api/v1/workflows/{deployment.workflow_id}"
-                    )
-            except httpx.HTTPError:
-                pass
+            with httpx.Client(
+                base_url="http://localhost:15678",
+                headers={"X-N8N-API-KEY": api_key},
+                timeout=10,
+            ) as cleanup:
+                for operation, path in (
+                    (
+                        "deactivate",
+                        f"/api/v1/workflows/{deployment.workflow_id}/deactivate",
+                    ),
+                    (
+                        "delete",
+                        f"/api/v1/workflows/{deployment.workflow_id}",
+                    ),
+                ):
+                    try:
+                        response = (
+                            cleanup.post(path)
+                            if operation == "deactivate"
+                            else cleanup.delete(path)
+                        )
+                        response.raise_for_status()
+                    except httpx.HTTPError as exc:
+                        cleanup_errors.append(
+                            f"n8n workflow {operation} cleanup failed: "
+                            f"{type(exc).__name__}"
+                        )
         gateway_process.terminate()
         try:
             gateway_process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             gateway_process.kill()
             gateway_process.wait(timeout=10)
+        if cleanup_errors:
+            message = "; ".join(cleanup_errors)
+            if primary_error is not None:
+                primary_error.add_note(message)
+            else:
+                pytest.fail(message)

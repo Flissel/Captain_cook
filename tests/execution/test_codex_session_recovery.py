@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -318,6 +319,81 @@ async def test_powershell_runner_bridges_authorized_run_to_real_launcher(
     assert result.jsonl_lines == ()
     identity = json.loads(state_path.read_text(encoding="utf-8"))
     assert identity["session_id"] == "runner-session-1"
+
+
+
+@pytest.mark.asyncio
+async def test_powershell_runner_timeout_cancels_recorded_child_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeper = tmp_path / "harmless-sleeper.exe"
+    source = (
+        "using System.Threading;"
+        "public static class Program {"
+        "public static int Main(string[] args) { Thread.Sleep(60000); return 23; }"
+        "}"
+    )
+    source_path = tmp_path / "harmless-sleeper.cs"
+    source_path.write_text(source, encoding="utf-8")
+    subprocess.run(
+        [
+            r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe",
+            "/nologo",
+            f"/out:{sleeper}",
+            str(source_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    state_path = tmp_path / "timed-out-process.json"
+    runner = PowerShellCodexRunner(
+        pwsh_path=Path(_pwsh()),
+        script_path=Path("scripts/codex-session.ps1").resolve(),
+        codex_path=sleeper,
+        session_id="runner-timeout-1",
+        state_path=state_path,
+        artifact_references=(),
+        timeout_seconds=2.0,
+    )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-cancel-controller")
+    assert "OPENAI_API_KEY" not in runner._cancellation_environment()
+
+    identity = None
+    try:
+        result = await runner.run(
+            AuthorizedCodexRun(
+                workspace=tmp_path,
+                command=("codex", "exec", "--json", "harmless timeout test"),
+                environment=FrozenEnvironment({"PATH": os.environ["PATH"]}),
+            )
+        )
+        identity = json.loads(state_path.read_text(encoding="utf-8"))
+        assert result.exit_code == 124
+        assert result.artifact_references == ()
+        assert result.jsonl_lines == ()
+        assert identity["session_id"] == "runner-timeout-1"
+        probe = subprocess.run(
+            [
+                _pwsh(),
+                "-NoProfile",
+                "-Command",
+                f"Get-Process -Id {identity['pid']} -ErrorAction Stop",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert probe.returncode != 0
+    finally:
+        if identity is None and state_path.exists():
+            identity = json.loads(state_path.read_text(encoding="utf-8"))
+        if identity is not None:
+            subprocess.run(
+                ["taskkill.exe", "/PID", str(identity["pid"]), "/T", "/F"],
+                capture_output=True,
+            )
 
 
 def test_powershell_7_launcher_emits_session_bound_process_identity(

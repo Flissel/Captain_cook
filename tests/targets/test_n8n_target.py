@@ -117,6 +117,8 @@ def test_gate_a_live_contract_is_fresh_supervised_and_causally_linked():
         "hashlib.sha256(sealed_bytes)",
         "DeliveryEventEnvelope.model_validate",
         "gateway_client.delivery_events",
+        "response.raise_for_status()",
+        "primary_error.add_note(message)",
     ):
         assert required in source
     assert "GATE_A_GATEWAY_RUN_ID" not in source

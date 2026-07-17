@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 
@@ -131,9 +133,24 @@ class PowerShellCodexRunner:
                 timeout=self._timeout_seconds,
             )
         except TimeoutError:
-            process.kill()
-            await process.wait()
-            raise RuntimeError("Codex process exceeded its supervised timeout") from None
+            cancelled = await self._cancel_timed_out_process()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=10)
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+            if not cancelled:
+                if process.returncode is None:
+                    process.kill()
+                    await process.wait()
+                raise RuntimeError(
+                    "Codex process exceeded timeout and tree cancellation failed"
+                ) from None
+            return CodexRunResult(
+                exit_code=124,
+                artifact_references=(),
+                jsonl_lines=(),
+            )
         return CodexRunResult(
             exit_code=process.returncode,
             artifact_references=self._artifact_references,
@@ -142,6 +159,66 @@ class PowerShellCodexRunner:
                 if line.strip()
             ),
         )
+
+
+
+    async def _cancel_timed_out_process(self) -> bool:
+        if not self._state_path.is_file():
+            return False
+        cancellation = await asyncio.create_subprocess_exec(
+            str(self._pwsh_path),
+            "-NoProfile",
+            "-File",
+            str(self._script_path),
+            "-CancelStatePath",
+            str(self._state_path),
+            "-SessionId",
+            self._session_id,
+            "-CancellationReason",
+            "timeout",
+            env=self._cancellation_environment(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(
+                cancellation.communicate(),
+                timeout=15,
+            )
+        except TimeoutError:
+            cancellation.kill()
+            await cancellation.wait()
+            return False
+        if cancellation.returncode != 0:
+            return False
+        try:
+            result = json.loads(stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        return result == {
+            "session_id": self._session_id,
+            "outcome": "cancelled",
+            "cancellation_reason": "timeout",
+        }
+
+
+
+    @staticmethod
+    def _cancellation_environment() -> dict[str, str]:
+        allowed = {
+            "systemroot",
+            "windir",
+            "path",
+            "pathext",
+            "temp",
+            "tmp",
+            "comspec",
+        }
+        return {
+            name: value
+            for name, value in os.environ.items()
+            if name.lower() in allowed
+        }
 
 
 class CodexExecutionAuthorizer(Protocol):
