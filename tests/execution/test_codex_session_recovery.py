@@ -23,6 +23,7 @@ from agenten.execution.codex_supervisor import (
     CodexRunRequest,
     CodexRunResult,
     CodexSupervisor,
+    PowerShellCodexRunner,
 )
 from agenten.execution.process import PackageExecutionStatus
 
@@ -288,6 +289,35 @@ def _process_identity(pid: int) -> dict[str, str]:
         text=True,
     )
     return json.loads(completed.stdout)
+
+
+
+@pytest.mark.asyncio
+async def test_powershell_runner_bridges_authorized_run_to_real_launcher(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "runner-process.json"
+    runner = PowerShellCodexRunner(
+        pwsh_path=Path(_pwsh()),
+        script_path=Path("scripts/codex-session.ps1").resolve(),
+        codex_path=Path(r"C:\Windows\System32\timeout.exe"),
+        session_id="runner-session-1",
+        state_path=state_path,
+        artifact_references=("artifact://sealed/runner-test",),
+    )
+    result = await runner.run(
+        AuthorizedCodexRun(
+            workspace=tmp_path,
+            command=("codex", "exec", "--json", "harmless test"),
+            environment=FrozenEnvironment({"PATH": "safe"}),
+        )
+    )
+
+    assert result.exit_code != 0
+    assert result.artifact_references == ("artifact://sealed/runner-test",)
+    assert result.jsonl_lines == ()
+    identity = json.loads(state_path.read_text(encoding="utf-8"))
+    assert identity["session_id"] == "runner-session-1"
 
 
 def test_powershell_7_launcher_emits_session_bound_process_identity(

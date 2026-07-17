@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
@@ -76,6 +77,71 @@ class CodexRunner(Protocol):
         self,
         authorized: AuthorizedCodexRun,
     ) -> CodexRunResult: ...
+
+
+
+class PowerShellCodexRunner:
+    """Execute an authorized Codex request through the session-bound PS7 launcher."""
+
+    def __init__(
+        self,
+        *,
+        pwsh_path: Path,
+        script_path: Path,
+        codex_path: Path,
+        session_id: str,
+        state_path: Path,
+        artifact_references: tuple[str, ...],
+        timeout_seconds: float = 600,
+    ) -> None:
+        self._pwsh_path = pwsh_path.resolve(strict=True)
+        self._script_path = script_path.resolve(strict=True)
+        self._codex_path = codex_path.resolve(strict=True)
+        self._session_id = session_id
+        self._state_path = state_path.resolve()
+        self._artifact_references = artifact_references
+        self._timeout_seconds = timeout_seconds
+
+    async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
+        if len(authorized.command) != 4:
+            raise ValueError("PowerShell Codex runner requires one prompt argument")
+        process = await asyncio.create_subprocess_exec(
+            str(self._pwsh_path),
+            "-NoProfile",
+            "-File",
+            str(self._script_path),
+            "-Workspace",
+            str(authorized.workspace),
+            "-Prompt",
+            authorized.command[3],
+            "-CodexPath",
+            str(self._codex_path),
+            "-SessionId",
+            self._session_id,
+            "-StatePath",
+            str(self._state_path),
+            cwd=authorized.workspace,
+            env=authorized.child_environment(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(
+                process.communicate(),
+                timeout=self._timeout_seconds,
+            )
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+            raise RuntimeError("Codex process exceeded its supervised timeout") from None
+        return CodexRunResult(
+            exit_code=process.returncode,
+            artifact_references=self._artifact_references,
+            jsonl_lines=tuple(
+                line for line in stdout.decode("utf-8", errors="replace").splitlines()
+                if line.strip()
+            ),
+        )
 
 
 class CodexExecutionAuthorizer(Protocol):

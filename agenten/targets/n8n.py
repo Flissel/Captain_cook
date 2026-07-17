@@ -136,6 +136,19 @@ class N8nTarget:
         self._client = client
 
     async def deploy(self, artifact: SealedArtifact) -> N8nDeployment:
+        forbidden_identity = {"name", "id", "workflowId", "webhookId", "webhook_path"}
+        if forbidden_identity.intersection(artifact.workflow):
+            raise ValueError("workflow definition must not override provider identity")
+        for node in artifact.workflow.get("nodes", []):
+            if not isinstance(node, dict):
+                continue
+            parameters = node.get("parameters")
+            if (
+                isinstance(parameters, dict)
+                and "path" in parameters
+                and parameters["path"] != "{{CAPTAIN_WEBHOOK_PATH}}"
+            ):
+                raise ValueError("workflow definition must not override provider identity")
         name = f"captain::{artifact.namespace}::{artifact.artifact_id}::{artifact.artifact_digest[:12]}"
         webhook_path = re.sub(r"[^a-z0-9-]+", "-", f"captain-{artifact.namespace}-{artifact.artifact_id}-{artifact.artifact_digest[:12]}").strip("-")
         definition = copy.deepcopy(artifact.workflow)

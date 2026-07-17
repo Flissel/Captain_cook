@@ -10,6 +10,9 @@ from agenten.targets.n8n import N8nEvidenceError, N8nHttpClient, N8nTarget, Seal
 class ProviderState:
     def __init__(self) -> None:
         self.workflow: dict[str, Any] | None = None
+        self.execution_id = "execution-1"
+        self.workflow_id = "workflow-1"
+        self.execution_status = "success"
         self.execution_output = {"artifact_digest": "a" * 64, "correlation_id": "correlation-1"}
         self.requests: list[tuple[str, str, dict[str, Any] | None]] = []
 
@@ -30,7 +33,7 @@ def n8n_server():
             if self.path.startswith("/api/v1/workflows"):
                 self._send(200, {"data": [] if state.workflow is None else [state.workflow]}); return
             if self.path.startswith("/api/v1/executions/execution-1"):
-                self._send(200, {"id":"execution-1","workflowId":"workflow-1","status":"success","data":{"resultData":{"runData":{"Respond":[{"data":{"main":[[{"json":state.execution_output}]]}}]}}}}); return
+                self._send(200, {"id":state.execution_id,"workflowId":state.workflow_id,"status":state.execution_status,"data":{"resultData":{"runData":{"Respond":[{"data":{"main":[[{"json":state.execution_output}]]}}]}}}}); return
             self._send(404, {"message":"not found"})
         def do_POST(self):
             payload = self._json(); state.requests.append(("POST", self.path, payload))
@@ -71,10 +74,61 @@ async def test_target_deploys_executes_and_fetches_matching_real_http_evidence(n
     webhook=next(item for item in state.requests if item[0]=="POST" and item[1].startswith("/webhook/"))
     assert webhook[2]=={"artifact_digest":artifact().artifact_digest,"correlation_id":"correlation-1","case_id":"case-1","input":{"message":"ping"}}
 
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("field","bad_value"),[("artifact_digest","b"*64),("correlation_id","wrong-correlation")])
+@pytest.mark.parametrize("identity_field", ["name", "id", "workflowId", "webhook_path"])
+async def test_target_rejects_definition_identity_override_before_http(
+    n8n_server,
+    identity_field,
+):
+    base_url, state = n8n_server
+    unsafe = artifact().model_copy(
+        update={"workflow": {**artifact().workflow, identity_field: "attacker-value"}}
+    )
+    async with httpx.AsyncClient() as http:
+        target = N8nTarget(
+            N8nHttpClient(
+                api_base_url=base_url,
+                webhook_base_url=base_url,
+                api_key="local-test-key",
+                http=http,
+            )
+        )
+        with pytest.raises(ValueError, match="provider identity"):
+            await target.deploy(unsafe)
+    assert state.requests == []
+
+
+
+def test_gate_a_live_contract_is_fresh_supervised_and_causally_linked():
+    source = (
+        __import__("pathlib").Path("tests/live/test_gate_a_codex_n8n.py")
+        .read_text(encoding="utf-8")
+    )
+    for required in (
+        "uuid4()",
+        "TemporaryDirectory",
+        "CodexExecutionPolicy",
+        "PowerShellCodexRunner",
+        "CodexSupervisor",
+        "GatewayCodexRunRepository",
+        "workflow_path.read_bytes()",
+        "hashlib.sha256(sealed_bytes)",
+        "DeliveryEventEnvelope.model_validate",
+        "gateway_client.delivery_events",
+    ):
+        assert required in source
+    assert "GATE_A_GATEWAY_RUN_ID" not in source
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field","bad_value"),[("artifact_digest","b"*64),("correlation_id","wrong-correlation"),("execution_id","other-execution"),("workflow_id","other-workflow"),("execution_status","error")])
 async def test_target_rejects_provider_success_without_matching_execution_evidence(n8n_server,field,bad_value):
-    base_url,state=n8n_server; state.execution_output[field]=bad_value
+    base_url,state=n8n_server
+    if field in state.execution_output:
+        state.execution_output[field]=bad_value
+    else:
+        setattr(state, field, bad_value)
     async with httpx.AsyncClient() as http:
         target=N8nTarget(N8nHttpClient(api_base_url=base_url,webhook_base_url=base_url,api_key="local-test-key",http=http))
         deployment=await target.deploy(artifact())
