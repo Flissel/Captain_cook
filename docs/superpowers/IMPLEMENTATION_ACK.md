@@ -13,7 +13,7 @@ SCHEDULE_STATE: PENDING_USER_CONFIRMATION_AND_NATIVE_UI
 PROPOSED_SCHEDULE: EVERY_30_MINUTES_WHILE_ACTIVE
 INTEGRATION_WORKTREE: C:\Users\User\Desktop\Captain_cook-main-integration
 INTEGRATION_BRANCH: feat/system-remediation-orchestration
-LAST_INTEGRATED_IMPLEMENTATION_SHA: 0d8b17a
+LAST_INTEGRATED_IMPLEMENTATION_SHA: 0b03d65
 CONTROL_DISPATCH_SHA: 4601806
 PRIMARY_WORKTREE_POLICY: PRESERVE_AND_DO_NOT_USE_FOR_INTEGRATION
 ACK_OWNER: ORCHESTRATOR_ONLY
@@ -41,6 +41,7 @@ may advance the base only after recording a new explicit dispatch SHA here.
 | P13 | `012ca6a` | `e6bb9da` | read-only SQLite import, captain-only archive writes, 50 DB and 477 full tests |
 | D01 | `313b779` | `313b779` | gateway-native cursor design and executable D02-D05 plan |
 | D02 | `0d8b17a` | `0d8b17a` | supervised Codex evidence, spec/quality PASS, 50 DB and 490 full tests |
+| D03 | `0b03d65` | `0b03d65` | recovery/reasoning events, spec/quality PASS, 50 DB and 508 full tests |
 
 P05 closed all known fail-open bootstrap result-shape gaps. P06 is unblocked.
 

@@ -67,13 +67,13 @@ class GatewayRecoveryService:
     async def recover_expired(self, now: datetime) -> tuple[RecoveryDecision, ...]: ...
 ```
 
-- [ ] Write failing tests for expiry, idempotent recovery replay, and rejection
+- [x] Write failing tests for expiry, idempotent recovery replay, and rejection
   of chain-of-thought/workspace-path payloads.
-- [ ] Run the module test; expect failure before the service exists.
-- [ ] Implement Captain-owned `recovery_decision` events (`requeue` or
+- [x] Run the module test; expect failure before the service exists.
+- [x] Implement Captain-owned `recovery_decision` events (`requeue` or
   `aborted_infra`) and opaque hash-bound reasoning references.
-- [ ] Run focused tests, architecture tests, and the selected MariaDB gate with zero skips.
-- [ ] Commit: `feat: add gateway recovery and reasoning slices`.
+- [x] Run focused tests, architecture tests, and the selected MariaDB gate with zero skips.
+- [x] Commit: `feat: add gateway recovery and reasoning slices` (`0b03d65`).
 
 ### Task 3: D04 evidence and independent review
 

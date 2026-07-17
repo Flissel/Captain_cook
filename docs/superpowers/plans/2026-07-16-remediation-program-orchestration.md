@@ -418,7 +418,7 @@ SHAs before either worker begins.
     cancellation while persisting process metadata through gateway events.
   - Gate and exact allowlist: defined by approved D01.
 
-- [ ] **D03 — Gateway-native reasoning slices and crash recovery**
+- [x] **D03 — Gateway-native reasoning slices and crash recovery**
   - Branch: assigned by D01; revised source: Broad Task 6; requires D02.
   - Replace SQLite state transitions with append-only gateway events, leases,
     reaping, and Windows resume behavior.
