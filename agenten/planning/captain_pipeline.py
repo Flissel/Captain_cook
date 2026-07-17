@@ -13,6 +13,8 @@ from agenten.planning.alignment import (
     validate_alignment,
 )
 from agenten.planning.policy import PlanningPolicy
+from agenten.planning.hermes_plan import ValidatedPlanningInput
+from agenten.agent_runtime.contracts import HermesPlanResult, IntegrationIntent
 from agenten.planning.run_models import (
     CaptainRunConflictError,
     CaptainRunState,
@@ -85,6 +87,15 @@ class CaptainCompiledPlan(BaseModel):
         return self
 
 
+class PlanCompilationResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_project_id: str = Field(min_length=1)
+    source_plan_version: int = Field(ge=1, strict=True)
+    source_plan_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    compiled: CaptainCompiledPlan
+
+
 class BatchReleaseClient(Protocol):
     async def release(self, batch: WorkBatch, holdouts: HoldoutSuite) -> None: ...
 
@@ -95,6 +106,10 @@ class CapabilityResolver(Protocol):
         target: str,
         capability_tags: Sequence[str],
     ) -> str | None: ...
+
+
+class HermesPlanResultReader(Protocol):
+    async def read(self, result: HermesPlanResult) -> ValidatedPlanningInput: ...
 
 
 Decompose = Callable[[str], Awaitable[List[PlannedSubtask]]]
@@ -118,6 +133,7 @@ class CaptainPipeline:
         allowed_targets: frozenset[str] | None = None,
         max_alignment_attempts: int = 2,
         run_store: CaptainRunStore | None = None,
+        plan_reader: HermesPlanResultReader | None = None,
     ) -> None:
         if max_alignment_attempts < 1:
             raise ValueError("max_alignment_attempts must be at least 1")
@@ -133,6 +149,7 @@ class CaptainPipeline:
             raise ValueError("default target must be included in allowed_targets")
         self._max_alignment_attempts = max_alignment_attempts
         self._run_store = run_store
+        self._plan_reader = plan_reader
 
     async def compile(self, project_description: str) -> CaptainCompiledPlan:
         """Build the complete reviewable plan without publishing it."""
@@ -218,6 +235,50 @@ class CaptainPipeline:
             batches=tuple(batches),
             holdouts=tuple(holdout_suites),
         )
+
+    async def compile_from_plan(
+        self,
+        source: ValidatedPlanningInput,
+    ) -> PlanCompilationResult:
+        """Compile validated Hermes input without crossing the release boundary."""
+
+        compiled = await self.compile(source.objective)
+        has_n8n_intent = any(
+            blueprint.integration_intent is IntegrationIntent.N8N
+            for blueprint in source.blueprints
+        )
+        if has_n8n_intent and not any(batch.target == "n8n" for batch in compiled.batches):
+            raise CaptainPlanningError("n8n blueprint produced no n8n work batch")
+        if has_n8n_intent:
+            batches = tuple(
+                batch.model_copy(
+                    update={
+                        "capability_tags": [*batch.capability_tags, "n8n-builder"]
+                    }
+                )
+                if batch.target == "n8n" and "n8n-builder" not in batch.capability_tags
+                else batch
+                for batch in compiled.batches
+            )
+            compiled = CaptainCompiledPlan(
+                batches=batches,
+                holdouts=compiled.holdouts,
+            )
+        return PlanCompilationResult(
+            source_project_id=source.project_id,
+            source_plan_version=source.subject_version,
+            source_plan_digest=source.plan_ref.sha256,
+            compiled=compiled,
+        )
+
+    async def compile_from_hermes_result(
+        self,
+        result: HermesPlanResult,
+    ) -> PlanCompilationResult:
+        if self._plan_reader is None:
+            raise CaptainPlanningError("Hermes plan compilation requires an injected reader")
+        source = await self._plan_reader.read(result)
+        return await self.compile_from_plan(source)
 
     async def run(
         self,

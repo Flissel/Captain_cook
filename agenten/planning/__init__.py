@@ -11,8 +11,10 @@ from .captain_pipeline import (
     CaptainPipeline,
     CaptainPlanningError,
     CaptainRunResult,
+    PlanCompilationResult,
     PlannedSubtask,
 )
+from .hermes_plan import HermesPlanReader, HermesPlanningError, ValidatedPlanningInput
 from .gateway_client import GatewayPlanningClient, GatewayPlanningError
 from .release import JsonDirectoryReleaseClient, ReleaseConflictError
 from .run_models import (
@@ -42,7 +44,11 @@ __all__ = [
     "CaptainPipeline",
     "CaptainPlanningError",
     "CaptainRunResult",
+    "PlanCompilationResult",
     "PlannedSubtask",
+    "HermesPlanReader",
+    "HermesPlanningError",
+    "ValidatedPlanningInput",
     "JsonDirectoryReleaseClient",
     "PlanningPolicy",
     "PlanningPolicyError",
