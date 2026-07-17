@@ -252,6 +252,17 @@ class ExecutionProcess:
             ):
                 raise ExecutionContractError("executor result does not match its request")
             results.append(result)
+            if result.status is PackageExecutionStatus.EVIDENCE_UNRESOLVED:
+                return self._run_result(
+                    plan,
+                    review,
+                    PackageExecutionStatus.EVIDENCE_UNRESOLVED,
+                    results,
+                    validations,
+                    run_id,
+                    trace_id,
+                    codex_session_id,
+                )
             if result.status is PackageExecutionStatus.FAILED:
                 return self._run_result(
                     plan,
