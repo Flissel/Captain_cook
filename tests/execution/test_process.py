@@ -189,6 +189,58 @@ async def test_execution_skips_reused_package_and_runs_dependency_order() -> Non
     assert result.results[1].artifact_versions == (1,)
 
 
+
+@pytest.mark.asyncio
+async def test_execution_propagates_evidence_unresolved_for_recovery() -> None:
+    plan = make_plan()
+
+    async def reviewer(_):
+        return []
+
+    review = await PlanReviewProcess(
+        reviewer_id="quality-warden",
+        reviewer_version="v1",
+    ).review(plan, reviewer)
+
+    class RecoveryRequiredExecutor:
+        async def execute(self, request: ExecutionRequest) -> PackageExecutionResult:
+            return PackageExecutionResult(
+                run_id=request.run_id,
+                trace_id=request.trace_id,
+                codex_session_id=request.codex_session_id,
+                batch_id=request.batch.batch_id,
+                worker_id=request.worker_id,
+                status=PackageExecutionStatus.EVIDENCE_UNRESOLVED,
+                artifact_refs=("artifact:recovery/evidence-1",),
+                artifact_versions=(1,),
+                error="codex terminal evidence requires recovery",
+            )
+
+    class ValidationMustNotRun(PassingValidationReader):
+        async def resolve(self, *args, **kwargs):
+            raise AssertionError("unresolved evidence must not enter validation")
+
+    result = await ExecutionProcess(
+        review_reader=StaticReviewReader(review),
+        capability_reader=ValidatedCapabilityReader(),
+        validation_reader=ValidationMustNotRun(),
+    ).execute(
+        plan,
+        review.review_id,
+        RecoveryRequiredExecutor(),
+        run_id=RUN_ID,
+        trace_id=TRACE_ID,
+        codex_session_id=CODEX_SESSION_ID,
+    )
+
+    assert result.status is PackageExecutionStatus.EVIDENCE_UNRESOLVED
+    unresolved = result.results[-1]
+    assert unresolved.status is PackageExecutionStatus.EVIDENCE_UNRESOLVED
+    assert unresolved.artifact_refs == ("artifact:recovery/evidence-1",)
+    assert unresolved.artifact_versions == (1,)
+    assert unresolved.error == "codex terminal evidence requires recovery"
+
+
 @pytest.mark.asyncio
 async def test_reused_capabilities_fail_closed_before_any_executor_call() -> None:
     plan = make_plan()

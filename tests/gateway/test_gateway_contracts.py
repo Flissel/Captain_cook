@@ -74,6 +74,8 @@ def claim(
     return child(
         index,
         "batch_claimed",
+        claim_id=f"claim-{index}",
+        fencing_token=max(1, index - PARENT_INDEX),
         claim_token_sha256=token_hash or f"token-{index}",
         claim_expires_at=expires_at or NOW + timedelta(minutes=30),
     )
@@ -85,6 +87,8 @@ def test_public_event_models_expose_the_planned_shapes() -> None:
     projection = BatchProjection(batch_id=BATCH_ID, parent_index=PARENT_INDEX, status="pending")
     claimed = ClaimEvent(
         batch_id=BATCH_ID,
+        claim_id="claim-1",
+        fencing_token=1,
         claim_token_sha256="sha256",
         claim_expires_at=expiry,
     )
@@ -93,10 +97,31 @@ def test_public_event_models_expose_the_planned_shapes() -> None:
     done = BatchDoneEvent(batch_id=BATCH_ID, outcome="aborted_infra", reason="database unavailable")
 
     assert projection.claim_iteration == 0
+    assert claimed.claim_id == "claim-1"
+    assert claimed.fencing_token == 1
     assert claimed.claim_token_sha256 == "sha256"
     assert heartbeat.claim_expires_at == expiry
     assert evidence.model_extra == {"artifact_ref": "run-1"}
     assert done.model_extra == {"reason": "database unavailable"}
+
+
+def test_existing_batch_projection_contract_remains_compatible() -> None:
+    assert tuple(BatchProjection.model_fields) == (
+        "batch_id",
+        "parent_index",
+        "status",
+        "claim_token_sha256",
+        "claim_id",
+        "fencing_token",
+        "claim_expires_at",
+        "claim_iteration",
+        "codex_session_recorded",
+        "validation_run_recorded",
+        "recovery_recorded",
+        "recovered_iteration",
+        "passing_review_recorded",
+        "failed_review_count",
+    )
 
 
 def test_event_models_reject_invalid_iterations_and_terminal_outcomes() -> None:

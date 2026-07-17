@@ -2,10 +2,440 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import Any, Literal, Sequence, TypeAlias
+from typing import Annotated, Any, Literal, Sequence, TypeAlias
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+
+
+DeliveryEventType: TypeAlias = Literal[
+    "codex_task",
+    "codex_session",
+    "codex_session_started",
+    "codex_session_event",
+    "codex_session_warning",
+    "codex_session_finished",
+    "artifact_built",
+    "deploy",
+    "validation_run",
+    "repair_request",
+    "batch_done",
+    "e2e_run",
+    "evaluation",
+    "release_decision",
+    "registry_mirror",
+]
+ReleaseStatus: TypeAlias = Literal["blocked", "ready"]
+
+
+class _FrozenContract(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class TraceContext(_FrozenContract):
+    project_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    trace_id: str = Field(min_length=1)
+    batch_id: str | None = Field(default=None, min_length=1)
+    worker_id: str | None = Field(default=None, min_length=1)
+    claim_id: str | None = Field(default=None, min_length=1)
+    fencing_token: int | None = Field(default=None, ge=0, strict=True)
+    artifact_id: str | None = Field(default=None, min_length=1)
+    session_id: str | None = Field(default=None, min_length=1)
+    case_id: str | None = Field(default=None, min_length=1)
+
+
+class CodexTaskPayload(_FrozenContract):
+    event_type: Literal["codex_task"]
+    task_id: str = Field(min_length=1)
+    target: str = Field(min_length=1)
+    context_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    workspace_ref: str = Field(min_length=1)
+    permissions: tuple[str, ...] = Field(min_length=1)
+    budget: int = Field(gt=0, strict=True)
+
+    @field_validator("workspace_ref")
+    @classmethod
+    def require_opaque_workspace_reference(cls, value: str) -> str:
+        if not value.startswith("artifact://"):
+            raise ValueError("workspace_ref must be an opaque artifact reference")
+        return value
+
+
+class CodexSessionPayload(_FrozenContract):
+    event_type: Literal["codex_session"]
+    session_id: str = Field(min_length=1)
+    process_ref: str = Field(min_length=1)
+    started_at: datetime
+    ended_at: datetime
+    exit_class: Literal["completed", "failed", "cancelled", "timed_out"]
+
+    @field_validator("process_ref")
+    @classmethod
+    def require_opaque_process_reference(cls, value: str) -> str:
+        if not value.startswith("artifact://"):
+            raise ValueError("process_ref must be an opaque artifact reference")
+        return value
+
+    @model_validator(mode="after")
+    def require_ordered_timestamps(self) -> CodexSessionPayload:
+        if _as_utc(self.ended_at) < _as_utc(self.started_at):
+            raise ValueError("ended_at cannot precede started_at")
+        return self
+
+
+CodexSessionOutcome: TypeAlias = Literal[
+    "succeeded",
+    "behavioral_failure",
+    "infrastructure_failure",
+    "policy_failure",
+    "cancelled",
+    "lost_process",
+]
+CodexCancellationReason: TypeAlias = Literal[
+    "operator",
+    "timeout",
+    "shutdown",
+    "claim_lost",
+]
+
+
+class CodexSessionStartedPayload(_FrozenContract):
+    event_type: Literal["codex_session_started"]
+    session_id: str = Field(min_length=1)
+    process_ref: str = Field(pattern=r"^artifact://[^\\]+$")
+    started_at: datetime
+    iteration: int = Field(ge=1, strict=True)
+    command_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    workspace_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class CodexSessionEventPayload(_FrozenContract):
+    event_type: Literal["codex_session_event"]
+    session_id: str = Field(min_length=1)
+    source_sequence: int = Field(ge=0, strict=True)
+    lifecycle: Literal[
+        "started",
+        "turn_started",
+        "turn_completed",
+        "item_completed",
+        "failed",
+    ]
+    item_id: str | None = Field(default=None, min_length=1)
+    item_type: str | None = Field(default=None, min_length=1)
+    input_tokens: int | None = Field(default=None, ge=0)
+    cached_input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def require_lifecycle_owned_metadata(self) -> CodexSessionEventPayload:
+        item_fields = (self.item_id, self.item_type)
+        token_fields = (
+            self.input_tokens,
+            self.cached_input_tokens,
+            self.output_tokens,
+        )
+        if self.lifecycle == "item_completed":
+            if any(value is None for value in item_fields) or any(
+                value is not None for value in token_fields
+            ):
+                raise ValueError("item_completed requires only item metadata")
+        elif self.lifecycle == "turn_completed":
+            if any(value is not None for value in item_fields) or any(
+                value is None for value in token_fields
+            ):
+                raise ValueError("turn_completed requires only token metadata")
+        elif any(value is not None for value in (*item_fields, *token_fields)):
+            raise ValueError(f"{self.lifecycle} forbids item and token metadata")
+        return self
+
+
+class CodexSessionWarningPayload(_FrozenContract):
+    event_type: Literal["codex_session_warning"]
+    session_id: str = Field(min_length=1)
+    source_sequence: int = Field(ge=0, strict=True)
+    warning_type: Literal["malformed_json", "unknown_event", "invalid_event"]
+    line_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class CodexSessionFinishedPayload(_FrozenContract):
+    event_type: Literal["codex_session_finished"]
+    session_id: str = Field(min_length=1)
+    process_ref: str = Field(pattern=r"^artifact://[^\\]+$")
+    started_at: datetime
+    ended_at: datetime
+    outcome: CodexSessionOutcome
+    exit_code: int | None = None
+    cancellation_reason: CodexCancellationReason | None = None
+    behavioral_repair_increment: Literal[0, 1] = 0
+
+    @model_validator(mode="after")
+    def require_truthful_terminal_outcome(self) -> CodexSessionFinishedPayload:
+        if _as_utc(self.ended_at) < _as_utc(self.started_at):
+            raise ValueError("ended_at cannot precede started_at")
+        expected_increment = 1 if self.outcome == "behavioral_failure" else 0
+        if self.behavioral_repair_increment != expected_increment:
+            raise ValueError("only behavioral_failure increments repair")
+        if self.outcome == "cancelled":
+            if self.cancellation_reason is None:
+                raise ValueError("cancelled outcome requires cancellation_reason")
+        elif self.cancellation_reason is not None:
+            raise ValueError("cancellation_reason requires cancelled outcome")
+        return self
+
+
+class ArtifactBuiltPayload(_FrozenContract):
+    event_type: Literal["artifact_built"]
+    artifact_id: str = Field(min_length=1)
+    artifact_version: str = Field(min_length=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    artifact_type: str = Field(min_length=1)
+    sealed_ref: str = Field(min_length=1)
+
+    @field_validator("sealed_ref")
+    @classmethod
+    def require_opaque_sealed_reference(cls, value: str) -> str:
+        if not value.startswith("artifact://"):
+            raise ValueError("sealed_ref must be an opaque artifact reference")
+        return value
+
+
+class DeployPayload(_FrozenContract):
+    event_type: Literal["deploy"]
+    deployment_id: str = Field(min_length=1)
+    target: str = Field(min_length=1)
+    artifact_version: str = Field(min_length=1)
+    external_deployment_ref: str = Field(min_length=1)
+    result: Literal["succeeded", "failed"]
+
+    @field_validator("external_deployment_ref")
+    @classmethod
+    def require_opaque_deployment_reference(cls, value: str) -> str:
+        if not value.startswith("artifact://"):
+            raise ValueError("external_deployment_ref must be an opaque artifact reference")
+        return value
+
+
+class AssertionResult(_FrozenContract):
+    assertion_id: str = Field(min_length=1)
+    outcome: Literal["passed", "failed"]
+
+
+class ValidationRunPayload(_FrozenContract):
+    event_type: Literal["validation_run"]
+    validation_id: str = Field(min_length=1)
+    layer: str = Field(min_length=1)
+    case_ids: tuple[str, ...] = Field(min_length=1)
+    assertion_results: tuple[AssertionResult, ...] = Field(min_length=1)
+    evidence_refs: tuple[str, ...] = Field(min_length=1)
+    artifact_version: str = Field(min_length=1)
+    passed: bool
+
+    @field_validator("assertion_results", mode="before")
+    @classmethod
+    def normalize_assertion_result_mapping(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            return tuple(
+                {"assertion_id": assertion_id, "outcome": outcome}
+                for assertion_id, outcome in value.items()
+            )
+        return value
+
+    @field_validator("case_ids")
+    @classmethod
+    def require_distinct_case_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not case_id for case_id in value) or len(set(value)) != len(value):
+            raise ValueError("case_ids must be non-empty and distinct")
+        return value
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def require_opaque_evidence_references(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not reference.startswith("artifact://") for reference in value):
+            raise ValueError("evidence_refs must be opaque artifact references")
+        return value
+
+    @model_validator(mode="after")
+    def require_passed_to_match_assertion_results(self) -> ValidationRunPayload:
+        assertion_results_passed = all(
+            result.outcome == "passed" for result in self.assertion_results
+        )
+        if self.passed != assertion_results_passed:
+            raise ValueError("passed must equal whether all assertion_results passed")
+        return self
+
+
+class RepairRequestPayload(_FrozenContract):
+    event_type: Literal["repair_request"]
+    repair_id: str = Field(min_length=1)
+    iteration: int = Field(ge=1, strict=True)
+    failure_class: str = Field(min_length=1)
+    report_ref: str = Field(min_length=1)
+
+    @field_validator("report_ref")
+    @classmethod
+    def require_opaque_report_reference(cls, value: str) -> str:
+        if not value.startswith("artifact://"):
+            raise ValueError("report_ref must be an opaque artifact reference")
+        return value
+
+
+class DeliveryBatchDonePayload(_FrozenContract):
+    event_type: Literal["batch_done"]
+    outcome: Literal["succeeded", "failed", "blocked", "escalated"]
+
+
+class E2ERunPayload(_FrozenContract):
+    event_type: Literal["e2e_run"]
+    e2e_run_id: str = Field(min_length=1)
+    run_index: int = Field(ge=1, strict=True)
+    clean: bool
+    trace_complete: bool
+    evidence_refs: tuple[str, ...] = Field(min_length=1)
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def require_opaque_e2e_evidence_references(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not reference.startswith("artifact://") for reference in value):
+            raise ValueError("evidence_refs must be opaque artifact references")
+        return value
+
+
+class EvaluationPayload(_FrozenContract):
+    event_type: Literal["evaluation"]
+    evaluation_id: str = Field(min_length=1)
+    hard_passed: bool
+    semantic_score: float = Field(ge=0, le=1)
+    safety_passed: bool
+
+
+class ReleaseDecisionPayload(_FrozenContract):
+    event_type: Literal["release_decision"]
+    decision: Literal["accepted", "rejected"]
+    policy_version: str = Field(min_length=1)
+    reasons: tuple[str, ...] = Field(min_length=1)
+
+
+class RegistryMirrorPayload(_FrozenContract):
+    event_type: Literal["registry_mirror"]
+    capability_id: str = Field(min_length=1)
+    capability_version: str = Field(min_length=1)
+    outcome: Literal["mirrored", "failed"]
+
+
+DeliveryEventPayload: TypeAlias = Annotated[
+    CodexTaskPayload
+    | CodexSessionPayload
+    | CodexSessionStartedPayload
+    | CodexSessionEventPayload
+    | CodexSessionWarningPayload
+    | CodexSessionFinishedPayload
+    | ArtifactBuiltPayload
+    | DeployPayload
+    | ValidationRunPayload
+    | RepairRequestPayload
+    | DeliveryBatchDonePayload
+    | E2ERunPayload
+    | EvaluationPayload
+    | ReleaseDecisionPayload
+    | RegistryMirrorPayload,
+    Field(discriminator="event_type"),
+]
+
+
+class DeliveryEventEnvelope(_FrozenContract):
+    event_id: UUID
+    event_type: DeliveryEventType
+    occurred_at: datetime
+    actor: str = Field(min_length=1)
+    trace: TraceContext
+    payload: DeliveryEventPayload
+
+    @model_validator(mode="after")
+    def require_matching_event_type_and_trace_context(self) -> DeliveryEventEnvelope:
+        if self.event_type != self.payload.event_type:
+            raise ValueError("payload event_type must match envelope event_type")
+
+        required_trace_fields: dict[DeliveryEventType, tuple[str, ...]] = {
+            "codex_task": ("batch_id",),
+            "codex_session": ("batch_id", "session_id"),
+            "codex_session_started": ("batch_id", "worker_id", "claim_id", "fencing_token", "session_id"),
+            "codex_session_event": ("batch_id", "worker_id", "claim_id", "fencing_token", "session_id"),
+            "codex_session_warning": ("batch_id", "worker_id", "claim_id", "fencing_token", "session_id"),
+            "codex_session_finished": ("batch_id", "worker_id", "claim_id", "fencing_token", "session_id"),
+            "artifact_built": ("batch_id", "artifact_id"),
+            "deploy": ("batch_id", "artifact_id"),
+            "validation_run": ("batch_id", "artifact_id", "case_id"),
+            "repair_request": ("batch_id",),
+            "batch_done": ("batch_id",),
+            "e2e_run": ("batch_id",),
+            "evaluation": ("batch_id", "case_id"),
+            "release_decision": (),
+            "registry_mirror": ("artifact_id",),
+        }
+        missing = [
+            field_name
+            for field_name in required_trace_fields[self.event_type]
+            if getattr(self.trace, field_name) is None
+        ]
+        if missing:
+            raise ValueError(f"trace requires {', '.join(missing)} for {self.event_type}")
+        if isinstance(self.payload, CodexSessionPayload) and self.trace.session_id != self.payload.session_id:
+            raise ValueError("trace session_id must match codex_session payload")
+        if isinstance(
+            self.payload,
+            (
+                CodexSessionStartedPayload,
+                CodexSessionEventPayload,
+                CodexSessionWarningPayload,
+                CodexSessionFinishedPayload,
+            ),
+        ) and self.trace.session_id != self.payload.session_id:
+            raise ValueError("trace session_id must match Codex session payload")
+        if isinstance(self.payload, ArtifactBuiltPayload) and self.trace.artifact_id != self.payload.artifact_id:
+            raise ValueError("trace artifact_id must match artifact_built payload")
+        if isinstance(self.payload, ValidationRunPayload) and self.trace.case_id not in self.payload.case_ids:
+            raise ValueError("trace case_id must appear in validation_run case_ids")
+        return self
+
+
+class ReleaseProjection(_FrozenContract):
+    status: ReleaseStatus
+    clean_e2e_run_ids: tuple[str, ...]
+    missing_clean_e2e_runs: int = Field(ge=0, le=3)
+
+
+def project_release(events: Sequence[DeliveryEventEnvelope]) -> ReleaseProjection:
+    """Derive the release gate from unique, complete clean E2E evidence."""
+
+    clean_runs: dict[str, E2ERunPayload] = {}
+    ordered_events = sorted(
+        events,
+        key=lambda event: (_as_utc(event.occurred_at), event.event_id.int),
+    )
+    for event in ordered_events:
+        if not isinstance(event.payload, E2ERunPayload):
+            continue
+        payload = event.payload
+        if payload.clean and payload.trace_complete:
+            clean_runs.setdefault(payload.e2e_run_id, payload)
+
+    clean_e2e_run_ids = tuple(clean_runs)
+    missing_clean_e2e_runs = max(0, 3 - len(clean_e2e_run_ids))
+    return ReleaseProjection(
+        status="ready" if missing_clean_e2e_runs == 0 else "blocked",
+        clean_e2e_run_ids=clean_e2e_run_ids,
+        missing_clean_e2e_runs=missing_clean_e2e_runs,
+    )
 
 
 BatchStatus: TypeAlias = Literal[
@@ -34,6 +464,8 @@ class BatchProjection(BaseModel):
     parent_index: int
     status: BatchStatus
     claim_token_sha256: str | None = None
+    claim_id: str | None = None
+    fencing_token: int | None = None
     claim_expires_at: datetime | None = None
     claim_iteration: int = 0
     codex_session_recorded: bool = False
@@ -46,6 +478,8 @@ class BatchProjection(BaseModel):
 
 class ClaimEvent(BaseModel):
     batch_id: str
+    claim_id: str = Field(min_length=1)
+    fencing_token: int = Field(ge=1, strict=True)
     claim_token_sha256: str
     claim_expires_at: datetime
 
@@ -245,6 +679,8 @@ def project_batch(
 
     status: BatchStatus = parent["status"]
     claim_token_sha256: str | None = None
+    claim_id: str | None = None
+    fencing_token: int | None = None
     claim_expires_at: datetime | None = None
     claim_iteration = 0
     codex_session_recorded = False
@@ -277,6 +713,8 @@ def project_batch(
             assert isinstance(event, ClaimEvent)
             claim_iteration += 1
             claim_token_sha256 = event.claim_token_sha256
+            claim_id = event.claim_id
+            fencing_token = event.fencing_token
             claim_expires_at = _as_utc(event.claim_expires_at)
             codex_session_recorded = False
             validation_run_recorded = False
@@ -341,6 +779,8 @@ def project_batch(
             recovery_recorded = True
             recovered_iteration = event.iteration
             claim_token_sha256 = None
+            claim_id = None
+            fencing_token = None
             claim_expires_at = None
             if event.decision == "aborted_infra":
                 status = "aborted_infra"
@@ -376,6 +816,8 @@ def project_batch(
         parent_index=parent["index"],
         status=status,
         claim_token_sha256=claim_token_sha256,
+        claim_id=claim_id,
+        fencing_token=fencing_token,
         claim_expires_at=claim_expires_at,
         claim_iteration=claim_iteration,
         codex_session_recorded=codex_session_recorded,

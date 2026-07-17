@@ -20,6 +20,8 @@ def projection(*, iteration: int = 1) -> dict[str, object]:
         "parent_index": 41,
         "status": "claimed",
         "claim_token_sha256": "a" * 64,
+        "claim_id": "claim-current",
+        "fencing_token": iteration,
         "claim_expires_at": "2026-07-16T12:00:00Z",
         "claim_iteration": iteration,
         "codex_session_recorded": False,
@@ -36,7 +38,12 @@ async def test_claim_returns_typed_token_and_current_iteration() -> None:
         if request.method == "POST":
             return httpx.Response(
                 200,
-                json={"claim_token": "claim-secret", "claim_expires_at": "2026-07-16T12:00:00Z"},
+                json={
+                    "claim_token": "claim-secret",
+                    "claim_id": "claim-current",
+                    "fencing_token": 3,
+                    "claim_expires_at": "2026-07-16T12:00:00Z",
+                },
                 request=request,
             )
         return httpx.Response(200, json=projection(iteration=3), request=request)
@@ -46,6 +53,8 @@ async def test_claim_returns_typed_token_and_current_iteration() -> None:
         claim = await client.claim("batch-1")
 
     assert claim.token == "claim-secret"
+    assert claim.claim_id == "claim-current"
+    assert claim.fencing_token == 3
     assert claim.iteration == 3
     assert claim.expires_at == datetime(2026, 7, 16, 12, tzinfo=timezone.utc)
     assert [request.url.path for request in requests] == [
@@ -201,3 +210,62 @@ async def test_delivery_conflict_and_transport_errors_are_sanitized() -> None:
         client = GatewayDeliveryClient("http://gateway", "worker-secret", http)
         with pytest.raises(GatewayDeliveryError):
             await client.heartbeat("batch-1", "claim-secret")
+
+
+@pytest.mark.asyncio
+async def test_delivery_event_routes_append_and_read_typed_envelopes() -> None:
+    from datetime import timedelta
+    from uuid import uuid4
+
+    from gateway.contracts import DeliveryEventEnvelope
+
+    event = DeliveryEventEnvelope.model_validate(
+        {
+            "event_id": uuid4(),
+            "event_type": "codex_session_started",
+            "occurred_at": datetime(2026, 7, 17, 12, tzinfo=timezone.utc),
+            "actor": "worker-1",
+            "trace": {
+                "project_id": "project-1",
+                "run_id": "run-1",
+                "trace_id": "trace-1",
+                "batch_id": "batch-1",
+                "worker_id": "worker-1",
+                "claim_id": "claim-1",
+                "fencing_token": 7,
+                "session_id": "session-1",
+            },
+            "payload": {
+                "event_type": "codex_session_started",
+                "session_id": "session-1",
+                "process_ref": "artifact://processes/session-1",
+                "started_at": datetime(2026, 7, 17, 12, tzinfo=timezone.utc),
+                "iteration": 1,
+                "command_sha256": "a" * 64,
+                "workspace_sha256": "b" * 64,
+            },
+        }
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(
+                201,
+                json={"event": event.model_dump(mode="json"), "replayed": False},
+                request=request,
+            )
+        return httpx.Response(200, json=[event.model_dump(mode="json")], request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = GatewayDeliveryClient("http://gateway", "worker-secret", http)
+        assert await client.append_delivery_event(event) == event
+        assert await client.delivery_events(
+            project_id="project-1", run_id="run-1"
+        ) == (event,)
+
+    assert [request.url.path for request in requests] == [
+        "/v1/delivery/events",
+        "/v1/projects/project-1/runs/run-1/events",
+    ]

@@ -32,6 +32,7 @@ class PackageExecutionStatus(str, Enum):
     REUSED = "reused"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    EVIDENCE_UNRESOLVED = "evidence_unresolved"
 
 
 class CapabilityStatus(str, Enum):
@@ -138,7 +139,10 @@ class PackageExecutionResult(BaseModel):
             raise ValueError("artifact references and versions must have equal length")
         if any(version < 1 for version in self.artifact_versions):
             raise ValueError("artifact versions must be positive")
-        if self.status is PackageExecutionStatus.FAILED and not self.error:
+        if self.status in {
+            PackageExecutionStatus.FAILED,
+            PackageExecutionStatus.EVIDENCE_UNRESOLVED,
+        } and not self.error:
             raise ValueError("failed execution results require an error")
         if self.status is PackageExecutionStatus.SUCCEEDED:
             if self.error:
@@ -248,6 +252,17 @@ class ExecutionProcess:
             ):
                 raise ExecutionContractError("executor result does not match its request")
             results.append(result)
+            if result.status is PackageExecutionStatus.EVIDENCE_UNRESOLVED:
+                return self._run_result(
+                    plan,
+                    review,
+                    PackageExecutionStatus.EVIDENCE_UNRESOLVED,
+                    results,
+                    validations,
+                    run_id,
+                    trace_id,
+                    codex_session_id,
+                )
             if result.status is PackageExecutionStatus.FAILED:
                 return self._run_result(
                     plan,

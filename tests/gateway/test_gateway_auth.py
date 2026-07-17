@@ -298,7 +298,9 @@ def test_captain_and_worker_route_matrix(client: TestClient) -> None:
         assert client.get("/batches/batch-1", headers=reader).status_code == 200
         assert client.get("/batches/batch-1/bundle", headers=reader).status_code == 200
         assert client.get("/batches/batch-1/blocks", headers=reader).status_code == 200
-        assert client.get("/batches/batch-1/holdout", headers=reader).status_code == 200
+        holdout_response = client.get("/batches/batch-1/holdout", headers=reader)
+        assert holdout_response.status_code == 410
+        assert "secret-1" not in holdout_response.text
         assert client.get("/capabilities", params={"need": "email"}, headers=reader).status_code == 200
 
     assert client.post("/sink/crm", headers=captain, json={"case_id": "case-1", "tag": "lead"}).status_code == 403
