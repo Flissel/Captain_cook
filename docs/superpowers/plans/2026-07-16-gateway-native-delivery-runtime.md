@@ -90,13 +90,18 @@ class ReviewDecisionEvent(EvidenceEvent):
     evidence_refs: tuple[str, ...]
 ```
 
-- [ ] Write failing tests proving success needs current-iteration validation
+- [x] Write failing tests proving success needs current-iteration validation
   and a passing review, while stale/forged/failed reviews are rejected.
-- [ ] Run focused tests; expect failure because review events are unknown.
-- [ ] Implement Captain-only review records and the terminal projection rule;
+- [x] Run focused tests; observed the expected missing review contract/controller.
+- [x] Implement Captain-only review records and the terminal projection rule;
   append `failed_after_max_iterations` after five immutable failed reviews.
 - [ ] Run focused gateway tests and full disposable-MariaDB gate.
-- [ ] Commit: `feat: require reviewed gateway evidence for success`.
+- [x] Commit: `feat: require reviewed gateway evidence for success` (`db92c82`),
+  followed by review hardening (`1adcf9b`); specification and quality review PASS.
+
+The focused D04 gates pass, but the disposable-MariaDB gate remains open because
+Docker Desktop was not running on 2026-07-17. D04 and dependent D05 remain open
+until `scripts/test_gateway.ps1` completes with zero selected skips.
 
 ### Task 4: D05 replay feed and projections
 

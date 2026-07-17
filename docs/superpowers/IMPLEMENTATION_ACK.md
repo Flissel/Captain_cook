@@ -47,6 +47,14 @@ P05 closed all known fail-open bootstrap result-shape gaps. P06 is unblocked.
 
 ## Active findings and stop gates
 
+D04 code is committed as `db92c82` plus hardening commit `1adcf9b` after an
+independent specification PASS and quality PASS. The focused review/controller,
+contract, delivery-client, recovery, and architecture gates pass. The required
+disposable-MariaDB gate is still a stop gate: Docker Desktop was not running on
+2026-07-17, so the isolated `mariadb:11.8.8` service could not start and the 14
+DB-backed authorization/transaction tests have not yet produced zero-skip
+evidence. D04 is not acknowledged complete and D05 is not unlocked.
+
 P07B candidate `6acee13` is integrated as merge commit `848c83f`. The focused
 real MariaDB gate passed 46 tests with zero skips and the complete integrated
 gate passed 391 tests with two explicit skips, one live deselection, one known
