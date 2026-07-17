@@ -14,6 +14,7 @@ from .contracts import (
 )
 from .capabilities import CapabilityDenied, derive_grant, validate_grant
 from .prompt_policy import PromptPolicyDenied, RenderedPrompt, render_codex_prompt
+from .service import AgentRuntimeService, RuntimeContractViolation
 
 __all__ = [
     "AgentBlueprint",
@@ -32,4 +33,6 @@ __all__ = [
     "PromptPolicyDenied",
     "RenderedPrompt",
     "render_codex_prompt",
+    "AgentRuntimeService",
+    "RuntimeContractViolation",
 ]
