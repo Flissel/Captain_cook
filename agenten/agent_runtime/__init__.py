@@ -12,6 +12,7 @@ from .contracts import (
     RuntimeOperation,
     RuntimeStatus,
 )
+from .capabilities import CapabilityDenied, derive_grant, validate_grant
 
 __all__ = [
     "AgentBlueprint",
@@ -24,4 +25,7 @@ __all__ = [
     "IntegrationIntent",
     "RuntimeOperation",
     "RuntimeStatus",
+    "CapabilityDenied",
+    "derive_grant",
+    "validate_grant",
 ]
