@@ -265,10 +265,16 @@ class CodexSupervisor:
             for event in events:
                 await self._repository.append(event)
         except Exception:
-            await self._finish_repository(
+            terminal_persisted = await self._finish_repository(
                 request.session_id,
                 CodexOutcome(classification="infrastructure_failure"),
             )
+            if not terminal_persisted:
+                return self._result(
+                    request,
+                    PackageExecutionStatus.EVIDENCE_UNRESOLVED,
+                    error="codex terminal evidence requires recovery",
+                )
             return self._result(
                 request,
                 PackageExecutionStatus.FAILED,

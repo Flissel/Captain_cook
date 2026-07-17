@@ -10,6 +10,8 @@ import httpx
 import pytest
 
 from agenten.delivery.codex_runs import (
+    CancellationPersistenceRequired,
+    CodexCancellationCoordinator,
     CodexCancellationResult,
     CodexOutcome,
     GatewayCodexRunRepository,
@@ -414,6 +416,110 @@ def test_powershell_cancellation_rejects_pid_reuse_identity_mismatch(
         child.wait(timeout=10)
 
 
+
+def _write_process_state(path: Path, session_id: str, child: subprocess.Popen[bytes]) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "session_id": session_id,
+                "pid": child.pid,
+                **_process_identity(child.pid),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancellation_coordinator_kills_and_persists_in_one_call(
+    tmp_path: Path,
+) -> None:
+    child = subprocess.Popen(
+        [_pwsh(), "-NoProfile", "-Command", "Start-Sleep -Seconds 60"]
+    )
+    state_path = tmp_path / "coordinated-process.json"
+    try:
+        _write_process_state(state_path, "session-1", child)
+        history = GatewayHistory()
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(history.handle)
+        ) as http:
+            runs = repository(history, http)
+            await runs.start(request(tmp_path))
+            result = await CodexCancellationCoordinator(
+                repository=runs,
+                worker_id="worker-1",
+                pwsh_path=Path(_pwsh()),
+                script_path=Path("scripts/codex-session.ps1").resolve(),
+            ).cancel(
+                session_id="session-1",
+                state_path=state_path,
+                reason="operator",
+            )
+
+        child.wait(timeout=10)
+        assert result == CodexCancellationResult(
+            session_id="session-1",
+            outcome="cancelled",
+            cancellation_reason="operator",
+        )
+        assert history.events[-1]["event_type"] == "codex_session_finished"
+        assert history.events[-1]["payload"]["cancellation_reason"] == "operator"
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_coordinator_persistence_failure_is_recoverable_not_complete(
+    tmp_path: Path,
+) -> None:
+    child = subprocess.Popen(
+        [_pwsh(), "-NoProfile", "-Command", "Start-Sleep -Seconds 60"]
+    )
+    state_path = tmp_path / "unresolved-process.json"
+    history = GatewayHistory()
+
+    def fail_terminal(request_: httpx.Request) -> httpx.Response:
+        if request_.method == "POST":
+            body = json.loads(request_.content)
+            if body["event_type"] == "codex_session_finished":
+                return httpx.Response(503, json={"detail": "down"}, request=request_)
+        return history.handle(request_)
+
+    try:
+        _write_process_state(state_path, "session-1", child)
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(fail_terminal)
+        ) as http:
+            runs = repository(history, http)
+            await runs.start(request(tmp_path))
+            coordinator = CodexCancellationCoordinator(
+                repository=runs,
+                worker_id="worker-1",
+                pwsh_path=Path(_pwsh()),
+                script_path=Path("scripts/codex-session.ps1").resolve(),
+            )
+            with pytest.raises(CancellationPersistenceRequired):
+                await coordinator.cancel(
+                    session_id="session-1",
+                    state_path=state_path,
+                    reason="shutdown",
+                )
+            assert len(await runs.active(worker_id="worker-1")) == 1
+
+        child.wait(timeout=10)
+        assert all(
+            event["event_type"] != "codex_session_finished"
+            for event in history.events
+        )
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+
+
 @pytest.mark.asyncio
 async def test_restart_replay_uses_original_start_time_and_rejects_terminal_conflict(
     tmp_path: Path,
@@ -534,6 +640,48 @@ async def test_supervisor_terminalizes_infrastructure_when_event_append_fails(
     assert history.events[-1]["event_type"] == "codex_session_finished"
     assert history.events[-1]["payload"]["outcome"] == "infrastructure_failure"
     assert history.events[-1]["payload"]["behavioral_repair_increment"] == 0
+
+
+
+@pytest.mark.asyncio
+async def test_supervisor_reports_unresolved_evidence_when_lifecycle_and_terminal_fail(
+    tmp_path: Path,
+) -> None:
+    history = GatewayHistory()
+
+    def fail_lifecycle_and_terminal(request_: httpx.Request) -> httpx.Response:
+        if request_.method == "POST":
+            body = json.loads(request_.content)
+            if body["event_type"] in {
+                "codex_session_event",
+                "codex_session_finished",
+            }:
+                return httpx.Response(503, json={"detail": "down"}, request=request_)
+        return history.handle(request_)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(fail_lifecycle_and_terminal)
+    ) as http:
+        runs = repository(history, http)
+
+        class Runner:
+            async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
+                return CodexRunResult(
+                    exit_code=0,
+                    artifact_references=(),
+                    jsonl_lines=('{"type":"turn.started"}',),
+                )
+
+        result = await CodexSupervisor(
+            runner=Runner(),
+            gateway=ForbiddenLegacyWriter(),
+            policy=AllowingPolicy(),
+            repository=runs,
+        ).run(request(tmp_path))
+
+        assert result.status is PackageExecutionStatus.EVIDENCE_UNRESOLVED
+        assert result.error == "codex terminal evidence requires recovery"
+        assert len(await runs.active(worker_id="worker-1")) == 1
 
 
 @pytest.mark.asyncio

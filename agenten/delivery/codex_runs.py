@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+from pathlib import Path
+import subprocess
 from collections.abc import Callable
 from datetime import datetime
 from typing import Literal, Protocol
@@ -57,6 +60,28 @@ class CodexOutcome(BaseModel):
         return self
 
 
+class CancellationExecutionError(RuntimeError):
+    """The session-bound process could not be safely cancelled."""
+
+
+class CancellationPersistenceRequired(RuntimeError):
+    """The process was cancelled but terminal Gateway evidence needs recovery."""
+
+    def __init__(self, result: "CodexCancellationResult") -> None:
+        super().__init__("cancelled process terminal evidence requires recovery")
+        self.result = result
+
+
+class CodexProcessIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    session_id: str = Field(min_length=1)
+    pid: int = Field(ge=1)
+    started_at_utc: datetime
+    start_time_utc_ticks: int = Field(ge=1)
+    executable: str = Field(min_length=1)
+
+
 class CodexCancellationResult(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -102,6 +127,93 @@ class CodexRunRepository(Protocol):
     async def persist_cancellation(
         self, result: CodexCancellationResult
     ) -> None: ...
+
+
+
+class CodexCancellationCoordinator:
+    """Cancel one verified process tree and durably finish its active session."""
+
+    def __init__(
+        self,
+        *,
+        repository: CodexRunRepository,
+        worker_id: str,
+        pwsh_path: Path,
+        script_path: Path,
+    ) -> None:
+        if not worker_id:
+            raise ValueError("worker_id must not be empty")
+        self._repository = repository
+        self._worker_id = worker_id
+        self._pwsh_path = pwsh_path.resolve(strict=True)
+        self._script_path = script_path.resolve(strict=True)
+
+    async def cancel(
+        self,
+        *,
+        session_id: str,
+        state_path: Path,
+        reason: CancellationReason,
+    ) -> CodexCancellationResult:
+        active = await self._repository.active(worker_id=self._worker_id)
+        if not any(record.session_id == session_id for record in active):
+            raise CancellationExecutionError("cancellation requires an active session")
+
+        try:
+            identity = CodexProcessIdentity.model_validate_json(
+                state_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            raise CancellationExecutionError(
+                "cancellation process identity is invalid"
+            ) from None
+        if identity.session_id != session_id:
+            raise CancellationExecutionError(
+                "cancellation process identity does not match session"
+            )
+
+        completed = await asyncio.to_thread(
+            subprocess.run,
+            [
+                str(self._pwsh_path),
+                "-NoProfile",
+                "-File",
+                str(self._script_path),
+                "-CancelStatePath",
+                str(state_path.resolve()),
+                "-SessionId",
+                session_id,
+                "-CancellationReason",
+                reason,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise CancellationExecutionError("session-bound cancellation failed")
+        try:
+            result = CodexCancellationResult.model_validate_json(
+                completed.stdout.strip()
+            )
+        except ValueError:
+            raise CancellationExecutionError(
+                "session-bound cancellation returned invalid evidence"
+            ) from None
+        if (
+            result.session_id != session_id
+            or result.outcome != "cancelled"
+            or result.cancellation_reason != reason
+        ):
+            raise CancellationExecutionError(
+                "session-bound cancellation result does not match request"
+            )
+
+        try:
+            await self._repository.persist_cancellation(result)
+        except Exception:
+            raise CancellationPersistenceRequired(result) from None
+        return result
 
 
 class GatewayCodexRunRepository:
