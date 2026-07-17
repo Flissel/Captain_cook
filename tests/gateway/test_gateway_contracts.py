@@ -11,6 +11,7 @@ from gateway.contracts import (
     BatchDoneEvent,
     BatchProjection,
     ClaimEvent,
+    CodexProcessEvent,
     EvidenceEvent,
     HeartbeatEvent,
     project_batch,
@@ -102,6 +103,47 @@ def test_event_models_reject_invalid_iterations_and_terminal_outcomes() -> None:
         EvidenceEvent(batch_id=BATCH_ID, iteration=0)
     with pytest.raises(ValidationError):
         BatchDoneEvent(batch_id=BATCH_ID, outcome="timed_out")
+
+
+def test_codex_process_is_strict_current_claim_evidence() -> None:
+    event = CodexProcessEvent(
+        batch_id=BATCH_ID,
+        iteration=1,
+        process_id="codex-session-1",
+        state="started",
+        command_digest="a" * 64,
+    )
+    assert event.state == "started"
+    with pytest.raises(ValidationError):
+        CodexProcessEvent(
+            batch_id=BATCH_ID, iteration=1, process_id="process", state="started",
+            command_digest="not-a-digest",
+        )
+
+    malformed = child(
+        12, "codex_process", iteration=1, process_id="process", state="started",
+        command_digest="not-a-digest",
+    )
+    with pytest.raises(ValueError, match="invalid codex_process data"):
+        project_batch([work_batch(), claim(11), malformed], BATCH_ID, now=NOW)
+
+
+def test_codex_process_does_not_replace_validation_evidence_for_success() -> None:
+    process = child(
+        12,
+        "codex_process",
+        iteration=1,
+        process_id="process-1",
+        state="exited",
+        command_digest="a" * 64,
+    )
+    done = child(13, "batch_done", outcome="succeeded")
+
+    with pytest.raises(
+        ValueError,
+        match="succeeded batch_done requires current-iteration validation_run evidence",
+    ):
+        project_batch([work_batch(), claim(11), process, done], BATCH_ID, now=NOW)
 
 
 @pytest.mark.parametrize("iteration", [True, "1"])

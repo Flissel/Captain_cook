@@ -19,6 +19,7 @@ from gateway.contracts import (
     BatchDoneEvent,
     BatchProjection,
     ClaimEvent,
+    CodexProcessEvent,
     HeartbeatEvent,
     project_batch,
 )
@@ -292,6 +293,8 @@ class GatewayStore:
                 data = WorkBatch.model_validate(data).model_dump(mode="json")
             elif block_type == "holdout":
                 data = HoldoutSuite.model_validate(data).model_dump(mode="json")
+            elif block_type == "codex_process":
+                data = CodexProcessEvent.model_validate(data).model_dump(mode="json")
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=exc.errors()) from exc
 

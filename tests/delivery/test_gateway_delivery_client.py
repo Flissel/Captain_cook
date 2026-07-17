@@ -76,6 +76,10 @@ async def test_fenced_writes_send_claim_token_and_typed_payloads() -> None:
         await client.record_codex_session(
             "batch-1", "claim-secret", iteration=2, session_id="thread-123"
         )
+        await client.record_codex_process(
+            "batch-1", "claim-secret", iteration=2, process_id="process-1",
+            state="started", command_digest="a" * 64,
+        )
         await client.record_validation(
             "batch-1", "claim-secret", iteration=2, artifact_ref="artifact://run/1"
         )
@@ -96,6 +100,7 @@ async def test_fenced_writes_send_claim_token_and_typed_payloads() -> None:
     payloads = [json.loads(request.content) for request in requests[1:]]
     assert [payload["block_type"] for payload in payloads] == [
         "codex_session",
+        "codex_process",
         "validation_run",
         "batch_done",
     ]
@@ -104,9 +109,13 @@ async def test_fenced_writes_send_claim_token_and_typed_payloads() -> None:
         "iteration": 2,
         "session_id": "thread-123",
     }
-    assert payloads[1]["data"]["artifact_ref"] == "artifact://run/1"
-    assert payloads[2]["status"] == "succeeded"
-    assert payloads[2]["data"] == {
+    assert payloads[1]["data"] == {
+        "batch_id": "batch-1", "iteration": 2, "process_id": "process-1",
+        "state": "started", "command_digest": "a" * 64,
+    }
+    assert payloads[2]["data"]["artifact_ref"] == "artifact://run/1"
+    assert payloads[3]["status"] == "succeeded"
+    assert payloads[3]["data"] == {
         "batch_id": "batch-1",
         "outcome": "succeeded",
         "capabilities": ["crm", "delivery"],

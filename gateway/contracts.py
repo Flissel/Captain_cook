@@ -58,6 +58,14 @@ class EvidenceEvent(BaseModel):
     iteration: int = Field(ge=1, strict=True)
 
 
+class CodexProcessEvent(EvidenceEvent):
+    model_config = ConfigDict(extra="forbid")
+
+    process_id: str = Field(min_length=1, max_length=128)
+    state: Literal["started", "heartbeat", "exited", "cancelled"]
+    command_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class BatchDoneEvent(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -71,6 +79,7 @@ _LIFECYCLE_BLOCK_TYPES = frozenset(
         "batch_claimed",
         "batch_heartbeat",
         "codex_session",
+        "codex_process",
         "validation_run",
         "batch_done",
     }
@@ -219,14 +228,17 @@ def project_batch(
             claim_expires_at = _as_utc(event.claim_expires_at)
             continue
 
-        if block_type in {"codex_session", "validation_run"}:
-            event = _event_data(block, EvidenceEvent)
+        if block_type in {"codex_session", "codex_process", "validation_run"}:
+            event_model: type[BaseModel] = (
+                CodexProcessEvent if block_type == "codex_process" else EvidenceEvent
+            )
+            event = _event_data(block, event_model)
             assert isinstance(event, EvidenceEvent)
             if claim_iteration == 0 or event.iteration != claim_iteration:
                 raise ValueError("evidence must match the current claim iteration")
             if block_type == "codex_session":
                 codex_session_recorded = True
-            else:
+            elif block_type == "validation_run":
                 validation_run_recorded = True
             continue
 

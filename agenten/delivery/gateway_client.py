@@ -203,6 +203,35 @@ class GatewayDeliveryClient:
             ),
         )
 
+    async def record_codex_process(
+        self,
+        batch_id: str,
+        claim_token: str,
+        *,
+        iteration: int,
+        process_id: str,
+        state: Literal["started", "heartbeat", "exited", "cancelled"],
+        command_digest: str,
+    ) -> None:
+        if not process_id:
+            raise ValueError("process_id must not be empty")
+        if len(command_digest) != 64 or any(
+            char not in "0123456789abcdef" for char in command_digest
+        ):
+            raise ValueError("command_digest must be a sha256 hex digest")
+        await self._append_event(
+            "codex_process",
+            batch_id,
+            claim_token,
+            {
+                "batch_id": batch_id,
+                "iteration": iteration,
+                "process_id": process_id,
+                "state": state,
+                "command_digest": command_digest,
+            },
+        )
+
     async def append_evidence(
         self,
         batch_id: str,

@@ -296,6 +296,45 @@ def test_captain_and_worker_route_matrix(client: TestClient) -> None:
     assert client.get("/sink/crm", params={"case_id": "case-1"}, headers=worker).status_code == 200
 
 
+def test_codex_process_requires_worker_role_and_live_claim_token(client: TestClient) -> None:
+    captain = authorization(CAPTAIN_TOKEN)
+    worker = authorization(WORKER_TOKEN)
+    batch = client.post(
+        "/blocks",
+        headers=captain,
+        json={"block_type": "work_batch", "status": "pending_review", "data": batch_payload()},
+    )
+    assert batch.status_code == 201
+    assert client.post("/batches/batch-1/approve", headers=captain).status_code == 200
+    claimed = client.post("/batches/batch-1/claim", headers=worker)
+    assert claimed.status_code == 200
+    claim_token = claimed.json()["claim_token"]
+    request = {
+        "block_type": "codex_process",
+        "data": {
+            "batch_id": "batch-1",
+            "iteration": 1,
+            "process_id": "codex-session-1",
+            "state": "started",
+            "command_digest": "a" * 64,
+        },
+    }
+
+    assert client.post("/blocks", json=request).status_code == 401
+    assert client.post("/blocks", headers=captain, json=request).status_code == 403
+    assert client.post("/blocks", headers=worker, json=request).status_code == 409
+    assert client.post(
+        "/blocks",
+        headers=authorization(WORKER_TOKEN, claim_token="invalid-claim-token"),
+        json=request,
+    ).status_code == 409
+    assert client.post(
+        "/blocks",
+        headers=authorization(WORKER_TOKEN, claim_token=claim_token),
+        json=request,
+    ).status_code == 201
+
+
 def test_runtime_lifespan_fails_closed_without_complete_settings(
     storage: MariaDBStorage,
     monkeypatch: pytest.MonkeyPatch,
