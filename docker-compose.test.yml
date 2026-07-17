@@ -1,0 +1,18 @@
+name: captain-cook-test
+services:
+  mariadb-test:
+    image: mariadb:11.8.8
+    environment:
+      MARIADB_DATABASE: captain_test
+      MARIADB_USER: captain_test
+      MARIADB_PASSWORD: "${MARIADB_TEST_PASSWORD:?required}"
+      MARIADB_ROOT_PASSWORD: "${MARIADB_TEST_ROOT_PASSWORD:?required}"
+    ports:
+      - "127.0.0.1:${MARIADB_TEST_PORT:-33306}:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      - /var/lib/mysql

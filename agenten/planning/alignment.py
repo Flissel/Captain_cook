@@ -21,6 +21,7 @@ class BatchDraft(BaseModel):
     title: str = Field(min_length=1)
     subtask_ids: List[str] = Field(min_length=1)
     depends_on: List[str] = Field(default_factory=list)
+    target: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_-]{0,31}$")
 
 
 class AlignmentPlan(BaseModel):

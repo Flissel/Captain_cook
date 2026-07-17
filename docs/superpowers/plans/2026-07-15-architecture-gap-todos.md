@@ -38,6 +38,7 @@
 - [ ] Replace the `AutoGenEventBus.subscribe` `NotImplementedError` boundary with an explicit supported adapter contract or a boot-time capability failure; add a test for the selected behavior.
 - [x] Add a durable event/dead-letter outcome for permanently unroutable work. `SubproblemUnroutable` is emitted by the coordinator and persisted as a terminal ledger failure by the sole writer.
 - [ ] Complete the distinct `feat/ledger-gateway` contract with gateway schemas and acceptance tests. Transactional MariaDB storage now exists on the branch; claim fencing and terminal-state gateway rejection remain to prove.
+  - [x] Declare the MariaDB gateway as the sole production delivery truth and enforce its exclusive `MariaDBStorage` reference boundary with an AST-based architecture test.
 - [ ] Keep the in-process ledger and future gateway behind one `LedgerQuery`/writer port so orchestration does not gain transport or database knowledge.
 - [ ] Add an end-to-end contract test proving that every terminal worker result is recorded exactly once and can be recovered after restart or replay.
 

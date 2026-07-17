@@ -2,6 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Program routing:** Do not dispatch this plan standalone. Follow
+> `2026-07-16-remediation-program-orchestration.md`. Captain Tasks 1, 3, 6, 7,
+> and the shared-document part of Task 8 are absorbed by canonical program
+> packets; only the orchestrator updates source-plan checkboxes.
+
 **Goal:** Make the Captain planning path production-ready by enforcing deterministic policy after every LLM stage, releasing through the sole-writer gateway, resuming partial project releases, and proving live persistence and runtime contracts.
 
 **Architecture:** Keep the deterministic `CaptainPipeline` independent of transports and databases. Add typed policy, release, capability, run-store, and event-publication ports; wire JSON implementations for offline operation and HTTP/MariaDB-backed implementations for production. Hermes and n8n remain external consumers and are not implemented here.
@@ -112,7 +117,7 @@ git commit -m "docs: establish canonical integration baseline"
 - Consumes: configured `allowed_capability_tags: frozenset[str]`, `BatchEnrichment`, and `WorkBatch`.
 - Produces: `PlanningPolicy.validate_enrichment(enrichment) -> None` and deterministic content fingerprints for golden/holdout isolation.
 
-- [ ] **Step 1: Write failing policy tests**
+- [x] **Step 1: Write failing policy tests**
 
 ```python
 def test_policy_rejects_enrichment_capability_outside_vocabulary() -> None:
@@ -132,13 +137,13 @@ def test_policy_rejects_same_case_content_under_different_ids() -> None:
         policy.validate_enrichment(enrichment)
 ```
 
-- [ ] **Step 2: Verify both tests fail**
+- [x] **Step 2: Verify both tests fail**
 
 Run: `python -m pytest -q tests/planning/test_policy.py`
 
 Expected: collection failure because `PlanningPolicy` does not exist.
 
-- [ ] **Step 3: Implement canonical fingerprints and validation**
+- [x] **Step 3: Implement canonical fingerprints and validation**
 
 ```python
 class PlanningPolicyError(ValueError):
@@ -165,11 +170,11 @@ class PlanningPolicy:
             raise PlanningPolicyError("holdout content overlaps build-visible golden content")
 ```
 
-- [ ] **Step 4: Inject policy into the pipeline and factory**
+- [x] **Step 4: Inject policy into the pipeline and factory**
 
 Add `policy: PlanningPolicy` to `CaptainPipeline.__init__`, call `self._policy.validate_enrichment(enrichment)` immediately after each enrichment, and construct it in `build_captain_pipeline` from `known_capability_tags`.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run: `python -m pytest -q tests/planning/test_policy.py tests/planning/test_captain_pipeline.py tests/planning/test_factory_e2e.py`
 
@@ -184,11 +189,15 @@ git commit -m "feat: enforce captain planning policy"
 
 ### Task 3: Add gateway release and capability adapters
 
+> **Program routing:** P07C owns Step 4's gateway-side idempotency after the
+> append-only store is integrated. P11 later owns Steps 1-3 and 5-6 plus the
+> planning HTTP adapter. Do not let either worker edit the other's allowlist.
+
 **Files:**
 - Create: `agenten/planning/gateway_client.py`
 - Modify: `agenten/planning/factory.py`
 - Modify: `agenten/planning/cli.py`
-- Modify: `gateway/app.py`
+- Modify for P07C only: `gateway/store.py`
 - Test: `tests/planning/test_gateway_client.py`
 - Test: `tests/gateway/test_gateway.py`
 
@@ -276,9 +285,18 @@ class GatewayPlanningClient(BatchReleaseClient, CapabilityResolver):
         return str(matches[0]["artifact_ref"]) if matches else None
 ```
 
-- [ ] **Step 4: Make Captain writes idempotent at the gateway**
+- [x] **Step 4: Make Captain writes idempotent at the gateway**
 
 Before returning `409` for an existing `work_batch`, compare the stored canonical data to the validated request. Return the existing block when identical; retain `409` for different content. Apply the same rule to one `holdout` child per batch.
+
+P07C verifies this rule through the isolated MariaDB gate and commits only its
+store boundary:
+
+```powershell
+pwsh -NoProfile -File scripts/test_gateway.ps1
+git add gateway/store.py tests/gateway/test_gateway.py
+git commit -m "feat: make gateway releases idempotent"
+```
 
 - [ ] **Step 5: Add explicit composition flags**
 
@@ -286,12 +304,12 @@ Extend the CLI with `--release-mode {json,gateway}` and `--gateway-url`. `json` 
 
 - [ ] **Step 6: Verify and commit**
 
-Run: `python -m pytest -q tests/planning/test_gateway_client.py tests/gateway/test_gateway.py -k 'not mariadb'`
+Run: `python -m pytest -q --no-cov tests/planning/test_gateway_client.py tests/planning/test_factory_e2e.py tests/planning/test_cli.py`
 
 Commit:
 
 ```powershell
-git add agenten/planning/gateway_client.py agenten/planning/factory.py agenten/planning/cli.py gateway/app.py tests/planning/test_gateway_client.py tests/gateway/test_gateway.py
+git add agenten/planning/gateway_client.py agenten/planning/factory.py agenten/planning/cli.py tests/planning/test_gateway_client.py tests/planning/test_factory_e2e.py tests/planning/test_cli.py
 git commit -m "feat: connect captain planning to ledger gateway"
 ```
 
@@ -311,7 +329,7 @@ git commit -m "feat: connect captain planning to ledger gateway"
 - Produces: `CaptainRunState`, `CaptainRunStatus`, `CaptainRunStore`, `JsonCaptainRunStore`, and `PartialReleaseError`.
 - Invariant: a retry with the same `run_id` never enriches or releases a completed batch again.
 
-- [ ] **Step 1: Write a failing crash/resume acceptance test**
+- [x] **Step 1: Write a failing crash/resume acceptance test**
 
 ```python
 @pytest.mark.asyncio
@@ -328,13 +346,13 @@ async def test_run_resumes_at_first_unreleased_batch(tmp_path: Path) -> None:
     assert release.calls == ["first", "second", "second"]
 ```
 
-- [ ] **Step 2: Verify it fails**
+- [x] **Step 2: Verify it fails**
 
 Run: `python -m pytest -q tests/planning/test_resume.py`
 
 Expected: `CaptainPipeline.run()` has no `run_id` or run-store support.
 
-- [ ] **Step 3: Define durable state**
+- [x] **Step 3: Define durable state**
 
 ```python
 class CaptainRunStatus(str, Enum):
@@ -357,15 +375,19 @@ class CaptainRunState(BaseModel):
     error_kind: str | None = None
 ```
 
-- [ ] **Step 4: Implement atomic JSON run persistence**
+- [x] **Step 4: Implement atomic JSON run persistence**
 
 `JsonCaptainRunStore.save()` writes canonical JSON to `<run_id>.tmp`, flushes it, and uses `os.replace`. `load()` validates with `CaptainRunState.model_validate_json`. Reject reuse of a `run_id` when the project digest differs.
 
-- [ ] **Step 5: Checkpoint before and after every release**
+- [x] **Step 5: Checkpoint before and after every release**
 
 Persist the planned immutable batches before releasing. On resume, load them instead of calling decomposition/alignment/enrichment again. After each successful release append the batch id and save. Raise `PartialReleaseError(run_id, released_batch_ids, failed_batch_id)` while retaining the checkpoint.
 
-- [ ] **Step 6: Verify and commit**
+The integrated implementation also persists the matching holdout suites, runs
+canonical-plan validation before the release phase, and holds a per-run OS file
+lock around resume so two Captain processes cannot duplicate a release.
+
+- [x] **Step 6: Verify and commit**
 
 Run: `python -m pytest -q tests/planning/test_run_store.py tests/planning/test_resume.py tests/planning/test_captain_pipeline.py`
 
@@ -391,7 +413,7 @@ git commit -m "feat: resume partial captain planning runs"
 - Produces: `LlmStage`, `LlmStageError`, `LlmTimeoutError`, `LlmSchemaError`, and `run_llm_stage`.
 - Policy: two attempts per stage, 30-second timeout per attempt, retry only timeout/transient provider failures, never retry deterministic planning-policy failures.
 
-- [ ] **Step 1: Write failing timeout and retry tests**
+- [x] **Step 1: Write failing timeout and retry tests**
 
 ```python
 @pytest.mark.asyncio
@@ -415,13 +437,13 @@ async def test_schema_error_is_not_retried() -> None:
     assert calls == 1
 ```
 
-- [ ] **Step 2: Verify failures**
+- [x] **Step 2: Verify failures**
 
 Run: `python -m pytest -q tests/llm/test_resilience.py`
 
 Expected: collection failure because resilience types do not exist.
 
-- [ ] **Step 3: Implement the bounded wrapper**
+- [x] **Step 3: Implement the bounded wrapper**
 
 ```python
 async def run_llm_stage(
@@ -451,11 +473,11 @@ async def run_llm_stage(
     raise AssertionError("unreachable")
 ```
 
-- [ ] **Step 4: Apply it to decomposition, alignment, and enrichment**
+- [x] **Step 4: Apply it to decomposition, alignment, and enrichment**
 
 Wrap each injected callable in the factory. Convert missing/wrong structured content in `plan_batches.py` to `LlmSchemaError` with the correct stage. Keep alignment-policy retries separate from provider retries.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run: `python -m pytest -q tests/llm tests/planning/test_factory_e2e.py`
 

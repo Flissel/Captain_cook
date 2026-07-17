@@ -1,6 +1,7 @@
 """Captain-owned project planning and batch release pipeline."""
 
 from collections.abc import Sequence
+import hashlib
 from typing import Awaitable, Callable, List, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -12,6 +13,13 @@ from agenten.planning.alignment import (
     validate_alignment,
 )
 from agenten.planning.policy import PlanningPolicy
+from agenten.planning.run_models import (
+    CaptainRunConflictError,
+    CaptainRunState,
+    CaptainRunStatus,
+    PartialReleaseError,
+)
+from agenten.planning.run_store import CaptainRunStore
 from agenten.validation.contracts import (
     AcceptanceAssertion,
     ExampleCase,
@@ -60,6 +68,23 @@ class CaptainRunResult(BaseModel):
     batches: List[WorkBatch]
 
 
+class CaptainCompiledPlan(BaseModel):
+    """Complete plan output before any publication side effect occurs."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    batches: tuple[WorkBatch, ...]
+    holdouts: tuple[HoldoutSuite, ...]
+
+    @model_validator(mode="after")
+    def batches_and_holdouts_match(self) -> "CaptainCompiledPlan":
+        batch_ids = [batch.batch_id for batch in self.batches]
+        holdout_ids = [holdout.batch_id for holdout in self.holdouts]
+        if batch_ids != holdout_ids:
+            raise ValueError("compiled batches and holdouts must have identical ordering")
+        return self
+
+
 class BatchReleaseClient(Protocol):
     async def release(self, batch: WorkBatch, holdouts: HoldoutSuite) -> None: ...
 
@@ -87,10 +112,12 @@ class CaptainPipeline:
         align: Align,
         enrich: Enrich,
         release_client: BatchReleaseClient,
-        policy: PlanningPolicy,
+        policy: PlanningPolicy | None = None,
         capability_resolver: CapabilityResolver | None = None,
         target: str,
+        allowed_targets: frozenset[str] | None = None,
         max_alignment_attempts: int = 2,
+        run_store: CaptainRunStore | None = None,
     ) -> None:
         if max_alignment_attempts < 1:
             raise ValueError("max_alignment_attempts must be at least 1")
@@ -101,9 +128,15 @@ class CaptainPipeline:
         self._policy = policy
         self._capability_resolver = capability_resolver
         self._target = target
+        self._allowed_targets = allowed_targets or frozenset({target})
+        if target not in self._allowed_targets:
+            raise ValueError("default target must be included in allowed_targets")
         self._max_alignment_attempts = max_alignment_attempts
+        self._run_store = run_store
 
-    async def run(self, project_description: str) -> CaptainRunResult:
+    async def compile(self, project_description: str) -> CaptainCompiledPlan:
+        """Build the complete reviewable plan without publishing it."""
+
         if not project_description.strip():
             raise CaptainPlanningError("project description must not be empty")
 
@@ -133,22 +166,32 @@ class CaptainPipeline:
         for draft in ordered_drafts:
             selected_subtasks = [subtasks_by_id[subtask_id] for subtask_id in draft.subtask_ids]
             enrichment = await self._enrich(project_description, draft, selected_subtasks)
-            self._policy.validate_enrichment(enrichment)
+            if self._policy is not None:
+                self._policy.validate_enrichment(enrichment)
             enriched_drafts.append((draft, enrichment))
 
-        self._policy.validate_run_isolation(
-            enrichment for _, enrichment in enriched_drafts
-        )
+        if self._policy is not None:
+            self._policy.validate_run_isolation(
+                enrichment for _, enrichment in enriched_drafts
+            )
 
-        compiled_contracts: List[tuple[WorkBatch, HoldoutSuite]] = []
+        batches: List[WorkBatch] = []
+        holdout_suites: List[HoldoutSuite] = []
         for draft, enrichment in enriched_drafts:
-            capability_tags = self._policy.canonical_capability_tags(
-                enrichment.capability_tags
+            batch_target = draft.target or self._target
+            if batch_target not in self._allowed_targets:
+                raise CaptainPlanningError(
+                    f"batch {draft.batch_id} requested disallowed target: {batch_target}"
+                )
+            capability_tags = (
+                self._policy.canonical_capability_tags(enrichment.capability_tags)
+                if self._policy is not None
+                else list(enrichment.capability_tags)
             )
             satisfied_by = None
             if self._capability_resolver is not None:
                 satisfied_by = await self._capability_resolver.find_match(
-                    self._target,
+                    batch_target,
                     list(capability_tags),
                 )
             batch = WorkBatch(
@@ -156,7 +199,10 @@ class CaptainPipeline:
                 title=draft.title,
                 goal=enrichment.goal,
                 subtask_ids=draft.subtask_ids,
-                target=self._target,
+                target=batch_target,
+                runtime=batch_target,
+                runtime_version="v1",
+                interface_schema=f"captain-{batch_target}-artifact/v1",
                 capability_tags=list(capability_tags),
                 depends_on=draft.depends_on,
                 constraints=enrichment.constraints,
@@ -165,14 +211,159 @@ class CaptainPipeline:
                 satisfied_by=satisfied_by,
             )
             holdouts = HoldoutSuite(batch_id=draft.batch_id, cases=enrichment.holdout_cases)
-            compiled_contracts.append((batch, holdouts))
+            batches.append(batch)
+            holdout_suites.append(holdouts)
 
-        for batch, holdouts in compiled_contracts:
+        return CaptainCompiledPlan(
+            batches=tuple(batches),
+            holdouts=tuple(holdout_suites),
+        )
+
+    async def run(
+        self,
+        project_description: str,
+        *,
+        run_id: str | None = None,
+    ) -> CaptainRunResult:
+        """Compatibility path: compile first, then publish each batch contract."""
+
+        if run_id is not None:
+            compiled = await self.compile_and_release(project_description, run_id=run_id)
+            return CaptainRunResult(batches=list(compiled.batches))
+        compiled = await self.compile(project_description)
+        await self.release(compiled)
+        return CaptainRunResult(batches=list(compiled.batches))
+
+    async def compile_and_release(
+        self,
+        project_description: str,
+        *,
+        run_id: str,
+    ) -> CaptainCompiledPlan:
+        """Compile once and resume idempotent publication from a durable checkpoint."""
+
+        await self.compile_checkpoint(project_description, run_id=run_id)
+        return await self.release_checkpoint(project_description, run_id=run_id)
+
+    async def compile_checkpoint(
+        self,
+        project_description: str,
+        *,
+        run_id: str,
+    ) -> CaptainCompiledPlan:
+        """Compile or reload an immutable plan without crossing the release boundary."""
+
+        if self._run_store is None:
+            raise ValueError("run_id requires an injected CaptainRunStore")
+        digest = hashlib.sha256(project_description.encode("utf-8")).hexdigest()
+        async with self._run_store.lock(run_id):
+            state = await self._run_store.load(run_id)
+            if state is None:
+                compiled = await self.compile(project_description)
+                state = CaptainRunState(
+                    run_id=run_id,
+                    project_id=f"project-{digest[:16]}",
+                    project_digest=digest,
+                    status=CaptainRunStatus.PLANNING,
+                    batches=compiled.batches,
+                    holdouts=compiled.holdouts,
+                )
+                await self._run_store.save(state)
+                return compiled
+
+            self._assert_project_digest(state, digest, run_id)
+            return CaptainCompiledPlan(
+                batches=tuple(state.batches),
+                holdouts=tuple(state.holdouts),
+            )
+
+    async def release_checkpoint(
+        self,
+        project_description: str,
+        *,
+        run_id: str,
+    ) -> CaptainCompiledPlan:
+        """Release only after the caller has validated the checkpointed full plan."""
+
+        if self._run_store is None:
+            raise ValueError("run_id requires an injected CaptainRunStore")
+        digest = hashlib.sha256(project_description.encode("utf-8")).hexdigest()
+        async with self._run_store.lock(run_id):
+            state = await self._run_store.load(run_id)
+            if state is None:
+                raise ValueError("run checkpoint must be compiled before release")
+            self._assert_project_digest(state, digest, run_id)
+            compiled = CaptainCompiledPlan(
+                batches=tuple(state.batches),
+                holdouts=tuple(state.holdouts),
+            )
+            if state.status is CaptainRunStatus.RELEASED:
+                return compiled
+            state = self._updated_state(
+                state,
+                status=CaptainRunStatus.RELEASING,
+                failed_batch_id=None,
+                error_kind=None,
+            )
+            await self._run_store.save(state)
+
+            released = list(state.released_batch_ids)
+            released_set = set(released)
+            for batch, holdouts in zip(compiled.batches, compiled.holdouts):
+                if batch.batch_id in released_set:
+                    continue
+                try:
+                    await self._release_client.release(
+                        batch.model_copy(deep=True),
+                        holdouts.model_copy(deep=True),
+                    )
+                except Exception as exc:
+                    failed = self._updated_state(
+                        state,
+                        status=CaptainRunStatus.PARTIALLY_RELEASED,
+                        released_batch_ids=released,
+                        failed_batch_id=batch.batch_id,
+                        error_kind=type(exc).__name__,
+                    )
+                    await self._run_store.save(failed)
+                    raise PartialReleaseError(run_id, released, batch.batch_id) from exc
+
+                released.append(batch.batch_id)
+                released_set.add(batch.batch_id)
+                state = self._updated_state(
+                    state,
+                    status=(
+                        CaptainRunStatus.RELEASED
+                        if len(released) == len(compiled.batches)
+                        else CaptainRunStatus.RELEASING
+                    ),
+                    released_batch_ids=released,
+                    failed_batch_id=None,
+                    error_kind=None,
+                )
+                await self._run_store.save(state)
+            return compiled
+
+    @staticmethod
+    def _assert_project_digest(
+        state: CaptainRunState,
+        digest: str,
+        run_id: str,
+    ) -> None:
+        if state.project_digest != digest:
+            raise CaptainRunConflictError(
+                f"run {run_id!r} already belongs to a different project"
+            )
+
+    @staticmethod
+    def _updated_state(state: CaptainRunState, **updates: object) -> CaptainRunState:
+        return CaptainRunState.model_validate(state.model_dump() | updates)
+
+    async def release(self, compiled: CaptainCompiledPlan) -> None:
+        """Publish one already-reviewed compiled plan through the injected port."""
+
+        for batch, holdouts in zip(compiled.batches, compiled.holdouts):
             await self._release_client.release(
                 batch.model_copy(deep=True),
                 holdouts.model_copy(deep=True),
             )
-
-        return CaptainRunResult(
-            batches=[batch for batch, _ in compiled_contracts]
-        )

@@ -48,7 +48,8 @@ must not be claimed from mocked evidence.
 
 ## Development workflow
 
-- Use Python 3.11 and the root `.venv` when available.
+- Use Python 3.11 and the project `.venv`. Install `requirements-dev.txt` for
+  development and testing; runtime-only environments install `requirements.txt`.
 - Add a failing acceptance test before behavioral changes.
 - Prefer focused tests while iterating, then run the complete gate.
 - Keep commits narrow and Conventional Commit formatted.
@@ -64,21 +65,27 @@ must not be claimed from mocked evidence.
 ## Verification commands
 
 ```powershell
-python -m pytest -q
-python scripts/verify_submission.py
-python main.py demo --output artifacts/demo-run.json
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pytest -q -m "not live"
+.\.venv\Scripts\python.exe scripts/verify_submission.py
+.\.venv\Scripts\python.exe main.py demo --output artifacts/demo-run.json
 ```
 
 For import or architecture work, also run:
 
 ```powershell
-python -m pytest -q tests/test_architecture_fitness.py tests/test_import_boundaries.py tests/test_workstream_docs.py
-python -m compileall -q agenten blockchain chats config
+.\.venv\Scripts\python.exe -m pytest -q --no-cov tests/test_architecture_fitness.py tests/test_import_boundaries.py tests/test_workstream_docs.py
+.\.venv\Scripts\python.exe -m compileall -q agenten blockchain chats config
 ```
 
 Do not rewrite `artifacts/demo-run.json` unless the task intentionally updates
 demo evidence. Report skipped tests and dependency warnings separately from
 failures.
+
+The default pytest configuration excludes tests marked `live`. Run a live gate
+only when its plan explicitly authorizes the target service and use `-m live`
+to opt in; never let an ordinary regression run mutate a reachable service.
 
 ## Secrets and local services
 

@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-CONTRACT_VERSION = "captain-work-batch/v1"
+CONTRACT_VERSION = "captain-work-batch/v2"
 RUBRIC_VERSION = "captain-observation-rubric/v1"
 
 
@@ -66,6 +66,9 @@ class WorkBatch(BaseModel):
     goal: str = Field(min_length=1)
     subtask_ids: List[str] = Field(min_length=1)
     target: str = Field(min_length=1, pattern=r"^[a-z][a-z0-9_-]{0,31}$")
+    runtime: str = Field(default="generic", min_length=1)
+    runtime_version: str = Field(default="v1", min_length=1)
+    interface_schema: str = Field(default="captain-artifact/v1", min_length=1)
     capability_tags: List[str] = Field(default_factory=list)
     depends_on: List[str] = Field(default_factory=list)
     constraints: List[str] = Field(default_factory=list)

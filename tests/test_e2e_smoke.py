@@ -33,7 +33,7 @@ from agenten.events.schemas import (
     topic_for,
 )
 from agenten.ledger_bridge.query import InProcessBudgetLedger
-from agenten.ledger_bridge.recorder import LedgerRecorderAgent
+from agenten.ledger_bridge.recorder import LedgerRecorderAgent, subscribe_recorder
 from agenten.ledger_bridge.recovery import recover_on_startup
 from agenten.ledger_bridge.stage_machine import TERMINAL_STAGES, Stage
 from agenten.orchestration.pipeline import (
@@ -235,6 +235,7 @@ async def test_crash_recovery_republishes_stuck_subproblems_to_completion():
     crashed_bus = InMemoryEventBus()
     budget_ledger = InProcessBudgetLedger(chain)
     crashed_recorder = LedgerRecorderAgent(crashed_bus, chain, budget_ledger)
+    subscribe_recorder(crashed_bus, crashed_recorder)
     await crashed_recorder.start()
     for subproblem_id, description in [
         ("crash-sp-1", "Stuck subproblem one, never validated"),

@@ -12,6 +12,12 @@ BeforeAll {
     if (Test-Path "$PSScriptRoot/Components.psm1") {
         Import-Module "$PSScriptRoot/Components.psm1" -Force
     }
+    if (Test-Path "$PSScriptRoot/Repository.psm1") {
+        Import-Module "$PSScriptRoot/Repository.psm1" -Force
+    }
+    if (Test-Path "$PSScriptRoot/StageValidation.psm1") {
+        Import-Module "$PSScriptRoot/StageValidation.psm1" -Force
+    }
     if (Test-Path "$PSScriptRoot/Lifecycle.psm1") {
         Import-Module "$PSScriptRoot/Lifecycle.psm1" -Force
     }
@@ -21,7 +27,7 @@ Describe 'Guided orchestration' {
     It 'resumes at the first incomplete stage' {
         $visited = [Collections.Generic.List[string]]::new()
 
-        $result = Invoke-GuidedSetup -Root $TestDrive -Checkpoint @{ Preflight = 'Complete'; Configuration = 'Incomplete' } -StageRunner {
+        $result = Invoke-GuidedSetup -Root $TestDrive -Checkpoint @{ Preflight = 'Complete'; Configuration = 'Incomplete' } -StageValidator { $true } -StageRunner {
             param($stage, $context)
             $visited.Add($stage)
             [pscustomobject]@{ Status = 'Complete'; Message = "$stage complete" }
@@ -72,6 +78,615 @@ Describe 'Guided orchestration' {
 
         $result.Status | Should -Be 'Failed'
         $result.Data.Results.Count | Should -Be 2
+    }
+}
+
+Describe 'Repository bootstrap and external n8n ownership' {
+    It 'defaults a new configuration to the declared external n8n endpoints' {
+        Copy-Item -LiteralPath "$PSScriptRoot/../../.env.example" `
+            -Destination (Join-Path $TestDrive '.env.example')
+
+        $result = Initialize-SetupConfiguration -Root $TestDrive -SecretPathValidator { $true }
+
+        $result.Status | Should -Be 'Ready'
+        $result.Data.Values.N8N_MODE | Should -Be 'external'
+        $result.Data.Values.N8N_URL | Should -Be 'http://localhost:15678'
+        $result.Data.Values.N8N_CONTAINER_URL | Should -Be 'http://host.docker.internal:15678'
+    }
+
+    It 'skips Git when the Hermes submodule is already present' {
+        $calls = [Collections.Generic.List[object]]::new()
+
+        $result = Initialize-SetupSubmodules -Root $TestDrive -HermesProbe { $true } -CommandRunner {
+            param($filePath, $argumentList, $workingDirectory)
+            $calls.Add([pscustomobject]@{ FilePath = $filePath; Arguments = $argumentList; Directory = $workingDirectory })
+            [pscustomobject]@{ ExitCode = 0; Output = 'unused' }
+        }
+
+        $result.Status | Should -Be 'Ready'
+        $calls.Count | Should -Be 0
+    }
+
+    It 'initializes declared submodules exactly once without destructive Git verbs' {
+        $calls = [Collections.Generic.List[object]]::new()
+        $probeState = [pscustomobject]@{ Calls = 0 }
+
+        $result = Initialize-SetupSubmodules -Root $TestDrive -HermesProbe {
+            param($candidateRoot)
+            $probeState.Calls++
+            $probeState.Calls -gt 1
+        } -CommandRunner {
+            param($filePath, $argumentList, $workingDirectory)
+            $calls.Add([pscustomobject]@{ FilePath = $filePath; Arguments = @($argumentList); Directory = $workingDirectory })
+            [pscustomobject]@{ ExitCode = 0; Output = 'ok' }
+        }
+
+        $result.Status | Should -Be 'Ready'
+        $probeState.Calls | Should -Be 2
+        $calls.Count | Should -Be 1
+        $calls[0].FilePath | Should -Be 'git'
+        $calls[0].Arguments | Should -Be @('submodule', 'update', '--init', '--recursive')
+        $calls[0].Directory | Should -Be $TestDrive
+        $calls[0].Arguments -join ' ' | Should -Not -Match '(?i)\b(reset|clean|checkout|pull|merge|rebase|deinit)\b'
+    }
+
+    It 'returns Failed and Retry when Git initialization fails' {
+        $calls = [pscustomobject]@{ Count = 0 }
+
+        $result = Initialize-SetupSubmodules -Root $TestDrive -HermesProbe { $false } -CommandRunner {
+            param($filePath, $argumentList, $workingDirectory)
+            $calls.Count++
+            [pscustomobject]@{ ExitCode = 128; Output = 'git failed' }
+        }
+
+        $result.Status | Should -Be 'Failed'
+        $result.Remediation | Should -Be 'Retry'
+        $calls.Count | Should -Be 1
+    }
+
+    It 'fails closed for every invalid command-runner exit-code shape' {
+        $cases = @(
+            [pscustomobject]@{ Name = 'no result'; Run = { return } }
+            [pscustomobject]@{ Name = 'missing property'; Run = { [pscustomobject]@{ Output = 'none' } } }
+            [pscustomobject]@{ Name = 'null value'; Run = { [pscustomobject]@{ ExitCode = $null } } }
+            [pscustomobject]@{ Name = 'empty string'; Run = { [pscustomobject]@{ ExitCode = '' } } }
+            [pscustomobject]@{ Name = 'boolean'; Run = { [pscustomobject]@{ ExitCode = $false } } }
+            [pscustomobject]@{ Name = 'array'; Run = { [pscustomobject]@{ ExitCode = [object[]]@(0) } } }
+            [pscustomobject]@{ Name = 'numeric string'; Run = { [pscustomobject]@{ ExitCode = '0' } } }
+            [pscustomobject]@{ Name = 'decimal'; Run = { [pscustomobject]@{ ExitCode = [decimal]0 } } }
+            [pscustomobject]@{ Name = 'non-numeric string'; Run = { [pscustomobject]@{ ExitCode = 'invalid' } } }
+            [pscustomobject]@{
+                Name = 'multiple results'
+                Run = {
+                    [pscustomobject]@{ ExitCode = 0 }
+                    [pscustomobject]@{ ExitCode = 0 }
+                }
+            }
+        )
+        $observations = foreach ($case in $cases) {
+            $probeState = [pscustomobject]@{ Calls = 0 }
+            $runnerState = [pscustomobject]@{ Calls = 0 }
+            $caseRunner = $case.Run
+            $result = $null
+            $exception = $null
+            try {
+                $result = Initialize-SetupSubmodules -Root $TestDrive -HermesProbe {
+                    $probeState.Calls++
+                    $probeState.Calls -gt 1
+                } -CommandRunner {
+                    param($filePath, $argumentList, $workingDirectory)
+                    $runnerState.Calls++
+                    & $caseRunner
+                }
+            }
+            catch {
+                $exception = $_.Exception.Message
+            }
+            [pscustomobject]@{
+                Name = $case.Name
+                Status = if ($null -eq $result) { $null } else { $result.Status }
+                Remediation = if ($null -eq $result) { $null } else { $result.Remediation }
+                ProbeCalls = $probeState.Calls
+                RunnerCalls = $runnerState.Calls
+                Exception = $exception
+            }
+        }
+
+        @($observations | Where-Object {
+            $_.Status -ne 'Failed' -or $_.Remediation -ne 'Retry' -or
+            $_.ProbeCalls -ne 1 -or $_.RunnerCalls -ne 1 -or $null -ne $_.Exception
+        }).Name | Should -Be @()
+    }
+
+    It 'returns Missing and Manual when Hermes is absent after successful Git initialization' {
+        $probeState = [pscustomobject]@{ Calls = 0 }
+
+        $result = Initialize-SetupSubmodules -Root $TestDrive -HermesProbe {
+            param($candidateRoot)
+            $probeState.Calls++
+            $false
+        } -CommandRunner {
+            param($filePath, $argumentList, $workingDirectory)
+            [pscustomobject]@{ ExitCode = 0; Output = 'ok' }
+        }
+
+        $result.Status | Should -Be 'Missing'
+        $result.Remediation | Should -Be 'Manual'
+        $probeState.Calls | Should -Be 2
+    }
+
+    It 'does not mutate the repository when the initial Hermes probe fails' {
+        $calls = [pscustomobject]@{ Count = 0 }
+
+        $result = Initialize-SetupSubmodules -Root $TestDrive -HermesProbe {
+            throw 'probe failed'
+        } -CommandRunner {
+            param($filePath, $argumentList, $workingDirectory)
+            $calls.Count++
+            [pscustomobject]@{ ExitCode = 0; Output = 'unused' }
+        }
+
+        $result.Status | Should -Be 'Failed'
+        $result.Remediation | Should -Be 'Retry'
+        $calls.Count | Should -Be 0
+    }
+
+    It 'fails closed for every non-scalar-boolean Hermes probe result' {
+        $cases = @(
+            [pscustomobject]@{ Name = 'no output'; Probe = { return } }
+            [pscustomobject]@{ Name = 'explicit null output'; Probe = { $null } }
+            [pscustomobject]@{ Name = 'string false'; Probe = { 'false' } }
+            [pscustomobject]@{ Name = 'object output'; Probe = { [pscustomobject]@{ Present = $false } } }
+            [pscustomobject]@{ Name = 'multiple booleans'; Probe = { $false; $true } }
+            [pscustomobject]@{ Name = 'boolean array'; Probe = { Write-Output -NoEnumerate ([bool[]]@($false)) } }
+            [pscustomobject]@{ Name = 'null provider'; Probe = $null }
+            [pscustomobject]@{ Name = 'invalid provider'; Probe = 'not-a-scriptblock' }
+        )
+        $observations = foreach ($case in $cases) {
+            $calls = [pscustomobject]@{ Count = 0 }
+            $result = $null
+            $exception = $null
+            try {
+                $result = Initialize-SetupSubmodules -Root $TestDrive -HermesProbe $case.Probe -CommandRunner {
+                    param($filePath, $argumentList, $workingDirectory)
+                    $calls.Count++
+                    [pscustomobject]@{ ExitCode = 0; Output = 'unused' }
+                }
+            }
+            catch {
+                $exception = $_.Exception.Message
+            }
+            [pscustomobject]@{
+                Name = $case.Name
+                Status = if ($null -eq $result) { $null } else { $result.Status }
+                Remediation = if ($null -eq $result) { $null } else { $result.Remediation }
+                GitCalls = $calls.Count
+                Exception = $exception
+            }
+        }
+
+        @($observations | Where-Object {
+            $_.Status -ne 'Failed' -or $_.Remediation -ne 'Retry' -or
+            $_.GitCalls -ne 0 -or $null -ne $_.Exception
+        }).Name | Should -Be @()
+    }
+
+    It 'returns Failed and Retry when Hermes cannot be probed after Git succeeds' {
+        $probeState = [pscustomobject]@{ Calls = 0 }
+
+        $result = Initialize-SetupSubmodules -Root $TestDrive -HermesProbe {
+            $probeState.Calls++
+            if ($probeState.Calls -gt 1) { throw 'probe failed' }
+            $false
+        } -CommandRunner {
+            param($filePath, $argumentList, $workingDirectory)
+            [pscustomobject]@{ ExitCode = 0; Output = 'ok' }
+        }
+
+        $result.Status | Should -Be 'Failed'
+        $result.Remediation | Should -Be 'Retry'
+        $probeState.Calls | Should -Be 2
+    }
+
+    It 'initializes submodules immediately before installing Hermes' {
+        $order = [Collections.Generic.List[string]]::new()
+        $context = @{
+            Root = $TestDrive
+            SubmoduleInitializer = {
+                param($candidateRoot)
+                [void]$order.Add('Submodules')
+                New-SetupResult -Component 'Repository' -Status 'Ready' -Message 'ready' -Remediation 'None'
+            }
+            HermesInstaller = {
+                param($candidateRoot)
+                [void]$order.Add('Hermes')
+                New-SetupResult -Component 'Hermes' -Status 'Ready' -Message 'ready' -Remediation 'None'
+            }
+        }
+
+        $result = Invoke-DefaultSetupStage -Stage 'Hermes' -Context $context
+
+        $result.Status | Should -Be 'Complete'
+        $order | Should -Be @('Submodules', 'Hermes')
+    }
+
+    It 'does not install Hermes after repository initialization fails' {
+        $order = [Collections.Generic.List[string]]::new()
+        $context = @{
+            Root = $TestDrive
+            SubmoduleInitializer = {
+                param($candidateRoot)
+                [void]$order.Add('Submodules')
+                New-SetupResult -Component 'Repository' -Status 'Failed' -Message 'failed' -Remediation 'Retry'
+            }
+            HermesInstaller = {
+                param($candidateRoot)
+                [void]$order.Add('Hermes')
+                throw 'Hermes installation must not run.'
+            }
+        }
+
+        $result = Invoke-DefaultSetupStage -Stage 'Hermes' -Context $context
+
+        $result.Status | Should -Be 'Failed'
+        $result.Message | Should -Be 'failed'
+        $order | Should -Be @('Submodules')
+    }
+
+    It 'fails closed for invalid injected Hermes-stage actions' {
+        $cases = @(
+            @{ SubmoduleInitializer = $null; HermesInstaller = { throw 'must not run' } }
+            @{
+                SubmoduleInitializer = { New-SetupResult -Component 'Repository' -Status 'Ready' -Message 'ready' -Remediation 'None' }
+                HermesInstaller = 'not-a-scriptblock'
+            }
+        )
+
+        foreach ($case in $cases) {
+            $observed = [pscustomobject]@{ Result = $null }
+
+            {
+                $observed.Result = Invoke-DefaultSetupStage -Stage 'Hermes' -Context (@{ Root = $TestDrive } + $case)
+            } | Should -Not -Throw
+
+            $observed.Result.Status | Should -Be 'Failed'
+        }
+    }
+
+    It 'fails closed for malformed Hermes-stage results' {
+        $cases = @(
+            @{ SubmoduleInitializer = { $null }; HermesInstaller = { throw 'must not run' } }
+            @{
+                SubmoduleInitializer = { New-SetupResult -Component 'Repository' -Status 'Ready' -Message 'ready' -Remediation 'None' }
+                HermesInstaller = { [pscustomobject]@{ Status = 'Ready' } }
+            }
+        )
+
+        foreach ($case in $cases) {
+            $observed = [pscustomobject]@{ Result = $null }
+
+            {
+                $observed.Result = Invoke-DefaultSetupStage -Stage 'Hermes' -Context (@{ Root = $TestDrive } + $case)
+            } | Should -Not -Throw
+
+            $observed.Result.Status | Should -Be 'Failed'
+        }
+    }
+
+    It 'fails closed for every invalid Hermes-stage result value and output shape' {
+        $cases = @(
+            [pscustomobject]@{ Name = 'null status'; Action = { [pscustomobject]@{ Status = $null; Message = 'ok' } } }
+            [pscustomobject]@{ Name = 'empty status'; Action = { [pscustomobject]@{ Status = ''; Message = 'ok' } } }
+            [pscustomobject]@{ Name = 'blank status'; Action = { [pscustomobject]@{ Status = '   '; Message = 'ok' } } }
+            [pscustomobject]@{ Name = 'boolean status'; Action = { [pscustomobject]@{ Status = $true; Message = 'ok' } } }
+            [pscustomobject]@{ Name = 'array status'; Action = { [pscustomobject]@{ Status = [object[]]@('Ready'); Message = 'ok' } } }
+            [pscustomobject]@{ Name = 'empty array status'; Action = { [pscustomobject]@{ Status = [object[]]@(); Message = 'ok' } } }
+            [pscustomobject]@{ Name = 'non-canonical ready status'; Action = { [pscustomobject]@{ Status = 'ready'; Message = 'ok' } } }
+            [pscustomobject]@{ Name = 'unknown status'; Action = { [pscustomobject]@{ Status = 'Unknown'; Message = 'ok' } } }
+            [pscustomobject]@{ Name = 'null message'; Action = { [pscustomobject]@{ Status = 'Ready'; Message = $null } } }
+            [pscustomobject]@{ Name = 'empty message'; Action = { [pscustomobject]@{ Status = 'Ready'; Message = '' } } }
+            [pscustomobject]@{ Name = 'blank message'; Action = { [pscustomobject]@{ Status = 'Ready'; Message = '   ' } } }
+            [pscustomobject]@{ Name = 'boolean message'; Action = { [pscustomobject]@{ Status = 'Ready'; Message = $true } } }
+            [pscustomobject]@{ Name = 'array message'; Action = { [pscustomobject]@{ Status = 'Ready'; Message = [object[]]@('ok') } } }
+            [pscustomobject]@{
+                Name = 'multiple results'
+                Action = {
+                    [pscustomobject]@{ Status = 'Ready'; Message = 'one' }
+                    [pscustomobject]@{ Status = 'Ready'; Message = 'two' }
+                }
+            }
+            [pscustomobject]@{
+                Name = 'result array'
+                Action = {
+                    $items = [object[]]@([pscustomobject]@{ Status = 'Ready'; Message = 'ok' })
+                    Write-Output -NoEnumerate $items
+                }
+            }
+        )
+        $observations = foreach ($case in $cases) {
+            $installerState = [pscustomobject]@{ Calls = 0 }
+            $caseAction = $case.Action
+            $result = $null
+            $exception = $null
+            try {
+                $result = Invoke-DefaultSetupStage -Stage 'Hermes' -Context @{
+                    Root = $TestDrive
+                    SubmoduleInitializer = $caseAction
+                    HermesInstaller = {
+                        $installerState.Calls++
+                        New-SetupResult -Component 'Hermes' -Status 'Ready' -Message 'ready' -Remediation 'None'
+                    }
+                }
+            }
+            catch {
+                $exception = $_.Exception.Message
+            }
+            [pscustomobject]@{
+                Name = $case.Name
+                Status = if ($null -eq $result) { $null } else { $result.Status }
+                InstallerCalls = $installerState.Calls
+                Exception = $exception
+            }
+        }
+
+        @($observations | Where-Object {
+            $_.Status -ne 'Failed' -or $_.InstallerCalls -ne 0 -or $null -ne $_.Exception
+        }).Name | Should -Be @()
+    }
+}
+
+Describe 'Checkpoint revalidation and targeted repair' {
+    It 'returns the first invalid stage and every successor' {
+        Get-InvalidatedSetupStages -Stages (Get-SetupStages) -FirstInvalidStage 'Hermes' |
+            Should -Be @('Hermes', 'Minibook', 'Services', 'Verification')
+    }
+
+    It 'rejects an unknown invalid stage' {
+        { Get-InvalidatedSetupStages -Stages (Get-SetupStages) -FirstInvalidStage 'Unknown' } |
+            Should -Throw '*Unbekannte Setup-Stage: Unknown*'
+    }
+
+    It 'validates file-backed stages inside the supplied root' {
+        New-Item -ItemType File -Force -Path (Join-Path $TestDrive '.env') | Out-Null
+        New-Item -ItemType File -Force -Path (Join-Path $TestDrive '.captain-cook/demo-run.json') | Out-Null
+        $hermes = Join-Path $TestDrive '.captain-cook/hermes/Scripts/hermes.exe'
+        New-Item -ItemType File -Force -Path $hermes | Out-Null
+        $minibookPython = Join-Path $TestDrive 'minibook/.venv/Scripts/python.exe'
+        $minibookBuild = Join-Path $TestDrive 'minibook/frontend/.next'
+        New-Item -ItemType File -Force -Path $minibookPython | Out-Null
+        New-Item -ItemType Directory -Force -Path $minibookBuild | Out-Null
+        $context = @{ Root = $TestDrive }
+
+        Test-SetupStage -Stage 'Configuration' -Context $context | Should -BeTrue
+        Test-SetupStage -Stage 'Captain' -Context $context | Should -BeTrue
+        Test-SetupStage -Stage 'Hermes' -Context $context | Should -BeTrue
+        Test-SetupStage -Stage 'Minibook' -Context $context | Should -BeTrue
+
+        Remove-Item -LiteralPath $hermes
+        Test-SetupStage -Stage 'Hermes' -Context $context | Should -BeFalse
+        Remove-Item -LiteralPath $minibookBuild
+        Test-SetupStage -Stage 'Minibook' -Context $context | Should -BeFalse
+    }
+
+    It 'exports only the public stage-validation contract' {
+        @((Get-Command -Module StageValidation).Name | Sort-Object) |
+            Should -Be @('Get-InvalidatedSetupStages', 'Test-SetupStage')
+        { Test-SetupStage -Stage 'Unknown' -Context @{ Root = $TestDrive } } |
+            Should -Throw '*Unbekannte Setup-Stage: Unknown*'
+    }
+
+    It 'fails closed when standalone verification has no status provider' {
+        $modulePath = (Resolve-Path "$PSScriptRoot/StageValidation.psm1").Path.Replace("'", "''")
+        $probe = @"
+`$ErrorActionPreference = 'Stop'
+Import-Module '$modulePath' -Force
+`$result = Test-SetupStage -Stage 'Verification' -Context @{ Root = 'unused' }
+if (`$result -ne `$false) { exit 11 }
+`$invalidProviderResult = Test-SetupStage -Stage 'Verification' -Context @{ Root = 'unused'; SystemStatusProvider = 'not-a-scriptblock' }
+if (`$invalidProviderResult -ne `$false) { exit 12 }
+"@
+
+        $output = & pwsh -NoProfile -Command $probe 2>&1
+        $exitCode = $LASTEXITCODE
+
+        $exitCode | Should -Be 0
+        $output -join "`n" | Should -Not -Match 'Get-CaptainSystemStatus|CommandNotFoundException'
+    }
+
+    It 'aggregates existing service-health results without starting services' {
+        InModuleScope StageValidation -Parameters @{ CandidateRoot = $TestDrive } {
+            Mock Read-DotEnv { @{ MAILPIT_WEB_PORT = '8025'; MAILPIT_SMTP_PORT = '1025'; N8N_URL = 'http://localhost:5678' } }
+            Mock Get-ServiceHealth {
+                @(
+                    New-SetupResult -Component 'Mailpit' -Status 'Ready' -Message 'ok' -Remediation 'None'
+                    New-SetupResult -Component 'n8n' -Status 'Failed' -Message 'down' -Remediation 'Retry'
+                )
+            }
+
+            $result = Get-CaptainServiceHealth -Root $CandidateRoot
+
+            $result.Status | Should -Be 'Failed'
+            $result.Data.Results.Count | Should -Be 2
+            $result.Message | Should -Be 'down'
+            Test-SetupStage -Stage 'Services' -Context @{ Root = $CandidateRoot } |
+                Should -BeFalse
+            Should -Invoke Get-ServiceHealth -Times 2 -Exactly
+
+            $providerState = [pscustomobject]@{ Calls = 0 }
+            $systemStatusProvider = {
+                param($root)
+                $providerState.Calls++
+                New-SetupResult -Component 'System' -Status 'Ready' -Message 'ok' -Remediation 'None'
+            }
+            Test-SetupStage -Stage 'Verification' -Context @{
+                Root = $CandidateRoot
+                SystemStatusProvider = $systemStatusProvider
+            } |
+                Should -BeTrue
+            $providerState.Calls | Should -Be 1
+        }
+    }
+
+    It 'revalidates completed stages and persists invalidation before rerunning successors' {
+        $called = [Collections.Generic.List[string]]::new()
+        $validated = [Collections.Generic.List[string]]::new()
+        $observed = [pscustomobject]@{ Checkpoint = $null }
+        $checkpoint = @{}
+        Get-SetupStages | ForEach-Object { $checkpoint[$_] = 'Complete' }
+        $checkpointPath = Join-Path $TestDrive '.captain-cook/checkpoint.json'
+        Save-SetupCheckpoint -Path $checkpointPath -Stages $checkpoint
+
+        $result = Invoke-GuidedSetup -Root $TestDrive -Checkpoint $checkpoint `
+            -StageValidator {
+                param($stage, $context)
+                [void]$validated.Add($stage)
+                $stage -ne 'Minibook'
+            } `
+            -StageRunner {
+                param($stage, $context)
+                if ($null -eq $observed.Checkpoint) {
+                    $observed.Checkpoint = Get-SetupCheckpoint -Path $checkpointPath
+                }
+                [void]$called.Add($stage)
+                [pscustomobject]@{ Status = 'Complete'; Message = 'ok' }
+            }
+
+        $result.Status | Should -Be 'Ready'
+        $validated | Should -Be @('Preflight', 'Configuration', 'Captain', 'Hermes', 'Minibook')
+        $called | Should -Be @('Minibook', 'Services', 'Verification')
+        $observed.Checkpoint.Captain | Should -Be 'Complete'
+        @($observed.Checkpoint.PSObject.Properties.Name) | Should -Not -Contain 'Minibook'
+        @($observed.Checkpoint.PSObject.Properties.Name) | Should -Not -Contain 'Verification'
+    }
+
+    It 'does not rerun completed stages when every validator succeeds' {
+        $validated = [Collections.Generic.List[string]]::new()
+        $checkpoint = @{}
+        Get-SetupStages | ForEach-Object { $checkpoint[$_] = 'Complete' }
+
+        $result = Invoke-GuidedSetup -Root $TestDrive -Checkpoint $checkpoint `
+            -StageValidator {
+                param($stage, $context)
+                [void]$validated.Add($stage)
+                $true
+            } `
+            -StageRunner { throw 'A healthy completed stage must not rerun.' }
+
+        $result.Status | Should -Be 'Ready'
+        $validated | Should -Be (Get-SetupStages)
+    }
+
+    It 'preserves the positional StageRunner facade' {
+        $stageRunnerPosition = @(
+            (Get-Command Invoke-GuidedSetup).Parameters.StageRunner.Attributes |
+                Where-Object { $_ -is [Management.Automation.ParameterAttribute] }
+        )[0].Position
+        $called = [Collections.Generic.List[string]]::new()
+        $runner = {
+            param($stage, $context)
+            [void]$called.Add($stage)
+            [pscustomobject]@{ Status = 'Complete'; Message = 'ok' }
+        }
+
+        $result = Invoke-GuidedSetup $TestDrive @{} $runner -StageValidator { $true }
+
+        $stageRunnerPosition | Should -Be 2
+        $result.Status | Should -Be 'Ready'
+        $called | Should -Be (Get-SetupStages)
+    }
+
+    It 'repairs from the first broken completed stage and preserves stable result data' {
+        $checkpoint = @{}
+        Get-SetupStages | ForEach-Object { $checkpoint[$_] = 'Complete' }
+        $checkpointPath = Join-Path $TestDrive '.captain-cook/checkpoint.json'
+        Save-SetupCheckpoint -Path $checkpointPath -Stages $checkpoint
+        $observed = [pscustomobject]@{ Checkpoint = $null; RunnerCalls = 0 }
+
+        $result = Repair-CaptainSystem -Root $TestDrive -StageValidator {
+            param($stage, $context)
+            $stage -ne 'Hermes'
+        } -SetupRunner {
+            $observed.RunnerCalls++
+            $observed.Checkpoint = Get-SetupCheckpoint -Path $checkpointPath
+            New-SetupResult -Component 'Setup' -Status 'Ready' -Message 'repaired' -Remediation 'None' -Data @{ Existing = 'kept' }
+        }
+
+        $result.PSObject.Properties.Name | Should -Be @('Component', 'Status', 'Message', 'Remediation', 'Data')
+        $result.Status | Should -Be 'Ready'
+        $result.Data.Existing | Should -Be 'kept'
+        $result.Data.InvalidatedStages | Should -Be @('Hermes', 'Minibook', 'Services', 'Verification')
+        $observed.RunnerCalls | Should -Be 1
+        $observed.Checkpoint.Captain | Should -Be 'Complete'
+        @($observed.Checkpoint.PSObject.Properties.Name) | Should -Not -Contain 'Hermes'
+        @($observed.Checkpoint.PSObject.Properties.Name) | Should -Not -Contain 'Verification'
+    }
+
+    It 'fails closed for null and malformed setup-runner results' {
+        $cases = @(
+            [pscustomobject]@{ Name = 'null'; Value = $null }
+            [pscustomobject]@{
+                Name = 'missing Data'
+                Value = [pscustomobject]@{
+                    Component = 'Setup'
+                    Status = 'Ready'
+                    Message = 'incomplete contract'
+                    Remediation = 'None'
+                }
+            }
+        )
+
+        for ($index = 0; $index -lt $cases.Count; $index++) {
+            $case = $cases[$index]
+            $caseRoot = Join-Path $TestDrive "runner-result-$index"
+            $checkpoint = @{}
+            Get-SetupStages | ForEach-Object { $checkpoint[$_] = 'Complete' }
+            Save-SetupCheckpoint -Path (Join-Path $caseRoot '.captain-cook/checkpoint.json') -Stages $checkpoint
+            $runnerValue = $case.Value
+            $observed = [pscustomobject]@{ Result = $null }
+
+            {
+                $observed.Result = Repair-CaptainSystem -Root $caseRoot `
+                    -StageValidator { param($stage, $context) $stage -ne 'Hermes' } `
+                    -SetupRunner { $runnerValue }
+            } | Should -Not -Throw -Because $case.Name
+
+            $observed.Result.PSObject.Properties.Name |
+                Should -Be @('Component', 'Status', 'Message', 'Remediation', 'Data')
+            $observed.Result.Component | Should -Be 'Setup'
+            $observed.Result.Status | Should -Be 'Failed'
+            $observed.Result.Remediation | Should -Be 'Retry'
+            $observed.Result.Message | Should -Match 'Setup-Runner'
+            $observed.Result.Data.InvalidatedStages |
+                Should -Be @('Hermes', 'Minibook', 'Services', 'Verification')
+        }
+    }
+
+    It 'is idempotent when every completed stage remains healthy' {
+        $checkpoint = @{}
+        Get-SetupStages | ForEach-Object { $checkpoint[$_] = 'Complete' }
+        $checkpointPath = Join-Path $TestDrive '.captain-cook/checkpoint.json'
+        Save-SetupCheckpoint -Path $checkpointPath -Stages $checkpoint
+        $before = Get-Content -LiteralPath $checkpointPath -Raw
+        $runnerState = [pscustomobject]@{ Calls = 0 }
+
+        $result = Repair-CaptainSystem -Root $TestDrive -StageValidator { $true } -SetupRunner {
+            $runnerState.Calls++
+            New-SetupResult -Component 'Setup' -Status 'Ready' -Message 'already healthy' -Remediation 'None'
+        }
+
+        $result.Status | Should -Be 'Ready'
+        @($result.Data.InvalidatedStages).Count | Should -Be 0
+        $runnerState.Calls | Should -Be 1
+        (Get-Content -LiteralPath $checkpointPath -Raw) | Should -BeExactly $before
+    }
+
+    It 'keeps repair.ps1 as a thin lifecycle facade' {
+        $source = Get-Content "$PSScriptRoot/../../repair.ps1" -Raw
+
+        $source | Should -Match 'Import-Module.*scripts/setup/Lifecycle\.psm1'
+        $source | Should -Match 'Repair-CaptainSystem\s+-Root\s+\$PSScriptRoot'
+        $source | Should -Match 'Write-Host\s+\$result\.Message'
+        $source | Should -Not -Match 'ConvertFrom-Json|Set-Content|\.Remove\('
     }
 }
 

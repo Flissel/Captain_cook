@@ -1,4 +1,4 @@
-"""HTTP adapter for Captain planning releases and capability lookup."""
+"""Authenticated HTTP adapter for Captain planning releases."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from agenten.validation.contracts import HoldoutSuite, WorkBatch
 
 
 class GatewayPlanningError(RuntimeError):
-    """A gateway planning operation failed with a safe, typed error."""
+    """A gateway planning operation failed without exposing credentials."""
 
 
 class _BlockResponse(BaseModel):
@@ -32,7 +32,10 @@ class _CapabilityResponse(BaseModel):
 class _CapabilityData(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    target: str
+    target: str | None = None
+    runtime: str | None = None
+    runtime_version: str | None = None
+    interface_schema: str | None = None
     capabilities: list[str] = Field(default_factory=list)
 
 
@@ -40,20 +43,30 @@ _CAPABILITIES = TypeAdapter(list[_CapabilityResponse])
 
 
 class GatewayPlanningClient:
-    """Publish immutable Captain contracts through the sole-writer gateway."""
+    """Publish immutable batches and query validated capability projections."""
 
-    def __init__(self, base_url: str, client: httpx.AsyncClient) -> None:
+    def __init__(self, base_url: str, token: str, client: httpx.AsyncClient) -> None:
         if not base_url.strip():
             raise ValueError("gateway base_url must not be empty")
+        if not token:
+            raise ValueError("gateway token must not be empty")
         self._base_url = base_url.rstrip("/")
+        self._token = token
         self._client = client
+
+    @property
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._token}"}
 
     async def release(self, batch: WorkBatch, holdouts: HoldoutSuite) -> None:
         if batch.batch_id != holdouts.batch_id:
             raise ValueError("batch and holdout suite must have the same batch_id")
 
         parent = await self._post_block(
-            {"block_type": "work_batch", "data": batch.model_dump(mode="json")},
+            {
+                "block_type": "work_batch",
+                "data": batch.model_dump(mode="json"),
+            },
             operation="release work batch",
         )
         await self._post_block(
@@ -81,20 +94,20 @@ class GatewayPlanningClient:
         try:
             matches = _CAPABILITIES.validate_python(response.json())
         except (ValueError, ValidationError):
-            raise GatewayPlanningError(
-                "query capabilities returned an invalid response"
-            ) from None
-        requested = set(capability_tags)
-        return next(
-            (
-                match.artifact_ref
-                for match in matches
-                if match.artifact_ref
-                and match.data.target == target
-                and requested.issubset(match.data.capabilities)
-            ),
-            None,
-        )
+            raise GatewayPlanningError("query capabilities returned an invalid response") from None
+        expected_interface = f"captain-{target}-artifact/v1"
+        requested_capabilities = set(capability_tags)
+        for match in matches:
+            compatible = (
+                match.data.target == target
+                and match.data.runtime == target
+                and match.data.runtime_version == "v1"
+                and match.data.interface_schema == expected_interface
+                and requested_capabilities.issubset(match.data.capabilities)
+            )
+            if compatible and match.artifact_ref:
+                return match.artifact_ref
+        return None
 
     async def _post_block(
         self,
@@ -110,7 +123,7 @@ class GatewayPlanningClient:
         )
         if response.status_code == 409:
             raise ReleaseConflictError(f"{operation} failed with gateway status 409")
-        self._require_status(response, {200, 201}, operation=operation)
+        self._require_status(response, {201}, operation=operation)
         try:
             return _BlockResponse.model_validate(response.json())
         except (ValueError, ValidationError):
@@ -128,6 +141,7 @@ class GatewayPlanningClient:
             return await self._client.request(
                 method,
                 f"{self._base_url}{path}",
+                headers=self._headers,
                 **kwargs,
             )
         except httpx.HTTPError:

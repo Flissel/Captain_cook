@@ -6,10 +6,16 @@ may silently broaden its scope or redefine another branch's interface.
 
 ## Integration rule
 
-`main` is the canonical integration baseline. New feature work starts from the
-current local/remote `main`; stale worktrees are fast-forwarded or retired
-before editing shared files. Feature work remains isolated in worktrees and is
-integrated only after its owned contract passes.
+`main` is the canonical integration baseline. The MariaDB gateway is the sole production delivery source of truth
+and sole MariaDB writer. The SQLite delivery ledger is legacy-import input
+only; new production delivery code talks to the gateway.
+
+Integration order: append-only gateway contract -> Captain/delivery clients ->
+migration and operations -> MariaDB CI gate -> public documentation.
+
+The offline demo, evidence artifact, judge-facing docs, and release verifier
+remain the reviewable fallback. Create subsequent worktrees from the latest
+approved integration branch; do not commit feature work directly to `main`.
 
 ```text
 feat/devpost-demo-readiness

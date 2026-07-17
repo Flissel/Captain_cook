@@ -11,8 +11,7 @@ AutoGen Core's runtime is a topic/subscription broadcast system: publishing
 targets a `TopicId` (a `(type, source)` pair), and agents are routed to a
 topic by *type* via a `TypeSubscription` that maps `(topic_type, source) ->
 agent instance keyed by source` -- not by registering ad-hoc callables the
-way InMemoryEventBus does. That's why `subscribe()` below cannot be
-implemented faithfully: there is no "callable subscribed to a topic" concept
+way InMemoryEventBus does. There is no "callable subscribed to a topic" concept
 in autogen_core to hang a handler off of. Each business-logic unit instead
 defines its own thin `RoutedAgent` subclass with `@event`/`@rpc`-decorated
 handler methods, registers it against the runtime via
@@ -24,7 +23,7 @@ from typing import Any
 
 from autogen_core import AgentRuntime, TopicId
 
-from agenten.runtime.event_bus import EventBus, Handler
+from agenten.runtime.event_bus import EventBus
 
 # TopicId is a (type, source) pair; TypeSubscription routes by source to a
 # per-source agent instance ("A topic_id with type `t1` and source `s1` will
@@ -38,13 +37,10 @@ DEFAULT_TOPIC_SOURCE = "default"
 
 class AutoGenEventBus(EventBus):
     """Adapter over autogen_core's pub/sub. publish() maps topic -> TopicId
-    and calls runtime.publish_message(). subscribe() is intentionally NOT
-    supported here -- AutoGen Core subscribes agent TYPES to topics via
+    and calls runtime.publish_message(). AutoGen Core subscribes agent TYPES to topics via
     TypeSubscription, not arbitrary callables. Each business-logic unit
     implements its own thin RoutedAgent adapter (see sibling units) and
-    registers a TypeSubscription directly against the runtime instead;
-    subscribe() exists only so this class satisfies the EventBus interface,
-    and raises NotImplementedError with a message pointing at that pattern.
+    registers a TypeSubscription directly against the runtime instead.
     """
 
     def __init__(self, runtime: AgentRuntime) -> None:
@@ -60,8 +56,3 @@ class AutoGenEventBus(EventBus):
         source = root_problem_id if root_problem_id is not None else DEFAULT_TOPIC_SOURCE
         topic_id = TopicId(type=topic, source=source)
         await self._runtime.publish_message(event, topic_id)
-
-    def subscribe(self, topic: str, handler: Handler) -> None:
-        raise NotImplementedError(
-            "AutoGenEventBus.subscribe: register a TypeSubscription against the runtime for your RoutedAgent instead"
-        )

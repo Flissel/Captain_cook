@@ -1,5 +1,7 @@
+import ast
 from pathlib import Path
 
+from tests import architecture_fitness
 from tests.architecture_fitness import (
     BoundaryRule,
     ImportedModule,
@@ -10,6 +12,27 @@ from tests.architecture_fitness import (
 
 
 ROOT = Path(__file__).parents[1]
+
+
+def test_callable_subscribe_calls_stay_in_local_composition_boundaries():
+    allowed = {
+        "agenten/ledger_bridge/recorder.py",
+        "agenten/orchestration/pipeline.py",
+    }
+    violations = []
+    for path in sorted((ROOT / "agenten").rglob("*.py")):
+        relative = path.relative_to(ROOT).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "subscribe"
+                and relative not in allowed
+            ):
+                violations.append(f"{relative}:{node.lineno}")
+
+    assert violations == [], "callable subscribe used outside local composition: " + ", ".join(violations)
 
 
 def test_import_parser_handles_import_and_from_import(tmp_path: Path):
@@ -121,3 +144,56 @@ def test_root_runtime_has_no_internal_import_cycles():
     cycles = find_import_cycles(ROOT, packages)
 
     assert cycles == [], "\n" + "\n".join(" -> ".join(cycle) for cycle in cycles)
+
+
+def test_symbol_reference_rule_reports_names_and_attributes(tmp_path: Path):
+    direct = tmp_path / "agenten" / "direct.py"
+    direct.parent.mkdir(parents=True)
+    direct.write_text("store = MariaDBStorage()\n", encoding="utf-8")
+    aliased = tmp_path / "agenten" / "aliased.py"
+    aliased.write_text(
+        "from blockchain.mariadb_storage import MariaDBStorage as Storage\n"
+        "store = Storage()\n",
+        encoding="utf-8",
+    )
+    qualified = tmp_path / "blockchain" / "qualified.py"
+    qualified.parent.mkdir(parents=True)
+    qualified.write_text("store = storage.MariaDBStorage()\n", encoding="utf-8")
+    allowed = tmp_path / "gateway" / "allowed.py"
+    allowed.parent.mkdir(parents=True)
+    allowed.write_text("store = MariaDBStorage()\n", encoding="utf-8")
+    foreign_worktree = tmp_path / ".worktrees" / "other" / "foreign.py"
+    foreign_worktree.parent.mkdir(parents=True)
+    foreign_worktree.write_text("store = MariaDBStorage()\n", encoding="utf-8")
+
+    finder = getattr(architecture_fitness, "find_symbol_references", None)
+    assert finder is not None, "find_symbol_references is not implemented"
+
+    references = finder(
+        tmp_path,
+        symbol="MariaDBStorage",
+        allowed_paths=("gateway/",),
+    )
+
+    assert [str(item) for item in references] == [
+        "agenten/aliased.py:1 references MariaDBStorage",
+        "agenten/direct.py:1 references MariaDBStorage",
+        "blockchain/qualified.py:1 references MariaDBStorage",
+    ]
+
+
+def test_only_gateway_may_reference_mariadb_storage():
+    finder = getattr(architecture_fitness, "find_symbol_references", None)
+    assert finder is not None, "find_symbol_references is not implemented"
+
+    violations = finder(
+        ROOT,
+        symbol="MariaDBStorage",
+        allowed_paths=(
+            "gateway/",
+            "tests/",
+            "scripts/migrate_sqlite_delivery_ledger.py",
+        ),
+    )
+
+    assert violations == [], "\n" + "\n".join(str(item) for item in violations)

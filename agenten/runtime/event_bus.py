@@ -21,21 +21,16 @@ class EventBus(ABC):
         exactly-once — handlers must be idempotent w.r.t. EventMeta.event_id.
         """
 
+
+class SubscribableEventBus(EventBus, ABC):
+    """Event bus with local callable-subscription capability."""
+
     @abstractmethod
     def subscribe(self, topic: str, handler: Handler) -> None:
-        """Register a handler for a topic.
-
-        NOTE: AutoGen Core subscribes agent TYPES to topics, not arbitrary
-        callables — AutoGenEventBus (unit U1) cannot implement this
-        faithfully and raises NotImplementedError; real AutoGen wiring
-        happens via each unit's RoutedAgent adapter + TypeSubscription
-        instead (see agenten/orchestration/pipeline.py, unit U11).
-        InMemoryEventBus is the one implementation where subscribe() is
-        the real mechanism, e.g. for tests.
-        """
+        """Register a local callable handler for a topic."""
 
 
-class InMemoryEventBus(EventBus):
+class InMemoryEventBus(SubscribableEventBus):
     """Sequential, deterministic in-process bus. Used for unit tests and as
     the default single-process runtime until an AutoGen-backed bus is wired
     up in unit U11.

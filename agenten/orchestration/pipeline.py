@@ -14,16 +14,10 @@ module docstring), and it is a strict *port* implementation --
 change to run for real.
 
 Swapping in ``AutoGenEventBus`` (``agenten.runtime.autogen_bus`` +
-``agenten.runtime.bootstrap.build_runtime_and_bus()``) is the production
-path, but it is NOT a drop-in replacement for the business-logic wiring
-below: ``AutoGenEventBus.subscribe()`` intentionally raises
-``NotImplementedError`` (AutoGen Core subscribes agent *types* to topics via
-``TypeSubscription``, not arbitrary callables -- see that module's
-docstring), while ``LedgerRecorderAgent.__init__`` unconditionally calls
-``self._bus.subscribe(...)`` for nine event types. That means constructing
-``LedgerRecorderAgent``/``LedgerRecorderRoutedAgent`` directly against an
-``AutoGenEventBus`` today raises immediately at boot -- a real production
-wiring needs each business-logic unit's already-defined ``RoutedAgent``
+``agenten.runtime.bootstrap.build_runtime_and_bus()``) is not a drop-in
+replacement for the callable wiring below. AutoGen Core subscribes agent
+*types* to topics via ``TypeSubscription``, not arbitrary callables. A real
+production wiring needs each business-logic unit's already-defined ``RoutedAgent``
 adapter (``LedgerRecorderRoutedAgent``, ``GatekeeperRoutedAgent``,
 ``RoutedSpawnCoordinatorAgent``, ``make_routed_agent_class(worker)``, ...)
 registered on the runtime via ``RoutedAgent.register(...)`` plus one
@@ -69,9 +63,9 @@ from agenten.events.schemas import (
     topic_for,
 )
 from agenten.ledger_bridge.query import InProcessBudgetLedger, LedgerQueryImpl
-from agenten.ledger_bridge.recorder import LedgerRecorderAgent
+from agenten.ledger_bridge.recorder import LedgerRecorderAgent, subscribe_recorder
 from agenten.ledger_bridge.stage_machine import Stage
-from agenten.runtime.event_bus import EventBus, InMemoryEventBus
+from agenten.runtime.event_bus import InMemoryEventBus, SubscribableEventBus
 from agenten.spawning.capability_registry import CapabilityRegistry
 from agenten.spawning.coordinator import SpawnCoordinatorAgent
 from agenten.supervision.reaper import ReaperAgent
@@ -129,7 +123,7 @@ class SupplyChainPipeline:
     recovery.recover_on_startup`` against a *fresh* pipeline's bus/query).
     """
 
-    bus: EventBus
+    bus: SubscribableEventBus
     blockchain: Blockchain
     budget_ledger: InProcessBudgetLedger
     ledger_query: LedgerQueryImpl
@@ -262,7 +256,7 @@ def build_pipeline(
     *,
     llm_decompose: LlmDecompose,
     llm_judge: Optional[LlmJudge] = None,
-    bus: Optional[EventBus] = None,
+    bus: SubscribableEventBus | None = None,
     blockchain: Optional[Blockchain] = None,
     storage: Optional[LedgerStorage] = None,
     blockchain_file_path: str = "blockchain.json",
@@ -305,6 +299,8 @@ def build_pipeline(
         )
     """
     bus = bus if bus is not None else InMemoryEventBus()
+    if not isinstance(bus, SubscribableEventBus):
+        raise TypeError("build_pipeline requires a SubscribableEventBus")
 
     if blockchain is not None:
         chain = blockchain
@@ -316,12 +312,11 @@ def build_pipeline(
     budget_ledger = InProcessBudgetLedger(chain)
     resolved_default_budget = default_budget if default_budget is not None else DecompositionBudget()
 
-    # --- Ledger Recorder (U8) — the sole ledger writer. Subscribes its own
-    # handle_xxx methods onto `bus` inside __init__ (see recorder.py); no
-    # bus.subscribe(...) call needed here for it. Also builds+seeds
-    # self.query (a LedgerQueryImpl), which every other agent below reads
-    # the ledger through.
+    # --- Ledger Recorder (U8) — the sole ledger writer. Local callable
+    # subscription is explicit here; AutoGen's RoutedAgent wrapper is wired
+    # separately through TypeSubscription and never calls this helper.
     recorder = LedgerRecorderAgent(bus, chain, budget_ledger, default_budget=resolved_default_budget)
+    subscribe_recorder(bus, recorder)
     ledger_query = recorder.query
 
     # --- Constitution Gatekeeper (U2) — independent admission check.

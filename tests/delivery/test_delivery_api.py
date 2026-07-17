@@ -1,16 +1,21 @@
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
-from agenten.delivery import DeliveryStatus, SqliteDeliveryLedger
-from agenten.delivery.api import create_delivery_app
+from agenten.delivery import DeliveryStatus
+from agenten.delivery.ledger import SqliteDeliveryLedger
+from agenten.delivery.legacy_api import create_legacy_delivery_app
 from agenten.delivery.events import DeliveryEventPublisher
 from agenten.runtime.event_bus import InMemoryEventBus
 
 
+pytestmark = pytest.mark.legacy
+
+
 def test_api_runs_complete_delivery_lifecycle_on_real_sqlite(tmp_path: Path) -> None:
     ledger = SqliteDeliveryLedger(tmp_path / "delivery.db")
-    app = create_delivery_app(ledger)
+    app = create_legacy_delivery_app(ledger)
     client = TestClient(app)
 
     response = client.post(
@@ -72,7 +77,7 @@ def test_publisher_observes_committed_state_and_duplicate_is_not_republished(
         observed_versions.append(ledger.get_todo(todo_id).version)
 
     bus.subscribe("delivery.events", reload_on_delivery)
-    app = create_delivery_app(ledger, DeliveryEventPublisher(bus))
+    app = create_legacy_delivery_app(ledger, DeliveryEventPublisher(bus))
     client = TestClient(app)
     todo = client.post(
         "/delivery/todos",
@@ -101,7 +106,7 @@ def test_publisher_observes_committed_state_and_duplicate_is_not_republished(
 
 def test_operational_endpoints_persist_lease_evidence_and_events(tmp_path: Path) -> None:
     ledger = SqliteDeliveryLedger(tmp_path / "delivery.db")
-    client = TestClient(create_delivery_app(ledger))
+    client = TestClient(create_legacy_delivery_app(ledger))
     todo = client.post(
         "/delivery/todos",
         json={
