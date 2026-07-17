@@ -293,6 +293,56 @@ def test_expired_non_terminal_claim_projects_as_pending() -> None:
     assert projection.claim_expires_at == expiry
 
 
+def test_requeue_recovery_clears_the_expired_claim_and_projects_pending() -> None:
+    expiry = NOW - timedelta(seconds=1)
+    recovery = child(
+        12,
+        "recovery_decision",
+        iteration=1,
+        reason="claim_expired",
+        decision="requeue",
+    )
+
+    projection = project_batch(
+        [work_batch(), claim(11, expires_at=expiry), recovery],
+        BATCH_ID,
+        now=NOW,
+    )
+
+    assert projection.status == "pending"
+    assert projection.claim_iteration == 1
+    assert projection.claim_token_sha256 is None
+    assert projection.claim_expires_at is None
+
+
+def test_aborted_infra_recovery_is_terminal() -> None:
+    expiry = NOW - timedelta(seconds=1)
+    recovery = child(
+        12,
+        "recovery_decision",
+        iteration=1,
+        reason="claim_expired",
+        decision="aborted_infra",
+    )
+
+    projection = project_batch(
+        [work_batch(), claim(11, expires_at=expiry), recovery],
+        BATCH_ID,
+        now=NOW,
+    )
+
+    assert projection.status == "aborted_infra"
+    assert projection.claim_token_sha256 is None
+    assert projection.claim_expires_at is None
+
+    with pytest.raises(ValueError, match="after terminal"):
+        project_batch(
+            [work_batch(), claim(11, expires_at=expiry), recovery, claim(13)],
+            BATCH_ID,
+            now=NOW,
+        )
+
+
 def test_default_clock_is_current_utc() -> None:
     future = datetime(2099, 1, 1, tzinfo=timezone.utc)
     past = datetime(2000, 1, 1, tzinfo=timezone.utc)

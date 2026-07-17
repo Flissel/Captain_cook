@@ -21,13 +21,15 @@ from gateway.contracts import (
     ClaimEvent,
     CodexProcessEvent,
     HeartbeatEvent,
+    ReasoningSliceEvent,
+    RecoveryDecisionEvent,
     project_batch,
 )
 
 
 CAPTAIN_BLOCK_TYPES = frozenset({"problem", "work_batch", "holdout"})
 GATEWAY_OWNED_EVENT_TYPES = frozenset(
-    {"batch_claimed", "batch_heartbeat", "batch_approved"}
+    {"batch_claimed", "batch_heartbeat", "batch_approved", "recovery_decision"}
 )
 TRANSIENT_TRANSACTION_ERRORS = frozenset({1020, 1213})
 TRANSACTION_ATTEMPTS = 3
@@ -295,6 +297,8 @@ class GatewayStore:
                 data = HoldoutSuite.model_validate(data).model_dump(mode="json")
             elif block_type == "codex_process":
                 data = CodexProcessEvent.model_validate(data).model_dump(mode="json")
+            elif block_type == "reasoning_slice":
+                data = ReasoningSliceEvent.model_validate(data).model_dump(mode="json")
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=exc.errors()) from exc
 
@@ -392,6 +396,61 @@ class GatewayStore:
                 self._insert(cursor, block)
                 if block_type == "batch_done" and data["outcome"] == "succeeded":
                     self._upsert_capability(cursor, block)
+        return block
+
+    def recover(self, request: RecoveryDecisionEvent) -> dict[str, Any]:
+        try:
+            return self._retry_write(lambda: self._recover_once(request))
+        except _IdempotentReplay as replay:
+            return replay.block
+
+    def _recover_once(self, request: RecoveryDecisionEvent) -> dict[str, Any]:
+        data = request.model_dump(mode="json")
+        now = _utcnow()
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                parent, children, projection = self._batch_context(
+                    cursor,
+                    request.batch_id,
+                    for_update=True,
+                    now=now,
+                )
+                existing = next(
+                    (
+                        child
+                        for child in children
+                        if child["block_type"] == "recovery_decision"
+                        and child["data"].get("iteration") == request.iteration
+                    ),
+                    None,
+                )
+                if existing is not None and self._has_identical_canonical_data(existing, data):
+                    raise _IdempotentReplay(existing)
+                if existing is not None:
+                    raise HTTPException(status_code=409, detail="recovery decision already exists")
+                if (
+                    projection.status != "pending"
+                    or projection.claim_iteration != request.iteration
+                    or projection.claim_expires_at is None
+                    or projection.claim_expires_at > now
+                ):
+                    raise HTTPException(status_code=409, detail="claim is not expired")
+                block = self._new_block(
+                    cursor,
+                    index=self._next_index(cursor),
+                    block_type="recovery_decision",
+                    data=data,
+                    status=request.decision,
+                    parent_index=parent["index"],
+                )
+                self._validate_candidate(
+                    parent,
+                    children,
+                    block,
+                    request.batch_id,
+                    now=now,
+                )
+                self._insert(cursor, block)
         return block
 
     def batch_projection(self, batch_id: str) -> BatchProjection:

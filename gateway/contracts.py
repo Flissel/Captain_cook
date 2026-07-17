@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal, Sequence, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 
 BatchStatus: TypeAlias = Literal[
@@ -38,6 +38,8 @@ class BatchProjection(BaseModel):
     claim_iteration: int = 0
     codex_session_recorded: bool = False
     validation_run_recorded: bool = False
+    recovery_recorded: bool = False
+    recovered_iteration: int | None = None
 
 
 class ClaimEvent(BaseModel):
@@ -58,6 +60,25 @@ class EvidenceEvent(BaseModel):
     iteration: int = Field(ge=1, strict=True)
 
 
+class ReasoningSliceEvent(EvidenceEvent):
+    """Opaque, integrity-bound reasoning summary reference; never raw reasoning."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    slice_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
+    summary_ref: str = Field(min_length=1, max_length=512)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("summary_ref")
+    @classmethod
+    def require_opaque_reference(cls, value: str) -> str:
+        lowered = value.lower()
+        forbidden = ("chain-of-thought", "chain_of_thought", "workspace", "\\", "file://")
+        if not value.startswith("artifact://") or any(item in lowered for item in forbidden):
+            raise ValueError("summary_ref must be an opaque artifact reference")
+        return value
+
+
 class CodexProcessEvent(EvidenceEvent):
     model_config = ConfigDict(extra="forbid")
 
@@ -73,6 +94,15 @@ class BatchDoneEvent(BaseModel):
     outcome: TerminalOutcome
 
 
+class RecoveryDecisionEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(min_length=1, max_length=32)
+    iteration: int = Field(ge=1, strict=True)
+    reason: Literal["claim_expired"]
+    decision: Literal["requeue", "aborted_infra"]
+
+
 _LIFECYCLE_BLOCK_TYPES = frozenset(
     {
         "batch_approved",
@@ -80,6 +110,8 @@ _LIFECYCLE_BLOCK_TYPES = frozenset(
         "batch_heartbeat",
         "codex_session",
         "codex_process",
+        "reasoning_slice",
+        "recovery_decision",
         "validation_run",
         "batch_done",
     }
@@ -193,6 +225,9 @@ def project_batch(
     codex_session_recorded = False
     validation_run_recorded = False
     terminal = False
+    recovered_iterations: set[int] = set()
+    recovery_recorded = False
+    recovered_iteration: int | None = None
 
     for block in children:
         block_type = block.get("block_type")
@@ -228,9 +263,13 @@ def project_batch(
             claim_expires_at = _as_utc(event.claim_expires_at)
             continue
 
-        if block_type in {"codex_session", "codex_process", "validation_run"}:
+        if block_type in {"codex_session", "codex_process", "reasoning_slice", "validation_run"}:
             event_model: type[BaseModel] = (
-                CodexProcessEvent if block_type == "codex_process" else EvidenceEvent
+                CodexProcessEvent
+                if block_type == "codex_process"
+                else ReasoningSliceEvent
+                if block_type == "reasoning_slice"
+                else EvidenceEvent
             )
             event = _event_data(block, event_model)
             assert isinstance(event, EvidenceEvent)
@@ -240,6 +279,29 @@ def project_batch(
                 codex_session_recorded = True
             elif block_type == "validation_run":
                 validation_run_recorded = True
+            continue
+
+        if block_type == "recovery_decision":
+            event = _event_data(block, RecoveryDecisionEvent)
+            assert isinstance(event, RecoveryDecisionEvent)
+            if (
+                claim_iteration == 0
+                or event.iteration != claim_iteration
+                or claim_expires_at is None
+                or claim_expires_at > current_time
+                or event.iteration in recovered_iterations
+            ):
+                raise ValueError("recovery decision requires one expired current claim")
+            recovered_iterations.add(event.iteration)
+            recovery_recorded = True
+            recovered_iteration = event.iteration
+            claim_token_sha256 = None
+            claim_expires_at = None
+            if event.decision == "aborted_infra":
+                status = "aborted_infra"
+                terminal = True
+            else:
+                status = "pending"
             continue
 
         if block_type == "batch_done":
@@ -252,7 +314,7 @@ def project_batch(
             status = event.outcome
             terminal = True
 
-    if not terminal and claim_iteration:
+    if not terminal and claim_iteration and not recovery_recorded:
         assert claim_expires_at is not None
         status = "claimed" if claim_expires_at > current_time else "pending"
 
@@ -265,4 +327,6 @@ def project_batch(
         claim_iteration=claim_iteration,
         codex_session_recorded=codex_session_recorded,
         validation_run_recorded=validation_run_recorded,
+        recovery_recorded=recovery_recorded,
+        recovered_iteration=recovered_iteration,
     )

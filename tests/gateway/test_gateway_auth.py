@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -333,6 +334,101 @@ def test_codex_process_requires_worker_role_and_live_claim_token(client: TestCli
         headers=authorization(WORKER_TOKEN, claim_token=claim_token),
         json=request,
     ).status_code == 201
+
+
+def test_reasoning_slice_requires_worker_role_and_current_claim(client: TestClient) -> None:
+    captain = authorization(CAPTAIN_TOKEN)
+    worker = authorization(WORKER_TOKEN)
+    batch = client.post(
+        "/blocks",
+        headers=captain,
+        json={"block_type": "work_batch", "status": "pending_review", "data": batch_payload()},
+    )
+    assert batch.status_code == 201
+    assert client.post("/batches/batch-1/approve", headers=captain).status_code == 200
+    claimed = client.post("/batches/batch-1/claim", headers=worker)
+    claim_token = claimed.json()["claim_token"]
+    request = {
+        "block_type": "reasoning_slice",
+        "data": {
+            "batch_id": "batch-1",
+            "iteration": 1,
+            "slice_id": "slice-1",
+            "summary_ref": "artifact://reasoning/summary-1",
+            "sha256": "a" * 64,
+        },
+    }
+
+    assert client.post("/blocks", json=request).status_code == 401
+    assert client.post("/blocks", headers=captain, json=request).status_code == 403
+    assert client.post("/blocks", headers=worker, json=request).status_code == 409
+    assert client.post(
+        "/blocks",
+        headers=authorization(WORKER_TOKEN, claim_token="wrong-claim"),
+        json=request,
+    ).status_code == 409
+    assert client.post(
+        "/blocks",
+        headers=authorization(WORKER_TOKEN, claim_token=claim_token),
+        json=request,
+    ).status_code == 201
+
+
+def test_recovery_route_is_captain_only_idempotent_and_cannot_be_bypassed(
+    client: TestClient,
+    storage: MariaDBStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gateway import store as store_module
+
+    start = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(store_module, "_utcnow", lambda: start)
+    captain = authorization(CAPTAIN_TOKEN)
+    worker = authorization(WORKER_TOKEN)
+    assert client.post(
+        "/blocks",
+        headers=captain,
+        json={"block_type": "work_batch", "data": batch_payload()},
+    ).status_code == 201
+    claimed = client.post("/batches/batch-1/claim", headers=worker)
+    assert claimed.status_code == 200
+    monkeypatch.setattr(store_module, "_utcnow", lambda: start + timedelta(minutes=91))
+    recovery = {
+        "batch_id": "batch-1",
+        "iteration": 1,
+        "reason": "claim_expired",
+        "decision": "requeue",
+    }
+
+    assert client.post("/batches/batch-1/recovery", json=recovery).status_code == 401
+    assert client.post(
+        "/batches/batch-1/recovery", headers=worker, json=recovery
+    ).status_code == 403
+    bypass = client.post(
+        "/blocks",
+        headers=captain,
+        json={"block_type": "recovery_decision", "data": recovery},
+    )
+    assert bypass.status_code == 422
+
+    first = client.post("/batches/batch-1/recovery", headers=captain, json=recovery)
+    blocks_after_first = storage.load()
+    replay = client.post("/batches/batch-1/recovery", headers=captain, json=recovery)
+
+    assert first.status_code == 201
+    assert replay.status_code == 201
+    assert replay.json() == first.json()
+    assert storage.load() == blocks_after_first
+    projection = client.get("/batches/batch-1", headers=captain).json()
+    assert projection["status"] == "pending"
+    assert projection["claim_expires_at"] is None
+
+    conflicting = client.post(
+        "/batches/batch-1/recovery",
+        headers=captain,
+        json={**recovery, "decision": "aborted_infra"},
+    )
+    assert conflicting.status_code == 409
 
 
 def test_runtime_lifespan_fails_closed_without_complete_settings(

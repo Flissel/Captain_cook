@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from datetime import datetime
 from collections.abc import Sequence
-from typing import Any, Literal, TypeAlias, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypeVar
 from urllib.parse import quote
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+if TYPE_CHECKING:
+    from agenten.delivery.recovery import RecoveryDecision
 
 
 BatchStatus: TypeAlias = Literal[
@@ -52,6 +55,8 @@ class GatewayBatchProjection(BaseModel):
     claim_iteration: int = Field(ge=0, strict=True)
     codex_session_recorded: bool
     validation_run_recorded: bool
+    recovery_recorded: bool = False
+    recovered_iteration: int | None = Field(default=None, ge=1, strict=True)
 
 
 class GatewayClaim(BaseModel):
@@ -114,6 +119,32 @@ class _BlockResponse(BaseModel):
     index: int = Field(ge=0, strict=True)
 
 
+class _BatchListItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(min_length=1)
+    title: str
+
+
+class _ReasoningSlice(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(min_length=1)
+    iteration: int = Field(ge=1, strict=True)
+    slice_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
+    summary_ref: str = Field(pattern=r"^artifact://[^\\]+$")
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class _RecoveryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(min_length=1, max_length=32)
+    iteration: int = Field(ge=1, strict=True)
+    reason: Literal["claim_expired"]
+    decision: Literal["requeue", "aborted_infra"]
+
+
 class GatewayDeliveryClient:
     """Drive claims and fenced lifecycle writes through the sole-writer API."""
 
@@ -138,6 +169,22 @@ class GatewayDeliveryClient:
             response,
             operation="read batch projection",
         )
+
+    async def list_batches(self, status: str) -> tuple[str, ...]:
+        if not status:
+            raise ValueError("status must not be empty")
+        response = await self._request(
+            "GET",
+            "/batches",
+            operation="list batches",
+            params={"status": status},
+        )
+        self._require_status(response, {200}, operation="list batches")
+        try:
+            items = [_BatchListItem.model_validate(item) for item in response.json()]
+        except (TypeError, ValueError, ValidationError):
+            raise GatewayDeliveryError("list batches returned an invalid response") from None
+        return tuple(item.batch_id for item in items)
 
     async def claim(self, batch_id: str) -> GatewayClaim:
         response = await self._request(
@@ -202,6 +249,47 @@ class GatewayDeliveryClient:
                 artifact_ref=artifact_ref,
             ),
         )
+
+    async def record_reasoning_slice(
+        self,
+        batch_id: str,
+        claim_token: str,
+        *,
+        iteration: int,
+        slice_id: str,
+        summary_ref: str,
+        sha256: str,
+    ) -> None:
+        event = _ReasoningSlice(
+            batch_id=batch_id,
+            iteration=iteration,
+            slice_id=slice_id,
+            summary_ref=summary_ref,
+            sha256=sha256,
+        )
+        await self._append_event(
+            "reasoning_slice",
+            batch_id,
+            claim_token,
+            event.model_dump(mode="json"),
+        )
+
+    async def record_recovery(self, decision: "RecoveryDecision") -> "RecoveryDecision":
+        from agenten.delivery.recovery import RecoveryDecision
+
+        response = await self._request(
+            "POST",
+            f"/batches/{self._batch_path(decision.batch_id)}/recovery",
+            operation="record recovery decision",
+            json=decision.model_dump(mode="json"),
+        )
+        self._require_status(response, {201}, operation="record recovery decision")
+        validated = self._validate(
+            _RecoveryResponse,
+            response,
+            operation="record recovery decision",
+        )
+        return RecoveryDecision.model_validate(validated.model_dump())
 
     async def record_codex_process(
         self,
