@@ -51,8 +51,11 @@ def client(storage: MariaDBStorage) -> TestClient:
     return TestClient(create_app(storage=storage, mirror=RecordingMirror(), settings=settings))
 
 
-def authorization(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
+def authorization(token: str, *, claim_token: str | None = None) -> dict[str, str]:
+    headers = {"Authorization": f"Bearer {token}"}
+    if claim_token is not None:
+        headers["X-Claim-Token"] = claim_token
+    return headers
 
 
 def publish_holdout(client: TestClient) -> None:
@@ -122,6 +125,43 @@ def sealed_artifact_event() -> DeliveryEventEnvelope:
             },
         }
     )
+
+
+@pytest.mark.parametrize(
+    "gateway_token",
+    [WORKER_TOKEN, CAPTAIN_TOKEN],
+    ids=["worker", "captain"],
+)
+def test_legacy_holdout_route_never_discloses_after_valid_claim_and_session(
+    client: TestClient,
+    gateway_token: str,
+) -> None:
+    publish_holdout(client)
+    claimed = client.post(
+        "/batches/batch-1/claim",
+        headers=authorization(WORKER_TOKEN),
+    )
+    assert claimed.status_code == 200, claimed.text
+    claim_token = claimed.json()["claim_token"]
+    worker_claim = authorization(WORKER_TOKEN, claim_token=claim_token)
+    session = client.post(
+        "/blocks",
+        headers=worker_claim,
+        json={
+            "block_type": "codex_session",
+            "data": {"batch_id": "batch-1", "iteration": 1},
+        },
+    )
+    assert session.status_code == 201, session.text
+
+    response = client.get(
+        "/batches/batch-1/holdout",
+        headers=authorization(gateway_token, claim_token=claim_token),
+    )
+
+    assert response.status_code == 410
+    assert response.json() == {"detail": "legacy holdout route is gone"}
+    assert "secret" not in response.text
 
 
 def test_builder_cannot_read_holdout_before_or_after_artifact_is_sealed(

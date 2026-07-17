@@ -301,10 +301,13 @@ def create_app(
     @app.get("/batches/{batch_id}/holdout")
     async def get_holdout(
         batch_id: str,
-        x_claim_token: str | None = Header(default=None),
         _: GatewayRole = Depends(require_reader),
-    ) -> dict[str, Any]:
-        return get_store().holdout(batch_id, x_claim_token)
+    ) -> None:
+        del batch_id
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="legacy holdout route is gone",
+        )
 
     @app.post("/sink/crm", status_code=status.HTTP_201_CREATED)
     async def write_sink(

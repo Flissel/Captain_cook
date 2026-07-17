@@ -720,7 +720,8 @@ def test_second_holdout_cannot_replace_the_immutable_suite(client: TestClient) -
     token = claim(client)
     assert worker_block(client, token).status_code == 201
     released = client.get("/batches/batch-1/holdout", headers={"X-Claim-Token": token})
-    assert released.json()["cases"][0]["case_id"] == "secret-1"
+    assert released.status_code == 410
+    assert "secret-1" not in released.text
 
 
 def test_identical_canonical_holdout_replay_returns_existing_block(
@@ -858,7 +859,9 @@ def test_claim_token_is_not_persisted_or_exposed(client: TestClient, storage: Ma
     assert claim_event["data"]["claim_token_sha256"] == hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def test_holdout_is_hidden_until_a_codex_session_exists(client: TestClient) -> None:
+def test_legacy_holdout_route_never_discloses_after_a_codex_session(
+    client: TestClient,
+) -> None:
     parent_index = create_batch(client)
     holdout = client.post(
         "/blocks",
@@ -872,17 +875,15 @@ def test_holdout_is_hidden_until_a_codex_session_exists(client: TestClient) -> N
     token = claim(client)
     headers = {"X-Claim-Token": token}
 
-    assert client.get("/batches/batch-1/holdout", headers=headers).status_code == 404
+    assert client.get("/batches/batch-1/holdout", headers=headers).status_code == 410
     assert worker_block(client, token).status_code == 201
 
     response = client.get("/batches/batch-1/holdout", headers=headers)
-    assert response.status_code == 200
-    assert response.json()["cases"] == [
-        {"case_id": "secret-1", "input": {"lead": 1}, "expected_observations": {}}
-    ]
+    assert response.status_code == 410
+    assert "secret-1" not in response.text
 
 
-def test_holdout_release_is_scoped_to_the_current_claim_iteration(
+def test_legacy_holdout_route_remains_gone_across_claim_iterations(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -904,18 +905,18 @@ def test_holdout_release_is_scoped_to_the_current_claim_iteration(
     assert client.get(
         "/batches/batch-1/holdout",
         headers={"X-Claim-Token": first_token},
-    ).status_code == 200
+    ).status_code == 410
 
     monkeypatch.setattr(store_module, "_utcnow", lambda: start + timedelta(minutes=91))
     second_token = claim(client)
     second_headers = {"X-Claim-Token": second_token}
-    assert client.get("/batches/batch-1/holdout", headers=second_headers).status_code == 404
+    assert client.get("/batches/batch-1/holdout", headers=second_headers).status_code == 410
     assert worker_block(
         client,
         second_token,
         data={"batch_id": "batch-1", "iteration": 2},
     ).status_code == 201
-    assert client.get("/batches/batch-1/holdout", headers=second_headers).status_code == 200
+    assert client.get("/batches/batch-1/holdout", headers=second_headers).status_code == 410
 
 
 def test_work_batch_and_holdout_remain_immutable_across_lifecycle(
