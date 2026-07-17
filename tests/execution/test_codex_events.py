@@ -81,3 +81,18 @@ def test_parser_outputs_are_immutable() -> None:
 
     with pytest.raises(ValidationError):
         event.lifecycle = "failed"
+
+
+def test_lone_surrogate_becomes_a_hashed_warning_without_raising() -> None:
+    line = "{\"type\":\"error\",\"message\":\"\\ud800\"}"
+
+    try:
+        warning = parse_codex_jsonl(line)
+    except UnicodeEncodeError as error:
+        pytest.fail(f"parser leaked a Unicode encoding error: {error}")
+
+    assert isinstance(warning, CodexParseWarning)
+    assert warning.warning_type == "malformed_json"
+    assert warning.line_sha256 == __import__("hashlib").sha256(
+        line.encode("utf-8", "surrogatepass")
+    ).hexdigest()

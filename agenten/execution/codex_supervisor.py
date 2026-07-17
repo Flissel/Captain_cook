@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from agenten.execution.codex_events import (
+    CodexParseWarning,
+    CodexProcessEvent,
+    parse_codex_jsonl,
+)
 from agenten.execution.process import PackageExecutionResult, PackageExecutionStatus
 
+if TYPE_CHECKING:
+    from agenten.execution.codex_policy import AuthorizedCodexRun
 
 Identifier = str
 
@@ -55,58 +60,25 @@ class CodexRunRequest(BaseModel):
         return command
 
 
+class CodexRunResult(BaseModel):
+    """Immutable, untrusted process output retained only until it is sanitized."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    exit_code: int
+    artifact_references: tuple[str, ...]
+    jsonl_lines: tuple[str, ...]
+
+
 class CodexRunner(Protocol):
     async def run(
         self,
-        command: Sequence[str],
-        *,
-        cwd: Path,
-        env: Mapping[str, str],
-    ) -> tuple[int, tuple[str, ...]]: ...
-
-
-class AuthorizedCodexRunBoundary(Protocol):
-    workspace: Path
-    command: tuple[str, ...]
-
-    def child_environment(self) -> dict[str, str]: ...
+        authorized: AuthorizedCodexRun,
+    ) -> CodexRunResult: ...
 
 
 class CodexExecutionAuthorizer(Protocol):
-    def authorize(self, request: CodexRunRequest) -> AuthorizedCodexRunBoundary: ...
-
-
-@dataclass(frozen=True)
-class _LegacyAuthorizedCodexRun:
-    workspace: Path
-    command: tuple[str, ...]
-    environment: Mapping[str, str]
-
-    def child_environment(self) -> dict[str, str]:
-        return dict(self.environment)
-
-
-class _LegacyCodexExecutionPolicy:
-    """Compatibility policy for callers not yet supplying the strict policy."""
-
-    def __init__(
-        self, *, workspace_root: Path, environment: Mapping[str, str]
-    ) -> None:
-        self._workspace_root = workspace_root.resolve()
-        self._environment = dict(environment)
-
-    def authorize(self, request: CodexRunRequest) -> _LegacyAuthorizedCodexRun:
-        workspace = request.workspace.resolve()
-        if (
-            workspace != self._workspace_root
-            and self._workspace_root not in workspace.parents
-        ):
-            raise ValueError("workspace is outside the approved root")
-        return _LegacyAuthorizedCodexRun(
-            workspace=workspace,
-            command=request.command,
-            environment=self._environment,
-        )
+    def authorize(self, request: CodexRunRequest) -> AuthorizedCodexRun: ...
 
 
 class GatewayCodexEvidenceWriter(Protocol):
@@ -130,35 +102,27 @@ class GatewayCodexEvidenceWriter(Protocol):
         command_digest: str,
     ) -> None: ...
 
+    async def record_codex_event(
+        self,
+        batch_id: str,
+        claim_token: str,
+        *,
+        iteration: int,
+        session_id: str,
+        event: CodexProcessEvent | CodexParseWarning,
+    ) -> None: ...
+
 
 class CodexSupervisor:
-    _ALLOWED_ENVIRONMENT_NAMES = frozenset(
-        {"PATH", "HOME", "USERPROFILE", "LANG", "LC_ALL", "TERM", "NO_COLOR"}
-    )
-
     def __init__(
         self,
         *,
         runner: CodexRunner,
         gateway: GatewayCodexEvidenceWriter,
-        workspace_root: Path | None = None,
-        environment: Mapping[str, str] | None = None,
-        policy: CodexExecutionAuthorizer | None = None,
+        policy: CodexExecutionAuthorizer,
     ) -> None:
         self._runner = runner
         self._gateway = gateway
-        sanitized_environment = {
-            name: value
-            for name, value in (environment or {}).items()
-            if name in self._ALLOWED_ENVIRONMENT_NAMES
-        }
-        if policy is None:
-            if workspace_root is None:
-                raise TypeError("workspace_root is required without an explicit policy")
-            policy = _LegacyCodexExecutionPolicy(
-                workspace_root=workspace_root,
-                environment=sanitized_environment,
-            )
         self._policy = policy
 
     async def run(self, request: CodexRunRequest) -> PackageExecutionResult:
@@ -183,11 +147,7 @@ class CodexSupervisor:
                 error="codex execution evidence could not be recorded",
             )
         try:
-            exit_code, artifacts = await self._runner.run(
-                authorized.command,
-                cwd=authorized.workspace,
-                env=authorized.child_environment(),
-            )
+            run_result = await self._runner.run(authorized)
         except Exception:
             try:
                 await self._record_process(
@@ -202,6 +162,15 @@ class CodexSupervisor:
             )
 
         try:
+            events = tuple(parse_codex_jsonl(line) for line in run_result.jsonl_lines)
+            for event in events:
+                await self._gateway.record_codex_event(
+                    request.batch_id,
+                    request.claim_token,
+                    iteration=request.iteration,
+                    session_id=request.session_id,
+                    event=event,
+                )
             await self._record_process(request, process_id, "exited", command_digest)
         except Exception:
             return self._result(
@@ -209,16 +178,26 @@ class CodexSupervisor:
                 PackageExecutionStatus.FAILED,
                 error="codex execution evidence could not be recorded",
             )
-        if exit_code:
+        if run_result.exit_code:
             return self._result(
                 request,
                 PackageExecutionStatus.FAILED,
-                error=f"codex process exited with code {exit_code}",
+                error=f"codex process exited with code {run_result.exit_code}",
+            )
+        if any(
+            isinstance(event, CodexParseWarning)
+            or event.lifecycle == "failed"
+            for event in events
+        ):
+            return self._result(
+                request,
+                PackageExecutionStatus.FAILED,
+                error="codex JSONL evidence is incomplete",
             )
         return self._result(
             request,
             PackageExecutionStatus.SUCCEEDED,
-            artifacts=artifacts,
+            artifacts=run_result.artifact_references,
         )
 
     async def _record_process(

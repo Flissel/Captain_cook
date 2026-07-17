@@ -46,14 +46,18 @@ class CodexParseWarning(BaseModel):
 
 def parse_codex_jsonl(line: str) -> CodexProcessEvent | CodexParseWarning:
     """Parse one JSONL record without retaining untrusted textual content."""
-    line_sha256 = hashlib.sha256(line.encode("utf-8")).hexdigest()
+    line_sha256 = hashlib.sha256(
+        line.encode("utf-8", "surrogatepass")
+    ).hexdigest()
     try:
         record = json.loads(line)
-    except (json.JSONDecodeError, UnicodeError):
+    except (json.JSONDecodeError, UnicodeError, RecursionError):
         return _warning("malformed_json", line_sha256)
 
     if not isinstance(record, dict):
         return _warning("invalid_event", line_sha256)
+    if _contains_lone_surrogate(record):
+        return _warning("malformed_json", line_sha256)
 
     record_type = record.get("type")
     if not isinstance(record_type, str):
@@ -115,3 +119,16 @@ def _warning(
         warning_type=warning_type,
         line_sha256=line_sha256,
     )
+
+
+def _contains_lone_surrogate(value: object) -> bool:
+    if isinstance(value, str):
+        return any("\ud800" <= character <= "\udfff" for character in value)
+    if isinstance(value, dict):
+        return any(
+            _contains_lone_surrogate(key) or _contains_lone_surrogate(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_contains_lone_surrogate(item) for item in value)
+    return False
