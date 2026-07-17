@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Protocol, TypeVar
 
@@ -16,15 +17,19 @@ from agenten.validation.contracts import HoldoutSuite, WorkBatch
 from blockchain.Blockchain_modell import Block
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.contracts import (
+    ArtifactBuiltPayload,
     BatchDoneEvent,
     BatchProjection,
     ClaimEvent,
     CodexProcessEvent,
+    DeliveryEventEnvelope,
     HeartbeatEvent,
     ReasoningSliceEvent,
     RecoveryDecisionEvent,
+    ReleaseProjection,
     ReviewDecisionEvent,
     project_batch,
+    project_release,
 )
 
 
@@ -56,6 +61,18 @@ class _IdempotentReplay(Exception):
     def __init__(self, block: dict[str, Any]):
         super().__init__("identical Captain block replay")
         self.block = block
+
+
+@dataclass(frozen=True)
+class AppendResult:
+    event: DeliveryEventEnvelope
+    replayed: bool
+
+
+class _DeliveryEventReplay(Exception):
+    def __init__(self, event: DeliveryEventEnvelope):
+        super().__init__("identical delivery event replay")
+        self.event = event
 
 
 def _utcnow() -> datetime:
@@ -102,6 +119,152 @@ class GatewayStore:
                     ) ENGINE=InnoDB
                     """
                 )
+
+    def append_delivery_event(self, event: DeliveryEventEnvelope) -> AppendResult:
+        try:
+            stored = self._retry_write(lambda: self._append_delivery_event_once(event))
+            return AppendResult(event=stored, replayed=False)
+        except _DeliveryEventReplay as replay:
+            return AppendResult(event=replay.event, replayed=True)
+
+    def _append_delivery_event_once(
+        self,
+        event: DeliveryEventEnvelope,
+    ) -> DeliveryEventEnvelope:
+        canonical = event.model_dump(mode="json")
+        trace = event.trace
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                index = self._next_index(cursor)
+                cursor.execute(
+                    """
+                    SELECT data FROM blocks
+                    WHERE block_type = 'delivery_event'
+                      AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.event_id')) = %s
+                    ORDER BY `index` LIMIT 1 FOR UPDATE
+                    """,
+                    (str(event.event_id),),
+                )
+                existing_row = cursor.fetchone()
+                if existing_row is not None:
+                    existing_data = existing_row["data"]
+                    if isinstance(existing_data, str):
+                        existing_data = json.loads(existing_data)
+                    existing = DeliveryEventEnvelope.model_validate(existing_data)
+                    if existing == event:
+                        raise _DeliveryEventReplay(existing)
+                    raise HTTPException(
+                        status_code=409,
+                        detail="event_id already exists with different content",
+                    )
+
+                batch_id = trace.batch_id
+                if batch_id is not None:
+                    cursor.execute(
+                        """
+                        SELECT data FROM blocks
+                        WHERE block_type = 'delivery_event'
+                          AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.trace.project_id')) = %s
+                          AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.trace.run_id')) = %s
+                          AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.trace.batch_id')) = %s
+                        ORDER BY `index` FOR UPDATE
+                        """,
+                        (trace.project_id, trace.run_id, batch_id),
+                    )
+                    prior_tokens: list[int] = []
+                    for row in cursor.fetchall():
+                        data = row["data"]
+                        if isinstance(data, str):
+                            data = json.loads(data)
+                        token = data.get("trace", {}).get("fencing_token")
+                        if isinstance(token, int) and not isinstance(token, bool):
+                            prior_tokens.append(token)
+                    if prior_tokens and (
+                        trace.fencing_token is None
+                        or trace.fencing_token < max(prior_tokens)
+                    ):
+                        raise HTTPException(status_code=409, detail="stale fencing token")
+
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="delivery_event",
+                    data=canonical,
+                    status="recorded",
+                    parent_index=None,
+                    metadata={"schema": "captain-delivery-event/v1"},
+                )
+                self._insert(cursor, block)
+        return event
+
+    def delivery_events(
+        self,
+        *,
+        project_id: str,
+        run_id: str,
+    ) -> tuple[DeliveryEventEnvelope, ...]:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT data FROM blocks
+                    WHERE block_type = 'delivery_event'
+                      AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.trace.project_id')) = %s
+                      AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.trace.run_id')) = %s
+                    ORDER BY `index`
+                    """,
+                    (project_id, run_id),
+                )
+                rows = cursor.fetchall()
+        return tuple(
+            DeliveryEventEnvelope.model_validate(
+                json.loads(row["data"]) if isinstance(row["data"], str) else row["data"]
+            )
+            for row in rows
+        )
+
+    def release_projection(self, *, project_id: str, run_id: str) -> ReleaseProjection:
+        return project_release(self.delivery_events(project_id=project_id, run_id=run_id))
+
+    def delivery_holdout_case(
+        self,
+        *,
+        project_id: str,
+        run_id: str,
+        case_id: str,
+    ) -> dict[str, Any]:
+        events = self.delivery_events(project_id=project_id, run_id=run_id)
+        sealed_batches = {
+            event.trace.batch_id
+            for event in events
+            if isinstance(event.payload, ArtifactBuiltPayload)
+            and event.trace.batch_id is not None
+        }
+        if not sealed_batches:
+            raise HTTPException(status_code=404, detail="holdout not released")
+
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                for batch_id in sealed_batches:
+                    cursor.execute(
+                        """
+                        SELECT data FROM blocks
+                        WHERE block_type = 'holdout'
+                          AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.batch_id')) = %s
+                        ORDER BY `index` DESC LIMIT 1
+                        """,
+                        (batch_id,),
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        continue
+                    data = row["data"]
+                    if isinstance(data, str):
+                        data = json.loads(data)
+                    for case in data.get("cases", []):
+                        if case.get("case_id") == case_id:
+                            return dict(case)
+        raise HTTPException(status_code=404, detail="holdout not found")
 
     def _batch_row(
         self,

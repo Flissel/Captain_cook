@@ -8,9 +8,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event
 from typing import Any
+from uuid import UUID
 
 import pytest
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from pymysql.cursors import DictCursor
@@ -20,6 +21,7 @@ from blockchain.Blockchain_modell import Block
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.app import CAPTAIN_WRITE_BLOCK_TYPES, BlockRequest, create_app
 from gateway.auth import GatewayRole, require_actor
+from gateway.contracts import DeliveryEventEnvelope, ReleaseProjection
 from gateway.settings import GatewaySettings
 from gateway.store import GatewayStore
 from tests.support.mariadb import assert_isolated_test_database
@@ -149,6 +151,26 @@ def worker_block(
     )
 
 
+def review_batch(
+    client: TestClient,
+    *,
+    iteration: int = 1,
+    decision: str = "passed",
+    review_id: str | None = None,
+) -> Any:
+    identifier = review_id or f"review-{iteration}-{decision}"
+    return client.post(
+        "/batches/batch-1/review",
+        json={
+            "batch_id": "batch-1",
+            "iteration": iteration,
+            "review_id": identifier,
+            "decision": decision,
+            "evidence_refs": [f"artifact://validation/{iteration}"],
+        },
+    )
+
+
 def test_legacy_import_route_is_idempotent_and_conflict_safe(client: TestClient) -> None:
     todo = {
         "legacy_record_id": "todo:todo-1",
@@ -204,8 +226,14 @@ def test_claim_and_completion_append_events_without_mutating_work_batch(
         client,
         token,
         block_type="validation_run",
-        data={"batch_id": "batch-1", "iteration": 1, "report_ref": "validation-1"},
+        data={
+            "batch_id": "batch-1",
+            "iteration": 1,
+            "report_ref": "validation-1",
+            "artifact_ref": "artifact://validation/1",
+        },
     )
+    review = review_batch(client)
     done = worker_block(
         client,
         token,
@@ -221,6 +249,7 @@ def test_claim_and_completion_append_events_without_mutating_work_batch(
     )
 
     assert validation.status_code == 201, validation.text
+    assert review.status_code == 201, review.text
     assert done.status_code == 201, done.text
     blocks = storage.load()
     parent_after = next(block for block in blocks if block["index"] == parent_index)
@@ -232,6 +261,7 @@ def test_claim_and_completion_append_events_without_mutating_work_batch(
     assert [block["block_type"] for block in lifecycle] == [
         "batch_claimed",
         "validation_run",
+        "review_decision",
         "batch_done",
     ]
     claim_data = lifecycle[0]["data"]
@@ -284,8 +314,9 @@ def test_gateway_executes_no_lifecycle_update_sql(
         client,
         token,
         block_type="validation_run",
-        data={"batch_id": "batch-1", "iteration": 1},
+        data={"batch_id": "batch-1", "iteration": 1, "artifact_ref": "artifact://validation/1"},
     ).status_code == 201
+    assert review_batch(client).status_code == 201
     assert worker_block(
         client,
         token,
@@ -914,8 +945,9 @@ def test_work_batch_and_holdout_remain_immutable_across_lifecycle(
         client,
         token,
         block_type="validation_run",
-        data={"batch_id": "batch-1", "iteration": 1},
+        data={"batch_id": "batch-1", "iteration": 1, "artifact_ref": "artifact://validation/1"},
     ).status_code == 201
+    assert review_batch(client).status_code == 201
     assert worker_block(
         client,
         token,
@@ -959,21 +991,51 @@ def test_all_terminal_outcomes_are_projected_and_fenced(client: TestClient, outc
             client,
             token,
             block_type="validation_run",
-            data={"batch_id": "batch-1", "iteration": 1},
+            data={"batch_id": "batch-1", "iteration": 1, "artifact_ref": "artifact://validation/1"},
         ).status_code == 201
-    done = worker_block(
-        client,
-        token,
-        block_type="batch_done",
-        status=outcome,
-        data={
-            "batch_id": "batch-1",
-            "outcome": outcome,
-            "artifact_ref": "workflow-42",
-            "capabilities": ["notifications", "email"],
-            "eval_score": 9,
-        },
-    )
+        assert review_batch(client).status_code == 201
+    elif outcome == "failed_after_max_iterations":
+        assert worker_block(
+            client,
+            token,
+            block_type="validation_run",
+            data={"batch_id": "batch-1", "iteration": 1, "artifact_ref": "artifact://validation/1"},
+        ).status_code == 201
+        for review_number in range(1, 6):
+            done = review_batch(
+                client,
+                decision="failed",
+                review_id=f"review-failed-{review_number}",
+            )
+            assert done.status_code == 201
+    else:
+        done = worker_block(
+            client,
+            token,
+            block_type="batch_done",
+            status=outcome,
+            data={
+                "batch_id": "batch-1",
+                "outcome": outcome,
+                "artifact_ref": "workflow-42",
+                "capabilities": ["notifications", "email"],
+                "eval_score": 9,
+            },
+        )
+    if outcome == "succeeded":
+        done = worker_block(
+            client,
+            token,
+            block_type="batch_done",
+            status=outcome,
+            data={
+                "batch_id": "batch-1",
+                "outcome": outcome,
+                "artifact_ref": "workflow-42",
+                "capabilities": ["notifications", "email"],
+                "eval_score": 9,
+            },
+        )
     assert done.status_code == 201
 
     detail = client.get("/batches/batch-1")
@@ -1004,8 +1066,17 @@ def test_succeeded_requires_current_iteration_validation_run(client: TestClient)
         client,
         token,
         block_type="validation_run",
-        data={"batch_id": "batch-1", "iteration": 1},
+        data={"batch_id": "batch-1", "iteration": 1, "artifact_ref": "artifact://validation/1"},
     ).status_code == 201
+    missing_review = worker_block(
+        client,
+        token,
+        block_type="batch_done",
+        status="succeeded",
+        data={"batch_id": "batch-1", "outcome": "succeeded"},
+    )
+    assert missing_review.status_code == 422
+    assert review_batch(client).status_code == 201
     assert worker_block(
         client,
         token,
@@ -1045,8 +1116,9 @@ def test_prior_iteration_validation_cannot_authorize_success(
         client,
         second_token,
         block_type="validation_run",
-        data={"batch_id": "batch-1", "iteration": 2},
+        data={"batch_id": "batch-1", "iteration": 2, "artifact_ref": "artifact://validation/2"},
     ).status_code == 201
+    assert review_batch(client, iteration=2).status_code == 201
     assert worker_block(
         client,
         second_token,
@@ -1173,8 +1245,9 @@ def test_successful_batch_is_searchable_as_validated_capability(client: TestClie
         client,
         token,
         block_type="validation_run",
-        data={"batch_id": "batch-1", "iteration": 1},
+        data={"batch_id": "batch-1", "iteration": 1, "artifact_ref": "artifact://validation/1"},
     ).status_code == 201
+    assert review_batch(client).status_code == 201
     assert worker_block(
         client,
         token,
@@ -1207,3 +1280,129 @@ def test_all_write_routes_are_async_and_uvicorn_is_single_worker(storage: MariaD
     assert all(inspect.iscoroutinefunction(route.endpoint) for route in write_routes)
     source = open("gateway/app.py", encoding="utf-8").read()
     assert 'workers=1' in source
+
+
+DELIVERY_NOW = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+
+
+def delivery_event(
+    event_id: int,
+    *,
+    project_id: str = "project-1",
+    run_id: str = "run-1",
+    fencing_token: int | None = 1,
+    e2e_run_id: str | None = None,
+) -> DeliveryEventEnvelope:
+    trace: dict[str, Any] = {
+        "project_id": project_id,
+        "run_id": run_id,
+        "trace_id": f"trace-{event_id}",
+        "batch_id": "batch-1",
+        "claim_id": "claim-1",
+        "fencing_token": fencing_token,
+    }
+    if e2e_run_id is None:
+        return DeliveryEventEnvelope.model_validate(
+            {
+                "event_id": UUID(int=event_id),
+                "event_type": "codex_task",
+                "occurred_at": DELIVERY_NOW + timedelta(minutes=event_id),
+                "actor": "captain",
+                "trace": trace,
+                "payload": {
+                    "event_type": "codex_task",
+                    "task_id": f"task-{event_id}",
+                    "target": "n8n",
+                    "context_sha256": "a" * 64,
+                    "workspace_ref": f"artifact://workspaces/{event_id}",
+                    "permissions": ["filesystem.read"],
+                    "budget": 100,
+                },
+            }
+        )
+    return DeliveryEventEnvelope.model_validate(
+        {
+            "event_id": UUID(int=event_id),
+            "event_type": "e2e_run",
+            "occurred_at": DELIVERY_NOW + timedelta(minutes=event_id),
+            "actor": "evaluator",
+            "trace": trace,
+            "payload": {
+                "event_type": "e2e_run",
+                "e2e_run_id": e2e_run_id,
+                "run_index": event_id,
+                "clean": True,
+                "trace_complete": True,
+                "evidence_refs": [f"artifact://evidence/{e2e_run_id}"],
+            },
+        }
+    )
+
+
+def test_delivery_event_append_is_idempotent_but_conflicting_reuse_is_rejected(
+    storage: MariaDBStorage,
+) -> None:
+    store = GatewayStore(storage)
+    event = delivery_event(1)
+
+    created = store.append_delivery_event(event)
+    replayed = store.append_delivery_event(event)
+
+    assert created.event == event
+    assert created.replayed is False
+    assert replayed.event == event
+    assert replayed.replayed is True
+    assert [block["block_type"] for block in storage.load()] == ["delivery_event"]
+
+    changed = event.model_copy(
+        update={"payload": event.payload.model_copy(update={"budget": 101})}
+    )
+    with pytest.raises(HTTPException, match="event_id already exists with different content") as exc:
+        store.append_delivery_event(changed)
+    assert exc.value.status_code == 409
+    assert len(storage.load()) == 1
+
+
+def test_delivery_history_is_append_only_filtered_and_rejects_stale_fencing(
+    storage: MariaDBStorage,
+) -> None:
+    store = GatewayStore(storage)
+    first = delivery_event(1, fencing_token=2)
+    other_run = delivery_event(2, run_id="run-2", fencing_token=1)
+    stale = delivery_event(3, fencing_token=1)
+
+    store.append_delivery_event(first)
+    store.append_delivery_event(other_run)
+    with pytest.raises(HTTPException, match="stale fencing token") as exc:
+        store.append_delivery_event(stale)
+
+    assert exc.value.status_code == 409
+    assert store.delivery_events(project_id="project-1", run_id="run-1") == (first,)
+    assert store.delivery_events(project_id="project-1", run_id="missing") == ()
+
+
+def test_delivery_api_returns_replay_history_and_stored_release_projection(
+    client: TestClient,
+) -> None:
+    events = [delivery_event(index, e2e_run_id=f"e2e-{index}") for index in range(1, 4)]
+
+    first = client.post("/v1/delivery/events", json=events[0].model_dump(mode="json"))
+    replay = client.post("/v1/delivery/events", json=events[0].model_dump(mode="json"))
+    for event in events[1:]:
+        response = client.post("/v1/delivery/events", json=event.model_dump(mode="json"))
+        assert response.status_code == 201, response.text
+
+    assert first.status_code == 201
+    assert first.json()["replayed"] is False
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+    history = client.get("/v1/projects/project-1/runs/run-1/events")
+    assert history.status_code == 200
+    assert [item["event_id"] for item in history.json()] == [str(event.event_id) for event in events]
+    release = client.get("/v1/projects/project-1/runs/run-1/release")
+    assert release.status_code == 200
+    assert release.json() == ReleaseProjection(
+        status="ready",
+        clean_e2e_run_ids=("e2e-1", "e2e-2", "e2e-3"),
+        missing_clean_e2e_runs=0,
+    ).model_dump(mode="json")

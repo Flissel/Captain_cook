@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from threading import Lock
 from typing import Any, Literal, Protocol
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -22,11 +22,17 @@ from gateway.auth import (
     require_reader,
     require_worker,
 )
-from gateway.contracts import BatchProjection, RecoveryDecisionEvent, ReviewDecisionEvent
+from gateway.contracts import (
+    BatchProjection,
+    DeliveryEventEnvelope,
+    ReleaseProjection,
+    RecoveryDecisionEvent,
+    ReviewDecisionEvent,
+)
 from gateway.mirror import MirrorQueue
 from gateway.registry_feed import mirror_validated_batch
 from gateway.settings import GatewaySettings
-from gateway.store import GatewayStore
+from gateway.store import AppendResult, GatewayStore
 
 
 logger = logging.getLogger(__name__)
@@ -164,6 +170,45 @@ def create_app(
         _: GatewayRole = Depends(require_reader),
     ) -> list[dict[str, str]]:
         return get_store().list_batches(status_filter)
+
+    @app.post("/v1/delivery/events")
+    async def append_delivery_event(
+        event: DeliveryEventEnvelope,
+        response: Response,
+        _: GatewayRole = Depends(require_actor),
+    ) -> AppendResult:
+        result = get_store().append_delivery_event(event)
+        response.status_code = status.HTTP_200_OK if result.replayed else status.HTTP_201_CREATED
+        return result
+
+    @app.get("/v1/projects/{project_id}/runs/{run_id}/events")
+    async def delivery_events(
+        project_id: str,
+        run_id: str,
+        _: GatewayRole = Depends(require_reader),
+    ) -> tuple[DeliveryEventEnvelope, ...]:
+        return get_store().delivery_events(project_id=project_id, run_id=run_id)
+
+    @app.get("/v1/projects/{project_id}/runs/{run_id}/release")
+    async def delivery_release(
+        project_id: str,
+        run_id: str,
+        _: GatewayRole = Depends(require_reader),
+    ) -> ReleaseProjection:
+        return get_store().release_projection(project_id=project_id, run_id=run_id)
+
+    @app.get("/v1/projects/{project_id}/runs/{run_id}/holdouts/{case_id}")
+    async def delivery_holdout_case(
+        project_id: str,
+        run_id: str,
+        case_id: str,
+        _: GatewayRole = Depends(require_captain),
+    ) -> dict[str, Any]:
+        return get_store().delivery_holdout_case(
+            project_id=project_id,
+            run_id=run_id,
+            case_id=case_id,
+        )
 
     @app.post("/batches/{batch_id}/claim")
     async def claim_batch(
