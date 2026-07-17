@@ -43,3 +43,29 @@ async def subscribe_type(runtime: AgentRuntime, topic: str, agent_type: str) -> 
     pair after all agent types have been registered on `runtime`.
     """
     await runtime.add_subscription(TypeSubscription(topic_type=topic, agent_type=agent_type))
+
+
+async def register_runtime_swarm(
+    runtime: AgentRuntime,
+    orchestrator: object,
+    *,
+    topic: str = "agent-runtime-ready",
+) -> str:
+    """Register and subscribe the thin routed agent-runtime adapter."""
+
+    from agenten.agent_runtime.swarm import (
+        AgentRuntimeSwarmRoutedAgent,
+        SwarmOrchestrator,
+    )
+
+    if AgentRuntimeSwarmRoutedAgent is None:
+        raise RuntimeError("autogen_core is required for runtime swarm registration")
+    if not isinstance(orchestrator, SwarmOrchestrator):
+        raise TypeError("orchestrator must be a SwarmOrchestrator")
+    registered = await AgentRuntimeSwarmRoutedAgent.register(
+        runtime,
+        "agent-runtime-swarm",
+        lambda: AgentRuntimeSwarmRoutedAgent(orchestrator),
+    )
+    await subscribe_type(runtime, topic, registered.type)
+    return registered.type
