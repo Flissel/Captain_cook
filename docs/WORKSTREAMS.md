@@ -6,10 +6,10 @@ may silently broaden its scope or redefine another branch's interface.
 
 ## Integration rule
 
-`feat/devpost-demo-readiness` is the current reviewable baseline. It contains
-the offline demo, evidence artifact, judge-facing docs, and release verifier.
-Create subsequent worktrees from the latest approved integration branch; do
-not commit feature work directly to `main`.
+`main` is the canonical integration baseline. New feature work starts from the
+current local/remote `main`; stale worktrees are fast-forwarded or retired
+before editing shared files. Feature work remains isolated in worktrees and is
+integrated only after its owned contract passes.
 
 ```text
 feat/devpost-demo-readiness

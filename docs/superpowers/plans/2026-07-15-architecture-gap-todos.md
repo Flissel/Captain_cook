@@ -14,7 +14,7 @@
 
 ## P0 — protect branch integration
 
-- [ ] Choose one canonical integration baseline and record it in `docs/WORKSTREAMS.md`. The document names `feat/devpost-demo-readiness`, while active work is based on later shared commits.
+- [x] Choose one canonical integration baseline and record it in `docs/WORKSTREAMS.md`. `main` is the canonical baseline for new isolated feature work.
 - [ ] Resolve remaining branch aliases before new work lands:
   - Earlier runtime/contract and ledger/baseline aliases have diverged into distinct implementation branches.
   - `feat/release-evidence` and `feat/worker-fleet` currently still point to the same commit.
