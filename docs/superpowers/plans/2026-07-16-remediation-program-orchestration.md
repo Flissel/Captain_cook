@@ -397,7 +397,7 @@ SHAs before either worker begins.
 
 ## Blocked design lane
 
-- [ ] **D01 — Design a gateway-native delivery runtime**
+- [x] **D01 — Design a gateway-native delivery runtime**
   - Branch: `docs/gateway-native-delivery-runtime`; requires P13; holds only
     `LOCK_DELIVERY_DESIGN`.
   - Owns exactly
@@ -412,7 +412,7 @@ SHAs before either worker begins.
     red/green acceptance commands. D02-D05 remain non-dispatchable until this
     review passes.
 
-- [ ] **D02 — Supervised Codex and Second Brain adapter**
+- [x] **D02 — Supervised Codex and Second Brain adapter**
   - Branch: assigned by D01; revised source: Broad Task 5; requires D01 and P11.
   - Preserve argument-array process supervision, workspace guards, resume, and
     cancellation while persisting process metadata through gateway events.

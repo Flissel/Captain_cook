@@ -39,15 +39,15 @@ class CodexSupervisor:
     async def run(self, request: CodexRunRequest) -> PackageExecutionResult: ...
 ```
 
-- [ ] Write a failing test that proves a successful run emits `codex_session`
+- [x] Write a failing test that proves a successful run emits `codex_session`
   plus sanitized `codex_process` events, and a non-zero exit returns a typed
   failed result without revealing environment values.
-- [ ] Run `python -m pytest -q --no-cov tests/execution/test_codex_supervisor.py`; expect failure because the adapter is absent.
-- [ ] Implement an injected argument-vector runner, workspace-root guard,
+- [x] Run `python -m pytest -q --no-cov tests/execution/test_codex_supervisor.py`; expect failure because the adapter is absent.
+- [x] Implement an injected argument-vector runner, workspace-root guard,
   allowlisted environment, strict event contract, and claim-fenced client call.
-- [ ] Run focused tests plus `tests/gateway/test_gateway_contracts.py` and
+- [x] Run focused tests plus `tests/gateway/test_gateway_contracts.py` and
   `tests/gateway/test_gateway_auth.py`; then add them to the disposable DB gate.
-- [ ] Commit: `feat: add supervised codex gateway evidence`.
+- [x] Commit: `feat: add supervised codex gateway evidence` (`0d8b17a`).
 
 ### Task 2: D03 recovery and reasoning slices
 
