@@ -20,15 +20,31 @@ class CodexRunRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    run_id: Identifier = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-    trace_id: Identifier = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-    batch_id: Identifier = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,31}$")
-    worker_id: Identifier = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    run_id: Identifier | None = Field(
+        default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    trace_id: Identifier | None = Field(
+        default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    batch_id: Identifier | None = Field(
+        default=None, pattern=r"^[a-z0-9][a-z0-9-]{0,31}$"
+    )
+    worker_id: Identifier | None = Field(
+        default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
     session_id: Identifier = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,121}$")
     claim_token: str = Field(min_length=1)
     iteration: int = Field(ge=1)
     command: tuple[str, ...] = Field(min_length=1)
     workspace: Path
+    project_id: Identifier | None = Field(
+        default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    claim_id: Identifier | None = Field(
+        default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    fencing_token: int | None = Field(default=None, ge=1)
+    project_root: Path | None = None
 
     @field_validator("command")
     @classmethod
