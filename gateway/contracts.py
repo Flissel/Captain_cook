@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, Sequence, TypeAlias
 from uuid import UUID
@@ -120,15 +121,30 @@ class DeployPayload(_FrozenContract):
         return value
 
 
+class AssertionResult(_FrozenContract):
+    assertion_id: str = Field(min_length=1)
+    outcome: Literal["passed", "failed"]
+
+
 class ValidationRunPayload(_FrozenContract):
     event_type: Literal["validation_run"]
     validation_id: str = Field(min_length=1)
     layer: str = Field(min_length=1)
     case_ids: tuple[str, ...] = Field(min_length=1)
-    assertion_results: dict[str, Literal["passed", "failed"]] = Field(min_length=1)
+    assertion_results: tuple[AssertionResult, ...] = Field(min_length=1)
     evidence_refs: tuple[str, ...] = Field(min_length=1)
     artifact_version: str = Field(min_length=1)
     passed: bool
+
+    @field_validator("assertion_results", mode="before")
+    @classmethod
+    def normalize_assertion_result_mapping(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            return tuple(
+                {"assertion_id": assertion_id, "outcome": outcome}
+                for assertion_id, outcome in value.items()
+            )
+        return value
 
     @field_validator("case_ids")
     @classmethod
@@ -143,6 +159,15 @@ class ValidationRunPayload(_FrozenContract):
         if any(not reference.startswith("artifact://") for reference in value):
             raise ValueError("evidence_refs must be opaque artifact references")
         return value
+
+    @model_validator(mode="after")
+    def require_passed_to_match_assertion_results(self) -> ValidationRunPayload:
+        assertion_results_passed = all(
+            result.outcome == "passed" for result in self.assertion_results
+        )
+        if self.passed != assertion_results_passed:
+            raise ValueError("passed must equal whether all assertion_results passed")
+        return self
 
 
 class RepairRequestPayload(_FrozenContract):

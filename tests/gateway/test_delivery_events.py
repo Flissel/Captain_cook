@@ -231,6 +231,156 @@ def test_delivery_event_rejects_a_payload_for_a_different_event_type() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "assertion_results, passed",
+    (
+        ({"schema": "failed"}, True),
+        ({"schema": "passed"}, False),
+    ),
+)
+def test_validation_run_rejects_contradictory_assertion_evidence(
+    assertion_results: dict[str, str],
+    passed: bool,
+) -> None:
+    with pytest.raises(ValidationError, match="passed"):
+        DeliveryEventEnvelope.model_validate(
+            {
+                "event_id": uuid4(),
+                "event_type": "validation_run",
+                "occurred_at": NOW,
+                "actor": "validator",
+                "trace": {
+                    **TRACE,
+                    "batch_id": "batch-1",
+                    "artifact_id": "artifact-1",
+                    "case_id": "case-1",
+                },
+                "payload": {
+                    "event_type": "validation_run",
+                    "validation_id": "validation-1",
+                    "layer": "holdout",
+                    "case_ids": ("case-1",),
+                    "assertion_results": assertion_results,
+                    "evidence_refs": ("artifact://evidence/validation-1",),
+                    "artifact_version": "v1",
+                    "passed": passed,
+                },
+            }
+        )
+
+
+def test_validation_run_assertion_evidence_is_immutable_after_mapping_input() -> None:
+    event = DeliveryEventEnvelope.model_validate(
+        {
+            "event_id": uuid4(),
+            "event_type": "validation_run",
+            "occurred_at": NOW,
+            "actor": "validator",
+            "trace": {
+                **TRACE,
+                "batch_id": "batch-1",
+                "artifact_id": "artifact-1",
+                "case_id": "case-1",
+            },
+            "payload": {
+                "event_type": "validation_run",
+                "validation_id": "validation-1",
+                "layer": "holdout",
+                "case_ids": ("case-1",),
+                "assertion_results": {"schema": "passed"},
+                "evidence_refs": ("artifact://evidence/validation-1",),
+                "artifact_version": "v1",
+                "passed": True,
+            },
+        }
+    )
+
+    assert event.payload.assertion_results[0].assertion_id == "schema"
+    assert event.payload.assertion_results[0].outcome == "passed"
+    with pytest.raises(TypeError):
+        event.payload.assertion_results[0] = event.payload.assertion_results[0]
+    with pytest.raises(ValidationError):
+        event.payload.assertion_results[0].outcome = "failed"
+
+
+def test_delivery_event_rejects_session_trace_and_payload_id_mismatch() -> None:
+    with pytest.raises(ValidationError, match="session_id"):
+        DeliveryEventEnvelope.model_validate(
+            {
+                "event_id": uuid4(),
+                "event_type": "codex_session",
+                "occurred_at": NOW,
+                "actor": "gateway",
+                "trace": {
+                    **TRACE,
+                    "batch_id": "batch-1",
+                    "session_id": "session-1",
+                },
+                "payload": {
+                    "event_type": "codex_session",
+                    "session_id": "session-2",
+                    "process_ref": "artifact://processes/session-2",
+                    "started_at": NOW,
+                    "ended_at": NOW,
+                    "exit_class": "completed",
+                },
+            }
+        )
+
+
+def test_delivery_event_rejects_artifact_trace_and_payload_id_mismatch() -> None:
+    with pytest.raises(ValidationError, match="artifact_id"):
+        DeliveryEventEnvelope.model_validate(
+            {
+                "event_id": uuid4(),
+                "event_type": "artifact_built",
+                "occurred_at": NOW,
+                "actor": "gateway",
+                "trace": {
+                    **TRACE,
+                    "batch_id": "batch-1",
+                    "artifact_id": "artifact-1",
+                },
+                "payload": {
+                    "event_type": "artifact_built",
+                    "artifact_id": "artifact-2",
+                    "artifact_version": "v1",
+                    "sha256": "b" * 64,
+                    "artifact_type": "workflow",
+                    "sealed_ref": "artifact://sealed/artifact-2",
+                },
+            }
+        )
+
+
+def test_delivery_event_rejects_validation_case_missing_from_trace() -> None:
+    with pytest.raises(ValidationError, match="case_id"):
+        DeliveryEventEnvelope.model_validate(
+            {
+                "event_id": uuid4(),
+                "event_type": "validation_run",
+                "occurred_at": NOW,
+                "actor": "validator",
+                "trace": {
+                    **TRACE,
+                    "batch_id": "batch-1",
+                    "artifact_id": "artifact-1",
+                    "case_id": "case-2",
+                },
+                "payload": {
+                    "event_type": "validation_run",
+                    "validation_id": "validation-1",
+                    "layer": "holdout",
+                    "case_ids": ("case-1",),
+                    "assertion_results": {"schema": "passed"},
+                    "evidence_refs": ("artifact://evidence/validation-1",),
+                    "artifact_version": "v1",
+                    "passed": True,
+                },
+            }
+        )
+
+
 def _e2e_event(
     run_id: str,
     *,
