@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -64,6 +65,50 @@ class CodexRunner(Protocol):
     ) -> tuple[int, tuple[str, ...]]: ...
 
 
+class AuthorizedCodexRunBoundary(Protocol):
+    workspace: Path
+    command: tuple[str, ...]
+
+    def child_environment(self) -> dict[str, str]: ...
+
+
+class CodexExecutionAuthorizer(Protocol):
+    def authorize(self, request: CodexRunRequest) -> AuthorizedCodexRunBoundary: ...
+
+
+@dataclass(frozen=True)
+class _LegacyAuthorizedCodexRun:
+    workspace: Path
+    command: tuple[str, ...]
+    environment: Mapping[str, str]
+
+    def child_environment(self) -> dict[str, str]:
+        return dict(self.environment)
+
+
+class _LegacyCodexExecutionPolicy:
+    """Compatibility policy for callers not yet supplying the strict policy."""
+
+    def __init__(
+        self, *, workspace_root: Path, environment: Mapping[str, str]
+    ) -> None:
+        self._workspace_root = workspace_root.resolve()
+        self._environment = dict(environment)
+
+    def authorize(self, request: CodexRunRequest) -> _LegacyAuthorizedCodexRun:
+        workspace = request.workspace.resolve()
+        if (
+            workspace != self._workspace_root
+            and self._workspace_root not in workspace.parents
+        ):
+            raise ValueError("workspace is outside the approved root")
+        return _LegacyAuthorizedCodexRun(
+            workspace=workspace,
+            command=request.command,
+            environment=self._environment,
+        )
+
+
 class GatewayCodexEvidenceWriter(Protocol):
     async def record_codex_session(
         self,
@@ -96,25 +141,31 @@ class CodexSupervisor:
         *,
         runner: CodexRunner,
         gateway: GatewayCodexEvidenceWriter,
-        workspace_root: Path,
-        environment: Mapping[str, str],
+        workspace_root: Path | None = None,
+        environment: Mapping[str, str] | None = None,
+        policy: CodexExecutionAuthorizer | None = None,
     ) -> None:
         self._runner = runner
         self._gateway = gateway
-        self._workspace_root = workspace_root.resolve()
-        self._environment = {
+        sanitized_environment = {
             name: value
-            for name, value in environment.items()
+            for name, value in (environment or {}).items()
             if name in self._ALLOWED_ENVIRONMENT_NAMES
         }
+        if policy is None:
+            if workspace_root is None:
+                raise TypeError("workspace_root is required without an explicit policy")
+            policy = _LegacyCodexExecutionPolicy(
+                workspace_root=workspace_root,
+                environment=sanitized_environment,
+            )
+        self._policy = policy
 
     async def run(self, request: CodexRunRequest) -> PackageExecutionResult:
-        workspace = request.workspace.resolve()
-        if workspace != self._workspace_root and self._workspace_root not in workspace.parents:
-            raise ValueError("workspace is outside the approved root")
+        authorized = self._policy.authorize(request)
 
         command_digest = hashlib.sha256(
-            "\0".join(request.command).encode("utf-8")
+            "\0".join(authorized.command).encode("utf-8")
         ).hexdigest()
         process_id = f"codex-{request.session_id}"
         try:
@@ -133,9 +184,9 @@ class CodexSupervisor:
             )
         try:
             exit_code, artifacts = await self._runner.run(
-                request.command,
-                cwd=workspace,
-                env=self._environment,
+                authorized.command,
+                cwd=authorized.workspace,
+                env=authorized.child_environment(),
             )
         except Exception:
             try:

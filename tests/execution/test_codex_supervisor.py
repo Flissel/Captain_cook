@@ -7,8 +7,32 @@ import pytest
 
 from pydantic import ValidationError
 
+from agenten.execution.codex_policy import (
+    AuthorizedCodexRun,
+    CodexPolicyViolation,
+    FrozenEnvironment,
+)
 from agenten.execution.codex_supervisor import CodexRunRequest, CodexSupervisor
 from agenten.execution.process import PackageExecutionStatus
+
+
+class RecordingPolicy:
+    def __init__(self, authorized: AuthorizedCodexRun) -> None:
+        self.authorized = authorized
+        self.requests: list[CodexRunRequest] = []
+
+    def authorize(self, request: CodexRunRequest) -> AuthorizedCodexRun:
+        self.requests.append(request)
+        return self.authorized
+
+
+class DenyingPolicy:
+    def __init__(self) -> None:
+        self.requests: list[CodexRunRequest] = []
+
+    def authorize(self, request: CodexRunRequest) -> AuthorizedCodexRun:
+        self.requests.append(request)
+        raise CodexPolicyViolation("request denied before side effects")
 
 
 class RecordingRunner:
@@ -77,11 +101,19 @@ async def test_successful_run_emits_fenced_sanitized_session_and_process_events(
     workspace.mkdir()
     runner = RecordingRunner(0, ("artifact://build/1",))
     gateway = RecordingGateway()
+    policy = RecordingPolicy(
+        AuthorizedCodexRun(
+            workspace=workspace.resolve(),
+            command=("codex", "exec", "--json", "sanitized-task"),
+            environment=FrozenEnvironment({"PATH": "safe-path"}),
+        )
+    )
     supervisor = CodexSupervisor(
         runner=runner,
         gateway=gateway,
         workspace_root=tmp_path,
         environment={"PATH": "safe-path"},
+        policy=policy,
     )
 
     request = CodexRunRequest(
@@ -93,7 +125,8 @@ async def test_successful_run_emits_fenced_sanitized_session_and_process_events(
 
     assert result.status is PackageExecutionStatus.SUCCEEDED
     assert result.artifact_refs == ("artifact://build/1",)
-    assert runner.command == ("codex", "exec", "build")
+    assert policy.requests == [request]
+    assert runner.command == ("codex", "exec", "--json", "sanitized-task")
     assert runner.cwd == workspace.resolve()
     assert runner.env == {"PATH": "safe-path"}
     assert [event[0] for event in gateway.events] == ["codex_session", "codex_process", "codex_process"]
@@ -101,6 +134,40 @@ async def test_successful_run_emits_fenced_sanitized_session_and_process_events(
     assert all(event[2] == "claim-secret" and event[3] == 1 for event in gateway.events)
     assert all("safe-path" not in repr(event) and "claim-secret" not in repr(event[4:]) for event in gateway.events)
     assert len(gateway.events[1][6]) == 64
+
+
+@pytest.mark.asyncio
+async def test_policy_denial_precedes_runner_and_gateway_writes(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runner = RecordingRunner(0, ("artifact://build/1",))
+    gateway = RecordingGateway()
+    policy = DenyingPolicy()
+    supervisor = CodexSupervisor(
+        runner=runner,
+        gateway=gateway,
+        workspace_root=tmp_path,
+        environment={"PATH": "safe-path"},
+        policy=policy,
+    )
+    request = CodexRunRequest(
+        run_id="run-1",
+        trace_id="trace-1",
+        batch_id="batch-1",
+        worker_id="worker-1",
+        session_id="session-1",
+        claim_token="claim-secret",
+        iteration=1,
+        command=("codex", "exec", "--json", "build"),
+        workspace=workspace,
+    )
+
+    with pytest.raises(CodexPolicyViolation, match="denied before side effects"):
+        await supervisor.run(request)
+
+    assert policy.requests == [request]
+    assert runner.command is None
+    assert gateway.events == []
 
 
 @pytest.mark.asyncio
