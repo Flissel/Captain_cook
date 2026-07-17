@@ -99,6 +99,23 @@ def test_public_event_models_expose_the_planned_shapes() -> None:
     assert done.model_extra == {"reason": "database unavailable"}
 
 
+def test_existing_batch_projection_contract_remains_compatible() -> None:
+    assert tuple(BatchProjection.model_fields) == (
+        "batch_id",
+        "parent_index",
+        "status",
+        "claim_token_sha256",
+        "claim_expires_at",
+        "claim_iteration",
+        "codex_session_recorded",
+        "validation_run_recorded",
+        "recovery_recorded",
+        "recovered_iteration",
+        "passing_review_recorded",
+        "failed_review_count",
+    )
+
+
 def test_event_models_reject_invalid_iterations_and_terminal_outcomes() -> None:
     with pytest.raises(ValidationError):
         EvidenceEvent(batch_id=BATCH_ID, iteration=0)
