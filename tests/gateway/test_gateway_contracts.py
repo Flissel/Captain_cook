@@ -14,6 +14,7 @@ from gateway.contracts import (
     CodexProcessEvent,
     EvidenceEvent,
     HeartbeatEvent,
+    ReviewDecisionEvent,
     project_batch,
 )
 
@@ -411,8 +412,35 @@ def test_new_claim_resets_current_iteration_evidence() -> None:
 def test_first_valid_batch_done_projects_every_terminal_outcome(outcome: str) -> None:
     blocks = [work_batch(), claim(11)]
     if outcome == "succeeded":
-        blocks.append(child(12, "validation_run", iteration=1))
-    blocks.append(child(13, "batch_done", outcome=outcome))
+        blocks.extend(
+            [
+                child(12, "validation_run", iteration=1),
+                child(
+                    13,
+                    "review_decision",
+                    iteration=1,
+                    review_id="review-passed",
+                    decision="passed",
+                    evidence_refs=("artifact://reviews/passed",),
+                ),
+            ]
+        )
+    elif outcome == "failed_after_max_iterations":
+        for offset in range(5):
+            blocks.extend(
+                [
+                    child(12 + offset * 2, "validation_run", iteration=1),
+                    child(
+                        13 + offset * 2,
+                        "review_decision",
+                        iteration=1,
+                        review_id=f"review-failed-{offset}",
+                        decision="failed",
+                        evidence_refs=(f"artifact://reviews/failed-{offset}",),
+                    ),
+                ]
+            )
+    blocks.append(child(max(block["index"] for block in blocks) + 1, "batch_done", outcome=outcome))
 
     assert project_batch(blocks, BATCH_ID, now=NOW).status == outcome
 
@@ -424,6 +452,128 @@ def test_succeeded_requires_prior_current_iteration_validation_evidence() -> Non
             BATCH_ID,
             now=NOW,
         )
+
+
+def test_review_decision_is_strict_immutable_current_iteration_evidence() -> None:
+    event = ReviewDecisionEvent(
+        batch_id=BATCH_ID,
+        iteration=1,
+        review_id="review-1",
+        decision="passed",
+        evidence_refs=("artifact://reviews/review-1",),
+    )
+
+    assert event.model_dump(mode="json")["evidence_refs"] == [
+        "artifact://reviews/review-1"
+    ]
+    with pytest.raises(ValidationError):
+        ReviewDecisionEvent.model_validate(
+            {**event.model_dump(), "workspace_path": r"C:\\private\\review.txt"}
+        )
+
+
+def test_succeeded_requires_current_iteration_passing_review() -> None:
+    validation = child(12, "validation_run", iteration=1)
+    done = child(14, "batch_done", outcome="succeeded")
+
+    with pytest.raises(ValueError, match="passing review"):
+        project_batch([work_batch(), claim(11), validation, done], BATCH_ID, now=NOW)
+    with pytest.raises(ValueError, match="passing review"):
+        project_batch(
+            [
+                work_batch(),
+                claim(11),
+                validation,
+                child(
+                    13,
+                    "review_decision",
+                    iteration=1,
+                    review_id="review-1",
+                    decision="failed",
+                    evidence_refs=("artifact://reviews/review-1",),
+                ),
+                done,
+            ],
+            BATCH_ID,
+            now=NOW,
+        )
+
+    projection = project_batch(
+        [
+            work_batch(),
+            claim(11),
+            validation,
+            child(
+                13,
+                "review_decision",
+                iteration=1,
+                review_id="review-1",
+                decision="passed",
+                evidence_refs=("artifact://reviews/review-1",),
+            ),
+            done,
+        ],
+        BATCH_ID,
+        now=NOW,
+    )
+    assert projection.status == "succeeded"
+
+
+def test_stale_review_cannot_authorize_success() -> None:
+    with pytest.raises(ValueError, match="current claim iteration"):
+        project_batch(
+            [
+                work_batch(),
+                claim(11),
+                child(12, "validation_run", iteration=1),
+                claim(13),
+                child(
+                    14,
+                    "review_decision",
+                    iteration=1,
+                    review_id="review-stale",
+                    decision="passed",
+                    evidence_refs=("artifact://reviews/stale",),
+                ),
+            ],
+            BATCH_ID,
+            now=NOW,
+        )
+
+
+def test_failed_after_max_iterations_requires_five_immutable_failed_reviews() -> None:
+    blocks = [work_batch()]
+    index = 11
+    for iteration in range(1, 6):
+        blocks.extend(
+            [
+                claim(index),
+                child(index + 1, "validation_run", iteration=iteration),
+                child(
+                    index + 2,
+                    "review_decision",
+                    iteration=iteration,
+                    review_id=f"review-{iteration}",
+                    decision="failed",
+                    evidence_refs=(f"artifact://reviews/{iteration}",),
+                ),
+            ]
+        )
+        index += 3
+
+    with pytest.raises(ValueError, match="five failed reviews"):
+        project_batch(
+            [*blocks[:-3], child(index, "batch_done", outcome="failed_after_max_iterations")],
+            BATCH_ID,
+            now=NOW,
+        )
+
+    projection = project_batch(
+        [*blocks, child(index, "batch_done", outcome="failed_after_max_iterations")],
+        BATCH_ID,
+        now=NOW,
+    )
+    assert projection.status == "failed_after_max_iterations"
 
 
 def test_boolean_iteration_cannot_authorize_success() -> None:

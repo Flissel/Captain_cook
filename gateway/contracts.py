@@ -40,6 +40,8 @@ class BatchProjection(BaseModel):
     validation_run_recorded: bool = False
     recovery_recorded: bool = False
     recovered_iteration: int | None = None
+    passing_review_recorded: bool = False
+    failed_review_count: int = 0
 
 
 class ClaimEvent(BaseModel):
@@ -103,6 +105,28 @@ class RecoveryDecisionEvent(BaseModel):
     decision: Literal["requeue", "aborted_infra"]
 
 
+class ReviewDecisionEvent(EvidenceEvent):
+    model_config = ConfigDict(extra="forbid")
+
+    review_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
+    decision: Literal["passed", "failed"]
+    evidence_refs: tuple[str, ...] = Field(min_length=1, max_length=64)
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def require_opaque_unique_references(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("evidence_refs must be unique")
+        forbidden = ("\\", "file://", "workspace", "chain-of-thought", "bearer ")
+        if any(
+            not reference.startswith("artifact://")
+            or any(item in reference.lower() for item in forbidden)
+            for reference in value
+        ):
+            raise ValueError("evidence_refs must contain opaque artifact references")
+        return value
+
+
 _LIFECYCLE_BLOCK_TYPES = frozenset(
     {
         "batch_approved",
@@ -112,6 +136,7 @@ _LIFECYCLE_BLOCK_TYPES = frozenset(
         "codex_process",
         "reasoning_slice",
         "recovery_decision",
+        "review_decision",
         "validation_run",
         "batch_done",
     }
@@ -228,6 +253,9 @@ def project_batch(
     recovered_iterations: set[int] = set()
     recovery_recorded = False
     recovered_iteration: int | None = None
+    passing_review_recorded = False
+    failed_review_count = 0
+    review_ids: set[str] = set()
 
     for block in children:
         block_type = block.get("block_type")
@@ -252,6 +280,7 @@ def project_batch(
             claim_expires_at = _as_utc(event.claim_expires_at)
             codex_session_recorded = False
             validation_run_recorded = False
+            passing_review_recorded = False
             status = "claimed"
             continue
 
@@ -279,6 +308,22 @@ def project_batch(
                 codex_session_recorded = True
             elif block_type == "validation_run":
                 validation_run_recorded = True
+            continue
+
+        if block_type == "review_decision":
+            event = _event_data(block, ReviewDecisionEvent)
+            assert isinstance(event, ReviewDecisionEvent)
+            if claim_iteration == 0 or event.iteration != claim_iteration:
+                raise ValueError("review must match the current claim iteration")
+            if not validation_run_recorded:
+                raise ValueError("review requires current-iteration validation_run evidence")
+            if event.review_id in review_ids:
+                raise ValueError("review_id must be immutable and unique")
+            review_ids.add(event.review_id)
+            if event.decision == "passed":
+                passing_review_recorded = True
+            else:
+                failed_review_count += 1
             continue
 
         if block_type == "recovery_decision":
@@ -309,8 +354,16 @@ def project_batch(
                 raise ValueError("terminal before claim is invalid")
             event = _event_data(block, BatchDoneEvent)
             assert isinstance(event, BatchDoneEvent)
-            if event.outcome == "succeeded" and not validation_run_recorded:
-                raise ValueError("succeeded batch_done requires current-iteration validation_run evidence")
+            if event.outcome == "succeeded":
+                if not validation_run_recorded:
+                    raise ValueError("succeeded batch_done requires current-iteration validation_run evidence")
+                if not passing_review_recorded:
+                    raise ValueError("succeeded batch_done requires a current-iteration passing review")
+            if (
+                event.outcome == "failed_after_max_iterations"
+                and failed_review_count < 5
+            ):
+                raise ValueError("failed_after_max_iterations requires five failed reviews")
             status = event.outcome
             terminal = True
 
@@ -329,4 +382,6 @@ def project_batch(
         validation_run_recorded=validation_run_recorded,
         recovery_recorded=recovery_recorded,
         recovered_iteration=recovered_iteration,
+        passing_review_recorded=passing_review_recorded,
+        failed_review_count=failed_review_count,
     )

@@ -67,6 +67,16 @@ def authorization(token: str, *, claim_token: str | None = None) -> dict[str, st
     return headers
 
 
+def review_payload(*, iteration: int = 1, decision: str = "passed") -> dict[str, Any]:
+    return {
+        "batch_id": "batch-1",
+        "iteration": iteration,
+        "review_id": f"review-{iteration}",
+        "decision": decision,
+        "evidence_refs": [f"artifact://reviews/{iteration}"],
+    }
+
+
 def test_legacy_delivery_import_is_captain_only(client: TestClient) -> None:
     request = {
         "legacy_record_id": "todo:legacy-1",
@@ -372,6 +382,147 @@ def test_reasoning_slice_requires_worker_role_and_current_claim(client: TestClie
         headers=authorization(WORKER_TOKEN, claim_token=claim_token),
         json=request,
     ).status_code == 201
+
+
+def test_review_route_is_captain_only_and_binds_current_validation(
+    client: TestClient,
+) -> None:
+    captain = authorization(CAPTAIN_TOKEN)
+    worker = authorization(WORKER_TOKEN)
+    batch = client.post(
+        "/blocks",
+        headers=captain,
+        json={"block_type": "work_batch", "data": batch_payload()},
+    )
+    assert batch.status_code == 201
+    claimed = client.post("/batches/batch-1/claim", headers=worker)
+    claim_token = claimed.json()["claim_token"]
+    worker_claim = authorization(WORKER_TOKEN, claim_token=claim_token)
+    validation_ref = "artifact://validation/run-1"
+    validation = client.post(
+        "/blocks",
+        headers=worker_claim,
+        json={
+            "block_type": "validation_run",
+            "data": {
+                "batch_id": "batch-1",
+                "iteration": 1,
+                "artifact_ref": validation_ref,
+            },
+        },
+    )
+    assert validation.status_code == 201
+    review = {
+        **review_payload(),
+        "evidence_refs": [validation_ref],
+    }
+
+    assert client.post("/batches/batch-1/review", json=review).status_code == 401
+    assert client.post(
+        "/batches/batch-1/review", headers=worker_claim, json=review
+    ).status_code == 403
+    assert client.post(
+        "/blocks",
+        headers=captain,
+        json={"block_type": "review_decision", "data": review},
+    ).status_code == 422
+
+    stale = client.post(
+        "/batches/batch-1/review",
+        headers=captain,
+        json={**review, "iteration": 2, "review_id": "review-stale"},
+    )
+    forged_ref = "artifact://validation/forged-private-reference"
+    forged = client.post(
+        "/batches/batch-1/review",
+        headers=captain,
+        json={**review, "review_id": "review-forged", "evidence_refs": [forged_ref]},
+    )
+    assert stale.status_code == 409
+    assert forged.status_code == 409
+    assert forged_ref not in forged.text
+
+    failed = client.post(
+        "/batches/batch-1/review",
+        headers=captain,
+        json={**review, "review_id": "review-failed", "decision": "failed"},
+    )
+    assert failed.status_code == 201
+    rejected_success = client.post(
+        "/blocks",
+        headers=worker_claim,
+        json={
+            "block_type": "batch_done",
+            "status": "succeeded",
+            "data": {"batch_id": "batch-1", "outcome": "succeeded"},
+        },
+    )
+    assert rejected_success.status_code == 422
+
+    passed = client.post(
+        "/batches/batch-1/review",
+        headers=captain,
+        json={**review, "review_id": "review-passed"},
+    )
+    assert passed.status_code == 201
+    succeeded = client.post(
+        "/blocks",
+        headers=worker_claim,
+        json={
+            "block_type": "batch_done",
+            "status": "succeeded",
+            "data": {"batch_id": "batch-1", "outcome": "succeeded"},
+        },
+    )
+    assert succeeded.status_code == 201
+
+
+def test_fifth_immutable_failed_review_appends_terminal_outcome(
+    client: TestClient,
+) -> None:
+    captain = authorization(CAPTAIN_TOKEN)
+    worker = authorization(WORKER_TOKEN)
+    assert client.post(
+        "/blocks",
+        headers=captain,
+        json={"block_type": "work_batch", "data": batch_payload()},
+    ).status_code == 201
+    claim = client.post("/batches/batch-1/claim", headers=worker).json()
+    worker_claim = authorization(WORKER_TOKEN, claim_token=claim["claim_token"])
+    validation_ref = "artifact://validation/run-1"
+    assert client.post(
+        "/blocks",
+        headers=worker_claim,
+        json={
+            "block_type": "validation_run",
+            "data": {
+                "batch_id": "batch-1",
+                "iteration": 1,
+                "artifact_ref": validation_ref,
+            },
+        },
+    ).status_code == 201
+
+    for number in range(1, 6):
+        response = client.post(
+            "/batches/batch-1/review",
+            headers=captain,
+            json={
+                "batch_id": "batch-1",
+                "iteration": 1,
+                "review_id": f"review-failed-{number}",
+                "decision": "failed",
+                "evidence_refs": [validation_ref],
+            },
+        )
+        assert response.status_code == 201
+
+    projection = client.get("/batches/batch-1", headers=captain).json()
+    blocks = client.get("/batches/batch-1/blocks", headers=captain).json()
+    assert projection["status"] == "failed_after_max_iterations"
+    assert projection["failed_review_count"] == 5
+    assert [block["block_type"] for block in blocks].count("review_decision") == 5
+    assert [block["block_type"] for block in blocks].count("batch_done") == 1
 
 
 def test_recovery_route_is_captain_only_idempotent_and_cannot_be_bypassed(

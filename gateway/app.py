@@ -19,7 +19,7 @@ from gateway.auth import (
     require_reader,
     require_worker,
 )
-from gateway.contracts import BatchProjection, RecoveryDecisionEvent
+from gateway.contracts import BatchProjection, RecoveryDecisionEvent, ReviewDecisionEvent
 from gateway.mirror import MirrorQueue
 from gateway.registry_feed import mirror_validated_batch
 from gateway.settings import GatewaySettings
@@ -60,7 +60,7 @@ class LegacyDeliveryImportRequest(BaseModel):
 
 
 CAPTAIN_WRITE_BLOCK_TYPES = frozenset(
-    {"problem", "work_batch", "holdout", "recovery_decision"}
+    {"problem", "work_batch", "holdout", "recovery_decision", "review_decision"}
 )
 
 
@@ -189,6 +189,20 @@ def create_app(
             raise HTTPException(status_code=422, detail="recovery batch_id must match route")
         block = get_store().recover(request)
         return RecoveryDecisionEvent.model_validate(block["data"])
+
+    @app.post(
+        "/batches/{batch_id}/review",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def record_review(
+        batch_id: str,
+        request: ReviewDecisionEvent,
+        _: GatewayRole = Depends(require_captain),
+    ) -> ReviewDecisionEvent:
+        if request.batch_id != batch_id:
+            raise HTTPException(status_code=422, detail="review batch_id must match route")
+        block = get_store().review(request)
+        return ReviewDecisionEvent.model_validate(block["data"])
 
     @app.post("/blocks", status_code=status.HTTP_201_CREATED)
     async def add_block(

@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 if TYPE_CHECKING:
     from agenten.delivery.recovery import RecoveryDecision
+    from agenten.review.gateway_controller import GatewayReviewDecision
 
 
 BatchStatus: TypeAlias = Literal[
@@ -57,6 +58,8 @@ class GatewayBatchProjection(BaseModel):
     validation_run_recorded: bool
     recovery_recorded: bool = False
     recovered_iteration: int | None = Field(default=None, ge=1, strict=True)
+    passing_review_recorded: bool = False
+    failed_review_count: int = Field(default=0, ge=0, strict=True)
 
 
 class GatewayClaim(BaseModel):
@@ -143,6 +146,16 @@ class _RecoveryResponse(BaseModel):
     iteration: int = Field(ge=1, strict=True)
     reason: Literal["claim_expired"]
     decision: Literal["requeue", "aborted_infra"]
+
+
+class _ReviewResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str = Field(min_length=1, max_length=32)
+    iteration: int = Field(ge=1, strict=True)
+    review_id: str = Field(min_length=1, max_length=128)
+    decision: Literal["passed", "failed"]
+    evidence_refs: tuple[str, ...] = Field(min_length=1)
 
 
 class GatewayDeliveryClient:
@@ -290,6 +303,25 @@ class GatewayDeliveryClient:
             operation="record recovery decision",
         )
         return RecoveryDecision.model_validate(validated.model_dump())
+
+    async def record_review(
+        self, decision: "GatewayReviewDecision"
+    ) -> "GatewayReviewDecision":
+        from agenten.review.gateway_controller import GatewayReviewDecision
+
+        response = await self._request(
+            "POST",
+            f"/batches/{self._batch_path(decision.batch_id)}/review",
+            operation="record review decision",
+            json=decision.model_dump(mode="json"),
+        )
+        self._require_status(response, {201}, operation="record review decision")
+        validated = self._validate(
+            _ReviewResponse,
+            response,
+            operation="record review decision",
+        )
+        return GatewayReviewDecision.model_validate(validated.model_dump())
 
     async def record_codex_process(
         self,

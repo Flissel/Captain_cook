@@ -23,13 +23,14 @@ from gateway.contracts import (
     HeartbeatEvent,
     ReasoningSliceEvent,
     RecoveryDecisionEvent,
+    ReviewDecisionEvent,
     project_batch,
 )
 
 
 CAPTAIN_BLOCK_TYPES = frozenset({"problem", "work_batch", "holdout"})
 GATEWAY_OWNED_EVENT_TYPES = frozenset(
-    {"batch_claimed", "batch_heartbeat", "batch_approved", "recovery_decision"}
+    {"batch_claimed", "batch_heartbeat", "batch_approved", "recovery_decision", "review_decision"}
 )
 TRANSIENT_TRANSACTION_ERRORS = frozenset({1020, 1213})
 TRANSACTION_ATTEMPTS = 3
@@ -459,6 +460,83 @@ class GatewayStore:
             with connection.cursor() as cursor:
                 _, _, projection = self._batch_context(cursor, batch_id, now=now)
         return projection
+
+    def review(self, request: ReviewDecisionEvent) -> dict[str, Any]:
+        try:
+            return self._retry_write(lambda: self._review_once(request))
+        except _IdempotentReplay as replay:
+            return replay.block
+
+    def _review_once(self, request: ReviewDecisionEvent) -> dict[str, Any]:
+        data = request.model_dump(mode="json")
+        now = _utcnow()
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                parent, children, projection = self._batch_context(
+                    cursor, request.batch_id, for_update=True, now=now
+                )
+                existing = next(
+                    (
+                        child
+                        for child in children
+                        if child["block_type"] == "review_decision"
+                        and child["data"].get("review_id") == request.review_id
+                    ),
+                    None,
+                )
+                if existing is not None and self._has_identical_canonical_data(existing, data):
+                    raise _IdempotentReplay(existing)
+                if existing is not None:
+                    raise HTTPException(status_code=409, detail="review decision already exists")
+                if (
+                    projection.status != "claimed"
+                    or projection.claim_iteration != request.iteration
+                    or not projection.validation_run_recorded
+                ):
+                    raise HTTPException(status_code=409, detail="review is not current")
+                validation_refs = {
+                    child["data"].get("artifact_ref")
+                    for child in children
+                    if child["block_type"] == "validation_run"
+                    and child["data"].get("iteration") == request.iteration
+                    and isinstance(child["data"].get("artifact_ref"), str)
+                }
+                if not set(request.evidence_refs).issubset(validation_refs):
+                    raise HTTPException(status_code=409, detail="review evidence is not authoritative")
+                block = self._new_block(
+                    cursor,
+                    index=self._next_index(cursor),
+                    block_type="review_decision",
+                    data=data,
+                    status=request.decision,
+                    parent_index=parent["index"],
+                )
+                self._validate_candidate(parent, children, block, request.batch_id, now=now)
+                self._insert(cursor, block)
+                projected = project_batch(
+                    [parent, *children, block], request.batch_id, now=now
+                )
+                if request.decision == "failed" and projected.failed_review_count == 5:
+                    terminal = self._new_block(
+                        cursor,
+                        index=self._next_index(cursor),
+                        block_type="batch_done",
+                        data={
+                            "batch_id": request.batch_id,
+                            "outcome": "failed_after_max_iterations",
+                        },
+                        status="failed_after_max_iterations",
+                        parent_index=parent["index"],
+                    )
+                    self._validate_candidate(
+                        parent,
+                        [*children, block],
+                        terminal,
+                        request.batch_id,
+                        now=now,
+                    )
+                    self._insert(cursor, terminal)
+        return block
 
     def claim(self, batch_id: str) -> dict[str, str]:
         return self._retry_write(lambda: self._claim_once(batch_id))
