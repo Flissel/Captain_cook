@@ -61,6 +61,19 @@ def _parse_time(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def canonical_captain_data_matches(
+    existing: dict[str, Any],
+    replay: dict[str, Any],
+) -> bool:
+    """Compare validated Captain payloads by canonical JSON content."""
+
+    return json.dumps(existing, sort_keys=True, separators=(",", ":")) == json.dumps(
+        replay,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 class GatewayStore:
     def __init__(self, storage: MariaDBStorage):
         self.storage = storage
@@ -119,6 +132,32 @@ class GatewayStore:
         return row
 
     @staticmethod
+    def _captain_block_row(
+        cursor: Any,
+        block_type: str,
+        batch_id: str,
+        *,
+        for_update: bool = False,
+    ) -> dict[str, Any] | None:
+        sql = """
+            SELECT `index`, parent_index, block_type, data, status, children,
+                   metadata, hash, previous_hash
+            FROM blocks
+            WHERE block_type = %s
+              AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.batch_id')) = %s
+            ORDER BY `index` DESC LIMIT 1
+        """
+        if for_update:
+            sql += " FOR UPDATE"
+        cursor.execute(sql, (block_type, batch_id))
+        row = cursor.fetchone()
+        if row:
+            for field in ("data", "children", "metadata"):
+                if isinstance(row[field], str):
+                    row[field] = json.loads(row[field])
+        return row
+
+    @staticmethod
     def _next_index(cursor: Any) -> int:
         cursor.execute("SELECT next_block_index FROM ledger_state WHERE id = 1 FOR UPDATE")
         index = int(cursor.fetchone()["next_block_index"])
@@ -164,9 +203,20 @@ class GatewayStore:
                     self._assert_live_claim(batch, claim_token)
                     if parent_index is None:
                         parent_index = batch["index"]
-                index = self._next_index(cursor)
-                if request.block_type == "work_batch" and self._batch_row(cursor, batch_id) is not None:
-                    raise HTTPException(status_code=409, detail="batch_id already exists")
+                if request.block_type == "work_batch":
+                    existing_batch = self._captain_block_row(
+                        cursor,
+                        "work_batch",
+                        batch_id,
+                        for_update=True,
+                    )
+                    if existing_batch is not None and canonical_captain_data_matches(
+                        existing_batch["data"],
+                        request.data,
+                    ):
+                        return existing_batch
+                    if existing_batch is not None:
+                        raise HTTPException(status_code=409, detail="batch_id already exists")
                 if request.block_type == "holdout" and parent_index is None:
                     raise HTTPException(status_code=422, detail="holdout requires its work_batch parent")
                 if parent_index is not None and request.block_type != "work_batch":
@@ -177,6 +227,28 @@ class GatewayStore:
                     parent_data = json.loads(parent["data"]) if isinstance(parent["data"], str) else parent["data"]
                     if parent_data.get("batch_id") != batch_id:
                         raise HTTPException(status_code=409, detail="parent belongs to another batch")
+                if request.block_type == "holdout":
+                    existing_holdout = self._captain_block_row(
+                        cursor,
+                        "holdout",
+                        batch_id,
+                        for_update=True,
+                    )
+                    if (
+                        existing_holdout is not None
+                        and existing_holdout["parent_index"] == parent_index
+                        and canonical_captain_data_matches(
+                            existing_holdout["data"],
+                            request.data,
+                        )
+                    ):
+                        return existing_holdout
+                    if existing_holdout is not None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="holdout suite already exists",
+                        )
+                index = self._next_index(cursor)
                 cursor.execute("SELECT hash FROM blocks ORDER BY `index` DESC LIMIT 1")
                 previous = cursor.fetchone()
                 from blockchain.Blockchain_modell import Block
@@ -230,7 +302,14 @@ class GatewayStore:
     def _upsert_capability(cursor: Any, block: dict[str, Any]) -> None:
         data = block["data"]
         capabilities = data.get("capabilities", [])
-        descriptor = " ".join(str(value) for value in capabilities)
+        batch = GatewayStore._batch_row(cursor, data["batch_id"])
+        if batch is None:
+            raise HTTPException(status_code=404, detail="batch not found")
+        payload = dict(data)
+        payload["target"] = batch["data"]["target"]
+        descriptor = " ".join(
+            [payload["target"], *(str(value) for value in capabilities)]
+        )
         cursor.execute(
             """
             INSERT INTO validated_capabilities
@@ -241,7 +320,7 @@ class GatewayStore:
             """,
             (
                 data["batch_id"], descriptor, data.get("artifact_ref"), block["index"],
-                json.dumps(data, sort_keys=True),
+                json.dumps(payload, sort_keys=True),
             ),
         )
 

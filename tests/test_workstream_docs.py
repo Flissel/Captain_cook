@@ -1,6 +1,13 @@
 from pathlib import Path
 
 
+def test_main_is_the_canonical_integration_baseline() -> None:
+    text = Path("docs/WORKSTREAMS.md").read_text(encoding="utf-8")
+
+    assert "`main` is the canonical integration baseline" in text
+    assert "`feat/devpost-demo-readiness` is the current reviewable baseline" not in text
+
+
 def test_modular_workstream_plan_defines_the_household_roles():
     plan = Path("docs/WORKSTREAMS.md").read_text(encoding="utf-8")
 

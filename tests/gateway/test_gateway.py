@@ -114,6 +114,40 @@ def test_duplicate_batch_ids_are_rejected(client: TestClient) -> None:
     assert response.status_code == 409
 
 
+def test_identical_work_batch_replay_returns_existing_block(client: TestClient) -> None:
+    first = client.post(
+        "/blocks",
+        json={"block_type": "work_batch", "data": batch_payload()},
+    )
+    replay = client.post(
+        "/blocks",
+        json={"block_type": "work_batch", "data": batch_payload()},
+    )
+
+    assert first.status_code == 201
+    assert replay.status_code == 201
+    assert replay.json()["index"] == first.json()["index"]
+
+
+def test_identical_holdout_replay_returns_existing_block(client: TestClient) -> None:
+    parent = create_batch(client)
+    payload = {
+        "block_type": "holdout",
+        "parent_index": parent,
+        "data": {
+            "batch_id": "batch-1",
+            "cases": [{"case_id": "secret-1", "input": {"version": 1}}],
+        },
+    }
+
+    first = client.post("/blocks", json=payload)
+    replay = client.post("/blocks", json=payload)
+
+    assert first.status_code == 201
+    assert replay.status_code == 201
+    assert replay.json()["index"] == first.json()["index"]
+
+
 def test_work_batch_must_satisfy_the_captain_contract(client: TestClient) -> None:
     response = client.post(
         "/blocks",
@@ -345,6 +379,8 @@ def test_successful_batch_is_searchable_as_validated_capability(client: TestClie
     assert response.status_code == 200
     assert response.json()[0]["batch_id"] == "batch-1"
     assert response.json()[0]["artifact_ref"] == "workflow-42"
+    assert response.json()[0]["data"]["target"] == "n8n"
+    assert response.json()[0]["data"]["capabilities"] == ["notifications", "email"]
 
 
 def test_all_write_routes_are_async_and_uvicorn_is_single_worker(storage: MariaDBStorage) -> None:

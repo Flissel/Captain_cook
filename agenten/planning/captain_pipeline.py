@@ -1,5 +1,6 @@
 """Captain-owned project planning and batch release pipeline."""
 
+from collections.abc import Sequence
 from typing import Awaitable, Callable, List, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -10,6 +11,7 @@ from agenten.planning.alignment import (
     BatchDraft,
     validate_alignment,
 )
+from agenten.planning.policy import PlanningPolicy
 from agenten.validation.contracts import (
     AcceptanceAssertion,
     ExampleCase,
@@ -63,7 +65,11 @@ class BatchReleaseClient(Protocol):
 
 
 class CapabilityResolver(Protocol):
-    async def find_match(self, target: str, capability_tags: List[str]) -> str | None: ...
+    async def find_match(
+        self,
+        target: str,
+        capability_tags: Sequence[str],
+    ) -> str | None: ...
 
 
 Decompose = Callable[[str], Awaitable[List[PlannedSubtask]]]
@@ -81,6 +87,7 @@ class CaptainPipeline:
         align: Align,
         enrich: Enrich,
         release_client: BatchReleaseClient,
+        policy: PlanningPolicy,
         capability_resolver: CapabilityResolver | None = None,
         target: str,
         max_alignment_attempts: int = 2,
@@ -91,6 +98,7 @@ class CaptainPipeline:
         self._align = align
         self._enrich = enrich
         self._release_client = release_client
+        self._policy = policy
         self._capability_resolver = capability_resolver
         self._target = target
         self._max_alignment_attempts = max_alignment_attempts
@@ -121,15 +129,27 @@ class CaptainPipeline:
             )
 
         subtasks_by_id = {subtask.subtask_id: subtask for subtask in subtasks}
-        released: List[WorkBatch] = []
+        enriched_drafts: List[tuple[BatchDraft, BatchEnrichment]] = []
         for draft in ordered_drafts:
             selected_subtasks = [subtasks_by_id[subtask_id] for subtask_id in draft.subtask_ids]
             enrichment = await self._enrich(project_description, draft, selected_subtasks)
+            self._policy.validate_enrichment(enrichment)
+            enriched_drafts.append((draft, enrichment))
+
+        self._policy.validate_run_isolation(
+            enrichment for _, enrichment in enriched_drafts
+        )
+
+        compiled_contracts: List[tuple[WorkBatch, HoldoutSuite]] = []
+        for draft, enrichment in enriched_drafts:
+            capability_tags = self._policy.canonical_capability_tags(
+                enrichment.capability_tags
+            )
             satisfied_by = None
             if self._capability_resolver is not None:
                 satisfied_by = await self._capability_resolver.find_match(
                     self._target,
-                    enrichment.capability_tags,
+                    list(capability_tags),
                 )
             batch = WorkBatch(
                 batch_id=draft.batch_id,
@@ -137,7 +157,7 @@ class CaptainPipeline:
                 goal=enrichment.goal,
                 subtask_ids=draft.subtask_ids,
                 target=self._target,
-                capability_tags=enrichment.capability_tags,
+                capability_tags=list(capability_tags),
                 depends_on=draft.depends_on,
                 constraints=enrichment.constraints,
                 acceptance_criteria=enrichment.acceptance_criteria,
@@ -145,7 +165,14 @@ class CaptainPipeline:
                 satisfied_by=satisfied_by,
             )
             holdouts = HoldoutSuite(batch_id=draft.batch_id, cases=enrichment.holdout_cases)
-            await self._release_client.release(batch, holdouts)
-            released.append(batch)
+            compiled_contracts.append((batch, holdouts))
 
-        return CaptainRunResult(batches=released)
+        for batch, holdouts in compiled_contracts:
+            await self._release_client.release(
+                batch.model_copy(deep=True),
+                holdouts.model_copy(deep=True),
+            )
+
+        return CaptainRunResult(
+            batches=[batch for batch, _ in compiled_contracts]
+        )
