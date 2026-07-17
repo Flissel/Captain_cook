@@ -435,3 +435,125 @@ def test_delivery_event_models_are_frozen() -> None:
 
     with pytest.raises(ValidationError):
         event.actor = "other"
+
+
+@pytest.mark.parametrize(
+    ("event_type", "payload"),
+    (
+        (
+            "codex_session_started",
+            {
+                "session_id": "session-1",
+                "process_ref": "artifact://processes/session-1",
+                "started_at": NOW,
+                "iteration": 1,
+                "command_sha256": "a" * 64,
+                "workspace_sha256": "b" * 64,
+            },
+        ),
+        (
+            "codex_session_event",
+            {
+                "session_id": "session-1",
+                "lifecycle": "turn_completed",
+                "input_tokens": 10,
+                "cached_input_tokens": 2,
+                "output_tokens": 3,
+            },
+        ),
+        (
+            "codex_session_warning",
+            {
+                "session_id": "session-1",
+                "warning_type": "malformed_json",
+                "line_sha256": "c" * 64,
+            },
+        ),
+        (
+            "codex_session_finished",
+            {
+                "session_id": "session-1",
+                "process_ref": "artifact://processes/session-1",
+                "started_at": NOW,
+                "ended_at": NOW + timedelta(seconds=1),
+                "outcome": "infrastructure_failure",
+                "exit_code": 23,
+                "behavioral_repair_increment": 0,
+            },
+        ),
+    ),
+)
+def test_codex_session_delivery_events_are_truthful_frozen_contracts(
+    event_type: str,
+    payload: dict[str, object],
+) -> None:
+    event = DeliveryEventEnvelope.model_validate(
+        {
+            "event_id": uuid4(),
+            "event_type": event_type,
+            "occurred_at": NOW,
+            "actor": "worker-1",
+            "trace": {
+                **TRACE,
+                "batch_id": "batch-1",
+                "worker_id": "worker-1",
+                "claim_id": "claim-1",
+                "fencing_token": 7,
+                "session_id": "session-1",
+            },
+            "payload": {"event_type": event_type, **payload},
+        }
+    )
+
+    assert event.payload.session_id == "session-1"
+    with pytest.raises(ValidationError):
+        event.payload.session_id = "different"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {
+            "outcome": "infrastructure_failure",
+            "behavioral_repair_increment": 1,
+        },
+        {
+            "outcome": "cancelled",
+            "behavioral_repair_increment": 0,
+        },
+        {
+            "outcome": "succeeded",
+            "behavioral_repair_increment": 0,
+            "cancellation_reason": "operator",
+        },
+    ),
+)
+def test_codex_terminal_outcome_enforces_repair_and_cancellation_invariants(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        DeliveryEventEnvelope.model_validate(
+            {
+                "event_id": uuid4(),
+                "event_type": "codex_session_finished",
+                "occurred_at": NOW,
+                "actor": "worker-1",
+                "trace": {
+                    **TRACE,
+                    "batch_id": "batch-1",
+                    "worker_id": "worker-1",
+                    "claim_id": "claim-1",
+                    "fencing_token": 7,
+                    "session_id": "session-1",
+                },
+                "payload": {
+                    "event_type": "codex_session_finished",
+                    "session_id": "session-1",
+                    "process_ref": "artifact://processes/session-1",
+                    "started_at": NOW,
+                    "ended_at": NOW,
+                    "exit_code": None,
+                    **payload,
+                },
+            }
+        )

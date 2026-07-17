@@ -201,3 +201,62 @@ async def test_delivery_conflict_and_transport_errors_are_sanitized() -> None:
         client = GatewayDeliveryClient("http://gateway", "worker-secret", http)
         with pytest.raises(GatewayDeliveryError):
             await client.heartbeat("batch-1", "claim-secret")
+
+
+@pytest.mark.asyncio
+async def test_delivery_event_routes_append_and_read_typed_envelopes() -> None:
+    from datetime import timedelta
+    from uuid import uuid4
+
+    from gateway.contracts import DeliveryEventEnvelope
+
+    event = DeliveryEventEnvelope.model_validate(
+        {
+            "event_id": uuid4(),
+            "event_type": "codex_session_started",
+            "occurred_at": datetime(2026, 7, 17, 12, tzinfo=timezone.utc),
+            "actor": "worker-1",
+            "trace": {
+                "project_id": "project-1",
+                "run_id": "run-1",
+                "trace_id": "trace-1",
+                "batch_id": "batch-1",
+                "worker_id": "worker-1",
+                "claim_id": "claim-1",
+                "fencing_token": 7,
+                "session_id": "session-1",
+            },
+            "payload": {
+                "event_type": "codex_session_started",
+                "session_id": "session-1",
+                "process_ref": "artifact://processes/session-1",
+                "started_at": datetime(2026, 7, 17, 12, tzinfo=timezone.utc),
+                "iteration": 1,
+                "command_sha256": "a" * 64,
+                "workspace_sha256": "b" * 64,
+            },
+        }
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(
+                201,
+                json={"event": event.model_dump(mode="json"), "replayed": False},
+                request=request,
+            )
+        return httpx.Response(200, json=[event.model_dump(mode="json")], request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = GatewayDeliveryClient("http://gateway", "worker-secret", http)
+        assert await client.append_delivery_event(event) == event
+        assert await client.delivery_events(
+            project_id="project-1", run_id="run-1"
+        ) == (event,)
+
+    assert [request.url.path for request in requests] == [
+        "/v1/delivery/events",
+        "/v1/projects/project-1/runs/run-1/events",
+    ]

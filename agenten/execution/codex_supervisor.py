@@ -16,6 +16,7 @@ from agenten.execution.codex_events import (
 from agenten.execution.process import PackageExecutionResult, PackageExecutionStatus
 
 if TYPE_CHECKING:
+    from agenten.delivery.codex_runs import CodexOutcome, CodexRunRepository
     from agenten.execution.codex_policy import AuthorizedCodexRun
 
 Identifier = str
@@ -120,10 +121,12 @@ class CodexSupervisor:
         runner: CodexRunner,
         gateway: GatewayCodexEvidenceWriter,
         policy: CodexExecutionAuthorizer,
+        repository: CodexRunRepository | None = None,
     ) -> None:
         self._runner = runner
         self._gateway = gateway
         self._policy = policy
+        self._repository = repository
 
     async def run(self, request: CodexRunRequest) -> PackageExecutionResult:
         authorized = self._policy.authorize(request)
@@ -132,6 +135,27 @@ class CodexSupervisor:
             "\0".join(authorized.command).encode("utf-8")
         ).hexdigest()
         process_id = f"codex-{request.session_id}"
+        if self._repository is not None:
+            try:
+                await self._repository.start(request)
+            except Exception:
+                return self._result(
+                    request,
+                    PackageExecutionStatus.FAILED,
+                    error="codex execution evidence could not be recorded",
+                )
+        else:
+            return await self._run_legacy(request, authorized, process_id, command_digest)
+
+        return await self._run_repository(request, authorized)
+
+    async def _run_legacy(
+        self,
+        request: CodexRunRequest,
+        authorized: AuthorizedCodexRun,
+        process_id: str,
+        command_digest: str,
+    ) -> PackageExecutionResult:
         try:
             await self._gateway.record_codex_session(
                 request.batch_id,
@@ -199,6 +223,89 @@ class CodexSupervisor:
             PackageExecutionStatus.SUCCEEDED,
             artifacts=run_result.artifact_references,
         )
+
+    async def _run_repository(
+        self,
+        request: CodexRunRequest,
+        authorized: AuthorizedCodexRun,
+    ) -> PackageExecutionResult:
+        from agenten.delivery.codex_runs import CodexOutcome
+
+        assert self._repository is not None
+        try:
+            run_result = await self._runner.run(authorized)
+        except Exception:
+            if not await self._finish_repository(
+                request.session_id,
+                CodexOutcome(classification="infrastructure_failure"),
+            ):
+                return self._result(
+                    request,
+                    PackageExecutionStatus.FAILED,
+                    error="codex execution evidence could not be recorded",
+                )
+            return self._result(
+                request,
+                PackageExecutionStatus.FAILED,
+                error="codex process could not be started",
+            )
+
+        try:
+            events = tuple(parse_codex_jsonl(line) for line in run_result.jsonl_lines)
+            for event in events:
+                await self._repository.append(event)
+        except Exception:
+            return self._result(
+                request,
+                PackageExecutionStatus.FAILED,
+                error="codex execution evidence could not be recorded",
+            )
+
+        if run_result.exit_code:
+            outcome = CodexOutcome(
+                classification="infrastructure_failure",
+                exit_code=run_result.exit_code,
+            )
+            error = f"codex process exited with code {run_result.exit_code}"
+        elif any(
+            isinstance(event, CodexParseWarning) or event.lifecycle == "failed"
+            for event in events
+        ):
+            outcome = CodexOutcome(
+                classification="behavioral_failure",
+                behavioral_repair_increment=1,
+            )
+            error = "codex JSONL evidence is incomplete"
+        else:
+            outcome = CodexOutcome(classification="succeeded")
+            error = None
+        if not await self._finish_repository(request.session_id, outcome):
+            return self._result(
+                request,
+                PackageExecutionStatus.FAILED,
+                error="codex execution evidence could not be recorded",
+            )
+        if error is not None:
+            return self._result(
+                request,
+                PackageExecutionStatus.FAILED,
+                error=error,
+            )
+        return self._result(
+            request,
+            PackageExecutionStatus.SUCCEEDED,
+            artifacts=run_result.artifact_references,
+        )
+
+    async def _finish_repository(
+        self, session_id: str, outcome: CodexOutcome
+    ) -> bool:
+        assert self._repository is not None
+        try:
+            await self._repository.finish(session_id, outcome)
+        except Exception:
+            return False
+        return True
 
     async def _record_process(
         self,

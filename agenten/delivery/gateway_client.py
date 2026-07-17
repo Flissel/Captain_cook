@@ -10,6 +10,8 @@ from urllib.parse import quote
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from gateway.contracts import DeliveryEventEnvelope
+
 if TYPE_CHECKING:
     from agenten.delivery.recovery import RecoveryDecision
     from agenten.review.gateway_controller import GatewayReviewDecision
@@ -122,6 +124,13 @@ class _BlockResponse(BaseModel):
     index: int = Field(ge=0, strict=True)
 
 
+class _AppendDeliveryEventResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    event: DeliveryEventEnvelope
+    replayed: bool
+
+
 class _BatchListItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -169,6 +178,50 @@ class GatewayDeliveryClient:
         self._base_url = base_url.rstrip("/")
         self._token = token
         self._client = client
+
+    async def append_delivery_event(
+        self,
+        event: DeliveryEventEnvelope,
+    ) -> DeliveryEventEnvelope:
+        response = await self._request(
+            "POST",
+            "/v1/delivery/events",
+            operation=f"append {event.event_type} delivery event",
+            json=event.model_dump(mode="json"),
+        )
+        self._require_status(
+            response,
+            {200, 201},
+            operation=f"append {event.event_type} delivery event",
+        )
+        appended = self._validate(
+            _AppendDeliveryEventResponse,
+            response,
+            operation=f"append {event.event_type} delivery event",
+        )
+        return appended.event
+
+    async def delivery_events(
+        self,
+        *,
+        project_id: str,
+        run_id: str,
+    ) -> tuple[DeliveryEventEnvelope, ...]:
+        response = await self._request(
+            "GET",
+            f"/v1/projects/{quote(project_id, safe='')}/runs/{quote(run_id, safe='')}/events",
+            operation="read delivery events",
+        )
+        self._require_status(response, {200}, operation="read delivery events")
+        try:
+            return tuple(
+                DeliveryEventEnvelope.model_validate(item)
+                for item in response.json()
+            )
+        except (TypeError, ValueError, ValidationError):
+            raise GatewayDeliveryError(
+                "read delivery events returned an invalid response"
+            ) from None
 
     async def get_batch(self, batch_id: str) -> GatewayBatchProjection:
         response = await self._request(

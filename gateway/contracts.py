@@ -20,6 +20,10 @@ from pydantic import (
 DeliveryEventType: TypeAlias = Literal[
     "codex_task",
     "codex_session",
+    "codex_session_started",
+    "codex_session_event",
+    "codex_session_warning",
+    "codex_session_finished",
     "artifact_built",
     "deploy",
     "validation_run",
@@ -86,6 +90,82 @@ class CodexSessionPayload(_FrozenContract):
     def require_ordered_timestamps(self) -> CodexSessionPayload:
         if _as_utc(self.ended_at) < _as_utc(self.started_at):
             raise ValueError("ended_at cannot precede started_at")
+        return self
+
+
+CodexSessionOutcome: TypeAlias = Literal[
+    "succeeded",
+    "behavioral_failure",
+    "infrastructure_failure",
+    "policy_failure",
+    "cancelled",
+    "lost_process",
+]
+CodexCancellationReason: TypeAlias = Literal[
+    "operator",
+    "timeout",
+    "shutdown",
+    "claim_lost",
+]
+
+
+class CodexSessionStartedPayload(_FrozenContract):
+    event_type: Literal["codex_session_started"]
+    session_id: str = Field(min_length=1)
+    process_ref: str = Field(pattern=r"^artifact://[^\\]+$")
+    started_at: datetime
+    iteration: int = Field(ge=1, strict=True)
+    command_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    workspace_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class CodexSessionEventPayload(_FrozenContract):
+    event_type: Literal["codex_session_event"]
+    session_id: str = Field(min_length=1)
+    lifecycle: Literal[
+        "started",
+        "turn_started",
+        "turn_completed",
+        "item_completed",
+        "failed",
+    ]
+    item_id: str | None = Field(default=None, min_length=1)
+    item_type: str | None = Field(default=None, min_length=1)
+    input_tokens: int | None = Field(default=None, ge=0)
+    cached_input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+
+
+class CodexSessionWarningPayload(_FrozenContract):
+    event_type: Literal["codex_session_warning"]
+    session_id: str = Field(min_length=1)
+    warning_type: Literal["malformed_json", "unknown_event", "invalid_event"]
+    line_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class CodexSessionFinishedPayload(_FrozenContract):
+    event_type: Literal["codex_session_finished"]
+    session_id: str = Field(min_length=1)
+    process_ref: str = Field(pattern=r"^artifact://[^\\]+$")
+    started_at: datetime
+    ended_at: datetime
+    outcome: CodexSessionOutcome
+    exit_code: int | None = None
+    cancellation_reason: CodexCancellationReason | None = None
+    behavioral_repair_increment: Literal[0, 1] = 0
+
+    @model_validator(mode="after")
+    def require_truthful_terminal_outcome(self) -> CodexSessionFinishedPayload:
+        if _as_utc(self.ended_at) < _as_utc(self.started_at):
+            raise ValueError("ended_at cannot precede started_at")
+        expected_increment = 1 if self.outcome == "behavioral_failure" else 0
+        if self.behavioral_repair_increment != expected_increment:
+            raise ValueError("only behavioral_failure increments repair")
+        if self.outcome == "cancelled":
+            if self.cancellation_reason is None:
+                raise ValueError("cancelled outcome requires cancellation_reason")
+        elif self.cancellation_reason is not None:
+            raise ValueError("cancellation_reason requires cancelled outcome")
         return self
 
 
@@ -231,6 +311,10 @@ class RegistryMirrorPayload(_FrozenContract):
 DeliveryEventPayload: TypeAlias = Annotated[
     CodexTaskPayload
     | CodexSessionPayload
+    | CodexSessionStartedPayload
+    | CodexSessionEventPayload
+    | CodexSessionWarningPayload
+    | CodexSessionFinishedPayload
     | ArtifactBuiltPayload
     | DeployPayload
     | ValidationRunPayload
@@ -260,6 +344,10 @@ class DeliveryEventEnvelope(_FrozenContract):
         required_trace_fields: dict[DeliveryEventType, tuple[str, ...]] = {
             "codex_task": ("batch_id",),
             "codex_session": ("batch_id", "session_id"),
+            "codex_session_started": ("batch_id", "worker_id", "claim_id", "fencing_token", "session_id"),
+            "codex_session_event": ("batch_id", "worker_id", "claim_id", "fencing_token", "session_id"),
+            "codex_session_warning": ("batch_id", "worker_id", "claim_id", "fencing_token", "session_id"),
+            "codex_session_finished": ("batch_id", "worker_id", "claim_id", "fencing_token", "session_id"),
             "artifact_built": ("batch_id", "artifact_id"),
             "deploy": ("batch_id", "artifact_id"),
             "validation_run": ("batch_id", "artifact_id", "case_id"),
@@ -279,6 +367,16 @@ class DeliveryEventEnvelope(_FrozenContract):
             raise ValueError(f"trace requires {', '.join(missing)} for {self.event_type}")
         if isinstance(self.payload, CodexSessionPayload) and self.trace.session_id != self.payload.session_id:
             raise ValueError("trace session_id must match codex_session payload")
+        if isinstance(
+            self.payload,
+            (
+                CodexSessionStartedPayload,
+                CodexSessionEventPayload,
+                CodexSessionWarningPayload,
+                CodexSessionFinishedPayload,
+            ),
+        ) and self.trace.session_id != self.payload.session_id:
+            raise ValueError("trace session_id must match Codex session payload")
         if isinstance(self.payload, ArtifactBuiltPayload) and self.trace.artifact_id != self.payload.artifact_id:
             raise ValueError("trace artifact_id must match artifact_built payload")
         if isinstance(self.payload, ValidationRunPayload) and self.trace.case_id not in self.payload.case_ids:
