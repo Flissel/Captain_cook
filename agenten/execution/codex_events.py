@@ -26,6 +26,7 @@ class CodexProcessEvent(BaseModel):
 
     event_type: Literal["codex_session"] = "codex_session"
     lifecycle: CodexLifecycle
+    source_sequence: int | None = Field(default=None, ge=0)
     session_id: str | None = Field(default=None, min_length=1)
     item_id: str | None = Field(default=None, min_length=1)
     item_type: str | None = Field(default=None, min_length=1)
@@ -40,6 +41,7 @@ class CodexParseWarning(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     event_type: Literal["codex_session_warning"] = "codex_session_warning"
+    source_sequence: int | None = Field(default=None, ge=0)
     warning_type: CodexWarningType
     line_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 

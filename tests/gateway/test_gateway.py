@@ -1407,3 +1407,54 @@ def test_delivery_api_returns_replay_history_and_stored_release_projection(
         clean_e2e_run_ids=("e2e-1", "e2e-2", "e2e-3"),
         missing_clean_e2e_runs=0,
     ).model_dump(mode="json")
+
+
+def test_delivery_event_requires_current_gateway_claim_identity_atomically(
+    storage: MariaDBStorage,
+) -> None:
+    store = GatewayStore(storage)
+    store.append(
+        BlockRequest(
+            block_type="work_batch",
+            status="pending",
+            data=batch_payload(),
+        ),
+        claim_token=None,
+    )
+    claim = store.claim("batch-1")
+    current = delivery_event(900).model_copy(
+        update={
+            "trace": delivery_event(900).trace.model_copy(
+                update={
+                    "claim_id": claim["claim_id"],
+                    "fencing_token": claim["fencing_token"],
+                }
+            )
+        }
+    )
+
+    assert store.append_delivery_event(
+        current, require_current_claim=True
+    ).event == current
+
+    wrong_claim = current.model_copy(
+        update={
+            "event_id": UUID(int=901),
+            "trace": current.trace.model_copy(update={"claim_id": "wrong-claim"}),
+        }
+    )
+    with pytest.raises(HTTPException, match="current claim") as claim_error:
+        store.append_delivery_event(wrong_claim, require_current_claim=True)
+    assert claim_error.value.status_code == 409
+
+    stale_fence = current.model_copy(
+        update={
+            "event_id": UUID(int=902),
+            "trace": current.trace.model_copy(
+                update={"fencing_token": claim["fencing_token"] - 1}
+            ),
+        }
+    )
+    with pytest.raises(HTTPException, match="current claim") as fence_error:
+        store.append_delivery_event(stale_fence, require_current_claim=True)
+    assert fence_error.value.status_code == 409

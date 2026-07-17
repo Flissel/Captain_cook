@@ -122,6 +122,7 @@ class CodexSessionStartedPayload(_FrozenContract):
 class CodexSessionEventPayload(_FrozenContract):
     event_type: Literal["codex_session_event"]
     session_id: str = Field(min_length=1)
+    source_sequence: int = Field(ge=0, strict=True)
     lifecycle: Literal[
         "started",
         "turn_started",
@@ -135,10 +136,33 @@ class CodexSessionEventPayload(_FrozenContract):
     cached_input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
 
+    @model_validator(mode="after")
+    def require_lifecycle_owned_metadata(self) -> CodexSessionEventPayload:
+        item_fields = (self.item_id, self.item_type)
+        token_fields = (
+            self.input_tokens,
+            self.cached_input_tokens,
+            self.output_tokens,
+        )
+        if self.lifecycle == "item_completed":
+            if any(value is None for value in item_fields) or any(
+                value is not None for value in token_fields
+            ):
+                raise ValueError("item_completed requires only item metadata")
+        elif self.lifecycle == "turn_completed":
+            if any(value is not None for value in item_fields) or any(
+                value is None for value in token_fields
+            ):
+                raise ValueError("turn_completed requires only token metadata")
+        elif any(value is not None for value in (*item_fields, *token_fields)):
+            raise ValueError(f"{self.lifecycle} forbids item and token metadata")
+        return self
+
 
 class CodexSessionWarningPayload(_FrozenContract):
     event_type: Literal["codex_session_warning"]
     session_id: str = Field(min_length=1)
+    source_sequence: int = Field(ge=0, strict=True)
     warning_type: Literal["malformed_json", "unknown_event", "invalid_event"]
     line_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
@@ -440,6 +464,8 @@ class BatchProjection(BaseModel):
     parent_index: int
     status: BatchStatus
     claim_token_sha256: str | None = None
+    claim_id: str | None = None
+    fencing_token: int | None = None
     claim_expires_at: datetime | None = None
     claim_iteration: int = 0
     codex_session_recorded: bool = False
@@ -452,6 +478,8 @@ class BatchProjection(BaseModel):
 
 class ClaimEvent(BaseModel):
     batch_id: str
+    claim_id: str = Field(min_length=1)
+    fencing_token: int = Field(ge=1, strict=True)
     claim_token_sha256: str
     claim_expires_at: datetime
 
@@ -651,6 +679,8 @@ def project_batch(
 
     status: BatchStatus = parent["status"]
     claim_token_sha256: str | None = None
+    claim_id: str | None = None
+    fencing_token: int | None = None
     claim_expires_at: datetime | None = None
     claim_iteration = 0
     codex_session_recorded = False
@@ -683,6 +713,8 @@ def project_batch(
             assert isinstance(event, ClaimEvent)
             claim_iteration += 1
             claim_token_sha256 = event.claim_token_sha256
+            claim_id = event.claim_id
+            fencing_token = event.fencing_token
             claim_expires_at = _as_utc(event.claim_expires_at)
             codex_session_recorded = False
             validation_run_recorded = False
@@ -747,6 +779,8 @@ def project_batch(
             recovery_recorded = True
             recovered_iteration = event.iteration
             claim_token_sha256 = None
+            claim_id = None
+            fencing_token = None
             claim_expires_at = None
             if event.decision == "aborted_infra":
                 status = "aborted_infra"
@@ -782,6 +816,8 @@ def project_batch(
         parent_index=parent["index"],
         status=status,
         claim_token_sha256=claim_token_sha256,
+        claim_id=claim_id,
+        fencing_token=fencing_token,
         claim_expires_at=claim_expires_at,
         claim_iteration=claim_iteration,
         codex_session_recorded=codex_session_recorded,

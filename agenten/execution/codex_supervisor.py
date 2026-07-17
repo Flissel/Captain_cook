@@ -186,7 +186,12 @@ class CodexSupervisor:
             )
 
         try:
-            events = tuple(parse_codex_jsonl(line) for line in run_result.jsonl_lines)
+            events = tuple(
+                parse_codex_jsonl(line).model_copy(
+                    update={"source_sequence": source_sequence}
+                )
+                for source_sequence, line in enumerate(run_result.jsonl_lines)
+            )
             for event in events:
                 await self._gateway.record_codex_event(
                     request.batch_id,
@@ -251,10 +256,19 @@ class CodexSupervisor:
             )
 
         try:
-            events = tuple(parse_codex_jsonl(line) for line in run_result.jsonl_lines)
+            events = tuple(
+                parse_codex_jsonl(line).model_copy(
+                    update={"source_sequence": source_sequence}
+                )
+                for source_sequence, line in enumerate(run_result.jsonl_lines)
+            )
             for event in events:
                 await self._repository.append(event)
         except Exception:
+            await self._finish_repository(
+                request.session_id,
+                CodexOutcome(classification="infrastructure_failure"),
+            )
             return self._result(
                 request,
                 PackageExecutionStatus.FAILED,

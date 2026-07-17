@@ -57,6 +57,14 @@ class CodexOutcome(BaseModel):
         return self
 
 
+class CodexCancellationResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    session_id: str = Field(min_length=1)
+    outcome: Literal["cancelled"]
+    cancellation_reason: CancellationReason
+
+
 class CodexRunRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -89,6 +97,10 @@ class CodexRunRepository(Protocol):
 
     async def finish(
         self, session_id: str, outcome: CodexOutcome
+    ) -> None: ...
+
+    async def persist_cancellation(
+        self, result: CodexCancellationResult
     ) -> None: ...
 
 
@@ -151,8 +163,7 @@ class GatewayCodexRunRepository:
         session_id: str,
         event: CodexProcessEvent | CodexParseWarning,
     ) -> None:
-        if not claim_token:
-            raise ValueError("claim_token must not be empty")
+        del claim_token  # Gateway validates current claim identity atomically.
         records = self._started(await self._history())
         record = records.get(session_id)
         if (
@@ -174,6 +185,8 @@ class GatewayCodexRunRepository:
         )
         if session_id is None:
             raise ValueError("Codex event has no active session")
+        if event.source_sequence is None:
+            raise ValueError("Codex event requires source_sequence")
         events = await self._history()
         record = self._started(events).get(session_id)
         if record is None or session_id in self._finished(events):
@@ -191,6 +204,7 @@ class GatewayCodexRunRepository:
             payload = CodexSessionWarningPayload(
                 event_type="codex_session_warning",
                 session_id=session_id,
+                source_sequence=event.source_sequence,
                 warning_type=event.warning_type,
                 line_sha256=event.line_sha256,
             )
@@ -247,6 +261,18 @@ class GatewayCodexRunRepository:
             payload=payload,
             event_key=f"finished:{session_id}",
             occurred_at=ended_at,
+        )
+
+    async def persist_cancellation(
+        self,
+        result: CodexCancellationResult,
+    ) -> None:
+        await self.finish(
+            result.session_id,
+            CodexOutcome(
+                classification=result.outcome,
+                cancellation_reason=result.cancellation_reason,
+            ),
         )
 
     async def reconcile(
@@ -400,15 +426,16 @@ class GatewayCodexRunRepository:
             payload = event.payload
             if not isinstance(payload, CodexSessionFinishedPayload):
                 continue
-            outcomes.setdefault(
-                payload.session_id,
-                CodexOutcome(
-                    classification=payload.outcome,
-                    exit_code=payload.exit_code,
-                    cancellation_reason=payload.cancellation_reason,
-                    behavioral_repair_increment=payload.behavioral_repair_increment,
-                ),
+            outcome = CodexOutcome(
+                classification=payload.outcome,
+                exit_code=payload.exit_code,
+                cancellation_reason=payload.cancellation_reason,
+                behavioral_repair_increment=payload.behavioral_repair_increment,
             )
+            existing = outcomes.get(payload.session_id)
+            if existing is not None and existing != outcome:
+                raise ValueError("conflicting terminal Codex session history")
+            outcomes.setdefault(payload.session_id, outcome)
         return outcomes
 
     @classmethod

@@ -54,6 +54,8 @@ class GatewayBatchProjection(BaseModel):
     parent_index: int = Field(ge=0, strict=True)
     status: BatchStatus
     claim_token_sha256: str | None = None
+    claim_id: str | None = None
+    fencing_token: int | None = None
     claim_expires_at: datetime | None = None
     claim_iteration: int = Field(ge=0, strict=True)
     codex_session_recorded: bool
@@ -68,6 +70,8 @@ class GatewayClaim(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     token: str = Field(min_length=1)
+    claim_id: str = Field(min_length=1)
+    fencing_token: int = Field(ge=1, strict=True)
     expires_at: datetime
     iteration: int = Field(ge=1, strict=True)
 
@@ -109,6 +113,8 @@ class _ClaimResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     claim_token: str = Field(min_length=1)
+    claim_id: str = Field(min_length=1)
+    fencing_token: int = Field(ge=1, strict=True)
     claim_expires_at: datetime
 
 
@@ -265,6 +271,8 @@ class GatewayDeliveryClient:
             raise GatewayDeliveryError("claim batch returned an inconsistent projection")
         return GatewayClaim(
             token=claimed.claim_token,
+            claim_id=claimed.claim_id,
+            fencing_token=claimed.fencing_token,
             expires_at=claimed.claim_expires_at,
             iteration=projection.claim_iteration,
         )

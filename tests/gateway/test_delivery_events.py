@@ -455,6 +455,7 @@ def test_delivery_event_models_are_frozen() -> None:
             "codex_session_event",
             {
                 "session_id": "session-1",
+                "source_sequence": 0,
                 "lifecycle": "turn_completed",
                 "input_tokens": 10,
                 "cached_input_tokens": 2,
@@ -465,6 +466,7 @@ def test_delivery_event_models_are_frozen() -> None:
             "codex_session_warning",
             {
                 "session_id": "session-1",
+                "source_sequence": 1,
                 "warning_type": "malformed_json",
                 "line_sha256": "c" * 64,
             },
@@ -554,6 +556,77 @@ def test_codex_terminal_outcome_enforces_repair_and_cancellation_invariants(
                     "ended_at": NOW,
                     "exit_code": None,
                     **payload,
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "payload_update",
+    (
+        {"lifecycle": "item_completed", "item_id": None, "item_type": None},
+        {"lifecycle": "item_completed", "input_tokens": 1},
+        {"lifecycle": "turn_completed", "item_id": "item-1", "item_type": "message"},
+        {"lifecycle": "turn_started", "output_tokens": 1},
+        {"lifecycle": "failed", "item_id": "item-1"},
+        {"lifecycle": "started", "cached_input_tokens": 1},
+    ),
+)
+def test_codex_lifecycle_payload_rejects_fields_owned_by_other_lifecycles(
+    payload_update: dict[str, object],
+) -> None:
+    payload = {
+        "event_type": "codex_session_event",
+        "session_id": "session-1",
+        "source_sequence": 3,
+        **payload_update,
+    }
+    if payload_update["lifecycle"] == "item_completed":
+        payload.setdefault("item_id", "item-1")
+        payload.setdefault("item_type", "message")
+    with pytest.raises(ValidationError):
+        DeliveryEventEnvelope.model_validate(
+            {
+                "event_id": uuid4(),
+                "event_type": "codex_session_event",
+                "occurred_at": NOW,
+                "actor": "worker-1",
+                "trace": {
+                    **TRACE,
+                    "batch_id": "batch-1",
+                    "worker_id": "worker-1",
+                    "claim_id": "claim-1",
+                    "fencing_token": 7,
+                    "session_id": "session-1",
+                },
+                "payload": payload,
+            }
+        )
+
+
+def test_codex_warning_requires_sequence_and_forbids_lifecycle_metadata() -> None:
+    with pytest.raises(ValidationError):
+        DeliveryEventEnvelope.model_validate(
+            {
+                "event_id": uuid4(),
+                "event_type": "codex_session_warning",
+                "occurred_at": NOW,
+                "actor": "worker-1",
+                "trace": {
+                    **TRACE,
+                    "batch_id": "batch-1",
+                    "worker_id": "worker-1",
+                    "claim_id": "claim-1",
+                    "fencing_token": 7,
+                    "session_id": "session-1",
+                },
+                "payload": {
+                    "event_type": "codex_session_warning",
+                    "session_id": "session-1",
+                    "source_sequence": 0,
+                    "warning_type": "malformed_json",
+                    "line_sha256": "a" * 64,
+                    "input_tokens": 1,
                 },
             }
         )

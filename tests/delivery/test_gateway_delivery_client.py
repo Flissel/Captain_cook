@@ -20,6 +20,8 @@ def projection(*, iteration: int = 1) -> dict[str, object]:
         "parent_index": 41,
         "status": "claimed",
         "claim_token_sha256": "a" * 64,
+        "claim_id": "claim-current",
+        "fencing_token": iteration,
         "claim_expires_at": "2026-07-16T12:00:00Z",
         "claim_iteration": iteration,
         "codex_session_recorded": False,
@@ -36,7 +38,12 @@ async def test_claim_returns_typed_token_and_current_iteration() -> None:
         if request.method == "POST":
             return httpx.Response(
                 200,
-                json={"claim_token": "claim-secret", "claim_expires_at": "2026-07-16T12:00:00Z"},
+                json={
+                    "claim_token": "claim-secret",
+                    "claim_id": "claim-current",
+                    "fencing_token": 3,
+                    "claim_expires_at": "2026-07-16T12:00:00Z",
+                },
                 request=request,
             )
         return httpx.Response(200, json=projection(iteration=3), request=request)
@@ -46,6 +53,8 @@ async def test_claim_returns_typed_token_and_current_iteration() -> None:
         claim = await client.claim("batch-1")
 
     assert claim.token == "claim-secret"
+    assert claim.claim_id == "claim-current"
+    assert claim.fencing_token == 3
     assert claim.iteration == 3
     assert claim.expires_at == datetime(2026, 7, 16, 12, tzinfo=timezone.utc)
     assert [request.url.path for request in requests] == [

@@ -175,9 +175,12 @@ def create_app(
     async def append_delivery_event(
         event: DeliveryEventEnvelope,
         response: Response,
-        _: GatewayRole = Depends(require_actor),
+        actor: GatewayRole = Depends(require_actor),
     ) -> AppendResult:
-        result = get_store().append_delivery_event(event)
+        result = get_store().append_delivery_event(
+            event,
+            require_current_claim=actor is GatewayRole.WORKER,
+        )
         response.status_code = status.HTTP_200_OK if result.replayed else status.HTTP_201_CREATED
         return result
 

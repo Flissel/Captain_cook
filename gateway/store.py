@@ -120,9 +120,19 @@ class GatewayStore:
                     """
                 )
 
-    def append_delivery_event(self, event: DeliveryEventEnvelope) -> AppendResult:
+    def append_delivery_event(
+        self,
+        event: DeliveryEventEnvelope,
+        *,
+        require_current_claim: bool = False,
+    ) -> AppendResult:
         try:
-            stored = self._retry_write(lambda: self._append_delivery_event_once(event))
+            stored = self._retry_write(
+                lambda: self._append_delivery_event_once(
+                    event,
+                    require_current_claim=require_current_claim,
+                )
+            )
             return AppendResult(event=stored, replayed=False)
         except _DeliveryEventReplay as replay:
             return AppendResult(event=replay.event, replayed=True)
@@ -130,12 +140,36 @@ class GatewayStore:
     def _append_delivery_event_once(
         self,
         event: DeliveryEventEnvelope,
+        *,
+        require_current_claim: bool,
     ) -> DeliveryEventEnvelope:
         canonical = event.model_dump(mode="json")
         trace = event.trace
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
                 index = self._next_index(cursor)
+                batch_id = trace.batch_id
+                if require_current_claim:
+                    if batch_id is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="delivery event must match the current claim",
+                        )
+                    _, _, projection = self._batch_context(
+                        cursor,
+                        batch_id,
+                        for_update=True,
+                        now=_utcnow(),
+                    )
+                    if (
+                        projection.status != "claimed"
+                        or trace.claim_id != projection.claim_id
+                        or trace.fencing_token != projection.fencing_token
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="delivery event must match the current claim",
+                        )
                 cursor.execute(
                     """
                     SELECT data FROM blocks
@@ -158,7 +192,6 @@ class GatewayStore:
                         detail="event_id already exists with different content",
                     )
 
-                batch_id = trace.batch_id
                 if batch_id is not None:
                     cursor.execute(
                         """
@@ -718,9 +751,13 @@ class GatewayStore:
                 if projection.status != "pending":
                     raise HTTPException(status_code=409, detail="batch is not claimable")
                 token = secrets.token_urlsafe(32)
+                claim_id = secrets.token_urlsafe(18)
+                fencing_token = projection.claim_iteration + 1
                 expiry = now + timedelta(minutes=90)
                 event = ClaimEvent(
                     batch_id=batch_id,
+                    claim_id=claim_id,
+                    fencing_token=fencing_token,
                     claim_token_sha256=hashlib.sha256(token.encode("utf-8")).hexdigest(),
                     claim_expires_at=expiry,
                 )
@@ -734,7 +771,12 @@ class GatewayStore:
                 )
                 self._validate_candidate(parent, children, block, batch_id, now=now)
                 self._insert(cursor, block)
-        return {"claim_token": token, "claim_expires_at": expiry.isoformat()}
+        return {
+            "claim_token": token,
+            "claim_id": claim_id,
+            "fencing_token": fencing_token,
+            "claim_expires_at": expiry.isoformat(),
+        }
 
     def heartbeat(self, batch_id: str, token: str | None) -> dict[str, str]:
         return self._retry_write(lambda: self._heartbeat_once(batch_id, token))
