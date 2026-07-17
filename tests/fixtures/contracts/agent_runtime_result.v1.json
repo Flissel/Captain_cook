@@ -1,0 +1,29 @@
+{
+  "schema": "captain.agent-runtime-result.v1",
+  "event_id": "00000000-0000-0000-0000-000000000003",
+  "command_id": "00000000-0000-0000-0000-000000000001",
+  "correlation_id": "00000000-0000-0000-0000-000000000002",
+  "occurred_at": "2026-07-17T12:05:00Z",
+  "producer": "hermes-runtime",
+  "subject_id": "subtask-1",
+  "subject_version": 3,
+  "grant_id": "grant-1",
+  "operation": "codex.run",
+  "status": "succeeded",
+  "session_id": "session-1",
+  "artifact_refs": [
+    {
+      "uri": "artifact://runtime/build-1",
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "media_type": "application/json"
+    }
+  ],
+  "evidence_refs": [
+    {
+      "uri": "artifact://runtime/evidence-1",
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "media_type": "application/json"
+    }
+  ],
+  "error": null
+}

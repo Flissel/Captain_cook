@@ -1,0 +1,23 @@
+schema: captain.agent-blueprint.v1
+name: integration_researcher
+purpose: Discover supported integrations and return a typed recommendation.
+inputs:
+  project_context: object
+outputs:
+  recommendation: object
+system_prompt_ref:
+  uri: artifact://runtime/system-prompt
+  sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  media_type: text/markdown
+tools:
+  - knowledge.search
+integration_intent: none
+n8n_tool_families: []
+handoffs:
+  - captain.decompose
+limits:
+  max_turns: 8
+  wall_seconds: 300
+evaluation_cases:
+  - case_id: rejects-unapproved-tools
+    assertion: tool_allowlist_enforced

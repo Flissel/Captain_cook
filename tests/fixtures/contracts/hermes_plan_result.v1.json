@@ -1,0 +1,35 @@
+{
+  "schema": "captain.hermes-plan-result.v1",
+  "project_id": "project-1",
+  "correlation_id": "00000000-0000-0000-0000-000000000002",
+  "subject_version": 1,
+  "plan_ref": {
+    "uri": "artifact://runtime/plan-1",
+    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "media_type": "text/markdown"
+  },
+  "decision_log_ref": {
+    "uri": "artifact://runtime/decision-log-1",
+    "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "media_type": "application/json"
+  },
+  "blueprint_refs": [
+    {
+      "uri": "artifact://runtime/blueprint-1",
+      "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "media_type": "application/yaml"
+    }
+  ],
+  "assumptions": ["The external integration endpoint is available."],
+  "open_questions": [],
+  "risks": ["External service availability can delay validation."],
+  "integration_intents": ["n8n"],
+  "minibook": {
+    "project_id": "minibook-project-1",
+    "post_id": "plan-post-1"
+  },
+  "planner_id": "hermes-planner-1",
+  "runtime_provenance": "hermes-agent/planner-v1",
+  "started_at": "2026-07-17T12:00:00Z",
+  "ended_at": "2026-07-17T12:04:00Z"
+}
