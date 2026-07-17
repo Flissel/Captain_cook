@@ -96,3 +96,19 @@ def test_lone_surrogate_becomes_a_hashed_warning_without_raising() -> None:
     assert warning.line_sha256 == __import__("hashlib").sha256(
         line.encode("utf-8", "surrogatepass")
     ).hexdigest()
+
+
+def test_oversized_json_integer_becomes_a_warning_without_raising() -> None:
+    line = (
+        '{"type":"turn.completed","usage":{"input_tokens":'
+        + "9" * 5000
+        + ',"cached_input_tokens":0,"output_tokens":1}}'
+    )
+
+    try:
+        warning = parse_codex_jsonl(line)
+    except ValueError as error:
+        pytest.fail(f"parser leaked a JSON decoding error: {error}")
+
+    assert isinstance(warning, CodexParseWarning)
+    assert warning.warning_type == "malformed_json"

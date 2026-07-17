@@ -51,7 +51,7 @@ def parse_codex_jsonl(line: str) -> CodexProcessEvent | CodexParseWarning:
     ).hexdigest()
     try:
         record = json.loads(line)
-    except (json.JSONDecodeError, UnicodeError, RecursionError):
+    except (ValueError, UnicodeError, RecursionError):
         return _warning("malformed_json", line_sha256)
 
     if not isinstance(record, dict):
