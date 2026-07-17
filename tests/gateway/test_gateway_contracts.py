@@ -470,6 +470,8 @@ def test_review_decision_is_strict_immutable_current_iteration_evidence() -> Non
         ReviewDecisionEvent.model_validate(
             {**event.model_dump(), "workspace_path": r"C:\\private\\review.txt"}
         )
+    with pytest.raises(ValidationError):
+        event.decision = "failed"
 
 
 def test_succeeded_requires_current_iteration_passing_review() -> None:

@@ -7,7 +7,10 @@ from contextlib import asynccontextmanager
 from threading import Lock
 from typing import Any, Literal, Protocol
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from blockchain.mariadb_storage import MariaDBStorage
@@ -111,6 +114,24 @@ def create_app(
     )
     app.state.gateway_settings = settings
     app.state.gateway_settings_lock = Lock()
+
+    @app.exception_handler(RequestValidationError)
+    async def sanitized_review_validation_error(
+        request: Request,
+        exc: RequestValidationError,
+    ):
+        path = request.url.path
+        if (
+            request.method == "POST"
+            and path.startswith("/batches/")
+            and path.endswith("/review")
+            and path.count("/") == 3
+        ):
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "invalid review decision"},
+            )
+        return await request_validation_exception_handler(request, exc)
 
     def get_store() -> GatewayStore:
         nonlocal store

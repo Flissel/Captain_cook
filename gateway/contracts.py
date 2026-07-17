@@ -106,7 +106,7 @@ class RecoveryDecisionEvent(BaseModel):
 
 
 class ReviewDecisionEvent(EvidenceEvent):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     review_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
     decision: Literal["passed", "failed"]

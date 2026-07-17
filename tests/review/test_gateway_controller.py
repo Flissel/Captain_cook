@@ -6,10 +6,14 @@ from pathlib import Path
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from pydantic import SecretStr
 
 from agenten.delivery.gateway_client import GatewayDeliveryClient, GatewayDeliveryError
 from agenten.review.gateway_controller import GatewayReviewController, GatewayReviewDecision
+from gateway.app import create_app
+from gateway.settings import GatewaySettings
 
 
 class FakeReviewGateway:
@@ -21,6 +25,11 @@ class FakeReviewGateway:
     ) -> GatewayReviewDecision:
         self.decisions.append(decision)
         return decision
+
+
+class RecordingMirror:
+    def enqueue_nowait(self, block: dict[str, object]) -> None:
+        del block
 
 
 @pytest.mark.asyncio
@@ -115,3 +124,32 @@ def test_gateway_review_controller_boundary_has_no_database_dependency() -> None
     assert "gateway.store" not in source
     assert "pymysql" not in source
     assert "mariadb" not in source
+
+
+def test_malformed_authenticated_review_does_not_echo_rejected_input() -> None:
+    secret_path = r"C:\\private\\captain-token.txt"
+    settings = GatewaySettings(
+        ledger_dsn=SecretStr("unused-test-dsn"),
+        captain_gateway_token=SecretStr("captain-token"),
+        worker_gateway_token=SecretStr("worker-token"),
+    )
+    application = create_app(mirror=RecordingMirror(), settings=settings)
+
+    with TestClient(application) as client:
+        response = client.post(
+            "/batches/batch-1/review",
+            headers={"Authorization": "Bearer captain-token"},
+            json={
+                "batch_id": "batch-1",
+                "iteration": 1,
+                "review_id": "review-1",
+                "decision": "passed",
+                "evidence_refs": ["artifact://validation/run-1"],
+                "workspace_path": secret_path,
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid review decision"}
+    assert secret_path not in response.text
+    assert "captain-token.txt" not in response.text
