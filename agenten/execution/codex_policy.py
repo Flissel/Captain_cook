@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
+from types import MappingProxyType
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -15,14 +17,48 @@ class CodexPolicyViolation(ValueError):
     """Raised when a requested Codex run cannot be launched safely."""
 
 
+class FrozenEnvironment(Mapping[str, str]):
+    """Immutable environment values with a secret-safe representation."""
+
+    __slots__ = ("_values",)
+
+    def __init__(self, values: Mapping[str, str]) -> None:
+        object.__setattr__(self, "_values", MappingProxyType(dict(values)))
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise TypeError("authorized environment is immutable")
+
+    def __getitem__(self, name: str) -> str:
+        return self._values[name]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __repr__(self) -> str:
+        return f"FrozenEnvironment(keys={tuple(self._values)!r})"
+
+    def copy_for_child(self) -> dict[str, str]:
+        """Return a fresh mutable mapping suitable for a child process."""
+        return dict(self._values)
+
+
 class AuthorizedCodexRun(BaseModel):
     """Sanitized launch data, safe to retain as non-secret process metadata."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True, extra="forbid", frozen=True, strict=True
+    )
 
     workspace: Path
     command: tuple[str, ...]
-    environment: Mapping[str, str] = Field(exclude=True, repr=False)
+    environment: FrozenEnvironment = Field(exclude=True, repr=False)
+
+    def child_environment(self) -> dict[str, str]:
+        """Return an isolated environment copy for the authorized child process."""
+        return self.environment.copy_for_child()
 
 
 class CodexExecutionPolicy:
@@ -32,8 +68,19 @@ class CodexExecutionPolicy:
         {"PATH", "HOME", "USERPROFILE", "LANG", "LC_ALL", "TERM", "NO_COLOR"}
     )
     _ALLOWED_COMMAND_PREFIX = ("codex", "exec", "--json")
-    _FORBIDDEN_SECRET_PATH_NAMES = frozenset(
-        {".env", ".env.local", ".env.production", "id_rsa", "id_ed25519"}
+    _FORBIDDEN_SECRET_PATH_PATTERNS = (
+        re.compile(
+            r"(?i)(?<![\w])\.env(?:\.[a-z0-9_-]+)?(?=$|[\\/\s'\"`),:;])"
+        ),
+        re.compile(
+            r"(?i)(?<![\w])id_(?:rsa|ed25519)(?:\.pub)?"
+            r"(?=$|[\\/\s'\"`),:;])"
+        ),
+        re.compile(
+            r"(?i)(?:[\\/]private[-_]key(?:\.(?:pem|key|p8|p12))?|"
+            r"(?<![\w])private[-_]key\.(?:pem|key|p8|p12))"
+            r"(?=$|[\\/\s'\"`),:;])"
+        ),
     )
 
     def __init__(
@@ -43,11 +90,13 @@ class CodexExecutionPolicy:
         environment: Mapping[str, str],
     ) -> None:
         self._workspace_root = workspace_root.resolve()
-        self._environment = {
-            name: value
-            for name, value in environment.items()
-            if name in self._ALLOWED_ENVIRONMENT_NAMES
-        }
+        self._environment = FrozenEnvironment(
+            {
+                name: value
+                for name, value in environment.items()
+                if name in self._ALLOWED_ENVIRONMENT_NAMES
+            }
+        )
 
     def authorize(self, request: CodexRunRequest) -> AuthorizedCodexRun:
         """Return a launch-safe request or reject it before any process starts."""
@@ -90,16 +139,19 @@ class CodexExecutionPolicy:
     @classmethod
     def _require_allowed_command(cls, command: tuple[str, ...]) -> None:
         if (
-            len(command) == len(cls._ALLOWED_COMMAND_PREFIX)
+            len(command) != len(cls._ALLOWED_COMMAND_PREFIX) + 1
             or command[: len(cls._ALLOWED_COMMAND_PREFIX)] != cls._ALLOWED_COMMAND_PREFIX
+            or command[-1].lstrip().startswith("-")
         ):
             raise CodexPolicyViolation("command is not in the Codex allowlist")
 
     @classmethod
     def _reject_secret_paths(cls, command: tuple[str, ...]) -> None:
         for argument in command:
-            path_name = Path(argument).name.casefold()
-            if path_name in cls._FORBIDDEN_SECRET_PATH_NAMES:
+            if any(
+                pattern.search(argument)
+                for pattern in cls._FORBIDDEN_SECRET_PATH_PATTERNS
+            ):
                 raise CodexPolicyViolation("command references a forbidden secret path")
 
     @staticmethod
