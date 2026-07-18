@@ -181,6 +181,31 @@ def test_external_mode_retains_existing_environment_contract() -> None:
     assert endpoint.api_key == "sensitive-key-for-redaction"
 
 
+def test_external_mode_rejects_configured_captain_endpoint_identity() -> None:
+    with pytest.raises(N8nEndpointConfigurationError, match="CAPTAIN_N8N_URL"):
+        resolve_n8n_endpoint(
+            {
+                "N8N_MODE": "external",
+                "N8N_URL": "http://LOCALHOST:5679/",
+                "N8N_MCP_TOKEN": "sensitive-key-for-redaction",
+                "CAPTAIN_N8N_URL": "http://localhost:5679",
+            }
+        )
+
+
+def test_external_mode_allows_unrelated_url_when_captain_url_is_configured() -> None:
+    endpoint = resolve_n8n_endpoint(
+        {
+            "N8N_MODE": "external",
+            "N8N_URL": "https://automation.example.test/n8n",
+            "N8N_MCP_TOKEN": "sensitive-key-for-redaction",
+            "CAPTAIN_N8N_URL": "http://localhost:5679",
+        }
+    )
+
+    assert endpoint.api_base_url == "https://automation.example.test/n8n"
+
+
 @pytest.mark.parametrize("mode", ["external", "captain-builder"])
 def test_endpoint_rejects_query_or_fragment_that_could_leak_secrets(
     mode: str,
@@ -280,6 +305,30 @@ def test_hermes_reference_returns_a_fresh_child_environment() -> None:
     assert reference.child_process_environment()["N8N_MCP_TOKEN"] == (
         "sensitive-key-for-redaction"
     )
+
+
+def test_hermes_reference_rejects_external_endpoint() -> None:
+    command = command_for()
+    grant = derive_grant(
+        command,
+        released_batch(capability_tag="n8n-builder"),
+        NOW,
+    )
+    external_endpoint = resolve_n8n_endpoint(
+        {
+            "N8N_MODE": "external",
+            "N8N_URL": "https://n8n.example.test",
+            "N8N_MCP_TOKEN": "sensitive-key-for-redaction",
+        }
+    )
+
+    with pytest.raises(N8nEndpointConfigurationError, match="captain-builder"):
+        build_hermes_n8n_reference(
+            grant,
+            command,
+            external_endpoint,
+            NOW + timedelta(seconds=1),
+        )
 
 
 def test_expired_grant_cannot_create_hermes_reference() -> None:

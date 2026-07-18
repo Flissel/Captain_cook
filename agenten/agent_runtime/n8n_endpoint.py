@@ -58,6 +58,13 @@ def resolve_n8n_endpoint(environment: Mapping[str, str]) -> N8nEndpoint:
         base_url = _required_value(environment, "N8N_URL")
         api_key = _required_value(environment, "N8N_MCP_TOKEN")
         normalized_url = _normalize_external_url(base_url)
+        captain_url = environment.get("CAPTAIN_N8N_URL", "").strip()
+        if captain_url and _endpoint_identity(normalized_url) == _endpoint_identity(
+            captain_url
+        ):
+            raise N8nEndpointConfigurationError(
+                "external N8N_URL must not equal CAPTAIN_N8N_URL"
+            )
     else:
         base_url = _required_value(environment, "CAPTAIN_N8N_URL")
         api_key = _required_value(
@@ -89,6 +96,10 @@ def build_hermes_n8n_reference(
     if grant.mcp_servers != ("n8n-mcp",):
         raise CapabilityDenied(
             "Hermes n8n configuration requires exactly the n8n-mcp server"
+        )
+    if endpoint.mode != "captain-builder":
+        raise N8nEndpointConfigurationError(
+            "Hermes n8n configuration requires a captain-builder endpoint"
         )
 
     reference = HermesN8nReference(endpoint_identity=endpoint.api_base_url)
@@ -165,6 +176,31 @@ def _parse_url(value: str) -> SplitResult:
             "selected n8n URL must not contain a query or fragment"
         )
     return parsed
+
+
+def _endpoint_identity(value: str) -> tuple[str, str, int | None, str] | None:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    if port is None:
+        port = 80 if parsed.scheme == "http" else 443
+    return (
+        parsed.scheme.lower(),
+        parsed.hostname.lower(),
+        port,
+        parsed.path.rstrip("/"),
+    )
 
 
 def _is_loopback_host(host: str) -> bool:
