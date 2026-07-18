@@ -1,0 +1,53 @@
+name: captain-n8n-builder
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${CAPTAIN_N8N_POSTGRES_DB:?missing}
+      POSTGRES_USER: ${CAPTAIN_N8N_POSTGRES_USER:?missing}
+      POSTGRES_PASSWORD: ${CAPTAIN_N8N_POSTGRES_PASSWORD:?missing}
+      TZ: Europe/Berlin
+    volumes:
+      - captain_n8n_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  n8n:
+    image: n8nio/n8n:2.29.10
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${CAPTAIN_N8N_POSTGRES_DB:?missing}
+      - DB_POSTGRESDB_USER=${CAPTAIN_N8N_POSTGRES_USER:?missing}
+      - DB_POSTGRESDB_PASSWORD=${CAPTAIN_N8N_POSTGRES_PASSWORD:?missing}
+      - N8N_ENCRYPTION_KEY=${CAPTAIN_N8N_ENCRYPTION_KEY:?missing}
+      - N8N_HOST=localhost
+      - N8N_PROTOCOL=http
+      - WEBHOOK_URL=http://localhost:${CAPTAIN_N8N_PORT:-5679}/
+      - GENERIC_TIMEZONE=Europe/Berlin
+      - TZ=Europe/Berlin
+      - EXECUTIONS_DATA_PRUNE=true
+      - EXECUTIONS_DATA_MAX_AGE=336
+    ports:
+      - "127.0.0.1:${CAPTAIN_N8N_PORT:-5679}:5678"
+    volumes:
+      - captain_n8n_data:/home/node/.n8n
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:5678/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  captain_n8n_postgres_data: {}
+  captain_n8n_data: {}
