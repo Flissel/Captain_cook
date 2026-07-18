@@ -402,6 +402,20 @@ function ConvertFrom-SecureValue {
     }
 }
 
+function ConvertTo-SecureStringValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Value
+    )
+
+    $secureValue = [System.Security.SecureString]::new()
+    foreach ($character in $Value.ToCharArray()) {
+        $secureValue.AppendChar($character)
+    }
+    $secureValue.MakeReadOnly()
+    return $secureValue
+}
+
 function Wait-CaptainN8nHealth {
     param(
         [Parameter(Mandatory = $true)]
@@ -470,13 +484,13 @@ function Invoke-Start {
 
     if (-not (Test-CaptainN8nRunning)) {
         Assert-LoopbackPortAvailable -Port (Get-CaptainPort)
-        & docker compose -p captain-n8n-builder --env-file $EnvFile -f $ComposeFile up -d --wait
-        if ($LASTEXITCODE -ne 0) {
-            throw "Captain n8n startup failed; inspect only the captain-n8n-builder project."
-        }
+    }
+    & docker compose -p captain-n8n-builder --env-file $EnvFile -f $ComposeFile up -d --wait
+    if ($LASTEXITCODE -ne 0) {
+        throw "Captain n8n readiness failed; inspect only the captain-n8n-builder project."
     }
     Assert-CaptainInventory
-    Write-Output "Captain n8n project is running with the expected inventory."
+    Write-Output "Captain n8n project services are ready with the expected inventory."
 }
 
 function Invoke-Bootstrap {
@@ -497,7 +511,7 @@ function Invoke-Bootstrap {
         return
     }
 
-    $securePassword = ConvertTo-SecureString -String $values["CAPTAIN_N8N_OWNER_PASSWORD"] -AsPlainText -Force
+    $securePassword = ConvertTo-SecureStringValue -Value $values["CAPTAIN_N8N_OWNER_PASSWORD"]
     $ownerPassword = ConvertFrom-SecureValue -SecureValue $securePassword
     $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
     try {
