@@ -97,10 +97,7 @@ def build_hermes_n8n_reference(
         raise CapabilityDenied(
             "Hermes n8n configuration requires exactly the n8n-mcp server"
         )
-    if endpoint.mode != "captain-builder":
-        raise N8nEndpointConfigurationError(
-            "Hermes n8n configuration requires a captain-builder endpoint"
-        )
+    _validate_builder_endpoint(endpoint)
 
     reference = HermesN8nReference(endpoint_identity=endpoint.api_base_url)
     reference._child_environment.update(
@@ -122,6 +119,19 @@ def _required_value(
     if not value:
         raise N8nEndpointConfigurationError(f"{label or name} must not be empty")
     return value
+
+
+def _validate_builder_endpoint(endpoint: N8nEndpoint) -> None:
+    if endpoint.mode != "captain-builder":
+        raise N8nEndpointConfigurationError(
+            "Hermes n8n configuration requires a captain-builder endpoint"
+        )
+    api_base_url = _normalize_builder_url(endpoint.api_base_url)
+    webhook_base_url = _normalize_builder_url(endpoint.webhook_base_url)
+    if _endpoint_identity(api_base_url) != _endpoint_identity(webhook_base_url):
+        raise N8nEndpointConfigurationError(
+            "captain-builder API and webhook endpoints must have one identity"
+        )
 
 
 def _normalize_builder_url(value: str) -> str:
@@ -195,9 +205,14 @@ def _endpoint_identity(value: str) -> tuple[str, str, int | None, str] | None:
         return None
     if port is None:
         port = 80 if parsed.scheme == "http" else 443
+    host = (
+        "loopback"
+        if _is_loopback_host(parsed.hostname)
+        else parsed.hostname.lower()
+    )
     return (
         parsed.scheme.lower(),
-        parsed.hostname.lower(),
+        host,
         port,
         parsed.path.rstrip("/"),
     )

@@ -193,6 +193,24 @@ def test_external_mode_rejects_configured_captain_endpoint_identity() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "external_url",
+    ["http://127.0.0.1:5679", "http://[::1]:5679"],
+)
+def test_external_mode_rejects_configured_captain_loopback_alias(
+    external_url: str,
+) -> None:
+    with pytest.raises(N8nEndpointConfigurationError, match="CAPTAIN_N8N_URL"):
+        resolve_n8n_endpoint(
+            {
+                "N8N_MODE": "external",
+                "N8N_URL": external_url,
+                "N8N_MCP_TOKEN": "sensitive-key-for-redaction",
+                "CAPTAIN_N8N_URL": "http://localhost:5679",
+            }
+        )
+
+
 def test_external_mode_allows_unrelated_url_when_captain_url_is_configured() -> None:
     endpoint = resolve_n8n_endpoint(
         {
@@ -327,6 +345,40 @@ def test_hermes_reference_rejects_external_endpoint() -> None:
             grant,
             command,
             external_endpoint,
+            NOW + timedelta(seconds=1),
+        )
+
+
+@pytest.mark.parametrize(
+    ("api_base_url", "webhook_base_url"),
+    [
+        ("http://localhost:15678", "http://localhost:15678"),
+        ("https://n8n.example.test", "https://n8n.example.test"),
+        ("http://localhost:5679", "http://example.test:5679"),
+    ],
+)
+def test_hermes_reference_rejects_forged_builder_endpoint(
+    api_base_url: str,
+    webhook_base_url: str,
+) -> None:
+    command = command_for()
+    grant = derive_grant(
+        command,
+        released_batch(capability_tag="n8n-builder"),
+        NOW,
+    )
+    forged_endpoint = N8nEndpoint(
+        mode="captain-builder",
+        api_base_url=api_base_url,
+        webhook_base_url=webhook_base_url,
+        api_key="sensitive-key-for-redaction",
+    )
+
+    with pytest.raises(N8nEndpointConfigurationError):
+        build_hermes_n8n_reference(
+            grant,
+            command,
+            forged_endpoint,
             NOW + timedelta(seconds=1),
         )
 
