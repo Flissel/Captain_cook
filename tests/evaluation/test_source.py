@@ -54,6 +54,36 @@ def test_load_evaluation_source_redacts_credentials_without_changing_source_prov
     assert "hunter2" not in source.blocks[0].text
 
 
+def test_load_evaluation_source_redacts_indented_and_fenced_secret_assignments(tmp_path: Path) -> None:
+    source_path = tmp_path / "input.md"
+    source_path.write_text(
+        "# Delivery\n\n    OPENAI_API_KEY=indented-secret\n\n```sh\nSERVICE_TOKEN=fenced-secret\npassword=code-password\n```\n",
+        encoding="utf-8",
+    )
+
+    source = load_evaluation_source(source_path, source_reference="input.md", max_block_bytes=1024)
+
+    stored_text = "\n".join(block.text for block in source.blocks)
+    assert stored_text.count("[REDACTED]") == 3
+    assert "indented-secret" not in stored_text
+    assert "fenced-secret" not in stored_text
+    assert "code-password" not in stored_text
+
+
+def test_source_block_rejects_unredacted_high_confidence_credential_assignment() -> None:
+    raw_text = "    SERVICE_TOKEN=raw-secret"
+
+    with pytest.raises(ValidationError, match="redacted"):
+        SourceBlock(
+            block_id="block-0001",
+            heading_path=("Delivery",),
+            line_start=1,
+            line_end=1,
+            sha256=hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
+            text=raw_text,
+        )
+
+
 def test_load_evaluation_source_splits_only_at_stable_line_boundaries(tmp_path: Path) -> None:
     source_path = tmp_path / "input.md"
     source_path.write_text("# Team\nalpha\nbeta\ngamma\n", encoding="utf-8")
@@ -62,6 +92,14 @@ def test_load_evaluation_source_splits_only_at_stable_line_boundaries(tmp_path: 
 
     assert [block.text for block in source.blocks] == ["# Team\nalpha", "beta\ngamma"]
     assert [(block.line_start, block.line_end) for block in source.blocks] == [(1, 2), (3, 4)]
+
+
+def test_load_evaluation_source_rejects_a_line_larger_than_the_block_limit(tmp_path: Path) -> None:
+    source_path = tmp_path / "input.md"
+    source_path.write_text("# Team\nthis line is too long\n", encoding="utf-8")
+
+    with pytest.raises(EvaluationSourceError, match="single source line"):
+        load_evaluation_source(source_path, source_reference="input.md", max_block_bytes=10)
 
 
 @pytest.mark.parametrize("raw", [b"", b" \r\n\t", b"\xff\xfe"])

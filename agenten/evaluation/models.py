@@ -9,6 +9,11 @@ from enum import Enum
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)(?P<name>(?:[A-Za-z][A-Za-z0-9_]*_)?(?:API_KEY|TOKEN)|password)=(?P<value>[^\r\n]*)$"
+)
+
+
 class EvaluationStatus(str, Enum):
     CREATED = "created"
     INVENTORYING = "inventorying"
@@ -38,6 +43,8 @@ class SourceBlock(BaseModel):
             raise ValueError("heading_path entries must be non-empty")
         if self.sha256 != hashlib.sha256(self.text.encode("utf-8")).hexdigest():
             raise ValueError("sha256 does not match redacted block text")
+        if any(match.group("value") != "[REDACTED]" for match in _SECRET_ASSIGNMENT.finditer(self.text)):
+            raise ValueError("source block credential assignments must be redacted")
         return self
 
 

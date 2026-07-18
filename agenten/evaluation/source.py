@@ -3,17 +3,11 @@
 from __future__ import annotations
 
 import hashlib
-import re
 from pathlib import Path
 
 from agenten.planning.input_parser import MarkdownProjectInputParser, ParsedProjectInput
 
-from .models import EvaluationSource, SourceBlock
-
-
-_ASSIGNMENT_SECRET = re.compile(
-    r"(?m)^(?P<name>(?:[A-Za-z][A-Za-z0-9_]*_)?(?:API_KEY|TOKEN)|password)=(?P<value>[^\r\n]*)"
-)
+from .models import EvaluationSource, SourceBlock, _SECRET_ASSIGNMENT
 
 
 class EvaluationSourceError(ValueError):
@@ -42,6 +36,8 @@ def _to_evaluation_source(parsed: ParsedProjectInput, *, max_block_bytes: int) -
     blocks: list[SourceBlock] = []
     for section in parsed.sections:
         section_lines = lines[section.line_start - 1 : section.line_end]
+        if any(len(line.encode("utf-8")) > max_block_bytes for line in section_lines):
+            raise EvaluationSourceError("single source line exceeds max_block_bytes")
         redacted_lines = [_redact(line) for line in section_lines]
         for chunk, line_start, line_end in _split_at_line_boundaries(
             redacted_lines,
@@ -67,7 +63,10 @@ def _to_evaluation_source(parsed: ParsedProjectInput, *, max_block_bytes: int) -
 
 
 def _redact(line: str) -> str:
-    return _ASSIGNMENT_SECRET.sub(lambda match: f"{match.group('name')}=[REDACTED]", line)
+    return _SECRET_ASSIGNMENT.sub(
+        lambda match: f"{match.group('indent')}{match.group('name')}=[REDACTED]",
+        line,
+    )
 
 
 def _split_at_line_boundaries(
