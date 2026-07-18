@@ -207,6 +207,20 @@ credentials or workflow content:
 powershell -ExecutionPolicy Bypass -File scripts/verify_captain_n8n.ps1
 ```
 
+### Hermes runtime readiness
+
+Captain's pinned Hermes submodule can be checked without starting Docker or
+contacting n8n:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/verify_hermes_readiness.ps1
+```
+
+The verifier fails closed when Hermes is uninitialized, differs from the
+parent gitlink, or has local changes. Its redacted report lists only the pinned
+commit, required Captain-planner/MCP entrypoints, focused-test status, and the
+lease-scoped `n8n-mcp` server identity.
+
 ## How Codex and GPT-5.6 fit
 
 Codex is used to build, test, and document the Devpost-ready vertical slice; the implementation history is recorded in this repository's Devpost feature branch and [docs/codex-sessions.md](docs/codex-sessions.md) records the primary submission session ID once captured. The LLM-backed production path is intentionally separate from the offline demo; its target model is configured as GPT-5.6 before the Devpost run. The video must show the working demo and explain both uses, as scripted in [docs/VIDEO_SCRIPT.md](docs/VIDEO_SCRIPT.md).
