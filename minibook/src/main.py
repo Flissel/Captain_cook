@@ -23,7 +23,7 @@ from sqlalchemy import text
 
 from .database import init_db
 from .models import (
-    Agent, Project, ProjectMember, Post, ProjectionEventPost,
+    Agent, Project, ProjectMember, Post, ProjectionPostFence, ProjectionEventPost,
     ProjectionSubjectHead, Comment, Webhook, Notification, GitHubWebhook,
     Question, AgentRegistry, AgentImprovement, generate_api_key,
 )
@@ -163,6 +163,17 @@ def _forbid_reserved_projection_name(project_name: str) -> None:
         raise HTTPException(403, "Reserved projection project identity")
 
 
+def _normalize_internal_identity(value: str) -> str:
+    return " ".join(value.split()).casefold()
+
+
+def _forbid_reserved_projection_service_name(agent_name: str) -> None:
+    if _normalize_internal_identity(agent_name) == _normalize_internal_identity(
+        PROJECTION_SERVICE_AGENT_NAME
+    ):
+        raise HTTPException(403, "Reserved projection service identity")
+
+
 def require_admin(authorization: str = Header(None)) -> bool:
     """Verify admin token for god mode operations."""
     # TODO: Re-enable for production
@@ -287,6 +298,7 @@ async def skill_file():
 @app.post("/api/v1/agents", response_model=AgentResponse)
 async def register_agent(data: AgentCreate, db=Depends(get_db)):
     """Register a new agent. Returns API key (only shown once)."""
+    _forbid_reserved_projection_service_name(data.name)
     # Rate limit registration by name (to prevent spam)
     rate_limiter.check(f"register:{data.name}", "register")
     
@@ -450,43 +462,42 @@ async def upsert_projection_project(
         raise HTTPException(422, "Unsupported projection project identity")
     db.commit()
     db.execute(text("BEGIN IMMEDIATE"))
-    service_agent = _ensure_projection_service_agent(db)
-    project = db.query(Project).filter(Project.id == external_id).first()
-    if project is None:
-        conflicting_name = db.query(Project).filter(
-            Project.name == PROJECTION_PROJECT_NAME
-        ).first()
-        if conflicting_name is not None:
-            db.rollback()
-            raise HTTPException(409, "Projection project identity conflicts")
-        project = Project(
-            id=external_id,
-            name=PROJECTION_PROJECT_NAME,
-            description=PROJECTION_PROJECT_DESCRIPTION,
-            primary_lead_agent_id=service_agent.id,
-        )
-        db.add(project)
-        db.flush()
-    elif (
-        project.name != PROJECTION_PROJECT_NAME
-        or project.description != PROJECTION_PROJECT_DESCRIPTION
-    ):
-        db.rollback()
-        raise HTTPException(409, "Projection project identity conflicts")
-    project.primary_lead_agent_id = service_agent.id
-    membership = db.query(ProjectMember).filter(
-        ProjectMember.agent_id == service_agent.id,
-        ProjectMember.project_id == project.id,
-    ).first()
-    if membership is None:
-        db.add(
-            ProjectMember(
-                agent_id=service_agent.id,
-                project_id=project.id,
-                role="projection-service",
+    try:
+        service_agent = _ensure_projection_service_agent(db)
+        project = db.query(Project).filter(Project.id == external_id).first()
+        if project is None:
+            project = _adopt_legacy_projection_project(db, service_agent)
+        if project is None:
+            project = Project(
+                id=external_id,
+                name=PROJECTION_PROJECT_NAME,
+                description=PROJECTION_PROJECT_DESCRIPTION,
+                primary_lead_agent_id=service_agent.id,
             )
-        )
-    db.commit()
+            db.add(project)
+            db.flush()
+        elif (
+            project.name != PROJECTION_PROJECT_NAME
+            or project.description != PROJECTION_PROJECT_DESCRIPTION
+        ):
+            raise HTTPException(409, "Projection project identity conflicts")
+        project.primary_lead_agent_id = service_agent.id
+        membership = db.query(ProjectMember).filter(
+            ProjectMember.agent_id == service_agent.id,
+            ProjectMember.project_id == project.id,
+        ).first()
+        if membership is None:
+            db.add(
+                ProjectMember(
+                    agent_id=service_agent.id,
+                    project_id=project.id,
+                    role="projection-service",
+                )
+            )
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
     db.refresh(project)
     return ProjectResponse(
         id=project.id,
@@ -498,6 +509,56 @@ async def upsert_projection_project(
     )
 
 
+def _adopt_legacy_projection_project(db, service_agent: Agent) -> Project | None:
+    """Adopt only verifiable v1 projection posts from the historical random ID."""
+
+    legacy = db.query(Project).filter(Project.name == PROJECTION_PROJECT_NAME).first()
+    if legacy is None:
+        return None
+    legacy_posts = db.query(Post).filter(Post.project_id == legacy.id).all()
+    marked_posts = [
+        post for post in legacy_posts if "captain-projection:v1" in post.tags
+    ]
+    if not marked_posts:
+        raise HTTPException(
+            409,
+            "Legacy projection identity is unverifiable; manual recovery is required",
+        )
+    retired_name = f"{PROJECTION_PROJECT_NAME} [legacy:{legacy.id}]"
+    if db.query(Project).filter(Project.name == retired_name).first() is not None:
+        raise HTTPException(
+            409,
+            "Legacy projection adoption is ambiguous; manual recovery is required",
+        )
+
+    legacy.name = retired_name
+    db.flush()
+    project = Project(
+        id=PROJECTION_PROJECT_ID,
+        name=PROJECTION_PROJECT_NAME,
+        description=PROJECTION_PROJECT_DESCRIPTION,
+        primary_lead_agent_id=service_agent.id,
+    )
+    db.add(project)
+    db.flush()
+    moved_post_ids = [post.id for post in marked_posts]
+    for post in marked_posts:
+        post.project_id = project.id
+    db.query(ProjectionPostFence).filter(
+        ProjectionPostFence.project_id == legacy.id,
+        ProjectionPostFence.post_id.in_(moved_post_ids),
+    ).update({ProjectionPostFence.project_id: project.id}, synchronize_session=False)
+    db.query(ProjectionEventPost).filter(
+        ProjectionEventPost.project_id == legacy.id,
+        ProjectionEventPost.post_id.in_(moved_post_ids),
+    ).update({ProjectionEventPost.project_id: project.id}, synchronize_session=False)
+    db.query(ProjectionSubjectHead).filter(
+        ProjectionSubjectHead.project_id == legacy.id
+    ).update({ProjectionSubjectHead.project_id: project.id}, synchronize_session=False)
+    db.flush()
+    return project
+
+
 def _ensure_projection_service_agent(db) -> Agent:
     """Return the internal author identity without exposing its random API key."""
 
@@ -507,10 +568,16 @@ def _ensure_projection_service_agent(db) -> Agent:
             db.rollback()
             raise HTTPException(409, "Projection service identity conflicts")
         return agent
-    if (
-        db.query(Agent).filter(Agent.name == PROJECTION_SERVICE_AGENT_NAME).first()
-        is not None
-    ):
+    conflicting_identity = next(
+        (
+            candidate
+            for candidate in db.query(Agent).all()
+            if _normalize_internal_identity(candidate.name)
+            == _normalize_internal_identity(PROJECTION_SERVICE_AGENT_NAME)
+        ),
+        None,
+    )
+    if conflicting_identity is not None:
         db.rollback()
         raise HTTPException(409, "Projection service identity conflicts")
     agent = Agent(
@@ -1696,6 +1763,8 @@ def _registry_response(entry: AgentRegistry) -> RegistryResponse:
 @app.post("/api/v1/registry", response_model=RegistryResponse)
 async def register_agent_team(data: RegistryCreate, db=Depends(get_db)):
     """Register a validated agent team (no auth — internal pipeline use)."""
+    if data.agent_name:
+        _forbid_reserved_projection_service_name(data.agent_name)
     # Deprecate older entries for same team_key
     db.query(AgentRegistry).filter(
         AgentRegistry.team_key == data.team_key,

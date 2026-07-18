@@ -75,16 +75,22 @@ across every ordinary write surface. Direct project routes, indirect post and
 webhook lookups, plan/member/admin routes, GitHub integration ingress, and
 registry project linkage all fail with HTTP 403. A route-inventory fitness test
 forces every new POST/PUT/PATCH/DELETE endpoint to be classified as guarded,
-projector-only, or project-independent.
+projector-only, or project-independent. The normalized internal service-agent
+name is also reserved across public agent and registry creation; a pre-existing
+collision fails closed instead of being adopted.
 
 Rebuild is dry-run by default and creates no cursor file, directory, table, or
 Minibook object. `--apply` repairs missing or modified projection posts and
 retires only marked duplicates/orphans, leaving unrelated Minibook content
 untouched. An unversioned v1 cursor, active v1 post set, or interrupted cutover
 requires an explicit full rebuild. The full rebuild validates the complete v2
-feed, replays one deterministic post per event, retires v1 posts, and atomically
-checkpoints the terminal cursor plus `contract_version=v2` only after
-convergence. Repair uses the structured canonical event upsert. Retirement is
+feed and transactionally adopts a verifiable historical v1 project that used a
+random ID. Only exactly v1-marked posts move to the fixed singleton; human
+posts, memberships, and integrations remain on the deterministically renamed
+legacy project. It then replays one deterministic post per event, retires v1
+posts, and atomically checkpoints the terminal cursor plus
+`contract_version=v2` only after convergence. Repair uses the structured
+canonical event upsert. Retirement is
 a separate projector-authenticated endpoint accepting only the fixed
 `duplicate`, `orphaned`, or `v1-cutover` reason enum; Minibook replaces title,
 content, tags, status, mentions, pinning, and integration references with its

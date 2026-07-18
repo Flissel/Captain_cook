@@ -93,6 +93,64 @@ def _seed_projection_post(
     return client.get_post(post_id)
 
 
+def _seed_real_v1_project() -> dict[str, str]:
+    from src import main as minibook_main
+    from src.models import Agent, Comment, GitHubWebhook, Post, Project, ProjectMember, Webhook
+
+    with minibook_main.SessionLocal() as db:
+        author = Agent(name=f"LegacyRebuilder_{uuid4().hex}")
+        db.add(author)
+        db.flush()
+        legacy = Project(
+            id=f"legacy-{uuid4().hex}",
+            name="Captain Runtime Projection",
+            description="Historical v1 projection",
+            primary_lead_agent_id=author.id,
+        )
+        db.add(legacy)
+        db.flush()
+        membership = ProjectMember(
+            agent_id=author.id,
+            project_id=legacy.id,
+            role="legacy-lead",
+        )
+        marked = Post(
+            project_id=legacy.id,
+            author_id=author.id,
+            title="Legacy v1 projection",
+            content="Legacy public content",
+            type="plan",
+        )
+        marked.tags = ["captain-projection:v1", f"captain-event:{uuid4()}"]
+        human = Post(
+            project_id=legacy.id,
+            author_id=author.id,
+            title="Human note",
+            content="Preserve this unrelated note",
+        )
+        human.tags = ["human"]
+        db.add_all((membership, marked, human))
+        db.flush()
+        comment = Comment(
+            post_id=marked.id,
+            author_id=author.id,
+            content="Legacy projection comment",
+        )
+        webhook = Webhook(project_id=legacy.id, url="https://example.test/legacy")
+        github = GitHubWebhook(project_id=legacy.id, secret="legacy-fixture-only")
+        db.add_all((comment, webhook, github))
+        db.commit()
+        return {
+            "legacy_id": str(legacy.id),
+            "marked_id": str(marked.id),
+            "human_id": str(human.id),
+            "membership_id": str(membership.id),
+            "webhook_id": str(webhook.id),
+            "github_id": str(github.id),
+            "comment_id": str(comment.id),
+        }
+
+
 def _corrupt_projection_post(post_id: str, *, content: str) -> None:
     from src import main as minibook_main
     from src.models import Post
@@ -633,16 +691,7 @@ def test_apply_full_rebuild_retires_v1_posts_and_records_v2_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     document = json.loads(FIXTURE.read_text(encoding="utf-8"))[0]
-    project = projection_api.ensure_projection_project(
-        external_id="captain-runtime-projection-v2",
-    )
-    legacy = _seed_projection_post(
-        projection_api,
-        project_id=project["id"],
-        title="Legacy v1 projection",
-        content="Legacy public content",
-        tags=["captain-projection:v1", f"captain-event:{document['event_id']}"],
-    )
+    legacy = _seed_real_v1_project()
     feed = _single_page_feed([document], cursor="after-v2-cutover")
     cursor_path = tmp_path / "cursor.db"
     monkeypatch.setenv("CAPTAIN_GATEWAY_TOKEN", "test-only")
@@ -664,8 +713,13 @@ def test_apply_full_rebuild_retires_v1_posts_and_records_v2_state(
         ]
     ) == 0
 
+    project = next(
+        item
+        for item in projection_api.list_projects()
+        if item["id"] == "captain-runtime-projection-v2"
+    )
     posts = projection_api.list_posts(project["id"])
-    retired = next(post for post in posts if post["id"] == legacy["id"])
+    retired = next(post for post in posts if post["id"] == legacy["marked_id"])
     active_v2 = [post for post in posts if "captain-projection:v2" in post["tags"]]
     store = ProjectionCursorStore(cursor_path)
     assert retired["status"] == "closed"
@@ -674,3 +728,63 @@ def test_apply_full_rebuild_retires_v1_posts_and_records_v2_state(
     assert store.processed_count() == 1
     assert store.get_feed_cursor() == "after-v2-cutover"
     assert store.get_contract_version() == "v2"
+
+    from src import main as minibook_main
+    from src.models import Comment, GitHubWebhook, Post, ProjectMember, Webhook
+
+    with minibook_main.SessionLocal() as db:
+        assert db.query(Post).filter(Post.id == legacy["human_id"]).one().project_id == legacy["legacy_id"]
+        assert db.query(Comment).filter(Comment.id == legacy["comment_id"]).one().post_id == legacy["marked_id"]
+        assert db.query(ProjectMember).filter(ProjectMember.id == legacy["membership_id"]).one().project_id == legacy["legacy_id"]
+        assert db.query(Webhook).filter(Webhook.id == legacy["webhook_id"]).one().project_id == legacy["legacy_id"]
+        assert db.query(GitHubWebhook).filter(GitHubWebhook.id == legacy["github_id"]).one().project_id == legacy["legacy_id"]
+
+
+def test_interrupted_real_v1_cutover_keeps_cursor_and_restart_converges(
+    tmp_path: Path,
+    projection_api: MinibookClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = json.loads(FIXTURE.read_text(encoding="utf-8"))[0]
+    legacy = _seed_real_v1_project()
+    cursor_path = tmp_path / "cursor.db"
+    ProjectionCursorStore(cursor_path).set_feed_cursor("legacy-position")
+    monkeypatch.setenv("CAPTAIN_GATEWAY_TOKEN", "test-only")
+    monkeypatch.setenv("MINIBOOK_API_KEY", "test-only")
+    monkeypatch.setenv("MINIBOOK_PROJECTION_API_KEY", PROJECTION_API_KEY)
+    monkeypatch.setattr(
+        rebuild_script,
+        "CaptainProjectionFeed",
+        lambda *a, **k: _single_page_feed([document], cursor="after-restart"),
+    )
+    monkeypatch.setattr(rebuild_script, "MinibookClient", lambda *a, **k: projection_api)
+    original_retire = projection_api.retire_projection_post
+
+    def abort_retirement(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("injected retirement abort")
+
+    monkeypatch.setattr(projection_api, "retire_projection_post", abort_retirement)
+    argv = [
+        "--captain-url",
+        "https://captain.test",
+        "--minibook-url",
+        "http://127.0.0.1",
+        "--cursor-db",
+        str(cursor_path),
+        "--apply",
+        "--full-rebuild",
+    ]
+    with pytest.raises(RuntimeError, match="injected retirement abort"):
+        rebuild_script.main(argv)
+
+    interrupted = ProjectionCursorStore(cursor_path)
+    assert interrupted.get_feed_cursor() == "legacy-position"
+    assert interrupted.get_contract_version() is None
+    monkeypatch.setattr(projection_api, "retire_projection_post", original_retire)
+
+    assert rebuild_script.main(argv) == 0
+    recovered = ProjectionCursorStore(cursor_path)
+    assert recovered.get_feed_cursor() == "after-restart"
+    assert recovered.get_contract_version() == "v2"
+    fixed_posts = projection_api.list_posts("captain-runtime-projection-v2")
+    assert next(post for post in fixed_posts if post["id"] == legacy["marked_id"])["status"] == "closed"

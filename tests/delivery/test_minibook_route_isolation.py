@@ -62,6 +62,213 @@ def _event() -> MinibookProjectionEvent:
     return MinibookProjectionEvent.model_validate(document)
 
 
+def _seed_legacy_projection_project(minibook_main: Any) -> dict[str, str]:
+    from src.models import Agent, Comment, GitHubWebhook, Post, Project, ProjectMember, Webhook
+
+    with minibook_main.SessionLocal() as db:
+        author = Agent(name=f"LegacyProjector_{uuid4().hex}")
+        db.add(author)
+        db.flush()
+        legacy = Project(
+            id=f"legacy-{uuid4().hex}",
+            name="Captain Runtime Projection",
+            description="Historical v1 projection",
+            primary_lead_agent_id=author.id,
+        )
+        db.add(legacy)
+        db.flush()
+        membership = ProjectMember(
+            agent_id=author.id,
+            project_id=legacy.id,
+            role="legacy-lead",
+        )
+        marked = Post(
+            project_id=legacy.id,
+            author_id=author.id,
+            title="Legacy v1 projection",
+            content="Legacy public projection",
+            type="plan",
+        )
+        marked.tags = ["captain-projection:v1", f"captain-event:{uuid4()}"]
+        human = Post(
+            project_id=legacy.id,
+            author_id=author.id,
+            title="Human note",
+            content="Preserve this unrelated note",
+        )
+        human.tags = ["human"]
+        db.add_all((membership, marked, human))
+        db.flush()
+        comment = Comment(
+            post_id=marked.id,
+            author_id=author.id,
+            content="Legacy projection comment",
+        )
+        webhook = Webhook(project_id=legacy.id, url="https://example.test/legacy")
+        github = GitHubWebhook(project_id=legacy.id, secret="legacy-fixture-only")
+        db.add_all((comment, webhook, github))
+        db.commit()
+        return {
+            "legacy_id": str(legacy.id),
+            "marked_id": str(marked.id),
+            "human_id": str(human.id),
+            "membership_id": str(membership.id),
+            "webhook_id": str(webhook.id),
+            "github_id": str(github.id),
+            "comment_id": str(comment.id),
+        }
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Captain Projection Service",
+        " captain projection service ",
+        "CAPTAIN   PROJECTION\tSERVICE",
+    ],
+)
+def test_public_agent_creation_reserves_normalized_projection_service_identity(
+    name: str,
+    isolated_projection_api: tuple[TestClient, MinibookClient, Any],
+) -> None:
+    http, _, minibook_main = isolated_projection_api
+
+    registration = http.post("/api/v1/agents", json={"name": name})
+    registry = http.post(
+        "/api/v1/registry",
+        json={
+            "team_key": f"reserved-{uuid4().hex}",
+            "run_id": uuid4().hex,
+            "agent_name": name,
+            "status": "candidate",
+            "eval_score": 0,
+        },
+    )
+
+    assert registration.status_code == 403
+    assert registry.status_code == 403
+    with minibook_main.SessionLocal() as db:
+        from src.models import Agent
+
+        normalized = " ".join(name.split()).casefold()
+        assert all(" ".join(agent.name.split()).casefold() != normalized for agent in db.query(Agent).all())
+
+
+def test_scoped_singleton_atomically_adopts_real_v1_project_and_is_idempotent(
+    isolated_projection_api: tuple[TestClient, MinibookClient, Any],
+) -> None:
+    _, client, minibook_main = isolated_projection_api
+    seeded = _seed_legacy_projection_project(minibook_main)
+
+    first = client.ensure_projection_project(external_id=PROJECTION_PROJECT_ID)
+    second = client.ensure_projection_project(external_id=PROJECTION_PROJECT_ID)
+
+    assert first["id"] == second["id"] == PROJECTION_PROJECT_ID
+    with minibook_main.SessionLocal() as db:
+        from src.models import Comment, GitHubWebhook, Post, Project, ProjectMember, Webhook
+
+        legacy = db.query(Project).filter(Project.id == seeded["legacy_id"]).one()
+        marked = db.query(Post).filter(Post.id == seeded["marked_id"]).one()
+        human = db.query(Post).filter(Post.id == seeded["human_id"]).one()
+        assert legacy.name == f"Captain Runtime Projection [legacy:{seeded['legacy_id']}]"
+        assert marked.project_id == PROJECTION_PROJECT_ID
+        assert human.project_id == seeded["legacy_id"]
+        assert db.query(Comment).filter(Comment.id == seeded["comment_id"]).one().post_id == marked.id
+        assert db.query(ProjectMember).filter(ProjectMember.id == seeded["membership_id"]).one().project_id == seeded["legacy_id"]
+        assert db.query(Webhook).filter(Webhook.id == seeded["webhook_id"]).one().project_id == seeded["legacy_id"]
+        assert db.query(GitHubWebhook).filter(GitHubWebhook.id == seeded["github_id"]).one().project_id == seeded["legacy_id"]
+
+
+def test_legacy_adoption_rolls_back_and_restart_converges(
+    isolated_projection_api: tuple[TestClient, MinibookClient, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, client, minibook_main = isolated_projection_api
+    seeded = _seed_legacy_projection_project(minibook_main)
+    original = minibook_main._adopt_legacy_projection_project
+
+    def abort_after_adoption(*args: Any, **kwargs: Any) -> Any:
+        original(*args, **kwargs)
+        raise RuntimeError("injected adoption abort")
+
+    monkeypatch.setattr(minibook_main, "_adopt_legacy_projection_project", abort_after_adoption)
+    with pytest.raises(RuntimeError, match="injected adoption abort"):
+        client.ensure_projection_project(external_id=PROJECTION_PROJECT_ID)
+
+    with minibook_main.SessionLocal() as db:
+        from src.models import Post, Project
+
+        assert db.query(Project).filter(Project.id == PROJECTION_PROJECT_ID).first() is None
+        legacy = db.query(Project).filter(Project.id == seeded["legacy_id"]).one()
+        assert legacy.name == "Captain Runtime Projection"
+        assert db.query(Post).filter(Post.id == seeded["marked_id"]).one().project_id == seeded["legacy_id"]
+
+    monkeypatch.setattr(minibook_main, "_adopt_legacy_projection_project", original)
+    assert client.ensure_projection_project(external_id=PROJECTION_PROJECT_ID)["id"] == PROJECTION_PROJECT_ID
+
+
+def test_unverifiable_legacy_name_collision_fails_closed_with_recovery_message(
+    isolated_projection_api: tuple[TestClient, MinibookClient, Any],
+) -> None:
+    _, client, minibook_main = isolated_projection_api
+    from src.models import Agent, Post, Project
+
+    with minibook_main.SessionLocal() as db:
+        author = Agent(name=f"HumanOwner_{uuid4().hex}")
+        db.add(author)
+        db.flush()
+        project = Project(
+            id=f"human-{uuid4().hex}",
+            name="Captain Runtime Projection",
+            description="Unrelated human project",
+            primary_lead_agent_id=author.id,
+        )
+        db.add(project)
+        db.flush()
+        human = Post(
+            project_id=project.id,
+            author_id=author.id,
+            title="Human-only content",
+            content="No v1 projection marker",
+        )
+        human.tags = ["human"]
+        db.add(human)
+        db.commit()
+        project_id = str(project.id)
+
+    with pytest.raises(httpx.HTTPStatusError) as error:
+        client.ensure_projection_project(external_id=PROJECTION_PROJECT_ID)
+
+    assert error.value.response.status_code == 409
+    assert "manual recovery" in error.value.response.text.lower()
+    with minibook_main.SessionLocal() as db:
+        project = db.query(Project).filter(Project.id == project_id).one()
+        assert project.name == "Captain Runtime Projection"
+
+
+def test_preexisting_normalized_service_identity_conflict_is_not_adopted(
+    isolated_projection_api: tuple[TestClient, MinibookClient, Any],
+) -> None:
+    _, client, minibook_main = isolated_projection_api
+    from src.models import Agent
+
+    with minibook_main.SessionLocal() as db:
+        conflict = Agent(name=" captain   PROJECTION service ")
+        db.add(conflict)
+        db.commit()
+        conflicting_id = str(conflict.id)
+
+    with pytest.raises(httpx.HTTPStatusError) as error:
+        client.ensure_projection_project(external_id=PROJECTION_PROJECT_ID)
+
+    assert error.value.response.status_code == 409
+    assert "identity conflicts" in error.value.response.text.lower()
+    with minibook_main.SessionLocal() as db:
+        conflict = db.query(Agent).filter(Agent.id == conflicting_id).one()
+        assert conflict.name == " captain   PROJECTION service "
+        assert db.query(Agent).filter(Agent.id == "captain-projection-service-v2").first() is None
+
+
 def _seed_reserved_state(
     *,
     case: str,
@@ -427,19 +634,29 @@ def test_mutating_route_inventory_requires_reserved_project_classification() -> 
         "upsert_projection_post",
         "retire_projection_post",
     }
+    identity_guarded = {
+        "register_agent": "_forbid_reserved_projection_service_name",
+        "register_agent_team": "_forbid_reserved_projection_service_name",
+    }
     global_mutations = {
-        "register_agent",
         "heartbeat",
         "mark_read",
         "mark_all_read",
         "create_question",
         "answer_question",
-        "register_agent_team",
         "add_improvement",
     }
-    assert set(routes) == set(guarded) | projector_only | global_mutations
+    assert set(routes) == set(guarded) | set(identity_guarded) | projector_only | global_mutations
 
     for function_name, required_call in guarded.items():
+        call_names = {
+            call.func.id
+            for call in ast.walk(functions[function_name])
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+        }
+        assert required_call in call_names, function_name
+
+    for function_name, required_call in identity_guarded.items():
         call_names = {
             call.func.id
             for call in ast.walk(functions[function_name])

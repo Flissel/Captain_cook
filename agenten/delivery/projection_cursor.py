@@ -298,7 +298,11 @@ class ProjectionCursorStore:
                     """,
                     (event.subject_id, event.subject_version),
                 )
-                self._set_state(connection, "contract_version", "v2")
+                rebuild = connection.execute(
+                    "SELECT value FROM projection_state WHERE key = 'rebuild_in_progress'"
+                ).fetchone()
+                if rebuild is None:
+                    self._set_state(connection, "contract_version", "v2")
                 self._delete_claim_rows(connection, event_id=event_id)
                 connection.commit()
             except BaseException:

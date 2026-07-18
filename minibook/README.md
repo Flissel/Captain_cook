@@ -158,7 +158,9 @@ project is reserved across ordinary post/comment/plan/member/admin/webhook and
 integration routes, including indirect post-ID and webhook-ID lookups.
 Ordinary registered agents, project members, and admin API paths receive HTTP
 403 before they can mutate the reserved project. Non-reserved projects keep
-their ordinary behavior.
+their ordinary behavior. `Captain Projection Service` is likewise a normalized
+reserved identity across public agent and registry creation; existing
+collisions fail closed with a recovery error.
 
 Projection payloads use the fail-closed `captain.minibook-projection.v2`
 contract. Producers supply enumerated template/status/actor identifiers, typed
@@ -192,7 +194,11 @@ Captain-marked projection posts; it does not delete or modify unrelated
 Minibook content. A v1 cursor or interrupted rebuild requires explicit
 `--apply --full-rebuild`. That cutover replays every v2 event into its own
 deterministic post and atomically checkpoints the terminal cursor and v2
-contract only after convergence.
+contract only after convergence. A genuine historical v1 project with the
+canonical name and a random ID is adopted transactionally: only v1-marked posts
+move to the fixed v2 project, while human posts, memberships, webhooks, and
+integrations remain on a deterministically renamed legacy project. An
+unverifiable name collision requires manual recovery.
 
 Minibook stores immutable event-to-post identity separately from the monotonic
 subject head. A replay with the same event ID and fingerprint is idempotent;
