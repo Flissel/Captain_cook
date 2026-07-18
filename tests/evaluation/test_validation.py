@@ -1,6 +1,7 @@
 import hashlib
 
 import pytest
+from pydantic import ValidationError
 
 from agenten.evaluation.models import (
     AcceptanceTestPlan,
@@ -9,6 +10,7 @@ from agenten.evaluation.models import (
     EvaluationSource,
     QaReview,
     SourceBlock,
+    ValidationIssue,
 )
 from agenten.evaluation.validation import (
     validate_candidate,
@@ -164,3 +166,61 @@ def test_candidate_reports_a_false_execution_claim() -> None:
     candidate = _candidate(claims=("Acceptance tests ran successfully.", "Implementation is complete."))
 
     assert [issue.code for issue in validate_candidate(candidate, _source())] == ["false_execution_claim"]
+
+
+@pytest.mark.parametrize(
+    "claim",
+    (
+        "Acceptance tests were executed.",
+        "All acceptance tests pass.",
+        "Implementation completed.",
+    ),
+)
+def test_candidate_reports_reviewed_false_execution_claims(claim: str) -> None:
+    assert [issue.code for issue in validate_candidate(_candidate(claims=(claim,)), _source())] == [
+        "false_execution_claim"
+    ]
+
+
+def test_new_contracts_reject_coercible_wrong_types() -> None:
+    with pytest.raises(ValidationError):
+        AcceptanceTestPlan(
+            test_id=1,
+            test_type="unit",
+            setup="Create the adapter.",
+            action="Submit a delivery.",
+            expected="The adapter returns a typed result.",
+            command="python -m pytest -q tests/evaluation",
+        )
+    with pytest.raises(ValidationError):
+        QaReview(
+            component_key="delivery-api",
+            revision="1",
+            decision="approved",
+            score=7,
+            defect_codes=(),
+            revision_requests=(),
+        )
+    with pytest.raises(ValidationError):
+        _candidate(component_key=1)
+    with pytest.raises(ValidationError):
+        ComponentInventoryCandidate(
+            inventory_id=1,
+            source=_source(),
+            source_citations=("block-0001",),
+            components=(_candidate(),),
+        )
+    with pytest.raises(ValidationError):
+        ValidationIssue(code=1, message="A deterministic finding.")
+
+
+def test_component_graph_preserves_duplicate_candidate_edges() -> None:
+    first = _candidate(component_key="shared", dependencies=("missing",))
+    second = _candidate(component_key="shared", dependencies=("other",))
+    other = _candidate(component_key="other", dependencies=("shared",))
+
+    assert [issue.code for issue in validate_component_graph((first, second, other))] == [
+        "duplicate_component_key",
+        "unknown_dependency",
+        "dependency_cycle",
+    ]

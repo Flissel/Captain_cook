@@ -90,7 +90,7 @@ class EvaluationRun(BaseModel):
 class AcceptanceTestPlan(BaseModel):
     """A proposed deterministic test with a reviewable oracle."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     test_id: str = Field(min_length=1)
     test_type: Literal["unit", "integration", "contract", "live"]
@@ -103,7 +103,7 @@ class AcceptanceTestPlan(BaseModel):
 class QaReview(BaseModel):
     """A bounded QA assessment of one component-plan revision."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     component_key: str = Field(min_length=1)
     revision: int = Field(ge=1, le=3)
@@ -116,7 +116,7 @@ class QaReview(BaseModel):
 class ComponentPlanCandidate(BaseModel):
     """A non-authoritative component implementation proposal."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     component_key: str = Field(min_length=1)
     scope: tuple[str, ...]
@@ -136,7 +136,7 @@ class ComponentPlanCandidate(BaseModel):
 class ComponentInventoryCandidate(BaseModel):
     """A source-bound inventory of non-authoritative component candidates."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     inventory_id: str = Field(min_length=1)
     source: EvaluationSource
@@ -147,7 +147,7 @@ class ComponentInventoryCandidate(BaseModel):
 class ValidationIssue(BaseModel):
     """One deterministic validation finding; never a lifecycle decision."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     code: str = Field(min_length=1)
     message: str = Field(min_length=1)

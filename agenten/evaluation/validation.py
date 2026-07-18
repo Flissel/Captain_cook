@@ -22,7 +22,7 @@ _RUBRIC_CODES = frozenset(
     }
 )
 _FALSE_EXECUTION_CLAIM = re.compile(
-    r"\b(?:acceptance\s+tests?\s+(?:ran|have\s+run|passed)|implementation\s+(?:is\s+)?complete)\b",
+    r"\b(?:acceptance\s+tests?\s+(?:(?:were\s+)?(?:executed|run)|have\s+run|ran|passed|pass)|all\s+acceptance\s+tests?\s+pass|implementation\s+(?:(?:is\s+)?complete(?:d)?|completed))\b",
     re.IGNORECASE,
 )
 
@@ -31,11 +31,7 @@ def validate_inventory(inventory: ComponentInventoryCandidate) -> tuple[Validati
     """Return source, uniqueness, candidate, and dependency findings in stable order."""
 
     issues = list(_validate_citations(inventory.source_citations, inventory.source, None))
-    seen_keys: set[str] = set()
     for candidate in inventory.components:
-        if candidate.component_key in seen_keys:
-            issues.append(_issue("duplicate_component_key", "component keys must be unique", candidate.component_key))
-        seen_keys.add(candidate.component_key)
         issues.extend(validate_candidate(candidate, inventory.source))
     issues.extend(validate_component_graph(inventory.components))
     return tuple(issues)
@@ -86,22 +82,34 @@ def validate_component_graph(
 ) -> tuple[ValidationIssue, ...]:
     """Validate known dependencies and DAG structure with ``TopologicalSorter``."""
 
-    keys = {candidate.component_key for candidate in candidates}
+    vertices_by_key: dict[str, list[str]] = {}
+    vertices: list[tuple[ComponentPlanCandidate, str]] = []
+    for index, candidate in enumerate(candidates):
+        vertex = f"{candidate.component_key}\x00{index:04d}"
+        vertices_by_key.setdefault(candidate.component_key, []).append(vertex)
+        vertices.append((candidate, vertex))
+
     graph: dict[str, set[str]] = {}
     issues: list[ValidationIssue] = []
-    for candidate in candidates:
-        known_dependencies = {dependency for dependency in candidate.dependencies if dependency in keys}
+    seen_keys: set[str] = set()
+    for candidate, _ in vertices:
+        if candidate.component_key in seen_keys:
+            issues.append(_issue("duplicate_component_key", "component keys must be unique", candidate.component_key))
+        seen_keys.add(candidate.component_key)
+    for candidate, vertex in vertices:
+        known_dependencies: set[str] = set()
         for dependency in candidate.dependencies:
-            if dependency not in keys:
+            dependency_vertices = vertices_by_key.get(dependency)
+            if dependency_vertices is None:
                 issues.append(_issue("unknown_dependency", f"unknown dependency: {dependency}", candidate.component_key))
-        graph[candidate.component_key] = known_dependencies
-    if issues:
-        return tuple(issues)
+            else:
+                known_dependencies.update(dependency_vertices)
+        graph[vertex] = known_dependencies
     try:
         tuple(TopologicalSorter(graph).static_order())
     except CycleError:
-        return (_issue("dependency_cycle", "component dependencies must form a DAG", None),)
-    return ()
+        issues.append(_issue("dependency_cycle", "component dependencies must form a DAG", None))
+    return tuple(issues)
 
 
 def _validate_citations(
