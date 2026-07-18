@@ -32,7 +32,7 @@
     {
       "server_name": "n8n-mcp",
       "tool_name": "workflow_validate",
-      "call_id": "n8n-mcp-jsonrpc-41",
+      "call_id": "captain-mcp-call-f786789bbdf972a3b004b1c8b2309c43d7d4d9970cc5bca0de42b25d5e6b2dab",
       "execution_id": "n8n-execution-1",
       "correlation_id": "00000000-0000-0000-0000-000000000002",
       "started_at": "2026-07-17T12:03:00Z",

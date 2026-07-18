@@ -129,7 +129,9 @@ def _validate_fixture(name: str, payload: dict[str, Any]) -> None:
     for evidence in payload["mcp_evidence"]:
         _require_exact_fields(evidence, MCP_EVIDENCE_FIELDS, "mcp evidence")
         assert evidence["correlation_id"] == payload["correlation_id"]
-        assert re.fullmatch(r"n8n-mcp-jsonrpc-[0-9]+", evidence["call_id"])
+        assert re.fullmatch(
+            r"captain-mcp-call-[0-9a-f]{64}", evidence["call_id"]
+        )
         assert evidence["execution_id"]
         assert SHA256.fullmatch(evidence["input_digest"])
         assert SHA256.fullmatch(evidence["output_digest"])
