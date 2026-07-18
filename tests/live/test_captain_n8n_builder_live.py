@@ -165,17 +165,29 @@ def _respond_to_webhook_workflow() -> dict[str, object]:
                 },
             },
             {
+                "name": "Evidence",
+                "type": "n8n-nodes-base.code",
+                "typeVersion": 2,
+                "position": [240, 0],
+                "parameters": {
+                    "jsCode": (
+                        "const payload = $input.first().json;\n"
+                        "return [{ json: {\n"
+                        "  execution_id: $execution.id,\n"
+                        "  artifact_digest: payload.body.artifact_digest,\n"
+                        "  correlation_id: payload.body.correlation_id,\n"
+                        "} }];"
+                    )
+                },
+            },
+            {
                 "name": "Respond to Webhook",
                 "type": "n8n-nodes-base.respondToWebhook",
                 "typeVersion": 1.4,
-                "position": [240, 0],
+                "position": [480, 0],
                 "parameters": {
                     "respondWith": "json",
-                    "responseBody": (
-                        "={{ { execution_id: $execution.id, "
-                        "artifact_digest: $json.body.artifact_digest, "
-                        "correlation_id: $json.body.correlation_id } }}"
-                    ),
+                    "responseBody": "={{ $json }}",
                     "options": {},
                 },
             },
@@ -185,13 +197,24 @@ def _respond_to_webhook_workflow() -> dict[str, object]:
                 "main": [
                     [
                         {
+                            "node": "Evidence",
+                            "type": "main",
+                            "index": 0,
+                        }
+                    ]
+                ]
+            },
+            "Evidence": {
+                "main": [
+                    [
+                        {
                             "node": "Respond to Webhook",
                             "type": "main",
                             "index": 0,
                         }
                     ]
                 ]
-            }
+            },
         },
         "settings": {"executionOrder": "v1"},
     }

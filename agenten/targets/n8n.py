@@ -1,5 +1,6 @@
 """Typed n8n deployment and execution target with verified provider evidence."""
 from __future__ import annotations
+import asyncio
 import copy
 import re
 from typing import Any, Literal, Protocol
@@ -72,20 +73,36 @@ def _provider_output(payload: dict[str, Any]) -> dict[str, Any]:
                 main = run["data"]["main"]
                 if main and main[0]:
                     output = main[0][0]["json"]
-                    if isinstance(output, dict):
+                    if isinstance(output, dict) and {
+                        "artifact_digest",
+                        "correlation_id",
+                    }.issubset(output):
                         return output
     except (KeyError, IndexError, TypeError):
         pass
     raise N8nEvidenceError("n8n did not return matching execution evidence")
 
 class N8nHttpClient:
-    def __init__(self, *, api_base_url: str, webhook_base_url: str, api_key: str, http: httpx.AsyncClient) -> None:
+    def __init__(
+        self,
+        *,
+        api_base_url: str,
+        webhook_base_url: str,
+        api_key: str,
+        http: httpx.AsyncClient,
+        evidence_attempts: int = 30,
+        evidence_delay_seconds: float = 0.1,
+    ) -> None:
         if not api_key:
             raise ValueError("n8n api_key must not be empty")
+        if evidence_attempts < 1 or evidence_delay_seconds < 0:
+            raise ValueError("n8n evidence polling configuration is invalid")
         self._api_base_url = api_base_url.rstrip("/")
         self._webhook_base_url = webhook_base_url.rstrip("/")
         self._headers = {"X-N8N-API-KEY": api_key}
         self._http = http
+        self._evidence_attempts = evidence_attempts
+        self._evidence_delay_seconds = evidence_delay_seconds
 
     @classmethod
     def from_endpoint(
@@ -133,12 +150,25 @@ class N8nHttpClient:
             raise N8nEvidenceError("n8n webhook did not return an execution id") from None
 
     async def fetch_execution(self, execution_id: str) -> N8nExecutionRecord:
-        response = await self._request("GET", f"{self._api_base_url}/api/v1/executions/{execution_id}", params={"includeData": "true"})
-        payload = response.json()
-        try:
-            return N8nExecutionRecord(execution_id=str(payload["id"]), workflow_id=str(payload["workflowId"]), status=str(payload["status"]), output=_provider_output(payload))
-        except (KeyError, ValueError):
-            raise N8nEvidenceError("n8n did not return matching execution evidence") from None
+        for attempt in range(self._evidence_attempts):
+            response = await self._request(
+                "GET",
+                f"{self._api_base_url}/api/v1/executions/{execution_id}",
+                params={"includeData": "true"},
+            )
+            try:
+                payload = response.json()
+                return N8nExecutionRecord(
+                    execution_id=str(payload["id"]),
+                    workflow_id=str(payload["workflowId"]),
+                    status=str(payload["status"]),
+                    output=_provider_output(payload),
+                )
+            except (KeyError, ValueError, N8nEvidenceError):
+                if attempt + 1 == self._evidence_attempts:
+                    break
+                await asyncio.sleep(self._evidence_delay_seconds)
+        raise N8nEvidenceError("n8n did not return matching execution evidence") from None
 
     async def _request(self, method: str, url: str, *, json: dict[str, Any] | None = None, params: dict[str, Any] | None = None, authenticated: bool = True) -> httpx.Response:
         try:
