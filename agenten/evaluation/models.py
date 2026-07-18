@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -84,3 +85,70 @@ class EvaluationRun(BaseModel):
     status: EvaluationStatus
     max_rounds: int = Field(ge=1)
     max_calls: int = Field(ge=1)
+
+
+class AcceptanceTestPlan(BaseModel):
+    """A proposed deterministic test with a reviewable oracle."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    test_id: str = Field(min_length=1)
+    test_type: Literal["unit", "integration", "contract", "live"]
+    setup: str
+    action: str
+    expected: str
+    command: str
+
+
+class QaReview(BaseModel):
+    """A bounded QA assessment of one component-plan revision."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    component_key: str = Field(min_length=1)
+    revision: int = Field(ge=1, le=3)
+    decision: Literal["approved", "revision_required"]
+    score: int = Field(ge=0, le=7)
+    defect_codes: tuple[str, ...]
+    revision_requests: tuple[str, ...]
+
+
+class ComponentPlanCandidate(BaseModel):
+    """A non-authoritative component implementation proposal."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    component_key: str = Field(min_length=1)
+    scope: tuple[str, ...]
+    non_goals: tuple[str, ...]
+    team_roles: tuple[str, ...]
+    implementation_steps: tuple[str, ...]
+    interfaces: tuple[str, ...]
+    acceptance_tests: tuple[AcceptanceTestPlan, ...]
+    definition_of_done: tuple[str, ...]
+    risks: tuple[str, ...]
+    dependencies: tuple[str, ...]
+    source_citations: tuple[str, ...]
+    claims: tuple[str, ...] = ()
+    qa_reviews: tuple[QaReview, ...] = ()
+
+
+class ComponentInventoryCandidate(BaseModel):
+    """A source-bound inventory of non-authoritative component candidates."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    inventory_id: str = Field(min_length=1)
+    source: EvaluationSource
+    source_citations: tuple[str, ...]
+    components: tuple[ComponentPlanCandidate, ...]
+
+
+class ValidationIssue(BaseModel):
+    """One deterministic validation finding; never a lifecycle decision."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    code: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+    component_key: str | None = None
