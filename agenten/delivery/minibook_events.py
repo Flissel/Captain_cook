@@ -26,7 +26,10 @@ ProjectionEventType = Literal[
     "replanning.requested",
 ]
 ProjectionView = Literal["project", "plan", "blueprint", "build", "validation"]
-NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+NonEmptyText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
+]
 ArtifactDigest = Annotated[str, StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$")]
 
 _FORBIDDEN_KEY_PARTS = ("token", "password", "secret", "holdout", "prompt", "transcript")

@@ -14,10 +14,10 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from agenten.delivery.minibook_client import MinibookClient
-from agenten.delivery.minibook_events import MinibookProjectionEvent
-from agenten.delivery.projection_cursor import ProjectionCursorStore
-from agenten.delivery.projector import MinibookProjector
+from agenten.delivery.minibook_client import MinibookClient  # noqa: E402
+from agenten.delivery.minibook_events import MinibookProjectionEvent  # noqa: E402
+from agenten.delivery.projection_cursor import ProjectionCursorStore  # noqa: E402
+from agenten.delivery.projector import MinibookProjector  # noqa: E402
 
 
 class CaptainProjectionFeed:

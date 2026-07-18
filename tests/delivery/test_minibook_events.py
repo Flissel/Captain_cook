@@ -87,3 +87,11 @@ def test_projection_subject_rejects_an_absolute_workspace_path() -> None:
 
     with pytest.raises(ValidationError):
         MinibookProjectionEvent.model_validate(document)
+
+
+def test_projection_rejects_oversized_public_text_fields() -> None:
+    document = json.loads(FIXTURE.read_text(encoding="utf-8"))[0]
+    document["payload"]["public_title"] = "x" * 201
+
+    with pytest.raises(ValidationError):
+        MinibookProjectionEvent.model_validate(document)
