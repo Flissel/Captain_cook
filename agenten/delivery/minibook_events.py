@@ -93,6 +93,12 @@ class MinibookProjectionEvent(BaseModel):
     event_type: ProjectionEventType
     payload: MinibookProjectionPayload
 
+    @field_validator("subject_id")
+    @classmethod
+    def validate_public_subject_id(cls, value: str) -> str:
+        _reject_forbidden_projection_data(value, location="subject_id")
+        return value
+
     @field_validator("payload", mode="before")
     @classmethod
     def validate_redacted_payload(cls, value: Any) -> MinibookProjectionPayload:

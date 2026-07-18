@@ -96,6 +96,9 @@ class MinibookClient:
             "POST", f"/api/v1/posts/{post_id}/comments", json={"content": content}
         )
 
+    def list_comments(self, post_id: str) -> list[dict[str, Any]]:
+        return self._request("GET", f"/api/v1/posts/{post_id}/comments")
+
     def close(self) -> None:
         if self._owns_client:
             self._client.close()

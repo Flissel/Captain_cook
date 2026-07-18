@@ -79,3 +79,11 @@ def test_projection_payload_is_a_strict_allow_list() -> None:
                 },
             }
         )
+
+
+def test_projection_subject_rejects_an_absolute_workspace_path() -> None:
+    document = json.loads(FIXTURE.read_text(encoding="utf-8"))[0]
+    document["subject_id"] = "C:\\private\\captain-workspace"
+
+    with pytest.raises(ValidationError):
+        MinibookProjectionEvent.model_validate(document)
