@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TypeVar
 
@@ -45,7 +46,15 @@ class JsonEvaluationStore:
         self._root = Path(root)
         self._lock = asyncio.Lock()
 
-    async def create_run(self, source: EvaluationSource, *, run_id: str, idempotency_key: str) -> EvaluationRun:
+    async def create_run(
+        self,
+        source: EvaluationSource,
+        *,
+        run_id: str,
+        idempotency_key: str,
+        max_rounds: int = 3,
+        max_calls: int = 1,
+    ) -> EvaluationRun:
         self._safe_id(run_id)
         source = redact_model(source)
         run = EvaluationRun(
@@ -53,8 +62,8 @@ class JsonEvaluationStore:
             idempotency_key=redact_text(idempotency_key),
             source=source,
             status=EvaluationStatus.CREATED,
-            max_rounds=3,
-            max_calls=1,
+            max_rounds=max_rounds,
+            max_calls=max_calls,
         )
         async with self._lock:
             stored = self._write_model(self._run_dir(run_id) / "source-manifest.json", run)
@@ -96,12 +105,27 @@ class JsonEvaluationStore:
             stored = self._write_model(self._run_dir(run_id) / relative, review)
         return ReviewReceipt(run_id=run_id, component_key=review.component_key, revision=review.revision, artifact_reference=relative, sha256=_digest(stored))
 
-    async def finalize(self, run_id: str, outcome: EvaluationOutcome) -> EvaluationManifest:
+    async def finalize(
+        self,
+        run_id: str,
+        outcome: EvaluationOutcome | Mapping[str, EvaluationOutcome],
+    ) -> EvaluationManifest:
         async with self._lock:
             run = self._read_run(run_id)
             inventory = self._read_model(self._run_dir(run_id) / "component-inventory.json", ComponentInventoryCandidate)
-            components = tuple(self._staged_component_outcome(run_id, candidate, outcome) for candidate in inventory.components)
-            status = _status_for(outcome)
+            requested = (
+                {candidate.component_key: outcome for candidate in inventory.components}
+                if isinstance(outcome, EvaluationOutcome)
+                else dict(outcome)
+            )
+            expected_keys = {candidate.component_key for candidate in inventory.components}
+            if set(requested) != expected_keys:
+                raise EvaluationConflictError("component outcomes must cover the staged inventory exactly")
+            components = tuple(
+                self._staged_component_outcome(run_id, candidate, requested[candidate.component_key])
+                for candidate in inventory.components
+            )
+            status = _status_for_components(components)
             digests = tuple(self._artifact_digests(run_id))
             manifest = EvaluationManifest(
                 run_id=run.run_id,
@@ -118,14 +142,21 @@ class JsonEvaluationStore:
 
     def _staged_component_outcome(self, run_id: str, inventory_candidate: ComponentPlanCandidate, outcome: EvaluationOutcome) -> ComponentOutcome:
         self._safe_id(inventory_candidate.component_key)
-        candidate_path = self._run_dir(run_id) / "candidates" / inventory_candidate.component_key / f"revision-{inventory_candidate.revision}.json"
-        candidate = self._read_model(candidate_path, ComponentPlanCandidate)
-        if candidate != inventory_candidate:
+        first_path = self._run_dir(run_id) / "candidates" / inventory_candidate.component_key / "revision-1.json"
+        first_candidate = self._read_model(first_path, ComponentPlanCandidate)
+        if first_candidate != inventory_candidate:
             raise EvaluationConflictError("candidate artifact does not match staged inventory")
+        candidate = first_candidate
+        for revision in range(2, 4):
+            candidate_path = self._run_dir(run_id) / "candidates" / inventory_candidate.component_key / f"revision-{revision}.json"
+            if not candidate_path.is_file():
+                break
+            candidate = self._read_model(candidate_path, ComponentPlanCandidate)
         review_path = self._run_dir(run_id) / "qa-reviews" / candidate.component_key / f"revision-{candidate.revision}.json"
         review = self._read_model(review_path, QaReview)
-        component_outcome = EvaluationOutcome.ACCEPTED if review and review.decision == "approved" and outcome == EvaluationOutcome.ACCEPTED else outcome
-        return ComponentOutcome(component_key=candidate.component_key, outcome=component_outcome, revision=candidate.revision, candidate=candidate, review=review)
+        if outcome == EvaluationOutcome.ACCEPTED and review.decision != "approved":
+            raise EvaluationConflictError("accepted component requires an approved persisted QA review")
+        return ComponentOutcome(component_key=candidate.component_key, outcome=outcome, revision=candidate.revision, candidate=candidate, review=review)
 
     def _artifact_digests(self, run_id: str) -> list[str]:
         run_dir = self._run_dir(run_id)
@@ -173,10 +204,10 @@ def _digest(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def _status_for(outcome: EvaluationOutcome) -> EvaluationStatus:
-    return {
-        EvaluationOutcome.ACCEPTED: EvaluationStatus.ACCEPTED,
-        EvaluationOutcome.NEEDS_REVISION: EvaluationStatus.PARTIAL,
-        EvaluationOutcome.UNRESOLVED: EvaluationStatus.PARTIAL,
-        EvaluationOutcome.FAILED: EvaluationStatus.FAILED,
-    }[outcome]
+def _status_for_components(components: tuple[ComponentOutcome, ...]) -> EvaluationStatus:
+    outcomes = {component.outcome for component in components}
+    if outcomes == {EvaluationOutcome.ACCEPTED}:
+        return EvaluationStatus.ACCEPTED
+    if EvaluationOutcome.FAILED in outcomes:
+        return EvaluationStatus.FAILED
+    return EvaluationStatus.PARTIAL
