@@ -10,6 +10,7 @@ def test_captain_builder_compose_isolated_from_vibemind() -> None:
     assert "name: captain-n8n-builder" in compose
     assert '127.0.0.1:${CAPTAIN_N8N_PORT:-5679}:5678' in compose
     assert "DB_TYPE=postgresdb" in compose
+    assert "N8N_SECURE_COOKIE=false" in compose
     assert "docker.sock" not in compose
     assert "vibemind" not in compose.lower()
     assert "external: true" not in compose

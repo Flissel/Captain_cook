@@ -33,6 +33,7 @@ services:
       - N8N_ENCRYPTION_KEY=${CAPTAIN_N8N_ENCRYPTION_KEY:?missing}
       - N8N_HOST=localhost
       - N8N_PROTOCOL=http
+      - N8N_SECURE_COOKIE=false
       - WEBHOOK_URL=http://localhost:${CAPTAIN_N8N_PORT:-5679}/
       - GENERIC_TIMEZONE=Europe/Berlin
       - TZ=Europe/Berlin
