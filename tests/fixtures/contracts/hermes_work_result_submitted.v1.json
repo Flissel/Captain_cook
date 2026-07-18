@@ -1,0 +1,44 @@
+{
+  "schema": "captain.hermes-work-result.v1",
+  "event_id": "00000000-0000-0000-0000-000000000011",
+  "command_id": "00000000-0000-0000-0000-000000000001",
+  "correlation_id": "00000000-0000-0000-0000-000000000002",
+  "occurred_at": "2026-07-17T12:05:00Z",
+  "producer": "hermes-runtime",
+  "subject_id": "subtask-1",
+  "subject_version": 3,
+  "batch_id": "batch-1",
+  "batch_version": 4,
+  "grant_id": "grant-1",
+  "integration_intent": "n8n",
+  "status": "succeeded",
+  "session_id": "codex-session-1",
+  "before_commit": "1111111111111111111111111111111111111111",
+  "after_commit": "2222222222222222222222222222222222222222",
+  "changed_paths": ["workflows/lead-routing.json"],
+  "artifact_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+  "codex_evidence": {
+    "session_id": "codex-session-1",
+    "turn_id": "codex-turn-1",
+    "started_at": "2026-07-17T12:01:00Z",
+    "ended_at": "2026-07-17T12:04:30Z",
+    "before_commit": "1111111111111111111111111111111111111111",
+    "after_commit": "2222222222222222222222222222222222222222",
+    "changed_paths": ["workflows/lead-routing.json"],
+    "output_digest": "4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "mcp_evidence": [
+    {
+      "server_name": "n8n-mcp",
+      "tool_name": "workflow_validate",
+      "call_id": "mcp-call-1",
+      "execution_id": "n8n-execution-1",
+      "correlation_id": "00000000-0000-0000-0000-000000000002",
+      "started_at": "2026-07-17T12:03:00Z",
+      "ended_at": "2026-07-17T12:03:10Z",
+      "input_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+      "output_digest": "6666666666666666666666666666666666666666666666666666666666666666"
+    }
+  ],
+  "error": null
+}

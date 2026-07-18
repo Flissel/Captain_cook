@@ -1,0 +1,59 @@
+{
+  "schema": "captain.work-package-released.v1",
+  "event_id": "00000000-0000-0000-0000-000000000010",
+  "correlation_id": "00000000-0000-0000-0000-000000000002",
+  "occurred_at": "2026-07-17T12:00:30Z",
+  "producer": "captain",
+  "subject_id": "subtask-1",
+  "subject_version": 3,
+  "command": {
+    "schema": "captain.agent-runtime-command.v1",
+    "event_id": "00000000-0000-0000-0000-000000000001",
+    "correlation_id": "00000000-0000-0000-0000-000000000002",
+    "causation_id": null,
+    "occurred_at": "2026-07-17T12:00:00Z",
+    "producer": "captain-swarm",
+    "subject_id": "subtask-1",
+    "subject_version": 3,
+    "payload": {
+      "operation": "codex.run",
+      "project_id": "project-1",
+      "batch_id": "batch-1",
+      "subtask_id": "subtask-1",
+      "workspace_ref": "workspace://authorized/project-1/subtask-1",
+      "prompt_ref": {
+        "uri": "artifact://runtime/prompt-1",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "media_type": "text/markdown"
+      },
+      "integration_intent": "n8n",
+      "capability_profile": "n8n-builder",
+      "limits": {
+        "wall_seconds": 900,
+        "max_iterations": 3
+      }
+    }
+  },
+  "grant": {
+    "schema": "captain.capability-grant.v1",
+    "grant_id": "grant-1",
+    "command_id": "00000000-0000-0000-0000-000000000001",
+    "batch_id": "batch-1",
+    "batch_version": 4,
+    "subtask_id": "subtask-1",
+    "workspace_ref": "workspace://authorized/project-1/subtask-1",
+    "profile": "n8n-builder",
+    "capabilities": [
+      "codex.run",
+      "codex.resume",
+      "codex.status",
+      "workspace.write",
+      "tests.run",
+      "mcp.n8n"
+    ],
+    "mcp_servers": ["n8n-mcp"],
+    "issued_at": "2026-07-17T11:59:00Z",
+    "expires_at": "2026-07-17T12:15:00Z"
+  },
+  "acceptance_assertion_ids": ["workflow-valid", "workspace-confined"]
+}
