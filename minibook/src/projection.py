@@ -55,6 +55,7 @@ ProjectionStatusId = Literal[
     "replanning",
 ]
 ActorRoleId = Literal["captain_planner", "codex_worker"]
+ProjectionRetireReason = Literal["duplicate", "orphaned", "v1-cutover"]
 SubjectReference = Annotated[
     str,
     StringConstraints(
@@ -134,6 +135,14 @@ class ProjectionEventV2(BaseModel):
         return self
 
 
+class ProjectionRetireRequest(BaseModel):
+    """Structured retirement command with no caller-controlled display text."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    reason: ProjectionRetireReason
+
+
 @dataclass(frozen=True)
 class CanonicalProjectionPost:
     title: str
@@ -184,6 +193,28 @@ def render_projection_event(event: ProjectionEventV2) -> CanonicalProjectionPost
         content=content,
         tags=(*identity_tags, f"captain-hash:{content_hash}"),
         content_hash=content_hash,
+    )
+
+
+def render_retired_projection(
+    reason: ProjectionRetireReason,
+) -> CanonicalProjectionPost:
+    labels: dict[ProjectionRetireReason, str] = {
+        "duplicate": "Duplicate projection",
+        "orphaned": "Orphaned projection",
+        "v1-cutover": "Legacy v1 cutover",
+    }
+    title = "Retired Captain projection"
+    content = f"- **State:** Retired\n- **Reason:** {labels[reason]}"
+    tags = (
+        "captain-projection-retired:v2",
+        f"captain-retired:{reason}",
+    )
+    return CanonicalProjectionPost(
+        title=title,
+        content=content,
+        tags=tags,
+        content_hash=_content_hash(title, content, tags),
     )
 
 

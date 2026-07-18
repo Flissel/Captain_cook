@@ -49,8 +49,10 @@ from .ratelimit import rate_limiter, init_rate_limiter
 from .github_webhook import verify_signature, process_github_event
 from .projection import (
     ProjectionEventV2,
+    ProjectionRetireRequest,
     projection_event_fingerprint,
     render_projection_event,
+    render_retired_projection,
 )
 
 
@@ -67,6 +69,14 @@ HOSTNAME = config.get("hostname", "localhost:8080")
 DB_PATH = config.get("database", "data/minibook.db")
 PUBLIC_URL = config.get("public_url", f"http://{HOSTNAME}")
 ADMIN_TOKEN = config.get("admin_token", None)
+
+PROJECTION_PROJECT_ID = "captain-runtime-projection-v2"
+PROJECTION_PROJECT_NAME = "Captain Runtime Projection"
+PROJECTION_PROJECT_DESCRIPTION = (
+    "Rebuildable, redacted collaboration views from committed Captain events."
+)
+PROJECTION_SERVICE_AGENT_ID = "captain-projection-service-v2"
+PROJECTION_SERVICE_AGENT_NAME = "Captain Projection Service"
 
 SessionLocal = None
 
@@ -141,6 +151,16 @@ def require_projector(authorization: str = Header(None)) -> bool:
     if not supplied or not hmac.compare_digest(supplied, expected):
         raise HTTPException(403, "Projection capability is required")
     return True
+
+
+def _forbid_reserved_projection_project(project_id: str) -> None:
+    if project_id == PROJECTION_PROJECT_ID:
+        raise HTTPException(403, "Reserved projection project is read-only")
+
+
+def _forbid_reserved_projection_name(project_name: str) -> None:
+    if project_name.casefold() == PROJECTION_PROJECT_NAME.casefold():
+        raise HTTPException(403, "Reserved projection project identity")
 
 
 def require_admin(authorization: str = Header(None)) -> bool:
@@ -393,6 +413,7 @@ async def get_agent_profile(agent_id: str, db=Depends(get_db)):
 @app.post("/api/v1/projects", response_model=ProjectResponse)
 async def create_project(data: ProjectCreate, agent: Agent = Depends(require_agent), db=Depends(get_db)):
     """Create a new project. Creator auto-joins as lead."""
+    _forbid_reserved_projection_name(data.name)
     if db.query(Project).filter(Project.name == data.name).first():
         raise HTTPException(400, "Project name already taken")
     
@@ -425,30 +446,31 @@ async def upsert_projection_project(
     db=Depends(get_db),
 ):
     """Create or return Captain's singleton projection project atomically."""
-    if external_id != "captain-runtime-projection-v2":
+    if external_id != PROJECTION_PROJECT_ID:
         raise HTTPException(422, "Unsupported projection project identity")
-    project_name = "Captain Runtime Projection"
-    project_description = (
-        "Rebuildable, redacted collaboration views from committed Captain events."
-    )
     db.commit()
     db.execute(text("BEGIN IMMEDIATE"))
     service_agent = _ensure_projection_service_agent(db)
     project = db.query(Project).filter(Project.id == external_id).first()
     if project is None:
-        conflicting_name = db.query(Project).filter(Project.name == project_name).first()
+        conflicting_name = db.query(Project).filter(
+            Project.name == PROJECTION_PROJECT_NAME
+        ).first()
         if conflicting_name is not None:
             db.rollback()
             raise HTTPException(409, "Projection project identity conflicts")
         project = Project(
             id=external_id,
-            name=project_name,
-            description=project_description,
+            name=PROJECTION_PROJECT_NAME,
+            description=PROJECTION_PROJECT_DESCRIPTION,
             primary_lead_agent_id=service_agent.id,
         )
         db.add(project)
         db.flush()
-    elif project.name != project_name or project.description != project_description:
+    elif (
+        project.name != PROJECTION_PROJECT_NAME
+        or project.description != PROJECTION_PROJECT_DESCRIPTION
+    ):
         db.rollback()
         raise HTTPException(409, "Projection project identity conflicts")
     project.primary_lead_agent_id = service_agent.id
@@ -479,18 +501,23 @@ async def upsert_projection_project(
 def _ensure_projection_service_agent(db) -> Agent:
     """Return the internal author identity without exposing its random API key."""
 
-    agent_id = "captain-projection-service-v2"
-    agent_name = "Captain Projection Service"
-    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    agent = db.query(Agent).filter(Agent.id == PROJECTION_SERVICE_AGENT_ID).first()
     if agent is not None:
-        if agent.name != agent_name:
+        if agent.name != PROJECTION_SERVICE_AGENT_NAME:
             db.rollback()
             raise HTTPException(409, "Projection service identity conflicts")
         return agent
-    if db.query(Agent).filter(Agent.name == agent_name).first() is not None:
+    if (
+        db.query(Agent).filter(Agent.name == PROJECTION_SERVICE_AGENT_NAME).first()
+        is not None
+    ):
         db.rollback()
         raise HTTPException(409, "Projection service identity conflicts")
-    agent = Agent(id=agent_id, name=agent_name, api_key=generate_api_key())
+    agent = Agent(
+        id=PROJECTION_SERVICE_AGENT_ID,
+        name=PROJECTION_SERVICE_AGENT_NAME,
+        api_key=generate_api_key(),
+    )
     db.add(agent)
     db.flush()
     return agent
@@ -525,6 +552,7 @@ async def get_project(project_id: str, db=Depends(get_db)):
 @app.post("/api/v1/projects/{project_id}/join", response_model=MemberResponse)
 async def join_project(project_id: str, data: JoinProject, agent: Agent = Depends(require_agent), db=Depends(get_db)):
     """Join a project with the requested free-text role."""
+    _forbid_reserved_projection_project(project_id)
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(404, "Project not found")
@@ -563,6 +591,7 @@ async def update_member_role(
     db=Depends(get_db)
 ):
     """Update a member's role. DEPRECATED: Use admin API instead. Returns 403."""
+    _forbid_reserved_projection_project(project_id)
     # Role updates disabled for regular API - use /api/v1/admin/... endpoints
     raise HTTPException(
         403, 
@@ -586,6 +615,7 @@ async def update_member_role(
 @app.post("/api/v1/projects/{project_id}/posts", response_model=PostResponse)
 async def create_post(project_id: str, data: PostCreate, agent: Agent = Depends(require_agent), db=Depends(get_db)):
     """Create a new post."""
+    _forbid_reserved_projection_project(project_id)
     # Rate limit posts
     rate_limiter.check(agent.id, "post")
     
@@ -651,7 +681,7 @@ async def upsert_projection_post(
     if project is None:
         db.rollback()
         raise HTTPException(404, "Project not found")
-    if project_id != "captain-runtime-projection-v2":
+    if project_id != PROJECTION_PROJECT_ID:
         db.rollback()
         raise HTTPException(422, "Unsupported projection project identity")
 
@@ -737,6 +767,49 @@ async def upsert_projection_post(
         head.event_id = event_id
         head.source_fingerprint = source_fingerprint
 
+    db.commit()
+    db.refresh(post)
+    return _projection_post_response(post)
+
+
+@app.post(
+    "/api/v1/projects/{project_id}/projection-posts/{post_id}/retire",
+    response_model=PostResponse,
+)
+async def retire_projection_post(
+    project_id: str,
+    post_id: str,
+    data: ProjectionRetireRequest,
+    _projector: bool = Depends(require_projector),
+    db=Depends(get_db),
+):
+    """Retire one projection post using only canonical, enumerated content."""
+
+    if project_id != PROJECTION_PROJECT_ID:
+        raise HTTPException(422, "Unsupported projection project identity")
+    db.commit()
+    db.execute(text("BEGIN IMMEDIATE"))
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if project is None:
+        db.rollback()
+        raise HTTPException(404, "Project not found")
+    post = db.query(Post).filter(
+        Post.id == post_id,
+        Post.project_id == project_id,
+    ).first()
+    if post is None:
+        db.rollback()
+        raise HTTPException(404, "Post not found")
+
+    rendered = render_retired_projection(data.reason)
+    post.title = rendered.title
+    post.content = rendered.content
+    post.type = "plan"
+    post.status = "closed"
+    post.tags = list(rendered.tags)
+    post.mentions = []
+    post.pin_order = None
+    post.github_ref = None
     db.commit()
     db.refresh(post)
     return _projection_post_response(post)
@@ -891,6 +964,7 @@ async def update_post(post_id: str, data: PostUpdate, agent: Agent = Depends(req
     post = db.query(Post).filter(Post.id == post_id).first()
     if not post:
         raise HTTPException(404, "Post not found")
+    _forbid_reserved_projection_project(post.project_id)
     
     old_status = post.status
     
@@ -934,12 +1008,13 @@ async def update_post(post_id: str, data: PostUpdate, agent: Agent = Depends(req
 @app.post("/api/v1/posts/{post_id}/comments", response_model=CommentResponse)
 async def create_comment(post_id: str, data: CommentCreate, agent: Agent = Depends(require_agent), db=Depends(get_db)):
     """Add a comment (supports nesting via parent_id)."""
-    # Rate limit comments
-    rate_limiter.check(agent.id, "comment")
-    
     post = db.query(Post).filter(Post.id == post_id).first()
     if not post:
         raise HTTPException(404, "Post not found")
+    _forbid_reserved_projection_project(post.project_id)
+
+    # Rate limit comments
+    rate_limiter.check(agent.id, "comment")
     
     raw_mentions, has_all = parse_mentions(data.content)
     mentions = validate_mentions(db, raw_mentions)
@@ -1007,6 +1082,7 @@ async def list_comments(post_id: str, db=Depends(get_db)):
 @app.post("/api/v1/projects/{project_id}/webhooks", response_model=WebhookResponse)
 async def create_webhook(project_id: str, data: WebhookCreate, agent: Agent = Depends(require_agent), db=Depends(get_db)):
     """Create a webhook for project events."""
+    _forbid_reserved_projection_project(project_id)
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(404, "Project not found")
@@ -1033,6 +1109,7 @@ async def delete_webhook(webhook_id: str, agent: Agent = Depends(require_agent),
     webhook = db.query(Webhook).filter(Webhook.id == webhook_id).first()
     if not webhook:
         raise HTTPException(404, "Webhook not found")
+    _forbid_reserved_projection_project(webhook.project_id)
     db.delete(webhook)
     db.commit()
     return {"status": "deleted"}
@@ -1092,6 +1169,7 @@ async def create_github_webhook(
     db=Depends(get_db)
 ):
     """Configure GitHub webhook for a project."""
+    _forbid_reserved_projection_project(project_id)
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(404, "Project not found")
@@ -1139,6 +1217,7 @@ async def get_github_webhook(project_id: str, agent: Agent = Depends(require_age
 @app.delete("/api/v1/projects/{project_id}/github-webhook")
 async def delete_github_webhook(project_id: str, agent: Agent = Depends(require_agent), db=Depends(get_db)):
     """Delete GitHub webhook config."""
+    _forbid_reserved_projection_project(project_id)
     config = db.query(GitHubWebhook).filter(GitHubWebhook.project_id == project_id).first()
     if not config:
         raise HTTPException(404, "GitHub webhook not configured")
@@ -1159,6 +1238,8 @@ async def receive_github_webhook(project_id: str, request: Request, db=Depends(g
     
     Set content type to application/json and provide your secret.
     """
+    _forbid_reserved_projection_project(project_id)
+
     # Get config
     config = db.query(GitHubWebhook).filter(
         GitHubWebhook.project_id == project_id,
@@ -1215,6 +1296,7 @@ async def set_role_descriptions(
     db=Depends(get_db)
 ):
     """Set role descriptions for a project. Body: {"Lead": "desc", "Developer": "desc", ...}"""
+    _forbid_reserved_projection_project(project_id)
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(404, "Project not found")
@@ -1262,6 +1344,7 @@ async def set_plan(
     db=Depends(get_db)
 ):
     """Create or update the project's Grand Plan (admin only via ADMIN_TOKEN)."""
+    _forbid_reserved_projection_project(project_id)
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(404, "Project not found")
@@ -1471,6 +1554,7 @@ async def admin_update_project(
     db=Depends(get_db)
 ):
     """Update project settings like primary lead (admin only)."""
+    _forbid_reserved_projection_project(project_id)
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(404, "Project not found")
@@ -1522,6 +1606,7 @@ async def admin_update_member_role(
     db=Depends(get_db)
 ):
     """Update a member's role (admin only)."""
+    _forbid_reserved_projection_project(project_id)
     member = db.query(ProjectMember).filter(
         ProjectMember.agent_id == agent_id,
         ProjectMember.project_id == project_id
@@ -1551,6 +1636,7 @@ async def admin_remove_member(
     db=Depends(get_db)
 ):
     """Remove a member from project (admin only)."""
+    _forbid_reserved_projection_project(project_id)
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(404, "Project not found")
@@ -1684,6 +1770,8 @@ async def update_registry_status(
     db=Depends(get_db),
 ):
     """Update the status of a registry entry. Requires agent auth."""
+    if data.community_project_id is not None:
+        _forbid_reserved_projection_project(data.community_project_id)
     entry = db.query(AgentRegistry).filter(AgentRegistry.id == registry_id).first()
     if not entry:
         raise HTTPException(404, "Registry entry not found")

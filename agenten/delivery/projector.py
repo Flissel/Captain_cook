@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from .minibook_client import (
     MinibookClient,
+    ProjectionRetireReason,
     RemoteProjectionConflict,
     RemoteProjectionStale,
 )
@@ -431,14 +432,17 @@ class MinibookProjector:
     ) -> dict[str, Any]:
         return self.client.upsert_projection_post(project_id, event=event)
 
-    def _retire_projection_post(self, post: dict[str, Any], *, reason: str) -> None:
-        tags = [
-            tag
-            for tag in post.get("tags", [])
-            if tag not in {"captain-projection:v1", "captain-projection:v2"}
-        ]
-        tags.extend(("captain-projection-retired:v2", f"captain-retired:{reason}"))
-        self.client.update_post(post["id"], status="closed", tags=sorted(set(tags)))
+    def _retire_projection_post(
+        self,
+        post: dict[str, Any],
+        *,
+        reason: ProjectionRetireReason,
+    ) -> None:
+        self.client.retire_projection_post(
+            self.PROJECTION_PROJECT_ID,
+            post["id"],
+            reason=reason,
+        )
 
     def _require_cursor_store(self) -> ProjectionCursorStore:
         if self.cursor_store is None:

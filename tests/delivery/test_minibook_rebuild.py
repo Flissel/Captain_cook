@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
-from typing import Iterator
+from typing import Any, Iterator
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -65,6 +65,44 @@ def load_events() -> list[MinibookProjectionEvent]:
     ]
 
 
+def _seed_projection_post(
+    client: MinibookClient,
+    *,
+    project_id: str,
+    title: str,
+    content: str,
+    tags: list[str],
+) -> dict[str, Any]:
+    """Inject pre-boundary drift directly; ordinary HTTP must stay fenced."""
+
+    from src import main as minibook_main
+    from src.models import Post
+
+    with minibook_main.SessionLocal() as db:
+        post = Post(
+            project_id=project_id,
+            author_id="captain-projection-service-v2",
+            title=title,
+            content=content,
+            type="plan",
+        )
+        post.tags = tags
+        db.add(post)
+        db.commit()
+        post_id = str(post.id)
+    return client.get_post(post_id)
+
+
+def _corrupt_projection_post(post_id: str, *, content: str) -> None:
+    from src import main as minibook_main
+    from src.models import Post
+
+    with minibook_main.SessionLocal() as db:
+        post = db.query(Post).filter(Post.id == post_id).one()
+        post.content = content
+        db.commit()
+
+
 def test_rebuild_reports_and_repairs_missing_modified_duplicate_and_orphaned_posts(
     tmp_path: Path,
     projection_api: MinibookClient,
@@ -93,21 +131,24 @@ def test_rebuild_reports_and_repairs_missing_modified_duplicate_and_orphaned_pos
     }
     first = by_event[str(events[0].event_id)]
     second = by_event[str(events[1].event_id)]
-    projection_api.update_post(first["id"], content="operator drift")
-    projection_api.create_post(
-        project["id"],
+    _corrupt_projection_post(first["id"], content="operator drift")
+    _seed_projection_post(
+        projection_api,
+        project_id=project["id"],
         title=second["title"],
         content=second["content"],
         tags=second["tags"],
     )
-    orphan = projection_api.create_post(
-        project["id"],
+    orphan = _seed_projection_post(
+        projection_api,
+        project_id=project["id"],
         title="Orphaned projection",
         content="No authoritative event remains.",
         tags=["captain-projection:v2", f"captain-event:{uuid4()}"],
     )
-    unrelated = projection_api.create_post(
-        project["id"],
+    unrelated = _seed_projection_post(
+        projection_api,
+        project_id=project["id"],
         title="Human collaboration",
         content="Must never be changed by rebuild.",
         tags=["human-owned"],
@@ -595,8 +636,9 @@ def test_apply_full_rebuild_retires_v1_posts_and_records_v2_state(
     project = projection_api.ensure_projection_project(
         external_id="captain-runtime-projection-v2",
     )
-    legacy = projection_api.create_post(
-        project["id"],
+    legacy = _seed_projection_post(
+        projection_api,
+        project_id=project["id"],
         title="Legacy v1 projection",
         content="Legacy public content",
         tags=["captain-projection:v1", f"captain-event:{document['event_id']}"],

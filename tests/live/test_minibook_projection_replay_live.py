@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 from threading import Thread
@@ -80,7 +81,7 @@ def projection_feed(
 
 
 @contextmanager
-def independent_minibook(tmp_path: Path) -> Iterator[tuple[str, str]]:
+def independent_minibook(tmp_path: Path) -> Iterator[tuple[str, str, Path]]:
     service_root = tmp_path / "minibook-service"
     shutil.copytree(
         MINIBOOK_ROOT,
@@ -143,7 +144,7 @@ def independent_minibook(tmp_path: Path) -> Iterator[tuple[str, str]]:
             time.sleep(0.1)
         else:
             pytest.fail("independent Minibook health endpoint did not become ready")
-        yield base_url, projection_api_key
+        yield base_url, projection_api_key, database_path
     finally:
         process.terminate()
         try:
@@ -169,7 +170,7 @@ def test_live_synthetic_captain_compatible_feed_replay_and_rebuild(
     )
 
     with independent_minibook(tmp_path) as minibook_service, projection_feed([event]) as feed_url:
-        minibook_url, projection_api_key = minibook_service
+        minibook_url, projection_api_key, database_path = minibook_service
         assert httpx.get(f"{minibook_url}/health").json()["status"] == "ok"
         registration = httpx.post(
             f"{minibook_url}/api/v1/agents",
@@ -208,7 +209,12 @@ def test_live_synthetic_captain_compatible_feed_replay_and_rebuild(
             posts = client.list_posts(project["id"])
             assert len(posts) == 1
 
-            client.update_post(posts[0]["id"], content="unsafe operator drift")
+            with sqlite3.connect(database_path) as connection:
+                connection.execute(
+                    "UPDATE posts SET content = ? WHERE id = ?",
+                    ("unsafe operator drift", posts[0]["id"]),
+                )
+                connection.commit()
             assert restarted.reconcile([event]).modified_event_ids == (
                 str(event.event_id),
             )

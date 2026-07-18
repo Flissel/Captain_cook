@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import httpx
@@ -17,6 +17,9 @@ class RemoteProjectionStale(RuntimeError):
 
 class RemoteProjectionConflict(RuntimeError):
     pass
+
+
+ProjectionRetireReason = Literal["duplicate", "orphaned", "v1-cutover"]
 
 
 def validate_service_base_url(base_url: str) -> str:
@@ -170,6 +173,19 @@ class MinibookClient:
         )
         response.raise_for_status()
         return response.json()
+
+    def retire_projection_post(
+        self,
+        project_id: str,
+        post_id: str,
+        *,
+        reason: ProjectionRetireReason,
+    ) -> dict[str, Any]:
+        return self._projection_request(
+            "POST",
+            f"/api/v1/projects/{project_id}/projection-posts/{post_id}/retire",
+            json={"reason": reason},
+        )
 
     def get_post(self, post_id: str) -> dict[str, Any]:
         return self._request("GET", f"/api/v1/posts/{post_id}")

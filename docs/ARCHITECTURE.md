@@ -68,9 +68,14 @@ The v2 event payload contains no producer-supplied display text. It accepts only
 enumerated template/status/actor identifiers, typed subject and batch
 references, bounded versions, and content-addressed artifact digests. Minibook
 revalidates that event and owns canonical titles, content, tags, fingerprints,
-and labels. Its two projection PUT routes require a dedicated
+and labels. Its projection mutation routes require a dedicated
 `MINIBOOK_PROJECTION_API_KEY`; ordinary agent credentials have no projection
-write scope.
+write scope. The deterministic projection project ID and name are reserved
+across every ordinary write surface. Direct project routes, indirect post and
+webhook lookups, plan/member/admin routes, GitHub integration ingress, and
+registry project linkage all fail with HTTP 403. A route-inventory fitness test
+forces every new POST/PUT/PATCH/DELETE endpoint to be classified as guarded,
+projector-only, or project-independent.
 
 Rebuild is dry-run by default and creates no cursor file, directory, table, or
 Minibook object. `--apply` repairs missing or modified projection posts and
@@ -79,7 +84,11 @@ untouched. An unversioned v1 cursor, active v1 post set, or interrupted cutover
 requires an explicit full rebuild. The full rebuild validates the complete v2
 feed, replays one deterministic post per event, retires v1 posts, and atomically
 checkpoints the terminal cursor plus `contract_version=v2` only after
-convergence.
+convergence. Repair uses the structured canonical event upsert. Retirement is
+a separate projector-authenticated endpoint accepting only the fixed
+`duplicate`, `orphaned`, or `v1-cutover` reason enum; Minibook replaces title,
+content, tags, status, mentions, pinning, and integration references with its
+canonical retired representation.
 
 Minibook starts independently with `python run.py`. Its health gate requires no
 Captain, Hermes, Codex, Docker, Forge, or n8n process. The separate live replay
