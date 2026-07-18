@@ -4,6 +4,7 @@ import copy
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -120,6 +121,8 @@ def test_runtime_command_is_idempotent_and_version_fenced(client: TestClient) ->
 def test_grant_and_result_require_the_exact_command(client: TestClient) -> None:
     release_batch(client)
     command = load("agent_runtime_command.v1.json")
+    issued_at = datetime.now(timezone.utc)
+    expires_at = issued_at + timedelta(minutes=15)
     grant = {
         "schema": "captain.capability-grant.v1",
         "grant_id": "grant-gateway-1",
@@ -130,6 +133,8 @@ def test_grant_and_result_require_the_exact_command(client: TestClient) -> None:
         "workspace_ref": "workspace://authorized/project-1/subtask-1",
         "profile": "n8n-builder",
         "capabilities": [
+            "codex.cancel",
+            "codex.heartbeat",
             "codex.resume",
             "codex.run",
             "codex.status",
@@ -138,8 +143,8 @@ def test_grant_and_result_require_the_exact_command(client: TestClient) -> None:
             "workspace.write",
         ],
         "mcp_servers": ["n8n-mcp"],
-        "issued_at": "2026-07-17T12:00:00Z",
-        "expires_at": "2026-07-17T12:15:00Z",
+        "issued_at": issued_at.isoformat().replace("+00:00", "Z"),
+        "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
     }
     result = load("agent_runtime_result.v1.json")
     result["grant_id"] = grant["grant_id"]
