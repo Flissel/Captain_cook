@@ -24,6 +24,15 @@ class EvaluationStatus(str, Enum):
     FAILED = "failed"
 
 
+class EvaluationOutcome(str, Enum):
+    """Captain's final per-component disposition, distinct from run status."""
+
+    ACCEPTED = "accepted"
+    NEEDS_REVISION = "needs_revision"
+    UNRESOLVED = "unresolved"
+    FAILED = "failed"
+
+
 class SourceBlock(BaseModel):
     """One immutable, redacted Markdown fragment safe for later model use."""
 
@@ -119,6 +128,7 @@ class ComponentPlanCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     component_key: str = Field(min_length=1)
+    revision: int = Field(default=1, ge=1, le=3)
     scope: tuple[str, ...]
     non_goals: tuple[str, ...]
     team_roles: tuple[str, ...]
@@ -152,3 +162,69 @@ class ValidationIssue(BaseModel):
     code: str = Field(min_length=1)
     message: str = Field(min_length=1)
     component_key: str | None = None
+
+
+class ComponentOutcome(BaseModel):
+    """Stored non-authoritative plan and review evidence for one component."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    component_key: str = Field(min_length=1)
+    outcome: EvaluationOutcome
+    revision: int = Field(ge=1, le=3)
+    candidate: ComponentPlanCandidate | None = None
+    review: QaReview | None = None
+
+
+class InventoryReceipt(BaseModel):
+    """Receipt for a Captain-owned append-only inventory write."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    run_id: str = Field(min_length=1)
+    inventory_id: str = Field(min_length=1)
+    artifact_reference: str = Field(min_length=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class CandidateReceipt(BaseModel):
+    """Receipt for one immutable candidate revision."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    run_id: str = Field(min_length=1)
+    component_key: str = Field(min_length=1)
+    revision: int = Field(ge=1, le=3)
+    artifact_reference: str = Field(min_length=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ReviewReceipt(BaseModel):
+    """Receipt for one immutable QA review revision."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    run_id: str = Field(min_length=1)
+    component_key: str = Field(min_length=1)
+    revision: int = Field(ge=1, le=3)
+    artifact_reference: str = Field(min_length=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class EvaluationManifest(BaseModel):
+    """Final redacted evidence projection, never a lifecycle authority."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    run_id: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    status: EvaluationStatus
+    source: EvaluationSource
+    component_outcomes: tuple[ComponentOutcome, ...]
+    model_identifier: str = Field(default="not-configured", min_length=1)
+    prompt_version: str = Field(default="not-configured", min_length=1)
+    call_count: int = Field(default=0, ge=0)
+    token_total: int = Field(default=0, ge=0)
+    cost_total: float = Field(default=0.0, ge=0)
+    artifact_digests: tuple[str, ...]
+    planning_disclaimer: str = "Acceptance tests are planned, not executed by this evaluation."
