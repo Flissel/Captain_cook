@@ -27,6 +27,8 @@ PROFILE_CAPABILITIES: dict[CapabilityProfile, frozenset[str]] = {
             "codex.run",
             "codex.resume",
             "codex.status",
+            "codex.cancel",
+            "codex.heartbeat",
             "workspace.write",
             "tests.run",
         }
@@ -36,6 +38,8 @@ PROFILE_CAPABILITIES: dict[CapabilityProfile, frozenset[str]] = {
             "codex.run",
             "codex.resume",
             "codex.status",
+            "codex.cancel",
+            "codex.heartbeat",
             "workspace.write",
             "tests.run",
             "mcp.n8n",

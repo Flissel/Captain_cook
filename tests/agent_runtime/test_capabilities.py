@@ -111,6 +111,26 @@ def test_expired_grant_cannot_resume_codex() -> None:
         validate_grant(grant, command, NOW)
 
 
+@pytest.mark.parametrize("operation", ["codex.cancel", "codex.heartbeat"])
+def test_internal_lifecycle_operations_receive_exact_builder_capability(
+    operation: str,
+) -> None:
+    command = command_for(
+        profile="code-builder",
+        intent="none",
+        operation=operation,
+    )
+
+    grant = derive_grant(
+        command,
+        released_batch(capability_tags=["code-builder"]),
+        NOW,
+    )
+
+    assert operation in grant.capabilities
+    assert frozenset(grant.capabilities) == PROFILE_CAPABILITIES[grant.profile]
+
+
 def test_grant_replay_for_another_command_is_denied() -> None:
     original = command_for()
     replay = command_for()

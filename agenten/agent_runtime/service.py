@@ -94,6 +94,10 @@ class AgentRuntimeService:
                 return await self._codex.resume(command, grant)
             case RuntimeOperation.CODEX_STATUS:
                 return await self._codex.status(command, grant)
+            case RuntimeOperation.CODEX_CANCEL:
+                return await self._codex.cancel(command, grant)
+            case RuntimeOperation.CODEX_HEARTBEAT:
+                return await self._codex.heartbeat(command, grant)
         raise RuntimeContractViolation("unsupported runtime operation")
 
     @staticmethod

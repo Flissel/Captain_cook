@@ -86,3 +86,15 @@ class CodexExecutionPort(Protocol):
         command: AgentRuntimeCommand,
         grant: CapabilityGrant,
     ) -> AgentRuntimeResult: ...
+
+    async def cancel(
+        self,
+        command: AgentRuntimeCommand,
+        grant: CapabilityGrant,
+    ) -> AgentRuntimeResult: ...
+
+    async def heartbeat(
+        self,
+        command: AgentRuntimeCommand,
+        grant: CapabilityGrant,
+    ) -> AgentRuntimeResult: ...

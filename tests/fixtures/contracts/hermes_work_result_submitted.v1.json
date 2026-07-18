@@ -25,13 +25,14 @@
     "before_commit": "1111111111111111111111111111111111111111",
     "after_commit": "2222222222222222222222222222222222222222",
     "changed_paths": ["workflows/lead-routing.json"],
-    "output_digest": "4444444444444444444444444444444444444444444444444444444444444444"
+    "output_digest": "4444444444444444444444444444444444444444444444444444444444444444",
+    "terminal_state": "completed"
   },
   "mcp_evidence": [
     {
       "server_name": "n8n-mcp",
       "tool_name": "workflow_validate",
-      "call_id": "mcp-call-1",
+      "call_id": "n8n-mcp-jsonrpc-41",
       "execution_id": "n8n-execution-1",
       "correlation_id": "00000000-0000-0000-0000-000000000002",
       "started_at": "2026-07-17T12:03:00Z",

@@ -36,6 +36,8 @@ class RuntimeOperation(str, Enum):
     CODEX_RUN = "codex.run"
     CODEX_RESUME = "codex.resume"
     CODEX_STATUS = "codex.status"
+    CODEX_CANCEL = "codex.cancel"
+    CODEX_HEARTBEAT = "codex.heartbeat"
 
 
 class IntegrationIntent(str, Enum):
@@ -102,6 +104,8 @@ class AgentRuntimeCommandPayload(_FrozenContract):
             RuntimeOperation.CODEX_RUN,
             RuntimeOperation.CODEX_RESUME,
             RuntimeOperation.CODEX_STATUS,
+            RuntimeOperation.CODEX_CANCEL,
+            RuntimeOperation.CODEX_HEARTBEAT,
         }
         if self.operation in codex_operations and not all(
             (self.batch_id, self.subtask_id, self.workspace_ref)

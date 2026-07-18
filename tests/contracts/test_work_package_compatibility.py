@@ -69,6 +69,7 @@ CODEX_EVIDENCE_FIELDS = {
     "after_commit",
     "changed_paths",
     "output_digest",
+    "terminal_state",
 }
 MCP_EVIDENCE_FIELDS = {
     "server_name",
@@ -128,7 +129,7 @@ def _validate_fixture(name: str, payload: dict[str, Any]) -> None:
     for evidence in payload["mcp_evidence"]:
         _require_exact_fields(evidence, MCP_EVIDENCE_FIELDS, "mcp evidence")
         assert evidence["correlation_id"] == payload["correlation_id"]
-        assert evidence["call_id"]
+        assert re.fullmatch(r"n8n-mcp-jsonrpc-[0-9]+", evidence["call_id"])
         assert evidence["execution_id"]
         assert SHA256.fullmatch(evidence["input_digest"])
         assert SHA256.fullmatch(evidence["output_digest"])
@@ -141,11 +142,47 @@ def _validate_fixture(name: str, payload: dict[str, Any]) -> None:
     assert GIT_SHA.fullmatch(payload["after_commit"])
     assert SHA256.fullmatch(payload["artifact_digest"])
     assert SHA256.fullmatch(payload["codex_evidence"]["output_digest"])
+    assert payload["codex_evidence"]["terminal_state"] in {
+        "completed",
+        "failed",
+        "interrupted",
+    }
+
+
+def _validate_pair(work_package: dict[str, Any], result: dict[str, Any]) -> None:
+    command = work_package["command"]
+    grant = work_package["grant"]
+    assert result["command_id"] == command["event_id"] == grant["command_id"]
+    assert result["grant_id"] == grant["grant_id"]
+    assert result["correlation_id"] == work_package["correlation_id"] == command["correlation_id"]
+    assert result["subject_id"] == work_package["subject_id"] == command["subject_id"] == grant["subtask_id"]
+    assert result["subject_version"] == work_package["subject_version"] == command["subject_version"]
+    assert result["batch_id"] == command["payload"]["batch_id"] == grant["batch_id"]
+    assert result["batch_version"] == grant["batch_version"]
+    assert result["integration_intent"] == command["payload"]["integration_intent"]
+    assert result["session_id"] == result["codex_evidence"]["session_id"]
+    assert result["codex_evidence"]["turn_id"]
+    assert len({evidence["call_id"] for evidence in result["mcp_evidence"]}) == len(
+        result["mcp_evidence"]
+    )
+    assert all(
+        evidence["correlation_id"] == result["correlation_id"]
+        and evidence["execution_id"]
+        for evidence in result["mcp_evidence"]
+    )
 
 
 @pytest.mark.parametrize("name", FIXTURE_NAMES)
 def test_reviewed_contract_fixture_copy_matches_pinned_hermes(name: str) -> None:
     assert (CAPTAIN_FIXTURES / name).read_bytes() == (HERMES_FIXTURES / name).read_bytes()
+
+
+@pytest.mark.parametrize("root", (CAPTAIN_FIXTURES, HERMES_FIXTURES), ids=("captain", "hermes"))
+def test_work_package_and_result_are_correlated_as_one_pair(root: Path) -> None:
+    _validate_pair(
+        _load(root, FIXTURE_NAMES[0]),
+        _load(root, FIXTURE_NAMES[1]),
+    )
 
 
 @pytest.mark.parametrize("root", (CAPTAIN_FIXTURES, HERMES_FIXTURES), ids=("captain", "hermes"))

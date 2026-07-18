@@ -163,6 +163,16 @@ class FakeCodex:
     ) -> AgentRuntimeResult:
         return self._result(command, grant)
 
+    async def cancel(
+        self, command: AgentRuntimeCommand, grant: CapabilityGrant
+    ) -> AgentRuntimeResult:
+        return self._result(command, grant)
+
+    async def heartbeat(
+        self, command: AgentRuntimeCommand, grant: CapabilityGrant
+    ) -> AgentRuntimeResult:
+        return self._result(command, grant)
+
     def _result(
         self, command: AgentRuntimeCommand, grant: CapabilityGrant
     ) -> AgentRuntimeResult:
@@ -278,13 +288,15 @@ async def test_replay_returns_stored_result_without_second_adapter_call() -> Non
 @pytest.mark.parametrize(
     ("operation", "expected"),
     [
-        ("codex.run", RuntimeOperation.CODEX_RUN),
-        ("codex.resume", RuntimeOperation.CODEX_RESUME),
-        ("codex.status", RuntimeOperation.CODEX_STATUS),
+        ("codex.run", "codex.run"),
+        ("codex.resume", "codex.resume"),
+        ("codex.status", "codex.status"),
+        ("codex.cancel", "codex.cancel"),
+        ("codex.heartbeat", "codex.heartbeat"),
     ],
 )
 @pytest.mark.asyncio
-async def test_codex_operations_dispatch_explicitly(operation: str, expected: RuntimeOperation) -> None:
+async def test_codex_operations_dispatch_explicitly(operation: str, expected: str) -> None:
     events: list[str] = []
     command = command_for(operation)
     state = FakeState(events, batch_for(command))
@@ -292,7 +304,7 @@ async def test_codex_operations_dispatch_explicitly(operation: str, expected: Ru
 
     await service_with(state, events, codex, FakeHermes(events)).execute(command)
 
-    assert codex.calls == [expected]
+    assert [call.value for call in codex.calls] == [expected]
 
 
 @pytest.mark.parametrize("operation", ["hermes.plan", "hermes.design_agent"])
