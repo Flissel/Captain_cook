@@ -229,6 +229,17 @@ class EvaluationSliceReceipt(BaseModel):
         return self
 
 
+class EvaluationLifecycleEvent(BaseModel):
+    """One atomic Captain-owned run phase or recovery transition."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    run_id: str = Field(min_length=1)
+    sequence: int = Field(ge=1)
+    status: EvaluationStatus
+    recovery_state: Literal["active", "cancelled", "resuming", "terminal"]
+
+
 class EvaluationManifest(BaseModel):
     """Final redacted evidence projection, never a lifecycle authority."""
 

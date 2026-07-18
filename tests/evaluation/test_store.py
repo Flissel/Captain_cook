@@ -255,6 +255,10 @@ async def test_store_persists_ordered_atomic_evaluation_artifacts(tmp_path: Path
         "qa-reviews/delivery-api/revision-1.json",
         "run-manifest.json",
         "evaluation.md",
+        "lifecycle/transition-0001.json",
+        "lifecycle/transition-0002.json",
+        "lifecycle/transition-0003.json",
+        "lifecycle/transition-0004.json",
     ])
     assert not list(run_dir.rglob("*.tmp"))
     assert json.loads((run_dir / "run-manifest.json").read_text("utf-8"))["status"] == "accepted"
@@ -327,3 +331,16 @@ async def test_store_enforces_persisted_round_limit_without_tool_service(tmp_pat
             component_key="delivery-api",
             revision=2,
         )
+
+
+@pytest.mark.asyncio
+async def test_store_finalizes_failed_run_without_inventory(tmp_path: Path) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    run = await store.create_run(_source(), run_id="eval-001", idempotency_key="input-v1")
+
+    manifest = await store.finalize(run.run_id, EvaluationOutcome.FAILED)
+
+    assert manifest.status is EvaluationStatus.FAILED
+    assert manifest.component_outcomes == ()
+    assert (tmp_path / "eval-001" / "run-manifest.json").is_file()
+    assert (tmp_path / "eval-001" / "evaluation.md").is_file()

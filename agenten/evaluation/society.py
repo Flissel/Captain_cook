@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import json
+
 from autogen_agentchat.agents import AssistantAgent, SocietyOfMindAgent
-from autogen_agentchat.conditions import TextMentionTermination
+from autogen_agentchat.conditions import SourceMatchTermination
 from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_core.models import ChatCompletionClient
 
+from .models import QaReview, ReviewReceipt
 from .tools import EvaluationToolService
 
-
-_SLICE_COMPLETE = "EVALUATION_SLICE_COMPLETE"
 
 _ANALYST_PROMPT = """You are the Source Analyst in a Captain-owned planning evaluation.
 Read only the requested redacted source blocks. For an inventory slice, stage exactly
@@ -29,7 +30,8 @@ EVALUATION_SLICE_COMPLETE; QA must run before termination.
 _QA_PROMPT = """You are the independent QA Reviewer in a Captain-owned planning evaluation.
 Review only the persisted candidate named by the slice and record one typed review
 through record_qa_review. You cannot replace the plan, finalize the run, release work,
-or call external systems. End the slice with EVALUATION_SLICE_COMPLETE.
+or call external systems. Captain observes the persisted review receipt and controls
+termination; prose cannot complete a slice.
 """
 
 _SUMMARY_PROMPT = """The inner team performed one bounded planning-evaluation slice.
@@ -69,16 +71,13 @@ def build_evaluation_society(
     reviewer = AssistantAgent(
         "qa_reviewer",
         model_client=model_client,
-        tools=[tools.record_qa_review],
+        tools=[_qa_review_tool(tools)],
         system_message=f"{_QA_PROMPT}\nCaptain permits at most {max_rounds} Planner/QA rounds per component.",
     )
     inner = RoundRobinGroupChat(
         [analyst, planner, reviewer],
         max_turns=10,
-        termination_condition=TextMentionTermination(
-            _SLICE_COMPLETE,
-            sources=("qa_reviewer",),
-        ),
+        termination_condition=SourceMatchTermination(["qa_reviewer"]),
     )
     return SocietyOfMindAgent(
         "agentfarm_evaluator",
@@ -87,3 +86,27 @@ def build_evaluation_society(
         instruction=_SUMMARY_PROMPT,
         response_prompt=_SUMMARY_RESPONSE_PROMPT,
     )
+
+
+def build_qa_review_team(
+    *,
+    model_client: ChatCompletionClient,
+    tools: EvaluationToolService,
+) -> RoundRobinGroupChat:
+    """Build a QA-only resume team that cannot execute Analyst or Planner."""
+
+    reviewer = AssistantAgent(
+        "qa_reviewer",
+        model_client=model_client,
+        tools=[_qa_review_tool(tools)],
+        system_message=_QA_PROMPT,
+    )
+    return RoundRobinGroupChat([reviewer], max_turns=1)
+
+
+def _qa_review_tool(tools: EvaluationToolService):
+    async def record_qa_review(run_id: str, review: dict[str, object]) -> ReviewReceipt:
+        validated = QaReview.model_validate_json(json.dumps(review))
+        return await tools.record_qa_review(run_id, validated)
+
+    return record_qa_review

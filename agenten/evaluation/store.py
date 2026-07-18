@@ -18,6 +18,7 @@ from .models import (
     ComponentInventoryCandidate,
     ComponentOutcome,
     ComponentPlanCandidate,
+    EvaluationLifecycleEvent,
     EvaluationManifest,
     EvaluationOutcome,
     EvaluationRun,
@@ -68,6 +69,8 @@ class JsonEvaluationStore:
         )
         async with self._lock:
             stored = self._write_model(self._run_dir(run_id) / "source-manifest.json", run)
+            if not self._lifecycle_paths(run_id):
+                self._append_lifecycle(run_id, EvaluationStatus.CREATED, "active")
         return EvaluationRun.model_validate_json(stored)
 
     async def stage_inventory(self, run_id: str, inventory: ComponentInventoryCandidate) -> InventoryReceipt:
@@ -78,6 +81,7 @@ class JsonEvaluationStore:
                 raise EvaluationConflictError("inventory source differs from source manifest")
             for candidate in inventory.components:
                 self._safe_id(candidate.component_key)
+            self._transition_lifecycle(run_id, EvaluationStatus.INVENTORYING, "active")
             relative = "component-inventory.json"
             stored = self._write_model(self._run_dir(run_id) / relative, inventory)
         return InventoryReceipt(run_id=run_id, inventory_id=inventory.inventory_id, artifact_reference=relative, sha256=_digest(stored))
@@ -95,6 +99,7 @@ class JsonEvaluationStore:
             if candidate.revision > 1:
                 previous = self._run_dir(run_id) / "candidates" / candidate.component_key / f"revision-{candidate.revision - 1}.json"
                 self._read_model(previous, ComponentPlanCandidate)
+            self._transition_lifecycle(run_id, EvaluationStatus.PLANNING, "active")
             relative = f"candidates/{candidate.component_key}/revision-{candidate.revision}.json"
             stored = self._write_model(self._run_dir(run_id) / relative, candidate)
         return CandidateReceipt(run_id=run_id, component_key=candidate.component_key, revision=candidate.revision, artifact_reference=relative, sha256=_digest(stored))
@@ -147,6 +152,25 @@ class JsonEvaluationStore:
         self._safe_id(run_id)
         return self._consumed_slice_count(run_id)
 
+    async def transition_run(
+        self,
+        run_id: str,
+        status: EvaluationStatus,
+        recovery_state: str = "active",
+    ) -> EvaluationLifecycleEvent:
+        """Append one atomic lifecycle transition after validating its predecessor."""
+
+        async with self._lock:
+            self._read_run(run_id)
+            return self._transition_lifecycle(run_id, status, recovery_state)
+
+    def lifecycle_events(self, run_id: str) -> tuple[EvaluationLifecycleEvent, ...]:
+        self._safe_id(run_id)
+        return tuple(
+            self._read_model(path, EvaluationLifecycleEvent)
+            for path in self._lifecycle_paths(run_id)
+        )
+
     async def finalize(
         self,
         run_id: str,
@@ -154,20 +178,29 @@ class JsonEvaluationStore:
     ) -> EvaluationManifest:
         async with self._lock:
             run = self._read_run(run_id)
-            inventory = self._read_model(self._run_dir(run_id) / "component-inventory.json", ComponentInventoryCandidate)
-            requested = (
-                {candidate.component_key: outcome for candidate in inventory.components}
-                if isinstance(outcome, EvaluationOutcome)
-                else dict(outcome)
-            )
-            expected_keys = {candidate.component_key for candidate in inventory.components}
-            if set(requested) != expected_keys:
-                raise EvaluationConflictError("component outcomes must cover the staged inventory exactly")
-            components = tuple(
-                self._staged_component_outcome(run, candidate, requested[candidate.component_key])
-                for candidate in inventory.components
-            )
-            status = _status_for_components(components)
+            inventory = self._optional_inventory(run_id)
+            if inventory is None:
+                if outcome != EvaluationOutcome.FAILED:
+                    raise EvaluationConflictError("component-inventory is missing and can only finalize as failed")
+                components: tuple[ComponentOutcome, ...] = ()
+                status = EvaluationStatus.FAILED
+            else:
+                current = self._latest_lifecycle(run_id)
+                if current.recovery_state != "terminal":
+                    self._transition_lifecycle(run_id, EvaluationStatus.PLANNING, "active")
+                requested = (
+                    {candidate.component_key: outcome for candidate in inventory.components}
+                    if isinstance(outcome, EvaluationOutcome)
+                    else dict(outcome)
+                )
+                expected_keys = {candidate.component_key for candidate in inventory.components}
+                if set(requested) != expected_keys:
+                    raise EvaluationConflictError("component outcomes must cover the staged inventory exactly")
+                components = tuple(
+                    self._staged_component_outcome(run, candidate, requested[candidate.component_key])
+                    for candidate in inventory.components
+                )
+                status = _status_for_components(components)
             digests = tuple(self._artifact_digests(run_id))
             manifest = EvaluationManifest(
                 run_id=run.run_id,
@@ -181,6 +214,7 @@ class JsonEvaluationStore:
             self._write_bytes(self._run_dir(run_id) / "evaluation.md", report)
             stored = self._write_model(self._run_dir(run_id) / "run-manifest.json", manifest)
             persisted = EvaluationManifest.model_validate_json(stored)
+            self._transition_lifecycle(run_id, status, "terminal")
         return persisted
 
     async def load_manifest(self, run_id: str) -> EvaluationManifest:
@@ -188,25 +222,30 @@ class JsonEvaluationStore:
 
         async with self._lock:
             run = self._read_run(run_id)
-            inventory = self._read_model(self._run_dir(run_id) / "component-inventory.json", ComponentInventoryCandidate)
+            inventory = self._optional_inventory(run_id)
             manifest = self._read_model(self._run_dir(run_id) / "run-manifest.json", EvaluationManifest)
             if manifest.run_id != run.run_id or manifest.idempotency_key != run.idempotency_key or manifest.source != run.source:
                 raise EvaluationConflictError("run manifest identity does not match source manifest")
             outcomes_by_key = {component.component_key: component for component in manifest.component_outcomes}
-            expected_keys = {candidate.component_key for candidate in inventory.components}
+            expected_keys = {candidate.component_key for candidate in inventory.components} if inventory is not None else set()
             if set(outcomes_by_key) != expected_keys:
                 raise EvaluationConflictError("run manifest does not cover the staged inventory")
-            expected_components = tuple(
-                self._staged_component_outcome(
-                    run,
-                    candidate,
-                    outcomes_by_key[candidate.component_key].outcome,
+            expected_components = (
+                tuple(
+                    self._staged_component_outcome(
+                        run,
+                        candidate,
+                        outcomes_by_key[candidate.component_key].outcome,
+                    )
+                    for candidate in inventory.components
                 )
-                for candidate in inventory.components
+                if inventory is not None
+                else ()
             )
             if manifest.component_outcomes != expected_components:
                 raise EvaluationConflictError("run manifest component evidence is inconsistent")
-            if manifest.status != _status_for_components(expected_components):
+            expected_status = _status_for_components(expected_components) if inventory is not None else EvaluationStatus.FAILED
+            if manifest.status != expected_status:
                 raise EvaluationConflictError("run manifest status is inconsistent")
             if manifest.artifact_digests != tuple(self._artifact_digests(run_id)):
                 raise EvaluationConflictError("run manifest artifact digests are inconsistent")
@@ -214,6 +253,9 @@ class JsonEvaluationStore:
                 self._run_dir(run_id) / "evaluation.md",
                 render_evaluation_markdown(manifest).encode("utf-8"),
             )
+            current = self._latest_lifecycle(run_id)
+            if current.status != manifest.status or current.recovery_state != "terminal":
+                self._transition_lifecycle(run_id, manifest.status, "terminal")
         return manifest
 
     def _staged_component_outcome(
@@ -248,8 +290,61 @@ class JsonEvaluationStore:
 
     def _artifact_digests(self, run_id: str) -> list[str]:
         run_dir = self._run_dir(run_id)
-        paths = sorted(path for path in run_dir.rglob("*.json") if path.name != "run-manifest.json")
+        paths = sorted(
+            path
+            for path in run_dir.rglob("*.json")
+            if path.name != "run-manifest.json" and "lifecycle" not in path.relative_to(run_dir).parts
+        )
         return [f"{path.relative_to(run_dir).as_posix()}:{_digest(path.read_bytes())}" for path in paths]
+
+    def _optional_inventory(self, run_id: str) -> ComponentInventoryCandidate | None:
+        path = self._run_dir(run_id) / "component-inventory.json"
+        if not path.is_file():
+            return None
+        return self._read_model(path, ComponentInventoryCandidate)
+
+    def _lifecycle_paths(self, run_id: str) -> tuple[Path, ...]:
+        return tuple(sorted((self._run_dir(run_id) / "lifecycle").glob("transition-*.json")))
+
+    def _latest_lifecycle(self, run_id: str) -> EvaluationLifecycleEvent:
+        paths = self._lifecycle_paths(run_id)
+        if not paths:
+            raise EvaluationConflictError("evaluation lifecycle is missing")
+        return self._read_model(paths[-1], EvaluationLifecycleEvent)
+
+    def _append_lifecycle(
+        self,
+        run_id: str,
+        status: EvaluationStatus,
+        recovery_state: str,
+    ) -> EvaluationLifecycleEvent:
+        sequence = len(self._lifecycle_paths(run_id)) + 1
+        event = EvaluationLifecycleEvent(
+            run_id=run_id,
+            sequence=sequence,
+            status=status,
+            recovery_state=recovery_state,
+        )
+        path = self._run_dir(run_id) / "lifecycle" / f"transition-{sequence:04d}.json"
+        stored = self._write_model(path, event)
+        return EvaluationLifecycleEvent.model_validate_json(stored)
+
+    def _transition_lifecycle(
+        self,
+        run_id: str,
+        status: EvaluationStatus,
+        recovery_state: str,
+    ) -> EvaluationLifecycleEvent:
+        current = self._latest_lifecycle(run_id)
+        if current.status in {EvaluationStatus.ACCEPTED, EvaluationStatus.PARTIAL, EvaluationStatus.FAILED}:
+            if current.status != status or recovery_state != "terminal":
+                raise EvaluationConflictError("terminal evaluation lifecycle cannot transition")
+            return current
+        if not _allowed_lifecycle_transition(current.status, status):
+            raise EvaluationConflictError("evaluation lifecycle transition is invalid")
+        if current.status == status and current.recovery_state == recovery_state:
+            return current
+        return self._append_lifecycle(run_id, status, recovery_state)
 
     def _consumed_slice_count(self, run_id: str) -> int:
         return len(tuple((self._run_dir(run_id) / "slices").glob("slice-*.json")))
@@ -302,3 +397,17 @@ def _status_for_components(components: tuple[ComponentOutcome, ...]) -> Evaluati
     if EvaluationOutcome.FAILED in outcomes:
         return EvaluationStatus.FAILED
     return EvaluationStatus.PARTIAL
+
+
+def _allowed_lifecycle_transition(current: EvaluationStatus, requested: EvaluationStatus) -> bool:
+    if current == requested:
+        return True
+    return requested in {
+        EvaluationStatus.CREATED: {EvaluationStatus.INVENTORYING, EvaluationStatus.PLANNING, EvaluationStatus.FAILED},
+        EvaluationStatus.INVENTORYING: {EvaluationStatus.PLANNING, EvaluationStatus.FAILED},
+        EvaluationStatus.PLANNING: {
+            EvaluationStatus.ACCEPTED,
+            EvaluationStatus.PARTIAL,
+            EvaluationStatus.FAILED,
+        },
+    }.get(current, set())

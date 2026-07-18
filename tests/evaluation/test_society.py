@@ -1,12 +1,22 @@
 import json
+import hashlib
 from pathlib import Path
 
 import pytest
 from autogen_agentchat.agents import SocietyOfMindAgent
-from autogen_core.models import ModelFamily, ModelInfo
+from autogen_core import FunctionCall
+from autogen_core.models import CreateResult, ModelFamily, ModelInfo, RequestUsage
 from autogen_ext.models.replay import ReplayChatCompletionClient
 
-from agenten.evaluation.society import build_evaluation_society
+from agenten.evaluation.models import (
+    AcceptanceTestPlan,
+    ComponentInventoryCandidate,
+    ComponentPlanCandidate,
+    EvaluationSource,
+    QaReview,
+    SourceBlock,
+)
+from agenten.evaluation.society import build_evaluation_society, build_qa_review_team
 from agenten.evaluation.store import JsonEvaluationStore
 from agenten.evaluation.tools import EvaluationToolService
 
@@ -51,7 +61,7 @@ class PromptAwareReplayClient(ReplayChatCompletionClient):
             if marker in system_text
         )
         response = f"{role} complete"
-        if role in {"analyst", "qa"}:
+        if role == "analyst":
             response += " EVALUATION_SLICE_COMPLETE"
         self.chat_completions[self._current_index] = response
         return await super().create(messages, **kwargs)  # type: ignore[arg-type]
@@ -117,7 +127,98 @@ async def test_real_round_robin_reaches_qa_before_termination(tmp_path: Path, ta
         "component_planner",
         "qa_reviewer",
     ]
-    assert result.stop_reason == "Text 'EVALUATION_SLICE_COMPLETE' mentioned"
+    assert result.stop_reason is not None and "qa_reviewer" in result.stop_reason
+
+
+@pytest.mark.asyncio
+async def test_real_qa_resume_team_executes_only_qa_review_tool(tmp_path: Path) -> None:
+    text = "# CRM\nBuild CRM."
+    source = EvaluationSource(
+        source_reference="agentfarm/input.md",
+        sha256="a" * 64,
+        byte_length=len(text.encode("utf-8")),
+        blocks=(
+            SourceBlock(
+                block_id="block-0001",
+                heading_path=("CRM",),
+                line_start=1,
+                line_end=2,
+                sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                text=text,
+            ),
+        ),
+    )
+    candidate = ComponentPlanCandidate(
+        component_key="crm",
+        scope=("Own CRM.",),
+        non_goals=("No external CRM.",),
+        team_roles=("Builder",),
+        implementation_steps=("Build adapter.",),
+        interfaces=("CrmAdapter",),
+        acceptance_tests=(
+            AcceptanceTestPlan(
+                test_id="crm-unit",
+                test_type="unit",
+                setup="Create adapter.",
+                action="Sync contact.",
+                expected="Return receipt.",
+                command="python -m pytest -q tests/crm",
+            ),
+        ),
+        definition_of_done=("Tests pass.",),
+        risks=("Schema drift.",),
+        dependencies=(),
+        source_citations=("block-0001",),
+    )
+    store = JsonEvaluationStore(tmp_path)
+    run = await store.create_run(source, run_id="eval-001", idempotency_key="input-v1")
+    tools = EvaluationToolService(store)
+    await tools.stage_component_inventory(
+        run.run_id,
+        ComponentInventoryCandidate(
+            inventory_id="inventory-001",
+            source=source,
+            source_citations=("block-0001",),
+            components=(candidate,),
+        ),
+    )
+    await tools.stage_component_plan(run.run_id, candidate)
+    review = QaReview(
+        component_key="crm",
+        revision=1,
+        decision="approved",
+        score=7,
+        defect_codes=(),
+        revision_requests=(),
+    )
+    call = FunctionCall(
+        id="qa-call-001",
+        name="record_qa_review",
+        arguments=json.dumps({"run_id": run.run_id, "review": review.model_dump(mode="json")}),
+    )
+    client = ReplayChatCompletionClient(
+        [
+            CreateResult(
+                finish_reason="function_calls",
+                content=[call],
+                usage=RequestUsage(prompt_tokens=1, completion_tokens=1),
+                cached=False,
+            ),
+        ],
+        model_info=ModelInfo(
+            vision=False,
+            function_calling=True,
+            json_output=True,
+            family=ModelFamily.UNKNOWN,
+            structured_output=True,
+        ),
+    )
+    team = build_qa_review_team(model_client=client, tools=tools)
+
+    result = await team.run(task="QA_SLICE run_id=eval-001 component_key=crm revision=1")
+
+    assert {message.source for message in result.messages} <= {"user", "qa_reviewer"}
+    assert (tmp_path / "eval-001" / "qa-reviews" / "crm" / "revision-1.json").is_file(), result.messages
 
 
 @pytest.mark.parametrize("max_rounds", (0, 4))

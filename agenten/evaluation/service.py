@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Protocol
 
@@ -14,9 +15,10 @@ from .models import (
     EvaluationOutcome,
     EvaluationRun,
     EvaluationSource,
+    EvaluationStatus,
     QaReview,
 )
-from .society import build_evaluation_society
+from .society import build_evaluation_society, build_qa_review_team
 from .store import EvaluationConflictError, JsonEvaluationStore
 from .tools import EvaluationToolService
 from .validation import validate_component_graph
@@ -42,6 +44,7 @@ class AgentFarmEvaluationService:
         max_rounds: int = 3,
         max_calls: int = 10,
         society: EvaluationSociety | None = None,
+        qa_society: EvaluationSociety | None = None,
     ) -> None:
         if isinstance(max_rounds, bool) or not isinstance(max_rounds, int) or not 1 <= max_rounds <= 3:
             raise ValueError("max_rounds must be between one and three")
@@ -61,6 +64,10 @@ class AgentFarmEvaluationService:
             tools=tools,
             max_rounds=max_rounds,
         )
+        self._qa_society = qa_society or build_qa_review_team(
+            model_client=model_client,
+            tools=tools,
+        )
 
     async def run(self, run_id: str) -> EvaluationManifest:
         """Run or resume one evaluation without consulting Society transcript state."""
@@ -70,13 +77,34 @@ class AgentFarmEvaluationService:
         if (self._store._run_dir(run_id) / "run-manifest.json").is_file():
             return await self._store.load_manifest(run_id)
 
+        lifecycle = self._store.lifecycle_events(run_id)[-1]
+        terminal_recovery = lifecycle.recovery_state == "terminal"
+        if lifecycle.recovery_state == "cancelled":
+            await self._store.transition_run(run_id, lifecycle.status, "resuming")
+
         max_rounds = run.max_rounds
         max_calls = run.max_calls
         inventory = self._optional_inventory(run_id)
 
         if inventory is None:
-            await self._run_slice(run, "inventory", self._inventory_task(run))
-            inventory = self._required_inventory(run_id)
+            if self._store.consumed_slice_count(run_id) >= max_calls:
+                return await self._store.finalize(run_id, EvaluationOutcome.FAILED)
+            await self._store.transition_run(run_id, EvaluationStatus.INVENTORYING)
+            await self._run_slice(
+                run,
+                "inventory",
+                self._inventory_task(run),
+                runner=self._society,
+            )
+            inventory = self._optional_inventory(run_id)
+            if inventory is None:
+                return await self._store.finalize(run_id, EvaluationOutcome.FAILED)
+
+        if not terminal_recovery:
+            lifecycle = self._store.lifecycle_events(run_id)[-1]
+            if lifecycle.status == EvaluationStatus.CREATED:
+                await self._store.transition_run(run_id, EvaluationStatus.INVENTORYING)
+            await self._store.transition_run(run_id, EvaluationStatus.PLANNING)
 
         outcomes: dict[str, EvaluationOutcome] = {}
         latest_candidates: list[ComponentPlanCandidate] = []
@@ -90,14 +118,16 @@ class AgentFarmEvaluationService:
                         run,
                         "qa",
                         self._qa_task(run.run_id, inventory_item.component_key, candidate.revision),
+                        runner=self._qa_society,
                         component_key=inventory_item.component_key,
                         revision=candidate.revision,
                     )
-                    review = self._required_review(
-                        run_id,
-                        inventory_item.component_key,
-                        candidate.revision,
+                    review = self._optional_model(
+                        self._review_path(run_id, inventory_item.component_key, candidate.revision),
+                        QaReview,
                     )
+                    if review is None:
+                        break
                     continue
                 if candidate is not None and review is not None and candidate.revision >= max_rounds:
                     break
@@ -108,11 +138,20 @@ class AgentFarmEvaluationService:
                     run,
                     "component",
                     self._component_task(run.run_id, inventory_item.component_key, revision),
+                    runner=self._society,
                     component_key=inventory_item.component_key,
                     revision=revision,
                 )
-                candidate = self._required_candidate(run_id, inventory_item.component_key, revision)
-                review = self._required_review(run_id, inventory_item.component_key, revision)
+                candidate = self._optional_model(
+                    self._candidate_path(run_id, inventory_item.component_key, revision),
+                    ComponentPlanCandidate,
+                )
+                review = self._optional_model(
+                    self._review_path(run_id, inventory_item.component_key, revision),
+                    QaReview,
+                )
+                if candidate is None or review is None:
+                    break
 
             if candidate is None or review is None:
                 outcomes[inventory_item.component_key] = EvaluationOutcome.UNRESOLVED
@@ -153,6 +192,7 @@ class AgentFarmEvaluationService:
         slice_kind: str,
         task: str,
         *,
+        runner: EvaluationSociety,
         component_key: str | None = None,
         revision: int | None = None,
     ) -> None:
@@ -162,7 +202,12 @@ class AgentFarmEvaluationService:
             component_key=component_key,
             revision=revision,
         )
-        await self._society.run(task=task)
+        try:
+            await runner.run(task=task)
+        except asyncio.CancelledError:
+            phase = self._store.lifecycle_events(run.run_id)[-1].status
+            await asyncio.shield(self._store.transition_run(run.run_id, phase, "cancelled"))
+            raise
 
     def _optional_inventory(self, run_id: str) -> ComponentInventoryCandidate | None:
         return self._optional_model(

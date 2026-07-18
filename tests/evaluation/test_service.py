@@ -166,6 +166,44 @@ class CandidateThenCancelSociety:
         raise asyncio.CancelledError
 
 
+class InventoryCancelSociety:
+    async def run(self, *, task: str) -> str:
+        assert task.startswith("INVENTORY_SLICE")
+        raise asyncio.CancelledError
+
+
+class NoInventorySociety:
+    async def run(self, *, task: str) -> str:
+        assert task.startswith("INVENTORY_SLICE")
+        return "EVALUATION_SLICE_COMPLETE without persisted inventory"
+
+
+class BlockingInventorySociety:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def run(self, *, task: str) -> str:
+        assert task.startswith("INVENTORY_SLICE")
+        self.started.set()
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+
+class CandidateWithoutReviewSociety:
+    def __init__(self, tools: EvaluationToolService) -> None:
+        self._tools = tools
+        self.calls = 0
+
+    async def run(self, *, task: str) -> str:
+        self.calls += 1
+        assert task.startswith("COMPONENT_SLICE")
+        await self._tools.stage_component_plan(
+            _field(task, "run_id"),
+            _candidate(revision=int(_field(task, "revision"))),
+        )
+        return "EVALUATION_SLICE_COMPLETE"
+
+
 def _field(task: str, name: str) -> str:
     match = re.search(rf"(?:^|\s){name}=([^\s]+)", task)
     assert match is not None
@@ -296,7 +334,8 @@ async def test_resume_reviews_persisted_candidate_without_replaying_planner(tmp_
         model_client=_model_client(),
         tools=tools,
         store=store,
-        society=society,
+        society=HistoryPoisonSociety(),
+        qa_society=society,
     )
 
     manifest = await service.run(run.run_id)
@@ -356,11 +395,48 @@ async def test_candidate_only_cancelled_slice_is_counted_and_resumed_within_budg
         model_client=_model_client(),
         tools=tools,
         store=store,
-        society=qa_society,
+        society=HistoryPoisonSociety(),
+        qa_society=qa_society,
     )
     manifest = await resumed.run(run.run_id)
     assert manifest.status is EvaluationStatus.ACCEPTED
     assert store.consumed_slice_count(run.run_id) == 2
+
+
+@pytest.mark.asyncio
+async def test_qa_prose_without_persisted_review_finalizes_unresolved(tmp_path: Path) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    tools = EvaluationToolService(store)
+    run = await store.create_run(
+        _source(),
+        run_id="eval-001",
+        idempotency_key="agentfarm-input-v1",
+        max_calls=1,
+    )
+    await tools.stage_component_inventory(
+        run.run_id,
+        ComponentInventoryCandidate(
+            inventory_id="inventory-001",
+            source=run.source,
+            source_citations=("block-0001",),
+            components=(_candidate(),),
+        ),
+    )
+    society = CandidateWithoutReviewSociety(tools)
+    service = AgentFarmEvaluationService(
+        model_client=_model_client(),
+        tools=tools,
+        store=store,
+        society=society,
+        qa_society=HistoryPoisonSociety(),
+    )
+
+    manifest = await service.run(run.run_id)
+
+    assert manifest.status is EvaluationStatus.PARTIAL
+    assert manifest.component_outcomes[0].outcome is EvaluationOutcome.UNRESOLVED
+    assert manifest.component_outcomes[0].review is None
+    assert society.calls == 1
 
 
 @pytest.mark.asyncio
@@ -566,3 +642,106 @@ async def test_resume_completes_finalization_after_manifest_write_failure(tmp_pa
     assert manifest.status is EvaluationStatus.ACCEPTED
     assert (run_dir / "run-manifest.json").is_file()
     assert (run_dir / "evaluation.md").is_file()
+
+
+@pytest.mark.asyncio
+async def test_normal_run_persists_created_inventorying_planning_and_terminal_states(tmp_path: Path) -> None:
+    service, _ = _service(tmp_path, ("approved",))
+
+    manifest = await service.run("eval-001")
+
+    events = JsonEvaluationStore(tmp_path).lifecycle_events("eval-001")
+    assert [event.status for event in events] == [
+        EvaluationStatus.CREATED,
+        EvaluationStatus.INVENTORYING,
+        EvaluationStatus.PLANNING,
+        EvaluationStatus.ACCEPTED,
+    ]
+    assert events[-1].recovery_state == "terminal"
+    assert manifest.status is EvaluationStatus.ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_inventory_cancellation_then_exhausted_resume_persists_failed_manifest(tmp_path: Path) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    tools = EvaluationToolService(store)
+    interrupted = AgentFarmEvaluationService(
+        model_client=_model_client(),
+        tools=tools,
+        store=store,
+        source=_source(),
+        idempotency_key="agentfarm-input-v1",
+        max_calls=1,
+        society=InventoryCancelSociety(),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await interrupted.run("eval-001")
+
+    cancelled = store.lifecycle_events("eval-001")[-1]
+    assert cancelled.status is EvaluationStatus.INVENTORYING
+    assert cancelled.recovery_state == "cancelled"
+    resumed = AgentFarmEvaluationService(
+        model_client=_model_client(),
+        tools=tools,
+        store=store,
+        source=_source(),
+        idempotency_key="agentfarm-input-v1",
+        max_calls=1,
+        society=HistoryPoisonSociety(),
+    )
+    manifest = await resumed.run("eval-001")
+
+    assert manifest.status is EvaluationStatus.FAILED
+    assert manifest.component_outcomes == ()
+    assert (tmp_path / "eval-001" / "evaluation.md").is_file()
+    events = store.lifecycle_events("eval-001")
+    assert any(event.recovery_state == "resuming" for event in events)
+    assert events[-1].status is EvaluationStatus.FAILED
+    assert events[-1].recovery_state == "terminal"
+
+
+@pytest.mark.asyncio
+async def test_real_task_cancellation_atomically_persists_cancelled_lifecycle(tmp_path: Path) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    society = BlockingInventorySociety()
+    service = AgentFarmEvaluationService(
+        model_client=_model_client(),
+        tools=EvaluationToolService(store),
+        store=store,
+        source=_source(),
+        idempotency_key="agentfarm-input-v1",
+        max_calls=1,
+        society=society,
+    )
+    running = asyncio.create_task(service.run("eval-001"))
+    await society.started.wait()
+
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    event = store.lifecycle_events("eval-001")[-1]
+    assert event.status is EvaluationStatus.INVENTORYING
+    assert event.recovery_state == "cancelled"
+    assert not list((tmp_path / "eval-001" / "lifecycle").glob("*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_adversarial_inventory_slice_without_artifact_persists_failed_manifest(tmp_path: Path) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    service = AgentFarmEvaluationService(
+        model_client=_model_client(),
+        tools=EvaluationToolService(store),
+        store=store,
+        source=_source(),
+        idempotency_key="agentfarm-input-v1",
+        max_calls=1,
+        society=NoInventorySociety(),
+    )
+
+    manifest = await service.run("eval-001")
+
+    assert manifest.status is EvaluationStatus.FAILED
+    assert manifest.component_outcomes == ()
+    assert store.lifecycle_events("eval-001")[-1].status is EvaluationStatus.FAILED
