@@ -155,6 +155,48 @@ async def test_store_enforces_stage_order_and_safe_run_ids_before_review_paths(t
 
 
 @pytest.mark.asyncio
+async def test_inventory_rejects_unsafe_component_keys_before_persistence(tmp_path: Path) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    run = await store.create_run(_source(), run_id="eval-001", idempotency_key="input-v1")
+    inventory = ComponentInventoryCandidate(
+        inventory_id="inventory-001",
+        source=run.source,
+        source_citations=("block-0001",),
+        components=(_candidate().model_copy(update={"component_key": "../outside"}),),
+    )
+
+    with pytest.raises(ValueError, match="safe logical identifier"):
+        await store.stage_inventory(run.run_id, inventory)
+
+    assert not (tmp_path / "eval-001" / "component-inventory.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_candidate_must_belong_to_declared_inventory_and_finalize_rechecks_safe_key(tmp_path: Path) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    run = await store.create_run(_source(), run_id="eval-001", idempotency_key="input-v1")
+    inventory = ComponentInventoryCandidate(
+        inventory_id="inventory-001",
+        source=run.source,
+        source_citations=("block-0001",),
+        components=(_candidate(),),
+    )
+    await store.stage_inventory(run.run_id, inventory)
+
+    with pytest.raises(EvaluationConflictError, match="declared inventory"):
+        await store.stage_candidate(run.run_id, _candidate().model_copy(update={"component_key": "other-component"}))
+
+    unsafe_inventory = inventory.model_copy(
+        update={"components": (_candidate().model_copy(update={"component_key": "../outside"}),)}
+    )
+    (tmp_path / "eval-001" / "component-inventory.json").write_text(
+        json.dumps(unsafe_inventory.model_dump(mode="json")), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="safe logical identifier"):
+        await store.finalize(run.run_id, EvaluationOutcome.ACCEPTED)
+
+
+@pytest.mark.asyncio
 async def test_finalize_rejects_candidate_that_disagrees_with_staged_inventory(tmp_path: Path) -> None:
     store = JsonEvaluationStore(tmp_path)
     run = await store.create_run(_source(), run_id="eval-001", idempotency_key="input-v1")

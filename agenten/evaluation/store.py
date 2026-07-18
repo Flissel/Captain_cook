@@ -66,6 +66,8 @@ class JsonEvaluationStore:
             inventory = redact_model(inventory)
             if inventory.source != run.source:
                 raise EvaluationConflictError("inventory source differs from source manifest")
+            for candidate in inventory.components:
+                self._safe_id(candidate.component_key)
             relative = "component-inventory.json"
             stored = self._write_model(self._run_dir(run_id) / relative, inventory)
         return InventoryReceipt(run_id=run_id, inventory_id=inventory.inventory_id, artifact_reference=relative, sha256=_digest(stored))
@@ -74,8 +76,13 @@ class JsonEvaluationStore:
         self._safe_id(candidate.component_key)
         async with self._lock:
             self._read_run(run_id)
-            self._read_model(self._run_dir(run_id) / "component-inventory.json", ComponentInventoryCandidate)
+            inventory = self._read_model(self._run_dir(run_id) / "component-inventory.json", ComponentInventoryCandidate)
             candidate = redact_model(candidate)
+            if not any(
+                declared.component_key == candidate.component_key and declared.revision == candidate.revision
+                for declared in inventory.components
+            ):
+                raise EvaluationConflictError("candidate does not belong to declared inventory")
             relative = f"candidates/{candidate.component_key}/revision-{candidate.revision}.json"
             stored = self._write_model(self._run_dir(run_id) / relative, candidate)
         return CandidateReceipt(run_id=run_id, component_key=candidate.component_key, revision=candidate.revision, artifact_reference=relative, sha256=_digest(stored))
@@ -113,6 +120,7 @@ class JsonEvaluationStore:
         return persisted
 
     def _staged_component_outcome(self, run_id: str, inventory_candidate: ComponentPlanCandidate, outcome: EvaluationOutcome) -> ComponentOutcome:
+        self._safe_id(inventory_candidate.component_key)
         candidate_path = self._run_dir(run_id) / "candidates" / inventory_candidate.component_key / f"revision-{inventory_candidate.revision}.json"
         candidate = self._read_model(candidate_path, ComponentPlanCandidate)
         if candidate != inventory_candidate:
