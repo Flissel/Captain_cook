@@ -1,0 +1,176 @@
+"""Fail-closed n8n endpoint selection for Captain runtime work."""
+
+from __future__ import annotations
+
+import ipaddress
+from datetime import datetime
+from typing import Literal, Mapping
+from urllib.parse import SplitResult, urlsplit
+
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+
+from agenten.agent_runtime.capabilities import CapabilityDenied, validate_grant
+from agenten.agent_runtime.contracts import (
+    AgentRuntimeCommand,
+    CapabilityGrant,
+    CapabilityProfile,
+)
+
+
+class N8nEndpointConfigurationError(ValueError):
+    """The selected n8n endpoint is incomplete or crosses ownership boundaries."""
+
+
+class N8nEndpoint(BaseModel):
+    """Immutable n8n connection data with a non-serializable credential."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    mode: Literal["external", "captain-builder"]
+    api_base_url: str = Field(min_length=1)
+    webhook_base_url: str = Field(min_length=1)
+    api_key: str = Field(min_length=1, exclude=True, repr=False)
+
+
+class HermesN8nReference(BaseModel):
+    """Serializable endpoint identity with private child-process credentials."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    endpoint_identity: str = Field(min_length=1)
+    server_name: Literal["n8n-mcp"] = "n8n-mcp"
+    _child_environment: dict[str, str] = PrivateAttr(default_factory=dict)
+
+    def child_process_environment(self) -> dict[str, str]:
+        """Return a fresh credential mapping for one authorized child process."""
+
+        return dict(self._child_environment)
+
+
+def resolve_n8n_endpoint(environment: Mapping[str, str]) -> N8nEndpoint:
+    """Select the explicitly configured n8n endpoint without mode fallback."""
+
+    mode = environment.get("N8N_MODE", "")
+    if mode not in {"external", "captain-builder"}:
+        raise N8nEndpointConfigurationError(f"unsupported N8N_MODE: {mode!r}")
+
+    if mode == "external":
+        base_url = _required_value(environment, "N8N_URL")
+        api_key = _required_value(environment, "N8N_MCP_TOKEN")
+        normalized_url = _normalize_external_url(base_url)
+    else:
+        base_url = _required_value(environment, "CAPTAIN_N8N_URL")
+        api_key = _required_value(
+            environment,
+            "CAPTAIN_N8N_API_KEY",
+            label="Captain n8n API key",
+        )
+        normalized_url = _normalize_builder_url(base_url)
+
+    return N8nEndpoint(
+        mode=mode,
+        api_base_url=normalized_url,
+        webhook_base_url=normalized_url,
+        api_key=api_key,
+    )
+
+
+def build_hermes_n8n_reference(
+    grant: CapabilityGrant,
+    command: AgentRuntimeCommand,
+    endpoint: N8nEndpoint,
+    now: datetime,
+) -> HermesN8nReference:
+    """Build Hermes child configuration from an active exact n8n lease."""
+
+    validate_grant(grant, command, now)
+    if grant.profile is not CapabilityProfile.N8N_BUILDER:
+        raise CapabilityDenied("Hermes n8n configuration requires an n8n-builder grant")
+    if grant.mcp_servers != ("n8n-mcp",):
+        raise CapabilityDenied(
+            "Hermes n8n configuration requires exactly the n8n-mcp server"
+        )
+
+    reference = HermesN8nReference(endpoint_identity=endpoint.api_base_url)
+    reference._child_environment.update(
+        {
+            "N8N_URL": endpoint.api_base_url,
+            "N8N_MCP_TOKEN": endpoint.api_key,
+        }
+    )
+    return reference
+
+
+def _required_value(
+    environment: Mapping[str, str],
+    name: str,
+    *,
+    label: str | None = None,
+) -> str:
+    value = environment.get(name, "").strip()
+    if not value:
+        raise N8nEndpointConfigurationError(f"{label or name} must not be empty")
+    return value
+
+
+def _normalize_builder_url(value: str) -> str:
+    parsed = _parse_url(value)
+    try:
+        port = parsed.port
+    except ValueError:
+        raise N8nEndpointConfigurationError(
+            "CAPTAIN_N8N_URL must be a loopback HTTP URL with an explicit port"
+        ) from None
+    if port == 15678:
+        raise N8nEndpointConfigurationError(
+            "captain-builder must not target the VibeMind n8n port"
+        )
+    if (
+        parsed.scheme != "http"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.hostname is None
+        or port is None
+        or not _is_loopback_host(parsed.hostname)
+    ):
+        raise N8nEndpointConfigurationError(
+            "CAPTAIN_N8N_URL must be a loopback HTTP URL with an explicit port"
+        )
+    return value.rstrip("/")
+
+
+def _normalize_external_url(value: str) -> str:
+    parsed = _parse_url(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise N8nEndpointConfigurationError(
+            "N8N_URL must be an HTTP URL without userinfo"
+        )
+    return value.rstrip("/")
+
+
+def _parse_url(value: str) -> SplitResult:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        raise N8nEndpointConfigurationError(
+            "selected n8n URL must be a valid HTTP URL without userinfo"
+        ) from None
+    if parsed.query or parsed.fragment:
+        raise N8nEndpointConfigurationError(
+            "selected n8n URL must not contain a query or fragment"
+        )
+    return parsed
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False

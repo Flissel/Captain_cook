@@ -5,6 +5,8 @@ import threading
 from typing import Any
 import httpx
 import pytest
+
+from agenten.agent_runtime.n8n_endpoint import resolve_n8n_endpoint
 from agenten.targets.n8n import N8nEvidenceError, N8nHttpClient, N8nTarget, SealedArtifact, ValidationCase
 
 class ProviderState:
@@ -55,6 +57,31 @@ def n8n_server():
 
 def artifact():
     return SealedArtifact(artifact_id="harmless-workflow",artifact_digest="a"*64,namespace="captain-gate-a",workflow={"nodes":[{"name":"Respond","type":"n8n-nodes-base.respondToWebhook","typeVersion":1,"position":[0,0],"parameters":{}}],"connections":{},"settings":{}})
+
+
+@pytest.mark.asyncio
+async def test_http_client_is_constructed_from_selected_endpoint(n8n_server):
+    base_url, state = n8n_server
+    endpoint = resolve_n8n_endpoint(
+        {
+            "N8N_MODE": "captain-builder",
+            "CAPTAIN_N8N_URL": base_url,
+            "CAPTAIN_N8N_API_KEY": "local-test-key",
+        }
+    )
+
+    async with httpx.AsyncClient() as http:
+        client = N8nHttpClient.from_endpoint(endpoint, http)
+        record = await client.create_or_update_workflow(
+            name="captain::selected-endpoint",
+            definition={"nodes": [], "connections": {}, "settings": {}},
+        )
+
+    assert record.id == "workflow-1"
+    assert state.workflow == {
+        "id": "workflow-1",
+        "name": "captain::selected-endpoint",
+    }
 
 @pytest.mark.asyncio
 async def test_target_deploys_executes_and_fetches_matching_real_http_evidence(n8n_server):

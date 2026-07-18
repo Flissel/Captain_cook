@@ -243,8 +243,9 @@ variables without changing the external default.
 
 - [ ] **Step 4: Derive Hermes configuration from a grant, not raw environment**
 
-Add `build_hermes_n8n_reference(grant, endpoint) -> HermesN8nReference` in
-the same module. It must call `validate_grant`, require the exact
+Add `build_hermes_n8n_reference(grant, command, endpoint, now) ->
+HermesN8nReference` in the same module. It must call
+`validate_grant(grant, command, now)`, require the exact
 `N8N_BUILDER` profile and `("n8n-mcp",)` server list, return only endpoint
 identity and server name in its serializable model, and expose the key only
 through an excluded child-process environment accessor. Add tests for expired,

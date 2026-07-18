@@ -6,6 +6,8 @@ from typing import Any, Literal, Protocol
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
+from agenten.agent_runtime.n8n_endpoint import N8nEndpoint
+
 class N8nTargetError(RuntimeError):
     """An n8n provider operation failed without exposing credentials."""
 
@@ -84,6 +86,21 @@ class N8nHttpClient:
         self._webhook_base_url = webhook_base_url.rstrip("/")
         self._headers = {"X-N8N-API-KEY": api_key}
         self._http = http
+
+    @classmethod
+    def from_endpoint(
+        cls,
+        endpoint: N8nEndpoint,
+        http: httpx.AsyncClient,
+    ) -> "N8nHttpClient":
+        """Create a client only from an already selected endpoint contract."""
+
+        return cls(
+            api_base_url=endpoint.api_base_url,
+            webhook_base_url=endpoint.webhook_base_url,
+            api_key=endpoint.api_key,
+            http=http,
+        )
 
     async def create_or_update_workflow(self, *, name: str, definition: dict[str, Any]) -> N8nWorkflowRecord:
         response = await self._request("GET", f"{self._api_base_url}/api/v1/workflows", params={"limit": 100})
