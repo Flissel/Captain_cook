@@ -126,12 +126,15 @@ capabilities.
 
 ```text
 read_source_block(run_id, block_id) -> SourceBlockView
+stage_component_inventory(run_id, inventory: ComponentInventoryCandidate) -> InventoryReceipt
 stage_component_plan(run_id, candidate: ComponentPlanCandidate) -> CandidateReceipt
 record_qa_review(run_id, review: QaReview) -> ReviewReceipt
 ```
 
 `read_source_block` checks run ownership and returns a redacted immutable
-view. `stage_component_plan` verifies source citations, candidate schema,
+view. `stage_component_inventory` verifies source citations, unique component
+keys, and allowed classifications before storing the append-only inventory
+artifact. `stage_component_plan` verifies source citations, candidate schema,
 unique component key, and expected revision number before storing an append-only
 candidate artifact. `record_qa_review` verifies that the review targets an
 existing candidate and uses only registered rubric codes.
@@ -210,6 +213,7 @@ Each run produces a gitignored directory:
 ```text
 artifacts/evaluations/<run_id>/
   source-manifest.json
+  component-inventory.json
   candidates/<component_key>/revision-<n>.json
   qa-reviews/<component_key>/revision-<n>.json
   evaluation.md
