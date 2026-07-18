@@ -28,6 +28,25 @@ class ProjectionPost:
     content_hash: str
 
 
+@dataclass(frozen=True)
+class DriftReport:
+    missing_event_ids: tuple[str, ...] = ()
+    modified_event_ids: tuple[str, ...] = ()
+    duplicate_event_ids: tuple[str, ...] = ()
+    duplicate_post_ids: tuple[str, ...] = ()
+    orphaned_post_ids: tuple[str, ...] = ()
+    changes_applied: int = 0
+
+    @property
+    def total_changes(self) -> int:
+        return (
+            len(self.missing_event_ids)
+            + len(self.modified_event_ids)
+            + len(self.duplicate_post_ids)
+            + len(self.orphaned_post_ids)
+        )
+
+
 class MinibookProjector:
     PROJECTION_PROJECT = "Captain Runtime Projection"
     PROJECTION_DESCRIPTION = (
@@ -112,6 +131,91 @@ class MinibookProjector:
     ) -> list[ProjectionResult]:
         return [self.project(event) for event in events]
 
+    def reconcile(
+        self,
+        events: Iterable[MinibookProjectionEvent],
+        *,
+        apply: bool = False,
+    ) -> DriftReport:
+        authoritative_events = list(events)
+        project = self.ensure_projection_project()
+        active_posts = [
+            post
+            for post in self.client.list_posts(project["id"])
+            if "captain-projection:v1" in post.get("tags", [])
+        ]
+        expected_ids = {str(event.event_id) for event in authoritative_events}
+        missing: list[str] = []
+        modified: list[str] = []
+        duplicate_events: list[str] = []
+        duplicate_posts: list[dict[str, Any]] = []
+        canonical_posts: dict[str, dict[str, Any]] = {}
+        desired_posts: dict[str, ProjectionPost] = {}
+
+        for event in authoritative_events:
+            event_id = str(event.event_id)
+            desired = self.render(event)
+            desired_posts[event_id] = desired
+            event_tag = f"captain-event:{event_id}"
+            matches = [post for post in active_posts if event_tag in post.get("tags", [])]
+            if not matches:
+                missing.append(event_id)
+                continue
+            canonical = next(
+                (post for post in matches if self._post_matches(post, desired)),
+                matches[0],
+            )
+            canonical_posts[event_id] = canonical
+            if not self._post_matches(canonical, desired):
+                modified.append(event_id)
+            extras = [post for post in matches if post["id"] != canonical["id"]]
+            if extras:
+                duplicate_events.append(event_id)
+                duplicate_posts.extend(extras)
+
+        duplicate_ids = {post["id"] for post in duplicate_posts}
+        orphaned_posts = [
+            post
+            for post in active_posts
+            if post["id"] not in duplicate_ids
+            and not any(
+                tag.removeprefix("captain-event:") in expected_ids
+                for tag in post.get("tags", [])
+                if tag.startswith("captain-event:")
+            )
+        ]
+
+        changes_applied = 0
+        if apply:
+            for event_id in missing:
+                self._create_projection_post(project["id"], desired_posts[event_id])
+                changes_applied += 1
+            for event_id in modified:
+                desired = desired_posts[event_id]
+                self.client.update_post(
+                    canonical_posts[event_id]["id"],
+                    title=desired.title,
+                    content=desired.content,
+                    status="open",
+                    tags=list(desired.tags),
+                )
+                changes_applied += 1
+            for post in duplicate_posts:
+                self._retire_projection_post(post, reason="duplicate")
+                changes_applied += 1
+            for post in orphaned_posts:
+                self._retire_projection_post(post, reason="orphaned")
+                changes_applied += 1
+
+        return DriftReport(
+            missing_event_ids=tuple(missing),
+            modified_event_ids=tuple(modified),
+            duplicate_event_ids=tuple(duplicate_events),
+            duplicate_post_ids=tuple(post["id"] for post in duplicate_posts),
+            orphaned_post_ids=tuple(post["id"] for post in orphaned_posts),
+            changes_applied=changes_applied,
+        )
+
     def render(self, event: MinibookProjectionEvent) -> ProjectionPost:
         payload = event.payload
         fields: list[tuple[str, str]] = [
@@ -166,6 +270,23 @@ class MinibookProjector:
             and post.get("status") == "open"
             and set(post.get("tags", [])) == set(desired.tags)
         )
+
+    def _create_projection_post(
+        self, project_id: str, desired: ProjectionPost
+    ) -> dict[str, Any]:
+        return self.client.create_post(
+            project_id,
+            title=desired.title,
+            content=desired.content,
+            tags=list(desired.tags),
+        )
+
+    def _retire_projection_post(self, post: dict[str, Any], *, reason: str) -> None:
+        tags = [
+            tag for tag in post.get("tags", []) if tag != "captain-projection:v1"
+        ]
+        tags.extend(("captain-projection-retired:v1", f"captain-retired:{reason}"))
+        self.client.update_post(post["id"], status="closed", tags=sorted(set(tags)))
 
     def _require_cursor_store(self) -> ProjectionCursorStore:
         if self.cursor_store is None:
