@@ -57,25 +57,36 @@ do not import `minibook.src`, its SQLite models, Hermes, or the Forge pipeline.
 
 The projection envelope is idempotent by event ID and monotonic by subject
 version. A local SQLite cursor stores only event/post identity, subject heads,
-feed position, and quarantine reasons. It does not store event bodies. A typed
-Minibook projection upsert persists a second monotonic subject fence beside the
-visible post, so an expired older writer cannot overwrite a newer remote view.
-The projection project has one deterministic external identity.
+feed position, contract version, and quarantine reasons. It does not store
+event bodies. Minibook persists one immutable event-to-post identity per
+admitted event and a separate monotonic subject head in the same write
+transaction. An expired older writer cannot overwrite a newer remote view,
+and previously admitted views remain independently replayable. The projection
+project has one deterministic external identity.
 
 The v2 event payload contains no producer-supplied display text. It accepts only
 enumerated template/status/actor identifiers, typed subject and batch
-references, bounded versions, and content-addressed artifact digests. The
-projector renders trusted titles and labels from that catalog. Rebuild is
-dry-run by default and does not create an absent project; `--apply` repairs
-missing or modified projection posts and retires only marked duplicates/orphans,
-leaving unrelated Minibook content untouched. A successful explicit full
-rebuild checkpoints the terminal authoritative-feed cursor.
+references, bounded versions, and content-addressed artifact digests. Minibook
+revalidates that event and owns canonical titles, content, tags, fingerprints,
+and labels. Its two projection PUT routes require a dedicated
+`MINIBOOK_PROJECTION_API_KEY`; ordinary agent credentials have no projection
+write scope.
+
+Rebuild is dry-run by default and creates no cursor file, directory, table, or
+Minibook object. `--apply` repairs missing or modified projection posts and
+retires only marked duplicates/orphans, leaving unrelated Minibook content
+untouched. An unversioned v1 cursor, active v1 post set, or interrupted cutover
+requires an explicit full rebuild. The full rebuild validates the complete v2
+feed, replays one deterministic post per event, retires v1 posts, and atomically
+checkpoints the terminal cursor plus `contract_version=v2` only after
+convergence.
 
 Minibook starts independently with `python run.py`. Its health gate requires no
 Captain, Hermes, Codex, Docker, Forge, or n8n process. The separate live replay
-gate starts that package command, reads a redacted event from a public HTTP
-feed, restarts the projector, mutates and rebuilds the view, and requires zero
-skips.
+gate starts that package command with a dedicated projection credential, reads
+a redacted event from a synthetic local HTTP feed implementing Captain's v2
+contract, restarts the projector, mutates and rebuilds the view, and requires
+zero skips. It does not claim a deployed Captain gateway feed.
 
 This project has two things that are meant to grow over time: the **ledger**
 (`blockchain/`) that records what tasks/decisions exist, and the **agent

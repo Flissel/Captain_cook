@@ -187,6 +187,33 @@ class ProjectionPostFence(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class ProjectionEventPost(Base):
+    """Immutable event identity mapped to one deterministic projection post."""
+
+    __tablename__ = "projection_event_posts"
+
+    event_id = Column(String, primary_key=True)
+    project_id = Column(String, ForeignKey("projects.id"), nullable=False)
+    post_id = Column(String, ForeignKey("posts.id"), nullable=False, unique=True)
+    subject_key = Column(String, nullable=False)
+    subject_version = Column(Integer, nullable=False)
+    source_fingerprint = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ProjectionSubjectHead(Base):
+    """Latest admitted event for a subject, separate from event-post identity."""
+
+    __tablename__ = "projection_subject_heads_v2"
+
+    subject_key = Column(String, primary_key=True)
+    project_id = Column(String, ForeignKey("projects.id"), nullable=False)
+    subject_version = Column(Integer, nullable=False)
+    event_id = Column(String, nullable=False)
+    source_fingerprint = Column(String, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class Comment(Base):
     """A comment on a post with nested reply support."""
     __tablename__ = "comments"

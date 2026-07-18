@@ -8,6 +8,8 @@ from urllib.parse import urlsplit
 import httpx
 import yaml
 
+from .minibook_events import MinibookProjectionEvent
+
 
 class RemoteProjectionStale(RuntimeError):
     pass
@@ -45,11 +47,17 @@ class MinibookClient:
         api_key: str,
         timeout_seconds: float = 10.0,
         *,
+        projection_api_key: str | None = None,
         client: httpx.Client | None = None,
     ) -> None:
         base_url = validate_service_base_url(base_url)
         self._base_url = base_url
         self._headers = {"Authorization": f"Bearer {api_key}"}
+        self._projection_headers = (
+            None
+            if projection_api_key is None
+            else {"Authorization": f"Bearer {projection_api_key}"}
+        )
         self._client = client or httpx.Client(
             base_url=base_url,
             timeout=httpx.Timeout(timeout_seconds),
@@ -102,13 +110,11 @@ class MinibookClient:
         self,
         *,
         external_id: str,
-        name: str,
-        description: str,
     ) -> dict[str, Any]:
-        return self._request(
+        return self._projection_request(
             "PUT",
             f"/api/v1/projection-projects/{external_id}",
-            json={"name": name, "description": description},
+            json={},
         )
 
     def list_posts(self, project_id: str) -> list[dict[str, Any]]:
@@ -135,33 +141,33 @@ class MinibookClient:
         self,
         project_id: str,
         *,
-        event_id: str,
-        subject_key: str,
-        subject_version: int,
-        source_fingerprint: str,
-        title: str,
-        content: str,
-        tags: list[str],
+        event: MinibookProjectionEvent,
     ) -> dict[str, Any]:
+        if self._projection_headers is None:
+            raise RuntimeError("MINIBOOK_PROJECTION_API_KEY is required")
         response = self._client.request(
             "PUT",
             f"{self._base_url}/api/v1/projects/{project_id}/projection-post",
-            headers=self._headers,
-            json={
-                "event_id": event_id,
-                "subject_key": subject_key,
-                "subject_version": subject_version,
-                "source_fingerprint": source_fingerprint,
-                "title": title,
-                "content": content,
-                "tags": tags,
-            },
+            headers=self._projection_headers,
+            json=event.model_dump(mode="json", by_alias=True),
         )
         if response.status_code == 409:
             detail = str(response.json().get("detail", ""))
             if detail == "stale_projection_version":
                 raise RemoteProjectionStale(detail)
             raise RemoteProjectionConflict(detail)
+        response.raise_for_status()
+        return response.json()
+
+    def _projection_request(self, method: str, path: str, **kwargs: Any) -> Any:
+        if self._projection_headers is None:
+            raise RuntimeError("MINIBOOK_PROJECTION_API_KEY is required")
+        response = self._client.request(
+            method,
+            f"{self._base_url}{path}",
+            headers=self._projection_headers,
+            **kwargs,
+        )
         response.raise_for_status()
         return response.json()
 

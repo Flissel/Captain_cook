@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+import httpx
 
 from agenten.delivery.minibook_client import MinibookClient
 from agenten.delivery.minibook_events import MinibookProjectionEvent
@@ -26,10 +27,15 @@ FIXTURE = (
     / "minibook_projection.v2.json"
 )
 MINIBOOK_ROOT = Path(__file__).parents[2] / "minibook"
+PROJECTION_API_KEY = "projection-scope-test-only"
 
 
 @pytest.fixture
-def projection_api(tmp_path: Path) -> Iterator[tuple[TestClient, MinibookClient]]:
+def projection_api(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[tuple[TestClient, MinibookClient]]:
+    monkeypatch.setenv("MINIBOOK_PROJECTION_API_KEY", PROJECTION_API_KEY)
     sys.path.insert(0, str(MINIBOOK_ROOT))
     from src import main as minibook_main
 
@@ -44,6 +50,7 @@ def projection_api(tmp_path: Path) -> Iterator[tuple[TestClient, MinibookClient]
         client = MinibookClient(
             "http://127.0.0.1",
             registration.json()["api_key"],
+            projection_api_key=PROJECTION_API_KEY,
             client=http,
         )
         yield http, client
@@ -86,10 +93,13 @@ def test_replay_is_idempotent_and_subject_versions_are_monotonic(
     posts = client.list_posts(project["id"])
     assert [result.outcome for result in first] == ["projected"] * 8
     assert [result.outcome for result in second] == ["duplicate"] * 8
-    assert len(posts) == 1
+    assert len(posts) == 8
     assert store.processed_count() == 8
     assert store.subject_version(events[0].subject_id) == 8
-    assert f"captain-event:{events[-1].event_id}" in posts[0]["tags"]
+    for event in events:
+        assert sum(
+            f"captain-event:{event.event_id}" in post["tags"] for post in posts
+        ) == 1
 
 
 def test_out_of_order_event_is_quarantined_without_remote_overwrite(
@@ -171,6 +181,7 @@ def test_two_concurrent_projectors_create_exactly_one_post_for_same_event(
     second_client = MinibookClient(
         "http://127.0.0.1",
         client._headers["Authorization"].removeprefix("Bearer "),
+        projection_api_key=PROJECTION_API_KEY,
         client=http,
     )
     first = MinibookProjector(first_client, ProjectionCursorStore(cursor_path))
@@ -200,6 +211,7 @@ def test_lower_version_cannot_write_after_newer_subject_claim(
     lower_client = MinibookClient(
         "http://127.0.0.1",
         client._headers["Authorization"].removeprefix("Bearer "),
+        projection_api_key=PROJECTION_API_KEY,
         client=http,
     )
     newer_projector = MinibookProjector(
@@ -328,6 +340,7 @@ def test_expired_lower_writer_cannot_overwrite_newer_remote_subject_version(
         MinibookClient(
             "http://127.0.0.1",
             client._headers["Authorization"].removeprefix("Bearer "),
+            projection_api_key=PROJECTION_API_KEY,
             client=http,
         ),
         ProjectionCursorStore(cursor_path, clock=clock),
@@ -363,6 +376,7 @@ def test_different_subject_projectors_create_one_projection_project_concurrently
     other = MinibookClient(
         "http://127.0.0.1",
         client._headers["Authorization"].removeprefix("Bearer "),
+        projection_api_key=PROJECTION_API_KEY,
         client=http,
     )
     first_projector = MinibookProjector(
@@ -382,3 +396,139 @@ def test_different_subject_projectors_create_one_projection_project_concurrently
     assert outcomes == {"projected"}
     assert len(client.list_projects()) == 1
     assert len(client.list_posts("captain-runtime-projection-v2")) == 2
+
+
+def test_ordinary_registered_agent_cannot_call_projection_put_routes(
+    projection_api: tuple[TestClient, MinibookClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    http, client = projection_api
+    monkeypatch.setenv("MINIBOOK_PROJECTION_API_KEY", "projection-scope-test-only")
+    ordinary_headers = client._headers
+    ordinary_project = http.post(
+        "/api/v1/projects",
+        headers=ordinary_headers,
+        json={"name": "Ordinary member project", "description": "membership proof"},
+    )
+    ordinary_project.raise_for_status()
+
+    project_response = http.put(
+        "/api/v1/projection-projects/captain-runtime-projection-v2",
+        headers=ordinary_headers,
+        json={},
+    )
+    post_response = http.put(
+        f"/api/v1/projects/{ordinary_project.json()['id']}/projection-post",
+        headers=ordinary_headers,
+        json=load_events()[0].model_dump(mode="json", by_alias=True),
+    )
+
+    assert project_response.status_code == 403
+    assert post_response.status_code == 403
+    assert "projection-scope-test-only" not in (
+        project_response.text + post_response.text
+    )
+
+
+def test_dedicated_projection_credential_renders_canonical_event_server_side(
+    projection_api: tuple[TestClient, MinibookClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    http, _ = projection_api
+    projection_token = "projection-scope-test-only"
+    monkeypatch.setenv("MINIBOOK_PROJECTION_API_KEY", projection_token)
+    headers = {"Authorization": f"Bearer {projection_token}"}
+    event_document = load_events()[0].model_dump(mode="json", by_alias=True)
+
+    project = http.put(
+        "/api/v1/projection-projects/captain-runtime-projection-v2",
+        headers=headers,
+        json={},
+    )
+    post = http.put(
+        "/api/v1/projects/captain-runtime-projection-v2/projection-post",
+        headers=headers,
+        json=event_document,
+    )
+    tampered = http.put(
+        "/api/v1/projects/captain-runtime-projection-v2/projection-post",
+        headers=headers,
+        json={**event_document, "title": "sk-proj-must-never-render"},
+    )
+
+    assert project.status_code == 200
+    assert post.status_code == 200
+    assert post.json()["title"] == "[plan.requested] Runtime planning requested"
+    assert "Requested" in post.json()["content"]
+    assert "captain-projection:v2" in post.json()["tags"]
+    assert tampered.status_code == 422
+    assert projection_token not in project.text + post.text + tampered.text
+
+
+def test_projection_client_sends_only_structured_v2_event_with_scoped_bearer() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "projection-post"}, request=request)
+
+    event = load_events()[0]
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        client = MinibookClient(
+            "https://minibook.example",
+            "ordinary-agent-key",
+            projection_api_key="projection-scope-key",
+            client=http,
+        )
+        client.upsert_projection_post(
+            "captain-runtime-projection-v2",
+            event=event,
+        )
+
+    body = json.loads(requests[0].content)
+    assert body == event.model_dump(mode="json", by_alias=True)
+    assert not {"title", "content", "tags", "source_fingerprint"} & body.keys()
+    assert requests[0].headers["Authorization"] == "Bearer projection-scope-key"
+
+
+def test_remote_rejects_conflicting_reuse_of_same_event_id(
+    tmp_path: Path,
+    projection_api: tuple[TestClient, MinibookClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    http, client = projection_api
+    monkeypatch.setenv("MINIBOOK_PROJECTION_API_KEY", "projection-scope-test-only")
+    original = load_events()[0]
+    conflicting = original.model_copy(
+        update={
+            "payload": original.payload.model_copy(
+                update={"batch_version": original.payload.batch_version + 1}
+            )
+        }
+    )
+    scoped_client = MinibookClient(
+        "http://127.0.0.1",
+        client._headers["Authorization"].removeprefix("Bearer "),
+        projection_api_key="projection-scope-test-only",
+        client=http,
+    )
+    first = MinibookProjector(
+        scoped_client,
+        ProjectionCursorStore(tmp_path / "first.db"),
+    )
+    conflicting_writer = MinibookProjector(
+        scoped_client,
+        ProjectionCursorStore(tmp_path / "second.db"),
+    )
+
+    assert first.project(original).outcome == "projected"
+    result = conflicting_writer.project(conflicting)
+
+    assert result.outcome == "quarantined"
+    assert conflicting_writer.cursor_store is not None
+    assert conflicting_writer.cursor_store.list_quarantine()[0].reason == (
+        "remote_projection_conflict"
+    )
+    posts = scoped_client.list_posts("captain-runtime-projection-v2")
+    assert len(posts) == 1
+    assert f"captain-event:{original.event_id}" in posts[0]["tags"]

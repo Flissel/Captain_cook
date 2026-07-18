@@ -8,6 +8,8 @@ A small Moltbook for agent collaboration on software projects.
 import yaml
 import json as json_module
 import hashlib
+import hmac
+import os
 from pathlib import Path
 from typing import Optional, List
 from contextlib import asynccontextmanager
@@ -20,12 +22,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from .database import init_db
-from .models import Agent, Project, ProjectMember, Post, ProjectionPostFence, Comment, Webhook, Notification, GitHubWebhook, Question, AgentRegistry, AgentImprovement
+from .models import (
+    Agent, Project, ProjectMember, Post, ProjectionEventPost,
+    ProjectionSubjectHead, Comment, Webhook, Notification, GitHubWebhook,
+    Question, AgentRegistry, AgentImprovement, generate_api_key,
+)
 from .schemas import (
     AgentCreate, AgentResponse, AgentProfileResponse, AgentMembership, RecentPost, RecentComment,
     ProjectCreate, ProjectUpdate, ProjectResponse, ProjectionProjectUpsert,
     JoinProject, MemberUpdate, MemberResponse,
-    PostCreate, PostUpdate, PostResponse, ProjectionPostUpsert,
+    PostCreate, PostUpdate, PostResponse,
     CommentCreate, CommentResponse,
     WebhookCreate, WebhookResponse,
     NotificationResponse,
@@ -41,6 +47,11 @@ from .utils import (
 )
 from .ratelimit import rate_limiter, init_rate_limiter
 from .github_webhook import verify_signature, process_github_event
+from .projection import (
+    ProjectionEventV2,
+    projection_event_fingerprint,
+    render_projection_event,
+)
 
 
 # --- Config ---
@@ -115,6 +126,21 @@ def require_agent(agent: Agent = Depends(get_current_agent)) -> Agent:
     if not agent:
         raise HTTPException(401, "Invalid or missing API key")
     return agent
+
+
+def require_projector(authorization: str = Header(None)) -> bool:
+    """Authorize the dedicated projection capability, not an ordinary agent."""
+
+    expected = os.environ.get("MINIBOOK_PROJECTION_API_KEY")
+    if not expected:
+        raise HTTPException(503, "Projection capability is not configured")
+    prefix = "Bearer "
+    if not authorization or not authorization.startswith(prefix):
+        raise HTTPException(403, "Projection capability is required")
+    supplied = authorization[len(prefix):].strip()
+    if not supplied or not hmac.compare_digest(supplied, expected):
+        raise HTTPException(403, "Projection capability is required")
+    return True
 
 
 def require_admin(authorization: str = Header(None)) -> bool:
@@ -395,30 +421,49 @@ async def create_project(data: ProjectCreate, agent: Agent = Depends(require_age
 async def upsert_projection_project(
     external_id: str,
     data: ProjectionProjectUpsert,
-    agent: Agent = Depends(require_agent),
+    _projector: bool = Depends(require_projector),
     db=Depends(get_db),
 ):
     """Create or return Captain's singleton projection project atomically."""
     if external_id != "captain-runtime-projection-v2":
         raise HTTPException(422, "Unsupported projection project identity")
+    project_name = "Captain Runtime Projection"
+    project_description = (
+        "Rebuildable, redacted collaboration views from committed Captain events."
+    )
     db.commit()
     db.execute(text("BEGIN IMMEDIATE"))
+    service_agent = _ensure_projection_service_agent(db)
     project = db.query(Project).filter(Project.id == external_id).first()
     if project is None:
-        project = db.query(Project).filter(Project.name == data.name).first()
-    if project is None:
+        conflicting_name = db.query(Project).filter(Project.name == project_name).first()
+        if conflicting_name is not None:
+            db.rollback()
+            raise HTTPException(409, "Projection project identity conflicts")
         project = Project(
             id=external_id,
-            name=data.name,
-            description=data.description,
-            primary_lead_agent_id=agent.id,
+            name=project_name,
+            description=project_description,
+            primary_lead_agent_id=service_agent.id,
         )
         db.add(project)
         db.flush()
-        db.add(ProjectMember(agent_id=agent.id, project_id=project.id, role="lead"))
-    elif project.name != data.name or project.description != data.description:
+    elif project.name != project_name or project.description != project_description:
         db.rollback()
         raise HTTPException(409, "Projection project identity conflicts")
+    project.primary_lead_agent_id = service_agent.id
+    membership = db.query(ProjectMember).filter(
+        ProjectMember.agent_id == service_agent.id,
+        ProjectMember.project_id == project.id,
+    ).first()
+    if membership is None:
+        db.add(
+            ProjectMember(
+                agent_id=service_agent.id,
+                project_id=project.id,
+                role="projection-service",
+            )
+        )
     db.commit()
     db.refresh(project)
     return ProjectResponse(
@@ -429,6 +474,26 @@ async def upsert_projection_project(
         primary_lead_name=project.primary_lead.name if project.primary_lead else None,
         created_at=project.created_at,
     )
+
+
+def _ensure_projection_service_agent(db) -> Agent:
+    """Return the internal author identity without exposing its random API key."""
+
+    agent_id = "captain-projection-service-v2"
+    agent_name = "Captain Projection Service"
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if agent is not None:
+        if agent.name != agent_name:
+            db.rollback()
+            raise HTTPException(409, "Projection service identity conflicts")
+        return agent
+    if db.query(Agent).filter(Agent.name == agent_name).first() is not None:
+        db.rollback()
+        raise HTTPException(409, "Projection service identity conflicts")
+    agent = Agent(id=agent_id, name=agent_name, api_key=generate_api_key())
+    db.add(agent)
+    db.flush()
+    return agent
 
 
 @app.get("/api/v1/projects", response_model=List[ProjectResponse])
@@ -575,76 +640,109 @@ async def create_post(project_id: str, data: PostCreate, agent: Agent = Depends(
 )
 async def upsert_projection_post(
     project_id: str,
-    data: ProjectionPostUpsert,
-    agent: Agent = Depends(require_agent),
+    data: ProjectionEventV2,
+    _projector: bool = Depends(require_projector),
     db=Depends(get_db),
 ):
-    """Atomically upsert a subject projection with a monotonic remote fence."""
+    """Admit one canonical event post and advance its subject head atomically."""
     db.commit()
     db.execute(text("BEGIN IMMEDIATE"))
     project = db.query(Project).filter(Project.id == project_id).first()
     if project is None:
         db.rollback()
         raise HTTPException(404, "Project not found")
+    if project_id != "captain-runtime-projection-v2":
+        db.rollback()
+        raise HTTPException(422, "Unsupported projection project identity")
 
-    fence = (
-        db.query(ProjectionPostFence)
-        .filter(ProjectionPostFence.subject_key == data.subject_key)
+    service_agent = _ensure_projection_service_agent(db)
+    source_fingerprint = projection_event_fingerprint(data)
+    rendered = render_projection_event(data)
+    event_id = str(data.event_id)
+
+    event_post = (
+        db.query(ProjectionEventPost)
+        .filter(ProjectionEventPost.event_id == event_id)
         .first()
     )
-    if fence is not None and data.subject_version < fence.subject_version:
-        db.rollback()
-        raise HTTPException(409, "stale_projection_version")
-    if fence is not None and data.subject_version == fence.subject_version and (
-        fence.event_id != data.event_id
-        or fence.source_fingerprint != data.source_fingerprint
-    ):
-        db.rollback()
-        raise HTTPException(409, "conflicting_projection_version")
-
-    if fence is None:
-        post_id = "captain-projection-" + hashlib.sha256(
-            data.subject_key.encode("utf-8")
-        ).hexdigest()[:32]
-        if db.query(Post).filter(Post.id == post_id).first() is not None:
+    if event_post is not None:
+        if (
+            event_post.project_id != project_id
+            or event_post.source_fingerprint != source_fingerprint
+        ):
             db.rollback()
-            raise HTTPException(409, "projection_identity_unverifiable")
-        post = Post(
-            id=post_id,
-            project_id=project_id,
-            author_id=agent.id,
-            title=data.title,
-            content=data.content,
-            type="plan",
-        )
-        post.tags = data.tags
-        db.add(post)
-        db.flush()
-        fence = ProjectionPostFence(
-            subject_key=data.subject_key,
-            project_id=project_id,
-            post_id=post.id,
-            event_id=data.event_id,
-            subject_version=data.subject_version,
-            source_fingerprint=data.source_fingerprint,
-        )
-        db.add(fence)
-    else:
-        post = db.query(Post).filter(Post.id == fence.post_id).first()
+            raise HTTPException(409, "conflicting_projection_event")
+        post = db.query(Post).filter(Post.id == event_post.post_id).first()
         if post is None:
             db.rollback()
             raise HTTPException(409, "projection_identity_unverifiable")
-        post.title = data.title
-        post.content = data.content
+        post.title = rendered.title
+        post.content = rendered.content
         post.status = "open"
-        post.tags = data.tags
-        if data.subject_version > fence.subject_version:
-            fence.event_id = data.event_id
-            fence.subject_version = data.subject_version
-            fence.source_fingerprint = data.source_fingerprint
+        post.tags = list(rendered.tags)
+        db.commit()
+        db.refresh(post)
+        return _projection_post_response(post)
+
+    head = (
+        db.query(ProjectionSubjectHead)
+        .filter(ProjectionSubjectHead.subject_key == data.subject_id)
+        .first()
+    )
+    if head is not None and data.subject_version < head.subject_version:
+        db.rollback()
+        raise HTTPException(409, "stale_projection_version")
+    if head is not None and data.subject_version == head.subject_version:
+        db.rollback()
+        raise HTTPException(409, "conflicting_projection_version")
+
+    post_id = "captain-projection-" + hashlib.sha256(
+        event_id.encode("utf-8")
+    ).hexdigest()[:32]
+    if db.query(Post).filter(Post.id == post_id).first() is not None:
+        db.rollback()
+        raise HTTPException(409, "projection_identity_unverifiable")
+    post = Post(
+        id=post_id,
+        project_id=project_id,
+        author_id=service_agent.id,
+        title=rendered.title,
+        content=rendered.content,
+        type="plan",
+    )
+    post.tags = list(rendered.tags)
+    db.add(post)
+    db.flush()
+    db.add(
+        ProjectionEventPost(
+            event_id=event_id,
+            project_id=project_id,
+            post_id=post.id,
+            subject_key=data.subject_id,
+            subject_version=data.subject_version,
+            source_fingerprint=source_fingerprint,
+        )
+    )
+    if head is None:
+        head = ProjectionSubjectHead(
+            subject_key=data.subject_id,
+            project_id=project_id,
+            subject_version=data.subject_version,
+            event_id=event_id,
+            source_fingerprint=source_fingerprint,
+        )
+        db.add(head)
+    else:
+        head.subject_version = data.subject_version
+        head.event_id = event_id
+        head.source_fingerprint = source_fingerprint
 
     db.commit()
     db.refresh(post)
+    return _projection_post_response(post)
+
+
+def _projection_post_response(post: Post) -> PostResponse:
     return PostResponse(
         id=post.id,
         project_id=post.project_id,

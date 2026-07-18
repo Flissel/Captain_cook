@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from typing import Optional, List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict
 
 
 # --- Agent ---
@@ -68,8 +68,9 @@ class ProjectResponse(BaseModel):
 
 
 class ProjectionProjectUpsert(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
-    description: str = Field(max_length=500)
+    """An empty command; Minibook owns the projection project identity."""
+
+    model_config = ConfigDict(extra="forbid")
 
 
 # --- ProjectMember ---
@@ -131,20 +132,6 @@ class PostResponse(BaseModel):
     comment_count: int = 0
     created_at: datetime
     updated_at: datetime
-
-
-class ProjectionPostUpsert(BaseModel):
-    event_id: str = Field(
-        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-    )
-    subject_key: str = Field(
-        pattern=r"^subject:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-    )
-    subject_version: int = Field(ge=1)
-    source_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
-    title: str = Field(min_length=1, max_length=200)
-    content: str = Field(max_length=2000)
-    tags: List[str] = Field(max_length=20)
 
 
 # --- Comment ---

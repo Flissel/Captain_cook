@@ -298,6 +298,7 @@ class ProjectionCursorStore:
                     """,
                     (event.subject_id, event.subject_version),
                 )
+                self._set_state(connection, "contract_version", "v2")
                 self._delete_claim_rows(connection, event_id=event_id)
                 connection.commit()
             except BaseException:
@@ -344,6 +345,78 @@ class ProjectionCursorStore:
                 "SELECT value FROM projection_state WHERE key = 'feed_cursor'"
             ).fetchone()
         return None if row is None else str(row["value"])
+
+    def get_contract_version(self) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM projection_state WHERE key = 'contract_version'"
+            ).fetchone()
+        return None if row is None else str(row["value"])
+
+    def validate_incremental_v2_state(self) -> None:
+        """Fail closed when an old or interrupted state needs a full rebuild."""
+
+        with self._connect() as connection:
+            rebuilding = connection.execute(
+                "SELECT value FROM projection_state WHERE key = 'rebuild_in_progress'"
+            ).fetchone()
+            version = connection.execute(
+                "SELECT value FROM projection_state WHERE key = 'contract_version'"
+            ).fetchone()
+            feed_cursor = connection.execute(
+                "SELECT 1 FROM projection_state WHERE key = 'feed_cursor'"
+            ).fetchone()
+            processed = connection.execute(
+                "SELECT 1 FROM processed_projection_events LIMIT 1"
+            ).fetchone()
+            heads = connection.execute(
+                "SELECT 1 FROM projection_subject_heads LIMIT 1"
+            ).fetchone()
+        if rebuilding is not None:
+            raise RuntimeError(
+                "projection rebuild was interrupted; run an explicit full rebuild"
+            )
+        if version is not None and str(version["value"]) != "v2":
+            raise RuntimeError("projection contract requires an explicit full rebuild")
+        if version is None and any(
+            value is not None for value in (feed_cursor, processed, heads)
+        ):
+            raise RuntimeError(
+                "unversioned projection state requires an explicit full rebuild"
+            )
+
+    def begin_v2_full_rebuild(self) -> None:
+        """Reset only rebuildable local state and leave a crash-detectable marker."""
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute("DELETE FROM processed_projection_events")
+                connection.execute("DELETE FROM projection_subject_heads")
+                connection.execute("DELETE FROM projection_event_claims")
+                connection.execute("DELETE FROM projection_subject_claims")
+                connection.execute("DELETE FROM projection_quarantine")
+                self._set_state(connection, "rebuild_in_progress", "v2")
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def checkpoint_v2_feed(self, cursor: str) -> None:
+        """Commit terminal v2 cursor/version and clear the rebuild marker atomically."""
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._set_feed_cursor(connection, cursor)
+                self._set_state(connection, "contract_version", "v2")
+                connection.execute(
+                    "DELETE FROM projection_state WHERE key = 'rebuild_in_progress'"
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
 
     def set_feed_cursor(self, cursor: str) -> None:
         with self._connect() as connection:
@@ -457,10 +530,18 @@ class ProjectionCursorStore:
 
     @staticmethod
     def _set_feed_cursor(connection: sqlite3.Connection, cursor: str) -> None:
+        ProjectionCursorStore._set_state(connection, "feed_cursor", cursor)
+
+    @staticmethod
+    def _set_state(
+        connection: sqlite3.Connection,
+        key: str,
+        value: str,
+    ) -> None:
         connection.execute(
             """
-            INSERT INTO projection_state(key, value) VALUES('feed_cursor', ?)
+            INSERT INTO projection_state(key, value) VALUES(?, ?)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             """,
-            (cursor,),
+            (key, value),
         )

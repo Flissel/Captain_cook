@@ -30,10 +30,15 @@ FIXTURE = (
     / "minibook_projection.v2.json"
 )
 MINIBOOK_ROOT = Path(__file__).parents[2] / "minibook"
+PROJECTION_API_KEY = "projection-scope-test-only"
 
 
 @pytest.fixture
-def projection_api(tmp_path: Path) -> Iterator[MinibookClient]:
+def projection_api(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[MinibookClient]:
+    monkeypatch.setenv("MINIBOOK_PROJECTION_API_KEY", PROJECTION_API_KEY)
     sys.path.insert(0, str(MINIBOOK_ROOT))
     from src import main as minibook_main
 
@@ -48,6 +53,7 @@ def projection_api(tmp_path: Path) -> Iterator[MinibookClient]:
         yield MinibookClient(
             "http://127.0.0.1",
             registration.json()["api_key"],
+            projection_api_key=PROJECTION_API_KEY,
             client=http,
         )
 
@@ -294,11 +300,11 @@ class FailCursorCommitStore(ProjectionCursorStore):
         super().__init__(path)
         self.failed = False
 
-    def set_feed_cursor(self, cursor: str) -> None:
+    def checkpoint_v2_feed(self, cursor: str) -> None:
         if not self.failed:
             self.failed = True
             raise RuntimeError("simulated crash before page cursor commit")
-        super().set_feed_cursor(cursor)
+        super().checkpoint_v2_feed(cursor)
 
 
 def _single_page_feed(
@@ -473,6 +479,27 @@ def test_incremental_dry_run_does_not_write_or_advance_cursor(
     assert projection_api.list_projects() == []
 
 
+def test_v1_feed_document_does_not_checkpoint_or_write(
+    tmp_path: Path,
+    projection_api: MinibookClient,
+) -> None:
+    document = json.loads(FIXTURE.read_text(encoding="utf-8"))[0]
+    document["schema"] = "captain.minibook-projection.v1"
+    store = ProjectionCursorStore(tmp_path / "cursor.db")
+
+    with pytest.raises(ValueError):
+        consume_incremental_projection(
+            _single_page_feed([document], cursor="must-not-commit"),
+            MinibookProjector(projection_api, store),
+            store,
+            apply=True,
+        )
+
+    assert store.get_feed_cursor() is None
+    assert store.get_contract_version() is None
+    assert projection_api.list_projects() == []
+
+
 def test_default_cli_dry_run_reports_missing_without_creating_project(
     tmp_path: Path,
     projection_api: MinibookClient,
@@ -486,6 +513,9 @@ def test_default_cli_dry_run_reports_missing_without_creating_project(
     monkeypatch.setattr(rebuild_script, "CaptainProjectionFeed", lambda *a, **k: feed)
     monkeypatch.setattr(rebuild_script, "MinibookClient", lambda *a, **k: projection_api)
 
+    cursor_path = tmp_path / "absent" / "nested" / "cursor.db"
+    assert not cursor_path.parent.exists()
+
     exit_code = rebuild_script.main(
         [
             "--captain-url",
@@ -493,7 +523,7 @@ def test_default_cli_dry_run_reports_missing_without_creating_project(
             "--minibook-url",
             "http://127.0.0.1",
             "--cursor-db",
-            str(tmp_path / "cursor.db"),
+            str(cursor_path),
         ]
     )
 
@@ -502,7 +532,7 @@ def test_default_cli_dry_run_reports_missing_without_creating_project(
     assert output["mode"] == "dry-run"
     assert output["missing_event_ids"] == [document["event_id"]]
     assert projection_api.list_projects() == []
-    assert ProjectionCursorStore(tmp_path / "cursor.db").get_feed_cursor() is None
+    assert not cursor_path.parent.exists()
 
 
 def test_successful_apply_full_rebuild_checkpoints_terminal_feed_cursor(
@@ -515,6 +545,7 @@ def test_successful_apply_full_rebuild_checkpoints_terminal_feed_cursor(
     cursor_path = tmp_path / "cursor.db"
     monkeypatch.setenv("CAPTAIN_GATEWAY_TOKEN", "test-only")
     monkeypatch.setenv("MINIBOOK_API_KEY", "test-only")
+    monkeypatch.setenv("MINIBOOK_PROJECTION_API_KEY", PROJECTION_API_KEY)
     monkeypatch.setattr(rebuild_script, "CaptainProjectionFeed", lambda *a, **k: feed)
     monkeypatch.setattr(rebuild_script, "MinibookClient", lambda *a, **k: projection_api)
 
@@ -533,3 +564,71 @@ def test_successful_apply_full_rebuild_checkpoints_terminal_feed_cursor(
 
     assert exit_code == 0
     assert ProjectionCursorStore(cursor_path).get_feed_cursor() == "after-full-rebuild"
+
+
+def test_incremental_requires_explicit_full_rebuild_for_unversioned_cursor(
+    tmp_path: Path,
+    projection_api: MinibookClient,
+) -> None:
+    document = json.loads(FIXTURE.read_text(encoding="utf-8"))[0]
+    store = ProjectionCursorStore(tmp_path / "legacy-cursor.db")
+    store.set_feed_cursor("legacy-v1-position")
+
+    with pytest.raises(RuntimeError, match="full rebuild"):
+        consume_incremental_projection(
+            _single_page_feed([document], cursor="after-v2"),
+            MinibookProjector(projection_api, store),
+            store,
+            apply=True,
+        )
+
+    assert store.get_feed_cursor() == "legacy-v1-position"
+    assert projection_api.list_projects() == []
+
+
+def test_apply_full_rebuild_retires_v1_posts_and_records_v2_state(
+    tmp_path: Path,
+    projection_api: MinibookClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = json.loads(FIXTURE.read_text(encoding="utf-8"))[0]
+    project = projection_api.ensure_projection_project(
+        external_id="captain-runtime-projection-v2",
+    )
+    legacy = projection_api.create_post(
+        project["id"],
+        title="Legacy v1 projection",
+        content="Legacy public content",
+        tags=["captain-projection:v1", f"captain-event:{document['event_id']}"],
+    )
+    feed = _single_page_feed([document], cursor="after-v2-cutover")
+    cursor_path = tmp_path / "cursor.db"
+    monkeypatch.setenv("CAPTAIN_GATEWAY_TOKEN", "test-only")
+    monkeypatch.setenv("MINIBOOK_API_KEY", "test-only")
+    monkeypatch.setenv("MINIBOOK_PROJECTION_API_KEY", "projection-scope-test-only")
+    monkeypatch.setattr(rebuild_script, "CaptainProjectionFeed", lambda *a, **k: feed)
+    monkeypatch.setattr(rebuild_script, "MinibookClient", lambda *a, **k: projection_api)
+
+    assert rebuild_script.main(
+        [
+            "--captain-url",
+            "https://captain.test",
+            "--minibook-url",
+            "http://127.0.0.1",
+            "--cursor-db",
+            str(cursor_path),
+            "--apply",
+            "--full-rebuild",
+        ]
+    ) == 0
+
+    posts = projection_api.list_posts(project["id"])
+    retired = next(post for post in posts if post["id"] == legacy["id"])
+    active_v2 = [post for post in posts if "captain-projection:v2" in post["tags"]]
+    store = ProjectionCursorStore(cursor_path)
+    assert retired["status"] == "closed"
+    assert "captain-projection-retired:v2" in retired["tags"]
+    assert len(active_v2) == 1
+    assert store.processed_count() == 1
+    assert store.get_feed_cursor() == "after-v2-cutover"
+    assert store.get_contract_version() == "v2"

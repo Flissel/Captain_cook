@@ -59,6 +59,7 @@ class DriftReport:
     duplicate_event_ids: tuple[str, ...] = ()
     duplicate_post_ids: tuple[str, ...] = ()
     orphaned_post_ids: tuple[str, ...] = ()
+    legacy_v1_post_ids: tuple[str, ...] = ()
     changes_applied: int = 0
 
     @property
@@ -68,6 +69,7 @@ class DriftReport:
             + len(self.modified_event_ids)
             + len(self.duplicate_post_ids)
             + len(self.orphaned_post_ids)
+            + len(self.legacy_v1_post_ids)
         )
 
 
@@ -101,8 +103,6 @@ class MinibookProjector:
     def ensure_projection_project(self) -> dict[str, Any]:
         return self.client.ensure_projection_project(
             external_id=self.PROJECTION_PROJECT_ID,
-            name=self.PROJECTION_PROJECT,
-            description=self.PROJECTION_DESCRIPTION,
         )
 
     def project(self, event: MinibookProjectionEvent) -> ProjectionResult:
@@ -139,16 +139,7 @@ class MinibookProjector:
         try:
             project = self.ensure_projection_project()
             desired = self.render(event)
-            post = self.client.upsert_projection_post(
-                project["id"],
-                event_id=event_id,
-                subject_key=event.subject_id,
-                subject_version=event.subject_version,
-                source_fingerprint=projection_event_fingerprint(event),
-                title=desired.title,
-                content=desired.content,
-                tags=list(desired.tags),
-            )
+            post = self.client.upsert_projection_post(project["id"], event=event)
         except RemoteProjectionStale:
             store.release_claim(event_id, owner_id=self.owner_id)
             store.quarantine(event, reason="remote_stale_subject_version")
@@ -233,12 +224,7 @@ class MinibookProjector:
         )
         if deduplicated.conflicting_event_ids:
             raise ConflictingProjectionEvent(deduplicated.conflicting_event_ids)
-        latest_by_subject: dict[str, MinibookProjectionEvent] = {}
-        for event in deduplicated.events:
-            current = latest_by_subject.get(event.subject_id)
-            if current is None or event.subject_version > current.subject_version:
-                latest_by_subject[event.subject_id] = event
-        authoritative_events = list(latest_by_subject.values())
+        authoritative_events = list(deduplicated.events)
         existing_project = next(
             (
                 item
@@ -252,10 +238,20 @@ class MinibookProjector:
                 missing_event_ids=tuple(str(event.event_id) for event in authoritative_events)
             )
         project = existing_project or self.ensure_projection_project()
-        active_posts = [
+        all_active_posts = [
             post
             for post in self.client.list_posts(project["id"])
+            if post.get("status") == "open"
+        ]
+        active_posts = [
+            post
+            for post in all_active_posts
             if "captain-projection:v2" in post.get("tags", [])
+        ]
+        legacy_v1_posts = [
+            post
+            for post in all_active_posts
+            if "captain-projection:v1" in post.get("tags", [])
         ]
         expected_ids = {str(event.event_id) for event in authoritative_events}
         missing: list[str] = []
@@ -263,13 +259,11 @@ class MinibookProjector:
         duplicate_events: list[str] = []
         duplicate_posts: list[dict[str, Any]] = []
         canonical_posts: dict[str, dict[str, Any]] = {}
-        desired_posts: dict[str, ProjectionPost] = {}
         events_by_id: dict[str, MinibookProjectionEvent] = {}
 
         for event in authoritative_events:
             event_id = str(event.event_id)
             desired = self.render(event)
-            desired_posts[event_id] = desired
             events_by_id[event_id] = event
             event_tag = f"captain-event:{event_id}"
             matches = [post for post in active_posts if event_tag in post.get("tags", [])]
@@ -306,14 +300,12 @@ class MinibookProjector:
                 self._upsert_projection_event(
                     project["id"],
                     events_by_id[event_id],
-                    desired_posts[event_id],
                 )
                 changes_applied += 1
             for event_id in modified:
                 self._upsert_projection_event(
                     project["id"],
                     events_by_id[event_id],
-                    desired_posts[event_id],
                 )
                 changes_applied += 1
             for post in duplicate_posts:
@@ -322,6 +314,9 @@ class MinibookProjector:
             for post in orphaned_posts:
                 self._retire_projection_post(post, reason="orphaned")
                 changes_applied += 1
+            for post in legacy_v1_posts:
+                self._retire_projection_post(post, reason="v1-cutover")
+                changes_applied += 1
 
         return DriftReport(
             missing_event_ids=tuple(missing),
@@ -329,6 +324,7 @@ class MinibookProjector:
             duplicate_event_ids=tuple(duplicate_events),
             duplicate_post_ids=tuple(post["id"] for post in duplicate_posts),
             orphaned_post_ids=tuple(post["id"] for post in orphaned_posts),
+            legacy_v1_post_ids=tuple(post["id"] for post in legacy_v1_posts),
             changes_applied=changes_applied,
         )
 
@@ -432,18 +428,8 @@ class MinibookProjector:
         self,
         project_id: str,
         event: MinibookProjectionEvent,
-        desired: ProjectionPost,
     ) -> dict[str, Any]:
-        return self.client.upsert_projection_post(
-            project_id,
-            event_id=str(event.event_id),
-            subject_key=event.subject_id,
-            subject_version=event.subject_version,
-            source_fingerprint=projection_event_fingerprint(event),
-            title=desired.title,
-            content=desired.content,
-            tags=list(desired.tags),
-        )
+        return self.client.upsert_projection_post(project_id, event=event)
 
     def _retire_projection_post(self, post: dict[str, Any], *, reason: str) -> None:
         tags = [

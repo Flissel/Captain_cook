@@ -285,7 +285,7 @@ N8N_URL=http://localhost:5678
 N8N_CONTAINER_URL=http://n8n:5678
 ```
 
-Keep `OPENAI_API_KEY`, `N8N_MCP_TOKEN`, `MARIADB_PASSWORD`, `MARIADB_ROOT_PASSWORD`, and `MINIBOOK_API_KEY` empty in the example.
+Keep `OPENAI_API_KEY`, `N8N_MCP_TOKEN`, `MARIADB_PASSWORD`, `MARIADB_ROOT_PASSWORD`, `MINIBOOK_API_KEY`, and `MINIBOOK_PROJECTION_API_KEY` empty in the example.
 
 - [ ] **Step 4: Run configuration and full tests**
 

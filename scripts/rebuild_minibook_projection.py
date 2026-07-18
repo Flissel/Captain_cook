@@ -113,6 +113,8 @@ def consume_incremental_projection(
 ) -> list[ProjectionResult]:
     """Consume complete feed pages and checkpoint only terminal page outcomes."""
     results: list[ProjectionResult] = []
+    if apply:
+        cursor_store.validate_incremental_v2_state()
     start_cursor = cursor_store.get_feed_cursor()
     for page in feed.iter_pages(cursor=start_cursor):
         deduplicated = projector.deduplicate_events(
@@ -129,7 +131,7 @@ def consume_incremental_projection(
             raise ProjectionPageIncomplete(
                 f"projection feed page {page.cursor!r} still has claimed events"
             )
-        cursor_store.set_feed_cursor(page.cursor)
+        cursor_store.checkpoint_v2_feed(page.cursor)
         results.extend(page_results)
     return results
 
@@ -157,20 +159,24 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     captain_token = os.environ.get("CAPTAIN_GATEWAY_TOKEN")
     minibook_api_key = os.environ.get("MINIBOOK_API_KEY")
+    projection_api_key = os.environ.get("MINIBOOK_PROJECTION_API_KEY")
     if not captain_token:
         raise SystemExit("CAPTAIN_GATEWAY_TOKEN is required")
     if not minibook_api_key:
         raise SystemExit("MINIBOOK_API_KEY is required")
+    if args.apply and not projection_api_key:
+        raise SystemExit("MINIBOOK_PROJECTION_API_KEY is required for --apply")
 
     feed = CaptainProjectionFeed(args.captain_url, token=captain_token)
-    minibook = MinibookClient(args.minibook_url, minibook_api_key)
+    minibook = MinibookClient(
+        args.minibook_url,
+        minibook_api_key,
+        projection_api_key=projection_api_key,
+    )
     try:
-        cursor_store = ProjectionCursorStore(args.cursor_db)
-        projector = MinibookProjector(
-            minibook,
-            cursor_store,
-        )
         if args.apply and not args.full_rebuild:
+            cursor_store = ProjectionCursorStore(args.cursor_db)
+            projector = MinibookProjector(minibook, cursor_store)
             results = consume_incremental_projection(
                 feed,
                 projector,
@@ -184,10 +190,28 @@ def main(argv: list[str] | None = None) -> int:
                 "cursor": cursor_store.get_feed_cursor(),
             }
         else:
+            projector = MinibookProjector(minibook)
             events = list(feed.iter_events(cursor=None))
-            report = projector.reconcile(events, apply=args.apply)
-            if args.apply and feed.last_cursor is not None:
-                cursor_store.set_feed_cursor(feed.last_cursor)
+            if args.apply:
+                if feed.last_cursor is None:
+                    raise RuntimeError("full projection feed has no terminal cursor")
+                cursor_store = ProjectionCursorStore(args.cursor_db)
+                cursor_store.begin_v2_full_rebuild()
+                projector = MinibookProjector(minibook, cursor_store)
+                rebuild_results = projector.rebuild(events)
+                incomplete = [
+                    result
+                    for result in rebuild_results
+                    if result.outcome not in {"projected", "duplicate"}
+                ]
+                if incomplete:
+                    raise ProjectionPageIncomplete(
+                        "full rebuild has non-projectable authoritative events"
+                    )
+                report = projector.reconcile(events, apply=True)
+                cursor_store.checkpoint_v2_feed(feed.last_cursor)
+            else:
+                report = projector.reconcile(events, apply=False)
             output = asdict(report)
             output["total_changes"] = report.total_changes
             output["mode"] = "full-rebuild" if args.apply else "dry-run"

@@ -45,6 +45,7 @@ FORBIDDEN = ("token", "password", "secret", "holdout", "prompt", "transcript")
 def projection_feed(
     events: list[MinibookProjectionEvent],
 ) -> Iterator[str]:
+    """Serve a synthetic local feed that implements Captain's public v2 shape."""
     documents = [
         event.model_dump(mode="json", by_alias=True) for event in events
     ]
@@ -79,7 +80,7 @@ def projection_feed(
 
 
 @contextmanager
-def independent_minibook(tmp_path: Path) -> Iterator[str]:
+def independent_minibook(tmp_path: Path) -> Iterator[tuple[str, str]]:
     service_root = tmp_path / "minibook-service"
     shutil.copytree(
         MINIBOOK_ROOT,
@@ -107,6 +108,7 @@ def independent_minibook(tmp_path: Path) -> Iterator[str]:
         encoding="utf-8",
     )
     env = os.environ.copy()
+    projection_api_key = f"live-projection-{uuid4().hex}"
     env.update(
         {
             "HERMES_HOME": str(tmp_path / "unavailable-hermes"),
@@ -114,6 +116,7 @@ def independent_minibook(tmp_path: Path) -> Iterator[str]:
             "DOCKER_HOST": "tcp://127.0.0.1:1",
             "FORGE_URL": "http://127.0.0.1:1",
             "CAPTAIN_GATEWAY_URL": "http://127.0.0.1:1",
+            "MINIBOOK_PROJECTION_API_KEY": projection_api_key,
         }
     )
     process = subprocess.Popen(
@@ -140,7 +143,7 @@ def independent_minibook(tmp_path: Path) -> Iterator[str]:
             time.sleep(0.1)
         else:
             pytest.fail("independent Minibook health endpoint did not become ready")
-        yield base_url
+        yield base_url, projection_api_key
     finally:
         process.terminate()
         try:
@@ -150,7 +153,7 @@ def independent_minibook(tmp_path: Path) -> Iterator[str]:
             process.wait(timeout=5)
 
 
-def test_live_public_http_replay_restart_and_rebuild_without_other_packages(
+def test_live_synthetic_captain_compatible_feed_replay_and_rebuild(
     tmp_path: Path,
 ) -> None:
     template = MinibookProjectionEvent.model_validate(
@@ -165,14 +168,19 @@ def test_live_public_http_replay_restart_and_rebuild_without_other_packages(
         }
     )
 
-    with independent_minibook(tmp_path) as minibook_url, projection_feed([event]) as feed_url:
+    with independent_minibook(tmp_path) as minibook_service, projection_feed([event]) as feed_url:
+        minibook_url, projection_api_key = minibook_service
         assert httpx.get(f"{minibook_url}/health").json()["status"] == "ok"
         registration = httpx.post(
             f"{minibook_url}/api/v1/agents",
             json={"name": f"CaptainLiveProjector_{uuid4().hex}"},
         )
         registration.raise_for_status()
-        client = MinibookClient(minibook_url, registration.json()["api_key"])
+        client = MinibookClient(
+            minibook_url,
+            registration.json()["api_key"],
+            projection_api_key=projection_api_key,
+        )
         feed = CaptainProjectionFeed(feed_url, token="live-test-only")
         try:
             cursor_path = tmp_path / "projection-cursor.db"

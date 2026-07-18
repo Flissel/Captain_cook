@@ -72,25 +72,53 @@ MIGRATIONS = [
         updated_at DATETIME
     )
     """,
+    # Captain v2 event-specific post identity
+    """
+    CREATE TABLE IF NOT EXISTS projection_event_posts (
+        event_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        post_id TEXT NOT NULL UNIQUE REFERENCES posts(id),
+        subject_key TEXT NOT NULL,
+        subject_version INTEGER NOT NULL,
+        source_fingerprint TEXT NOT NULL,
+        created_at DATETIME
+    )
+    """,
+    # Captain v2 monotonic subject head, deliberately separate from event posts
+    """
+    CREATE TABLE IF NOT EXISTS projection_subject_heads_v2 (
+        subject_key TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        subject_version INTEGER NOT NULL,
+        event_id TEXT NOT NULL,
+        source_fingerprint TEXT NOT NULL,
+        updated_at DATETIME
+    )
+    """,
 ]
 
 def run():
     print(f"Migrating: {DB_PATH}")
     conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    for sql in MIGRATIONS:
-        stmt = sql.strip()
-        try:
-            cur.execute(stmt)
-            conn.commit()
-            first_line = stmt.splitlines()[0][:60]
-            print(f"  OK: {first_line}")
-        except sqlite3.OperationalError as e:
-            if "duplicate column" in str(e).lower() or "already exists" in str(e).lower():
-                pass  # idempotent
-            else:
-                print(f"  WARN: {e}")
-    conn.close()
+    try:
+        conn.execute("BEGIN")
+        for sql in MIGRATIONS:
+            stmt = sql.strip()
+            try:
+                conn.execute(stmt)
+                first_line = stmt.splitlines()[0][:60]
+                print(f"  OK: {first_line}")
+            except sqlite3.OperationalError as error:
+                message = str(error).lower()
+                if "duplicate column" in message or "already exists" in message:
+                    continue
+                raise
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     print("Done.")
 
 if __name__ == "__main__":
