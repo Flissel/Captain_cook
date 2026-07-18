@@ -140,11 +140,14 @@ class CodexSessionStartedPayload(_FrozenContract):
 class CodexSessionEventPayload(_FrozenContract):
     event_type: Literal["codex_session_event"]
     session_id: str = Field(min_length=1)
+    external_session_id: str | None = Field(default=None, min_length=1)
     source_sequence: int = Field(ge=0, strict=True)
     lifecycle: Literal[
         "started",
         "turn_started",
         "turn_completed",
+        "item_started",
+        "item_updated",
         "item_completed",
         "failed",
     ]
@@ -162,7 +165,7 @@ class CodexSessionEventPayload(_FrozenContract):
             self.cached_input_tokens,
             self.output_tokens,
         )
-        if self.lifecycle == "item_completed":
+        if self.lifecycle in {"item_started", "item_updated", "item_completed"}:
             if any(value is None for value in item_fields) or any(
                 value is not None for value in token_fields
             ):

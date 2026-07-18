@@ -70,19 +70,31 @@ def _git(workspace: Path, *args: str) -> None:
 
 
 def _codex_binary() -> Path | None:
-    npm = subprocess.run(
-        ["npm", "root", "-g"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    candidates = tuple(
-        Path(npm).glob(
-            "@openai/codex/node_modules/@openai/codex-win32-x64/"
-            "vendor/x86_64-pc-windows-msvc/bin/codex.exe"
-        )
+    relative_binary = Path(
+        "@openai/codex/node_modules/@openai/codex-win32-x64/"
+        "vendor/x86_64-pc-windows-msvc/bin/codex.exe"
     )
-    return candidates[0] if candidates else None
+    roots = []
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        roots.append(Path(appdata) / "npm" / "node_modules")
+    try:
+        npm = subprocess.run(
+            ["npm", "root", "-g"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+    else:
+        roots.append(Path(npm))
+
+    for root in roots:
+        candidate = root / relative_binary
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 class _ForbiddenLegacyWriter:
@@ -210,13 +222,15 @@ async def test_gate_a_real_codex_n8n_gateway_trace() -> None:
 
             workflow_path = workspace / "workflow.json"
             prompt = (
-                "Create workflow.json in the current workspace containing only valid "
-                "JSON for a harmless n8n workflow with Webhook and Code nodes. The "
-                "Webhook parameters.path must be {{CAPTAIN_WEBHOOK_PATH}}, POST, and "
-                "responseMode lastNode. The Code node must return the incoming JSON "
-                "plus execution_id from $execution.id. Connect Webhook to Code. "
-                "Do not modify any other file."
-            )
+                    "Create workflow.json in the current workspace containing only valid "
+                    "JSON for a harmless n8n workflow with Webhook and Code nodes. The "
+                    "Webhook parameters.path must be {{CAPTAIN_WEBHOOK_PATH}}, POST, and "
+                    "responseMode lastNode. The Code node must return the incoming JSON "
+                    "plus execution_id from $execution.id. Connect Webhook to Code. "
+                    "Do not include root-level name, id, workflowId, webhookId, or "
+                    "webhook_path fields; Captain assigns provider identity during deployment. "
+                    "Do not modify any other file."
+                )
             request = CodexRunRequest(
                 project_id=project_id,
                 run_id=run_id,

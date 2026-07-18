@@ -65,7 +65,29 @@ class CodexExecutionPolicy:
     """Authorize only fenced Codex commands with a complete delivery trace."""
 
     _ALLOWED_ENVIRONMENT_NAMES = frozenset(
-        {"PATH", "HOME", "USERPROFILE", "LANG", "LC_ALL", "TERM", "NO_COLOR"}
+        {
+            "PATH",
+            "HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "PROGRAMDATA",
+            "SYSTEMROOT",
+            "WINDIR",
+            "COMSPEC",
+            "PATHEXT",
+            "TEMP",
+            "TMP",
+            "USERNAME",
+            "USERDOMAIN",
+            "OS",
+            "PROCESSOR_ARCHITECTURE",
+            "LANG",
+            "LC_ALL",
+            "TERM",
+            "NO_COLOR",
+            "OPENAI_API_KEY",
+        }
     )
     _ALLOWED_COMMAND_PREFIX = ("codex", "exec", "--json")
     _FORBIDDEN_SECRET_PATH_PATTERNS = (

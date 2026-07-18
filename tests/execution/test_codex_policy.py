@@ -62,16 +62,30 @@ def test_authorize_returns_resolved_run_with_allowlisted_nonserialized_environme
     approved_root, project, workspace = _clean_project(tmp_path)
     policy = CodexExecutionPolicy(
         workspace_root=approved_root,
-        environment={"PATH": "safe-path", "API_TOKEN": "sensitive-value"},
+        environment={
+            "PATH": "safe-path",
+            "APPDATA": "appdata-path",
+            "SYSTEMROOT": "system-root",
+            "OPENAI_API_KEY": "codex-api-key",
+            "API_TOKEN": "sensitive-value",
+        },
     )
 
     authorized = policy.authorize(_request(project, workspace))
 
     assert authorized.workspace == workspace.resolve()
     assert authorized.command[:3] == ("codex", "exec", "--json")
-    assert authorized.environment == {"PATH": "safe-path"}
+    assert authorized.environment == {
+        "PATH": "safe-path",
+        "APPDATA": "appdata-path",
+        "SYSTEMROOT": "system-root",
+        "OPENAI_API_KEY": "codex-api-key",
+    }
     serialized = authorized.model_dump_json()
     assert "safe-path" not in serialized
+    assert "appdata-path" not in serialized
+    assert "system-root" not in serialized
+    assert "codex-api-key" not in serialized
     assert "sensitive-value" not in serialized
     assert "safe-path" not in repr(authorized)
 

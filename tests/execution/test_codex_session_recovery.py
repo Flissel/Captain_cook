@@ -317,6 +317,9 @@ async def test_powershell_runner_bridges_authorized_run_to_real_launcher(
     assert result.exit_code != 0
     assert result.artifact_references == ("artifact://sealed/runner-test",)
     assert result.jsonl_lines == ()
+    assert 'ArgumentList.Add("--sandbox")' in Path(
+        "scripts/codex-session.ps1"
+    ).read_text(encoding="utf-8")
     identity = json.loads(state_path.read_text(encoding="utf-8"))
     assert identity["session_id"] == "runner-session-1"
 
@@ -682,6 +685,29 @@ async def test_gateway_repository_implements_task3b_record_codex_event_port(
 
     assert history.events[-1]["event_type"] == "codex_session_event"
     assert "claim-secret" not in json.dumps(history.events)
+
+
+@pytest.mark.asyncio
+async def test_gateway_repository_preserves_external_codex_thread_id(
+    tmp_path: Path,
+) -> None:
+    history = GatewayHistory()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(history.handle)
+    ) as http:
+        runs = repository(history, http)
+        await runs.start(request(tmp_path))
+        await runs.append(
+            CodexProcessEvent(
+                lifecycle="started",
+                session_id="codex-thread-1",
+                source_sequence=0,
+            )
+        )
+
+    event = history.events[-1]
+    assert event["payload"]["session_id"] == "session-1"
+    assert event["payload"]["external_session_id"] == "codex-thread-1"
 
 
 @pytest.mark.asyncio

@@ -13,6 +13,8 @@ CodexLifecycle = Literal[
     "started",
     "turn_started",
     "turn_completed",
+    "item_started",
+    "item_updated",
     "item_completed",
     "failed",
 ]
@@ -86,7 +88,7 @@ def parse_codex_jsonl(line: str) -> CodexProcessEvent | CodexParseWarning:
                 cached_input_tokens=usage.get("cached_input_tokens"),
                 output_tokens=usage.get("output_tokens"),
             )
-        if record_type == "item.completed":
+        if record_type in {"item.started", "item.updated", "item.completed"}:
             item = record.get("item")
             if not isinstance(item, dict):
                 return _warning("invalid_event", line_sha256)
@@ -100,7 +102,11 @@ def parse_codex_jsonl(line: str) -> CodexProcessEvent | CodexParseWarning:
             ):
                 return _warning("invalid_event", line_sha256)
             return CodexProcessEvent(
-                lifecycle="item_completed",
+                lifecycle={
+                    "item.started": "item_started",
+                    "item.updated": "item_updated",
+                    "item.completed": "item_completed",
+                }[record_type],
                 item_id=item_id,
                 item_type=item_type,
             )

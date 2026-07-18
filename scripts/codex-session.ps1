@@ -16,6 +16,10 @@ param(
     [Parameter(Mandatory, ParameterSetName = "Run")]
     [string] $StatePath,
 
+    [Parameter(ParameterSetName = "Run")]
+    [ValidateSet("read-only", "workspace-write")]
+    [string] $Sandbox = "workspace-write",
+
     [Parameter(Mandatory, ParameterSetName = "Cancel")]
     [string] $CancelStatePath,
 
@@ -91,6 +95,8 @@ $startInfo.CreateNoWindow = $true
 $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
 $startInfo.ArgumentList.Add("exec")
+$startInfo.ArgumentList.Add("--sandbox")
+$startInfo.ArgumentList.Add($Sandbox)
 $startInfo.ArgumentList.Add("--json")
 $startInfo.ArgumentList.Add($Prompt)
 

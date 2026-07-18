@@ -290,11 +290,7 @@ class GatewayCodexRunRepository:
     async def append(
         self, event: CodexProcessEvent | CodexParseWarning
     ) -> None:
-        session_id = (
-            event.session_id
-            if isinstance(event, CodexProcessEvent) and event.session_id is not None
-            else self._current_session_id
-        )
+        session_id = self._current_session_id
         if session_id is None:
             raise ValueError("Codex event has no active session")
         if event.source_sequence is None:
@@ -309,6 +305,7 @@ class GatewayCodexRunRepository:
             payload = CodexSessionEventPayload(
                 event_type="codex_session_event",
                 session_id=session_id,
+                external_session_id=event.session_id,
                 **safe,
             )
             event_type = "codex_session_event"

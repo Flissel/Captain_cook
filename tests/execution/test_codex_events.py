@@ -17,6 +17,8 @@ from agenten.execution.codex_events import (
     [
         ('{"type":"thread.started","thread_id":"019f-thread-1"}', "started", "019f-thread-1"),
         ('{"type":"turn.started"}', "turn_started", None),
+        ('{"type":"item.started","item":{"id":"item-1","type":"command_execution"}}', "item_started", None),
+        ('{"type":"item.updated","item":{"id":"item-1","type":"command_execution"}}', "item_updated", None),
         ('{"type":"turn.completed","usage":{"input_tokens":12,"cached_input_tokens":3,"output_tokens":5}}', "turn_completed", None),
         ('{"type":"error","message":"provider detail must be redacted"}', "failed", None),
     ],
