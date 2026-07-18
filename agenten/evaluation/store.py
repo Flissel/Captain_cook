@@ -26,7 +26,7 @@ from .models import (
     QaReview,
     ReviewReceipt,
 )
-from .models import _SECRET_ASSIGNMENT
+from .redaction import redact_model, redact_text
 from .report import render_evaluation_markdown
 
 
@@ -47,9 +47,10 @@ class JsonEvaluationStore:
 
     async def create_run(self, source: EvaluationSource, *, run_id: str, idempotency_key: str) -> EvaluationRun:
         self._safe_id(run_id)
+        source = redact_model(source)
         run = EvaluationRun(
             run_id=run_id,
-            idempotency_key=idempotency_key,
+            idempotency_key=redact_text(idempotency_key),
             source=source,
             status=EvaluationStatus.CREATED,
             max_rounds=3,
@@ -62,9 +63,9 @@ class JsonEvaluationStore:
     async def stage_inventory(self, run_id: str, inventory: ComponentInventoryCandidate) -> InventoryReceipt:
         async with self._lock:
             run = self._read_run(run_id)
+            inventory = redact_model(inventory)
             if inventory.source != run.source:
                 raise EvaluationConflictError("inventory source differs from source manifest")
-            _reject_unredacted_credentials(inventory)
             relative = "component-inventory.json"
             stored = self._write_model(self._run_dir(run_id) / relative, inventory)
         return InventoryReceipt(run_id=run_id, inventory_id=inventory.inventory_id, artifact_reference=relative, sha256=_digest(stored))
@@ -73,17 +74,20 @@ class JsonEvaluationStore:
         self._safe_id(candidate.component_key)
         async with self._lock:
             self._read_run(run_id)
-            _reject_unredacted_credentials(candidate)
+            self._read_model(self._run_dir(run_id) / "component-inventory.json", ComponentInventoryCandidate)
+            candidate = redact_model(candidate)
             relative = f"candidates/{candidate.component_key}/revision-{candidate.revision}.json"
             stored = self._write_model(self._run_dir(run_id) / relative, candidate)
         return CandidateReceipt(run_id=run_id, component_key=candidate.component_key, revision=candidate.revision, artifact_reference=relative, sha256=_digest(stored))
 
     async def record_review(self, run_id: str, review: QaReview) -> ReviewReceipt:
+        self._safe_id(run_id)
         self._safe_id(review.component_key)
         async with self._lock:
+            self._read_run(run_id)
             candidate_path = self._run_dir(run_id) / "candidates" / review.component_key / f"revision-{review.revision}.json"
             self._read_model(candidate_path, ComponentPlanCandidate)
-            _reject_unredacted_credentials(review)
+            review = redact_model(review)
             relative = f"qa-reviews/{review.component_key}/revision-{review.revision}.json"
             stored = self._write_model(self._run_dir(run_id) / relative, review)
         return ReviewReceipt(run_id=run_id, component_key=review.component_key, revision=review.revision, artifact_reference=relative, sha256=_digest(stored))
@@ -92,7 +96,7 @@ class JsonEvaluationStore:
         async with self._lock:
             run = self._read_run(run_id)
             inventory = self._read_model(self._run_dir(run_id) / "component-inventory.json", ComponentInventoryCandidate)
-            components = tuple(self._component_outcome(run_id, candidate, outcome) for candidate in inventory.components)
+            components = tuple(self._staged_component_outcome(run_id, candidate, outcome) for candidate in inventory.components)
             status = _status_for(outcome)
             digests = tuple(self._artifact_digests(run_id))
             manifest = EvaluationManifest(
@@ -108,9 +112,13 @@ class JsonEvaluationStore:
             self._write_bytes(self._run_dir(run_id) / "evaluation.md", render_evaluation_markdown(persisted).encode("utf-8"))
         return persisted
 
-    def _component_outcome(self, run_id: str, candidate: ComponentPlanCandidate, outcome: EvaluationOutcome) -> ComponentOutcome:
+    def _staged_component_outcome(self, run_id: str, inventory_candidate: ComponentPlanCandidate, outcome: EvaluationOutcome) -> ComponentOutcome:
+        candidate_path = self._run_dir(run_id) / "candidates" / inventory_candidate.component_key / f"revision-{inventory_candidate.revision}.json"
+        candidate = self._read_model(candidate_path, ComponentPlanCandidate)
+        if candidate != inventory_candidate:
+            raise EvaluationConflictError("candidate artifact does not match staged inventory")
         review_path = self._run_dir(run_id) / "qa-reviews" / candidate.component_key / f"revision-{candidate.revision}.json"
-        review = self._read_model(review_path, QaReview) if review_path.exists() else None
+        review = self._read_model(review_path, QaReview)
         component_outcome = EvaluationOutcome.ACCEPTED if review and review.decision == "approved" and outcome == EvaluationOutcome.ACCEPTED else outcome
         return ComponentOutcome(component_key=candidate.component_key, outcome=component_outcome, revision=candidate.revision, candidate=candidate, review=review)
 
@@ -167,22 +175,3 @@ def _status_for(outcome: EvaluationOutcome) -> EvaluationStatus:
         EvaluationOutcome.UNRESOLVED: EvaluationStatus.PARTIAL,
         EvaluationOutcome.FAILED: EvaluationStatus.FAILED,
     }[outcome]
-
-
-def _reject_unredacted_credentials(model: BaseModel) -> None:
-    """Reject secret-like assignments instead of preserving raw agent output."""
-
-    for value in _string_values(model.model_dump(mode="json")):
-        for match in _SECRET_ASSIGNMENT.finditer(value):
-            if match.group("value") != "[REDACTED]":
-                raise ValueError("evaluation artifacts must not contain raw credential assignments")
-
-
-def _string_values(value: object) -> tuple[str, ...]:
-    if isinstance(value, str):
-        return (value,)
-    if isinstance(value, dict):
-        return tuple(item for child in value.values() for item in _string_values(child))
-    if isinstance(value, (list, tuple)):
-        return tuple(item for child in value for item in _string_values(child))
-    return ()

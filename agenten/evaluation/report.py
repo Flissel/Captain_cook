@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-import re
-
 from .models import EvaluationManifest
-
-
-_SECRET_VALUE = re.compile(r"(?im)^([ \t]*[A-Z][A-Z0-9_]*(?:API_KEY|TOKEN)|[ \t]*password)=([^\r\n]*)$")
+from .redaction import redact_text
 
 
 def render_evaluation_markdown(manifest: EvaluationManifest) -> str:
@@ -16,18 +12,18 @@ def render_evaluation_markdown(manifest: EvaluationManifest) -> str:
     lines = [
         "# AgentFarm Evaluation Evidence",
         "",
-        f"- Run ID: `{manifest.run_id}`",
+        f"- Run ID: `{_redact(manifest.run_id)}`",
         f"- Status: `{manifest.status.value}`",
-        f"- Source reference: `{manifest.source.source_reference}`",
+        f"- Source reference: `{_redact(manifest.source.source_reference)}`",
         f"- Source digest: `{manifest.source.sha256}`",
         "- Source content: [REDACTED]",
-        f"- Model version: `{manifest.model_identifier}`",
-        f"- Prompt version: `{manifest.prompt_version}`",
+        f"- Model version: `{_redact(manifest.model_identifier)}`",
+        f"- Prompt version: `{_redact(manifest.prompt_version)}`",
         f"- Calls: {manifest.call_count}",
         f"- Tokens: {manifest.token_total}",
         f"- Cost: {manifest.cost_total}",
         "",
-        manifest.planning_disclaimer,
+        _redact(manifest.planning_disclaimer),
         "",
         "## Components",
         "",
@@ -35,7 +31,7 @@ def render_evaluation_markdown(manifest: EvaluationManifest) -> str:
     for component in manifest.component_outcomes:
         lines.extend(
             [
-                f"### {component.component_key}",
+                f"### {_redact(component.component_key)}",
                 "",
                 f"- Outcome: `{component.outcome.value}`",
                 f"- Revision: {component.revision}",
@@ -50,11 +46,11 @@ def render_evaluation_markdown(manifest: EvaluationManifest) -> str:
                 f"- Planned acceptance tests: {_redact(' | '.join(test.test_id for test in component.candidate.acceptance_tests))}"
             )
         if component.review is not None:
-            lines.append(f"- QA decision: `{component.review.decision}` (score {component.review.score})")
+            lines.append(f"- QA decision: `{_redact(component.review.decision)}` (score {component.review.score})")
         lines.append("")
-    lines.extend(["## Artifacts", "", *[f"- `{digest}`" for digest in manifest.artifact_digests], ""])
+    lines.extend(["## Artifacts", "", *[f"- `{_redact(digest)}`" for digest in manifest.artifact_digests], ""])
     return "\n".join(lines)
 
 
 def _redact(value: str) -> str:
-    return _SECRET_VALUE.sub(lambda match: f"{match.group(1)}=[REDACTED]", value)
+    return redact_text(value)

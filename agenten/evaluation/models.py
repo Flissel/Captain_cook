@@ -9,10 +9,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-
-_SECRET_ASSIGNMENT = re.compile(
-    r"(?m)^(?P<indent>[ \t]*)(?P<name>(?:[A-Za-z][A-Za-z0-9_]*_)?(?:API_KEY|TOKEN)|password)=(?P<value>[^\r\n]*)$"
-)
+from .redaction import redact_text
 
 
 class EvaluationStatus(str, Enum):
@@ -36,7 +33,7 @@ class EvaluationOutcome(str, Enum):
 class SourceBlock(BaseModel):
     """One immutable, redacted Markdown fragment safe for later model use."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     block_id: str = Field(pattern=r"^block-[0-9]{4}$")
     heading_path: tuple[str, ...] = Field(min_length=1)
@@ -53,7 +50,7 @@ class SourceBlock(BaseModel):
             raise ValueError("heading_path entries must be non-empty")
         if self.sha256 != hashlib.sha256(self.text.encode("utf-8")).hexdigest():
             raise ValueError("sha256 does not match redacted block text")
-        if any(match.group("value") != "[REDACTED]" for match in _SECRET_ASSIGNMENT.finditer(self.text)):
+        if self.text != redact_text(self.text):
             raise ValueError("source block credential assignments must be redacted")
         return self
 
@@ -61,7 +58,7 @@ class SourceBlock(BaseModel):
 class EvaluationSource(BaseModel):
     """Redacted blocks and original-byte provenance, without a filesystem path."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     source_reference: str = Field(min_length=1)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -86,7 +83,7 @@ class EvaluationSource(BaseModel):
 class EvaluationRun(BaseModel):
     """Frozen later-task execution envelope."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     run_id: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)

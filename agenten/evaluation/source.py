@@ -7,7 +7,8 @@ from pathlib import Path
 
 from agenten.planning.input_parser import MarkdownProjectInputParser, ParsedProjectInput
 
-from .models import EvaluationSource, SourceBlock, _SECRET_ASSIGNMENT
+from .models import EvaluationSource, SourceBlock
+from .redaction import redact_text
 
 
 class EvaluationSourceError(ValueError):
@@ -63,10 +64,7 @@ def _to_evaluation_source(parsed: ParsedProjectInput, *, max_block_bytes: int) -
 
 
 def _redact(line: str) -> str:
-    return _SECRET_ASSIGNMENT.sub(
-        lambda match: f"{match.group('indent')}{match.group('name')}=[REDACTED]",
-        line,
-    )
+    return redact_text(line)
 
 
 def _split_at_line_boundaries(
