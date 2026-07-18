@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import hashlib
+import json
 from pathlib import Path
 import sys
 from typing import Any, Iterator
@@ -27,6 +29,33 @@ FIXTURE = (
 )
 PROJECTION_API_KEY = "projection-route-scope-test-only"
 PROJECTION_PROJECT_ID = "captain-runtime-projection-v2"
+
+
+def _legacy_v1_tags(
+    *,
+    title: str,
+    content: str,
+    event_id: str,
+    correlation_id: str,
+    subject_id: str,
+    subject_version: int,
+    view: str,
+) -> list[str]:
+    identity_tags = (
+        "captain-projection:v1",
+        f"captain-event:{event_id}",
+        f"captain-correlation:{correlation_id}",
+        f"captain-subject:{subject_id}",
+        f"captain-version:{subject_version}",
+        f"captain-view:{view}",
+    )
+    canonical = json.dumps(
+        {"title": title, "content": content, "tags": identity_tags},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    content_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return [*identity_tags, f"captain-hash:{content_hash}"]
 
 
 @pytest.fixture
@@ -82,6 +111,9 @@ def _seed_legacy_projection_project(minibook_main: Any) -> dict[str, str]:
             project_id=legacy.id,
             role="legacy-lead",
         )
+        event_id = str(uuid4())
+        correlation_id = str(uuid4())
+        subject_id = f"legacy-subject-{uuid4().hex}"
         marked = Post(
             project_id=legacy.id,
             author_id=author.id,
@@ -89,7 +121,15 @@ def _seed_legacy_projection_project(minibook_main: Any) -> dict[str, str]:
             content="Legacy public projection",
             type="plan",
         )
-        marked.tags = ["captain-projection:v1", f"captain-event:{uuid4()}"]
+        marked.tags = _legacy_v1_tags(
+            title=marked.title,
+            content=marked.content,
+            event_id=event_id,
+            correlation_id=correlation_id,
+            subject_id=subject_id,
+            subject_version=1,
+            view="plan",
+        )
         human = Post(
             project_id=legacy.id,
             author_id=author.id,
@@ -116,6 +156,8 @@ def _seed_legacy_projection_project(minibook_main: Any) -> dict[str, str]:
             "webhook_id": str(webhook.id),
             "github_id": str(github.id),
             "comment_id": str(comment.id),
+            "event_id": event_id,
+            "subject_id": subject_id,
         }
 
 
@@ -205,6 +247,222 @@ def test_legacy_adoption_rolls_back_and_restart_converges(
 
     monkeypatch.setattr(minibook_main, "_adopt_legacy_projection_project", original)
     assert client.ensure_projection_project(external_id=PROJECTION_PROJECT_ID)["id"] == PROJECTION_PROJECT_ID
+
+
+@pytest.mark.parametrize("tamper", ["marker-only", "hash-mismatch"])
+def test_legacy_adoption_rejects_spoofed_or_modified_v1_posts_before_writes(
+    tamper: str,
+    isolated_projection_api: tuple[TestClient, MinibookClient, Any],
+) -> None:
+    _, client, minibook_main = isolated_projection_api
+    seeded = _seed_legacy_projection_project(minibook_main)
+
+    with minibook_main.SessionLocal() as db:
+        from src.models import Post
+
+        marked = db.query(Post).filter(Post.id == seeded["marked_id"]).one()
+        if tamper == "marker-only":
+            marked.tags = ["captain-projection:v1", f"captain-event:{seeded['event_id']}"]
+        else:
+            marked.content = f"{marked.content} [modified]"
+        db.commit()
+
+    with pytest.raises(httpx.HTTPStatusError) as error:
+        client.ensure_projection_project(external_id=PROJECTION_PROJECT_ID)
+
+    assert error.value.response.status_code == 409
+    assert "manual recovery" in error.value.response.text.lower()
+    with minibook_main.SessionLocal() as db:
+        from src.models import Agent, Post, Project
+
+        legacy = db.query(Project).filter(Project.id == seeded["legacy_id"]).one()
+        assert legacy.name == "Captain Runtime Projection"
+        assert db.query(Post).filter(Post.id == seeded["marked_id"]).one().project_id == legacy.id
+        assert db.query(Project).filter(Project.id == PROJECTION_PROJECT_ID).first() is None
+        assert db.query(Agent).filter(Agent.id == "captain-projection-service-v2").first() is None
+
+
+@pytest.mark.parametrize("duplicate", ["event", "subject-version"])
+def test_legacy_adoption_rejects_duplicate_v1_identities(
+    duplicate: str,
+    isolated_projection_api: tuple[TestClient, MinibookClient, Any],
+) -> None:
+    _, client, minibook_main = isolated_projection_api
+    seeded = _seed_legacy_projection_project(minibook_main)
+
+    with minibook_main.SessionLocal() as db:
+        from src.models import Post
+
+        original = db.query(Post).filter(Post.id == seeded["marked_id"]).one()
+        event_id = seeded["event_id"] if duplicate == "event" else str(uuid4())
+        clone = Post(
+            project_id=seeded["legacy_id"],
+            author_id=original.author_id,
+            title="Second valid-looking v1 projection",
+            content="Second valid-looking public projection",
+            type="plan",
+        )
+        clone.tags = _legacy_v1_tags(
+            title=clone.title,
+            content=clone.content,
+            event_id=event_id,
+            correlation_id=str(uuid4()),
+            subject_id=seeded["subject_id"],
+            subject_version=1,
+            view="plan",
+        )
+        db.add(clone)
+        db.commit()
+
+    with pytest.raises(httpx.HTTPStatusError) as error:
+        client.ensure_projection_project(external_id=PROJECTION_PROJECT_ID)
+
+    assert error.value.response.status_code == 409
+    assert "manual recovery" in error.value.response.text.lower()
+
+
+def test_legacy_adoption_rejects_unmarked_v1_identity_among_valid_posts(
+    isolated_projection_api: tuple[TestClient, MinibookClient, Any],
+) -> None:
+    _, client, minibook_main = isolated_projection_api
+    seeded = _seed_legacy_projection_project(minibook_main)
+
+    with minibook_main.SessionLocal() as db:
+        from src.models import Post
+
+        original = db.query(Post).filter(Post.id == seeded["marked_id"]).one()
+        unmarked = Post(
+            project_id=seeded["legacy_id"],
+            author_id=original.author_id,
+            title="Projection identity with missing marker",
+            content="This must not be classified as a human post",
+            type="plan",
+        )
+        unmarked.tags = _legacy_v1_tags(
+            title=unmarked.title,
+            content=unmarked.content,
+            event_id=str(uuid4()),
+            correlation_id=str(uuid4()),
+            subject_id=f"legacy-subject-{uuid4().hex}",
+            subject_version=1,
+            view="plan",
+        )[1:]
+        db.add(unmarked)
+        db.commit()
+
+    with pytest.raises(httpx.HTTPStatusError) as error:
+        client.ensure_projection_project(external_id=PROJECTION_PROJECT_ID)
+
+    assert error.value.response.status_code == 409
+    assert "manual recovery" in error.value.response.text.lower()
+
+
+@pytest.mark.parametrize("reference", ["event-post", "fence", "subject-head"])
+def test_legacy_adoption_rejects_orphaned_or_unmarked_projection_references(
+    reference: str,
+    isolated_projection_api: tuple[TestClient, MinibookClient, Any],
+) -> None:
+    _, client, minibook_main = isolated_projection_api
+    seeded = _seed_legacy_projection_project(minibook_main)
+
+    with minibook_main.SessionLocal() as db:
+        from src.models import (
+            ProjectionEventPost,
+            ProjectionPostFence,
+            ProjectionSubjectHead,
+        )
+
+        if reference == "event-post":
+            row = ProjectionEventPost(
+                event_id=seeded["event_id"],
+                project_id=seeded["legacy_id"],
+                post_id=seeded["human_id"],
+                subject_key=seeded["subject_id"],
+                subject_version=1,
+                source_fingerprint="f" * 64,
+            )
+        elif reference == "fence":
+            row = ProjectionPostFence(
+                subject_key=seeded["subject_id"],
+                project_id=seeded["legacy_id"],
+                post_id=seeded["human_id"],
+                event_id=seeded["event_id"],
+                subject_version=1,
+                source_fingerprint="f" * 64,
+            )
+        else:
+            row = ProjectionSubjectHead(
+                subject_key="missing-legacy-subject",
+                project_id=seeded["legacy_id"],
+                event_id=str(uuid4()),
+                subject_version=1,
+                source_fingerprint="f" * 64,
+            )
+        db.add(row)
+        db.commit()
+
+    with pytest.raises(httpx.HTTPStatusError) as error:
+        client.ensure_projection_project(external_id=PROJECTION_PROJECT_ID)
+
+    assert error.value.response.status_code == 409
+    assert "manual recovery" in error.value.response.text.lower()
+
+
+def test_legacy_adoption_moves_only_consistent_projection_references(
+    isolated_projection_api: tuple[TestClient, MinibookClient, Any],
+) -> None:
+    _, client, minibook_main = isolated_projection_api
+    seeded = _seed_legacy_projection_project(minibook_main)
+
+    with minibook_main.SessionLocal() as db:
+        from src.models import (
+            ProjectionEventPost,
+            ProjectionPostFence,
+            ProjectionSubjectHead,
+        )
+
+        fingerprint = "f" * 64
+        db.add_all(
+            (
+                ProjectionEventPost(
+                    event_id=seeded["event_id"],
+                    project_id=seeded["legacy_id"],
+                    post_id=seeded["marked_id"],
+                    subject_key=seeded["subject_id"],
+                    subject_version=1,
+                    source_fingerprint=fingerprint,
+                ),
+                ProjectionPostFence(
+                    subject_key=seeded["subject_id"],
+                    project_id=seeded["legacy_id"],
+                    post_id=seeded["marked_id"],
+                    event_id=seeded["event_id"],
+                    subject_version=1,
+                    source_fingerprint=fingerprint,
+                ),
+                ProjectionSubjectHead(
+                    subject_key=seeded["subject_id"],
+                    project_id=seeded["legacy_id"],
+                    event_id=seeded["event_id"],
+                    subject_version=1,
+                    source_fingerprint=fingerprint,
+                ),
+            )
+        )
+        db.commit()
+
+    client.ensure_projection_project(external_id=PROJECTION_PROJECT_ID)
+
+    with minibook_main.SessionLocal() as db:
+        from src.models import (
+            ProjectionEventPost,
+            ProjectionPostFence,
+            ProjectionSubjectHead,
+        )
+
+        assert db.query(ProjectionEventPost).one().project_id == PROJECTION_PROJECT_ID
+        assert db.query(ProjectionPostFence).one().project_id == PROJECTION_PROJECT_ID
+        assert db.query(ProjectionSubjectHead).one().project_id == PROJECTION_PROJECT_ID
 
 
 def test_unverifiable_legacy_name_collision_fails_closed_with_recovery_message(

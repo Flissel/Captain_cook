@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -31,6 +32,33 @@ FIXTURE = (
 )
 MINIBOOK_ROOT = Path(__file__).parents[2] / "minibook"
 PROJECTION_API_KEY = "projection-scope-test-only"
+
+
+def _legacy_v1_tags(
+    *,
+    title: str,
+    content: str,
+    event_id: str,
+    correlation_id: str,
+    subject_id: str,
+    subject_version: int,
+    view: str,
+) -> list[str]:
+    identity_tags = (
+        "captain-projection:v1",
+        f"captain-event:{event_id}",
+        f"captain-correlation:{correlation_id}",
+        f"captain-subject:{subject_id}",
+        f"captain-version:{subject_version}",
+        f"captain-view:{view}",
+    )
+    canonical = json.dumps(
+        {"title": title, "content": content, "tags": identity_tags},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    content_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return [*identity_tags, f"captain-hash:{content_hash}"]
 
 
 @pytest.fixture
@@ -114,6 +142,9 @@ def _seed_real_v1_project() -> dict[str, str]:
             project_id=legacy.id,
             role="legacy-lead",
         )
+        event_id = str(uuid4())
+        correlation_id = str(uuid4())
+        subject_id = f"legacy-subject-{uuid4().hex}"
         marked = Post(
             project_id=legacy.id,
             author_id=author.id,
@@ -121,7 +152,15 @@ def _seed_real_v1_project() -> dict[str, str]:
             content="Legacy public content",
             type="plan",
         )
-        marked.tags = ["captain-projection:v1", f"captain-event:{uuid4()}"]
+        marked.tags = _legacy_v1_tags(
+            title=marked.title,
+            content=marked.content,
+            event_id=event_id,
+            correlation_id=correlation_id,
+            subject_id=subject_id,
+            subject_version=1,
+            view="plan",
+        )
         human = Post(
             project_id=legacy.id,
             author_id=author.id,
@@ -148,6 +187,8 @@ def _seed_real_v1_project() -> dict[str, str]:
             "webhook_id": str(webhook.id),
             "github_id": str(github.id),
             "comment_id": str(comment.id),
+            "event_id": event_id,
+            "subject_id": subject_id,
         }
 
 

@@ -10,10 +10,12 @@ import json as json_module
 import hashlib
 import hmac
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List
+from typing import List, NoReturn, Optional
 from contextlib import asynccontextmanager
 from datetime import datetime
+from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -77,6 +79,33 @@ PROJECTION_PROJECT_DESCRIPTION = (
 )
 PROJECTION_SERVICE_AGENT_ID = "captain-projection-service-v2"
 PROJECTION_SERVICE_AGENT_NAME = "Captain Projection Service"
+LEGACY_PROJECTION_V1_VIEWS = frozenset(
+    {"project", "plan", "blueprint", "build", "validation"}
+)
+LEGACY_PROJECTION_V1_TAG_PREFIXES = (
+    "captain-event:",
+    "captain-correlation:",
+    "captain-subject:",
+    "captain-version:",
+    "captain-view:",
+    "captain-hash:",
+)
+
+
+@dataclass(frozen=True)
+class LegacyProjectionPostIdentity:
+    post_id: str
+    event_id: str
+    correlation_id: str
+    subject_id: str
+    subject_version: int
+    view: str
+
+
+@dataclass(frozen=True)
+class LegacyProjectionAdoption:
+    project_id: str
+    posts: tuple[LegacyProjectionPostIdentity, ...]
 
 SessionLocal = None
 
@@ -460,13 +489,28 @@ async def upsert_projection_project(
     """Create or return Captain's singleton projection project atomically."""
     if external_id != PROJECTION_PROJECT_ID:
         raise HTTPException(422, "Unsupported projection project identity")
-    db.commit()
+
+    existing_project = db.query(Project).filter(Project.id == external_id).first()
+    initial_adoption = None
+    if existing_project is None:
+        initial_adoption = _preflight_legacy_projection_project(db)
+    db.rollback()
     db.execute(text("BEGIN IMMEDIATE"))
     try:
-        service_agent = _ensure_projection_service_agent(db)
         project = db.query(Project).filter(Project.id == external_id).first()
         if project is None:
-            project = _adopt_legacy_projection_project(db, service_agent)
+            locked_adoption = _preflight_legacy_projection_project(db)
+            if locked_adoption != initial_adoption:
+                _reject_legacy_projection_adoption("state changed during preflight")
+        else:
+            locked_adoption = None
+        service_agent = _ensure_projection_service_agent(db)
+        if project is None:
+            project = _adopt_legacy_projection_project(
+                db,
+                service_agent,
+                locked_adoption,
+            )
         if project is None:
             project = Project(
                 id=external_id,
@@ -509,27 +553,204 @@ async def upsert_projection_project(
     )
 
 
-def _adopt_legacy_projection_project(db, service_agent: Agent) -> Project | None:
-    """Adopt only verifiable v1 projection posts from the historical random ID."""
+def _reject_legacy_projection_adoption(reason: str) -> NoReturn:
+    raise HTTPException(
+        409,
+        f"Legacy projection preflight failed ({reason}); manual recovery is required",
+    )
 
+
+def _single_legacy_tag_value(tags: tuple[str, ...], prefix: str) -> str:
+    values = [tag.removeprefix(prefix) for tag in tags if tag.startswith(prefix)]
+    if len(values) != 1 or not values[0]:
+        _reject_legacy_projection_adoption(f"invalid {prefix.removesuffix(':')} tag")
+    return values[0]
+
+
+def _canonical_legacy_uuid(value: str, *, field: str) -> str:
+    try:
+        parsed = UUID(value)
+    except ValueError:
+        _reject_legacy_projection_adoption(f"invalid {field}")
+    canonical = str(parsed)
+    if canonical != value:
+        _reject_legacy_projection_adoption(f"non-canonical {field}")
+    return canonical
+
+
+def _parse_legacy_projection_post(post: Post) -> LegacyProjectionPostIdentity:
+    tags = tuple(post.tags)
+    if len(tags) != 7 or len(set(tags)) != 7:
+        _reject_legacy_projection_adoption(f"post {post.id} has incomplete v1 tags")
+    if "captain-projection:v1" not in tags:
+        _reject_legacy_projection_adoption(f"post {post.id} lacks the v1 marker")
+
+    event_id = _canonical_legacy_uuid(
+        _single_legacy_tag_value(tags, "captain-event:"),
+        field="event identity",
+    )
+    correlation_id = _canonical_legacy_uuid(
+        _single_legacy_tag_value(tags, "captain-correlation:"),
+        field="correlation identity",
+    )
+    subject_id = _single_legacy_tag_value(tags, "captain-subject:")
+    if subject_id != subject_id.strip() or len(subject_id) > 200:
+        _reject_legacy_projection_adoption(f"post {post.id} has invalid subject identity")
+    version_text = _single_legacy_tag_value(tags, "captain-version:")
+    try:
+        subject_version = int(version_text)
+    except ValueError:
+        _reject_legacy_projection_adoption(f"post {post.id} has invalid subject version")
+    if subject_version < 1 or str(subject_version) != version_text:
+        _reject_legacy_projection_adoption(f"post {post.id} has invalid subject version")
+    view = _single_legacy_tag_value(tags, "captain-view:")
+    if view not in LEGACY_PROJECTION_V1_VIEWS:
+        _reject_legacy_projection_adoption(f"post {post.id} has invalid projection view")
+    stored_hash = _single_legacy_tag_value(tags, "captain-hash:")
+    if len(stored_hash) != 64 or any(char not in "0123456789abcdef" for char in stored_hash):
+        _reject_legacy_projection_adoption(f"post {post.id} has invalid content hash")
+
+    identity_tags = (
+        "captain-projection:v1",
+        f"captain-event:{event_id}",
+        f"captain-correlation:{correlation_id}",
+        f"captain-subject:{subject_id}",
+        f"captain-version:{subject_version}",
+        f"captain-view:{view}",
+    )
+    canonical = json_module.dumps(
+        {"title": post.title, "content": post.content, "tags": identity_tags},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    expected_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    expected_tags = (*identity_tags, f"captain-hash:{expected_hash}")
+    if tags != expected_tags or not hmac.compare_digest(stored_hash, expected_hash):
+        _reject_legacy_projection_adoption(f"post {post.id} content hash does not match")
+    return LegacyProjectionPostIdentity(
+        post_id=str(post.id),
+        event_id=event_id,
+        correlation_id=correlation_id,
+        subject_id=subject_id,
+        subject_version=subject_version,
+        view=view,
+    )
+
+
+def _preflight_legacy_projection_references(
+    db,
+    adoption: LegacyProjectionAdoption,
+) -> None:
+    by_post_id = {identity.post_id: identity for identity in adoption.posts}
+    by_event_id = {identity.event_id: identity for identity in adoption.posts}
+    latest_by_subject: dict[str, LegacyProjectionPostIdentity] = {}
+    for identity in adoption.posts:
+        current = latest_by_subject.get(identity.subject_id)
+        if current is None or identity.subject_version > current.subject_version:
+            latest_by_subject[identity.subject_id] = identity
+
+    event_posts = db.query(ProjectionEventPost).filter(
+        (ProjectionEventPost.project_id == adoption.project_id)
+        | ProjectionEventPost.post_id.in_(tuple(by_post_id))
+        | ProjectionEventPost.event_id.in_(tuple(by_event_id))
+    ).all()
+    for row in event_posts:
+        identity = by_post_id.get(str(row.post_id))
+        if (
+            identity is None
+            or row.project_id != adoption.project_id
+            or row.event_id != identity.event_id
+            or row.subject_key != identity.subject_id
+            or row.subject_version != identity.subject_version
+        ):
+            _reject_legacy_projection_adoption("orphaned or unmarked event-post reference")
+
+    fences = db.query(ProjectionPostFence).filter(
+        (ProjectionPostFence.project_id == adoption.project_id)
+        | ProjectionPostFence.post_id.in_(tuple(by_post_id))
+        | ProjectionPostFence.event_id.in_(tuple(by_event_id))
+    ).all()
+    for row in fences:
+        identity = by_post_id.get(str(row.post_id))
+        if (
+            identity is None
+            or row.project_id != adoption.project_id
+            or row.event_id != identity.event_id
+            or row.subject_key != identity.subject_id
+            or row.subject_version != identity.subject_version
+            or latest_by_subject.get(identity.subject_id) != identity
+        ):
+            _reject_legacy_projection_adoption("orphaned or unmarked fence reference")
+
+    subject_heads = db.query(ProjectionSubjectHead).filter(
+        (ProjectionSubjectHead.project_id == adoption.project_id)
+        | ProjectionSubjectHead.event_id.in_(tuple(by_event_id))
+    ).all()
+    for row in subject_heads:
+        identity = by_event_id.get(str(row.event_id))
+        if (
+            identity is None
+            or row.project_id != adoption.project_id
+            or row.subject_key != identity.subject_id
+            or row.subject_version != identity.subject_version
+            or latest_by_subject.get(identity.subject_id) != identity
+        ):
+            _reject_legacy_projection_adoption("orphaned subject-head reference")
+
+
+def _preflight_legacy_projection_project(db) -> LegacyProjectionAdoption | None:
     legacy = db.query(Project).filter(Project.name == PROJECTION_PROJECT_NAME).first()
     if legacy is None:
         return None
     legacy_posts = db.query(Post).filter(Post.project_id == legacy.id).all()
+    unmarked_projection_posts = [
+        post
+        for post in legacy_posts
+        if "captain-projection:v1" not in post.tags
+        and any(
+            tag.startswith(LEGACY_PROJECTION_V1_TAG_PREFIXES)
+            for tag in post.tags
+        )
+    ]
+    if unmarked_projection_posts:
+        _reject_legacy_projection_adoption("unmarked v1 projection identity")
     marked_posts = [
         post for post in legacy_posts if "captain-projection:v1" in post.tags
     ]
     if not marked_posts:
-        raise HTTPException(
-            409,
-            "Legacy projection identity is unverifiable; manual recovery is required",
+        _reject_legacy_projection_adoption("no complete v1 projection posts")
+    identities = tuple(
+        sorted(
+            (_parse_legacy_projection_post(post) for post in marked_posts),
+            key=lambda identity: identity.post_id,
         )
+    )
+    if len({identity.event_id for identity in identities}) != len(identities):
+        _reject_legacy_projection_adoption("duplicate event identity")
+    subject_versions = {
+        (identity.subject_id, identity.subject_version) for identity in identities
+    }
+    if len(subject_versions) != len(identities):
+        _reject_legacy_projection_adoption("duplicate subject version")
     retired_name = f"{PROJECTION_PROJECT_NAME} [legacy:{legacy.id}]"
     if db.query(Project).filter(Project.name == retired_name).first() is not None:
-        raise HTTPException(
-            409,
-            "Legacy projection adoption is ambiguous; manual recovery is required",
-        )
+        _reject_legacy_projection_adoption("retired project identity already exists")
+    adoption = LegacyProjectionAdoption(project_id=str(legacy.id), posts=identities)
+    _preflight_legacy_projection_references(db, adoption)
+    return adoption
+
+
+def _adopt_legacy_projection_project(
+    db,
+    service_agent: Agent,
+    adoption: LegacyProjectionAdoption | None,
+) -> Project | None:
+    """Move only a preflighted historical v1 projection into the v2 singleton."""
+
+    if adoption is None:
+        return None
+    legacy = db.query(Project).filter(Project.id == adoption.project_id).one()
+    retired_name = f"{PROJECTION_PROJECT_NAME} [legacy:{legacy.id}]"
 
     legacy.name = retired_name
     db.flush()
@@ -541,7 +762,8 @@ def _adopt_legacy_projection_project(db, service_agent: Agent) -> Project | None
     )
     db.add(project)
     db.flush()
-    moved_post_ids = [post.id for post in marked_posts]
+    moved_post_ids = [identity.post_id for identity in adoption.posts]
+    marked_posts = db.query(Post).filter(Post.id.in_(moved_post_ids)).all()
     for post in marked_posts:
         post.project_id = project.id
     db.query(ProjectionPostFence).filter(
@@ -553,7 +775,10 @@ def _adopt_legacy_projection_project(db, service_agent: Agent) -> Project | None
         ProjectionEventPost.post_id.in_(moved_post_ids),
     ).update({ProjectionEventPost.project_id: project.id}, synchronize_session=False)
     db.query(ProjectionSubjectHead).filter(
-        ProjectionSubjectHead.project_id == legacy.id
+        ProjectionSubjectHead.project_id == legacy.id,
+        ProjectionSubjectHead.event_id.in_(
+            tuple(identity.event_id for identity in adoption.posts)
+        ),
     ).update({ProjectionSubjectHead.project_id: project.id}, synchronize_session=False)
     db.flush()
     return project

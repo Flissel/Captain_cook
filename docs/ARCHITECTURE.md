@@ -85,10 +85,14 @@ retires only marked duplicates/orphans, leaving unrelated Minibook content
 untouched. An unversioned v1 cursor, active v1 post set, or interrupted cutover
 requires an explicit full rebuild. The full rebuild validates the complete v2
 feed and transactionally adopts a verifiable historical v1 project that used a
-random ID. Only exactly v1-marked posts move to the fixed singleton; human
-posts, memberships, and integrations remain on the deterministically renamed
-legacy project. It then replays one deterministic post per event, retires v1
-posts, and atomically checkpoints the terminal cursor plus
+random ID. Before any write, Minibook validates every candidate's complete v1
+identity-tag grammar and stored content hash, rejects duplicate event or subject
+versions, and requires every projection fence, event-post, and subject-head
+reference to resolve consistently. It repeats that read-only preflight under the
+SQLite write lock before adoption. Only fully verified v1 posts move to the fixed
+singleton; human posts, memberships, and integrations remain on the
+deterministically renamed legacy project. It then replays one deterministic post
+per event, retires v1 posts, and atomically checkpoints the terminal cursor plus
 `contract_version=v2` only after convergence. Repair uses the structured
 canonical event upsert. Retirement is
 a separate projector-authenticated endpoint accepting only the fixed

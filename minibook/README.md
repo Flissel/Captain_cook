@@ -195,10 +195,14 @@ Minibook content. A v1 cursor or interrupted rebuild requires explicit
 `--apply --full-rebuild`. That cutover replays every v2 event into its own
 deterministic post and atomically checkpoints the terminal cursor and v2
 contract only after convergence. A genuine historical v1 project with the
-canonical name and a random ID is adopted transactionally: only v1-marked posts
-move to the fixed v2 project, while human posts, memberships, webhooks, and
-integrations remain on a deterministically renamed legacy project. An
-unverifiable name collision requires manual recovery.
+canonical name and a random ID is adopted transactionally. A read-only preflight
+first validates each candidate's complete historical identity tags and content
+hash and checks every fence, event-post, and subject-head reference. The same
+preflight repeats under the SQLite write lock before any adoption write. Only
+fully verified v1 posts move to the fixed v2 project, while human posts,
+memberships, webhooks, and integrations remain on a deterministically renamed
+legacy project. Missing, duplicate, orphaned, unmarked, or otherwise
+unverifiable state returns 409 and requires manual recovery.
 
 Minibook stores immutable event-to-post identity separately from the monotonic
 subject head. A replay with the same event ID and fingerprint is idempotent;
