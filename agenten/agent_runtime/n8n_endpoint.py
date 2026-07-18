@@ -185,6 +185,10 @@ def _parse_url(value: str) -> SplitResult:
         raise N8nEndpointConfigurationError(
             "selected n8n URL must not contain a query or fragment"
         )
+    if _has_dot_segment(parsed.path):
+        raise N8nEndpointConfigurationError(
+            "selected n8n URL must not contain RFC dot segments"
+        )
     return parsed
 
 
@@ -201,6 +205,7 @@ def _endpoint_identity(value: str) -> tuple[str, str, int | None, str] | None:
         or parsed.password is not None
         or parsed.query
         or parsed.fragment
+        or _has_dot_segment(parsed.path)
     ):
         return None
     if port is None:
@@ -219,9 +224,14 @@ def _endpoint_identity(value: str) -> tuple[str, str, int | None, str] | None:
 
 
 def _is_loopback_host(host: str) -> bool:
-    if host.lower() == "localhost":
+    normalized_host = host.lower().removesuffix(".")
+    if normalized_host == "localhost":
         return True
     try:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _has_dot_segment(path: str) -> bool:
+    return any(segment in {".", ".."} for segment in path.split("/"))

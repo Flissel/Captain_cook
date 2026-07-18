@@ -211,6 +211,24 @@ def test_external_mode_rejects_configured_captain_loopback_alias(
         )
 
 
+@pytest.mark.parametrize(
+    "external_url",
+    ["http://localhost.:5679", "http://localhost:5679/."],
+)
+def test_external_mode_rejects_equivalent_captain_uri_variant(
+    external_url: str,
+) -> None:
+    with pytest.raises(N8nEndpointConfigurationError):
+        resolve_n8n_endpoint(
+            {
+                "N8N_MODE": "external",
+                "N8N_URL": external_url,
+                "N8N_MCP_TOKEN": "sensitive-key-for-redaction",
+                "CAPTAIN_N8N_URL": "http://localhost:5679",
+            }
+        )
+
+
 def test_external_mode_allows_unrelated_url_when_captain_url_is_configured() -> None:
     endpoint = resolve_n8n_endpoint(
         {
