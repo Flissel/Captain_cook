@@ -107,24 +107,46 @@ async def test_tool_service_rejects_unsafe_run_ids_and_component_keys_before_sto
         await service.read_source_block("../outside", "block-0001")
     with pytest.raises(EvaluationToolError, match="safe logical identifier"):
         await service.stage_component_inventory("eval-001", _inventory(_candidate(component_key="../outside")))
+    with pytest.raises(EvaluationToolError, match="safe logical identifier"):
+        await service.stage_component_inventory(
+            "eval-001",
+            _inventory(_candidate()).model_copy(update={"inventory_id": "../outside"}),
+        )
 
     assert not (tmp_path / "eval-001" / "component-inventory.json").exists()
 
 
 @pytest.mark.asyncio
-async def test_tool_service_requires_monotonic_revisions_and_enforces_three_round_ceiling(tmp_path: Path) -> None:
+async def test_tool_service_stages_three_monotonic_revisions_for_one_inventory_component(tmp_path: Path) -> None:
     service = await _service(tmp_path)
-    second_revision = _candidate(revision=2)
-    await service.stage_component_inventory("eval-001", _inventory(second_revision))
+    inventory_candidate = _candidate()
+    await service.stage_component_inventory("eval-001", _inventory(inventory_candidate))
 
-    with pytest.raises(EvaluationToolError, match="expected revision 1"):
-        await service.stage_component_plan("eval-001", second_revision)
+    receipts = []
+    for revision in range(1, 4):
+        receipts.append(await service.stage_component_plan("eval-001", _candidate(revision=revision)))
+
+    assert [receipt.revision for receipt in receipts] == [1, 2, 3]
 
     fourth_values = _candidate().model_dump()
     fourth_values["revision"] = 4
     fourth = ComponentPlanCandidate.model_construct(**fourth_values)
     with pytest.raises(EvaluationToolError, match="three-round"):
         await service.stage_component_plan("eval-001", fourth)
+
+
+@pytest.mark.asyncio
+async def test_tool_service_hides_store_collision_paths(tmp_path: Path) -> None:
+    service = await _service(tmp_path)
+    inventory = _inventory(_candidate())
+    await service.stage_component_inventory("eval-001", inventory)
+    changed_inventory = inventory.model_copy(update={"inventory_id": "inventory-002"})
+
+    with pytest.raises(EvaluationToolError, match="unable to stage component inventory") as error:
+        await service.stage_component_inventory("eval-001", changed_inventory)
+
+    assert str(tmp_path) not in str(error.value)
+    assert "component-inventory.json" not in str(error.value)
 
 
 @pytest.mark.asyncio

@@ -72,13 +72,14 @@ class EvaluationToolService:
         run = self._run(run_id)
         if inventory.source != run.source:
             raise EvaluationToolError("inventory source does not belong to this run")
+        self._safe_inventory_id(inventory.inventory_id)
         for candidate in inventory.components:
             self._safe_component_key(candidate.component_key)
         self._raise_validation_issues(validate_inventory(inventory))
         try:
             return await self._store.stage_inventory(run_id, inventory)
-        except (EvaluationConflictError, ValueError) as error:
-            raise EvaluationToolError(str(error)) from error
+        except (EvaluationConflictError, OSError, ValueError) as error:
+            raise EvaluationToolError("unable to stage component inventory") from error
 
     async def stage_component_plan(
         self,
@@ -89,10 +90,7 @@ class EvaluationToolService:
         self._safe_component_key(candidate.component_key)
         self._validate_round(candidate.revision)
         inventory = self._inventory(run_id)
-        if not any(
-            item.component_key == candidate.component_key and item.revision == candidate.revision
-            for item in inventory.components
-        ):
+        if not any(item.component_key == candidate.component_key for item in inventory.components):
             raise EvaluationToolError("candidate does not belong to the staged inventory")
         expected_revision = self._expected_revision(run_id, candidate.component_key)
         if candidate.revision != expected_revision:
@@ -100,8 +98,8 @@ class EvaluationToolService:
         self._raise_validation_issues(validate_candidate(candidate, run.source))
         try:
             return await self._store.stage_candidate(run_id, candidate)
-        except (EvaluationConflictError, ValueError) as error:
-            raise EvaluationToolError(str(error)) from error
+        except (EvaluationConflictError, OSError, ValueError) as error:
+            raise EvaluationToolError("unable to stage component plan") from error
 
     async def record_qa_review(self, run_id: str, review: QaReview) -> ReviewReceipt:
         run = self._run(run_id)
@@ -112,8 +110,8 @@ class EvaluationToolService:
         self._raise_validation_issues(validate_candidate(checked_candidate, run.source))
         try:
             return await self._store.record_review(run_id, review)
-        except (EvaluationConflictError, ValueError) as error:
-            raise EvaluationToolError(str(error)) from error
+        except (EvaluationConflictError, OSError, ValueError) as error:
+            raise EvaluationToolError("unable to record QA review") from error
 
     def _run(self, run_id: str) -> EvaluationRun:
         self._safe_run_id(run_id)
@@ -128,7 +126,7 @@ class EvaluationToolService:
                 self._store._run_dir(run_id) / "component-inventory.json",
                 ComponentInventoryCandidate,
             )
-        except EvaluationConflictError as error:
+        except (EvaluationConflictError, ValueError) as error:
             raise EvaluationToolError("component inventory has not been staged") from error
 
     def _candidate(self, run_id: str, component_key: str, revision: int) -> ComponentPlanCandidate:
@@ -137,7 +135,7 @@ class EvaluationToolService:
                 self._store._run_dir(run_id) / "candidates" / component_key / f"revision-{revision}.json",
                 ComponentPlanCandidate,
             )
-        except EvaluationConflictError as error:
+        except (EvaluationConflictError, ValueError) as error:
             raise EvaluationToolError("component candidate has not been staged") from error
 
     def _expected_revision(self, run_id: str, component_key: str) -> int:
@@ -163,6 +161,15 @@ class EvaluationToolService:
             raise EvaluationToolError("artifact identity must be a safe logical identifier")
         try:
             JsonEvaluationStore._safe_id(component_key)
+        except ValueError as error:
+            raise EvaluationToolError(str(error)) from error
+
+    @staticmethod
+    def _safe_inventory_id(inventory_id: str) -> None:
+        if not isinstance(inventory_id, str):
+            raise EvaluationToolError("artifact identity must be a safe logical identifier")
+        try:
+            JsonEvaluationStore._safe_id(inventory_id)
         except ValueError as error:
             raise EvaluationToolError(str(error)) from error
 

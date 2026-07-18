@@ -78,10 +78,7 @@ class JsonEvaluationStore:
             self._read_run(run_id)
             inventory = self._read_model(self._run_dir(run_id) / "component-inventory.json", ComponentInventoryCandidate)
             candidate = redact_model(candidate)
-            if not any(
-                declared.component_key == candidate.component_key and declared.revision == candidate.revision
-                for declared in inventory.components
-            ):
+            if not any(declared.component_key == candidate.component_key for declared in inventory.components):
                 raise EvaluationConflictError("candidate does not belong to declared inventory")
             relative = f"candidates/{candidate.component_key}/revision-{candidate.revision}.json"
             stored = self._write_model(self._run_dir(run_id) / relative, candidate)
