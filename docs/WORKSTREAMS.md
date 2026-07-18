@@ -48,6 +48,7 @@ gateway-backed, single-worker end-to-end run is green.
 | `feat/worker-fleet` | Delivery Builder | Hermes worker skill, provisioning, heartbeat and resume loop | One worker claims, builds, validates, and finalizes exactly one fenced batch without operator input |
 | `feat/release-evidence` | Quality Warden | Demo sandbox, release verifier, Devpost assets, reproducibility checks | A clean clone can inspect evidence and complete the documented demo path without rebuilding every dependency |
 | `feat/demo-polish` | Quality Warden | Recording captures, copy review, public-repo audit | Video, README, and submission checklist match actual commands and no credential or unimplemented claim appears |
+| `codex/agent-runtime-architecture` | Architect / Delivery Builder | Hermes-plan ingestion, Captain-owned DAG release, swarm runtime tools, scoped Codex/n8n leases, restart checkpoints, and one redacted evidence manifest | Deterministic control-plane suite plus both required real Codex/n8n live cases pass with zero skips; branch is rebased or merged only after a worktree-aware integration audit |
 
 ## Householder model
 
@@ -82,8 +83,11 @@ prompt file.
 
 `feat/householder-runtime-contract` is complete and provides the reviewed
 manifest/executor/factory boundary. `feat/householder-runtime` remains the
-deterministic fallback path. `feat/ledger-gateway` now contains transactional
-MariaDB storage; its next owned contract is the FastAPI sole-writer surface,
-validation schemas, claim fencing, and terminal-state rejection against the
-local MariaDB test container. Preserve the offline demo as the judge-facing
-fallback until a live integration has separate evidence.
+deterministic fallback path. The agent-runtime control-plane workstream now has
+separate deterministic and real Codex/n8n evidence; it does not replace the
+MariaDB gateway as lifecycle authority and does not claim a combined live
+Minibook HTTP path. `feat/ledger-gateway` owns the remaining production
+sole-writer, claim-fencing, and terminal-state gate. Preserve the offline demo
+as the judge-facing fallback until every production service boundary has its own
+live evidence. After an approved integration, merge into `main`, rerun all gates
+there, and treat `main` as the only source of truth.

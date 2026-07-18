@@ -31,3 +31,36 @@ Get-Content artifacts/demo-run.json | ConvertFrom-Json | Format-List
 The artifact is evidence of the current vertical slice. It does not simulate or
 claim Hermes, Codex CLI execution, n8n deployment, MariaDB, Minibook
 integration, or live LLM/MCP execution by the Householder workers.
+
+## Agent-runtime control-plane demo
+
+The separate agent-runtime demo executes the real Captain compiler, runtime
+service, runtime tools, swarm scheduler, checkpoint store, and evidence-manifest
+builder with deterministic external ports:
+
+```powershell
+python scripts/run_agent_runtime_demo.py --output artifacts/agent-runtime-demo.json
+```
+
+The JSON object has exactly one top-level correlation-ID key. Its envelope says
+`mode: deterministic-offline` and `external_execution: false`; the nested
+manifest records the Hermes plan and Minibook references, Captain batch order,
+the code-only versus scoped-n8n capability split, deterministic runtime evidence,
+and validation artifacts. Reusing the same `--state-dir` produces the same
+terminal manifest after restart. This command does not call a model, Codex CLI,
+Minibook HTTP, or n8n.
+
+Run the two required external gates explicitly:
+
+```powershell
+python -m pytest -q --no-cov -m live tests/live/test_agent_runtime_n8n_live.py -rs
+```
+
+The first case runs a real Codex CLI session in a disposable authorized Git
+repository and proves that its scoped config has no n8n MCP server. The second
+case uses real Codex plus the existing VibeMind n8n MCP endpoint to validate,
+create, test, publish, execute, and finally archive one correlation-named webhook
+workflow. It never starts or stops n8n and never adopts or changes its volumes.
+Both cases are required and fail rather than skip when a live prerequisite is
+missing. The live file currently uses a strict Minibook planning-port test double;
+use the independent Minibook live projection gate for HTTP/restart evidence.

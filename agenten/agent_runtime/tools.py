@@ -157,6 +157,7 @@ class RuntimeToolset:
                     tool_name,
                     context.subject_id,
                     str(context.subject_version),
+                    context.prompt_ref.sha256,
                 )
             ),
         )

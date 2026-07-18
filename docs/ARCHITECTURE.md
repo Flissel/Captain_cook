@@ -107,6 +107,52 @@ a redacted event from a synthetic local HTTP feed implementing Captain's v2
 contract, restarts the projector, mutates and rebuilds the view, and requires
 zero skips. It does not claim a deployed Captain gateway feed.
 
+## Agent-runtime control plane
+
+`agenten/agent_runtime/control_plane.py` composes the reviewed Hermes planning,
+Captain compilation, swarm scheduling, runtime-tool, capability, and validation
+ports. Captain remains lifecycle authority: it compiles and releases the
+versioned DAG, derives every code or n8n capability profile from the released
+batch, owns the behavioral retry budget, and decides `passed`, `redo`, or
+`replan`. Hermes supplies a versioned plan and agent-blueprint references;
+Minibook contributes only the collaboration-post reference.
+
+For each correlation ID, the control plane persists an atomic checkpoint before
+and after effects. The checkpoint binds the Hermes plan digest, the canonical
+public compiled-batch digest, task order, opaque `workspace://` references,
+content-addressed prompt references, results, and public validation records. It
+contains neither prompt bodies nor private holdout cases. Infrastructure failures
+have a separate finite retry budget and never consume a behavioral iteration.
+Validation records must name exactly the acceptance assertions Captain released.
+An unchanged terminal checkpoint produces a byte-stable evidence manifest after
+restart.
+
+The swarm receives only dependency-ready task projections. `codex.run` and
+`codex.resume` command identities include the prompt digest, so a validation
+artifact can resume the same session without colliding with the original
+command. A code-builder grant has no MCP servers. Only a Captain-released
+`n8n-builder` task receives the short-lived `n8n-mcp` lease; this does not grant
+permission to start, stop, adopt, or migrate the VibeMind-owned n8n service or
+its volumes.
+
+The correlation-indexed manifest contains typed Hermes, Captain, Codex/n8n, and
+validation observations plus artifact/evidence digests. Model validation rejects
+secret-like fields and values, raw authorization material, and absolute user
+paths. It is an evidence projection, not a second source of lifecycle truth.
+
+Verification is split deliberately:
+
+- `tests/integration/test_agent_runtime_control_plane.py` uses the real Captain
+  compiler, runtime service, tools, and swarm with strict deterministic external
+  ports. It proves ordering, lease derivation, restart recovery, redo/replan, and
+  redaction without claiming external execution.
+- `tests/live/test_agent_runtime_n8n_live.py` uses the Hermes worker adapters and
+  a real Codex CLI in disposable Git repositories. Its n8n case discovers the
+  scoped tools, validates an SDK workflow, creates/tests/publishes/executes it,
+  records real call and execution evidence, and archives the isolated workflow.
+  The live file uses a strict Minibook planning-port test double; the independent
+  Minibook HTTP/restart behavior is proven by its own live projection gate.
+
 This project has two things that are meant to grow over time: the **ledger**
 (`blockchain/`) that records what tasks/decisions exist, and the **agent
 logic** (`agenten/`) that produces and refines them. Both were previously
