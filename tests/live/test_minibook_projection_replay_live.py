@@ -21,7 +21,10 @@ from agenten.delivery.minibook_client import MinibookClient
 from agenten.delivery.minibook_events import MinibookProjectionEvent
 from agenten.delivery.projection_cursor import ProjectionCursorStore
 from agenten.delivery.projector import MinibookProjector
-from scripts.rebuild_minibook_projection import CaptainProjectionFeed
+from scripts.rebuild_minibook_projection import (
+    CaptainProjectionFeed,
+    consume_incremental_projection,
+)
 
 
 pytestmark = pytest.mark.live
@@ -51,7 +54,9 @@ def projection_feed(
             if urlparse(self.path).path != "/api/v1/projections/minibook/events":
                 self.send_error(404)
                 return
-            body = json.dumps({"events": documents, "next_cursor": None}).encode()
+            body = json.dumps(
+                {"events": documents, "cursor": "live-page-1", "has_more": False}
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -173,23 +178,57 @@ def test_live_public_http_replay_restart_and_rebuild_without_other_packages(
         client = MinibookClient(minibook_url, registration.json()["api_key"])
         feed = CaptainProjectionFeed(feed_url, token="live-test-only")
         try:
-            replay_events = list(feed.iter_events())
             cursor_path = tmp_path / "projection-cursor.db"
-            first = MinibookProjector(client, ProjectionCursorStore(cursor_path))
-            assert first.rebuild(replay_events)[0].outcome == "projected"
+            first_store = ProjectionCursorStore(cursor_path)
+            first = MinibookProjector(client, first_store)
+            first_results = consume_incremental_projection(
+                feed,
+                first,
+                first_store,
+                apply=True,
+            )
+            assert first_results[0].outcome == "projected"
+            assert first_store.get_feed_cursor() == "live-page-1"
 
-            restarted = MinibookProjector(client, ProjectionCursorStore(cursor_path))
-            assert restarted.rebuild(list(feed.iter_events()))[0].outcome == "duplicate"
+            restarted_store = ProjectionCursorStore(cursor_path)
+            restarted = MinibookProjector(client, restarted_store)
+            restarted_results = consume_incremental_projection(
+                feed,
+                restarted,
+                restarted_store,
+                apply=True,
+            )
+            assert restarted_results[0].outcome == "duplicate"
             project = restarted.ensure_projection_project()
             posts = client.list_posts(project["id"])
             assert len(posts) == 1
 
             client.update_post(posts[0]["id"], content="unsafe operator drift")
-            assert restarted.reconcile(replay_events).modified_event_ids == (
+            assert restarted.reconcile([event]).modified_event_ids == (
                 str(event.event_id),
             )
-            assert restarted.reconcile(replay_events, apply=True).changes_applied == 1
-            assert restarted.reconcile(replay_events, apply=True).total_changes == 0
+            assert restarted.reconcile([event], apply=True).changes_applied == 1
+            assert restarted.reconcile([event], apply=True).total_changes == 0
+
+            canaries = (
+                f"Bearer live-canary-{uuid4().hex}",
+                f"raw transcript: live-canary-{uuid4().hex}",
+                f"complete log: HOLDOUT_CANARY_{uuid4().hex}",
+                f"artifact C:\\Users\\Operator\\private-{uuid4().hex}.txt",
+                f"artifact /srv/captain/private-{uuid4().hex}.txt",
+                f"file:///var/tmp/private-{uuid4().hex}.txt",
+            )
+            for canary in canaries:
+                unsafe_event = event.model_copy(
+                    update={
+                        "event_id": uuid4(),
+                        "payload": event.payload.model_copy(
+                            update={"evidence_summary": canary}
+                        ),
+                    }
+                )
+                with pytest.raises(ValueError):
+                    restarted.project(unsafe_event)
 
             post = client.get_post(posts[0]["id"])
             comments = client.list_comments(posts[0]["id"])
@@ -200,6 +239,7 @@ def test_live_public_http_replay_restart_and_rebuild_without_other_packages(
                 {"post": post, "comments": comments, "search": search}
             ).lower()
             assert not any(term in public_readback for term in FORBIDDEN)
+            assert not any(canary.lower() in public_readback for canary in canaries)
         finally:
             feed.close()
             client.close()

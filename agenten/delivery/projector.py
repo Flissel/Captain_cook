@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 import hashlib
 import json
 from typing import Any, Iterable, Literal
+from uuid import uuid4
 
 from .minibook_client import MinibookClient
 from .minibook_events import MinibookProjectionEvent
-from .projection_cursor import ProjectionCursorStore, StaleProjectionVersion
+from .projection_cursor import ProjectionCursorStore, projection_event_fingerprint
 
 
-ProjectionOutcome = Literal["projected", "duplicate", "quarantined"]
+ProjectionOutcome = Literal["projected", "duplicate", "quarantined", "busy"]
 
 
 @dataclass(frozen=True)
@@ -18,6 +20,24 @@ class ProjectionResult:
     event_id: str
     outcome: ProjectionOutcome
     post_id: str | None = None
+
+
+@dataclass(frozen=True)
+class DeduplicatedProjectionEvents:
+    events: tuple[MinibookProjectionEvent, ...]
+    quarantined: tuple[ProjectionResult, ...]
+    conflicting_event_ids: tuple[str, ...]
+
+
+class ConflictingProjectionEvent(ValueError):
+    """Raised when one authoritative page assigns different data to one event ID."""
+
+    def __init__(self, event_ids: Iterable[str]) -> None:
+        self.event_ids = tuple(event_ids)
+        super().__init__(
+            "conflicting authoritative projection event IDs: "
+            + ", ".join(self.event_ids)
+        )
 
 
 @dataclass(frozen=True)
@@ -57,9 +77,14 @@ class MinibookProjector:
         self,
         client: MinibookClient,
         cursor_store: ProjectionCursorStore | None = None,
+        *,
+        claim_ttl: timedelta = timedelta(seconds=30),
+        owner_id: str | None = None,
     ) -> None:
         self.client = client
         self.cursor_store = cursor_store
+        self.claim_ttl = claim_ttl
+        self.owner_id = owner_id or str(uuid4())
 
     def ensure_project(self, name: str, description: str) -> dict[str, Any]:
         existing = next(
@@ -71,59 +96,105 @@ class MinibookProjector:
     def ensure_projection_project(self) -> dict[str, Any]:
         return self.ensure_project(self.PROJECTION_PROJECT, self.PROJECTION_DESCRIPTION)
 
-    def project(
-        self,
-        event: MinibookProjectionEvent,
-        *,
-        feed_cursor: str | None = None,
-    ) -> ProjectionResult:
+    def project(self, event: MinibookProjectionEvent) -> ProjectionResult:
+        event = self._validated_event(event)
         store = self._require_cursor_store()
         event_id = str(event.event_id)
-        if store.is_processed(event_id):
-            if feed_cursor is not None:
-                store.set_feed_cursor(feed_cursor)
+        claim = store.claim_event(
+            event,
+            owner_id=self.owner_id,
+            ttl=self.claim_ttl,
+        )
+        if claim.outcome == "duplicate":
             return ProjectionResult(event_id=event_id, outcome="duplicate")
-
-        subject_version = store.subject_version(event.subject_id)
-        if subject_version is not None and event.subject_version <= subject_version:
+        if claim.outcome == "conflict":
+            store.quarantine(
+                event,
+                reason="conflicting_duplicate_event_id",
+                retryable=False,
+            )
+            return ProjectionResult(event_id=event_id, outcome="quarantined")
+        if claim.outcome == "stale":
             store.quarantine(event, reason="stale_subject_version")
             return ProjectionResult(event_id=event_id, outcome="quarantined")
+        if claim.outcome == "busy":
+            return ProjectionResult(event_id=event_id, outcome="busy")
 
-        project = self.ensure_projection_project()
-        desired = self.render(event)
-        event_tag = f"captain-event:{event_id}"
-        matches = self.client.search_posts(project_id=project["id"], tag=event_tag)
-        if matches:
-            post = matches[0]
-            if not self._post_matches(post, desired):
-                post = self.client.update_post(
-                    post["id"],
+        try:
+            project = self.ensure_projection_project()
+            desired = self.render(event)
+            event_tag = f"captain-event:{event_id}"
+            matches = self.client.search_posts(project_id=project["id"], tag=event_tag)
+            if matches:
+                post = matches[0]
+                if not self._post_matches(post, desired):
+                    post = self.client.update_post(
+                        post["id"],
+                        title=desired.title,
+                        content=desired.content,
+                        status="open",
+                        tags=list(desired.tags),
+                    )
+            else:
+                post = self.client.create_post(
+                    project["id"],
                     title=desired.title,
                     content=desired.content,
-                    status="open",
                     tags=list(desired.tags),
                 )
-        else:
-            post = self.client.create_post(
-                project["id"],
-                title=desired.title,
-                content=desired.content,
-                tags=list(desired.tags),
-            )
-        try:
-            store.commit_event(
-                event,
-                post_id=post["id"],
-                content_hash=desired.content_hash,
-                feed_cursor=feed_cursor,
-            )
-        except StaleProjectionVersion:
-            store.quarantine(event, reason="stale_subject_version")
-            return ProjectionResult(event_id=event_id, outcome="quarantined")
+        except BaseException:
+            store.release_claim(event_id, owner_id=self.owner_id)
+            raise
+        store.complete_claim(
+            event,
+            owner_id=self.owner_id,
+            post_id=post["id"],
+            content_hash=desired.content_hash,
+        )
         return ProjectionResult(
             event_id=event_id,
             outcome="projected",
             post_id=post["id"],
+        )
+
+    def deduplicate_events(
+        self,
+        events: Iterable[MinibookProjectionEvent],
+        *,
+        quarantine_conflicts: bool,
+    ) -> DeduplicatedProjectionEvents:
+        unique: dict[str, tuple[str, MinibookProjectionEvent]] = {}
+        conflicted: dict[str, MinibookProjectionEvent] = {}
+        for candidate in events:
+            event = self._validated_event(candidate)
+            event_id = str(event.event_id)
+            fingerprint = projection_event_fingerprint(event)
+            prior = unique.get(event_id)
+            if prior is None and event_id not in conflicted:
+                unique[event_id] = (fingerprint, event)
+                continue
+            if prior is not None and prior[0] == fingerprint:
+                continue
+            if prior is not None:
+                conflicted[event_id] = prior[1]
+                del unique[event_id]
+
+        quarantined: list[ProjectionResult] = []
+        if quarantine_conflicts:
+            store = self._require_cursor_store()
+            for event_id, event in conflicted.items():
+                store.quarantine(
+                    event,
+                    reason="conflicting_duplicate_event_id",
+                    retryable=False,
+                )
+                quarantined.append(
+                    ProjectionResult(event_id=event_id, outcome="quarantined")
+                )
+        return DeduplicatedProjectionEvents(
+            events=tuple(item[1] for item in unique.values()),
+            quarantined=tuple(quarantined),
+            conflicting_event_ids=tuple(conflicted),
         )
 
     def rebuild(
@@ -137,7 +208,13 @@ class MinibookProjector:
         *,
         apply: bool = False,
     ) -> DriftReport:
-        authoritative_events = list(events)
+        deduplicated = self.deduplicate_events(
+            events,
+            quarantine_conflicts=apply,
+        )
+        if deduplicated.conflicting_event_ids:
+            raise ConflictingProjectionEvent(deduplicated.conflicting_event_ids)
+        authoritative_events = list(deduplicated.events)
         project = self.ensure_projection_project()
         active_posts = [
             post
@@ -292,6 +369,12 @@ class MinibookProjector:
         if self.cursor_store is None:
             raise RuntimeError("projection cursor store is required for event projection")
         return self.cursor_store
+
+    @staticmethod
+    def _validated_event(event: MinibookProjectionEvent) -> MinibookProjectionEvent:
+        return MinibookProjectionEvent.model_validate(
+            event.model_dump(mode="python", by_alias=True)
+        )
 
     def upsert_plan(self, project_id: str, title: str, content: str) -> dict[str, Any]:
         existing = next(

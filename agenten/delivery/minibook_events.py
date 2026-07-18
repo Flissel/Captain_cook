@@ -33,7 +33,24 @@ NonEmptyText = Annotated[
 ArtifactDigest = Annotated[str, StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$")]
 
 _FORBIDDEN_KEY_PARTS = ("token", "password", "secret", "holdout", "prompt", "transcript")
-_ABSOLUTE_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\|/)")
+_PRIVATE_VALUE_PATTERNS = (
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(
+        r"(?i)\b(?:authorization|api[_-]?key|auth[_-]?token|token|password|passwd|credential|secret)"
+        r"\s*[:=]\s*[^\s,;]+"
+    ),
+    re.compile(
+        r"(?i)\b(?:raw[\s_-]*(?:system[\s_-]*)?prompt|raw[\s_-]*transcript|"
+        r"complete[\s_-]*log|holdout(?:[\s_-]*(?:body|case|suite))?)\b"
+    ),
+)
+_PATH_VALUE_PATTERNS = (
+    re.compile(r"(?i)file://"),
+    re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/][^\s]+"),
+    re.compile(r"\\\\[^\\\s]+\\[^\s]+"),
+    re.compile(r"(?<![A-Za-z0-9\\])\\(?:[^\\\s]+\\)+[^\\\s]+"),
+    re.compile(r"(?<![:/A-Za-z0-9])/(?!/)[^\s/]+(?:/[^\s/]+)*"),
+)
 
 
 class MinibookProjectionPayload(BaseModel):
@@ -66,8 +83,11 @@ def _reject_forbidden_projection_data(value: object, *, location: str = "payload
         for index, nested in enumerate(value):
             _reject_forbidden_projection_data(nested, location=f"{location}[{index}]")
         return
-    if isinstance(value, str) and _ABSOLUTE_PATH.match(value.strip()):
-        raise ValueError(f"absolute paths are forbidden at {location}")
+    if isinstance(value, str):
+        if any(pattern.search(value) for pattern in _PRIVATE_VALUE_PATTERNS):
+            raise ValueError(f"private projection value at {location}")
+        if any(pattern.search(value) for pattern in _PATH_VALUE_PATTERNS):
+            raise ValueError(f"absolute paths are forbidden at {location}")
 
 
 def redact_projection_payload(payload: dict[str, object]) -> MinibookProjectionPayload:

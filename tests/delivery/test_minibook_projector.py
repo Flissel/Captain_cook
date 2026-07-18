@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sys
+from threading import Event
 from typing import Iterator
 from uuid import uuid4
 
@@ -38,7 +41,7 @@ def projection_api(tmp_path: Path) -> Iterator[tuple[TestClient, MinibookClient]
         )
         assert registration.status_code == 200
         client = MinibookClient(
-            "http://testserver",
+            "http://127.0.0.1",
             registration.json()["api_key"],
             client=http,
         )
@@ -115,49 +118,151 @@ def test_out_of_order_event_is_quarantined_without_remote_overwrite(
     assert quarantine[0].reason == "stale_subject_version"
 
 
-class FailOnceCursorStore(ProjectionCursorStore):
-    def __init__(self, path: Path) -> None:
-        super().__init__(path)
-        self.failed = False
+def test_unsafe_model_copy_is_revalidated_before_any_minibook_write(
+    tmp_path: Path,
+    projection_api: tuple[TestClient, MinibookClient],
+) -> None:
+    _, client = projection_api
+    event = load_events()[0]
+    unsafe = event.model_copy(
+        update={
+            "payload": event.payload.model_copy(
+                update={
+                    "evidence_summary": "Authorization: Bearer fake-review-token-123456"
+                }
+            )
+        }
+    )
+    projector = MinibookProjector(
+        client,
+        ProjectionCursorStore(tmp_path / "cursor.db"),
+    )
 
-    def commit_event(
-        self,
-        event: MinibookProjectionEvent,
-        *,
-        post_id: str,
-        content_hash: str,
-        feed_cursor: str | None = None,
-    ) -> None:
-        if not self.failed:
-            self.failed = True
-            raise RuntimeError("simulated crash before cursor commit")
-        super().commit_event(
-            event,
-            post_id=post_id,
-            content_hash=content_hash,
-            feed_cursor=feed_cursor,
-        )
+    with pytest.raises(ValueError):
+        projector.project(unsafe)
+
+    assert client.list_projects() == []
 
 
-def test_remote_update_before_cursor_commit_converges_on_replay(
+class BlockingSearchClient:
+    def __init__(self, delegate: MinibookClient) -> None:
+        self.delegate = delegate
+        self.search_completed = Event()
+        self.release_search = Event()
+
+    def search_posts(
+        self, *, project_id: str, tag: str | None = None, query: str = ""
+    ) -> list[dict[str, object]]:
+        posts = self.delegate.search_posts(project_id=project_id, tag=tag, query=query)
+        self.search_completed.set()
+        assert self.release_search.wait(timeout=5)
+        return posts
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.delegate, name)
+
+
+def test_two_concurrent_projectors_create_exactly_one_post_for_same_event(
+    tmp_path: Path,
+    projection_api: tuple[TestClient, MinibookClient],
+) -> None:
+    http, client = projection_api
+    event = load_events()[0]
+    cursor_path = tmp_path / "cursor.db"
+    first_client = BlockingSearchClient(client)
+    second_client = MinibookClient(
+        "http://127.0.0.1",
+        client._headers["Authorization"].removeprefix("Bearer "),
+        client=http,
+    )
+    first = MinibookProjector(first_client, ProjectionCursorStore(cursor_path))
+    second = MinibookProjector(second_client, ProjectionCursorStore(cursor_path))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(first.project, event)
+        assert first_client.search_completed.wait(timeout=5)
+        second_future = pool.submit(second.project, event)
+        second_result = second_future.result(timeout=5)
+        first_client.release_search.set()
+        first_result = first_future.result(timeout=5)
+
+    project = first.ensure_projection_project()
+    assert {first_result.outcome, second_result.outcome} == {"projected", "busy"}
+    assert len(client.list_posts(project["id"])) == 1
+
+
+def test_lower_version_cannot_write_after_newer_subject_claim(
+    tmp_path: Path,
+    projection_api: tuple[TestClient, MinibookClient],
+) -> None:
+    http, client = projection_api
+    lower, newer = load_events()[:2]
+    cursor_path = tmp_path / "cursor.db"
+    newer_client = BlockingSearchClient(client)
+    lower_client = MinibookClient(
+        "http://127.0.0.1",
+        client._headers["Authorization"].removeprefix("Bearer "),
+        client=http,
+    )
+    newer_projector = MinibookProjector(
+        newer_client,
+        ProjectionCursorStore(cursor_path),
+    )
+    lower_projector = MinibookProjector(
+        lower_client,
+        ProjectionCursorStore(cursor_path),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        newer_future = pool.submit(newer_projector.project, newer)
+        assert newer_client.search_completed.wait(timeout=5)
+        lower_result = pool.submit(lower_projector.project, lower).result(timeout=5)
+        newer_client.release_search.set()
+        newer_result = newer_future.result(timeout=5)
+
+    project = newer_projector.ensure_projection_project()
+    assert newer_result.outcome == "projected"
+    assert lower_result.outcome == "quarantined"
+    assert len(client.list_posts(project["id"])) == 1
+    assert ProjectionCursorStore(cursor_path).list_quarantine()[0].reason == (
+        "stale_subject_version"
+    )
+
+
+class FailCompleteClaimStore(ProjectionCursorStore):
+    def complete_claim(self, *args: object, **kwargs: object) -> None:
+        raise RuntimeError("simulated crash before cursor commit")
+
+
+def test_remote_write_recovers_after_claim_expiry_without_duplicate_post(
     tmp_path: Path,
     projection_api: tuple[TestClient, MinibookClient],
 ) -> None:
     _, client = projection_api
     event = load_events()[0]
     cursor_path = tmp_path / "cursor.db"
-    crashing = MinibookProjector(client, FailOnceCursorStore(cursor_path))
+    now = [datetime(2026, 7, 18, tzinfo=timezone.utc)]
+    def clock() -> datetime:
+        return now[0]
+    crashing = MinibookProjector(
+        client,
+        FailCompleteClaimStore(cursor_path, clock=clock),
+        claim_ttl=timedelta(seconds=5),
+    )
 
     with pytest.raises(RuntimeError, match="simulated crash"):
         crashing.project(event)
 
     project = crashing.ensure_projection_project()
     assert len(client.list_posts(project["id"])) == 1
+    recovering = MinibookProjector(
+        client,
+        ProjectionCursorStore(cursor_path, clock=clock),
+        claim_ttl=timedelta(seconds=5),
+    )
+    assert recovering.project(event).outcome == "busy"
 
-    recovered_store = ProjectionCursorStore(cursor_path)
-    recovered = MinibookProjector(client, recovered_store)
-    result = recovered.project(event)
-
-    assert result.outcome == "projected"
-    assert recovered_store.is_processed(str(event.event_id))
+    now[0] += timedelta(seconds=6)
+    assert recovering.project(event).outcome == "projected"
     assert len(client.list_posts(project["id"])) == 1
+    assert ProjectionCursorStore(cursor_path).is_processed(str(event.event_id))

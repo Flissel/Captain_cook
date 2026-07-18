@@ -95,3 +95,58 @@ def test_projection_rejects_oversized_public_text_fields() -> None:
 
     with pytest.raises(ValidationError):
         MinibookProjectionEvent.model_validate(document)
+
+
+@pytest.mark.parametrize(
+    "unsafe_value",
+    [
+        "Authorization: Bearer fake-review-token-123456",
+        "credential=fake-review-credential-123456",
+        "password: fake-review-password-123456",
+        "raw prompt canary must remain private",
+        "raw transcript canary must remain private",
+        "complete-log canary must remain private",
+        "holdout canary must remain private",
+        "artifact at C:\\private\\workspace\\result.json",
+        "artifact at \\\\server\\share\\result.json",
+        "artifact at /home/runner/private/result.json",
+        "artifact at /private",
+        "artifact at \\private\\result.json",
+        "artifact at file:///home/runner/private/result.json",
+    ],
+)
+def test_redaction_rejects_private_values_inside_allowed_fields(
+    unsafe_value: str,
+) -> None:
+    with pytest.raises(ValueError):
+        redact_projection_payload(
+            {
+                "view": "validation",
+                "public_title": "Public validation result",
+                "status": "recorded",
+                "evidence_summary": unsafe_value,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("public_title", "Runtime delivery plan published"),
+        ("status", "validation-ready"),
+        ("evidence_summary", "Public checks passed: 18 of 18."),
+        ("assignee_display_name", "Captain Quality Warden"),
+    ],
+)
+def test_redaction_accepts_normal_public_projection_text(
+    field: str,
+    value: str,
+) -> None:
+    payload: dict[str, object] = {
+        "view": "validation",
+        "public_title": "Public validation result",
+        "status": "recorded",
+    }
+    payload[field] = value
+
+    assert redact_projection_payload(payload).model_dump()[field] == value
