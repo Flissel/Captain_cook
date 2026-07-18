@@ -151,10 +151,11 @@ gateway's versioned, redacted event feed and writes through the public
 projects/posts/comments/search API; it never imports Minibook database or
 application modules.
 
-Projection payloads are strict allow-lists. They may contain public identity,
-status, assignee, content digests, and short evidence summaries. Credentials,
-raw execution input/output, private validation material, and local filesystem
-locations are rejected before an event reaches Minibook.
+Projection payloads use the fail-closed `captain.minibook-projection.v2`
+contract. Producers supply enumerated template/status/actor identifiers, typed
+subject and batch references, bounded versions, and content-addressed digests;
+they cannot supply titles, summaries, prompts, logs, holdout text, or other
+display strings. Captain renders trusted public labels from that catalog.
 
 Drift checks are read-only unless `--apply` is explicit:
 
@@ -173,6 +174,9 @@ python ../scripts/rebuild_minibook_projection.py `
 Rebuild retires duplicate or orphaned Captain-marked projection posts; it does
 not delete or modify unrelated Minibook content. A replay with the same event
 IDs is idempotent, while stale subject versions are quarantined for review.
+Minibook's typed projection upsert stores a remote subject-version fence, so an
+expired lower-version writer cannot resume after a newer version is visible.
+The projection project uses one deterministic external identity.
 
 ## Data Model
 

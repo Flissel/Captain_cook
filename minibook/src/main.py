@@ -7,6 +7,7 @@ A small Moltbook for agent collaboration on software projects.
 
 import yaml
 import json as json_module
+import hashlib
 from pathlib import Path
 from typing import Optional, List
 from contextlib import asynccontextmanager
@@ -16,14 +17,15 @@ from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocke
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
 from .database import init_db
-from .models import Agent, Project, ProjectMember, Post, Comment, Webhook, Notification, GitHubWebhook, Question, AgentRegistry, AgentImprovement
+from .models import Agent, Project, ProjectMember, Post, ProjectionPostFence, Comment, Webhook, Notification, GitHubWebhook, Question, AgentRegistry, AgentImprovement
 from .schemas import (
     AgentCreate, AgentResponse, AgentProfileResponse, AgentMembership, RecentPost, RecentComment,
-    ProjectCreate, ProjectUpdate, ProjectResponse,
+    ProjectCreate, ProjectUpdate, ProjectResponse, ProjectionProjectUpsert,
     JoinProject, MemberUpdate, MemberResponse,
-    PostCreate, PostUpdate, PostResponse,
+    PostCreate, PostUpdate, PostResponse, ProjectionPostUpsert,
     CommentCreate, CommentResponse,
     WebhookCreate, WebhookResponse,
     NotificationResponse,
@@ -389,6 +391,46 @@ async def create_project(data: ProjectCreate, agent: Agent = Depends(require_age
     )
 
 
+@app.put("/api/v1/projection-projects/{external_id}", response_model=ProjectResponse)
+async def upsert_projection_project(
+    external_id: str,
+    data: ProjectionProjectUpsert,
+    agent: Agent = Depends(require_agent),
+    db=Depends(get_db),
+):
+    """Create or return Captain's singleton projection project atomically."""
+    if external_id != "captain-runtime-projection-v2":
+        raise HTTPException(422, "Unsupported projection project identity")
+    db.commit()
+    db.execute(text("BEGIN IMMEDIATE"))
+    project = db.query(Project).filter(Project.id == external_id).first()
+    if project is None:
+        project = db.query(Project).filter(Project.name == data.name).first()
+    if project is None:
+        project = Project(
+            id=external_id,
+            name=data.name,
+            description=data.description,
+            primary_lead_agent_id=agent.id,
+        )
+        db.add(project)
+        db.flush()
+        db.add(ProjectMember(agent_id=agent.id, project_id=project.id, role="lead"))
+    elif project.name != data.name or project.description != data.description:
+        db.rollback()
+        raise HTTPException(409, "Projection project identity conflicts")
+    db.commit()
+    db.refresh(project)
+    return ProjectResponse(
+        id=project.id,
+        name=project.name,
+        description=project.description,
+        primary_lead_agent_id=project.primary_lead_agent_id,
+        primary_lead_name=project.primary_lead.name if project.primary_lead else None,
+        created_at=project.created_at,
+    )
+
+
 @app.get("/api/v1/projects", response_model=List[ProjectResponse])
 async def list_projects(db=Depends(get_db)):
     """List all projects."""
@@ -524,6 +566,102 @@ async def create_post(project_id: str, data: PostCreate, agent: Agent = Depends(
         tags=post.tags, mentions=post.mentions, pinned=(post.pin_order is not None), pin_order=post.pin_order, github_ref=post.github_ref,
         comment_count=0,
         created_at=post.created_at, updated_at=post.updated_at
+    )
+
+
+@app.put(
+    "/api/v1/projects/{project_id}/projection-post",
+    response_model=PostResponse,
+)
+async def upsert_projection_post(
+    project_id: str,
+    data: ProjectionPostUpsert,
+    agent: Agent = Depends(require_agent),
+    db=Depends(get_db),
+):
+    """Atomically upsert a subject projection with a monotonic remote fence."""
+    db.commit()
+    db.execute(text("BEGIN IMMEDIATE"))
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if project is None:
+        db.rollback()
+        raise HTTPException(404, "Project not found")
+
+    fence = (
+        db.query(ProjectionPostFence)
+        .filter(ProjectionPostFence.subject_key == data.subject_key)
+        .first()
+    )
+    if fence is not None and data.subject_version < fence.subject_version:
+        db.rollback()
+        raise HTTPException(409, "stale_projection_version")
+    if fence is not None and data.subject_version == fence.subject_version and (
+        fence.event_id != data.event_id
+        or fence.source_fingerprint != data.source_fingerprint
+    ):
+        db.rollback()
+        raise HTTPException(409, "conflicting_projection_version")
+
+    if fence is None:
+        post_id = "captain-projection-" + hashlib.sha256(
+            data.subject_key.encode("utf-8")
+        ).hexdigest()[:32]
+        if db.query(Post).filter(Post.id == post_id).first() is not None:
+            db.rollback()
+            raise HTTPException(409, "projection_identity_unverifiable")
+        post = Post(
+            id=post_id,
+            project_id=project_id,
+            author_id=agent.id,
+            title=data.title,
+            content=data.content,
+            type="plan",
+        )
+        post.tags = data.tags
+        db.add(post)
+        db.flush()
+        fence = ProjectionPostFence(
+            subject_key=data.subject_key,
+            project_id=project_id,
+            post_id=post.id,
+            event_id=data.event_id,
+            subject_version=data.subject_version,
+            source_fingerprint=data.source_fingerprint,
+        )
+        db.add(fence)
+    else:
+        post = db.query(Post).filter(Post.id == fence.post_id).first()
+        if post is None:
+            db.rollback()
+            raise HTTPException(409, "projection_identity_unverifiable")
+        post.title = data.title
+        post.content = data.content
+        post.status = "open"
+        post.tags = data.tags
+        if data.subject_version > fence.subject_version:
+            fence.event_id = data.event_id
+            fence.subject_version = data.subject_version
+            fence.source_fingerprint = data.source_fingerprint
+
+    db.commit()
+    db.refresh(post)
+    return PostResponse(
+        id=post.id,
+        project_id=post.project_id,
+        author_id=post.author_id,
+        author_name=post.author.name,
+        title=post.title,
+        content=post.content,
+        type=post.type,
+        status=post.status,
+        tags=post.tags,
+        mentions=post.mentions,
+        pinned=(post.pin_order is not None),
+        pin_order=post.pin_order,
+        github_ref=post.github_ref,
+        comment_count=0,
+        created_at=post.created_at,
+        updated_at=post.updated_at,
     )
 
 

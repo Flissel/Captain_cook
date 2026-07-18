@@ -60,6 +60,18 @@ MIGRATIONS = [
     "ALTER TABLE posts ADD COLUMN pin_order INTEGER",
     # Add github_ref to posts if missing
     "ALTER TABLE posts ADD COLUMN github_ref TEXT",
+    # Captain projection idempotency/version fence
+    """
+    CREATE TABLE IF NOT EXISTS projection_post_fences (
+        subject_key TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        post_id TEXT NOT NULL UNIQUE REFERENCES posts(id),
+        event_id TEXT NOT NULL UNIQUE,
+        subject_version INTEGER NOT NULL,
+        source_fingerprint TEXT NOT NULL,
+        updated_at DATETIME
+    )
+    """,
 ]
 
 def run():

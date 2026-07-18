@@ -7,7 +7,11 @@ import json
 from typing import Any, Iterable, Literal
 from uuid import uuid4
 
-from .minibook_client import MinibookClient
+from .minibook_client import (
+    MinibookClient,
+    RemoteProjectionConflict,
+    RemoteProjectionStale,
+)
 from .minibook_events import MinibookProjectionEvent
 from .projection_cursor import ProjectionCursorStore, projection_event_fingerprint
 
@@ -68,6 +72,7 @@ class DriftReport:
 
 
 class MinibookProjector:
+    PROJECTION_PROJECT_ID = "captain-runtime-projection-v2"
     PROJECTION_PROJECT = "Captain Runtime Projection"
     PROJECTION_DESCRIPTION = (
         "Rebuildable, redacted collaboration views from committed Captain events."
@@ -94,7 +99,11 @@ class MinibookProjector:
         return existing or self.client.create_project(name, description)
 
     def ensure_projection_project(self) -> dict[str, Any]:
-        return self.ensure_project(self.PROJECTION_PROJECT, self.PROJECTION_DESCRIPTION)
+        return self.client.ensure_projection_project(
+            external_id=self.PROJECTION_PROJECT_ID,
+            name=self.PROJECTION_PROJECT,
+            description=self.PROJECTION_DESCRIPTION,
+        )
 
     def project(self, event: MinibookProjectionEvent) -> ProjectionResult:
         event = self._validated_event(event)
@@ -114,6 +123,13 @@ class MinibookProjector:
                 retryable=False,
             )
             return ProjectionResult(event_id=event_id, outcome="quarantined")
+        if claim.outcome == "unverifiable":
+            store.quarantine(
+                event,
+                reason="unverifiable_legacy_event_fingerprint",
+                retryable=False,
+            )
+            return ProjectionResult(event_id=event_id, outcome="quarantined")
         if claim.outcome == "stale":
             store.quarantine(event, reason="stale_subject_version")
             return ProjectionResult(event_id=event_id, outcome="quarantined")
@@ -123,25 +139,28 @@ class MinibookProjector:
         try:
             project = self.ensure_projection_project()
             desired = self.render(event)
-            event_tag = f"captain-event:{event_id}"
-            matches = self.client.search_posts(project_id=project["id"], tag=event_tag)
-            if matches:
-                post = matches[0]
-                if not self._post_matches(post, desired):
-                    post = self.client.update_post(
-                        post["id"],
-                        title=desired.title,
-                        content=desired.content,
-                        status="open",
-                        tags=list(desired.tags),
-                    )
-            else:
-                post = self.client.create_post(
-                    project["id"],
-                    title=desired.title,
-                    content=desired.content,
-                    tags=list(desired.tags),
-                )
+            post = self.client.upsert_projection_post(
+                project["id"],
+                event_id=event_id,
+                subject_key=event.subject_id,
+                subject_version=event.subject_version,
+                source_fingerprint=projection_event_fingerprint(event),
+                title=desired.title,
+                content=desired.content,
+                tags=list(desired.tags),
+            )
+        except RemoteProjectionStale:
+            store.release_claim(event_id, owner_id=self.owner_id)
+            store.quarantine(event, reason="remote_stale_subject_version")
+            return ProjectionResult(event_id=event_id, outcome="quarantined")
+        except RemoteProjectionConflict:
+            store.release_claim(event_id, owner_id=self.owner_id)
+            store.quarantine(
+                event,
+                reason="remote_projection_conflict",
+                retryable=False,
+            )
+            return ProjectionResult(event_id=event_id, outcome="quarantined")
         except BaseException:
             store.release_claim(event_id, owner_id=self.owner_id)
             raise
@@ -214,12 +233,29 @@ class MinibookProjector:
         )
         if deduplicated.conflicting_event_ids:
             raise ConflictingProjectionEvent(deduplicated.conflicting_event_ids)
-        authoritative_events = list(deduplicated.events)
-        project = self.ensure_projection_project()
+        latest_by_subject: dict[str, MinibookProjectionEvent] = {}
+        for event in deduplicated.events:
+            current = latest_by_subject.get(event.subject_id)
+            if current is None or event.subject_version > current.subject_version:
+                latest_by_subject[event.subject_id] = event
+        authoritative_events = list(latest_by_subject.values())
+        existing_project = next(
+            (
+                item
+                for item in self.client.list_projects()
+                if item["name"] == self.PROJECTION_PROJECT
+            ),
+            None,
+        )
+        if existing_project is None and not apply:
+            return DriftReport(
+                missing_event_ids=tuple(str(event.event_id) for event in authoritative_events)
+            )
+        project = existing_project or self.ensure_projection_project()
         active_posts = [
             post
             for post in self.client.list_posts(project["id"])
-            if "captain-projection:v1" in post.get("tags", [])
+            if "captain-projection:v2" in post.get("tags", [])
         ]
         expected_ids = {str(event.event_id) for event in authoritative_events}
         missing: list[str] = []
@@ -228,11 +264,13 @@ class MinibookProjector:
         duplicate_posts: list[dict[str, Any]] = []
         canonical_posts: dict[str, dict[str, Any]] = {}
         desired_posts: dict[str, ProjectionPost] = {}
+        events_by_id: dict[str, MinibookProjectionEvent] = {}
 
         for event in authoritative_events:
             event_id = str(event.event_id)
             desired = self.render(event)
             desired_posts[event_id] = desired
+            events_by_id[event_id] = event
             event_tag = f"captain-event:{event_id}"
             matches = [post for post in active_posts if event_tag in post.get("tags", [])]
             if not matches:
@@ -265,16 +303,17 @@ class MinibookProjector:
         changes_applied = 0
         if apply:
             for event_id in missing:
-                self._create_projection_post(project["id"], desired_posts[event_id])
+                self._upsert_projection_event(
+                    project["id"],
+                    events_by_id[event_id],
+                    desired_posts[event_id],
+                )
                 changes_applied += 1
             for event_id in modified:
-                desired = desired_posts[event_id]
-                self.client.update_post(
-                    canonical_posts[event_id]["id"],
-                    title=desired.title,
-                    content=desired.content,
-                    status="open",
-                    tags=list(desired.tags),
+                self._upsert_projection_event(
+                    project["id"],
+                    events_by_id[event_id],
+                    desired_posts[event_id],
                 )
                 changes_applied += 1
             for post in duplicate_posts:
@@ -296,8 +335,8 @@ class MinibookProjector:
     def render(self, event: MinibookProjectionEvent) -> ProjectionPost:
         payload = event.payload
         fields: list[tuple[str, str]] = [
-            ("Status", payload.status),
-            ("View", payload.view),
+            ("Status", self._status_label(payload.status_id)),
+            ("View", self._view_label(payload.view)),
             ("Correlation", str(event.correlation_id)),
             ("Subject", event.subject_id),
             ("Subject version", str(event.subject_version)),
@@ -306,16 +345,14 @@ class MinibookProjector:
             fields.append(("Batch", payload.batch_id))
         if payload.batch_version is not None:
             fields.append(("Batch version", str(payload.batch_version)))
-        if payload.assignee_display_name is not None:
-            fields.append(("Assignee", payload.assignee_display_name))
+        if payload.actor_role_id is not None:
+            fields.append(("Actor", self._actor_label(payload.actor_role_id)))
         if payload.artifact_digest is not None:
             fields.append(("Artifact", payload.artifact_digest))
-        if payload.evidence_summary is not None:
-            fields.append(("Evidence", payload.evidence_summary))
         content = "\n".join(f"- **{label}:** {value}" for label, value in fields)
-        title = f"[{event.event_type}] {payload.public_title}"
+        title = f"[{event.event_type}] {self._template_title(payload.template_id)}"
         identity_tags = (
-            "captain-projection:v1",
+            "captain-projection:v2",
             f"captain-event:{event.event_id}",
             f"captain-correlation:{event.correlation_id}",
             f"captain-subject:{event.subject_id}",
@@ -329,6 +366,49 @@ class MinibookProjector:
             tags=(*identity_tags, f"captain-hash:{content_hash}"),
             content_hash=content_hash,
         )
+
+    @staticmethod
+    def _template_title(template_id: str) -> str:
+        return {
+            "runtime_plan_requested": "Runtime planning requested",
+            "runtime_plan_published": "Runtime delivery plan published",
+            "runtime_blueprint_published": "Runtime blueprint published",
+            "runtime_build_running": "Runtime build running",
+            "runtime_build_recorded": "Runtime build result recorded",
+            "automation_evidence_recorded": "Automation evidence recorded",
+            "runtime_validation_recorded": "Runtime validation recorded",
+            "runtime_replanning_requested": "Runtime replanning requested",
+        }[template_id]
+
+    @staticmethod
+    def _status_label(status_id: str) -> str:
+        return {
+            "requested": "Requested",
+            "planned": "Planned",
+            "ready": "Ready",
+            "running": "Running",
+            "built": "Built",
+            "observed": "Observed",
+            "validated": "Validated",
+            "replanning": "Replanning",
+        }[status_id]
+
+    @staticmethod
+    def _view_label(view: str) -> str:
+        return {
+            "project": "Project",
+            "plan": "Plan",
+            "blueprint": "Blueprint",
+            "build": "Build",
+            "validation": "Validation",
+        }[view]
+
+    @staticmethod
+    def _actor_label(actor_role_id: str) -> str:
+        return {
+            "captain_planner": "Captain Planner",
+            "codex_worker": "Codex Worker",
+        }[actor_role_id]
 
     @staticmethod
     def _content_hash(title: str, content: str, tags: tuple[str, ...]) -> str:
@@ -348,11 +428,18 @@ class MinibookProjector:
             and set(post.get("tags", [])) == set(desired.tags)
         )
 
-    def _create_projection_post(
-        self, project_id: str, desired: ProjectionPost
+    def _upsert_projection_event(
+        self,
+        project_id: str,
+        event: MinibookProjectionEvent,
+        desired: ProjectionPost,
     ) -> dict[str, Any]:
-        return self.client.create_post(
+        return self.client.upsert_projection_post(
             project_id,
+            event_id=str(event.event_id),
+            subject_key=event.subject_id,
+            subject_version=event.subject_version,
+            source_fingerprint=projection_event_fingerprint(event),
             title=desired.title,
             content=desired.content,
             tags=list(desired.tags),
@@ -360,9 +447,11 @@ class MinibookProjector:
 
     def _retire_projection_post(self, post: dict[str, Any], *, reason: str) -> None:
         tags = [
-            tag for tag in post.get("tags", []) if tag != "captain-projection:v1"
+            tag
+            for tag in post.get("tags", [])
+            if tag not in {"captain-projection:v1", "captain-projection:v2"}
         ]
-        tags.extend(("captain-projection-retired:v1", f"captain-retired:{reason}"))
+        tags.extend(("captain-projection-retired:v2", f"captain-retired:{reason}"))
         self.client.update_post(post["id"], status="closed", tags=sorted(set(tags)))
 
     def _require_cursor_store(self) -> ProjectionCursorStore:
@@ -372,9 +461,9 @@ class MinibookProjector:
 
     @staticmethod
     def _validated_event(event: MinibookProjectionEvent) -> MinibookProjectionEvent:
-        return MinibookProjectionEvent.model_validate(
-            event.model_dump(mode="python", by_alias=True)
-        )
+        document = dict(event.__dict__)
+        document["payload"] = dict(event.payload.__dict__)
+        return MinibookProjectionEvent.model_validate(document)
 
     def upsert_plan(self, project_id: str, title: str, content: str) -> dict[str, Any]:
         existing = next(

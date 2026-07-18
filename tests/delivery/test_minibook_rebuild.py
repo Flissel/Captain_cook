@@ -9,6 +9,7 @@ from uuid import uuid4
 from fastapi.testclient import TestClient
 import httpx
 import pytest
+import scripts.rebuild_minibook_projection as rebuild_script
 
 from agenten.delivery.minibook_client import MinibookClient
 from agenten.delivery.minibook_events import MinibookProjectionEvent
@@ -26,7 +27,7 @@ FIXTURE = (
     Path(__file__).parents[1]
     / "fixtures"
     / "contracts"
-    / "minibook_projection.v1.json"
+    / "minibook_projection.v2.json"
 )
 MINIBOOK_ROOT = Path(__file__).parents[2] / "minibook"
 
@@ -62,7 +63,15 @@ def test_rebuild_reports_and_repairs_missing_modified_duplicate_and_orphaned_pos
     tmp_path: Path,
     projection_api: MinibookClient,
 ) -> None:
-    events = load_events()[:4]
+    events = [
+        event.model_copy(
+            update={
+                "subject_id": f"subject:{uuid4()}",
+                "subject_version": 1,
+            }
+        )
+        for event in load_events()[:4]
+    ]
     projector = MinibookProjector(
         projection_api,
         ProjectionCursorStore(tmp_path / "cursor.db"),
@@ -89,7 +98,7 @@ def test_rebuild_reports_and_repairs_missing_modified_duplicate_and_orphaned_pos
         project["id"],
         title="Orphaned projection",
         content="No authoritative event remains.",
-        tags=["captain-projection:v1", f"captain-event:{uuid4()}"],
+        tags=["captain-projection:v2", f"captain-event:{uuid4()}"],
     )
     unrelated = projection_api.create_post(
         project["id"],
@@ -264,7 +273,11 @@ def test_reconcile_quarantines_conflicting_duplicate_event_ids_before_write(
 ) -> None:
     event = load_events()[0]
     conflicting = event.model_copy(
-        update={"payload": event.payload.model_copy(update={"status": "conflict"})}
+        update={
+            "payload": event.payload.model_copy(
+                update={"batch_version": event.payload.batch_version + 1}
+            )
+        }
     )
     store = ProjectionCursorStore(tmp_path / "cursor.db")
     projector = MinibookProjector(projection_api, store)
@@ -415,7 +428,11 @@ def test_conflicting_page_events_advance_cursor_after_quarantine(
 ) -> None:
     lower, newer = load_events()[:2]
     conflict = lower.model_copy(
-        update={"payload": lower.payload.model_copy(update={"status": "conflict"})}
+        update={
+            "payload": lower.payload.model_copy(
+                update={"batch_version": lower.payload.batch_version + 1}
+            )
+        }
     )
     store = ProjectionCursorStore(tmp_path / "cursor.db")
     projector = MinibookProjector(projection_api, store)
@@ -454,3 +471,65 @@ def test_incremental_dry_run_does_not_write_or_advance_cursor(
     assert results == []
     assert store.get_feed_cursor() is None
     assert projection_api.list_projects() == []
+
+
+def test_default_cli_dry_run_reports_missing_without_creating_project(
+    tmp_path: Path,
+    projection_api: MinibookClient,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    document = json.loads(FIXTURE.read_text(encoding="utf-8"))[0]
+    feed = _single_page_feed([document], cursor="after-dry-run")
+    monkeypatch.setenv("CAPTAIN_GATEWAY_TOKEN", "test-only")
+    monkeypatch.setenv("MINIBOOK_API_KEY", "test-only")
+    monkeypatch.setattr(rebuild_script, "CaptainProjectionFeed", lambda *a, **k: feed)
+    monkeypatch.setattr(rebuild_script, "MinibookClient", lambda *a, **k: projection_api)
+
+    exit_code = rebuild_script.main(
+        [
+            "--captain-url",
+            "https://captain.test",
+            "--minibook-url",
+            "http://127.0.0.1",
+            "--cursor-db",
+            str(tmp_path / "cursor.db"),
+        ]
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert output["mode"] == "dry-run"
+    assert output["missing_event_ids"] == [document["event_id"]]
+    assert projection_api.list_projects() == []
+    assert ProjectionCursorStore(tmp_path / "cursor.db").get_feed_cursor() is None
+
+
+def test_successful_apply_full_rebuild_checkpoints_terminal_feed_cursor(
+    tmp_path: Path,
+    projection_api: MinibookClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = json.loads(FIXTURE.read_text(encoding="utf-8"))[0]
+    feed = _single_page_feed([document], cursor="after-full-rebuild")
+    cursor_path = tmp_path / "cursor.db"
+    monkeypatch.setenv("CAPTAIN_GATEWAY_TOKEN", "test-only")
+    monkeypatch.setenv("MINIBOOK_API_KEY", "test-only")
+    monkeypatch.setattr(rebuild_script, "CaptainProjectionFeed", lambda *a, **k: feed)
+    monkeypatch.setattr(rebuild_script, "MinibookClient", lambda *a, **k: projection_api)
+
+    exit_code = rebuild_script.main(
+        [
+            "--captain-url",
+            "https://captain.test",
+            "--minibook-url",
+            "http://127.0.0.1",
+            "--cursor-db",
+            str(cursor_path),
+            "--apply",
+            "--full-rebuild",
+        ]
+    )
+
+    assert exit_code == 0
+    assert ProjectionCursorStore(cursor_path).get_feed_cursor() == "after-full-rebuild"

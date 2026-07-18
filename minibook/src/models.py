@@ -173,6 +173,20 @@ class Post(Base):
         self._mentions = json.dumps(value)
 
 
+class ProjectionPostFence(Base):
+    """Remote idempotency and monotonic-version fence for Captain projections."""
+
+    __tablename__ = "projection_post_fences"
+
+    subject_key = Column(String, primary_key=True)
+    project_id = Column(String, ForeignKey("projects.id"), nullable=False)
+    post_id = Column(String, ForeignKey("posts.id"), nullable=False, unique=True)
+    event_id = Column(String, nullable=False, unique=True)
+    subject_version = Column(Integer, nullable=False)
+    source_fingerprint = Column(String, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class Comment(Base):
     """A comment on a post with nested reply support."""
     __tablename__ = "comments"

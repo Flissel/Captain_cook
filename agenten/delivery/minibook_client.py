@@ -9,6 +9,14 @@ import httpx
 import yaml
 
 
+class RemoteProjectionStale(RuntimeError):
+    pass
+
+
+class RemoteProjectionConflict(RuntimeError):
+    pass
+
+
 def validate_service_base_url(base_url: str) -> str:
     normalized = base_url.rstrip("/")
     parsed = urlsplit(normalized)
@@ -90,6 +98,19 @@ class MinibookClient:
             "POST", "/api/v1/projects", json={"name": name, "description": description}
         )
 
+    def ensure_projection_project(
+        self,
+        *,
+        external_id: str,
+        name: str,
+        description: str,
+    ) -> dict[str, Any]:
+        return self._request(
+            "PUT",
+            f"/api/v1/projection-projects/{external_id}",
+            json={"name": name, "description": description},
+        )
+
     def list_posts(self, project_id: str) -> list[dict[str, Any]]:
         return self._request("GET", f"/api/v1/projects/{project_id}/posts")
 
@@ -109,6 +130,40 @@ class MinibookClient:
             f"/api/v1/projects/{project_id}/posts",
             json={"title": title, "content": content, "type": "plan", "tags": tags},
         )
+
+    def upsert_projection_post(
+        self,
+        project_id: str,
+        *,
+        event_id: str,
+        subject_key: str,
+        subject_version: int,
+        source_fingerprint: str,
+        title: str,
+        content: str,
+        tags: list[str],
+    ) -> dict[str, Any]:
+        response = self._client.request(
+            "PUT",
+            f"{self._base_url}/api/v1/projects/{project_id}/projection-post",
+            headers=self._headers,
+            json={
+                "event_id": event_id,
+                "subject_key": subject_key,
+                "subject_version": subject_version,
+                "source_fingerprint": source_fingerprint,
+                "title": title,
+                "content": content,
+                "tags": tags,
+            },
+        )
+        if response.status_code == 409:
+            detail = str(response.json().get("detail", ""))
+            if detail == "stale_projection_version":
+                raise RemoteProjectionStale(detail)
+            raise RemoteProjectionConflict(detail)
+        response.raise_for_status()
+        return response.json()
 
     def get_post(self, post_id: str) -> dict[str, Any]:
         return self._request("GET", f"/api/v1/posts/{post_id}")

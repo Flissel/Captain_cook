@@ -11,7 +11,7 @@ FIXTURE = (
     Path(__file__).parents[1]
     / "fixtures"
     / "contracts"
-    / "minibook_projection.v1.json"
+    / "minibook_projection.v2.json"
 )
 FORBIDDEN_TERMS = (
     "token",
@@ -37,7 +37,17 @@ def test_runtime_projection_contract_is_versioned_complete_and_redacted() -> Non
         "build",
         "validation",
     }
-    assert all(event.schema_name.endswith(".v1") for event in events)
+    assert all(event.schema_name.endswith(".v2") for event in events)
+    assert not any(
+        key in document["payload"]
+        for document in documents
+        for key in (
+            "public_title",
+            "status",
+            "assignee_display_name",
+            "evidence_summary",
+        )
+    )
     assert not any(term in raw.lower() for term in FORBIDDEN_TERMS)
     assert "C:\\" not in raw
     assert '"/' not in raw

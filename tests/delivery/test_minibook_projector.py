@@ -4,9 +4,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import sqlite3
 import sys
 from threading import Event
-from typing import Iterator
+from typing import Any, Iterator
 from uuid import uuid4
 
 import pytest
@@ -22,7 +23,7 @@ FIXTURE = (
     Path(__file__).parents[1]
     / "fixtures"
     / "contracts"
-    / "minibook_projection.v1.json"
+    / "minibook_projection.v2.json"
 )
 MINIBOOK_ROOT = Path(__file__).parents[2] / "minibook"
 
@@ -85,12 +86,10 @@ def test_replay_is_idempotent_and_subject_versions_are_monotonic(
     posts = client.list_posts(project["id"])
     assert [result.outcome for result in first] == ["projected"] * 8
     assert [result.outcome for result in second] == ["duplicate"] * 8
-    assert len(posts) == 8
+    assert len(posts) == 1
     assert store.processed_count() == 8
-    assert store.subject_version("runtime-case-1") == 8
-    for event in events:
-        tag = f"captain-event:{event.event_id}"
-        assert sum(tag in post["tags"] for post in posts) == 1
+    assert store.subject_version(events[0].subject_id) == 8
+    assert f"captain-event:{events[-1].event_id}" in posts[0]["tags"]
 
 
 def test_out_of_order_event_is_quarantined_without_remote_overwrite(
@@ -150,13 +149,12 @@ class BlockingSearchClient:
         self.search_completed = Event()
         self.release_search = Event()
 
-    def search_posts(
-        self, *, project_id: str, tag: str | None = None, query: str = ""
-    ) -> list[dict[str, object]]:
-        posts = self.delegate.search_posts(project_id=project_id, tag=tag, query=query)
+    def upsert_projection_post(
+        self, *args: object, **kwargs: object
+    ) -> dict[str, Any]:
         self.search_completed.set()
         assert self.release_search.wait(timeout=5)
-        return posts
+        return self.delegate.upsert_projection_post(*args, **kwargs)
 
     def __getattr__(self, name: str) -> object:
         return getattr(self.delegate, name)
@@ -266,3 +264,121 @@ def test_remote_write_recovers_after_claim_expiry_without_duplicate_post(
     assert recovering.project(event).outcome == "projected"
     assert len(client.list_posts(project["id"])) == 1
     assert ProjectionCursorStore(cursor_path).is_processed(str(event.event_id))
+
+
+def test_legacy_empty_event_fingerprint_fails_closed_and_quarantines(
+    tmp_path: Path,
+    projection_api: tuple[TestClient, MinibookClient],
+) -> None:
+    _, client = projection_api
+    event = load_events()[0]
+    cursor_path = tmp_path / "cursor.db"
+    store = ProjectionCursorStore(cursor_path)
+    store.commit_event(event, post_id="legacy-post", content_hash="legacy")
+    with sqlite3.connect(cursor_path) as connection:
+        connection.execute(
+            "UPDATE processed_projection_events SET event_fingerprint = '' "
+            "WHERE event_id = ?",
+            (str(event.event_id),),
+        )
+
+    result = MinibookProjector(client, store).project(event)
+
+    assert result.outcome == "quarantined"
+    assert client.list_projects() == []
+    quarantine = store.list_quarantine()
+    assert quarantine[0].reason == "unverifiable_legacy_event_fingerprint"
+    assert quarantine[0].retryable is False
+
+
+class BlockingProjectionUpsertClient:
+    def __init__(self, delegate: MinibookClient) -> None:
+        self.delegate = delegate
+        self.upsert_started = Event()
+        self.release_upsert = Event()
+
+    def upsert_projection_post(self, *args: object, **kwargs: object) -> dict[str, Any]:
+        self.upsert_started.set()
+        assert self.release_upsert.wait(timeout=5)
+        return self.delegate.upsert_projection_post(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.delegate, name)
+
+
+def test_expired_lower_writer_cannot_overwrite_newer_remote_subject_version(
+    tmp_path: Path,
+    projection_api: tuple[TestClient, MinibookClient],
+) -> None:
+    http, client = projection_api
+    lower, newer = load_events()[:2]
+    cursor_path = tmp_path / "cursor.db"
+    now = [datetime(2026, 7, 18, tzinfo=timezone.utc)]
+
+    def clock() -> datetime:
+        return now[0]
+
+    blocked_client = BlockingProjectionUpsertClient(client)
+    writer_a = MinibookProjector(
+        blocked_client,
+        ProjectionCursorStore(cursor_path, clock=clock),
+        claim_ttl=timedelta(seconds=5),
+    )
+    writer_b = MinibookProjector(
+        MinibookClient(
+            "http://127.0.0.1",
+            client._headers["Authorization"].removeprefix("Bearer "),
+            client=http,
+        ),
+        ProjectionCursorStore(cursor_path, clock=clock),
+        claim_ttl=timedelta(seconds=5),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        stale_future = pool.submit(writer_a.project, lower)
+        assert blocked_client.upsert_started.wait(timeout=5)
+        now[0] += timedelta(seconds=6)
+        newer_result = pool.submit(writer_b.project, newer).result(timeout=5)
+        blocked_client.release_upsert.set()
+        stale_result = stale_future.result(timeout=5)
+
+    project = writer_b.ensure_projection_project()
+    posts = client.list_posts(project["id"])
+    assert newer_result.outcome == "projected"
+    assert stale_result.outcome == "quarantined"
+    assert len(posts) == 1
+    assert f"captain-event:{newer.event_id}" in posts[0]["tags"]
+    assert f"captain-version:{newer.subject_version}" in posts[0]["tags"]
+
+
+def test_different_subject_projectors_create_one_projection_project_concurrently(
+    tmp_path: Path,
+    projection_api: tuple[TestClient, MinibookClient],
+) -> None:
+    http, client = projection_api
+    first_event, second_event = load_events()[:2]
+    second_event = second_event.model_copy(
+        update={"subject_id": f"subject:{uuid4()}", "subject_version": 1}
+    )
+    other = MinibookClient(
+        "http://127.0.0.1",
+        client._headers["Authorization"].removeprefix("Bearer "),
+        client=http,
+    )
+    first_projector = MinibookProjector(
+        client,
+        ProjectionCursorStore(tmp_path / "first-cursor.db"),
+    )
+    second_projector = MinibookProjector(
+        other,
+        ProjectionCursorStore(tmp_path / "second-cursor.db"),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(first_projector.project, first_event)
+        second = pool.submit(second_projector.project, second_event)
+        outcomes = {first.result(timeout=5).outcome, second.result(timeout=5).outcome}
+
+    assert outcomes == {"projected"}
+    assert len(client.list_projects()) == 1
+    assert len(client.list_posts("captain-runtime-projection-v2")) == 2

@@ -28,7 +28,7 @@
 
 - [ ] Write failing parameterized tests rejecting keys matching `token`, `password`, `secret`, `holdout`, `prompt`, and unrestricted absolute paths at any nesting depth.
 - [ ] Run focused tests; expect import failure.
-- [ ] Implement a strict allow-list projection model containing correlation ID, batch ID/version, public title/status, assignee display name, artifact digest, and evidence summary only.
+- [ ] Implement the v2 fail-closed projection model containing correlation ID, typed subject/batch references and versions, enumerated template/status/actor IDs, and content-addressed artifact digests only. Producers supply no display text.
 - [ ] Prove the fixture round trips and forbidden fields fail closed.
 - [ ] Commit with `feat: define redacted minibook projection events`.
 
@@ -44,7 +44,7 @@
 
 - [ ] Write tests using a real temporary SQLite cursor store and an in-process Minibook API test app.
 - [ ] Prove duplicate event IDs are no-ops, stale versions are quarantined, and a crash after remote update but before cursor commit converges on replay.
-- [ ] Implement correlation tags and event IDs in Minibook post metadata/tags; search before create and compare content hash before update.
+- [ ] Implement correlation tags plus a typed Minibook upsert with deterministic project identity and a persistent monotonic subject-version fence, so lease-expired writers cannot duplicate or overwrite a newer remote view.
 - [ ] Run focused tests; expect PASS.
 - [ ] Commit with `feat: make minibook projection replayable`.
 

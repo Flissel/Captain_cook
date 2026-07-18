@@ -13,7 +13,14 @@ from uuid import uuid4
 from .minibook_events import MinibookProjectionEvent
 
 
-ClaimOutcome = Literal["acquired", "duplicate", "stale", "busy", "conflict"]
+ClaimOutcome = Literal[
+    "acquired",
+    "duplicate",
+    "stale",
+    "busy",
+    "conflict",
+    "unverifiable",
+]
 
 
 @dataclass(frozen=True)
@@ -146,9 +153,10 @@ class ProjectionCursorStore:
                 ).fetchone()
                 if processed is not None:
                     stored = str(processed["event_fingerprint"])
-                    outcome: ClaimOutcome = (
-                        "conflict" if stored and stored != fingerprint else "duplicate"
-                    )
+                    if not stored:
+                        outcome: ClaimOutcome = "unverifiable"
+                    else:
+                        outcome = "conflict" if stored != fingerprint else "duplicate"
                     connection.commit()
                     return ClaimResult(outcome)
 
@@ -361,6 +369,8 @@ class ProjectionCursorStore:
             raise StaleProjectionVersion(event.subject_id)
         if claim.outcome == "conflict":
             raise ValueError("conflicting event payload for processed event ID")
+        if claim.outcome == "unverifiable":
+            raise ValueError("legacy event fingerprint is unverifiable")
         if claim.outcome == "busy":
             raise LostProjectionClaim(str(event.event_id))
         if claim.outcome == "acquired":

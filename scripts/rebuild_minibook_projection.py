@@ -54,6 +54,7 @@ class CaptainProjectionFeed:
         self._client = client or httpx.Client(timeout=10.0)
         self._owns_client = client is None
         self._page_size = page_size
+        self.last_cursor: str | None = None
 
     def iter_pages(self, *, cursor: str | None = None) -> Iterator[ProjectionFeedPage]:
         seen_cursors: set[str] = set()
@@ -88,6 +89,7 @@ class CaptainProjectionFeed:
                 cursor=raw_cursor,
                 has_more=has_more,
             )
+            self.last_cursor = raw_cursor
             if not has_more:
                 return
             seen_cursors.add(raw_cursor)
@@ -184,6 +186,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             events = list(feed.iter_events(cursor=None))
             report = projector.reconcile(events, apply=args.apply)
+            if args.apply and feed.last_cursor is not None:
+                cursor_store.set_feed_cursor(feed.last_cursor)
             output = asdict(report)
             output["total_changes"] = report.total_changes
             output["mode"] = "full-rebuild" if args.apply else "dry-run"

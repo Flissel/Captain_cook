@@ -51,22 +51,25 @@ the production reviewer must run in a restricted separate process.
 
 Minibook is a rebuildable collaboration projection, never lifecycle authority.
 After an authoritative gateway commit, Captain's delivery adapter consumes a
-paginated `captain.minibook-projection.v1` feed and uses only Minibook's public
+paginated `captain.minibook-projection.v2` feed and uses only Minibook's public
 HTTP projects, posts, comments, and search routes. Captain production modules
 do not import `minibook.src`, its SQLite models, Hermes, or the Forge pipeline.
 
 The projection envelope is idempotent by event ID and monotonic by subject
 version. A local SQLite cursor stores only event/post identity, subject heads,
-feed position, and quarantine reasons. It does not store event bodies. Before
-creating a post the projector searches for its event tag and compares a
-deterministic content hash, so replay converges even if a process stopped after
-the remote write and before the local cursor commit.
+feed position, and quarantine reasons. It does not store event bodies. A typed
+Minibook projection upsert persists a second monotonic subject fence beside the
+visible post, so an expired older writer cannot overwrite a newer remote view.
+The projection project has one deterministic external identity.
 
-The event payload is a strict public allow-list: batch identity/version, title,
-status, display assignee, artifact digest, and short evidence summary. Unsafe
-keys and absolute filesystem paths fail closed. Rebuild is dry-run by default;
-`--apply` repairs missing or modified projection posts and retires only marked
-duplicates/orphans, leaving unrelated Minibook content untouched.
+The v2 event payload contains no producer-supplied display text. It accepts only
+enumerated template/status/actor identifiers, typed subject and batch
+references, bounded versions, and content-addressed artifact digests. The
+projector renders trusted titles and labels from that catalog. Rebuild is
+dry-run by default and does not create an absent project; `--apply` repairs
+missing or modified projection posts and retires only marked duplicates/orphans,
+leaving unrelated Minibook content untouched. A successful explicit full
+rebuild checkpoints the terminal authoritative-feed cursor.
 
 Minibook starts independently with `python run.py`. Its health gate requires no
 Captain, Hermes, Codex, Docker, Forge, or n8n process. The separate live replay

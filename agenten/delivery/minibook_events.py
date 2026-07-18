@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from typing import Any, Literal
 from uuid import UUID
 
@@ -11,6 +10,7 @@ from pydantic import (
     Field,
     StringConstraints,
     field_validator,
+    model_validator,
 )
 from typing_extensions import Annotated
 
@@ -26,31 +26,62 @@ ProjectionEventType = Literal[
     "replanning.requested",
 ]
 ProjectionView = Literal["project", "plan", "blueprint", "build", "validation"]
-NonEmptyText = Annotated[
+ProjectionTemplateId = Literal[
+    "runtime_plan_requested",
+    "runtime_plan_published",
+    "runtime_blueprint_published",
+    "runtime_build_running",
+    "runtime_build_recorded",
+    "automation_evidence_recorded",
+    "runtime_validation_recorded",
+    "runtime_replanning_requested",
+]
+ProjectionStatusId = Literal[
+    "requested",
+    "planned",
+    "ready",
+    "running",
+    "built",
+    "observed",
+    "validated",
+    "replanning",
+]
+ActorRoleId = Literal["captain_planner", "codex_worker"]
+SubjectReference = Annotated[
     str,
-    StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
+    StringConstraints(
+        pattern=r"^subject:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    ),
+]
+BatchReference = Annotated[
+    str,
+    StringConstraints(
+        pattern=r"^batch:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    ),
 ]
 ArtifactDigest = Annotated[str, StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$")]
 
-_FORBIDDEN_KEY_PARTS = ("token", "password", "secret", "holdout", "prompt", "transcript")
-_PRIVATE_VALUE_PATTERNS = (
-    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"),
-    re.compile(
-        r"(?i)\b(?:authorization|api[_-]?key|auth[_-]?token|token|password|passwd|credential|secret)"
-        r"\s*[:=]\s*[^\s,;]+"
+_EVENT_CATALOG: dict[
+    ProjectionEventType,
+    tuple[ProjectionView, ProjectionTemplateId, ProjectionStatusId],
+] = {
+    "plan.requested": ("project", "runtime_plan_requested", "requested"),
+    "plan.published": ("plan", "runtime_plan_published", "planned"),
+    "blueprint.published": ("blueprint", "runtime_blueprint_published", "ready"),
+    "codex.running": ("build", "runtime_build_running", "running"),
+    "codex.result": ("build", "runtime_build_recorded", "built"),
+    "n8n.evidence": ("build", "automation_evidence_recorded", "observed"),
+    "validation.recorded": (
+        "validation",
+        "runtime_validation_recorded",
+        "validated",
     ),
-    re.compile(
-        r"(?i)\b(?:raw[\s_-]*(?:system[\s_-]*)?prompt|raw[\s_-]*transcript|"
-        r"complete[\s_-]*log|holdout(?:[\s_-]*(?:body|case|suite))?)\b"
+    "replanning.requested": (
+        "plan",
+        "runtime_replanning_requested",
+        "replanning",
     ),
-)
-_PATH_VALUE_PATTERNS = (
-    re.compile(r"(?i)file://"),
-    re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/][^\s]+"),
-    re.compile(r"\\\\[^\\\s]+\\[^\s]+"),
-    re.compile(r"(?<![A-Za-z0-9\\])\\(?:[^\\\s]+\\)+[^\\\s]+"),
-    re.compile(r"(?<![:/A-Za-z0-9])/(?!/)[^\s/]+(?:/[^\s/]+)*"),
-)
+}
 
 
 class MinibookProjectionPayload(BaseModel):
@@ -59,41 +90,17 @@ class MinibookProjectionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     view: ProjectionView
-    batch_id: NonEmptyText | None = None
+    template_id: ProjectionTemplateId
+    status_id: ProjectionStatusId
+    batch_id: BatchReference | None = None
     batch_version: int | None = Field(default=None, ge=1)
-    public_title: NonEmptyText
-    status: NonEmptyText
-    assignee_display_name: NonEmptyText | None = None
+    actor_role_id: ActorRoleId | None = None
     artifact_digest: ArtifactDigest | None = None
-    evidence_summary: Annotated[
-        str,
-        StringConstraints(strip_whitespace=True, min_length=1, max_length=500),
-    ] | None = None
-
-
-def _reject_forbidden_projection_data(value: object, *, location: str = "payload") -> None:
-    if isinstance(value, dict):
-        for key, nested in value.items():
-            normalized_key = str(key).casefold()
-            if any(part in normalized_key for part in _FORBIDDEN_KEY_PARTS):
-                raise ValueError(f"forbidden projection key at {location}.{key}")
-            _reject_forbidden_projection_data(nested, location=f"{location}.{key}")
-        return
-    if isinstance(value, (list, tuple)):
-        for index, nested in enumerate(value):
-            _reject_forbidden_projection_data(nested, location=f"{location}[{index}]")
-        return
-    if isinstance(value, str):
-        if any(pattern.search(value) for pattern in _PRIVATE_VALUE_PATTERNS):
-            raise ValueError(f"private projection value at {location}")
-        if any(pattern.search(value) for pattern in _PATH_VALUE_PATTERNS):
-            raise ValueError(f"absolute paths are forbidden at {location}")
 
 
 def redact_projection_payload(payload: dict[str, object]) -> MinibookProjectionPayload:
-    """Validate the redacted allow-list, failing closed on unsafe input."""
+    """Validate the structured public contract, failing closed on free text."""
 
-    _reject_forbidden_projection_data(payload)
     return MinibookProjectionPayload.model_validate(payload)
 
 
@@ -102,7 +109,7 @@ class MinibookProjectionEvent(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
 
-    schema_name: Literal["captain.minibook-projection.v1"] = Field(
+    schema_name: Literal["captain.minibook-projection.v2"] = Field(
         alias="schema",
         serialization_alias="schema",
     )
@@ -111,16 +118,10 @@ class MinibookProjectionEvent(BaseModel):
     causation_id: UUID | None
     occurred_at: AwareDatetime
     producer: Literal["captain-gateway"]
-    subject_id: NonEmptyText
+    subject_id: SubjectReference
     subject_version: int = Field(ge=1)
     event_type: ProjectionEventType
     payload: MinibookProjectionPayload
-
-    @field_validator("subject_id")
-    @classmethod
-    def validate_public_subject_id(cls, value: str) -> str:
-        _reject_forbidden_projection_data(value, location="subject_id")
-        return value
 
     @field_validator("payload", mode="before")
     @classmethod
@@ -130,3 +131,15 @@ class MinibookProjectionEvent(BaseModel):
         if not isinstance(value, dict):
             raise ValueError("projection payload must be an object")
         return redact_projection_payload(value)
+
+    @model_validator(mode="after")
+    def validate_catalog_entry(self) -> "MinibookProjectionEvent":
+        expected = _EVENT_CATALOG[self.event_type]
+        actual = (
+            self.payload.view,
+            self.payload.template_id,
+            self.payload.status_id,
+        )
+        if actual != expected:
+            raise ValueError("projection template/status does not match event type")
+        return self
