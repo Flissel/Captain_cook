@@ -82,7 +82,7 @@ The bootstrap command generates missing local-only secrets with a
 cryptographically secure generator and writes them only to a gitignored
 `.env.captain-n8n` file with restrictive filesystem permissions where the
 platform supports them. It creates the local owner account
-`captain@local` using the pinned n8n version's supported first-run setup
+`captain@local.test` using the pinned n8n version's supported first-run setup
 surface, never by modifying n8n database rows directly.
 
 After owner setup, the bootstrap creates or verifies a dedicated Captain API

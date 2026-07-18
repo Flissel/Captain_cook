@@ -112,7 +112,7 @@ git commit -m "feat: add isolated captain n8n stack"
 **Interfaces:**
 - Consumes: `scripts/captain-n8n.ps1 -Action init|start|bootstrap|status|stop`.
 - Produces: a gitignored `.env.captain-n8n`, healthy Captain-owned resources,
-  the `captain@local` owner, and `CAPTAIN_N8N_API_KEY` only in that environment file.
+  the `captain@local.test` owner, and `CAPTAIN_N8N_API_KEY` only in that environment file.
 
 - [ ] **Step 1: Write static and argument-construction tests**
 
@@ -123,7 +123,7 @@ def test_lifecycle_script_scopes_every_compose_call() -> None:
     assert "-f $ComposeFile" in source
     assert "down -v" not in source.lower()
     assert "vibemind-n8n" not in source.lower()
-    assert "captain@local" in source
+    assert "captain@local.test" in source
     assert "ConvertTo-SecureString" in source
 
 def test_bootstrap_never_echoes_secret_values() -> None:
