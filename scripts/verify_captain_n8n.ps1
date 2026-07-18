@@ -125,6 +125,6 @@ $workflowStatus = Invoke-StatusRequest `
     -EndpointIdentity "workflows" `
     -Headers @{ "X-N8N-API-KEY" = $apiKey }
 
-Write-Output "endpoint=project:captain-n8n-builder status=ok"
+Write-Output "endpoint=mode:captain-builder identity=$baseUrl status=ok"
 Write-Output "endpoint=healthz status=$healthStatus"
 Write-Output "endpoint=workflows status=$workflowStatus"

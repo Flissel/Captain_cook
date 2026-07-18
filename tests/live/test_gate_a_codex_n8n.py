@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -16,6 +17,7 @@ from uuid import uuid4
 import httpx
 import pytest
 
+from agenten.agent_runtime.n8n_endpoint import resolve_n8n_endpoint
 from agenten.delivery.codex_runs import GatewayCodexRunRepository
 from agenten.delivery.gateway_client import GatewayDeliveryClient
 from agenten.execution.codex_policy import CodexExecutionPolicy
@@ -34,6 +36,7 @@ def _secret(name: str) -> str | None:
     if value:
         return value
     for env_path in (
+        Path(__file__).resolve().parents[2] / ".env.captain-n8n",
         Path(__file__).resolve().parents[2] / ".env",
         Path(__file__).resolve().parents[3] / ".env",
     ):
@@ -104,12 +107,25 @@ class _ForbiddenLegacyWriter:
 
 @pytest.mark.live
 @pytest.mark.asyncio
-async def test_gate_a_real_codex_n8n_gateway_trace() -> None:
-    # This credential gate is intentionally first: no process, HTTP, DB, or file
-    # side effect may occur when the externally owned n8n credential is absent.
-    api_key = _required(
-        "N8N_API_KEY",
-        "N8N_API_KEY for existing VibeMind n8n",
+async def test_gate_a_real_codex_n8n_gateway_trace(
+    record_property: Callable[[str, object], None],
+) -> None:
+    captain_port = _required(
+        "CAPTAIN_N8N_PORT",
+        "CAPTAIN_N8N_PORT for isolated Captain builder",
+    )
+    endpoint = resolve_n8n_endpoint(
+        {
+            "N8N_MODE": "captain-builder",
+            "CAPTAIN_N8N_URL": (
+                _secret("CAPTAIN_N8N_URL")
+                or f"http://127.0.0.1:{captain_port}"
+            ),
+            "CAPTAIN_N8N_API_KEY": _required(
+                "CAPTAIN_N8N_API_KEY",
+                "CAPTAIN_N8N_API_KEY for isolated Captain builder",
+            ),
+        }
     )
     ledger_dsn = _required(
         "TEST_MARIADB_DSN",
@@ -135,6 +151,7 @@ async def test_gate_a_real_codex_n8n_gateway_trace() -> None:
     worker_token = secrets.token_urlsafe(32)
     gateway_port = _free_port()
     gateway_base = f"http://127.0.0.1:{gateway_port}"
+    gateway_delivery_event_id = uuid4()
 
     gateway_env = os.environ.copy()
     gateway_env.update(
@@ -295,12 +312,7 @@ async def test_gate_a_real_codex_n8n_gateway_trace() -> None:
 
                 async with httpx.AsyncClient(timeout=30) as n8n_http:
                     target = N8nTarget(
-                        N8nHttpClient(
-                            api_base_url="http://localhost:15678",
-                            webhook_base_url="http://localhost:15678",
-                            api_key=api_key,
-                            http=n8n_http,
-                        )
+                        N8nHttpClient.from_endpoint(endpoint, n8n_http)
                     )
                     deployment = await target.deploy(artifact)
                     execution = await target.execute(
@@ -381,7 +393,7 @@ async def test_gate_a_real_codex_n8n_gateway_trace() -> None:
                         },
                     },
                     {
-                        "event_id": uuid4(),
+                        "event_id": gateway_delivery_event_id,
                         "event_type": "e2e_run",
                         "occurred_at": now,
                         "actor": worker_id,
@@ -419,6 +431,24 @@ async def test_gate_a_real_codex_n8n_gateway_trace() -> None:
             assert session_id in serialized
             assert artifact_digest in serialized
             assert run_id in serialized
+            assert str(gateway_delivery_event_id) in serialized
+            assert endpoint.mode == "captain-builder"
+            assert endpoint.api_base_url in {
+                _secret("CAPTAIN_N8N_URL"),
+                f"http://127.0.0.1:{captain_port}",
+            }
+            record_property(
+                "n8n_target_identity",
+                f"{endpoint.mode}:{endpoint.api_base_url}",
+            )
+            record_property("workflow_id", deployment.workflow_id)
+            record_property("execution_id", execution.execution_id)
+            record_property("artifact_digest", artifact_digest)
+            record_property("correlation_id", correlation_id)
+            record_property(
+                "gateway_delivery_event_id",
+                str(gateway_delivery_event_id),
+            )
             assert {
                 event.event_type for event in events
             }.issuperset(
@@ -436,8 +466,8 @@ async def test_gate_a_real_codex_n8n_gateway_trace() -> None:
         cleanup_errors: list[str] = []
         if deployment is not None:
             with httpx.Client(
-                base_url="http://localhost:15678",
-                headers={"X-N8N-API-KEY": api_key},
+                base_url=endpoint.api_base_url,
+                headers={"X-N8N-API-KEY": endpoint.api_key},
                 timeout=10,
             ) as cleanup:
                 for operation, path in (
