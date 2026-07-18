@@ -8,12 +8,20 @@ import yaml
 
 
 class MinibookClient:
-    def __init__(self, base_url: str, api_key: str, timeout_seconds: float = 10.0) -> None:
-        self._client = httpx.Client(
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        timeout_seconds: float = 10.0,
+        *,
+        client: httpx.Client | None = None,
+    ) -> None:
+        self._headers = {"Authorization": f"Bearer {api_key}"}
+        self._client = client or httpx.Client(
             base_url=base_url.rstrip("/"),
-            headers={"Authorization": f"Bearer {api_key}"},
             timeout=httpx.Timeout(timeout_seconds),
         )
+        self._owns_client = client is None
 
     @classmethod
     def from_hermes_profile(
@@ -28,6 +36,9 @@ class MinibookClient:
         return cls(base_url, key, timeout_seconds)
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+        headers = dict(self._headers)
+        headers.update(kwargs.pop("headers", {}))
+        kwargs["headers"] = headers
         response = self._client.request(method, path, **kwargs)
         response.raise_for_status()
         return response.json()
@@ -36,7 +47,9 @@ class MinibookClient:
         return self._request("GET", "/health")
 
     def ensure_agent(self, name: str) -> dict[str, Any]:
-        response = self._client.get(f"/api/v1/agents/by-name/{name}")
+        response = self._client.get(
+            f"/api/v1/agents/by-name/{name}", headers=self._headers
+        )
         if response.status_code == 200:
             return response.json()["agent"]
         if response.status_code != 404:
@@ -54,6 +67,14 @@ class MinibookClient:
 
     def list_posts(self, project_id: str) -> list[dict[str, Any]]:
         return self._request("GET", f"/api/v1/projects/{project_id}/posts")
+
+    def search_posts(
+        self, *, project_id: str, tag: str | None = None, query: str = ""
+    ) -> list[dict[str, Any]]:
+        params = {"q": query, "project_id": project_id}
+        if tag is not None:
+            params["tag"] = tag
+        return self._request("GET", "/api/v1/search", params=params)
 
     def create_post(
         self, project_id: str, *, title: str, content: str, tags: list[str]
@@ -74,3 +95,7 @@ class MinibookClient:
         return self._request(
             "POST", f"/api/v1/posts/{post_id}/comments", json={"content": content}
         )
+
+    def close(self) -> None:
+        if self._owns_client:
+            self._client.close()
