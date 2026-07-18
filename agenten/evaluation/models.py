@@ -208,6 +208,27 @@ class ReviewReceipt(BaseModel):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class EvaluationSliceReceipt(BaseModel):
+    """Durable proof that one bounded Society slice consumed run budget."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    run_id: str = Field(min_length=1)
+    slice_index: int = Field(ge=1)
+    slice_kind: Literal["inventory", "component", "qa"]
+    component_key: str | None = None
+    revision: int | None = Field(default=None, ge=1, le=3)
+
+    @model_validator(mode="after")
+    def has_kind_specific_identity(self) -> "EvaluationSliceReceipt":
+        if self.slice_kind == "inventory":
+            if self.component_key is not None or self.revision is not None:
+                raise ValueError("inventory slice cannot name a component revision")
+        elif self.component_key is None or self.revision is None:
+            raise ValueError("component and QA slices require a component revision")
+        return self
+
+
 class EvaluationManifest(BaseModel):
     """Final redacted evidence projection, never a lifecycle authority."""
 

@@ -259,3 +259,71 @@ async def test_store_persists_ordered_atomic_evaluation_artifacts(tmp_path: Path
     assert not list(run_dir.rglob("*.tmp"))
     assert json.loads((run_dir / "run-manifest.json").read_text("utf-8"))["status"] == "accepted"
     assert manifest.artifact_digests
+
+
+@pytest.mark.asyncio
+async def test_finalize_persists_unresolved_component_without_candidate_or_review(tmp_path: Path) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    run = await store.create_run(_source(), run_id="eval-001", idempotency_key="input-v1")
+    await store.stage_inventory(
+        run.run_id,
+        ComponentInventoryCandidate(
+            inventory_id="inventory-001",
+            source=run.source,
+            source_citations=("block-0001",),
+            components=(_candidate(),),
+        ),
+    )
+
+    manifest = await store.finalize(
+        run.run_id,
+        {"delivery-api": EvaluationOutcome.UNRESOLVED},
+    )
+
+    outcome = manifest.component_outcomes[0]
+    assert manifest.status is EvaluationStatus.PARTIAL
+    assert outcome.outcome is EvaluationOutcome.UNRESOLVED
+    assert outcome.candidate is None
+    assert outcome.review is None
+
+
+@pytest.mark.asyncio
+async def test_store_enforces_persisted_round_limit_without_tool_service(tmp_path: Path) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    run = await store.create_run(
+        _source(),
+        run_id="eval-001",
+        idempotency_key="input-v1",
+        max_rounds=1,
+    )
+    await store.stage_inventory(
+        run.run_id,
+        ComponentInventoryCandidate(
+            inventory_id="inventory-001",
+            source=run.source,
+            source_citations=("block-0001",),
+            components=(_candidate(),),
+        ),
+    )
+
+    with pytest.raises(EvaluationConflictError, match="round limit"):
+        await store.stage_candidate(run.run_id, _candidate(revision=2))
+    with pytest.raises(EvaluationConflictError, match="round limit"):
+        await store.record_review(
+            run.run_id,
+            QaReview(
+                component_key="delivery-api",
+                revision=2,
+                decision="approved",
+                score=7,
+                defect_codes=(),
+                revision_requests=(),
+            ),
+        )
+    with pytest.raises(EvaluationConflictError, match="round limit"):
+        await store.consume_slice(
+            run.run_id,
+            slice_kind="component",
+            component_key="delivery-api",
+            revision=2,
+        )

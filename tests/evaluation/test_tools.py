@@ -170,3 +170,21 @@ async def test_tool_service_validates_citations_and_qa_rubric_before_store_calls
 
     with pytest.raises(EvaluationToolError, match="unknown_rubric_code"):
         await service.record_qa_review("eval-001", invalid_review)
+
+
+@pytest.mark.asyncio
+async def test_tool_service_enforces_run_specific_one_round_ceiling(tmp_path: Path) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    run = await store.create_run(
+        _source(),
+        run_id="eval-001",
+        idempotency_key="input-v1",
+        max_rounds=1,
+    )
+    service = EvaluationToolService(store)
+    inventory = _inventory(_candidate())
+    await service.stage_component_inventory(run.run_id, inventory)
+    await service.stage_component_plan(run.run_id, _candidate())
+
+    with pytest.raises(EvaluationToolError, match="one-round ceiling"):
+        await service.stage_component_plan(run.run_id, _candidate(revision=2))

@@ -21,6 +21,7 @@ from .models import (
     EvaluationManifest,
     EvaluationOutcome,
     EvaluationRun,
+    EvaluationSliceReceipt,
     EvaluationStatus,
     EvaluationSource,
     InventoryReceipt,
@@ -84,11 +85,16 @@ class JsonEvaluationStore:
     async def stage_candidate(self, run_id: str, candidate: ComponentPlanCandidate) -> CandidateReceipt:
         self._safe_id(candidate.component_key)
         async with self._lock:
-            self._read_run(run_id)
+            run = self._read_run(run_id)
+            if candidate.revision > run.max_rounds:
+                raise EvaluationConflictError("candidate revision exceeds the persisted round limit")
             inventory = self._read_model(self._run_dir(run_id) / "component-inventory.json", ComponentInventoryCandidate)
             candidate = redact_model(candidate)
             if not any(declared.component_key == candidate.component_key for declared in inventory.components):
                 raise EvaluationConflictError("candidate does not belong to declared inventory")
+            if candidate.revision > 1:
+                previous = self._run_dir(run_id) / "candidates" / candidate.component_key / f"revision-{candidate.revision - 1}.json"
+                self._read_model(previous, ComponentPlanCandidate)
             relative = f"candidates/{candidate.component_key}/revision-{candidate.revision}.json"
             stored = self._write_model(self._run_dir(run_id) / relative, candidate)
         return CandidateReceipt(run_id=run_id, component_key=candidate.component_key, revision=candidate.revision, artifact_reference=relative, sha256=_digest(stored))
@@ -97,13 +103,49 @@ class JsonEvaluationStore:
         self._safe_id(run_id)
         self._safe_id(review.component_key)
         async with self._lock:
-            self._read_run(run_id)
+            run = self._read_run(run_id)
+            if review.revision > run.max_rounds:
+                raise EvaluationConflictError("QA revision exceeds the persisted round limit")
             candidate_path = self._run_dir(run_id) / "candidates" / review.component_key / f"revision-{review.revision}.json"
             self._read_model(candidate_path, ComponentPlanCandidate)
             review = redact_model(review)
             relative = f"qa-reviews/{review.component_key}/revision-{review.revision}.json"
             stored = self._write_model(self._run_dir(run_id) / relative, review)
         return ReviewReceipt(run_id=run_id, component_key=review.component_key, revision=review.revision, artifact_reference=relative, sha256=_digest(stored))
+
+    async def consume_slice(
+        self,
+        run_id: str,
+        *,
+        slice_kind: str,
+        component_key: str | None = None,
+        revision: int | None = None,
+    ) -> EvaluationSliceReceipt:
+        """Atomically consume one run-budget slot before starting Society work."""
+
+        async with self._lock:
+            run = self._read_run(run_id)
+            if component_key is not None:
+                self._safe_id(component_key)
+            if revision is not None and revision > run.max_rounds:
+                raise EvaluationConflictError("slice revision exceeds the persisted round limit")
+            index = self._consumed_slice_count(run_id) + 1
+            if index > run.max_calls:
+                raise EvaluationConflictError("evaluation call budget is exhausted")
+            receipt = EvaluationSliceReceipt(
+                run_id=run_id,
+                slice_index=index,
+                slice_kind=slice_kind,
+                component_key=component_key,
+                revision=revision,
+            )
+            relative = f"slices/slice-{index:04d}.json"
+            stored = self._write_model(self._run_dir(run_id) / relative, receipt)
+        return EvaluationSliceReceipt.model_validate_json(stored)
+
+    def consumed_slice_count(self, run_id: str) -> int:
+        self._safe_id(run_id)
+        return self._consumed_slice_count(run_id)
 
     async def finalize(
         self,
@@ -122,7 +164,7 @@ class JsonEvaluationStore:
             if set(requested) != expected_keys:
                 raise EvaluationConflictError("component outcomes must cover the staged inventory exactly")
             components = tuple(
-                self._staged_component_outcome(run_id, candidate, requested[candidate.component_key])
+                self._staged_component_outcome(run, candidate, requested[candidate.component_key])
                 for candidate in inventory.components
             )
             status = _status_for_components(components)
@@ -135,33 +177,82 @@ class JsonEvaluationStore:
                 component_outcomes=components,
                 artifact_digests=digests,
             )
+            report = render_evaluation_markdown(manifest).encode("utf-8")
+            self._write_bytes(self._run_dir(run_id) / "evaluation.md", report)
             stored = self._write_model(self._run_dir(run_id) / "run-manifest.json", manifest)
             persisted = EvaluationManifest.model_validate_json(stored)
-            self._write_bytes(self._run_dir(run_id) / "evaluation.md", render_evaluation_markdown(persisted).encode("utf-8"))
         return persisted
 
-    def _staged_component_outcome(self, run_id: str, inventory_candidate: ComponentPlanCandidate, outcome: EvaluationOutcome) -> ComponentOutcome:
+    async def load_manifest(self, run_id: str) -> EvaluationManifest:
+        """Validate a finalized projection and recover its deterministic report."""
+
+        async with self._lock:
+            run = self._read_run(run_id)
+            inventory = self._read_model(self._run_dir(run_id) / "component-inventory.json", ComponentInventoryCandidate)
+            manifest = self._read_model(self._run_dir(run_id) / "run-manifest.json", EvaluationManifest)
+            if manifest.run_id != run.run_id or manifest.idempotency_key != run.idempotency_key or manifest.source != run.source:
+                raise EvaluationConflictError("run manifest identity does not match source manifest")
+            outcomes_by_key = {component.component_key: component for component in manifest.component_outcomes}
+            expected_keys = {candidate.component_key for candidate in inventory.components}
+            if set(outcomes_by_key) != expected_keys:
+                raise EvaluationConflictError("run manifest does not cover the staged inventory")
+            expected_components = tuple(
+                self._staged_component_outcome(
+                    run,
+                    candidate,
+                    outcomes_by_key[candidate.component_key].outcome,
+                )
+                for candidate in inventory.components
+            )
+            if manifest.component_outcomes != expected_components:
+                raise EvaluationConflictError("run manifest component evidence is inconsistent")
+            if manifest.status != _status_for_components(expected_components):
+                raise EvaluationConflictError("run manifest status is inconsistent")
+            if manifest.artifact_digests != tuple(self._artifact_digests(run_id)):
+                raise EvaluationConflictError("run manifest artifact digests are inconsistent")
+            self._write_bytes(
+                self._run_dir(run_id) / "evaluation.md",
+                render_evaluation_markdown(manifest).encode("utf-8"),
+            )
+        return manifest
+
+    def _staged_component_outcome(
+        self,
+        run: EvaluationRun,
+        inventory_candidate: ComponentPlanCandidate,
+        outcome: EvaluationOutcome,
+    ) -> ComponentOutcome:
         self._safe_id(inventory_candidate.component_key)
-        first_path = self._run_dir(run_id) / "candidates" / inventory_candidate.component_key / "revision-1.json"
-        first_candidate = self._read_model(first_path, ComponentPlanCandidate)
-        if first_candidate != inventory_candidate:
-            raise EvaluationConflictError("candidate artifact does not match staged inventory")
-        candidate = first_candidate
-        for revision in range(2, 4):
-            candidate_path = self._run_dir(run_id) / "candidates" / inventory_candidate.component_key / f"revision-{revision}.json"
+        candidate: ComponentPlanCandidate | None = None
+        for revision in range(1, run.max_rounds + 1):
+            candidate_path = self._run_dir(run.run_id) / "candidates" / inventory_candidate.component_key / f"revision-{revision}.json"
             if not candidate_path.is_file():
                 break
             candidate = self._read_model(candidate_path, ComponentPlanCandidate)
-        review_path = self._run_dir(run_id) / "qa-reviews" / candidate.component_key / f"revision-{candidate.revision}.json"
-        review = self._read_model(review_path, QaReview)
-        if outcome == EvaluationOutcome.ACCEPTED and review.decision != "approved":
+            if revision == 1 and candidate != inventory_candidate:
+                raise EvaluationConflictError("candidate artifact does not match staged inventory")
+        review: QaReview | None = None
+        if candidate is not None:
+            review_path = self._run_dir(run.run_id) / "qa-reviews" / candidate.component_key / f"revision-{candidate.revision}.json"
+            if review_path.is_file():
+                review = self._read_model(review_path, QaReview)
+        if outcome == EvaluationOutcome.ACCEPTED and (review is None or review.decision != "approved"):
             raise EvaluationConflictError("accepted component requires an approved persisted QA review")
-        return ComponentOutcome(component_key=candidate.component_key, outcome=outcome, revision=candidate.revision, candidate=candidate, review=review)
+        return ComponentOutcome(
+            component_key=inventory_candidate.component_key,
+            outcome=outcome,
+            revision=candidate.revision if candidate is not None else 1,
+            candidate=candidate,
+            review=review,
+        )
 
     def _artifact_digests(self, run_id: str) -> list[str]:
         run_dir = self._run_dir(run_id)
         paths = sorted(path for path in run_dir.rglob("*.json") if path.name != "run-manifest.json")
         return [f"{path.relative_to(run_dir).as_posix()}:{_digest(path.read_bytes())}" for path in paths]
+
+    def _consumed_slice_count(self, run_id: str) -> int:
+        return len(tuple((self._run_dir(run_id) / "slices").glob("slice-*.json")))
 
     def _read_run(self, run_id: str) -> EvaluationRun:
         self._safe_id(run_id)

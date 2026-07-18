@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 from pathlib import Path
@@ -152,6 +153,19 @@ class QaResumeSociety:
         return "non-authoritative"
 
 
+class CandidateThenCancelSociety:
+    def __init__(self, tools: EvaluationToolService) -> None:
+        self._tools = tools
+
+    async def run(self, *, task: str) -> str:
+        assert task.startswith("COMPONENT_SLICE")
+        await self._tools.stage_component_plan(
+            _field(task, "run_id"),
+            _candidate(revision=int(_field(task, "revision"))),
+        )
+        raise asyncio.CancelledError
+
+
 def _field(task: str, name: str) -> str:
     match = re.search(rf"(?:^|\s){name}=([^\s]+)", task)
     assert match is not None
@@ -163,6 +177,7 @@ def _service(
     decisions: tuple[str, ...],
     *,
     max_calls: int = 10,
+    max_rounds: int = 3,
 ) -> tuple[AgentFarmEvaluationService, ScriptedSociety]:
     store = JsonEvaluationStore(tmp_path)
     tools = EvaluationToolService(store)
@@ -173,7 +188,7 @@ def _service(
         store=store,
         source=_source(),
         idempotency_key="agentfarm-input-v1",
-        max_rounds=3,
+        max_rounds=max_rounds,
         max_calls=max_calls,
         society=society,
     )
@@ -289,3 +304,265 @@ async def test_resume_reviews_persisted_candidate_without_replaying_planner(tmp_
     assert manifest.status is EvaluationStatus.ACCEPTED
     assert society.tasks == ["QA_SLICE run_id=eval-001 component_key=crm revision=1"]
     assert not (tmp_path / "eval-001" / "candidates" / "crm" / "revision-2.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_service_obeys_persisted_two_round_ceiling(tmp_path: Path) -> None:
+    service, society = _service(
+        tmp_path,
+        ("revision_required",) * 3,
+        max_rounds=2,
+    )
+
+    manifest = await service.run("eval-001")
+
+    assert manifest.status is EvaluationStatus.PARTIAL
+    assert manifest.component_outcomes[0].revision == 2
+    assert society.planner_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_candidate_only_cancelled_slice_is_counted_and_resumed_within_budget(tmp_path: Path) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    tools = EvaluationToolService(store)
+    run = await store.create_run(
+        _source(),
+        run_id="eval-001",
+        idempotency_key="agentfarm-input-v1",
+        max_calls=2,
+    )
+    await tools.stage_component_inventory(
+        run.run_id,
+        ComponentInventoryCandidate(
+            inventory_id="inventory-001",
+            source=run.source,
+            source_citations=("block-0001",),
+            components=(_candidate(),),
+        ),
+    )
+    interrupted = AgentFarmEvaluationService(
+        model_client=_model_client(),
+        tools=tools,
+        store=store,
+        society=CandidateThenCancelSociety(tools),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await interrupted.run(run.run_id)
+
+    assert store.consumed_slice_count(run.run_id) == 1
+    qa_society = QaResumeSociety(tools)
+    resumed = AgentFarmEvaluationService(
+        model_client=_model_client(),
+        tools=tools,
+        store=store,
+        society=qa_society,
+    )
+    manifest = await resumed.run(run.run_id)
+    assert manifest.status is EvaluationStatus.ACCEPTED
+    assert store.consumed_slice_count(run.run_id) == 2
+
+
+@pytest.mark.asyncio
+async def test_exhausted_budget_persists_candidate_without_review_as_unresolved(tmp_path: Path) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    tools = EvaluationToolService(store)
+    run = await store.create_run(
+        _source(),
+        run_id="eval-001",
+        idempotency_key="agentfarm-input-v1",
+        max_calls=1,
+    )
+    await tools.stage_component_inventory(
+        run.run_id,
+        ComponentInventoryCandidate(
+            inventory_id="inventory-001",
+            source=run.source,
+            source_citations=("block-0001",),
+            components=(_candidate(),),
+        ),
+    )
+    interrupted = AgentFarmEvaluationService(
+        model_client=_model_client(),
+        tools=tools,
+        store=store,
+        society=CandidateThenCancelSociety(tools),
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await interrupted.run(run.run_id)
+
+    resumed = AgentFarmEvaluationService(
+        model_client=_model_client(),
+        tools=tools,
+        store=store,
+        society=HistoryPoisonSociety(),
+    )
+    manifest = await resumed.run(run.run_id)
+
+    assert manifest.status is EvaluationStatus.PARTIAL
+    assert manifest.component_outcomes[0].outcome is EvaluationOutcome.UNRESOLVED
+    assert manifest.component_outcomes[0].candidate is not None
+    assert manifest.component_outcomes[0].review is None
+    assert store.consumed_slice_count(run.run_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_exhausted_budget_before_component_persists_incomplete_outcome(tmp_path: Path) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    tools = EvaluationToolService(store)
+    run = await store.create_run(
+        _source(),
+        run_id="eval-001",
+        idempotency_key="agentfarm-input-v1",
+        max_calls=1,
+    )
+    await tools.stage_component_inventory(
+        run.run_id,
+        ComponentInventoryCandidate(
+            inventory_id="inventory-001",
+            source=run.source,
+            source_citations=("block-0001",),
+            components=(_candidate(),),
+        ),
+    )
+    await store.consume_slice(run.run_id, slice_kind="inventory")
+    service = AgentFarmEvaluationService(
+        model_client=_model_client(),
+        tools=tools,
+        store=store,
+        society=HistoryPoisonSociety(),
+    )
+
+    manifest = await service.run(run.run_id)
+
+    outcome = manifest.component_outcomes[0]
+    assert manifest.status is EvaluationStatus.PARTIAL
+    assert outcome.outcome is EvaluationOutcome.UNRESOLVED
+    assert outcome.candidate is None
+    assert outcome.review is None
+
+
+def test_service_validates_run_id_before_any_filesystem_lookup(tmp_path: Path) -> None:
+    class LookupGuardStore(JsonEvaluationStore):
+        def _run_dir(self, run_id: str) -> Path:
+            assert ".." not in run_id, "filesystem lookup happened before run_id validation"
+            return super()._run_dir(run_id)
+
+    store = LookupGuardStore(tmp_path)
+    service = AgentFarmEvaluationService(
+        model_client=_model_client(),
+        tools=EvaluationToolService(store),
+        store=store,
+        source=_source(),
+        idempotency_key="agentfarm-input-v1",
+        society=HistoryPoisonSociety(),
+    )
+
+    with pytest.raises(ValueError, match="safe logical identifier"):
+        asyncio.run(service.run("../outside"))
+
+
+@pytest.mark.asyncio
+async def test_existing_manifest_must_match_requested_idempotency_key(tmp_path: Path) -> None:
+    service, _ = _service(tmp_path, ("approved",))
+    await service.run("eval-001")
+    store = JsonEvaluationStore(tmp_path)
+    mismatched = AgentFarmEvaluationService(
+        model_client=_model_client(),
+        tools=EvaluationToolService(store),
+        store=store,
+        source=_source(),
+        idempotency_key="different-input",
+        society=HistoryPoisonSociety(),
+    )
+
+    with pytest.raises(Exception, match="idempotency"):
+        await mismatched.run("eval-001")
+
+
+@pytest.mark.asyncio
+async def test_existing_manifest_must_match_requested_source(tmp_path: Path) -> None:
+    service, _ = _service(tmp_path, ("approved",))
+    await service.run("eval-001")
+    store = JsonEvaluationStore(tmp_path)
+    mismatched = AgentFarmEvaluationService(
+        model_client=_model_client(),
+        tools=EvaluationToolService(store),
+        store=store,
+        source=_source().model_copy(update={"sha256": "b" * 64}),
+        idempotency_key="agentfarm-input-v1",
+        society=HistoryPoisonSociety(),
+    )
+
+    with pytest.raises(Exception, match="source"):
+        await mismatched.run("eval-001")
+
+
+@pytest.mark.asyncio
+async def test_resume_rebuilds_missing_report_from_validated_manifest(tmp_path: Path) -> None:
+    service, _ = _service(tmp_path, ("approved",))
+    expected = await service.run("eval-001")
+    report_path = tmp_path / "eval-001" / "evaluation.md"
+    report_path.unlink()
+    store = JsonEvaluationStore(tmp_path)
+    resumed = AgentFarmEvaluationService(
+        model_client=_model_client(),
+        tools=EvaluationToolService(store),
+        store=store,
+        source=_source(),
+        idempotency_key="agentfarm-input-v1",
+        society=HistoryPoisonSociety(),
+    )
+
+    manifest = await resumed.run("eval-001")
+
+    assert manifest == expected
+    assert report_path.is_file()
+    assert "Acceptance tests are planned" in report_path.read_text("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_resume_completes_finalization_after_manifest_write_failure(tmp_path: Path) -> None:
+    class FailManifestOnceStore(JsonEvaluationStore):
+        failed = False
+
+        def _write_model(self, path: Path, model: object) -> bytes:  # type: ignore[override]
+            if path.name == "run-manifest.json" and not self.failed:
+                self.failed = True
+                raise OSError("simulated manifest write interruption")
+            return super()._write_model(path, model)  # type: ignore[arg-type]
+
+    store = FailManifestOnceStore(tmp_path)
+    tools = EvaluationToolService(store)
+    society = ScriptedSociety(tools, ("approved",))
+    service = AgentFarmEvaluationService(
+        model_client=_model_client(),
+        tools=tools,
+        store=store,
+        source=_source(),
+        idempotency_key="agentfarm-input-v1",
+        max_calls=10,
+        society=society,
+    )
+
+    with pytest.raises(OSError, match="manifest write interruption"):
+        await service.run("eval-001")
+
+    run_dir = tmp_path / "eval-001"
+    assert (run_dir / "evaluation.md").is_file()
+    assert not (run_dir / "run-manifest.json").exists()
+    resumed_store = JsonEvaluationStore(tmp_path)
+    resumed = AgentFarmEvaluationService(
+        model_client=_model_client(),
+        tools=EvaluationToolService(resumed_store),
+        store=resumed_store,
+        source=_source(),
+        idempotency_key="agentfarm-input-v1",
+        society=HistoryPoisonSociety(),
+    )
+
+    manifest = await resumed.run("eval-001")
+
+    assert manifest.status is EvaluationStatus.ACCEPTED
+    assert (run_dir / "run-manifest.json").is_file()
+    assert (run_dir / "evaluation.md").is_file()

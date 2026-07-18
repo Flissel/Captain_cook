@@ -88,11 +88,11 @@ class EvaluationToolService:
     ) -> CandidateReceipt:
         run = self._run(run_id)
         self._safe_component_key(candidate.component_key)
-        self._validate_round(candidate.revision)
+        self._validate_round(candidate.revision, run.max_rounds)
         inventory = self._inventory(run_id)
         if not any(item.component_key == candidate.component_key for item in inventory.components):
             raise EvaluationToolError("candidate does not belong to the staged inventory")
-        expected_revision = self._expected_revision(run_id, candidate.component_key)
+        expected_revision = self._expected_revision(run_id, candidate.component_key, run.max_rounds)
         if candidate.revision != expected_revision:
             raise EvaluationToolError(f"expected revision {expected_revision} for component candidate")
         self._raise_validation_issues(validate_candidate(candidate, run.source))
@@ -104,7 +104,7 @@ class EvaluationToolService:
     async def record_qa_review(self, run_id: str, review: QaReview) -> ReviewReceipt:
         run = self._run(run_id)
         self._safe_component_key(review.component_key)
-        self._validate_round(review.revision)
+        self._validate_round(review.revision, run.max_rounds)
         candidate = self._candidate(run_id, review.component_key, review.revision)
         checked_candidate = candidate.model_copy(update={"qa_reviews": (review,)})
         self._raise_validation_issues(validate_candidate(checked_candidate, run.source))
@@ -138,13 +138,13 @@ class EvaluationToolService:
         except (EvaluationConflictError, ValueError) as error:
             raise EvaluationToolError("component candidate has not been staged") from error
 
-    def _expected_revision(self, run_id: str, component_key: str) -> int:
-        for revision in range(1, 4):
+    def _expected_revision(self, run_id: str, component_key: str, max_rounds: int) -> int:
+        for revision in range(1, max_rounds + 1):
             try:
                 self._candidate(run_id, component_key, revision)
             except EvaluationToolError:
                 return revision
-        raise EvaluationToolError("three-round ceiling prevents another component candidate")
+        raise EvaluationToolError(f"{_round_word(max_rounds)}-round ceiling prevents another component candidate")
 
     @staticmethod
     def _safe_run_id(run_id: str) -> None:
@@ -174,9 +174,9 @@ class EvaluationToolService:
             raise EvaluationToolError(str(error)) from error
 
     @staticmethod
-    def _validate_round(revision: int) -> None:
-        if not isinstance(revision, int) or isinstance(revision, bool) or not 1 <= revision <= 3:
-            raise EvaluationToolError("three-round ceiling prevents this revision")
+    def _validate_round(revision: int, max_rounds: int) -> None:
+        if not isinstance(revision, int) or isinstance(revision, bool) or not 1 <= revision <= max_rounds:
+            raise EvaluationToolError(f"{_round_word(max_rounds)}-round ceiling prevents this revision")
 
     @staticmethod
     def _raise_validation_issues(issues: tuple[object, ...]) -> None:
@@ -189,3 +189,7 @@ def _redacted_view_text(text: str) -> str:
     """Remove credential assignment identifiers as well as values from tool views."""
 
     return CREDENTIAL_ASSIGNMENT.sub("[REDACTED]", redact_text(text))
+
+
+def _round_word(max_rounds: int) -> str:
+    return {1: "one", 2: "two", 3: "three"}.get(max_rounds, str(max_rounds))

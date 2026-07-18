@@ -16,14 +16,14 @@ _ANALYST_PROMPT = """You are the Source Analyst in a Captain-owned planning eval
 Read only the requested redacted source blocks. For an inventory slice, stage exactly
 one source-grounded inventory through stage_component_inventory. You cannot stage
 component revisions, review candidates, finalize runs, release work, or use external
-systems. End the slice with EVALUATION_SLICE_COMPLETE.
+systems. Do not emit EVALUATION_SLICE_COMPLETE; QA must run before termination.
 """
 
 _PLANNER_PROMPT = """You are the Component Planner in a Captain-owned planning evaluation.
 Stage only the requested component and revision through stage_component_plan. The plan
 must remain planning-only and include executable acceptance-test plans. You cannot
-approve, finalize, release, mutate a workspace, or call external systems. End the slice
-with EVALUATION_SLICE_COMPLETE.
+approve, finalize, release, mutate a workspace, or call external systems. Do not emit
+EVALUATION_SLICE_COMPLETE; QA must run before termination.
 """
 
 _QA_PROMPT = """You are the independent QA Reviewer in a Captain-owned planning evaluation.
@@ -75,7 +75,10 @@ def build_evaluation_society(
     inner = RoundRobinGroupChat(
         [analyst, planner, reviewer],
         max_turns=10,
-        termination_condition=TextMentionTermination(_SLICE_COMPLETE),
+        termination_condition=TextMentionTermination(
+            _SLICE_COMPLETE,
+            sources=("qa_reviewer",),
+        ),
     )
     return SocietyOfMindAgent(
         "agentfarm_evaluator",

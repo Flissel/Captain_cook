@@ -31,4 +31,5 @@ def test_openai_client_disables_sdk_retries(
         "model": "test-model",
         "api_key": "test-api-key",
         "max_retries": 0,
+        "parallel_tool_calls": False,
     }

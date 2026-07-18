@@ -65,22 +65,17 @@ class AgentFarmEvaluationService:
     async def run(self, run_id: str) -> EvaluationManifest:
         """Run or resume one evaluation without consulting Society transcript state."""
 
-        existing_manifest = self._optional_model(
-            self._store._run_dir(run_id) / "run-manifest.json",
-            EvaluationManifest,
-        )
-        if existing_manifest is not None:
-            return existing_manifest
-
+        self._store._safe_id(run_id)
         run = await self._load_or_create_run(run_id)
-        max_rounds = min(run.max_rounds, self._max_rounds)
-        max_calls = min(run.max_calls, self._max_calls)
+        if (self._store._run_dir(run_id) / "run-manifest.json").is_file():
+            return await self._store.load_manifest(run_id)
+
+        max_rounds = run.max_rounds
+        max_calls = run.max_calls
         inventory = self._optional_inventory(run_id)
-        calls_used = self._persisted_slice_count(run_id, inventory)
 
         if inventory is None:
-            calls_used = self._require_budget(calls_used, max_calls)
-            await self._society.run(task=self._inventory_task(run))
+            await self._run_slice(run, "inventory", self._inventory_task(run))
             inventory = self._required_inventory(run_id)
 
         outcomes: dict[str, EvaluationOutcome] = {}
@@ -89,9 +84,14 @@ class AgentFarmEvaluationService:
             candidate, review = self._latest_round(run_id, inventory_item.component_key, max_rounds)
             while review is None or review.decision != "approved":
                 if candidate is not None and review is None:
-                    calls_used = self._require_budget(calls_used, max_calls)
-                    await self._society.run(
-                        task=self._qa_task(run.run_id, inventory_item.component_key, candidate.revision)
+                    if self._store.consumed_slice_count(run_id) >= max_calls:
+                        break
+                    await self._run_slice(
+                        run,
+                        "qa",
+                        self._qa_task(run.run_id, inventory_item.component_key, candidate.revision),
+                        component_key=inventory_item.component_key,
+                        revision=candidate.revision,
                     )
                     review = self._required_review(
                         run_id,
@@ -101,18 +101,21 @@ class AgentFarmEvaluationService:
                     continue
                 if candidate is not None and review is not None and candidate.revision >= max_rounds:
                     break
-                if candidate is not None and review is not None and calls_used >= max_calls:
+                if self._store.consumed_slice_count(run_id) >= max_calls:
                     break
                 revision = 1 if candidate is None else candidate.revision + 1
-                calls_used = self._require_budget(calls_used, max_calls)
-                await self._society.run(
-                    task=self._component_task(run.run_id, inventory_item.component_key, revision)
+                await self._run_slice(
+                    run,
+                    "component",
+                    self._component_task(run.run_id, inventory_item.component_key, revision),
+                    component_key=inventory_item.component_key,
+                    revision=revision,
                 )
                 candidate = self._required_candidate(run_id, inventory_item.component_key, revision)
                 review = self._required_review(run_id, inventory_item.component_key, revision)
 
             if candidate is None or review is None:
-                outcomes[inventory_item.component_key] = EvaluationOutcome.FAILED
+                outcomes[inventory_item.component_key] = EvaluationOutcome.UNRESOLVED
                 continue
             latest_candidates.append(candidate)
             outcomes[inventory_item.component_key] = (
@@ -140,7 +143,26 @@ class AgentFarmEvaluationService:
             )
         if self._source is not None and run.source != self._source:
             raise EvaluationConflictError("persisted evaluation source differs from requested source")
+        if self._idempotency_key is not None and run.idempotency_key != self._idempotency_key:
+            raise EvaluationConflictError("persisted evaluation idempotency key differs from requested key")
         return run
+
+    async def _run_slice(
+        self,
+        run: EvaluationRun,
+        slice_kind: str,
+        task: str,
+        *,
+        component_key: str | None = None,
+        revision: int | None = None,
+    ) -> None:
+        await self._store.consume_slice(
+            run.run_id,
+            slice_kind=slice_kind,
+            component_key=component_key,
+            revision=revision,
+        )
+        await self._society.run(task=task)
 
     def _optional_inventory(self, run_id: str) -> ComponentInventoryCandidate | None:
         return self._optional_model(
@@ -191,26 +213,6 @@ class AgentFarmEvaluationService:
             self._review_path(run_id, component_key, revision),
             QaReview,
         )
-
-    def _persisted_slice_count(
-        self,
-        run_id: str,
-        inventory: ComponentInventoryCandidate | None,
-    ) -> int:
-        if inventory is None:
-            return 0
-        return 1 + sum(
-            1
-            for item in inventory.components
-            for revision in range(1, 4)
-            if self._review_path(run_id, item.component_key, revision).is_file()
-        )
-
-    @staticmethod
-    def _require_budget(calls_used: int, max_calls: int) -> int:
-        if calls_used >= max_calls:
-            raise EvaluationConflictError("evaluation call budget is exhausted")
-        return calls_used + 1
 
     @staticmethod
     def _inventory_task(run: EvaluationRun) -> str:
