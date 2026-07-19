@@ -6,6 +6,7 @@ import pytest
 from autogen_agentchat.agents import SocietyOfMindAgent
 from autogen_core import FunctionCall
 from autogen_core.models import CreateResult, ModelFamily, ModelInfo, RequestUsage
+from autogen_core.tools import FunctionTool
 from autogen_ext.models.replay import ReplayChatCompletionClient
 
 from agenten.evaluation.models import (
@@ -16,7 +17,11 @@ from agenten.evaluation.models import (
     QaReview,
     SourceBlock,
 )
-from agenten.evaluation.society import build_evaluation_society, build_qa_review_team
+from agenten.evaluation.society import (
+    _stage_inventory_tool,
+    build_evaluation_society,
+    build_qa_review_team,
+)
 from agenten.evaluation.store import JsonEvaluationStore
 from agenten.evaluation.tools import EvaluationToolService
 
@@ -106,6 +111,40 @@ def test_build_society_uses_bounded_autogen_075_team_and_receipt_tools_only(tmp_
     assert not hasattr(service, "finalize")
 
 
+def test_inventory_tool_exposes_complete_candidate_schema_to_live_model(tmp_path: Path) -> None:
+    service = EvaluationToolService(JsonEvaluationStore(tmp_path))
+    tool = FunctionTool(
+        _stage_inventory_tool(service),
+        description="stage one inventory",
+    )
+
+    component_schema = tool.schema["parameters"]["properties"]["components"]["items"]
+    required = set(component_schema["required"])
+
+    assert {
+        "component_key",
+        "scope",
+        "non_goals",
+        "team_roles",
+        "implementation_steps",
+        "interfaces",
+        "acceptance_tests",
+        "definition_of_done",
+        "risks",
+        "dependencies",
+        "source_citations",
+    } <= required
+    test_schema = component_schema["properties"]["acceptance_tests"]["items"]
+    assert set(test_schema["required"]) == {
+        "test_id",
+        "test_type",
+        "setup",
+        "action",
+        "expected",
+        "command",
+    }
+
+
 @pytest.mark.asyncio
 async def test_live_shaped_society_reads_block_then_stages_inventory_plan_and_review_in_four_calls(
     tmp_path: Path,
@@ -170,7 +209,9 @@ async def test_live_shaped_society_reads_block_then_stages_inventory_plan_and_re
                     "run_id": "eval-live-shape",
                     "inventory_id": "inventory-001",
                     "source_citations": ["block-0001"],
-                    "components": [candidate.model_dump(mode="json")],
+                        "components": [
+                            candidate.model_dump(mode="json", exclude={"qa_reviews"})
+                        ],
                 }
             ),
         ),
@@ -178,7 +219,10 @@ async def test_live_shaped_society_reads_block_then_stages_inventory_plan_and_re
             id="candidate-001",
             name="stage_component_plan",
             arguments=json.dumps(
-                {"run_id": "eval-live-shape", "candidate": candidate.model_dump(mode="json")}
+                {
+                    "run_id": "eval-live-shape",
+                    "candidate": candidate.model_dump(mode="json", exclude={"qa_reviews"}),
+                }
             ),
         ),
         FunctionCall(

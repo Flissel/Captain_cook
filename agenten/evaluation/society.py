@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from typing import Literal
 
 from autogen_agentchat.agents import AssistantAgent, SocietyOfMindAgent
 from autogen_agentchat.conditions import SourceMatchTermination
 from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_core.models import ChatCompletionClient
+from pydantic import BaseModel, ConfigDict, Field
 
 from .models import (
     ComponentInventoryCandidate,
@@ -23,7 +25,9 @@ from .tools import EvaluationToolService
 _ANALYST_PROMPT = """You are the Source Analyst in a Captain-owned planning evaluation.
 For an inventory slice, first call read_source_block once for the most relevant overview
 block named in the task. Then call stage_component_inventory with at most the requested
-max_components and source-grounded candidate plans. Captain supplies immutable source
+max_components and source-grounded candidate plans; never call read_source_block twice.
+Every component must fill every required field in the advertised tool schema, including
+one complete acceptance_tests item with setup, action, expected, and command. Captain supplies immutable source
 provenance; never attempt to reproduce the whole source manifest. You cannot stage
 component revisions, review candidates, finalize runs, release work, or use external
 systems. Do not emit EVALUATION_SLICE_COMPLETE; QA must run before termination.
@@ -52,6 +56,37 @@ _SUMMARY_RESPONSE_PROMPT = """Return a short non-authoritative slice summary. Do
 claim acceptance, implementation, finalization, release, or execution evidence. End
 with EVALUATION_SLICE_COMPLETE.
 """
+
+
+class _AcceptanceTestToolInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    test_id: str = Field(min_length=1)
+    test_type: Literal["unit", "integration", "contract", "live"]
+    setup: str = Field(min_length=1)
+    action: str = Field(min_length=1)
+    expected: str = Field(min_length=1)
+    command: str = Field(min_length=1)
+
+
+class _ComponentPlanToolInput(BaseModel):
+    """JSON-friendly input that advertises the strict domain candidate schema."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    component_key: str = Field(min_length=1)
+    revision: int = Field(default=1, ge=1, le=3)
+    scope: list[str] = Field(min_length=1)
+    non_goals: list[str] = Field(min_length=1)
+    team_roles: list[str] = Field(min_length=1)
+    implementation_steps: list[str] = Field(min_length=1)
+    interfaces: list[str] = Field(min_length=1)
+    acceptance_tests: list[_AcceptanceTestToolInput] = Field(min_length=1)
+    definition_of_done: list[str] = Field(min_length=1)
+    risks: list[str] = Field(min_length=1)
+    dependencies: list[str]
+    source_citations: list[str] = Field(min_length=1)
+    claims: list[str] = Field(default_factory=list)
 
 
 def build_evaluation_society(
@@ -128,7 +163,7 @@ def _stage_inventory_tool(tools: EvaluationToolService):
         run_id: str,
         inventory_id: str,
         source_citations: list[str],
-        components: list[dict[str, object]],
+        components: list[_ComponentPlanToolInput],
     ) -> InventoryReceipt:
         run = tools._run(run_id)
         inventory = ComponentInventoryCandidate(
@@ -136,7 +171,7 @@ def _stage_inventory_tool(tools: EvaluationToolService):
             source=run.source,
             source_citations=tuple(source_citations),
             components=tuple(
-                ComponentPlanCandidate.model_validate_json(json.dumps(component))
+                ComponentPlanCandidate.model_validate_json(component.model_dump_json())
                 for component in components
             ),
         )
@@ -148,9 +183,9 @@ def _stage_inventory_tool(tools: EvaluationToolService):
 def _stage_plan_tool(tools: EvaluationToolService):
     async def stage_component_plan(
         run_id: str,
-        candidate: dict[str, object],
+        candidate: _ComponentPlanToolInput,
     ) -> CandidateReceipt:
-        validated = ComponentPlanCandidate.model_validate_json(json.dumps(candidate))
+        validated = ComponentPlanCandidate.model_validate_json(candidate.model_dump_json())
         return await tools.stage_component_plan(run_id, validated)
 
     return stage_component_plan
