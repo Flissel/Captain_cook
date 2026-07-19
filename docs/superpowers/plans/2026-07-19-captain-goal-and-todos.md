@@ -103,6 +103,11 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
   kurzlebigen Lease-Broker/Proxy ersetzen. Eine Rotation des jetzigen
   instanzweiten Schlüssels wäre kein sicherer Einzelwiderruf, weil sie
   parallele, rechtmäßige Runs ebenfalls unterbrechen würde.
+- [x] Aktive Codex-Sessions nach einem Neustart fail-closed einzäunen
+  (`0661ca4`): der Gateway-Event-Append liefert jetzt auch seinen
+  Replay-Status; bei einer schon aktiven Session startet der Supervisor keinen
+  zweiten Provider-Run, sondern meldet `evidence_unresolved`. Ein
+  Parallel-Restart-Test lässt genau einen Session-Owner zu.
 - [ ] Den E2E- und Recovery-Pfad nach Prozessneustart mit unveränderten
   Artifacts/Gatewaydaten prüfen: keine doppelte Provider-Reservierung,
   Freigabe oder Ledger-Transition. Der deterministische Control-Plane-
