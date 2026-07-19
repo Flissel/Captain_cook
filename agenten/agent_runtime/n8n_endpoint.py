@@ -16,6 +16,7 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrantRevocation,
     CapabilityProfile,
 )
+from agenten.agent_runtime.n8n_mcp_broker import McpLeaseIssuer
 
 
 class N8nEndpointConfigurationError(ValueError):
@@ -32,6 +33,7 @@ class N8nEndpoint(BaseModel):
     webhook_base_url: str = Field(min_length=1)
     api_key: str = Field(min_length=1, exclude=True, repr=False)
     mcp_token: str = Field(default="", exclude=True, repr=False)
+    mcp_broker_url: str = Field(default="", exclude=True)
 
 
 class HermesN8nReference(BaseModel):
@@ -75,9 +77,11 @@ def resolve_n8n_endpoint(environment: Mapping[str, str]) -> N8nEndpoint:
             label="Captain n8n API key",
         )
         mcp_token = environment.get("CAPTAIN_N8N_MCP_TOKEN", "").strip()
+        mcp_broker_url = environment.get("CAPTAIN_N8N_MCP_BROKER_URL", "").strip()
         normalized_url = _normalize_builder_url(base_url)
     if mode == "external":
         mcp_token = api_key
+        mcp_broker_url = ""
 
     return N8nEndpoint(
         mode=mode,
@@ -85,6 +89,11 @@ def resolve_n8n_endpoint(environment: Mapping[str, str]) -> N8nEndpoint:
         webhook_base_url=normalized_url,
         api_key=api_key,
         mcp_token=mcp_token,
+        mcp_broker_url=(
+            _normalize_builder_url(mcp_broker_url)
+            if mcp_broker_url
+            else ""
+        ),
     )
 
 
@@ -94,6 +103,7 @@ def build_hermes_n8n_reference(
     endpoint: N8nEndpoint,
     now: datetime,
     revocation: CapabilityGrantRevocation | None = None,
+    broker_issuer: McpLeaseIssuer | None = None,
 ) -> HermesN8nReference:
     """Build Hermes child configuration from an active exact n8n lease."""
 
@@ -105,6 +115,17 @@ def build_hermes_n8n_reference(
             "Hermes n8n configuration requires exactly the n8n-mcp server"
         )
     _validate_builder_endpoint(endpoint)
+    if endpoint.mcp_broker_url:
+        if broker_issuer is None:
+            raise N8nEndpointConfigurationError(
+                "Captain n8n MCP broker requires a lease-token issuer"
+            )
+        token = broker_issuer.issue(grant, command, endpoint.mcp_broker_url, now)
+        reference = HermesN8nReference(endpoint_identity=endpoint.mcp_broker_url)
+        reference._child_environment.update(
+            {"N8N_URL": endpoint.mcp_broker_url, "N8N_MCP_TOKEN": token}
+        )
+        return reference
     if not endpoint.mcp_token:
         raise N8nEndpointConfigurationError(
             "Captain n8n MCP token must not be empty for Hermes MCP access"
