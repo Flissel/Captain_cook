@@ -57,6 +57,7 @@ from agenten.agent_runtime.contracts import (  # noqa: E402
     AgentRuntimeResult,
     ArtifactRef,
     CapabilityGrant,
+    CapabilityGrantRevocation,
     CapabilityProfile,
     HermesPlanResult,
     IntegrationIntent,
@@ -887,6 +888,22 @@ async def test_real_n8n_mcp_workflow_is_validated_published_executed_and_archive
                 command,
                 endpoint,
                 now + timedelta(minutes=16),
+            )
+        revocation = CapabilityGrantRevocation(
+            schema_name="captain.capability-grant-revocation.v1",
+            revocation_id=uuid4(),
+            grant_id=grant.grant_id,
+            command_id=command.event_id,
+            revoked_at=now + timedelta(seconds=1),
+            reason="captain_cancelled",
+        )
+        with pytest.raises(CapabilityDenied, match="revoked"):
+            build_hermes_n8n_reference(
+                grant,
+                command,
+                endpoint,
+                now + timedelta(seconds=2),
+                revocation,
             )
     finally:
         runtime.close()

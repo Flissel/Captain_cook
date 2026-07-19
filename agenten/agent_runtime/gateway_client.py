@@ -13,6 +13,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
     CapabilityGrant,
+    CapabilityGrantRevocation,
 )
 
 
@@ -37,6 +38,7 @@ class RuntimeOperationProjection(BaseModel):
     operation_id: UUID
     command: AgentRuntimeCommand
     grant: CapabilityGrant | None = None
+    revocation: CapabilityGrantRevocation | None = None
     result: AgentRuntimeResult | None = None
 
 
@@ -89,6 +91,17 @@ class GatewayRuntimeClient:
             operation="record runtime result",
         )
 
+    async def record_capability_grant_revocation(
+        self,
+        revocation: CapabilityGrantRevocation,
+    ) -> RuntimeWriteReceipt:
+        return await self._write(
+            "/v1/runtime/grant-revocations",
+            revocation.model_dump(mode="json", by_alias=True),
+            expected={200, 201},
+            operation="record capability grant revocation",
+        )
+
     async def get_runtime_operation(
         self,
         operation_id: UUID,
@@ -119,6 +132,11 @@ class GatewayRuntimeClient:
 
     async def get_grant(self, command_id: UUID) -> CapabilityGrant | None:
         return (await self.get_runtime_operation(command_id)).grant
+
+    async def get_grant_revocation(
+        self, command_id: UUID
+    ) -> CapabilityGrantRevocation | None:
+        return (await self.get_runtime_operation(command_id)).revocation
 
     async def get_result(self, command_id: UUID) -> AgentRuntimeResult | None:
         return (await self.get_runtime_operation(command_id)).result

@@ -61,7 +61,8 @@ class AgentRuntimeService:
         if grant is None:
             derived = self._capabilities.derive(command, batch, now)
             grant = await self._state.record_grant(derived)
-        grant = self._capabilities.validate(grant, command, now)
+        revocation = await self._state.get_grant_revocation(command.event_id)
+        grant = self._capabilities.validate(grant, command, now, revocation)
         await self._artifacts.require(command.payload.prompt_ref)
 
         try:

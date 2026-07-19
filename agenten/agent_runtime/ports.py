@@ -11,6 +11,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeResult,
     ArtifactRef,
     CapabilityGrant,
+    CapabilityGrantRevocation,
     HermesPlanResult,
 )
 from agenten.validation.contracts import WorkBatch
@@ -26,6 +27,10 @@ class RuntimeStatePort(Protocol):
     async def get_released_batch(self, command: AgentRuntimeCommand) -> WorkBatch: ...
 
     async def get_grant(self, command_id: UUID) -> CapabilityGrant | None: ...
+
+    async def get_grant_revocation(
+        self, command_id: UUID
+    ) -> CapabilityGrantRevocation | None: ...
 
     async def record_grant(self, grant: CapabilityGrant) -> CapabilityGrant: ...
 
@@ -51,6 +56,7 @@ class CapabilityPolicyPort(Protocol):
         grant: CapabilityGrant,
         command: AgentRuntimeCommand,
         now: datetime,
+        revocation: CapabilityGrantRevocation | None = None,
     ) -> CapabilityGrant: ...
 
 

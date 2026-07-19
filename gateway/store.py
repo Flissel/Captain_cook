@@ -20,6 +20,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
     CapabilityGrant,
+    CapabilityGrantRevocation,
 )
 from blockchain.Blockchain_modell import Block
 from blockchain.mariadb_storage import MariaDBStorage
@@ -405,6 +406,90 @@ class GatewayStore:
             return RuntimeWriteReceipt(operation_id=replay.operation_id, replayed=True)
         return RuntimeWriteReceipt(operation_id=result.command_id, replayed=False)
 
+    def record_capability_grant_revocation(
+        self,
+        revocation: CapabilityGrantRevocation,
+    ) -> RuntimeWriteReceipt:
+        try:
+            self._retry_write(
+                lambda: self._record_capability_grant_revocation_once(revocation)
+            )
+        except _RuntimeReplay as replay:
+            return RuntimeWriteReceipt(operation_id=replay.operation_id, replayed=True)
+        return RuntimeWriteReceipt(operation_id=revocation.command_id, replayed=False)
+
+    def _record_capability_grant_revocation_once(
+        self, revocation: CapabilityGrantRevocation
+    ) -> None:
+        canonical = revocation.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                index = self._next_index(cursor)
+                grant_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_grant",
+                    field="grant_id",
+                    value=revocation.grant_id,
+                    for_update=True,
+                )
+                if grant_block is None:
+                    raise HTTPException(status_code=409, detail="runtime grant not found")
+                grant = CapabilityGrant.model_validate(grant_block["data"])
+                if grant.command_id != revocation.command_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime revocation belongs to a different command",
+                    )
+                command_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_command",
+                    field="event_id",
+                    value=str(revocation.command_id),
+                    for_update=True,
+                )
+                if command_block is None:
+                    raise HTTPException(status_code=409, detail="runtime command not found")
+                command = AgentRuntimeCommand.model_validate(command_block["data"])
+                try:
+                    validate_grant(grant, command, revocation.revoked_at)
+                except CapabilityDenied as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                if self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_result",
+                    field="command_id",
+                    value=str(revocation.command_id),
+                    for_update=True,
+                ) is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="completed runtime grant cannot be revoked",
+                    )
+                existing = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_grant_revocation",
+                    field="grant_id",
+                    value=revocation.grant_id,
+                    for_update=True,
+                )
+                if existing is not None:
+                    if existing["data"] == canonical:
+                        raise _RuntimeReplay(revocation.command_id)
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime grant already has a different revocation",
+                    )
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="agent_runtime_grant_revocation",
+                    data=canonical,
+                    status="revoked",
+                    parent_index=grant_block["index"],
+                    metadata={"schema": "captain.capability-grant-revocation.v1"},
+                )
+                self._insert(cursor, block)
+
     def _record_runtime_result_once(self, result: AgentRuntimeResult) -> None:
         canonical = result.model_dump(mode="json", by_alias=True)
         with self.storage.transaction() as connection:
@@ -436,6 +521,18 @@ class GatewayStore:
                     raise HTTPException(
                         status_code=409,
                         detail="runtime grant belongs to a different command",
+                    )
+                revocation_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_grant_revocation",
+                    field="grant_id",
+                    value=grant.grant_id,
+                    for_update=True,
+                )
+                if revocation_block is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="revoked runtime grant cannot record a result",
                     )
 
                 existing = self._runtime_result_block(cursor, result, for_update=True)
@@ -480,12 +577,23 @@ class GatewayStore:
                     field="command_id",
                     value=str(operation_id),
                 )
+                revocation_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_grant_revocation",
+                    field="command_id",
+                    value=str(operation_id),
+                )
         return RuntimeOperationProjection(
             operation_id=operation_id,
             command=AgentRuntimeCommand.model_validate(command_block["data"]),
             grant=(
                 CapabilityGrant.model_validate(grant_block["data"])
                 if grant_block is not None
+                else None
+            ),
+            revocation=(
+                CapabilityGrantRevocation.model_validate(revocation_block["data"])
+                if revocation_block is not None
                 else None
             ),
             result=(

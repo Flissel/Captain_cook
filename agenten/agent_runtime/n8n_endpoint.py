@@ -13,6 +13,7 @@ from agenten.agent_runtime.capabilities import CapabilityDenied, validate_grant
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     CapabilityGrant,
+    CapabilityGrantRevocation,
     CapabilityProfile,
 )
 
@@ -92,10 +93,11 @@ def build_hermes_n8n_reference(
     command: AgentRuntimeCommand,
     endpoint: N8nEndpoint,
     now: datetime,
+    revocation: CapabilityGrantRevocation | None = None,
 ) -> HermesN8nReference:
     """Build Hermes child configuration from an active exact n8n lease."""
 
-    validate_grant(grant, command, now)
+    validate_grant(grant, command, now, revocation)
     if grant.profile is not CapabilityProfile.N8N_BUILDER:
         raise CapabilityDenied("Hermes n8n configuration requires an n8n-builder grant")
     if grant.mcp_servers != ("n8n-mcp",):

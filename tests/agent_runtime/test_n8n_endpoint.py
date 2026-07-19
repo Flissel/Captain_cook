@@ -14,6 +14,7 @@ from agenten.agent_runtime.capabilities import (
     derive_grant,
 )
 from agenten.agent_runtime.contracts import AgentRuntimeCommand
+from agenten.agent_runtime.contracts import CapabilityGrantRevocation
 from agenten.agent_runtime.n8n_endpoint import (
     N8nEndpoint,
     N8nEndpointConfigurationError,
@@ -417,6 +418,32 @@ def test_expired_grant_cannot_create_hermes_reference() -> None:
 
     with pytest.raises(CapabilityDenied, match="expired"):
         build_hermes_n8n_reference(grant, command, builder_endpoint(), NOW)
+
+
+def test_revoked_grant_cannot_create_hermes_reference() -> None:
+    command = command_for()
+    grant = derive_grant(
+        command,
+        released_batch(capability_tag="n8n-builder"),
+        NOW,
+    )
+    revocation = CapabilityGrantRevocation(
+        schema_name="captain.capability-grant-revocation.v1",
+        revocation_id=uuid4(),
+        grant_id=grant.grant_id,
+        command_id=command.event_id,
+        revoked_at=NOW + timedelta(seconds=1),
+        reason="captain_cancelled",
+    )
+
+    with pytest.raises(CapabilityDenied, match="revoked"):
+        build_hermes_n8n_reference(
+            grant,
+            command,
+            builder_endpoint(),
+            NOW + timedelta(seconds=2),
+            revocation,
+        )
 
 
 def test_plain_builder_grant_cannot_create_hermes_reference() -> None:

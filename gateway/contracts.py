@@ -20,6 +20,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
     CapabilityGrant,
+    CapabilityGrantRevocation,
 )
 
 
@@ -56,6 +57,7 @@ class RuntimeOperationProjection(_FrozenContract):
     operation_id: UUID
     command: AgentRuntimeCommand
     grant: CapabilityGrant | None = None
+    revocation: CapabilityGrantRevocation | None = None
     result: AgentRuntimeResult | None = None
 
 

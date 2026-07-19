@@ -199,6 +199,25 @@ class CapabilityGrant(_FrozenContract):
         return self
 
 
+class CapabilityGrantRevocation(_FrozenContract):
+    """Captain's append-only invalidation of an otherwise valid grant."""
+
+    schema_name: Literal["captain.capability-grant-revocation.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    revocation_id: UUID
+    grant_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    command_id: UUID
+    revoked_at: datetime
+    reason: Literal["captain_cancelled", "policy_violation", "operator_cancelled"]
+
+    @field_validator("revoked_at")
+    @classmethod
+    def require_utc_timestamp(cls, value: datetime) -> datetime:
+        return _require_utc(value)
+
+
 class AgentRuntimeResult(_FrozenContract):
     schema_name: Literal["captain.agent-runtime-result.v1"] = Field(
         alias="schema",

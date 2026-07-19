@@ -163,6 +163,65 @@ def test_grant_and_result_require_the_exact_command(client: TestClient) -> None:
     assert operation.json()["result"] == result
 
 
+def test_captain_can_revoke_an_active_grant_once_and_gateway_projects_it(
+    client: TestClient,
+) -> None:
+    release_batch(client)
+    command = load("agent_runtime_command.v1.json")
+    issued_at = datetime.now(timezone.utc)
+    grant = {
+        "schema": "captain.capability-grant.v1",
+        "grant_id": "grant-revocation-1",
+        "command_id": command["event_id"],
+        "batch_id": "batch-1",
+        "batch_version": 3,
+        "subtask_id": "subtask-1",
+        "workspace_ref": "workspace://authorized/project-1/subtask-1",
+        "profile": "n8n-builder",
+        "capabilities": [
+            "codex.cancel",
+            "codex.heartbeat",
+            "codex.resume",
+            "codex.run",
+            "codex.status",
+            "mcp.n8n",
+            "tests.run",
+            "workspace.write",
+        ],
+        "mcp_servers": ["n8n-mcp"],
+        "issued_at": issued_at.isoformat().replace("+00:00", "Z"),
+        "expires_at": (issued_at + timedelta(minutes=15)).isoformat().replace(
+            "+00:00", "Z"
+        ),
+    }
+    revocation = {
+        "schema": "captain.capability-grant-revocation.v1",
+        "revocation_id": str(uuid4()),
+        "grant_id": grant["grant_id"],
+        "command_id": command["event_id"],
+        "revoked_at": (issued_at + timedelta(seconds=1)).isoformat().replace(
+            "+00:00", "Z"
+        ),
+        "reason": "captain_cancelled",
+    }
+    result = load("agent_runtime_result.v1.json")
+    result["grant_id"] = grant["grant_id"]
+
+    assert client.post("/v1/runtime/commands", json=command).status_code == 202
+    assert client.post("/v1/runtime/grants", json=grant).status_code == 201
+    first = client.post("/v1/runtime/grant-revocations", json=revocation)
+    replay = client.post("/v1/runtime/grant-revocations", json=revocation)
+
+    assert first.status_code == 201
+    assert replay.status_code == 200
+    assert first.json()["replayed"] is False
+    assert replay.json()["replayed"] is True
+    operation = client.get(f"/v1/runtime/operations/{command['event_id']}")
+    assert operation.status_code == 200
+    assert operation.json()["revocation"] == revocation
+    assert client.post("/v1/runtime/results", json=result).status_code == 409
+
+
 def test_result_mismatch_and_conflicting_replay_are_rejected(client: TestClient) -> None:
     release_batch(client)
     command = load("agent_runtime_command.v1.json")
