@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from collections.abc import Callable
+from pathlib import Path
 from typing import Protocol
 
 from autogen_core.models import ChatCompletionClient
@@ -30,6 +30,10 @@ class EvaluationSociety(Protocol):
     """Small injected seam shared by AutoGen and deterministic scripted tests."""
 
     async def run(self, *, task: str) -> object: ...
+
+
+class EvaluationSliceFailure(RuntimeError):
+    """A bounded provider-backed slice failed after Captain persisted its budget."""
 
 
 class AgentFarmEvaluationService:
@@ -85,6 +89,14 @@ class AgentFarmEvaluationService:
 
     async def run(self, run_id: str) -> EvaluationManifest:
         """Run or resume one evaluation without consulting Society transcript state."""
+
+        try:
+            return await self._run_authoritative(run_id)
+        except EvaluationSliceFailure:
+            return await self._finalize_failure(run_id)
+
+    async def _run_authoritative(self, run_id: str) -> EvaluationManifest:
+        """Execute the receipt-driven lifecycle after validating run identity."""
 
         self._store._safe_id(run_id)
         run = await self._load_or_create_run(run_id)
@@ -223,6 +235,20 @@ class AgentFarmEvaluationService:
             phase = self._store.lifecycle_events(run.run_id)[-1].status
             await asyncio.shield(self._store.transition_run(run.run_id, phase, "cancelled"))
             raise
+        except Exception as exc:
+            raise EvaluationSliceFailure("evaluation slice failed") from exc
+
+    async def _finalize_failure(self, run_id: str) -> EvaluationManifest:
+        inventory = self._optional_inventory(run_id)
+        outcome: EvaluationOutcome | dict[str, EvaluationOutcome]
+        if inventory is None:
+            outcome = EvaluationOutcome.FAILED
+        else:
+            outcome = {
+                component.component_key: EvaluationOutcome.FAILED
+                for component in inventory.components
+            }
+        return await self._finalize(run_id, outcome)
 
     def _optional_inventory(self, run_id: str) -> ComponentInventoryCandidate | None:
         return self._optional_model(

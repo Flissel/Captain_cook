@@ -38,7 +38,7 @@ def test_report_is_reproducible_from_manifest_and_redacts_credentials() -> None:
         prompt_version="PASSWORD = rendered-secret",
         call_count=0,
         token_total=0,
-        cost_total=0.0,
+        cost_total=None,
         artifact_digests=("source-manifest.json:" + "a" * 64,),
     )
 
@@ -50,3 +50,4 @@ def test_report_is_reproducible_from_manifest_and_redacts_credentials() -> None:
     assert "rendered-secret" not in report
     assert "planned-model-v1" in report
     assert "delivery-api" in report
+    assert "Cost: unavailable" in report

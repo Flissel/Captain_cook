@@ -21,7 +21,7 @@ def render_evaluation_markdown(manifest: EvaluationManifest) -> str:
         f"- Prompt version: `{_redact(manifest.prompt_version)}`",
         f"- Calls: {manifest.call_count}",
         f"- Tokens: {manifest.token_total}",
-        f"- Cost: {manifest.cost_total}",
+        f"- Cost: {manifest.cost_total if manifest.cost_total is not None else 'unavailable'}",
         "",
         _redact(manifest.planning_disclaimer),
         "",

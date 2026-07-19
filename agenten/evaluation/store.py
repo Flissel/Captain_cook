@@ -27,6 +27,8 @@ from .models import (
     EvaluationSource,
     EvaluationTelemetry,
     InventoryReceipt,
+    ProviderCallCompletion,
+    ProviderCallReservation,
     QaReview,
     ReviewReceipt,
 )
@@ -157,6 +159,95 @@ class JsonEvaluationStore:
         self._safe_id(run_id)
         return self._consumed_slice_count(run_id)
 
+    async def reserve_provider_call(
+        self,
+        run_id: str,
+        *,
+        model_identifier: str,
+    ) -> ProviderCallReservation:
+        """Persist one raw-call reservation before delegating to a provider."""
+
+        async with self._lock:
+            run = self._read_run(run_id)
+            paths = self._provider_reservation_paths(run_id)
+            call_index = len(paths) + 1
+            if call_index > run.max_calls:
+                raise EvaluationConflictError("persisted provider call budget is exhausted")
+            reservation = ProviderCallReservation(
+                run_id=run_id,
+                call_index=call_index,
+                model_identifier=redact_text(model_identifier),
+            )
+            stored = self._write_model(
+                self._run_dir(run_id)
+                / "provider-calls"
+                / f"reservation-{call_index:04d}.json",
+                reservation,
+            )
+        return ProviderCallReservation.model_validate_json(stored)
+
+    async def complete_provider_call(
+        self,
+        run_id: str,
+        *,
+        call_index: int,
+        prompt_tokens: int,
+        completion_tokens: int,
+    ) -> ProviderCallCompletion:
+        """Append usage for a previously reserved provider call."""
+
+        async with self._lock:
+            self._read_model(
+                self._run_dir(run_id)
+                / "provider-calls"
+                / f"reservation-{call_index:04d}.json",
+                ProviderCallReservation,
+            )
+            completion = ProviderCallCompletion(
+                run_id=run_id,
+                call_index=call_index,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
+            stored = self._write_model(
+                self._run_dir(run_id)
+                / "provider-calls"
+                / f"completion-{call_index:04d}.json",
+                completion,
+            )
+        return ProviderCallCompletion.model_validate_json(stored)
+
+    def provider_telemetry(
+        self,
+        run_id: str,
+        *,
+        prompt_version: str,
+    ) -> EvaluationTelemetry:
+        """Rebuild restart-safe provider totals from Captain-owned receipts."""
+
+        self._read_run(run_id)
+        reservations = tuple(
+            self._read_model(path, ProviderCallReservation)
+            for path in self._provider_reservation_paths(run_id)
+        )
+        identifiers = {reservation.model_identifier for reservation in reservations}
+        if len(identifiers) > 1:
+            raise EvaluationConflictError("provider reservations disagree on model identifier")
+        completions = tuple(
+            self._read_model(path, ProviderCallCompletion)
+            for path in self._provider_completion_paths(run_id)
+        )
+        return EvaluationTelemetry(
+            model_identifier=next(iter(identifiers), "not-configured"),
+            prompt_version=prompt_version,
+            call_count=len(reservations),
+            token_total=sum(
+                completion.prompt_tokens + completion.completion_tokens
+                for completion in completions
+            ),
+            cost_total=None,
+        )
+
     async def transition_run(
         self,
         run_id: str,
@@ -185,6 +276,16 @@ class JsonEvaluationStore:
     ) -> EvaluationManifest:
         async with self._lock:
             run = self._read_run(run_id)
+            if telemetry is not None and telemetry.call_count > run.max_calls:
+                raise EvaluationConflictError("provider telemetry exceeds the persisted call budget")
+            persisted_provider = self.provider_telemetry(
+                run_id,
+                prompt_version=(
+                    telemetry.prompt_version if telemetry is not None else "not-configured"
+                ),
+            )
+            if persisted_provider.call_count and telemetry != persisted_provider:
+                raise EvaluationConflictError("provider telemetry differs from persisted call receipts")
             inventory = self._optional_inventory(run_id)
             if inventory is None:
                 if outcome != EvaluationOutcome.FAILED:
@@ -223,7 +324,7 @@ class JsonEvaluationStore:
                 ),
                 call_count=telemetry.call_count if telemetry is not None else 0,
                 token_total=telemetry.token_total if telemetry is not None else 0,
-                cost_total=telemetry.cost_total if telemetry is not None else 0.0,
+                cost_total=telemetry.cost_total if telemetry is not None else None,
                 artifact_digests=digests,
             )
             report = render_evaluation_markdown(manifest).encode("utf-8")
@@ -263,6 +364,19 @@ class JsonEvaluationStore:
             expected_status = _status_for_components(expected_components) if inventory is not None else EvaluationStatus.FAILED
             if manifest.status != expected_status:
                 raise EvaluationConflictError("run manifest status is inconsistent")
+            if manifest.call_count > run.max_calls:
+                raise EvaluationConflictError("run manifest exceeds the persisted provider budget")
+            persisted_provider = self.provider_telemetry(
+                run_id,
+                prompt_version=manifest.prompt_version,
+            )
+            if persisted_provider.call_count and (
+                manifest.model_identifier != persisted_provider.model_identifier
+                or manifest.call_count != persisted_provider.call_count
+                or manifest.token_total != persisted_provider.token_total
+                or manifest.cost_total is not None
+            ):
+                raise EvaluationConflictError("run manifest provider telemetry is inconsistent")
             if manifest.artifact_digests != tuple(self._artifact_digests(run_id)):
                 raise EvaluationConflictError("run manifest artifact digests are inconsistent")
             self._write_bytes(
@@ -364,6 +478,16 @@ class JsonEvaluationStore:
 
     def _consumed_slice_count(self, run_id: str) -> int:
         return len(tuple((self._run_dir(run_id) / "slices").glob("slice-*.json")))
+
+    def _provider_reservation_paths(self, run_id: str) -> tuple[Path, ...]:
+        return tuple(
+            sorted((self._run_dir(run_id) / "provider-calls").glob("reservation-*.json"))
+        )
+
+    def _provider_completion_paths(self, run_id: str) -> tuple[Path, ...]:
+        return tuple(
+            sorted((self._run_dir(run_id) / "provider-calls").glob("completion-*.json"))
+        )
 
     def _read_run(self, run_id: str) -> EvaluationRun:
         self._safe_id(run_id)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 from collections.abc import AsyncGenerator, Mapping, Sequence
@@ -25,10 +26,10 @@ from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_ext.models.replay import ReplayChatCompletionClient
 from pydantic import BaseModel, ValidationError
 
-from .models import EvaluationTelemetry
+from .models import EvaluationStatus, EvaluationTelemetry, ProviderCallReservation
 from .service import AgentFarmEvaluationService
 from .source import EvaluationSourceError, load_evaluation_source
-from .store import JsonEvaluationStore
+from .store import EvaluationConflictError, JsonEvaluationStore
 from .tools import EvaluationToolService
 
 
@@ -40,6 +41,10 @@ class EvaluationCallBudgetExceeded(RuntimeError):
     """A provider call would exceed Captain's immutable live-call budget."""
 
 
+class EvaluationSourceDigestMismatch(ValueError):
+    """A configured immutable source differs from its approved digest."""
+
+
 class UsageTrackingChatCompletionClient(ChatCompletionClient):
     """Delegate model calls while enforcing and reporting one raw-call budget."""
 
@@ -48,14 +53,13 @@ class UsageTrackingChatCompletionClient(ChatCompletionClient):
         inner: ChatCompletionClient,
         *,
         model_identifier: str,
-        max_calls: int,
+        store: JsonEvaluationStore,
+        run_id: str,
     ) -> None:
-        if isinstance(max_calls, bool) or not isinstance(max_calls, int) or max_calls < 1:
-            raise ValueError("max_calls must be positive")
         self._inner = inner
         self._model_identifier = model_identifier
-        self._max_calls = max_calls
-        self._call_count = 0
+        self._store = store
+        self._run_id = run_id
 
     async def create(
         self,
@@ -67,8 +71,8 @@ class UsageTrackingChatCompletionClient(ChatCompletionClient):
         extra_create_args: Mapping[str, Any] = {},
         cancellation_token: CancellationToken | None = None,
     ) -> CreateResult:
-        self._reserve_call()
-        return await self._inner.create(
+        reservation = await self._reserve_call()
+        result = await self._inner.create(
             messages,
             tools=tools,
             tool_choice=tool_choice,
@@ -76,6 +80,13 @@ class UsageTrackingChatCompletionClient(ChatCompletionClient):
             extra_create_args=extra_create_args,
             cancellation_token=cancellation_token,
         )
+        await self._store.complete_provider_call(
+            self._run_id,
+            call_index=reservation.call_index,
+            prompt_tokens=result.usage.prompt_tokens,
+            completion_tokens=result.usage.completion_tokens,
+        )
+        return result
 
     def create_stream(
         self,
@@ -87,15 +98,26 @@ class UsageTrackingChatCompletionClient(ChatCompletionClient):
         extra_create_args: Mapping[str, Any] = {},
         cancellation_token: CancellationToken | None = None,
     ) -> AsyncGenerator[str | CreateResult, None]:
-        self._reserve_call()
-        return self._inner.create_stream(
-            messages,
-            tools=tools,
-            tool_choice=tool_choice,
-            json_output=json_output,
-            extra_create_args=extra_create_args,
-            cancellation_token=cancellation_token,
-        )
+        async def tracked_stream() -> AsyncGenerator[str | CreateResult, None]:
+            reservation = await self._reserve_call()
+            async for item in self._inner.create_stream(
+                messages,
+                tools=tools,
+                tool_choice=tool_choice,
+                json_output=json_output,
+                extra_create_args=extra_create_args,
+                cancellation_token=cancellation_token,
+            ):
+                if isinstance(item, CreateResult):
+                    await self._store.complete_provider_call(
+                        self._run_id,
+                        call_index=reservation.call_index,
+                        prompt_tokens=item.usage.prompt_tokens,
+                        completion_tokens=item.usage.completion_tokens,
+                    )
+                yield item
+
+        return tracked_stream()
 
     async def close(self) -> None:
         await self._inner.close()
@@ -131,27 +153,21 @@ class UsageTrackingChatCompletionClient(ChatCompletionClient):
         return self._inner.model_info
 
     def evaluation_telemetry(self) -> EvaluationTelemetry:
-        usage = self.total_usage()
-        return EvaluationTelemetry(
-            model_identifier=self._model_identifier,
+        return self._store.provider_telemetry(
+            self._run_id,
             prompt_version=PROMPT_VERSION,
-            call_count=self._call_count,
-            token_total=usage.prompt_tokens + usage.completion_tokens,
-            cost_total=0.0,
         )
 
-    def _reserve_call(self) -> None:
-        if self._call_count >= self._max_calls:
-            raise EvaluationCallBudgetExceeded(
-                f"evaluation provider budget is limited to {self._max_calls_word()} calls"
+    async def _reserve_call(self) -> ProviderCallReservation:
+        try:
+            return await self._store.reserve_provider_call(
+                self._run_id,
+                model_identifier=self._model_identifier,
             )
-        self._call_count += 1
-
-    def _max_calls_word(self) -> str:
-        return {1: "one", 2: "two", 3: "three", 4: "four"}.get(
-            self._max_calls,
-            str(self._max_calls),
-        )
+        except EvaluationConflictError as exc:
+            raise EvaluationCallBudgetExceeded(
+                "evaluation provider budget is exhausted"
+            ) from exc
 
 
 def build_evaluation_model_client(
@@ -212,6 +228,8 @@ async def async_main(
         return 1
 
     model_identifier = args.model or os.environ.get("CAPTAIN_MODEL") or DEFAULT_MODEL
+    run_id = args.run_id or f"agentfarm-{source.sha256[:12]}"
+    store = JsonEvaluationStore(args.output)
     owned_client = model_client is None
     try:
         inner = model_client or build_evaluation_model_client(
@@ -221,9 +239,9 @@ async def async_main(
         tracked_client = UsageTrackingChatCompletionClient(
             inner,
             model_identifier=model_identifier,
-            max_calls=args.max_calls,
+            store=store,
+            run_id=run_id,
         )
-        store = JsonEvaluationStore(args.output)
         tools = EvaluationToolService(store)
         service = AgentFarmEvaluationService(
             model_client=tracked_client,
@@ -237,7 +255,6 @@ async def async_main(
             summary_model_client=_build_summary_model_client(args.max_calls),
             telemetry=tracked_client.evaluation_telemetry,
         )
-        run_id = args.run_id or f"agentfarm-{source.sha256[:12]}"
         manifest = await service.run(run_id)
         _print_summary(
             {
@@ -249,7 +266,7 @@ async def async_main(
                 "token_total": manifest.token_total,
             }
         )
-        return 0
+        return 0 if manifest.status is EvaluationStatus.ACCEPTED else 2
     except Exception:
         _print_summary({"error": "evaluation_failed", "status": "failed"})
         return 1
@@ -260,6 +277,22 @@ async def async_main(
 
 def main(argv: Sequence[str] | None = None) -> int:
     return asyncio.run(async_main(argv))
+
+
+def verify_source_digest(path: Path, *, expected_sha256: str) -> Path:
+    """Hard-fail a configured unreadable or changed immutable source."""
+
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise EvaluationSourceDigestMismatch(
+            "configured source digest cannot be verified"
+        ) from exc
+    if digest != expected_sha256:
+        raise EvaluationSourceDigestMismatch(
+            "configured source digest does not match the approved source"
+        )
+    return path
 
 
 def _positive_int(value: str) -> int:

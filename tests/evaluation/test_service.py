@@ -179,6 +179,11 @@ class NoInventorySociety:
         return "EVALUATION_SLICE_COMPLETE without persisted inventory"
 
 
+class ProviderFailureSociety:
+    async def run(self, *, task: str) -> str:
+        raise RuntimeError("provider unavailable with runtime-only-secret")
+
+
 class BlockingInventorySociety:
     def __init__(self) -> None:
         self.started = asyncio.Event()
@@ -269,7 +274,7 @@ async def test_service_finalizes_with_injected_provider_telemetry_and_persisted_
             prompt_version="agentfarm-evaluation-v1",
             call_count=4,
             token_total=321,
-            cost_total=0.0,
+            cost_total=None,
         ),
     )
 
@@ -781,3 +786,36 @@ async def test_adversarial_inventory_slice_without_artifact_persists_failed_mani
     assert manifest.status is EvaluationStatus.FAILED
     assert manifest.component_outcomes == ()
     assert store.lifecycle_events("eval-001")[-1].status is EvaluationStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_provider_exception_persists_terminal_failed_manifest_and_report(
+    tmp_path: Path,
+) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    tools = EvaluationToolService(store)
+    service = AgentFarmEvaluationService(
+        model_client=_model_client(),
+        tools=tools,
+        store=store,
+        source=_source(),
+        idempotency_key="agentfarm-input-v1",
+        max_calls=4,
+        society=ProviderFailureSociety(),
+        telemetry=lambda: EvaluationTelemetry(
+            model_identifier="gpt-provider-failure",
+            prompt_version="agentfarm-evaluation-v1",
+            call_count=1,
+            token_total=0,
+            cost_total=None,
+        ),
+    )
+
+    manifest = await service.run("eval-provider-failure")
+
+    assert manifest.status is EvaluationStatus.FAILED
+    assert manifest.call_count == 1
+    assert manifest.cost_total is None
+    assert (tmp_path / "eval-provider-failure" / "run-manifest.json").is_file()
+    assert (tmp_path / "eval-provider-failure" / "evaluation.md").is_file()
+    assert store.lifecycle_events("eval-provider-failure")[-1].recovery_state == "terminal"

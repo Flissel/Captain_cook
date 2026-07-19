@@ -151,7 +151,11 @@ python -m agenten.evaluation.cli $env:AGENTFARM_INPUT_PATH `
 
 The command prints only a redacted JSON summary with a relative artifact
 reference. Source paths, source text, prompts, provider responses, and API keys
-are not written to that summary or the evaluation report.
+are not written to that summary or the evaluation report. Exit code `0` means
+the Captain manifest is `accepted`; `2` means the run produced a durable
+`partial` or `failed` manifest; configuration or unrecoverable setup errors use
+exit code `1`. Provider cost is reported as unavailable when the client cannot
+provide a trustworthy value.
 
 The real-model smoke gate is opt-in and fixes its own stricter budget. Set
 `AGENTFARM_INPUT_PATH` and `OPENAI_API_KEY` only in the local process
@@ -163,7 +167,9 @@ python -m pytest -q -m live tests/live/test_agentfarm_input_evaluation_live.py
 
 That gate verifies the approved source digest before any provider call and
 enforces one component, one Planner/QA round, and at most four raw model calls.
-It does not contact or modify n8n or any other local service.
+A missing path or API key skips the opt-in gate. A configured unreadable or
+digest-mismatched source fails the gate before provider construction. It does
+not contact or modify n8n or any other local service.
 
 ## Roadmap boundary
 

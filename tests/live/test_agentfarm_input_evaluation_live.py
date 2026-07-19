@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import os
 from pathlib import Path
 
 import pytest
 
 from agenten.evaluation.cli import (
+    EvaluationSourceDigestMismatch,
     async_main,
+    verify_source_digest,
 )
 from agenten.evaluation.models import EvaluationManifest, EvaluationStatus
 
@@ -24,14 +25,10 @@ def require_live_evaluation_environment() -> Path:
         pytest.skip("AGENTFARM_INPUT_PATH is required for the live evaluation gate")
     if not os.environ.get("OPENAI_API_KEY"):
         pytest.skip("OPENAI_API_KEY is required for the live evaluation gate")
-    path = Path(configured)
-    try:
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError:
-        pytest.skip("AGENTFARM_INPUT_PATH must identify a readable immutable source")
-    if digest != EXPECTED_AGENTFARM_SOURCE_SHA256:
-        pytest.skip("AGENTFARM_INPUT_PATH digest does not match the approved immutable source")
-    return path
+    return verify_source_digest(
+        Path(configured),
+        expected_sha256=EXPECTED_AGENTFARM_SOURCE_SHA256,
+    )
 
 
 @pytest.mark.live
@@ -40,6 +37,20 @@ def test_live_agentfarm_evaluation_requires_explicit_environment(
 ) -> None:
     monkeypatch.delenv("AGENTFARM_INPUT_PATH", raising=False)
     with pytest.raises(pytest.skip.Exception, match="AGENTFARM_INPUT_PATH"):
+        require_live_evaluation_environment()
+
+
+@pytest.mark.live
+def test_live_configured_digest_mismatch_fails_instead_of_skipping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    changed = tmp_path / "input.md"
+    changed.write_text("# changed source\n", encoding="utf-8")
+    monkeypatch.setenv("AGENTFARM_INPUT_PATH", str(changed))
+    monkeypatch.setenv("OPENAI_API_KEY", "test-only-key")
+
+    with pytest.raises(EvaluationSourceDigestMismatch, match="digest"):
         require_live_evaluation_environment()
 
 
@@ -78,7 +89,7 @@ async def test_live_agentfarm_evaluation_is_real_bounded_and_planning_only(
     report = (output / run_id / "evaluation.md").read_text(encoding="utf-8")
 
     assert manifest.source.sha256 == EXPECTED_AGENTFARM_SOURCE_SHA256
-    assert manifest.status in {EvaluationStatus.ACCEPTED, EvaluationStatus.PARTIAL}
+    assert manifest.status is EvaluationStatus.ACCEPTED
     assert manifest.model_identifier not in {"", "not-configured"}
     assert 0 < manifest.call_count <= 4
     assert manifest.token_total > 0

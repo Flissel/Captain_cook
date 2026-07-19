@@ -241,6 +241,27 @@ class EvaluationLifecycleEvent(BaseModel):
     recovery_state: Literal["active", "cancelled", "resuming", "terminal"]
 
 
+class ProviderCallReservation(BaseModel):
+    """Durable Captain reservation written before one provider delegation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    run_id: str = Field(min_length=1)
+    call_index: int = Field(ge=1)
+    model_identifier: str = Field(min_length=1)
+
+
+class ProviderCallCompletion(BaseModel):
+    """Append-only token usage for one completed reserved provider call."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    run_id: str = Field(min_length=1)
+    call_index: int = Field(ge=1)
+    prompt_tokens: int = Field(ge=0)
+    completion_tokens: int = Field(ge=0)
+
+
 class EvaluationTelemetry(BaseModel):
     """Redacted provider totals captured at Captain's finalization boundary."""
 
@@ -250,7 +271,7 @@ class EvaluationTelemetry(BaseModel):
     prompt_version: str = Field(min_length=1)
     call_count: int = Field(ge=0)
     token_total: int = Field(ge=0)
-    cost_total: float = Field(ge=0)
+    cost_total: float | None = Field(default=None, ge=0)
 
 
 class EvaluationManifest(BaseModel):
@@ -267,6 +288,6 @@ class EvaluationManifest(BaseModel):
     prompt_version: str = Field(default="not-configured", min_length=1)
     call_count: int = Field(default=0, ge=0)
     token_total: int = Field(default=0, ge=0)
-    cost_total: float = Field(default=0.0, ge=0)
+    cost_total: float | None = Field(default=None, ge=0)
     artifact_digests: tuple[str, ...]
     planning_disclaimer: str = "Acceptance tests are planned, not executed by this evaluation."

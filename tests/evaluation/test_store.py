@@ -351,7 +351,12 @@ async def test_store_finalizes_failed_run_without_inventory(tmp_path: Path) -> N
 @pytest.mark.asyncio
 async def test_store_persists_typed_provider_telemetry_in_terminal_manifest(tmp_path: Path) -> None:
     store = JsonEvaluationStore(tmp_path)
-    await store.create_run(_source(), run_id="eval-telemetry", idempotency_key="input-v1")
+    await store.create_run(
+        _source(),
+        run_id="eval-telemetry",
+        idempotency_key="input-v1",
+        max_calls=4,
+    )
 
     manifest = await store.finalize(
         "eval-telemetry",
@@ -361,7 +366,7 @@ async def test_store_persists_typed_provider_telemetry_in_terminal_manifest(tmp_
             prompt_version="agentfarm-evaluation-v1",
             call_count=4,
             token_total=123,
-            cost_total=0.0,
+            cost_total=None,
         ),
     )
 
@@ -372,6 +377,66 @@ async def test_store_persists_typed_provider_telemetry_in_terminal_manifest(tmp_
     assert persisted.model_identifier == "gpt-live-test"
     assert persisted.call_count == 4
     assert persisted.token_total == 123
+    assert persisted.cost_total is None
+
+
+@pytest.mark.asyncio
+async def test_provider_call_reservations_are_restart_durable_and_run_authoritative(
+    tmp_path: Path,
+) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    await store.create_run(
+        _source(),
+        run_id="eval-provider-budget",
+        idempotency_key="input-v1",
+        max_calls=4,
+    )
+
+    for expected_index in range(1, 5):
+        receipt = await store.reserve_provider_call(
+            "eval-provider-budget",
+            model_identifier="gpt-test",
+        )
+        assert receipt.call_index == expected_index
+
+    restarted = JsonEvaluationStore(tmp_path)
+    with pytest.raises(EvaluationConflictError, match="provider call budget"):
+        await restarted.reserve_provider_call(
+            "eval-provider-budget",
+            model_identifier="gpt-test",
+        )
+
+    telemetry = restarted.provider_telemetry(
+        "eval-provider-budget",
+        prompt_version="agentfarm-evaluation-v1",
+    )
+    assert telemetry.call_count == 4
+    assert telemetry.token_total == 0
+    assert telemetry.cost_total is None
+
+
+@pytest.mark.asyncio
+async def test_finalize_rejects_telemetry_above_persisted_provider_budget(tmp_path: Path) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    await store.create_run(
+        _source(),
+        run_id="eval-telemetry-over-budget",
+        idempotency_key="input-v1",
+        max_calls=4,
+    )
+
+    with pytest.raises(EvaluationConflictError, match="telemetry exceeds"):
+        await store.finalize(
+            "eval-telemetry-over-budget",
+            EvaluationOutcome.FAILED,
+            telemetry=EvaluationTelemetry(
+                model_identifier="gpt-test",
+                prompt_version="agentfarm-evaluation-v1",
+                call_count=5,
+                token_total=10,
+                cost_total=None,
+            ),
+        )
 
 
 @pytest.mark.asyncio
