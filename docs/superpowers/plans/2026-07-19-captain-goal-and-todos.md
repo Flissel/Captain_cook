@@ -90,10 +90,19 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
   Referenz. Der MariaDB-Gateway-Gate bestand mit `6 passed`; der reale
   Codex-/n8n-Live-Gate mit zusätzlicher Revocation-Prüfung bestand mit
   `1 passed in 29,98 s` (2026-07-19).
-- [ ] Einen laufenden Codex-Prozess beim Widerruf aktiv abbrechen und den
-  bereits ausgegebenen n8n-MCP-Token rotieren; der jetzige Gate verhindert
-  weitere Captain-dispatchte Effekte und Referenzen, enthält aber keinen
-  Live-Race-Test für einen bereits laufenden Tool-Call.
+- [x] Einen laufenden Codex-Prozess bei einem persistierten Lease-Widerruf
+  über den vorhandenen, sessiongebundenen Process-Tree-Canceller abbrechen;
+  ein grant- und command-gebundener Monitor gewinnt gegen den laufenden Run
+  und bewahrt dessen terminale Gateway-Abbruch-Evidenz (`48f261b`; `209
+  passed, 6 skipped`, inklusive realem PowerShell-Process-Tree-Abbruch).
+  Der echte LLM-/MCP-Race-Gate bleibt separat offen.
+- [ ] Einen echten LLM-/MCP-Run während eines Captain-Lease-Widerrufs live
+  abbrechen und nachweisen, dass keine spätere Tool- oder Resultat-Evidenz
+  den persistierten Abbruch überschreibt.
+- [ ] Den statischen n8n-MCP-Instanzschlüssel durch einen Captain-eigenen,
+  kurzlebigen Lease-Broker/Proxy ersetzen. Eine Rotation des jetzigen
+  instanzweiten Schlüssels wäre kein sicherer Einzelwiderruf, weil sie
+  parallele, rechtmäßige Runs ebenfalls unterbrechen würde.
 - [ ] Den E2E- und Recovery-Pfad nach Prozessneustart mit unveränderten
   Artifacts/Gatewaydaten prüfen: keine doppelte Provider-Reservierung,
   Freigabe oder Ledger-Transition. Der deterministische Control-Plane-
