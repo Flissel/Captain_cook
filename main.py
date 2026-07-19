@@ -21,6 +21,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Path for the generated JSON evidence artifact",
     )
     subparsers.add_parser("legacy", help="Run the API-key-backed legacy prototype")
+    recovery_parser = subparsers.add_parser(
+        "recover-gateway",
+        help="Run one fail-closed Captain recovery pass for expired Gateway claims",
+    )
+    recovery_parser.add_argument(
+        "--gateway-url",
+        help="override CAPTAIN_GATEWAY_URL for this recovery pass",
+    )
     return parser.parse_args(argv)
 
 
@@ -63,6 +71,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary = asyncio.run(run_demo(args.output))
         print(f"Demo complete: {summary.done_count} subproblems reached done")
         return 0
+    if args.command == "recover-gateway":
+        from agenten.delivery.recovery_cli import main as recovery_main
+
+        recovery_argv = (
+            ["--gateway-url", args.gateway_url]
+            if args.gateway_url is not None
+            else []
+        )
+        return recovery_main(recovery_argv)
     return run_legacy()
 
 

@@ -15,6 +15,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeResult,
     ArtifactRef,
     CapabilityGrant,
+    CapabilityGrantRevocation,
     HermesPlanResult,
     IntegrationIntent,
     RuntimeOperation,
@@ -143,6 +144,7 @@ class RuntimeState:
         self.batches: dict[str, WorkBatch] = {}
         self.commands: dict[UUID, AgentRuntimeCommand] = {}
         self.grants: dict[UUID, CapabilityGrant] = {}
+        self.revocations: dict[UUID, CapabilityGrantRevocation] = {}
         self.results: dict[UUID, AgentRuntimeResult] = {}
         self.release_order: list[str] = []
 
@@ -168,6 +170,11 @@ class RuntimeState:
 
     async def get_grant(self, command_id: UUID) -> CapabilityGrant | None:
         return self.grants.get(command_id)
+
+    async def get_grant_revocation(
+        self, command_id: UUID
+    ) -> CapabilityGrantRevocation | None:
+        return self.revocations.get(command_id)
 
     async def record_grant(self, grant: CapabilityGrant) -> CapabilityGrant:
         self.grants[grant.command_id] = grant
@@ -195,8 +202,9 @@ class CapabilityPolicy:
         grant: CapabilityGrant,
         command: AgentRuntimeCommand,
         now: datetime,
+        revocation: CapabilityGrantRevocation | None = None,
     ) -> CapabilityGrant:
-        return validate_grant(grant, command, now)
+        return validate_grant(grant, command, now, revocation)
 
 
 class Clock:

@@ -33,6 +33,7 @@ class GatewaySettings(BaseModel):
     approval_enabled: bool = False
     host: Literal["127.0.0.1"] = "127.0.0.1"
     port: int = Field(default=8090, ge=1, le=65535)
+    claim_ttl_seconds: int = Field(default=5_400, ge=1, le=86_400)
 
     @field_validator(
         "ledger_dsn",
@@ -91,6 +92,12 @@ class GatewaySettings(BaseModel):
         except (TypeError, ValueError):
             raise GatewayConfigurationError("invalid gateway configuration") from None
 
+        claim_ttl_raw = source.get("GATEWAY_CLAIM_TTL_SECONDS", "5400")
+        try:
+            claim_ttl_seconds = int(claim_ttl_raw)
+        except (TypeError, ValueError):
+            raise GatewayConfigurationError("invalid gateway configuration") from None
+
         try:
             return cls(
                 ledger_dsn=SecretStr(source["LEDGER_DSN"]),
@@ -98,6 +105,7 @@ class GatewaySettings(BaseModel):
                 worker_gateway_token=SecretStr(worker_token),
                 approval_enabled=approval_enabled,
                 port=port,
+                claim_ttl_seconds=claim_ttl_seconds,
             )
         except ValidationError:
             raise GatewayConfigurationError("invalid gateway configuration") from None

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -10,6 +12,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
     CapabilityGrant,
+    CapabilityGrantRevocation,
 )
 from agenten.agent_runtime.gateway_client import (
     GatewayRuntimeClient,
@@ -58,6 +61,18 @@ def result() -> AgentRuntimeResult:
     )
     value["grant_id"] = grant().grant_id
     return AgentRuntimeResult.model_validate(value)
+
+
+def revocation() -> CapabilityGrantRevocation:
+    issued_at = datetime(2026, 7, 17, 12, tzinfo=timezone.utc)
+    return CapabilityGrantRevocation(
+        schema_name="captain.capability-grant-revocation.v1",
+        revocation_id=uuid4(),
+        grant_id=grant().grant_id,
+        command_id=command().event_id,
+        revoked_at=issued_at + timedelta(minutes=1),
+        reason="captain_cancelled",
+    )
 
 
 @pytest.mark.asyncio
@@ -134,6 +149,45 @@ async def test_client_maps_conflict_without_leaking_response_or_token() -> None:
 
     assert "captain-secret" not in str(raised.value)
     assert "sensitive" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_client_records_and_reads_an_append_only_grant_revocation() -> None:
+    value = revocation()
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/grant-revocations"):
+            return httpx.Response(
+                201,
+                json={"operation_id": str(command().event_id), "replayed": False},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={
+                "operation_id": str(command().event_id),
+                "command": command().model_dump(mode="json", by_alias=True),
+                "grant": grant().model_dump(mode="json", by_alias=True),
+                "revocation": value.model_dump(mode="json", by_alias=True),
+                "result": None,
+            },
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = GatewayRuntimeClient("https://gateway.test", "captain-secret", http)
+        receipt = await client.record_capability_grant_revocation(value)
+        observed = await client.get_grant_revocation(command().event_id)
+
+    assert receipt.replayed is False
+    assert observed == value
+    assert [request.url.path for request in requests] == [
+        "/v1/runtime/grant-revocations",
+        f"/v1/runtime/operations/{command().event_id}",
+    ]
+    assert "captain-secret" not in requests[0].content.decode()
 
 
 @pytest.mark.asyncio

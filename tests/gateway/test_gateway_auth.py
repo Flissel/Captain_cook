@@ -584,6 +584,61 @@ def test_recovery_route_is_captain_only_idempotent_and_cannot_be_bypassed(
     assert conflicting.status_code == 409
 
 
+def test_expired_claim_requires_captain_requeue_before_worker_can_reclaim(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gateway import store as store_module
+
+    start = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(store_module, "_utcnow", lambda: start)
+    captain = authorization(CAPTAIN_TOKEN)
+    worker = authorization(WORKER_TOKEN)
+    assert client.post(
+        "/blocks",
+        headers=captain,
+        json={"block_type": "work_batch", "data": batch_payload()},
+    ).status_code == 201
+    first = client.post("/batches/batch-1/claim", headers=worker)
+    assert first.status_code == 200
+
+    monkeypatch.setattr(store_module, "_utcnow", lambda: start + timedelta(minutes=91))
+    assert client.post("/batches/batch-1/claim", headers=worker).status_code == 409
+
+    recovery = {
+        "batch_id": "batch-1",
+        "iteration": 1,
+        "reason": "claim_expired",
+        "decision": "requeue",
+    }
+    assert client.post("/batches/batch-1/recovery", headers=captain, json=recovery).status_code == 201
+    second = client.post("/batches/batch-1/claim", headers=worker)
+
+    assert second.status_code == 200
+    assert second.json()["fencing_token"] > first.json()["fencing_token"]
+
+
+def test_claim_id_remains_a_codex_request_identifier_for_all_random_bodies(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gateway import store as store_module
+
+    monkeypatch.setattr(store_module.secrets, "token_urlsafe", lambda _: "-random")
+    captain = authorization(CAPTAIN_TOKEN)
+    worker = authorization(WORKER_TOKEN)
+    assert client.post(
+        "/blocks",
+        headers=captain,
+        json={"block_type": "work_batch", "data": batch_payload()},
+    ).status_code == 201
+
+    claim = client.post("/batches/batch-1/claim", headers=worker)
+
+    assert claim.status_code == 200
+    assert claim.json()["claim_id"] == "claim--random"
+
+
 def test_runtime_lifespan_fails_closed_without_complete_settings(
     storage: MariaDBStorage,
     monkeypatch: pytest.MonkeyPatch,

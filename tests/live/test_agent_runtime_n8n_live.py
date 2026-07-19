@@ -8,9 +8,9 @@ import shutil
 import subprocess
 import sys
 import tomllib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from uuid import UUID, uuid4, uuid5
 
 import pytest
@@ -42,17 +42,22 @@ from hermes_cli.captain_worker_contracts import (  # noqa: E402
 from hermes_cli.n8n_worker_mcp import (  # noqa: E402
     HermesGenericMcpTransport,
     JsonFileMcpCallStore,
+    N8nMcpError,
     N8nWorkerMcp,
     ScopedCodexEnvironment,
     ScopedCodexHomeFactory,
 )
 
-from agenten.agent_runtime.capabilities import derive_grant  # noqa: E402
+from agenten.agent_runtime.capabilities import (  # noqa: E402
+    CapabilityDenied,
+    derive_grant,
+)
 from agenten.agent_runtime.contracts import (  # noqa: E402
     AgentRuntimeCommand,
     AgentRuntimeResult,
     ArtifactRef,
     CapabilityGrant,
+    CapabilityGrantRevocation,
     CapabilityProfile,
     HermesPlanResult,
     IntegrationIntent,
@@ -61,6 +66,11 @@ from agenten.agent_runtime.contracts import (  # noqa: E402
 from agenten.agent_runtime.control_plane import (  # noqa: E402
     ControlPlaneEvidenceManifest,
     EvidenceObservation,
+)
+from agenten.agent_runtime.n8n_endpoint import (  # noqa: E402
+    N8nEndpoint,
+    build_hermes_n8n_reference,
+    resolve_n8n_endpoint,
 )
 from agenten.agent_runtime.tools import (  # noqa: E402
     AuthoritativeRuntimeState,
@@ -114,14 +124,42 @@ def _workflow_prompt(correlation_id: UUID) -> bytes:
     ).encode()
 
 
+def _captain_builder_endpoint() -> N8nEndpoint:
+    environment_path = ROOT / ".env.captain-n8n"
+    if not environment_path.is_file():
+        pytest.fail("required live gate: Captain builder environment is unavailable")
+    values: dict[str, str] = {}
+    for raw_line in environment_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            pytest.fail("required live gate: Captain builder environment is invalid")
+        name, value = line.split("=", 1)
+        values[name] = value
+    port = values.get("CAPTAIN_N8N_PORT", "").strip()
+    api_key = values.get("CAPTAIN_N8N_API_KEY", "").strip()
+    mcp_token = values.get("CAPTAIN_N8N_MCP_TOKEN", "").strip()
+    if not port or not api_key or not mcp_token:
+        pytest.fail("required live gate: Captain builder credentials are unavailable")
+    return resolve_n8n_endpoint(
+        {
+            "N8N_MODE": "captain-builder",
+            "CAPTAIN_N8N_URL": f"http://127.0.0.1:{port}",
+            "CAPTAIN_N8N_API_KEY": api_key,
+            "CAPTAIN_N8N_MCP_TOKEN": mcp_token,
+        }
+    )
+
+
 def _require_live_environment(*, n8n: bool) -> None:
     if shutil.which("codex") is None:
         pytest.fail("required live gate: Codex CLI is unavailable")
     auth = Path.home() / ".codex" / "auth.json"
     if not auth.is_file() and not os.environ.get("OPENAI_API_KEY"):
         pytest.fail("required live gate: Codex authentication is unavailable")
-    if n8n and not os.environ.get("N8N_MCP_TOKEN"):
-        pytest.fail("required live gate: N8N_MCP_TOKEN is unavailable")
+    if n8n:
+        _captain_builder_endpoint()
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -435,17 +473,10 @@ def _package(
     )
 
 
-def _configured_n8n_server() -> dict[str, dict[str, Any]]:
-    config_path = Path.home() / ".codex" / "config.toml"
-    if not config_path.is_file():
-        pytest.fail("required live gate: Codex MCP config is unavailable")
-    payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    entry = (payload.get("mcp_servers") or {}).get("n8n")
-    if not isinstance(entry, dict) or not entry.get("url"):
-        pytest.fail("required live gate: Codex n8n MCP server is unavailable")
+def _configured_n8n_server(endpoint: N8nEndpoint) -> dict[str, dict[str, Any]]:
     return {
         "n8n-mcp": {
-            "url": str(entry["url"]),
+            "url": f"{endpoint.api_base_url}/mcp-server/http",
             "headers": {"Authorization": "Bearer ${N8N_MCP_TOKEN}"},
             "tools": {
                 "include": [
@@ -493,6 +524,7 @@ def _worker(
     state_root: Path,
     codex_home_root: Path,
     configured_servers: dict[str, dict[str, Any]],
+    n8n_environment: Mapping[str, str] | None = None,
     now: datetime,
 ) -> CaptainWorker:
     return CaptainWorker(
@@ -512,9 +544,9 @@ def _worker(
                 else None
             ),
         ),
-        codex_environment_factory=lambda current: ScopedCodexEnvironment().for_grant(
-            current.grant
-        ),
+        codex_environment_factory=lambda current: ScopedCodexEnvironment(
+            n8n_environment
+        ).for_grant(current.grant),
     )
 
 
@@ -688,7 +720,7 @@ async def test_real_codex_without_n8n_is_confined_and_restart_safe(tmp_path: Pat
 
 @pytest.mark.asyncio
 async def test_real_n8n_mcp_workflow_is_validated_published_executed_and_archived(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _require_live_environment(n8n=True)
     now = datetime.now(timezone.utc)
@@ -709,7 +741,13 @@ async def test_real_n8n_mcp_workflow_is_validated_published_executed_and_archive
         now=now,
     )
     package = _package(command, grant, batch, now)
-    configured = _configured_n8n_server()
+    endpoint = _captain_builder_endpoint()
+    reference = build_hermes_n8n_reference(grant, command, endpoint, now)
+    n8n_environment = reference.child_process_environment()
+    monkeypatch.setenv("N8N_MCP_TOKEN", n8n_environment["N8N_MCP_TOKEN"])
+    configured = _configured_n8n_server(endpoint)
+    assert configured["n8n-mcp"]["url"] == f"{endpoint.api_base_url}/mcp-server/http"
+    assert "15678" not in configured["n8n-mcp"]["url"]
     runtime = CountingRuntime()
     worker = _worker(
         workspace=workspace,
@@ -718,6 +756,7 @@ async def test_real_n8n_mcp_workflow_is_validated_published_executed_and_archive
         state_root=tmp_path / "worker-state",
         codex_home_root=tmp_path / "codex-home",
         configured_servers=configured,
+        n8n_environment=n8n_environment,
         now=now,
     )
     mcp = N8nWorkerMcp(
@@ -737,6 +776,16 @@ async def test_real_n8n_mcp_workflow_is_validated_published_executed_and_archive
         workflow_path = workspace / "workflow.ts"
         assert record.session_id
         assert record.changed_paths == ("workflow.ts",)
+        scoped_config = tomllib.loads(
+            next((tmp_path / "codex-home").rglob("config.toml")).read_text(
+                encoding="utf-8"
+            )
+        )
+        scoped_servers = scoped_config.get("mcp_servers", {})
+        assert isinstance(scoped_servers, dict)
+        assert scoped_servers["n8n-mcp"]["url"] == configured["n8n-mcp"]["url"]
+        assert "15678" not in json.dumps(scoped_config)
+        assert n8n_environment["N8N_MCP_TOKEN"] not in json.dumps(scoped_config)
         code = workflow_path.read_text(encoding="utf-8")
         assert code == _workflow_code(correlation_id)
 
@@ -825,6 +874,37 @@ async def test_real_n8n_mcp_workflow_is_validated_published_executed_and_archive
         assert workflow_id in serialized
         assert executed.evidence.execution_id in serialized
         assert "N8N_MCP_TOKEN" not in serialized
+        expired_mcp = N8nWorkerMcp(
+            grant=package.grant,
+            configured_servers=configured,
+            transport=HermesGenericMcpTransport(),
+            clock=lambda: now + timedelta(minutes=16),
+        )
+        with pytest.raises(N8nMcpError, match="expired"):
+            expired_mcp.discover_capabilities()
+        with pytest.raises(CapabilityDenied, match="expired"):
+            build_hermes_n8n_reference(
+                grant,
+                command,
+                endpoint,
+                now + timedelta(minutes=16),
+            )
+        revocation = CapabilityGrantRevocation(
+            schema_name="captain.capability-grant-revocation.v1",
+            revocation_id=uuid4(),
+            grant_id=grant.grant_id,
+            command_id=command.event_id,
+            revoked_at=now + timedelta(seconds=1),
+            reason="captain_cancelled",
+        )
+        with pytest.raises(CapabilityDenied, match="revoked"):
+            build_hermes_n8n_reference(
+                grant,
+                command,
+                endpoint,
+                now + timedelta(seconds=2),
+                revocation,
+            )
     finally:
         runtime.close()
         if workflow_id is not None:

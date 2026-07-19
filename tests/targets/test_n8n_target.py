@@ -5,6 +5,8 @@ import threading
 from typing import Any
 import httpx
 import pytest
+
+from agenten.agent_runtime.n8n_endpoint import resolve_n8n_endpoint
 from agenten.targets.n8n import N8nEvidenceError, N8nHttpClient, N8nTarget, SealedArtifact, ValidationCase
 
 class ProviderState:
@@ -14,6 +16,8 @@ class ProviderState:
         self.workflow_id = "workflow-1"
         self.execution_status = "success"
         self.execution_output = {"artifact_digest": "a" * 64, "correlation_id": "correlation-1"}
+        self.execution_reads = 0
+        self.missing_execution_evidence_reads = 0
         self.requests: list[tuple[str, str, dict[str, Any] | None]] = []
 
 @pytest.fixture
@@ -33,7 +37,32 @@ def n8n_server():
             if self.path.startswith("/api/v1/workflows"):
                 self._send(200, {"data": [] if state.workflow is None else [state.workflow]}); return
             if self.path.startswith("/api/v1/executions/execution-1"):
-                self._send(200, {"id":state.execution_id,"workflowId":state.workflow_id,"status":state.execution_status,"data":{"resultData":{"runData":{"Respond":[{"data":{"main":[[{"json":state.execution_output}]]}}]}}}}); return
+                state.execution_reads += 1
+                if state.execution_reads <= state.missing_execution_evidence_reads:
+                    run_data = {}
+                else:
+                    run_data = {
+                        "Evidence": [
+                            {"data": {"main": [[{"json": state.execution_output}]]}}
+                        ],
+                        "Respond": [
+                            {
+                                "data": {
+                                    "main": [[{"json": {"responseCode": 200}}]]
+                                }
+                            }
+                        ],
+                    }
+                self._send(
+                    200,
+                    {
+                        "id": state.execution_id,
+                        "workflowId": state.workflow_id,
+                        "status": state.execution_status,
+                        "data": {"resultData": {"runData": run_data}},
+                    },
+                )
+                return
             self._send(404, {"message":"not found"})
         def do_POST(self):
             payload = self._json(); state.requests.append(("POST", self.path, payload))
@@ -56,6 +85,31 @@ def n8n_server():
 def artifact():
     return SealedArtifact(artifact_id="harmless-workflow",artifact_digest="a"*64,namespace="captain-gate-a",workflow={"nodes":[{"name":"Respond","type":"n8n-nodes-base.respondToWebhook","typeVersion":1,"position":[0,0],"parameters":{}}],"connections":{},"settings":{}})
 
+
+@pytest.mark.asyncio
+async def test_http_client_is_constructed_from_selected_endpoint(n8n_server):
+    base_url, state = n8n_server
+    endpoint = resolve_n8n_endpoint(
+        {
+            "N8N_MODE": "captain-builder",
+            "CAPTAIN_N8N_URL": base_url,
+            "CAPTAIN_N8N_API_KEY": "local-test-key",
+        }
+    )
+
+    async with httpx.AsyncClient() as http:
+        client = N8nHttpClient.from_endpoint(endpoint, http)
+        record = await client.create_or_update_workflow(
+            name="captain::selected-endpoint",
+            definition={"nodes": [], "connections": {}, "settings": {}},
+        )
+
+    assert record.id == "workflow-1"
+    assert state.workflow == {
+        "id": "workflow-1",
+        "name": "captain::selected-endpoint",
+    }
+
 @pytest.mark.asyncio
 async def test_target_deploys_executes_and_fetches_matching_real_http_evidence(n8n_server):
     base_url,state=n8n_server
@@ -73,6 +127,34 @@ async def test_target_deploys_executes_and_fetches_matching_real_http_evidence(n
     assert create[2]=={"name":deployment.workflow_name,"nodes":artifact().workflow["nodes"],"connections":{},"settings":{}}
     webhook=next(item for item in state.requests if item[0]=="POST" and item[1].startswith("/webhook/"))
     assert webhook[2]=={"artifact_digest":artifact().artifact_digest,"correlation_id":"correlation-1","case_id":"case-1","input":{"message":"ping"}}
+
+
+@pytest.mark.asyncio
+async def test_http_client_polls_until_execution_evidence_is_persisted(n8n_server):
+    base_url, state = n8n_server
+    state.missing_execution_evidence_reads = 1
+    async with httpx.AsyncClient() as http:
+        target = N8nTarget(
+            N8nHttpClient(
+                api_base_url=base_url,
+                webhook_base_url=base_url,
+                api_key="local-test-key",
+                http=http,
+                evidence_delay_seconds=0,
+            )
+        )
+        deployment = await target.deploy(artifact())
+        evidence = await target.execute(
+            deployment,
+            ValidationCase(
+                case_id="case-1",
+                correlation_id="correlation-1",
+                input_payload={},
+            ),
+        )
+
+    assert evidence.execution_id == "execution-1"
+    assert state.execution_reads == 2
 
 
 
@@ -110,7 +192,9 @@ def test_gate_a_live_contract_is_fresh_supervised_and_causally_linked():
         "uuid4()",
         "TemporaryDirectory",
         "CodexExecutionPolicy",
-        "PowerShellCodexRunner",
+        "HermesAppServerRunner",
+        "HermesCodexRuntime",
+        "write_capability_scoped_codex_config",
         "CodexSupervisor",
         "GatewayCodexRunRepository",
         "workflow_path.read_bytes()",

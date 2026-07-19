@@ -76,6 +76,24 @@ class GatewayClaim(BaseModel):
     iteration: int = Field(ge=1, strict=True)
 
 
+class GatewayActiveCodexSession(BaseModel):
+    """Gateway-derived trace needed for host-local terminal evidence."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    project_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    trace_id: str = Field(min_length=1)
+    batch_id: str = Field(min_length=1)
+    worker_id: str = Field(min_length=1)
+    claim_id: str = Field(min_length=1)
+    fencing_token: int = Field(ge=1, strict=True)
+    session_id: str = Field(min_length=1)
+    iteration: int = Field(ge=1, strict=True)
+    process_ref: str = Field(pattern=r"^artifact://")
+    started_at: datetime
+
+
 class GatewayEvidence(BaseModel):
     """Closed evidence union accepted by the current gateway projection."""
 
@@ -189,6 +207,15 @@ class GatewayDeliveryClient:
         self,
         event: DeliveryEventEnvelope,
     ) -> DeliveryEventEnvelope:
+        appended, _ = await self.append_delivery_event_with_receipt(event)
+        return appended
+
+    async def append_delivery_event_with_receipt(
+        self,
+        event: DeliveryEventEnvelope,
+    ) -> tuple[DeliveryEventEnvelope, bool]:
+        """Append one idempotent event and retain whether Gateway replayed it."""
+
         response = await self._request(
             "POST",
             "/v1/delivery/events",
@@ -205,7 +232,7 @@ class GatewayDeliveryClient:
             response,
             operation=f"append {event.event_type} delivery event",
         )
-        return appended.event
+        return appended.event, appended.replayed
 
     async def delivery_events(
         self,
@@ -228,6 +255,29 @@ class GatewayDeliveryClient:
             raise GatewayDeliveryError(
                 "read delivery events returned an invalid response"
             ) from None
+
+    async def record_release_decision(
+        self,
+        *,
+        project_id: str,
+        run_id: str,
+        policy_version: str,
+    ) -> DeliveryEventEnvelope:
+        response = await self._request(
+            "POST",
+            (
+                f"/v1/projects/{quote(project_id, safe='')}/runs/"
+                f"{quote(run_id, safe='')}/release/decision"
+            ),
+            operation="record Captain release decision",
+            json={"policy_version": policy_version},
+        )
+        self._require_status(response, {200}, operation="record Captain release decision")
+        return self._validate(
+            DeliveryEventEnvelope,
+            response,
+            operation="record Captain release decision",
+        )
 
     async def get_batch(self, batch_id: str) -> GatewayBatchProjection:
         response = await self._request(
@@ -257,6 +307,26 @@ class GatewayDeliveryClient:
         except (TypeError, ValueError, ValidationError):
             raise GatewayDeliveryError("list batches returned an invalid response") from None
         return tuple(item.batch_id for item in items)
+
+    async def active_codex_sessions(
+        self,
+        batch_id: str,
+    ) -> tuple[GatewayActiveCodexSession, ...]:
+        response = await self._request(
+            "GET",
+            f"/batches/{self._batch_path(batch_id)}/active-codex-sessions",
+            operation="read active Codex sessions",
+        )
+        self._require_status(response, {200}, operation="read active Codex sessions")
+        try:
+            payload = response.json()
+            if not isinstance(payload, list):
+                raise ValueError("active Codex session response must be an array")
+            return tuple(GatewayActiveCodexSession.model_validate(item) for item in payload)
+        except (TypeError, ValueError, ValidationError):
+            raise GatewayDeliveryError(
+                "read active Codex sessions returned an invalid response"
+            ) from None
 
     async def claim(self, batch_id: str) -> GatewayClaim:
         response = await self._request(

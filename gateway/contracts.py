@@ -20,6 +20,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
     CapabilityGrant,
+    CapabilityGrantRevocation,
 )
 from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease
 from agenten.agent_factory.state_machine import FactoryLifecycleStatus, FactoryProjection
@@ -58,6 +59,7 @@ class RuntimeOperationProjection(_FrozenContract):
     operation_id: UUID
     command: AgentRuntimeCommand
     grant: CapabilityGrant | None = None
+    revocation: CapabilityGrantRevocation | None = None
     result: AgentRuntimeResult | None = None
 
 
@@ -138,6 +140,7 @@ CodexCancellationReason: TypeAlias = Literal[
     "timeout",
     "shutdown",
     "claim_lost",
+    "captain_revoked",
 ]
 
 
@@ -154,11 +157,14 @@ class CodexSessionStartedPayload(_FrozenContract):
 class CodexSessionEventPayload(_FrozenContract):
     event_type: Literal["codex_session_event"]
     session_id: str = Field(min_length=1)
+    external_session_id: str | None = Field(default=None, min_length=1)
     source_sequence: int = Field(ge=0, strict=True)
     lifecycle: Literal[
         "started",
         "turn_started",
         "turn_completed",
+        "item_started",
+        "item_updated",
         "item_completed",
         "failed",
     ]
@@ -176,16 +182,19 @@ class CodexSessionEventPayload(_FrozenContract):
             self.cached_input_tokens,
             self.output_tokens,
         )
-        if self.lifecycle == "item_completed":
+        if self.lifecycle in {"item_started", "item_updated", "item_completed"}:
             if any(value is None for value in item_fields) or any(
                 value is not None for value in token_fields
             ):
                 raise ValueError("item_completed requires only item metadata")
         elif self.lifecycle == "turn_completed":
-            if any(value is not None for value in item_fields) or any(
+            usage_is_partial = any(value is not None for value in token_fields) and any(
                 value is None for value in token_fields
-            ):
-                raise ValueError("turn_completed requires only token metadata")
+            )
+            if any(value is not None for value in item_fields) or usage_is_partial:
+                raise ValueError(
+                    "turn_completed requires no usage or complete token metadata"
+                )
         elif any(value is not None for value in (*item_fields, *token_fields)):
             raise ValueError(f"{self.lifecycle} forbids item and token metadata")
         return self
@@ -506,6 +515,24 @@ class BatchProjection(BaseModel):
     recovered_iteration: int | None = None
     passing_review_recorded: bool = False
     failed_review_count: int = 0
+
+
+class ActiveCodexSession(BaseModel):
+    """Minimal, redacted trace for Captain's host-local session recovery."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    project_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    trace_id: str = Field(min_length=1)
+    batch_id: str = Field(min_length=1)
+    worker_id: str = Field(min_length=1)
+    claim_id: str = Field(min_length=1)
+    fencing_token: int = Field(ge=1, strict=True)
+    session_id: str = Field(min_length=1)
+    iteration: int = Field(ge=1, strict=True)
+    process_ref: str = Field(pattern=r"^artifact://")
+    started_at: datetime
 
 
 class ClaimEvent(BaseModel):

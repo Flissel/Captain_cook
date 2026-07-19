@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     CapabilityGrant,
+    CapabilityGrantRevocation,
     CapabilityProfile,
 )
 from agenten.validation.contracts import WorkBatch
@@ -130,6 +131,7 @@ def validate_grant(
     grant: CapabilityGrant,
     command: AgentRuntimeCommand,
     now: datetime,
+    revocation: CapabilityGrantRevocation | None = None,
 ) -> CapabilityGrant:
     """Validate an existing grant against its command and current UTC time."""
 
@@ -162,6 +164,12 @@ def validate_grant(
     )
     if grant.mcp_servers != expected_servers:
         raise CapabilityDenied("grant MCP servers do not exactly match its profile")
+    if revocation is not None:
+        if revocation.grant_id != grant.grant_id:
+            raise CapabilityDenied("grant revocation belongs to a different grant")
+        if revocation.command_id != command.event_id:
+            raise CapabilityDenied("grant revocation belongs to a different command")
+        raise CapabilityDenied("grant has been revoked by Captain")
     return grant
 
 

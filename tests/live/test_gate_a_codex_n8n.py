@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timezone
+import asyncio
 import hashlib
 import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
@@ -16,17 +19,25 @@ from uuid import uuid4
 import httpx
 import pytest
 
+from agenten.agent_runtime.n8n_endpoint import resolve_n8n_endpoint
 from agenten.delivery.codex_runs import GatewayCodexRunRepository
 from agenten.delivery.gateway_client import GatewayDeliveryClient
 from agenten.execution.codex_policy import CodexExecutionPolicy
 from agenten.execution.codex_supervisor import (
     CodexRunRequest,
+    CodexRunResult,
     CodexSupervisor,
-    PowerShellCodexRunner,
 )
 from agenten.execution.process import PackageExecutionStatus
 from agenten.targets.n8n import N8nHttpClient, N8nTarget, SealedArtifact, ValidationCase
 from gateway.contracts import DeliveryEventEnvelope
+
+
+HERMES_ROOT = Path(__file__).resolve().parents[2] / "hermes-agent"
+sys.path.insert(0, str(HERMES_ROOT))
+
+from hermes_cli.captain_worker import HermesCodexRuntime  # noqa: E402
+from hermes_cli.mcp_config import write_capability_scoped_codex_config  # noqa: E402
 
 
 def _secret(name: str) -> str | None:
@@ -34,6 +45,7 @@ def _secret(name: str) -> str | None:
     if value:
         return value
     for env_path in (
+        Path(__file__).resolve().parents[2] / ".env.captain-n8n",
         Path(__file__).resolve().parents[2] / ".env",
         Path(__file__).resolve().parents[3] / ".env",
     ):
@@ -70,19 +82,31 @@ def _git(workspace: Path, *args: str) -> None:
 
 
 def _codex_binary() -> Path | None:
-    npm = subprocess.run(
-        ["npm", "root", "-g"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    candidates = tuple(
-        Path(npm).glob(
-            "@openai/codex/node_modules/@openai/codex-win32-x64/"
-            "vendor/x86_64-pc-windows-msvc/bin/codex.exe"
-        )
+    relative_binary = Path(
+        "@openai/codex/node_modules/@openai/codex-win32-x64/"
+        "vendor/x86_64-pc-windows-msvc/bin/codex.exe"
     )
-    return candidates[0] if candidates else None
+    roots = []
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        roots.append(Path(appdata) / "npm" / "node_modules")
+    try:
+        npm = subprocess.run(
+            ["npm", "root", "-g"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+    else:
+        roots.append(Path(npm))
+
+    for root in roots:
+        candidate = root / relative_binary
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 class _ForbiddenLegacyWriter:
@@ -90,14 +114,93 @@ class _ForbiddenLegacyWriter:
         raise AssertionError(f"legacy evidence writer used: {name}")
 
 
+class HermesAppServerRunner:
+    """Run an approved Codex task through Hermes' workspace approval bridge."""
+
+    def __init__(
+        self,
+        *,
+        codex_home: Path,
+        artifact_references: tuple[str, ...],
+        wall_seconds: int,
+    ) -> None:
+        self._codex_home = codex_home
+        self._artifact_references = artifact_references
+        self._wall_seconds = wall_seconds
+        self.failure_type: str | None = None
+
+    async def run(self, authorized: object) -> CodexRunResult:
+        workspace = getattr(authorized, "workspace")
+        command = getattr(authorized, "command")
+        runtime = HermesCodexRuntime()
+        try:
+            outcome = await asyncio.to_thread(
+                runtime.start,
+                workspace=workspace,
+                prompt=command[3].encode("utf-8"),
+                codex_home=self._codex_home,
+                wall_seconds=self._wall_seconds,
+                environment={},
+            )
+        except Exception as exc:
+            self.failure_type = type(exc).__name__
+            return CodexRunResult(
+                exit_code=1,
+                artifact_references=(),
+                jsonl_lines=(),
+            )
+        finally:
+            runtime.close()
+        if outcome.error is not None or outcome.interrupted:
+            self.failure_type = (
+                f"terminal={outcome.terminal_state.value}; "
+                f"error_present={outcome.error is not None}; "
+                f"interrupted={outcome.interrupted}"
+            )
+        lines = (
+            json.dumps({"type": "thread.started", "thread_id": outcome.session_id}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"id": outcome.turn_id, "type": "agent_message"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {},
+                }
+            ),
+        )
+        return CodexRunResult(
+            exit_code=0 if outcome.error is None and not outcome.interrupted else 1,
+            artifact_references=self._artifact_references,
+            jsonl_lines=lines,
+        )
+
+
 @pytest.mark.live
 @pytest.mark.asyncio
-async def test_gate_a_real_codex_n8n_gateway_trace() -> None:
-    # This credential gate is intentionally first: no process, HTTP, DB, or file
-    # side effect may occur when the externally owned n8n credential is absent.
-    api_key = _required(
-        "N8N_API_KEY",
-        "N8N_API_KEY for existing VibeMind n8n",
+async def test_gate_a_real_codex_n8n_gateway_trace(
+    record_property: Callable[[str, object], None],
+) -> None:
+    captain_port = _required(
+        "CAPTAIN_N8N_PORT",
+        "CAPTAIN_N8N_PORT for isolated Captain builder",
+    )
+    endpoint = resolve_n8n_endpoint(
+        {
+            "N8N_MODE": "captain-builder",
+            "CAPTAIN_N8N_URL": (
+                _secret("CAPTAIN_N8N_URL")
+                or f"http://127.0.0.1:{captain_port}"
+            ),
+            "CAPTAIN_N8N_API_KEY": _required(
+                "CAPTAIN_N8N_API_KEY",
+                "CAPTAIN_N8N_API_KEY for isolated Captain builder",
+            ),
+        }
     )
     ledger_dsn = _required(
         "TEST_MARIADB_DSN",
@@ -109,8 +212,15 @@ async def test_gate_a_real_codex_n8n_gateway_trace() -> None:
         pytest.skip("Gate A prerequisite missing: official Codex CLI native binary")
 
     unique = uuid4().hex
-    project_id = f"gate-a-{unique[:12]}"
-    run_id = f"run-{unique[:20]}"
+    project_id = os.environ.get("CAPTAIN_GATE_A_PROJECT_ID", f"gate-a-{unique[:12]}")
+    run_id = os.environ.get("CAPTAIN_GATE_A_RUN_ID", f"run-{unique[:20]}")
+    run_index_raw = os.environ.get("CAPTAIN_GATE_A_RUN_INDEX", "1")
+    try:
+        run_index = int(run_index_raw)
+    except ValueError:
+        pytest.fail("CAPTAIN_GATE_A_RUN_INDEX must be a positive integer")
+    if run_index < 1:
+        pytest.fail("CAPTAIN_GATE_A_RUN_INDEX must be a positive integer")
     trace_id = f"trace-{unique[:20]}"
     batch_id = f"gate-a-{unique[:20]}"
     worker_id = f"worker-{unique[:12]}"
@@ -123,6 +233,7 @@ async def test_gate_a_real_codex_n8n_gateway_trace() -> None:
     worker_token = secrets.token_urlsafe(32)
     gateway_port = _free_port()
     gateway_base = f"http://127.0.0.1:{gateway_port}"
+    gateway_delivery_event_id = uuid4()
 
     gateway_env = os.environ.copy()
     gateway_env.update(
@@ -200,7 +311,14 @@ async def test_gate_a_real_codex_n8n_gateway_trace() -> None:
         fencing_token = claim["fencing_token"]
 
         with tempfile.TemporaryDirectory(prefix="captain-gate-a-") as directory:
-            workspace = Path(directory)
+            temporary_root = Path(directory)
+            workspace = temporary_root / "workspace"
+            workspace.mkdir()
+            codex_home = temporary_root / "codex-home"
+            write_capability_scoped_codex_config(codex_home, {})
+            source_auth = Path.home() / ".codex" / "auth.json"
+            if source_auth.is_file():
+                shutil.copy2(source_auth, codex_home / "auth.json")
             _git(workspace, "init", "-q")
             _git(workspace, "config", "user.email", "gate-a@localhost")
             _git(workspace, "config", "user.name", "Captain Gate A")
@@ -209,13 +327,72 @@ async def test_gate_a_real_codex_n8n_gateway_trace() -> None:
             _git(workspace, "commit", "-qm", "chore: initialize gate workspace")
 
             workflow_path = workspace / "workflow.json"
+            workflow_blueprint = {
+                "nodes": [
+                    {
+                        "name": "Webhook",
+                        "type": "n8n-nodes-base.webhook",
+                        "typeVersion": 2,
+                        "position": [0, 0],
+                        "parameters": {
+                            "httpMethod": "POST",
+                            "path": "{{CAPTAIN_WEBHOOK_PATH}}",
+                            "responseMode": "responseNode",
+                            "options": {},
+                        },
+                    },
+                    {
+                        "name": "Code",
+                        "type": "n8n-nodes-base.code",
+                        "typeVersion": 2,
+                        "position": [240, 0],
+                        "parameters": {
+                            "jsCode": (
+                                "const payload = $input.first().json;\n"
+                                "return [{ json: {\n"
+                                "  execution_id: $execution.id,\n"
+                                "  artifact_digest: payload.body.artifact_digest,\n"
+                                "  correlation_id: payload.body.correlation_id,\n"
+                                "} }];"
+                            ),
+                        },
+                        },
+                        {
+                            "name": "Respond to Webhook",
+                            "type": "n8n-nodes-base.respondToWebhook",
+                            "typeVersion": 1.4,
+                            "position": [480, 0],
+                            "parameters": {
+                                "respondWith": "json",
+                                "responseBody": "={{ $json }}",
+                                "options": {},
+                            },
+                        },
+                ],
+                "connections": {
+                    "Webhook": {
+                        "main": [[{"node": "Code", "type": "main", "index": 0}]]
+                    },
+                    "Code": {
+                        "main": [
+                            [
+                                {
+                                    "node": "Respond to Webhook",
+                                    "type": "main",
+                                    "index": 0,
+                                }
+                            ]
+                        ]
+                    }
+                },
+                "settings": {"executionOrder": "v1"},
+            }
             prompt = (
-                "Create workflow.json in the current workspace containing only valid "
-                "JSON for a harmless n8n workflow with Webhook and Code nodes. The "
-                "Webhook parameters.path must be {{CAPTAIN_WEBHOOK_PATH}}, POST, and "
-                "responseMode lastNode. The Code node must return the incoming JSON "
-                "plus execution_id from $execution.id. Connect Webhook to Code. "
-                "Do not modify any other file."
+                "Create exactly one file named workflow.json in the current workspace. "
+                "Its complete UTF-8 content must be exactly the JSON below. Do not modify "
+                "any other file, do not commit, and stop after writing it.\n\n"
+                + json.dumps(workflow_blueprint, indent=2)
+                + "\n"
             )
             request = CodexRunRequest(
                 project_id=project_id,
@@ -249,16 +426,10 @@ async def test_gate_a_real_codex_n8n_gateway_trace() -> None:
                     actor=worker_id,
                     now=lambda: datetime.now(timezone.utc),
                 )
-                runner = PowerShellCodexRunner(
-                    pwsh_path=Path(
-                        r"C:\Program Files\PowerShell\7\pwsh.exe"
-                    ),
-                    script_path=Path("scripts/codex-session.ps1").resolve(),
-                    codex_path=codex_binary,
-                    session_id=session_id,
-                    state_path=workspace / "codex-process.json",
+                runner = HermesAppServerRunner(
                     artifact_references=(f"artifact://sealed/{artifact_id}",),
-                    timeout_seconds=300,
+                    codex_home=codex_home,
+                    wall_seconds=300,
                 )
                 result = await CodexSupervisor(
                     runner=runner,
@@ -266,8 +437,25 @@ async def test_gate_a_real_codex_n8n_gateway_trace() -> None:
                     policy=policy,
                     repository=repository,
                 ).run(request)
-                assert result.status is PackageExecutionStatus.SUCCEEDED
-                assert workflow_path.is_file()
+                assert result.status is PackageExecutionStatus.SUCCEEDED, (
+                    f"Hermes app-server failure type: {runner.failure_type}"
+                )
+                codex_events = await gateway_client.delivery_events(
+                    project_id=project_id,
+                    run_id=run_id,
+                )
+                codex_item_types = sorted(
+                    {
+                        event.payload.item_type
+                        for event in codex_events
+                        if event.event_type == "codex_session_event"
+                        and isinstance(event.payload.item_type, str)
+                    }
+                )
+                assert workflow_path.is_file(), (
+                    "Codex completed without the required workspace artifact; "
+                    f"recorded item types: {codex_item_types}"
+                )
 
                 sealed_bytes = workflow_path.read_bytes()
                 artifact_digest = hashlib.sha256(sealed_bytes).hexdigest()
@@ -281,12 +469,7 @@ async def test_gate_a_real_codex_n8n_gateway_trace() -> None:
 
                 async with httpx.AsyncClient(timeout=30) as n8n_http:
                     target = N8nTarget(
-                        N8nHttpClient(
-                            api_base_url="http://localhost:15678",
-                            webhook_base_url="http://localhost:15678",
-                            api_key=api_key,
-                            http=n8n_http,
-                        )
+                        N8nHttpClient.from_endpoint(endpoint, n8n_http)
                     )
                     deployment = await target.deploy(artifact)
                     execution = await target.execute(
@@ -367,7 +550,7 @@ async def test_gate_a_real_codex_n8n_gateway_trace() -> None:
                         },
                     },
                     {
-                        "event_id": uuid4(),
+                        "event_id": gateway_delivery_event_id,
                         "event_type": "e2e_run",
                         "occurred_at": now,
                         "actor": worker_id,
@@ -375,7 +558,7 @@ async def test_gate_a_real_codex_n8n_gateway_trace() -> None:
                         "payload": {
                             "event_type": "e2e_run",
                             "e2e_run_id": f"e2e-{unique[:16]}",
-                            "run_index": 1,
+                            "run_index": run_index,
                             "clean": True,
                             "trace_complete": True,
                             "evidence_refs": [
@@ -405,6 +588,24 @@ async def test_gate_a_real_codex_n8n_gateway_trace() -> None:
             assert session_id in serialized
             assert artifact_digest in serialized
             assert run_id in serialized
+            assert str(gateway_delivery_event_id) in serialized
+            assert endpoint.mode == "captain-builder"
+            assert endpoint.api_base_url in {
+                _secret("CAPTAIN_N8N_URL"),
+                f"http://127.0.0.1:{captain_port}",
+            }
+            record_property(
+                "n8n_target_identity",
+                f"{endpoint.mode}:{endpoint.api_base_url}",
+            )
+            record_property("workflow_id", deployment.workflow_id)
+            record_property("execution_id", execution.execution_id)
+            record_property("artifact_digest", artifact_digest)
+            record_property("correlation_id", correlation_id)
+            record_property(
+                "gateway_delivery_event_id",
+                str(gateway_delivery_event_id),
+            )
             assert {
                 event.event_type for event in events
             }.issuperset(
@@ -422,8 +623,8 @@ async def test_gate_a_real_codex_n8n_gateway_trace() -> None:
         cleanup_errors: list[str] = []
         if deployment is not None:
             with httpx.Client(
-                base_url="http://localhost:15678",
-                headers={"X-N8N-API-KEY": api_key},
+                base_url=endpoint.api_base_url,
+                headers={"X-N8N-API-KEY": endpoint.api_key},
                 timeout=10,
             ) as cleanup:
                 for operation, path in (

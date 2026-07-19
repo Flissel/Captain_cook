@@ -31,10 +31,19 @@ def test_settings_load_explicit_environment_without_exposing_secrets() -> None:
     assert settings.approval_enabled is True
     assert settings.host == "127.0.0.1"
     assert settings.port == 18090
+    assert settings.claim_ttl_seconds == 5_400
     rendered = repr(settings)
     assert "database-secret" not in rendered
     assert "captain-test-token" not in rendered
     assert "worker-test-token" not in rendered
+
+
+def test_settings_accept_a_bounded_claim_ttl_for_isolated_recovery_gates() -> None:
+    settings = GatewaySettings.from_env(
+        valid_environment(GATEWAY_CLAIM_TTL_SECONDS="2")
+    )
+
+    assert settings.claim_ttl_seconds == 2
 
 
 @pytest.mark.parametrize("untrusted_host", ("0.0.0.0", "gateway.example.test"))
@@ -78,6 +87,8 @@ def test_settings_reject_ambiguous_role_tokens_without_echoing_them() -> None:
         ("GATEWAY_APPROVAL_ENABLED", "yes"),
         ("GATEWAY_PORT", "not-a-port"),
         ("GATEWAY_PORT", "70000"),
+        ("GATEWAY_CLAIM_TTL_SECONDS", "0"),
+        ("GATEWAY_CLAIM_TTL_SECONDS", "not-a-duration"),
     ),
 )
 def test_settings_fail_closed_on_invalid_explicit_values(name: str, value: str) -> None:

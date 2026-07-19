@@ -8,7 +8,7 @@ import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Protocol, TypeVar
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import HTTPException
 from pydantic import ValidationError
@@ -20,6 +20,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
     CapabilityGrant,
+    CapabilityGrantRevocation,
 )
 from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease, FactoryRole
 from agenten.agent_factory.leases import FactoryLeaseDenied, validate_factory_lease
@@ -27,10 +28,13 @@ from agenten.agent_factory.state_machine import FactoryActionKind, FactoryLifecy
 from blockchain.Blockchain_modell import Block
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.contracts import (
+    ActiveCodexSession,
     ArtifactBuiltPayload,
     BatchDoneEvent,
     BatchProjection,
     ClaimEvent,
+    CodexSessionFinishedPayload,
+    CodexSessionStartedPayload,
     CodexProcessEvent,
     DeliveryEventEnvelope,
     HeartbeatEvent,
@@ -45,6 +49,7 @@ from gateway.contracts import (
     project_batch,
     project_release,
 )
+from gateway.release_policy import ReleaseReadiness, evaluate_release_readiness
 
 
 CAPTAIN_BLOCK_TYPES = frozenset({"problem", "work_batch", "holdout"})
@@ -102,8 +107,16 @@ def _utcnow() -> datetime:
 class GatewayStore:
     """Own all gateway queries and append-only ledger writes."""
 
-    def __init__(self, storage: MariaDBStorage):
+    def __init__(
+        self,
+        storage: MariaDBStorage,
+        *,
+        claim_ttl: timedelta = timedelta(minutes=90),
+    ):
+        if claim_ttl <= timedelta(0):
+            raise ValueError("claim_ttl must be positive")
         self.storage = storage
+        self._claim_ttl = claim_ttl
         self._ensure_schema()
 
     def _ensure_schema(self) -> None:
@@ -410,6 +423,90 @@ class GatewayStore:
             return RuntimeWriteReceipt(operation_id=replay.operation_id, replayed=True)
         return RuntimeWriteReceipt(operation_id=result.command_id, replayed=False)
 
+    def record_capability_grant_revocation(
+        self,
+        revocation: CapabilityGrantRevocation,
+    ) -> RuntimeWriteReceipt:
+        try:
+            self._retry_write(
+                lambda: self._record_capability_grant_revocation_once(revocation)
+            )
+        except _RuntimeReplay as replay:
+            return RuntimeWriteReceipt(operation_id=replay.operation_id, replayed=True)
+        return RuntimeWriteReceipt(operation_id=revocation.command_id, replayed=False)
+
+    def _record_capability_grant_revocation_once(
+        self, revocation: CapabilityGrantRevocation
+    ) -> None:
+        canonical = revocation.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                index = self._next_index(cursor)
+                grant_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_grant",
+                    field="grant_id",
+                    value=revocation.grant_id,
+                    for_update=True,
+                )
+                if grant_block is None:
+                    raise HTTPException(status_code=409, detail="runtime grant not found")
+                grant = CapabilityGrant.model_validate(grant_block["data"])
+                if grant.command_id != revocation.command_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime revocation belongs to a different command",
+                    )
+                command_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_command",
+                    field="event_id",
+                    value=str(revocation.command_id),
+                    for_update=True,
+                )
+                if command_block is None:
+                    raise HTTPException(status_code=409, detail="runtime command not found")
+                command = AgentRuntimeCommand.model_validate(command_block["data"])
+                try:
+                    validate_grant(grant, command, revocation.revoked_at)
+                except CapabilityDenied as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                if self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_result",
+                    field="command_id",
+                    value=str(revocation.command_id),
+                    for_update=True,
+                ) is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="completed runtime grant cannot be revoked",
+                    )
+                existing = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_grant_revocation",
+                    field="grant_id",
+                    value=revocation.grant_id,
+                    for_update=True,
+                )
+                if existing is not None:
+                    if existing["data"] == canonical:
+                        raise _RuntimeReplay(revocation.command_id)
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime grant already has a different revocation",
+                    )
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="agent_runtime_grant_revocation",
+                    data=canonical,
+                    status="revoked",
+                    parent_index=grant_block["index"],
+                    metadata={"schema": "captain.capability-grant-revocation.v1"},
+                )
+                self._insert(cursor, block)
+
     def _record_runtime_result_once(self, result: AgentRuntimeResult) -> None:
         canonical = result.model_dump(mode="json", by_alias=True)
         with self.storage.transaction() as connection:
@@ -441,6 +538,18 @@ class GatewayStore:
                     raise HTTPException(
                         status_code=409,
                         detail="runtime grant belongs to a different command",
+                    )
+                revocation_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_grant_revocation",
+                    field="grant_id",
+                    value=grant.grant_id,
+                    for_update=True,
+                )
+                if revocation_block is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="revoked runtime grant cannot record a result",
                     )
 
                 existing = self._runtime_result_block(cursor, result, for_update=True)
@@ -485,12 +594,23 @@ class GatewayStore:
                     field="command_id",
                     value=str(operation_id),
                 )
+                revocation_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_grant_revocation",
+                    field="command_id",
+                    value=str(operation_id),
+                )
         return RuntimeOperationProjection(
             operation_id=operation_id,
             command=AgentRuntimeCommand.model_validate(command_block["data"]),
             grant=(
                 CapabilityGrant.model_validate(grant_block["data"])
                 if grant_block is not None
+                else None
+            ),
+            revocation=(
+                CapabilityGrantRevocation.model_validate(revocation_block["data"])
+                if revocation_block is not None
                 else None
             ),
             result=(
@@ -775,6 +895,58 @@ class GatewayStore:
 
     def release_projection(self, *, project_id: str, run_id: str) -> ReleaseProjection:
         return project_release(self.delivery_events(project_id=project_id, run_id=run_id))
+
+    def record_release_decision(
+        self,
+        *,
+        project_id: str,
+        run_id: str,
+        policy_version: str,
+    ) -> tuple[DeliveryEventEnvelope, ReleaseReadiness]:
+        """Persist the Captain-only release decision after a fail-closed audit."""
+
+        events = self.delivery_events(project_id=project_id, run_id=run_id)
+        readiness = evaluate_release_readiness(events)
+        decision = "accepted" if readiness.ready else "rejected"
+        for event in events:
+            if (
+                event.event_type == "release_decision"
+                and event.payload.policy_version == policy_version
+                and event.payload.decision == decision
+            ):
+                return event, readiness
+
+        reasons = (
+            ("three_complete_provider_backed_e2e_runs",)
+            if readiness.ready
+            else readiness.reasons
+        )
+        event = DeliveryEventEnvelope.model_validate(
+            {
+                "event_id": uuid5(
+                    NAMESPACE_URL,
+                    (
+                        "captain-release-decision:"
+                        f"{project_id}:{run_id}:{policy_version}:{decision}"
+                    ),
+                ),
+                "event_type": "release_decision",
+                "occurred_at": _utcnow(),
+                "actor": "captain-gateway",
+                "trace": {
+                    "project_id": project_id,
+                    "run_id": run_id,
+                    "trace_id": f"release:{policy_version}",
+                },
+                "payload": {
+                    "event_type": "release_decision",
+                    "decision": decision,
+                    "policy_version": policy_version,
+                    "reasons": reasons,
+                },
+            }
+        )
+        return self.append_delivery_event(event).event, readiness
 
     def delivery_holdout_case(
         self,
@@ -1149,6 +1321,11 @@ class GatewayStore:
                     or projection.claim_expires_at > now
                 ):
                     raise HTTPException(status_code=409, detail="claim is not expired")
+                if self._active_codex_sessions(cursor, request.batch_id, request.iteration):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="active Codex session requires terminal evidence",
+                    )
                 block = self._new_block(
                     cursor,
                     index=self._next_index(cursor),
@@ -1167,12 +1344,114 @@ class GatewayStore:
                 self._insert(cursor, block)
         return block
 
+    @staticmethod
+    def _active_codex_sessions(
+        cursor: Any,
+        batch_id: str,
+        iteration: int,
+    ) -> set[tuple[str, str, str]]:
+        """Return sessions that Captain must terminalize before requeueing."""
+
+        cursor.execute(
+            """
+            SELECT data FROM blocks
+            WHERE block_type = 'delivery_event'
+              AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.trace.batch_id')) = %s
+            ORDER BY `index`
+            FOR UPDATE
+            """,
+            (batch_id,),
+        )
+        started: set[tuple[str, str, str]] = set()
+        finished: set[tuple[str, str, str]] = set()
+        for row in cursor.fetchall():
+            event = row["data"]
+            if isinstance(event, str):
+                event = json.loads(event)
+            trace = event.get("trace")
+            payload = event.get("payload")
+            if not isinstance(trace, dict) or not isinstance(payload, dict):
+                continue
+            project_id = trace.get("project_id")
+            run_id = trace.get("run_id")
+            session_id = payload.get("session_id")
+            if not all(
+                isinstance(value, str) and value
+                for value in (project_id, run_id, session_id)
+            ):
+                continue
+            identity = (project_id, run_id, session_id)
+            if (
+                event.get("event_type") == "codex_session_started"
+                and payload.get("iteration") == iteration
+            ):
+                started.add(identity)
+            elif event.get("event_type") == "codex_session_finished":
+                finished.add(identity)
+        return started - finished
+
     def batch_projection(self, batch_id: str) -> BatchProjection:
         now = _utcnow()
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
                 _, _, projection = self._batch_context(cursor, batch_id, now=now)
         return projection
+
+    def active_codex_sessions(self, batch_id: str) -> tuple[ActiveCodexSession, ...]:
+        """Return only non-terminal Codex traces for the current batch iteration."""
+
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                _, _, projection = self._batch_context(cursor, batch_id)
+                cursor.execute(
+                    """
+                    SELECT data FROM blocks
+                    WHERE block_type = 'delivery_event'
+                      AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.trace.batch_id')) = %s
+                    ORDER BY `index`
+                    """,
+                    (batch_id,),
+                )
+                rows = cursor.fetchall()
+        started: dict[str, ActiveCodexSession] = {}
+        finished: set[str] = set()
+        for row in rows:
+            raw = row["data"]
+            event = DeliveryEventEnvelope.model_validate(
+                json.loads(raw) if isinstance(raw, str) else raw
+            )
+            payload = event.payload
+            if isinstance(payload, CodexSessionStartedPayload):
+                trace = event.trace
+                if (
+                    payload.iteration == projection.claim_iteration
+                    and trace.worker_id is not None
+                    and trace.claim_id is not None
+                    and trace.fencing_token is not None
+                    and trace.session_id is not None
+                ):
+                    started.setdefault(
+                        payload.session_id,
+                        ActiveCodexSession(
+                            project_id=trace.project_id,
+                            run_id=trace.run_id,
+                            trace_id=trace.trace_id,
+                            batch_id=batch_id,
+                            worker_id=trace.worker_id,
+                            claim_id=trace.claim_id,
+                            fencing_token=trace.fencing_token,
+                            session_id=payload.session_id,
+                            iteration=payload.iteration,
+                            process_ref=payload.process_ref,
+                            started_at=payload.started_at,
+                        ),
+                    )
+            elif isinstance(payload, CodexSessionFinishedPayload):
+                finished.add(payload.session_id)
+        return tuple(
+            started[session_id]
+            for session_id in sorted(set(started) - finished)
+        )
 
     def review(self, request: ReviewDecisionEvent) -> dict[str, Any]:
         try:
@@ -1265,12 +1544,18 @@ class GatewayStore:
                     for_update=True,
                     now=now,
                 )
-                if projection.status != "pending":
+                claim_expired_without_recovery = (
+                    projection.claim_iteration > 0
+                    and projection.claim_expires_at is not None
+                    and projection.claim_expires_at <= now
+                    and not projection.recovery_recorded
+                )
+                if projection.status != "pending" or claim_expired_without_recovery:
                     raise HTTPException(status_code=409, detail="batch is not claimable")
                 token = secrets.token_urlsafe(32)
-                claim_id = secrets.token_urlsafe(18)
+                claim_id = f"claim-{secrets.token_urlsafe(18)}"
                 fencing_token = projection.claim_iteration + 1
-                expiry = now + timedelta(minutes=90)
+                expiry = now + self._claim_ttl
                 event = ClaimEvent(
                     batch_id=batch_id,
                     claim_id=claim_id,

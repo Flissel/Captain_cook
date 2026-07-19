@@ -1,6 +1,6 @@
 # Captain Zielbild und verbindliche TODOs
 
-**Status:** aktiv  
+**Status:** abgeschlossen, evidenzgeprüft am 2026-07-19
 **Owner:** Captain Core  
 **Source of truth:** Captain-validierte, versionierte Zustände und Evidence im
 Gateway/Ledger. AutoGen, Hermes, Codex, Minibook und n8n sind begrenzte
@@ -103,9 +103,10 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
   Grant/Token; der persistierte Captain-Widerruf terminiert den Run
   sessiongebunden als `captain_revoked`, der Broker verweigert das Token danach
   mit HTTP 403 und es bleibt genau eine terminale Gateway-Evidenz. Der
-  isolierte Live-Gate bestand mit `3 passed in 25,20 s` (2026-07-19); der
-  zugehörige Gateway-Runner mit `960 passed, 1 skipped, 10 deselected` in
-  76,43 s. Der Test rekonstruiert nicht den Modell-Toolcall aus Codex-Logs,
+  isolierte Live-Gate bestand auf integriertem `main` mit `3 passed in
+  22,45 s` (2026-07-19); der zugehörige Gateway-Runner mit `1061 passed,
+  1 skipped, 13 deselected` in 76,79 s. Der Test rekonstruiert nicht den
+  Modell-Toolcall aus Codex-Logs,
   sondern beweist Provider-Laufzeit und MCP-Wirkung unter derselben Lease.
 - [x] Den statischen n8n-MCP-Instanzschlüssel durch einen Captain-eigenen,
   kurzlebigen Lease-Broker/Proxy ersetzen. Eine Rotation des jetzigen
@@ -123,28 +124,48 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
   Replay-Status; bei einer schon aktiven Session startet der Supervisor keinen
   zweiten Provider-Run, sondern meldet `evidence_unresolved`. Ein
   Parallel-Restart-Test lässt genau einen Session-Owner zu.
-- [ ] Den E2E- und Recovery-Pfad nach Prozessneustart mit unveränderten
-  Artifacts/Gatewaydaten prüfen: keine doppelte Provider-Reservierung,
-  Freigabe oder Ledger-Transition. Der deterministische Control-Plane-
-  Restart-Gate ist grün (`tests/integration/test_agent_runtime_control_plane.py`,
-  `8 passed`, 2026-07-19). Zusätzlich startet der Live-Gate nach einem echten
-  Neustart des temporären FastAPI/MariaDB-Gateways einen frischen Supervisor;
-  die persistierte Session wird vor jedem Provider-Start wiedergefunden,
-  erzeugt keinen zweiten Provider-Runner und endet fail-closed als
-  `EVIDENCE_UNRESOLVED` (`6447355`; gemeinsam mit Broker-Gate `2 passed in
-  11,06 s`, 2026-07-19). Offen bleibt die vollständige Wiederaufnahme eines
-  bereits laufenden externen Provider-Prozesses inklusive unveränderter
-  Artifact-/Release-/Ledger-Transitions.
-- [ ] Gesamt-Readiness prüfen: vollständiger non-live Gate, explizite
+- [x] Den E2E- und Recovery-Pfad nach Prozessneustart mit unveränderten
+  Gatewaydaten geprüft: Nach einem echten Neustart des temporären
+  FastAPI/MariaDB-Gateways terminalisiert Captain eine verlorene, persistierte
+  Codex-Session einmalig unter ihrem vorhandenen Fence, zeichnet genau eine
+  `claim_expired`-Requeue auf und erlaubt erst danach eine neue, gefencete
+  Claim-Iteration samt neuer Session. Der echte Gate
+  `tests/live/test_n8n_mcp_broker_live.py` bestand mit `4 passed in 27,15 s`
+  und der Gateway-Runner mit `1066 passed, 1 skipped, 14 deselected` (2026-07-19).
+  `GATEWAY_CLAIM_TTL_SECONDS` ist streng positiv konfigurierbar (Default
+  5.400 s); die eine Sekunde gilt ausschließlich für den isolierten Test.
+  Captain reattached keinen nicht beobachtbaren fremden Provider-Stream.
+- [x] Einen produktiven Captain-Startaufrufer für abgelaufene Gateway-Leases
+  bereitgestellt: `python main.py recover-gateway` verwendet ausschließlich
+  das Captain-Token, gibt nur maschinenlesbare `recovered_batch_ids` und
+  `deferred_batch_ids` aus und fährt bei fehlender Terminal-Evidenz fail-closed
+  fort. `start.ps1` startet Gateway und MariaDB, prüft `/healthz` und führt
+  diesen Pass vor den abhängigen Diensten aus. Die CLI-/Start-Verträge sind mit
+  `15 passed` geprüft (2026-07-19); die Konfiguration erzeugt lokale
+  Gateway-Tokens und eine loopback-DSN nur in der gitignorierten `.env`.
+- [x] Einen lokalen Codex-Worker-Recovery-Director an `recover-gateway`
+  gebunden (`fc2c575`): Captain liest aktive Session-Traces, prüft die
+  host-lokale `<session-id>.json`-Prozessidentität, beendet nur eine exakt
+  passende Prozess-Instanz oder zeichnet einen belegten verlorenen Prozess als
+  `lost_process` terminal auf. Fehlende oder widersprüchliche Identität bleibt
+  bewusst `deferred`; erst nach Terminal-Evidenz darf der Requeue erfolgen.
+- [x] Den neuen Startpfad mit einem echten sessiongebundenen PowerShell-
+  Kindprozess, persistierter PID-/Startzeit-/Executable-Identität und
+  Gateway-Neustart live beweisen. Der Director terminalisiert den exakt
+  verifizierten Baum, schreibt die Gateway-Terminalevidenz und gibt erst dann
+  die nächste gefencete Claim-Iteration frei
+  (`tests/live/test_n8n_mcp_broker_live.py`, `4 passed in 27,04 s`,
+  2026-07-19). Der volle Gateway-Regressionsteil bleibt ein separater Gate.
+- [x] Gesamt-Readiness prüfen: vollständiger non-live Gate, explizite
   Live-Gates, Architektur-/Importgrenzen, Demo-Evidenz und branch-sichere
-  main-Integration. Aktuell: `882 passed, 79 skipped, 10 deselected`
+  main-Integration. Aktuell: `986 passed, 79 skipped, 14 deselected`
   (`python -m pytest -q --no-cov -m "not live"`, 2026-07-19),
   Architektur-/Import-/Workstream-Gates mit `18 passed`, erfolgreicher
   Compile der Captain-Pakete und Demo-Evidenz mit vier terminalen
   Subproblemen sowie erfolgreiche Builder-, Gate-A-, n8n-MCP- und
   Broker-Revocation-Live-Gates.
-  Der aktuelle isolierte Gateway-Runner lief mit `960 passed, 1 skipped,
-  10 deselected`; der eine Skip ist der absichtlich nicht in-process testbare
+  Der aktuelle isolierte Gateway-Runner lief mit `1064 passed, 1 skipped,
+  14 deselected`; der eine Skip ist der absichtlich nicht in-process testbare
   No-AutoGen-Degradationspfad. Skips ersetzen weder eine separat grüne
   Gateway-Teilmenge noch die Live-Nachweise.
 

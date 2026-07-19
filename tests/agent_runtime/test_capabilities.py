@@ -17,6 +17,7 @@ from agenten.agent_runtime.capabilities import (
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     CapabilityGrant,
+    CapabilityGrantRevocation,
     CapabilityProfile,
 )
 from agenten.validation.contracts import AcceptanceAssertion, AssertionKind, WorkBatch
@@ -255,3 +256,43 @@ def test_factory_role_cannot_escalate_to_another_roles_runtime_operation(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         command_for(profile=profile, operation=operation, intent=intent)
+
+
+def test_captain_revocation_denies_an_otherwise_active_grant() -> None:
+    command = command_for()
+    grant = derive_grant(
+        command,
+        released_batch(capability_tags=["n8n-builder"]),
+        NOW,
+    )
+    revocation = CapabilityGrantRevocation(
+        schema_name="captain.capability-grant-revocation.v1",
+        revocation_id=uuid4(),
+        grant_id=grant.grant_id,
+        command_id=command.event_id,
+        revoked_at=NOW + timedelta(seconds=1),
+        reason="captain_cancelled",
+    )
+
+    with pytest.raises(CapabilityDenied, match="revoked"):
+        validate_grant(grant, command, NOW + timedelta(seconds=2), revocation)
+
+
+def test_revocation_for_another_grant_fails_closed() -> None:
+    command = command_for()
+    grant = derive_grant(
+        command,
+        released_batch(capability_tags=["n8n-builder"]),
+        NOW,
+    )
+    revocation = CapabilityGrantRevocation(
+        schema_name="captain.capability-grant-revocation.v1",
+        revocation_id=uuid4(),
+        grant_id="grant-for-another-command",
+        command_id=command.event_id,
+        revoked_at=NOW + timedelta(seconds=1),
+        reason="operator_cancelled",
+    )
+
+    with pytest.raises(CapabilityDenied, match="different grant"):
+        validate_grant(grant, command, NOW + timedelta(seconds=2), revocation)

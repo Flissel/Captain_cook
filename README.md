@@ -2,7 +2,12 @@
 
 **Captain Cook is an auditable agent-work orchestrator:** it decomposes an engineering problem, gates proposed work against a constitution, routes accepted tasks to workers, and records the lifecycle in a local ledger.
 
-This repository contains a working, offline vertical slice for the OpenAI Build Week **Developer Tools** track. It is intentionally honest about the boundary: the deterministic orchestration demo works today; the larger Captain → Hermes → Codex delivery fleet is a documented roadmap, not a claim about the current runtime.
+This repository contains an auditable offline vertical slice and bounded live
+Captain delivery gates for the OpenAI Build Week **Developer Tools** track.
+The deterministic demo remains a separate, credential-free evidence path;
+Gateway-fenced Codex delivery, n8n capability leases, restart recovery and the
+Captain LLM planning evaluation are independently live-tested. Remaining
+operational limits are documented under [Runtime boundary](#runtime-boundary).
 
 ## Einfache Einrichtung unter Windows 11
 
@@ -98,6 +103,10 @@ The command writes [artifacts/demo-run.json](artifacts/demo-run.json), a compact
 - Four constrained Householder workers (Architect, Ledger Steward, Delivery Builder, and Quality Warden) that emit structured, explicitly offline audit reports.
 - A sole-writer ledger recorder and state-machine transitions for an auditable run.
 - An offline CLI demo and committed run evidence.
+- A loopback-bound Captain Gateway with MariaDB-backed, append-only delivery
+  evidence, short-lived claims and a start-time recovery pass. `start.ps1`
+  starts it after MariaDB is healthy; `status.ps1 -Detailed` includes its
+  health endpoint.
 
 ## Run the standalone Captain planner
 
@@ -171,9 +180,31 @@ A missing path or API key skips the opt-in gate. A configured unreadable or
 digest-mismatched source fails the gate before provider construction. It does
 not contact or modify n8n or any other local service.
 
-## Roadmap boundary
+## Gateway recovery at startup
 
-The submission demo does **not** yet include a FastAPI/MariaDB ledger gateway, Hermes workers that drive Codex CLI, n8n deployment, Mailpit validation, Minibook mirroring, or a live LLM/MCP-backed Householder executor. Those integrations are designed in [the delivery-fleet specification](docs/superpowers/specs/2026-07-15-hackathon-pipeline-design.md) and deliberately kept separate from claims about the runnable demo.
+`start.ps1` creates missing local Gateway credentials in the gitignored `.env`,
+starts the Gateway after MariaDB, waits for `/healthz`, and executes one
+Captain-owned recovery pass before starting dependent local processes. The
+same bounded pass can be run independently:
+
+```powershell
+python main.py recover-gateway
+```
+
+It reports only durable `recovered_batch_ids` and sessions that remain
+`deferred_batch_ids`. A deferred batch has an active Codex session without
+terminal process evidence; Captain deliberately does not requeue it, because
+doing so could run an external provider twice. A host-local worker-recovery
+director is required to prove that process terminal before it can be requeued.
+
+## Runtime boundary
+
+The offline demo remains a deliberately separate evidence path. The live
+delivery path provides the FastAPI/MariaDB Gateway, Captain-fenced Codex
+sessions, constrained n8n MCP leases, Mailpit and Minibook integrations, and
+the bounded live LLM planning evaluation. Full automatic recovery of an active
+Codex worker still requires the host-local process-evidence director described
+above; it is not claimed as completed.
 
 ## Test it
 
@@ -215,6 +246,49 @@ powershell -ExecutionPolicy Bypass -File scripts/verify_delivery_stack.ps1
 Stop Captain Cook's services with `docker compose down`. Do not run
 `docker compose down -v`: it deletes the Captain ledger volume. Captain Cook's
 scripts never delete or adopt either existing n8n volume.
+
+### Isolated Captain n8n builder
+
+The optional Captain builder is a separate Compose project on
+`http://127.0.0.1:5679`. It has its own PostgreSQL database, encryption key,
+API key, and named volumes. It does not replace the default external n8n mode.
+VibeMind remains untouched: these commands do not contact its API or inspect,
+start, stop, restart, mount, or alter its container, workflows, or volumes.
+
+Run the lifecycle in order from the repository root:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/captain-n8n.ps1 -Action init
+powershell -ExecutionPolicy Bypass -File scripts/captain-n8n.ps1 -Action start
+powershell -ExecutionPolicy Bypass -File scripts/captain-n8n.ps1 -Action bootstrap
+powershell -ExecutionPolicy Bypass -File scripts/captain-n8n.ps1 -Action status
+powershell -ExecutionPolicy Bypass -File scripts/captain-n8n.ps1 -Action stop
+```
+
+`init` generates missing local secrets in the gitignored
+`.env.captain-n8n`. `bootstrap` creates or authenticates the local owner
+`captain@local.test`, creates or recovers one labelled API key through n8n's
+supported API, and stores that key only in the same environment file. It does
+not edit n8n database rows. Verify the running builder without displaying
+credentials or workflow content:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/verify_captain_n8n.ps1
+```
+
+### Hermes runtime readiness
+
+Captain's pinned Hermes submodule can be checked without starting Docker or
+contacting n8n:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/verify_hermes_readiness.ps1
+```
+
+The verifier fails closed when Hermes is uninitialized, differs from the
+parent gitlink, or has local changes. Its redacted report lists only the pinned
+commit, required Captain-planner/MCP entrypoints, focused-test status, and the
+lease-scoped `n8n-mcp` server identity.
 
 ## How Codex and GPT-5.6 fit
 

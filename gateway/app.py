@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from threading import Lock
 from typing import Any, Literal, Protocol
 from uuid import UUID
@@ -19,6 +20,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
     CapabilityGrant,
+    CapabilityGrantRevocation,
 )
 from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease
 from gateway.auth import (
@@ -30,6 +32,7 @@ from gateway.auth import (
     require_worker,
 )
 from gateway.contracts import (
+    ActiveCodexSession,
     BatchProjection,
     DeliveryEventEnvelope,
     ReleaseProjection,
@@ -79,6 +82,12 @@ class LegacyDeliveryImportRequest(BaseModel):
     data: dict[str, Any]
 
 
+class ReleaseDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    policy_version: str = Field(min_length=1, max_length=128)
+
+
 CAPTAIN_WRITE_BLOCK_TYPES = frozenset(
     {"problem", "work_batch", "holdout", "recovery_decision", "review_decision"}
 )
@@ -105,7 +114,16 @@ def create_app(
 ) -> FastAPI:
     mirror = mirror or MirrorQueue(mirror_captain_projection)
     store_lock = Lock()
-    store: GatewayStore | None = GatewayStore(storage) if storage else None
+    store: GatewayStore | None = (
+        GatewayStore(
+            storage,
+            claim_ttl=timedelta(seconds=settings.claim_ttl_seconds),
+        )
+        if storage and settings
+        else GatewayStore(storage)
+        if storage
+        else None
+    )
     sink_calls: list[dict[str, Any]] = []
 
     @asynccontextmanager
@@ -155,8 +173,12 @@ def create_app(
         if store is None:
             with store_lock:
                 if store is None:
-                    dsn = load_gateway_settings(app).ledger_dsn.get_secret_value()
-                    store = GatewayStore(MariaDBStorage(dsn))
+                    configured = load_gateway_settings(app)
+                    dsn = configured.ledger_dsn.get_secret_value()
+                    store = GatewayStore(
+                        MariaDBStorage(dsn),
+                        claim_ttl=timedelta(seconds=configured.claim_ttl_seconds),
+                    )
         return store
 
     @app.get("/healthz")
@@ -288,6 +310,29 @@ def create_app(
             )
         return receipt
 
+    @app.post("/v1/runtime/grant-revocations", status_code=status.HTTP_201_CREATED)
+    async def revoke_runtime_grant(
+        revocation: CapabilityGrantRevocation,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> RuntimeWriteReceipt:
+        receipt = get_store().record_capability_grant_revocation(revocation)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        else:
+            enqueue_runtime_projection(
+                {
+                    "event_type": "runtime_capability_revoked",
+                    "event_id": str(revocation.revocation_id),
+                    "operation_id": str(revocation.command_id),
+                    "grant_id": revocation.grant_id,
+                    "status": "revoked",
+                    "reason": revocation.reason,
+                    "revoked_at": revocation.revoked_at.isoformat(),
+                }
+            )
+        return receipt
+
     @app.post("/v1/runtime/results", status_code=status.HTTP_201_CREATED)
     async def record_runtime_result(
         result: AgentRuntimeResult,
@@ -349,6 +394,20 @@ def create_app(
     ) -> ReleaseProjection:
         return get_store().release_projection(project_id=project_id, run_id=run_id)
 
+    @app.post("/v1/projects/{project_id}/runs/{run_id}/release/decision")
+    async def record_release_decision(
+        project_id: str,
+        run_id: str,
+        request: ReleaseDecisionRequest,
+        _: GatewayRole = Depends(require_captain),
+    ) -> DeliveryEventEnvelope:
+        decision, _readiness = get_store().record_release_decision(
+            project_id=project_id,
+            run_id=run_id,
+            policy_version=request.policy_version,
+        )
+        return decision
+
     @app.get("/v1/projects/{project_id}/runs/{run_id}/holdouts/{case_id}")
     async def delivery_holdout_case(
         project_id: str,
@@ -393,6 +452,13 @@ def create_app(
         _: GatewayRole = Depends(require_reader),
     ) -> BatchProjection:
         return get_store().batch_projection(batch_id)
+
+    @app.get("/batches/{batch_id}/active-codex-sessions")
+    async def get_active_codex_sessions(
+        batch_id: str,
+        _: GatewayRole = Depends(require_captain),
+    ) -> tuple[ActiveCodexSession, ...]:
+        return get_store().active_codex_sessions(batch_id)
 
     @app.post(
         "/batches/{batch_id}/recovery",
