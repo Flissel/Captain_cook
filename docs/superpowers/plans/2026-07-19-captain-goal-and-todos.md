@@ -74,10 +74,18 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
   2026-07-19). Der Test nutzt eine disposable MariaDB, einen temporären
   Workspace und den Builder auf Port 5679; VibeMind und seine Volumes bleiben
   unverändert.
-- [ ] Eine explizite, kurzlebige `integration_intent=n8n`-MCP-Lease inklusive
-  Ablauf und Widerruf durch einen Captain-fenced Codex-Run live beweisen. Der
-  grüne Gate-A-Workflow verwendet bewusst den isolierten Builder-HTTP-Target,
-  nicht die externe VibeMind-n8n-MCP-Verbindung.
+- [x] Ablauf einer expliziten, kurzlebigen `integration_intent=n8n`-MCP-Lease
+  durch einen Captain-fenced Codex-Run live bewiesen
+  (`tests/live/test_agent_runtime_n8n_live.py`, 1 passed in 23,22 s;
+  2026-07-19). Codex erstellt den begrenzten Workflow, Hermes ruft über den
+  Captain-gebundenen n8n-MCP-Server dessen Validierung, Erstellung, Test,
+  Veröffentlichung, Ausführung und Archivierung auf. Nach Lease-Ablauf
+  verweigert der Test sowohl die MCP-Entdeckung als auch eine neue
+  Hermes-Referenz; er verwendet ausschließlich den isolierten Builder auf Port
+  5679, nicht die externe VibeMind-n8n-MCP-Verbindung.
+- [ ] Einen expliziten Captain-seitigen Widerruf einer noch gültigen
+  `integration_intent=n8n`-Lease implementieren und live beweisen; derzeit ist
+  der Ablauf fail-closed erzwungen, ein vorzeitiger Widerrufsdatensatz fehlt.
 - [ ] Den E2E- und Recovery-Pfad nach Prozessneustart mit unveränderten
   Artifacts/Gatewaydaten prüfen: keine doppelte Provider-Reservierung,
   Freigabe oder Ledger-Transition.
