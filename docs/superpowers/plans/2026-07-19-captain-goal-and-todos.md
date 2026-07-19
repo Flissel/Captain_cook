@@ -103,9 +103,10 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
   Grant/Token; der persistierte Captain-Widerruf terminiert den Run
   sessiongebunden als `captain_revoked`, der Broker verweigert das Token danach
   mit HTTP 403 und es bleibt genau eine terminale Gateway-Evidenz. Der
-  isolierte Live-Gate bestand mit `3 passed in 25,20 s` (2026-07-19); der
-  zugehörige Gateway-Runner mit `960 passed, 1 skipped, 10 deselected` in
-  76,43 s. Der Test rekonstruiert nicht den Modell-Toolcall aus Codex-Logs,
+  isolierte Live-Gate bestand auf integriertem `main` mit `3 passed in
+  22,45 s` (2026-07-19); der zugehörige Gateway-Runner mit `1061 passed,
+  1 skipped, 13 deselected` in 76,79 s. Der Test rekonstruiert nicht den
+  Modell-Toolcall aus Codex-Logs,
   sondern beweist Provider-Laufzeit und MCP-Wirkung unter derselben Lease.
 - [x] Den statischen n8n-MCP-Instanzschlüssel durch einen Captain-eigenen,
   kurzlebigen Lease-Broker/Proxy ersetzen. Eine Rotation des jetzigen
@@ -135,7 +136,7 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
   11,06 s`, 2026-07-19). Offen bleibt die vollständige Wiederaufnahme eines
   bereits laufenden externen Provider-Prozesses inklusive unveränderter
   Artifact-/Release-/Ledger-Transitions.
-- [ ] Gesamt-Readiness prüfen: vollständiger non-live Gate, explizite
+- [x] Gesamt-Readiness prüfen: vollständiger non-live Gate, explizite
   Live-Gates, Architektur-/Importgrenzen, Demo-Evidenz und branch-sichere
   main-Integration. Aktuell: `983 passed, 79 skipped, 13 deselected`
   (`python -m pytest -q --no-cov -m "not live"`, 2026-07-19),
