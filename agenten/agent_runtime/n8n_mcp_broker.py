@@ -7,9 +7,13 @@ import hashlib
 import hmac
 import json
 from datetime import datetime, timezone
+from collections.abc import Callable
 from typing import Protocol
 from uuid import UUID
 
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from agenten.agent_runtime.capabilities import CapabilityDenied, validate_grant
@@ -137,6 +141,66 @@ class McpLeaseRevocationAuthorizer:
         return claim
 
 
+class McpLeaseAuthorizer(Protocol):
+    async def authorize(self, token: str, now: datetime) -> McpLeaseClaim: ...
+
+
+def create_mcp_broker_app(
+    *,
+    authorizer: McpLeaseAuthorizer,
+    expected_endpoint_identity: str,
+    upstream_url: str,
+    upstream_token: str,
+    client: httpx.AsyncClient,
+    clock: Callable[[], datetime],
+) -> FastAPI:
+    """Create the narrow, Captain-only reverse proxy for n8n MCP HTTP calls."""
+
+    if not expected_endpoint_identity:
+        raise ValueError("expected_endpoint_identity must not be empty")
+    if not upstream_url.startswith("http"):
+        raise ValueError("upstream_url must be an HTTP URL")
+    if not upstream_token:
+        raise ValueError("upstream_token must not be empty")
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+    @app.post("/mcp-server/http")
+    async def proxy_mcp(request: Request) -> Response:
+        token = _bearer_token(request.headers.get("authorization"))
+        try:
+            claim = await authorizer.authorize(token, clock())
+        except McpLeaseDenied:
+            raise HTTPException(status_code=403, detail="Captain MCP lease denied") from None
+        if claim.endpoint_identity != expected_endpoint_identity:
+            raise HTTPException(status_code=403, detail="Captain MCP lease denied")
+        try:
+            upstream = await client.post(
+                upstream_url,
+                content=await request.body(),
+                headers={
+                    "Authorization": f"Bearer {upstream_token}",
+                    "Content-Type": request.headers.get(
+                        "content-type", "application/json"
+                    ),
+                    "Accept": request.headers.get("accept", "application/json"),
+                },
+            )
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="Captain n8n MCP unavailable") from None
+        safe_headers = {
+            name: value
+            for name, value in upstream.headers.items()
+            if name.lower() in {"content-type", "cache-control"}
+        }
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            headers=safe_headers,
+        )
+
+    return app
+
+
 def _canonical_claim(claim: McpLeaseClaim) -> bytes:
     return json.dumps(
         claim.model_dump(mode="json", by_alias=True),
@@ -154,3 +218,12 @@ def _unb64url(value: str) -> bytes:
         raise ValueError("invalid base64url")
     padding = "=" * (-len(value) % 4)
     return base64.urlsafe_b64decode(f"{value}{padding}".encode("ascii"))
+
+
+def _bearer_token(value: str | None) -> str:
+    if value is None:
+        raise McpLeaseDenied("MCP lease token is missing")
+    scheme, separator, token = value.partition(" ")
+    if scheme.lower() != "bearer" or not separator or not token:
+        raise McpLeaseDenied("MCP lease token is malformed")
+    return token
