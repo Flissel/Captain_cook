@@ -43,6 +43,7 @@ class FactoryAction(BaseModel):
 
     kind: FactoryActionKind
     attempt: int = Field(ge=1, le=5)
+    job_id: UUID | None = None
 
 
 class FactoryProjection(BaseModel):
@@ -176,4 +177,3 @@ def _allowed_next_phases(projection: FactoryProjection) -> frozenset[FactoryPhas
         return transitions[phase]  # type: ignore[index]
     except KeyError as exc:
         raise FactoryLifecycleError(f"no legal transition from {phase!r}") from exc
-

@@ -8,6 +8,7 @@ from .contracts import (
     FactoryRole,
     PromotedCapability,
 )
+from .service import FactoryCoordinator, FactoryRepository, InMemoryFactoryRepository
 
 __all__ = [
     "AgentFactoryJob",
@@ -16,5 +17,7 @@ __all__ = [
     "FactoryPhase",
     "FactoryRole",
     "PromotedCapability",
+    "FactoryCoordinator",
+    "FactoryRepository",
+    "InMemoryFactoryRepository",
 ]
-
