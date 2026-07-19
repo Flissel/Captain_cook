@@ -67,15 +67,27 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
   getestet (`771e042`; `tests/planning/test_evaluation_bridge.py`). Die
   Brücke akzeptiert nur persistierte QA-Entscheidungen, bindet Quellen/DAG
   deterministisch und veröffentlicht einen identischen Run nie doppelt.
-- [ ] Einen einzelnen dependency-bereiten Subtask durch den Captain-fenced
-  Codex-Run bis zur terminalen Gateway-Evidenz beweisen; n8n nur für explizite
-  Lease-Tests und ohne VibeMind-Volumes anzutasten.
+- [x] Einen einzelnen dependency-bereiten Subtask durch den Captain-fenced
+  Hermes/Codex-App-Server-Run bis zur terminalen Gateway-Evidenz beweisen und
+  das daraus erzeugte Artefakt auf dem isolierten Captain-n8n-Builder deployen
+  und ausführen (`tests/live/test_gate_a_codex_n8n.py`, 1 passed in 30,32 s;
+  2026-07-19). Der Test nutzt eine disposable MariaDB, einen temporären
+  Workspace und den Builder auf Port 5679; VibeMind und seine Volumes bleiben
+  unverändert.
+- [ ] Eine explizite, kurzlebige `integration_intent=n8n`-MCP-Lease inklusive
+  Ablauf und Widerruf durch einen Captain-fenced Codex-Run live beweisen. Der
+  grüne Gate-A-Workflow verwendet bewusst den isolierten Builder-HTTP-Target,
+  nicht die externe VibeMind-n8n-MCP-Verbindung.
 - [ ] Den E2E- und Recovery-Pfad nach Prozessneustart mit unveränderten
   Artifacts/Gatewaydaten prüfen: keine doppelte Provider-Reservierung,
   Freigabe oder Ledger-Transition.
 - [ ] Gesamt-Readiness prüfen: vollständiger non-live Gate, explizite
   Live-Gates, Architektur-/Importgrenzen, Demo-Evidenz und branch-sichere
-  main-Integration.
+  main-Integration. Aktuell: `858 passed, 78 skipped, 7 deselected`
+  (`python -m pytest -q --no-cov -m "not live"`, 2026-07-19) sowie
+  `3 passed in 30,57 s` für Builder- und Gate-A-Live-Tests. Die ausgelassenen
+  Tests benötigen eine separat konfigurierte MariaDB; sie sind kein Ersatz
+  für den Gate-A-Nachweis.
 
 ## Pflege-Regel
 
