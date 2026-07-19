@@ -19,7 +19,7 @@ from agenten.execution.codex_supervisor import (
     CodexRunResult,
     CodexSupervisor,
 )
-from agenten.delivery.codex_runs import CodexOutcome
+from agenten.delivery.codex_runs import ActiveCodexSessionRecoveryRequired, CodexOutcome
 from agenten.execution.process import PackageExecutionStatus
 
 
@@ -135,6 +135,12 @@ class InMemoryRunRepository:
         if existing is not None and existing != outcome:
             raise ValueError("terminal outcome conflicts")
         self.outcomes[session_id] = outcome
+
+
+class RecoveryRequiredRepository:
+    async def start(self, request: CodexRunRequest) -> object:
+        del request
+        raise ActiveCodexSessionRecoveryRequired("session is already active")
 
 
 class StartMonitor:
@@ -289,6 +295,25 @@ async def test_captain_revocation_cancels_the_active_session_without_overwriting
             cancellation_reason="captain_revoked",
         )
     }
+
+
+@pytest.mark.asyncio
+async def test_active_gateway_session_never_starts_a_second_codex_runner(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runner = RecordingRunner(0, ("artifact://build/1",))
+    result = await CodexSupervisor(
+        runner=runner,
+        gateway=RecordingGateway(),
+        policy=AllowingPolicy(),
+        repository=RecoveryRequiredRepository(),
+    ).run(_request(workspace))
+
+    assert result.status is PackageExecutionStatus.EVIDENCE_UNRESOLVED
+    assert result.error == "active Codex session requires recovery before retry"
+    assert runner.command is None
 
 
 def test_revocation_monitor_and_canceller_must_be_configured_together(

@@ -79,6 +79,10 @@ class CancellationPersistenceRequired(RuntimeError):
         self.result = result
 
 
+class ActiveCodexSessionRecoveryRequired(RuntimeError):
+    """A prior process owns this session and must be recovered before any retry."""
+
+
 class CodexProcessIdentity(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -319,7 +323,9 @@ class GatewayCodexRunRepository:
             if self._identity(existing) != self._identity(record):
                 raise ValueError("Codex session identity conflicts with Gateway history")
             self._current_session_id = record.session_id
-            return existing
+            raise ActiveCodexSessionRecoveryRequired(
+                "active Codex session requires recovery before it can be resumed"
+            )
 
         payload = CodexSessionStartedPayload(
             event_type="codex_session_started",
@@ -330,7 +336,7 @@ class GatewayCodexRunRepository:
             command_sha256=record.command_sha256,
             workspace_sha256=record.workspace_sha256,
         )
-        await self._append_envelope(
+        created = await self._append_envelope(
             event_type="codex_session_started",
             trace=self._trace(record),
             payload=payload,
@@ -338,6 +344,10 @@ class GatewayCodexRunRepository:
             occurred_at=record.started_at,
         )
         self._current_session_id = record.session_id
+        if not created:
+            raise ActiveCodexSessionRecoveryRequired(
+                "active Codex session requires recovery before it can be resumed"
+            )
         return record
 
     async def record_codex_event(
@@ -486,14 +496,14 @@ class GatewayCodexRunRepository:
         payload: BaseModel,
         event_key: str,
         occurred_at: datetime | None = None,
-    ) -> None:
+    ) -> bool:
         event_id = uuid5(_EVENT_NAMESPACE, event_key)
         existing = next(
             (event for event in await self._history() if event.event_id == event_id),
             None,
         )
         if existing is not None:
-            return
+            return False
         envelope = DeliveryEventEnvelope.model_validate(
             {
                 "event_id": event_id,
@@ -504,7 +514,8 @@ class GatewayCodexRunRepository:
                 "payload": payload,
             }
         )
-        await self._client.append_delivery_event(envelope)
+        _, replayed = await self._client.append_delivery_event_with_receipt(envelope)
+        return not replayed
 
     def _record_from_request(self, request: CodexRunRequest) -> CodexRunRecord:
         required = (

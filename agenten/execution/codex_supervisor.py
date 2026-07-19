@@ -303,7 +303,15 @@ class CodexSupervisor:
         if self._repository is not None:
             try:
                 await self._repository.start(request)
-            except Exception:
+            except Exception as exc:
+                from agenten.delivery.codex_runs import ActiveCodexSessionRecoveryRequired
+
+                if isinstance(exc, ActiveCodexSessionRecoveryRequired):
+                    return self._result(
+                        request,
+                        PackageExecutionStatus.EVIDENCE_UNRESOLVED,
+                        error="active Codex session requires recovery before retry",
+                    )
                 return self._result(
                     request,
                     PackageExecutionStatus.FAILED,

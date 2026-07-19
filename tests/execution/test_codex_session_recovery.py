@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 import json
 import os
@@ -12,12 +13,14 @@ import httpx
 import pytest
 
 from agenten.delivery.codex_runs import (
+    ActiveCodexSessionRecoveryRequired,
     CancellationExecutionError,
     CancellationPersistenceRequired,
     CapabilityGrantRevocationMonitor,
     CodexCancellationCoordinator,
     CodexCancellationResult,
     CodexOutcome,
+    CodexRunRecord,
     GatewayCodexRunRepository,
     SessionBoundCodexCanceller,
 )
@@ -187,6 +190,31 @@ async def test_active_sessions_are_recovered_and_lost_process_is_durable_once(
 
 
 @pytest.mark.asyncio
+async def test_concurrent_restart_claims_admit_only_one_codex_session_owner(
+    tmp_path: Path,
+) -> None:
+    history = GatewayHistory()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(history.handle)
+    ) as http:
+        first = repository(history, http)
+        second = repository(history, http)
+        results = await asyncio.gather(
+            first.start(request(tmp_path)),
+            second.start(request(tmp_path)),
+            return_exceptions=True,
+        )
+
+    assert sum(isinstance(item, CodexRunRecord) for item in results) == 1
+    assert sum(
+        isinstance(item, ActiveCodexSessionRecoveryRequired) for item in results
+    ) == 1
+    assert [event["event_type"] for event in history.events] == [
+        "codex_session_started"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_cancellation_and_infrastructure_outcomes_never_consume_repair(
     tmp_path: Path,
 ) -> None:
@@ -221,7 +249,8 @@ async def test_replay_and_sanitized_event_payloads_are_idempotent_and_secret_fre
     ) as http:
         runs = repository(history, http)
         first = await runs.start(request(tmp_path, prompt=raw_prompt))
-        assert await runs.start(request(tmp_path, prompt=raw_prompt)) == first
+        with pytest.raises(ActiveCodexSessionRecoveryRequired, match="requires recovery"):
+            await runs.start(request(tmp_path, prompt=raw_prompt))
         event = CodexProcessEvent(lifecycle="failed", source_sequence=0)
         warning = CodexParseWarning(
             source_sequence=1,
@@ -811,7 +840,8 @@ async def test_restart_replay_uses_original_start_time_and_rejects_terminal_conf
             actor="worker-1",
             now=lambda: NOW + timedelta(minutes=5),
         )
-        assert await later.start(request(tmp_path)) == original
+        with pytest.raises(ActiveCodexSessionRecoveryRequired, match="requires recovery"):
+            await later.start(request(tmp_path))
         await later.finish(
             "session-1", CodexOutcome(classification="succeeded")
         )

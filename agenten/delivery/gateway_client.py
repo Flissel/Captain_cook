@@ -189,6 +189,15 @@ class GatewayDeliveryClient:
         self,
         event: DeliveryEventEnvelope,
     ) -> DeliveryEventEnvelope:
+        appended, _ = await self.append_delivery_event_with_receipt(event)
+        return appended
+
+    async def append_delivery_event_with_receipt(
+        self,
+        event: DeliveryEventEnvelope,
+    ) -> tuple[DeliveryEventEnvelope, bool]:
+        """Append one idempotent event and retain whether Gateway replayed it."""
+
         response = await self._request(
             "POST",
             "/v1/delivery/events",
@@ -205,7 +214,7 @@ class GatewayDeliveryClient:
             response,
             operation=f"append {event.event_type} delivery event",
         )
-        return appended.event
+        return appended.event, appended.replayed
 
     async def delivery_events(
         self,
