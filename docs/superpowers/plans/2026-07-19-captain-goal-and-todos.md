@@ -149,9 +149,13 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
   passende Prozess-Instanz oder zeichnet einen belegten verlorenen Prozess als
   `lost_process` terminal auf. Fehlende oder widersprüchliche Identität bleibt
   bewusst `deferred`; erst nach Terminal-Evidenz darf der Requeue erfolgen.
-- [ ] Den neuen Startpfad mit einem echten PowerShell-Codex-Kindprozess und
-  Gateway-Neustart live beweisen; die bisherigen gezielten Unit-Gates decken
-  den Director-Vertrag ab (`14 passed`), ersetzen aber keinen Live-Gate.
+- [x] Den neuen Startpfad mit einem echten sessiongebundenen PowerShell-
+  Kindprozess, persistierter PID-/Startzeit-/Executable-Identität und
+  Gateway-Neustart live beweisen. Der Director terminalisiert den exakt
+  verifizierten Baum, schreibt die Gateway-Terminalevidenz und gibt erst dann
+  die nächste gefencete Claim-Iteration frei
+  (`tests/live/test_n8n_mcp_broker_live.py`, `4 passed in 27,04 s`,
+  2026-07-19). Der volle Gateway-Regressionsteil bleibt ein separater Gate.
 - [x] Gesamt-Readiness prüfen: vollständiger non-live Gate, explizite
   Live-Gates, Architektur-/Importgrenzen, Demo-Evidenz und branch-sichere
   main-Integration. Aktuell: `986 passed, 79 skipped, 14 deselected`

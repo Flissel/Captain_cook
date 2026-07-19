@@ -8,6 +8,7 @@ authority is held by an ephemeral local Gateway backed by TEST_MARIADB_DSN.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import secrets
 import shutil
@@ -40,6 +41,7 @@ from agenten.delivery.gateway_client import (
     GatewayDeliveryConflictError,
 )
 from agenten.delivery.recovery import GatewayRecoveryService, RecoveryDecision
+from agenten.delivery.worker_recovery import LocalCodexWorkerRecoveryDirector
 from agenten.execution.codex_policy import (
     AuthorizedCodexRun,
     CodexExecutionPolicy,
@@ -704,6 +706,30 @@ async def test_gateway_restart_requeues_one_orphaned_codex_session_into_new_iter
                 now=lambda: datetime.now(timezone.utc),
             )
             await first_repository.start(first_request)
+            pwsh = shutil.which("pwsh")
+            if not pwsh:
+                pytest.fail("required live gate: PowerShell 7 is unavailable")
+            state_dir = tmp_path / "codex-session-state"
+            state_dir.mkdir()
+            child = subprocess.Popen(
+                [pwsh, "-NoProfile", "-Command", "Start-Sleep -Seconds 60"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            identity_json = subprocess.check_output(
+                [
+                    pwsh,
+                    "-NoProfile",
+                    "-Command",
+                    f"$p=Get-Process -Id {child.pid}; [pscustomobject]@{{pid=$p.Id;started_at_utc=$p.StartTime.ToUniversalTime().ToString('O');start_time_utc_ticks=$p.StartTime.ToUniversalTime().Ticks;executable=$p.Path}} | ConvertTo-Json -Compress",
+                ],
+                text=True,
+            )
+            identity = json.loads(identity_json)
+            identity["session_id"] = first_request.session_id
+            (state_dir / f"{first_request.session_id}.json").write_text(
+                json.dumps(identity), encoding="utf-8"
+            )
 
             process.terminate()
             process.wait(timeout=15)
@@ -718,30 +744,24 @@ async def test_gateway_restart_requeues_one_orphaned_codex_session_into_new_iter
 
             recovered_worker = GatewayDeliveryClient(gateway_base, worker_token, http)
             recovered_captain = GatewayDeliveryClient(gateway_base, gateway_token, http)
-            recovered_repository = GatewayCodexRunRepository(
-                client=recovered_captain,
-                project_id=project_id,
-                run_id=run_id,
-                actor=worker_id,
-                now=lambda: datetime.now(timezone.utc),
-            )
-
             await asyncio.sleep(1.2)
             with pytest.raises(GatewayDeliveryConflictError):
                 await recovered_worker.claim(batch_id)
-            with pytest.raises(GatewayDeliveryConflictError):
-                await GatewayRecoveryService(recovered_captain).recover_expired(
-                    datetime.now(timezone.utc)
-                )
-            reconciled = await recovered_repository.reconcile(
-                worker_id=worker_id,
-                live_process_ids=frozenset(),
+            assert await GatewayRecoveryService(recovered_captain).recover_expired(
+                datetime.now(timezone.utc)
+            ) == ()
+            director = LocalCodexWorkerRecoveryDirector(
+                client=recovered_captain,
+                state_dir=state_dir,
             )
-            assert len(reconciled) == 1
-            assert reconciled[0].session_id == first_request.session_id
-            assert reconciled[0].outcome is not None
-            assert reconciled[0].outcome.classification == "lost_process"
-            decisions = await GatewayRecoveryService(recovered_captain).recover_expired(
+            prepared = await director.prepare(batch_id, first_claim.iteration)
+            assert prepared.terminalized_session_ids == (first_request.session_id,)
+            assert prepared.deferred_session_ids == ()
+            child.wait(timeout=15)
+            decisions = await GatewayRecoveryService(
+                recovered_captain,
+                prepare_for_requeue=director.ready_for_requeue,
+            ).recover_expired(
                 datetime.now(timezone.utc)
             )
             assert decisions == (
