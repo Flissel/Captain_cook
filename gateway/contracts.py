@@ -20,6 +20,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
     CapabilityGrant,
+    CapabilityGrantRevocation,
 )
 
 
@@ -56,6 +57,7 @@ class RuntimeOperationProjection(_FrozenContract):
     operation_id: UUID
     command: AgentRuntimeCommand
     grant: CapabilityGrant | None = None
+    revocation: CapabilityGrantRevocation | None = None
     result: AgentRuntimeResult | None = None
 
 
@@ -124,6 +126,7 @@ CodexCancellationReason: TypeAlias = Literal[
     "timeout",
     "shutdown",
     "claim_lost",
+    "captain_revoked",
 ]
 
 
@@ -171,10 +174,13 @@ class CodexSessionEventPayload(_FrozenContract):
             ):
                 raise ValueError("item_completed requires only item metadata")
         elif self.lifecycle == "turn_completed":
-            if any(value is not None for value in item_fields) or any(
+            usage_is_partial = any(value is not None for value in token_fields) and any(
                 value is None for value in token_fields
-            ):
-                raise ValueError("turn_completed requires only token metadata")
+            )
+            if any(value is not None for value in item_fields) or usage_is_partial:
+                raise ValueError(
+                    "turn_completed requires no usage or complete token metadata"
+                )
         elif any(value is not None for value in (*item_fields, *token_fields)):
             raise ValueError(f"{self.lifecycle} forbids item and token metadata")
         return self

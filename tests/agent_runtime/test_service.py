@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -14,6 +14,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeResult,
     ArtifactRef,
     CapabilityGrant,
+    CapabilityGrantRevocation,
     HermesPlanResult,
     RuntimeOperation,
     RuntimeStatus,
@@ -90,8 +91,9 @@ class FakeCapabilityPolicy:
         grant: CapabilityGrant,
         command: AgentRuntimeCommand,
         now: datetime,
+        revocation: CapabilityGrantRevocation | None = None,
     ) -> CapabilityGrant:
-        return validate_grant(grant, command, now)
+        return validate_grant(grant, command, now, revocation)
 
 
 class FakeState:
@@ -100,6 +102,7 @@ class FakeState:
         self.batch = batch
         self.commands: dict[UUID, AgentRuntimeCommand] = {}
         self.grants: dict[UUID, CapabilityGrant] = {}
+        self.revocations: dict[UUID, CapabilityGrantRevocation] = {}
         self.results: dict[UUID, AgentRuntimeResult] = {}
 
     async def get_result(self, command_id: UUID) -> AgentRuntimeResult | None:
@@ -119,6 +122,11 @@ class FakeState:
 
     async def get_grant(self, command_id: UUID) -> CapabilityGrant | None:
         return self.grants.get(command_id)
+
+    async def get_grant_revocation(
+        self, command_id: UUID
+    ) -> CapabilityGrantRevocation | None:
+        return self.revocations.get(command_id)
 
     async def record_grant(self, grant: CapabilityGrant) -> CapabilityGrant:
         self.grants[grant.command_id] = grant
@@ -283,6 +291,30 @@ async def test_replay_returns_stored_result_without_second_adapter_call() -> Non
     assert replay == first
     assert codex.calls == [RuntimeOperation.CODEX_RUN]
     assert events.count("command_accepted") == 1
+
+
+@pytest.mark.asyncio
+async def test_captain_revocation_blocks_an_existing_grant_before_external_effect() -> None:
+    events: list[str] = []
+    command = command_for()
+    state = FakeState(events, batch_for(command))
+    grant = derive_grant(command, state.batch, NOW)
+    state.grants[command.event_id] = grant
+    state.revocations[command.event_id] = CapabilityGrantRevocation(
+        schema_name="captain.capability-grant-revocation.v1",
+        revocation_id=uuid4(),
+        grant_id=grant.grant_id,
+        command_id=command.event_id,
+        revoked_at=NOW,
+        reason="captain_cancelled",
+    )
+    codex = FakeCodex(events)
+
+    with pytest.raises(CapabilityDenied, match="revoked"):
+        await service_with(state, events, codex, FakeHermes(events)).execute(command)
+
+    assert codex.calls == []
+    assert events == ["command_accepted"]
 
 
 @pytest.mark.parametrize(

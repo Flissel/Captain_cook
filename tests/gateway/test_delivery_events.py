@@ -512,6 +512,36 @@ def test_codex_session_delivery_events_are_truthful_frozen_contracts(
         event.payload.session_id = "different"
 
 
+def test_codex_turn_completed_accepts_unavailable_usage_without_inventing_tokens() -> None:
+    """App-server integrations may complete a turn without usage telemetry."""
+    event = DeliveryEventEnvelope.model_validate(
+        {
+            "event_id": uuid4(),
+            "event_type": "codex_session_event",
+            "occurred_at": NOW,
+            "actor": "worker-1",
+            "trace": {
+                **TRACE,
+                "batch_id": "batch-1",
+                "worker_id": "worker-1",
+                "claim_id": "claim-1",
+                "fencing_token": 7,
+                "session_id": "session-1",
+            },
+            "payload": {
+                "event_type": "codex_session_event",
+                "session_id": "session-1",
+                "source_sequence": 0,
+                "lifecycle": "turn_completed",
+            },
+        }
+    )
+
+    assert event.payload.input_tokens is None
+    assert event.payload.cached_input_tokens is None
+    assert event.payload.output_tokens is None
+
+
 @pytest.mark.parametrize(
     "payload",
     (
@@ -567,6 +597,7 @@ def test_codex_terminal_outcome_enforces_repair_and_cancellation_invariants(
         {"lifecycle": "item_completed", "item_id": None, "item_type": None},
         {"lifecycle": "item_completed", "input_tokens": 1},
         {"lifecycle": "turn_completed", "item_id": "item-1", "item_type": "message"},
+        {"lifecycle": "turn_completed", "input_tokens": 1},
         {"lifecycle": "turn_started", "output_tokens": 1},
         {"lifecycle": "failed", "item_id": "item-1"},
         {"lifecycle": "started", "cached_input_tokens": 1},

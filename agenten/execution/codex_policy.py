@@ -90,6 +90,7 @@ class CodexExecutionPolicy:
         }
     )
     _ALLOWED_COMMAND_PREFIX = ("codex", "exec", "--json")
+    _MCP_LEASE_ENVIRONMENT_NAMES = frozenset({"N8N_MCP_TOKEN"})
     _FORBIDDEN_SECRET_PATH_PATTERNS = (
         re.compile(
             r"(?i)(?<![\w])\.env(?:\.[a-z0-9_-]+)?(?=$|[\\/\s'\"`),:;])"
@@ -110,15 +111,18 @@ class CodexExecutionPolicy:
         *,
         workspace_root: Path,
         environment: Mapping[str, str],
+        mcp_lease_environment: Mapping[str, str] | None = None,
     ) -> None:
         self._workspace_root = workspace_root.resolve()
-        self._environment = FrozenEnvironment(
-            {
-                name: value
-                for name, value in environment.items()
-                if name in self._ALLOWED_ENVIRONMENT_NAMES
-            }
+        authorized_environment = {
+            name: value
+            for name, value in environment.items()
+            if name in self._ALLOWED_ENVIRONMENT_NAMES
+        }
+        authorized_environment.update(
+            self._validate_mcp_lease_environment(mcp_lease_environment)
         )
+        self._environment = FrozenEnvironment(authorized_environment)
 
     def authorize(self, request: CodexRunRequest) -> AuthorizedCodexRun:
         """Return a launch-safe request or reject it before any process starts."""
@@ -151,6 +155,28 @@ class CodexExecutionPolicy:
         )
         if any(value is None for value in required_values):
             raise CodexPolicyViolation("complete delivery trace context is required")
+
+    @classmethod
+    def _validate_mcp_lease_environment(
+        cls, value: Mapping[str, str] | None
+    ) -> dict[str, str]:
+        """Admit only the per-run token issued after Captain lease validation.
+
+        The standard process environment never inherits MCP credentials.  A
+        caller may provide exactly the token from a validated, short-lived
+        lease; endpoint identity remains in the isolated Codex configuration.
+        """
+
+        if value is None:
+            return {}
+        if set(value) != cls._MCP_LEASE_ENVIRONMENT_NAMES:
+            raise CodexPolicyViolation(
+                "MCP lease environment must contain only N8N_MCP_TOKEN"
+            )
+        token = value.get("N8N_MCP_TOKEN", "")
+        if not isinstance(token, str) or not token.strip():
+            raise CodexPolicyViolation("MCP lease token must not be empty")
+        return {"N8N_MCP_TOKEN": token}
 
     @staticmethod
     def _resolve_project_root(request: CodexRunRequest) -> Path:

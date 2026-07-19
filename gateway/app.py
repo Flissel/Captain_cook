@@ -19,6 +19,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
     CapabilityGrant,
+    CapabilityGrantRevocation,
 )
 from gateway.auth import (
     GatewayRole,
@@ -232,6 +233,29 @@ def create_app(
                     "profile": grant.profile.value,
                     "status": "active",
                     "expires_at": grant.expires_at.isoformat(),
+                }
+            )
+        return receipt
+
+    @app.post("/v1/runtime/grant-revocations", status_code=status.HTTP_201_CREATED)
+    async def revoke_runtime_grant(
+        revocation: CapabilityGrantRevocation,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> RuntimeWriteReceipt:
+        receipt = get_store().record_capability_grant_revocation(revocation)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        else:
+            enqueue_runtime_projection(
+                {
+                    "event_type": "runtime_capability_revoked",
+                    "event_id": str(revocation.revocation_id),
+                    "operation_id": str(revocation.command_id),
+                    "grant_id": revocation.grant_id,
+                    "status": "revoked",
+                    "reason": revocation.reason,
+                    "revoked_at": revocation.revoked_at.isoformat(),
                 }
             )
         return receipt

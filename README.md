@@ -178,6 +178,49 @@ Stop Captain Cook's services with `docker compose down`. Do not run
 `docker compose down -v`: it deletes the Captain ledger volume. Captain Cook's
 scripts never delete or adopt either existing n8n volume.
 
+### Isolated Captain n8n builder
+
+The optional Captain builder is a separate Compose project on
+`http://127.0.0.1:5679`. It has its own PostgreSQL database, encryption key,
+API key, and named volumes. It does not replace the default external n8n mode.
+VibeMind remains untouched: these commands do not contact its API or inspect,
+start, stop, restart, mount, or alter its container, workflows, or volumes.
+
+Run the lifecycle in order from the repository root:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/captain-n8n.ps1 -Action init
+powershell -ExecutionPolicy Bypass -File scripts/captain-n8n.ps1 -Action start
+powershell -ExecutionPolicy Bypass -File scripts/captain-n8n.ps1 -Action bootstrap
+powershell -ExecutionPolicy Bypass -File scripts/captain-n8n.ps1 -Action status
+powershell -ExecutionPolicy Bypass -File scripts/captain-n8n.ps1 -Action stop
+```
+
+`init` generates missing local secrets in the gitignored
+`.env.captain-n8n`. `bootstrap` creates or authenticates the local owner
+`captain@local.test`, creates or recovers one labelled API key through n8n's
+supported API, and stores that key only in the same environment file. It does
+not edit n8n database rows. Verify the running builder without displaying
+credentials or workflow content:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/verify_captain_n8n.ps1
+```
+
+### Hermes runtime readiness
+
+Captain's pinned Hermes submodule can be checked without starting Docker or
+contacting n8n:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/verify_hermes_readiness.ps1
+```
+
+The verifier fails closed when Hermes is uninitialized, differs from the
+parent gitlink, or has local changes. Its redacted report lists only the pinned
+commit, required Captain-planner/MCP entrypoints, focused-test status, and the
+lease-scoped `n8n-mcp` server identity.
+
 ## How Codex and GPT-5.6 fit
 
 Codex is used to build, test, and document the Devpost-ready vertical slice; the implementation history is recorded in this repository's Devpost feature branch and [docs/codex-sessions.md](docs/codex-sessions.md) records the primary submission session ID once captured. The LLM-backed production path is intentionally separate from the offline demo; its target model is configured as GPT-5.6 before the Devpost run. The video must show the working demo and explain both uses, as scripted in [docs/VIDEO_SCRIPT.md](docs/VIDEO_SCRIPT.md).

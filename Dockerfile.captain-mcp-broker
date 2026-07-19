@@ -1,0 +1,13 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+RUN pip install --no-cache-dir \
+    pydantic==2.13.4 \
+    fastapi==0.139.0 \
+    httpx==0.28.1 \
+    uvicorn==0.51.0
+COPY agenten ./agenten
+COPY gateway ./gateway
+COPY blockchain ./blockchain
+
+CMD ["python", "-m", "agenten.agent_runtime.n8n_mcp_broker_server"]
