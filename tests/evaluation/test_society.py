@@ -18,6 +18,8 @@ from agenten.evaluation.models import (
     SourceBlock,
 )
 from agenten.evaluation.society import (
+    _QA_PROMPT,
+    _ComponentPlanToolInput,
     _qa_review_tool,
     _stage_inventory_tool,
     _stage_plan_tool,
@@ -98,8 +100,8 @@ def test_build_society_uses_bounded_autogen_075_team_and_receipt_tools_only(tmp_
         max_rounds=3,
     )
 
-    assert isinstance(society, SocietyOfMindAgent)
-    component = society.dump_component().model_dump(mode="json")
+    assert isinstance(society.presentation, SocietyOfMindAgent)
+    component = society.presentation.dump_component().model_dump(mode="json")
     serialized = json.dumps(component, sort_keys=True)
     assert "RoundRobinGroupChat" in serialized
     assert '"max_turns": 10' in serialized
@@ -174,6 +176,53 @@ def test_planner_and_qa_tools_expose_strict_json_friendly_schemas(tmp_path: Path
         "approved",
         "revision_required",
     ]
+
+
+def test_qa_prompt_lists_only_captain_registered_rubric_codes_and_approved_shape() -> None:
+    assert "unknown_dependency" in _QA_PROMPT
+    assert "weak_test_oracle" in _QA_PROMPT
+    assert "score=7" in _QA_PROMPT
+    assert "defect_codes=[]" in _QA_PROMPT
+    assert "Do not assess implementation existence" in _QA_PROMPT
+
+
+def test_component_tool_input_drops_non_authoritative_qa_reviews_before_staging() -> None:
+    candidate = ComponentPlanCandidate(
+        component_key="crm",
+        scope=("Own CRM.",),
+        non_goals=("No external CRM.",),
+        team_roles=("Builder",),
+        implementation_steps=("Build adapter.",),
+        interfaces=("CrmAdapter",),
+        acceptance_tests=(
+            AcceptanceTestPlan(
+                test_id="crm-unit",
+                test_type="unit",
+                setup="Create adapter.",
+                action="Sync contact.",
+                expected="Return receipt.",
+                command="python -m pytest -q tests/crm",
+            ),
+        ),
+        definition_of_done=("Tests pass.",),
+        risks=("Schema drift.",),
+        dependencies=(),
+        source_citations=("block-0001",),
+        qa_reviews=(
+            QaReview(
+                component_key="crm",
+                revision=1,
+                decision="approved",
+                score=7,
+                defect_codes=(),
+                revision_requests=(),
+            ),
+        ),
+    )
+
+    tool_input = _ComponentPlanToolInput.model_validate(candidate.model_dump(mode="json"))
+
+    assert "qa_reviews" not in tool_input.model_dump()
 
 
 @pytest.mark.asyncio
@@ -308,8 +357,7 @@ async def test_live_shaped_society_reads_block_then_stages_inventory_plan_and_re
         max_rounds=1,
     )
 
-    assert society._model_client is summary_client  # type: ignore[attr-defined]
-    result = await society._team.run(  # type: ignore[attr-defined]
+    result = await society.run(
         task=(
             "INVENTORY_SLICE run_id=eval-live-shape "
             "source_blocks=block-0001:CRM max_components=1"
@@ -328,6 +376,7 @@ async def test_live_shaped_society_reads_block_then_stages_inventory_plan_and_re
         for item in message.content
     ]
     assert all(not item.is_error for item in execution_results), execution_results
+    assert execution_results
     assert real_client._current_index == 4
     assert (run_dir / "component-inventory.json").is_file()
     assert (run_dir / "candidates" / "crm" / "revision-1.json").is_file(), trace
@@ -348,7 +397,7 @@ async def test_real_round_robin_reaches_qa_before_termination(tmp_path: Path, ta
         tools=EvaluationToolService(JsonEvaluationStore(tmp_path)),
     )
 
-    result = await society._team.run(task=task)  # type: ignore[attr-defined]
+    result = await society.run(task=task)
 
     assert [message.source for message in result.messages[-3:]] == [
         "source_analyst",

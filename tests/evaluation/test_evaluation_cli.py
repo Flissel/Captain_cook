@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+from autogen_core import FunctionCall
 from autogen_core.models import CreateResult, ModelFamily, ModelInfo, RequestUsage
 from autogen_ext.models.replay import ReplayChatCompletionClient
 
@@ -357,3 +358,60 @@ async def test_usage_tracking_telemetry_survives_client_restart(tmp_path: Path) 
     assert telemetry.call_count == 1
     assert telemetry.token_total == 18
     assert telemetry.cost_total is None
+
+
+@pytest.mark.asyncio
+async def test_usage_tracking_persists_argument_free_provider_tool_observation(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.md"
+    input_path.write_text("# CRM\nBuild CRM.\n", encoding="utf-8")
+    source = load_evaluation_source(input_path, "agentfarm/input.md", 12_000)
+    store = JsonEvaluationStore(tmp_path / "artifacts")
+    await store.create_run(source, run_id="eval-observation", idempotency_key=source.sha256)
+    call = FunctionCall(
+        id="opaque-provider-id",
+        name="stage_component_inventory",
+        arguments=json.dumps(
+            {
+                "run_id": "eval-observation",
+                "inventory_id": "inventory-001",
+                "source_citations": ["block-0001"],
+                "components": [{"component_key": "crm"}],
+            }
+        ),
+    )
+    client = UsageTrackingChatCompletionClient(
+        ReplayChatCompletionClient(
+            [
+                CreateResult(
+                    finish_reason="function_calls",
+                    content=[call],
+                    usage=RequestUsage(prompt_tokens=2, completion_tokens=3),
+                    cached=False,
+                )
+            ],
+            model_info=ModelInfo(
+                vision=False,
+                function_calling=True,
+                json_output=True,
+                family=ModelFamily.UNKNOWN,
+                structured_output=True,
+            ),
+        ),
+        model_identifier="replay-live-shape",
+        store=store,
+        run_id="eval-observation",
+    )
+
+    await client.create([])
+
+    observations = store.provider_call_observations("eval-observation")
+    assert len(observations) == 1
+    assert observations[0].call_index == 1
+    assert observations[0].finish_reason == "function_calls"
+    assert observations[0].tool_calls == (
+        ("stage_component_inventory", ("components", "inventory_id", "run_id", "source_citations")),
+    )
+    serialized = observations[0].model_dump_json()
+    assert "opaque-provider-id" not in serialized
+    assert "block-0001" not in serialized
+    assert "crm" not in serialized

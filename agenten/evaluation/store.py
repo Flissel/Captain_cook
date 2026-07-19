@@ -28,9 +28,11 @@ from .models import (
     EvaluationTelemetry,
     InventoryReceipt,
     ProviderCallCompletion,
+    ProviderCallObservation,
     ProviderCallReservation,
     QaReview,
     ReviewReceipt,
+    ToolExecutionObservation,
 )
 from .redaction import redact_model, redact_text
 from .report import render_evaluation_markdown
@@ -217,6 +219,79 @@ class JsonEvaluationStore:
             )
         return ProviderCallCompletion.model_validate_json(stored)
 
+    async def observe_provider_call(
+        self,
+        run_id: str,
+        *,
+        call_index: int,
+        finish_reason: str,
+        tool_calls: tuple[tuple[str, tuple[str, ...]], ...],
+    ) -> ProviderCallObservation:
+        """Persist a redacted structural observation for one reserved call."""
+
+        async with self._lock:
+            self._read_model(
+                self._run_dir(run_id)
+                / "provider-calls"
+                / f"reservation-{call_index:04d}.json",
+                ProviderCallReservation,
+            )
+            observation = ProviderCallObservation(
+                run_id=run_id,
+                call_index=call_index,
+                finish_reason=finish_reason,
+                tool_calls=tool_calls,
+            )
+            stored = self._write_model(
+                self._run_dir(run_id)
+                / "provider-calls"
+                / f"observation-{call_index:04d}.json",
+                observation,
+            )
+        return ProviderCallObservation.model_validate_json(stored)
+
+    def provider_call_observations(self, run_id: str) -> tuple[ProviderCallObservation, ...]:
+        self._read_run(run_id)
+        return tuple(
+            self._read_model(path, ProviderCallObservation)
+            for path in self._provider_observation_paths(run_id)
+        )
+
+    async def record_tool_execution(
+        self,
+        run_id: str,
+        *,
+        tool_name: str,
+        outcome: str,
+        reason_codes: tuple[str, ...] = (),
+    ) -> ToolExecutionObservation:
+        """Append a structural AutoGen tool execution result without arguments."""
+
+        async with self._lock:
+            self._read_run(run_id)
+            sequence = len(self._tool_execution_paths(run_id)) + 1
+            observation = ToolExecutionObservation(
+                run_id=run_id,
+                sequence=sequence,
+                tool_name=tool_name,
+                outcome=outcome,
+                reason_codes=reason_codes,
+            )
+            stored = self._write_model(
+                self._run_dir(run_id)
+                / "tool-executions"
+                / f"execution-{sequence:04d}.json",
+                observation,
+            )
+        return ToolExecutionObservation.model_validate_json(stored)
+
+    def tool_execution_observations(self, run_id: str) -> tuple[ToolExecutionObservation, ...]:
+        self._read_run(run_id)
+        return tuple(
+            self._read_model(path, ToolExecutionObservation)
+            for path in self._tool_execution_paths(run_id)
+        )
+
     def provider_telemetry(
         self,
         run_id: str,
@@ -401,8 +476,13 @@ class JsonEvaluationStore:
             if not candidate_path.is_file():
                 break
             candidate = self._read_model(candidate_path, ComponentPlanCandidate)
-            if revision == 1 and candidate != inventory_candidate:
-                raise EvaluationConflictError("candidate artifact does not match staged inventory")
+            if revision == 1 and not _preserves_inventory_identity(
+                inventory_candidate,
+                candidate,
+            ):
+                raise EvaluationConflictError(
+                    "candidate artifact does not preserve staged inventory identity"
+                )
         review: QaReview | None = None
         if candidate is not None:
             review_path = self._run_dir(run.run_id) / "qa-reviews" / candidate.component_key / f"revision-{candidate.revision}.json"
@@ -489,6 +569,16 @@ class JsonEvaluationStore:
             sorted((self._run_dir(run_id) / "provider-calls").glob("completion-*.json"))
         )
 
+    def _provider_observation_paths(self, run_id: str) -> tuple[Path, ...]:
+        return tuple(
+            sorted((self._run_dir(run_id) / "provider-calls").glob("observation-*.json"))
+        )
+
+    def _tool_execution_paths(self, run_id: str) -> tuple[Path, ...]:
+        return tuple(
+            sorted((self._run_dir(run_id) / "tool-executions").glob("execution-*.json"))
+        )
+
     def _read_run(self, run_id: str) -> EvaluationRun:
         self._safe_id(run_id)
         return self._read_model(self._run_dir(run_id) / "source-manifest.json", EvaluationRun)
@@ -537,6 +627,19 @@ def _status_for_components(components: tuple[ComponentOutcome, ...]) -> Evaluati
     if EvaluationOutcome.FAILED in outcomes:
         return EvaluationStatus.FAILED
     return EvaluationStatus.PARTIAL
+
+
+def _preserves_inventory_identity(
+    inventory_candidate: ComponentPlanCandidate,
+    candidate: ComponentPlanCandidate,
+) -> bool:
+    """Keep inventory membership, provenance, and DAG edges immutable across planning."""
+
+    return (
+        candidate.component_key == inventory_candidate.component_key
+        and candidate.dependencies == inventory_candidate.dependencies
+        and candidate.source_citations == inventory_candidate.source_citations
+    )
 
 
 def _allowed_lifecycle_transition(current: EvaluationStatus, requested: EvaluationStatus) -> bool:

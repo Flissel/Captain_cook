@@ -199,7 +199,7 @@ async def test_candidate_must_belong_to_declared_inventory_and_finalize_rechecks
 
 
 @pytest.mark.asyncio
-async def test_finalize_rejects_candidate_that_disagrees_with_staged_inventory(tmp_path: Path) -> None:
+async def test_finalize_rejects_candidate_that_changes_inventory_provenance(tmp_path: Path) -> None:
     store = JsonEvaluationStore(tmp_path)
     run = await store.create_run(_source(), run_id="eval-001", idempotency_key="input-v1")
     inventory = ComponentInventoryCandidate(
@@ -209,14 +209,43 @@ async def test_finalize_rejects_candidate_that_disagrees_with_staged_inventory(t
         components=(_candidate(scope="Inventory scope."),),
     )
     await store.stage_inventory(run.run_id, inventory)
-    await store.stage_candidate(run.run_id, _candidate(scope="Different staged scope."))
+    await store.stage_candidate(
+        run.run_id,
+        _candidate(scope="Different staged scope.").model_copy(
+            update={"source_citations": ("block-0002",)}
+        ),
+    )
     await store.record_review(
         run.run_id,
         QaReview(component_key="delivery-api", revision=1, decision="approved", score=7, defect_codes=(), revision_requests=()),
     )
 
-    with pytest.raises(EvaluationConflictError, match="does not match staged inventory"):
+    with pytest.raises(EvaluationConflictError, match="does not preserve staged inventory identity"):
         await store.finalize(run.run_id, EvaluationOutcome.ACCEPTED)
+
+
+@pytest.mark.asyncio
+async def test_finalize_accepts_expanded_plan_that_preserves_inventory_identity(tmp_path: Path) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    run = await store.create_run(_source(), run_id="eval-001", idempotency_key="input-v1")
+    inventory = ComponentInventoryCandidate(
+        inventory_id="inventory-001",
+        source=run.source,
+        source_citations=("block-0001",),
+        components=(_candidate(scope="Inventory outline."),),
+    )
+    await store.stage_inventory(run.run_id, inventory)
+    await store.stage_candidate(run.run_id, _candidate(scope="Expanded implementation plan."))
+    await store.record_review(
+        run.run_id,
+        QaReview(component_key="delivery-api", revision=1, decision="approved", score=7, defect_codes=(), revision_requests=()),
+    )
+
+    manifest = await store.finalize(run.run_id, EvaluationOutcome.ACCEPTED)
+
+    assert manifest.status is EvaluationStatus.ACCEPTED
+    assert manifest.component_outcomes[0].candidate is not None
+    assert manifest.component_outcomes[0].candidate.scope == ("Expanded implementation plan.",)
 
 
 @pytest.mark.asyncio
@@ -460,3 +489,21 @@ async def test_store_enforces_persisted_component_limit_at_inventory_boundary(tm
         await store.stage_inventory("eval-component-limit", inventory)
 
     assert not (tmp_path / "eval-component-limit" / "component-inventory.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_store_persists_argument_free_tool_execution_outcomes(tmp_path: Path) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    await store.create_run(_source(), run_id="eval-tool-observation", idempotency_key="input-v1")
+
+    observation = await store.record_tool_execution(
+        "eval-tool-observation",
+        tool_name="stage_component_inventory",
+        outcome="validation_rejected",
+    )
+
+    assert observation.sequence == 1
+    assert observation.tool_name == "stage_component_inventory"
+    assert observation.outcome == "validation_rejected"
+    assert store.tool_execution_observations("eval-tool-observation") == (observation,)
+    assert "input-v1" not in observation.model_dump_json()

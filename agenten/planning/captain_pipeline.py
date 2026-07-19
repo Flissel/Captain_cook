@@ -2,6 +2,7 @@
 
 from collections.abc import Sequence
 import hashlib
+import re
 from typing import Awaitable, Callable, List, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -349,6 +350,48 @@ class CaptainPipeline:
         if self._run_store is None:
             raise ValueError("run_id requires an injected CaptainRunStore")
         digest = hashlib.sha256(project_description.encode("utf-8")).hexdigest()
+        return await self._release_checkpoint_digest(run_id, digest)
+
+    async def release_compiled_checkpoint(
+        self,
+        compiled: CaptainCompiledPlan,
+        *,
+        source_digest: str,
+        run_id: str,
+    ) -> CaptainCompiledPlan:
+        """Checkpoint externally validated Captain work before any release side effect."""
+
+        if self._run_store is None:
+            raise ValueError("run_id requires an injected CaptainRunStore")
+        if not re.fullmatch(r"[0-9a-f]{64}", source_digest):
+            raise ValueError("source_digest must be a SHA-256 hex digest")
+        async with self._run_store.lock(run_id):
+            state = await self._run_store.load(run_id)
+            if state is None:
+                state = CaptainRunState(
+                    run_id=run_id,
+                    project_id=f"evaluation-{source_digest[:16]}",
+                    project_digest=source_digest,
+                    status=CaptainRunStatus.PLANNING,
+                    batches=compiled.batches,
+                    holdouts=compiled.holdouts,
+                )
+                await self._run_store.save(state)
+            else:
+                self._assert_project_digest(state, source_digest, run_id)
+                if tuple(state.batches) != compiled.batches or tuple(state.holdouts) != compiled.holdouts:
+                    raise CaptainRunConflictError(
+                        f"run {run_id!r} already contains different compiled work"
+                    )
+        return await self._release_checkpoint_digest(run_id, source_digest)
+
+    async def _release_checkpoint_digest(
+        self,
+        run_id: str,
+        digest: str,
+    ) -> CaptainCompiledPlan:
+        """Publish one persisted compiled plan exactly once per batch in order."""
+
         async with self._run_store.lock(run_id):
             state = await self._run_store.load(run_id)
             if state is None:

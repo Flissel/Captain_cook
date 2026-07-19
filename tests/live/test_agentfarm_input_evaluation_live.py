@@ -78,7 +78,7 @@ async def test_live_agentfarm_evaluation_is_real_bounded_and_planning_only(
             "--max-rounds",
             "1",
             "--max-calls",
-            "4",
+            "8",
         ]
     )
 
@@ -91,7 +91,7 @@ async def test_live_agentfarm_evaluation_is_real_bounded_and_planning_only(
     assert manifest.source.sha256 == EXPECTED_AGENTFARM_SOURCE_SHA256
     assert manifest.status is EvaluationStatus.ACCEPTED
     assert manifest.model_identifier not in {"", "not-configured"}
-    assert 0 < manifest.call_count <= 4
+    assert 0 < manifest.call_count <= 8
     assert manifest.token_total > 0
     assert manifest.planning_disclaimer in report
     assert summary["call_count"] == manifest.call_count

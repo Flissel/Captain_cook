@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from autogen_core.models import ModelFamily, ModelInfo
@@ -14,6 +15,7 @@ from agenten.evaluation.models import (
     ComponentInventoryCandidate,
     ComponentPlanCandidate,
     EvaluationOutcome,
+    EvaluationRun,
     EvaluationSource,
     EvaluationStatus,
     EvaluationTelemetry,
@@ -81,6 +83,36 @@ def _model_client() -> ReplayChatCompletionClient:
             structured_output=True,
         ),
     )
+
+
+def test_inventory_task_binds_one_exact_source_citation_and_single_component_dependencies() -> None:
+    source = _source()
+    run = EvaluationRun(
+        run_id="eval-001",
+        idempotency_key="input-v1",
+        source=source,
+        status=EvaluationStatus.CREATED,
+        max_components=1,
+        max_rounds=1,
+        max_calls=4,
+    )
+
+    task = AgentFarmEvaluationService._inventory_task(run)
+
+    assert "required_source_block=block-0001" in task
+    assert "source_citations=[block-0001]" in task
+    assert "dependencies=[]" in task
+    assert "component_key=crm" in task
+    assert "revision=1" in task
+
+
+def test_component_task_binds_inventory_identity_for_the_planner() -> None:
+    task = AgentFarmEvaluationService._component_task("eval-001", _candidate(), 1)
+
+    assert "component_key=crm" in task
+    assert "revision=1" in task
+    assert "source_citations=[block-0001]" in task
+    assert "dependencies=[]" in task
 
 
 class ScriptedSociety:
@@ -177,6 +209,27 @@ class NoInventorySociety:
     async def run(self, *, task: str) -> str:
         assert task.startswith("INVENTORY_SLICE")
         return "EVALUATION_SLICE_COMPLETE without persisted inventory"
+
+
+class SchemaRejectedInventorySociety:
+    async def run(self, *, task: str) -> object:
+        assert task.startswith("INVENTORY_SLICE")
+        return SimpleNamespace(
+            messages=(
+                SimpleNamespace(
+                    content=(
+                        SimpleNamespace(
+                            name="stage_component_inventory",
+                            is_error=True,
+                            content=(
+                                "evaluation tool input is invalid: "
+                                "missing_source_citation, false_execution_claim"
+                            ),
+                        ),
+                    )
+                ),
+            )
+        )
 
 
 class ProviderFailureSociety:
@@ -786,6 +839,32 @@ async def test_adversarial_inventory_slice_without_artifact_persists_failed_mani
     assert manifest.status is EvaluationStatus.FAILED
     assert manifest.component_outcomes == ()
     assert store.lifecycle_events("eval-001")[-1].status is EvaluationStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_service_persists_safe_schema_rejection_from_society_tool_execution(tmp_path: Path) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    service = AgentFarmEvaluationService(
+        model_client=_model_client(),
+        tools=EvaluationToolService(store),
+        store=store,
+        source=_source(),
+        idempotency_key="agentfarm-input-v1",
+        max_calls=1,
+        society=SchemaRejectedInventorySociety(),
+    )
+
+    manifest = await service.run("eval-schema-rejected")
+
+    assert manifest.status is EvaluationStatus.FAILED
+    observations = store.tool_execution_observations("eval-schema-rejected")
+    assert [(item.tool_name, item.outcome) for item in observations] == [
+        ("stage_component_inventory", "validation_rejected")
+    ]
+    assert observations[0].reason_codes == (
+        "false_execution_claim",
+        "missing_source_citation",
+    )
 
 
 @pytest.mark.asyncio

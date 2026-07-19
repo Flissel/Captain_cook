@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import unicodedata
 from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
@@ -24,6 +26,34 @@ from .society import build_evaluation_society, build_qa_review_team
 from .store import EvaluationConflictError, JsonEvaluationStore
 from .tools import EvaluationToolService
 from .validation import validate_component_graph
+
+
+_SAFE_TOOL_REASON_CODES = frozenset(
+    {
+        "missing_scope",
+        "missing_non_goals",
+        "missing_team_roles",
+        "missing_implementation_steps",
+        "missing_interfaces",
+        "missing_acceptance_tests",
+        "missing_definition_of_done",
+        "missing_risks",
+        "missing_source_citations",
+        "missing_setup",
+        "missing_action",
+        "missing_expected",
+        "missing_command",
+        "missing_source_citation",
+        "duplicate_component_key",
+        "unknown_dependency",
+        "dependency_cycle",
+        "qa_component_mismatch",
+        "invalid_qa_approval",
+        "missing_revision_request",
+        "unknown_rubric_code",
+        "false_execution_claim",
+    }
+)
 
 
 class EvaluationSociety(Protocol):
@@ -163,7 +193,7 @@ class AgentFarmEvaluationService:
                 await self._run_slice(
                     run,
                     "component",
-                    self._component_task(run.run_id, inventory_item.component_key, revision),
+                    self._component_task(run.run_id, inventory_item, revision),
                     runner=self._society,
                     component_key=inventory_item.component_key,
                     revision=revision,
@@ -230,7 +260,8 @@ class AgentFarmEvaluationService:
             revision=revision,
         )
         try:
-            await runner.run(task=task)
+            result = await runner.run(task=task)
+            await self._record_tool_execution_observations(run.run_id, result)
         except asyncio.CancelledError:
             phase = self._store.lifecycle_events(run.run_id)[-1].status
             await asyncio.shield(self._store.transition_run(run.run_id, phase, "cancelled"))
@@ -302,13 +333,20 @@ class AgentFarmEvaluationService:
 
     @staticmethod
     def _inventory_task(run: EvaluationRun) -> str:
-        block_ids = " | ".join(
-            f"{block.block_id}:{' > '.join(block.heading_path)}"
-            for block in run.source.blocks
+        block = max(
+            run.source.blocks,
+            key=lambda item: (
+                _inventory_block_priority(item.heading_path),
+                -item.line_start,
+            ),
         )
         return (
-            f"INVENTORY_SLICE run_id={run.run_id} source_blocks={block_ids} "
-            f"max_components={run.max_components}"
+            f"INVENTORY_SLICE run_id={run.run_id} "
+            f"required_source_block={block.block_id} "
+            f"source_citations=[{block.block_id}] "
+            f"max_components={run.max_components} "
+            f"component_key={_component_key_for_block(block.heading_path, block.block_id)} "
+            "revision=1 dependencies=[]"
         )
 
     async def _finalize(
@@ -320,10 +358,15 @@ class AgentFarmEvaluationService:
         return await self._store.finalize(run_id, outcome, telemetry=telemetry)
 
     @staticmethod
-    def _component_task(run_id: str, component_key: str, revision: int) -> str:
+    def _component_task(
+        run_id: str,
+        inventory_item: ComponentPlanCandidate,
+        revision: int,
+    ) -> str:
         return (
-            f"COMPONENT_SLICE run_id={run_id} component_key={component_key} "
-            f"revision={revision}"
+            f"COMPONENT_SLICE run_id={run_id} component_key={inventory_item.component_key} "
+            f"revision={revision} source_citations=[{','.join(inventory_item.source_citations)}] "
+            f"dependencies=[{','.join(inventory_item.dependencies)}]"
         )
 
     @staticmethod
@@ -336,8 +379,79 @@ class AgentFarmEvaluationService:
     def _review_path(self, run_id: str, component_key: str, revision: int) -> Path:
         return self._store._run_dir(run_id) / "qa-reviews" / component_key / f"revision-{revision}.json"
 
+    async def _record_tool_execution_observations(self, run_id: str, result: object) -> None:
+        """Persist only structural tool outcomes from an AutoGen task result."""
+
+        messages = getattr(result, "messages", ())
+        for message in messages if isinstance(messages, (tuple, list)) else ():
+            content = getattr(message, "content", ())
+            for item in content if isinstance(content, (tuple, list)) else ():
+                tool_name = getattr(item, "name", None)
+                if tool_name not in {
+                    "read_source_block",
+                    "stage_component_inventory",
+                    "stage_component_plan",
+                    "record_qa_review",
+                }:
+                    continue
+                if getattr(item, "is_error", False):
+                    error = str(getattr(item, "content", "")).lower()
+                    reason_codes: tuple[str, ...] = ()
+                    if "validation error" in error:
+                        outcome = "schema_rejected"
+                    elif "evaluation tool input is invalid" in error:
+                        outcome = "validation_rejected"
+                        reason_codes = tuple(
+                            sorted(
+                                {
+                                    code
+                                    for code in re.findall(r"[a-z_]+", error)
+                                    if code in _SAFE_TOOL_REASON_CODES
+                                }
+                            )
+                        )
+                    elif "unable to stage" in error or "has not been staged" in error:
+                        outcome = "staging_rejected"
+                    else:
+                        outcome = "unexpected_error"
+                else:
+                    outcome = "succeeded"
+                    reason_codes = ()
+                await self._store.record_tool_execution(
+                    run_id,
+                    tool_name=tool_name,
+                    outcome=outcome,
+                    reason_codes=reason_codes,
+                )
+
     @staticmethod
     def _optional_model(path: Path, model_type: type[EvaluationManifest] | type[ComponentInventoryCandidate] | type[ComponentPlanCandidate] | type[QaReview]):
         if not path.is_file():
             return None
         return model_type.model_validate_json(path.read_bytes())
+
+
+def _inventory_block_priority(heading_path: tuple[str, ...]) -> int:
+    """Choose a deterministic implementation-oriented block for a bounded smoke slice."""
+
+    heading = " ".join(heading_path).lower()
+    return sum(
+        weight
+        for token, weight in (
+            ("phase 1", 8),
+            ("foundation", 6),
+            ("implementation guide", 4),
+            ("getting started", 2),
+        )
+        if token in heading
+    )
+
+
+def _component_key_for_block(heading_path: tuple[str, ...], block_id: str) -> str:
+    """Derive a stable safe component identity before the LLM starts planning."""
+
+    normalized = unicodedata.normalize("NFKD", " ".join(heading_path)).encode(
+        "ascii", "ignore"
+    ).decode("ascii")
+    key = re.sub(r"[^a-z0-9]+", "-", normalized.lower()).strip("-")
+    return key or f"component-{block_id.removeprefix('block-')}"

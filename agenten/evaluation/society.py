@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal
 
 from autogen_agentchat.agents import AssistantAgent, SocietyOfMindAgent
@@ -22,9 +23,12 @@ from .tools import EvaluationToolService
 
 
 _ANALYST_PROMPT = """You are the Source Analyst in a Captain-owned planning evaluation.
-For an inventory slice, first call read_source_block once for the most relevant overview
-block named in the task. Then call stage_component_inventory with at most the requested
-max_components and source-grounded candidate plans; never call read_source_block twice.
+For an inventory slice, first call read_source_block exactly once for required_source_block.
+Then call stage_component_inventory with at most the requested max_components and
+source-grounded candidate plans; never call read_source_block twice. Stage exactly the
+slice's component_key at revision=1. Every candidate's source_citations must be exactly
+[required_source_block]. When max_components=1, stage exactly one root component and set
+dependencies=[]; do not mention unselected components.
 Every component must fill every required field in the advertised tool schema, including
 one complete acceptance_tests item with setup, action, expected, and command. Captain supplies immutable source
 provenance; never attempt to reproduce the whole source manifest. You cannot stage
@@ -34,16 +38,28 @@ systems. Do not emit EVALUATION_SLICE_COMPLETE; QA must run before termination.
 
 _PLANNER_PROMPT = """You are the Component Planner in a Captain-owned planning evaluation.
 Stage only the requested component and revision through stage_component_plan. The plan
-must remain planning-only and include executable acceptance-test plans. You cannot
-approve, finalize, release, mutate a workspace, or call external systems. Do not emit
-EVALUATION_SLICE_COMPLETE; QA must run before termination.
+must preserve the slice's exact source_citations and dependencies; Captain rejects any
+change to that inventory identity. Fill every advertised schema field, including at
+least one complete, executable acceptance-test plan with setup, action, expected, and
+command. It must remain planning-only: do not claim implementation, test execution,
+deployment, or release. You cannot approve, finalize, release, mutate a workspace, or
+call external systems. Do not emit EVALUATION_SLICE_COMPLETE; QA must run before
+termination.
 """
 
 _QA_PROMPT = """You are the independent QA Reviewer in a Captain-owned planning evaluation.
 Review only the persisted candidate named by the slice and record one typed review
 through record_qa_review. You cannot replace the plan, finalize the run, release work,
 or call external systems. Captain observes the persisted review receipt and controls
-termination; prose cannot complete a slice.
+termination; prose cannot complete a slice. This is plan QA, not delivery QA:
+Do not assess implementation existence, execution results, deployment, or whether the
+acceptance-test commands have been run. Evaluate only whether the plan is source-bound,
+has coherent scope and dependencies, and defines complete, observable acceptance tests.
+Use only these defect_codes:
+missing_citation, duplicate_scope, unknown_dependency, dependency_cycle,
+incomplete_implementation, missing_test, weak_test_oracle, wrong_test_level,
+false_execution_claim. If the candidate is complete, record decision=approved,
+score=7, defect_codes=[], and revision_requests=[] exactly.
 """
 
 _SUMMARY_PROMPT = """The inner team performed one bounded planning-evaluation slice.
@@ -86,6 +102,7 @@ class _ComponentPlanToolInput(BaseModel):
     dependencies: list[str]
     source_citations: list[str] = Field(min_length=1)
     claims: list[str] = Field(default_factory=list)
+    qa_reviews: list[object] = Field(default_factory=list, exclude=True)
 
 
 class _QaReviewToolInput(BaseModel):
@@ -101,14 +118,27 @@ class _QaReviewToolInput(BaseModel):
     revision_requests: list[str]
 
 
+@dataclass(frozen=True)
+class CaptainEvaluationSociety:
+    """Captain-owned slice runner with a separate non-authoritative presenter."""
+
+    team: RoundRobinGroupChat
+    presentation: SocietyOfMindAgent
+
+    async def run(self, *, task: str) -> object:
+        """Return the inner result so Captain can persist tool execution evidence."""
+
+        return await self.team.run(task=task)
+
+
 def build_evaluation_society(
     *,
     model_client: ChatCompletionClient,
     summary_model_client: ChatCompletionClient | None = None,
     tools: EvaluationToolService,
     max_rounds: int = 3,
-) -> SocietyOfMindAgent:
-    """Build the presentation wrapper and its ten-turn, receipt-only inner team."""
+) -> CaptainEvaluationSociety:
+    """Build a Captain-observable inner team plus a presentation-only Society shell."""
 
     if isinstance(max_rounds, bool) or not isinstance(max_rounds, int) or not 1 <= max_rounds <= 3:
         raise ValueError("max_rounds must be between one and three")
@@ -137,13 +167,14 @@ def build_evaluation_society(
         max_turns=10,
         termination_condition=SourceMatchTermination(["qa_reviewer"]),
     )
-    return SocietyOfMindAgent(
+    presentation = SocietyOfMindAgent(
         "agentfarm_evaluator",
         team=inner,
         model_client=summary_model_client or model_client,
         instruction=_SUMMARY_PROMPT,
         response_prompt=_SUMMARY_RESPONSE_PROMPT,
     )
+    return CaptainEvaluationSociety(team=inner, presentation=presentation)
 
 
 def build_qa_review_team(

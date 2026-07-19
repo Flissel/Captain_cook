@@ -448,7 +448,7 @@ parser.add_argument("--max-rounds", type=int, choices=(1, 2, 3), default=3)
 parser.add_argument("--max-calls", type=int, default=8)
 ```
 
-The live test must use `AGENTFARM_INPUT_PATH`, validate the expected source digest before starting, set `max_components=1`, `max_rounds=1`, and `max_calls=4`, then assert the manifest records a real model identifier and positive usage while stating that acceptance tests were not executed. It must create artifacts only under pytest's temporary directory. Do not print the API key, raw prompt, raw response, or source text.
+The live test must use `AGENTFARM_INPUT_PATH`, validate the expected source digest before starting, set `max_components=1`, `max_rounds=1`, and `max_calls=8`, then assert the manifest records a real model identifier and positive usage while stating that acceptance tests were not executed. Eight calls are the bounded real-AgentChat allowance for three tool turns plus required post-tool completions. It must create artifacts only under pytest's temporary directory. Do not print the API key, raw prompt, raw response, or source text.
 
 Document one normal command and one cost-bounded live command in `README.md`; add only `AGENTFARM_INPUT_PATH=` and evaluation budget names to `.env.example`, never a source path or secret value.
 
@@ -462,7 +462,7 @@ Expected: deterministic tests PASS; the live test is SKIPPED with a clear prereq
 
 Run: `$env:AGENTFARM_INPUT_PATH='C:\\Users\\User\\Desktop\\Vibemind_V1\\vibemind-os\\voice\\external\\Autogen_AgentFarm\\input.md'; python -m pytest -q -m live tests/live/test_agentfarm_input_evaluation_live.py`
 
-Expected: PASS only if the source digest matches, a real configured model answers within the four-call budget, and the resulting report is clearly labeled as a plan evaluation. Report actual model ID, call count, token usage, artifact path, and any non-green status; never treat a skip or provider failure as green.
+Expected: PASS only if the source digest matches, a real configured model answers within the eight-call budget, and the resulting report is clearly labeled as a plan evaluation. Report actual model ID, call count, token usage, artifact path, and any non-green status; never treat a skip or provider failure as green.
 
 - [ ] **Step 6: Run final project gates and commit**
 

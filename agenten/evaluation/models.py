@@ -262,6 +262,40 @@ class ProviderCallCompletion(BaseModel):
     completion_tokens: int = Field(ge=0)
 
 
+class ProviderCallObservation(BaseModel):
+    """Argument-free record of a provider tool-call decision."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    run_id: str = Field(min_length=1)
+    call_index: int = Field(ge=1)
+    finish_reason: str = Field(min_length=1)
+    tool_calls: tuple[tuple[str, tuple[str, ...]], ...] = ()
+
+
+class ToolExecutionObservation(BaseModel):
+    """Argument-free Captain evidence for one AutoGen tool execution."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    run_id: str = Field(min_length=1)
+    sequence: int = Field(ge=1)
+    tool_name: Literal[
+        "read_source_block",
+        "stage_component_inventory",
+        "stage_component_plan",
+        "record_qa_review",
+    ]
+    outcome: Literal[
+        "succeeded",
+        "schema_rejected",
+        "validation_rejected",
+        "staging_rejected",
+        "unexpected_error",
+    ]
+    reason_codes: tuple[str, ...] = ()
+
+
 class EvaluationTelemetry(BaseModel):
     """Redacted provider totals captured at Captain's finalization boundary."""
 

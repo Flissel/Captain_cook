@@ -11,7 +11,7 @@ from collections.abc import AsyncGenerator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
-from autogen_core import CancellationToken
+from autogen_core import CancellationToken, FunctionCall
 from autogen_core.models import (
     ChatCompletionClient,
     CreateResult,
@@ -35,6 +35,15 @@ from .tools import EvaluationToolService
 
 DEFAULT_MODEL = "gpt-5.6"
 PROMPT_VERSION = "agentfarm-evaluation-v1"
+
+_TOOL_ARGUMENT_KEYS = {
+    "read_source_block": frozenset({"run_id", "block_id"}),
+    "stage_component_inventory": frozenset(
+        {"run_id", "inventory_id", "source_citations", "components"}
+    ),
+    "stage_component_plan": frozenset({"run_id", "candidate"}),
+    "record_qa_review": frozenset({"run_id", "review"}),
+}
 
 
 class EvaluationCallBudgetExceeded(RuntimeError):
@@ -80,6 +89,12 @@ class UsageTrackingChatCompletionClient(ChatCompletionClient):
             extra_create_args=extra_create_args,
             cancellation_token=cancellation_token,
         )
+        await self._store.observe_provider_call(
+            self._run_id,
+            call_index=reservation.call_index,
+            finish_reason=str(result.finish_reason),
+            tool_calls=_structural_tool_calls(result),
+        )
         await self._store.complete_provider_call(
             self._run_id,
             call_index=reservation.call_index,
@@ -109,6 +124,12 @@ class UsageTrackingChatCompletionClient(ChatCompletionClient):
                 cancellation_token=cancellation_token,
             ):
                 if isinstance(item, CreateResult):
+                    await self._store.observe_provider_call(
+                        self._run_id,
+                        call_index=reservation.call_index,
+                        finish_reason=str(item.finish_reason),
+                        tool_calls=_structural_tool_calls(item),
+                    )
                     await self._store.complete_provider_call(
                         self._run_id,
                         call_index=reservation.call_index,
@@ -317,6 +338,32 @@ def _build_summary_model_client(max_calls: int) -> ChatCompletionClient:
 
 def _print_summary(summary: Mapping[str, object]) -> None:
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+
+
+def _structural_tool_calls(result: CreateResult) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Keep only approved tool names and public top-level argument keys."""
+
+    if not isinstance(result.content, list):
+        return ()
+    observations: list[tuple[str, tuple[str, ...]]] = []
+    for item in result.content:
+        if not isinstance(item, FunctionCall):
+            continue
+        allowed_keys = _TOOL_ARGUMENT_KEYS.get(item.name)
+        if allowed_keys is None:
+            observations.append(("unknown", ()))
+            continue
+        try:
+            arguments = json.loads(item.arguments)
+        except (TypeError, json.JSONDecodeError):
+            arguments = None
+        keys = (
+            tuple(sorted(key for key in arguments if isinstance(key, str) and key in allowed_keys))
+            if isinstance(arguments, dict)
+            else ()
+        )
+        observations.append((item.name, keys))
+    return tuple(observations)
 
 
 if __name__ == "__main__":
