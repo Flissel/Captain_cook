@@ -41,7 +41,7 @@ from gateway.contracts import (
     FactoryWriteReceipt,
 )
 from gateway.mirror import MirrorQueue
-from gateway.registry_feed import mirror_validated_batch
+from gateway.registry_feed import mirror_captain_projection
 from gateway.settings import GatewaySettings
 from gateway.store import AppendResult, GatewayStore
 
@@ -103,7 +103,7 @@ def create_app(
     mirror: Mirror | None = None,
     settings: GatewaySettings | None = None,
 ) -> FastAPI:
-    mirror = mirror or MirrorQueue(mirror_validated_batch)
+    mirror = mirror or MirrorQueue(mirror_captain_projection)
     store_lock = Lock()
     store: GatewayStore | None = GatewayStore(storage) if storage else None
     sink_calls: list[dict[str, Any]] = []
@@ -207,6 +207,19 @@ def create_app(
         receipt = get_store().record_factory_block(evidence)
         if receipt.replayed:
             response.status_code = status.HTTP_200_OK
+        else:
+            factory = get_store().factory_job(evidence.job_id)
+            enqueue_runtime_projection(
+                {
+                    "event_type": "factory_lifecycle",
+                    "job_id": str(evidence.job_id),
+                    "capability_id": factory.job.required_capability,
+                    "phase": evidence.phase.value,
+                    "status": evidence.status.value,
+                    "attempt": evidence.attempt,
+                    "subject_version": evidence.subject_version,
+                }
+            )
         return receipt
 
     @app.post("/v1/factory/leases", status_code=status.HTTP_201_CREATED)
