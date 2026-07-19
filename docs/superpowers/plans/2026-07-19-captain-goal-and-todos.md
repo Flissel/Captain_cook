@@ -116,7 +116,7 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
   Provider-übergreifende Live-Wiederaufnahme.
 - [ ] Gesamt-Readiness prüfen: vollständiger non-live Gate, explizite
   Live-Gates, Architektur-/Importgrenzen, Demo-Evidenz und branch-sichere
-  main-Integration. Aktuell: `865 passed, 79 skipped, 7 deselected`
+  main-Integration. Aktuell: `872 passed, 79 skipped, 7 deselected`
   (`python -m pytest -q --no-cov -m "not live"`, 2026-07-19) sowie
   erfolgreiche Builder-, Gate-A- und n8n-MCP-Live-Gates. Die 79 ausgelassenen
   Tests benötigen überwiegend eine separat konfigurierte MariaDB; sie sind
