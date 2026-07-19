@@ -403,7 +403,7 @@ git commit -m "feat: add bounded agentfarm evaluation society"
 - Create: `agenten/evaluation/cli.py`
 - Modify: `agenten/evaluation/__init__.py`
 - Modify: `.env.example`
-- Create: `tests/evaluation/test_cli.py`
+- Create: `tests/evaluation/test_evaluation_cli.py`
 - Create: `tests/live/test_agentfarm_input_evaluation_live.py`
 - Modify: `README.md`
 
@@ -431,7 +431,7 @@ def test_live_agentfarm_evaluation_requires_explicit_environment(monkeypatch: py
 
 - [ ] **Step 2: Run CLI tests to verify failure**
 
-Run: `python -m pytest -q tests/evaluation/test_cli.py`
+Run: `python -m pytest -q tests/evaluation/test_evaluation_cli.py`
 
 Expected: FAIL because the evaluator CLI does not exist.
 
@@ -454,7 +454,7 @@ Document one normal command and one cost-bounded live command in `README.md`; ad
 
 - [ ] **Step 4: Run CLI, live-gate skip, and selected full tests**
 
-Run: `python -m pytest -q tests/evaluation/test_cli.py tests/evaluation/test_service.py tests/live/test_agentfarm_input_evaluation_live.py`
+Run: `python -m pytest -q tests/evaluation/test_evaluation_cli.py tests/evaluation/test_service.py tests/live/test_agentfarm_input_evaluation_live.py`
 
 Expected: deterministic tests PASS; the live test is SKIPPED with a clear prerequisite message unless both `OPENAI_API_KEY` and `AGENTFARM_INPUT_PATH` are deliberately configured.
 
@@ -473,7 +473,7 @@ Run: `python -m compileall -q agenten`
 Expected: PASS; report any separately skipped MariaDB, Minibook, or live-service gates.
 
 ```powershell
-git add .env.example README.md agenten/evaluation/__init__.py agenten/evaluation/cli.py tests/evaluation/test_cli.py tests/live/test_agentfarm_input_evaluation_live.py
+git add .env.example README.md agenten/evaluation/__init__.py agenten/evaluation/cli.py tests/evaluation/test_evaluation_cli.py tests/live/test_agentfarm_input_evaluation_live.py
 git commit -m "feat: add agentfarm evaluation cli"
 ```
 
