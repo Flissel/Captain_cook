@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from agenten.agent_factory.contracts import FactoryEvidenceBlock
+from agenten.agent_factory.contracts import FactoryEvidenceBlock, FactoryPhase, FactoryRole
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError, HermesFactoryPort
 
 
@@ -30,8 +31,7 @@ class HermesCliFactory(HermesFactoryPort):
         try:
             process = await asyncio.create_subprocess_exec(
                 self._settings.executable,
-                "chat",
-                "-q",
+                "-z",
                 prompt,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -55,6 +55,25 @@ class HermesCliFactory(HermesFactoryPort):
 def _prompt_for(request: FactoryDispatch, skill_path: Path) -> str:
     assert request.role is not None
     assert request.lease is not None
+    phase = _ROLE_EVIDENCE_PHASE[request.role]
+    response_shape = {
+        "schema": "captain.agent-factory-block.v1",
+        "event_id": "generate a new UUID",
+        "job_id": str(request.job.job_id),
+        "correlation_id": str(request.job.correlation_id),
+        "causation_id": str(request.job.event_id),
+        "occurred_at": request.lease.issued_at.isoformat(),
+        "producer": "hermes",
+        "subject_version": request.job.subject_version,
+        "attempt": request.action.attempt,
+        "phase": phase.value,
+        "role": request.role.value,
+        "status": "succeeded",
+        "artifact_refs": [],
+        "evidence_refs": [],
+        "assertion_ids": [],
+        "lease_id": request.lease.lease_id,
+    }
     return "\n".join(
         (
             f"Use the skill at {skill_path.as_posix()}.",
@@ -69,6 +88,16 @@ def _prompt_for(request: FactoryDispatch, skill_path: Path) -> str:
             f"input_ref={request.job.input_ref.uri}",
             f"required_capability={request.job.required_capability}",
             f"acceptance_assertion_ids={','.join(request.job.acceptance_assertion_ids)}",
-            "Return exactly one JSON object conforming to captain.agent-factory-block.v1; no markdown or prose.",
+            "Return exactly one JSON object and no markdown or prose.",
+            "Use this exact evidence envelope; replace only event_id with a new UUID and occurred_at with the actual UTC time.",
+            json.dumps(response_shape, separators=(",", ":")),
         )
     )
+
+
+_ROLE_EVIDENCE_PHASE = {
+    FactoryRole.AGENT_ARCHITECT: FactoryPhase.BLUEPRINT_CREATED,
+    FactoryRole.TOOL_INTEGRATOR: FactoryPhase.TOOL_CANDIDATE_TESTED,
+    FactoryRole.REAL_CASE_TESTER: FactoryPhase.REAL_CASE_EVIDENCE,
+    FactoryRole.QUALITY_WARDEN: FactoryPhase.QUALITY_REVIEWED,
+}
