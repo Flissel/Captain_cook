@@ -503,6 +503,24 @@ class BatchProjection(BaseModel):
     failed_review_count: int = 0
 
 
+class ActiveCodexSession(BaseModel):
+    """Minimal, redacted trace for Captain's host-local session recovery."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    project_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    trace_id: str = Field(min_length=1)
+    batch_id: str = Field(min_length=1)
+    worker_id: str = Field(min_length=1)
+    claim_id: str = Field(min_length=1)
+    fencing_token: int = Field(ge=1, strict=True)
+    session_id: str = Field(min_length=1)
+    iteration: int = Field(ge=1, strict=True)
+    process_ref: str = Field(pattern=r"^artifact://")
+    started_at: datetime
+
+
 class ClaimEvent(BaseModel):
     batch_id: str
     claim_id: str = Field(min_length=1)

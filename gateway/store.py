@@ -25,10 +25,13 @@ from agenten.agent_runtime.contracts import (
 from blockchain.Blockchain_modell import Block
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.contracts import (
+    ActiveCodexSession,
     ArtifactBuiltPayload,
     BatchDoneEvent,
     BatchProjection,
     ClaimEvent,
+    CodexSessionFinishedPayload,
+    CodexSessionStartedPayload,
     CodexProcessEvent,
     DeliveryEventEnvelope,
     HeartbeatEvent,
@@ -1173,6 +1176,62 @@ class GatewayStore:
             with connection.cursor() as cursor:
                 _, _, projection = self._batch_context(cursor, batch_id, now=now)
         return projection
+
+    def active_codex_sessions(self, batch_id: str) -> tuple[ActiveCodexSession, ...]:
+        """Return only non-terminal Codex traces for the current batch iteration."""
+
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                _, _, projection = self._batch_context(cursor, batch_id)
+                cursor.execute(
+                    """
+                    SELECT data FROM blocks
+                    WHERE block_type = 'delivery_event'
+                      AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.trace.batch_id')) = %s
+                    ORDER BY `index`
+                    """,
+                    (batch_id,),
+                )
+                rows = cursor.fetchall()
+        started: dict[str, ActiveCodexSession] = {}
+        finished: set[str] = set()
+        for row in rows:
+            raw = row["data"]
+            event = DeliveryEventEnvelope.model_validate(
+                json.loads(raw) if isinstance(raw, str) else raw
+            )
+            payload = event.payload
+            if isinstance(payload, CodexSessionStartedPayload):
+                trace = event.trace
+                if (
+                    payload.iteration == projection.claim_iteration
+                    and trace.worker_id is not None
+                    and trace.claim_id is not None
+                    and trace.fencing_token is not None
+                    and trace.session_id is not None
+                ):
+                    started.setdefault(
+                        payload.session_id,
+                        ActiveCodexSession(
+                            project_id=trace.project_id,
+                            run_id=trace.run_id,
+                            trace_id=trace.trace_id,
+                            batch_id=batch_id,
+                            worker_id=trace.worker_id,
+                            claim_id=trace.claim_id,
+                            fencing_token=trace.fencing_token,
+                            session_id=payload.session_id,
+                            iteration=payload.iteration,
+                            process_ref=payload.process_ref,
+                            started_at=payload.started_at,
+                        ),
+                    )
+            elif isinstance(payload, CodexSessionFinishedPayload):
+                finished.add(payload.session_id)
+        return tuple(
+            started[session_id]
+            for session_id in sorted(set(started) - finished)
+        )
 
     def review(self, request: ReviewDecisionEvent) -> dict[str, Any]:
         try:

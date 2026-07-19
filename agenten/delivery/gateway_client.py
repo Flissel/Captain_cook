@@ -76,6 +76,24 @@ class GatewayClaim(BaseModel):
     iteration: int = Field(ge=1, strict=True)
 
 
+class GatewayActiveCodexSession(BaseModel):
+    """Gateway-derived trace needed for host-local terminal evidence."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    project_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    trace_id: str = Field(min_length=1)
+    batch_id: str = Field(min_length=1)
+    worker_id: str = Field(min_length=1)
+    claim_id: str = Field(min_length=1)
+    fencing_token: int = Field(ge=1, strict=True)
+    session_id: str = Field(min_length=1)
+    iteration: int = Field(ge=1, strict=True)
+    process_ref: str = Field(pattern=r"^artifact://")
+    started_at: datetime
+
+
 class GatewayEvidence(BaseModel):
     """Closed evidence union accepted by the current gateway projection."""
 
@@ -266,6 +284,26 @@ class GatewayDeliveryClient:
         except (TypeError, ValueError, ValidationError):
             raise GatewayDeliveryError("list batches returned an invalid response") from None
         return tuple(item.batch_id for item in items)
+
+    async def active_codex_sessions(
+        self,
+        batch_id: str,
+    ) -> tuple[GatewayActiveCodexSession, ...]:
+        response = await self._request(
+            "GET",
+            f"/batches/{self._batch_path(batch_id)}/active-codex-sessions",
+            operation="read active Codex sessions",
+        )
+        self._require_status(response, {200}, operation="read active Codex sessions")
+        try:
+            payload = response.json()
+            if not isinstance(payload, list):
+                raise ValueError("active Codex session response must be an array")
+            return tuple(GatewayActiveCodexSession.model_validate(item) for item in payload)
+        except (TypeError, ValueError, ValidationError):
+            raise GatewayDeliveryError(
+                "read active Codex sessions returned an invalid response"
+            ) from None
 
     async def claim(self, batch_id: str) -> GatewayClaim:
         response = await self._request(

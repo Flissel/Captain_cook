@@ -31,6 +31,7 @@ from gateway.auth import (
     require_worker,
 )
 from gateway.contracts import (
+    ActiveCodexSession,
     BatchProjection,
     DeliveryEventEnvelope,
     ReleaseProjection,
@@ -379,6 +380,13 @@ def create_app(
         _: GatewayRole = Depends(require_reader),
     ) -> BatchProjection:
         return get_store().batch_projection(batch_id)
+
+    @app.get("/batches/{batch_id}/active-codex-sessions")
+    async def get_active_codex_sessions(
+        batch_id: str,
+        _: GatewayRole = Depends(require_captain),
+    ) -> tuple[ActiveCodexSession, ...]:
+        return get_store().active_codex_sessions(batch_id)
 
     @app.post(
         "/batches/{batch_id}/recovery",
