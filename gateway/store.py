@@ -600,7 +600,10 @@ class GatewayStore:
         if for_update:
             sql += " FOR UPDATE"
         cursor.execute(sql, (str(job_id),))
-        return tuple(FactoryEvidenceBlock.model_validate(row["data"]) for row in cursor.fetchall())
+        return tuple(
+            FactoryEvidenceBlock.model_validate(self.storage._decode_row(row)["data"])
+            for row in cursor.fetchall()
+        )
 
     def _runtime_grant_block(
         self,
