@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agenten.agent_factory.contracts import FactoryEvidenceBlock, FactoryPhase, FactoryRole
+from agenten.agent_factory.evidence_store import FactoryEvidenceStore, FilesystemFactoryEvidenceStore
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError, HermesFactoryPort
 
 
@@ -16,13 +17,19 @@ class HermesCliSettings:
     executable: str = "hermes"
     skill_path: Path = Path("agenten/agent_factory/skills/autogen-agent-factory")
     timeout_seconds: int = 900
+    evidence_root: Path = Path("artifacts/agent-factory/evidence")
 
 
 class HermesCliFactory(HermesFactoryPort):
     """Run one hermetic Hermes query and accept only a typed evidence response."""
 
-    def __init__(self, settings: HermesCliSettings = HermesCliSettings()) -> None:
+    def __init__(
+        self,
+        settings: HermesCliSettings = HermesCliSettings(),
+        evidence_store: FactoryEvidenceStore | None = None,
+    ) -> None:
         self._settings = settings
+        self._evidence_store = evidence_store or FilesystemFactoryEvidenceStore(settings.evidence_root)
 
     async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
         if request.role is None or request.lease is None:
@@ -47,8 +54,13 @@ class HermesCliFactory(HermesFactoryPort):
             detail = stderr.decode("utf-8", errors="replace").strip()
             raise FactoryDispatchError(f"Hermes factory role failed: {detail[:500]}")
         try:
-            return FactoryEvidenceBlock.model_validate_json(stdout.decode("utf-8"))
-        except ValueError as exc:
+            payload = json.loads(stdout)
+            if not isinstance(payload, dict):
+                raise ValueError("Hermes output must be an object")
+            transcript = await self._evidence_store.persist(request.job, stdout)
+            payload["evidence_refs"] = [transcript.model_dump(mode="json")]
+            return FactoryEvidenceBlock.model_validate(payload)
+        except (TypeError, ValueError) as exc:
             raise FactoryDispatchError("Hermes must return exactly one factory evidence JSON object") from exc
 
 

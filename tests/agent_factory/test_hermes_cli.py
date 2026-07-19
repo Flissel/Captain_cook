@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import pytest
 
 from agenten.agent_factory.contracts import FactoryPhase, FactoryRole
+from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.hermes_cli import HermesCliFactory
 from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.orchestration import FactoryDispatch
@@ -35,6 +36,14 @@ async def test_dispatch_uses_oneshot_mode_for_parseable_evidence(monkeypatch: py
     )
     observed: tuple[str, ...] = ()
 
+    class EvidenceStore:
+        async def persist(self, _, content: bytes) -> ArtifactRef:
+            return ArtifactRef(
+                uri="artifact://factory-evidence/test/transcript",
+                sha256="a" * 64,
+                media_type="application/json",
+            )
+
     class Process:
         returncode = 0
 
@@ -48,10 +57,11 @@ async def test_dispatch_uses_oneshot_mode_for_parseable_evidence(monkeypatch: py
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
 
-    evidence = await HermesCliFactory().dispatch(request)
+    evidence = await HermesCliFactory(evidence_store=EvidenceStore()).dispatch(request)
 
     assert observed[:2] == ("hermes", "-z")
     assert "chat" not in observed
     assert '"phase":"blueprint_created"' in observed[-1]
     assert f'"lease_id":"{lease.lease_id}"' in observed[-1]
     assert evidence.phase is FactoryPhase.BLUEPRINT_CREATED
+    assert evidence.evidence_refs[0].uri == "artifact://factory-evidence/test/transcript"
