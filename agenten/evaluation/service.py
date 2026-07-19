@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from collections.abc import Callable
 from typing import Protocol
 
 from autogen_core.models import ChatCompletionClient
@@ -16,6 +17,7 @@ from .models import (
     EvaluationRun,
     EvaluationSource,
     EvaluationStatus,
+    EvaluationTelemetry,
     QaReview,
 )
 from .society import build_evaluation_society, build_qa_review_team
@@ -41,11 +43,20 @@ class AgentFarmEvaluationService:
         store: JsonEvaluationStore,
         source: EvaluationSource | None = None,
         idempotency_key: str | None = None,
+        max_components: int = 1,
         max_rounds: int = 3,
         max_calls: int = 10,
         society: EvaluationSociety | None = None,
         qa_society: EvaluationSociety | None = None,
+        summary_model_client: ChatCompletionClient | None = None,
+        telemetry: Callable[[], EvaluationTelemetry] | None = None,
     ) -> None:
+        if (
+            isinstance(max_components, bool)
+            or not isinstance(max_components, int)
+            or max_components < 1
+        ):
+            raise ValueError("max_components must be positive")
         if isinstance(max_rounds, bool) or not isinstance(max_rounds, int) or not 1 <= max_rounds <= 3:
             raise ValueError("max_rounds must be between one and three")
         if isinstance(max_calls, bool) or not isinstance(max_calls, int) or max_calls < 1:
@@ -57,10 +68,13 @@ class AgentFarmEvaluationService:
         self._store = store
         self._source = source
         self._idempotency_key = idempotency_key
+        self._max_components = max_components
         self._max_rounds = max_rounds
         self._max_calls = max_calls
+        self._telemetry = telemetry
         self._society = society or build_evaluation_society(
             model_client=model_client,
+            summary_model_client=summary_model_client,
             tools=tools,
             max_rounds=max_rounds,
         )
@@ -88,7 +102,7 @@ class AgentFarmEvaluationService:
 
         if inventory is None:
             if self._store.consumed_slice_count(run_id) >= max_calls:
-                return await self._store.finalize(run_id, EvaluationOutcome.FAILED)
+                return await self._finalize(run_id, EvaluationOutcome.FAILED)
             await self._store.transition_run(run_id, EvaluationStatus.INVENTORYING)
             await self._run_slice(
                 run,
@@ -98,7 +112,7 @@ class AgentFarmEvaluationService:
             )
             inventory = self._optional_inventory(run_id)
             if inventory is None:
-                return await self._store.finalize(run_id, EvaluationOutcome.FAILED)
+                return await self._finalize(run_id, EvaluationOutcome.FAILED)
 
         if not terminal_recovery:
             lifecycle = self._store.lifecycle_events(run_id)[-1]
@@ -165,7 +179,7 @@ class AgentFarmEvaluationService:
 
         if validate_component_graph(tuple(latest_candidates)):
             outcomes = {key: EvaluationOutcome.FAILED for key in outcomes}
-        return await self._store.finalize(run_id, outcomes)
+        return await self._finalize(run_id, outcomes)
 
     async def _load_or_create_run(self, run_id: str) -> EvaluationRun:
         try:
@@ -177,6 +191,7 @@ class AgentFarmEvaluationService:
                 self._source,
                 run_id=run_id,
                 idempotency_key=self._idempotency_key,
+                max_components=self._max_components,
                 max_rounds=self._max_rounds,
                 max_calls=self._max_calls,
             )
@@ -261,8 +276,22 @@ class AgentFarmEvaluationService:
 
     @staticmethod
     def _inventory_task(run: EvaluationRun) -> str:
-        block_ids = ",".join(block.block_id for block in run.source.blocks)
-        return f"INVENTORY_SLICE run_id={run.run_id} source_blocks={block_ids}"
+        block_ids = " | ".join(
+            f"{block.block_id}:{' > '.join(block.heading_path)}"
+            for block in run.source.blocks
+        )
+        return (
+            f"INVENTORY_SLICE run_id={run.run_id} source_blocks={block_ids} "
+            f"max_components={run.max_components}"
+        )
+
+    async def _finalize(
+        self,
+        run_id: str,
+        outcome: EvaluationOutcome | dict[str, EvaluationOutcome],
+    ) -> EvaluationManifest:
+        telemetry = self._telemetry() if self._telemetry is not None else None
+        return await self._store.finalize(run_id, outcome, telemetry=telemetry)
 
     @staticmethod
     def _component_task(run_id: str, component_key: str, revision: int) -> str:

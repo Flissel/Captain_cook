@@ -16,6 +16,7 @@ from agenten.evaluation.models import (
     EvaluationOutcome,
     EvaluationSource,
     EvaluationStatus,
+    EvaluationTelemetry,
     QaReview,
     SourceBlock,
 )
@@ -244,6 +245,41 @@ async def test_service_schedules_inventory_candidate_qa_then_captain_acceptance(
     assert society.inventory_calls == 1
     assert society.planner_calls == 1
     assert (tmp_path / "eval-001" / "evaluation.md").is_file()
+
+
+@pytest.mark.asyncio
+async def test_service_finalizes_with_injected_provider_telemetry_and_persisted_component_cap(
+    tmp_path: Path,
+) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    tools = EvaluationToolService(store)
+    society = ScriptedSociety(tools, ("approved",))
+    service = AgentFarmEvaluationService(
+        model_client=_model_client(),
+        tools=tools,
+        store=store,
+        source=_source(),
+        idempotency_key="agentfarm-input-v1",
+        max_components=1,
+        max_rounds=1,
+        max_calls=4,
+        society=society,
+        telemetry=lambda: EvaluationTelemetry(
+            model_identifier="gpt-live-test",
+            prompt_version="agentfarm-evaluation-v1",
+            call_count=4,
+            token_total=321,
+            cost_total=0.0,
+        ),
+    )
+
+    manifest = await service.run("eval-telemetry")
+
+    assert manifest.model_identifier == "gpt-live-test"
+    assert manifest.call_count == 4
+    assert manifest.token_total == 321
+    assert "max_components=1" in society.tasks[0]
+    assert store._read_run("eval-telemetry").max_components == 1
 
 
 @pytest.mark.asyncio

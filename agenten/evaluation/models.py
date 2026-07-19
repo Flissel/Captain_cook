@@ -89,6 +89,7 @@ class EvaluationRun(BaseModel):
     idempotency_key: str = Field(min_length=1)
     source: EvaluationSource
     status: EvaluationStatus
+    max_components: int = Field(default=100, ge=1)
     max_rounds: int = Field(ge=1)
     max_calls: int = Field(ge=1)
 
@@ -238,6 +239,18 @@ class EvaluationLifecycleEvent(BaseModel):
     sequence: int = Field(ge=1)
     status: EvaluationStatus
     recovery_state: Literal["active", "cancelled", "resuming", "terminal"]
+
+
+class EvaluationTelemetry(BaseModel):
+    """Redacted provider totals captured at Captain's finalization boundary."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    model_identifier: str = Field(min_length=1)
+    prompt_version: str = Field(min_length=1)
+    call_count: int = Field(ge=0)
+    token_total: int = Field(ge=0)
+    cost_total: float = Field(ge=0)
 
 
 class EvaluationManifest(BaseModel):

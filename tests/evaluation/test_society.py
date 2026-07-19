@@ -107,6 +107,159 @@ def test_build_society_uses_bounded_autogen_075_team_and_receipt_tools_only(tmp_
 
 
 @pytest.mark.asyncio
+async def test_live_shaped_society_reads_block_then_stages_inventory_plan_and_review_in_four_calls(
+    tmp_path: Path,
+) -> None:
+    text = "# CRM\nBuild a deterministic CRM boundary."
+    source = EvaluationSource(
+        source_reference="agentfarm/input.md",
+        sha256="a" * 64,
+        byte_length=len(text.encode("utf-8")),
+        blocks=(
+            SourceBlock(
+                block_id="block-0001",
+                heading_path=("CRM",),
+                line_start=1,
+                line_end=2,
+                sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                text=text,
+            ),
+        ),
+    )
+    candidate = ComponentPlanCandidate(
+        component_key="crm",
+        scope=("Own CRM.",),
+        non_goals=("No external CRM.",),
+        team_roles=("Builder",),
+        implementation_steps=("Build adapter.",),
+        interfaces=("CrmAdapter",),
+        acceptance_tests=(
+            AcceptanceTestPlan(
+                test_id="crm-unit",
+                test_type="unit",
+                setup="Create adapter.",
+                action="Sync contact.",
+                expected="Return receipt.",
+                command="python -m pytest -q tests/crm",
+            ),
+        ),
+        definition_of_done=("Tests pass.",),
+        risks=("Schema drift.",),
+        dependencies=(),
+        source_citations=("block-0001",),
+    )
+    review = QaReview(
+        component_key="crm",
+        revision=1,
+        decision="approved",
+        score=7,
+        defect_codes=(),
+        revision_requests=(),
+    )
+    calls = [
+        FunctionCall(
+            id="read-001",
+            name="read_source_block",
+            arguments=json.dumps({"run_id": "eval-live-shape", "block_id": "block-0001"}),
+        ),
+        FunctionCall(
+            id="inventory-001",
+            name="stage_component_inventory",
+            arguments=json.dumps(
+                {
+                    "run_id": "eval-live-shape",
+                    "inventory_id": "inventory-001",
+                    "source_citations": ["block-0001"],
+                    "components": [candidate.model_dump(mode="json")],
+                }
+            ),
+        ),
+        FunctionCall(
+            id="candidate-001",
+            name="stage_component_plan",
+            arguments=json.dumps(
+                {"run_id": "eval-live-shape", "candidate": candidate.model_dump(mode="json")}
+            ),
+        ),
+        FunctionCall(
+            id="review-001",
+            name="record_qa_review",
+            arguments=json.dumps(
+                {"run_id": "eval-live-shape", "review": review.model_dump(mode="json")}
+            ),
+        ),
+    ]
+    real_client = ReplayChatCompletionClient(
+        [
+            CreateResult(
+                finish_reason="function_calls",
+                content=[call],
+                usage=RequestUsage(prompt_tokens=1, completion_tokens=1),
+                cached=False,
+            )
+            for call in calls
+        ],
+        model_info=ModelInfo(
+            vision=False,
+            function_calling=True,
+            json_output=True,
+            family=ModelFamily.UNKNOWN,
+            structured_output=True,
+        ),
+    )
+    summary_client = ReplayChatCompletionClient(
+        ["Non-authoritative planning slice summary."],
+        model_info=ModelInfo(
+            vision=False,
+            function_calling=False,
+            json_output=False,
+            family=ModelFamily.UNKNOWN,
+            structured_output=False,
+        ),
+    )
+    store = JsonEvaluationStore(tmp_path)
+    await store.create_run(
+        source,
+        run_id="eval-live-shape",
+        idempotency_key="input-v1",
+        max_components=1,
+        max_rounds=1,
+        max_calls=4,
+    )
+    society = build_evaluation_society(
+        model_client=real_client,
+        summary_model_client=summary_client,
+        tools=EvaluationToolService(store),
+        max_rounds=1,
+    )
+
+    assert society._model_client is summary_client  # type: ignore[attr-defined]
+    result = await society._team.run(  # type: ignore[attr-defined]
+        task=(
+            "INVENTORY_SLICE run_id=eval-live-shape "
+            "source_blocks=block-0001:CRM max_components=1"
+        )
+    )
+
+    run_dir = tmp_path / "eval-live-shape"
+    trace = [
+        (message.source, type(message).__name__, str(message.content)[:300])
+        for message in result.messages
+    ]
+    execution_results = [
+        item
+        for message in result.messages
+        if type(message).__name__ == "ToolCallExecutionEvent"
+        for item in message.content
+    ]
+    assert all(not item.is_error for item in execution_results), execution_results
+    assert real_client._current_index == 4
+    assert (run_dir / "component-inventory.json").is_file()
+    assert (run_dir / "candidates" / "crm" / "revision-1.json").is_file(), trace
+    assert (run_dir / "qa-reviews" / "crm" / "revision-1.json").is_file()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "task",
     (

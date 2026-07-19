@@ -133,6 +133,38 @@ External executors integrate by implementing the small `BatchReleaseClient`
 protocol in `agenten/planning/captain_pipeline.py`. The Captain repository does
 not implement or operate those external systems.
 
+## Evaluate the AgentFarm input as plans
+
+The evaluation CLI reads immutable Markdown, asks the bounded AutoGen Society
+for a component inventory and QA-reviewed plans, and writes Captain-owned
+evidence under `artifacts/evaluations/`. It is planning-only: listed acceptance
+tests are not executed and no Codex, n8n, Hermes, Minibook, browser, or delivery
+capability is available.
+
+```powershell
+python -m agenten.evaluation.cli $env:AGENTFARM_INPUT_PATH `
+  --source-reference agentfarm/input.md `
+  --max-components 1 `
+  --max-rounds 3 `
+  --max-calls 8
+```
+
+The command prints only a redacted JSON summary with a relative artifact
+reference. Source paths, source text, prompts, provider responses, and API keys
+are not written to that summary or the evaluation report.
+
+The real-model smoke gate is opt-in and fixes its own stricter budget. Set
+`AGENTFARM_INPUT_PATH` and `OPENAI_API_KEY` only in the local process
+environment, then run:
+
+```powershell
+python -m pytest -q -m live tests/live/test_agentfarm_input_evaluation_live.py
+```
+
+That gate verifies the approved source digest before any provider call and
+enforces one component, one Planner/QA round, and at most four raw model calls.
+It does not contact or modify n8n or any other local service.
+
 ## Roadmap boundary
 
 The submission demo does **not** yet include a FastAPI/MariaDB ledger gateway, Hermes workers that drive Codex CLI, n8n deployment, Mailpit validation, Minibook mirroring, or a live LLM/MCP-backed Householder executor. Those integrations are designed in [the delivery-fleet specification](docs/superpowers/specs/2026-07-15-hackathon-pipeline-design.md) and deliberately kept separate from claims about the runnable demo.

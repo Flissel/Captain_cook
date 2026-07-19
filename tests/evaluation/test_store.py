@@ -9,10 +9,12 @@ from agenten.evaluation.models import (
     AcceptanceTestPlan,
     ComponentInventoryCandidate,
     ComponentPlanCandidate,
+    EvaluationManifest,
     EvaluationOutcome,
     EvaluationRun,
     EvaluationSource,
     EvaluationStatus,
+    EvaluationTelemetry,
     QaReview,
     SourceBlock,
 )
@@ -344,3 +346,52 @@ async def test_store_finalizes_failed_run_without_inventory(tmp_path: Path) -> N
     assert manifest.component_outcomes == ()
     assert (tmp_path / "eval-001" / "run-manifest.json").is_file()
     assert (tmp_path / "eval-001" / "evaluation.md").is_file()
+
+
+@pytest.mark.asyncio
+async def test_store_persists_typed_provider_telemetry_in_terminal_manifest(tmp_path: Path) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    await store.create_run(_source(), run_id="eval-telemetry", idempotency_key="input-v1")
+
+    manifest = await store.finalize(
+        "eval-telemetry",
+        EvaluationOutcome.FAILED,
+        telemetry=EvaluationTelemetry(
+            model_identifier="gpt-live-test",
+            prompt_version="agentfarm-evaluation-v1",
+            call_count=4,
+            token_total=123,
+            cost_total=0.0,
+        ),
+    )
+
+    persisted = EvaluationManifest.model_validate_json(
+        (tmp_path / "eval-telemetry" / "run-manifest.json").read_bytes()
+    )
+    assert manifest == persisted
+    assert persisted.model_identifier == "gpt-live-test"
+    assert persisted.call_count == 4
+    assert persisted.token_total == 123
+
+
+@pytest.mark.asyncio
+async def test_store_enforces_persisted_component_limit_at_inventory_boundary(tmp_path: Path) -> None:
+    store = JsonEvaluationStore(tmp_path)
+    await store.create_run(
+        _source(),
+        run_id="eval-component-limit",
+        idempotency_key="input-v1",
+        max_components=1,
+    )
+    second = _candidate().model_copy(update={"component_key": "second-component"})
+    inventory = ComponentInventoryCandidate(
+        inventory_id="inventory-too-large",
+        source=_source(),
+        source_citations=("block-0001",),
+        components=(_candidate(), second),
+    )
+
+    with pytest.raises(EvaluationConflictError, match="component limit"):
+        await store.stage_inventory("eval-component-limit", inventory)
+
+    assert not (tmp_path / "eval-component-limit" / "component-inventory.json").exists()

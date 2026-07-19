@@ -9,13 +9,22 @@ from autogen_agentchat.conditions import SourceMatchTermination
 from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_core.models import ChatCompletionClient
 
-from .models import QaReview, ReviewReceipt
+from .models import (
+    ComponentInventoryCandidate,
+    ComponentPlanCandidate,
+    CandidateReceipt,
+    InventoryReceipt,
+    QaReview,
+    ReviewReceipt,
+)
 from .tools import EvaluationToolService
 
 
 _ANALYST_PROMPT = """You are the Source Analyst in a Captain-owned planning evaluation.
-Read only the requested redacted source blocks. For an inventory slice, stage exactly
-one source-grounded inventory through stage_component_inventory. You cannot stage
+For an inventory slice, first call read_source_block once for the most relevant overview
+block named in the task. Then call stage_component_inventory with at most the requested
+max_components and source-grounded candidate plans. Captain supplies immutable source
+provenance; never attempt to reproduce the whole source manifest. You cannot stage
 component revisions, review candidates, finalize runs, release work, or use external
 systems. Do not emit EVALUATION_SLICE_COMPLETE; QA must run before termination.
 """
@@ -48,6 +57,7 @@ with EVALUATION_SLICE_COMPLETE.
 def build_evaluation_society(
     *,
     model_client: ChatCompletionClient,
+    summary_model_client: ChatCompletionClient | None = None,
     tools: EvaluationToolService,
     max_rounds: int = 3,
 ) -> SocietyOfMindAgent:
@@ -59,13 +69,14 @@ def build_evaluation_society(
     analyst = AssistantAgent(
         "source_analyst",
         model_client=model_client,
-        tools=[tools.read_source_block, tools.stage_component_inventory],
+        tools=[tools.read_source_block, _stage_inventory_tool(tools)],
         system_message=f"{_ANALYST_PROMPT}\nCaptain permits at most {max_rounds} Planner/QA rounds per component.",
+        max_tool_iterations=2,
     )
     planner = AssistantAgent(
         "component_planner",
         model_client=model_client,
-        tools=[tools.stage_component_plan],
+        tools=[_stage_plan_tool(tools)],
         system_message=f"{_PLANNER_PROMPT}\nCaptain permits at most {max_rounds} Planner/QA rounds per component.",
     )
     reviewer = AssistantAgent(
@@ -82,7 +93,7 @@ def build_evaluation_society(
     return SocietyOfMindAgent(
         "agentfarm_evaluator",
         team=inner,
-        model_client=model_client,
+        model_client=summary_model_client or model_client,
         instruction=_SUMMARY_PROMPT,
         response_prompt=_SUMMARY_RESPONSE_PROMPT,
     )
@@ -110,3 +121,36 @@ def _qa_review_tool(tools: EvaluationToolService):
         return await tools.record_qa_review(run_id, validated)
 
     return record_qa_review
+
+
+def _stage_inventory_tool(tools: EvaluationToolService):
+    async def stage_component_inventory(
+        run_id: str,
+        inventory_id: str,
+        source_citations: list[str],
+        components: list[dict[str, object]],
+    ) -> InventoryReceipt:
+        run = tools._run(run_id)
+        inventory = ComponentInventoryCandidate(
+            inventory_id=inventory_id,
+            source=run.source,
+            source_citations=tuple(source_citations),
+            components=tuple(
+                ComponentPlanCandidate.model_validate_json(json.dumps(component))
+                for component in components
+            ),
+        )
+        return await tools.stage_component_inventory(run_id, inventory)
+
+    return stage_component_inventory
+
+
+def _stage_plan_tool(tools: EvaluationToolService):
+    async def stage_component_plan(
+        run_id: str,
+        candidate: dict[str, object],
+    ) -> CandidateReceipt:
+        validated = ComponentPlanCandidate.model_validate_json(json.dumps(candidate))
+        return await tools.stage_component_plan(run_id, validated)
+
+    return stage_component_plan

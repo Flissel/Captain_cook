@@ -25,6 +25,7 @@ from .models import (
     EvaluationSliceReceipt,
     EvaluationStatus,
     EvaluationSource,
+    EvaluationTelemetry,
     InventoryReceipt,
     QaReview,
     ReviewReceipt,
@@ -54,6 +55,7 @@ class JsonEvaluationStore:
         *,
         run_id: str,
         idempotency_key: str,
+        max_components: int = 100,
         max_rounds: int = 3,
         max_calls: int = 1,
     ) -> EvaluationRun:
@@ -64,6 +66,7 @@ class JsonEvaluationStore:
             idempotency_key=redact_text(idempotency_key),
             source=source,
             status=EvaluationStatus.CREATED,
+            max_components=max_components,
             max_rounds=max_rounds,
             max_calls=max_calls,
         )
@@ -79,6 +82,8 @@ class JsonEvaluationStore:
             inventory = redact_model(inventory)
             if inventory.source != run.source:
                 raise EvaluationConflictError("inventory source differs from source manifest")
+            if len(inventory.components) > run.max_components:
+                raise EvaluationConflictError("inventory exceeds the persisted component limit")
             for candidate in inventory.components:
                 self._safe_id(candidate.component_key)
             self._transition_lifecycle(run_id, EvaluationStatus.INVENTORYING, "active")
@@ -175,6 +180,8 @@ class JsonEvaluationStore:
         self,
         run_id: str,
         outcome: EvaluationOutcome | Mapping[str, EvaluationOutcome],
+        *,
+        telemetry: EvaluationTelemetry | None = None,
     ) -> EvaluationManifest:
         async with self._lock:
             run = self._read_run(run_id)
@@ -208,6 +215,15 @@ class JsonEvaluationStore:
                 status=status,
                 source=run.source,
                 component_outcomes=components,
+                model_identifier=(
+                    telemetry.model_identifier if telemetry is not None else "not-configured"
+                ),
+                prompt_version=(
+                    telemetry.prompt_version if telemetry is not None else "not-configured"
+                ),
+                call_count=telemetry.call_count if telemetry is not None else 0,
+                token_total=telemetry.token_total if telemetry is not None else 0,
+                cost_total=telemetry.cost_total if telemetry is not None else 0.0,
                 artifact_digests=digests,
             )
             report = render_evaluation_markdown(manifest).encode("utf-8")
