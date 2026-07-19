@@ -96,9 +96,17 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
   und bewahrt dessen terminale Gateway-Abbruch-Evidenz (`48f261b`; `209
   passed, 6 skipped`, inklusive realem PowerShell-Process-Tree-Abbruch).
   Der echte LLM-/MCP-Race-Gate bleibt separat offen.
-- [ ] Einen echten LLM-/MCP-Run während eines Captain-Lease-Widerrufs live
-  abbrechen und nachweisen, dass keine spätere Tool- oder Resultat-Evidenz
-  den persistierten Abbruch überschreibt.
+- [x] Einen echten nativen Codex-Provider-Prozess mit pro-Lease n8n-MCP-
+  Konfiguration während eines Captain-Lease-Widerrufs live abbrechen
+  (`9cfb9fe`; `tests/live/test_n8n_mcp_broker_live.py`). Während der Prozess
+  nachweisbar aktiv ist, gelingt eine n8n-MCP-Entdeckung unter demselben
+  Grant/Token; der persistierte Captain-Widerruf terminiert den Run
+  sessiongebunden als `captain_revoked`, der Broker verweigert das Token danach
+  mit HTTP 403 und es bleibt genau eine terminale Gateway-Evidenz. Der
+  isolierte Live-Gate bestand mit `3 passed in 25,20 s` (2026-07-19); der
+  zugehörige Gateway-Runner mit `960 passed, 1 skipped, 10 deselected` in
+  76,43 s. Der Test rekonstruiert nicht den Modell-Toolcall aus Codex-Logs,
+  sondern beweist Provider-Laufzeit und MCP-Wirkung unter derselben Lease.
 - [x] Den statischen n8n-MCP-Instanzschlüssel durch einen Captain-eigenen,
   kurzlebigen Lease-Broker/Proxy ersetzen. Eine Rotation des jetzigen
   instanzweiten Schlüssels wäre kein sicherer Einzelwiderruf, weil sie
@@ -132,8 +140,8 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
   main-Integration. Aktuell: `872 passed, 79 skipped, 7 deselected`
   (`python -m pytest -q --no-cov -m "not live"`, 2026-07-19) sowie
   erfolgreiche Builder-, Gate-A-, n8n-MCP- und Broker-Revocation-Live-Gates.
-  Der aktuelle isolierte Gateway-Runner lief mit `956 passed, 1 skipped,
-  8 deselected`; der eine Skip ist der absichtlich nicht in-process testbare
+  Der aktuelle isolierte Gateway-Runner lief mit `960 passed, 1 skipped,
+  10 deselected`; der eine Skip ist der absichtlich nicht in-process testbare
   No-AutoGen-Degradationspfad. Skips ersetzen weder eine separat grüne
   Gateway-Teilmenge noch die Live-Nachweise.
 
