@@ -21,6 +21,8 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeResult,
     CapabilityGrant,
 )
+from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock
+from agenten.agent_factory.state_machine import FactoryLifecycleError, FactoryProjection, apply_block
 from blockchain.Blockchain_modell import Block
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.contracts import (
@@ -36,6 +38,8 @@ from gateway.contracts import (
     ReleaseProjection,
     RuntimeOperationProjection,
     RuntimeWriteReceipt,
+    FactoryJobProjection,
+    FactoryWriteReceipt,
     ReviewDecisionEvent,
     project_batch,
     project_release,
@@ -494,6 +498,109 @@ class GatewayStore:
                 else None
             ),
         )
+
+    def record_factory_job(self, job: AgentFactoryJob) -> FactoryWriteReceipt:
+        canonical = job.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                existing = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_job",
+                    field="job_id",
+                    value=str(job.job_id),
+                    for_update=True,
+                )
+                if existing is not None:
+                    if existing["data"] == canonical:
+                        return FactoryWriteReceipt(event_id=job.event_id, replayed=True)
+                    raise HTTPException(status_code=409, detail="factory job already exists with different content")
+                index = self._next_index(cursor)
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="agent_factory_job",
+                    data=canonical,
+                    status="accepted",
+                    parent_index=None,
+                    metadata={"schema": "captain.agent-factory-job.v1"},
+                )
+                self._insert(cursor, block)
+        return FactoryWriteReceipt(event_id=job.event_id, replayed=False)
+
+    def record_factory_block(self, evidence: FactoryEvidenceBlock) -> FactoryWriteReceipt:
+        canonical = evidence.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                job_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_job",
+                    field="job_id",
+                    value=str(evidence.job_id),
+                    for_update=True,
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job not found")
+                existing = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_block",
+                    field="event_id",
+                    value=str(evidence.event_id),
+                    for_update=True,
+                )
+                if existing is not None:
+                    if existing["data"] == canonical:
+                        return FactoryWriteReceipt(event_id=evidence.event_id, replayed=True)
+                    raise HTTPException(status_code=409, detail="factory event_id already exists with different content")
+                projection = self._factory_projection(cursor, AgentFactoryJob.model_validate(job_block["data"]))
+                try:
+                    apply_block(projection, evidence)
+                except FactoryLifecycleError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                index = self._next_index(cursor)
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="agent_factory_block",
+                    data=canonical,
+                    status=evidence.status.value,
+                    parent_index=job_block["index"],
+                    metadata={"schema": "captain.agent-factory-block.v1", "phase": evidence.phase.value},
+                )
+                self._insert(cursor, block)
+        return FactoryWriteReceipt(event_id=evidence.event_id, replayed=False)
+
+    def factory_job(self, job_id: UUID) -> FactoryJobProjection:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                job_block = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_factory_job", field="job_id", value=str(job_id)
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=404, detail="factory job not found")
+                job = AgentFactoryJob.model_validate(job_block["data"])
+                blocks = self._factory_blocks(cursor, job_id)
+                projection = FactoryProjection.from_job(job)
+                for evidence in blocks:
+                    projection = apply_block(projection, evidence)
+        return FactoryJobProjection(job=job, blocks=blocks, projection=projection)
+
+    def _factory_projection(self, cursor: Any, job: AgentFactoryJob) -> FactoryProjection:
+        projection = FactoryProjection.from_job(job)
+        for evidence in self._factory_blocks(cursor, job.job_id, for_update=True):
+            projection = apply_block(projection, evidence)
+        return projection
+
+    def _factory_blocks(
+        self, cursor: Any, job_id: UUID, *, for_update: bool = False
+    ) -> tuple[FactoryEvidenceBlock, ...]:
+        sql = """
+            SELECT data FROM blocks WHERE block_type = 'agent_factory_block'
+            AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.job_id')) = %s ORDER BY `index`
+        """
+        if for_update:
+            sql += " FOR UPDATE"
+        cursor.execute(sql, (str(job_id),))
+        return tuple(FactoryEvidenceBlock.model_validate(row["data"]) for row in cursor.fetchall())
 
     def _runtime_grant_block(
         self,

@@ -21,6 +21,8 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeResult,
     CapabilityGrant,
 )
+from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock
+from agenten.agent_factory.state_machine import FactoryLifecycleStatus, FactoryProjection
 
 
 DeliveryEventType: TypeAlias = Literal[
@@ -57,6 +59,17 @@ class RuntimeOperationProjection(_FrozenContract):
     command: AgentRuntimeCommand
     grant: CapabilityGrant | None = None
     result: AgentRuntimeResult | None = None
+
+
+class FactoryWriteReceipt(_FrozenContract):
+    event_id: UUID
+    replayed: bool
+
+
+class FactoryJobProjection(_FrozenContract):
+    job: AgentFactoryJob
+    blocks: tuple[FactoryEvidenceBlock, ...]
+    projection: FactoryProjection
 
 
 class TraceContext(_FrozenContract):

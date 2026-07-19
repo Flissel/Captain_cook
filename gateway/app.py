@@ -20,6 +20,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeResult,
     CapabilityGrant,
 )
+from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock
 from gateway.auth import (
     GatewayRole,
     load_gateway_settings,
@@ -36,6 +37,8 @@ from gateway.contracts import (
     ReviewDecisionEvent,
     RuntimeOperationProjection,
     RuntimeWriteReceipt,
+    FactoryJobProjection,
+    FactoryWriteReceipt,
 )
 from gateway.mirror import MirrorQueue
 from gateway.registry_feed import mirror_validated_batch
@@ -187,6 +190,31 @@ def create_app(
                 "Could not enqueue runtime event %s for Minibook mirroring",
                 projection.get("event_id"),
             )
+
+    @app.post("/v1/factory/jobs", status_code=status.HTTP_202_ACCEPTED)
+    async def accept_factory_job(
+        job: AgentFactoryJob,
+        _: GatewayRole = Depends(require_captain),
+    ) -> FactoryWriteReceipt:
+        return get_store().record_factory_job(job)
+
+    @app.post("/v1/factory/blocks", status_code=status.HTTP_201_CREATED)
+    async def record_factory_block(
+        evidence: FactoryEvidenceBlock,
+        response: Response,
+        _: GatewayRole = Depends(require_actor),
+    ) -> FactoryWriteReceipt:
+        receipt = get_store().record_factory_block(evidence)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
+
+    @app.get("/v1/factory/jobs/{job_id}")
+    async def get_factory_job(
+        job_id: UUID,
+        _: GatewayRole = Depends(require_reader),
+    ) -> FactoryJobProjection:
+        return get_store().factory_job(job_id)
 
     @app.post("/v1/runtime/commands", status_code=status.HTTP_202_ACCEPTED)
     async def accept_runtime_command(
