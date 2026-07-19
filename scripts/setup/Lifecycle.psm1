@@ -244,6 +244,20 @@ function Initialize-SetupConfiguration {
     foreach ($key in @('MARIADB_PASSWORD', 'MARIADB_ROOT_PASSWORD')) {
         if (-not $values.ContainsKey($key) -or [string]::IsNullOrWhiteSpace([string]$values[$key])) { $values[$key] = New-SetupSecret }
     }
+    foreach ($key in @('CAPTAIN_GATEWAY_TOKEN', 'WORKER_GATEWAY_TOKEN')) {
+        if (-not $values.ContainsKey($key) -or [string]::IsNullOrWhiteSpace([string]$values[$key])) { $values[$key] = New-SetupSecret }
+    }
+    if (-not $values.ContainsKey('GATEWAY_PORT') -or [string]::IsNullOrWhiteSpace([string]$values.GATEWAY_PORT)) { $values.GATEWAY_PORT = '8090' }
+    if (-not $values.ContainsKey('CAPTAIN_GATEWAY_URL') -or [string]::IsNullOrWhiteSpace([string]$values.CAPTAIN_GATEWAY_URL)) {
+        $values.CAPTAIN_GATEWAY_URL = "http://127.0.0.1:$($values.GATEWAY_PORT)"
+    }
+    if (-not $values.ContainsKey('LEDGER_DSN') -or [string]::IsNullOrWhiteSpace([string]$values.LEDGER_DSN)) {
+        $database = if ($values.ContainsKey('MARIADB_DATABASE') -and $values.MARIADB_DATABASE) { [string]$values.MARIADB_DATABASE } else { 'captain_ledger' }
+        $user = if ($values.ContainsKey('MARIADB_USER') -and $values.MARIADB_USER) { [string]$values.MARIADB_USER } else { 'captain' }
+        $port = if ($values.ContainsKey('MARIADB_PORT') -and $values.MARIADB_PORT) { [string]$values.MARIADB_PORT } else { '3306' }
+        $password = [uri]::EscapeDataString([string]$values.MARIADB_PASSWORD)
+        $values.LEDGER_DSN = "mariadb://$user`:$password@127.0.0.1:$port/$database"
+    }
     if (-not $values.ContainsKey('N8N_MODE') -or $values.N8N_MODE -notin @('owned', 'external')) { $values.N8N_MODE = 'external' }
     Write-DotEnv -Path $path -Values $values
     New-SetupResult -Component 'Configuration' -Status 'Ready' -Message 'Die lokale Konfiguration ist vollständig und sicher gespeichert.' -Remediation 'None' -Data @{ Values = $values }
@@ -294,6 +308,63 @@ function Start-MinibookProcesses {
     Start-ManagedProcess -Name 'minibook-frontend' -FilePath 'npm.cmd' -Arguments @('start') -WorkingDirectory (Join-Path $minibook 'frontend') -RuntimeDirectory $runtime -Environment @{
         PORT = '3457'; BACKEND_URL = [string]$Configuration.MINIBOOK_BACKEND_URL; NEXT_PUBLIC_BASE_URL = [string]$Configuration.MINIBOOK_PUBLIC_URL
     }
+}
+
+function Start-CaptainGateway {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string] $Root, [Parameter(Mandatory)][hashtable] $Configuration)
+
+    $python = Join-Path $Root '.venv/Scripts/python.exe'
+    if (-not (Test-Path -LiteralPath $python)) {
+        return New-SetupResult -Component 'Captain Gateway' -Status 'Failed' -Message 'Der Captain-Python-Interpreter fehlt.' -Remediation 'Retry'
+    }
+    foreach ($key in @('LEDGER_DSN', 'CAPTAIN_GATEWAY_TOKEN', 'WORKER_GATEWAY_TOKEN', 'CAPTAIN_GATEWAY_URL', 'GATEWAY_PORT')) {
+        if (-not $Configuration.ContainsKey($key) -or [string]::IsNullOrWhiteSpace([string]$Configuration[$key])) {
+            return New-SetupResult -Component 'Captain Gateway' -Status 'Failed' -Message "Die lokale Gateway-Konfiguration $key fehlt." -Remediation 'Configure'
+        }
+    }
+    $runtime = Join-Path $Root '.captain-cook/runtime'
+    $environment = @{}
+    foreach ($key in @('LEDGER_DSN', 'CAPTAIN_GATEWAY_TOKEN', 'WORKER_GATEWAY_TOKEN', 'GATEWAY_PORT', 'GATEWAY_APPROVAL_ENABLED', 'GATEWAY_CLAIM_TTL_SECONDS')) {
+        if ($Configuration.ContainsKey($key) -and -not [string]::IsNullOrWhiteSpace([string]$Configuration[$key])) { $environment[$key] = [string]$Configuration[$key] }
+    }
+    Start-ManagedProcess -Name 'captain-gateway' -FilePath $python -Arguments @('-m', 'gateway.app') -WorkingDirectory $Root -RuntimeDirectory $runtime -Environment $environment
+    if (-not (Wait-SetupEndpoint -Uri "$([string]$Configuration.CAPTAIN_GATEWAY_URL.TrimEnd('/'))/healthz" -TimeoutSeconds 30)) {
+        return New-SetupResult -Component 'Captain Gateway' -Status 'Failed' -Message 'Captain Gateway wurde nicht gesund.' -Remediation 'Retry'
+    }
+    New-SetupResult -Component 'Captain Gateway' -Status 'Ready' -Message 'Captain Gateway ist gesund und lifecycle-authoritativ.' -Remediation 'None'
+}
+
+function Stop-CaptainGateway {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string] $Root)
+
+    $path = Join-Path $Root '.captain-cook/runtime/captain-gateway.json'
+    if (Test-ManagedProcess $path) {
+        $metadata = Get-Content $path -Raw | ConvertFrom-Json
+        Stop-Process -Id $metadata.Id -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+}
+
+function Invoke-CaptainGatewayRecovery {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string] $Root, [Parameter(Mandatory)][hashtable] $Configuration)
+
+    $python = Join-Path $Root '.venv/Scripts/python.exe'
+    $previousToken = $env:CAPTAIN_GATEWAY_TOKEN
+    try {
+        $env:CAPTAIN_GATEWAY_TOKEN = [string]$Configuration.CAPTAIN_GATEWAY_TOKEN
+        & $python (Join-Path $Root 'main.py') 'recover-gateway' '--gateway-url' ([string]$Configuration.CAPTAIN_GATEWAY_URL) *> $null
+        if ($LASTEXITCODE -ne 0) {
+            return New-SetupResult -Component 'Captain Recovery' -Status 'Failed' -Message 'Captain Gateway-Recovery konnte nicht sicher ausgeführt werden.' -Remediation 'Retry'
+        }
+    }
+    finally {
+        if ($null -eq $previousToken) { Remove-Item Env:CAPTAIN_GATEWAY_TOKEN -ErrorAction SilentlyContinue }
+        else { $env:CAPTAIN_GATEWAY_TOKEN = $previousToken }
+    }
+    New-SetupResult -Component 'Captain Recovery' -Status 'Ready' -Message 'Captain-Recovery-Pass wurde fail-closed ausgeführt.' -Remediation 'None'
 }
 
 function Stop-MinibookProcesses {
@@ -406,6 +477,7 @@ function Get-CaptainSystemStatus {
         $config = Read-DotEnv -Path (Join-Path $Root '.env')
         $HealthProbes = @(
             { if (Test-Path (Join-Path $Root '.captain-cook/demo-run.json')) { New-SetupResult 'Captain' Ready 'Offline-Demo verifiziert.' None } else { New-SetupResult 'Captain' Failed 'Offline-Demo fehlt.' Retry } },
+            { Test-HttpService -Name 'Captain Gateway' -Uri "$([string]$config.CAPTAIN_GATEWAY_URL.TrimEnd('/'))/healthz" },
             { Test-HttpService -Name 'Minibook' -Uri "$($config.MINIBOOK_BACKEND_URL)/health" },
             { Test-HttpService -Name 'Mailpit' -Uri "http://localhost:$($config.MAILPIT_WEB_PORT)/api/v1/info" },
             { Test-HttpService -Name 'n8n' -Uri "$([string]$config.N8N_URL.TrimEnd('/'))/healthz" }
@@ -423,8 +495,14 @@ function Start-CaptainSystem {
     $config = Read-DotEnv -Path (Join-Path $Root '.env')
     $captain = Install-Captain -Root $Root
     if ($captain.Status -ne 'Ready') { return $captain }
+    $services = Start-CaptainServices -Root $Root -N8nMode $(if ($config.N8N_MODE -eq 'external') {'External'} else {'Owned'})
+    if ($services.Status -ne 'Ready') { return $services }
+    $gateway = Start-CaptainGateway -Root $Root -Configuration $config
+    if ($gateway.Status -ne 'Ready') { return $gateway }
+    $recovery = Invoke-CaptainGatewayRecovery -Root $Root -Configuration $config
+    if ($recovery.Status -ne 'Ready') { return $recovery }
     Start-MinibookProcesses -Root $Root -Configuration $config
-    Start-CaptainServices -Root $Root -N8nMode $(if ($config.N8N_MODE -eq 'external') {'External'} else {'Owned'})
+    New-SetupResult -Component 'System' -Status 'Ready' -Message 'Captain, Gateway-Recovery und lokale Dienste sind gestartet.' -Remediation 'None'
 }
 
 function Stop-CaptainSystem {
@@ -432,7 +510,8 @@ function Stop-CaptainSystem {
     param([string] $Root)
     $config = Read-DotEnv -Path (Join-Path $Root '.env')
     Stop-MinibookProcesses -Root $Root
+    Stop-CaptainGateway -Root $Root
     Stop-CaptainServices -Root $Root -N8nMode $(if ($config.N8N_MODE -eq 'external') {'External'} else {'Owned'})
 }
 
-Export-ModuleMember -Function @('Get-SetupStages','Invoke-GuidedSetup','Repair-CaptainSystem','Invoke-DefaultSetupStage','Initialize-SetupConfiguration','Get-CaptainSystemStatus','Start-CaptainSystem','Stop-CaptainSystem')
+Export-ModuleMember -Function @('Get-SetupStages','Invoke-GuidedSetup','Repair-CaptainSystem','Invoke-DefaultSetupStage','Initialize-SetupConfiguration','Get-CaptainSystemStatus','Start-CaptainSystem','Stop-CaptainSystem','Start-CaptainGateway','Stop-CaptainGateway','Invoke-CaptainGatewayRecovery')

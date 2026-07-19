@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from threading import Lock
 from typing import Any, Literal, Protocol
 from uuid import UUID
@@ -103,7 +104,16 @@ def create_app(
 ) -> FastAPI:
     mirror = mirror or MirrorQueue(mirror_validated_batch)
     store_lock = Lock()
-    store: GatewayStore | None = GatewayStore(storage) if storage else None
+    store: GatewayStore | None = (
+        GatewayStore(
+            storage,
+            claim_ttl=timedelta(seconds=settings.claim_ttl_seconds),
+        )
+        if storage and settings
+        else GatewayStore(storage)
+        if storage
+        else None
+    )
     sink_calls: list[dict[str, Any]] = []
 
     @asynccontextmanager
@@ -153,8 +163,12 @@ def create_app(
         if store is None:
             with store_lock:
                 if store is None:
-                    dsn = load_gateway_settings(app).ledger_dsn.get_secret_value()
-                    store = GatewayStore(MariaDBStorage(dsn))
+                    configured = load_gateway_settings(app)
+                    dsn = configured.ledger_dsn.get_secret_value()
+                    store = GatewayStore(
+                        MariaDBStorage(dsn),
+                        claim_ttl=timedelta(seconds=configured.claim_ttl_seconds),
+                    )
         return store
 
     @app.get("/healthz")

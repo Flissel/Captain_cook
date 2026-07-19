@@ -131,6 +131,24 @@ def claim(client: TestClient, batch_id: str = "batch-1") -> str:
     return response.json()["claim_token"]
 
 
+def requeue_expired_claim(
+    client: TestClient,
+    *,
+    batch_id: str = "batch-1",
+    iteration: int = 1,
+) -> None:
+    response = client.post(
+        f"/batches/{batch_id}/recovery",
+        json={
+            "batch_id": batch_id,
+            "iteration": iteration,
+            "reason": "claim_expired",
+            "decision": "requeue",
+        },
+    )
+    assert response.status_code == 201, response.text
+
+
 def worker_block(
     client: TestClient,
     token: str | None,
@@ -920,6 +938,7 @@ def test_legacy_holdout_route_remains_gone_across_claim_iterations(
     ).status_code == 410
 
     monkeypatch.setattr(store_module, "_utcnow", lambda: start + timedelta(minutes=91))
+    requeue_expired_claim(client)
     second_token = claim(client)
     second_headers = {"X-Claim-Token": second_token}
     assert client.get("/batches/batch-1/holdout", headers=second_headers).status_code == 410
@@ -1117,6 +1136,7 @@ def test_prior_iteration_validation_cannot_authorize_success(
     ).status_code == 201
 
     monkeypatch.setattr(store_module, "_utcnow", lambda: start + timedelta(minutes=91))
+    requeue_expired_claim(client)
     second_token = claim(client)
     assert worker_block(
         client,
@@ -1189,7 +1209,7 @@ def test_heartbeat_extends_a_live_claim(client: TestClient, storage: MariaDBStor
     assert datetime.fromisoformat(lifecycle[-1]["data"]["claim_expires_at"]) == expiry
 
 
-def test_expired_claim_is_lazily_reclaimable_and_lists_as_pending(
+def test_expired_claim_requires_recovery_before_reclaim_and_lists_as_pending(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1206,6 +1226,8 @@ def test_expired_claim_is_lazily_reclaimable_and_lists_as_pending(
         {"batch_id": "batch-1", "title": "Build the notification workflow"}
     ]
 
+    assert client.post("/batches/batch-1/claim").status_code == 409
+    requeue_expired_claim(client)
     new_token = claim(client)
 
     assert new_token != old_token

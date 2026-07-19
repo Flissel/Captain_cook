@@ -98,6 +98,10 @@ The command writes [artifacts/demo-run.json](artifacts/demo-run.json), a compact
 - Four constrained Householder workers (Architect, Ledger Steward, Delivery Builder, and Quality Warden) that emit structured, explicitly offline audit reports.
 - A sole-writer ledger recorder and state-machine transitions for an auditable run.
 - An offline CLI demo and committed run evidence.
+- A loopback-bound Captain Gateway with MariaDB-backed, append-only delivery
+  evidence, short-lived claims and a start-time recovery pass. `start.ps1`
+  starts it after MariaDB is healthy; `status.ps1 -Detailed` includes its
+  health endpoint.
 
 ## Run the standalone Captain planner
 
@@ -171,9 +175,31 @@ A missing path or API key skips the opt-in gate. A configured unreadable or
 digest-mismatched source fails the gate before provider construction. It does
 not contact or modify n8n or any other local service.
 
-## Roadmap boundary
+## Gateway recovery at startup
 
-The submission demo does **not** yet include a FastAPI/MariaDB ledger gateway, Hermes workers that drive Codex CLI, n8n deployment, Mailpit validation, Minibook mirroring, or a live LLM/MCP-backed Householder executor. Those integrations are designed in [the delivery-fleet specification](docs/superpowers/specs/2026-07-15-hackathon-pipeline-design.md) and deliberately kept separate from claims about the runnable demo.
+`start.ps1` creates missing local Gateway credentials in the gitignored `.env`,
+starts the Gateway after MariaDB, waits for `/healthz`, and executes one
+Captain-owned recovery pass before starting dependent local processes. The
+same bounded pass can be run independently:
+
+```powershell
+python main.py recover-gateway
+```
+
+It reports only durable `recovered_batch_ids` and sessions that remain
+`deferred_batch_ids`. A deferred batch has an active Codex session without
+terminal process evidence; Captain deliberately does not requeue it, because
+doing so could run an external provider twice. A host-local worker-recovery
+director is required to prove that process terminal before it can be requeued.
+
+## Runtime boundary
+
+The offline demo remains a deliberately separate evidence path. The live
+delivery path provides the FastAPI/MariaDB Gateway, Captain-fenced Codex
+sessions, constrained n8n MCP leases, Mailpit and Minibook integrations, and
+the bounded live LLM planning evaluation. Full automatic recovery of an active
+Codex worker still requires the host-local process-evidence director described
+above; it is not claimed as completed.
 
 ## Test it
 

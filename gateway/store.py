@@ -98,8 +98,16 @@ def _utcnow() -> datetime:
 class GatewayStore:
     """Own all gateway queries and append-only ledger writes."""
 
-    def __init__(self, storage: MariaDBStorage):
+    def __init__(
+        self,
+        storage: MariaDBStorage,
+        *,
+        claim_ttl: timedelta = timedelta(minutes=90),
+    ):
+        if claim_ttl <= timedelta(0):
+            raise ValueError("claim_ttl must be positive")
         self.storage = storage
+        self._claim_ttl = claim_ttl
         self._ensure_schema()
 
     def _ensure_schema(self) -> None:
@@ -1090,6 +1098,11 @@ class GatewayStore:
                     or projection.claim_expires_at > now
                 ):
                     raise HTTPException(status_code=409, detail="claim is not expired")
+                if self._active_codex_sessions(cursor, request.batch_id, request.iteration):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="active Codex session requires terminal evidence",
+                    )
                 block = self._new_block(
                     cursor,
                     index=self._next_index(cursor),
@@ -1107,6 +1120,52 @@ class GatewayStore:
                 )
                 self._insert(cursor, block)
         return block
+
+    @staticmethod
+    def _active_codex_sessions(
+        cursor: Any,
+        batch_id: str,
+        iteration: int,
+    ) -> set[tuple[str, str, str]]:
+        """Return sessions that Captain must terminalize before requeueing."""
+
+        cursor.execute(
+            """
+            SELECT data FROM blocks
+            WHERE block_type = 'delivery_event'
+              AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.trace.batch_id')) = %s
+            ORDER BY `index`
+            FOR UPDATE
+            """,
+            (batch_id,),
+        )
+        started: set[tuple[str, str, str]] = set()
+        finished: set[tuple[str, str, str]] = set()
+        for row in cursor.fetchall():
+            event = row["data"]
+            if isinstance(event, str):
+                event = json.loads(event)
+            trace = event.get("trace")
+            payload = event.get("payload")
+            if not isinstance(trace, dict) or not isinstance(payload, dict):
+                continue
+            project_id = trace.get("project_id")
+            run_id = trace.get("run_id")
+            session_id = payload.get("session_id")
+            if not all(
+                isinstance(value, str) and value
+                for value in (project_id, run_id, session_id)
+            ):
+                continue
+            identity = (project_id, run_id, session_id)
+            if (
+                event.get("event_type") == "codex_session_started"
+                and payload.get("iteration") == iteration
+            ):
+                started.add(identity)
+            elif event.get("event_type") == "codex_session_finished":
+                finished.add(identity)
+        return started - finished
 
     def batch_projection(self, batch_id: str) -> BatchProjection:
         now = _utcnow()
@@ -1206,12 +1265,18 @@ class GatewayStore:
                     for_update=True,
                     now=now,
                 )
-                if projection.status != "pending":
+                claim_expired_without_recovery = (
+                    projection.claim_iteration > 0
+                    and projection.claim_expires_at is not None
+                    and projection.claim_expires_at <= now
+                    and not projection.recovery_recorded
+                )
+                if projection.status != "pending" or claim_expired_without_recovery:
                     raise HTTPException(status_code=409, detail="batch is not claimable")
                 token = secrets.token_urlsafe(32)
-                claim_id = secrets.token_urlsafe(18)
+                claim_id = f"claim-{secrets.token_urlsafe(18)}"
                 fencing_token = projection.claim_iteration + 1
-                expiry = now + timedelta(minutes=90)
+                expiry = now + self._claim_ttl
                 event = ClaimEvent(
                     batch_id=batch_id,
                     claim_id=claim_id,

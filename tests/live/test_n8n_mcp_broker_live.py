@@ -35,7 +35,11 @@ from agenten.delivery.codex_runs import (
     CodexCancellationCoordinator,
     SessionBoundCodexCanceller,
 )
-from agenten.delivery.gateway_client import GatewayDeliveryClient
+from agenten.delivery.gateway_client import (
+    GatewayDeliveryClient,
+    GatewayDeliveryConflictError,
+)
+from agenten.delivery.recovery import GatewayRecoveryService, RecoveryDecision
 from agenten.execution.codex_policy import (
     AuthorizedCodexRun,
     CodexExecutionPolicy,
@@ -161,6 +165,7 @@ def _start_gateway(
     token: str,
     port: int,
     worker_token: str | None = None,
+    claim_ttl_seconds: int | None = None,
 ) -> subprocess.Popen[bytes]:
     environment = os.environ.copy()
     environment.update(
@@ -171,6 +176,8 @@ def _start_gateway(
             "GATEWAY_PORT": str(port),
         }
     )
+    if claim_ttl_seconds is not None:
+        environment["GATEWAY_CLAIM_TTL_SECONDS"] = str(claim_ttl_seconds)
     return subprocess.Popen(
         [
             sys.executable,
@@ -611,6 +618,169 @@ async def test_gateway_restart_fences_an_active_codex_session_before_provider_st
                 run_id=run_id,
             )
             assert after_restart == before_restart
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=15)
+
+
+@pytest.mark.asyncio
+async def test_gateway_restart_requeues_one_orphaned_codex_session_into_new_iteration(
+    tmp_path: Path,
+) -> None:
+    """A lost session is terminalized once before Captain releases a new fence."""
+
+    dsn = os.environ.get("TEST_MARIADB_DSN", "").strip()
+    if not dsn:
+        pytest.fail("required live gate: TEST_MARIADB_DSN is unavailable")
+    unique = uuid4().hex[:16]
+    batch_id = f"recovery-{unique}"
+    worker_id = f"worker-{unique[:12]}"
+    project_id = f"project-{unique}"
+    run_id = f"run-{unique}"
+    gateway_token = secrets.token_urlsafe(32)
+    worker_token = secrets.token_urlsafe(32)
+    gateway_port = _free_port()
+    gateway_base = f"http://127.0.0.1:{gateway_port}"
+    process = _start_gateway(
+        dsn=dsn,
+        token=gateway_token,
+        worker_token=worker_token,
+        port=gateway_port,
+        claim_ttl_seconds=1,
+    )
+    try:
+        await _wait_for_gateway(gateway_base)
+        async with httpx.AsyncClient(timeout=20) as http:
+            batch = {
+                "batch_id": batch_id,
+                "title": "Gateway restart recovery",
+                "goal": "Requeue one orphaned Codex session exactly once",
+                "subtask_ids": [f"subtask-{unique}"],
+                "target": "codex",
+                "capability_tags": ["code-builder"],
+                "depends_on": [],
+                "constraints": [],
+                "acceptance_criteria": [
+                    {
+                        "assertion_id": "one-recovered-iteration",
+                        "kind": "status_equals",
+                        "expected": "succeeded",
+                    }
+                ],
+                "golden_cases": [],
+            }
+            created = await http.post(
+                f"{gateway_base}/blocks",
+                headers={"Authorization": f"Bearer {gateway_token}"},
+                json={"block_type": "work_batch", "status": "pending", "data": batch},
+            )
+            assert created.status_code in {200, 201}
+            worker = GatewayDeliveryClient(gateway_base, worker_token, http)
+            first_claim = await worker.claim(batch_id)
+            first_request = CodexRunRequest(
+                project_id=project_id,
+                run_id=run_id,
+                trace_id=f"trace-{unique}",
+                batch_id=batch_id,
+                worker_id=worker_id,
+                claim_id=first_claim.claim_id,
+                fencing_token=first_claim.fencing_token,
+                session_id=f"session-{unique}",
+                claim_token=first_claim.token,
+                iteration=first_claim.iteration,
+                command=("codex", "exec", "--json", "write no files"),
+                workspace=tmp_path,
+                project_root=tmp_path,
+            )
+            first_repository = GatewayCodexRunRepository(
+                client=worker,
+                project_id=project_id,
+                run_id=run_id,
+                actor=worker_id,
+                now=lambda: datetime.now(timezone.utc),
+            )
+            await first_repository.start(first_request)
+
+            process.terminate()
+            process.wait(timeout=15)
+            process = _start_gateway(
+                dsn=dsn,
+                token=gateway_token,
+                worker_token=worker_token,
+                port=gateway_port,
+                claim_ttl_seconds=1,
+            )
+            await _wait_for_gateway(gateway_base)
+
+            recovered_worker = GatewayDeliveryClient(gateway_base, worker_token, http)
+            recovered_captain = GatewayDeliveryClient(gateway_base, gateway_token, http)
+            recovered_repository = GatewayCodexRunRepository(
+                client=recovered_captain,
+                project_id=project_id,
+                run_id=run_id,
+                actor=worker_id,
+                now=lambda: datetime.now(timezone.utc),
+            )
+
+            await asyncio.sleep(1.2)
+            with pytest.raises(GatewayDeliveryConflictError):
+                await recovered_worker.claim(batch_id)
+            with pytest.raises(GatewayDeliveryConflictError):
+                await GatewayRecoveryService(recovered_captain).recover_expired(
+                    datetime.now(timezone.utc)
+                )
+            reconciled = await recovered_repository.reconcile(
+                worker_id=worker_id,
+                live_process_ids=frozenset(),
+            )
+            assert len(reconciled) == 1
+            assert reconciled[0].session_id == first_request.session_id
+            assert reconciled[0].outcome is not None
+            assert reconciled[0].outcome.classification == "lost_process"
+            decisions = await GatewayRecoveryService(recovered_captain).recover_expired(
+                datetime.now(timezone.utc)
+            )
+            assert decisions == (
+                RecoveryDecision(
+                    batch_id=batch_id,
+                    iteration=first_claim.iteration,
+                    reason="claim_expired",
+                    decision="requeue",
+                ),
+            )
+            assert await GatewayRecoveryService(recovered_captain).recover_expired(
+                datetime.now(timezone.utc)
+            ) == ()
+
+            second_claim = await recovered_worker.claim(batch_id)
+            assert second_claim.iteration == first_claim.iteration + 1
+            second_request = first_request.model_copy(
+                update={
+                    "claim_id": second_claim.claim_id,
+                    "fencing_token": second_claim.fencing_token,
+                    "session_id": f"recovered-{unique}",
+                    "claim_token": second_claim.token,
+                    "iteration": second_claim.iteration,
+                }
+            )
+            second_repository = GatewayCodexRunRepository(
+                client=recovered_worker,
+                project_id=project_id,
+                run_id=run_id,
+                actor=worker_id,
+                now=lambda: datetime.now(timezone.utc),
+            )
+            await second_repository.start(second_request)
+            events = await recovered_worker.delivery_events(
+                project_id=project_id,
+                run_id=run_id,
+            )
+            assert [event.event_type for event in events].count("codex_session_started") == 2
+            assert [event.event_type for event in events].count("codex_session_finished") == 1
     finally:
         process.terminate()
         try:
