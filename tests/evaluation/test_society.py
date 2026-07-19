@@ -18,7 +18,9 @@ from agenten.evaluation.models import (
     SourceBlock,
 )
 from agenten.evaluation.society import (
+    _qa_review_tool,
     _stage_inventory_tool,
+    _stage_plan_tool,
     build_evaluation_society,
     build_qa_review_team,
 )
@@ -143,6 +145,35 @@ def test_inventory_tool_exposes_complete_candidate_schema_to_live_model(tmp_path
         "expected",
         "command",
     }
+
+
+def test_planner_and_qa_tools_expose_strict_json_friendly_schemas(tmp_path: Path) -> None:
+    service = EvaluationToolService(JsonEvaluationStore(tmp_path))
+    planner = FunctionTool(_stage_plan_tool(service), description="stage plan")
+    qa = FunctionTool(_qa_review_tool(service), description="record review")
+
+    candidate_schema = planner.schema["parameters"]["properties"]["candidate"]
+    assert {
+        "component_key",
+        "scope",
+        "non_goals",
+        "implementation_steps",
+        "acceptance_tests",
+        "source_citations",
+    } <= set(candidate_schema["required"])
+    qa_schema = qa.schema["parameters"]["properties"]["review"]
+    assert set(qa_schema["required"]) == {
+        "component_key",
+        "revision",
+        "decision",
+        "score",
+        "defect_codes",
+        "revision_requests",
+    }
+    assert qa_schema["properties"]["decision"]["enum"] == [
+        "approved",
+        "revision_required",
+    ]
 
 
 @pytest.mark.asyncio
@@ -328,7 +359,25 @@ async def test_real_round_robin_reaches_qa_before_termination(tmp_path: Path, ta
 
 
 @pytest.mark.asyncio
-async def test_real_qa_resume_team_executes_only_qa_review_tool(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("decision", "score", "defect_codes", "revision_requests"),
+    (
+        ("approved", 7, (), ()),
+        (
+            "revision_required",
+            5,
+            ("weak_test_oracle",),
+            ("Make the expected result independently observable.",),
+        ),
+    ),
+)
+async def test_real_qa_resume_team_executes_only_typed_qa_review_tool(
+    tmp_path: Path,
+    decision: str,
+    score: int,
+    defect_codes: tuple[str, ...],
+    revision_requests: tuple[str, ...],
+) -> None:
     text = "# CRM\nBuild CRM."
     source = EvaluationSource(
         source_reference="agentfarm/input.md",
@@ -383,10 +432,10 @@ async def test_real_qa_resume_team_executes_only_qa_review_tool(tmp_path: Path) 
     review = QaReview(
         component_key="crm",
         revision=1,
-        decision="approved",
-        score=7,
-        defect_codes=(),
-        revision_requests=(),
+        decision=decision,
+        score=score,
+        defect_codes=defect_codes,
+        revision_requests=revision_requests,
     )
     call = FunctionCall(
         id="qa-call-001",
@@ -415,7 +464,12 @@ async def test_real_qa_resume_team_executes_only_qa_review_tool(tmp_path: Path) 
     result = await team.run(task="QA_SLICE run_id=eval-001 component_key=crm revision=1")
 
     assert {message.source for message in result.messages} <= {"user", "qa_reviewer"}
-    assert (tmp_path / "eval-001" / "qa-reviews" / "crm" / "revision-1.json").is_file(), result.messages
+    review_path = tmp_path / "eval-001" / "qa-reviews" / "crm" / "revision-1.json"
+    assert review_path.is_file(), result.messages
+    persisted = QaReview.model_validate_json(review_path.read_bytes())
+    assert persisted.decision == decision
+    assert persisted.defect_codes == defect_codes
+    assert persisted.revision_requests == revision_requests
 
 
 @pytest.mark.parametrize("max_rounds", (0, 4))

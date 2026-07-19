@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from typing import Literal
 
 from autogen_agentchat.agents import AssistantAgent, SocietyOfMindAgent
@@ -89,6 +88,19 @@ class _ComponentPlanToolInput(BaseModel):
     claims: list[str] = Field(default_factory=list)
 
 
+class _QaReviewToolInput(BaseModel):
+    """JSON-friendly input that advertises every strict QA review field."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    component_key: str = Field(min_length=1)
+    revision: int = Field(ge=1, le=3)
+    decision: Literal["approved", "revision_required"]
+    score: int = Field(ge=0, le=7)
+    defect_codes: list[str]
+    revision_requests: list[str]
+
+
 def build_evaluation_society(
     *,
     model_client: ChatCompletionClient,
@@ -151,8 +163,8 @@ def build_qa_review_team(
 
 
 def _qa_review_tool(tools: EvaluationToolService):
-    async def record_qa_review(run_id: str, review: dict[str, object]) -> ReviewReceipt:
-        validated = QaReview.model_validate_json(json.dumps(review))
+    async def record_qa_review(run_id: str, review: _QaReviewToolInput) -> ReviewReceipt:
+        validated = QaReview.model_validate_json(review.model_dump_json())
         return await tools.record_qa_review(run_id, validated)
 
     return record_qa_review
