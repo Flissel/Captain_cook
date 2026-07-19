@@ -9,7 +9,11 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from agenten.agent_runtime.contracts import ArtifactRef, IDENTIFIER_PATTERN
+from agenten.agent_runtime.contracts import (
+    ArtifactRef,
+    CapabilityProfile,
+    IDENTIFIER_PATTERN,
+)
 
 
 class _FrozenContract(BaseModel):
@@ -44,6 +48,14 @@ class FactoryBlockStatus(str, Enum):
     RECOMMENDED = "recommended"
 
 
+_ROLE_PROFILES: dict[FactoryRole, CapabilityProfile] = {
+    FactoryRole.AGENT_ARCHITECT: CapabilityProfile.FACTORY_ARCHITECT,
+    FactoryRole.TOOL_INTEGRATOR: CapabilityProfile.FACTORY_TOOL_INTEGRATOR,
+    FactoryRole.REAL_CASE_TESTER: CapabilityProfile.FACTORY_REAL_CASE_TESTER,
+    FactoryRole.QUALITY_WARDEN: CapabilityProfile.FACTORY_QUALITY_WARDEN,
+}
+
+
 class AgentFactoryJob(_FrozenContract):
     schema_name: Literal["captain.agent-factory-job.v1"] = Field(
         alias="schema",
@@ -74,6 +86,41 @@ class AgentFactoryJob(_FrozenContract):
         if any(not assertion for assertion in value):
             raise ValueError("acceptance_assertion_ids must not contain blanks")
         return value
+
+
+class FactoryLease(_FrozenContract):
+    """Short-lived Captain authority for exactly one Hermes factory role."""
+
+    schema_name: Literal["captain.factory-lease.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    lease_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    role: FactoryRole
+    capability_profile: CapabilityProfile
+    capabilities: tuple[str, ...] = Field(min_length=1)
+    workspace_ref: str = Field(pattern=r"^workspace://")
+    issued_at: datetime
+    expires_at: datetime
+
+    @field_validator("issued_at", "expires_at")
+    @classmethod
+    def require_utc_timestamp(cls, value: datetime) -> datetime:
+        return _require_utc(value)
+
+    @model_validator(mode="after")
+    def require_exact_role_scope(self) -> "FactoryLease":
+        if self.capability_profile is not _ROLE_PROFILES[self.role]:
+            raise ValueError("factory lease profile does not match role")
+        if self.expires_at <= self.issued_at:
+            raise ValueError("factory lease must expire after it is issued")
+        if len(self.capabilities) != len(set(self.capabilities)):
+            raise ValueError("factory lease capabilities must not contain duplicates")
+        return self
 
 
 class FactoryEvidenceBlock(_FrozenContract):
@@ -179,4 +226,3 @@ def _require_utc(value: datetime) -> datetime:
     if value.utcoffset() != timezone.utc.utcoffset(value):
         raise ValueError("timestamps must be UTC")
     return value.astimezone(timezone.utc)
-

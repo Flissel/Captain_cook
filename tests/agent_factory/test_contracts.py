@@ -6,12 +6,15 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+from agenten.agent_runtime.contracts import CapabilityProfile
+
 from agenten.agent_factory.contracts import (
     AgentFactoryJob,
     FactoryBlockStatus,
     FactoryEvidenceBlock,
     FactoryPhase,
     FactoryRole,
+    FactoryLease,
     PromotedCapability,
 )
 
@@ -142,4 +145,31 @@ def test_promoted_capability_requires_captain_promotion_reference() -> None:
                 "tool_refs": [],
                 "promotion_block_ref": None,
             }
+        )
+
+
+def test_factory_lease_is_short_lived_and_role_scoped() -> None:
+    lease = FactoryLease.model_validate(
+        {
+            "schema": "captain.factory-lease.v1",
+            "lease_id": "factory-lease-1",
+            "job_id": "00000000-0000-0000-0000-000000000003",
+            "correlation_id": "00000000-0000-0000-0000-000000000002",
+            "subject_version": 1,
+            "attempt": 1,
+            "role": "agent_architect",
+            "capability_profile": "factory-architect",
+            "capabilities": ["hermes.plan", "context7.query"],
+            "workspace_ref": "workspace://factory/support-triage",
+            "issued_at": NOW,
+            "expires_at": datetime(2026, 7, 19, 10, 15, tzinfo=timezone.utc),
+        }
+    )
+
+    assert lease.capability_profile is CapabilityProfile.FACTORY_ARCHITECT
+
+    with pytest.raises(ValidationError, match="does not match"):
+        FactoryLease.model_validate(
+            lease.model_dump(mode="json", by_alias=True)
+            | {"capability_profile": "factory-tool-integrator"}
         )
