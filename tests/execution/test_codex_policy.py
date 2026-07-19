@@ -228,6 +228,46 @@ def test_authorized_environment_is_immutable_and_child_copies_are_isolated(
     assert "safe-path" not in authorized.model_dump_json()
 
 
+def test_mcp_lease_token_is_explicit_scoped_and_never_serialized(
+    tmp_path: Path,
+) -> None:
+    approved_root, project, workspace = _clean_project(tmp_path)
+    authorized = CodexExecutionPolicy(
+        workspace_root=approved_root,
+        environment={"N8N_MCP_TOKEN": "must-not-be-inherited", "PATH": "safe-path"},
+        mcp_lease_environment={"N8N_MCP_TOKEN": "captain-lease-token"},
+    ).authorize(_request(project, workspace))
+
+    assert authorized.child_environment() == {
+        "PATH": "safe-path",
+        "N8N_MCP_TOKEN": "captain-lease-token",
+    }
+    assert "captain-lease-token" not in repr(authorized)
+    assert "captain-lease-token" not in authorized.model_dump_json()
+    assert "must-not-be-inherited" not in authorized.child_environment().values()
+
+
+@pytest.mark.parametrize(
+    "lease_environment",
+    (
+        {},
+        {"N8N_MCP_TOKEN": ""},
+        {"N8N_MCP_TOKEN": "lease", "N8N_URL": "http://127.0.0.1:5680"},
+    ),
+)
+def test_mcp_lease_environment_fails_closed_when_not_exact(
+    tmp_path: Path, lease_environment: dict[str, str]
+) -> None:
+    approved_root, _, _ = _clean_project(tmp_path)
+
+    with pytest.raises(CodexPolicyViolation, match="MCP lease"):
+        CodexExecutionPolicy(
+            workspace_root=approved_root,
+            environment={},
+            mcp_lease_environment=lease_environment,
+        )
+
+
 @pytest.mark.parametrize(
     "prompt",
     [
