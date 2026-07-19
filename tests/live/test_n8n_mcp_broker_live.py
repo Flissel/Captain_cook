@@ -30,12 +30,22 @@ from agenten.agent_runtime.contracts import (
 from agenten.agent_runtime.gateway_client import GatewayRuntimeClient
 from agenten.agent_runtime.n8n_mcp_broker import McpLeaseIssuer
 from agenten.delivery.codex_runs import GatewayCodexRunRepository
+from agenten.delivery.codex_runs import (
+    CapabilityGrantRevocationMonitor,
+    CodexCancellationCoordinator,
+    SessionBoundCodexCanceller,
+)
 from agenten.delivery.gateway_client import GatewayDeliveryClient
-from agenten.execution.codex_policy import AuthorizedCodexRun, FrozenEnvironment
+from agenten.execution.codex_policy import (
+    AuthorizedCodexRun,
+    CodexExecutionPolicy,
+    FrozenEnvironment,
+)
 from agenten.execution.codex_supervisor import (
     CodexRunRequest,
     CodexRunResult,
     CodexSupervisor,
+    PowerShellCodexRunner,
 )
 from agenten.execution.process import PackageExecutionStatus
 
@@ -48,6 +58,7 @@ from hermes_cli.n8n_worker_mcp import (  # noqa: E402
     HermesGenericMcpTransport,
     N8nWorkerMcp,
 )
+from hermes_cli.mcp_config import write_capability_scoped_codex_config  # noqa: E402
 
 
 pytestmark = [pytest.mark.live]
@@ -284,6 +295,67 @@ async def _wait_for_broker(url: str) -> None:
                 pass
             await asyncio.sleep(0.25)
     pytest.fail("required live gate: Captain MCP broker did not become ready")
+
+
+def _native_codex_binary() -> Path:
+    relative = Path(
+        "@openai/codex/node_modules/@openai/codex-win32-x64/"
+        "vendor/x86_64-pc-windows-msvc/bin/codex.exe"
+    )
+    roots: list[Path] = []
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        roots.append(Path(appdata) / "npm" / "node_modules")
+    try:
+        npm_root = subprocess.run(
+            ["npm", "root", "-g"],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=20,
+        ).stdout.strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        npm_root = ""
+    if npm_root:
+        roots.append(Path(npm_root))
+    for root in roots:
+        candidate = root / relative
+        if candidate.is_file():
+            return candidate
+    pytest.fail("required live gate: official Codex CLI native binary is unavailable")
+
+
+def _clean_workspace(path: Path) -> None:
+    path.mkdir()
+    for command in (
+        ("git", "init", "-q"),
+        ("git", "config", "user.email", "captain-live@example.invalid"),
+        ("git", "config", "user.name", "Captain Live Gate"),
+    ):
+        subprocess.run(command, cwd=path, check=True, capture_output=True, text=True)
+    (path / "README.md").write_text("live cancellation gate\n", encoding="utf-8")
+    subprocess.run(
+        ("git", "add", "README.md"),
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ("git", "commit", "-qm", "test: initialize live cancellation gate"),
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+async def _wait_for_process_identity(path: Path) -> None:
+    for _ in range(80):
+        if path.is_file() and path.stat().st_size > 0:
+            return
+        await asyncio.sleep(0.25)
+    pytest.fail("required live gate: Codex process identity was not persisted")
 
 
 @pytest.mark.asyncio
@@ -546,3 +618,213 @@ async def test_gateway_restart_fences_an_active_codex_session_before_provider_st
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=15)
+
+
+@pytest.mark.asyncio
+async def test_live_codex_mcp_lease_is_revoked_during_real_provider_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Captain cancels a real Codex process and denies later MCP effects."""
+
+    dsn = os.environ.get("TEST_MARIADB_DSN", "").strip()
+    if not dsn:
+        pytest.fail("required live gate: TEST_MARIADB_DSN is unavailable")
+    auth_source = Path.home() / ".codex" / "auth.json"
+    if not auth_source.is_file() and not os.environ.get("OPENAI_API_KEY"):
+        pytest.fail("required live gate: Codex authentication is unavailable")
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        pytest.fail("required live gate: PowerShell 7 is unavailable")
+    builder = _builder_environment()
+    broker_url = builder["CAPTAIN_N8N_MCP_BROKER_URL"].rstrip("/")
+    if _broker_is_running():
+        pytest.fail("required live gate: Captain MCP broker is already running")
+
+    now = datetime.now(timezone.utc)
+    unique = uuid4().hex[:16]
+    command = _runtime_command(unique=unique, now=now)
+    grant = _grant(command, now)
+    gateway_token = secrets.token_urlsafe(32)
+    worker_token = secrets.token_urlsafe(32)
+    gateway_port = _free_port()
+    gateway_base = f"http://127.0.0.1:{gateway_port}"
+    gateway_process = _start_gateway(
+        dsn=dsn,
+        token=gateway_token,
+        worker_token=worker_token,
+        port=gateway_port,
+    )
+    broker_started = False
+    try:
+        await _wait_for_gateway(gateway_base)
+        async with httpx.AsyncClient(timeout=30) as http:
+            batch = {
+                "batch_id": command.payload.batch_id,
+                "title": "Live Codex MCP revocation gate",
+                "goal": "Cancel one authorized Codex MCP run before later effects",
+                "subtask_ids": [command.payload.subtask_id],
+                "target": "n8n",
+                "capability_tags": ["n8n-builder"],
+                "depends_on": [],
+                "constraints": [],
+                "acceptance_criteria": [
+                    {
+                        "assertion_id": "revoked-run-has-no-later-mcp-effect",
+                        "kind": "status_equals",
+                        "expected": "succeeded",
+                    }
+                ],
+                "golden_cases": [],
+            }
+            created = await http.post(
+                f"{gateway_base}/blocks",
+                headers={"Authorization": f"Bearer {gateway_token}"},
+                json={"block_type": "work_batch", "status": "pending", "data": batch},
+            )
+            assert created.status_code in {200, 201}, "Gateway rejected the live batch"
+            runtime_gateway = GatewayRuntimeClient(gateway_base, gateway_token, http)
+            await runtime_gateway.accept_runtime_command(command)
+            await runtime_gateway.record_capability_grant(grant)
+            delivery = GatewayDeliveryClient(gateway_base, worker_token, http)
+            claim = await delivery.claim(command.payload.batch_id or "")
+
+            _start_broker(gateway_port=gateway_port, gateway_token=gateway_token)
+            broker_started = True
+            await _wait_for_broker(broker_url)
+            issuer = McpLeaseIssuer(builder["CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET"])
+            mcp_token = issuer.issue(grant, command, broker_url, now)
+            monkeypatch.setenv("N8N_MCP_TOKEN", mcp_token)
+            configured = {
+                "n8n-mcp": {
+                    "url": f"{broker_url}/mcp-server/http",
+                    "headers": {"Authorization": "Bearer ${N8N_MCP_TOKEN}"},
+                    "tools": {"include": ["search_workflows"]},
+                    "timeout": 45,
+                    "enabled": True,
+                }
+            }
+            workspace = tmp_path / "workspace"
+            _clean_workspace(workspace)
+            codex_home = tmp_path / "codex-home"
+            write_capability_scoped_codex_config(codex_home, configured)
+            if auth_source.is_file():
+                shutil.copy2(auth_source, codex_home / "auth.json")
+            session_id = f"session-{unique}"
+            request = CodexRunRequest(
+                project_id=f"live-{unique}",
+                run_id=f"run-{unique}",
+                trace_id=f"trace-{unique}",
+                batch_id=command.payload.batch_id,
+                worker_id=f"worker-{unique[:12]}",
+                claim_id=claim.claim_id,
+                fencing_token=claim.fencing_token,
+                session_id=session_id,
+                claim_token=claim.token,
+                iteration=claim.iteration,
+                command=(
+                    "codex",
+                    "exec",
+                    "--json",
+                    "This is an authorized Captain live cancellation gate. Use the configured "
+                    "n8n MCP search_workflows tool exactly once, then run Start-Sleep -Seconds 30. "
+                    "Do not write, delete, or commit any file. Do not make any other tool call.",
+                ),
+                workspace=workspace,
+                project_root=workspace,
+            )
+            repository = GatewayCodexRunRepository(
+                client=delivery,
+                project_id=request.project_id or "",
+                run_id=request.run_id or "",
+                actor=request.worker_id or "",
+                now=lambda: datetime.now(timezone.utc),
+            )
+            state_path = tmp_path / "codex-process.json"
+            runner = PowerShellCodexRunner(
+                pwsh_path=Path(pwsh),
+                script_path=ROOT / "scripts" / "codex-session.ps1",
+                codex_path=_native_codex_binary(),
+                session_id=session_id,
+                state_path=state_path,
+                artifact_references=(),
+                codex_home=codex_home,
+                timeout_seconds=120,
+            )
+            coordinator = CodexCancellationCoordinator(
+                repository=repository,
+                worker_id=request.worker_id or "",
+                pwsh_path=Path(pwsh),
+                script_path=ROOT / "scripts" / "codex-session.ps1",
+            )
+            supervisor = CodexSupervisor(
+                runner=runner,
+                gateway=_UnusedLegacyEvidenceWriter(),
+                policy=CodexExecutionPolicy(
+                    workspace_root=workspace,
+                    environment=os.environ,
+                    mcp_lease_environment={"N8N_MCP_TOKEN": mcp_token},
+                ),
+                repository=repository,
+                cancellation_monitor=CapabilityGrantRevocationMonitor(
+                    reader=runtime_gateway,
+                    command_id=command.event_id,
+                    grant_id=grant.grant_id,
+                    poll_seconds=0.1,
+                ),
+                canceller=SessionBoundCodexCanceller(
+                    coordinator=coordinator,
+                    session_id=session_id,
+                    state_path=state_path,
+                ),
+            )
+            running = asyncio.create_task(supervisor.run(request))
+            await _wait_for_process_identity(state_path)
+            await asyncio.sleep(4)
+            assert not running.done(), "Codex run ended before Captain could revoke its lease"
+
+            mcp = N8nWorkerMcp(
+                grant=grant,
+                configured_servers=configured,
+                transport=HermesGenericMcpTransport(),
+                clock=lambda: now,
+            )
+            assert await asyncio.to_thread(mcp.discover_capabilities) == (
+                "search_workflows",
+            )
+            await runtime_gateway.record_capability_grant_revocation(
+                CapabilityGrantRevocation(
+                    schema_name="captain.capability-grant-revocation.v1",
+                    revocation_id=uuid4(),
+                    grant_id=grant.grant_id,
+                    command_id=command.event_id,
+                    revoked_at=datetime.now(timezone.utc),
+                    reason="captain_cancelled",
+                )
+            )
+            result = await asyncio.wait_for(running, timeout=45)
+            assert result.status is PackageExecutionStatus.FAILED
+            assert result.error == "Codex capability grant was revoked by Captain"
+            denied = await http.post(
+                f"{broker_url}/mcp-server/http",
+                headers={"Authorization": f"Bearer {mcp_token}"},
+                json={"jsonrpc": "2.0", "id": "post-revocation", "method": "tools/list"},
+            )
+            assert denied.status_code == 403
+            events = await delivery.delivery_events(
+                project_id=request.project_id or "",
+                run_id=request.run_id or "",
+            )
+            assert [event.event_type for event in events].count("codex_session_started") == 1
+            finished = [event for event in events if event.event_type == "codex_session_finished"]
+            assert len(finished) == 1
+            assert finished[0].payload.cancellation_reason == "captain_revoked"
+    finally:
+        if broker_started:
+            _stop_broker()
+        gateway_process.terminate()
+        try:
+            gateway_process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            gateway_process.kill()
+            gateway_process.wait(timeout=15)
