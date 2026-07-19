@@ -137,7 +137,7 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
   Artifact-/Release-/Ledger-Transitions.
 - [ ] Gesamt-Readiness prüfen: vollständiger non-live Gate, explizite
   Live-Gates, Architektur-/Importgrenzen, Demo-Evidenz und branch-sichere
-  main-Integration. Aktuell: `882 passed, 79 skipped, 10 deselected`
+  main-Integration. Aktuell: `983 passed, 79 skipped, 13 deselected`
   (`python -m pytest -q --no-cov -m "not live"`, 2026-07-19),
   Architektur-/Import-/Workstream-Gates mit `18 passed`, erfolgreicher
   Compile der Captain-Pakete und Demo-Evidenz mit vier terminalen
