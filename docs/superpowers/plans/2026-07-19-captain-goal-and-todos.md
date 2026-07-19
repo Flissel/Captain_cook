@@ -55,14 +55,18 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
   Captain-finalisiert den Lauf.
 - [x] Persistierte Provider-Call-Reservierungen, Resume-/Restart-Grenzen,
   Fehlerterminalisierung und sichere CLI-Evidenz implementiert.
-- [x] Vollständiger non-live Branch-Gate nachgewiesen: 889 passed, 78 skipped,
-  8 deselected (Stand 2026-07-19).
-- [ ] Reale LLM-Evaluierung mit kanonischer AgentFarm-Eingabe bis zu einem
-  `accepted`-Manifest führen. Der letzte reale Vier-Call-Lauf endete korrekt
-  als `failed`, weil kein Inventory geschrieben wurde; dies ist **kein**
-  Erfolgsnachweis.
-- [ ] Den akzeptierten Evaluierungsplan über den Captain-Planungs-/Gatewaypfad
-  in eine versionierte, capability-validierte WorkBatch-DAG überführen.
+- [x] Vollständiger non-live Branch-Gate nachgewiesen: `893 passed, 78 skipped,
+  16 deselected`, Coverage 81,23 % (`python -m pytest -q`, 2026-07-19).
+- [x] Reale LLM-Evaluierung mit kanonischer AgentFarm-Eingabe bis zu einem
+  `accepted`-Manifest geführt: `gpt-5.6-sol`, vier Provider-Aufrufe, 4.825
+  Tokens, akzeptierter Komponentenplan und QA-Review. Der einzelne Live-Test
+  bestand; sein isolierter Prozess meldete ausschließlich die globale
+  Coverage-Schwelle als Exit-Status.
+- [x] Akzeptierten Evaluierungsplan in eine versionierte,
+  capability-validierte WorkBatch-DAG überführt und checkpointed Release
+  getestet (`771e042`; `tests/planning/test_evaluation_bridge.py`). Die
+  Brücke akzeptiert nur persistierte QA-Entscheidungen, bindet Quellen/DAG
+  deterministisch und veröffentlicht einen identischen Run nie doppelt.
 - [ ] Einen einzelnen dependency-bereiten Subtask durch den Captain-fenced
   Codex-Run bis zur terminalen Gateway-Evidenz beweisen; n8n nur für explizite
   Lease-Tests und ohne VibeMind-Volumes anzutasten.
