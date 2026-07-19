@@ -166,8 +166,8 @@ def create_mcp_broker_app(
 
     @app.post("/mcp-server/http")
     async def proxy_mcp(request: Request) -> Response:
-        token = _bearer_token(request.headers.get("authorization"))
         try:
+            token = _bearer_token(request.headers.get("authorization"))
             claim = await authorizer.authorize(token, clock())
         except McpLeaseDenied:
             raise HTTPException(status_code=403, detail="Captain MCP lease denied") from None

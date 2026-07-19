@@ -173,6 +173,24 @@ def test_broker_forwards_only_authorized_request_with_internal_n8n_token() -> No
     assert "internal-n8n-token" not in response.text
 
 
+def test_broker_rejects_missing_bearer_token_without_an_internal_error() -> None:
+    value = command()
+    issuer = McpLeaseIssuer("broker-signing-secret")
+    app = create_mcp_broker_app(
+        authorizer=McpLeaseRevocationAuthorizer(issuer, Reader()),
+        expected_endpoint_identity="http://127.0.0.1:5680",
+        upstream_url="http://n8n.internal/mcp-server/http",
+        upstream_token="internal-n8n-token",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200))),
+        clock=lambda: NOW,
+    )
+    del value
+    with TestClient(app) as broker:
+        response = broker.post("/mcp-server/http", json={"method": "tools/list"})
+
+    assert response.status_code == 403
+
+
 @pytest.mark.asyncio
 async def test_broker_authorizer_rejects_revoked_lease_before_upstream_request() -> None:
     value = command()

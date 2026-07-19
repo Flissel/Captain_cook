@@ -827,6 +827,7 @@ function Invoke-Stop {
 function Invoke-BrokerStart {
     Assert-LocalContractFiles
     Assert-DockerAvailable
+    Initialize-CaptainEnvironment
     Assert-EnvironmentReady
     foreach ($required in @("CAPTAIN_GATEWAY_URL", "CAPTAIN_GATEWAY_TOKEN")) {
         if ([string]::IsNullOrWhiteSpace([string][Environment]::GetEnvironmentVariable($required))) {
