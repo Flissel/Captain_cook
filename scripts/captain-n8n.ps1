@@ -24,7 +24,8 @@ $AllowedEnvironmentKeys = @(
     "CAPTAIN_N8N_POSTGRES_USER",
     "CAPTAIN_N8N_POSTGRES_DB",
     "CAPTAIN_N8N_OWNER_PASSWORD",
-    "CAPTAIN_N8N_API_KEY"
+    "CAPTAIN_N8N_API_KEY",
+    "CAPTAIN_N8N_MCP_TOKEN"
 )
 
 function Assert-LocalContractFiles {
@@ -270,7 +271,7 @@ function Assert-CaptainInventory {
 
     $services = @()
     foreach ($id in $ids) {
-        $service = & docker inspect --format '{{ index .Config.Labels \"com.docker.compose.service\" }}' $id 2>&1
+        $service = & docker inspect --format '{{ index .Config.Labels "com.docker.compose.service" }}' $id 2>&1
         if ($LASTEXITCODE -ne 0) {
             throw "Could not validate a Captain n8n project container."
         }
@@ -316,7 +317,7 @@ function Get-HttpErrorStatusCode {
 function Invoke-N8nJsonRequest {
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet("GET", "POST")]
+        [ValidateSet("GET", "POST", "PATCH")]
         [string]$Method,
         [Parameter(Mandatory = $true)]
         [string]$Uri,
@@ -467,6 +468,148 @@ function Test-CaptainApiKey {
     }
 }
 
+function Enable-CaptainMcpAccess {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BaseUrl,
+        [Parameter(Mandatory = $true)]
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session
+    )
+
+    $settings = Invoke-N8nJsonRequest `
+        -Method PATCH `
+        -Uri "$BaseUrl/rest/mcp/settings" `
+        -EndpointIdentity "MCP access settings" `
+        -Session $Session `
+        -Body @{ mcpAccessEnabled = $true }
+    if (
+        $null -eq $settings.Data -or
+        $null -eq $settings.Data.PSObject.Properties["mcpAccessEnabled"] -or
+        $settings.Data.mcpAccessEnabled -ne $true
+    ) {
+        throw "n8n MCP access settings returned an unsupported schema; the Captain stack remains running."
+    }
+}
+
+function Get-CaptainMcpAccessToken {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BaseUrl,
+        [Parameter(Mandatory = $true)]
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Values,
+        [switch]$Rotate
+    )
+
+    $storedToken = $Values["CAPTAIN_N8N_MCP_TOKEN"]
+    if (-not $Rotate -and -not [string]::IsNullOrWhiteSpace([string]$storedToken)) {
+        return [string]$storedToken
+    }
+
+    $tokenResult = Invoke-N8nJsonRequest `
+        -Method GET `
+        -Uri "$BaseUrl/rest/mcp/api-key" `
+        -EndpointIdentity "MCP access token" `
+        -Session $Session `
+        -Body $null
+    if (
+        $null -eq $tokenResult.Data -or
+        $null -eq $tokenResult.Data.PSObject.Properties["apiKey"] -or
+        [string]::IsNullOrWhiteSpace($tokenResult.Data.apiKey)
+    ) {
+        throw "n8n MCP access token response omitted apiKey; the Captain stack remains running."
+    }
+    $token = [string]$tokenResult.Data.apiKey
+    if ($Rotate -or $token -match "^\*+$") {
+        $tokenResult = Invoke-N8nJsonRequest `
+            -Method POST `
+            -Uri "$BaseUrl/rest/mcp/api-key/rotate" `
+            -EndpointIdentity "MCP access token recovery rotation" `
+            -Session $Session `
+            -Body $null
+        if (
+            $null -eq $tokenResult.Data -or
+            $null -eq $tokenResult.Data.PSObject.Properties["apiKey"] -or
+            [string]::IsNullOrWhiteSpace($tokenResult.Data.apiKey)
+        ) {
+            throw "n8n MCP access token rotation omitted apiKey; the Captain stack remains running."
+        }
+        $token = [string]$tokenResult.Data.apiKey
+    }
+    Set-EnvValue -Name "CAPTAIN_N8N_MCP_TOKEN" -Value $token
+    return $token
+}
+
+function Test-CaptainMcpAccessToken {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BaseUrl,
+        [Parameter(Mandatory = $true)]
+        [string]$McpToken
+    )
+
+    $initializeRequest = @{
+        jsonrpc = "2.0"
+        id = "captain-bootstrap"
+        method = "initialize"
+        params = @{
+            protocolVersion = "2025-03-26"
+            capabilities = @{}
+            clientInfo = @{ name = "captain-bootstrap"; version = "1" }
+        }
+    } | ConvertTo-Json -Compress -Depth 8
+    try {
+        $response = Invoke-WebRequest `
+            -Uri "$BaseUrl/mcp-server/http" `
+            -Method POST `
+            -Headers @{
+                Authorization = "Bearer $McpToken"
+                Accept = "application/json, text/event-stream"
+            } `
+            -ContentType "application/json" `
+            -Body $initializeRequest `
+            -UseBasicParsing `
+            -TimeoutSec 15 `
+            -ErrorAction Stop
+        if ([int]$response.StatusCode -ne 200) {
+            throw "MCP access verification returned an unexpected status."
+        }
+        return 200
+    }
+    catch {
+        $statusCode = Get-HttpErrorStatusCode -ErrorRecord $_
+        if ($statusCode -eq 0) {
+            throw "n8n MCP endpoint is unavailable or timed out; the Captain stack remains running."
+        }
+        throw "n8n MCP endpoint returned HTTP $statusCode; the Captain stack remains running."
+    }
+}
+
+function Invoke-CaptainMcpBootstrap {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BaseUrl,
+        [Parameter(Mandatory = $true)]
+        [Microsoft.PowerShell.Commands.WebRequestSession]$Session,
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Values
+    )
+
+    Enable-CaptainMcpAccess -BaseUrl $BaseUrl -Session $Session
+    $token = Get-CaptainMcpAccessToken -BaseUrl $BaseUrl -Session $Session -Values $Values
+    try {
+        return Test-CaptainMcpAccessToken -BaseUrl $BaseUrl -McpToken $token
+    }
+    catch {
+        if ($_.Exception.Message -notmatch "HTTP 401") {
+            throw
+        }
+        $token = Get-CaptainMcpAccessToken -BaseUrl $BaseUrl -Session $Session -Values $Values -Rotate
+        return Test-CaptainMcpAccessToken -BaseUrl $BaseUrl -McpToken $token
+    }
+}
+
 function Invoke-Init {
     Assert-LocalContractFiles
     Assert-DockerAvailable
@@ -506,8 +649,26 @@ function Invoke-Bootstrap {
 
     if ($values.ContainsKey("CAPTAIN_N8N_API_KEY") -and -not [string]::IsNullOrWhiteSpace($values["CAPTAIN_N8N_API_KEY"])) {
         $workflowStatus = Test-CaptainApiKey -BaseUrl $baseUrl -ApiKey $values["CAPTAIN_N8N_API_KEY"]
+        $securePassword = ConvertTo-SecureStringValue -Value $values["CAPTAIN_N8N_OWNER_PASSWORD"]
+        $ownerPassword = ConvertFrom-SecureValue -SecureValue $securePassword
+        $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+        try {
+            $login = Invoke-N8nJsonRequest `
+                -Method POST `
+                -Uri "$baseUrl/rest/login" `
+                -EndpointIdentity "owner login for MCP bootstrap" `
+                -Session $session `
+                -Body @{ emailOrLdapLoginId = $OwnerEmail; password = $ownerPassword }
+            Assert-OwnerResponse -Data $login.Data -EndpointIdentity "owner login for MCP bootstrap"
+            $mcpStatus = Invoke-CaptainMcpBootstrap -BaseUrl $baseUrl -Session $session -Values $values
+        }
+        finally {
+            $ownerPassword = $null
+            $securePassword.Dispose()
+        }
         Write-Output "endpoint=healthz status=$healthStatus"
         Write-Output "endpoint=workflows status=$workflowStatus"
+        Write-Output "endpoint=mcp status=$mcpStatus"
         return
     }
 
@@ -622,9 +783,11 @@ function Invoke-Bootstrap {
         $apiKey = [string]$keyResult.Data.rawApiKey
         Set-EnvValue -Name "CAPTAIN_N8N_API_KEY" -Value $apiKey
         $workflowStatus = Test-CaptainApiKey -BaseUrl $baseUrl -ApiKey $apiKey
+        $mcpStatus = Invoke-CaptainMcpBootstrap -BaseUrl $baseUrl -Session $session -Values $values
 
         Write-Output "endpoint=healthz status=$healthStatus"
         Write-Output "endpoint=workflows status=$workflowStatus"
+        Write-Output "endpoint=mcp status=$mcpStatus"
     }
     finally {
         $ownerPassword = $null

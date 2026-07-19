@@ -76,6 +76,7 @@ def builder_endpoint() -> N8nEndpoint:
             "N8N_MODE": "captain-builder",
             "CAPTAIN_N8N_URL": "http://localhost:5679",
             "CAPTAIN_N8N_API_KEY": "sensitive-key-for-redaction",
+            "CAPTAIN_N8N_MCP_TOKEN": "sensitive-mcp-token-for-redaction",
         }
     )
 
@@ -86,6 +87,7 @@ def test_builder_mode_uses_only_captain_values() -> None:
             "N8N_MODE": "captain-builder",
             "CAPTAIN_N8N_URL": "http://localhost:5679",
             "CAPTAIN_N8N_API_KEY": "sensitive-key-for-redaction",
+            "CAPTAIN_N8N_MCP_TOKEN": "sensitive-mcp-token-for-redaction",
             "N8N_URL": "http://localhost:15678",
             "N8N_MCP_TOKEN": "unselected-external-key",
         }
@@ -94,8 +96,10 @@ def test_builder_mode_uses_only_captain_values() -> None:
     assert endpoint.api_base_url == "http://localhost:5679"
     assert endpoint.webhook_base_url == "http://localhost:5679"
     assert endpoint.api_key == "sensitive-key-for-redaction"
+    assert endpoint.mcp_token == "sensitive-mcp-token-for-redaction"
     assert "sensitive-key-for-redaction" not in repr(endpoint)
     assert "sensitive-key-for-redaction" not in endpoint.model_dump_json()
+    assert "sensitive-mcp-token-for-redaction" not in endpoint.model_dump_json()
     assert endpoint.model_dump() == {
         "mode": "captain-builder",
         "api_base_url": "http://localhost:5679",
@@ -315,10 +319,12 @@ def test_hermes_reference_is_lease_bound_and_secret_excluded() -> None:
     }
     assert reference.child_process_environment() == {
         "N8N_URL": "http://localhost:5679",
-        "N8N_MCP_TOKEN": "sensitive-key-for-redaction",
+        "N8N_MCP_TOKEN": "sensitive-mcp-token-for-redaction",
     }
     assert "sensitive-key-for-redaction" not in repr(reference)
+    assert "sensitive-mcp-token-for-redaction" not in repr(reference)
     assert "sensitive-key-for-redaction" not in reference.model_dump_json()
+    assert "sensitive-mcp-token-for-redaction" not in reference.model_dump_json()
 
 
 def test_hermes_reference_returns_a_fresh_child_environment() -> None:
@@ -339,7 +345,7 @@ def test_hermes_reference_returns_a_fresh_child_environment() -> None:
     child_environment["N8N_MCP_TOKEN"] = "changed-by-child"
 
     assert reference.child_process_environment()["N8N_MCP_TOKEN"] == (
-        "sensitive-key-for-redaction"
+        "sensitive-mcp-token-for-redaction"
     )
 
 
@@ -470,4 +476,5 @@ def test_example_environment_keeps_external_default_and_documents_builder_opt_in
     assert "N8N_MODE=external" in example
     assert "CAPTAIN_N8N_URL=http://localhost:5679" in example
     assert "CAPTAIN_N8N_API_KEY=" in example
+    assert "CAPTAIN_N8N_MCP_TOKEN=" in example
     assert "CAPTAIN_N8N_PORT=5679" in example

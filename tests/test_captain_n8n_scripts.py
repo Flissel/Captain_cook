@@ -89,7 +89,11 @@ def script_sandbox(tmp_path: Path) -> dict[str, Any]:
 
 
 def _write_environment(
-    sandbox: dict[str, Any], port: int, *, api_key: str | None = None
+    sandbox: dict[str, Any],
+    port: int,
+    *,
+    api_key: str | None = None,
+    mcp_token: str | None = None,
 ) -> None:
     lines = [
         f"CAPTAIN_N8N_PORT={port}",
@@ -101,6 +105,8 @@ def _write_environment(
     ]
     if api_key is not None:
         lines.append(f"CAPTAIN_N8N_API_KEY={api_key}")
+    if mcp_token is not None:
+        lines.append(f"CAPTAIN_N8N_MCP_TOKEN={mcp_token}")
     sandbox["env_file"].write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -155,6 +161,7 @@ class _MockN8nServer:
 
             do_GET = _respond
             do_POST = _respond
+            do_PATCH = _respond
 
             def log_message(self, _format: str, *args: object) -> None:
                 del args
@@ -232,7 +239,7 @@ def test_verifier_preserves_docker_go_template_label_quotes_on_windows() -> None
     for script_name in ("captain-n8n.ps1", "verify_captain_n8n.ps1"):
         source = (ROOT / "scripts" / script_name).read_text(encoding="utf-8")
 
-        assert '\\"com.docker.compose.service\\"' in source
+        assert '"com.docker.compose.service"' in source
 
 
 def test_readme_documents_only_captain_builder_lifecycle() -> None:
@@ -325,6 +332,113 @@ def test_bootstrap_rejects_malformed_api_key_response_without_emitting_secret(
     assert echoed_secret not in output
     assert script_sandbox["owner_secret"] not in output
     assert ("POST", "/rest/api-keys") in [
+        (method, path) for method, path, _body in server.requests
+    ]
+
+
+def test_bootstrap_enables_and_persists_a_captain_mcp_access_token(
+    script_sandbox: dict[str, Any],
+) -> None:
+    api_key = "captain-api-key-fixture"
+    mcp_token = "captain-mcp-token-fixture"
+
+    def responder(
+        method: str,
+        path: str,
+        _body: dict[str, Any] | None,
+    ) -> tuple[int, object]:
+        if method == "GET" and path == "/healthz":
+            return 200, "ok"
+        if method == "POST" and path == "/rest/login":
+            return 200, {"data": {"email": "captain@local.test"}}
+        if method == "GET" and path == "/rest/api-keys":
+            return 200, {"data": {"items": []}}
+        if method == "GET" and path == "/rest/api-keys/scopes":
+            return 200, {"data": ["workflow:read"]}
+        if method == "POST" and path == "/rest/api-keys":
+            return 200, {"data": {"rawApiKey": api_key}}
+        if method == "GET" and path == "/api/v1/workflows":
+            return 200, {"data": []}
+        if method == "PATCH" and path == "/rest/mcp/settings":
+            return 200, {"data": {"mcpAccessEnabled": True}}
+        if method == "GET" and path == "/rest/mcp/api-key":
+            return 200, {"data": {"apiKey": mcp_token}}
+        if method == "POST" and path == "/mcp-server/http":
+            return 200, {"jsonrpc": "2.0", "id": "captain-bootstrap", "result": {}}
+        raise AssertionError(f"Unexpected request: {method} {path}")
+
+    with _MockN8nServer(responder) as server:
+        _write_environment(script_sandbox, server.port)
+        result = _run_action(script_sandbox, "bootstrap")
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    persisted = script_sandbox["env_file"].read_text(encoding="utf-8")
+    assert f"CAPTAIN_N8N_API_KEY={api_key}" in persisted
+    assert f"CAPTAIN_N8N_MCP_TOKEN={mcp_token}" in persisted
+    assert api_key not in output
+    assert mcp_token not in output
+    assert ("PATCH", "/rest/mcp/settings") in [
+        (method, path) for method, path, _body in server.requests
+    ]
+
+
+def test_bootstrap_rotates_a_rejected_stored_mcp_access_token(
+    script_sandbox: dict[str, Any],
+) -> None:
+    api_key = "captain-api-key-fixture"
+    stale_token = "stale-mcp-token-fixture"
+    fresh_token = "fresh-mcp-token-fixture"
+    mcp_attempts = 0
+
+    def responder(
+        method: str,
+        path: str,
+        _body: dict[str, Any] | None,
+    ) -> tuple[int, object]:
+        nonlocal mcp_attempts
+        if method == "GET" and path == "/healthz":
+            return 200, "ok"
+        if method == "POST" and path == "/rest/login":
+            return 200, {"data": {"email": "captain@local.test"}}
+        if method == "GET" and path == "/rest/api-keys":
+            return 200, {"data": {"items": []}}
+        if method == "GET" and path == "/rest/api-keys/scopes":
+            return 200, {"data": ["workflow:read"]}
+        if method == "POST" and path == "/rest/api-keys":
+            return 200, {"data": {"rawApiKey": api_key}}
+        if method == "GET" and path == "/api/v1/workflows":
+            return 200, {"data": []}
+        if method == "PATCH" and path == "/rest/mcp/settings":
+            return 200, {"data": {"mcpAccessEnabled": True}}
+        if method == "GET" and path == "/rest/mcp/api-key":
+            return 200, {"data": {"apiKey": "********"}}
+        if method == "POST" and path == "/rest/mcp/api-key/rotate":
+            return 200, {"data": {"apiKey": fresh_token}}
+        if method == "POST" and path == "/mcp-server/http":
+            mcp_attempts += 1
+            if mcp_attempts == 1:
+                return 401, {"message": "expired"}
+            return 200, {"jsonrpc": "2.0", "id": "captain-bootstrap", "result": {}}
+        raise AssertionError(f"Unexpected request: {method} {path}")
+
+    with _MockN8nServer(responder) as server:
+        _write_environment(
+            script_sandbox,
+            server.port,
+            api_key=api_key,
+            mcp_token=stale_token,
+        )
+        result = _run_action(script_sandbox, "bootstrap")
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    persisted = script_sandbox["env_file"].read_text(encoding="utf-8")
+    assert f"CAPTAIN_N8N_MCP_TOKEN={fresh_token}" in persisted
+    assert stale_token not in output
+    assert fresh_token not in output
+    assert mcp_attempts == 2
+    assert ("POST", "/rest/mcp/api-key/rotate") in [
         (method, path) for method, path, _body in server.requests
     ]
 

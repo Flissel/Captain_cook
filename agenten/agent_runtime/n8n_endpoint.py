@@ -30,6 +30,7 @@ class N8nEndpoint(BaseModel):
     api_base_url: str = Field(min_length=1)
     webhook_base_url: str = Field(min_length=1)
     api_key: str = Field(min_length=1, exclude=True, repr=False)
+    mcp_token: str = Field(default="", exclude=True, repr=False)
 
 
 class HermesN8nReference(BaseModel):
@@ -72,13 +73,17 @@ def resolve_n8n_endpoint(environment: Mapping[str, str]) -> N8nEndpoint:
             "CAPTAIN_N8N_API_KEY",
             label="Captain n8n API key",
         )
+        mcp_token = environment.get("CAPTAIN_N8N_MCP_TOKEN", "").strip()
         normalized_url = _normalize_builder_url(base_url)
+    if mode == "external":
+        mcp_token = api_key
 
     return N8nEndpoint(
         mode=mode,
         api_base_url=normalized_url,
         webhook_base_url=normalized_url,
         api_key=api_key,
+        mcp_token=mcp_token,
     )
 
 
@@ -98,12 +103,16 @@ def build_hermes_n8n_reference(
             "Hermes n8n configuration requires exactly the n8n-mcp server"
         )
     _validate_builder_endpoint(endpoint)
+    if not endpoint.mcp_token:
+        raise N8nEndpointConfigurationError(
+            "Captain n8n MCP token must not be empty for Hermes MCP access"
+        )
 
     reference = HermesN8nReference(endpoint_identity=endpoint.api_base_url)
     reference._child_environment.update(
         {
             "N8N_URL": endpoint.api_base_url,
-            "N8N_MCP_TOKEN": endpoint.api_key,
+            "N8N_MCP_TOKEN": endpoint.mcp_token,
         }
     )
     return reference
