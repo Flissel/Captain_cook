@@ -21,7 +21,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeResult,
     CapabilityGrant,
 )
-from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock
+from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease
 from agenten.agent_factory.state_machine import FactoryLifecycleStatus, FactoryProjection
 
 
@@ -69,6 +69,7 @@ class FactoryWriteReceipt(_FrozenContract):
 class FactoryJobProjection(_FrozenContract):
     job: AgentFactoryJob
     blocks: tuple[FactoryEvidenceBlock, ...]
+    leases: tuple[FactoryLease, ...]
     projection: FactoryProjection
 
 

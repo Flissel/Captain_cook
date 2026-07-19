@@ -21,8 +21,9 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeResult,
     CapabilityGrant,
 )
-from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock
-from agenten.agent_factory.state_machine import FactoryLifecycleError, FactoryProjection, apply_block
+from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease, FactoryRole
+from agenten.agent_factory.leases import FactoryLeaseDenied, validate_factory_lease
+from agenten.agent_factory.state_machine import FactoryActionKind, FactoryLifecycleError, FactoryProjection, apply_block, next_action
 from blockchain.Blockchain_modell import Block
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.contracts import (
@@ -579,10 +580,43 @@ class GatewayStore:
                     raise HTTPException(status_code=404, detail="factory job not found")
                 job = AgentFactoryJob.model_validate(job_block["data"])
                 blocks = self._factory_blocks(cursor, job_id)
+                leases = self._factory_leases(cursor, job_id)
                 projection = FactoryProjection.from_job(job)
                 for evidence in blocks:
                     projection = apply_block(projection, evidence)
-        return FactoryJobProjection(job=job, blocks=blocks, projection=projection)
+        return FactoryJobProjection(job=job, blocks=blocks, leases=leases, projection=projection)
+
+    def record_factory_lease(self, lease: FactoryLease) -> FactoryWriteReceipt:
+        canonical = lease.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                job_block = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_factory_job", field="job_id", value=str(lease.job_id), for_update=True
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job not found")
+                job = AgentFactoryJob.model_validate(job_block["data"])
+                projection = self._factory_projection(cursor, job)
+                self._assert_lease_is_next_action(lease, projection)
+                try:
+                    validate_factory_lease(lease, job=job, role=lease.role, attempt=projection.attempt, now=lease.issued_at)
+                except FactoryLeaseDenied as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                existing = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_factory_lease", field="lease_id", value=lease.lease_id, for_update=True
+                )
+                if existing is not None:
+                    if existing["data"] == canonical:
+                        return FactoryWriteReceipt(event_id=job.event_id, replayed=True)
+                    raise HTTPException(status_code=409, detail="factory lease already exists with different content")
+                index = self._next_index(cursor)
+                block = self._new_block(
+                    cursor, index=index, block_type="agent_factory_lease", data=canonical,
+                    status="active", parent_index=job_block["index"],
+                    metadata={"schema": "captain.factory-lease.v1", "role": lease.role.value},
+                )
+                self._insert(cursor, block)
+        return FactoryWriteReceipt(event_id=job.event_id, replayed=False)
 
     def _factory_projection(self, cursor: Any, job: AgentFactoryJob) -> FactoryProjection:
         projection = FactoryProjection.from_job(job)
@@ -604,6 +638,29 @@ class GatewayStore:
             FactoryEvidenceBlock.model_validate(self.storage._decode_row(row)["data"])
             for row in cursor.fetchall()
         )
+
+    def _factory_leases(self, cursor: Any, job_id: UUID) -> tuple[FactoryLease, ...]:
+        cursor.execute(
+            """SELECT data FROM blocks WHERE block_type = 'agent_factory_lease'
+            AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.job_id')) = %s ORDER BY `index`""",
+            (str(job_id),),
+        )
+        return tuple(
+            FactoryLease.model_validate(self.storage._decode_row(row)["data"])
+            for row in cursor.fetchall()
+        )
+
+    @staticmethod
+    def _assert_lease_is_next_action(lease: FactoryLease, projection: FactoryProjection) -> None:
+        action = next_action(projection)
+        role_actions = {
+            FactoryRole.AGENT_ARCHITECT: FactoryActionKind.DISPATCH_AGENT_ARCHITECT,
+            FactoryRole.TOOL_INTEGRATOR: FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,
+            FactoryRole.REAL_CASE_TESTER: FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
+            FactoryRole.QUALITY_WARDEN: FactoryActionKind.DISPATCH_QUALITY_WARDEN,
+        }
+        if action.kind is not role_actions[lease.role]:
+            raise HTTPException(status_code=409, detail="factory lease role is not the next authorized action")
 
     def _runtime_grant_block(
         self,

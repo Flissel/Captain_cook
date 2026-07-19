@@ -20,7 +20,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeResult,
     CapabilityGrant,
 )
-from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock
+from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease
 from gateway.auth import (
     GatewayRole,
     load_gateway_settings,
@@ -205,6 +205,17 @@ def create_app(
         _: GatewayRole = Depends(require_actor),
     ) -> FactoryWriteReceipt:
         receipt = get_store().record_factory_block(evidence)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
+
+    @app.post("/v1/factory/leases", status_code=status.HTTP_201_CREATED)
+    async def record_factory_lease(
+        lease: FactoryLease,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> FactoryWriteReceipt:
+        receipt = get_store().record_factory_lease(lease)
         if receipt.replayed:
             response.status_code = status.HTTP_200_OK
         return receipt
