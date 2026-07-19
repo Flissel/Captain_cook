@@ -94,6 +94,8 @@ $startInfo.UseShellExecute = $false
 $startInfo.CreateNoWindow = $true
 $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
+$startInfo.ArgumentList.Add("-a")
+$startInfo.ArgumentList.Add("never")
 $startInfo.ArgumentList.Add("exec")
 $startInfo.ArgumentList.Add("--sandbox")
 $startInfo.ArgumentList.Add($Sandbox)

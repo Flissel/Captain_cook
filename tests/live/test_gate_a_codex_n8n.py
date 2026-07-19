@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
@@ -229,7 +230,14 @@ async def test_gate_a_real_codex_n8n_gateway_trace(
         fencing_token = claim["fencing_token"]
 
         with tempfile.TemporaryDirectory(prefix="captain-gate-a-") as directory:
-            workspace = Path(directory)
+            temporary_root = Path(directory)
+            workspace = temporary_root / "workspace"
+            workspace.mkdir()
+            codex_home = temporary_root / "codex-home"
+            codex_home.mkdir()
+            source_auth = Path.home() / ".codex" / "auth.json"
+            if source_auth.is_file():
+                shutil.copy2(source_auth, codex_home / "auth.json")
             _git(workspace, "init", "-q")
             _git(workspace, "config", "user.email", "gate-a@localhost")
             _git(workspace, "config", "user.name", "Captain Gate A")
@@ -238,16 +246,44 @@ async def test_gate_a_real_codex_n8n_gateway_trace(
             _git(workspace, "commit", "-qm", "chore: initialize gate workspace")
 
             workflow_path = workspace / "workflow.json"
+            workflow_blueprint = {
+                "nodes": [
+                    {
+                        "name": "Webhook",
+                        "type": "n8n-nodes-base.webhook",
+                        "typeVersion": 2,
+                        "position": [0, 0],
+                        "parameters": {
+                            "httpMethod": "POST",
+                            "path": "{{CAPTAIN_WEBHOOK_PATH}}",
+                            "responseMode": "lastNode",
+                            "options": {},
+                        },
+                    },
+                    {
+                        "name": "Code",
+                        "type": "n8n-nodes-base.code",
+                        "typeVersion": 2,
+                        "position": [240, 0],
+                        "parameters": {
+                            "jsCode": "return [{ json: $input.first().json }];",
+                        },
+                    },
+                ],
+                "connections": {
+                    "Webhook": {
+                        "main": [[{"node": "Code", "type": "main", "index": 0}]]
+                    }
+                },
+                "settings": {"executionOrder": "v1"},
+            }
             prompt = (
-                    "Create workflow.json in the current workspace containing only valid "
-                    "JSON for a harmless n8n workflow with Webhook and Code nodes. The "
-                    "Webhook parameters.path must be {{CAPTAIN_WEBHOOK_PATH}}, POST, and "
-                    "responseMode lastNode. The Code node must return the incoming JSON "
-                    "plus execution_id from $execution.id. Connect Webhook to Code. "
-                    "Do not include root-level name, id, workflowId, webhookId, or "
-                    "webhook_path fields; Captain assigns provider identity during deployment. "
-                    "Do not modify any other file."
-                )
+                "Create exactly one file named workflow.json in the current workspace. "
+                "Its complete UTF-8 content must be exactly the JSON below. Do not modify "
+                "any other file, do not commit, and stop after writing it.\n\n"
+                + json.dumps(workflow_blueprint, indent=2)
+                + "\n"
+            )
             request = CodexRunRequest(
                 project_id=project_id,
                 run_id=run_id,
@@ -289,6 +325,7 @@ async def test_gate_a_real_codex_n8n_gateway_trace(
                     session_id=session_id,
                     state_path=workspace / "codex-process.json",
                     artifact_references=(f"artifact://sealed/{artifact_id}",),
+                    codex_home=codex_home,
                     timeout_seconds=300,
                 )
                 result = await CodexSupervisor(
@@ -298,7 +335,22 @@ async def test_gate_a_real_codex_n8n_gateway_trace(
                     repository=repository,
                 ).run(request)
                 assert result.status is PackageExecutionStatus.SUCCEEDED
-                assert workflow_path.is_file()
+                codex_events = await gateway_client.delivery_events(
+                    project_id=project_id,
+                    run_id=run_id,
+                )
+                codex_item_types = sorted(
+                    {
+                        event.payload.item_type
+                        for event in codex_events
+                        if event.event_type == "codex_session_event"
+                        and isinstance(event.payload.item_type, str)
+                    }
+                )
+                assert workflow_path.is_file(), (
+                    "Codex completed without the required workspace artifact; "
+                    f"recorded item types: {codex_item_types}"
+                )
 
                 sealed_bytes = workflow_path.read_bytes()
                 artifact_digest = hashlib.sha256(sealed_bytes).hexdigest()

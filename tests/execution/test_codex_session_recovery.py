@@ -298,6 +298,8 @@ async def test_powershell_runner_bridges_authorized_run_to_real_launcher(
     tmp_path: Path,
 ) -> None:
     state_path = tmp_path / "runner-process.json"
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
     runner = PowerShellCodexRunner(
         pwsh_path=Path(_pwsh()),
         script_path=Path("scripts/codex-session.ps1").resolve(),
@@ -305,6 +307,7 @@ async def test_powershell_runner_bridges_authorized_run_to_real_launcher(
         session_id="runner-session-1",
         state_path=state_path,
         artifact_references=("artifact://sealed/runner-test",),
+        codex_home=codex_home,
     )
     result = await runner.run(
         AuthorizedCodexRun(
@@ -320,9 +323,66 @@ async def test_powershell_runner_bridges_authorized_run_to_real_launcher(
     assert 'ArgumentList.Add("--sandbox")' in Path(
         "scripts/codex-session.ps1"
     ).read_text(encoding="utf-8")
+    assert 'ArgumentList.Add("-a")' in Path(
+        "scripts/codex-session.ps1"
+    ).read_text(encoding="utf-8")
+    assert 'ArgumentList.Add("never")' in Path(
+        "scripts/codex-session.ps1"
+    ).read_text(encoding="utf-8")
+    launcher = Path("scripts/codex-session.ps1").read_text(encoding="utf-8")
+    assert launcher.index('ArgumentList.Add("-a")') < launcher.index(
+        'ArgumentList.Add("exec")'
+    )
     identity = json.loads(state_path.read_text(encoding="utf-8"))
     assert identity["session_id"] == "runner-session-1"
 
+
+
+@pytest.mark.asyncio
+async def test_powershell_runner_sets_a_scoped_codex_home_for_the_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"", b""
+
+    async def create_process(*args: object, **kwargs: object) -> Process:
+        captured["args"] = args
+        captured["environment"] = kwargs["env"]
+        return Process()
+
+    monkeypatch.setattr(
+        "agenten.execution.codex_supervisor.asyncio.create_subprocess_exec",
+        create_process,
+    )
+    codex_home = tmp_path / "scoped-codex-home"
+    codex_home.mkdir()
+    runner = PowerShellCodexRunner(
+        pwsh_path=Path(_pwsh()),
+        script_path=Path("scripts/codex-session.ps1").resolve(),
+        codex_path=Path(r"C:\Windows\System32\timeout.exe"),
+        session_id="runner-scoped-home-1",
+        state_path=tmp_path / "runner-process.json",
+        artifact_references=(),
+        codex_home=codex_home,
+    )
+
+    await runner.run(
+        AuthorizedCodexRun(
+            workspace=tmp_path,
+            command=("codex", "exec", "--json", "harmless test"),
+            environment=FrozenEnvironment({"PATH": "safe-path"}),
+        )
+    )
+
+    environment = captured["environment"]
+    assert isinstance(environment, dict)
+    assert environment["CODEX_HOME"] == str(codex_home.resolve())
 
 
 @pytest.mark.asyncio
@@ -351,6 +411,8 @@ async def test_powershell_runner_timeout_cancels_recorded_child_tree(
         text=True,
     )
     state_path = tmp_path / "timed-out-process.json"
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
     runner = PowerShellCodexRunner(
         pwsh_path=Path(_pwsh()),
         script_path=Path("scripts/codex-session.ps1").resolve(),
@@ -358,6 +420,7 @@ async def test_powershell_runner_timeout_cancels_recorded_child_tree(
         session_id="runner-timeout-1",
         state_path=state_path,
         artifact_references=(),
+        codex_home=codex_home,
         timeout_seconds=2.0,
     )
 

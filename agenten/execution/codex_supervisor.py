@@ -94,6 +94,7 @@ class PowerShellCodexRunner:
         session_id: str,
         state_path: Path,
         artifact_references: tuple[str, ...],
+        codex_home: Path,
         timeout_seconds: float = 600,
     ) -> None:
         self._pwsh_path = pwsh_path.resolve(strict=True)
@@ -102,11 +103,14 @@ class PowerShellCodexRunner:
         self._session_id = session_id
         self._state_path = state_path.resolve()
         self._artifact_references = artifact_references
+        self._codex_home = codex_home.resolve(strict=True)
         self._timeout_seconds = timeout_seconds
 
     async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
         if len(authorized.command) != 4:
             raise ValueError("PowerShell Codex runner requires one prompt argument")
+        child_environment = authorized.child_environment()
+        child_environment["CODEX_HOME"] = str(self._codex_home)
         process = await asyncio.create_subprocess_exec(
             str(self._pwsh_path),
             "-NoProfile",
@@ -123,7 +127,7 @@ class PowerShellCodexRunner:
             "-StatePath",
             str(self._state_path),
             cwd=authorized.workspace,
-            env=authorized.child_environment(),
+            env=child_environment,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
