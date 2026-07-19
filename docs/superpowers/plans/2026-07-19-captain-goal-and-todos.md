@@ -103,6 +103,9 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
   kurzlebigen Lease-Broker/Proxy ersetzen. Eine Rotation des jetzigen
   instanzweiten Schlüssels wäre kein sicherer Einzelwiderruf, weil sie
   parallele, rechtmäßige Runs ebenfalls unterbrechen würde.
+  Der Token-/Proxy-/Referenzkern ist vorhanden (`c469caa`, `1f8a902`,
+  `cdcb48b`); offen sind die isolierte Compose-Laufzeit, Gateway-Reader und
+  der echte Live-Gate.
 - [x] Aktive Codex-Sessions nach einem Neustart fail-closed einzäunen
   (`0661ca4`): der Gateway-Event-Append liefert jetzt auch seinen
   Replay-Status; bei einer schon aktiven Session startet der Supervisor keinen
