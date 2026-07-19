@@ -45,6 +45,41 @@ PROFILE_CAPABILITIES: dict[CapabilityProfile, frozenset[str]] = {
             "mcp.n8n",
         }
     ),
+    CapabilityProfile.FACTORY_ARCHITECT: frozenset(
+        {
+            "hermes.plan",
+            "hermes.design_agent",
+            "workspace.read",
+            "context7.query",
+        }
+    ),
+    CapabilityProfile.FACTORY_TOOL_INTEGRATOR: frozenset(
+        {
+            "codex.run",
+            "codex.resume",
+            "codex.status",
+            "codex.cancel",
+            "codex.heartbeat",
+            "workspace.read",
+            "workspace.write",
+            "tests.run",
+            "context7.query",
+        }
+    ),
+    CapabilityProfile.FACTORY_REAL_CASE_TESTER: frozenset(
+        {
+            "workspace.read",
+            "tests.run",
+            "evidence.write",
+        }
+    ),
+    CapabilityProfile.FACTORY_QUALITY_WARDEN: frozenset(
+        {
+            "workspace.read",
+            "evidence.read",
+            "context7.query",
+        }
+    ),
 }
 
 LEASE_DURATION = timedelta(minutes=15)

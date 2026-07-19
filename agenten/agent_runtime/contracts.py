@@ -50,6 +50,10 @@ class CapabilityProfile(str, Enum):
     AGENT_DESIGNER = "agent-designer"
     CODE_BUILDER = "code-builder"
     N8N_BUILDER = "n8n-builder"
+    FACTORY_ARCHITECT = "factory-architect"
+    FACTORY_TOOL_INTEGRATOR = "factory-tool-integrator"
+    FACTORY_REAL_CASE_TESTER = "factory-real-case-tester"
+    FACTORY_QUALITY_WARDEN = "factory-quality-warden"
 
 
 class RuntimeStatus(str, Enum):
@@ -111,11 +115,22 @@ class AgentRuntimeCommandPayload(_FrozenContract):
             (self.batch_id, self.subtask_id, self.workspace_ref)
         ):
             raise ValueError("Codex operations require batch, subtask, and workspace refs")
-        if self.operation is RuntimeOperation.HERMES_PLAN and self.capability_profile is not CapabilityProfile.PLANNER:
+        planner_profiles = {
+            CapabilityProfile.PLANNER,
+            CapabilityProfile.FACTORY_ARCHITECT,
+        }
+        if (
+            self.operation is RuntimeOperation.HERMES_PLAN
+            and self.capability_profile not in planner_profiles
+        ):
             raise ValueError("hermes.plan requires the planner profile")
+        designer_profiles = {
+            CapabilityProfile.AGENT_DESIGNER,
+            CapabilityProfile.FACTORY_ARCHITECT,
+        }
         if (
             self.operation is RuntimeOperation.HERMES_DESIGN_AGENT
-            and self.capability_profile is not CapabilityProfile.AGENT_DESIGNER
+            and self.capability_profile not in designer_profiles
         ):
             raise ValueError("hermes.design_agent requires the agent-designer profile")
         if self.capability_profile is CapabilityProfile.N8N_BUILDER:
@@ -126,6 +141,7 @@ class AgentRuntimeCommandPayload(_FrozenContract):
         if self.operation in codex_operations and self.capability_profile not in {
             CapabilityProfile.CODE_BUILDER,
             CapabilityProfile.N8N_BUILDER,
+            CapabilityProfile.FACTORY_TOOL_INTEGRATOR,
         }:
             raise ValueError("Codex operations require a builder profile")
         return self

@@ -204,3 +204,54 @@ def test_valid_grant_round_trip_is_accepted() -> None:
     )
 
     assert validate_grant(reloaded, command, NOW + timedelta(seconds=1)) == reloaded
+
+
+@pytest.mark.parametrize(
+    ("profile", "operation", "intent", "expected_capability"),
+    [
+        ("factory-architect", "hermes.plan", "none", "hermes.plan"),
+        (
+            "factory-architect",
+            "hermes.design_agent",
+            "none",
+            "hermes.design_agent",
+        ),
+        ("factory-tool-integrator", "codex.run", "none", "codex.run"),
+        ("factory-tool-integrator", "codex.cancel", "none", "codex.cancel"),
+    ],
+)
+def test_factory_role_profile_receives_only_its_released_runtime_capabilities(
+    profile: str,
+    operation: str,
+    intent: str,
+    expected_capability: str,
+) -> None:
+    command = command_for(profile=profile, operation=operation, intent=intent)
+
+    grant = derive_grant(
+        command,
+        released_batch(capability_tags=[profile]),
+        NOW,
+    )
+
+    assert expected_capability in grant.capabilities
+    assert grant.mcp_servers == ()
+
+
+@pytest.mark.parametrize(
+    ("profile", "operation", "intent", "message"),
+    [
+        ("factory-tool-integrator", "hermes.plan", "none", "planner"),
+        ("factory-architect", "codex.run", "none", "builder"),
+        ("factory-real-case-tester", "codex.status", "none", "builder"),
+        ("factory-quality-warden", "hermes.plan", "none", "planner"),
+    ],
+)
+def test_factory_role_cannot_escalate_to_another_roles_runtime_operation(
+    profile: str,
+    operation: str,
+    intent: str,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        command_for(profile=profile, operation=operation, intent=intent)
