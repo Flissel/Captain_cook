@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("init", "start", "bootstrap", "status", "stop")]
+    [ValidateSet("init", "start", "broker-start", "bootstrap", "status", "stop")]
     [string]$Action
 )
 
@@ -824,9 +824,25 @@ function Invoke-Stop {
     }
 }
 
+function Invoke-BrokerStart {
+    Assert-LocalContractFiles
+    Assert-DockerAvailable
+    Assert-EnvironmentReady
+    foreach ($required in @("CAPTAIN_GATEWAY_URL", "CAPTAIN_GATEWAY_TOKEN")) {
+        if ([string]::IsNullOrWhiteSpace([string][Environment]::GetEnvironmentVariable($required))) {
+            throw "$required must be supplied only for this broker-start invocation."
+        }
+    }
+    & docker compose -p captain-n8n-builder --env-file $EnvFile --profile mcp-broker -f $ComposeFile up -d mcp-broker
+    if ($LASTEXITCODE -ne 0) {
+        throw "Captain MCP broker start failed."
+    }
+}
+
 switch ($Action) {
     "init" { Invoke-Init }
     "start" { Invoke-Start }
+    "broker-start" { Invoke-BrokerStart }
     "bootstrap" { Invoke-Bootstrap }
     "status" { Invoke-Status }
     "stop" { Invoke-Stop }
