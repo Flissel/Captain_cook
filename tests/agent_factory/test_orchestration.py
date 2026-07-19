@@ -1,0 +1,67 @@
+from __future__ import annotations
+
+import pytest
+
+from agenten.agent_factory.contracts import FactoryPhase, FactoryRole
+from agenten.agent_factory.orchestration import FactoryDispatchError, FactoryDispatcher
+from agenten.agent_factory.service import FactoryCoordinator, InMemoryFactoryRepository
+from agenten.agent_factory.state_machine import FactoryActionKind
+from tests.agent_factory.test_state_machine import block, job
+
+
+class Hermes:
+    def __init__(self) -> None:
+        self.requests = []
+
+    async def dispatch(self, request: object) -> None:
+        self.requests.append(request)
+
+
+class Forge:
+    def __init__(self) -> None:
+        self.requests = []
+
+    async def submit(self, request: object) -> None:
+        self.requests.append(request)
+
+
+@pytest.mark.asyncio
+async def test_dispatches_architect_only_after_captain_forge_request() -> None:
+    coordinator = FactoryCoordinator(InMemoryFactoryRepository())
+    factory_job = job()
+    coordinator.register(factory_job)
+    coordinator.record(block(FactoryPhase.FORGE_REQUESTED))
+    hermes, forge = Hermes(), Forge()
+
+    action = await FactoryDispatcher(coordinator=coordinator, hermes=hermes, forge=forge).dispatch_next(factory_job.job_id)
+
+    assert action.kind is FactoryActionKind.DISPATCH_AGENT_ARCHITECT
+    assert hermes.requests[0].role is FactoryRole.AGENT_ARCHITECT
+    assert forge.requests == []
+
+
+@pytest.mark.asyncio
+async def test_dispatches_forge_only_after_tool_candidate_evidence() -> None:
+    coordinator = FactoryCoordinator(InMemoryFactoryRepository())
+    factory_job = job()
+    coordinator.register(factory_job)
+    coordinator.record(block(FactoryPhase.FORGE_REQUESTED))
+    coordinator.record(block(FactoryPhase.BLUEPRINT_CREATED))
+    coordinator.record(block(FactoryPhase.TOOL_CANDIDATE_TESTED))
+    hermes, forge = Hermes(), Forge()
+
+    action = await FactoryDispatcher(coordinator=coordinator, hermes=hermes, forge=forge).dispatch_next(factory_job.job_id)
+
+    assert action.kind is FactoryActionKind.SUBMIT_FORGE_JOB
+    assert len(forge.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_captain_transition_is_not_dispatched_externally() -> None:
+    coordinator = FactoryCoordinator(InMemoryFactoryRepository())
+    factory_job = job()
+    coordinator.register(factory_job)
+    hermes, forge = Hermes(), Forge()
+
+    with pytest.raises(FactoryDispatchError, match="Captain state transition"):
+        await FactoryDispatcher(coordinator=coordinator, hermes=hermes, forge=forge).dispatch_next(factory_job.job_id)
