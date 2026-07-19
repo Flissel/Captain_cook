@@ -55,7 +55,7 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
   Captain-finalisiert den Lauf.
 - [x] Persistierte Provider-Call-Reservierungen, Resume-/Restart-Grenzen,
   Fehlerterminalisierung und sichere CLI-Evidenz implementiert.
-- [x] Vollständiger non-live Branch-Gate nachgewiesen: `893 passed, 78 skipped,
+- [x] Vollständiger non-live Branch-Gate nachgewiesen: `894 passed, 78 skipped,
   16 deselected`, Coverage 81,23 % (`python -m pytest -q`, 2026-07-19).
 - [x] Reale LLM-Evaluierung mit kanonischer AgentFarm-Eingabe bis zu einem
   `accepted`-Manifest geführt: `gpt-5.6-sol`, vier Provider-Aufrufe, 4.825
