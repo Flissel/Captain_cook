@@ -49,6 +49,28 @@ services:
       timeout: 5s
       retries: 10
 
+  mcp-broker:
+    profiles: ["mcp-broker"]
+    build:
+      context: .
+      dockerfile: Dockerfile.captain-mcp-broker
+    restart: unless-stopped
+    depends_on:
+      n8n:
+        condition: service_healthy
+    environment:
+      - CAPTAIN_N8N_MCP_BROKER_PORT=5680
+      - CAPTAIN_N8N_MCP_BROKER_URL=${CAPTAIN_N8N_MCP_BROKER_URL:-http://127.0.0.1:5680}
+      - CAPTAIN_MCP_BROKER_UPSTREAM_URL=http://n8n:5678/mcp-server/http
+      - CAPTAIN_N8N_MCP_TOKEN=${CAPTAIN_N8N_MCP_TOKEN:-}
+      - CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET=${CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET:-}
+      - CAPTAIN_GATEWAY_URL=${CAPTAIN_GATEWAY_URL:-}
+      - CAPTAIN_GATEWAY_TOKEN=${CAPTAIN_GATEWAY_TOKEN:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:${CAPTAIN_N8N_MCP_BROKER_PORT:-5680}:5680"
+
 volumes:
   captain_n8n_postgres_data: {}
   captain_n8n_data: {}

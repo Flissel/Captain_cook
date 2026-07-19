@@ -25,7 +25,9 @@ $AllowedEnvironmentKeys = @(
     "CAPTAIN_N8N_POSTGRES_DB",
     "CAPTAIN_N8N_OWNER_PASSWORD",
     "CAPTAIN_N8N_API_KEY",
-    "CAPTAIN_N8N_MCP_TOKEN"
+    "CAPTAIN_N8N_MCP_TOKEN",
+    "CAPTAIN_N8N_MCP_BROKER_URL",
+    "CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET"
 )
 
 function Assert-LocalContractFiles {
@@ -224,6 +226,12 @@ function Initialize-CaptainEnvironment {
     }
     if (-not $values.ContainsKey("CAPTAIN_N8N_OWNER_PASSWORD") -or [string]::IsNullOrWhiteSpace($values["CAPTAIN_N8N_OWNER_PASSWORD"])) {
         Set-EnvValue -Name "CAPTAIN_N8N_OWNER_PASSWORD" -Value ("A1" + (New-RandomSecret -ByteCount 30))
+    }
+    if (-not $values.ContainsKey("CAPTAIN_N8N_MCP_BROKER_URL") -or [string]::IsNullOrWhiteSpace($values["CAPTAIN_N8N_MCP_BROKER_URL"])) {
+        Set-EnvValue -Name "CAPTAIN_N8N_MCP_BROKER_URL" -Value "http://127.0.0.1:5680"
+    }
+    if (-not $values.ContainsKey("CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET") -or [string]::IsNullOrWhiteSpace($values["CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET"])) {
+        Set-EnvValue -Name "CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET" -Value (New-RandomSecret -ByteCount 32)
     }
 }
 
