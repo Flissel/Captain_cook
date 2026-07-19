@@ -43,9 +43,17 @@ class MinibookForgePort(Protocol):
         """Submit only; Forge must later post an immutable evidence block."""
 
 
+class FactoryCandidateValidationPort(Protocol):
+    """Evaluate the sealed generated candidate in an isolated workspace."""
+
+    async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
+        """Return build, real-case, or quality evidence for the leased role."""
+
+
 _ROLE_ACTIONS: dict[FactoryActionKind, FactoryRole] = {
     FactoryActionKind.DISPATCH_AGENT_ARCHITECT: FactoryRole.AGENT_ARCHITECT,
     FactoryActionKind.DISPATCH_TOOL_INTEGRATOR: FactoryRole.TOOL_INTEGRATOR,
+    FactoryActionKind.DISPATCH_BUILD_VALIDATOR: FactoryRole.TOOL_INTEGRATOR,
     FactoryActionKind.DISPATCH_REAL_CASE_TESTER: FactoryRole.REAL_CASE_TESTER,
     FactoryActionKind.DISPATCH_QUALITY_WARDEN: FactoryRole.QUALITY_WARDEN,
 }
@@ -60,12 +68,14 @@ class FactoryDispatcher:
         coordinator: FactoryCoordinator,
         hermes: HermesFactoryPort,
         forge: MinibookForgePort,
+        candidate_validator: FactoryCandidateValidationPort | None = None,
         leases: FactoryLeasePort,
         clock: FactoryClock,
     ) -> None:
         self._coordinator = coordinator
         self._hermes = hermes
         self._forge = forge
+        self._candidate_validator = candidate_validator
         self._leases = leases
         self._clock = clock
 
@@ -74,14 +84,27 @@ class FactoryDispatcher:
         job = self._coordinator.projection(job_id).job
         if action.kind in _ROLE_ACTIONS:
             role = _ROLE_ACTIONS[action.kind]
-            evidence = await self._hermes.dispatch(
-                FactoryDispatch(
-                    job=job,
-                    action=action,
-                    role=role,
-                    lease=self._leases.active(job, role, action.attempt, self._clock.now()),
-                )
+            request = FactoryDispatch(
+                job=job,
+                action=action,
+                role=role,
+                lease=self._leases.active(job, role, action.attempt, self._clock.now()),
             )
+            if action.kind is FactoryActionKind.DISPATCH_BUILD_VALIDATOR:
+                if self._candidate_validator is None:
+                    raise FactoryDispatchError("candidate build validator is not configured")
+                evidence = await self._candidate_validator.dispatch(request)
+            elif (
+                action.kind
+                in {
+                    FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
+                    FactoryActionKind.DISPATCH_QUALITY_WARDEN,
+                }
+                and self._candidate_validator is not None
+            ):
+                evidence = await self._candidate_validator.dispatch(request)
+            else:
+                evidence = await self._hermes.dispatch(request)
             self._coordinator.record(evidence)
             return action
         if action.kind is FactoryActionKind.SUBMIT_FORGE_JOB:
