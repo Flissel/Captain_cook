@@ -119,8 +119,14 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
   Artifacts/Gatewaydaten prüfen: keine doppelte Provider-Reservierung,
   Freigabe oder Ledger-Transition. Der deterministische Control-Plane-
   Restart-Gate ist grün (`tests/integration/test_agent_runtime_control_plane.py`,
-  `8 passed`, 2026-07-19), beweist aber noch keine vollständige Gateway- und
-  Provider-übergreifende Live-Wiederaufnahme.
+  `8 passed`, 2026-07-19). Zusätzlich startet der Live-Gate nach einem echten
+  Neustart des temporären FastAPI/MariaDB-Gateways einen frischen Supervisor;
+  die persistierte Session wird vor jedem Provider-Start wiedergefunden,
+  erzeugt keinen zweiten Provider-Runner und endet fail-closed als
+  `EVIDENCE_UNRESOLVED` (`6447355`; gemeinsam mit Broker-Gate `2 passed in
+  11,06 s`, 2026-07-19). Offen bleibt die vollständige Wiederaufnahme eines
+  bereits laufenden externen Provider-Prozesses inklusive unveränderter
+  Artifact-/Release-/Ledger-Transitions.
 - [ ] Gesamt-Readiness prüfen: vollständiger non-live Gate, explizite
   Live-Gates, Architektur-/Importgrenzen, Demo-Evidenz und branch-sichere
   main-Integration. Aktuell: `872 passed, 79 skipped, 7 deselected`
