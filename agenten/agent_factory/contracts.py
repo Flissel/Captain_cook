@@ -181,6 +181,8 @@ class FactoryEvidenceBlock(_FrozenContract):
                 raise ValueError(f"{self.phase.value} requires {expected_role.value.title().replace('_', '')}")
             if self.lease_id is None:
                 raise ValueError(f"{self.phase.value} requires a lease")
+            if not self.evidence_refs:
+                raise ValueError(f"{self.phase.value} requires verifiable evidence")
         elif self.phase in _CAPTAIN_PHASES:
             if self.producer != "captain":
                 raise ValueError(f"{self.phase.value} requires Captain authority")

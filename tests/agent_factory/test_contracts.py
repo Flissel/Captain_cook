@@ -109,6 +109,11 @@ def test_evidence_block_binds_phase_role_and_lease() -> None:
         FactoryEvidenceBlock.model_validate(block_payload(lease_id=None))
 
 
+def test_hermes_role_block_requires_verifiable_evidence() -> None:
+    with pytest.raises(ValidationError, match="evidence"):
+        FactoryEvidenceBlock.model_validate(block_payload(evidence_refs=[]))
+
+
 def test_promotion_is_captain_only_and_requires_complete_evidence() -> None:
     with pytest.raises(ValidationError, match="Captain"):
         FactoryEvidenceBlock.model_validate(

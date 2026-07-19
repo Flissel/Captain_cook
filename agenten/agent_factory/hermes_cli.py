@@ -70,7 +70,13 @@ def _prompt_for(request: FactoryDispatch, skill_path: Path) -> str:
         "role": request.role.value,
         "status": "succeeded",
         "artifact_refs": [],
-        "evidence_refs": [],
+        "evidence_refs": [
+            {
+                "uri": "artifact://factory/replace-with-real-evidence",
+                "sha256": "replace-with-sha256-of-real-evidence",
+                "media_type": "application/json",
+            }
+        ],
         "assertion_ids": [],
         "lease_id": request.lease.lease_id,
     }
@@ -89,7 +95,8 @@ def _prompt_for(request: FactoryDispatch, skill_path: Path) -> str:
             f"required_capability={request.job.required_capability}",
             f"acceptance_assertion_ids={','.join(request.job.acceptance_assertion_ids)}",
             "Return exactly one JSON object and no markdown or prose.",
-            "Use this exact evidence envelope; replace only event_id with a new UUID and occurred_at with the actual UTC time.",
+            "Use this exact evidence envelope; replace event_id, occurred_at, and evidence_refs with actual values.",
+            "Every role block needs at least one real evidence_ref. Create and hash the evidence before returning; never claim success with a placeholder.",
             json.dumps(response_shape, separators=(",", ":")),
         )
     )
