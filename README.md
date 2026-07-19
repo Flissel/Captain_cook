@@ -2,7 +2,12 @@
 
 **Captain Cook is an auditable agent-work orchestrator:** it decomposes an engineering problem, gates proposed work against a constitution, routes accepted tasks to workers, and records the lifecycle in a local ledger.
 
-This repository contains a working, offline vertical slice for the OpenAI Build Week **Developer Tools** track. It is intentionally honest about the boundary: the deterministic orchestration demo works today; the larger Captain → Hermes → Codex delivery fleet is a documented roadmap, not a claim about the current runtime.
+This repository contains an auditable offline vertical slice and bounded live
+Captain delivery gates for the OpenAI Build Week **Developer Tools** track.
+The deterministic demo remains a separate, credential-free evidence path;
+Gateway-fenced Codex delivery, n8n capability leases, restart recovery and the
+Captain LLM planning evaluation are independently live-tested. Remaining
+operational limits are documented under [Runtime boundary](#runtime-boundary).
 
 ## Einfache Einrichtung unter Windows 11
 

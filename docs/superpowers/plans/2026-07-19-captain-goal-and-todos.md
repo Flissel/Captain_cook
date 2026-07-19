@@ -1,6 +1,6 @@
 # Captain Zielbild und verbindliche TODOs
 
-**Status:** aktiv  
+**Status:** abgeschlossen, evidenzgeprüft am 2026-07-19  
 **Owner:** Captain Core  
 **Source of truth:** Captain-validierte, versionierte Zustände und Evidence im
 Gateway/Ledger. AutoGen, Hermes, Codex, Minibook und n8n sind begrenzte
