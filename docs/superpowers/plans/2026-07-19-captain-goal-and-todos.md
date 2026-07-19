@@ -99,13 +99,17 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
 - [ ] Einen echten LLM-/MCP-Run während eines Captain-Lease-Widerrufs live
   abbrechen und nachweisen, dass keine spätere Tool- oder Resultat-Evidenz
   den persistierten Abbruch überschreibt.
-- [ ] Den statischen n8n-MCP-Instanzschlüssel durch einen Captain-eigenen,
+- [x] Den statischen n8n-MCP-Instanzschlüssel durch einen Captain-eigenen,
   kurzlebigen Lease-Broker/Proxy ersetzen. Eine Rotation des jetzigen
   instanzweiten Schlüssels wäre kein sicherer Einzelwiderruf, weil sie
-  parallele, rechtmäßige Runs ebenfalls unterbrechen würde.
-  Der Token-/Proxy-/Referenzkern ist vorhanden (`c469caa`, `1f8a902`,
-  `cdcb48b`); offen sind die isolierte Compose-Laufzeit, Gateway-Reader und
-  der echte Live-Gate.
+  parallele, rechtmäßige Runs ebenfalls unterbrechen würde. Token-, Proxy- und
+  Referenzkern (`c469caa`, `1f8a902`, `cdcb48b`), isolierte Compose-Laufzeit
+  und Gateway-Reader sind verbunden. Der echte Gate
+  `tests/live/test_n8n_mcp_broker_live.py` erzeugt ein temporäres MariaDB- und
+  Gateway-Paar, entdeckt n8n-MCP einmal über den Broker und erhält nach einem
+  persistierten Gateway-Widerruf mit demselben Lease-Token HTTP 403
+  (`6582e93`; `1 passed in 7,56 s`, 2026-07-19). Der Broker wird ausschließlich
+  gestoppt; Builder-n8n, VibeMind und Volumes bleiben unverändert.
 - [x] Aktive Codex-Sessions nach einem Neustart fail-closed einzäunen
   (`0661ca4`): der Gateway-Event-Append liefert jetzt auch seinen
   Replay-Status; bei einer schon aktiven Session startet der Supervisor keinen
@@ -121,9 +125,11 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
   Live-Gates, Architektur-/Importgrenzen, Demo-Evidenz und branch-sichere
   main-Integration. Aktuell: `872 passed, 79 skipped, 7 deselected`
   (`python -m pytest -q --no-cov -m "not live"`, 2026-07-19) sowie
-  erfolgreiche Builder-, Gate-A- und n8n-MCP-Live-Gates. Die 79 ausgelassenen
-  Tests benötigen überwiegend eine separat konfigurierte MariaDB; sie sind
-  kein Ersatz für die separat grüne Gateway-Teilmenge oder die Live-Nachweise.
+  erfolgreiche Builder-, Gate-A-, n8n-MCP- und Broker-Revocation-Live-Gates.
+  Der aktuelle isolierte Gateway-Runner lief mit `956 passed, 1 skipped,
+  8 deselected`; der eine Skip ist der absichtlich nicht in-process testbare
+  No-AutoGen-Degradationspfad. Skips ersetzen weder eine separat grüne
+  Gateway-Teilmenge noch die Live-Nachweise.
 
 ## Pflege-Regel
 
