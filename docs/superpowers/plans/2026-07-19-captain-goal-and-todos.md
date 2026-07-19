@@ -143,13 +143,15 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
   diesen Pass vor den abhängigen Diensten aus. Die CLI-/Start-Verträge sind mit
   `15 passed` geprüft (2026-07-19); die Konfiguration erzeugt lokale
   Gateway-Tokens und eine loopback-DSN nur in der gitignorierten `.env`.
-- [ ] Einen lokalen Codex-Worker-Recovery-Director an den Startpfad binden,
-  der die zu einer aktiven Session gehörende, verifizierte Prozessidentität
-  sicher findet, den Baum terminalisiert oder als verloren beweist und erst
-  dann den bereits vorhandenen Captain-Requeue auslöst. Solange eine solche
-  host-lokale Evidenz nicht vorhanden ist, bleibt der Batch bewusst
-  `deferred`; das ist korrektes Fail-Closed-Verhalten, aber keine vollständige
-  automatische Worker-Recovery.
+- [x] Einen lokalen Codex-Worker-Recovery-Director an `recover-gateway`
+  gebunden (`fc2c575`): Captain liest aktive Session-Traces, prüft die
+  host-lokale `<session-id>.json`-Prozessidentität, beendet nur eine exakt
+  passende Prozess-Instanz oder zeichnet einen belegten verlorenen Prozess als
+  `lost_process` terminal auf. Fehlende oder widersprüchliche Identität bleibt
+  bewusst `deferred`; erst nach Terminal-Evidenz darf der Requeue erfolgen.
+- [ ] Den neuen Startpfad mit einem echten PowerShell-Codex-Kindprozess und
+  Gateway-Neustart live beweisen; die bisherigen gezielten Unit-Gates decken
+  den Director-Vertrag ab (`14 passed`), ersetzen aber keinen Live-Gate.
 - [x] Gesamt-Readiness prüfen: vollständiger non-live Gate, explizite
   Live-Gates, Architektur-/Importgrenzen, Demo-Evidenz und branch-sichere
   main-Integration. Aktuell: `986 passed, 79 skipped, 14 deselected`
