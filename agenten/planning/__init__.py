@@ -25,6 +25,12 @@ from .run_models import (
 )
 from .run_store import CaptainRunStore, CaptainRunStoreError, JsonCaptainRunStore
 from .policy import PlanningPolicy, PlanningPolicyError
+from .evaluation_bridge import (
+    EvaluationBridgeError,
+    EvaluationBridgePolicy,
+    compile_accepted_evaluation,
+    release_accepted_evaluation,
+)
 
 __all__ = [
     "AlignmentError",
@@ -52,6 +58,10 @@ __all__ = [
     "JsonDirectoryReleaseClient",
     "PlanningPolicy",
     "PlanningPolicyError",
+    "EvaluationBridgeError",
+    "EvaluationBridgePolicy",
+    "compile_accepted_evaluation",
+    "release_accepted_evaluation",
     "ReleaseConflictError",
     "CaptainRunConflictError",
     "CaptainRunState",
