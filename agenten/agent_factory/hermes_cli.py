@@ -1,0 +1,74 @@
+"""Concrete non-interactive Hermes CLI adapter for Captain factory roles."""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from pathlib import Path
+
+from agenten.agent_factory.contracts import FactoryEvidenceBlock
+from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError, HermesFactoryPort
+
+
+@dataclass(frozen=True)
+class HermesCliSettings:
+    executable: str = "hermes"
+    skill_path: Path = Path("agenten/agent_factory/skills/autogen-agent-factory")
+    timeout_seconds: int = 900
+
+
+class HermesCliFactory(HermesFactoryPort):
+    """Run one hermetic Hermes query and accept only a typed evidence response."""
+
+    def __init__(self, settings: HermesCliSettings = HermesCliSettings()) -> None:
+        self._settings = settings
+
+    async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
+        if request.role is None or request.lease is None:
+            raise FactoryDispatchError("Hermes factory dispatch requires a role and active lease")
+        prompt = _prompt_for(request, self._settings.skill_path)
+        try:
+            process = await asyncio.create_subprocess_exec(
+                self._settings.executable,
+                "chat",
+                "-q",
+                prompt,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=self._settings.timeout_seconds
+            )
+        except FileNotFoundError as exc:
+            raise FactoryDispatchError("Hermes CLI executable is not available") from exc
+        except TimeoutError as exc:
+            raise FactoryDispatchError("Hermes factory role timed out") from exc
+        if process.returncode != 0:
+            detail = stderr.decode("utf-8", errors="replace").strip()
+            raise FactoryDispatchError(f"Hermes factory role failed: {detail[:500]}")
+        try:
+            return FactoryEvidenceBlock.model_validate_json(stdout.decode("utf-8"))
+        except ValueError as exc:
+            raise FactoryDispatchError("Hermes must return exactly one factory evidence JSON object") from exc
+
+
+def _prompt_for(request: FactoryDispatch, skill_path: Path) -> str:
+    assert request.role is not None
+    assert request.lease is not None
+    return "\n".join(
+        (
+            f"Use the skill at {skill_path.as_posix()}.",
+            "You are a leased Hermes factory role. Do not write Captain's ledger directly.",
+            f"job_id={request.job.job_id}",
+            f"correlation_id={request.job.correlation_id}",
+            f"subject_version={request.job.subject_version}",
+            f"attempt={request.action.attempt}",
+            f"role={request.role.value}",
+            f"lease_id={request.lease.lease_id}",
+            f"workspace_ref={request.lease.workspace_ref}",
+            f"input_ref={request.job.input_ref.uri}",
+            f"required_capability={request.job.required_capability}",
+            f"acceptance_assertion_ids={','.join(request.job.acceptance_assertion_ids)}",
+            "Return exactly one JSON object conforming to captain.agent-factory-block.v1; no markdown or prose.",
+        )
+    )

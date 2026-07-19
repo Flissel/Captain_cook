@@ -15,8 +15,9 @@ class Hermes:
     def __init__(self) -> None:
         self.requests = []
 
-    async def dispatch(self, request: object) -> None:
+    async def dispatch(self, request: object):
         self.requests.append(request)
+        return block(FactoryPhase.BLUEPRINT_CREATED)
 
 
 class Forge:
@@ -67,6 +68,7 @@ async def test_dispatches_architect_only_after_captain_forge_request() -> None:
     assert action.kind is FactoryActionKind.DISPATCH_AGENT_ARCHITECT
     assert hermes.requests[0].role is FactoryRole.AGENT_ARCHITECT
     assert hermes.requests[0].lease is not None
+    assert coordinator.projection(factory_job.job_id).phase is FactoryPhase.BLUEPRINT_CREATED
     assert forge.requests == []
 
 

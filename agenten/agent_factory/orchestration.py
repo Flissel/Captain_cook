@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
-from agenten.agent_factory.contracts import AgentFactoryJob, FactoryLease, FactoryRole
+from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease, FactoryRole
 from agenten.agent_factory.leases import FactoryLeasePort
 from agenten.agent_factory.service import FactoryCoordinator
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
@@ -32,8 +32,8 @@ class FactoryClock(Protocol):
 class HermesFactoryPort(Protocol):
     """Execute one role step and return evidence through the gateway separately."""
 
-    async def dispatch(self, request: FactoryDispatch) -> None:
-        """Start the leased Hermes role action without bypassing Captain evidence."""
+    async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
+        """Run one leased Hermes role and return its untrusted evidence payload."""
 
 
 class MinibookForgePort(Protocol):
@@ -74,7 +74,7 @@ class FactoryDispatcher:
         job = self._coordinator.projection(job_id).job
         if action.kind in _ROLE_ACTIONS:
             role = _ROLE_ACTIONS[action.kind]
-            await self._hermes.dispatch(
+            evidence = await self._hermes.dispatch(
                 FactoryDispatch(
                     job=job,
                     action=action,
@@ -82,6 +82,7 @@ class FactoryDispatcher:
                     lease=self._leases.active(job, role, action.attempt, self._clock.now()),
                 )
             )
+            self._coordinator.record(evidence)
             return action
         if action.kind is FactoryActionKind.SUBMIT_FORGE_JOB:
             await self._forge.submit(FactoryDispatch(job=job, action=action, role=None, lease=None))
