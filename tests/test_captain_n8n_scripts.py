@@ -228,6 +228,13 @@ def test_verifier_is_project_scoped_and_uses_authenticated_harmless_read() -> No
     assert "Write-Output $ApiKey" not in source
 
 
+def test_verifier_preserves_docker_go_template_label_quotes_on_windows() -> None:
+    for script_name in ("captain-n8n.ps1", "verify_captain_n8n.ps1"):
+        source = (ROOT / "scripts" / script_name).read_text(encoding="utf-8")
+
+        assert '\\"com.docker.compose.service\\"' in source
+
+
 def test_readme_documents_only_captain_builder_lifecycle() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 

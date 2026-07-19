@@ -270,7 +270,7 @@ function Assert-CaptainInventory {
 
     $services = @()
     foreach ($id in $ids) {
-        $service = & docker inspect --format '{{ index .Config.Labels "com.docker.compose.service" }}' $id 2>&1
+        $service = & docker inspect --format '{{ index .Config.Labels \"com.docker.compose.service\" }}' $id 2>&1
         if ($LASTEXITCODE -ne 0) {
             throw "Could not validate a Captain n8n project container."
         }
