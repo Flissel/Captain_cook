@@ -212,8 +212,15 @@ async def test_gate_a_real_codex_n8n_gateway_trace(
         pytest.skip("Gate A prerequisite missing: official Codex CLI native binary")
 
     unique = uuid4().hex
-    project_id = f"gate-a-{unique[:12]}"
-    run_id = f"run-{unique[:20]}"
+    project_id = os.environ.get("CAPTAIN_GATE_A_PROJECT_ID", f"gate-a-{unique[:12]}")
+    run_id = os.environ.get("CAPTAIN_GATE_A_RUN_ID", f"run-{unique[:20]}")
+    run_index_raw = os.environ.get("CAPTAIN_GATE_A_RUN_INDEX", "1")
+    try:
+        run_index = int(run_index_raw)
+    except ValueError:
+        pytest.fail("CAPTAIN_GATE_A_RUN_INDEX must be a positive integer")
+    if run_index < 1:
+        pytest.fail("CAPTAIN_GATE_A_RUN_INDEX must be a positive integer")
     trace_id = f"trace-{unique[:20]}"
     batch_id = f"gate-a-{unique[:20]}"
     worker_id = f"worker-{unique[:12]}"
@@ -551,7 +558,7 @@ async def test_gate_a_real_codex_n8n_gateway_trace(
                         "payload": {
                             "event_type": "e2e_run",
                             "e2e_run_id": f"e2e-{unique[:16]}",
-                            "run_index": 1,
+                            "run_index": run_index,
                             "clean": True,
                             "trace_complete": True,
                             "evidence_refs": [

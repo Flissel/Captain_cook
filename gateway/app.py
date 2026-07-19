@@ -79,6 +79,12 @@ class LegacyDeliveryImportRequest(BaseModel):
     data: dict[str, Any]
 
 
+class ReleaseDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    policy_version: str = Field(min_length=1, max_length=128)
+
+
 CAPTAIN_WRITE_BLOCK_TYPES = frozenset(
     {"problem", "work_batch", "holdout", "recovery_decision", "review_decision"}
 )
@@ -335,6 +341,20 @@ def create_app(
         _: GatewayRole = Depends(require_reader),
     ) -> ReleaseProjection:
         return get_store().release_projection(project_id=project_id, run_id=run_id)
+
+    @app.post("/v1/projects/{project_id}/runs/{run_id}/release/decision")
+    async def record_release_decision(
+        project_id: str,
+        run_id: str,
+        request: ReleaseDecisionRequest,
+        _: GatewayRole = Depends(require_captain),
+    ) -> DeliveryEventEnvelope:
+        decision, _readiness = get_store().record_release_decision(
+            project_id=project_id,
+            run_id=run_id,
+            policy_version=request.policy_version,
+        )
+        return decision
 
     @app.get("/v1/projects/{project_id}/runs/{run_id}/holdouts/{case_id}")
     async def delivery_holdout_case(

@@ -256,6 +256,29 @@ class GatewayDeliveryClient:
                 "read delivery events returned an invalid response"
             ) from None
 
+    async def record_release_decision(
+        self,
+        *,
+        project_id: str,
+        run_id: str,
+        policy_version: str,
+    ) -> DeliveryEventEnvelope:
+        response = await self._request(
+            "POST",
+            (
+                f"/v1/projects/{quote(project_id, safe='')}/runs/"
+                f"{quote(run_id, safe='')}/release/decision"
+            ),
+            operation="record Captain release decision",
+            json={"policy_version": policy_version},
+        )
+        self._require_status(response, {200}, operation="record Captain release decision")
+        return self._validate(
+            DeliveryEventEnvelope,
+            response,
+            operation="record Captain release decision",
+        )
+
     async def get_batch(self, batch_id: str) -> GatewayBatchProjection:
         response = await self._request(
             "GET",

@@ -179,8 +179,18 @@ class N8nHttpClient:
             raise N8nTargetError("n8n provider request failed") from None
 
 class N8nTarget:
-    def __init__(self, client: N8nClient) -> None:
+    def __init__(
+        self,
+        client: N8nClient,
+        *,
+        evidence_attempts: int = 10,
+        evidence_delay_seconds: float = 0.1,
+    ) -> None:
+        if evidence_attempts < 1 or evidence_delay_seconds < 0:
+            raise ValueError("n8n evidence polling configuration is invalid")
         self._client = client
+        self._evidence_attempts = evidence_attempts
+        self._evidence_delay_seconds = evidence_delay_seconds
 
     async def deploy(self, artifact: SealedArtifact) -> N8nDeployment:
         forbidden_identity = {"name", "id", "workflowId", "webhookId", "webhook_path"}
@@ -209,10 +219,25 @@ class N8nTarget:
     async def execute(self, deployment: N8nDeployment, case: ValidationCase) -> N8nExecutionEvidence:
         payload = {"artifact_digest": deployment.artifact_digest, "correlation_id": case.correlation_id, "case_id": case.case_id, "input": case.input_payload}
         started = await self._client.execute_webhook(deployment.webhook_path, payload)
-        record = await self._client.fetch_execution(started.execution_id)
-        if (record.execution_id != started.execution_id or record.workflow_id != deployment.workflow_id or record.status != "success" or record.output.get("artifact_digest") != deployment.artifact_digest or record.output.get("correlation_id") != case.correlation_id):
-            raise N8nEvidenceError("n8n did not return matching execution evidence")
-        return N8nExecutionEvidence(execution_id=record.execution_id, workflow_id=record.workflow_id, artifact_digest=deployment.artifact_digest, correlation_id=case.correlation_id, status="success")
+        for attempt in range(self._evidence_attempts):
+            record = await self._client.fetch_execution(started.execution_id)
+            if (
+                record.execution_id == started.execution_id
+                and record.workflow_id == deployment.workflow_id
+                and record.status == "success"
+                and record.output.get("artifact_digest") == deployment.artifact_digest
+                and record.output.get("correlation_id") == case.correlation_id
+            ):
+                return N8nExecutionEvidence(
+                    execution_id=record.execution_id,
+                    workflow_id=record.workflow_id,
+                    artifact_digest=deployment.artifact_digest,
+                    correlation_id=case.correlation_id,
+                    status="success",
+                )
+            if attempt + 1 < self._evidence_attempts:
+                await asyncio.sleep(self._evidence_delay_seconds)
+        raise N8nEvidenceError("n8n did not return matching execution evidence")
 
     @classmethod
     def _replace_webhook_placeholder(cls, value: Any, webhook_path: str) -> None:

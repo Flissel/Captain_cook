@@ -8,7 +8,7 @@ import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Protocol, TypeVar
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import HTTPException
 from pydantic import ValidationError
@@ -44,6 +44,7 @@ from gateway.contracts import (
     project_batch,
     project_release,
 )
+from gateway.release_policy import ReleaseReadiness, evaluate_release_readiness
 
 
 CAPTAIN_BLOCK_TYPES = frozenset({"problem", "work_batch", "holdout"})
@@ -727,6 +728,58 @@ class GatewayStore:
 
     def release_projection(self, *, project_id: str, run_id: str) -> ReleaseProjection:
         return project_release(self.delivery_events(project_id=project_id, run_id=run_id))
+
+    def record_release_decision(
+        self,
+        *,
+        project_id: str,
+        run_id: str,
+        policy_version: str,
+    ) -> tuple[DeliveryEventEnvelope, ReleaseReadiness]:
+        """Persist the Captain-only release decision after a fail-closed audit."""
+
+        events = self.delivery_events(project_id=project_id, run_id=run_id)
+        readiness = evaluate_release_readiness(events)
+        decision = "accepted" if readiness.ready else "rejected"
+        for event in events:
+            if (
+                event.event_type == "release_decision"
+                and event.payload.policy_version == policy_version
+                and event.payload.decision == decision
+            ):
+                return event, readiness
+
+        reasons = (
+            ("three_complete_provider_backed_e2e_runs",)
+            if readiness.ready
+            else readiness.reasons
+        )
+        event = DeliveryEventEnvelope.model_validate(
+            {
+                "event_id": uuid5(
+                    NAMESPACE_URL,
+                    (
+                        "captain-release-decision:"
+                        f"{project_id}:{run_id}:{policy_version}:{decision}"
+                    ),
+                ),
+                "event_type": "release_decision",
+                "occurred_at": _utcnow(),
+                "actor": "captain-gateway",
+                "trace": {
+                    "project_id": project_id,
+                    "run_id": run_id,
+                    "trace_id": f"release:{policy_version}",
+                },
+                "payload": {
+                    "event_type": "release_decision",
+                    "decision": decision,
+                    "policy_version": policy_version,
+                    "reasons": reasons,
+                },
+            }
+        )
+        return self.append_delivery_event(event).event, readiness
 
     def delivery_holdout_case(
         self,
