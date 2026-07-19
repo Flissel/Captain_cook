@@ -1,0 +1,4 @@
+interface:
+  display_name: "AutoGen Agent Factory"
+  short_description: "Build and validate a Captain-approved AutoGen agent team"
+  default_prompt: "Build a Captain-authorized AutoGen agent team, validate it, and emit lifecycle evidence."
