@@ -24,6 +24,7 @@ from agenten.planning.evaluation_bridge import (
 from agenten.planning.captain_pipeline import CaptainPipeline
 from agenten.planning.run_models import CaptainRunConflictError
 from agenten.planning.run_store import JsonCaptainRunStore
+from agenten.evaluation.release_cli import async_main as release_cli_main
 
 
 def _source() -> EvaluationSource:
@@ -191,3 +192,27 @@ async def test_release_checkpoints_accepted_evaluation_without_duplicate_gateway
     changed = manifest.model_copy(update={"token_total": 1})
     with pytest.raises(CaptainRunConflictError, match="different project"):
         await release_accepted_evaluation(changed, policy=_policy(), pipeline=pipeline, run_id="evaluation-001")
+
+
+@pytest.mark.asyncio
+async def test_release_cli_publishes_an_accepted_manifest_without_llm_calls(tmp_path, capsys) -> None:
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(_manifest(_accepted("foundation")).model_dump_json(), encoding="utf-8")
+
+    exit_code = await release_cli_main(
+        [
+            str(manifest_path),
+            "--capability",
+            "codex-cli",
+            "--run-id",
+            "evaluation-001",
+            "--output",
+            str(tmp_path / "release"),
+            "--run-dir",
+            str(tmp_path / "runs"),
+        ]
+    )
+
+    assert exit_code == 0
+    assert '"status": "released"' in capsys.readouterr().out
+    assert len(list((tmp_path / "release" / "batches").glob("*.json"))) == 1
