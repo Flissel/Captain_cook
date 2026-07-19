@@ -29,6 +29,15 @@ from agenten.agent_runtime.contracts import (
 )
 from agenten.agent_runtime.gateway_client import GatewayRuntimeClient
 from agenten.agent_runtime.n8n_mcp_broker import McpLeaseIssuer
+from agenten.delivery.codex_runs import GatewayCodexRunRepository
+from agenten.delivery.gateway_client import GatewayDeliveryClient
+from agenten.execution.codex_policy import AuthorizedCodexRun, FrozenEnvironment
+from agenten.execution.codex_supervisor import (
+    CodexRunRequest,
+    CodexRunResult,
+    CodexSupervisor,
+)
+from agenten.execution.process import PackageExecutionStatus
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -135,13 +144,19 @@ def _grant(command: AgentRuntimeCommand, now: datetime) -> CapabilityGrant:
     )
 
 
-def _start_gateway(*, dsn: str, token: str, port: int) -> subprocess.Popen[bytes]:
+def _start_gateway(
+    *,
+    dsn: str,
+    token: str,
+    port: int,
+    worker_token: str | None = None,
+) -> subprocess.Popen[bytes]:
     environment = os.environ.copy()
     environment.update(
         {
             "LEDGER_DSN": dsn,
             "CAPTAIN_GATEWAY_TOKEN": token,
-            "WORKER_GATEWAY_TOKEN": secrets.token_urlsafe(32),
+            "WORKER_GATEWAY_TOKEN": worker_token or secrets.token_urlsafe(32),
             "GATEWAY_PORT": str(port),
         }
     )
@@ -379,3 +394,155 @@ async def test_captain_mcp_broker_revocation_is_enforced_by_live_gateway(
         except subprocess.TimeoutExpired:
             gateway_process.kill()
             gateway_process.wait(timeout=15)
+
+
+class _RestartPolicy:
+    """Authorize a request only to prove the persisted session blocks a runner."""
+
+    def authorize(self, request: CodexRunRequest) -> AuthorizedCodexRun:
+        return AuthorizedCodexRun(
+            workspace=request.workspace.resolve(),
+            command=request.command,
+            environment=FrozenEnvironment({}),
+        )
+
+
+class _RunnerThatMustNotStart:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
+        del authorized
+        self.calls += 1
+        raise AssertionError("Gateway recovery started a duplicate Codex provider run")
+
+
+class _UnusedLegacyEvidenceWriter:
+    def __getattr__(self, name: str) -> object:
+        raise AssertionError(f"legacy evidence writer used during recovery: {name}")
+
+
+@pytest.mark.asyncio
+async def test_gateway_restart_fences_an_active_codex_session_before_provider_start(
+    tmp_path: Path,
+) -> None:
+    """A new supervisor process must not duplicate a Gateway-persisted session."""
+
+    dsn = os.environ.get("TEST_MARIADB_DSN", "").strip()
+    if not dsn:
+        pytest.fail("required live gate: TEST_MARIADB_DSN is unavailable")
+    unique = uuid4().hex[:16]
+    batch_id = f"restart-{unique}"
+    worker_id = f"worker-{unique[:12]}"
+    project_id = f"project-{unique}"
+    run_id = f"run-{unique}"
+    gateway_token = secrets.token_urlsafe(32)
+    worker_token = secrets.token_urlsafe(32)
+    gateway_port = _free_port()
+    gateway_base = f"http://127.0.0.1:{gateway_port}"
+    process = _start_gateway(
+        dsn=dsn,
+        token=gateway_token,
+        worker_token=worker_token,
+        port=gateway_port,
+    )
+    try:
+        await _wait_for_gateway(gateway_base)
+        async with httpx.AsyncClient(timeout=20) as http:
+            batch = {
+                "batch_id": batch_id,
+                "title": "Gateway restart session fence",
+                "goal": "Prove an active Codex session is never launched twice",
+                "subtask_ids": [f"subtask-{unique}"],
+                "target": "codex",
+                "capability_tags": ["code-builder"],
+                "depends_on": [],
+                "constraints": [],
+                "acceptance_criteria": [
+                    {
+                        "assertion_id": "no-duplicate-provider",
+                        "kind": "status_equals",
+                        "expected": "succeeded",
+                    }
+                ],
+                "golden_cases": [],
+            }
+            created = await http.post(
+                f"{gateway_base}/blocks",
+                headers={"Authorization": f"Bearer {gateway_token}"},
+                json={"block_type": "work_batch", "status": "pending", "data": batch},
+            )
+            assert created.status_code in {200, 201}, "Gateway rejected the recovery batch"
+            delivery = GatewayDeliveryClient(gateway_base, worker_token, http)
+            claim = await delivery.claim(batch_id)
+            request = CodexRunRequest(
+                project_id=project_id,
+                run_id=run_id,
+                trace_id=f"trace-{unique}",
+                batch_id=batch_id,
+                worker_id=worker_id,
+                claim_id=claim.claim_id,
+                fencing_token=claim.fencing_token,
+                session_id=f"session-{unique}",
+                claim_token=claim.token,
+                iteration=claim.iteration,
+                command=("codex", "exec", "--json", "write no files"),
+                workspace=tmp_path,
+                project_root=tmp_path,
+            )
+            first_repository = GatewayCodexRunRepository(
+                client=delivery,
+                project_id=project_id,
+                run_id=run_id,
+                actor=worker_id,
+                now=lambda: datetime.now(timezone.utc),
+            )
+            started = await first_repository.start(request)
+            assert started.session_id == request.session_id
+            before_restart = await delivery.delivery_events(
+                project_id=project_id,
+                run_id=run_id,
+            )
+            assert [event.event_type for event in before_restart] == [
+                "codex_session_started"
+            ]
+
+            process.terminate()
+            process.wait(timeout=15)
+            process = _start_gateway(
+                dsn=dsn,
+                token=gateway_token,
+                worker_token=worker_token,
+                port=gateway_port,
+            )
+            await _wait_for_gateway(gateway_base)
+
+            restarted_delivery = GatewayDeliveryClient(gateway_base, worker_token, http)
+            restarted_repository = GatewayCodexRunRepository(
+                client=restarted_delivery,
+                project_id=project_id,
+                run_id=run_id,
+                actor=worker_id,
+                now=lambda: datetime.now(timezone.utc),
+            )
+            runner = _RunnerThatMustNotStart()
+            recovered = await CodexSupervisor(
+                runner=runner,
+                gateway=_UnusedLegacyEvidenceWriter(),
+                policy=_RestartPolicy(),
+                repository=restarted_repository,
+            ).run(request)
+            assert recovered.status is PackageExecutionStatus.EVIDENCE_UNRESOLVED
+            assert runner.calls == 0
+            after_restart = await restarted_delivery.delivery_events(
+                project_id=project_id,
+                run_id=run_id,
+            )
+            assert after_restart == before_restart
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=15)
