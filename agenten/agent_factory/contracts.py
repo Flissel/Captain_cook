@@ -13,6 +13,7 @@ from agenten.agent_runtime.contracts import (
     ArtifactRef,
     CapabilityProfile,
     IDENTIFIER_PATTERN,
+    IntegrationIntent,
 )
 
 
@@ -102,6 +103,7 @@ class FactoryLease(_FrozenContract):
     attempt: int = Field(ge=1, le=5, strict=True)
     role: FactoryRole
     capability_profile: CapabilityProfile
+    integration_intent: IntegrationIntent = IntegrationIntent.NONE
     capabilities: tuple[str, ...] = Field(min_length=1)
     workspace_ref: str = Field(pattern=r"^workspace://")
     issued_at: datetime
@@ -114,8 +116,19 @@ class FactoryLease(_FrozenContract):
 
     @model_validator(mode="after")
     def require_exact_role_scope(self) -> "FactoryLease":
-        if self.capability_profile is not _ROLE_PROFILES[self.role]:
+        expected_profile = _ROLE_PROFILES[self.role]
+        if (
+            self.role is FactoryRole.TOOL_INTEGRATOR
+            and self.integration_intent is IntegrationIntent.N8N
+        ):
+            expected_profile = CapabilityProfile.N8N_BUILDER
+        if self.capability_profile is not expected_profile:
             raise ValueError("factory lease profile does not match role")
+        if (
+            self.integration_intent is IntegrationIntent.N8N
+            and self.role is not FactoryRole.TOOL_INTEGRATOR
+        ):
+            raise ValueError("n8n factory lease is restricted to the tool integrator")
         if self.expires_at <= self.issued_at:
             raise ValueError("factory lease must expire after it is issued")
         if len(self.capabilities) != len(set(self.capabilities)):

@@ -9,6 +9,7 @@ from typing import Protocol
 from agenten.agent_factory.contracts import AgentFactoryJob, FactoryLease, FactoryRole
 from agenten.agent_runtime.capabilities import PROFILE_CAPABILITIES
 from agenten.agent_runtime.contracts import CapabilityProfile
+from agenten.agent_runtime.contracts import IntegrationIntent
 
 
 FACTORY_LEASE_DURATION = timedelta(minutes=15)
@@ -37,9 +38,12 @@ def issue_factory_lease(
     attempt: int,
     workspace_ref: str,
     now: datetime,
+    integration_intent: IntegrationIntent = IntegrationIntent.NONE,
 ) -> FactoryLease:
     issued_at = _require_utc(now)
     profile = _ROLE_PROFILES[role]
+    if role is FactoryRole.TOOL_INTEGRATOR and integration_intent is IntegrationIntent.N8N:
+        profile = CapabilityProfile.N8N_BUILDER
     binding = "|".join((str(job.job_id), role.value, str(attempt), workspace_ref))
     lease_id = f"factory-{hashlib.sha256(binding.encode('utf-8')).hexdigest()[:32]}"
     return FactoryLease(
@@ -51,6 +55,7 @@ def issue_factory_lease(
         attempt=attempt,
         role=role,
         capability_profile=profile,
+        integration_intent=integration_intent,
         capabilities=tuple(sorted(PROFILE_CAPABILITIES[profile])),
         workspace_ref=workspace_ref,
         issued_at=issued_at,
