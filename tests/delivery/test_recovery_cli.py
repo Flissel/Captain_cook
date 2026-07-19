@@ -50,6 +50,8 @@ async def test_recovery_cli_runs_captain_pass_and_reports_requeue(
             return httpx.Response(200, json=[{"batch_id": "batch-1", "title": "work"}])
         if request.url.path == "/batches/batch-1":
             return httpx.Response(200, json=_projection("batch-1"))
+        if request.url.path == "/batches/batch-1/active-codex-sessions":
+            return httpx.Response(200, json=[])
         if request.url.path == "/batches/batch-1/recovery":
             return httpx.Response(201, json=json.loads(request.content))
         raise AssertionError(f"unexpected request {request.method} {request.url.path}")
@@ -81,6 +83,8 @@ async def test_recovery_cli_defers_conflicted_session_instead_of_failing_the_pas
             return httpx.Response(200, json=[{"batch_id": "batch-active", "title": "work"}])
         if request.url.path == "/batches/batch-active":
             return httpx.Response(200, json=_projection("batch-active"))
+        if request.url.path == "/batches/batch-active/active-codex-sessions":
+            return httpx.Response(200, json=[])
         if request.url.path == "/batches/batch-active/recovery":
             return httpx.Response(409, json={"detail": "active Codex session requires terminal evidence"})
         raise AssertionError(f"unexpected request {request.method} {request.url.path}")

@@ -11,6 +11,7 @@ param(
 
     [Parameter(Mandatory, ParameterSetName = "Run")]
     [Parameter(Mandatory, ParameterSetName = "Cancel")]
+    [Parameter(Mandatory, ParameterSetName = "Inspect")]
     [string] $SessionId,
 
     [Parameter(Mandatory, ParameterSetName = "Run")]
@@ -23,6 +24,9 @@ param(
     [Parameter(Mandatory, ParameterSetName = "Cancel")]
     [string] $CancelStatePath,
 
+    [Parameter(Mandatory, ParameterSetName = "Inspect")]
+    [string] $InspectStatePath,
+
     [Parameter(Mandatory, ParameterSetName = "Cancel")]
     [ValidateSet("operator", "timeout", "shutdown", "claim_lost", "captain_revoked")]
     [string] $CancellationReason
@@ -33,6 +37,32 @@ $ErrorActionPreference = "Stop"
 
 if ($PSVersionTable.PSVersion.Major -lt 7) {
     throw "PowerShell 7 or newer is required."
+}
+
+if ($PSCmdlet.ParameterSetName -eq "Inspect") {
+    $state = Get-Content -LiteralPath $InspectStatePath -Raw -Encoding UTF8 |
+        ConvertFrom-Json -ErrorAction Stop
+    if (
+        $state.session_id -ne $SessionId -or
+        [int] $state.pid -lt 1 -or
+        [long] $state.start_time_utc_ticks -lt 1 -or
+        [string]::IsNullOrWhiteSpace([string] $state.executable)
+    ) {
+        throw "Inspection state does not match the requested session."
+    }
+    $current = Get-Process -Id ([int] $state.pid) -ErrorAction SilentlyContinue
+    $status = "lost"
+    if ($null -ne $current) {
+        $matches = $current.StartTime.ToUniversalTime().Ticks -eq [long] $state.start_time_utc_ticks -and
+            [string]::Equals(
+                [IO.Path]::GetFullPath($current.Path),
+                [IO.Path]::GetFullPath([string] $state.executable),
+                [StringComparison]::OrdinalIgnoreCase
+            )
+        $status = if ($matches) { "active" } else { "identity_mismatch" }
+    }
+    [pscustomobject] @{ session_id = $SessionId; status = $status } | ConvertTo-Json -Compress
+    exit 0
 }
 
 if ($PSCmdlet.ParameterSetName -eq "Cancel") {

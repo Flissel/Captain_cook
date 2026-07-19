@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from collections.abc import Awaitable, Callable
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -42,8 +43,14 @@ class RecoveryPass:
 class GatewayRecoveryService:
     """Find expired claims through the gateway and persist Captain decisions."""
 
-    def __init__(self, gateway: RecoveryGateway) -> None:
+    def __init__(
+        self,
+        gateway: RecoveryGateway,
+        *,
+        prepare_for_requeue: Callable[[str, int], Awaitable[bool]] | None = None,
+    ) -> None:
         self._gateway = gateway
+        self._prepare_for_requeue = prepare_for_requeue
 
     async def recover_expired(self, now: datetime) -> tuple[RecoveryDecision, ...]:
         """Compatibility view exposing only decisions persisted by this pass."""
@@ -82,6 +89,14 @@ class GatewayRecoveryService:
                 reason="claim_expired",
                 decision="requeue",
             )
+            if self._prepare_for_requeue is not None:
+                try:
+                    if not await self._prepare_for_requeue(batch_id, projection.claim_iteration):
+                        deferred.append(batch_id)
+                        continue
+                except Exception:
+                    deferred.append(batch_id)
+                    continue
             try:
                 recovered.append(await self._gateway.record_recovery(decision))
             except GatewayDeliveryConflictError:

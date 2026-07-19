@@ -9,11 +9,13 @@ import logging
 import os
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 
 from agenten.delivery.gateway_client import GatewayDeliveryClient
 from agenten.delivery.recovery import GatewayRecoveryService
+from agenten.delivery.worker_recovery import LocalCodexWorkerRecoveryDirector
 
 
 logger = logging.getLogger(__name__)
@@ -32,6 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--gateway-url",
         default=os.getenv("CAPTAIN_GATEWAY_URL", "http://127.0.0.1:8090"),
         help="authenticated Captain Gateway base URL",
+    )
+    parser.add_argument(
+        "--codex-state-dir",
+        type=Path,
+        default=Path(os.getenv("CAPTAIN_CODEX_SESSION_STATE_DIR", ".captain-cook/codex-sessions")),
+        help="host-local directory containing <session-id>.json process evidence",
     )
     return parser
 
@@ -52,7 +60,14 @@ async def async_main(
 
     async def recover(client: httpx.AsyncClient) -> int:
         gateway = GatewayDeliveryClient(args.gateway_url, token, client)
-        outcome = await GatewayRecoveryService(gateway).recover_expired_pass(clock())
+        director = LocalCodexWorkerRecoveryDirector(
+            client=gateway,
+            state_dir=args.codex_state_dir,
+        )
+        outcome = await GatewayRecoveryService(
+            gateway,
+            prepare_for_requeue=director.ready_for_requeue,
+        ).recover_expired_pass(clock())
         print(
             json.dumps(
                 {
