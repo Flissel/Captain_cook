@@ -83,19 +83,30 @@ deterministisch wiederholbar und restart-sicher geprüft sein.
   verweigert der Test sowohl die MCP-Entdeckung als auch eine neue
   Hermes-Referenz; er verwendet ausschließlich den isolierten Builder auf Port
   5679, nicht die externe VibeMind-n8n-MCP-Verbindung.
-- [ ] Einen expliziten Captain-seitigen Widerruf einer noch gültigen
-  `integration_intent=n8n`-Lease implementieren und live beweisen; derzeit ist
-  der Ablauf fail-closed erzwungen, ein vorzeitiger Widerrufsdatensatz fehlt.
+- [x] Einen expliziten Captain-seitigen Widerruf einer noch gültigen
+  `integration_intent=n8n`-Lease implementiert (`2d03993`): ein append-only
+  Gateway-Revocation-Event bindet Grant und Command, blockiert danach neue
+  Runtime-Effekte und Ergebnisse und verweigert jede weitere Hermes-/n8n-MCP-
+  Referenz. Der MariaDB-Gateway-Gate bestand mit `6 passed`; der reale
+  Codex-/n8n-Live-Gate mit zusätzlicher Revocation-Prüfung bestand mit
+  `1 passed in 29,98 s` (2026-07-19).
+- [ ] Einen laufenden Codex-Prozess beim Widerruf aktiv abbrechen und den
+  bereits ausgegebenen n8n-MCP-Token rotieren; der jetzige Gate verhindert
+  weitere Captain-dispatchte Effekte und Referenzen, enthält aber keinen
+  Live-Race-Test für einen bereits laufenden Tool-Call.
 - [ ] Den E2E- und Recovery-Pfad nach Prozessneustart mit unveränderten
   Artifacts/Gatewaydaten prüfen: keine doppelte Provider-Reservierung,
-  Freigabe oder Ledger-Transition.
+  Freigabe oder Ledger-Transition. Der deterministische Control-Plane-
+  Restart-Gate ist grün (`tests/integration/test_agent_runtime_control_plane.py`,
+  `8 passed`, 2026-07-19), beweist aber noch keine vollständige Gateway- und
+  Provider-übergreifende Live-Wiederaufnahme.
 - [ ] Gesamt-Readiness prüfen: vollständiger non-live Gate, explizite
   Live-Gates, Architektur-/Importgrenzen, Demo-Evidenz und branch-sichere
-  main-Integration. Aktuell: `858 passed, 78 skipped, 7 deselected`
+  main-Integration. Aktuell: `865 passed, 79 skipped, 7 deselected`
   (`python -m pytest -q --no-cov -m "not live"`, 2026-07-19) sowie
-  `3 passed in 30,57 s` für Builder- und Gate-A-Live-Tests. Die ausgelassenen
-  Tests benötigen eine separat konfigurierte MariaDB; sie sind kein Ersatz
-  für den Gate-A-Nachweis.
+  erfolgreiche Builder-, Gate-A- und n8n-MCP-Live-Gates. Die 79 ausgelassenen
+  Tests benötigen überwiegend eine separat konfigurierte MariaDB; sie sind
+  kein Ersatz für die separat grüne Gateway-Teilmenge oder die Live-Nachweise.
 
 ## Pflege-Regel
 
