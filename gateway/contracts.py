@@ -126,6 +126,7 @@ CodexCancellationReason: TypeAlias = Literal[
     "timeout",
     "shutdown",
     "claim_lost",
+    "captain_revoked",
 ]
 
 

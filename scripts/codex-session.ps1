@@ -24,7 +24,7 @@ param(
     [string] $CancelStatePath,
 
     [Parameter(Mandatory, ParameterSetName = "Cancel")]
-    [ValidateSet("operator", "timeout", "shutdown", "claim_lost")]
+    [ValidateSet("operator", "timeout", "shutdown", "claim_lost", "captain_revoked")]
     [string] $CancellationReason
 )
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -18,6 +19,7 @@ from agenten.execution.codex_supervisor import (
     CodexRunResult,
     CodexSupervisor,
 )
+from agenten.delivery.codex_runs import CodexOutcome
 from agenten.execution.process import PackageExecutionStatus
 
 
@@ -98,6 +100,67 @@ class StreamingRunner:
     async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
         self.authorized = authorized
         return self.result
+
+
+class BlockingRunner:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
+        del authorized
+        self.started.set()
+        await self.release.wait()
+        return CodexRunResult(
+            exit_code=0,
+            artifact_references=("artifact://build/1",),
+            jsonl_lines=(),
+        )
+
+
+class InMemoryRunRepository:
+    def __init__(self) -> None:
+        self.started: set[str] = set()
+        self.outcomes: dict[str, CodexOutcome] = {}
+
+    async def start(self, request: CodexRunRequest) -> object:
+        self.started.add(request.session_id)
+        return object()
+
+    async def append(self, event: object) -> None:
+        del event
+
+    async def finish(self, session_id: str, outcome: CodexOutcome) -> None:
+        existing = self.outcomes.get(session_id)
+        if existing is not None and existing != outcome:
+            raise ValueError("terminal outcome conflicts")
+        self.outcomes[session_id] = outcome
+
+
+class StartMonitor:
+    def __init__(self, runner: BlockingRunner) -> None:
+        self._runner = runner
+
+    async def wait(self) -> None:
+        await self._runner.started.wait()
+
+
+class PersistingCanceller:
+    def __init__(self, runner: BlockingRunner, repository: InMemoryRunRepository) -> None:
+        self._runner = runner
+        self._repository = repository
+        self.calls = 0
+
+    async def cancel(self) -> None:
+        self.calls += 1
+        await self._repository.finish(
+            "session-1",
+            CodexOutcome(
+                classification="cancelled",
+                cancellation_reason="captain_revoked",
+            ),
+        )
+        self._runner.release.set()
 
 
 class RecordingGateway:
@@ -193,6 +256,62 @@ async def test_successful_run_emits_fenced_sanitized_session_and_process_events(
     assert all(event[2] == "claim-secret" and event[3] == 1 for event in gateway.events)
     assert all("safe-path" not in repr(event) and "claim-secret" not in repr(event[4:]) for event in gateway.events)
     assert len(gateway.events[1][6]) == 64
+
+
+@pytest.mark.asyncio
+async def test_captain_revocation_cancels_the_active_session_without_overwriting_evidence(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runner = BlockingRunner()
+    repository = InMemoryRunRepository()
+    canceller = PersistingCanceller(runner, repository)
+    supervisor = CodexSupervisor(
+        runner=runner,
+        gateway=RecordingGateway(),
+        policy=AllowingPolicy(),
+        repository=repository,
+        cancellation_monitor=StartMonitor(runner),
+        canceller=canceller,
+    )
+
+    result = await asyncio.wait_for(
+        supervisor.run(_request(workspace)), timeout=2
+    )
+
+    assert result.status is PackageExecutionStatus.FAILED
+    assert result.error == "Codex capability grant was revoked by Captain"
+    assert canceller.calls == 1
+    assert repository.outcomes == {
+        "session-1": CodexOutcome(
+            classification="cancelled",
+            cancellation_reason="captain_revoked",
+        )
+    }
+
+
+def test_revocation_monitor_and_canceller_must_be_configured_together(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with pytest.raises(ValueError, match="must be paired"):
+        CodexSupervisor(
+            runner=RecordingRunner(0, ("artifact://build/1",)),
+            gateway=RecordingGateway(),
+            policy=AllowingPolicy(),
+            cancellation_monitor=StartMonitor(BlockingRunner()),
+        )
+
+    with pytest.raises(ValueError, match="must be paired"):
+        CodexSupervisor(
+            runner=RecordingRunner(0, ("artifact://build/1",)),
+            gateway=RecordingGateway(),
+            policy=AllowingPolicy(),
+            canceller=PersistingCanceller(BlockingRunner(), InMemoryRunRepository()),
+        )
 
 
 @pytest.mark.asyncio

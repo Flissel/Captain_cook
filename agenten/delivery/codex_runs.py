@@ -15,6 +15,7 @@ from uuid import UUID, uuid5
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agenten.delivery.gateway_client import GatewayDeliveryClient
+from agenten.agent_runtime.contracts import CapabilityGrantRevocation
 from agenten.execution.codex_events import CodexParseWarning, CodexProcessEvent
 from agenten.execution.codex_supervisor import CodexRunRequest
 from gateway.contracts import (
@@ -36,7 +37,13 @@ OutcomeClass = Literal[
     "cancelled",
     "lost_process",
 ]
-CancellationReason = Literal["operator", "timeout", "shutdown", "claim_lost"]
+CancellationReason = Literal[
+    "operator",
+    "timeout",
+    "shutdown",
+    "claim_lost",
+    "captain_revoked",
+]
 
 
 class CodexOutcome(BaseModel):
@@ -127,6 +134,73 @@ class CodexRunRepository(Protocol):
     async def persist_cancellation(
         self, result: CodexCancellationResult
     ) -> None: ...
+
+
+class CapabilityGrantRevocationReader(Protocol):
+    """Read Captain's authoritative, append-only lease revocations."""
+
+    async def get_grant_revocation(
+        self, command_id: UUID
+    ) -> CapabilityGrantRevocation | None: ...
+
+
+class CapabilityGrantRevocationMonitor:
+    """Wait for the exact lease bound to one active Codex session to be revoked."""
+
+    def __init__(
+        self,
+        *,
+        reader: CapabilityGrantRevocationReader,
+        command_id: UUID,
+        grant_id: str,
+        poll_seconds: float = 0.25,
+    ) -> None:
+        if not grant_id:
+            raise ValueError("grant_id must not be empty")
+        if poll_seconds <= 0:
+            raise ValueError("poll_seconds must be positive")
+        self._reader = reader
+        self._command_id = command_id
+        self._grant_id = grant_id
+        self._poll_seconds = poll_seconds
+
+    async def wait(self) -> None:
+        while True:
+            revocation = await self._reader.get_grant_revocation(self._command_id)
+            if revocation is not None:
+                if (
+                    revocation.command_id != self._command_id
+                    or revocation.grant_id != self._grant_id
+                ):
+                    raise CancellationExecutionError(
+                        "runtime revocation does not match the active Codex lease"
+                    )
+                return
+            await asyncio.sleep(self._poll_seconds)
+
+
+class SessionBoundCodexCanceller:
+    """Adapt one verified session cancellation into the supervisor boundary."""
+
+    def __init__(
+        self,
+        *,
+        coordinator: "CodexCancellationCoordinator",
+        session_id: str,
+        state_path: Path,
+    ) -> None:
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        self._coordinator = coordinator
+        self._session_id = session_id
+        self._state_path = state_path
+
+    async def cancel(self) -> None:
+        await self._coordinator.cancel(
+            session_id=self._session_id,
+            state_path=self._state_path,
+            reason="captain_revoked",
+        )
 
 
 

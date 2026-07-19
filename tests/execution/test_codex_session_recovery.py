@@ -6,17 +6,22 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+from uuid import uuid4
 
 import httpx
 import pytest
 
 from agenten.delivery.codex_runs import (
+    CancellationExecutionError,
     CancellationPersistenceRequired,
+    CapabilityGrantRevocationMonitor,
     CodexCancellationCoordinator,
     CodexCancellationResult,
     CodexOutcome,
     GatewayCodexRunRepository,
+    SessionBoundCodexCanceller,
 )
+from agenten.agent_runtime.contracts import CapabilityGrantRevocation
 from agenten.delivery.gateway_client import GatewayDeliveryClient
 from agenten.execution.codex_events import CodexParseWarning, CodexProcessEvent
 from agenten.execution.codex_policy import AuthorizedCodexRun, FrozenEnvironment
@@ -30,6 +35,17 @@ from agenten.execution.process import PackageExecutionStatus
 
 
 NOW = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+
+
+class RevocationReader:
+    def __init__(self) -> None:
+        self.revocation: CapabilityGrantRevocation | None = None
+
+    async def get_grant_revocation(
+        self, command_id: object
+    ) -> CapabilityGrantRevocation | None:
+        del command_id
+        return self.revocation
 
 
 class GatewayHistory:
@@ -337,6 +353,51 @@ async def test_powershell_runner_bridges_authorized_run_to_real_launcher(
     assert identity["session_id"] == "runner-session-1"
 
 
+@pytest.mark.asyncio
+async def test_capability_revocation_monitor_accepts_only_the_bound_lease() -> None:
+    command_id = uuid4()
+    reader = RevocationReader()
+    monitor = CapabilityGrantRevocationMonitor(
+        reader=reader,
+        command_id=command_id,
+        grant_id="grant-1",
+        poll_seconds=0.001,
+    )
+    reader.revocation = CapabilityGrantRevocation(
+        schema_name="captain.capability-grant-revocation.v1",
+        revocation_id=uuid4(),
+        grant_id="grant-1",
+        command_id=command_id,
+        revoked_at=NOW,
+        reason="captain_cancelled",
+    )
+
+    await monitor.wait()
+
+
+@pytest.mark.asyncio
+async def test_capability_revocation_monitor_fails_closed_for_other_lease() -> None:
+    command_id = uuid4()
+    reader = RevocationReader()
+    monitor = CapabilityGrantRevocationMonitor(
+        reader=reader,
+        command_id=command_id,
+        grant_id="grant-1",
+        poll_seconds=0.001,
+    )
+    reader.revocation = CapabilityGrantRevocation(
+        schema_name="captain.capability-grant-revocation.v1",
+        revocation_id=uuid4(),
+        grant_id="grant-other",
+        command_id=command_id,
+        revoked_at=NOW,
+        reason="captain_cancelled",
+    )
+
+    with pytest.raises(CancellationExecutionError, match="does not match"):
+        await monitor.wait()
+
+
 
 @pytest.mark.asyncio
 async def test_powershell_runner_sets_a_scoped_codex_home_for_the_child(
@@ -637,6 +698,44 @@ async def test_cancellation_coordinator_kills_and_persists_in_one_call(
         )
         assert history.events[-1]["event_type"] == "codex_session_finished"
         assert history.events[-1]["payload"]["cancellation_reason"] == "operator"
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+
+
+@pytest.mark.asyncio
+async def test_session_bound_canceller_persists_a_captain_revocation(
+    tmp_path: Path,
+) -> None:
+    child = subprocess.Popen(
+        [_pwsh(), "-NoProfile", "-Command", "Start-Sleep -Seconds 60"]
+    )
+    state_path = tmp_path / "captain-revoked-process.json"
+    try:
+        _write_process_state(state_path, "session-1", child)
+        history = GatewayHistory()
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(history.handle)
+        ) as http:
+            runs = repository(history, http)
+            await runs.start(request(tmp_path))
+            canceller = SessionBoundCodexCanceller(
+                coordinator=CodexCancellationCoordinator(
+                    repository=runs,
+                    worker_id="worker-1",
+                    pwsh_path=Path(_pwsh()),
+                    script_path=Path("scripts/codex-session.ps1").resolve(),
+                ),
+                session_id="session-1",
+                state_path=state_path,
+            )
+            await canceller.cancel()
+
+        child.wait(timeout=10)
+        assert history.events[-1]["event_type"] == "codex_session_finished"
+        assert history.events[-1]["payload"]["outcome"] == "cancelled"
+        assert history.events[-1]["payload"]["cancellation_reason"] == "captain_revoked"
     finally:
         if child.poll() is None:
             child.kill()

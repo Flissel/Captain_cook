@@ -81,6 +81,18 @@ class CodexRunner(Protocol):
     ) -> CodexRunResult: ...
 
 
+class CodexRunCancellationMonitor(Protocol):
+    """Wait until Captain withdraws the capability for this exact run."""
+
+    async def wait(self) -> None: ...
+
+
+class CodexRunCanceller(Protocol):
+    """Cancel the verified process tree and persist terminal evidence."""
+
+    async def cancel(self) -> None: ...
+
+
 
 class PowerShellCodexRunner:
     """Execute an authorized Codex request through the session-bound PS7 launcher."""
@@ -269,11 +281,17 @@ class CodexSupervisor:
         gateway: GatewayCodexEvidenceWriter,
         policy: CodexExecutionAuthorizer,
         repository: CodexRunRepository | None = None,
+        cancellation_monitor: CodexRunCancellationMonitor | None = None,
+        canceller: CodexRunCanceller | None = None,
     ) -> None:
+        if (cancellation_monitor is None) != (canceller is None):
+            raise ValueError("Codex cancellation monitor and canceller must be paired")
         self._runner = runner
         self._gateway = gateway
         self._policy = policy
         self._repository = repository
+        self._cancellation_monitor = cancellation_monitor
+        self._canceller = canceller
 
     async def run(self, request: CodexRunRequest) -> PackageExecutionResult:
         authorized = self._policy.authorize(request)
@@ -294,8 +312,67 @@ class CodexSupervisor:
         else:
             return await self._run_legacy(request, authorized, process_id, command_digest)
 
-        return await self._run_repository(request, authorized)
+        if self._cancellation_monitor is None:
+            return await self._run_repository(request, authorized)
+        return await self._run_repository_until_revoked(request, authorized)
 
+    async def _run_repository_until_revoked(
+        self,
+        request: CodexRunRequest,
+        authorized: AuthorizedCodexRun,
+    ) -> PackageExecutionResult:
+        """Race one active run against Captain's durable lease revocation.
+
+        The canceller owns the OS process tree and its terminal Gateway record.
+        This supervisor only converts the resulting cancellation into a
+        fail-closed package result; it never overwrites the cancellation with a
+        later local process exit.
+        """
+
+        assert self._cancellation_monitor is not None
+        assert self._canceller is not None
+        execution = asyncio.create_task(self._run_repository(request, authorized))
+        revoked = asyncio.create_task(self._cancellation_monitor.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {execution, revoked}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if execution in done:
+                return await execution
+
+            try:
+                await revoked
+                await self._canceller.cancel()
+            except Exception:
+                # The lease is revoked but we cannot prove the process tree is
+                # gone. Never turn this ambiguous state into local success.
+                execution.add_done_callback(_consume_background_result)
+                return self._result(
+                    request,
+                    PackageExecutionStatus.EVIDENCE_UNRESOLVED,
+                    error="revoked Codex session cancellation requires recovery",
+                )
+
+            try:
+                await execution
+            except Exception:
+                # The terminal cancellation has already been persisted by the
+                # session-bound canceller, so a local runner exception does not
+                # change the authoritative outcome.
+                pass
+            return self._result(
+                request,
+                PackageExecutionStatus.FAILED,
+                error="Codex capability grant was revoked by Captain",
+            )
+        finally:
+            if not revoked.done():
+                revoked.cancel()
+            if revoked.done() and not revoked.cancelled():
+                try:
+                    revoked.exception()
+                except Exception:
+                    pass
     async def _run_legacy(
         self,
         request: CodexRunRequest,
@@ -509,3 +586,12 @@ class CodexSupervisor:
             artifact_versions=tuple(1 for _ in artifacts),
             error=error,
         )
+
+
+def _consume_background_result(task: asyncio.Task[object]) -> None:
+    """Retrieve a detached task exception after an evidence-unresolved return."""
+
+    try:
+        task.exception()
+    except (asyncio.CancelledError, Exception):
+        pass
