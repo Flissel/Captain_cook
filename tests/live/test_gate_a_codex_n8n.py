@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime, timezone
+import asyncio
 import hashlib
 import json
 import os
@@ -24,12 +25,19 @@ from agenten.delivery.gateway_client import GatewayDeliveryClient
 from agenten.execution.codex_policy import CodexExecutionPolicy
 from agenten.execution.codex_supervisor import (
     CodexRunRequest,
+    CodexRunResult,
     CodexSupervisor,
-    PowerShellCodexRunner,
 )
 from agenten.execution.process import PackageExecutionStatus
 from agenten.targets.n8n import N8nHttpClient, N8nTarget, SealedArtifact, ValidationCase
 from gateway.contracts import DeliveryEventEnvelope
+
+
+HERMES_ROOT = Path(__file__).resolve().parents[2] / "hermes-agent"
+sys.path.insert(0, str(HERMES_ROOT))
+
+from hermes_cli.captain_worker import HermesCodexRuntime  # noqa: E402
+from hermes_cli.mcp_config import write_capability_scoped_codex_config  # noqa: E402
 
 
 def _secret(name: str) -> str | None:
@@ -104,6 +112,72 @@ def _codex_binary() -> Path | None:
 class _ForbiddenLegacyWriter:
     def __getattr__(self, name: str) -> object:
         raise AssertionError(f"legacy evidence writer used: {name}")
+
+
+class HermesAppServerRunner:
+    """Run an approved Codex task through Hermes' workspace approval bridge."""
+
+    def __init__(
+        self,
+        *,
+        codex_home: Path,
+        artifact_references: tuple[str, ...],
+        wall_seconds: int,
+    ) -> None:
+        self._codex_home = codex_home
+        self._artifact_references = artifact_references
+        self._wall_seconds = wall_seconds
+        self.failure_type: str | None = None
+
+    async def run(self, authorized: object) -> CodexRunResult:
+        workspace = getattr(authorized, "workspace")
+        command = getattr(authorized, "command")
+        runtime = HermesCodexRuntime()
+        try:
+            outcome = await asyncio.to_thread(
+                runtime.start,
+                workspace=workspace,
+                prompt=command[3].encode("utf-8"),
+                codex_home=self._codex_home,
+                wall_seconds=self._wall_seconds,
+                environment={},
+            )
+        except Exception as exc:
+            self.failure_type = type(exc).__name__
+            return CodexRunResult(
+                exit_code=1,
+                artifact_references=(),
+                jsonl_lines=(),
+            )
+        finally:
+            runtime.close()
+        if outcome.error is not None or outcome.interrupted:
+            self.failure_type = (
+                f"terminal={outcome.terminal_state.value}; "
+                f"error_present={outcome.error is not None}; "
+                f"interrupted={outcome.interrupted}"
+            )
+        lines = (
+            json.dumps({"type": "thread.started", "thread_id": outcome.session_id}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"id": outcome.turn_id, "type": "agent_message"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {},
+                }
+            ),
+        )
+        return CodexRunResult(
+            exit_code=0 if outcome.error is None and not outcome.interrupted else 1,
+            artifact_references=self._artifact_references,
+            jsonl_lines=lines,
+        )
 
 
 @pytest.mark.live
@@ -234,7 +308,7 @@ async def test_gate_a_real_codex_n8n_gateway_trace(
             workspace = temporary_root / "workspace"
             workspace.mkdir()
             codex_home = temporary_root / "codex-home"
-            codex_home.mkdir()
+            write_capability_scoped_codex_config(codex_home, {})
             source_auth = Path.home() / ".codex" / "auth.json"
             if source_auth.is_file():
                 shutil.copy2(source_auth, codex_home / "auth.json")
@@ -256,7 +330,7 @@ async def test_gate_a_real_codex_n8n_gateway_trace(
                         "parameters": {
                             "httpMethod": "POST",
                             "path": "{{CAPTAIN_WEBHOOK_PATH}}",
-                            "responseMode": "lastNode",
+                            "responseMode": "responseNode",
                             "options": {},
                         },
                     },
@@ -266,13 +340,42 @@ async def test_gate_a_real_codex_n8n_gateway_trace(
                         "typeVersion": 2,
                         "position": [240, 0],
                         "parameters": {
-                            "jsCode": "return [{ json: $input.first().json }];",
+                            "jsCode": (
+                                "const payload = $input.first().json;\n"
+                                "return [{ json: {\n"
+                                "  execution_id: $execution.id,\n"
+                                "  artifact_digest: payload.body.artifact_digest,\n"
+                                "  correlation_id: payload.body.correlation_id,\n"
+                                "} }];"
+                            ),
                         },
-                    },
+                        },
+                        {
+                            "name": "Respond to Webhook",
+                            "type": "n8n-nodes-base.respondToWebhook",
+                            "typeVersion": 1.4,
+                            "position": [480, 0],
+                            "parameters": {
+                                "respondWith": "json",
+                                "responseBody": "={{ $json }}",
+                                "options": {},
+                            },
+                        },
                 ],
                 "connections": {
                     "Webhook": {
                         "main": [[{"node": "Code", "type": "main", "index": 0}]]
+                    },
+                    "Code": {
+                        "main": [
+                            [
+                                {
+                                    "node": "Respond to Webhook",
+                                    "type": "main",
+                                    "index": 0,
+                                }
+                            ]
+                        ]
                     }
                 },
                 "settings": {"executionOrder": "v1"},
@@ -316,17 +419,10 @@ async def test_gate_a_real_codex_n8n_gateway_trace(
                     actor=worker_id,
                     now=lambda: datetime.now(timezone.utc),
                 )
-                runner = PowerShellCodexRunner(
-                    pwsh_path=Path(
-                        r"C:\Program Files\PowerShell\7\pwsh.exe"
-                    ),
-                    script_path=Path("scripts/codex-session.ps1").resolve(),
-                    codex_path=codex_binary,
-                    session_id=session_id,
-                    state_path=workspace / "codex-process.json",
+                runner = HermesAppServerRunner(
                     artifact_references=(f"artifact://sealed/{artifact_id}",),
                     codex_home=codex_home,
-                    timeout_seconds=300,
+                    wall_seconds=300,
                 )
                 result = await CodexSupervisor(
                     runner=runner,
@@ -334,7 +430,9 @@ async def test_gate_a_real_codex_n8n_gateway_trace(
                     policy=policy,
                     repository=repository,
                 ).run(request)
-                assert result.status is PackageExecutionStatus.SUCCEEDED
+                assert result.status is PackageExecutionStatus.SUCCEEDED, (
+                    f"Hermes app-server failure type: {runner.failure_type}"
+                )
                 codex_events = await gateway_client.delivery_events(
                     project_id=project_id,
                     run_id=run_id,
