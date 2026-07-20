@@ -59,11 +59,11 @@
 - Modify: `agenten/agent_factory/evidence_store.py`
 - Create: `tests/agent_factory/test_skill_store.py`
 
-- [ ] Start with failing tests for `SkillEvaluationStore` operations: record a receipt, record a tool gap, retain a candidate only after a successful evidence record, fetch by evaluation id, and idempotently replay identical records.
-- [ ] Add failure tests proving that a failed build/test cannot create a candidate, a changed replay under the same id is rejected, and callers cannot persist a released/shared status through this private store.
-- [ ] Implement a filesystem test adapter under `artifacts/agent-factory/skill-evaluations/`, using content-addressed references and the same write-once/hash verification approach as `FilesystemFactoryEvidenceStore`.
-- [ ] Define a `SkillEvaluationRepository` protocol and an `InMemorySkillEvaluationRepository` for tests. Keep the protocol free of MariaDB or Hermes imports so Gateway can implement it without violating import boundaries.
-- [ ] Persist only redacted structured records. Tests must assert no secret-looking fields or raw n8n endpoint values are accepted in stored metadata.
+- [x] Start with failing tests for `SkillEvaluationStore` operations: record a receipt, record a tool gap, retain a candidate only after a successful evidence record, fetch by evaluation id, and idempotently replay identical records.
+- [x] Add failure tests proving that a failed build/test cannot create a candidate, a changed replay under the same id is rejected, and callers cannot persist a released/shared status through this private store.
+- [x] Implement a filesystem test adapter under `artifacts/agent-factory/skill-evaluations/`, using content-addressed references and the same write-once/hash verification approach as `FilesystemFactoryEvidenceStore`.
+- [x] Define a `SkillEvaluationRepository` protocol and an `InMemorySkillEvaluationRepository` for tests. Keep the protocol free of MariaDB or Hermes imports so Gateway can implement it without violating import boundaries.
+- [x] Persist only redacted structured records. Tests must assert no secret-looking fields or raw n8n endpoint values are accepted in stored metadata.
 
 ### Task 3: Make Hermes consume one released skill and emit typed evaluation evidence
 
