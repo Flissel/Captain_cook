@@ -794,6 +794,7 @@ class GatewayStore:
             FactoryRole.TOOL_INTEGRATOR: frozenset(
                 {
                     FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,
+                    FactoryActionKind.SUBMIT_FORGE_JOB,
                     FactoryActionKind.DISPATCH_BUILD_VALIDATOR,
                 }
             ),

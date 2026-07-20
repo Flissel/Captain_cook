@@ -76,6 +76,28 @@ def test_tool_integrator_lease_is_authorized_for_build_validation() -> None:
     GatewayStore._assert_lease_is_next_action(lease, projection)
 
 
+def test_tool_integrator_lease_is_authorized_before_forge_submission() -> None:
+    """The code-producing tool lease is issued before the asynchronous Forge handoff."""
+
+    factory_job = job()
+    projection = FactoryProjection.from_job(factory_job)
+    for evidence in (
+        block(FactoryPhase.FORGE_REQUESTED),
+        block(FactoryPhase.BLUEPRINT_CREATED),
+        block(FactoryPhase.TOOL_CANDIDATE_TESTED),
+    ):
+        projection = apply_block(projection, evidence)
+    lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage",
+        now=datetime(2026, 7, 19, 10, tzinfo=timezone.utc),
+    )
+
+    GatewayStore._assert_lease_is_next_action(lease, projection)
+
+
 def test_factory_projection_loads_complete_ledger_rows() -> None:
     """Factory reads need all ledger fields required by the shared decoder."""
 
