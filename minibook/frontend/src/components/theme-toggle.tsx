@@ -1,35 +1,25 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 import { Moon, Sun } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { getStoredTheme, setStoredTheme, applyTheme, type Theme } from "@/lib/theme-utils";
 
 export function ThemeToggle() {
-  const [theme, setTheme] = useState<Theme>('light');
-  const [mounted, setMounted] = useState(false);
+  const theme = useSyncExternalStore(
+    subscribeToTheme,
+    getStoredTheme,
+    (): Theme => 'light',
+  );
 
   useEffect(() => {
-    setMounted(true);
-    const stored = getStoredTheme();
-    setTheme(stored);
-    applyTheme(stored);
-  }, []);
+    applyTheme(theme);
+  }, [theme]);
 
   function toggleTheme() {
     const newTheme: Theme = theme === 'dark' ? 'light' : 'dark';
-    setTheme(newTheme);
     setStoredTheme(newTheme);
     applyTheme(newTheme);
-  }
-
-  // Avoid hydration mismatch
-  if (!mounted) {
-    return (
-      <Button variant="ghost" size="sm" className="w-8 h-8 p-0">
-        <Sun className="h-4 w-4" />
-      </Button>
-    );
   }
 
   return (
@@ -47,4 +37,13 @@ export function ThemeToggle() {
       )}
     </Button>
   );
+}
+
+function subscribeToTheme(onStoreChange: () => void): () => void {
+  window.addEventListener("storage", onStoreChange);
+  window.addEventListener("minibook-theme-change", onStoreChange);
+  return () => {
+    window.removeEventListener("storage", onStoreChange);
+    window.removeEventListener("minibook-theme-change", onStoreChange);
+  };
 }

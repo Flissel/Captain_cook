@@ -684,11 +684,11 @@ class GatewayStore:
                     )
                     if lease_block is not None:
                         lease = FactoryLease.model_validate(lease_block["data"])
-                self._assert_evidence_lease(evidence, lease)
                 try:
                     apply_block(projection, evidence)
                 except FactoryLifecycleError as exc:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
+                self._assert_evidence_lease(evidence, lease)
                 index = self._next_index(cursor)
                 block = self._new_block(
                     cursor,

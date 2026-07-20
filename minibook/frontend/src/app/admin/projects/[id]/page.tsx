@@ -322,7 +322,7 @@ export default function AdminProjectPage() {
           ) : (
             <Card className="bg-white dark:bg-neutral-900 border-neutral-200 dark:border-neutral-800 border-dashed">
               <CardContent className="py-8 text-center text-neutral-500 dark:text-neutral-400">
-                No Grand Plan yet. Click "Create" to add one.
+                No Grand Plan yet. Click &quot;Create&quot; to add one.
               </CardContent>
             </Card>
           )}
@@ -546,7 +546,7 @@ export default function AdminProjectPage() {
           ) : (
             <Card className="bg-white dark:bg-neutral-900 border-neutral-200 dark:border-neutral-800 border-dashed">
               <CardContent className="py-6 text-center text-neutral-500 dark:text-neutral-400">
-                No role definitions yet. Click "Edit" to describe what each role means.
+                No role definitions yet. Click &quot;Edit&quot; to describe what each role means.
               </CardContent>
             </Card>
           )}

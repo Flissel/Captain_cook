@@ -109,7 +109,8 @@ class SwarmPipeline:
                  input_manifest: dict = None,
                  input_phase: str = None,
                  input_team_key: str = None,
-                 sub_team_dirs: dict = None):
+                 sub_team_dirs: dict = None,
+                 interactive: bool = True):
         self.agents = agents  # {name: {id, name, api_key}}
         self.project_id = project_id
         self.task_name = task_name
@@ -136,6 +137,7 @@ class SwarmPipeline:
         self.input_team_key = input_team_key
         self.sub_team_dirs = sub_team_dirs or {}
         self.is_input_file = input_manifest is not None
+        self.interactive = interactive
         # MCP Discovery (CatalogAgent)
         self.mcp_catalog = {}  # Full Docker MCP catalog
         self.mcp_selection = ""  # LLM-selected MCP servers for this task
@@ -152,6 +154,10 @@ class SwarmPipeline:
         self.export_result = None  # {"status": "SUCCESS|FAIL", "path": ..., "repo_url": ...}
         self.pre_todo_eval = None  # eval result before TodoImplementer (mock tools)
         self.todo_implemented = False  # True if step_todo_implement updated tools.py
+
+    def allows_user_feedback(self) -> bool:
+        """Whether this run may wait for Minibook UI responses."""
+        return self.interactive
 
     # --- Cascade helper methods ---
 
@@ -513,6 +519,10 @@ class SwarmPipeline:
             return results
 
         # Ask user via WebSocket modal
+        if not self.allows_user_feedback():
+            print("[CatalogAgent] Non-interactive run — skipping MCP configuration modal")
+            return results
+
         answer = await ask_user(
             question_type="mcp_config",
             tool_name="CatalogAgent",
@@ -688,28 +698,31 @@ class SwarmPipeline:
             {"name": s["name"], "description": s["status"], "needs_key": s["secrets"]}
             for s in installed
         ]
-        answer = await ask_user(
-            question_type="mcp_selection",
-            tool_name="CatalogAgent",
-            message=review_msg,
-            metadata={
-                "available_servers": available_for_review,
-                "selected_servers": selected_names,
-                "install_candidates": needs_install,
-                "domain_hints": domain_info.get("domains", []),
-                "reasoning": reasoning,
-            },
-            timeout=60,
-        )
-        if answer["action"] == "reply" and answer["text"]:
-            try:
-                user_sel = json.loads(answer["text"])
-                if "servers" in user_sel:
-                    selected_names = [s for s in user_sel["servers"] if s in installed_names]
-                    needs_install = [s for s in user_sel.get("install", []) if s in registry]
-                print(f"[CatalogAgent] User adjusted: installed={selected_names}, install={needs_install}")
-            except (json.JSONDecodeError, KeyError):
-                pass
+        if self.allows_user_feedback():
+            answer = await ask_user(
+                question_type="mcp_selection",
+                tool_name="CatalogAgent",
+                message=review_msg,
+                metadata={
+                    "available_servers": available_for_review,
+                    "selected_servers": selected_names,
+                    "install_candidates": needs_install,
+                    "domain_hints": domain_info.get("domains", []),
+                    "reasoning": reasoning,
+                },
+                timeout=60,
+            )
+            if answer["action"] == "reply" and answer["text"]:
+                try:
+                    user_sel = json.loads(answer["text"])
+                    if "servers" in user_sel:
+                        selected_names = [s for s in user_sel["servers"] if s in installed_names]
+                        needs_install = [s for s in user_sel.get("install", []) if s in registry]
+                    print(f"[CatalogAgent] User adjusted: installed={selected_names}, install={needs_install}")
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        else:
+            print("[CatalogAgent] Non-interactive run — accepting deterministic MCP selection")
 
         # ── Step 5: Auto-configure installed servers that need CONFIG ─────
         # Process auto-configurable and config-required servers BEFORE enabling
@@ -948,7 +961,7 @@ class SwarmPipeline:
 
         # Human review: show architecture diagram
         graph = self._build_architecture_graph()
-        if graph["nodes"]:
+        if graph["nodes"] and self.allows_user_feedback():
             answer = await ask_user(
                 question_type="architecture_review",
                 tool_name="ArchitectAgent",

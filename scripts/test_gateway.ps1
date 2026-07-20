@@ -43,6 +43,16 @@ function Set-ProcessEnvironmentValue {
     [System.Environment]::SetEnvironmentVariable($Name, [string]$Value, "Process")
 }
 
+function Test-PythonCanImportPytest {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Python
+    )
+
+    & $Python -c "import pytest" 2>$null
+    return $LASTEXITCODE -eq 0
+}
+
 function Invoke-Pytest {
     param(
         [Parameter(Mandatory)]
@@ -120,7 +130,7 @@ $localPython = if ($isWindowsPlatform) {
 } else {
     Join-Path $repoRoot ".venv/bin/python"
 }
-$pythonCommand = if (Test-Path -LiteralPath $localPython) {
+$pythonCommand = if ((Test-Path -LiteralPath $localPython) -and (Test-PythonCanImportPytest -Python $localPython)) {
     [System.IO.Path]::GetFullPath($localPython)
 } else {
     (Get-Command python -ErrorAction Stop).Source

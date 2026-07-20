@@ -21,6 +21,7 @@ class MinibookForgeSettings:
     python_executable: str = "python"
     swarm_script: Path = Path("minibook/autogen_swarm.py")
     working_directory: Path = Path(".")
+    max_runtime_seconds: int = 1800
 
 
 class MinibookSwarmForge(MinibookForgePort):
@@ -41,12 +42,17 @@ class MinibookSwarmForge(MinibookForgePort):
         input_path = self._materializer.materialize(request.job.input_ref)
         if not input_path.is_file():
             raise FactoryDispatchError("factory input artifact did not materialize to a file")
+        if self._settings.max_runtime_seconds <= 0:
+            raise FactoryDispatchError("Minibook Forge runtime limit must be positive")
         try:
             await asyncio.create_subprocess_exec(
                 self._settings.python_executable,
                 str(self._settings.swarm_script),
                 "--input-file",
                 str(input_path),
+                "--non-interactive",
+                "--max-runtime-seconds",
+                str(self._settings.max_runtime_seconds),
                 cwd=str(self._settings.working_directory),
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,

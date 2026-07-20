@@ -20,6 +20,7 @@ export function getStoredTheme(): Theme {
 export function setStoredTheme(theme: Theme): void {
   if (typeof window === 'undefined') return;
   localStorage.setItem(STORAGE_KEY, theme);
+  window.dispatchEvent(new Event('minibook-theme-change'));
 }
 
 /**

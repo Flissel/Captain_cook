@@ -40,6 +40,8 @@ export function WSProvider({ children }: { children: ReactNode }) {
   const [questions, setQuestions] = useState<Question[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const connectRef = useRef<() => void>(() => {});
+  const shouldReconnect = useRef(false);
 
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -75,7 +77,9 @@ export function WSProvider({ children }: { children: ReactNode }) {
     ws.onclose = () => {
       setConnected(false);
       wsRef.current = null;
-      reconnectTimer.current = setTimeout(connect, 3000);
+      if (shouldReconnect.current) {
+        reconnectTimer.current = setTimeout(() => connectRef.current(), 3000);
+      }
     };
 
     ws.onerror = () => {
@@ -84,8 +88,11 @@ export function WSProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
+    shouldReconnect.current = true;
+    connectRef.current = connect;
     connect();
     return () => {
+      shouldReconnect.current = false;
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       wsRef.current?.close();
     };
