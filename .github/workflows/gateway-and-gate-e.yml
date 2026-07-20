@@ -60,6 +60,8 @@ jobs:
       CAPTAIN_N8N_PORT: ${{ vars.CAPTAIN_N8N_PORT || '5679' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Install Captain dependencies
         shell: pwsh
         run: python --version; python -m pip install --upgrade pip; python -m pip install -r requirements.txt pytest pytest-cov

@@ -60,6 +60,12 @@ def test_gate_e_is_manual_and_uses_the_isolated_local_live_runner() -> None:
 
     steps = job["steps"]
     assert isinstance(steps, list)
+    checkout = steps[0]
+    assert isinstance(checkout, dict)
+    assert checkout["uses"] == "actions/checkout@v4"
+    checkout_options = checkout["with"]
+    assert isinstance(checkout_options, dict)
+    assert checkout_options["submodules"] == "recursive"
     uses = "\n".join(str(step.get("uses", "")) for step in steps if isinstance(step, dict))
     assert "actions/setup-python" not in uses
     commands = "\n".join(str(step.get("run", "")) for step in steps if isinstance(step, dict))
