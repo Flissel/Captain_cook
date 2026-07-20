@@ -432,10 +432,21 @@ def _terminate_sync_process_tree(
         if completed.returncode not in {0, 128} and process.poll() is None:
             process.kill()
     else:
+        group_found = True
         try:
-            os.killpg(pid, signal.SIGKILL)
+            os.killpg(pid, signal.SIGTERM)
         except ProcessLookupError:
-            return
+            group_found = False
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        finally:
+            if group_found:
+                try:
+                    os.killpg(pid, 9)
+                except ProcessLookupError:
+                    pass
 
 
 class ResolvedFactoryCandidate(_FrozenModel):

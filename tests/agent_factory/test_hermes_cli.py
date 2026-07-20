@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import signal
 import time
+from types import SimpleNamespace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -460,7 +462,16 @@ async def test_skill_prompt_rejects_secret_like_and_raw_endpoint_bypasses_before
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("field", ["lease_capability", "released_skill_ref", "candidate_ref"])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "lease_capability",
+        "lease_raw_bearer",
+        "released_skill_ref",
+        "candidate_ref",
+        "candidate_raw_key",
+    ],
+)
 async def test_skill_prompt_recursively_rejects_unsafe_nested_request_strings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -473,11 +484,16 @@ async def test_skill_prompt_recursively_rejects_unsafe_nested_request_strings(
     skill_path.parent.mkdir(parents=True)
     skill_path.write_bytes(content)
     request = _released_skill_request(relative_skill, content)
-    if field == "lease_capability":
+    if field in {"lease_capability", "lease_raw_bearer"}:
+        unsafe = (
+            "n8n_endpoint=n8n.internal:5678"
+            if field == "lease_capability"
+            else "Bearer abcdefghijklmnop"
+        )
         request = request.model_copy(
             update={
                 "lease": request.lease.model_copy(
-                    update={"capabilities": ("codex.run", "n8n_endpoint=n8n.internal:5678")}
+                    update={"capabilities": ("codex.run", unsafe)}
                 )
             }
         )
@@ -493,10 +509,15 @@ async def test_skill_prompt_recursively_rejects_unsafe_nested_request_strings(
             }
         )
     else:
+        unsafe_uri = (
+            "artifact://factory/source/sk-abcdefghijk12345"
+            if field == "candidate_raw_key"
+            else "artifact://factory/source/n8n.internal:5678/api/v1"
+        )
         request = request.model_copy(
             update={
                 "candidate_source_ref": request.candidate_source_ref.model_copy(
-                    update={"uri": "artifact://factory/source/n8n.internal:5678/api/v1"}
+                    update={"uri": unsafe_uri}
                 )
             }
         )
@@ -659,6 +680,85 @@ async def test_skill_usage_timeout_terminates_the_verified_hermes_process_tree(
         ).issue_skill_usage(request, max_seconds=0.1)
 
     assert terminated == [4242]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_skill_usage_terminates_the_verified_hermes_process_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agenten.agent_factory.hermes_cli as hermes_cli
+
+    skill_root = tmp_path / "released-skills"
+    relative_skill = Path("factory_skill_evaluator/v1/SKILL.md")
+    content = b"# Released skill\n"
+    skill_path = skill_root / relative_skill
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_bytes(content)
+    request = _released_skill_request(relative_skill, content)
+    communicating = asyncio.Event()
+    terminated: list[int] = []
+
+    class Process:
+        returncode = None
+        pid = 4545
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            communicating.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    async def create_process(*_: str, **__: object) -> Process:
+        return Process()
+
+    async def terminate_tree(process: Process, *, executable: str) -> None:
+        assert executable == "hermes"
+        terminated.append(process.pid)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    monkeypatch.setattr(hermes_cli, "_terminate_async_process_tree", terminate_tree)
+    task = asyncio.create_task(
+        HermesCliFactory(
+            settings=HermesCliSettings(released_skill_root=skill_root)
+        ).issue_skill_usage(request, max_seconds=30)
+    )
+    await communicating.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert terminated == [4545]
+
+
+@pytest.mark.asyncio
+async def test_posix_hermes_tree_cleanup_escalates_even_after_the_leader_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agenten.agent_factory.hermes_cli as hermes_cli
+
+    signals: list[int] = []
+
+    class Process:
+        pid = 4646
+        returncode = None
+
+        async def wait(self) -> int:
+            self.returncode = -signal.SIGTERM
+            return self.returncode
+
+    monkeypatch.setattr(
+        hermes_cli,
+        "os",
+        SimpleNamespace(
+            name="posix",
+            killpg=lambda _pid, sent: signals.append(sent),
+        ),
+    )
+
+    await hermes_cli._terminate_async_process_tree(Process(), executable="hermes")
+
+    assert signals == [signal.SIGTERM, 9]
 
 
 @pytest.mark.asyncio

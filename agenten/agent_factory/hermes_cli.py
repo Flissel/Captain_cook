@@ -22,6 +22,7 @@ from agenten.agent_factory.skill_evaluation import (
     HermesSkillEvaluationRequest,
     HermesSkillUsageReceipt,
 )
+from agenten.agent_factory.skill_store import reject_sensitive_data
 from agenten.agent_runtime.contracts import ArtifactRef
 
 if TYPE_CHECKING:
@@ -183,6 +184,14 @@ class HermesCliFactory(HermesFactoryPort):
                 executable=self._settings.executable,
             )
             raise FactoryDispatchError("Hermes skill evaluation timed out") from exc
+        except asyncio.CancelledError:
+            await asyncio.shield(
+                _terminate_async_process_tree(
+                    process,
+                    executable=self._settings.executable,
+                )
+            )
+            raise
         _remaining_deadline_seconds(deadline)
         if process.returncode != 0:
             detail = stderr.decode("utf-8", errors="replace").strip()
@@ -427,6 +436,12 @@ def _validate_skill_prompt_request(request: HermesSkillEvaluationRequest) -> Non
 
 
 def _validate_serialized_prompt_value(value: object) -> None:
+    try:
+        reject_sensitive_data(value, "skill prompt")
+    except ValueError as exc:
+        raise FactoryDispatchError(
+            "skill evaluation request contains an unsafe prompt value"
+        ) from exc
     if isinstance(value, dict):
         for key, nested in value.items():
             _validate_serialized_prompt_value(key)
@@ -499,21 +514,23 @@ async def _terminate_async_process_tree(
         if killer.returncode not in {0, 128} and process.returncode is None:
             process.kill()
     else:
+        group_found = True
         try:
             os.killpg(pid, signal.SIGTERM)
         except ProcessLookupError:
-            return
+            group_found = False
     try:
         await asyncio.wait_for(process.wait(), timeout=5)
     except TimeoutError:
-        if os.name != "nt":
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        else:
+        if os.name == "nt":
             process.kill()
         await process.wait()
+    finally:
+        if os.name != "nt" and group_found:
+            try:
+                os.killpg(pid, 9)
+            except ProcessLookupError:
+                pass
 
 
 def _require_matching_receipt(

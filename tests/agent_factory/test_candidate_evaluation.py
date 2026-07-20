@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import signal
 import subprocess
 import sys
+from types import SimpleNamespace
 import zipfile
 from pathlib import Path
 
@@ -283,6 +285,43 @@ def test_evaluator_timeout_terminates_the_verified_candidate_process_tree(
         )
 
     assert terminated == [4343]
+
+
+def test_posix_evaluator_tree_cleanup_escalates_after_the_leader_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agenten.agent_factory.candidate_evaluation as candidate_evaluation
+
+    signals: list[int] = []
+
+    class Process:
+        pid = 4444
+        returncode = None
+        args = (sys.executable, "-c", "pass")
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.returncode = -signal.SIGTERM
+            return self.returncode
+
+    monkeypatch.setattr(
+        candidate_evaluation,
+        "os",
+        SimpleNamespace(
+            name="posix",
+            path=candidate_evaluation.os.path,
+            killpg=lambda _pid, sent: signals.append(sent),
+        ),
+    )
+
+    candidate_evaluation._terminate_sync_process_tree(
+        Process(),
+        executable=sys.executable,
+    )
+
+    assert signals == [signal.SIGTERM, 9]
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -328,7 +329,17 @@ async def test_usage_receipt_is_durable_before_candidate_resolution_or_evaluatio
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["failed", "before_request", "after_lease", "future"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "failed",
+        "before_request",
+        "after_lease",
+        "future",
+        "assertion_missing",
+        "assertion_reordered",
+    ],
+)
 async def test_invalid_staged_receipt_is_rejected_before_persistence_or_candidate_work(
     tmp_path: Path,
     case: str,
@@ -345,8 +356,16 @@ async def test_invalid_staged_receipt_is_rejected_before_persistence_or_candidat
         receipt = receipt.model_copy(update={"occurred_at": request.occurred_at - timedelta(seconds=1)})
     elif case == "after_lease":
         receipt = receipt.model_copy(update={"occurred_at": request.lease.expires_at})
-    else:
+    elif case == "future":
         receipt = receipt.model_copy(update={"occurred_at": active + timedelta(seconds=1)})
+    elif case == "assertion_missing":
+        receipt = receipt.model_copy(
+            update={"occurred_at": active, "assertion_ids": request.acceptance_assertion_ids[:1]}
+        )
+    else:
+        receipt = receipt.model_copy(
+            update={"occurred_at": active, "assertion_ids": tuple(reversed(request.acceptance_assertion_ids))}
+        )
     proposal = proposal.model_copy(update={"receipt": receipt})
     hermes = Hermes([proposal], events)
     candidates = CandidateStore(
@@ -546,6 +565,134 @@ async def test_sealed_checks_use_persisted_canonical_evaluator_payload_and_trust
     assert persisted["candidate_manifest"]["candidate_id"] == candidate.candidate_id
     assert persisted["candidate_manifest"]["build_command"] == list(candidate.build_command)
     assert [check["name"] for check in persisted["checks"]][-2:] == ["build", "real_case"]
+
+
+@pytest.mark.asyncio
+async def test_wrong_evaluator_trace_is_rejected_before_persistence_or_hermes_proposal(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    candidate, archive = _candidate(tmp_path)
+    request = _request(candidate)
+    hermes = Hermes([_evidence(request)], events)
+    candidates = CandidateStore(
+        [ResolvedFactoryCandidate(candidate=candidate, source_archive=archive)],
+        events,
+    )
+
+    class WrongTraceEvaluator(Evaluator):
+        def evaluate_skill(self, *, max_seconds: float, **kwargs: object) -> object:
+            result = super().evaluate_skill(max_seconds=max_seconds, **kwargs)
+            return result.model_copy(update={"trace_id": "wrong-trace"})
+
+    coordinator, _ = _coordinator(
+        tmp_path,
+        hermes=hermes,
+        candidates=candidates,
+        evaluator=WrongTraceEvaluator(events),
+        events=events,
+    )
+
+    with pytest.raises(FactoryDispatchError, match="trace"):
+        await coordinator.evaluate(request)
+
+    assert "candidate_evaluation_persisted" not in events
+    assert "proposal_requested" not in events
+
+
+@pytest.mark.asyncio
+async def test_sealed_evidence_replaces_future_hermes_timestamps_with_captain_time(
+    tmp_path: Path,
+) -> None:
+    candidate, archive = _candidate(tmp_path)
+    request = _request(candidate)
+    captain_now = request.occurred_at + timedelta(minutes=1, seconds=30)
+    proposal = _evidence(request)
+    assert proposal.occurred_at > captain_now
+    assert proposal.candidate is not None and proposal.candidate.created_at > captain_now
+    coordinator, _ = _coordinator(
+        tmp_path,
+        hermes=Hermes([proposal]),
+        candidates=CandidateStore(
+            [ResolvedFactoryCandidate(candidate=candidate, source_archive=archive)]
+        ),
+        clock=Clock(captain_now),
+    )
+
+    result = await coordinator.evaluate(request)
+
+    assert result.evidence.occurred_at == captain_now
+    assert result.evidence.candidate is not None
+    assert result.evidence.candidate.created_at == captain_now
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_operation", ["record_evaluation", "retain_candidate"])
+async def test_absolute_deadline_cancels_final_store_operations_before_success(
+    tmp_path: Path,
+    blocked_operation: str,
+) -> None:
+    candidate, archive = _candidate(tmp_path)
+    request = _request(candidate)
+    candidate_result = FactoryCandidateEvaluator().evaluate_skill(
+        request=request,
+        candidate=candidate,
+        source_archive=archive,
+    )
+    inner = SkillEvaluationStore(
+        repository=InMemorySkillEvaluationRepository(),
+        evidence_store=FilesystemSkillEvaluationEvidenceStore(tmp_path / "evidence"),
+    )
+
+    class BlockingStore:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        async def record_receipt(self, receipt):
+            return await inner.record_receipt(receipt)
+
+        async def record_candidate_evaluation(self, request_id, result):
+            return await inner.record_candidate_evaluation(request_id, result)
+
+        async def record_tool_gap(self, evaluation_id, marker):
+            return await inner.record_tool_gap(evaluation_id, marker)
+
+        async def _block(self):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+        async def record_evaluation(self, evidence):
+            if blocked_operation == "record_evaluation":
+                return await self._block()
+            return await inner.record_evaluation(evidence)
+
+        async def retain_candidate(self, evaluation_id, skill_candidate):
+            if blocked_operation == "retain_candidate":
+                return await self._block()
+            return await inner.retain_candidate(evaluation_id, skill_candidate)
+
+    class StaticEvaluator:
+        def evaluate_skill(self, **_: object):
+            return candidate_result
+
+    store = BlockingStore()
+    coordinator = HermesSkillEvaluationCoordinator(
+        cli=Hermes([_evidence(request)]),
+        evaluator=StaticEvaluator(),
+        candidate_store=CandidateStore(
+            [ResolvedFactoryCandidate(candidate=candidate, source_archive=archive)]
+        ),
+        private_store=store,
+        clock=Clock(request.lease.expires_at - timedelta(seconds=0.25)),
+    )
+
+    with pytest.raises(FactoryDispatchError, match="timed out"):
+        await asyncio.wait_for(coordinator.evaluate(request), timeout=1)
+
+    assert store.cancelled is True
 
 
 @pytest.mark.asyncio

@@ -363,7 +363,7 @@ def _record_content(
     metadata: Mapping[str, object] | None,
 ) -> bytes:
     payload = model.model_dump(mode="json", by_alias=True)
-    _reject_sensitive_data(payload, "record")
+    reject_sensitive_data(payload, "record")
     safe_metadata = _validated_metadata(metadata)
     return json.dumps(
         {
@@ -385,21 +385,23 @@ def _validated_metadata(metadata: Mapping[str, object] | None) -> dict[str, obje
         json.dumps(safe_metadata, ensure_ascii=False, sort_keys=True)
     except (TypeError, ValueError) as exc:
         raise ValueError("metadata must contain JSON-compatible structured values") from exc
-    _reject_sensitive_data(safe_metadata, "metadata")
+    reject_sensitive_data(safe_metadata, "metadata")
     return safe_metadata
 
 
-def _reject_sensitive_data(value: object, location: str) -> None:
+def reject_sensitive_data(value: object, location: str) -> None:
+    """Reject nested raw endpoints, credential fields, and credential values."""
+
     if isinstance(value, Mapping):
         for key, nested in value.items():
             key_text = str(key)
             if _SECRET_KEY_PATTERN.search(key_text.replace("-", "_")):
                 raise ValueError(f"{location} contains a secret-like field")
-            _reject_sensitive_data(nested, f"{location}.{key_text}")
+            reject_sensitive_data(nested, f"{location}.{key_text}")
         return
     if isinstance(value, (tuple, list)):
         for index, nested in enumerate(value):
-            _reject_sensitive_data(nested, f"{location}[{index}]")
+            reject_sensitive_data(nested, f"{location}[{index}]")
         return
     if isinstance(value, str):
         if _ENDPOINT_PATTERN.search(value):

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import time
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Awaitable, Protocol, TypeVar
 from uuid import UUID
 
 from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease, FactoryRole
@@ -31,6 +32,9 @@ if TYPE_CHECKING:
         FactoryCandidateManifest,
         ResolvedFactoryCandidate,
     )
+
+
+_T = TypeVar("_T")
 
 
 class FactoryDispatchError(RuntimeError):
@@ -191,6 +195,8 @@ class HermesSkillEvaluationCoordinator:
                 raise FactoryDispatchError("sealed candidate evaluation could not start") from exc
             if candidate_result.candidate_manifest != resolved.candidate:
                 raise FactoryDispatchError("sealed evaluator result does not match the resolved candidate manifest")
+            if candidate_result.trace_id != str(request.correlation_id):
+                raise FactoryDispatchError("sealed evaluator result trace does not match the Captain request")
             self._remaining_budget_seconds(request, deadline)
             evaluator_ref = await self._private_store.record_candidate_evaluation(
                 request.request_id,
@@ -223,7 +229,12 @@ class HermesSkillEvaluationCoordinator:
                 self._remaining_budget_seconds(request, deadline)
                 await self._private_store.record_tool_gap(evidence.evidence_id, marker)
             self._remaining_budget_seconds(request, deadline)
-            evidence_ref = await self._private_store.record_evaluation(evidence)
+            evidence_ref = await self._await_with_budget(
+                self._private_store.record_evaluation(evidence),
+                request=request,
+                deadline=deadline,
+                operation="evaluation evidence persistence",
+            )
             candidate_ref = None
             if (
                 evidence.outcome == "passed"
@@ -231,9 +242,14 @@ class HermesSkillEvaluationCoordinator:
                 and not required_tool_gaps(evidence)
             ):
                 self._remaining_budget_seconds(request, deadline)
-                candidate_ref = await self._private_store.retain_candidate(
-                    evidence.evidence_id,
-                    evidence.candidate,
+                candidate_ref = await self._await_with_budget(
+                    self._private_store.retain_candidate(
+                        evidence.evidence_id,
+                        evidence.candidate,
+                    ),
+                    request=request,
+                    deadline=deadline,
+                    operation="candidate retention",
                 )
             result = HermesSkillEvaluationResult(
                 evidence=evidence,
@@ -243,6 +259,7 @@ class HermesSkillEvaluationCoordinator:
             )
             if _candidate_test_failed(candidate_result) and iteration < request.max_iterations:
                 continue
+            self._remaining_budget_seconds(request, deadline)
             return result
         raise AssertionError("bounded skill evaluation loop did not return")
 
@@ -262,6 +279,24 @@ class HermesSkillEvaluationCoordinator:
         if monotonic_remaining <= 0:
             raise FactoryDispatchError("skill evaluation timed out within the active lease")
         return min(self._remaining_lease_seconds(request), monotonic_remaining)
+
+    async def _await_with_budget(
+        self,
+        awaitable: Awaitable[_T],
+        *,
+        request: HermesSkillEvaluationRequest,
+        deadline: float,
+        operation: str,
+    ) -> _T:
+        timeout = self._remaining_budget_seconds(request, deadline)
+        try:
+            result = await asyncio.wait_for(awaitable, timeout=timeout)
+        except TimeoutError as exc:
+            raise FactoryDispatchError(
+                f"{operation} timed out within the active lease"
+            ) from exc
+        self._remaining_budget_seconds(request, deadline)
+        return result
 
     def _active_time(self, request: HermesSkillEvaluationRequest) -> datetime:
         now = self._clock.now()
@@ -339,8 +374,13 @@ def _seal_candidate_result(
         ),
     )
     payload = proposed.model_dump(mode="python", by_alias=True)
+    candidate = proposed.candidate
+    if candidate is not None:
+        candidate = candidate.model_copy(update={"created_at": occurred_at})
     payload.update(
         {
+            "occurred_at": occurred_at,
+            "candidate": candidate,
             "checks": checks,
             "assertion_ids": assertion_ids,
             "outcome": outcome,
@@ -364,6 +404,7 @@ def _require_staged_receipt(
         or receipt.used_skill_id != request.released_skill.skill_id
         or receipt.used_skill_version != request.released_skill.version
         or receipt.used_skill_sha256 != request.released_skill.content_sha256
+        or receipt.assertion_ids != request.acceptance_assertion_ids
         or receipt.outcome != "unresolved"
         or receipt.occurred_at < request.occurred_at
         or not request.lease.issued_at <= receipt.occurred_at < request.lease.expires_at
