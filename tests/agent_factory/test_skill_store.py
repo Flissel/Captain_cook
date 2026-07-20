@@ -97,6 +97,24 @@ async def test_store_rejects_candidate_until_successful_evidence_is_recorded(tmp
 
 
 @pytest.mark.asyncio
+async def test_store_accepts_a_prework_usage_receipt_after_sealed_evidence_passes(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    staged_receipt = HermesSkillUsageReceipt.model_validate(
+        receipt_payload(outcome="unresolved")
+    )
+    evidence = HermesSkillEvaluationEvidence.model_validate(
+        evidence_payload(receipt=staged_receipt.model_dump(mode="json", by_alias=True))
+    )
+
+    await store.record_receipt(staged_receipt)
+    await store.record_evaluation(evidence)
+
+    candidate_ref = await store.retain_candidate(evidence.evidence_id, evidence.candidate)
+
+    assert store.get_evaluation(evidence.evidence_id).candidate_ref == candidate_ref
+
+
+@pytest.mark.asyncio
 async def test_store_does_not_retain_candidate_with_unresolved_required_tool_gap(
     tmp_path: Path,
 ) -> None:

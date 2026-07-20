@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import compileall
 import hashlib
 import json
 import os
@@ -11,6 +10,7 @@ import stat
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+import time
 from typing import Literal
 from uuid import NAMESPACE_URL, uuid5
 import zipfile
@@ -119,6 +119,7 @@ class FactoryCandidateEvaluator:
             acceptance_assertion_ids=job.acceptance_assertion_ids,
             candidate=candidate,
             source_archive=source_archive,
+            max_seconds=None,
         )
 
     def evaluate_skill(
@@ -127,6 +128,7 @@ class FactoryCandidateEvaluator:
         request: HermesSkillEvaluationRequest,
         candidate: FactoryCandidateManifest,
         source_archive: Path,
+        max_seconds: float | None = None,
     ) -> FactoryCandidateEvaluationResult:
         """Reuse the sealed evaluator without requiring a lifecycle job projection."""
 
@@ -137,6 +139,7 @@ class FactoryCandidateEvaluator:
             acceptance_assertion_ids=request.acceptance_assertion_ids,
             candidate=candidate,
             source_archive=source_archive,
+            max_seconds=max_seconds,
         )
 
     def _evaluate(
@@ -146,7 +149,11 @@ class FactoryCandidateEvaluator:
         acceptance_assertion_ids: tuple[str, ...],
         candidate: FactoryCandidateManifest,
         source_archive: Path,
+        max_seconds: float | None,
     ) -> FactoryCandidateEvaluationResult:
+        if max_seconds is not None and max_seconds <= 0:
+            raise ValueError("candidate evaluation requires positive remaining lease time")
+        deadline = None if max_seconds is None else time.monotonic() + max_seconds
         tool_names = tuple(tool.name for tool in candidate.n8n_tools)
         checks: list[FactoryEvaluationCheck] = []
         try:
@@ -169,14 +176,36 @@ class FactoryCandidateEvaluator:
                     checks.append(
                         FactoryEvaluationCheck(name=f"tool_schema_{index}", status="passed", detail="sha256 and JSON verified")
                     )
-                if not compileall.compile_dir(str(workspace), quiet=1):
-                    return self._failed(trace_id, tool_names, checks, "static_compile", "Python compilation failed")
+                static_compile = self._run(
+                    ("python", "-m", "compileall", "-q", "."),
+                    workspace,
+                    trace_id,
+                    self._command_timeout(candidate.timeout_seconds, deadline),
+                )
+                if static_compile.returncode != 0:
+                    return self._failed(
+                        trace_id,
+                        tool_names,
+                        checks,
+                        "static_compile",
+                        self._command_failure(static_compile),
+                    )
                 checks.append(FactoryEvaluationCheck(name="static_compile", status="passed", detail="compileall succeeded"))
-                build = self._run(candidate.build_command, workspace, trace_id, candidate.timeout_seconds)
+                build = self._run(
+                    candidate.build_command,
+                    workspace,
+                    trace_id,
+                    self._command_timeout(candidate.timeout_seconds, deadline),
+                )
                 if build.returncode != 0:
                     return self._failed(trace_id, tool_names, checks, "build", self._command_failure(build))
                 checks.append(FactoryEvaluationCheck(name="build", status="passed", detail="command exited 0"))
-                real_case = self._run(candidate.real_case_command, workspace, trace_id, candidate.timeout_seconds)
+                real_case = self._run(
+                    candidate.real_case_command,
+                    workspace,
+                    trace_id,
+                    self._command_timeout(candidate.timeout_seconds, deadline),
+                )
                 if real_case.returncode != 0:
                     return self._failed(trace_id, tool_names, checks, "real_case", self._command_failure(real_case))
                 assertion_ids = self._read_real_case_output(
@@ -283,6 +312,15 @@ class FactoryCandidateEvaluator:
     def _command_failure(result: subprocess.CompletedProcess[str]) -> str:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
         return f"candidate command failed: {detail[:300]}"
+
+    @staticmethod
+    def _command_timeout(configured_seconds: int, deadline: float | None) -> float:
+        if deadline is None:
+            return float(configured_seconds)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValueError("candidate evaluation timed out within the active lease")
+        return min(float(configured_seconds), remaining)
 
     @staticmethod
     def _failed(

@@ -140,6 +140,46 @@ def test_evaluator_accepts_the_typed_skill_evaluation_request_context(tmp_path: 
     assert result.trace_id == str(request.correlation_id)
 
 
+def test_skill_evaluator_bounds_candidate_commands_by_remaining_lease_time(tmp_path: Path) -> None:
+    archive_path = tmp_path / "candidate.zip"
+    team_ref, workflow_ref, input_schema_ref, output_schema_ref, source_ref = _write_candidate_archive(archive_path)
+    candidate = FactoryCandidateManifest(
+        candidate_id="support_triage_v1",
+        source_archive_ref=source_ref,
+        team_manifest={"reference": team_ref, "relative_path": "team_manifest.json"},
+        workflow_artifacts=({"reference": workflow_ref, "relative_path": "workflows/support_triage.json"},),
+        tool_schema_artifacts=(
+            {"reference": input_schema_ref, "relative_path": "schemas/support_triage.input.json"},
+            {"reference": output_schema_ref, "relative_path": "schemas/support_triage.output.json"},
+        ),
+        n8n_tools=(
+            TypedN8nTool(
+                name="support_triage",
+                description="Route a support request.",
+                input_schema_ref=input_schema_ref.uri,
+                output_schema_ref=output_schema_ref.uri,
+            ),
+        ),
+        build_command=("python", "-c", "import time; time.sleep(5)"),
+        real_case_command=("python", "run_case.py"),
+        timeout_seconds=10,
+    )
+    request = HermesSkillEvaluationRequest.model_validate(
+        request_payload(candidate_source_ref=source_ref.model_dump(mode="json"))
+    )
+
+    result = FactoryCandidateEvaluator().evaluate_skill(
+        request=request,
+        candidate=candidate,
+        source_archive=archive_path,
+        max_seconds=0.05,
+    )
+
+    assert result.status == "failed"
+    assert result.checks[-1].name == "validation"
+    assert "timed out" in result.checks[-1].detail
+
+
 @pytest.mark.asyncio
 async def test_validator_persists_build_evidence_for_a_leased_candidate(tmp_path: Path) -> None:
     archive_path = tmp_path / "candidate.zip"

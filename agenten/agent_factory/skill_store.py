@@ -309,7 +309,7 @@ def _has_successful_evidence(
     evidence = stored.evidence
     return (
         evidence.outcome == "passed"
-        and evidence.receipt.outcome == "passed"
+        and evidence.receipt.outcome in {"unresolved", "passed"}
         and {check.kind for check in evidence.checks} == {"build", "test"}
         and all(check.status == "passed" for check in evidence.checks)
     )

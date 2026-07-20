@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from agenten.agent_factory.contracts import FactoryPhase, FactoryRole
+from agenten.agent_factory.candidate_evaluation import (
+    FactoryCandidateEvaluationResult,
+    FactoryEvaluationCheck,
+)
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.hermes_cli import HermesCliFactory, HermesCliSettings
 from agenten.agent_factory.leases import issue_factory_lease
@@ -15,9 +20,14 @@ from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatch
 from agenten.agent_factory.skill_evaluation import (
     HermesSkillEvaluationEvidence,
     HermesSkillEvaluationRequest,
+    HermesSkillUsageReceipt,
 )
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
-from tests.agent_factory.test_skill_evaluation_contracts import evidence_payload, request_payload
+from tests.agent_factory.test_skill_evaluation_contracts import (
+    evidence_payload,
+    receipt_payload,
+    request_payload,
+)
 from tests.agent_factory.test_state_machine import block, job
 
 
@@ -150,6 +160,50 @@ def _skill_evaluation_payload(request: HermesSkillEvaluationRequest) -> dict[str
     }
 
 
+def _usage_receipt(request: HermesSkillEvaluationRequest) -> HermesSkillUsageReceipt:
+    return HermesSkillUsageReceipt.model_validate(
+        {
+            **receipt_payload(),
+            "request_id": str(request.request_id),
+            "job_id": str(request.job_id),
+            "correlation_id": str(request.correlation_id),
+            "lease_id": request.lease.lease_id,
+            "released_skill": request.released_skill.model_dump(mode="json", by_alias=True),
+            "used_skill_id": request.released_skill.skill_id,
+            "used_skill_version": request.released_skill.version,
+            "used_skill_sha256": request.released_skill.content_sha256,
+        }
+    )
+
+
+def _candidate_result(request: HermesSkillEvaluationRequest) -> FactoryCandidateEvaluationResult:
+    return FactoryCandidateEvaluationResult(
+        status="succeeded",
+        trace_id=str(request.correlation_id),
+        assertion_ids=request.acceptance_assertion_ids,
+        tool_names=("support_triage",),
+        checks=(
+            FactoryEvaluationCheck(name="build", status="passed", detail="command exited 0"),
+            FactoryEvaluationCheck(name="real_case", status="passed", detail="assertions verified"),
+        ),
+    )
+
+
+def test_settings_preserve_legacy_positional_constructor_order() -> None:
+    settings = HermesCliSettings(
+        "custom-hermes",
+        Path("legacy-skill"),
+        17,
+        Path("legacy-evidence"),
+    )
+
+    assert settings.executable == "custom-hermes"
+    assert settings.skill_path == Path("legacy-skill")
+    assert settings.timeout_seconds == 17
+    assert settings.evidence_root == Path("legacy-evidence")
+    assert settings.released_skill_root == Path("agenten/agent_factory/released-skills")
+
+
 @pytest.mark.asyncio
 async def test_skill_evaluation_prompt_binds_exactly_one_released_skill_and_lease(
     tmp_path: Path,
@@ -167,10 +221,39 @@ async def test_skill_evaluation_prompt_binds_exactly_one_released_skill_and_leas
     class Process:
         returncode = 0
 
+        def __init__(self, prompt: str) -> None:
+            self.prompt = prompt
+
         async def communicate(self) -> tuple[bytes, bytes]:
+            captain_request = json.loads(
+                next(
+                    line.removeprefix("captain_request_json=")
+                    for line in self.prompt.splitlines()
+                    if line.startswith("captain_request_json=")
+                )
+            )
+            response_shape = json.loads(
+                next(
+                    line.removeprefix("response_shape_json=")
+                    for line in self.prompt.splitlines()
+                    if line.startswith("response_shape_json=")
+                )
+            )
+            payload = _skill_evaluation_payload(request)
+            payload.update(
+                {
+                    "request_id": captain_request["request_id"],
+                    "job_id": captain_request["job_id"],
+                    "correlation_id": captain_request["correlation_id"],
+                    "subject_id": captain_request["subject_id"],
+                    "subject_version": captain_request["subject_version"],
+                    "request": captain_request,
+                    "receipt": response_shape["receipt"],
+                }
+            )
             return (
                 HermesSkillEvaluationEvidence.model_validate(
-                    _skill_evaluation_payload(request)
+                    payload
                 ).model_dump_json(by_alias=True).encode(),
                 b"",
             )
@@ -178,21 +261,70 @@ async def test_skill_evaluation_prompt_binds_exactly_one_released_skill_and_leas
     async def create_process(*command: str, **_: object) -> Process:
         nonlocal observed
         observed = command
-        return Process()
+        return Process(command[-1])
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
     settings = HermesCliSettings(released_skill_root=skill_root)
 
-    evidence = await HermesCliFactory(settings=settings).evaluate_skill(request)
+    receipt = _usage_receipt(request)
+    evidence = await HermesCliFactory(settings=settings).evaluate_skill(
+        request,
+        receipt=receipt,
+        candidate_result=_candidate_result(request),
+        candidate_id="support_triage_v1",
+        candidate_source_ref=request.candidate_source_ref,
+        max_seconds=30,
+    )
 
     prompt = observed[-1]
     expected_path = skill_path.resolve().as_posix()
     assert prompt.count(expected_path) == 1
-    assert prompt.count(request.released_skill.content_ref.uri) == 1
-    assert prompt.count(request.released_skill.content_sha256) == 1
-    assert prompt.count(request.lease.lease_id) == 1
-    assert prompt.count(request.lease.workspace_ref) == 1
-    assert all(prompt.count(assertion_id) == 1 for assertion_id in request.acceptance_assertion_ids)
+    captain_request = json.loads(
+        next(line.removeprefix("captain_request_json=") for line in prompt.splitlines() if line.startswith("captain_request_json="))
+    )
+    response_shape = json.loads(
+        next(line.removeprefix("response_shape_json=") for line in prompt.splitlines() if line.startswith("response_shape_json="))
+    )
+    assert captain_request == request.model_dump(mode="json", by_alias=True)
+    assert {
+        "schema",
+        "evidence_id",
+        "request_id",
+        "job_id",
+        "correlation_id",
+        "subject_id",
+        "subject_version",
+        "occurred_at",
+        "producer",
+        "request",
+        "receipt",
+        "candidate",
+        "tool_gaps",
+        "checks",
+        "assertion_ids",
+        "outcome",
+    } == set(response_shape)
+    assert response_shape["request"] == captain_request
+    assert response_shape["receipt"] == receipt.model_dump(mode="json", by_alias=True)
+    assert set(response_shape["checks"][0]) == {
+        "check_id",
+        "kind",
+        "command",
+        "status",
+        "occurred_at",
+        "evidence_ref",
+        "assertion_ids",
+    }
+    assert response_shape["tool_gaps"][0]["schema"] == "TODO_TOOL.v1"
+    assert request.released_skill.content_ref.uri in prompt
+    assert request.released_skill.content_sha256 in prompt
+    assert str(request.request_id) in prompt
+    assert str(request.job_id) in prompt
+    assert str(request.correlation_id) in prompt
+    assert request.subject_id in prompt
+    assert str(request.subject_version) in prompt
+    assert request.candidate_source_ref.uri in prompt
+    assert str(request.max_iterations) in prompt
     assert "api_key" not in prompt.lower()
     assert "authorization" not in prompt.lower()
     assert "http://" not in prompt.lower()
@@ -235,7 +367,7 @@ async def test_skill_evaluation_rejects_invalid_released_skill_before_spawning_h
     with pytest.raises(FactoryDispatchError, match="released skill"):
         await HermesCliFactory(
             settings=HermesCliSettings(released_skill_root=skill_root)
-        ).evaluate_skill(request)
+        ).issue_skill_usage(request, max_seconds=30)
 
     assert spawned is False
 
@@ -267,4 +399,101 @@ async def test_skill_evaluation_rejects_malformed_hermes_json(
     with pytest.raises(FactoryDispatchError, match="typed skill evaluation JSON"):
         await HermesCliFactory(
             settings=HermesCliSettings(released_skill_root=skill_root)
-        ).evaluate_skill(request)
+        ).evaluate_skill(
+            request,
+            receipt=_usage_receipt(request),
+            candidate_result=_candidate_result(request),
+            candidate_id="support_triage_v1",
+            candidate_source_ref=request.candidate_source_ref,
+            max_seconds=30,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "unsafe"),
+    [
+        ("workspace", "workspace://factory/build?api_key=top-secret"),
+        ("workspace", "workspace://factory/http://localhost:5678/api/v1"),
+        ("workspace", "workspace://factory/n8n.internal:5678/api/v1"),
+        ("assertion", "schema_valid authorization=Bearer-hidden"),
+        ("assertion", "real_case_green=https://localhost:5678/webhook"),
+        ("assertion", "x-authorization=benign-looking"),
+        ("assertion", "n8n_endpoint=n8n.internal:5678"),
+    ],
+)
+async def test_skill_prompt_rejects_secret_like_and_raw_endpoint_bypasses_before_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    unsafe: str,
+) -> None:
+    skill_root = tmp_path / "released-skills"
+    relative_skill = Path("factory_skill_evaluator/v1/SKILL.md")
+    content = b"# Released skill\n"
+    skill_path = skill_root / relative_skill
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_bytes(content)
+    request = _released_skill_request(relative_skill, content)
+    if field == "workspace":
+        request = request.model_copy(
+            update={"lease": request.lease.model_copy(update={"workspace_ref": unsafe})}
+        )
+    else:
+        request = request.model_copy(update={"acceptance_assertion_ids": (unsafe,)})
+    spawned = False
+
+    async def create_process(*_: str, **__: object) -> object:
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("Hermes must not be spawned")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    with pytest.raises(FactoryDispatchError, match="unsafe prompt value"):
+        await HermesCliFactory(
+            settings=HermesCliSettings(released_skill_root=skill_root)
+        ).issue_skill_usage(request, max_seconds=30)
+
+    assert spawned is False
+
+
+@pytest.mark.asyncio
+async def test_skill_usage_timeout_terminates_the_hermes_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill_root = tmp_path / "released-skills"
+    relative_skill = Path("factory_skill_evaluator/v1/SKILL.md")
+    content = b"# Released skill\n"
+    skill_path = skill_root / relative_skill
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_bytes(content)
+    request = _released_skill_request(relative_skill, content)
+    terminated = False
+
+    class Process:
+        returncode = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        def terminate(self) -> None:
+            nonlocal terminated
+            terminated = True
+
+        async def wait(self) -> int:
+            return -15
+
+    async def create_process(*_: str, **__: object) -> Process:
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    with pytest.raises(FactoryDispatchError, match="timed out"):
+        await HermesCliFactory(
+            settings=HermesCliSettings(released_skill_root=skill_root)
+        ).issue_skill_usage(request, max_seconds=0.01)
+
+    assert terminated is True
