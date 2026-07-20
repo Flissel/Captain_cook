@@ -42,7 +42,30 @@ def test_gateway_ci_uses_a_real_mariadb_service_without_skips() -> None:
     assert "tests/gateway/test_gateway.py" in commands
     assert "minibook/tests" in commands
     assert "--no-cov" in commands
-    assert "--ignore=tests/live" in commands
+    assert "tests/test_architecture_fitness.py" in commands
+    assert "tests/live" not in commands
+
+
+def test_windows_ci_covers_the_full_deterministic_runtime() -> None:
+    workflow = _workflow()
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    job = jobs["deterministic_windows"]
+    assert isinstance(job, dict)
+    assert job["runs-on"] == ["self-hosted", "windows"]
+
+    steps = job["steps"]
+    assert isinstance(steps, list)
+    checkout = steps[0]
+    assert isinstance(checkout, dict)
+    assert checkout["uses"] == "actions/checkout@v4"
+    checkout_options = checkout["with"]
+    assert isinstance(checkout_options, dict)
+    assert checkout_options["submodules"] == "recursive"
+
+    commands = "\n".join(str(step.get("run", "")) for step in steps if isinstance(step, dict))
+    assert "minibook/requirements.txt" in commands
+    assert '-m "not live" --ignore=tests/live' in commands
 
 
 def test_gate_e_is_manual_and_uses_the_isolated_local_live_runner() -> None:

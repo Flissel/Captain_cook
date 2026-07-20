@@ -44,10 +44,32 @@ jobs:
           tests/blockchain/test_mariadb_storage.py
           tests/gateway/test_gateway.py
           tests/gateway/test_agent_runtime.py
-      - name: Exercise the remaining deterministic suite
-        run: python -m pytest -q --no-cov -rs -m "not live" --ignore=tests/live
+      - name: Exercise architecture and CI contracts
+        run: >-
+          python -m pytest -q --no-cov -rs
+          tests/test_architecture_fitness.py
+          tests/test_import_boundaries.py
+          tests/test_workstream_docs.py
+          tests/scripts/test_ci_workflow.py
       - name: Exercise Minibook Forge runtime controls
         run: PYTHONPATH=minibook python -m pytest -q --no-cov minibook/tests
+
+  deterministic_windows:
+    name: Windows deterministic runtime
+    runs-on: [self-hosted, windows]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Captain and Minibook dependencies
+        shell: pwsh
+        run: >-
+          python --version;
+          python -m pip install --upgrade pip;
+          python -m pip install -r requirements.txt -r minibook/requirements.txt pytest pytest-cov
+      - name: Exercise complete Windows deterministic suite
+        shell: pwsh
+        run: python -m pytest -q --no-cov -rs -m "not live" --ignore=tests/live
 
   gate_e_live:
     name: Gate E live release decision
