@@ -60,12 +60,9 @@ jobs:
       CAPTAIN_N8N_PORT: ${{ vars.CAPTAIN_N8N_PORT || '5679' }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
       - name: Install Captain dependencies
         shell: pwsh
-        run: python -m pip install --upgrade pip; python -m pip install -r requirements.txt pytest pytest-cov
+        run: python --version; python -m pip install --upgrade pip; python -m pip install -r requirements.txt pytest pytest-cov
       - name: Run three provider traces and fail-closed release decision
         shell: pwsh
         run: pwsh -NoProfile -File scripts/run-gate-e-ci.ps1

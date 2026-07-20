@@ -60,6 +60,8 @@ def test_gate_e_is_manual_and_uses_the_isolated_local_live_runner() -> None:
 
     steps = job["steps"]
     assert isinstance(steps, list)
+    uses = "\n".join(str(step.get("uses", "")) for step in steps if isinstance(step, dict))
+    assert "actions/setup-python" not in uses
     commands = "\n".join(str(step.get("run", "")) for step in steps if isinstance(step, dict))
     assert "scripts/run-gate-e-ci.ps1" in commands
 
