@@ -138,10 +138,10 @@
 - Optionally modify: `scripts/run-gate-e.ps1` only if a new non-secret argument is needed to select a prepared skill-evaluation fixture
 - Create or modify: `tests/integration/test_hermes_skill_evaluation_gateway.py`
 
-- [ ] Add an integration test using the Gateway repository, a sealed candidate archive, a released fixture skill, a successful Hermes receipt, and a required/optional tool-gap mix. Verify the exact Captain-only chain: request → skill usage → build/test evidence → candidate retained → Gateway validation → skill published → ready-to-use promotion.
-- [ ] Add recovery tests: altered skill digest, a deliberately failing build, a missing required tool, and a stale lease must fail closed; a subsequent clean bounded retry must create fresh evidence and still require the existing recovery-plus-three-successful-E2E release decision.
-- [ ] Update architecture/workstream docs with ownership and the command sequence. State explicitly that Minibook receives only the resulting projection and that the Hermes submodule is not a shared-registry writer.
-- [ ] Run targeted deterministic suites while iterating:
+- [x] Add an integration test using the Gateway repository, a sealed candidate archive, a released fixture skill, a successful Hermes receipt, and a required/optional tool-gap mix. Verify the exact Captain-only chain: request → skill usage → build/test evidence → candidate retained → Gateway validation → skill published → ready-to-use promotion.
+- [x] Add recovery tests: altered skill digest, a deliberately failing build, a missing required tool, and a stale lease must fail closed; a subsequent clean bounded retry must create fresh evidence and still require the existing recovery-plus-three-successful-E2E release decision.
+- [x] Update architecture/workstream docs with ownership and the command sequence. State explicitly that Minibook receives only the resulting projection and that the Hermes submodule is not a shared-registry writer.
+- [x] Run targeted deterministic suites while iterating:
 
   ```powershell
   python -m pytest -q tests/agent_factory tests/gateway/test_agent_factory.py tests/gateway/test_factory_repository.py tests/gateway/test_delivery_events.py tests/agent_runtime/test_n8n_endpoint.py
