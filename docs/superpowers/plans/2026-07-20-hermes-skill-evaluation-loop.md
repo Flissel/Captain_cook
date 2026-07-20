@@ -75,12 +75,12 @@
 - Modify: `tests/agent_factory/test_hermes_cli.py`
 - Modify: `tests/agent_factory/test_candidate_evaluation.py`
 
-- [ ] Add failing adapter tests proving that the Hermes prompt contains exactly the selected released skill path/reference, its digest, the Factory lease id, workspace reference, assertion ids, and no credential or raw n8n endpoint.
-- [ ] Extend `HermesCliSettings` with an explicit read-only released-skill root. Reject a resolved skill outside that root and reject a missing or digest-mismatched skill before spawning Hermes.
-- [ ] Change `_prompt_for()` so Hermes is instructed to: use the supplied skill first; write only in the leased workspace; return one typed evaluation envelope; record a `TODO_TOOL.v1` rather than inventing access; retain a skill candidate only after the task is successful; and never publish a skill or write the ledger.
-- [ ] Add a `HermesSkillEvaluationCoordinator` which receives an approved request, invokes the CLI adapter, passes candidate build/test work to the existing `FactoryCandidateEvaluator`, persists receipt/evidence through the private store, and returns a Captain-recordable result. Inject the CLI, evaluator, clock, and stores for deterministic tests.
-- [ ] Reuse the sealed archive / temporary-workspace evaluator. Add tests for: successful skill usage plus retained candidate; build failure with no candidate; test failure triggering Captain's bounded improvement path; malformed Hermes JSON; stale lease; and an unresolved required gap.
-- [ ] Keep `HermesCliFactory.dispatch()` compatible with current role dispatches. The skill-evaluation path must be additive, not silently change existing block parsing.
+- [x] Add failing adapter tests proving that the Hermes prompt contains exactly the selected released skill path/reference, its digest, the Factory lease id, workspace reference, assertion ids, and no credential or raw n8n endpoint.
+- [x] Extend `HermesCliSettings` with an explicit read-only released-skill root. Reject a resolved skill outside that root and reject a missing or digest-mismatched skill before spawning Hermes.
+- [x] Change `_prompt_for()` so Hermes is instructed to: use the supplied skill first; write only in the leased workspace; return one typed evaluation envelope; record a `TODO_TOOL.v1` rather than inventing access; retain a skill candidate only after the task is successful; and never publish a skill or write the ledger.
+- [x] Add a `HermesSkillEvaluationCoordinator` which receives an approved request, invokes the CLI adapter, passes candidate build/test work to the existing `FactoryCandidateEvaluator`, persists receipt/evidence through the private store, and returns a Captain-recordable result. Inject the CLI, evaluator, clock, and stores for deterministic tests.
+- [x] Reuse the sealed archive / temporary-workspace evaluator. Add tests for: successful skill usage plus retained candidate; build failure with no candidate; test failure triggering Captain's bounded improvement path; malformed Hermes JSON; stale lease; and an unresolved required gap.
+- [x] Keep `HermesCliFactory.dispatch()` compatible with current role dispatches. The skill-evaluation path must be additive, not silently change existing block parsing.
 
 ### Task 4: Enforce tool-gap and evaluation evidence in the Factory lifecycle
 
