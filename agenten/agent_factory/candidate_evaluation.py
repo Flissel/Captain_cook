@@ -328,7 +328,12 @@ class FactoryCandidateEvaluator:
                 process.communicate(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
-                process.communicate()
+                try:
+                    process.communicate(timeout=5)
+                except subprocess.TimeoutExpired as cleanup_exc:
+                    raise ValueError(
+                        "candidate process tree did not terminate within the cleanup window"
+                    ) from cleanup_exc
             raise ValueError(f"candidate command timed out after {timeout_seconds} seconds") from exc
 
     @staticmethod
@@ -419,8 +424,6 @@ def _terminate_sync_process_tree(
         != os.path.normcase(os.path.abspath(executable))
     ):
         raise ValueError("candidate process identity does not match the evaluator executable")
-    if process.poll() is not None:
-        return
     if os.name == "nt":
         completed = subprocess.run(
             ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
@@ -447,6 +450,12 @@ def _terminate_sync_process_tree(
                     os.killpg(pid, 9)
                 except ProcessLookupError:
                     pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError(
+                "candidate process tree did not terminate within the cleanup window"
+            ) from exc
 
 
 class ResolvedFactoryCandidate(_FrozenModel):

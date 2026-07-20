@@ -627,7 +627,16 @@ async def test_sealed_evidence_replaces_future_hermes_timestamps_with_captain_ti
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("blocked_operation", ["record_evaluation", "retain_candidate"])
+@pytest.mark.parametrize(
+    "blocked_operation",
+    [
+        "record_receipt",
+        "record_candidate_evaluation",
+        "record_tool_gap",
+        "record_evaluation",
+        "retain_candidate",
+    ],
+)
 async def test_absolute_deadline_cancels_final_store_operations_before_success(
     tmp_path: Path,
     blocked_operation: str,
@@ -649,12 +658,18 @@ async def test_absolute_deadline_cancels_final_store_operations_before_success(
             self.cancelled = False
 
         async def record_receipt(self, receipt):
+            if blocked_operation == "record_receipt":
+                return await self._block()
             return await inner.record_receipt(receipt)
 
         async def record_candidate_evaluation(self, request_id, result):
+            if blocked_operation == "record_candidate_evaluation":
+                return await self._block()
             return await inner.record_candidate_evaluation(request_id, result)
 
         async def record_tool_gap(self, evaluation_id, marker):
+            if blocked_operation == "record_tool_gap":
+                return await self._block()
             return await inner.record_tool_gap(evaluation_id, marker)
 
         async def _block(self):
@@ -680,7 +695,9 @@ async def test_absolute_deadline_cancels_final_store_operations_before_success(
 
     store = BlockingStore()
     coordinator = HermesSkillEvaluationCoordinator(
-        cli=Hermes([_evidence(request)]),
+        cli=Hermes(
+            [_evidence(request, required_gap=blocked_operation == "record_tool_gap")]
+        ),
         evaluator=StaticEvaluator(),
         candidate_store=CandidateStore(
             [ResolvedFactoryCandidate(candidate=candidate, source_archive=archive)]

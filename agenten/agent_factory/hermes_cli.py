@@ -494,8 +494,6 @@ async def _terminate_async_process_tree(
         process.terminate()
         await process.wait()
         return
-    if process.returncode is not None:
-        return
     if os.name == "nt":
         killer = await asyncio.create_subprocess_exec(
             "taskkill.exe",
@@ -510,7 +508,7 @@ async def _terminate_async_process_tree(
             await asyncio.wait_for(killer.communicate(), timeout=5)
         except TimeoutError:
             killer.kill()
-            await killer.wait()
+            await asyncio.wait_for(killer.wait(), timeout=5)
         if killer.returncode not in {0, 128} and process.returncode is None:
             process.kill()
     else:
@@ -522,15 +520,21 @@ async def _terminate_async_process_tree(
     try:
         await asyncio.wait_for(process.wait(), timeout=5)
     except TimeoutError:
-        if os.name == "nt":
-            process.kill()
-        await process.wait()
+        pass
     finally:
         if os.name != "nt" and group_found:
             try:
                 os.killpg(pid, 9)
             except ProcessLookupError:
                 pass
+        elif os.name == "nt" and process.returncode is None:
+            process.kill()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+    except TimeoutError as exc:
+        raise FactoryDispatchError(
+            f"could not terminate Hermes process tree for {executable}"
+        ) from exc
 
 
 def _require_matching_receipt(

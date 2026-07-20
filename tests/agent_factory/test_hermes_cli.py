@@ -741,7 +741,7 @@ async def test_posix_hermes_tree_cleanup_escalates_even_after_the_leader_exits(
 
     class Process:
         pid = 4646
-        returncode = None
+        returncode = 0
 
         async def wait(self) -> int:
             self.returncode = -signal.SIGTERM
@@ -759,6 +759,46 @@ async def test_posix_hermes_tree_cleanup_escalates_even_after_the_leader_exits(
     await hermes_cli._terminate_async_process_tree(Process(), executable="hermes")
 
     assert signals == [signal.SIGTERM, 9]
+
+
+@pytest.mark.asyncio
+async def test_posix_hermes_tree_cleanup_bounds_both_waits_around_group_kill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agenten.agent_factory.hermes_cli as hermes_cli
+
+    signals: list[int] = []
+    wait_timeouts: list[float] = []
+
+    class Process:
+        pid = 4747
+        returncode = None
+
+        async def wait(self) -> int:
+            self.returncode = -signal.SIGTERM
+            return self.returncode
+
+    async def bounded_wait(awaitable, *, timeout: float):
+        wait_timeouts.append(timeout)
+        if len(wait_timeouts) == 1:
+            awaitable.close()
+            raise TimeoutError
+        return await awaitable
+
+    monkeypatch.setattr(
+        hermes_cli,
+        "os",
+        SimpleNamespace(
+            name="posix",
+            killpg=lambda _pid, sent: signals.append(sent),
+        ),
+    )
+    monkeypatch.setattr(hermes_cli.asyncio, "wait_for", bounded_wait)
+
+    await hermes_cli._terminate_async_process_tree(Process(), executable="hermes")
+
+    assert signals == [signal.SIGTERM, 9]
+    assert wait_timeouts == [5, 5]
 
 
 @pytest.mark.asyncio

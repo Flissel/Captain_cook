@@ -180,7 +180,13 @@ class HermesSkillEvaluationCoordinator:
             )
             receipt_time = self._active_time(request)
             _require_staged_receipt(request, receipt, now=receipt_time)
-            await self._private_store.record_receipt(receipt)
+            await self._await_with_budget(
+                self._private_store.record_receipt(receipt),
+                request=request,
+                deadline=deadline,
+                operation="usage receipt persistence",
+                known_active_time=receipt_time,
+            )
             self._remaining_budget_seconds(request, deadline)
             resolved = self._candidate_store.candidate_for_evaluation(request, receipt)
             evaluator_seconds = self._remaining_budget_seconds(request, deadline)
@@ -198,9 +204,14 @@ class HermesSkillEvaluationCoordinator:
             if candidate_result.trace_id != str(request.correlation_id):
                 raise FactoryDispatchError("sealed evaluator result trace does not match the Captain request")
             self._remaining_budget_seconds(request, deadline)
-            evaluator_ref = await self._private_store.record_candidate_evaluation(
-                request.request_id,
-                candidate_result,
+            evaluator_ref = await self._await_with_budget(
+                self._private_store.record_candidate_evaluation(
+                    request.request_id,
+                    candidate_result,
+                ),
+                request=request,
+                deadline=deadline,
+                operation="candidate evaluation persistence",
             )
             self._remaining_budget_seconds(request, deadline)
             proposed = await self._cli.evaluate_skill(
@@ -226,8 +237,12 @@ class HermesSkillEvaluationCoordinator:
                 check_time,
             )
             for marker in evidence.tool_gaps:
-                self._remaining_budget_seconds(request, deadline)
-                await self._private_store.record_tool_gap(evidence.evidence_id, marker)
+                await self._await_with_budget(
+                    self._private_store.record_tool_gap(evidence.evidence_id, marker),
+                    request=request,
+                    deadline=deadline,
+                    operation="tool gap persistence",
+                )
             self._remaining_budget_seconds(request, deadline)
             evidence_ref = await self._await_with_budget(
                 self._private_store.record_evaluation(evidence),
@@ -287,8 +302,20 @@ class HermesSkillEvaluationCoordinator:
         request: HermesSkillEvaluationRequest,
         deadline: float,
         operation: str,
+        known_active_time: datetime | None = None,
     ) -> _T:
-        timeout = self._remaining_budget_seconds(request, deadline)
+        if known_active_time is None:
+            timeout = self._remaining_budget_seconds(request, deadline)
+        else:
+            monotonic_remaining = deadline - time.monotonic()
+            lease_remaining = (
+                request.lease.expires_at - known_active_time
+            ).total_seconds()
+            timeout = min(monotonic_remaining, lease_remaining)
+            if timeout <= 0:
+                raise FactoryDispatchError(
+                    f"{operation} timed out within the active lease"
+                )
         try:
             result = await asyncio.wait_for(awaitable, timeout=timeout)
         except TimeoutError as exc:

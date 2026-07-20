@@ -296,7 +296,7 @@ def test_posix_evaluator_tree_cleanup_escalates_after_the_leader_exits(
 
     class Process:
         pid = 4444
-        returncode = None
+        returncode = 0
         args = (sys.executable, "-c", "pass")
 
         def poll(self) -> int | None:
@@ -322,6 +322,46 @@ def test_posix_evaluator_tree_cleanup_escalates_after_the_leader_exits(
     )
 
     assert signals == [signal.SIGTERM, 9]
+
+
+def test_evaluator_timeout_never_uses_an_unbounded_post_termination_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agenten.agent_factory.candidate_evaluation as candidate_evaluation
+
+    wait_timeouts: list[float | None] = []
+
+    class Process:
+        pid = 4848
+        returncode = None
+        args = (sys.executable, "-c", "pass")
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            wait_timeouts.append(timeout)
+            if len(wait_timeouts) <= 2:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            return "", ""
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: Process())
+    monkeypatch.setattr(
+        candidate_evaluation,
+        "_terminate_sync_process_tree",
+        lambda process, *, executable: None,
+    )
+
+    with pytest.raises(ValueError, match="timed out"):
+        FactoryCandidateEvaluator._run(
+            ("python", "-c", "pass"),
+            tmp_path,
+            "trace-1",
+            0.01,
+        )
+
+    assert wait_timeouts == [0.01, 5, 5]
 
 
 @pytest.mark.asyncio
