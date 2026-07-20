@@ -18,6 +18,8 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import MappingProxyType
+from typing import Mapping
 from uuid import uuid4
 
 import httpx
@@ -67,7 +69,9 @@ from hermes_cli.n8n_worker_mcp import (  # noqa: E402
 from hermes_cli.mcp_config import write_capability_scoped_codex_config  # noqa: E402
 
 
-pytestmark = [pytest.mark.live]
+_CAPTAIN_APPROVED_READ_ONLY_MCP_SCHEMAS: Mapping[str, frozenset[str]] = MappingProxyType(
+    {"search_workflows": frozenset({"query"})}
+)
 
 
 def _free_port() -> int:
@@ -99,11 +103,13 @@ def _builder_environment() -> dict[str, str]:
     return values
 
 
-def _approved_read_only_tool() -> tuple[str, dict[str, object]]:
+def _approved_read_only_tool(
+    environment: Mapping[str, str] = os.environ,
+) -> tuple[str, dict[str, object]]:
     """Load the operator-prepared, least-privilege MCP call without recording it."""
 
-    tool_name = os.environ.get("CAPTAIN_N8N_LIVE_READ_ONLY_TOOL", "").strip()
-    arguments_raw = os.environ.get("CAPTAIN_N8N_LIVE_READ_ONLY_ARGUMENTS", "").strip()
+    tool_name = environment.get("CAPTAIN_N8N_LIVE_READ_ONLY_TOOL", "").strip()
+    arguments_raw = environment.get("CAPTAIN_N8N_LIVE_READ_ONLY_ARGUMENTS", "").strip()
     if not tool_name or not arguments_raw:
         pytest.skip(
             "opt-in live gate: CAPTAIN_N8N_LIVE_READ_ONLY_TOOL and "
@@ -115,7 +121,45 @@ def _approved_read_only_tool() -> tuple[str, dict[str, object]]:
         pytest.fail("required live gate: approved read-only tool arguments are invalid JSON")
     if not isinstance(arguments, dict):
         pytest.fail("required live gate: approved read-only tool arguments must be an object")
+    allowed_fields = _CAPTAIN_APPROVED_READ_ONLY_MCP_SCHEMAS.get(tool_name)
+    if allowed_fields is None:
+        pytest.fail(
+            "required live gate: configured read-only tool is not Captain-approved"
+        )
+    if set(arguments) != allowed_fields:
+        pytest.fail(
+            "required live gate: configured read-only tool arguments violate "
+            "the Captain-approved schema"
+        )
+    query = arguments.get("query")
+    if not isinstance(query, str) or not query.strip() or len(query) > 128:
+        pytest.fail(
+            "required live gate: configured read-only tool arguments violate "
+            "the Captain-approved schema"
+        )
     return tool_name, arguments
+
+
+def test_approved_read_only_tool_rejects_arbitrary_or_mutating_environment_calls() -> None:
+    with pytest.raises(pytest.fail.Exception, match="Captain-approved"):
+        _approved_read_only_tool(
+            {
+                "CAPTAIN_N8N_LIVE_READ_ONLY_TOOL": "delete_workflow",
+                "CAPTAIN_N8N_LIVE_READ_ONLY_ARGUMENTS": '{"workflow_id":"hidden"}',
+            }
+        )
+    with pytest.raises(pytest.fail.Exception, match="schema"):
+        _approved_read_only_tool(
+            {
+                "CAPTAIN_N8N_LIVE_READ_ONLY_TOOL": "search_workflows",
+                "CAPTAIN_N8N_LIVE_READ_ONLY_ARGUMENTS": '{"query":"captain","delete":true}',
+            }
+        )
+
+
+def test_approved_read_only_tool_keeps_missing_operator_configuration_as_a_skip() -> None:
+    with pytest.raises(pytest.skip.Exception, match="opt-in live gate"):
+        _approved_read_only_tool({})
 
 
 def _runtime_command(*, unique: str, now: datetime) -> AgentRuntimeCommand:
@@ -386,6 +430,7 @@ async def _wait_for_process_identity(path: Path) -> None:
     pytest.fail("required live gate: Codex process identity was not persisted")
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_captain_mcp_broker_revocation_is_enforced_by_live_gateway(
     monkeypatch: pytest.MonkeyPatch,
@@ -530,6 +575,7 @@ class _UnusedLegacyEvidenceWriter:
         raise AssertionError(f"legacy evidence writer used during recovery: {name}")
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_gateway_restart_fences_an_active_codex_session_before_provider_start(
     tmp_path: Path,
@@ -656,6 +702,7 @@ async def test_gateway_restart_fences_an_active_codex_session_before_provider_st
             process.wait(timeout=15)
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_gateway_restart_requeues_one_orphaned_codex_session_into_new_iteration(
     tmp_path: Path,
@@ -837,6 +884,7 @@ async def test_gateway_restart_requeues_one_orphaned_codex_session_into_new_iter
             process.wait(timeout=15)
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_live_codex_mcp_lease_is_revoked_during_real_provider_execution(
     tmp_path: Path,
