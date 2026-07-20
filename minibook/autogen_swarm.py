@@ -48,6 +48,8 @@ from swarm.pipeline import SwarmPipeline
 from swarm.forge_agents import ForgeState, load_forge_state, save_forge_state
 from swarm.forge_orchestrator import ForgeOrchestrator, ForgeAPI
 from swarm.input_designer import InputDesignPipeline
+from swarm.local_services import default_npm_command, ensure_frontend_dependencies
+from swarm.runtime_options import parse_runtime_options
 
 
 # --- Setup ---
@@ -738,7 +740,15 @@ async def _publish_to_registry(
 
 MAX_TEAM_RETRIES = 2  # retries per team on FAIL (total attempts = 3)
 
-async def run_input_file_pipeline(session, agents, project_id, task, manifest, registry_agent_api_key=None):
+async def run_input_file_pipeline(
+    session,
+    agents,
+    project_id,
+    task,
+    manifest,
+    registry_agent_api_key=None,
+    interactive: bool = True,
+):
     """Multi-phase pipeline: core → sub-teams → wiring.
 
     Each run starts fresh (no checkpoint resuming). Progress is still
@@ -782,7 +792,8 @@ async def run_input_file_pipeline(session, agents, project_id, task, manifest, r
             print(f"{'=' * 60}")
             core_pipeline = SwarmPipeline(
                 agents, project_id, f"{task} — Core Team",
-                input_manifest=manifest, input_phase="core", input_team_key="core")
+                input_manifest=manifest, input_phase="core", input_team_key="core",
+                interactive=interactive)
             core_success = await core_pipeline.run(session, f"{task} — Core Team")
             result = _team_result(core_pipeline)
             result["retries"] = attempt - 1
@@ -858,7 +869,7 @@ async def run_input_file_pipeline(session, agents, project_id, task, manifest, r
             sub_pipeline = SwarmPipeline(
                 agents, project_id, sub_task,
                 input_manifest=manifest, input_phase="sub_team",
-                input_team_key=team_key)
+                input_team_key=team_key, interactive=interactive)
 
             try:
                 sub_success = await sub_pipeline.run(session, sub_task)
@@ -929,7 +940,8 @@ async def run_input_file_pipeline(session, agents, project_id, task, manifest, r
             wiring_pipeline = SwarmPipeline(
                 agents, project_id, f"{task} — CLI Wiring",
                 input_manifest=manifest, input_phase="wiring",
-                input_team_key="wiring", sub_team_dirs=sub_team_dirs)
+                input_team_key="wiring", sub_team_dirs=sub_team_dirs,
+                interactive=interactive)
 
             try:
                 wiring_success = await wiring_pipeline.run(session, f"{task} — CLI Wiring")
@@ -1069,12 +1081,15 @@ async def _ensure_minibook(session):
             print("Frontend dashboard: OK")
         except Exception:
             print("Frontend dashboard not running -- starting automatically...")
+            if not ensure_frontend_dependencies(_frontend_dir):
+                print("ERROR: Frontend dependencies could not be installed. Check output/frontend.log")
+                return
             _frontend_proc = subprocess.Popen(
-                ["npm", "run", "dev"],
+                [default_npm_command(), "run", "dev"],
                 cwd=str(_frontend_dir),
                 stdout=open(str(Path("output") / "frontend.log"), "w"),
                 stderr=subprocess.STDOUT,
-                shell=True,
+                shell=False,
             )
             atexit.register(lambda: _frontend_proc.terminate() if _frontend_proc else None)
             # Brief wait for Next.js to start
@@ -1109,6 +1124,11 @@ async def main():
     positional_args = []
 
     argv = sys.argv[1:]
+    try:
+        runtime_options = parse_runtime_options(argv)
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        raise SystemExit(2) from exc
     i = 0
     while i < len(argv):
         if argv[i] == "--cascade-from" and i + 1 < len(argv):
@@ -1125,6 +1145,10 @@ async def main():
             i += 2
         elif argv[i] == "--input-image" and i + 1 < len(argv):
             input_image = argv[i + 1]
+            i += 2
+        elif argv[i] == "--non-interactive":
+            i += 1
+        elif argv[i] == "--max-runtime-seconds" and i + 1 < len(argv):
             i += 2
         elif argv[i].startswith("--"):
             i += 1  # skip unknown flags
@@ -1199,21 +1223,34 @@ async def main():
         if input_file:
             # INPUT FILE MODE: core team → sub-teams → wiring
             registry_key = agents.get("RegistryAgent", {}).get("api_key")
-            await run_input_file_pipeline(session, agents, project_id, task, manifest,
-                                          registry_agent_api_key=registry_key)
+            run = run_input_file_pipeline(
+                session, agents, project_id, task, manifest,
+                registry_agent_api_key=registry_key,
+                interactive=runtime_options.interactive,
+            )
         elif is_cascade and features:
             # CASCADE MODE: run multiple iterations
-            await run_cascade(session, agents, project_id, task, features, start_from=cascade_from)
+            run = run_cascade(session, agents, project_id, task, features, start_from=cascade_from)
         elif is_cascade and cascade_from and not features:
             # Single cascade iteration: task is the feature
             ctx = load_cascade_context(cascade_from)
             pipeline = SwarmPipeline(agents, project_id, task,
-                                     cascade_from=ctx, cascade_feature=task)
-            await pipeline.run(session, task)
+                                     cascade_from=ctx, cascade_feature=task,
+                                     interactive=runtime_options.interactive)
+            run = pipeline.run(session, task)
         else:
             # Normal single-pass mode
-            pipeline = SwarmPipeline(agents, project_id, task)
-            await pipeline.run(session, task)
+            pipeline = SwarmPipeline(agents, project_id, task, interactive=runtime_options.interactive)
+            run = pipeline.run(session, task)
+
+        try:
+            if runtime_options.max_runtime_seconds is None:
+                await run
+            else:
+                await asyncio.wait_for(run, timeout=runtime_options.max_runtime_seconds)
+        except asyncio.TimeoutError as exc:
+            print(f"ERROR: Swarm run exceeded {runtime_options.max_runtime_seconds:g} seconds")
+            raise SystemExit(124) from exc
 
         print(f"\nView on Minibook: http://localhost:3457/forum")
 

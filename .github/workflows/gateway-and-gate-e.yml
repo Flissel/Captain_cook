@@ -1,0 +1,71 @@
+name: Gateway and Gate E
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mariadb_gateway:
+    name: MariaDB Gateway contract
+    runs-on: ubuntu-latest
+    services:
+      mariadb:
+        image: mariadb:11.8.8
+        env:
+          MARIADB_DATABASE: captain_test
+          MARIADB_USER: captain_test
+          MARIADB_PASSWORD: captain_ci_password
+          MARIADB_ROOT_PASSWORD: captain_ci_root_password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      TEST_MARIADB_DSN: mariadb://captain_test:captain_ci_password@127.0.0.1:3306/captain_test
+      REQUIRE_MARIADB_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Captain dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pytest pytest-cov
+      - name: Exercise MariaDB storage and Gateway without skips
+        run: >-
+          python -m pytest -q --no-cov -rs
+          tests/blockchain/test_mariadb_storage.py
+          tests/gateway/test_gateway.py
+          tests/gateway/test_agent_runtime.py
+      - name: Exercise the remaining deterministic suite
+        run: python -m pytest -q --no-cov -rs -m "not live"
+      - name: Exercise Minibook Forge runtime controls
+        run: PYTHONPATH=minibook python -m pytest -q --no-cov minibook/tests
+
+  gate_e_live:
+    name: Gate E live release decision
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, windows, captain-live]
+    timeout-minutes: 90
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      CAPTAIN_N8N_API_KEY: ${{ secrets.CAPTAIN_N8N_API_KEY }}
+      CAPTAIN_N8N_PORT: ${{ vars.CAPTAIN_N8N_PORT || '5679' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Captain dependencies
+        shell: pwsh
+        run: python -m pip install --upgrade pip; python -m pip install -r requirements.txt pytest pytest-cov
+      - name: Run three provider traces and fail-closed release decision
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/run-gate-e-ci.ps1

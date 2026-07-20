@@ -128,23 +128,45 @@ def test_factory_gateway_allows_tool_integrator_lease_for_build_validation(stora
     """The same constrained tool role may create code and validate its build."""
 
     factory_job = job()
+    architect_lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.AGENT_ARCHITECT,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage/architecture",
+        now=datetime(2026, 7, 19, 10, tzinfo=timezone.utc),
+    )
+    tool_lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage/tooling",
+        now=datetime(2026, 7, 19, 10, tzinfo=timezone.utc),
+    )
     build_lease = issue_factory_lease(
         job=factory_job,
         role=FactoryRole.TOOL_INTEGRATOR,
         attempt=1,
-        workspace_ref="workspace://factory/support-triage",
+        workspace_ref="workspace://factory/support-triage/build",
         now=datetime(2026, 7, 19, 10, tzinfo=timezone.utc),
     )
-    history = (
-        block(FactoryPhase.FORGE_REQUESTED),
-        block(FactoryPhase.BLUEPRINT_CREATED),
-        block(FactoryPhase.TOOL_CANDIDATE_TESTED),
-        block(FactoryPhase.AGENT_CODE_CREATED),
+    forge = block(FactoryPhase.FORGE_REQUESTED)
+    blueprint = block(FactoryPhase.BLUEPRINT_CREATED).model_copy(
+        update={"lease_id": architect_lease.lease_id}
+    )
+    tool_candidate = block(FactoryPhase.TOOL_CANDIDATE_TESTED).model_copy(
+        update={"lease_id": tool_lease.lease_id}
+    )
+    agent_code = block(FactoryPhase.AGENT_CODE_CREATED).model_copy(
+        update={"lease_id": tool_lease.lease_id}
     )
     with TestClient(application(storage)) as client:
         assert client.post("/v1/factory/jobs", json=factory_job.model_dump(mode="json", by_alias=True)).status_code == 202
-        for evidence in history:
-            assert client.post("/v1/factory/blocks", json=evidence.model_dump(mode="json", by_alias=True)).status_code == 201
+        assert client.post("/v1/factory/blocks", json=forge.model_dump(mode="json", by_alias=True)).status_code == 201
+        assert client.post("/v1/factory/leases", json=architect_lease.model_dump(mode="json", by_alias=True)).status_code == 201
+        assert client.post("/v1/factory/blocks", json=blueprint.model_dump(mode="json", by_alias=True)).status_code == 201
+        assert client.post("/v1/factory/leases", json=tool_lease.model_dump(mode="json", by_alias=True)).status_code == 201
+        assert client.post("/v1/factory/blocks", json=tool_candidate.model_dump(mode="json", by_alias=True)).status_code == 201
+        assert client.post("/v1/factory/blocks", json=agent_code.model_dump(mode="json", by_alias=True)).status_code == 201
         response = client.post("/v1/factory/leases", json=build_lease.model_dump(mode="json", by_alias=True))
 
     assert response.status_code == 201

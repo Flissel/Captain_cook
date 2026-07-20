@@ -168,6 +168,15 @@ def test_gate_uses_cryptographic_process_local_encoded_credentials() -> None:
     assert "Out-File" not in source
 
 
+def test_gate_falls_back_when_the_local_venv_cannot_import_pytest() -> None:
+    source = (ROOT / "scripts/test_gateway.ps1").read_text(encoding="utf-8")
+
+    assert "Test-PythonCanImportPytest" in source
+    assert "-c" in source
+    assert '"import pytest"' in source
+    assert "Test-PythonCanImportPytest -Python $localPython" in source
+
+
 def test_environment_helper_preserves_missing_and_empty_values() -> None:
     source = (ROOT / "scripts/test_gateway.ps1").read_text(encoding="utf-8")
     function_start = source.index("function Set-ProcessEnvironmentValue")
