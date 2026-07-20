@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,12 +11,17 @@ from pathlib import Path
 from agenten.agent_factory.contracts import FactoryEvidenceBlock, FactoryPhase, FactoryRole
 from agenten.agent_factory.evidence_store import FactoryEvidenceStore, FilesystemFactoryEvidenceStore
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError, HermesFactoryPort
+from agenten.agent_factory.skill_evaluation import (
+    HermesSkillEvaluationEvidence,
+    HermesSkillEvaluationRequest,
+)
 
 
 @dataclass(frozen=True)
 class HermesCliSettings:
     executable: str = "hermes"
     skill_path: Path = Path("agenten/agent_factory/skills/autogen-agent-factory")
+    released_skill_root: Path = Path("agenten/agent_factory/released-skills")
     timeout_seconds: int = 900
     evidence_root: Path = Path("artifacts/agent-factory/evidence")
 
@@ -65,6 +71,39 @@ class HermesCliFactory(HermesFactoryPort):
             return FactoryEvidenceBlock.model_validate(payload)
         except (TypeError, ValueError) as exc:
             raise FactoryDispatchError("Hermes must return exactly one factory evidence JSON object") from exc
+
+    async def evaluate_skill(
+        self,
+        request: HermesSkillEvaluationRequest,
+    ) -> HermesSkillEvaluationEvidence:
+        """Run the additive typed skill-evaluation path under one released skill."""
+
+        skill_path = _resolve_released_skill(self._settings.released_skill_root, request)
+        prompt = _skill_evaluation_prompt_for(request, skill_path)
+        try:
+            process = await asyncio.create_subprocess_exec(
+                self._settings.executable,
+                "-z",
+                prompt,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=self._settings.timeout_seconds
+            )
+        except FileNotFoundError as exc:
+            raise FactoryDispatchError("Hermes CLI executable is not available") from exc
+        except TimeoutError as exc:
+            raise FactoryDispatchError("Hermes skill evaluation timed out") from exc
+        if process.returncode != 0:
+            detail = stderr.decode("utf-8", errors="replace").strip()
+            raise FactoryDispatchError(f"Hermes skill evaluation failed: {detail[:500]}")
+        try:
+            return HermesSkillEvaluationEvidence.model_validate(_parse_evidence_payload(stdout))
+        except (TypeError, ValueError) as exc:
+            raise FactoryDispatchError(
+                "Hermes must return exactly one typed skill evaluation JSON object"
+            ) from exc
 
 
 def _parse_evidence_payload(stdout: bytes) -> object:
@@ -125,6 +164,51 @@ def _prompt_for(request: FactoryDispatch, skill_path: Path) -> str:
             "Use this exact evidence envelope; replace event_id, occurred_at, and evidence_refs with actual values.",
             "Every role block needs at least one real evidence_ref. Create and hash the evidence before returning; never claim success with a placeholder.",
             json.dumps(response_shape, separators=(",", ":")),
+        )
+    )
+
+
+def _resolve_released_skill(
+    released_skill_root: Path,
+    request: HermesSkillEvaluationRequest,
+) -> Path:
+    prefix = "artifact://released-skills/"
+    reference = request.released_skill.content_ref.uri
+    if not reference.startswith(prefix):
+        raise FactoryDispatchError("released skill reference is outside the configured root")
+    relative = Path(reference.removeprefix(prefix))
+    root = released_skill_root.resolve()
+    resolved = (root / relative).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise FactoryDispatchError("released skill path is outside the configured root") from exc
+    if not resolved.is_file():
+        raise FactoryDispatchError("released skill file is missing")
+    digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    if digest != request.released_skill.content_sha256:
+        raise FactoryDispatchError("released skill digest does not match Captain's reference")
+    return resolved
+
+
+def _skill_evaluation_prompt_for(
+    request: HermesSkillEvaluationRequest,
+    skill_path: Path,
+) -> str:
+    return "\n".join(
+        (
+            "Use the supplied released skill first; do not substitute or load another skill.",
+            f"released_skill_path={skill_path.as_posix()}",
+            f"released_skill_ref={request.released_skill.content_ref.uri}",
+            f"released_skill_sha256={request.released_skill.content_sha256}",
+            f"lease_id={request.lease.lease_id}",
+            f"workspace_ref={request.lease.workspace_ref}",
+            f"acceptance_assertion_ids={','.join(request.acceptance_assertion_ids)}",
+            "Write only in the leased workspace.",
+            "Return exactly one hermes.skill-evaluation-evidence.v1 JSON object and no markdown or prose.",
+            "When required access is unavailable, record TODO_TOOL.v1 instead of inventing access.",
+            "Retain a private candidate only after the task is successful.",
+            "Never publish a skill and never write Captain's ledger.",
         )
     )
 

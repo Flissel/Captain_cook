@@ -22,7 +22,9 @@ from agenten.agent_factory.orchestration import FactoryDispatch
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.n8n_tools import TypedN8nTool
+from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationRequest
 from tests.agent_factory.test_state_machine import job
+from tests.agent_factory.test_skill_evaluation_contracts import request_payload
 
 
 def _ref(uri: str, content: bytes, media_type: str = "application/json") -> ArtifactRef:
@@ -97,6 +99,45 @@ def test_evaluator_runs_a_sealed_candidate_in_a_temporary_workspace(tmp_path: Pa
     assert result.workspace_was_temporary is True
     assert result.tool_names == ("support_triage",)
     assert all(check.status == "passed" for check in result.checks)
+
+
+def test_evaluator_accepts_the_typed_skill_evaluation_request_context(tmp_path: Path) -> None:
+    archive_path = tmp_path / "candidate.zip"
+    team_ref, workflow_ref, input_schema_ref, output_schema_ref, source_ref = _write_candidate_archive(archive_path)
+    candidate = FactoryCandidateManifest(
+        candidate_id="support_triage_v1",
+        source_archive_ref=source_ref,
+        team_manifest={"reference": team_ref, "relative_path": "team_manifest.json"},
+        workflow_artifacts=(({"reference": workflow_ref, "relative_path": "workflows/support_triage.json"}),),
+        tool_schema_artifacts=(
+            {"reference": input_schema_ref, "relative_path": "schemas/support_triage.input.json"},
+            {"reference": output_schema_ref, "relative_path": "schemas/support_triage.output.json"},
+        ),
+        n8n_tools=(
+            TypedN8nTool(
+                name="support_triage",
+                description="Route a support request.",
+                input_schema_ref=input_schema_ref.uri,
+                output_schema_ref=output_schema_ref.uri,
+            ),
+        ),
+        build_command=("python", "-m", "compileall", "-q", "."),
+        real_case_command=("python", "run_case.py"),
+        timeout_seconds=10,
+    )
+    request = HermesSkillEvaluationRequest.model_validate(
+        request_payload(candidate_source_ref=source_ref.model_dump(mode="json"))
+    )
+
+    result = FactoryCandidateEvaluator().evaluate_skill(
+        request=request,
+        candidate=candidate,
+        source_archive=archive_path,
+    )
+
+    assert result.status == "succeeded"
+    assert result.assertion_ids == request.acceptance_assertion_ids
+    assert result.trace_id == str(request.correlation_id)
 
 
 @pytest.mark.asyncio

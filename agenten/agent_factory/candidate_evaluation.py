@@ -27,6 +27,7 @@ from agenten.agent_factory.contracts import (
 from agenten.agent_factory.evidence_store import FactoryEvidenceStore
 from agenten.agent_factory.n8n_tools import TypedN8nTool
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
+from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationRequest
 from agenten.agent_factory.state_machine import FactoryActionKind
 from agenten.agent_runtime.contracts import ArtifactRef
 
@@ -113,7 +114,39 @@ class FactoryCandidateEvaluator:
         candidate: FactoryCandidateManifest,
         source_archive: Path,
     ) -> FactoryCandidateEvaluationResult:
-        trace_id = str(job.correlation_id)
+        return self._evaluate(
+            trace_id=str(job.correlation_id),
+            acceptance_assertion_ids=job.acceptance_assertion_ids,
+            candidate=candidate,
+            source_archive=source_archive,
+        )
+
+    def evaluate_skill(
+        self,
+        *,
+        request: HermesSkillEvaluationRequest,
+        candidate: FactoryCandidateManifest,
+        source_archive: Path,
+    ) -> FactoryCandidateEvaluationResult:
+        """Reuse the sealed evaluator without requiring a lifecycle job projection."""
+
+        if candidate.source_archive_ref != request.candidate_source_ref:
+            raise ValueError("candidate source does not match the skill evaluation request")
+        return self._evaluate(
+            trace_id=str(request.correlation_id),
+            acceptance_assertion_ids=request.acceptance_assertion_ids,
+            candidate=candidate,
+            source_archive=source_archive,
+        )
+
+    def _evaluate(
+        self,
+        *,
+        trace_id: str,
+        acceptance_assertion_ids: tuple[str, ...],
+        candidate: FactoryCandidateManifest,
+        source_archive: Path,
+    ) -> FactoryCandidateEvaluationResult:
         tool_names = tuple(tool.name for tool in candidate.n8n_tools)
         checks: list[FactoryEvaluationCheck] = []
         try:
@@ -146,7 +179,11 @@ class FactoryCandidateEvaluator:
                 real_case = self._run(candidate.real_case_command, workspace, trace_id, candidate.timeout_seconds)
                 if real_case.returncode != 0:
                     return self._failed(trace_id, tool_names, checks, "real_case", self._command_failure(real_case))
-                assertion_ids = self._read_real_case_output(real_case.stdout, trace_id, job)
+                assertion_ids = self._read_real_case_output(
+                    real_case.stdout,
+                    trace_id,
+                    acceptance_assertion_ids,
+                )
                 checks.append(FactoryEvaluationCheck(name="real_case", status="passed", detail="trace and assertions verified"))
                 return FactoryCandidateEvaluationResult(
                     status="succeeded",
@@ -222,7 +259,11 @@ class FactoryCandidateEvaluator:
             raise ValueError(f"candidate command timed out after {timeout_seconds} seconds") from exc
 
     @staticmethod
-    def _read_real_case_output(stdout: str, trace_id: str, job: AgentFactoryJob) -> tuple[str, ...]:
+    def _read_real_case_output(
+        stdout: str,
+        trace_id: str,
+        acceptance_assertion_ids: tuple[str, ...],
+    ) -> tuple[str, ...]:
         try:
             payload = json.loads(stdout)
         except json.JSONDecodeError as exc:
@@ -234,9 +275,9 @@ class FactoryCandidateEvaluator:
             raise ValueError("real-case result must contain non-empty assertion_ids")
         if len(assertions) != len(set(assertions)):
             raise ValueError("real-case result assertion_ids must be unique")
-        if set(assertions) != set(job.acceptance_assertion_ids):
+        if set(assertions) != set(acceptance_assertion_ids):
             raise ValueError("real-case result does not prove exactly the Captain acceptance assertions")
-        return tuple(job.acceptance_assertion_ids)
+        return tuple(acceptance_assertion_ids)
 
     @staticmethod
     def _command_failure(result: subprocess.CompletedProcess[str]) -> str:
