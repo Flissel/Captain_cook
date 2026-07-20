@@ -97,6 +97,23 @@ async def test_store_rejects_candidate_until_successful_evidence_is_recorded(tmp
 
 
 @pytest.mark.asyncio
+async def test_store_does_not_retain_candidate_with_unresolved_required_tool_gap(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    evidence = HermesSkillEvaluationEvidence.model_validate(
+        evidence_payload(tool_gaps=[gap_payload(severity="required", status="unresolved")])
+    )
+    await store.record_receipt(evidence.receipt)
+    await store.record_evaluation(evidence)
+
+    with pytest.raises(ValueError, match="required tool gap"):
+        await store.retain_candidate(evidence.evidence_id, evidence.candidate)
+
+    assert store.get_evaluation(evidence.evidence_id).candidate_ref is None
+
+
+@pytest.mark.asyncio
 async def test_store_rejects_a_candidate_after_any_failed_build_or_test(tmp_path: Path) -> None:
     store = _store(tmp_path)
     evidence = HermesSkillEvaluationEvidence.model_validate(evidence_payload())
@@ -140,6 +157,9 @@ async def test_store_never_accepts_released_or_shared_candidate_status(tmp_path:
         {"api_key": "sk-test-secret"},
         {"nested": {"authorization": "Bearer test-secret"}},
         {"n8n_endpoint": "http://localhost:5678/api/v1"},
+        {"x-api-key": "benign"},
+        {"x-authorization": "benign"},
+        {"client-secret": "benign"},
         {"diagnostic": "captured output: Bearer real-token"},
         {"diagnostic": "captured output: n8n at http://localhost:5678/api/v1"},
     ],

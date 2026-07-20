@@ -14,6 +14,7 @@ from agenten.agent_factory.skill_evaluation import (
     HermesSkillEvaluationEvidence,
     HermesSkillUsageReceipt,
     ToolGapMarker,
+    required_tool_gaps,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
 
@@ -267,6 +268,8 @@ class SkillEvaluationStore:
         if canonical.status != "private_candidate":
             raise ValueError("private candidate store only accepts private_candidate status")
         stored = self._repository.evaluation(evaluation_id)
+        if stored is not None and required_tool_gaps(stored.evidence):
+            raise ValueError("candidate retention is blocked by an unresolved required tool gap")
         if not _has_successful_evidence(stored, canonical):
             raise ValueError("candidate retention requires successful evaluation evidence")
         content = _record_content("candidate", canonical.candidate_id, canonical, metadata)
@@ -343,7 +346,7 @@ def _reject_sensitive_data(value: object, location: str) -> None:
     if isinstance(value, Mapping):
         for key, nested in value.items():
             key_text = str(key)
-            if _SECRET_KEY_PATTERN.search(key_text):
+            if _SECRET_KEY_PATTERN.search(key_text.replace("-", "_")):
                 raise ValueError(f"{location} contains a secret-like field")
             _reject_sensitive_data(nested, f"{location}.{key_text}")
         return
