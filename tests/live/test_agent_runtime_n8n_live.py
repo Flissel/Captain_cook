@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,7 +20,33 @@ import yaml
 
 ROOT = Path(__file__).parents[2]
 HERMES_ROOT = ROOT / "hermes-agent"
+SITE_PACKAGES = Path(sysconfig.get_paths()["purelib"]).resolve()
+sys.path.insert(0, str(SITE_PACKAGES))
 sys.path.insert(0, str(HERMES_ROOT))
+
+# Pytest plugins in the developer environment may preload an unrelated
+# top-level ``utils`` module. Hermes intentionally imports its repository-local
+# ``utils.py`` by that legacy name, so make the live boundary authoritative.
+loaded_utils = sys.modules.get("utils")
+if loaded_utils is not None:
+    loaded_path = Path(getattr(loaded_utils, "__file__", "")).resolve()
+    if loaded_path != (HERMES_ROOT / "utils.py").resolve():
+        del sys.modules["utils"]
+import utils as _hermes_utils  # noqa: E402,F401
+
+# A sibling checkout named ``mcp`` may also be preloaded by pytest. The live
+# gate requires the pinned SDK from this repository's virtual environment.
+for module_name in tuple(sys.modules):
+    if module_name == "mcp" or module_name.startswith("mcp."):
+        del sys.modules[module_name]
+
+# Load Hermes' optional MCP transport after its source root is authoritative.
+# Under pytest, importing the higher-level worker first can freeze the optional
+# transport probe before the SDK extra is discoverable.
+from tools import mcp_tool as _hermes_mcp_tool  # noqa: E402,F401
+assert _hermes_mcp_tool._MCP_HTTP_AVAILABLE, (
+    "Hermes MCP HTTP transport import failed after selecting the pinned SDK"
+)
 
 from hermes_cli.captain_planner import (  # noqa: E402
     CaptainPlanner,
@@ -47,6 +74,11 @@ from hermes_cli.n8n_worker_mcp import (  # noqa: E402
     ScopedCodexEnvironment,
     ScopedCodexHomeFactory,
 )
+
+# Do not let Hermes' legacy top-level package names shadow Captain packages
+# while pytest collects the rest of the live suite.
+sys.path.remove(str(HERMES_ROOT))
+sys.path.remove(str(SITE_PACKAGES))
 
 from agenten.agent_runtime.capabilities import (  # noqa: E402
     CapabilityDenied,
