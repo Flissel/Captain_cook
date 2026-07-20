@@ -3,10 +3,13 @@
 ## Decision
 
 Hermes extends an already Captain-released agent team only through versioned
-skill candidates. A skill candidate may evaluate a team, diagnose failures,
-run the released tests, make bounded workspace fixes, and propose a new
-capability. Hermes has no authority to publish a skill, widen a capability
-lease, release a new work package, or declare an agent team ready for use.
+skills and skill candidates. Hermes must select a released skill before it
+works on a task. That skill may evaluate a team, diagnose failures, run the
+released tests, make bounded workspace fixes, and propose a new capability.
+After a task succeeds, Hermes persists the proven skill usage and any new skill
+candidate in its private candidate store. Hermes has no authority to publish a
+skill, widen a capability lease, release a new work package, or declare an
+agent team ready for use.
 
 Captain remains the lifecycle authority. It validates every candidate's
 source, scope, tests, evidence, and required capabilities through the Gateway
@@ -19,7 +22,8 @@ AutoGen-based Hermes teams:
 
 1. Captain releases a bounded evaluation request for one existing work
    package, agent blueprint, workspace revision, and acceptance-test set.
-2. Hermes evaluates the released team and runs only the approved diagnostics
+2. Hermes resolves one released skill from the approved catalog and evaluates
+   the released team through that skill, using only the approved diagnostics
    and test commands.
 3. Hermes may apply a bounded code or skill-candidate fix in the leased
    workspace, then rerun the affected tests.
@@ -83,7 +87,15 @@ It contains a stable skill ID, semantic version, source digest, declared
 inputs/outputs, allowed tool identities, required capability types, test-case
 references, failure behavior, and provenance to one evaluation request. A
 candidate can be local-tested by Hermes but is unavailable to all other agents
-until Captain publishes its immutable digest to the skill registry.
+until Captain publishes its immutable digest to the skill registry. On a
+successful task, Hermes stores the candidate and its successful usage receipt
+in a private, append-only candidate store. A failed or unverified task cannot
+create a reusable stored skill.
+
+`HermesSkillUsageReceipt.v1` records the selected released skill, task and
+workspace digests, fulfilled assertion IDs, final test evidence digest, and
+whether the task produced a new candidate. It is the proof that a skill was
+actually used to fulfill the task; it is not a publication record.
 
 ### Tool-gap marker
 
@@ -116,8 +128,9 @@ of iterations:
 
 1. Validate the request's schema, digests, lease, allowed commands, and
    workspace baseline before executing anything.
-2. Evaluate the team against the released acceptance assertions and approved
-   skills.
+2. Resolve exactly one compatible released skill and evaluate the team through
+   its declared contract. A missing compatible skill becomes a TODO_TOOL; no
+   generic unskilled execution is allowed.
 3. Run the relevant test or diagnostic command through the Captain-provided
    executor boundary.
 4. If it fails, classify the cause as code defect, skill defect, configuration
@@ -128,7 +141,9 @@ of iterations:
 6. For unavailable capabilities, append `TODO_TOOL.v1`; Hermes may create a
    local skill candidate only when the request's lease explicitly permits its
    declared capabilities.
-7. Stop with `passed`, `redo`, `blocked_tool_gap`, `unresolved`, or `failed`.
+7. After all required assertions pass, persist the skill usage receipt and any
+   new candidate to the private candidate store.
+8. Stop with `passed`, `redo`, `blocked_tool_gap`, `unresolved`, or `failed`.
 
 Hermes never converts its own `passed` result into a release. It can only
 return a candidate evidence bundle to Captain.
@@ -146,8 +161,10 @@ Captain validates a submitted evidence bundle fail-closed:
    payloads.
 4. It requires every `required` TODO_TOOL to be resolved by a Captain-published
    skill and a passing declared acceptance test.
-5. It may publish a candidate skill only after its contract and test evidence
-   pass; publication creates a new immutable registry version.
+5. It verifies that the submitted usage receipt proves a released skill was
+   used and fulfilled the task. It may publish a stored candidate skill only
+   after its contract and test evidence pass; publication creates a new
+   immutable registry version.
 6. It writes `ready-to-use` only when all required assertions pass, no
    unresolved required gap remains, and the resulting skill/team registry
    versions are recorded in the block evidence.
@@ -180,7 +197,8 @@ The implementation is complete only when it proves all of the following:
 1. Contract tests reject unknown schemas, stale leases, unapproved commands,
    invalid digests, secret-like fields, and out-of-scope changes.
 2. Deterministic tests prove a passing team, code-fix retry, skill-fix retry,
-   required tool-gap block, optional tool-gap acceptance, and idempotent replay.
+   required tool-gap block, optional tool-gap acceptance, private skill storage
+   only after task success, and idempotent replay.
 3. Gateway tests prove Captain alone can publish a skill and write a
    `ready-to-use` validation record.
 4. Architecture tests prove Hermes does not import Gateway storage, Minibook,
