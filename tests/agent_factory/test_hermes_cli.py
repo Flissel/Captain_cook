@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -459,6 +460,208 @@ async def test_skill_prompt_rejects_secret_like_and_raw_endpoint_bypasses_before
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["lease_capability", "released_skill_ref", "candidate_ref"])
+async def test_skill_prompt_recursively_rejects_unsafe_nested_request_strings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+) -> None:
+    skill_root = tmp_path / "released-skills"
+    relative_skill = Path("factory_skill_evaluator/v1/SKILL.md")
+    content = b"# Released skill\n"
+    skill_path = skill_root / relative_skill
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_bytes(content)
+    request = _released_skill_request(relative_skill, content)
+    if field == "lease_capability":
+        request = request.model_copy(
+            update={
+                "lease": request.lease.model_copy(
+                    update={"capabilities": ("codex.run", "n8n_endpoint=n8n.internal:5678")}
+                )
+            }
+        )
+    elif field == "released_skill_ref":
+        unsafe_ref = request.released_skill.content_ref.model_copy(
+            update={"uri": f"artifact://released-skills/{relative_skill.as_posix()}?api_key=hidden"}
+        )
+        request = request.model_copy(
+            update={
+                "released_skill": request.released_skill.model_copy(
+                    update={"content_ref": unsafe_ref}
+                )
+            }
+        )
+    else:
+        request = request.model_copy(
+            update={
+                "candidate_source_ref": request.candidate_source_ref.model_copy(
+                    update={"uri": "artifact://factory/source/n8n.internal:5678/api/v1"}
+                )
+            }
+        )
+    spawned = False
+
+    async def create_process(*_: str, **__: object) -> object:
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("Hermes must not be spawned")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    with pytest.raises(FactoryDispatchError, match="unsafe prompt value"):
+        await HermesCliFactory(
+            settings=HermesCliSettings(released_skill_root=skill_root)
+        ).issue_skill_usage(request, max_seconds=30)
+
+    assert spawned is False
+
+
+@pytest.mark.asyncio
+async def test_skill_prompt_recursively_rejects_unsafe_receipt_artifact_uri(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill_root = tmp_path / "released-skills"
+    relative_skill = Path("factory_skill_evaluator/v1/SKILL.md")
+    content = b"# Released skill\n"
+    skill_path = skill_root / relative_skill
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_bytes(content)
+    request = _released_skill_request(relative_skill, content)
+    receipt = _usage_receipt(request)
+    unsafe_ref = receipt.evidence_refs[0].model_copy(
+        update={"uri": "artifact://factory/receipt?authorization=Bearer-hidden"}
+    )
+    receipt = receipt.model_copy(update={"evidence_refs": (unsafe_ref, *receipt.evidence_refs[1:])})
+    spawned = False
+
+    async def create_process(*_: str, **__: object) -> object:
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("Hermes must not be spawned")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    with pytest.raises(FactoryDispatchError, match="unsafe prompt value"):
+        await HermesCliFactory(
+            settings=HermesCliSettings(released_skill_root=skill_root)
+        ).evaluate_skill(
+            request,
+            receipt=receipt,
+            candidate_result=_candidate_result(request),
+            candidate_id="support_triage_v1",
+            candidate_source_ref=request.candidate_source_ref,
+            max_seconds=30,
+        )
+
+    assert spawned is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slow_phase", ["resolution", "parsing"])
+async def test_skill_usage_uses_one_deadline_through_resolution_and_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slow_phase: str,
+) -> None:
+    import agenten.agent_factory.hermes_cli as hermes_cli
+
+    skill_root = tmp_path / "released-skills"
+    relative_skill = Path("factory_skill_evaluator/v1/SKILL.md")
+    content = b"# Released skill\n"
+    skill_path = skill_root / relative_skill
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_bytes(content)
+    request = _released_skill_request(relative_skill, content)
+    original_resolve = hermes_cli._resolve_released_skill
+    original_parse = hermes_cli._parse_evidence_payload
+
+    if slow_phase == "resolution":
+        def slow_resolve(*args: object, **kwargs: object) -> Path:
+            time.sleep(0.03)
+            return original_resolve(*args, **kwargs)
+
+        monkeypatch.setattr(hermes_cli, "_resolve_released_skill", slow_resolve)
+    else:
+        def slow_parse(stdout: bytes) -> object:
+            time.sleep(0.03)
+            return original_parse(stdout)
+
+        monkeypatch.setattr(hermes_cli, "_parse_evidence_payload", slow_parse)
+
+    class Process:
+        returncode = 0
+        pid = 101
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return _usage_receipt(request).model_dump_json(by_alias=True).encode(), b""
+
+    async def create_process(*_: str, **__: object) -> Process:
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    with pytest.raises(FactoryDispatchError, match="timed out|remaining lease time"):
+        await HermesCliFactory(
+            settings=HermesCliSettings(released_skill_root=skill_root)
+        ).issue_skill_usage(request, max_seconds=0.01)
+
+
+@pytest.mark.asyncio
+async def test_skill_usage_timeout_terminates_the_verified_hermes_process_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agenten.agent_factory.hermes_cli as hermes_cli
+
+    skill_root = tmp_path / "released-skills"
+    relative_skill = Path("factory_skill_evaluator/v1/SKILL.md")
+    content = b"# Released skill\n"
+    skill_path = skill_root / relative_skill
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_bytes(content)
+    request = _released_skill_request(relative_skill, content)
+    terminated: list[int] = []
+
+    class Process:
+        returncode = None
+        pid = 4242
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        def terminate(self) -> None:
+            pass
+
+        async def wait(self) -> int:
+            return -15
+
+    async def create_process(*_: str, **__: object) -> Process:
+        return Process()
+
+    async def terminate_tree(process: Process, *, executable: str) -> None:
+        assert executable == "hermes"
+        terminated.append(process.pid)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    monkeypatch.setattr(
+        hermes_cli,
+        "_terminate_async_process_tree",
+        terminate_tree,
+        raising=False,
+    )
+
+    with pytest.raises(FactoryDispatchError, match="timed out"):
+        await HermesCliFactory(
+            settings=HermesCliSettings(released_skill_root=skill_root)
+        ).issue_skill_usage(request, max_seconds=0.1)
+
+    assert terminated == [4242]
+
+
+@pytest.mark.asyncio
 async def test_skill_usage_timeout_terminates_the_hermes_subprocess(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -494,6 +697,6 @@ async def test_skill_usage_timeout_terminates_the_hermes_subprocess(
     with pytest.raises(FactoryDispatchError, match="timed out"):
         await HermesCliFactory(
             settings=HermesCliSettings(released_skill_root=skill_root)
-        ).issue_skill_usage(request, max_seconds=0.01)
+        ).issue_skill_usage(request, max_seconds=0.1)
 
     assert terminated is True

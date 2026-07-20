@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import time
 from typing import TYPE_CHECKING, Protocol
 from uuid import UUID
 
@@ -14,6 +13,7 @@ from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBloc
 from agenten.agent_factory.leases import FactoryLeasePort
 from agenten.agent_factory.service import FactoryCoordinator
 from agenten.agent_factory.skill_evaluation import (
+    BoundedEvaluationCommand,
     HermesSkillCandidate,
     HermesSkillEvaluationEvidence,
     HermesSkillEvaluationRequest,
@@ -112,6 +112,12 @@ class SkillCandidateEvaluatorPort(Protocol):
 class PrivateSkillEvaluationStore(Protocol):
     async def record_receipt(self, receipt: HermesSkillUsageReceipt) -> ArtifactRef: ...
 
+    async def record_candidate_evaluation(
+        self,
+        request_id: UUID,
+        result: "FactoryCandidateEvaluationResult",
+    ) -> ArtifactRef: ...
+
     async def record_tool_gap(
         self,
         evaluation_id: UUID,
@@ -162,17 +168,18 @@ class HermesSkillEvaluationCoordinator:
         self,
         request: HermesSkillEvaluationRequest,
     ) -> HermesSkillEvaluationResult:
+        deadline = time.monotonic() + self._remaining_lease_seconds(request)
         for iteration in range(1, request.max_iterations + 1):
             receipt = await self._cli.issue_skill_usage(
                 request,
-                max_seconds=self._remaining_lease_seconds(request),
+                max_seconds=self._remaining_budget_seconds(request, deadline),
             )
-            _require_staged_receipt(request, receipt)
-            self._remaining_lease_seconds(request)
+            receipt_time = self._active_time(request)
+            _require_staged_receipt(request, receipt, now=receipt_time)
             await self._private_store.record_receipt(receipt)
-            self._remaining_lease_seconds(request)
+            self._remaining_budget_seconds(request, deadline)
             resolved = self._candidate_store.candidate_for_evaluation(request, receipt)
-            evaluator_seconds = self._remaining_lease_seconds(request)
+            evaluator_seconds = self._remaining_budget_seconds(request, deadline)
             try:
                 candidate_result = self._evaluator.evaluate_skill(
                     request=request,
@@ -182,28 +189,40 @@ class HermesSkillEvaluationCoordinator:
                 )
             except (OSError, ValueError) as exc:
                 raise FactoryDispatchError("sealed candidate evaluation could not start") from exc
+            if candidate_result.candidate_manifest != resolved.candidate:
+                raise FactoryDispatchError("sealed evaluator result does not match the resolved candidate manifest")
+            self._remaining_budget_seconds(request, deadline)
+            evaluator_ref = await self._private_store.record_candidate_evaluation(
+                request.request_id,
+                candidate_result,
+            )
+            self._remaining_budget_seconds(request, deadline)
             proposed = await self._cli.evaluate_skill(
                 request,
                 receipt=receipt,
                 candidate_result=candidate_result,
                 candidate_id=resolved.candidate.candidate_id,
                 candidate_source_ref=resolved.candidate.source_archive_ref,
-                max_seconds=self._remaining_lease_seconds(request),
+                max_seconds=self._remaining_budget_seconds(request, deadline),
             )
             if proposed.request != request or proposed.receipt != receipt:
                 raise FactoryDispatchError("Hermes evaluation does not match the staged request and receipt")
-            _require_sealed_candidate_binding(request, proposed, resolved.candidate)
+            _require_sealed_candidate_binding(
+                request,
+                proposed,
+                candidate_result.candidate_manifest,
+            )
             check_time = self._active_time(request)
             evidence = _seal_candidate_result(
                 proposed,
                 candidate_result,
-                resolved.candidate,
+                evaluator_ref,
                 check_time,
             )
             for marker in evidence.tool_gaps:
-                self._remaining_lease_seconds(request)
+                self._remaining_budget_seconds(request, deadline)
                 await self._private_store.record_tool_gap(evidence.evidence_id, marker)
-            self._remaining_lease_seconds(request)
+            self._remaining_budget_seconds(request, deadline)
             evidence_ref = await self._private_store.record_evaluation(evidence)
             candidate_ref = None
             if (
@@ -211,7 +230,7 @@ class HermesSkillEvaluationCoordinator:
                 and evidence.candidate is not None
                 and not required_tool_gaps(evidence)
             ):
-                self._remaining_lease_seconds(request)
+                self._remaining_budget_seconds(request, deadline)
                 candidate_ref = await self._private_store.retain_candidate(
                     evidence.evidence_id,
                     evidence.candidate,
@@ -234,6 +253,16 @@ class HermesSkillEvaluationCoordinator:
             raise FactoryDispatchError("skill evaluation requires an active Factory lease")
         return remaining
 
+    def _remaining_budget_seconds(
+        self,
+        request: HermesSkillEvaluationRequest,
+        deadline: float,
+    ) -> float:
+        monotonic_remaining = deadline - time.monotonic()
+        if monotonic_remaining <= 0:
+            raise FactoryDispatchError("skill evaluation timed out within the active lease")
+        return min(self._remaining_lease_seconds(request), monotonic_remaining)
+
     def _active_time(self, request: HermesSkillEvaluationRequest) -> datetime:
         now = self._clock.now()
         if (
@@ -248,23 +277,45 @@ class HermesSkillEvaluationCoordinator:
 def _seal_candidate_result(
     proposed: HermesSkillEvaluationEvidence,
     candidate_result: "FactoryCandidateEvaluationResult",
-    candidate: "FactoryCandidateManifest",
+    evaluator_ref: ArtifactRef,
     occurred_at: datetime,
 ) -> HermesSkillEvaluationEvidence:
+    manifest = candidate_result.candidate_manifest
+    if manifest is None:
+        raise FactoryDispatchError("sealed evaluator result is missing its candidate manifest")
     required_gaps = required_tool_gaps(proposed)
-    if candidate_result.status == "succeeded":
+    actual_checks = {check.name: check for check in candidate_result.checks}
+    build_passed = (
+        actual_checks.get("build") is not None
+        and actual_checks["build"].status == "passed"
+    )
+    test_passed = (
+        actual_checks.get("real_case") is not None
+        and actual_checks["real_case"].status == "passed"
+    )
+    test_failed = (
+        actual_checks.get("real_case") is not None
+        and actual_checks["real_case"].status == "failed"
+    )
+    if candidate_result.status == "succeeded" and build_passed and test_passed:
         outcome = "blocked_tool_gap" if required_gaps else "passed"
         assertion_ids = candidate_result.assertion_ids
-    elif _candidate_test_failed(candidate_result):
+    elif build_passed and test_failed:
         outcome = "redo"
         assertion_ids = proposed.request.acceptance_assertion_ids
     else:
         outcome = "failed"
         assertion_ids = proposed.request.acceptance_assertion_ids
-    build_status = "passed" if candidate_result.status == "succeeded" or _candidate_test_failed(candidate_result) else "failed"
-    test_status = "passed" if candidate_result.status == "succeeded" else "failed" if _candidate_test_failed(candidate_result) else "skipped"
-    build_command = proposed.receipt.commands[0]
-    test_command = proposed.receipt.commands[-1]
+    build_status = "passed" if build_passed else "failed"
+    test_status = "passed" if test_passed else "failed" if test_failed else "skipped"
+    build_command = BoundedEvaluationCommand(
+        command_id="captain.candidate.build",
+        max_seconds=manifest.timeout_seconds,
+    )
+    test_command = BoundedEvaluationCommand(
+        command_id="captain.candidate.real_case",
+        max_seconds=manifest.timeout_seconds,
+    )
     checks = (
         SkillEvaluationCheck(
             check_id="sealed-build",
@@ -272,7 +323,7 @@ def _seal_candidate_result(
             command=build_command,
             status=build_status,
             occurred_at=occurred_at,
-            evidence_ref=_sealed_check_reference(candidate_result, candidate, "build"),
+            evidence_ref=evaluator_ref,
             assertion_ids=(),
         ),
         SkillEvaluationCheck(
@@ -281,7 +332,7 @@ def _seal_candidate_result(
             command=test_command,
             status=test_status,
             occurred_at=occurred_at,
-            evidence_ref=_sealed_check_reference(candidate_result, candidate, "test"),
+            evidence_ref=evaluator_ref,
             assertion_ids=(
                 candidate_result.assertion_ids if candidate_result.status == "succeeded" else ()
             ),
@@ -301,6 +352,8 @@ def _seal_candidate_result(
 def _require_staged_receipt(
     request: HermesSkillEvaluationRequest,
     receipt: HermesSkillUsageReceipt,
+    *,
+    now: datetime,
 ) -> None:
     if (
         receipt.request_id != request.request_id
@@ -311,6 +364,10 @@ def _require_staged_receipt(
         or receipt.used_skill_id != request.released_skill.skill_id
         or receipt.used_skill_version != request.released_skill.version
         or receipt.used_skill_sha256 != request.released_skill.content_sha256
+        or receipt.outcome != "unresolved"
+        or receipt.occurred_at < request.occurred_at
+        or not request.lease.issued_at <= receipt.occurred_at < request.lease.expires_at
+        or receipt.occurred_at > now
     ):
         raise FactoryDispatchError("Hermes usage receipt does not match the Captain request")
 
@@ -330,34 +387,6 @@ def _require_sealed_candidate_binding(
         or proposed.candidate.content_sha256 != candidate.source_archive_ref.sha256
     ):
         raise FactoryDispatchError("Hermes candidate does not match the sealed candidate identity and digest")
-
-
-def _sealed_check_reference(
-    result: "FactoryCandidateEvaluationResult",
-    candidate: "FactoryCandidateManifest",
-    kind: str,
-) -> ArtifactRef:
-    payload = json.dumps(
-        {
-            "schema": "captain.sealed-candidate-check.v1",
-            "kind": kind,
-            "candidate_id": candidate.candidate_id,
-            "source_sha256": candidate.source_archive_ref.sha256,
-            "status": result.status,
-            "trace_id": result.trace_id,
-            "assertion_ids": list(result.assertion_ids),
-            "checks": [check.model_dump(mode="json") for check in result.checks],
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    digest = hashlib.sha256(payload).hexdigest()
-    return ArtifactRef(
-        uri=f"artifact://factory-candidate-evaluation/{candidate.candidate_id}/{kind}/{digest}",
-        sha256=digest,
-        media_type="application/json",
-    )
 
 
 def _candidate_test_failed(result: "FactoryCandidateEvaluationResult") -> bool:

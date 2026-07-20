@@ -5,7 +5,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
+import signal
+import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -91,7 +95,13 @@ class HermesCliFactory(HermesFactoryPort):
     ) -> HermesSkillEvaluationEvidence:
         """Request a final proposal only after Captain has sealed build/test results."""
 
+        deadline = _deadline(max_seconds)
         _validate_skill_prompt_request(request)
+        _validate_serialized_prompt_value(
+            receipt.model_dump(mode="json", by_alias=True)
+        )
+        _validate_serialized_prompt_value(candidate_id)
+        _validate_serialized_prompt_value(candidate_source_ref.model_dump(mode="json"))
         try:
             _require_matching_receipt(request, receipt)
         except ValueError as exc:
@@ -99,6 +109,7 @@ class HermesCliFactory(HermesFactoryPort):
         if candidate_source_ref != request.candidate_source_ref:
             raise FactoryDispatchError("sealed candidate source does not match the Captain request")
         skill_path = _resolve_released_skill(self._settings.released_skill_root, request)
+        _remaining_deadline_seconds(deadline)
         prompt = _skill_evaluation_prompt_for(
             request,
             receipt,
@@ -107,9 +118,13 @@ class HermesCliFactory(HermesFactoryPort):
             candidate_source_ref,
             skill_path,
         )
-        stdout = await self._run_skill_prompt(prompt, max_seconds=max_seconds)
+        stdout = await self._run_skill_prompt(
+            prompt,
+            max_seconds=_remaining_deadline_seconds(deadline),
+        )
         try:
             evidence = HermesSkillEvaluationEvidence.model_validate(_parse_evidence_payload(stdout))
+            _remaining_deadline_seconds(deadline)
         except (TypeError, ValueError) as exc:
             raise FactoryDispatchError(
                 "Hermes must return exactly one typed skill evaluation JSON object"
@@ -126,14 +141,17 @@ class HermesCliFactory(HermesFactoryPort):
     ) -> HermesSkillUsageReceipt:
         """Obtain only the digest-matching usage receipt before any candidate work."""
 
+        deadline = _deadline(max_seconds)
         _validate_skill_prompt_request(request)
         skill_path = _resolve_released_skill(self._settings.released_skill_root, request)
+        _remaining_deadline_seconds(deadline)
         stdout = await self._run_skill_prompt(
             _skill_usage_prompt_for(request, skill_path),
-            max_seconds=max_seconds,
+            max_seconds=_remaining_deadline_seconds(deadline),
         )
         try:
             receipt = HermesSkillUsageReceipt.model_validate(_parse_evidence_payload(stdout))
+            _remaining_deadline_seconds(deadline)
             _require_matching_receipt(request, receipt)
         except (TypeError, ValueError) as exc:
             raise FactoryDispatchError(
@@ -142,9 +160,7 @@ class HermesCliFactory(HermesFactoryPort):
         return receipt
 
     async def _run_skill_prompt(self, prompt: str, *, max_seconds: float) -> bytes:
-        timeout = min(float(self._settings.timeout_seconds), max_seconds)
-        if timeout <= 0:
-            raise FactoryDispatchError("Hermes skill evaluation has no remaining lease time")
+        deadline = _deadline(min(float(self._settings.timeout_seconds), max_seconds))
         try:
             process = await asyncio.create_subprocess_exec(
                 self._settings.executable,
@@ -152,19 +168,22 @@ class HermesCliFactory(HermesFactoryPort):
                 prompt,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **_async_process_group_options(),
             )
         except FileNotFoundError as exc:
             raise FactoryDispatchError("Hermes CLI executable is not available") from exc
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=_remaining_deadline_seconds(deadline),
+            )
         except TimeoutError as exc:
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except TimeoutError:
-                process.kill()
-                await process.wait()
+            await _terminate_async_process_tree(
+                process,
+                executable=self._settings.executable,
+            )
             raise FactoryDispatchError("Hermes skill evaluation timed out") from exc
+        _remaining_deadline_seconds(deadline)
         if process.returncode != 0:
             detail = stderr.decode("utf-8", errors="replace").strip()
             raise FactoryDispatchError(f"Hermes skill evaluation failed: {detail[:500]}")
@@ -404,16 +423,97 @@ _PROMPT_SECRET = re.compile(
 
 
 def _validate_skill_prompt_request(request: HermesSkillEvaluationRequest) -> None:
-    values = (request.lease.workspace_ref, *request.acceptance_assertion_ids)
-    for value in values:
-        if (
-            "\r" in value
-            or "\n" in value
-            or _PROMPT_ENDPOINT.search(value)
-            or _PROMPT_N8N_ENDPOINT.search(value)
-            or _PROMPT_SECRET.search(value)
-        ):
-            raise FactoryDispatchError("skill evaluation request contains an unsafe prompt value")
+    _validate_serialized_prompt_value(request.model_dump(mode="json", by_alias=True))
+
+
+def _validate_serialized_prompt_value(value: object) -> None:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            _validate_serialized_prompt_value(key)
+            _validate_serialized_prompt_value(nested)
+        return
+    if isinstance(value, (tuple, list)):
+        for nested in value:
+            _validate_serialized_prompt_value(nested)
+        return
+    if not isinstance(value, str):
+        return
+    if (
+        "\r" in value
+        or "\n" in value
+        or _PROMPT_ENDPOINT.search(value)
+        or _PROMPT_N8N_ENDPOINT.search(value)
+        or _PROMPT_SECRET.search(value)
+    ):
+        raise FactoryDispatchError("skill evaluation request contains an unsafe prompt value")
+
+
+def _deadline(max_seconds: float) -> float:
+    if max_seconds <= 0:
+        raise FactoryDispatchError("Hermes skill evaluation has no remaining lease time")
+    return time.monotonic() + max_seconds
+
+
+def _remaining_deadline_seconds(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise FactoryDispatchError("Hermes skill evaluation timed out")
+    return remaining
+
+
+def _async_process_group_options() -> dict[str, object]:
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+async def _terminate_async_process_tree(
+    process: asyncio.subprocess.Process,
+    *,
+    executable: str,
+) -> None:
+    """Terminate only the tree rooted at the process this adapter just spawned."""
+
+    pid = getattr(process, "pid", None)
+    if not isinstance(pid, int) or pid <= 0:
+        process.terminate()
+        await process.wait()
+        return
+    if process.returncode is not None:
+        return
+    if os.name == "nt":
+        killer = await asyncio.create_subprocess_exec(
+            "taskkill.exe",
+            "/PID",
+            str(pid),
+            "/T",
+            "/F",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await asyncio.wait_for(killer.communicate(), timeout=5)
+        except TimeoutError:
+            killer.kill()
+            await killer.wait()
+        if killer.returncode not in {0, 128} and process.returncode is None:
+            process.kill()
+    else:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+    except TimeoutError:
+        if os.name != "nt":
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
+            process.kill()
+        await process.wait()
 
 
 def _require_matching_receipt(

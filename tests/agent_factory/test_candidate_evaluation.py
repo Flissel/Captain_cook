@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -178,6 +179,110 @@ def test_skill_evaluator_bounds_candidate_commands_by_remaining_lease_time(tmp_p
     assert result.status == "failed"
     assert result.checks[-1].name == "validation"
     assert "timed out" in result.checks[-1].detail
+
+
+@pytest.mark.parametrize(
+    "real_case_code",
+    [
+        "print('not-json')",
+        "import json; print(json.dumps({'trace_id': 'wrong', 'assertion_ids': ['schema_valid', 'real_case_green']}))",
+        "import json, os; print(json.dumps({'trace_id': os.environ['CAPTAIN_TRACE_ID']}))",
+    ],
+)
+def test_exit_zero_invalid_real_case_output_is_an_actual_real_case_failure(
+    tmp_path: Path,
+    real_case_code: str,
+) -> None:
+    archive_path = tmp_path / "candidate.zip"
+    team_ref, workflow_ref, input_schema_ref, output_schema_ref, source_ref = _write_candidate_archive(archive_path)
+    candidate = FactoryCandidateManifest(
+        candidate_id="support_triage_v1",
+        source_archive_ref=source_ref,
+        team_manifest={"reference": team_ref, "relative_path": "team_manifest.json"},
+        workflow_artifacts=({"reference": workflow_ref, "relative_path": "workflows/support_triage.json"},),
+        tool_schema_artifacts=(
+            {"reference": input_schema_ref, "relative_path": "schemas/support_triage.input.json"},
+            {"reference": output_schema_ref, "relative_path": "schemas/support_triage.output.json"},
+        ),
+        n8n_tools=(
+            TypedN8nTool(
+                name="support_triage",
+                description="Route a support request.",
+                input_schema_ref=input_schema_ref.uri,
+                output_schema_ref=output_schema_ref.uri,
+            ),
+        ),
+        build_command=("python", "-m", "compileall", "-q", "."),
+        real_case_command=("python", "-c", real_case_code),
+        timeout_seconds=10,
+    )
+    request = HermesSkillEvaluationRequest.model_validate(
+        request_payload(candidate_source_ref=source_ref.model_dump(mode="json"))
+    )
+
+    result = FactoryCandidateEvaluator().evaluate_skill(
+        request=request,
+        candidate=candidate,
+        source_archive=archive_path,
+    )
+
+    assert result.status == "failed"
+    assert result.checks[-1].name == "real_case"
+    assert result.checks[-1].status == "failed"
+
+
+def test_evaluator_timeout_terminates_the_verified_candidate_process_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agenten.agent_factory.candidate_evaluation as candidate_evaluation
+
+    terminated: list[int] = []
+
+    class Process:
+        pid = 4343
+        returncode = None
+        args = (sys.executable, "-c", "pass")
+
+        def __enter__(self) -> "Process":
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            pass
+
+        def communicate(self, *_: object, timeout: float | None = None) -> tuple[str, str]:
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            return "", ""
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+    def terminate_tree(process: Process, *, executable: str) -> None:
+        assert executable == sys.executable
+        terminated.append(process.pid)
+        process.returncode = -9
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: Process())
+    monkeypatch.setattr(
+        candidate_evaluation,
+        "_terminate_sync_process_tree",
+        terminate_tree,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="timed out"):
+        FactoryCandidateEvaluator._run(
+            ("python", "-c", "pass"),
+            tmp_path,
+            "trace-1",
+            0.01,
+        )
+
+    assert terminated == [4343]
 
 
 @pytest.mark.asyncio

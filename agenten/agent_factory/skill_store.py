@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Mapping, Protocol
+from typing import TYPE_CHECKING, Mapping, Protocol
 from uuid import UUID
+
+from pydantic import BaseModel
 
 from agenten.agent_factory.evidence_store import SkillEvaluationEvidenceStore
 from agenten.agent_factory.skill_evaluation import (
@@ -17,6 +19,9 @@ from agenten.agent_factory.skill_evaluation import (
     required_tool_gaps,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
+
+if TYPE_CHECKING:
+    from agenten.agent_factory.candidate_evaluation import FactoryCandidateEvaluationResult
 
 
 _SECRET_KEY_PATTERN = re.compile(
@@ -221,6 +226,34 @@ class SkillEvaluationStore:
         self._repository.record_receipt(canonical, reference)
         return reference
 
+    async def record_candidate_evaluation(
+        self,
+        request_id: UUID,
+        result: "FactoryCandidateEvaluationResult",
+        *,
+        metadata: Mapping[str, object] | None = None,
+    ) -> ArtifactRef:
+        from agenten.agent_factory.candidate_evaluation import FactoryCandidateEvaluationResult
+
+        canonical = FactoryCandidateEvaluationResult.model_validate(
+            result.model_dump(mode="json", by_alias=True)
+        )
+        if canonical.candidate_manifest is None:
+            raise ValueError("candidate evaluation requires its trusted candidate manifest")
+        record_id = canonical.candidate_manifest.candidate_id
+        content = _record_content(
+            "candidate-evaluation",
+            record_id,
+            canonical,
+            metadata,
+        )
+        return await self._evidence_store.persist(
+            request_id,
+            "candidate-evaluations",
+            record_id,
+            content,
+        )
+
     async def record_tool_gap(
         self,
         evaluation_id: UUID,
@@ -326,7 +359,7 @@ def _required_tool_gaps(markers: tuple[ToolGapMarker, ...]) -> tuple[ToolGapMark
 def _record_content(
     record_kind: str,
     record_id: str,
-    model: HermesSkillUsageReceipt | ToolGapMarker | HermesSkillEvaluationEvidence | HermesSkillCandidate,
+    model: BaseModel,
     metadata: Mapping[str, object] | None,
 ) -> bytes:
     payload = model.model_dump(mode="json", by_alias=True)

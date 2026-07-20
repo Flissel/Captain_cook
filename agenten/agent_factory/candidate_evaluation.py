@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import signal
 import stat
 import subprocess
 import sys
@@ -102,6 +103,7 @@ class FactoryCandidateEvaluationResult(_FrozenModel):
     tool_names: tuple[str, ...]
     workspace_was_temporary: Literal[True] = True
     checks: tuple[FactoryEvaluationCheck, ...]
+    candidate_manifest: FactoryCandidateManifest | None = None
 
 
 class FactoryCandidateEvaluator:
@@ -189,6 +191,7 @@ class FactoryCandidateEvaluator:
                         checks,
                         "static_compile",
                         self._command_failure(static_compile),
+                        candidate,
                     )
                 checks.append(FactoryEvaluationCheck(name="static_compile", status="passed", detail="compileall succeeded"))
                 build = self._run(
@@ -198,7 +201,14 @@ class FactoryCandidateEvaluator:
                     self._command_timeout(candidate.timeout_seconds, deadline),
                 )
                 if build.returncode != 0:
-                    return self._failed(trace_id, tool_names, checks, "build", self._command_failure(build))
+                    return self._failed(
+                        trace_id,
+                        tool_names,
+                        checks,
+                        "build",
+                        self._command_failure(build),
+                        candidate,
+                    )
                 checks.append(FactoryEvaluationCheck(name="build", status="passed", detail="command exited 0"))
                 real_case = self._run(
                     candidate.real_case_command,
@@ -207,12 +217,30 @@ class FactoryCandidateEvaluator:
                     self._command_timeout(candidate.timeout_seconds, deadline),
                 )
                 if real_case.returncode != 0:
-                    return self._failed(trace_id, tool_names, checks, "real_case", self._command_failure(real_case))
-                assertion_ids = self._read_real_case_output(
-                    real_case.stdout,
-                    trace_id,
-                    acceptance_assertion_ids,
-                )
+                    return self._failed(
+                        trace_id,
+                        tool_names,
+                        checks,
+                        "real_case",
+                        self._command_failure(real_case),
+                        candidate,
+                    )
+                try:
+                    assertion_ids = self._read_real_case_output(
+                        real_case.stdout,
+                        trace_id,
+                        acceptance_assertion_ids,
+                    )
+                    self._command_timeout(candidate.timeout_seconds, deadline)
+                except ValueError as exc:
+                    return self._failed(
+                        trace_id,
+                        tool_names,
+                        checks,
+                        "real_case",
+                        str(exc),
+                        candidate,
+                    )
                 checks.append(FactoryEvaluationCheck(name="real_case", status="passed", detail="trace and assertions verified"))
                 return FactoryCandidateEvaluationResult(
                     status="succeeded",
@@ -220,6 +248,7 @@ class FactoryCandidateEvaluator:
                     assertion_ids=assertion_ids,
                     tool_names=tool_names,
                     checks=tuple(checks),
+                    candidate_manifest=candidate,
                 )
         except (FileNotFoundError, OSError, zipfile.BadZipFile) as exc:
             checks.append(FactoryEvaluationCheck(name="infrastructure", status="infrastructure_failed", detail=str(exc)))
@@ -228,6 +257,7 @@ class FactoryCandidateEvaluator:
                 trace_id=trace_id,
                 tool_names=tool_names,
                 checks=tuple(checks),
+                candidate_manifest=candidate,
             )
         except ValueError as exc:
             checks.append(FactoryEvaluationCheck(name="validation", status="failed", detail=str(exc)))
@@ -236,6 +266,7 @@ class FactoryCandidateEvaluator:
                 trace_id=trace_id,
                 tool_names=tool_names,
                 checks=tuple(checks),
+                candidate_manifest=candidate,
             )
 
     @staticmethod
@@ -272,19 +303,32 @@ class FactoryCandidateEvaluator:
             raise ValueError("candidate workflow artifact is not valid JSON") from exc
 
     @staticmethod
-    def _run(command: tuple[str, ...], workspace: Path, trace_id: str, timeout_seconds: int) -> subprocess.CompletedProcess[str]:
+    def _run(command: tuple[str, ...], workspace: Path, trace_id: str, timeout_seconds: float) -> subprocess.CompletedProcess[str]:
         resolved = (sys.executable, *command[1:])
+        process = subprocess.Popen(
+            resolved,
+            cwd=workspace,
+            env=_isolated_environment(trace_id),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            **_sync_process_group_options(),
+        )
         try:
-            return subprocess.run(
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+            return subprocess.CompletedProcess(
                 resolved,
-                cwd=workspace,
-                env=_isolated_environment(trace_id),
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                check=False,
+                process.returncode,
+                stdout,
+                stderr,
             )
         except subprocess.TimeoutExpired as exc:
+            _terminate_sync_process_tree(process, executable=sys.executable)
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
             raise ValueError(f"candidate command timed out after {timeout_seconds} seconds") from exc
 
     @staticmethod
@@ -329,6 +373,7 @@ class FactoryCandidateEvaluator:
         checks: list[FactoryEvaluationCheck],
         name: str,
         detail: str,
+        candidate: FactoryCandidateManifest,
     ) -> FactoryCandidateEvaluationResult:
         checks.append(FactoryEvaluationCheck(name=name, status="failed", detail=detail))
         return FactoryCandidateEvaluationResult(
@@ -336,6 +381,7 @@ class FactoryCandidateEvaluator:
             trace_id=trace_id,
             tool_names=tool_names,
             checks=tuple(checks),
+            candidate_manifest=candidate,
         )
 
 
@@ -348,6 +394,48 @@ def _isolated_environment(trace_id: str) -> dict[str, str]:
     environment["CAPTAIN_FACTORY_EVALUATION"] = "1"
     environment["PYTHONUTF8"] = "1"
     return environment
+
+
+def _sync_process_group_options() -> dict[str, object]:
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def _terminate_sync_process_tree(
+    process: subprocess.Popen[str],
+    *,
+    executable: str,
+) -> None:
+    """Terminate only the tree rooted at the verified process just spawned."""
+
+    pid = process.pid
+    if not isinstance(pid, int) or pid <= 0:
+        raise ValueError("candidate process identity is invalid")
+    args = process.args
+    actual_executable = args[0] if isinstance(args, (tuple, list)) and args else args
+    if not isinstance(actual_executable, str) or (
+        os.path.normcase(os.path.abspath(actual_executable))
+        != os.path.normcase(os.path.abspath(executable))
+    ):
+        raise ValueError("candidate process identity does not match the evaluator executable")
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if completed.returncode not in {0, 128} and process.poll() is None:
+            process.kill()
+    else:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
 
 
 class ResolvedFactoryCandidate(_FrozenModel):

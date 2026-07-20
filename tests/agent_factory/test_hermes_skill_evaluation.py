@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -121,12 +122,15 @@ class Evaluator:
         self.events = events if events is not None else []
         self.calls = 0
         self.max_seconds: list[float] = []
+        self.results: list[object] = []
 
     def evaluate_skill(self, *, max_seconds: float, **kwargs: object) -> object:
         self.calls += 1
         self.max_seconds.append(max_seconds)
         self.events.append("candidate_evaluated")
-        return self._inner.evaluate_skill(max_seconds=max_seconds, **kwargs)
+        result = self._inner.evaluate_skill(max_seconds=max_seconds, **kwargs)
+        self.results.append(result)
+        return result
 
 
 class RecordingStore:
@@ -137,6 +141,11 @@ class RecordingStore:
     async def record_receipt(self, receipt: HermesSkillUsageReceipt):
         reference = await self._inner.record_receipt(receipt)
         self._events.append("receipt_persisted")
+        return reference
+
+    async def record_candidate_evaluation(self, request_id, result):
+        reference = await self._inner.record_candidate_evaluation(request_id, result)
+        self._events.append("candidate_evaluation_persisted")
         return reference
 
     async def record_tool_gap(self, evaluation_id, marker):
@@ -319,6 +328,51 @@ async def test_usage_receipt_is_durable_before_candidate_resolution_or_evaluatio
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["failed", "before_request", "after_lease", "future"])
+async def test_invalid_staged_receipt_is_rejected_before_persistence_or_candidate_work(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    events: list[str] = []
+    candidate, archive = _candidate(tmp_path)
+    request = _request(candidate)
+    proposal = _evidence(request)
+    receipt = proposal.receipt
+    active = request.occurred_at + timedelta(seconds=30)
+    if case == "failed":
+        receipt = receipt.model_copy(update={"outcome": "failed", "occurred_at": active})
+    elif case == "before_request":
+        receipt = receipt.model_copy(update={"occurred_at": request.occurred_at - timedelta(seconds=1)})
+    elif case == "after_lease":
+        receipt = receipt.model_copy(update={"occurred_at": request.lease.expires_at})
+    else:
+        receipt = receipt.model_copy(update={"occurred_at": active + timedelta(seconds=1)})
+    proposal = proposal.model_copy(update={"receipt": receipt})
+    hermes = Hermes([proposal], events)
+    candidates = CandidateStore(
+        [ResolvedFactoryCandidate(candidate=candidate, source_archive=archive)],
+        events,
+    )
+    evaluator = Evaluator(events)
+    coordinator, _ = _coordinator(
+        tmp_path,
+        hermes=hermes,
+        candidates=candidates,
+        evaluator=evaluator,
+        events=events,
+        clock=Clock(active),
+    )
+
+    with pytest.raises(FactoryDispatchError, match="usage receipt"):
+        await coordinator.evaluate(request)
+
+    assert "receipt_persisted" not in events
+    assert candidates.calls == 0
+    assert evaluator.calls == 0
+    assert hermes.calls == 0
+
+
+@pytest.mark.asyncio
 async def test_sealed_evaluator_reconciles_untrusted_hermes_check_statuses(tmp_path: Path) -> None:
     candidate, archive = _candidate(tmp_path)
     request = _request(candidate)
@@ -422,6 +476,76 @@ async def test_test_failure_uses_the_bounded_improvement_iteration(tmp_path: Pat
     assert hermes.receipt_calls == 2
     assert hermes.calls == 2
     assert candidates.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_exit_zero_malformed_real_case_drives_the_bounded_retry_from_actual_checks(
+    tmp_path: Path,
+) -> None:
+    valid, archive = _candidate(tmp_path)
+    malformed = valid.model_copy(
+        update={"real_case_command": ("python", "-c", "print('not-json')")}
+    )
+    request = _request(valid, max_iterations=2)
+    hermes = Hermes([_evidence(request, attempt=1), _evidence(request, attempt=2)])
+    candidates = CandidateStore(
+        [
+            ResolvedFactoryCandidate(candidate=malformed, source_archive=archive),
+            ResolvedFactoryCandidate(candidate=valid, source_archive=archive),
+        ]
+    )
+    coordinator, _ = _coordinator(tmp_path, hermes=hermes, candidates=candidates)
+
+    result = await coordinator.evaluate(request)
+
+    assert result.iterations == 2
+    assert result.evidence.outcome == "passed"
+    assert tuple(check.status for check in result.evidence.checks) == ("passed", "passed")
+
+
+@pytest.mark.asyncio
+async def test_sealed_checks_use_persisted_canonical_evaluator_payload_and_trusted_commands(
+    tmp_path: Path,
+) -> None:
+    candidate, archive = _candidate(tmp_path)
+    request = _request(candidate)
+    proposal = _evidence(request)
+    forged_commands = tuple(
+        command.model_copy(update={"command_id": f"hermes.claim.{index}"})
+        for index, command in enumerate(proposal.receipt.commands, start=1)
+    )
+    forged_receipt = proposal.receipt.model_copy(update={"commands": forged_commands})
+    proposal = proposal.model_copy(update={"receipt": forged_receipt})
+    hermes = Hermes([proposal])
+    candidates = CandidateStore(
+        [ResolvedFactoryCandidate(candidate=candidate, source_archive=archive)]
+    )
+    evaluator = Evaluator()
+    coordinator, store = _coordinator(
+        tmp_path,
+        hermes=hermes,
+        candidates=candidates,
+        evaluator=evaluator,
+    )
+
+    result = await coordinator.evaluate(request)
+
+    assert tuple(check.command.command_id for check in result.evidence.checks) == (
+        "captain.candidate.build",
+        "captain.candidate.real_case",
+    )
+    assert all(check.command.max_seconds == candidate.timeout_seconds for check in result.evidence.checks)
+    evaluator_refs = {check.evidence_ref for check in result.evidence.checks}
+    assert len(evaluator_refs) == 1
+    evaluator_ref = evaluator_refs.pop()
+    await store.require(evaluator_ref)
+    records = [json.loads(path.read_text(encoding="utf-8")) for path in (tmp_path / "evidence").rglob("*.json")]
+    evaluator_records = [record for record in records if record["record_kind"] == "candidate-evaluation"]
+    assert len(evaluator_records) == 1
+    persisted = evaluator_records[0]["payload"]
+    assert persisted["candidate_manifest"]["candidate_id"] == candidate.candidate_id
+    assert persisted["candidate_manifest"]["build_command"] == list(candidate.build_command)
+    assert [check["name"] for check in persisted["checks"]][-2:] == ["build", "real_case"]
 
 
 @pytest.mark.asyncio
