@@ -20,6 +20,10 @@ from agenten.agent_factory.state_machine import (
     apply_block,
     next_action,
 )
+from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationEvidence
+from agenten.agent_factory.skill_store import StoredSkillEvaluation
+from agenten.agent_runtime.contracts import ArtifactRef
+from tests.agent_factory.test_skill_evaluation_contracts import evidence_payload
 
 
 NOW = datetime(2026, 7, 19, 10, tzinfo=timezone.utc)
@@ -90,6 +94,83 @@ def block(
             "assertion_ids": list(assertions),
             "lease_id": "lease-1" if effective_role else None,
         }
+    )
+
+
+def accepted_evaluation() -> StoredSkillEvaluation:
+    factory_job = job()
+    evidence = HermesSkillEvaluationEvidence.model_validate(evidence_payload())
+    request = evidence.request.model_copy(
+        update={
+            "job_id": factory_job.job_id,
+            "correlation_id": factory_job.correlation_id,
+            "subject_version": factory_job.subject_version,
+            "acceptance_assertion_ids": factory_job.acceptance_assertion_ids,
+            "lease": evidence.request.lease.model_copy(
+                update={
+                    "job_id": factory_job.job_id,
+                    "correlation_id": factory_job.correlation_id,
+                    "subject_version": factory_job.subject_version,
+                }
+            ),
+        }
+    )
+    receipt = evidence.receipt.model_copy(
+        update={
+            "job_id": factory_job.job_id,
+            "correlation_id": factory_job.correlation_id,
+            "lease_id": request.lease.lease_id,
+            "released_skill": request.released_skill,
+            "assertion_ids": factory_job.acceptance_assertion_ids,
+        }
+    )
+    evidence = evidence.model_copy(
+        update={
+            "job_id": factory_job.job_id,
+            "correlation_id": factory_job.correlation_id,
+            "subject_version": factory_job.subject_version,
+            "request": request,
+            "receipt": receipt,
+            "assertion_ids": factory_job.acceptance_assertion_ids,
+        }
+    )
+    return StoredSkillEvaluation(
+        evidence=evidence,
+        evidence_ref=ArtifactRef.model_validate(artifact("accepted-skill-evaluation")),
+        receipt_ref=ArtifactRef.model_validate(artifact("accepted-skill-receipt")),
+        tool_gaps=evidence.tool_gaps,
+        tool_gap_refs=tuple(
+            (marker.gap_id, marker.evidence_ref) for marker in evidence.tool_gaps
+        ),
+        candidate_ref=ArtifactRef.model_validate(artifact("retained-skill-candidate")),
+    )
+
+
+def quality_reviewed_projection(*, attempt: int = 1) -> FactoryProjection:
+    state = FactoryProjection.from_job(job()).model_copy(update={"attempt": attempt})
+    for phase in (
+        FactoryPhase.FORGE_REQUESTED,
+        FactoryPhase.BLUEPRINT_CREATED,
+        FactoryPhase.TOOL_CANDIDATE_TESTED,
+        FactoryPhase.AGENT_CODE_CREATED,
+        FactoryPhase.BUILD_PASSED,
+    ):
+        state = apply_block(state, block(phase, attempt=attempt))
+    state = apply_block(
+        state,
+        block(
+            FactoryPhase.REAL_CASE_EVIDENCE,
+            attempt=attempt,
+            assertions=("real_case_green",),
+        ),
+    )
+    return apply_block(
+        state,
+        block(
+            FactoryPhase.QUALITY_REVIEWED,
+            attempt=attempt,
+            assertions=("schema_valid",),
+        ),
     )
 
 
@@ -168,3 +249,44 @@ def test_out_of_order_block_and_version_mismatch_fail_closed() -> None:
     stale = block(FactoryPhase.FORGE_REQUESTED).model_copy(update={"subject_version": 2})
     with pytest.raises(FactoryLifecycleError, match="subject version"):
         apply_block(FactoryProjection.from_job(job()), stale)
+
+
+def test_quality_review_cannot_promote_without_accepted_evaluation() -> None:
+    state = quality_reviewed_projection()
+    promotion = block(
+        FactoryPhase.CAPABILITY_PROMOTED,
+        assertions=job().acceptance_assertion_ids,
+    )
+
+    with pytest.raises(
+        FactoryLifecycleError,
+        match="missing accepted Hermes skill evaluation evidence",
+    ):
+        apply_block(state, promotion)
+
+    evaluation = accepted_evaluation()
+    promoted = apply_block(state, promotion, evaluation=evaluation)
+
+    assert promoted.status is FactoryLifecycleStatus.READY_TO_USE
+    assert promoted.evaluation_id == evaluation.evidence.evidence_id
+    assert promoted.evaluation_ref == evaluation.evidence_ref
+    assert promoted.tool_gaps == evaluation.tool_gaps
+
+
+def test_failed_skill_evaluation_uses_existing_improvement_and_attempt_ceiling() -> None:
+    failed = accepted_evaluation()
+    failed = StoredSkillEvaluation(
+        **{
+            **failed.__dict__,
+            "evidence": failed.evidence.model_copy(update={"outcome": "redo"}),
+        }
+    )
+
+    assert (
+        next_action(quality_reviewed_projection(), evaluation=failed).kind
+        is FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED
+    )
+    assert (
+        next_action(quality_reviewed_projection(attempt=5), evaluation=failed).kind
+        is FactoryActionKind.APPEND_ESCALATED
+    )

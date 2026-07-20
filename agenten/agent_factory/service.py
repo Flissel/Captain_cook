@@ -7,6 +7,7 @@ from typing import Protocol
 from uuid import UUID
 
 from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock
+from agenten.agent_factory.skill_store import StoredSkillEvaluation
 from agenten.agent_factory.state_machine import (
     FactoryAction,
     FactoryLifecycleError,
@@ -35,6 +36,9 @@ class FactoryRepository(Protocol):
     def blocks(self, job_id: UUID) -> tuple[FactoryEvidenceBlock, ...]:
         """Return blocks in their append order."""
 
+    def evaluation_for_job(self, job_id: UUID) -> StoredSkillEvaluation | None:
+        """Return Captain-readable evaluation evidence without granting writes."""
+
 
 @dataclass
 class InMemoryFactoryRepository:
@@ -43,6 +47,7 @@ class InMemoryFactoryRepository:
     _jobs: dict[UUID, AgentFactoryJob] = field(default_factory=dict)
     _blocks: dict[UUID, list[FactoryEvidenceBlock]] = field(default_factory=dict)
     _event_ids: dict[UUID, FactoryEvidenceBlock] = field(default_factory=dict)
+    _evaluations_by_job: dict[UUID, StoredSkillEvaluation] = field(default_factory=dict)
 
     def register(self, job: AgentFactoryJob) -> None:
         existing = self._jobs.get(job.job_id)
@@ -74,6 +79,10 @@ class InMemoryFactoryRepository:
         self.job(job_id)
         return tuple(self._blocks[job_id])
 
+    def evaluation_for_job(self, job_id: UUID) -> StoredSkillEvaluation | None:
+        self.job(job_id)
+        return self._evaluations_by_job.get(job_id)
+
 
 class FactoryCoordinator:
     """Rebuild state before every append; no worker may bypass Captain policy."""
@@ -91,20 +100,38 @@ class FactoryCoordinator:
                 return False
             raise FactoryRepositoryError("event_id already exists with different content")
         projection = self.projection(block.job_id)
-        apply_block(projection, block)
+        evaluation = self.evaluation_for_job(block.job_id) if block.phase.value == "capability_promoted" else None
+        apply_block(projection, block, evaluation=evaluation)
         return self._repository.append(block)
 
     def projection(self, job_id: UUID) -> FactoryProjection:
         projection = FactoryProjection.from_job(self._repository.job(job_id))
         for stored_block in self._repository.blocks(job_id):
-            projection = apply_block(projection, stored_block)
+            evaluation = (
+                self.evaluation_for_job(job_id)
+                if stored_block.phase.value == "capability_promoted"
+                else None
+            )
+            projection = apply_block(projection, stored_block, evaluation=evaluation)
         return projection
 
     def next_action(self, job_id: UUID) -> FactoryAction:
-        return next_action(self.projection(job_id)).model_copy(update={"job_id": job_id})
+        projection = self.projection(job_id)
+        evaluation = (
+            self.evaluation_for_job(job_id)
+            if projection.phase is not None and projection.phase.value == "quality_reviewed"
+            else None
+        )
+        return next_action(projection, evaluation=evaluation).model_copy(update={"job_id": job_id})
 
     def blocks(self, job_id: UUID) -> tuple[FactoryEvidenceBlock, ...]:
         return self._repository.blocks(job_id)
+
+    def evaluation_for_job(self, job_id: UUID) -> StoredSkillEvaluation | None:
+        lookup = getattr(self._repository, "evaluation_for_job", None)
+        if lookup is None:
+            return None
+        return lookup(job_id)
 
     def _existing_block(self, incoming: FactoryEvidenceBlock) -> FactoryEvidenceBlock | None:
         return next(

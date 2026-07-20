@@ -9,6 +9,14 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from .contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryPhase
+from .release_gate import (
+    evaluation_requires_improvement,
+    evaluation_tool_gaps,
+    factory_evaluation_block_reason,
+)
+from .skill_evaluation import ToolGapMarker
+from .skill_store import StoredSkillEvaluation
+from agenten.agent_runtime.contracts import ArtifactRef
 
 
 class FactoryLifecycleError(ValueError):
@@ -58,6 +66,9 @@ class FactoryProjection(BaseModel):
     attempt: int = Field(ge=1, le=5)
     observed_assertion_ids: tuple[str, ...] = ()
     block_ids: tuple[UUID, ...] = ()
+    evaluation_id: UUID | None = None
+    evaluation_ref: ArtifactRef | None = None
+    tool_gaps: tuple[ToolGapMarker, ...] = ()
 
     @classmethod
     def from_job(cls, job: AgentFactoryJob) -> "FactoryProjection":
@@ -67,6 +78,8 @@ class FactoryProjection(BaseModel):
 def apply_block(
     projection: FactoryProjection,
     block: FactoryEvidenceBlock,
+    *,
+    evaluation: StoredSkillEvaluation | None = None,
 ) -> FactoryProjection:
     """Apply one new immutable block after enforcing lifecycle ordering."""
 
@@ -101,15 +114,25 @@ def apply_block(
     assertions = tuple(dict.fromkeys((*projection.observed_assertion_ids, *block.assertion_ids)))
     status = FactoryLifecycleStatus.RUNNING
     attempt = projection.attempt
+    evaluation_update: dict[str, object] = {}
     if block.phase is FactoryPhase.IMPROVEMENT_REQUESTED:
         if projection.attempt >= projection.job.max_behavioral_iterations:
             raise FactoryLifecycleError("behavioral iteration ceiling reached")
         attempt += 1
     elif block.phase is FactoryPhase.CAPABILITY_PROMOTED:
+        evaluation_reason = factory_evaluation_block_reason(projection.job, evaluation)
+        if evaluation_reason is not None:
+            raise FactoryLifecycleError(evaluation_reason)
+        assert evaluation is not None
         required = set(projection.job.acceptance_assertion_ids)
         if not required.issubset(assertions):
             raise FactoryLifecycleError("promotion is missing required assertions")
         status = FactoryLifecycleStatus.READY_TO_USE
+        evaluation_update = {
+            "evaluation_id": evaluation.evidence.evidence_id,
+            "evaluation_ref": evaluation.evidence_ref,
+            "tool_gaps": evaluation_tool_gaps(evaluation),
+        }
     elif block.phase is FactoryPhase.ESCALATED:
         status = FactoryLifecycleStatus.ESCALATED
 
@@ -120,11 +143,16 @@ def apply_block(
             "attempt": attempt,
             "observed_assertion_ids": assertions,
             "block_ids": (*projection.block_ids, block.event_id),
+            **evaluation_update,
         }
     )
 
 
-def next_action(projection: FactoryProjection) -> FactoryAction:
+def next_action(
+    projection: FactoryProjection,
+    *,
+    evaluation: StoredSkillEvaluation | None = None,
+) -> FactoryAction:
     """Return the one allowed next side effect for a derived projection."""
 
     if projection.status is FactoryLifecycleStatus.INFRASTRUCTURE_BLOCKED:
@@ -150,6 +178,16 @@ def next_action(projection: FactoryProjection) -> FactoryAction:
     if phase in {FactoryPhase.BUILD_FAILED, FactoryPhase.QUALITY_REVIEWED}:
         required = set(projection.job.acceptance_assertion_ids)
         if phase is FactoryPhase.QUALITY_REVIEWED and required.issubset(projection.observed_assertion_ids):
+            if evaluation_requires_improvement(projection.job, evaluation):
+                if projection.attempt < projection.job.max_behavioral_iterations:
+                    return FactoryAction(
+                        kind=FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED,
+                        attempt=projection.attempt,
+                    )
+                return FactoryAction(
+                    kind=FactoryActionKind.APPEND_ESCALATED,
+                    attempt=projection.attempt,
+                )
             return FactoryAction(kind=FactoryActionKind.VALIDATE_FOR_PROMOTION, attempt=projection.attempt)
         if projection.attempt < projection.job.max_behavioral_iterations:
             return FactoryAction(kind=FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED, attempt=projection.attempt)
