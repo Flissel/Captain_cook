@@ -41,16 +41,16 @@
 - Create: `agenten/agent_factory/skill_evaluation.py`
 - Create: `tests/agent_factory/test_skill_evaluation_contracts.py`
 
-- [ ] Write failing contract tests for the following frozen, `extra="forbid"`, schema-versioned records:
+- [x] Write failing contract tests for the following frozen, `extra="forbid"`, schema-versioned records:
   - `ReleasedHermesSkill.v1`: Captain-owned `skill_id`, integer version, capability, immutable `content_ref`, SHA-256, and lifecycle status `released`.
   - `HermesSkillEvaluationRequest.v1`: job/correlation/subject identity, active Factory lease, exactly one released skill, candidate source reference, accepted assertions, and bounded iteration budget.
   - `HermesSkillUsageReceipt.v1`: Hermes producer, request/lease identity, used skill id/version/digest, bounded command/evidence references, and outcome.
   - `HermesSkillCandidate.v1`: immutable candidate content/digest, parent released-skill reference, creation reason and private-candidate status.
   - `ToolGapMarker.v1`: the literal schema name `TODO_TOOL.v1`, `required|optional` severity, needed input/output contract, least-privilege capability, at most three implementation options, acceptance assertion ids, and evidence reference.
   - `HermesSkillEvaluationEvidence.v1`: links receipt, candidate evaluation, tool gaps, build/test checks, and assertion ids to one job and correlation.
-- [ ] Assert rejection of unknown schema fields, non-UTC timestamps, duplicate references/assertions, altered digests, a skill not marked `released`, a lease/job/correlation mismatch, an empty tool option, more than three tool options, and an unbounded command.
-- [ ] Implement the models in `skill_evaluation.py`; add only shared Factory enums or references that genuinely belong in `contracts.py`. Reuse `ArtifactRef`, `CapabilityProfile`, `IntegrationIntent`, identifier validation, and the existing `FactoryLease` rather than creating parallel authority types.
-- [ ] Add a small `required_tool_gaps(evidence)` helper with tests that returns precisely the unresolved `required` markers. It must not decide publication.
+- [x] Assert rejection of unknown schema fields, non-UTC timestamps, duplicate references/assertions, altered digests, a skill not marked `released`, a lease/job/correlation mismatch, an empty tool option, more than three tool options, and an unbounded command.
+- [x] Implement the models in `skill_evaluation.py`; add only shared Factory enums or references that genuinely belong in `contracts.py`. Reuse `ArtifactRef`, `CapabilityProfile`, `IntegrationIntent`, identifier validation, and the existing `FactoryLease` rather than creating parallel authority types.
+- [x] Add a small `required_tool_gaps(evidence)` helper with tests that returns precisely the unresolved `required` markers. It must not decide publication.
 
 ### Task 2: Add an append-only private candidate and receipt store
 
