@@ -57,6 +57,15 @@ def test_gate_e_is_manual_and_uses_the_isolated_local_live_runner() -> None:
     assert isinstance(job, dict)
     assert job["if"] == "github.event_name == 'workflow_dispatch'"
     assert job["runs-on"] == ["self-hosted", "windows"]
+    environment = job["env"]
+    assert isinstance(environment, dict)
+    assert environment["MINIBOOK_BACKEND_URL"] == (
+        "${{ vars.MINIBOOK_BACKEND_URL || 'http://127.0.0.1:3456' }}"
+    )
+    assert environment["MINIBOOK_API_KEY"] == "${{ secrets.MINIBOOK_API_KEY }}"
+    assert environment["MINIBOOK_PROJECTION_API_KEY"] == (
+        "${{ secrets.MINIBOOK_PROJECTION_API_KEY }}"
+    )
 
     steps = job["steps"]
     assert isinstance(steps, list)
@@ -76,4 +85,5 @@ def test_gate_e_is_manual_and_uses_the_isolated_local_live_runner() -> None:
     source = runner.read_text(encoding="utf-8")
     assert "TEST_MARIADB_DSN" in source
     assert "run-gate-e.ps1" in source
+    assert "MINIBOOK_PROJECTION_API_KEY" in source
     assert "finally" in source

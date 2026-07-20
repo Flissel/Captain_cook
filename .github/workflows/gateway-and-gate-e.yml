@@ -58,6 +58,9 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       CAPTAIN_N8N_API_KEY: ${{ secrets.CAPTAIN_N8N_API_KEY }}
       CAPTAIN_N8N_PORT: ${{ vars.CAPTAIN_N8N_PORT || '5679' }}
+      MINIBOOK_BACKEND_URL: ${{ vars.MINIBOOK_BACKEND_URL || 'http://127.0.0.1:3456' }}
+      MINIBOOK_API_KEY: ${{ secrets.MINIBOOK_API_KEY }}
+      MINIBOOK_PROJECTION_API_KEY: ${{ secrets.MINIBOOK_PROJECTION_API_KEY }}
     steps:
       - uses: actions/checkout@v4
         with:

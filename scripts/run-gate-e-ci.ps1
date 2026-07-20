@@ -37,7 +37,14 @@ function Set-ProcessEnvironmentValue {
     [System.Environment]::SetEnvironmentVariable($Name, [string]$Value, "Process")
 }
 
-foreach ($name in @("OPENAI_API_KEY", "CAPTAIN_N8N_API_KEY", "CAPTAIN_N8N_PORT")) {
+foreach ($name in @(
+    "OPENAI_API_KEY",
+    "CAPTAIN_N8N_API_KEY",
+    "CAPTAIN_N8N_PORT",
+    "MINIBOOK_BACKEND_URL",
+    "MINIBOOK_API_KEY",
+    "MINIBOOK_PROJECTION_API_KEY"
+)) {
     if (-not (Get-Item -Path ("Env:" + $name) -ErrorAction SilentlyContinue).Value) {
         throw "$name is required for the real Gate E release run."
     }
