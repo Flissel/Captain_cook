@@ -336,6 +336,15 @@ class HermesSkillEvaluationEvidence(_FrozenContract):
         unknown_receipt_assertions = set(receipt.assertion_ids) - accepted_assertions
         if unknown_receipt_assertions:
             raise ValueError("evaluation receipt contains unknown Captain assertions")
+        for marker in self.tool_gaps:
+            marker_assertions = set(marker.acceptance_assertion_ids)
+            if marker_assertions - accepted_assertions:
+                raise ValueError("tool gap marker contains unknown Captain assertions")
+            for option in marker.implementation_options:
+                if option.acceptance_assertion_id not in accepted_assertions:
+                    raise ValueError("tool gap option contains unknown Captain assertions")
+                if option.acceptance_assertion_id not in marker_assertions:
+                    raise ValueError("tool gap option assertion must belong to its marker")
         for check in self.checks:
             unknown_check_assertions = set(check.assertion_ids) - accepted_assertions
             if unknown_check_assertions:

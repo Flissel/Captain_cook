@@ -142,10 +142,10 @@ def gap_payload(**overrides: object) -> dict[str, object]:
             {
                 "option_id": "captain-diagnostic-adapter",
                 "description": "Expose a read-only diagnostic adapter.",
-                "acceptance_assertion_id": "diagnostic_available",
+                "acceptance_assertion_id": "schema_valid",
             }
         ],
-        "acceptance_assertion_ids": ["diagnostic_available"],
+        "acceptance_assertion_ids": ["schema_valid"],
         "evidence_ref": artifact("tool-gap-evidence"),
         "status": "unresolved",
     }
@@ -287,7 +287,7 @@ def test_tool_gap_is_typed_bounded_and_rejects_empty_options() -> None:
                     {
                         "option_id": "empty-option",
                         "description": "",
-                        "acceptance_assertion_id": "diagnostic_available",
+                        "acceptance_assertion_id": "schema_valid",
                     }
                 ]
             )
@@ -299,7 +299,7 @@ def test_tool_gap_is_typed_bounded_and_rejects_empty_options() -> None:
                     {
                         "option_id": f"option-{index}",
                         "description": "A valid bounded option.",
-                        "acceptance_assertion_id": "diagnostic_available",
+                        "acceptance_assertion_id": "schema_valid",
                     }
                     for index in range(4)
                 ]
@@ -307,7 +307,61 @@ def test_tool_gap_is_typed_bounded_and_rejects_empty_options() -> None:
         )
     with pytest.raises(ValidationError, match="duplicates"):
         ToolGapMarker.model_validate(
-            gap_payload(acceptance_assertion_ids=["diagnostic_available", "diagnostic_available"])
+            gap_payload(acceptance_assertion_ids=["schema_valid", "schema_valid"])
+        )
+
+
+def test_evidence_rejects_tool_gap_assertions_outside_the_captain_request() -> None:
+    with pytest.raises(ValidationError, match="unknown"):
+        HermesSkillEvaluationEvidence.model_validate(
+            evidence_payload(
+                tool_gaps=[
+                    gap_payload(
+                        acceptance_assertion_ids=["unknown_marker_assertion"],
+                        implementation_options=[
+                            {
+                                "option_id": "unknown-marker-option",
+                                "description": "A bounded unknown marker option.",
+                                "acceptance_assertion_id": "unknown_marker_assertion",
+                            }
+                        ],
+                    )
+                ]
+            )
+        )
+    with pytest.raises(ValidationError, match="unknown"):
+        HermesSkillEvaluationEvidence.model_validate(
+            evidence_payload(
+                tool_gaps=[
+                    gap_payload(
+                        acceptance_assertion_ids=["schema_valid"],
+                        implementation_options=[
+                            {
+                                "option_id": "unknown-option-assertion",
+                                "description": "A bounded unknown option assertion.",
+                                "acceptance_assertion_id": "unknown_option_assertion",
+                            }
+                        ],
+                    )
+                ]
+            )
+        )
+    with pytest.raises(ValidationError, match="marker"):
+        HermesSkillEvaluationEvidence.model_validate(
+            evidence_payload(
+                tool_gaps=[
+                    gap_payload(
+                        acceptance_assertion_ids=["schema_valid"],
+                        implementation_options=[
+                            {
+                                "option_id": "option-not-in-marker",
+                                "description": "A known assertion omitted by the marker.",
+                                "acceptance_assertion_id": "real_case_green",
+                            }
+                        ],
+                    )
+                ]
+            )
         )
 
 
