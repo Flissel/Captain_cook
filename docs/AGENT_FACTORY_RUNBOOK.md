@@ -72,6 +72,29 @@ occurred.
    successful normal E2E runs. Captain evaluates the release gate and only then
    appends `capability_promoted`.
 
+## Recording evidence handoff
+
+The live integration owner exports a redacted
+`captain.live-demo-evidence.v1` object outside the repository. Every stage and
+all four run records carry the same UUID correlation ID and only opaque
+`artifact://` references. Exclude tokens, authorization, raw provider data,
+prompts, private holdouts, and host-local paths.
+
+Runtime and n8n outcomes are `succeeded`, the Gateway decision is `accepted`,
+and Minibook is `read-back`. Recovery records the expected failure and a
+`recovered` outcome. Normal runs are distinct, ordered 1–3, and successful.
+
+```powershell
+$env:CAPTAIN_LIVE_EVIDENCE_INPUT = '<absolute path to redacted live export>'
+python -m pytest -q --no-cov -m live tests/live/test_live_evidence_recording.py -rs
+python -m docs.live_evidence_reporter `
+  --input $env:CAPTAIN_LIVE_EVIDENCE_INPUT `
+  --output artifacts/live-demo-a2-report.json
+```
+
+Absent input skips; configured but unreadable or rejected input fails. Never
+replace this with a fixture or claim the reporter itself called live services.
+
 ## Expected projections
 
 Minibook receives a redacted registry projection only after Captain records a

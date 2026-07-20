@@ -10,3 +10,25 @@ Keep the public YouTube video under three minutes.
 6. **2:30–2:55 — Why it matters.** Show the delivery-fleet roadmap and clearly label Hermes, gateway, n8n, and Minibook work as next-stage integrations.
 
 Before uploading, verify spoken audio says both “Codex” and “GPT-5.6”, the recorded terminal shows an actual successful run, and no credentials are visible.
+
+## Live Demo A2 insert: evidence chain
+
+Use this only when the dedicated live recording test passes against the current
+provider-backed export. Keep the raw export and environment panes off screen.
+
+1. **Preflight (not recorded).** Verify presence—not values—of isolated
+   MariaDB, Codex/provider, Captain n8n, Minibook, and evidence input. Run Gate E
+   after every database-resetting test.
+2. **Runtime.** Show the compact report's correlation ID, runtime gate, and
+   opaque Codex session reference.
+3. **Gateway and n8n.** Keep that ID visible while showing accepted release and
+   succeeded execution. Never open credentials, headers, or raw payloads.
+4. **Minibook.** Show readback and say Minibook is a read-only projection, not
+   release authority.
+5. **Recovery.** Show controlled recovery and state that the expected failure
+   was observed first.
+6. **Stability.** Show the three distinct normal-run references in order.
+7. **Close.** Run the live recording test. A skip or block is not a green take.
+
+Checklist: one correlation ID; six passed gates; one recovery plus three normal
+runs; no `.env`, token, absolute path, raw prompt, holdout, or provider payload.

@@ -64,3 +64,24 @@ workflow. It never starts or stops n8n and never adopts or changes its volumes.
 Both cases are required and fail rather than skip when a live prerequisite is
 missing. The live file currently uses a strict Minibook planning-port test double;
 use the independent Minibook live projection gate for HTTP/restart evidence.
+
+## Live Demo A2 recording evidence
+
+This gate consumes a JSON export captured by the approved live integration and
+requires `mode: provider-backed-live`; the reporter itself calls no service and
+cannot turn mocks into provider evidence. It enforces one UUID correlation ID
+across Codex runtime, accepted Gateway release, n8n execution, Minibook HTTP
+readback, controlled recovery, and exactly three normal follow-up runs.
+
+```powershell
+$env:CAPTAIN_LIVE_EVIDENCE_INPUT = '<absolute path to redacted live export>'
+python -m pytest -q --no-cov -m live tests/live/test_live_evidence_recording.py -rs
+python -m docs.live_evidence_reporter `
+  --input $env:CAPTAIN_LIVE_EVIDENCE_INPUT `
+  --output artifacts/live-demo-a2-report.json
+```
+
+Absent input skips. Configured but invalid, incomplete, inconsistent,
+mock-labelled, or unredacted input fails. The generated report contains only
+gate states, the correlation ID, and opaque `artifact://` references. Keep the
+raw export outside the repository and off screen.
