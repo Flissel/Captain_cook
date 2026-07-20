@@ -6,8 +6,19 @@ import os
 from typing import Any
 
 import aiohttp
+from pydantic import BaseModel, ConfigDict
 
 from agenten.delivery.minibook_events import MinibookProjectionEvent
+
+
+class MinibookProjectionFeedPage(BaseModel):
+    """One cursor page from Captain's redacted, read-only projection feed."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    events: tuple[MinibookProjectionEvent, ...]
+    cursor: str
+    has_more: bool
 
 
 def factory_promotion_projection(

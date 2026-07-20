@@ -46,12 +46,11 @@ from gateway.contracts import (
     FactoryWriteReceipt,
     FactorySkillEvaluationSubmission,
     FactorySkillWriteReceipt,
-    MinibookProjectionFeedPage,
     PublishedHermesSkill,
 )
 from gateway.mirror import MirrorQueue
 from gateway.registry_feed import mirror_captain_projection
-from gateway.registry_feed import factory_promotion_projection
+from gateway.registry_feed import MinibookProjectionFeedPage, factory_promotion_projection
 from gateway.settings import GatewaySettings
 from gateway.store import AppendResult, GatewayStore
 
