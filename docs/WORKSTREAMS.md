@@ -17,6 +17,18 @@ The offline demo, evidence artifact, judge-facing docs, and release verifier
 remain the reviewable fallback. Create subsequent worktrees from the latest
 approved integration branch; do not commit feature work directly to `main`.
 
+### Hermes skill-evaluation ownership
+
+Captain/MariaDB owns the Factory job, lease, skill release, evaluation
+validation, shared-skill publication, and `ready_to_use` promotion. Hermes is
+a leased worker: it uses one released skill, records build/test evidence and
+may retain a private candidate, but it cannot publish or promote. Required
+`TODO_TOOL.v1` gaps block Captain promotion; optional gaps remain evidence.
+Minibook receives only the resulting read-only projection. The `hermes-agent/`
+submodule never writes the shared registry. n8n capabilities are limited to a
+Captain-issued `integration_intent=n8n` tool-integrator lease and opaque MCP
+references.
+
 ```text
 feat/devpost-demo-readiness
         │

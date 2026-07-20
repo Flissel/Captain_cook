@@ -2,6 +2,31 @@
 
 ## Agent-Factory process boundaries
 
+## Hermes skill-evaluation release path
+
+Captain/MariaDB is the lifecycle authority for Hermes skill evaluation.  Hermes
+may use exactly one Captain-released, digest-verified skill under a short-lived
+Factory lease; it can build, test, and retain an immutable private candidate,
+but it cannot publish a shared skill or write a `ready_to_use` block.
+
+```text
+request -> skill usage -> build/test evidence -> candidate retained -> Gateway validation -> skill published -> ready-to-use promotion
+```
+
+The Gateway accepts Hermes evidence only when its Factory lease, job,
+correlation, subject version, content references, and digests match.  A
+required `TODO_TOOL.v1` remains visible and blocks publication/promotion;
+an optional gap remains audit evidence without bypassing the released
+acceptance assertions.  Captain alone publishes a evaluated candidate and
+records the final promotion.  The `hermes-agent/` submodule is a leased worker
+runtime and never a shared-registry writer.
+
+The deterministic integration path uses sealed candidate archives and the
+Gateway repository.  Provider-backed Gate E is separate: it needs the Captain
+test database, a released fixture skill, and the configured local n8n MCP
+broker.  Missing live prerequisites are reported as skips or blocks, never as
+deterministic success.
+
 The Agent-Factory path is split into three independently composed process
 contracts. They exchange frozen, versioned data; none imports the next stage's
 implementation. The local candidate runs these stages in one Python runtime;
