@@ -16,12 +16,19 @@ from agenten.agent_runtime.capabilities import (
 from agenten.agent_runtime.contracts import AgentRuntimeCommand
 from agenten.agent_runtime.contracts import CapabilityGrantRevocation
 from agenten.agent_runtime.n8n_endpoint import (
+    CapabilityScopedN8nMcpReference,
     N8nEndpoint,
     N8nEndpointConfigurationError,
+    build_capability_scoped_n8n_reference,
     build_hermes_n8n_reference,
     resolve_n8n_endpoint,
 )
+from agenten.agent_factory.contracts import FactoryRole
+from agenten.agent_factory.leases import issue_factory_lease
+from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference
+from agenten.agent_runtime.contracts import IntegrationIntent
 from agenten.validation.contracts import AcceptanceAssertion, AssertionKind, WorkBatch
+from tests.agent_factory.test_state_machine import job
 
 
 NOW = datetime(2026, 7, 18, 12, tzinfo=timezone.utc)
@@ -78,6 +85,18 @@ def builder_endpoint() -> N8nEndpoint:
             "CAPTAIN_N8N_URL": "http://localhost:5679",
             "CAPTAIN_N8N_API_KEY": "sensitive-key-for-redaction",
             "CAPTAIN_N8N_MCP_TOKEN": "sensitive-mcp-token-for-redaction",
+        }
+    )
+
+
+def brokered_builder_endpoint() -> N8nEndpoint:
+    return resolve_n8n_endpoint(
+        {
+            "N8N_MODE": "captain-builder",
+            "CAPTAIN_N8N_URL": "http://localhost:5679",
+            "CAPTAIN_N8N_API_KEY": "sensitive-key-for-redaction",
+            "CAPTAIN_N8N_MCP_TOKEN": "sensitive-mcp-token-for-redaction",
+            "CAPTAIN_N8N_MCP_BROKER_URL": "http://localhost:5680",
         }
     )
 
@@ -348,6 +367,66 @@ def test_hermes_reference_returns_a_fresh_child_environment() -> None:
     assert reference.child_process_environment()["N8N_MCP_TOKEN"] == (
         "sensitive-mcp-token-for-redaction"
     )
+
+
+def test_tool_gap_reference_is_opaque_and_has_a_fresh_least_privilege_environment() -> None:
+    lease = issue_factory_lease(
+        job=job(),
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage",
+        now=NOW,
+        integration_intent=IntegrationIntent.N8N,
+    )
+    tool_reference = OpaqueN8nToolReference(
+        schema_name="captain.n8n-mcp-tool-reference.v1",
+        tool_name="support_triage",
+        input_schema_ref="artifact://factory/schema/support-triage-input",
+        output_schema_ref="artifact://factory/schema/support-triage-output",
+    )
+
+    reference = build_capability_scoped_n8n_reference(
+        lease=lease,
+        tool_reference=tool_reference,
+        endpoint=brokered_builder_endpoint(),
+    )
+
+    assert isinstance(reference, CapabilityScopedN8nMcpReference)
+    assert reference.model_dump() == tool_reference.model_dump()
+    assert "http://" not in reference.model_dump_json()
+    assert "sensitive" not in reference.model_dump_json()
+    child_environment = reference.child_process_environment()
+    assert child_environment == {
+        "N8N_URL": "http://localhost:5680",
+        "N8N_MCP_TOKEN": "sensitive-mcp-token-for-redaction",
+        "N8N_MCP_ALLOWED_TOOL": "support_triage",
+    }
+    child_environment["N8N_MCP_TOKEN"] = "changed-by-child"
+    assert reference.child_process_environment()["N8N_MCP_TOKEN"] == "sensitive-mcp-token-for-redaction"
+
+
+def test_tool_gap_reference_rejects_an_unleased_direct_endpoint() -> None:
+    lease = issue_factory_lease(
+        job=job(),
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage",
+        now=NOW,
+        integration_intent=IntegrationIntent.N8N,
+    )
+    tool_reference = OpaqueN8nToolReference(
+        schema_name="captain.n8n-mcp-tool-reference.v1",
+        tool_name="support_triage",
+        input_schema_ref="artifact://factory/schema/support-triage-input",
+        output_schema_ref="artifact://factory/schema/support-triage-output",
+    )
+
+    with pytest.raises(N8nEndpointConfigurationError, match="broker"):
+        build_capability_scoped_n8n_reference(
+            lease=lease,
+            tool_reference=tool_reference,
+            endpoint=builder_endpoint(),
+        )
 
 
 def test_hermes_reference_rejects_external_endpoint() -> None:

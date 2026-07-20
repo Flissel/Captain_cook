@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Literal, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from agenten.agent_factory.contracts import FactoryLease, FactoryRole
 from agenten.agent_runtime.contracts import IntegrationIntent
+from agenten.agent_factory.skill_evaluation import ToolGapMarker, ToolImplementationOption
 from agenten.targets.n8n import N8nDeployment, N8nExecutionEvidence, ValidationCase
 
 
@@ -19,6 +20,31 @@ class TypedN8nTool(BaseModel):
     description: str = Field(min_length=1)
     input_schema_ref: str = Field(pattern=r"^artifact://")
     output_schema_ref: str = Field(pattern=r"^artifact://")
+
+    def opaque_reference(self) -> "OpaqueN8nToolReference":
+        """Return the only serializable reference for this approved typed tool."""
+
+        return OpaqueN8nToolReference(
+            schema_name="captain.n8n-mcp-tool-reference.v1",
+            tool_name=self.name,
+            input_schema_ref=self.input_schema_ref,
+            output_schema_ref=self.output_schema_ref,
+        )
+
+
+class OpaqueN8nToolReference(BaseModel):
+    """A typed n8n MCP capability without endpoint or workflow implementation data."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    schema_name: Literal["captain.n8n-mcp-tool-reference.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    tool_name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    input_schema_ref: str = Field(pattern=r"^artifact://")
+    output_schema_ref: str = Field(pattern=r"^artifact://")
+    server_name: Literal["n8n-mcp"] = "n8n-mcp"
 
 
 class TypedN8nCall(BaseModel):
@@ -82,13 +108,35 @@ class TypedN8nCatalog:
             raise ValueError("typed n8n tool names must be unique")
         self._tools = {tool.name: tool for tool in tools}
 
+    def resolve_tool_gap_option(
+        self,
+        *,
+        lease: FactoryLease,
+        marker: ToolGapMarker,
+        option: ToolImplementationOption,
+    ) -> OpaqueN8nToolReference:
+        """Resolve one Captain-approved tool gap option without exposing n8n internals."""
+
+        _require_n8n_tool_lease(lease)
+        if marker.least_privilege_capability != "mcp.n8n":
+            raise PermissionError("tool gap does not request the approved n8n capability")
+        if option not in marker.implementation_options:
+            raise PermissionError("tool gap option is not part of the recorded marker")
+        try:
+            tool = self._tools[option.option_id]
+        except KeyError as exc:
+            raise PermissionError("tool gap option is not a registered typed n8n tool") from exc
+        if (
+            tool.input_schema_ref != marker.input_contract_ref.uri
+            or tool.output_schema_ref != marker.output_contract_ref.uri
+        ):
+            raise PermissionError("typed n8n tool schemas do not match the tool gap contract")
+        return tool.opaque_reference()
+
     async def invoke(
         self, *, lease: FactoryLease, call: TypedN8nCall, mcp: N8nMcpPort
     ) -> dict[str, object]:
-        if lease.role is not FactoryRole.TOOL_INTEGRATOR:
-            raise PermissionError("typed n8n tools require the tool integrator lease")
-        if lease.integration_intent is not IntegrationIntent.N8N or "mcp.n8n" not in lease.capabilities:
-            raise PermissionError("typed n8n tools require a Captain-issued n8n lease")
+        _require_n8n_tool_lease(lease)
         try:
             tool = self._tools[call.tool_name]
         except KeyError as exc:
@@ -96,3 +144,22 @@ class TypedN8nCatalog:
         if isinstance(mcp, N8nDeploymentToolAdapter):
             return await mcp.call_with_context(call)
         return await mcp.call_typed_tool(tool, call.payload)
+
+
+def resolve_tool_gap_n8n_option(
+    *,
+    lease: FactoryLease,
+    marker: ToolGapMarker,
+    option: ToolImplementationOption,
+    catalog: TypedN8nCatalog,
+) -> OpaqueN8nToolReference:
+    """Resolve a TODO_TOOL option through the Captain-owned typed catalog."""
+
+    return catalog.resolve_tool_gap_option(lease=lease, marker=marker, option=option)
+
+
+def _require_n8n_tool_lease(lease: FactoryLease) -> None:
+    if lease.role is not FactoryRole.TOOL_INTEGRATOR:
+        raise PermissionError("typed n8n tools require a Captain-issued n8n lease")
+    if lease.integration_intent is not IntegrationIntent.N8N or "mcp.n8n" not in lease.capabilities:
+        raise PermissionError("typed n8n tools require a Captain-issued n8n lease")

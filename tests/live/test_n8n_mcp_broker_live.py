@@ -99,6 +99,25 @@ def _builder_environment() -> dict[str, str]:
     return values
 
 
+def _approved_read_only_tool() -> tuple[str, dict[str, object]]:
+    """Load the operator-prepared, least-privilege MCP call without recording it."""
+
+    tool_name = os.environ.get("CAPTAIN_N8N_LIVE_READ_ONLY_TOOL", "").strip()
+    arguments_raw = os.environ.get("CAPTAIN_N8N_LIVE_READ_ONLY_ARGUMENTS", "").strip()
+    if not tool_name or not arguments_raw:
+        pytest.skip(
+            "opt-in live gate: CAPTAIN_N8N_LIVE_READ_ONLY_TOOL and "
+            "CAPTAIN_N8N_LIVE_READ_ONLY_ARGUMENTS are unavailable"
+        )
+    try:
+        arguments = json.loads(arguments_raw)
+    except json.JSONDecodeError:
+        pytest.fail("required live gate: approved read-only tool arguments are invalid JSON")
+    if not isinstance(arguments, dict):
+        pytest.fail("required live gate: approved read-only tool arguments must be an object")
+    return tool_name, arguments
+
+
 def _runtime_command(*, unique: str, now: datetime) -> AgentRuntimeCommand:
     subtask_id = f"subtask-{unique}"
     return AgentRuntimeCommand.model_validate(
@@ -371,12 +390,13 @@ async def _wait_for_process_identity(path: Path) -> None:
 async def test_captain_mcp_broker_revocation_is_enforced_by_live_gateway(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An accepted gateway grant reaches n8n once and is denied after revocation."""
+    """An approved read-only MCP tool runs once through the broker and is then denied."""
 
     dsn = os.environ.get("TEST_MARIADB_DSN", "").strip()
     if not dsn:
         pytest.fail("required live gate: TEST_MARIADB_DSN is unavailable")
     builder = _builder_environment()
+    approved_tool, approved_arguments = _approved_read_only_tool()
     broker_url = builder["CAPTAIN_N8N_MCP_BROKER_URL"].rstrip("/")
     if _broker_is_running():
         pytest.fail("required live gate: Captain MCP broker is already running")
@@ -400,7 +420,7 @@ async def test_captain_mcp_broker_revocation_is_enforced_by_live_gateway(
             batch = {
                 "batch_id": command.payload.batch_id,
                 "title": "Captain MCP broker live gate",
-                "goal": "Discover isolated n8n MCP capabilities once",
+                "goal": "Execute one operator-approved read-only n8n MCP tool once",
                 "subtask_ids": [command.payload.subtask_id],
                 "target": "n8n",
                 "capability_tags": ["n8n-builder"],
@@ -436,7 +456,7 @@ async def test_captain_mcp_broker_revocation_is_enforced_by_live_gateway(
                 "n8n-mcp": {
                     "url": f"{broker_url}/mcp-server/http",
                     "headers": {"Authorization": "Bearer ${N8N_MCP_TOKEN}"},
-                    "tools": {"include": ["search_workflows"]},
+                    "tools": {"include": [approved_tool]},
                     "timeout": 45,
                     "enabled": True,
                 }
@@ -447,9 +467,16 @@ async def test_captain_mcp_broker_revocation_is_enforced_by_live_gateway(
                 transport=HermesGenericMcpTransport(),
                 clock=lambda: now,
             )
-            assert await asyncio.to_thread(mcp.discover_capabilities) == (
-                "search_workflows",
+            assert await asyncio.to_thread(mcp.discover_capabilities) == (approved_tool,)
+            result = await asyncio.to_thread(
+                mcp.invoke_tool,
+                approved_tool,
+                approved_arguments,
+                command.correlation_id,
+                idempotency_key=f"live-read-only-{unique}",
             )
+            assert result.evidence.server_name == "n8n-mcp"
+            assert result.evidence.tool_name == approved_tool
 
             revocation = CapabilityGrantRevocation(
                 schema_name="captain.capability-grant-revocation.v1",

@@ -24,8 +24,17 @@ from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.orchestration import FactoryDispatch
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from agenten.agent_runtime.contracts import ArtifactRef
-from agenten.agent_factory.n8n_tools import TypedN8nTool
-from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationRequest
+from agenten.agent_factory.n8n_tools import (
+    TypedN8nCatalog,
+    TypedN8nTool,
+    resolve_tool_gap_n8n_option,
+)
+from agenten.agent_factory.skill_evaluation import (
+    HermesSkillEvaluationRequest,
+    ToolGapMarker,
+    ToolImplementationOption,
+)
+from agenten.agent_runtime.contracts import IntegrationIntent
 from tests.agent_factory.test_state_machine import job
 from tests.agent_factory.test_skill_evaluation_contracts import request_payload
 
@@ -128,6 +137,7 @@ def test_evaluator_accepts_the_typed_skill_evaluation_request_context(tmp_path: 
         real_case_command=("python", "run_case.py"),
         timeout_seconds=10,
     )
+
     request = HermesSkillEvaluationRequest.model_validate(
         request_payload(candidate_source_ref=source_ref.model_dump(mode="json"))
     )
@@ -141,6 +151,140 @@ def test_evaluator_accepts_the_typed_skill_evaluation_request_context(tmp_path: 
     assert result.status == "succeeded"
     assert result.assertion_ids == request.acceptance_assertion_ids
     assert result.trace_id == str(request.correlation_id)
+
+
+def test_tool_gap_option_resolves_only_through_an_approved_n8n_tool_lease(
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "candidate.zip"
+    _, _, input_schema_ref, output_schema_ref, source_ref = _write_candidate_archive(archive_path)
+    tool = TypedN8nTool(
+        name="support_triage",
+        description="Route a support request through the approved workflow.",
+        input_schema_ref=input_schema_ref.uri,
+        output_schema_ref=output_schema_ref.uri,
+    )
+    marker = ToolGapMarker(
+        schema_name="TODO_TOOL.v1",
+        gap_id="support-triage-gap",
+        severity="required",
+        input_contract_ref=input_schema_ref,
+        output_contract_ref=output_schema_ref,
+        least_privilege_capability="mcp.n8n",
+        implementation_options=(
+            ToolImplementationOption(
+                option_id="support_triage",
+                description="Use the released support triage MCP tool.",
+                acceptance_assertion_id="schema_valid",
+            ),
+        ),
+        acceptance_assertion_ids=("schema_valid",),
+        evidence_ref=source_ref,
+        status="unresolved",
+    )
+    lease = issue_factory_lease(
+        job=job(),
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage",
+        now=job().occurred_at,
+        integration_intent=IntegrationIntent.N8N,
+    )
+
+    reference = resolve_tool_gap_n8n_option(
+        lease=lease,
+        marker=marker,
+        option=marker.implementation_options[0],
+        catalog=TypedN8nCatalog((tool,)),
+    )
+    candidate = FactoryCandidateManifest(
+        candidate_id="support_triage_v1",
+        source_archive_ref=source_ref,
+        team_manifest={
+            "reference": _ref("artifact://factory/team/support-triage", b"{}"),
+            "relative_path": "team_manifest.json",
+        },
+        workflow_artifacts=(
+            {
+                "reference": _ref("artifact://factory/workflow/support-triage", b"{}"),
+                "relative_path": "workflows/support_triage.json",
+            },
+        ),
+        tool_schema_artifacts=(
+            {"reference": input_schema_ref, "relative_path": "schemas/support_triage.input.json"},
+            {"reference": output_schema_ref, "relative_path": "schemas/support_triage.output.json"},
+        ),
+        n8n_tools=(tool,),
+        n8n_tool_references=(reference,),
+        build_command=("python", "-m", "compileall", "-q", "."),
+        real_case_command=("python", "run_case.py"),
+        timeout_seconds=10,
+    )
+
+    assert reference.model_dump() == {
+        "schema_name": "captain.n8n-mcp-tool-reference.v1",
+        "tool_name": "support_triage",
+        "input_schema_ref": input_schema_ref.uri,
+        "output_schema_ref": output_schema_ref.uri,
+        "server_name": "n8n-mcp",
+    }
+    serialized = candidate.model_dump_json()
+    assert "hidden-workflow-id" not in serialized
+    assert "token" not in serialized.lower()
+    assert "http://" not in serialized
+
+
+@pytest.mark.parametrize(
+    "lease",
+    (
+        issue_factory_lease(
+            job=job(),
+            role=FactoryRole.TOOL_INTEGRATOR,
+            attempt=1,
+            workspace_ref="workspace://factory/support-triage",
+            now=job().occurred_at,
+        ),
+        issue_factory_lease(
+            job=job(),
+            role=FactoryRole.AGENT_ARCHITECT,
+            attempt=1,
+            workspace_ref="workspace://factory/support-triage",
+            now=job().occurred_at,
+        ),
+        issue_factory_lease(
+            job=job(),
+            role=FactoryRole.TOOL_INTEGRATOR,
+            attempt=1,
+            workspace_ref="workspace://factory/support-triage",
+            now=job().occurred_at,
+            integration_intent=IntegrationIntent.N8N,
+        ).model_copy(update={"capabilities": ("codex.run",)}),
+    ),
+)
+def test_tool_gap_option_rejects_unapproved_or_nonintegrator_leases(lease: object) -> None:
+    input_schema_ref = _ref("artifact://factory/schema/support-triage-input", b"{}")
+    output_schema_ref = _ref("artifact://factory/schema/support-triage-output", b"{}")
+    marker = ToolGapMarker(
+        schema_name="TODO_TOOL.v1",
+        gap_id="support-triage-gap",
+        severity="required",
+        input_contract_ref=input_schema_ref,
+        output_contract_ref=output_schema_ref,
+        least_privilege_capability="mcp.n8n",
+        implementation_options=(ToolImplementationOption(option_id="support_triage", description="Use tool.", acceptance_assertion_id="schema_valid"),),
+        acceptance_assertion_ids=("schema_valid",),
+        evidence_ref=_ref("artifact://factory/evidence/support-triage", b"{}"),
+        status="unresolved",
+    )
+    catalog = TypedN8nCatalog((TypedN8nTool(name="support_triage", description="Route support.", input_schema_ref=input_schema_ref.uri, output_schema_ref=output_schema_ref.uri),))
+
+    with pytest.raises(PermissionError, match="Captain-issued n8n lease"):
+        resolve_tool_gap_n8n_option(
+            lease=lease,
+            marker=marker,
+            option=marker.implementation_options[0],
+            catalog=catalog,
+        )
 
 
 def test_skill_evaluator_bounds_candidate_commands_by_remaining_lease_time(tmp_path: Path) -> None:

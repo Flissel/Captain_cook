@@ -26,7 +26,7 @@ from agenten.agent_factory.contracts import (
     FactoryRole,
 )
 from agenten.agent_factory.evidence_store import FactoryEvidenceStore
-from agenten.agent_factory.n8n_tools import TypedN8nTool
+from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference, TypedN8nTool
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
 from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationRequest
 from agenten.agent_factory.state_machine import FactoryActionKind
@@ -62,6 +62,7 @@ class FactoryCandidateManifest(_FrozenModel):
     workflow_artifacts: tuple[FactoryCandidateArtifact, ...] = Field(min_length=1)
     tool_schema_artifacts: tuple[FactoryCandidateArtifact, ...] = Field(min_length=2)
     n8n_tools: tuple[TypedN8nTool, ...] = Field(min_length=1)
+    n8n_tool_references: tuple[OpaqueN8nToolReference, ...] = ()
     build_command: tuple[str, ...] = Field(min_length=1)
     real_case_command: tuple[str, ...] = Field(min_length=1)
     timeout_seconds: int = Field(ge=1, le=300)
@@ -87,6 +88,14 @@ class FactoryCandidateManifest(_FrozenModel):
             raise ValueError("each typed n8n input/output schema must be sealed in the candidate archive")
         if len(references) != len(self.tool_schema_artifacts):
             raise ValueError("candidate tool schema artifact references must be unique")
+        if self.n8n_tool_references:
+            expected_references = tuple(
+                tool.opaque_reference() for tool in self.n8n_tools
+            )
+            if self.n8n_tool_references != expected_references:
+                raise ValueError(
+                    "candidate n8n tool references must exactly match the typed tool schemas"
+                )
         return self
 
 

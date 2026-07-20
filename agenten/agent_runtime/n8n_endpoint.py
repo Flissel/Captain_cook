@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import ipaddress
 from datetime import datetime
-from typing import Literal, Mapping
+from typing import TYPE_CHECKING, Literal, Mapping
 from urllib.parse import SplitResult, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
+from agenten.agent_factory.contracts import FactoryLease, FactoryRole
 from agenten.agent_runtime.capabilities import CapabilityDenied, validate_grant
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
@@ -17,6 +18,9 @@ from agenten.agent_runtime.contracts import (
     CapabilityProfile,
 )
 from agenten.agent_runtime.n8n_mcp_broker import McpLeaseIssuer
+
+if TYPE_CHECKING:
+    from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference
 
 
 class N8nEndpointConfigurationError(ValueError):
@@ -47,6 +51,27 @@ class HermesN8nReference(BaseModel):
 
     def child_process_environment(self) -> dict[str, str]:
         """Return a fresh credential mapping for one authorized child process."""
+
+        return dict(self._child_environment)
+
+
+class CapabilityScopedN8nMcpReference(BaseModel):
+    """Serializable single-tool identity with private broker-only child configuration."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    schema_name: Literal["captain.n8n-mcp-tool-reference.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    tool_name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    input_schema_ref: str = Field(pattern=r"^artifact://")
+    output_schema_ref: str = Field(pattern=r"^artifact://")
+    server_name: Literal["n8n-mcp"] = "n8n-mcp"
+    _child_environment: dict[str, str] = PrivateAttr(default_factory=dict)
+
+    def child_process_environment(self) -> dict[str, str]:
+        """Return a fresh environment constrained to this one typed tool."""
 
         return dict(self._child_environment)
 
@@ -141,6 +166,41 @@ def build_hermes_n8n_reference(
     return reference
 
 
+def build_capability_scoped_n8n_reference(
+    *,
+    lease: FactoryLease,
+    tool_reference: "OpaqueN8nToolReference",
+    endpoint: N8nEndpoint,
+) -> CapabilityScopedN8nMcpReference:
+    """Bind one approved typed tool to the Captain MCP broker without serializing secrets."""
+
+    _validate_factory_tool_lease(lease)
+    _validate_builder_endpoint(endpoint)
+    if not endpoint.mcp_broker_url:
+        raise N8nEndpointConfigurationError(
+            "capability-scoped n8n reference requires the Captain MCP broker"
+        )
+    if not endpoint.mcp_token:
+        raise N8nEndpointConfigurationError(
+            "Captain n8n MCP token must not be empty for broker access"
+        )
+    reference = CapabilityScopedN8nMcpReference(
+        schema_name=tool_reference.schema_name,
+        tool_name=tool_reference.tool_name,
+        input_schema_ref=tool_reference.input_schema_ref,
+        output_schema_ref=tool_reference.output_schema_ref,
+        server_name=tool_reference.server_name,
+    )
+    reference._child_environment.update(
+        {
+            "N8N_URL": endpoint.mcp_broker_url,
+            "N8N_MCP_TOKEN": endpoint.mcp_token,
+            "N8N_MCP_ALLOWED_TOOL": reference.tool_name,
+        }
+    )
+    return reference
+
+
 def _required_value(
     environment: Mapping[str, str],
     name: str,
@@ -151,6 +211,13 @@ def _required_value(
     if not value:
         raise N8nEndpointConfigurationError(f"{label or name} must not be empty")
     return value
+
+
+def _validate_factory_tool_lease(lease: FactoryLease) -> None:
+    if lease.role is not FactoryRole.TOOL_INTEGRATOR:
+        raise CapabilityDenied("n8n tool references require a tool integrator lease")
+    if lease.integration_intent.value != "n8n" or "mcp.n8n" not in lease.capabilities:
+        raise CapabilityDenied("n8n tool references require a Captain-issued n8n lease")
 
 
 def _validate_builder_endpoint(endpoint: N8nEndpoint) -> None:
