@@ -148,6 +148,18 @@ function Stop-CaptainN8nContainers {
 }
 function Start-Gateway($Values) {
     try { if ((Invoke-WebRequest "$($Values['CAPTAIN_GATEWAY_URL'])/healthz" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200) { Write-Host '[ready] Gateway already healthy'; return } } catch {}
+    $gatewayPort = [Uri]$Values['CAPTAIN_GATEWAY_URL'] | Select-Object -ExpandProperty Port
+    $listener = Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $gatewayPort -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($listener) {
+        $conflict = Get-CimInstance Win32_Process -Filter "ProcessId=$($listener.OwningProcess)"
+        if ($conflict -and $conflict.CommandLine -match '(?i)(^|\s)-m\s+gateway\.app(\s|$)') {
+            & taskkill.exe /PID $listener.OwningProcess /T /F *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'Stale local Gateway process could not be stopped.' }
+            Write-Host '[ready] stale local Gateway process stopped after failed health check'
+        } else {
+            throw 'Gateway port is occupied by a non-demo process; refusing to stop it.'
+        }
+    }
     New-Item -ItemType Directory -Force $stateDir | Out-Null
     $python = Join-Path $root '.venv\Scripts\python.exe'
     if (-not (Test-Path $python)) { $python = (& python -c 'import sys; print(sys.executable)').Trim() }
@@ -191,7 +203,7 @@ try {
             Start-Gateway $values
             docker compose --env-file $rootEnv up -d --wait mailpit
             if ($LASTEXITCODE -ne 0) { throw 'Captain Mailpit failed to start.' }
-            & (Join-Path $PSScriptRoot 'minibook-demo.ps1') bootstrap
+            & (Join-Path $PSScriptRoot 'minibook-demo.ps1') bootstrap -RecoverDemoCredentials:$RecoverDemoCredentials
             Invoke-Health
         }
         health { Invoke-Health }

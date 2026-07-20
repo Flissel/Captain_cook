@@ -73,6 +73,9 @@ def test_minibook_demo_bootstrap_is_local_reusable_and_redacted() -> None:
     assert "/api/v1/agents/me" in source
     assert "/api/v1/agents" in source
     assert "captain-demo-service" in source
+    assert "[switch]$RecoverDemoCredentials" in source
+    assert "Minibook demo service credential recovered locally" in source
+    assert "SELECT api_key FROM agents WHERE name" in source
     assert "Write-Output $apiKey" not in source
     assert "minibook-demo.pid" in source
 
@@ -90,6 +93,9 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "mariadb-test" in source
     assert "python" in source and "gateway.app" in source
     assert "gateway-demo.pid" in source
+    assert "Gateway port is occupied by a non-demo process" in source
+    assert "stale local Gateway process stopped" in source
+    assert "Get-CimInstance Win32_Process" in source
     assert ".env.captain-n8n" in source
     assert "CAPTAIN_N8N_API_KEY" in source
     assert "CAPTAIN_N8N_MCP_TOKEN" in source
@@ -112,6 +118,7 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "docker stop" in source
     assert "com.docker.compose.project=captain-n8n-builder" in source
     assert "application/json, text/event-stream" in PREFLIGHT.read_text(encoding="utf-8")
+    assert "bootstrap -RecoverDemoCredentials:$RecoverDemoCredentials" in source
     assert "OPENAI" not in source.upper()
     assert source.index("Initialize-CaptainN8n $values") < source.index("mariadb-test")
     lowered = source.lower()

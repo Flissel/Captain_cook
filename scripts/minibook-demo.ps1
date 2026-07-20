@@ -3,7 +3,8 @@
 param(
     [Parameter(Mandatory, Position=0)]
     [ValidateSet("start", "bootstrap", "status", "stop")]
-    [string]$Action
+    [string]$Action,
+    [switch]$RecoverDemoCredentials
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -42,6 +43,21 @@ function Start-Service {
     foreach ($attempt in 1..60) { if (Test-Health) { Write-Host '[ready] Minibook local instance'; return }; Start-Sleep -Milliseconds 500 }
     throw 'Minibook local instance did not become healthy.'
 }
+function Recover-ServiceCredential($values) {
+    $database = Join-Path $root 'minibook\data\minibook.db'
+    if (-not (Test-Path $database -PathType Leaf)) { throw 'Minibook demo identity exists but its local database is unavailable for explicit recovery.' }
+    $python = Join-Path $root '.venv\Scripts\python.exe'; if (-not (Test-Path $python)) { $python = (Get-Command python).Source }
+    $query = "import sqlite3, sys; con=sqlite3.connect(sys.argv[1]); rows=con.execute('SELECT api_key FROM agents WHERE name = ?', (sys.argv[2],)).fetchall(); sys.stdout.write(rows[0][0] if len(rows) == 1 else '')"
+    $apiKey = (& $python -c $query $database $serviceName).Trim()
+    if ([string]::IsNullOrWhiteSpace($apiKey)) { throw 'Minibook demo identity recovery was ambiguous or unavailable.' }
+    try {
+        $me = Invoke-RestMethod "$baseUrl/api/v1/agents/me" -Headers @{Authorization="Bearer $apiKey"} -TimeoutSec 5
+        if ($me.name -ne $serviceName) { throw 'Recovered Minibook key belongs to another identity.' }
+    } catch { throw 'Recovered Minibook key did not validate against the local service.' }
+    $values['CAPTAIN_DEMO_MINIBOOK_API_KEY'] = $apiKey
+    Save-Env $values
+    Write-Host '[ready] Minibook demo service credential recovered locally (credential redacted)'
+}
 function Bootstrap-Service {
     Start-Service
     $values = Read-Env
@@ -55,7 +71,10 @@ function Bootstrap-Service {
     }
     try {
         $created = Invoke-RestMethod "$baseUrl/api/v1/agents" -Method Post -ContentType 'application/json' -Body (@{name=$serviceName}|ConvertTo-Json) -TimeoutSec 5
-    } catch { throw 'Minibook demo identity exists or registration failed; restore its local key instead of rotating implicitly.' }
+    } catch {
+        if ($RecoverDemoCredentials) { Recover-ServiceCredential $values; return }
+        throw 'Minibook demo identity exists or registration failed; use -RecoverDemoCredentials to restore its local key.'
+    }
     if (-not $created.api_key) { throw 'Minibook registration returned no API key.' }
     $values['CAPTAIN_DEMO_MINIBOOK_API_KEY'] = [string]$created.api_key
     Save-Env $values
