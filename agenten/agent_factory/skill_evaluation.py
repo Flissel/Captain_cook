@@ -92,6 +92,8 @@ class HermesSkillEvaluationRequest(_FrozenContract):
             raise ValueError("evaluation request lease subject version does not match request")
         if self.lease.role is not FactoryRole.TOOL_INTEGRATOR:
             raise ValueError("skill evaluation requires a tool integrator lease")
+        if not self.lease.issued_at <= self.occurred_at < self.lease.expires_at:
+            raise ValueError("skill evaluation request must be issued under an active lease")
         return self
 
 
@@ -319,6 +321,8 @@ class HermesSkillEvaluationEvidence(_FrozenContract):
         lease = request.lease
         if not lease.issued_at <= receipt.occurred_at < lease.expires_at:
             raise ValueError("evaluation evidence receipt was not issued under an active lease")
+        if receipt.occurred_at < request.occurred_at:
+            raise ValueError("evaluation evidence receipt cannot precede the Captain request")
         if self.candidate is not None:
             if self.candidate.request_id != request.request_id:
                 raise ValueError("evaluation evidence candidate request does not match evidence")
@@ -328,14 +332,36 @@ class HermesSkillEvaluationEvidence(_FrozenContract):
                 raise ValueError("evaluation evidence candidate must be created after the receipt")
             if self.candidate.created_at >= lease.expires_at:
                 raise ValueError("evaluation evidence candidate was created outside the active lease")
-        known_assertions = set(self.assertion_ids)
+        accepted_assertions = set(request.acceptance_assertion_ids)
+        unknown_receipt_assertions = set(receipt.assertion_ids) - accepted_assertions
+        if unknown_receipt_assertions:
+            raise ValueError("evaluation receipt contains unknown Captain assertions")
         for check in self.checks:
-            if not set(check.assertion_ids).issubset(known_assertions):
-                raise ValueError("evaluation check assertions must belong to evidence")
+            unknown_check_assertions = set(check.assertion_ids) - accepted_assertions
+            if unknown_check_assertions:
+                raise ValueError("evaluation check contains unknown Captain assertions")
             if check.occurred_at <= receipt.occurred_at:
                 raise ValueError("evaluation check must occur after the receipt")
             if check.occurred_at >= lease.expires_at:
                 raise ValueError("evaluation check occurred outside the active lease")
+        unknown_evidence_assertions = set(self.assertion_ids) - accepted_assertions
+        if unknown_evidence_assertions:
+            raise ValueError("evaluation evidence contains unknown Captain assertions")
+        if self.outcome == "passed":
+            missing_evidence_assertions = accepted_assertions - set(self.assertion_ids)
+            if missing_evidence_assertions:
+                raise ValueError("evaluation evidence is missing Captain acceptance assertions")
+            successful_assertions = {
+                assertion_id
+                for check in self.checks
+                if check.status == "passed"
+                for assertion_id in check.assertion_ids
+            }
+            missing_successful_assertions = accepted_assertions - successful_assertions
+            if missing_successful_assertions:
+                raise ValueError(
+                    "evaluation evidence lacks successful checks for Captain acceptance assertions"
+                )
         if self.occurred_at <= receipt.occurred_at:
             raise ValueError("evaluation evidence must occur after the receipt")
         if self.occurred_at >= lease.expires_at:

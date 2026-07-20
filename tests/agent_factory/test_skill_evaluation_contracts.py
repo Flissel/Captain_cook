@@ -229,6 +229,17 @@ def test_request_rejects_non_utc_duplicate_assertions_unreleased_skills_and_mism
         )
 
 
+def test_request_must_be_issued_within_its_factory_lease() -> None:
+    with pytest.raises(ValidationError, match="active"):
+        HermesSkillEvaluationRequest.model_validate(
+            request_payload(occurred_at=NOW - timedelta(seconds=1))
+        )
+    with pytest.raises(ValidationError, match="active"):
+        HermesSkillEvaluationRequest.model_validate(
+            request_payload(occurred_at=NOW + timedelta(minutes=10))
+        )
+
+
 def test_released_and_candidate_skill_content_digests_are_immutable() -> None:
     with pytest.raises(ValidationError, match="digest"):
         ReleasedHermesSkill.model_validate(released_skill_payload(content_sha256="b" * 64))
@@ -364,6 +375,84 @@ def test_evidence_requires_receipt_before_candidate_creation_and_checks() -> Non
                     }
                 ]
             )
+        )
+
+
+def test_evidence_rejects_unknown_or_incomplete_captain_assertions() -> None:
+    with pytest.raises(ValidationError, match="unknown"):
+        HermesSkillEvaluationEvidence.model_validate(
+            evidence_payload(receipt=receipt_payload(assertion_ids=["unknown_assertion"]))
+        )
+    with pytest.raises(ValidationError, match="unknown"):
+        HermesSkillEvaluationEvidence.model_validate(
+            evidence_payload(assertion_ids=["schema_valid", "real_case_green", "unknown_assertion"])
+        )
+    with pytest.raises(ValidationError, match="unknown"):
+        HermesSkillEvaluationEvidence.model_validate(
+            evidence_payload(
+                assertion_ids=["schema_valid", "real_case_green", "unknown_assertion"],
+                checks=[
+                    {
+                        "check_id": "unknown-check",
+                        "kind": "test",
+                        "command": {"command_id": "captain.real_case", "max_seconds": 120},
+                        "status": "passed",
+                        "occurred_at": NOW + timedelta(minutes=2),
+                        "evidence_ref": artifact("unknown-check"),
+                        "assertion_ids": ["unknown_assertion"],
+                    }
+                ],
+            )
+        )
+    with pytest.raises(ValidationError, match="missing"):
+        HermesSkillEvaluationEvidence.model_validate(
+            evidence_payload(
+                receipt=receipt_payload(assertion_ids=["schema_valid"]),
+                checks=[
+                    {
+                        "check_id": "build",
+                        "kind": "build",
+                        "command": {"command_id": "python.compileall", "max_seconds": 60},
+                        "status": "passed",
+                        "occurred_at": NOW + timedelta(minutes=2),
+                        "evidence_ref": artifact("build-check"),
+                        "assertion_ids": ["schema_valid"],
+                    }
+                ],
+                assertion_ids=["schema_valid"],
+            )
+        )
+    with pytest.raises(ValidationError, match="successful"):
+        HermesSkillEvaluationEvidence.model_validate(
+            evidence_payload(
+                checks=[
+                    {
+                        "check_id": "build",
+                        "kind": "build",
+                        "command": {"command_id": "python.compileall", "max_seconds": 60},
+                        "status": "passed",
+                        "occurred_at": NOW + timedelta(minutes=2),
+                        "evidence_ref": artifact("build-check"),
+                        "assertion_ids": ["schema_valid"],
+                    },
+                    {
+                        "check_id": "real-case",
+                        "kind": "test",
+                        "command": {"command_id": "captain.real_case", "max_seconds": 120},
+                        "status": "failed",
+                        "occurred_at": NOW + timedelta(minutes=3),
+                        "evidence_ref": artifact("test-check"),
+                        "assertion_ids": ["real_case_green"],
+                    },
+                ]
+            )
+        )
+
+
+def test_evidence_rejects_a_receipt_that_precedes_the_captain_request() -> None:
+    with pytest.raises(ValidationError, match="request"):
+        HermesSkillEvaluationEvidence.model_validate(
+            evidence_payload(request=request_payload(occurred_at=NOW + timedelta(minutes=2)))
         )
 
 
