@@ -8,14 +8,16 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-function Read-SafeEnv([string]$Path) {
+function Read-SafeEnv([string]$Path, [string[]]$AllowedNames) {
     $values = [ordered]@{}
     if (Test-Path -LiteralPath $Path) {
         foreach ($line in [IO.File]::ReadAllLines($Path)) {
             if ($line -match '^\s*#' -or [string]::IsNullOrWhiteSpace($line)) { continue }
             if ($line -notmatch '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') { throw 'Invalid .env line; expected NAME=value.' }
-            if ($values.Contains($Matches[1])) { throw "Duplicate .env key: $($Matches[1])" }
-            $values[$Matches[1]] = $Matches[2]
+            $name = $Matches[1]
+            if ($AllowedNames -notcontains $name) { continue }
+            if ($values.Contains($name)) { throw "Duplicate .env key: $name" }
+            $values[$name] = $Matches[2]
         }
     }
     return $values
@@ -28,7 +30,16 @@ function Set-SafeDefault($Values, [string]$Name, [string]$Value) {
 function Save-SafeEnv($Values, [string]$Path) {
     $parent = Split-Path -Parent $Path
     if ($parent -and -not (Test-Path -LiteralPath $parent)) { [void](New-Item -ItemType Directory -Path $parent) }
-    $lines = foreach ($entry in $Values.GetEnumerator()) { '{0}={1}' -f $entry.Key, $entry.Value }
+    $pending = [ordered]@{}; foreach ($entry in $Values.GetEnumerator()) { $pending[$entry.Key] = $entry.Value }
+    $lines = [Collections.Generic.List[string]]::new()
+    if (Test-Path -LiteralPath $Path) { foreach ($line in [IO.File]::ReadAllLines($Path)) {
+        if ($line -match '^([A-Za-z_][A-Za-z0-9_]*)=') {
+            $name = $Matches[1]
+            if ($pending.Contains($name)) { $lines.Add(('{0}={1}' -f $name,$pending[$name])); $pending.Remove($name); continue }
+        }
+        $lines.Add($line)
+    }}
+    foreach ($entry in $pending.GetEnumerator()) { $lines.Add(('{0}={1}' -f $entry.Key,$entry.Value)) }
     [IO.File]::WriteAllLines($Path, $lines, [Text.UTF8Encoding]::new($false))
 }
 
@@ -40,7 +51,8 @@ function Test-Http([string]$Name, [string]$Uri, [hashtable]$Headers = @{}, [stri
     Write-Host "[ready] $Name"
 }
 
-$config = Read-SafeEnv $EnvFile
+$allowedNames = @('MAILPIT_WEB_PORT','MAILPIT_URL','MAILPIT_SMTP_PORT','CAPTAIN_N8N_URL','CAPTAIN_GATEWAY_URL','MINIBOOK_BACKEND_URL','CAPTAIN_N8N_API_KEY','N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','N8N_MCP_TOKEN','TEST_MARIADB_DSN')
+$config = Read-SafeEnv $EnvFile $allowedNames
 # The running Captain Mailpit instance is intentionally published on 18025.
 $config['MAILPIT_WEB_PORT'] = '18025'
 $config['MAILPIT_URL'] = 'http://localhost:18025'
@@ -65,7 +77,7 @@ $minibookUrl = ([string]$config['MINIBOOK_BACKEND_URL']).TrimEnd('/')
 $gatewayUrl = ([string]$config['CAPTAIN_GATEWAY_URL']).TrimEnd('/')
 Test-Http 'Captain n8n REST' "$captainN8nUrl/api/v1/workflows?limit=1" @{ 'X-N8N-API-KEY'=[string]$config['CAPTAIN_N8N_API_KEY'] }
 $mcpBody = '{"jsonrpc":"2.0","id":"demo-preflight","method":"tools/list","params":{}}'
-Test-Http 'Captain n8n MCP' "$captainN8nUrl/mcp-server/http" @{ Authorization="Bearer $([string]$config['CAPTAIN_N8N_MCP_TOKEN'])" } 'POST' $mcpBody
+Test-Http 'Captain n8n MCP' "$captainN8nUrl/mcp-server/http" @{ Authorization="Bearer $([string]$config['CAPTAIN_N8N_MCP_TOKEN'])"; Accept='application/json, text/event-stream' } 'POST' $mcpBody
 Test-Http 'Mailpit' "$mailpitUrl/api/v1/info"
 Test-Http 'Minibook' "$minibookUrl/health"
 Test-Http 'Gateway' "$gatewayUrl/healthz"

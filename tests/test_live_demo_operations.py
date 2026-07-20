@@ -32,8 +32,9 @@ def test_demo_runner_requires_explicit_provider_opt_in() -> None:
 def test_normalize_writes_safe_defaults_and_aliases_without_secret_output(tmp_path: Path) -> None:
     env_file = tmp_path / ".env"
     secret = "fixture-secret-never-log"
+    opaque_provider = "provider-value-must-remain-opaque"
     env_file.write_text(
-        f"N8N_API_KEY={secret}\nMAILPIT_WEB_PORT=8025\nMAILPIT_URL=http://localhost:8025\n",
+        f"OPENAI_API_KEY={opaque_provider}\nN8N_API_KEY={secret}\nMAILPIT_WEB_PORT=8025\nMAILPIT_URL=http://localhost:8025\n",
         encoding="utf-8",
     )
     result = subprocess.run(
@@ -54,7 +55,10 @@ def test_normalize_writes_safe_defaults_and_aliases_without_secret_output(tmp_pa
     assert "MAILPIT_WEB_PORT=18025" in normalized
     assert "MAILPIT_URL=http://localhost:18025" in normalized
     assert f"CAPTAIN_N8N_API_KEY={secret}" in normalized
+    assert f"OPENAI_API_KEY={opaque_provider}" in normalized
     assert secret not in output
+    assert opaque_provider not in output
+    assert "$AllowedNames -notcontains $name" in PREFLIGHT.read_text(encoding="utf-8")
 
 
 def test_requirements_dev_installs_minibook_test_dependencies() -> None:
@@ -94,6 +98,22 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "CAPTAIN_GATEWAY_TOKEN" in source
     assert "WORKER_GATEWAY_TOKEN" in source
     assert "RandomNumberGenerator" in source
+    assert "[switch]$RecoverDemoCredentials" in source
+    assert "[string]$CredentialSourceEnv" in source
+    assert "N8N_API_KEY" in source
+    assert "N8N_MCP_TOKEN" in source
+    assert "http://127.0.0.1:5679" in source
+    assert "/api/v1/workflows?limit=1" in source
+    assert "/mcp-server/http" in source
+    assert "X-N8N-API-KEY" in source
+    assert "Authorization" in source
+    assert "application/json, text/event-stream" in source
+    assert "docker ps -a" in source
+    assert "docker stop" in source
+    assert "com.docker.compose.project=captain-n8n-builder" in source
+    assert "application/json, text/event-stream" in PREFLIGHT.read_text(encoding="utf-8")
+    assert "OPENAI" not in source.upper()
+    assert source.index("Initialize-CaptainN8n $values") < source.index("mariadb-test")
     lowered = source.lower()
     assert "down -v" not in lowered
     assert "volume rm" not in lowered
@@ -107,6 +127,8 @@ def test_readme_documents_safe_recording_commands() -> None:
     assert "scripts/run-live-demo.ps1 -LiveProviders" in readme
     assert "captain_test" in readme
     assert ".env.captain-n8n" in readme
+    assert "-RecoverDemoCredentials" in readme
+    assert "-CredentialSourceEnv" in readme
     env = (ROOT / ".env.example").read_text(encoding="utf-8")
     for name in ("MARIADB_TEST_PORT", "MARIADB_TEST_PASSWORD", "MARIADB_TEST_ROOT_PASSWORD", "TEST_MARIADB_DSN"):
         assert f"{name}=" in env

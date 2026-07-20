@@ -17,12 +17,16 @@ $serviceName = 'captain-demo-service'
 function Read-Env {
     $values = [ordered]@{}
     if (Test-Path $envFile) { foreach ($line in [IO.File]::ReadAllLines($envFile)) {
-        if ($line -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') { $values[$Matches[1]] = $Matches[2] }
+        if ($line -match '^CAPTAIN_DEMO_MINIBOOK_API_KEY=(.*)$') { $values['CAPTAIN_DEMO_MINIBOOK_API_KEY'] = $Matches[1] }
     }}
     $values
 }
 function Save-Env($values) {
-    $lines = foreach ($item in $values.GetEnumerator()) { '{0}={1}' -f $item.Key,$item.Value }
+    $lines = [Collections.Generic.List[string]]::new(); $written = $false
+    if (Test-Path $envFile) { foreach ($line in [IO.File]::ReadAllLines($envFile)) {
+        if ($line -match '^CAPTAIN_DEMO_MINIBOOK_API_KEY=') { $lines.Add("CAPTAIN_DEMO_MINIBOOK_API_KEY=$($values['CAPTAIN_DEMO_MINIBOOK_API_KEY'])"); $written=$true } else { $lines.Add($line) }
+    }}
+    if (-not $written) { $lines.Add("CAPTAIN_DEMO_MINIBOOK_API_KEY=$($values['CAPTAIN_DEMO_MINIBOOK_API_KEY'])") }
     [IO.File]::WriteAllLines($envFile, $lines, [Text.UTF8Encoding]::new($false))
 }
 function Test-Health {
