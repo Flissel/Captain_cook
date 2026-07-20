@@ -588,6 +588,10 @@ def test_captain_publication_then_promotion_is_authoritative(
             "/v1/factory/blocks",
             json=promotion.model_dump(mode="json", by_alias=True),
         )
+        decision_replay = captain.post(
+            "/v1/factory/release-decisions",
+            json=release_submission.model_dump(mode="json", by_alias=True),
+        )
         late_decision = captain.post(
             "/v1/factory/release-decisions",
             json=blocked_release_submission.model_dump(mode="json", by_alias=True),
@@ -598,6 +602,8 @@ def test_captain_publication_then_promotion_is_authoritative(
     assert decision.status_code == 201
     assert published.status_code == 201
     assert promoted.status_code == 201
+    assert decision_replay.status_code == 200
+    assert decision_replay.json()["replayed"] is True
     assert late_decision.status_code == 409
     assert late_decision.json()["detail"] == (
         "Factory release decisions are sealed after capability promotion"

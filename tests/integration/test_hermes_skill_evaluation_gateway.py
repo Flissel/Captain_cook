@@ -208,6 +208,12 @@ class _DeterministicGatewayStore:
         submission: FactoryReleaseDecisionSubmission,
     ) -> SimpleNamespace:
         job_id = submission.decision.job_id
+        canonical = submission.model_dump(mode="json", by_alias=True)
+        if any(
+            existing.model_dump(mode="json", by_alias=True) == canonical
+            for existing in self.release_decisions.get(job_id, ())
+        ):
+            return SimpleNamespace(replayed=True)
         evaluation = self.evaluations[job_id]
         GatewayStore._assert_factory_release_decision(
             self.jobs[job_id],
@@ -658,6 +664,7 @@ async def test_sealed_candidate_reaches_only_captain_owned_publication_and_promo
         coordinator.record(_promotion(bundle))
 
     blocked_submission = _release_submission(bundle, 2, gateway_evaluation)
+    late_blocked_submission = _release_submission(bundle, 1, gateway_evaluation)
     store.record_factory_release_decision(blocked_submission)
     with pytest.raises(FactoryLifecycleError, match="release decision is blocked"):
         coordinator.record(_promotion(bundle))
@@ -680,8 +687,11 @@ async def test_sealed_candidate_reaches_only_captain_owned_publication_and_promo
     assert projection.evaluation_id == gateway_evaluation.evidence.evidence_id
     assert projection.evaluation_ref == gateway_evaluation.evidence_ref
 
+    decision_replay = store.record_factory_release_decision(release_submission)
+    assert decision_replay.replayed is True
+
     with pytest.raises(HTTPException, match="sealed after capability promotion"):
-        store.record_factory_release_decision(blocked_submission)
+        store.record_factory_release_decision(late_blocked_submission)
 
     replayed = coordinator.projection(bundle.job.job_id)
     assert replayed.status is FactoryLifecycleStatus.READY_TO_USE
