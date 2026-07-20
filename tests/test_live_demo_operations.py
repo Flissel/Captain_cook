@@ -6,6 +6,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PREFLIGHT = ROOT / "scripts" / "demo-preflight.ps1"
 RUNNER = ROOT / "scripts" / "run-live-demo.ps1"
+SERVICES = ROOT / "scripts" / "live-demo-services.ps1"
+MINIBOOK = ROOT / "scripts" / "minibook-demo.ps1"
 
 
 def test_demo_preflight_contract_is_fail_closed_and_redacted() -> None:
@@ -58,6 +60,31 @@ def test_normalize_writes_safe_defaults_and_aliases_without_secret_output(tmp_pa
 def test_requirements_dev_installs_minibook_test_dependencies() -> None:
     requirements = (ROOT / "requirements-dev.txt").read_text(encoding="utf-8")
     assert "-r minibook/requirements.txt" in requirements
+
+
+def test_minibook_demo_bootstrap_is_local_reusable_and_redacted() -> None:
+    source = MINIBOOK.read_text(encoding="utf-8")
+    assert 'ValidateSet("start", "bootstrap", "status", "stop")' in source
+    assert "CAPTAIN_DEMO_MINIBOOK_API_KEY" in source
+    assert "/api/v1/agents/me" in source
+    assert "/api/v1/agents" in source
+    assert "captain-demo-service" in source
+    assert "Write-Output $apiKey" not in source
+    assert "minibook-demo.pid" in source
+
+
+def test_live_demo_services_only_operates_captain_resources() -> None:
+    source = SERVICES.read_text(encoding="utf-8")
+    assert 'ValidateSet("start", "health", "stop")' in source
+    assert "captain-n8n.ps1" in source
+    assert "minibook-demo.ps1" in source
+    assert "docker compose" in source
+    assert "mailpit" in source
+    assert "evidence/live-demo-services.json" in source
+    lowered = source.lower()
+    assert "down -v" not in lowered
+    assert "volume rm" not in lowered
+    assert "vibemind" not in lowered
 
 
 def test_readme_documents_safe_recording_commands() -> None:

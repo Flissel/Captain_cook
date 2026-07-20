@@ -241,6 +241,25 @@ secrets in `.env`. Output contains status identities but never secret values:
 pwsh -NoProfile -File scripts/run-live-demo.ps1 -LiveProviders
 ```
 
+For the Captain-owned local demo services, use the explicit lifecycle:
+
+```powershell
+pwsh -NoProfile -File scripts/live-demo-services.ps1 start
+pwsh -NoProfile -File scripts/live-demo-services.ps1 health
+pwsh -NoProfile -File scripts/live-demo-services.ps1 stop
+```
+
+`start` reuses the isolated Captain n8n credentials, creates the dedicated
+`captain-demo-service` API key only in the local Minibook instance when it is
+missing, and never prints either credential. `health` fails closed unless the
+Gateway is reachable with a `TEST_MARIADB_DSN` ending in `/captain_test`,
+Mailpit, Minibook, Captain n8n REST and MCP are healthy. Its redacted summary
+is written to the gitignored
+`.captain-cook/evidence/live-demo-services.json`. `stop` stops only the
+Captain n8n Compose project, Captain Mailpit, and the Minibook process recorded
+in `.captain-cook/minibook-demo.pid`; it does not operate on VibeMind resources
+or delete volumes.
+
 Captain Cook reuses the existing VibeMind n8n instance and owns only Mailpit
 and MariaDB. This keeps VibeMind's workflows, credentials, encryption key, and
 `voice_vibemind-n8n-data` volume under the VibeMind project's control.
