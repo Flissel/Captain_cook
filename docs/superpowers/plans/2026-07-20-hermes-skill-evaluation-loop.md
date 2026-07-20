@@ -92,12 +92,12 @@
 - Modify: `tests/agent_factory/test_service.py`
 - Modify: `tests/agent_factory/test_release_gate.py`
 
-- [ ] First add failing lifecycle tests for a normal Factory path that reaches `QUALITY_REVIEWED` but cannot produce `CAPABILITY_PROMOTED` without an accepted matching `HermesSkillEvaluationEvidence`.
-- [ ] Test that matching job/correlation/subject version, a successful candidate evaluator, a valid usage receipt, and all required acceptance assertion ids are necessary; any required unresolved `TODO_TOOL` returns a specific blocked reason.
-- [ ] Test that optional unresolved markers do not block a fully proven candidate, but remain attached to the Captain decision/evidence projection.
-- [ ] Extend the Factory coordinator/repository port with an explicit read-only evaluation lookup. Make promotion validation call that port rather than trusting a Hermes-supplied boolean or artifact name.
-- [ ] Extend `evaluate_factory_release()` with a typed evaluation input and fail closed before applying the existing recovery-plus-three-E2E rule. Preserve the existing ordered E2E checks and return auditable reason strings for each missing prerequisite.
-- [ ] Preserve the five-attempt ceiling. A code/skill failure must go through the existing `IMPROVEMENT_REQUESTED` transition; Hermes cannot self-issue another lease or alter capability scope.
+- [x] First add failing lifecycle tests for a normal Factory path that reaches `QUALITY_REVIEWED` but cannot produce `CAPABILITY_PROMOTED` without an accepted matching `HermesSkillEvaluationEvidence`.
+- [x] Test that matching job/correlation/subject version, a successful candidate evaluator, a valid usage receipt, and all required acceptance assertion ids are necessary; any required unresolved `TODO_TOOL` returns a specific blocked reason.
+- [x] Test that optional unresolved markers do not block a fully proven candidate, but remain attached to the Captain decision/evidence projection.
+- [x] Extend the Factory coordinator/repository port with an explicit read-only evaluation lookup. Make promotion validation call that port rather than trusting a Hermes-supplied boolean or artifact name.
+- [x] Extend `evaluate_factory_release()` with a typed evaluation input and fail closed before applying the existing recovery-plus-three-E2E rule. Preserve the existing ordered E2E checks and return auditable reason strings for each missing prerequisite.
+- [x] Preserve the five-attempt ceiling. A code/skill failure must go through the existing `IMPROVEMENT_REQUESTED` transition; Hermes cannot self-issue another lease or alter capability scope.
 
 ### Task 5: Persist and validate the aggregate at the Captain Gateway boundary
 
