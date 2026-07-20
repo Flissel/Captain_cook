@@ -17,6 +17,7 @@ from agenten.delivery.minibook_events import MinibookProjectionEvent
 from agenten.delivery.projection_cursor import ProjectionCursorStore
 from agenten.delivery.projector import MinibookProjector
 from agenten.delivery.projector import ConflictingProjectionEvent
+from gateway.registry_feed import factory_promotion_projection
 from scripts.rebuild_minibook_projection import (
     CaptainProjectionFeed,
     build_parser,
@@ -91,6 +92,44 @@ def load_events() -> list[MinibookProjectionEvent]:
         MinibookProjectionEvent.model_validate(item)
         for item in json.loads(FIXTURE.read_text(encoding="utf-8"))
     ]
+
+
+def test_factory_promotion_rebuild_is_visible_and_idempotent_with_same_correlation(
+    tmp_path: Path,
+    projection_api: MinibookClient,
+) -> None:
+    correlation_id = "30000000-0000-4000-8000-000000000001"
+    event = factory_promotion_projection(
+        {
+            "event_id": "10000000-0000-4000-8000-000000000001",
+            "job_id": "20000000-0000-4000-8000-000000000001",
+            "phase": "capability_promoted",
+            "status": "succeeded",
+            "subject_version": 1,
+            "occurred_at": "2026-07-20T12:00:00Z",
+        },
+        {
+            "correlation_id": correlation_id,
+            "required_capability": "support_triage",
+        },
+    )
+    feed = _single_page_feed(
+        [event.model_dump(mode="json", by_alias=True)],
+        cursor="factory-promotion-1",
+    )
+    store = ProjectionCursorStore(tmp_path / "factory-projection.db")
+    projector = MinibookProjector(projection_api, store)
+
+    first = consume_incremental_projection(feed, projector, store, apply=True)
+    replay = consume_incremental_projection(feed, projector, store, apply=True)
+
+    assert [result.outcome for result in first] == ["projected"]
+    assert [result.outcome for result in replay] == ["duplicate"]
+    posts = projection_api.list_posts("captain-runtime-projection-v2")
+    assert len(posts) == 1
+    assert correlation_id in posts[0]["content"]
+    assert f"captain-correlation:{correlation_id}" in posts[0]["tags"]
+    assert "support_triage" not in str(posts[0])
 
 
 def _seed_projection_post(
