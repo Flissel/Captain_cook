@@ -14,6 +14,7 @@ output/
 .venv/
 graphify-out/
 test_claude_output.txt
+.superpowers/
 
 # Selenium/driver binaries (removed 2026-07-15)
 *.exe

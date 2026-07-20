@@ -34,7 +34,7 @@
 
 ## Implementation tasks
 
-### 1. Define the skill-evaluation contracts before adding behavior
+### Task 1: Define the skill-evaluation contracts before adding behavior
 
 **Files:**
 - Modify: `agenten/agent_factory/contracts.py`
@@ -52,7 +52,7 @@
 - [ ] Implement the models in `skill_evaluation.py`; add only shared Factory enums or references that genuinely belong in `contracts.py`. Reuse `ArtifactRef`, `CapabilityProfile`, `IntegrationIntent`, identifier validation, and the existing `FactoryLease` rather than creating parallel authority types.
 - [ ] Add a small `required_tool_gaps(evidence)` helper with tests that returns precisely the unresolved `required` markers. It must not decide publication.
 
-### 2. Add an append-only private candidate and receipt store
+### Task 2: Add an append-only private candidate and receipt store
 
 **Files:**
 - Create: `agenten/agent_factory/skill_store.py`
@@ -65,7 +65,7 @@
 - [ ] Define a `SkillEvaluationRepository` protocol and an `InMemorySkillEvaluationRepository` for tests. Keep the protocol free of MariaDB or Hermes imports so Gateway can implement it without violating import boundaries.
 - [ ] Persist only redacted structured records. Tests must assert no secret-looking fields or raw n8n endpoint values are accepted in stored metadata.
 
-### 3. Make Hermes consume one released skill and emit typed evaluation evidence
+### Task 3: Make Hermes consume one released skill and emit typed evaluation evidence
 
 **Files:**
 - Modify: `agenten/agent_factory/hermes_cli.py`
@@ -82,7 +82,7 @@
 - [ ] Reuse the sealed archive / temporary-workspace evaluator. Add tests for: successful skill usage plus retained candidate; build failure with no candidate; test failure triggering Captain's bounded improvement path; malformed Hermes JSON; stale lease; and an unresolved required gap.
 - [ ] Keep `HermesCliFactory.dispatch()` compatible with current role dispatches. The skill-evaluation path must be additive, not silently change existing block parsing.
 
-### 4. Enforce tool-gap and evaluation evidence in the Factory lifecycle
+### Task 4: Enforce tool-gap and evaluation evidence in the Factory lifecycle
 
 **Files:**
 - Modify: `agenten/agent_factory/state_machine.py`
@@ -99,7 +99,7 @@
 - [ ] Extend `evaluate_factory_release()` with a typed evaluation input and fail closed before applying the existing recovery-plus-three-E2E rule. Preserve the existing ordered E2E checks and return auditable reason strings for each missing prerequisite.
 - [ ] Preserve the five-attempt ceiling. A code/skill failure must go through the existing `IMPROVEMENT_REQUESTED` transition; Hermes cannot self-issue another lease or alter capability scope.
 
-### 5. Persist and validate the aggregate at the Captain Gateway boundary
+### Task 5: Persist and validate the aggregate at the Captain Gateway boundary
 
 **Files:**
 - Modify: `gateway/contracts.py`
@@ -116,7 +116,7 @@
 - [ ] Make the Gateway validate content references/digests and proof of an active role-compatible lease before accepting Hermes-originated evidence. Publishing an evaluated candidate and writing `CAPABILITY_PROMOTED` remain Captain-only code paths.
 - [ ] Add API/store tests for the full flow: Captain registers job and released skill; Hermes submits successful evaluation; Captain records publication; Captain promotion succeeds. Assert Hermes-originated publication and direct ready-to-use attempts are rejected.
 
-### 6. Connect tool-gap resolution to the capability-scoped n8n MCP path
+### Task 6: Connect tool-gap resolution to the capability-scoped n8n MCP path
 
 **Files:**
 - Modify: `agenten/agent_factory/n8n_tools.py`
@@ -130,7 +130,7 @@
 - [ ] Ensure the candidate manifest records typed input/output schemas and opaque tool references, not n8n workflow internals or credentials. Add a negative test for an unleased direct endpoint.
 - [ ] Extend the opt-in live test only to execute an already-approved, least-privilege workflow through the MCP broker. It must fail/skip honestly when required local configuration is absent and must never be counted as a green deterministic gate.
 
-### 7. Run end-to-end verification and document the operational contract
+### Task 7: Run end-to-end verification and document the operational contract
 
 **Files:**
 - Modify: `docs/ARCHITECTURE.md`
