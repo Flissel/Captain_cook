@@ -22,9 +22,9 @@ _SECRET_KEY_PATTERN = re.compile(
     r"(?i)(?:^|_)(?:api[_-]?key|authorization|credential|password|private[_-]?key|secret|token)(?:$|_)"
 )
 _SECRET_VALUE_PATTERN = re.compile(
-    r"(?i)(?:^|\\b)(?:sk-[a-z0-9_-]{8,}|bearer\\s+|(?:api[_-]?key|authorization|credential|password|secret|token)\\s*[=:])"
+    r"(?i)(?:\b(?:sk-[a-z0-9_-]{8,}|bearer\s+\S+)|\b(?:api[_-]?key|authorization|credential|password|secret|token)\b\s*[=:])"
 )
-_ENDPOINT_PATTERN = re.compile(r"(?i)^https?://")
+_ENDPOINT_PATTERN = re.compile(r"(?i)https?://[^\s\"'<>]+")
 
 
 @dataclass(frozen=True)
@@ -352,7 +352,7 @@ def _reject_sensitive_data(value: object, location: str) -> None:
             _reject_sensitive_data(nested, f"{location}[{index}]")
         return
     if isinstance(value, str):
-        if _ENDPOINT_PATTERN.match(value):
+        if _ENDPOINT_PATTERN.search(value):
             raise ValueError(f"{location} contains a raw endpoint")
         if _SECRET_VALUE_PATTERN.search(value):
             raise ValueError(f"{location} contains a secret-like value")

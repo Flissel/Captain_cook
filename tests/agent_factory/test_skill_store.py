@@ -140,6 +140,8 @@ async def test_store_never_accepts_released_or_shared_candidate_status(tmp_path:
         {"api_key": "sk-test-secret"},
         {"nested": {"authorization": "Bearer test-secret"}},
         {"n8n_endpoint": "http://localhost:5678/api/v1"},
+        {"diagnostic": "captured output: Bearer real-token"},
+        {"diagnostic": "captured output: n8n at http://localhost:5678/api/v1"},
     ],
 )
 async def test_store_rejects_secret_like_or_raw_endpoint_metadata(

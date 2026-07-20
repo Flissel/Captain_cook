@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 from pathlib import Path
+import tempfile
 from typing import Protocol
 from uuid import UUID
 
@@ -60,9 +62,24 @@ class FilesystemFactoryEvidenceStore:
             if path.read_bytes() != content:
                 raise ValueError("factory evidence digest collision")
             return
-        temporary = path.with_suffix(".tmp")
-        temporary.write_bytes(content)
-        temporary.replace(path)
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                if path.read_bytes() != content:
+                    raise ValueError("factory evidence digest collision")
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 class SkillEvaluationEvidenceStore(Protocol):
