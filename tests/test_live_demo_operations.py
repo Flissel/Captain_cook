@@ -81,6 +81,19 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "docker compose" in source
     assert "mailpit" in source
     assert "evidence/live-demo-services.json" in source
+    assert "docker-compose.test.yml" in source
+    assert "captain-cook-live-demo" in source
+    assert "mariadb-test" in source
+    assert "python" in source and "gateway.app" in source
+    assert "gateway-demo.pid" in source
+    assert ".env.captain-n8n" in source
+    assert "CAPTAIN_N8N_API_KEY" in source
+    assert "CAPTAIN_N8N_MCP_TOKEN" in source
+    assert "TEST_MARIADB_DSN" in source
+    assert "captain_test" in source
+    assert "CAPTAIN_GATEWAY_TOKEN" in source
+    assert "WORKER_GATEWAY_TOKEN" in source
+    assert "RandomNumberGenerator" in source
     lowered = source.lower()
     assert "down -v" not in lowered
     assert "volume rm" not in lowered
@@ -93,3 +106,7 @@ def test_readme_documents_safe_recording_commands() -> None:
     assert "scripts/run-live-demo.ps1" in readme
     assert "scripts/run-live-demo.ps1 -LiveProviders" in readme
     assert "captain_test" in readme
+    assert ".env.captain-n8n" in readme
+    env = (ROOT / ".env.example").read_text(encoding="utf-8")
+    for name in ("MARIADB_TEST_PORT", "MARIADB_TEST_PASSWORD", "MARIADB_TEST_ROOT_PASSWORD", "TEST_MARIADB_DSN"):
+        assert f"{name}=" in env

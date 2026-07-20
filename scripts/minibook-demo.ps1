@@ -62,7 +62,7 @@ function Stop-Service {
     try { $identity = Get-Content $pidFile -Raw | ConvertFrom-Json } catch { throw 'Invalid managed Minibook PID file.' }
     $process = Get-Process -Id ([int]$identity.pid) -ErrorAction SilentlyContinue
     if ($process) {
-        $sameStart = $process.StartTime.ToUniversalTime().ToString('o') -eq [string]$identity.started_at
+        $sameStart = $process.StartTime.ToUniversalTime().Ticks -eq ([DateTimeOffset]$identity.started_at).UtcDateTime.Ticks
         $sameExecutable = [IO.Path]::GetFullPath($process.Path) -eq [IO.Path]::GetFullPath([string]$identity.executable)
         if (-not $sameStart -or -not $sameExecutable) { throw 'PID no longer belongs to the managed Minibook process.' }
         Stop-Process -Id $process.Id -ErrorAction Stop

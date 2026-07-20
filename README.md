@@ -260,6 +260,12 @@ Captain n8n Compose project, Captain Mailpit, and the Minibook process recorded
 in `.captain-cook/minibook-demo.pid`; it does not operate on VibeMind resources
 or delete volumes.
 
+If the labelled `captain-n8n-builder` containers already run but their
+gitignored `.env.captain-n8n` is missing, `start` stops before starting any
+other service and asks you to restore that file. Owner, API, and MCP
+credentials are deliberately not recovered from or rotated inside an existing
+n8n database.
+
 Captain Cook reuses the existing VibeMind n8n instance and owns only Mailpit
 and MariaDB. This keeps VibeMind's workflows, credentials, encryption key, and
 `voice_vibemind-n8n-data` volume under the VibeMind project's control.
