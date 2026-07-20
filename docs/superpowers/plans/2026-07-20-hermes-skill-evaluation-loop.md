@@ -110,11 +110,11 @@
 - Modify: `tests/gateway/test_factory_repository.py`
 - Modify: `tests/gateway/test_delivery_events.py`
 
-- [ ] Add failing Gateway tests for recording an evaluation under an active matching Factory lease, immutable identical replay, rejection of changed replay, cross-job/correlation rejection, expired/missing lease rejection, and unknown evidence references.
-- [ ] Introduce explicit delivery event payloads for `hermes_skill_evaluation_requested`, `hermes_skill_candidate_built`, `hermes_skill_test_recorded`, `hermes_tool_gap_recorded`, `hermes_skill_evaluation_submitted`, `hermes_skill_published`, and `hermes_ready_to_use_validated`. Each payload must have the required trace context in `DeliveryEventEnvelope` and be added to its parameterized coverage.
-- [ ] Extend the Gateway storage schema/migrations and transaction methods to append evaluations, candidate metadata, and tool gaps. Store the shared published-skill state separately from private candidates and expose a read method used by `GatewayFactoryRepository`.
-- [ ] Make the Gateway validate content references/digests and proof of an active role-compatible lease before accepting Hermes-originated evidence. Publishing an evaluated candidate and writing `CAPABILITY_PROMOTED` remain Captain-only code paths.
-- [ ] Add API/store tests for the full flow: Captain registers job and released skill; Hermes submits successful evaluation; Captain records publication; Captain promotion succeeds. Assert Hermes-originated publication and direct ready-to-use attempts are rejected.
+- [x] Add failing Gateway tests for recording an evaluation under an active matching Factory lease, immutable identical replay, rejection of changed replay, cross-job/correlation rejection, expired/missing lease rejection, and unknown evidence references.
+- [x] Introduce explicit delivery event payloads for `hermes_skill_evaluation_requested`, `hermes_skill_candidate_built`, `hermes_skill_test_recorded`, `hermes_tool_gap_recorded`, `hermes_skill_evaluation_submitted`, `hermes_skill_published`, and `hermes_ready_to_use_validated`. Each payload must have the required trace context in `DeliveryEventEnvelope` and be added to its parameterized coverage.
+- [x] Extend the Gateway storage schema/migrations and transaction methods to append evaluations, candidate metadata, and tool gaps. Store the shared published-skill state separately from private candidates and expose a read method used by `GatewayFactoryRepository`.
+- [x] Make the Gateway validate content references/digests and proof of an active role-compatible lease before accepting Hermes-originated evidence. Publishing an evaluated candidate and writing `CAPABILITY_PROMOTED` remain Captain-only code paths.
+- [x] Add API/store tests for the full flow: Captain registers job and released skill; Hermes submits successful evaluation; Captain records publication; Captain promotion succeeds. Assert Hermes-originated publication and direct ready-to-use attempts are rejected.
 
 ### Task 6: Connect tool-gap resolution to the capability-scoped n8n MCP path
 
