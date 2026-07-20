@@ -66,6 +66,12 @@ def test_requirements_dev_installs_minibook_test_dependencies() -> None:
     assert "-r minibook/requirements.txt" in requirements
 
 
+def test_runtime_dependencies_install_hermes_streamable_http_transport() -> None:
+    requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+    assert "mcp==1.26.0" in requirements
+    assert "starlette==1.0.1" in requirements
+
+
 def test_minibook_demo_bootstrap_is_local_reusable_and_redacted() -> None:
     source = MINIBOOK.read_text(encoding="utf-8")
     assert 'ValidateSet("start", "bootstrap", "status", "stop")' in source

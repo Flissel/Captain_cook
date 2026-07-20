@@ -26,6 +26,11 @@ selenium==4.46.0
 pymysql==1.2.0
 uvicorn==0.51.0
 
+# Hermes' native Streamable HTTP transport for the Captain-owned n8n MCP
+# endpoint. Keep these pins aligned with hermes-agent[mcp].
+mcp==1.26.0
+starlette==1.0.1
+
 # The legacy `pyautogen` 0.2 distribution is intentionally not supported.
 # Compatibility entry points use current AgentChat classes or plain Python
 # services, so a clean install has one AutoGen API surface.
