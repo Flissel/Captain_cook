@@ -42,6 +42,7 @@ def test_gateway_ci_uses_a_real_mariadb_service_without_skips() -> None:
     assert "tests/gateway/test_gateway.py" in commands
     assert "minibook/tests" in commands
     assert "--no-cov" in commands
+    assert "--ignore=tests/live" in commands
 
 
 def test_gate_e_is_manual_and_uses_the_isolated_local_live_runner() -> None:
@@ -55,7 +56,7 @@ def test_gate_e_is_manual_and_uses_the_isolated_local_live_runner() -> None:
     job = jobs["gate_e_live"]
     assert isinstance(job, dict)
     assert job["if"] == "github.event_name == 'workflow_dispatch'"
-    assert job["runs-on"] == ["self-hosted", "windows", "captain-live"]
+    assert job["runs-on"] == ["self-hosted", "windows"]
 
     steps = job["steps"]
     assert isinstance(steps, list)

@@ -45,14 +45,14 @@ jobs:
           tests/gateway/test_gateway.py
           tests/gateway/test_agent_runtime.py
       - name: Exercise the remaining deterministic suite
-        run: python -m pytest -q --no-cov -rs -m "not live"
+        run: python -m pytest -q --no-cov -rs -m "not live" --ignore=tests/live
       - name: Exercise Minibook Forge runtime controls
         run: PYTHONPATH=minibook python -m pytest -q --no-cov minibook/tests
 
   gate_e_live:
     name: Gate E live release decision
     if: github.event_name == 'workflow_dispatch'
-    runs-on: [self-hosted, windows, captain-live]
+    runs-on: [self-hosted, windows]
     timeout-minutes: 90
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
