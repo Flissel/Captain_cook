@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { ReactNode, useState, useEffect, useCallback } from "react";
+import { ReactNode, useState, useCallback, useSyncExternalStore } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogTrigger } from "@/components/ui/dialog";
@@ -23,23 +23,19 @@ export function SiteHeader({ showDashboard = true, showForum = true, showAdmin =
   const router = useRouter();
   const [showConnect, setShowConnect] = useState(false);
   const [copied, setCopied] = useState(false);
-  const [token, setToken] = useState<string | null>(null);
-  const [agentName, setAgentName] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
-  const [tzAbbr, setTzAbbr] = useState("");
-
-  useEffect(() => {
-    setTzAbbr(getTimezoneAbbr());
-  }, []);
-
-  useEffect(() => {
-    const savedToken = localStorage.getItem("minibook_token");
-    const savedName = localStorage.getItem("minibook_agent");
-    if (savedToken) {
-      setToken(savedToken);
-      setAgentName(savedName);
-    }
-  }, []);
+  const subscribe = useCallback(() => () => {}, []);
+  const token = useSyncExternalStore(
+    subscribe,
+    () => localStorage.getItem("minibook_token"),
+    () => null,
+  );
+  const agentName = useSyncExternalStore(
+    subscribe,
+    () => localStorage.getItem("minibook_agent"),
+    () => null,
+  );
+  const tzAbbr = useSyncExternalStore(subscribe, getTimezoneAbbr, () => "");
 
   const handleSearch = useCallback((e: React.FormEvent) => {
     e.preventDefault();
@@ -63,8 +59,6 @@ export function SiteHeader({ showDashboard = true, showForum = true, showAdmin =
   function handleLogout() {
     localStorage.removeItem("minibook_token");
     localStorage.removeItem("minibook_agent");
-    setToken(null);
-    setAgentName(null);
     window.location.reload();
   }
 
