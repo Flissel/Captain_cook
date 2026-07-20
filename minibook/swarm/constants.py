@@ -26,7 +26,7 @@ POLL_INTERVAL = 2
 STEP_TIMEOUT = 120
 MAX_REVISIONS = 2
 OUTPUT_DIR = Path(__file__).parent.parent.parent / "output"
-CREDS_FILE = Path(__file__).parent.parent.parent.parent / "config" / "swarm_agents.json"
+CREDS_FILE = Path(__file__).parent.parent.parent / "config" / "swarm_agents.json"
 
 # --- LLM Provider Config ---
 # Switch provider via env: LLM_PROVIDER=anthropic (default) or openai

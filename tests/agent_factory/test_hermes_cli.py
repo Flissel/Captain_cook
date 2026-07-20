@@ -65,3 +65,43 @@ async def test_dispatch_uses_oneshot_mode_for_parseable_evidence(monkeypatch: py
     assert f'"lease_id":"{lease.lease_id}"' in observed[-1]
     assert evidence.phase is FactoryPhase.BLUEPRINT_CREATED
     assert evidence.evidence_refs[0].uri == "artifact://factory-evidence/test/transcript"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_accepts_one_json_block_followed_by_hermes_tool_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory_job = job()
+    lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.AGENT_ARCHITECT,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage",
+        now=datetime(2026, 7, 19, 10, tzinfo=timezone.utc),
+    )
+    request = FactoryDispatch(
+        job=factory_job,
+        action=FactoryAction(kind=FactoryActionKind.DISPATCH_AGENT_ARCHITECT, attempt=1, job_id=factory_job.job_id),
+        role=FactoryRole.AGENT_ARCHITECT,
+        lease=lease,
+    )
+
+    class EvidenceStore:
+        async def persist(self, _, content: bytes) -> ArtifactRef:
+            return ArtifactRef(uri="artifact://factory-evidence/test/transcript", sha256="a" * 64, media_type="application/json")
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            payload = block(FactoryPhase.BLUEPRINT_CREATED).model_dump_json(by_alias=True)
+            return f"{payload}\n  [tool] (computing...)\n".encode(), b""
+
+    async def create_process(*_: str, **__: object) -> Process:
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    evidence = await HermesCliFactory(evidence_store=EvidenceStore()).dispatch(request)
+
+    assert evidence.phase is FactoryPhase.BLUEPRINT_CREATED

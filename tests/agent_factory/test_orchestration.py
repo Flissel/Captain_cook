@@ -28,6 +28,15 @@ class Forge:
         self.requests.append(request)
 
 
+class CandidateValidator:
+    def __init__(self) -> None:
+        self.requests = []
+
+    async def dispatch(self, request: object):
+        self.requests.append(request)
+        return block(FactoryPhase.BUILD_PASSED)
+
+
 class Clock:
     def now(self) -> datetime:
         return datetime(2026, 7, 19, 10, tzinfo=timezone.utc)
@@ -45,11 +54,12 @@ class Leases:
         return validate_factory_lease(lease, job=factory_job, role=role, attempt=attempt, now=now)
 
 
-def dispatcher(coordinator, hermes, forge) -> FactoryDispatcher:
+def dispatcher(coordinator, hermes, forge, validator=None) -> FactoryDispatcher:
     return FactoryDispatcher(
         coordinator=coordinator,
         hermes=hermes,
         forge=forge,
+        candidate_validator=validator,
         leases=Leases(),
         clock=Clock(),
     )
@@ -97,3 +107,25 @@ async def test_captain_transition_is_not_dispatched_externally() -> None:
 
     with pytest.raises(FactoryDispatchError, match="Captain state transition"):
         await dispatcher(coordinator, hermes, forge).dispatch_next(factory_job.job_id)
+
+
+@pytest.mark.asyncio
+async def test_dispatches_candidate_build_validator_after_agent_code_evidence() -> None:
+    coordinator = FactoryCoordinator(InMemoryFactoryRepository())
+    factory_job = job()
+    coordinator.register(factory_job)
+    for phase in (
+        FactoryPhase.FORGE_REQUESTED,
+        FactoryPhase.BLUEPRINT_CREATED,
+        FactoryPhase.TOOL_CANDIDATE_TESTED,
+        FactoryPhase.AGENT_CODE_CREATED,
+    ):
+        coordinator.record(block(phase))
+    hermes, forge, validator = Hermes(), Forge(), CandidateValidator()
+
+    action = await dispatcher(coordinator, hermes, forge, validator).dispatch_next(factory_job.job_id)
+
+    assert action.kind is FactoryActionKind.DISPATCH_BUILD_VALIDATOR
+    assert validator.requests[0].role is FactoryRole.TOOL_INTEGRATOR
+    assert coordinator.projection(factory_job.job_id).phase is FactoryPhase.BUILD_PASSED
+    assert hermes.requests == []

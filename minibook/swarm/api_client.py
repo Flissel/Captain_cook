@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import os
+import re
 import aiohttp
 
 from .constants import MINIBOOK_URL, CREDS_FILE
@@ -63,19 +65,31 @@ def save_credentials(creds: dict):
 
 
 async def register_agent(session: aiohttp.ClientSession, name: str, creds: dict) -> dict:
-    if name in creds:
+    credential_key, remote_name = _agent_identity(name)
+    if credential_key in creds:
         print(f"  [=] Loaded {name}")
-        return creds[name]
+        return creds[credential_key]
     try:
-        result = await api_post(session, "/api/v1/agents", {"name": name})
+        result = await api_post(session, "/api/v1/agents", {"name": remote_name})
         print(f"  [+] Registered {name}")
-        creds[name] = result
+        creds[credential_key] = result
         save_credentials(creds)
         return result
     except Exception as e:
         if "already taken" in str(e):
             raise Exception(f"Agent {name} exists but no saved key. Delete swarm_agents.json and minibook.db.")
         raise
+
+
+def _agent_identity(name: str) -> tuple[str, str]:
+    """Scope credentials and Minibook names for concurrent factory runs."""
+
+    suffix = os.environ.get("MINIBOOK_SWARM_AGENT_SUFFIX", "").strip()
+    if not suffix:
+        return name, name
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", suffix):
+        raise ValueError("MINIBOOK_SWARM_AGENT_SUFFIX must be a safe identifier")
+    return f"{name}::{suffix}", f"{name} [{suffix}]"
 
 
 # --- Agent Registry ---

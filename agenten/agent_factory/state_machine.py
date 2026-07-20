@@ -28,7 +28,8 @@ class FactoryActionKind(str, Enum):
     DISPATCH_AGENT_ARCHITECT = "dispatch_agent_architect"
     DISPATCH_TOOL_INTEGRATOR = "dispatch_tool_integrator"
     SUBMIT_FORGE_JOB = "submit_forge_job"
-    WAIT_BUILD_EVIDENCE = "wait_build_evidence"
+    EMIT_AGENT_CODE_EVIDENCE = "emit_agent_code_evidence"
+    DISPATCH_BUILD_VALIDATOR = "dispatch_build_validator"
     DISPATCH_REAL_CASE_TESTER = "dispatch_real_case_tester"
     DISPATCH_QUALITY_WARDEN = "dispatch_quality_warden"
     APPEND_IMPROVEMENT_REQUESTED = "append_improvement_requested"
@@ -141,7 +142,7 @@ def next_action(projection: FactoryProjection) -> FactoryAction:
     if phase is FactoryPhase.TOOL_CANDIDATE_TESTED:
         return FactoryAction(kind=FactoryActionKind.SUBMIT_FORGE_JOB, attempt=projection.attempt)
     if phase is FactoryPhase.AGENT_CODE_CREATED:
-        return FactoryAction(kind=FactoryActionKind.WAIT_BUILD_EVIDENCE, attempt=projection.attempt)
+        return FactoryAction(kind=FactoryActionKind.DISPATCH_BUILD_VALIDATOR, attempt=projection.attempt)
     if phase is FactoryPhase.BUILD_PASSED:
         return FactoryAction(kind=FactoryActionKind.DISPATCH_REAL_CASE_TESTER, attempt=projection.attempt)
     if phase is FactoryPhase.REAL_CASE_EVIDENCE:

@@ -673,6 +673,18 @@ class GatewayStore:
                         return FactoryWriteReceipt(event_id=evidence.event_id, replayed=True)
                     raise HTTPException(status_code=409, detail="factory event_id already exists with different content")
                 projection = self._factory_projection(cursor, AgentFactoryJob.model_validate(job_block["data"]))
+                lease = None
+                if evidence.lease_id is not None:
+                    lease_block = self._runtime_block_by_json_value(
+                        cursor,
+                        block_type="agent_factory_lease",
+                        field="lease_id",
+                        value=evidence.lease_id,
+                        for_update=True,
+                    )
+                    if lease_block is not None:
+                        lease = FactoryLease.model_validate(lease_block["data"])
+                self._assert_evidence_lease(evidence, lease)
                 try:
                     apply_block(projection, evidence)
                 except FactoryLifecycleError as exc:
@@ -748,7 +760,9 @@ class GatewayStore:
         self, cursor: Any, job_id: UUID, *, for_update: bool = False
     ) -> tuple[FactoryEvidenceBlock, ...]:
         sql = """
-            SELECT data FROM blocks WHERE block_type = 'agent_factory_block'
+            SELECT `index`, parent_index, block_type, data, status, children,
+                   metadata, hash, previous_hash
+            FROM blocks WHERE block_type = 'agent_factory_block'
             AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.job_id')) = %s ORDER BY `index`
         """
         if for_update:
@@ -761,7 +775,9 @@ class GatewayStore:
 
     def _factory_leases(self, cursor: Any, job_id: UUID) -> tuple[FactoryLease, ...]:
         cursor.execute(
-            """SELECT data FROM blocks WHERE block_type = 'agent_factory_lease'
+            """SELECT `index`, parent_index, block_type, data, status, children,
+                   metadata, hash, previous_hash
+            FROM blocks WHERE block_type = 'agent_factory_lease'
             AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.job_id')) = %s ORDER BY `index`""",
             (str(job_id),),
         )
@@ -774,13 +790,38 @@ class GatewayStore:
     def _assert_lease_is_next_action(lease: FactoryLease, projection: FactoryProjection) -> None:
         action = next_action(projection)
         role_actions = {
-            FactoryRole.AGENT_ARCHITECT: FactoryActionKind.DISPATCH_AGENT_ARCHITECT,
-            FactoryRole.TOOL_INTEGRATOR: FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,
-            FactoryRole.REAL_CASE_TESTER: FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
-            FactoryRole.QUALITY_WARDEN: FactoryActionKind.DISPATCH_QUALITY_WARDEN,
+            FactoryRole.AGENT_ARCHITECT: frozenset({FactoryActionKind.DISPATCH_AGENT_ARCHITECT}),
+            FactoryRole.TOOL_INTEGRATOR: frozenset(
+                {
+                    FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,
+                    FactoryActionKind.SUBMIT_FORGE_JOB,
+                    FactoryActionKind.DISPATCH_BUILD_VALIDATOR,
+                }
+            ),
+            FactoryRole.REAL_CASE_TESTER: frozenset({FactoryActionKind.DISPATCH_REAL_CASE_TESTER}),
+            FactoryRole.QUALITY_WARDEN: frozenset({FactoryActionKind.DISPATCH_QUALITY_WARDEN}),
         }
-        if action.kind is not role_actions[lease.role]:
+        if action.kind not in role_actions[lease.role]:
             raise HTTPException(status_code=409, detail="factory lease role is not the next authorized action")
+
+    @staticmethod
+    def _assert_evidence_lease(evidence: FactoryEvidenceBlock, lease: FactoryLease | None) -> None:
+        """Bind Hermes evidence to one previously persisted, active role lease."""
+
+        if evidence.role is None:
+            return
+        if lease is None or evidence.lease_id != lease.lease_id:
+            raise HTTPException(status_code=409, detail="missing matching active factory lease for evidence")
+        if (
+            lease.job_id != evidence.job_id
+            or lease.correlation_id != evidence.correlation_id
+            or lease.subject_version != evidence.subject_version
+            or lease.attempt != evidence.attempt
+            or lease.role is not evidence.role
+            or lease.issued_at > evidence.occurred_at
+            or lease.expires_at <= evidence.occurred_at
+        ):
+            raise HTTPException(status_code=409, detail="factory evidence is outside its active lease")
 
     def _runtime_grant_block(
         self,

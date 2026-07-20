@@ -9,6 +9,8 @@ blockchain.json
 .captain-cook/
 artifacts/evaluations/
 artifacts/agent-factory/
+config/swarm_agents.json
+output/
 .venv/
 graphify-out/
 test_claude_output.txt

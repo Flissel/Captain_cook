@@ -47,9 +47,27 @@ occurred.
 5. Bind every n8n workflow to a registered typed tool name. The agent call may
    contain a tool name, case ID, correlation ID, and typed payload—never a
    workflow ID.
-6. Execute isolated static/build/real-case validation. Repeat behavioral repair
-   no more than five times; preserve an infrastructure failure without charging
-   an iteration.
+6. Have Hermes create a `captain.factory-candidate.v1` manifest plus a ZIP of
+   the generated source. Its content-addressed bindings must cover the team
+   manifest, every n8n workflow, and every typed tool input/output schema.
+   Run one matching validation lease for each lifecycle phase:
+
+   ```powershell
+   python -m agenten.agent_factory.evaluation_cli `
+     --job <captain-job.json> --lease <captain-active-lease.json> `
+     --candidate <sealed-candidate.json> --source-archive <generated-source.zip> `
+     --action dispatch_build_validator --evidence-root artifacts/agent-factory/evidence
+   ```
+
+   Repeat with `dispatch_real_case_tester` and
+   `dispatch_quality_warden`, each time using the active lease for that exact
+   role. Append the JSON block returned by the CLI unchanged through the
+   Captain gateway. The evaluator verifies all digests, compiles the extracted
+   code, executes it in a new temporary workspace with provider/database/n8n
+   secrets removed, and requires an exact trace ID and assertion set. It is
+   still local isolated evidence; it does not claim a live n8n or LLM call.
+   Repeat behavioral repair no more than five times; preserve an infrastructure
+   failure without charging an iteration.
 7. Record one intentionally failing recovery scenario, then three consecutive
    successful normal E2E runs. Captain evaluates the release gate and only then
    appends `capability_promoted`.
