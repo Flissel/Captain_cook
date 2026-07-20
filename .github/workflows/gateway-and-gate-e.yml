@@ -31,6 +31,7 @@ jobs:
     env:
       TEST_MARIADB_DSN: mariadb://captain_test:captain_ci_password@127.0.0.1:3306/captain_test
       REQUIRE_MARIADB_TESTS: "1"
+      OPENAI_API_KEY: ci-placeholder
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

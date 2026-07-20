@@ -33,6 +33,7 @@ def test_gateway_ci_uses_a_real_mariadb_service_without_skips() -> None:
     environment = job["env"]
     assert isinstance(environment, dict)
     assert environment["REQUIRE_MARIADB_TESTS"] == "1"
+    assert environment["OPENAI_API_KEY"] == "ci-placeholder"
     assert "captain_test" in str(environment["TEST_MARIADB_DSN"])
 
     steps = job["steps"]
