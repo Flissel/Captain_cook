@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
@@ -200,13 +202,26 @@ def _artifact(name: str, digest: str = "a" * 64) -> ArtifactRef:
     )
 
 
+def _canonical_artifact(model, name: str) -> ArtifactRef:
+    content = json.dumps(
+        model.model_dump(mode="json", by_alias=True),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return _artifact(name, hashlib.sha256(content).hexdigest())
+
+
 def _evaluation_submission(
     factory_job: AgentFactoryJob,
     lease,
 ) -> FactorySkillEvaluationSubmission:
     base = HermesSkillEvaluationEvidence.model_validate(evidence_payload(tool_gaps=[]))
     released = base.request.released_skill.model_copy(
-        update={"released_at": lease.issued_at - timedelta(minutes=1)}
+        update={
+            "released_at": lease.issued_at - timedelta(minutes=1),
+            "capability": factory_job.required_capability,
+        }
     )
     request = base.request.model_copy(
         update={
@@ -263,8 +278,8 @@ def _evaluation_submission(
     assert evidence.candidate is not None
     return FactorySkillEvaluationSubmission(
         evidence=evidence,
-        evidence_ref=_artifact("accepted-evaluation"),
-        receipt_ref=_artifact("usage-receipt"),
+        evidence_ref=_canonical_artifact(evidence, "accepted-evaluation"),
+        receipt_ref=_canonical_artifact(evidence.receipt, "usage-receipt"),
         candidate_ref=evidence.candidate.content_ref,
         tool_gap_refs=(),
     )
@@ -314,6 +329,28 @@ def test_factory_evaluation_is_lease_bound_idempotent_and_reference_checked(
         ).status_code == 201
 
     with TestClient(application(storage, actor=GatewayRole.WORKER)) as hermes:
+        bad_evidence_ref = submission.model_copy(
+            update={
+                "evidence_ref": submission.evidence_ref.model_copy(
+                    update={"sha256": "0" * 64}
+                )
+            }
+        )
+        bad_receipt_ref = submission.model_copy(
+            update={
+                "receipt_ref": submission.receipt_ref.model_copy(
+                    update={"sha256": "1" * 64}
+                )
+            }
+        )
+        evidence_ref_rejected = hermes.post(
+            "/v1/factory/evaluations",
+            json=bad_evidence_ref.model_dump(mode="json", by_alias=True),
+        )
+        receipt_ref_rejected = hermes.post(
+            "/v1/factory/evaluations",
+            json=bad_receipt_ref.model_dump(mode="json", by_alias=True),
+        )
         first = hermes.post(
             "/v1/factory/evaluations",
             json=submission.model_dump(mode="json", by_alias=True),
@@ -333,6 +370,8 @@ def test_factory_evaluation_is_lease_bound_idempotent_and_reference_checked(
             json=unknown.model_dump(mode="json", by_alias=True),
         )
 
+    assert evidence_ref_rejected.status_code == 409
+    assert receipt_ref_rejected.status_code == 409
     assert first.status_code == 201
     assert first.json()["replayed"] is False
     assert replay.status_code == 200

@@ -116,6 +116,8 @@ def factory_evaluation_block_reason(
         )
     ):
         return "skill evaluation subject version does not match the factory job"
+    if request.released_skill.capability != job.required_capability:
+        return "released skill capability does not match the factory job"
     required_assertions = set(job.acceptance_assertion_ids)
     if set(request.acceptance_assertion_ids) != required_assertions:
         return "skill evaluation request assertions do not match the factory job"

@@ -100,12 +100,16 @@ def block(
 def accepted_evaluation() -> StoredSkillEvaluation:
     factory_job = job()
     evidence = HermesSkillEvaluationEvidence.model_validate(evidence_payload())
+    released_skill = evidence.request.released_skill.model_copy(
+        update={"capability": factory_job.required_capability}
+    )
     request = evidence.request.model_copy(
         update={
             "job_id": factory_job.job_id,
             "correlation_id": factory_job.correlation_id,
             "subject_version": factory_job.subject_version,
             "acceptance_assertion_ids": factory_job.acceptance_assertion_ids,
+            "released_skill": released_skill,
             "lease": evidence.request.lease.model_copy(
                 update={
                     "job_id": factory_job.job_id,
@@ -120,9 +124,16 @@ def accepted_evaluation() -> StoredSkillEvaluation:
             "job_id": factory_job.job_id,
             "correlation_id": factory_job.correlation_id,
             "lease_id": request.lease.lease_id,
-            "released_skill": request.released_skill,
+            "released_skill": released_skill,
+            "used_skill_id": released_skill.skill_id,
+            "used_skill_version": released_skill.version,
+            "used_skill_sha256": released_skill.content_sha256,
             "assertion_ids": factory_job.acceptance_assertion_ids,
         }
+    )
+    assert evidence.candidate is not None
+    candidate = evidence.candidate.model_copy(
+        update={"parent_released_skill": released_skill}
     )
     evidence = evidence.model_copy(
         update={
@@ -131,6 +142,7 @@ def accepted_evaluation() -> StoredSkillEvaluation:
             "subject_version": factory_job.subject_version,
             "request": request,
             "receipt": receipt,
+            "candidate": candidate,
             "assertion_ids": factory_job.acceptance_assertion_ids,
         }
     )

@@ -11,7 +11,7 @@ from typing import Any, Callable, Protocol, TypeVar
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import HTTPException
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from pymysql.err import OperationalError
 
 from agenten.validation.contracts import HoldoutSuite, WorkBatch
@@ -24,10 +24,10 @@ from agenten.agent_runtime.contracts import (
 )
 from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease, FactoryPhase, FactoryRole
 from agenten.agent_factory.leases import FactoryLeaseDenied, validate_factory_lease
+from agenten.agent_factory.release_gate import factory_evaluation_block_reason
 from agenten.agent_factory.skill_evaluation import (
     HermesSkillEvaluationEvidence,
     ReleasedHermesSkill,
-    required_tool_gaps,
 )
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
 from agenten.agent_factory.state_machine import FactoryActionKind, FactoryLifecycleError, FactoryProjection, apply_block, next_action
@@ -968,22 +968,20 @@ class GatewayStore:
                     self._decode_json(evaluation_row["payload"])
                 )
                 evidence = submission.evidence
-                candidate = evidence.candidate
-                if (
-                    evidence.outcome != "passed"
-                    or candidate is None
-                    or required_tool_gaps(evidence)
-                    or publication.candidate_id != candidate.candidate_id
-                    or publication.content_ref != candidate.content_ref
-                    or publication.content_sha256 != candidate.content_sha256
-                    or publication.skill_id != evidence.request.released_skill.skill_id
-                    or publication.version != evidence.request.released_skill.version + 1
-                    or publication.published_at <= evidence.occurred_at
-                ):
-                    raise HTTPException(
-                        status_code=409,
-                        detail="publication does not match an accepted private skill candidate",
-                    )
+                job_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_job",
+                    field="job_id",
+                    value=str(evidence.job_id),
+                    for_update=True,
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job not found")
+                self._assert_publication_qualification(
+                    publication,
+                    submission,
+                    AgentFactoryJob.model_validate(job_block["data"]),
+                )
                 index = self._next_index(cursor)
                 block = self._new_block(
                     cursor,
@@ -1182,6 +1180,7 @@ class GatewayStore:
     def _stored_factory_evaluation(
         submission: FactorySkillEvaluationSubmission,
     ) -> StoredSkillEvaluation:
+        GatewayStore._assert_evaluation_references(submission)
         evidence = submission.evidence
         gap_refs = tuple(
             (reference.gap_id, reference.evidence_ref)
@@ -1232,6 +1231,11 @@ class GatewayStore:
         job: AgentFactoryJob,
     ) -> None:
         request = evidence.request
+        if request.released_skill.capability != job.required_capability:
+            raise HTTPException(
+                status_code=409,
+                detail="released skill capability does not match the factory job",
+            )
         if (
             evidence.job_id != job.job_id
             or evidence.correlation_id != job.correlation_id
@@ -1267,6 +1271,24 @@ class GatewayStore:
         submission: FactorySkillEvaluationSubmission,
     ) -> None:
         evidence = submission.evidence
+        expected_evidence_digest = GatewayStore._canonical_model_sha256(evidence)
+        expected_receipt_digest = GatewayStore._canonical_model_sha256(evidence.receipt)
+        if (
+            submission.evidence_ref.sha256 != expected_evidence_digest
+            or submission.evidence_ref.media_type != "application/json"
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="skill evaluation evidence_ref digest does not resolve to canonical evidence",
+            )
+        if (
+            submission.receipt_ref.sha256 != expected_receipt_digest
+            or submission.receipt_ref.media_type != "application/json"
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="skill evaluation receipt_ref digest does not resolve to canonical receipt",
+            )
         if evidence.candidate is None:
             if submission.candidate_ref is not None:
                 raise HTTPException(
@@ -1291,6 +1313,46 @@ class GatewayStore:
             raise HTTPException(
                 status_code=409,
                 detail="skill evaluation contains unknown tool-gap evidence references",
+            )
+
+    @staticmethod
+    def _canonical_model_sha256(model: BaseModel) -> str:
+        content = json.dumps(
+            model.model_dump(mode="json", by_alias=True),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(content).hexdigest()
+
+    @staticmethod
+    def _assert_publication_qualification(
+        publication: PublishedHermesSkill,
+        submission: FactorySkillEvaluationSubmission,
+        job: AgentFactoryJob,
+    ) -> None:
+        evidence = submission.evidence
+        GatewayStore._assert_factory_evaluation_job(evidence, job)
+        GatewayStore._assert_evaluation_references(submission)
+        reason = factory_evaluation_block_reason(
+            job,
+            GatewayStore._stored_factory_evaluation(submission),
+        )
+        if reason is not None:
+            raise HTTPException(status_code=409, detail=reason)
+        candidate = evidence.candidate
+        if (
+            candidate is None
+            or publication.candidate_id != candidate.candidate_id
+            or publication.content_ref != candidate.content_ref
+            or publication.content_sha256 != candidate.content_sha256
+            or publication.skill_id != evidence.request.released_skill.skill_id
+            or publication.version != evidence.request.released_skill.version + 1
+            or publication.published_at <= evidence.occurred_at
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="publication does not match an accepted private skill candidate",
             )
 
     @staticmethod

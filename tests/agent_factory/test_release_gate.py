@@ -99,6 +99,33 @@ def test_release_requires_matching_evaluation_identity(field, value, reason) -> 
     assert decision.reasons == (reason,)
 
 
+def test_release_rejects_a_skill_for_another_factory_capability() -> None:
+    stored = accepted_evaluation()
+    other_skill = stored.evidence.request.released_skill.model_copy(
+        update={"capability": "other_capability"}
+    )
+    request = stored.evidence.request.model_copy(update={"released_skill": other_skill})
+    receipt = stored.evidence.receipt.model_copy(update={"released_skill": other_skill})
+    assert stored.evidence.candidate is not None
+    candidate = stored.evidence.candidate.model_copy(
+        update={"parent_released_skill": other_skill}
+    )
+    mismatched = stored.evidence.model_copy(
+        update={"request": request, "receipt": receipt, "candidate": candidate}
+    )
+
+    decision = evaluate_factory_release(
+        job(),
+        successful_e2e(),
+        with_evidence(stored, mismatched),
+    )
+
+    assert decision.status == "blocked"
+    assert decision.reasons == (
+        "released skill capability does not match the factory job",
+    )
+
+
 def test_release_requires_valid_receipt_successful_evaluator_and_all_assertions() -> None:
     stored = accepted_evaluation()
     invalid_receipt = stored.evidence.receipt.model_copy(update={"outcome": "failed"})
