@@ -21,7 +21,7 @@ def test_env_example_defaults_to_external_n8n_and_documents_local_ports() -> Non
         "N8N_MODE=external",
         "N8N_URL=http://localhost:15678",
         "N8N_CONTAINER_URL=http://host.docker.internal:15678",
-        "MAILPIT_WEB_PORT=8025",
+        "MAILPIT_WEB_PORT=18025",
         "MAILPIT_SMTP_PORT=1025",
         "MARIADB_PORT=3306",
     ):
@@ -73,7 +73,7 @@ def test_readme_documents_delivery_stack_operation_and_data_safety() -> None:
     for expected in (
         "scripts/start_delivery_stack.ps1",
         "http://localhost:15678",
-        "http://localhost:8025",
+        "http://localhost:18025",
         "localhost:3306",
         "docker compose down",
         "docker compose down -v",

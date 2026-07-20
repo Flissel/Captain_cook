@@ -40,7 +40,7 @@ Nach der Einrichtung verwendest du:
 ```
 
 - Minibook: `http://localhost:3457`
-- Mailpit: `http://localhost:8025`
+- Mailpit: `http://localhost:18025`
 - n8n: standardmäßig die bestehende VibeMind-Instanz unter
   `http://localhost:15678`; die Adresse steht in `.env`.
 
@@ -234,7 +234,7 @@ powershell -ExecutionPolicy Bypass -File scripts/start_delivery_stack.ps1
 | Service | Local endpoint | Ownership |
 | --- | --- | --- |
 | n8n | http://localhost:15678 | Existing VibeMind Compose project |
-| Mailpit | http://localhost:8025 (SMTP `localhost:1025`) | Captain Cook |
+| Mailpit | http://localhost:18025 (SMTP `localhost:1025`) | Captain Cook |
 | MariaDB | `localhost:3306`, database `ledger` | Captain Cook |
 
 Run the non-destructive checks again at any time with:
