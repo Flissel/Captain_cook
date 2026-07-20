@@ -337,7 +337,12 @@ class CandidateEvaluationFactory:
             result.model_dump_json(exclude_none=True).encode("utf-8"),
         )
         block_phase = _result_phase(phase, result.status)
-        assertions = result.assertion_ids if result.status == "succeeded" and phase is not FactoryPhase.BUILD_PASSED else ()
+        assertions = (
+            result.assertion_ids
+            if result.status == "succeeded"
+            and phase in {FactoryPhase.REAL_CASE_EVIDENCE, FactoryPhase.QUALITY_REVIEWED}
+            else ()
+        )
         event_id = uuid5(
             NAMESPACE_URL,
             f"factory-evaluation|{request.job.job_id}|{request.action.attempt}|{block_phase.value}|{evidence.sha256}",
@@ -369,6 +374,7 @@ class CandidateEvaluationFactory:
 
 def _validation_phase(action: FactoryActionKind) -> tuple[FactoryPhase, FactoryRole]:
     phases = {
+        FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE: (FactoryPhase.AGENT_CODE_CREATED, FactoryRole.TOOL_INTEGRATOR),
         FactoryActionKind.DISPATCH_BUILD_VALIDATOR: (FactoryPhase.BUILD_PASSED, FactoryRole.TOOL_INTEGRATOR),
         FactoryActionKind.DISPATCH_REAL_CASE_TESTER: (FactoryPhase.REAL_CASE_EVIDENCE, FactoryRole.REAL_CASE_TESTER),
         FactoryActionKind.DISPATCH_QUALITY_WARDEN: (FactoryPhase.QUALITY_REVIEWED, FactoryRole.QUALITY_WARDEN),

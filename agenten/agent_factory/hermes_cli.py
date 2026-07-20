@@ -54,14 +54,29 @@ class HermesCliFactory(HermesFactoryPort):
             detail = stderr.decode("utf-8", errors="replace").strip()
             raise FactoryDispatchError(f"Hermes factory role failed: {detail[:500]}")
         try:
-            payload = json.loads(stdout)
+            payload = _parse_evidence_payload(stdout)
             if not isinstance(payload, dict):
                 raise ValueError("Hermes output must be an object")
-            transcript = await self._evidence_store.persist(request.job, stdout)
+            transcript = await self._evidence_store.persist(
+                request.job,
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+            )
             payload["evidence_refs"] = [transcript.model_dump(mode="json")]
             return FactoryEvidenceBlock.model_validate(payload)
         except (TypeError, ValueError) as exc:
             raise FactoryDispatchError("Hermes must return exactly one factory evidence JSON object") from exc
+
+
+def _parse_evidence_payload(stdout: bytes) -> object:
+    """Accept one JSON object plus Hermes' non-semantic trailing tool telemetry."""
+
+    text = stdout.decode("utf-8")
+    decoder = json.JSONDecoder()
+    payload, end = decoder.raw_decode(text.lstrip())
+    remainder = text.lstrip()[end:].strip()
+    if remainder and any(not line.strip().startswith("[tool]") for line in remainder.splitlines() if line.strip()):
+        raise ValueError("Hermes output contains non-telemetry content after its evidence object")
+    return payload
 
 
 def _prompt_for(request: FactoryDispatch, skill_path: Path) -> str:

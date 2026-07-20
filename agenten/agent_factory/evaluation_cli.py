@@ -23,6 +23,7 @@ from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 
 
 _ACTION_ROLES: dict[FactoryActionKind, FactoryRole] = {
+    FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE: FactoryRole.TOOL_INTEGRATOR,
     FactoryActionKind.DISPATCH_BUILD_VALIDATOR: FactoryRole.TOOL_INTEGRATOR,
     FactoryActionKind.DISPATCH_REAL_CASE_TESTER: FactoryRole.REAL_CASE_TESTER,
     FactoryActionKind.DISPATCH_QUALITY_WARDEN: FactoryRole.QUALITY_WARDEN,

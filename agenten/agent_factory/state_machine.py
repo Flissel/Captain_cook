@@ -28,6 +28,7 @@ class FactoryActionKind(str, Enum):
     DISPATCH_AGENT_ARCHITECT = "dispatch_agent_architect"
     DISPATCH_TOOL_INTEGRATOR = "dispatch_tool_integrator"
     SUBMIT_FORGE_JOB = "submit_forge_job"
+    EMIT_AGENT_CODE_EVIDENCE = "emit_agent_code_evidence"
     DISPATCH_BUILD_VALIDATOR = "dispatch_build_validator"
     DISPATCH_REAL_CASE_TESTER = "dispatch_real_case_tester"
     DISPATCH_QUALITY_WARDEN = "dispatch_quality_warden"

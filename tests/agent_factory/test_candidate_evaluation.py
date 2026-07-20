@@ -152,3 +152,42 @@ async def test_validator_persists_build_evidence_for_a_leased_candidate(tmp_path
     assert block.status.value == "succeeded"
     assert block.assertion_ids == ()
     assert block.evidence_refs[0].uri.startswith("artifact://factory-evidence/")
+
+
+@pytest.mark.asyncio
+async def test_validator_emits_agent_code_evidence_for_a_leased_forge_result(tmp_path: Path) -> None:
+    archive_path = tmp_path / "candidate.zip"
+    team_ref, workflow_ref, input_schema_ref, output_schema_ref, source_ref = _write_candidate_archive(archive_path)
+    candidate = FactoryCandidateManifest(
+        candidate_id="support_triage_v1",
+        source_archive_ref=source_ref,
+        team_manifest={"reference": team_ref, "relative_path": "team_manifest.json"},
+        workflow_artifacts=({"reference": workflow_ref, "relative_path": "workflows/support_triage.json"},),
+        tool_schema_artifacts=(
+            {"reference": input_schema_ref, "relative_path": "schemas/support_triage.input.json"},
+            {"reference": output_schema_ref, "relative_path": "schemas/support_triage.output.json"},
+        ),
+        n8n_tools=(TypedN8nTool(name="support_triage", description="Route a support request.", input_schema_ref=input_schema_ref.uri, output_schema_ref=output_schema_ref.uri),),
+        build_command=("python", "-m", "compileall", "-q", "."),
+        real_case_command=("python", "run_case.py"),
+        timeout_seconds=10,
+    )
+    factory_job = job()
+    lease = issue_factory_lease(job=factory_job, role=FactoryRole.TOOL_INTEGRATOR, attempt=1, workspace_ref="workspace://factory/support-triage", now=factory_job.occurred_at)
+    validator = CandidateEvaluationFactory(
+        provider=StaticFactoryCandidateProvider({factory_job.job_id: ResolvedFactoryCandidate(candidate=candidate, source_archive=archive_path)}),
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
+    )
+
+    block = await validator.dispatch(
+        FactoryDispatch(
+            job=factory_job,
+            action=FactoryAction(kind=FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE, attempt=1),
+            role=FactoryRole.TOOL_INTEGRATOR,
+            lease=lease,
+        )
+    )
+
+    assert block.phase is FactoryPhase.AGENT_CODE_CREATED
+    assert block.status.value == "succeeded"
+    assert block.assertion_ids == ()

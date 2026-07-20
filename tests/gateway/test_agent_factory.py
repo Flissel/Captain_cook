@@ -122,3 +122,29 @@ def test_factory_gateway_records_only_the_next_role_lease(storage: MariaDBStorag
     assert first.status_code == 201
     assert replay.status_code == 200
     assert len(projection.json()["leases"]) == 1
+
+
+def test_factory_gateway_allows_tool_integrator_lease_for_build_validation(storage: MariaDBStorage) -> None:
+    """The same constrained tool role may create code and validate its build."""
+
+    factory_job = job()
+    build_lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage",
+        now=datetime(2026, 7, 19, 10, tzinfo=timezone.utc),
+    )
+    history = (
+        block(FactoryPhase.FORGE_REQUESTED),
+        block(FactoryPhase.BLUEPRINT_CREATED),
+        block(FactoryPhase.TOOL_CANDIDATE_TESTED),
+        block(FactoryPhase.AGENT_CODE_CREATED),
+    )
+    with TestClient(application(storage)) as client:
+        assert client.post("/v1/factory/jobs", json=factory_job.model_dump(mode="json", by_alias=True)).status_code == 202
+        for evidence in history:
+            assert client.post("/v1/factory/blocks", json=evidence.model_dump(mode="json", by_alias=True)).status_code == 201
+        response = client.post("/v1/factory/leases", json=build_lease.model_dump(mode="json", by_alias=True))
+
+    assert response.status_code == 201
