@@ -32,6 +32,7 @@ ProjectionEventType = Literal[
     "n8n.evidence",
     "validation.recorded",
     "replanning.requested",
+    "capability.promoted",
 ]
 ProjectionView = Literal["project", "plan", "blueprint", "build", "validation"]
 ProjectionTemplateId = Literal[
@@ -43,6 +44,7 @@ ProjectionTemplateId = Literal[
     "automation_evidence_recorded",
     "runtime_validation_recorded",
     "runtime_replanning_requested",
+    "factory_capability_ready_to_use",
 ]
 ProjectionStatusId = Literal[
     "requested",
@@ -53,8 +55,9 @@ ProjectionStatusId = Literal[
     "observed",
     "validated",
     "replanning",
+    "ready_to_use",
 ]
-ActorRoleId = Literal["captain_planner", "codex_worker"]
+ActorRoleId = Literal["captain_planner", "codex_worker", "captain_gateway"]
 ProjectionRetireReason = Literal["duplicate", "orphaned", "v1-cutover"]
 SubjectReference = Annotated[
     str,
@@ -89,6 +92,11 @@ _EVENT_CATALOG: dict[
         "plan",
         "runtime_replanning_requested",
         "replanning",
+    ),
+    "capability.promoted": (
+        "validation",
+        "factory_capability_ready_to_use",
+        "ready_to_use",
     ),
 }
 
@@ -228,6 +236,7 @@ def _template_title(template_id: ProjectionTemplateId) -> str:
         "automation_evidence_recorded": "Automation evidence recorded",
         "runtime_validation_recorded": "Runtime validation recorded",
         "runtime_replanning_requested": "Runtime replanning requested",
+        "factory_capability_ready_to_use": "Factory capability ready to use",
     }[template_id]
 
 
@@ -241,6 +250,7 @@ def _status_label(status_id: ProjectionStatusId) -> str:
         "observed": "Observed",
         "validated": "Validated",
         "replanning": "Replanning",
+        "ready_to_use": "Ready to use",
     }[status_id]
 
 
@@ -258,6 +268,7 @@ def _actor_label(actor_role_id: ActorRoleId) -> str:
     return {
         "captain_planner": "Captain Planner",
         "codex_worker": "Codex Worker",
+        "captain_gateway": "Captain Gateway",
     }[actor_role_id]
 
 

@@ -1304,6 +1304,45 @@ class GatewayStore:
             for row in cursor.fetchall()
         )
 
+    def factory_projection_feed(
+        self,
+        *,
+        after_index: int,
+        limit: int,
+    ) -> tuple[list[tuple[int, dict[str, Any], dict[str, Any]]], bool]:
+        """Read committed successful Factory promotions in ledger order."""
+
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT promotion.`index`, promotion.parent_index,
+                           promotion.block_type, promotion.data,
+                           promotion.status, promotion.children,
+                           promotion.metadata, promotion.hash,
+                           promotion.previous_hash,
+                           job.data AS job_data
+                    FROM blocks AS promotion
+                    JOIN blocks AS job ON job.`index` = promotion.parent_index
+                    WHERE promotion.block_type = 'agent_factory_block'
+                      AND job.block_type = 'agent_factory_job'
+                      AND promotion.`index` > %s
+                      AND JSON_UNQUOTE(JSON_EXTRACT(promotion.data, '$.phase')) = 'capability_promoted'
+                      AND JSON_UNQUOTE(JSON_EXTRACT(promotion.data, '$.status')) = 'succeeded'
+                    ORDER BY promotion.`index`
+                    LIMIT %s
+                    """,
+                    (after_index, limit + 1),
+                )
+                rows = list(cursor.fetchall())
+        has_more = len(rows) > limit
+        records: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+        for row in rows[:limit]:
+            promotion = self.storage._decode_row(row)
+            job = self._decode_json(row["job_data"])
+            records.append((int(row["index"]), promotion["data"], job))
+        return records, has_more
+
     def _factory_leases(self, cursor: Any, job_id: UUID) -> tuple[FactoryLease, ...]:
         cursor.execute(
             """SELECT `index`, parent_index, block_type, data, status, children,

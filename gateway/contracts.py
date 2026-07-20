@@ -16,6 +16,18 @@ from pydantic import (
     model_validator,
 )
 
+from agenten.delivery.minibook_events import MinibookProjectionEvent
+
+
+class MinibookProjectionFeedPage(BaseModel):
+    """One cursor page from Captain's redacted, read-only projection feed."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    events: tuple[MinibookProjectionEvent, ...]
+    cursor: str
+    has_more: bool
+
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,

@@ -7,6 +7,35 @@ from typing import Any
 
 import aiohttp
 
+from agenten.delivery.minibook_events import MinibookProjectionEvent
+
+
+def factory_promotion_projection(
+    block: dict[str, Any],
+    job: dict[str, Any],
+) -> MinibookProjectionEvent:
+    """Build the strict public view of one committed Factory promotion."""
+
+    return MinibookProjectionEvent.model_validate(
+        {
+            "schema": "captain.minibook-projection.v2",
+            "event_id": block["event_id"],
+            "correlation_id": job["correlation_id"],
+            "causation_id": job.get("event_id"),
+            "occurred_at": block["occurred_at"],
+            "producer": "captain-gateway",
+            "subject_id": f"subject:{block['job_id']}",
+            "subject_version": block["subject_version"],
+            "event_type": "capability.promoted",
+            "payload": {
+                "view": "validation",
+                "template_id": "factory_capability_ready_to_use",
+                "status_id": "ready_to_use",
+                "actor_role_id": "captain_gateway",
+            },
+        }
+    )
+
 
 async def _post_registry(payload: dict[str, Any]) -> None:
     base_url = os.getenv("MINIBOOK_URL", "http://localhost:8080").rstrip("/")

@@ -46,10 +46,12 @@ from gateway.contracts import (
     FactoryWriteReceipt,
     FactorySkillEvaluationSubmission,
     FactorySkillWriteReceipt,
+    MinibookProjectionFeedPage,
     PublishedHermesSkill,
 )
 from gateway.mirror import MirrorQueue
 from gateway.registry_feed import mirror_captain_projection
+from gateway.registry_feed import factory_promotion_projection
 from gateway.settings import GatewaySettings
 from gateway.store import AppendResult, GatewayStore
 
@@ -375,6 +377,28 @@ def create_app(
         _: GatewayRole = Depends(require_reader),
     ) -> FactoryJobProjection:
         return get_store().factory_job(job_id)
+
+    @app.get("/api/v1/projections/minibook/events")
+    async def minibook_projection_feed(
+        cursor: str | None = Query(default=None, pattern=r"^[0-9]+$"),
+        limit: int = Query(default=100, ge=1, le=100),
+        _: GatewayRole = Depends(require_captain),
+    ) -> MinibookProjectionFeedPage:
+        after_index = int(cursor) if cursor is not None else -1
+        records, has_more = get_store().factory_projection_feed(
+            after_index=after_index,
+            limit=limit,
+        )
+        events = tuple(
+            factory_promotion_projection(block, job)
+            for _, block, job in records
+        )
+        next_cursor = str(records[-1][0]) if records else str(after_index)
+        return MinibookProjectionFeedPage(
+            events=events,
+            cursor=next_cursor,
+            has_more=has_more,
+        )
 
     @app.post("/v1/runtime/commands", status_code=status.HTTP_202_ACCEPTED)
     async def accept_runtime_command(

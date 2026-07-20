@@ -375,6 +375,7 @@ class MinibookProjector:
             "automation_evidence_recorded": "Automation evidence recorded",
             "runtime_validation_recorded": "Runtime validation recorded",
             "runtime_replanning_requested": "Runtime replanning requested",
+            "factory_capability_ready_to_use": "Factory capability ready to use",
         }[template_id]
 
     @staticmethod
@@ -388,6 +389,7 @@ class MinibookProjector:
             "observed": "Observed",
             "validated": "Validated",
             "replanning": "Replanning",
+            "ready_to_use": "Ready to use",
         }[status_id]
 
     @staticmethod
@@ -405,6 +407,7 @@ class MinibookProjector:
         return {
             "captain_planner": "Captain Planner",
             "codex_worker": "Codex Worker",
+            "captain_gateway": "Captain Gateway",
         }[actor_role_id]
 
     @staticmethod

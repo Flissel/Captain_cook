@@ -24,6 +24,7 @@ ProjectionEventType = Literal[
     "n8n.evidence",
     "validation.recorded",
     "replanning.requested",
+    "capability.promoted",
 ]
 ProjectionView = Literal["project", "plan", "blueprint", "build", "validation"]
 ProjectionTemplateId = Literal[
@@ -35,6 +36,7 @@ ProjectionTemplateId = Literal[
     "automation_evidence_recorded",
     "runtime_validation_recorded",
     "runtime_replanning_requested",
+    "factory_capability_ready_to_use",
 ]
 ProjectionStatusId = Literal[
     "requested",
@@ -45,8 +47,9 @@ ProjectionStatusId = Literal[
     "observed",
     "validated",
     "replanning",
+    "ready_to_use",
 ]
-ActorRoleId = Literal["captain_planner", "codex_worker"]
+ActorRoleId = Literal["captain_planner", "codex_worker", "captain_gateway"]
 SubjectReference = Annotated[
     str,
     StringConstraints(
@@ -80,6 +83,11 @@ _EVENT_CATALOG: dict[
         "plan",
         "runtime_replanning_requested",
         "replanning",
+    ),
+    "capability.promoted": (
+        "validation",
+        "factory_capability_ready_to_use",
+        "ready_to_use",
     ),
 }
 
