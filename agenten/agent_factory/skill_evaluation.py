@@ -13,6 +13,10 @@ from agenten.agent_runtime.contracts import ArtifactRef, IDENTIFIER_PATTERN, SHA
 from .contracts import FactoryLease, FactoryRole
 
 
+MAX_EVALUATION_COMMANDS = 5
+MAX_EVALUATION_EVIDENCE_REFS = 10
+
+
 class _FrozenContract(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
 
@@ -107,8 +111,14 @@ class HermesSkillUsageReceipt(_FrozenContract):
     used_skill_id: str = Field(pattern=IDENTIFIER_PATTERN)
     used_skill_version: int = Field(ge=1, strict=True)
     used_skill_sha256: str = Field(pattern=SHA256_PATTERN)
-    commands: tuple[BoundedEvaluationCommand, ...] = Field(min_length=1)
-    evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
+    commands: tuple[BoundedEvaluationCommand, ...] = Field(
+        min_length=1,
+        max_length=MAX_EVALUATION_COMMANDS,
+    )
+    evidence_refs: tuple[ArtifactRef, ...] = Field(
+        min_length=1,
+        max_length=MAX_EVALUATION_EVIDENCE_REFS,
+    )
     assertion_ids: tuple[str, ...] = Field(min_length=1)
     outcome: Literal["passed", "redo", "blocked_tool_gap", "unresolved", "failed"]
 
@@ -214,6 +224,7 @@ class SkillEvaluationCheck(_FrozenContract):
     kind: Literal["build", "test"]
     command: BoundedEvaluationCommand
     status: Literal["passed", "failed", "skipped"]
+    occurred_at: datetime
     evidence_ref: ArtifactRef
     assertion_ids: tuple[str, ...] = ()
 
@@ -221,6 +232,11 @@ class SkillEvaluationCheck(_FrozenContract):
     @classmethod
     def require_unique_assertions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return _require_unique_nonblank(value, "assertion_ids")
+
+    @field_validator("occurred_at")
+    @classmethod
+    def require_utc_timestamp(cls, value: datetime) -> datetime:
+        return _require_utc(value)
 
 
 class HermesSkillEvaluationEvidence(_FrozenContract):
@@ -236,6 +252,7 @@ class HermesSkillEvaluationEvidence(_FrozenContract):
     subject_version: int = Field(ge=1, strict=True)
     occurred_at: datetime
     producer: Literal["hermes"]
+    request: HermesSkillEvaluationRequest
     receipt: HermesSkillUsageReceipt
     candidate: HermesSkillCandidate | None = None
     tool_gaps: tuple[ToolGapMarker, ...] = ()
@@ -273,22 +290,56 @@ class HermesSkillEvaluationEvidence(_FrozenContract):
 
     @model_validator(mode="after")
     def require_linked_evaluation_records(self) -> "HermesSkillEvaluationEvidence":
+        request = self.request
         receipt = self.receipt
-        if receipt.request_id != self.request_id:
+        if self.request_id != request.request_id:
+            raise ValueError("evaluation evidence request does not match Captain request")
+        if self.job_id != request.job_id:
+            raise ValueError("evaluation evidence job does not match Captain request")
+        if self.correlation_id != request.correlation_id:
+            raise ValueError("evaluation evidence correlation does not match Captain request")
+        if self.subject_id != request.subject_id or self.subject_version != request.subject_version:
+            raise ValueError("evaluation evidence subject does not match Captain request")
+        if receipt.request_id != request.request_id:
             raise ValueError("evaluation evidence receipt request does not match evidence")
-        if receipt.job_id != self.job_id:
+        if receipt.job_id != request.job_id:
             raise ValueError("evaluation evidence receipt job does not match evidence")
-        if receipt.correlation_id != self.correlation_id:
+        if receipt.correlation_id != request.correlation_id:
             raise ValueError("evaluation evidence receipt correlation does not match evidence")
+        if receipt.lease_id != request.lease.lease_id:
+            raise ValueError("evaluation evidence receipt lease does not match Captain request")
+        if receipt.released_skill != request.released_skill:
+            raise ValueError("evaluation evidence receipt released skill does not match Captain request")
+        if (
+            receipt.used_skill_id != request.released_skill.skill_id
+            or receipt.used_skill_version != request.released_skill.version
+            or receipt.used_skill_sha256 != request.released_skill.content_sha256
+        ):
+            raise ValueError("evaluation evidence receipt used skill does not match Captain request")
+        lease = request.lease
+        if not lease.issued_at <= receipt.occurred_at < lease.expires_at:
+            raise ValueError("evaluation evidence receipt was not issued under an active lease")
         if self.candidate is not None:
-            if self.candidate.request_id != self.request_id:
+            if self.candidate.request_id != request.request_id:
                 raise ValueError("evaluation evidence candidate request does not match evidence")
-            if self.candidate.parent_released_skill != receipt.released_skill:
-                raise ValueError("evaluation evidence candidate parent skill does not match receipt")
+            if self.candidate.parent_released_skill != request.released_skill:
+                raise ValueError("evaluation evidence candidate parent skill does not match Captain request")
+            if self.candidate.created_at <= receipt.occurred_at:
+                raise ValueError("evaluation evidence candidate must be created after the receipt")
+            if self.candidate.created_at >= lease.expires_at:
+                raise ValueError("evaluation evidence candidate was created outside the active lease")
         known_assertions = set(self.assertion_ids)
         for check in self.checks:
             if not set(check.assertion_ids).issubset(known_assertions):
                 raise ValueError("evaluation check assertions must belong to evidence")
+            if check.occurred_at <= receipt.occurred_at:
+                raise ValueError("evaluation check must occur after the receipt")
+            if check.occurred_at >= lease.expires_at:
+                raise ValueError("evaluation check occurred outside the active lease")
+        if self.occurred_at <= receipt.occurred_at:
+            raise ValueError("evaluation evidence must occur after the receipt")
+        if self.occurred_at >= lease.expires_at:
+            raise ValueError("evaluation evidence occurred outside the active lease")
         return self
 
 

@@ -95,7 +95,7 @@ def receipt_payload(**overrides: object) -> dict[str, object]:
         "job_id": JOB_ID,
         "correlation_id": CORRELATION_ID,
         "lease_id": "factory-lease-skill-evaluation",
-        "occurred_at": NOW,
+        "occurred_at": NOW + timedelta(minutes=1),
         "producer": "hermes",
         "released_skill": released_skill_payload(),
         "used_skill_id": "factory_skill_evaluator",
@@ -118,7 +118,7 @@ def candidate_payload(**overrides: object) -> dict[str, object]:
         "schema": "hermes.skill-candidate.v1",
         "candidate_id": "factory_skill_evaluator_candidate",
         "request_id": REQUEST_ID,
-        "created_at": NOW,
+        "created_at": NOW + timedelta(minutes=2),
         "producer": "hermes",
         "content_ref": artifact("candidate-skill", "b" * 64),
         "content_sha256": "b" * 64,
@@ -162,8 +162,9 @@ def evidence_payload(**overrides: object) -> dict[str, object]:
         "correlation_id": CORRELATION_ID,
         "subject_id": "support_triage",
         "subject_version": 1,
-        "occurred_at": NOW,
+        "occurred_at": NOW + timedelta(minutes=4),
         "producer": "hermes",
+        "request": request_payload(),
         "receipt": receipt_payload(),
         "candidate": candidate_payload(),
         "tool_gaps": [gap_payload(severity="optional")],
@@ -173,6 +174,7 @@ def evidence_payload(**overrides: object) -> dict[str, object]:
                 "kind": "build",
                 "command": {"command_id": "python.compileall", "max_seconds": 60},
                 "status": "passed",
+                "occurred_at": NOW + timedelta(minutes=2),
                 "evidence_ref": artifact("build-check"),
                 "assertion_ids": ["schema_valid"],
             },
@@ -181,6 +183,7 @@ def evidence_payload(**overrides: object) -> dict[str, object]:
                 "kind": "test",
                 "command": {"command_id": "captain.real_case", "max_seconds": 120},
                 "status": "passed",
+                "occurred_at": NOW + timedelta(minutes=3),
                 "evidence_ref": artifact("test-check"),
                 "assertion_ids": ["real_case_green"],
             },
@@ -247,6 +250,19 @@ def test_usage_receipt_requires_bounded_unique_commands_and_evidence() -> None:
         )
     with pytest.raises(ValidationError, match="digest"):
         HermesSkillUsageReceipt.model_validate(receipt_payload(used_skill_sha256="c" * 64))
+    with pytest.raises(ValidationError):
+        HermesSkillUsageReceipt.model_validate(
+            receipt_payload(
+                commands=[
+                    {"command_id": f"command-{index}", "max_seconds": 60}
+                    for index in range(6)
+                ]
+            )
+        )
+    with pytest.raises(ValidationError):
+        HermesSkillUsageReceipt.model_validate(
+            receipt_payload(evidence_refs=[artifact(f"evidence-{index}") for index in range(11)])
+        )
 
 
 def test_tool_gap_is_typed_bounded_and_rejects_empty_options() -> None:
@@ -296,6 +312,58 @@ def test_evidence_links_one_request_receipt_candidate_and_checks() -> None:
     with pytest.raises(ValidationError, match="assertion"):
         HermesSkillEvaluationEvidence.model_validate(
             evidence_payload(assertion_ids=["schema_valid"])
+        )
+
+
+def test_evidence_rejects_a_receipt_not_authorized_by_the_captain_request() -> None:
+    with pytest.raises(ValidationError, match="lease"):
+        HermesSkillEvaluationEvidence.model_validate(
+            evidence_payload(receipt=receipt_payload(lease_id="unrelated-factory-lease"))
+        )
+
+    other_skill = released_skill_payload(
+        skill_id="other_factory_skill",
+        version=2,
+        content_ref=artifact("other-released-skill", "d" * 64),
+        content_sha256="d" * 64,
+    )
+    with pytest.raises(ValidationError, match="released skill"):
+        HermesSkillEvaluationEvidence.model_validate(
+            evidence_payload(
+                receipt=receipt_payload(
+                    released_skill=other_skill,
+                    used_skill_id="other_factory_skill",
+                    used_skill_version=2,
+                    used_skill_sha256="d" * 64,
+                )
+            )
+        )
+    with pytest.raises(ValidationError, match="active"):
+        HermesSkillEvaluationEvidence.model_validate(
+            evidence_payload(receipt=receipt_payload(occurred_at=NOW + timedelta(minutes=10)))
+        )
+
+
+def test_evidence_requires_receipt_before_candidate_creation_and_checks() -> None:
+    with pytest.raises(ValidationError, match="candidate"):
+        HermesSkillEvaluationEvidence.model_validate(
+            evidence_payload(candidate=candidate_payload(created_at=NOW))
+        )
+    with pytest.raises(ValidationError, match="check"):
+        HermesSkillEvaluationEvidence.model_validate(
+            evidence_payload(
+                checks=[
+                    {
+                        "check_id": "build",
+                        "kind": "build",
+                        "command": {"command_id": "python.compileall", "max_seconds": 60},
+                        "status": "passed",
+                        "occurred_at": NOW,
+                        "evidence_ref": artifact("build-check"),
+                        "assertion_ids": ["schema_valid"],
+                    }
+                ]
+            )
         )
 
 
