@@ -35,6 +35,7 @@ class StoredSkillEvaluation:
     evidence: HermesSkillEvaluationEvidence
     evidence_ref: ArtifactRef
     receipt_ref: ArtifactRef
+    tool_gaps: tuple[ToolGapMarker, ...]
     tool_gap_refs: tuple[tuple[str, ArtifactRef], ...]
     candidate_ref: ArtifactRef | None
 
@@ -150,9 +151,9 @@ class InMemorySkillEvaluationRepository:
         receipt = self._receipts.get(evidence.receipt.receipt_id)
         if receipt is None:
             raise ValueError("recorded evaluation is missing its usage receipt")
-        tool_gaps = tuple(
-            (gap_id, reference)
-            for (stored_evaluation_id, gap_id), (_, reference) in self._tool_gaps.items()
+        stored_tool_gaps = tuple(
+            (gap_id, marker, reference)
+            for (stored_evaluation_id, gap_id), (marker, reference) in self._tool_gaps.items()
             if stored_evaluation_id == evaluation_id
         )
         candidate = self._candidates.get(evaluation_id)
@@ -160,7 +161,10 @@ class InMemorySkillEvaluationRepository:
             evidence=evidence,
             evidence_ref=evidence_ref,
             receipt_ref=receipt[1],
-            tool_gap_refs=tool_gaps,
+            tool_gaps=tuple(marker for _, marker, _ in stored_tool_gaps),
+            tool_gap_refs=tuple(
+                (gap_id, reference) for gap_id, _, reference in stored_tool_gaps
+            ),
             candidate_ref=None if candidate is None else candidate[1],
         )
 
@@ -268,7 +272,9 @@ class SkillEvaluationStore:
         if canonical.status != "private_candidate":
             raise ValueError("private candidate store only accepts private_candidate status")
         stored = self._repository.evaluation(evaluation_id)
-        if stored is not None and required_tool_gaps(stored.evidence):
+        if stored is not None and (
+            required_tool_gaps(stored.evidence) or _required_tool_gaps(stored.tool_gaps)
+        ):
             raise ValueError("candidate retention is blocked by an unresolved required tool gap")
         if not _has_successful_evidence(stored, canonical):
             raise ValueError("candidate retention requires successful evaluation evidence")
@@ -306,6 +312,14 @@ def _has_successful_evidence(
         and evidence.receipt.outcome == "passed"
         and {check.kind for check in evidence.checks} == {"build", "test"}
         and all(check.status == "passed" for check in evidence.checks)
+    )
+
+
+def _required_tool_gaps(markers: tuple[ToolGapMarker, ...]) -> tuple[ToolGapMarker, ...]:
+    return tuple(
+        marker
+        for marker in markers
+        if marker.severity == "required" and marker.status == "unresolved"
     )
 
 

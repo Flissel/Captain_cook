@@ -114,6 +114,23 @@ async def test_store_does_not_retain_candidate_with_unresolved_required_tool_gap
 
 
 @pytest.mark.asyncio
+async def test_store_does_not_retain_candidate_with_separately_recorded_required_tool_gap(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    evidence = HermesSkillEvaluationEvidence.model_validate(evidence_payload(tool_gaps=[]))
+    required_gap = ToolGapMarker.model_validate(gap_payload(severity="required", status="unresolved"))
+    await store.record_receipt(evidence.receipt)
+    await store.record_tool_gap(evidence.evidence_id, required_gap)
+    await store.record_evaluation(evidence)
+
+    with pytest.raises(ValueError, match="required tool gap"):
+        await store.retain_candidate(evidence.evidence_id, evidence.candidate)
+
+    assert store.get_evaluation(evidence.evidence_id).candidate_ref is None
+
+
+@pytest.mark.asyncio
 async def test_store_rejects_a_candidate_after_any_failed_build_or_test(tmp_path: Path) -> None:
     store = _store(tmp_path)
     evidence = HermesSkillEvaluationEvidence.model_validate(evidence_payload())
