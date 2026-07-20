@@ -125,10 +125,10 @@
 - Modify: `tests/agent_runtime/test_n8n_endpoint.py`
 - Modify: `tests/live/test_n8n_mcp_broker_live.py`
 
-- [ ] Add deterministic tests that a `TODO_TOOL.v1` option can reference an existing typed n8n tool only when its lease has `integration_intent=n8n`, the role is `TOOL_INTEGRATOR`, and the capability is explicitly approved.
-- [ ] Add a resolver that converts an approved tool-gap option into an opaque, capability-scoped n8n MCP reference. It must return a fresh child environment and must not serialize the token, API key, host URL, or unrestricted tool list.
-- [ ] Ensure the candidate manifest records typed input/output schemas and opaque tool references, not n8n workflow internals or credentials. Add a negative test for an unleased direct endpoint.
-- [ ] Extend the opt-in live test only to execute an already-approved, least-privilege workflow through the MCP broker. It must fail/skip honestly when required local configuration is absent and must never be counted as a green deterministic gate.
+- [x] Add deterministic tests that a `TODO_TOOL.v1` option can reference an existing typed n8n tool only when its lease has `integration_intent=n8n`, the role is `TOOL_INTEGRATOR`, and the capability is explicitly approved.
+- [x] Add a resolver that converts an approved tool-gap option into an opaque, capability-scoped n8n MCP reference. It must return a fresh child environment and must not serialize the token, API key, host URL, or unrestricted tool list.
+- [x] Ensure the candidate manifest records typed input/output schemas and opaque tool references, not n8n workflow internals or credentials. Add a negative test for an unleased direct endpoint.
+- [x] Extend the opt-in live test only to execute an already-approved, least-privilege workflow through the MCP broker. It must fail/skip honestly when required local configuration is absent and must never be counted as a green deterministic gate.
 
 ### Task 7: Run end-to-end verification and document the operational contract
 
