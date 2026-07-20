@@ -29,6 +29,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--gateway-url",
         help="override CAPTAIN_GATEWAY_URL for this recovery pass",
     )
+    live_demo_parser = subparsers.add_parser(
+        "live-demo-a2",
+        help="Run the opt-in Factory/Hermes/AutoGen/Gateway/projection one-shot",
+    )
+    live_demo_parser.add_argument("--release", type=Path, required=True)
+    live_demo_parser.add_argument("--output", type=Path, required=True)
+    live_demo_parser.add_argument("--gateway-url", required=True)
+    live_demo_parser.add_argument("--runtime-url", required=True)
+    live_demo_parser.add_argument("--hermes-executable", default="hermes")
     return parser.parse_args(argv)
 
 
@@ -80,6 +89,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             else []
         )
         return recovery_main(recovery_argv)
+    if args.command == "live-demo-a2":
+        from agenten.agent_factory.live_demo_entrypoint import run_live_demo_a2
+
+        summary = asyncio.run(
+            run_live_demo_a2(
+                release_path=args.release,
+                output_path=args.output,
+                gateway_url=args.gateway_url,
+                runtime_url=args.runtime_url,
+                hermes_executable=args.hermes_executable,
+            )
+        )
+        print(summary.model_dump_json(by_alias=True))
+        return 0
     return run_legacy()
 
 
