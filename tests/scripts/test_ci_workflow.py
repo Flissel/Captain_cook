@@ -41,6 +41,7 @@ def test_gateway_ci_uses_a_real_mariadb_service_without_skips() -> None:
     assert "tests/blockchain/test_mariadb_storage.py" in commands
     assert "tests/gateway/test_gateway.py" in commands
     assert "minibook/tests" in commands
+    assert "minibook/requirements.txt" in commands
     assert "--no-cov" in commands
     assert "tests/test_architecture_fitness.py" in commands
     assert "tests/live" not in commands
