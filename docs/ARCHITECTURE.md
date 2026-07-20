@@ -27,6 +27,43 @@ test database, a released fixture skill, and the configured local n8n MCP
 broker.  Missing live prerequisites are reported as skips or blocks, never as
 deterministic success.
 
+`CAPABILITY_PROMOTED` consumes the latest Gateway-accepted
+`FactoryReleaseDecision`.  The Gateway recomputes that decision from the stored
+skill evaluation plus the submitted E2E records.  A missing or blocked decision
+fails closed; only recovery evidence followed by three consecutive successful
+normal E2E runs can produce the `ready` decision used by Captain promotion.
+
+### Verification command sequence
+
+Run the deterministic focused integration first, then the related offline
+Factory/Gateway regressions:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q --no-cov tests/integration/test_hermes_skill_evaluation_gateway.py
+.\.venv\Scripts\python.exe -m pytest -q --no-cov tests/agent_factory tests/gateway/test_factory_repository.py tests/gateway/test_delivery_events.py tests/agent_runtime/test_n8n_endpoint.py
+```
+
+The direct MariaDB path is separate and destructive only to the disposable
+test database. `TEST_MARIADB_DSN` must target the exact isolated database
+`captain_test`; the guard rejects every other database name. Supply the DSN
+only through the local environment, then run the DB-backed integration files:
+
+```powershell
+$env:TEST_MARIADB_DSN = "<isolated MariaDB DSN ending in /captain_test>"
+.\.venv\Scripts\python.exe -m pytest -q --no-cov tests/integration/test_hermes_skill_evaluation_gateway.py tests/gateway/test_agent_factory.py
+```
+
+After all database-resetting tests, the provider-backed release gate remains
+explicitly opt in:
+
+```powershell
+pwsh -NoProfile -File scripts/run-gate-e.ps1
+```
+
+Gate E requires the prepared Captain test database, released skill fixture,
+Codex/provider configuration, and the approved local n8n MCP broker. Missing
+prerequisites are a skip or block, never a green Gate E.
+
 The Agent-Factory path is split into three independently composed process
 contracts. They exchange frozen, versioned data; none imports the next stage's
 implementation. The local candidate runs these stages in one Python runtime;

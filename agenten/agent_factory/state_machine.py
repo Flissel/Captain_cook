@@ -10,9 +10,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryPhase
 from .release_gate import (
+    FactoryReleaseDecision,
     evaluation_requires_improvement,
     evaluation_tool_gaps,
     factory_evaluation_block_reason,
+    factory_release_decision_block_reason,
 )
 from .skill_evaluation import ToolGapMarker
 from .skill_store import StoredSkillEvaluation
@@ -80,6 +82,7 @@ def apply_block(
     block: FactoryEvidenceBlock,
     *,
     evaluation: StoredSkillEvaluation | None = None,
+    release_decision: FactoryReleaseDecision | None = None,
 ) -> FactoryProjection:
     """Apply one new immutable block after enforcing lifecycle ordering."""
 
@@ -123,6 +126,13 @@ def apply_block(
         evaluation_reason = factory_evaluation_block_reason(projection.job, evaluation)
         if evaluation_reason is not None:
             raise FactoryLifecycleError(evaluation_reason)
+        decision_reason = factory_release_decision_block_reason(
+            projection.job,
+            evaluation,
+            release_decision,
+        )
+        if decision_reason is not None:
+            raise FactoryLifecycleError(decision_reason)
         assert evaluation is not None
         required = set(projection.job.acceptance_assertion_ids)
         if not required.issubset(assertions):

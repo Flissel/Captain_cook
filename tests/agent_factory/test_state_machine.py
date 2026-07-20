@@ -20,6 +20,12 @@ from agenten.agent_factory.state_machine import (
     apply_block,
     next_action,
 )
+from agenten.agent_factory.release_gate import (
+    E2EKind,
+    E2EOutcome,
+    E2ERunEvidence,
+    evaluate_factory_release,
+)
 from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationEvidence
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
 from agenten.agent_runtime.contracts import ArtifactRef
@@ -158,6 +164,32 @@ def accepted_evaluation() -> StoredSkillEvaluation:
     )
 
 
+def accepted_release_decision(
+    evaluation: StoredSkillEvaluation | None = None,
+):
+    stored = evaluation or accepted_evaluation()
+    runs = (
+        E2ERunEvidence(
+            run_number=1,
+            correlation_id=job().correlation_id,
+            kind=E2EKind.RECOVERY,
+            outcome=E2EOutcome.EXPECTED_FAILURE,
+            evidence_ref=ArtifactRef.model_validate(artifact("recovery-e2e")),
+        ),
+        *(
+            E2ERunEvidence(
+                run_number=number,
+                correlation_id=job().correlation_id,
+                kind=E2EKind.NORMAL,
+                outcome=E2EOutcome.SUCCEEDED,
+                evidence_ref=ArtifactRef.model_validate(artifact(f"normal-e2e-{number}")),
+            )
+            for number in range(2, 5)
+        ),
+    )
+    return evaluate_factory_release(job(), runs, stored)
+
+
 def quality_reviewed_projection(*, attempt: int = 1) -> FactoryProjection:
     state = FactoryProjection.from_job(job()).model_copy(update={"attempt": attempt})
     for phase in (
@@ -277,7 +309,27 @@ def test_quality_review_cannot_promote_without_accepted_evaluation() -> None:
         apply_block(state, promotion)
 
     evaluation = accepted_evaluation()
-    promoted = apply_block(state, promotion, evaluation=evaluation)
+    with pytest.raises(
+        FactoryLifecycleError,
+        match="missing accepted Factory release decision",
+    ):
+        apply_block(state, promotion, evaluation=evaluation)
+
+    blocked = evaluate_factory_release(job(), (), evaluation)
+    with pytest.raises(FactoryLifecycleError, match="release decision is blocked"):
+        apply_block(
+            state,
+            promotion,
+            evaluation=evaluation,
+            release_decision=blocked,
+        )
+
+    promoted = apply_block(
+        state,
+        promotion,
+        evaluation=evaluation,
+        release_decision=accepted_release_decision(evaluation),
+    )
 
     assert promoted.status is FactoryLifecycleStatus.READY_TO_USE
     assert promoted.evaluation_id == evaluation.evidence.evidence_id

@@ -24,6 +24,7 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrantRevocation,
 )
 from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease
+from agenten.agent_factory.release_gate import E2ERunEvidence, FactoryReleaseDecision
 from agenten.agent_factory.skill_evaluation import (
     HermesSkillEvaluationEvidence,
 )
@@ -100,6 +101,16 @@ class FactorySkillEvaluationSubmission(_FrozenContract):
     receipt_ref: ArtifactRef
     candidate_ref: ArtifactRef | None = None
     tool_gap_refs: tuple[FactoryToolGapReference, ...] = ()
+
+
+class FactoryReleaseDecisionSubmission(_FrozenContract):
+    schema_name: Literal["captain.factory-release-decision-submission.v1"] = Field(
+        default="captain.factory-release-decision-submission.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    decision: FactoryReleaseDecision
+    e2e_evidence: tuple[E2ERunEvidence, ...] = Field(min_length=1)
 
 
 class PublishedHermesSkill(_FrozenContract):

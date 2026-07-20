@@ -5,17 +5,27 @@ import json
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
+
+import gateway.contracts as gateway_contracts
 
 from agenten.agent_factory.contracts import FactoryPhase
 from agenten.agent_factory.contracts import FactoryRole
 from agenten.agent_factory.leases import issue_factory_lease
+from agenten.agent_factory.release_gate import E2EKind, E2EOutcome, E2ERunEvidence
 from agenten.agent_factory.service import FactoryCoordinator
 from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationEvidence
 from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.contracts import FactorySkillEvaluationSubmission, PublishedHermesSkill
 from gateway.factory_repository import GatewayFactoryLeases, GatewayFactoryRepository
 from gateway.store import GatewayStore
-from tests.agent_factory.test_state_machine import accepted_evaluation, block, job
+from tests.agent_factory.test_state_machine import (
+    accepted_evaluation,
+    accepted_release_decision,
+    artifact,
+    block,
+    job,
+)
 
 
 class Store:
@@ -23,6 +33,7 @@ class Store:
         self.jobs = {}
         self.events = {}
         self.evaluations = {}
+        self.decisions = {}
 
     def record_factory_job(self, factory_job):
         self.jobs.setdefault(factory_job.job_id, factory_job)
@@ -37,6 +48,9 @@ class Store:
 
     def factory_skill_evaluation(self, job_id):
         return self.evaluations.get(job_id)
+
+    def factory_release_decision(self, job_id):
+        return self.decisions.get(job_id)
 
 
 def test_gateway_adapter_runs_coordinator_against_gateway_store_shape() -> None:
@@ -80,6 +94,16 @@ def test_gateway_adapter_reads_the_gateway_owned_skill_evaluation() -> None:
     store.evaluations[factory_job.job_id] = evaluation
 
     assert GatewayFactoryRepository(store).evaluation_for_job(factory_job.job_id) == evaluation
+
+
+def test_gateway_adapter_reads_the_gateway_accepted_release_decision() -> None:
+    store = Store()
+    factory_job = job()
+    decision = accepted_release_decision()
+    store.jobs[factory_job.job_id] = factory_job
+    store.decisions[factory_job.job_id] = decision
+
+    assert GatewayFactoryRepository(store).release_decision_for_job(factory_job.job_id) == decision
 
 
 def _canonical_ref(model, name: str) -> ArtifactRef:
@@ -209,3 +233,57 @@ def test_gateway_publication_uses_the_full_factory_evaluation_qualification() ->
             unqualified,
             job(),
         )
+
+
+def _release_evidence() -> tuple[E2ERunEvidence, ...]:
+    return (
+        E2ERunEvidence(
+            run_number=1,
+            correlation_id=job().correlation_id,
+            kind=E2EKind.RECOVERY,
+            outcome=E2EOutcome.EXPECTED_FAILURE,
+            evidence_ref=ArtifactRef.model_validate(artifact("recovery-e2e")),
+        ),
+        *(
+            E2ERunEvidence(
+                run_number=number,
+                correlation_id=job().correlation_id,
+                kind=E2EKind.NORMAL,
+                outcome=E2EOutcome.SUCCEEDED,
+                evidence_ref=ArtifactRef.model_validate(artifact(f"normal-e2e-{number}")),
+            )
+            for number in range(2, 5)
+        ),
+    )
+
+
+def test_gateway_recomputes_the_factory_release_decision_before_acceptance() -> None:
+    validator = getattr(GatewayStore, "_assert_factory_release_decision", None)
+    assert validator is not None, "Gateway release-decision validator is missing"
+    evaluation = accepted_evaluation()
+    decision = accepted_release_decision(evaluation)
+
+    validator(job(), evaluation, _release_evidence(), decision)
+
+    with pytest.raises(HTTPException, match="recomputed"):
+        validator(job(), evaluation, _release_evidence()[:-1], decision)
+
+
+def test_factory_release_decision_submission_is_typed_and_strict() -> None:
+    submission_type = getattr(
+        gateway_contracts,
+        "FactoryReleaseDecisionSubmission",
+        None,
+    )
+    assert submission_type is not None, "Factory release submission contract is missing"
+    payload = {
+        "decision": accepted_release_decision(),
+        "e2e_evidence": _release_evidence(),
+    }
+
+    submission = submission_type.model_validate(payload)
+
+    assert submission.decision.status == "ready"
+    assert len(submission.e2e_evidence) == 4
+    with pytest.raises(ValidationError):
+        submission_type.model_validate({**payload, "unexpected": True})

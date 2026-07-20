@@ -42,6 +42,7 @@ from gateway.contracts import (
     RuntimeOperationProjection,
     RuntimeWriteReceipt,
     FactoryJobProjection,
+    FactoryReleaseDecisionSubmission,
     FactoryWriteReceipt,
     FactorySkillEvaluationSubmission,
     FactorySkillWriteReceipt,
@@ -342,6 +343,17 @@ def create_app(
         _: GatewayRole = Depends(require_captain),
     ) -> FactorySkillWriteReceipt:
         receipt = get_store().publish_factory_skill(publication)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
+
+    @app.post("/v1/factory/release-decisions", status_code=status.HTTP_201_CREATED)
+    async def record_factory_release_decision(
+        submission: FactoryReleaseDecisionSubmission,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> FactorySkillWriteReceipt:
+        receipt = get_store().record_factory_release_decision(submission)
         if receipt.replayed:
             response.status_code = status.HTTP_200_OK
         return receipt

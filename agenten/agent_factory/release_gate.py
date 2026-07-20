@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -39,11 +40,36 @@ class FactoryReleaseDecision(BaseModel):
 
     job_id: UUID
     correlation_id: UUID
-    status: str
+    status: Literal["blocked", "ready"]
     reasons: tuple[str, ...]
     evaluation_id: UUID | None = None
     evaluation_ref: ArtifactRef | None = None
     tool_gaps: tuple[ToolGapMarker, ...] = ()
+
+
+def factory_release_decision_block_reason(
+    job: AgentFactoryJob,
+    evaluation: StoredSkillEvaluation | None,
+    decision: FactoryReleaseDecision | None,
+) -> str | None:
+    """Require one Captain decision bound to the accepted evaluation."""
+
+    if decision is None:
+        return "missing accepted Factory release decision"
+    if decision.status != "ready":
+        return "Factory release decision is blocked: " + ", ".join(decision.reasons)
+    if decision.job_id != job.job_id or decision.correlation_id != job.correlation_id:
+        return "Factory release decision does not match the factory job"
+    if evaluation is None:
+        return "missing accepted Hermes skill evaluation evidence"
+    if (
+        decision.evaluation_id != evaluation.evidence.evidence_id
+        or decision.evaluation_ref != evaluation.evidence_ref
+    ):
+        return "Factory release decision does not match the accepted skill evaluation"
+    if decision.tool_gaps != evaluation_tool_gaps(evaluation):
+        return "Factory release decision tool gaps do not match the accepted skill evaluation"
+    return None
 
 
 def evaluate_factory_release(

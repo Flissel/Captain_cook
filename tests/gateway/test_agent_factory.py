@@ -13,6 +13,12 @@ from pydantic import SecretStr
 
 from agenten.agent_factory.contracts import AgentFactoryJob, FactoryPhase, FactoryRole
 from agenten.agent_factory.leases import issue_factory_lease
+from agenten.agent_factory.release_gate import (
+    E2EKind,
+    E2EOutcome,
+    E2ERunEvidence,
+    evaluate_factory_release,
+)
 from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationEvidence
 from agenten.agent_runtime.contracts import ArtifactRef
 from blockchain.mariadb_storage import MariaDBStorage
@@ -20,9 +26,11 @@ from gateway.app import create_app
 from gateway.auth import GatewayRole, require_actor
 from gateway.contracts import (
     FactorySkillEvaluationSubmission,
+    FactoryReleaseDecisionSubmission,
     PublishedHermesSkill,
 )
 from gateway.settings import GatewaySettings
+from gateway.store import GatewayStore
 from tests.agent_factory.test_state_machine import block, job
 from tests.agent_factory.test_skill_evaluation_contracts import evidence_payload
 from tests.support.mariadb import assert_isolated_test_database
@@ -316,6 +324,36 @@ def _register_through_tool_lease(storage: MariaDBStorage) -> tuple[AgentFactoryJ
     return factory_job, tool_lease
 
 
+def _release_submission(
+    factory_job: AgentFactoryJob,
+    submission: FactorySkillEvaluationSubmission,
+) -> FactoryReleaseDecisionSubmission:
+    e2e = (
+        E2ERunEvidence(
+            run_number=1,
+            correlation_id=factory_job.correlation_id,
+            kind=E2EKind.RECOVERY,
+            outcome=E2EOutcome.EXPECTED_FAILURE,
+            evidence_ref=_artifact("recovery-e2e"),
+        ),
+        *(
+            E2ERunEvidence(
+                run_number=number,
+                correlation_id=factory_job.correlation_id,
+                kind=E2EKind.NORMAL,
+                outcome=E2EOutcome.SUCCEEDED,
+                evidence_ref=_artifact(f"normal-e2e-{number}"),
+            )
+            for number in range(2, 5)
+        ),
+    )
+    evaluation = GatewayStore._stored_factory_evaluation(submission)
+    return FactoryReleaseDecisionSubmission(
+        decision=evaluate_factory_release(factory_job, e2e, evaluation),
+        e2e_evidence=e2e,
+    )
+
+
 def test_factory_evaluation_is_lease_bound_idempotent_and_reference_checked(
     storage: MariaDBStorage,
 ) -> None:
@@ -514,8 +552,13 @@ def test_captain_publication_then_promotion_is_authoritative(
             "evidence_refs": (submission.evidence_ref,),
         }
     )
+    release_submission = _release_submission(factory_job, submission)
 
     with TestClient(application(storage, actor=GatewayRole.WORKER)) as hermes:
+        assert hermes.post(
+            "/v1/factory/release-decisions",
+            json=release_submission.model_dump(mode="json", by_alias=True),
+        ).status_code == 403
         assert hermes.post(
             "/v1/factory/skills/publications",
             json=publication.model_dump(mode="json", by_alias=True),
@@ -526,6 +569,10 @@ def test_captain_publication_then_promotion_is_authoritative(
         ).status_code == 403
 
     with TestClient(application(storage)) as captain:
+        decision = captain.post(
+            "/v1/factory/release-decisions",
+            json=release_submission.model_dump(mode="json", by_alias=True),
+        )
         published = captain.post(
             "/v1/factory/skills/publications",
             json=publication.model_dump(mode="json", by_alias=True),
@@ -537,6 +584,7 @@ def test_captain_publication_then_promotion_is_authoritative(
         projection = captain.get(f"/v1/factory/jobs/{factory_job.job_id}")
         evaluation = captain.get(f"/v1/factory/evaluations/{factory_job.job_id}")
 
+    assert decision.status_code == 201
     assert published.status_code == 201
     assert promoted.status_code == 201
     assert projection.json()["projection"]["status"] == "ready_to_use"

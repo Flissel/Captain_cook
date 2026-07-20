@@ -24,7 +24,12 @@ from agenten.agent_runtime.contracts import (
 )
 from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease, FactoryPhase, FactoryRole
 from agenten.agent_factory.leases import FactoryLeaseDenied, validate_factory_lease
-from agenten.agent_factory.release_gate import factory_evaluation_block_reason
+from agenten.agent_factory.release_gate import (
+    E2ERunEvidence,
+    FactoryReleaseDecision,
+    evaluate_factory_release,
+    factory_evaluation_block_reason,
+)
 from agenten.agent_factory.skill_evaluation import (
     HermesSkillEvaluationEvidence,
     ReleasedHermesSkill,
@@ -50,6 +55,7 @@ from gateway.contracts import (
     RuntimeOperationProjection,
     RuntimeWriteReceipt,
     FactoryJobProjection,
+    FactoryReleaseDecisionSubmission,
     FactoryWriteReceipt,
     FactorySkillEvaluationSubmission,
     FactorySkillWriteReceipt,
@@ -225,6 +231,20 @@ class GatewayStore:
                         payload JSON NOT NULL,
                         PRIMARY KEY (skill_id, version),
                         CONSTRAINT fk_factory_published_skill_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS factory_release_decisions (
+                        decision_id CHAR(64) NOT NULL PRIMARY KEY,
+                        job_id CHAR(36) NOT NULL,
+                        evaluation_id CHAR(36) NOT NULL,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        INDEX idx_factory_release_decision_job (job_id, block_index),
+                        CONSTRAINT fk_factory_release_decision_block
                             FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
                     ) ENGINE=InnoDB
                     """
@@ -937,6 +957,91 @@ class GatewayStore:
                 )
         return self._stored_factory_evaluation(submission)
 
+    def record_factory_release_decision(
+        self,
+        submission: FactoryReleaseDecisionSubmission,
+    ) -> FactorySkillWriteReceipt:
+        canonical = submission.model_dump(mode="json", by_alias=True)
+        decision_id = self._canonical_model_sha256(submission)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT payload FROM factory_release_decisions WHERE decision_id = %s FOR UPDATE",
+                    (decision_id,),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    if self._decode_json(existing["payload"]) == canonical:
+                        return FactorySkillWriteReceipt(
+                            record_id=decision_id,
+                            replayed=True,
+                        )
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Factory release decision already exists with different content",
+                    )
+                job_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_job",
+                    field="job_id",
+                    value=str(submission.decision.job_id),
+                    for_update=True,
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job not found")
+                evaluation_row = self._factory_skill_evaluation_row_for_job(
+                    cursor,
+                    submission.decision.job_id,
+                    for_update=True,
+                )
+                if evaluation_row is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="missing accepted Hermes skill evaluation evidence",
+                    )
+                evaluation_submission = FactorySkillEvaluationSubmission.model_validate(
+                    self._decode_json(evaluation_row["payload"])
+                )
+                evaluation = self._stored_factory_evaluation(evaluation_submission)
+                job = AgentFactoryJob.model_validate(job_block["data"])
+                self._assert_factory_release_decision(
+                    job,
+                    evaluation,
+                    submission.e2e_evidence,
+                    submission.decision,
+                )
+                index = self._next_index(cursor)
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="factory_release_decision",
+                    data=canonical,
+                    status=submission.decision.status,
+                    parent_index=evaluation_row["block_index"],
+                    metadata={
+                        "schema": "captain.factory-release-decision-submission.v1"
+                    },
+                )
+                self._insert(cursor, block)
+                cursor.execute(
+                    """INSERT INTO factory_release_decisions
+                       (decision_id, job_id, evaluation_id, block_index, payload)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (
+                        decision_id,
+                        str(job.job_id),
+                        str(evaluation.evidence.evidence_id),
+                        index,
+                        json.dumps(canonical, sort_keys=True),
+                    ),
+                )
+        return FactorySkillWriteReceipt(record_id=decision_id, replayed=False)
+
+    def factory_release_decision(self, job_id: UUID) -> FactoryReleaseDecision | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                return self._factory_release_decision_for_job(cursor, job_id)
+
     def publish_factory_skill(
         self,
         publication: PublishedHermesSkill,
@@ -1047,6 +1152,7 @@ class GatewayStore:
                     if lease_block is not None:
                         lease = FactoryLease.model_validate(lease_block["data"])
                 evaluation = None
+                release_decision = None
                 if evidence.phase is FactoryPhase.CAPABILITY_PROMOTED:
                     evaluation = self._factory_skill_evaluation_for_job(cursor, evidence.job_id)
                     if evaluation is None:
@@ -1060,8 +1166,17 @@ class GatewayStore:
                             status_code=409,
                             detail="capability promotion must reference its accepted skill evaluation",
                         )
+                    release_decision = self._factory_release_decision_for_job(
+                        cursor,
+                        evidence.job_id,
+                    )
                 try:
-                    apply_block(projection, evidence, evaluation=evaluation)
+                    apply_block(
+                        projection,
+                        evidence,
+                        evaluation=evaluation,
+                        release_decision=release_decision,
+                    )
                 except FactoryLifecycleError as exc:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
                 self._assert_evidence_lease(evidence, lease)
@@ -1096,7 +1211,17 @@ class GatewayStore:
                         if evidence.phase is FactoryPhase.CAPABILITY_PROMOTED
                         else None
                     )
-                    projection = apply_block(projection, evidence, evaluation=evaluation)
+                    release_decision = (
+                        self._factory_release_decision_for_job(cursor, job_id)
+                        if evidence.phase is FactoryPhase.CAPABILITY_PROMOTED
+                        else None
+                    )
+                    projection = apply_block(
+                        projection,
+                        evidence,
+                        evaluation=evaluation,
+                        release_decision=release_decision,
+                    )
         return FactoryJobProjection(job=job, blocks=blocks, leases=leases, projection=projection)
 
     def record_factory_lease(self, lease: FactoryLease) -> FactoryWriteReceipt:
@@ -1139,7 +1264,17 @@ class GatewayStore:
                 if evidence.phase is FactoryPhase.CAPABILITY_PROMOTED
                 else None
             )
-            projection = apply_block(projection, evidence, evaluation=evaluation)
+            release_decision = (
+                self._factory_release_decision_for_job(cursor, job.job_id)
+                if evidence.phase is FactoryPhase.CAPABILITY_PROMOTED
+                else None
+            )
+            projection = apply_block(
+                projection,
+                evidence,
+                evaluation=evaluation,
+                release_decision=release_decision,
+            )
         return projection
 
     def _factory_blocks(
@@ -1208,6 +1343,22 @@ class GatewayStore:
         cursor.execute(sql, (str(evidence_id),))
         return cursor.fetchone()
 
+    def _factory_skill_evaluation_row_for_job(
+        self,
+        cursor: Any,
+        job_id: UUID,
+        *,
+        for_update: bool,
+    ) -> dict[str, Any] | None:
+        sql = (
+            "SELECT evidence_id, job_id, block_index, payload "
+            "FROM factory_skill_evaluations WHERE job_id = %s"
+        )
+        if for_update:
+            sql += " FOR UPDATE"
+        cursor.execute(sql, (str(job_id),))
+        return cursor.fetchone()
+
     def _factory_skill_evaluation_for_job(
         self,
         cursor: Any,
@@ -1224,6 +1375,24 @@ class GatewayStore:
             self._decode_json(row["payload"])
         )
         return self._stored_factory_evaluation(submission)
+
+    def _factory_release_decision_for_job(
+        self,
+        cursor: Any,
+        job_id: UUID,
+    ) -> FactoryReleaseDecision | None:
+        cursor.execute(
+            """SELECT payload FROM factory_release_decisions
+               WHERE job_id = %s ORDER BY block_index DESC LIMIT 1""",
+            (str(job_id),),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        submission = FactoryReleaseDecisionSubmission.model_validate(
+            self._decode_json(row["payload"])
+        )
+        return submission.decision
 
     @staticmethod
     def _assert_factory_evaluation_job(
@@ -1353,6 +1522,20 @@ class GatewayStore:
             raise HTTPException(
                 status_code=409,
                 detail="publication does not match an accepted private skill candidate",
+            )
+
+    @staticmethod
+    def _assert_factory_release_decision(
+        job: AgentFactoryJob,
+        evaluation: StoredSkillEvaluation,
+        evidence: tuple[E2ERunEvidence, ...],
+        decision: FactoryReleaseDecision,
+    ) -> None:
+        expected = evaluate_factory_release(job, evidence, evaluation)
+        if decision != expected:
+            raise HTTPException(
+                status_code=409,
+                detail="Factory release decision does not match the Gateway-recomputed decision",
             )
 
     @staticmethod

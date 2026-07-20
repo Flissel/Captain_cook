@@ -10,6 +10,7 @@ from datetime import datetime
 
 from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease, FactoryRole
 from agenten.agent_factory.leases import FactoryLeaseDenied, FactoryLeasePort, validate_factory_lease
+from agenten.agent_factory.release_gate import FactoryReleaseDecision
 from agenten.agent_factory.service import FactoryRepository, FactoryRepositoryError
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
 from gateway.store import GatewayStore
@@ -36,6 +37,9 @@ class GatewayFactoryRepository(FactoryRepository):
 
     def evaluation_for_job(self, job_id: UUID) -> StoredSkillEvaluation | None:
         return self._translate(lambda: self._store.factory_skill_evaluation(job_id))
+
+    def release_decision_for_job(self, job_id: UUID) -> FactoryReleaseDecision | None:
+        return self._translate(lambda: self._store.factory_release_decision(job_id))
 
     @staticmethod
     def _translate(operation):

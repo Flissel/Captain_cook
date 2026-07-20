@@ -7,6 +7,7 @@ from typing import Protocol
 from uuid import UUID
 
 from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock
+from agenten.agent_factory.release_gate import FactoryReleaseDecision
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
 from agenten.agent_factory.state_machine import (
     FactoryAction,
@@ -39,6 +40,9 @@ class FactoryRepository(Protocol):
     def evaluation_for_job(self, job_id: UUID) -> StoredSkillEvaluation | None:
         """Return Captain-readable evaluation evidence without granting writes."""
 
+    def release_decision_for_job(self, job_id: UUID) -> FactoryReleaseDecision | None:
+        """Return the Gateway-accepted Captain release decision, if present."""
+
 
 @dataclass
 class InMemoryFactoryRepository:
@@ -48,6 +52,9 @@ class InMemoryFactoryRepository:
     _blocks: dict[UUID, list[FactoryEvidenceBlock]] = field(default_factory=dict)
     _event_ids: dict[UUID, FactoryEvidenceBlock] = field(default_factory=dict)
     _evaluations_by_job: dict[UUID, StoredSkillEvaluation] = field(default_factory=dict)
+    _release_decisions_by_job: dict[UUID, FactoryReleaseDecision] = field(
+        default_factory=dict
+    )
 
     def register(self, job: AgentFactoryJob) -> None:
         existing = self._jobs.get(job.job_id)
@@ -83,6 +90,10 @@ class InMemoryFactoryRepository:
         self.job(job_id)
         return self._evaluations_by_job.get(job_id)
 
+    def release_decision_for_job(self, job_id: UUID) -> FactoryReleaseDecision | None:
+        self.job(job_id)
+        return self._release_decisions_by_job.get(job_id)
+
 
 class FactoryCoordinator:
     """Rebuild state before every append; no worker may bypass Captain policy."""
@@ -100,8 +111,15 @@ class FactoryCoordinator:
                 return False
             raise FactoryRepositoryError("event_id already exists with different content")
         projection = self.projection(block.job_id)
-        evaluation = self.evaluation_for_job(block.job_id) if block.phase.value == "capability_promoted" else None
-        apply_block(projection, block, evaluation=evaluation)
+        promotion = block.phase.value == "capability_promoted"
+        evaluation = self.evaluation_for_job(block.job_id) if promotion else None
+        release_decision = self.release_decision_for_job(block.job_id) if promotion else None
+        apply_block(
+            projection,
+            block,
+            evaluation=evaluation,
+            release_decision=release_decision,
+        )
         return self._repository.append(block)
 
     def projection(self, job_id: UUID) -> FactoryProjection:
@@ -112,7 +130,17 @@ class FactoryCoordinator:
                 if stored_block.phase.value == "capability_promoted"
                 else None
             )
-            projection = apply_block(projection, stored_block, evaluation=evaluation)
+            release_decision = (
+                self.release_decision_for_job(job_id)
+                if stored_block.phase.value == "capability_promoted"
+                else None
+            )
+            projection = apply_block(
+                projection,
+                stored_block,
+                evaluation=evaluation,
+                release_decision=release_decision,
+            )
         return projection
 
     def next_action(self, job_id: UUID) -> FactoryAction:
@@ -129,6 +157,12 @@ class FactoryCoordinator:
 
     def evaluation_for_job(self, job_id: UUID) -> StoredSkillEvaluation | None:
         lookup = getattr(self._repository, "evaluation_for_job", None)
+        if lookup is None:
+            return None
+        return lookup(job_id)
+
+    def release_decision_for_job(self, job_id: UUID) -> FactoryReleaseDecision | None:
+        lookup = getattr(self._repository, "release_decision_for_job", None)
         if lookup is None:
             return None
         return lookup(job_id)

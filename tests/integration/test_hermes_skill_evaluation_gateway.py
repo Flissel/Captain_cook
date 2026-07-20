@@ -51,10 +51,11 @@ from agenten.agent_factory.skill_store import (
     SkillEvaluationStore,
     StoredSkillEvaluation,
 )
-from agenten.agent_factory.state_machine import FactoryLifecycleStatus
+from agenten.agent_factory.state_machine import FactoryLifecycleError, FactoryLifecycleStatus
 from agenten.agent_runtime.contracts import ArtifactRef
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.contracts import (
+    FactoryReleaseDecisionSubmission,
     FactorySkillEvaluationSubmission,
     FactoryToolGapReference,
     PublishedHermesSkill,
@@ -80,12 +81,29 @@ def test_captain_skill_evaluation_operational_chain_is_explicit() -> None:
     """Task 7 must expose one auditable Captain-owned operational chain."""
 
     architecture = Path("docs/ARCHITECTURE.md").read_text(encoding="utf-8")
+    normalized_architecture = " ".join(architecture.split())
 
     assert "## Hermes skill-evaluation release path" in architecture
     assert (
         "request -> skill usage -> build/test evidence -> candidate retained "
         "-> Gateway validation -> skill published -> ready-to-use promotion"
         in architecture
+    )
+    assert "### Verification command sequence" in architecture
+    assert (
+        ".\\.venv\\Scripts\\python.exe -m pytest -q --no-cov "
+        "tests/integration/test_hermes_skill_evaluation_gateway.py"
+        in architecture
+    )
+    assert (
+        "`TEST_MARIADB_DSN` must target the exact isolated database "
+        "`captain_test`"
+        in normalized_architecture
+    )
+    assert "pwsh -NoProfile -File scripts/run-gate-e.ps1" in architecture
+    assert (
+        "Missing prerequisites are a skip or block, never a green Gate E."
+        in normalized_architecture
     )
 
 
@@ -111,6 +129,7 @@ class _DeterministicGatewayStore:
         self.submissions: dict[UUID, FactorySkillEvaluationSubmission] = {}
         self.evaluations: dict[UUID, StoredSkillEvaluation] = {}
         self.publications: dict[UUID, PublishedHermesSkill] = {}
+        self.release_decisions: dict[UUID, list[FactoryReleaseDecisionSubmission]] = {}
 
     def record_factory_job(self, job: AgentFactoryJob) -> SimpleNamespace:
         existing = self.jobs.get(job.job_id)
@@ -175,6 +194,25 @@ class _DeterministicGatewayStore:
 
     def factory_skill_evaluation(self, job_id: UUID) -> StoredSkillEvaluation | None:
         return self.evaluations.get(job_id)
+
+    def record_factory_release_decision(
+        self,
+        submission: FactoryReleaseDecisionSubmission,
+    ) -> SimpleNamespace:
+        job_id = submission.decision.job_id
+        evaluation = self.evaluations[job_id]
+        GatewayStore._assert_factory_release_decision(
+            self.jobs[job_id],
+            evaluation,
+            submission.e2e_evidence,
+            submission.decision,
+        )
+        self.release_decisions.setdefault(job_id, []).append(submission)
+        return SimpleNamespace(replayed=False)
+
+    def factory_release_decision(self, job_id: UUID):
+        submissions = self.release_decisions.get(job_id, ())
+        return None if not submissions else submissions[-1].decision
 
     def publish_factory_skill(self, publication: PublishedHermesSkill) -> SimpleNamespace:
         submission = self.submissions[publication.evaluation_id]
@@ -545,6 +583,18 @@ def _e2e_runs(job: AgentFactoryJob, normal_successes: int) -> tuple[E2ERunEviden
     return tuple(outcomes)
 
 
+def _release_submission(
+    bundle: _EvaluationBundle,
+    normal_successes: int,
+    evaluation: StoredSkillEvaluation,
+) -> FactoryReleaseDecisionSubmission:
+    evidence = _e2e_runs(bundle.job, normal_successes)
+    return FactoryReleaseDecisionSubmission(
+        decision=evaluate_factory_release(bundle.job, evidence, evaluation),
+        e2e_evidence=evidence,
+    )
+
+
 @pytest.mark.asyncio
 async def test_sealed_candidate_reaches_only_captain_owned_publication_and_promotion(
     tmp_path: Path,
@@ -579,13 +629,22 @@ async def test_sealed_candidate_reaches_only_captain_owned_publication_and_promo
         ("optional", "unresolved"),
     }
 
-    release = evaluate_factory_release(
-        bundle.job,
-        _e2e_runs(bundle.job, 3),
-        gateway_evaluation,
-    )
+    release_submission = _release_submission(bundle, 3, gateway_evaluation)
+    release = release_submission.decision
     assert release.status == "ready"
 
+    with pytest.raises(
+        FactoryLifecycleError,
+        match="missing accepted Factory release decision",
+    ):
+        coordinator.record(_promotion(bundle))
+
+    blocked_submission = _release_submission(bundle, 2, gateway_evaluation)
+    store.record_factory_release_decision(blocked_submission)
+    with pytest.raises(FactoryLifecycleError, match="release decision is blocked"):
+        coordinator.record(_promotion(bundle))
+
+    store.record_factory_release_decision(release_submission)
     with pytest.raises(
         FactoryRepositoryError,
         match="Captain-published skill",
@@ -771,11 +830,9 @@ async def test_real_mariadb_gateway_store_persists_the_captain_owned_chain(
         _record_evaluation_through_quality(coordinator, store, bundle)
         stored = store.factory_skill_evaluation(bundle.job.job_id)
         assert stored is not None
-        assert evaluate_factory_release(
-            bundle.job,
-            _e2e_runs(bundle.job, 3),
-            stored,
-        ).status == "ready"
+        release_submission = _release_submission(bundle, 3, stored)
+        assert release_submission.decision.status == "ready"
+        store.record_factory_release_decision(release_submission)
         store.publish_factory_skill(_publication(bundle))
         coordinator.record(_promotion(bundle))
 

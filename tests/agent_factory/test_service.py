@@ -8,20 +8,30 @@ from agenten.agent_factory.service import (
     InMemoryFactoryRepository,
 )
 from agenten.agent_factory.state_machine import FactoryActionKind, FactoryLifecycleError
-from tests.agent_factory.test_state_machine import block, job
 from agenten.agent_factory.contracts import FactoryPhase
-from tests.agent_factory.test_state_machine import accepted_evaluation
+from tests.agent_factory.test_state_machine import (
+    accepted_evaluation,
+    accepted_release_decision,
+    block,
+    job,
+)
 
 
 class EvaluationLookupRepository(InMemoryFactoryRepository):
-    def __init__(self, evaluation):
+    def __init__(self, evaluation, decision=None):
         super().__init__()
         self.evaluation = evaluation
+        self.decision = decision
         self.lookup_job_ids = []
+        self.decision_lookup_job_ids = []
 
     def evaluation_for_job(self, job_id):
         self.lookup_job_ids.append(job_id)
         return self.evaluation
+
+    def release_decision_for_job(self, job_id):
+        self.decision_lookup_job_ids.append(job_id)
+        return self.decision
 
 
 def test_repository_rebuilds_state_and_returns_next_captain_action() -> None:
@@ -68,7 +78,10 @@ def test_invalid_transition_is_never_persisted() -> None:
 def test_promotion_reads_accepted_evaluation_from_repository() -> None:
     factory_job = job()
     evaluation = accepted_evaluation()
-    repository = EvaluationLookupRepository(evaluation)
+    repository = EvaluationLookupRepository(
+        evaluation,
+        accepted_release_decision(evaluation),
+    )
     coordinator = FactoryCoordinator(repository)
     coordinator.register(factory_job)
     for phase, assertions in (
@@ -90,6 +103,7 @@ def test_promotion_reads_accepted_evaluation_from_repository() -> None:
     )
 
     assert repository.lookup_job_ids == [factory_job.job_id]
+    assert repository.decision_lookup_job_ids == [factory_job.job_id]
     assert coordinator.projection(factory_job.job_id).evaluation_id == evaluation.evidence.evidence_id
 
 
