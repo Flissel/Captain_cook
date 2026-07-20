@@ -15,6 +15,7 @@ from agenten.agent_factory.contracts import (
 )
 from agenten.agent_factory.live_demo_runtime_chain import (
     LiveDemoRuntimeChain,
+    LiveDemoRuntimeChainError,
     LiveDemoRuntimeRelease,
 )
 from agenten.agent_factory.orchestration import FactoryDispatch
@@ -112,3 +113,19 @@ async def test_one_shot_chain_routes_hermes_evidence_through_real_autogen_runtim
     assert result.runtime_result.status is RuntimeStatus.SUCCEEDED
     assert runtime.commands == [result.command]
     assert result.autogen_delivery_count == 1
+
+
+class FailedHermes(HermesWorker):
+    async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
+        evidence = await super().dispatch(request)
+        return evidence.model_copy(update={"status": FactoryBlockStatus.FAILED})
+
+
+@pytest.mark.asyncio
+async def test_failed_hermes_evidence_never_reaches_autogen_or_codex() -> None:
+    runtime = GatewayBackedRuntime()
+    with pytest.raises(LiveDemoRuntimeChainError, match="successful Hermes evidence"):
+        await LiveDemoRuntimeChain(
+            hermes=FailedHermes(), runtime_service=runtime, clock=lambda: NOW
+        ).run(_release())
+    assert runtime.commands == []

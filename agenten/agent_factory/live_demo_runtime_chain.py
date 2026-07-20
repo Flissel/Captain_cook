@@ -7,7 +7,11 @@ from datetime import datetime
 from typing import Callable
 from uuid import UUID
 
-from agenten.agent_factory.contracts import FactoryEvidenceBlock, FactoryRole
+from agenten.agent_factory.contracts import (
+    FactoryBlockStatus,
+    FactoryEvidenceBlock,
+    FactoryRole,
+)
 from agenten.agent_factory.leases import validate_factory_lease
 from agenten.agent_factory.orchestration import FactoryDispatch, HermesFactoryPort
 from agenten.agent_factory.state_machine import FactoryActionKind
@@ -94,6 +98,8 @@ class LiveDemoRuntimeChain:
             or evidence.role is not FactoryRole.TOOL_INTEGRATOR
         ):
             raise LiveDemoRuntimeChainError("Hermes evidence is not bound to the released job and lease")
+        if evidence.status is not FactoryBlockStatus.SUCCEEDED:
+            raise LiveDemoRuntimeChainError("live demo requires successful Hermes evidence")
         result, delivery_count = await self._relay.deliver(
             LiveDemoRuntimeMessage(
                 correlation_id=command.correlation_id,
