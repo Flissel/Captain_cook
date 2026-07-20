@@ -43,6 +43,7 @@ def test_gateway_ci_uses_a_real_mariadb_service_without_skips() -> None:
     assert "tests/gateway/test_gateway.py" in commands
     assert "minibook/tests" in commands
     assert "minibook/requirements.txt" in commands
+    assert "pytest-asyncio" in commands
     assert "--no-cov" in commands
     assert "tests/test_architecture_fitness.py" in commands
     assert "tests/live" not in commands
@@ -67,6 +68,7 @@ def test_windows_ci_covers_the_full_deterministic_runtime() -> None:
 
     commands = "\n".join(str(step.get("run", "")) for step in steps if isinstance(step, dict))
     assert "minibook/requirements.txt" in commands
+    assert "pytest-asyncio" in commands
     assert '-m "not live" --ignore=tests/live' in commands
 
 
