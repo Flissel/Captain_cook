@@ -58,3 +58,11 @@ def test_normalize_writes_safe_defaults_and_aliases_without_secret_output(tmp_pa
 def test_requirements_dev_installs_minibook_test_dependencies() -> None:
     requirements = (ROOT / "requirements-dev.txt").read_text(encoding="utf-8")
     assert "-r minibook/requirements.txt" in requirements
+
+
+def test_readme_documents_safe_recording_commands() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "scripts/demo-preflight.ps1 -NormalizeOnly" in readme
+    assert "scripts/run-live-demo.ps1" in readme
+    assert "scripts/run-live-demo.ps1 -LiveProviders" in readme
+    assert "captain_test" in readme

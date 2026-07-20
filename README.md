@@ -217,6 +217,30 @@ The first command runs the engineering regression suite. The second verifies tha
 
 ## Local delivery services
 
+### Full-Mermaid recording preflight
+
+Prepare a gitignored `.env` and normalize only non-secret compatibility values
+(including Mailpit `18025` and the legacy `N8N_API_KEY` alias):
+
+```powershell
+pwsh -NoProfile -File scripts/demo-preflight.ps1 -NormalizeOnly
+```
+
+The recording runner checks Captain-n8n REST/MCP, MariaDB `captain_test`,
+Mailpit, Minibook, and Gateway and fails closed if any prerequisite is absent.
+It does not start, stop, reset, or adopt Docker services or volumes:
+
+```powershell
+pwsh -NoProfile -File scripts/run-live-demo.ps1
+```
+
+Provider-backed Gate E runs only with explicit opt-in and all documented local
+secrets in `.env`. Output contains status identities but never secret values:
+
+```powershell
+pwsh -NoProfile -File scripts/run-live-demo.ps1 -LiveProviders
+```
+
 Captain Cook reuses the existing VibeMind n8n instance and owns only Mailpit
 and MariaDB. This keeps VibeMind's workflows, credentials, encryption key, and
 `voice_vibemind-n8n-data` volume under the VibeMind project's control.
