@@ -22,7 +22,8 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrant,
     CapabilityGrantRevocation,
 )
-from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease
+from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease, FactoryPhase
+from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from gateway.auth import (
     GatewayRole,
     load_gateway_settings,
@@ -42,6 +43,9 @@ from gateway.contracts import (
     RuntimeWriteReceipt,
     FactoryJobProjection,
     FactoryWriteReceipt,
+    FactorySkillEvaluationSubmission,
+    FactorySkillWriteReceipt,
+    PublishedHermesSkill,
 )
 from gateway.mirror import MirrorQueue
 from gateway.registry_feed import mirror_captain_projection
@@ -91,6 +95,29 @@ class ReleaseDecisionRequest(BaseModel):
 CAPTAIN_WRITE_BLOCK_TYPES = frozenset(
     {"problem", "work_batch", "holdout", "recovery_decision", "review_decision"}
 )
+CAPTAIN_FACTORY_PHASES = frozenset(
+    {
+        FactoryPhase.FORGE_REQUESTED,
+        FactoryPhase.IMPROVEMENT_REQUESTED,
+        FactoryPhase.CAPABILITY_PROMOTED,
+        FactoryPhase.ESCALATED,
+    }
+)
+CAPTAIN_SKILL_EVENT_TYPES = frozenset(
+    {
+        "hermes_skill_evaluation_requested",
+        "hermes_skill_published",
+        "hermes_ready_to_use_validated",
+    }
+)
+HERMES_SKILL_EVENT_TYPES = frozenset(
+    {
+        "hermes_skill_candidate_built",
+        "hermes_skill_test_recorded",
+        "hermes_tool_gap_recorded",
+        "hermes_skill_evaluation_submitted",
+    }
+)
 
 
 def require_block_writer(block_type: str, actor: GatewayRole) -> None:
@@ -100,6 +127,37 @@ def require_block_writer(block_type: str, actor: GatewayRole) -> None:
         else GatewayRole.WORKER
     )
     if actor is not expected:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="insufficient gateway role",
+        )
+
+
+def require_factory_block_writer(evidence: FactoryEvidenceBlock, actor: GatewayRole) -> None:
+    expected = (
+        GatewayRole.CAPTAIN
+        if evidence.phase in CAPTAIN_FACTORY_PHASES
+        else GatewayRole.WORKER
+    )
+    if actor is not expected:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="insufficient gateway role",
+        )
+
+
+def require_skill_event_writer(event: DeliveryEventEnvelope, actor: GatewayRole) -> None:
+    expected: GatewayRole | None = None
+    expected_payload_actor: str | None = None
+    if event.event_type in CAPTAIN_SKILL_EVENT_TYPES:
+        expected = GatewayRole.CAPTAIN
+        expected_payload_actor = "captain"
+    elif event.event_type in HERMES_SKILL_EVENT_TYPES:
+        expected = GatewayRole.WORKER
+        expected_payload_actor = "hermes"
+    if expected is not None and (
+        actor is not expected or event.actor != expected_payload_actor
+    ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="insufficient gateway role",
@@ -224,8 +282,9 @@ def create_app(
     async def record_factory_block(
         evidence: FactoryEvidenceBlock,
         response: Response,
-        _: GatewayRole = Depends(require_actor),
+        actor: GatewayRole = Depends(require_actor),
     ) -> FactoryWriteReceipt:
+        require_factory_block_writer(evidence, actor)
         receipt = get_store().record_factory_block(evidence)
         if receipt.replayed:
             response.status_code = status.HTTP_200_OK
@@ -242,6 +301,49 @@ def create_app(
                     "subject_version": evidence.subject_version,
                 }
             )
+        return receipt
+
+    @app.post("/v1/factory/skills/releases", status_code=status.HTTP_201_CREATED)
+    async def record_released_factory_skill(
+        skill: ReleasedHermesSkill,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> FactorySkillWriteReceipt:
+        receipt = get_store().record_released_factory_skill(skill)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
+
+    @app.post("/v1/factory/evaluations", status_code=status.HTTP_201_CREATED)
+    async def record_factory_skill_evaluation(
+        submission: FactorySkillEvaluationSubmission,
+        response: Response,
+        _: GatewayRole = Depends(require_worker),
+    ) -> FactorySkillWriteReceipt:
+        receipt = get_store().record_factory_skill_evaluation(submission)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
+
+    @app.get("/v1/factory/evaluations/{job_id}")
+    async def get_factory_skill_evaluation(
+        job_id: UUID,
+        _: GatewayRole = Depends(require_reader),
+    ) -> Any:
+        evaluation = get_store().factory_skill_evaluation(job_id)
+        if evaluation is None:
+            raise HTTPException(status_code=404, detail="factory skill evaluation not found")
+        return evaluation
+
+    @app.post("/v1/factory/skills/publications", status_code=status.HTTP_201_CREATED)
+    async def publish_factory_skill(
+        publication: PublishedHermesSkill,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> FactorySkillWriteReceipt:
+        receipt = get_store().publish_factory_skill(publication)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
         return receipt
 
     @app.post("/v1/factory/leases", status_code=status.HTTP_201_CREATED)
@@ -371,9 +473,13 @@ def create_app(
         response: Response,
         actor: GatewayRole = Depends(require_actor),
     ) -> AppendResult:
+        require_skill_event_writer(event, actor)
         result = get_store().append_delivery_event(
             event,
-            require_current_claim=actor is GatewayRole.WORKER,
+            require_current_claim=(
+                actor is GatewayRole.WORKER
+                and event.event_type not in HERMES_SKILL_EVENT_TYPES
+            ),
         )
         response.status_code = status.HTTP_200_OK if result.replayed else status.HTTP_201_CREATED
         return result

@@ -22,8 +22,14 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrant,
     CapabilityGrantRevocation,
 )
-from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease, FactoryRole
+from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease, FactoryPhase, FactoryRole
 from agenten.agent_factory.leases import FactoryLeaseDenied, validate_factory_lease
+from agenten.agent_factory.skill_evaluation import (
+    HermesSkillEvaluationEvidence,
+    ReleasedHermesSkill,
+    required_tool_gaps,
+)
+from agenten.agent_factory.skill_store import StoredSkillEvaluation
 from agenten.agent_factory.state_machine import FactoryActionKind, FactoryLifecycleError, FactoryProjection, apply_block, next_action
 from blockchain.Blockchain_modell import Block
 from blockchain.mariadb_storage import MariaDBStorage
@@ -45,6 +51,9 @@ from gateway.contracts import (
     RuntimeWriteReceipt,
     FactoryJobProjection,
     FactoryWriteReceipt,
+    FactorySkillEvaluationSubmission,
+    FactorySkillWriteReceipt,
+    PublishedHermesSkill,
     ReviewDecisionEvent,
     project_batch,
     project_release,
@@ -148,6 +157,74 @@ class GatewayStore:
                         created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
                         FULLTEXT INDEX idx_capability_descriptor (descriptor),
                         CONSTRAINT fk_capability_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS factory_released_skills (
+                        skill_id VARCHAR(128) NOT NULL,
+                        version INT NOT NULL,
+                        content_sha256 CHAR(64) NOT NULL,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        PRIMARY KEY (skill_id, version),
+                        CONSTRAINT fk_factory_released_skill_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS factory_skill_evaluations (
+                        evidence_id CHAR(36) NOT NULL PRIMARY KEY,
+                        request_id CHAR(36) NOT NULL UNIQUE,
+                        job_id CHAR(36) NOT NULL UNIQUE,
+                        lease_id VARCHAR(128) NOT NULL,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        CONSTRAINT fk_factory_skill_evaluation_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS factory_skill_candidates (
+                        candidate_id VARCHAR(128) NOT NULL PRIMARY KEY,
+                        evidence_id CHAR(36) NOT NULL UNIQUE,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        CONSTRAINT fk_factory_skill_candidate_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS factory_skill_tool_gaps (
+                        evidence_id CHAR(36) NOT NULL,
+                        gap_id VARCHAR(128) NOT NULL,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        PRIMARY KEY (evidence_id, gap_id),
+                        CONSTRAINT fk_factory_skill_gap_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS factory_published_skills (
+                        skill_id VARCHAR(128) NOT NULL,
+                        version INT NOT NULL,
+                        evaluation_id CHAR(36) NOT NULL UNIQUE,
+                        candidate_id VARCHAR(128) NOT NULL,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        PRIMARY KEY (skill_id, version),
+                        CONSTRAINT fk_factory_published_skill_block
                             FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
                     ) ENGINE=InnoDB
                     """
@@ -648,6 +725,293 @@ class GatewayStore:
                 self._insert(cursor, block)
         return FactoryWriteReceipt(event_id=job.event_id, replayed=False)
 
+    def record_released_factory_skill(
+        self,
+        skill: ReleasedHermesSkill,
+    ) -> FactorySkillWriteReceipt:
+        canonical = skill.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT payload FROM factory_released_skills WHERE skill_id = %s AND version = %s FOR UPDATE",
+                    (skill.skill_id, skill.version),
+                )
+                row = cursor.fetchone()
+                if row is not None:
+                    if self._decode_json(row["payload"]) == canonical:
+                        return FactorySkillWriteReceipt(
+                            record_id=f"{skill.skill_id}:{skill.version}", replayed=True
+                        )
+                    raise HTTPException(
+                        status_code=409,
+                        detail="released skill already exists with different content",
+                    )
+                index = self._next_index(cursor)
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="factory_released_skill",
+                    data=canonical,
+                    status="released",
+                    parent_index=None,
+                    metadata={"schema": "captain.released-hermes-skill.v1"},
+                )
+                self._insert(cursor, block)
+                cursor.execute(
+                    """INSERT INTO factory_released_skills
+                       (skill_id, version, content_sha256, block_index, payload)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (
+                        skill.skill_id,
+                        skill.version,
+                        skill.content_sha256,
+                        index,
+                        json.dumps(canonical, sort_keys=True),
+                    ),
+                )
+        return FactorySkillWriteReceipt(
+            record_id=f"{skill.skill_id}:{skill.version}", replayed=False
+        )
+
+    def record_factory_skill_evaluation(
+        self,
+        submission: FactorySkillEvaluationSubmission,
+    ) -> FactorySkillWriteReceipt:
+        evidence = submission.evidence
+        canonical = submission.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                existing = self._factory_skill_evaluation_row(
+                    cursor, evidence.evidence_id, for_update=True
+                )
+                if existing is not None:
+                    if self._decode_json(existing["payload"]) == canonical:
+                        return FactorySkillWriteReceipt(
+                            record_id=str(evidence.evidence_id), replayed=True
+                        )
+                    raise HTTPException(
+                        status_code=409,
+                        detail="factory skill evaluation already exists with different content",
+                    )
+                cursor.execute(
+                    """SELECT payload FROM factory_skill_evaluations
+                       WHERE job_id = %s OR request_id = %s FOR UPDATE""",
+                    (str(evidence.job_id), str(evidence.request_id)),
+                )
+                if cursor.fetchone() is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="factory job or request already has a different skill evaluation",
+                    )
+                job_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_job",
+                    field="job_id",
+                    value=str(evidence.job_id),
+                    for_update=True,
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job not found")
+                job = AgentFactoryJob.model_validate(job_block["data"])
+                self._assert_factory_evaluation_job(evidence, job)
+                lease_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_lease",
+                    field="lease_id",
+                    value=evidence.request.lease.lease_id,
+                    for_update=True,
+                )
+                if lease_block is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="missing matching active factory lease for skill evaluation",
+                    )
+                lease = FactoryLease.model_validate(lease_block["data"])
+                if lease != evidence.request.lease:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="skill evaluation lease differs from Captain ledger lease",
+                    )
+                try:
+                    validate_factory_lease(
+                        lease,
+                        job=job,
+                        role=FactoryRole.TOOL_INTEGRATOR,
+                        attempt=lease.attempt,
+                        now=evidence.occurred_at,
+                    )
+                except FactoryLeaseDenied as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                self._assert_released_skill(cursor, evidence.request.released_skill)
+                self._assert_evaluation_references(submission)
+
+                evaluation_index = self._next_index(cursor)
+                evaluation_block = self._new_block(
+                    cursor,
+                    index=evaluation_index,
+                    block_type="factory_skill_evaluation",
+                    data=canonical,
+                    status=evidence.outcome,
+                    parent_index=job_block["index"],
+                    metadata={"schema": "captain.factory-skill-evaluation-submission.v1"},
+                )
+                self._insert(cursor, evaluation_block)
+                cursor.execute(
+                    """INSERT INTO factory_skill_evaluations
+                       (evidence_id, request_id, job_id, lease_id, block_index, payload)
+                       VALUES (%s, %s, %s, %s, %s, %s)""",
+                    (
+                        str(evidence.evidence_id),
+                        str(evidence.request_id),
+                        str(evidence.job_id),
+                        evidence.request.lease.lease_id,
+                        evaluation_index,
+                        json.dumps(canonical, sort_keys=True),
+                    ),
+                )
+                if evidence.candidate is not None:
+                    candidate = evidence.candidate
+                    candidate_index = self._next_index(cursor)
+                    candidate_payload = candidate.model_dump(mode="json", by_alias=True)
+                    candidate_block = self._new_block(
+                        cursor,
+                        index=candidate_index,
+                        block_type="factory_skill_candidate",
+                        data=candidate_payload,
+                        status="private_candidate",
+                        parent_index=evaluation_index,
+                        metadata={"schema": "hermes.skill-candidate.v1"},
+                    )
+                    self._insert(cursor, candidate_block)
+                    cursor.execute(
+                        """INSERT INTO factory_skill_candidates
+                           (candidate_id, evidence_id, block_index, payload)
+                           VALUES (%s, %s, %s, %s)""",
+                        (
+                            candidate.candidate_id,
+                            str(evidence.evidence_id),
+                            candidate_index,
+                            json.dumps(candidate_payload, sort_keys=True),
+                        ),
+                    )
+                for marker in evidence.tool_gaps:
+                    gap_index = self._next_index(cursor)
+                    gap_payload = marker.model_dump(mode="json", by_alias=True)
+                    gap_block = self._new_block(
+                        cursor,
+                        index=gap_index,
+                        block_type="factory_skill_tool_gap",
+                        data=gap_payload,
+                        status=marker.status,
+                        parent_index=evaluation_index,
+                        metadata={"schema": "TODO_TOOL.v1"},
+                    )
+                    self._insert(cursor, gap_block)
+                    cursor.execute(
+                        """INSERT INTO factory_skill_tool_gaps
+                           (evidence_id, gap_id, block_index, payload)
+                           VALUES (%s, %s, %s, %s)""",
+                        (
+                            str(evidence.evidence_id),
+                            marker.gap_id,
+                            gap_index,
+                            json.dumps(gap_payload, sort_keys=True),
+                        ),
+                    )
+        return FactorySkillWriteReceipt(
+            record_id=str(evidence.evidence_id), replayed=False
+        )
+
+    def factory_skill_evaluation(self, job_id: UUID) -> StoredSkillEvaluation | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT payload FROM factory_skill_evaluations WHERE job_id = %s",
+                    (str(job_id),),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                submission = FactorySkillEvaluationSubmission.model_validate(
+                    self._decode_json(row["payload"])
+                )
+        return self._stored_factory_evaluation(submission)
+
+    def publish_factory_skill(
+        self,
+        publication: PublishedHermesSkill,
+    ) -> FactorySkillWriteReceipt:
+        canonical = publication.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT payload FROM factory_published_skills WHERE skill_id = %s AND version = %s FOR UPDATE",
+                    (publication.skill_id, publication.version),
+                )
+                row = cursor.fetchone()
+                if row is not None:
+                    if self._decode_json(row["payload"]) == canonical:
+                        return FactorySkillWriteReceipt(
+                            record_id=f"{publication.skill_id}:{publication.version}",
+                            replayed=True,
+                        )
+                    raise HTTPException(
+                        status_code=409,
+                        detail="published skill already exists with different content",
+                    )
+                evaluation_row = self._factory_skill_evaluation_row(
+                    cursor, publication.evaluation_id, for_update=True
+                )
+                if evaluation_row is None:
+                    raise HTTPException(status_code=409, detail="skill evaluation not found")
+                submission = FactorySkillEvaluationSubmission.model_validate(
+                    self._decode_json(evaluation_row["payload"])
+                )
+                evidence = submission.evidence
+                candidate = evidence.candidate
+                if (
+                    evidence.outcome != "passed"
+                    or candidate is None
+                    or required_tool_gaps(evidence)
+                    or publication.candidate_id != candidate.candidate_id
+                    or publication.content_ref != candidate.content_ref
+                    or publication.content_sha256 != candidate.content_sha256
+                    or publication.skill_id != evidence.request.released_skill.skill_id
+                    or publication.version != evidence.request.released_skill.version + 1
+                    or publication.published_at <= evidence.occurred_at
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="publication does not match an accepted private skill candidate",
+                    )
+                index = self._next_index(cursor)
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="factory_published_skill",
+                    data=canonical,
+                    status="published",
+                    parent_index=evaluation_row["block_index"],
+                    metadata={"schema": "captain.published-hermes-skill.v1"},
+                )
+                self._insert(cursor, block)
+                cursor.execute(
+                    """INSERT INTO factory_published_skills
+                       (skill_id, version, evaluation_id, candidate_id, block_index, payload)
+                       VALUES (%s, %s, %s, %s, %s, %s)""",
+                    (
+                        publication.skill_id,
+                        publication.version,
+                        str(publication.evaluation_id),
+                        publication.candidate_id,
+                        index,
+                        json.dumps(canonical, sort_keys=True),
+                    ),
+                )
+        return FactorySkillWriteReceipt(
+            record_id=f"{publication.skill_id}:{publication.version}", replayed=False
+        )
+
     def record_factory_block(self, evidence: FactoryEvidenceBlock) -> FactoryWriteReceipt:
         canonical = evidence.model_dump(mode="json", by_alias=True)
         with self.storage.transaction() as connection:
@@ -684,8 +1048,22 @@ class GatewayStore:
                     )
                     if lease_block is not None:
                         lease = FactoryLease.model_validate(lease_block["data"])
+                evaluation = None
+                if evidence.phase is FactoryPhase.CAPABILITY_PROMOTED:
+                    evaluation = self._factory_skill_evaluation_for_job(cursor, evidence.job_id)
+                    if evaluation is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="missing accepted Hermes skill evaluation evidence",
+                        )
+                    self._assert_evaluation_is_published(cursor, evaluation)
+                    if evaluation.evidence_ref not in evidence.evidence_refs:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="capability promotion must reference its accepted skill evaluation",
+                        )
                 try:
-                    apply_block(projection, evidence)
+                    apply_block(projection, evidence, evaluation=evaluation)
                 except FactoryLifecycleError as exc:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
                 self._assert_evidence_lease(evidence, lease)
@@ -715,7 +1093,12 @@ class GatewayStore:
                 leases = self._factory_leases(cursor, job_id)
                 projection = FactoryProjection.from_job(job)
                 for evidence in blocks:
-                    projection = apply_block(projection, evidence)
+                    evaluation = (
+                        self._factory_skill_evaluation_for_job(cursor, job_id)
+                        if evidence.phase is FactoryPhase.CAPABILITY_PROMOTED
+                        else None
+                    )
+                    projection = apply_block(projection, evidence, evaluation=evaluation)
         return FactoryJobProjection(job=job, blocks=blocks, leases=leases, projection=projection)
 
     def record_factory_lease(self, lease: FactoryLease) -> FactoryWriteReceipt:
@@ -753,7 +1136,12 @@ class GatewayStore:
     def _factory_projection(self, cursor: Any, job: AgentFactoryJob) -> FactoryProjection:
         projection = FactoryProjection.from_job(job)
         for evidence in self._factory_blocks(cursor, job.job_id, for_update=True):
-            projection = apply_block(projection, evidence)
+            evaluation = (
+                self._factory_skill_evaluation_for_job(cursor, job.job_id)
+                if evidence.phase is FactoryPhase.CAPABILITY_PROMOTED
+                else None
+            )
+            projection = apply_block(projection, evidence, evaluation=evaluation)
         return projection
 
     def _factory_blocks(
@@ -785,6 +1173,140 @@ class GatewayStore:
             FactoryLease.model_validate(self.storage._decode_row(row)["data"])
             for row in cursor.fetchall()
         )
+
+    @staticmethod
+    def _decode_json(value: Any) -> Any:
+        return json.loads(value) if isinstance(value, (str, bytes, bytearray)) else value
+
+    @staticmethod
+    def _stored_factory_evaluation(
+        submission: FactorySkillEvaluationSubmission,
+    ) -> StoredSkillEvaluation:
+        evidence = submission.evidence
+        gap_refs = tuple(
+            (reference.gap_id, reference.evidence_ref)
+            for reference in submission.tool_gap_refs
+        )
+        return StoredSkillEvaluation(
+            evidence=evidence,
+            evidence_ref=submission.evidence_ref,
+            receipt_ref=submission.receipt_ref,
+            tool_gaps=evidence.tool_gaps,
+            tool_gap_refs=gap_refs,
+            candidate_ref=submission.candidate_ref,
+        )
+
+    def _factory_skill_evaluation_row(
+        self,
+        cursor: Any,
+        evidence_id: UUID,
+        *,
+        for_update: bool,
+    ) -> dict[str, Any] | None:
+        sql = "SELECT evidence_id, job_id, block_index, payload FROM factory_skill_evaluations WHERE evidence_id = %s"
+        if for_update:
+            sql += " FOR UPDATE"
+        cursor.execute(sql, (str(evidence_id),))
+        return cursor.fetchone()
+
+    def _factory_skill_evaluation_for_job(
+        self,
+        cursor: Any,
+        job_id: UUID,
+    ) -> StoredSkillEvaluation | None:
+        cursor.execute(
+            "SELECT payload FROM factory_skill_evaluations WHERE job_id = %s",
+            (str(job_id),),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        submission = FactorySkillEvaluationSubmission.model_validate(
+            self._decode_json(row["payload"])
+        )
+        return self._stored_factory_evaluation(submission)
+
+    @staticmethod
+    def _assert_factory_evaluation_job(
+        evidence: HermesSkillEvaluationEvidence,
+        job: AgentFactoryJob,
+    ) -> None:
+        request = evidence.request
+        if (
+            evidence.job_id != job.job_id
+            or evidence.correlation_id != job.correlation_id
+            or evidence.subject_version != job.subject_version
+            or request.job_id != job.job_id
+            or request.correlation_id != job.correlation_id
+            or request.subject_version != job.subject_version
+            or request.subject_id != job.required_capability
+            or request.candidate_source_ref != job.input_ref
+            or request.acceptance_assertion_ids != job.acceptance_assertion_ids
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="skill evaluation does not match its Captain factory job",
+            )
+
+    def _assert_released_skill(self, cursor: Any, skill: ReleasedHermesSkill) -> None:
+        cursor.execute(
+            "SELECT payload FROM factory_released_skills WHERE skill_id = %s AND version = %s",
+            (skill.skill_id, skill.version),
+        )
+        row = cursor.fetchone()
+        if row is None or self._decode_json(row["payload"]) != skill.model_dump(
+            mode="json", by_alias=True
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="skill evaluation references an unknown released skill",
+            )
+
+    @staticmethod
+    def _assert_evaluation_references(
+        submission: FactorySkillEvaluationSubmission,
+    ) -> None:
+        evidence = submission.evidence
+        if evidence.candidate is None:
+            if submission.candidate_ref is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="skill evaluation contains an unknown candidate reference",
+                )
+        elif submission.candidate_ref != evidence.candidate.content_ref:
+            raise HTTPException(
+                status_code=409,
+                detail="skill evaluation contains an unknown candidate reference",
+            )
+        expected_gaps = {
+            marker.gap_id: marker.evidence_ref for marker in evidence.tool_gaps
+        }
+        supplied_gaps = {
+            reference.gap_id: reference.evidence_ref
+            for reference in submission.tool_gap_refs
+        }
+        if supplied_gaps != expected_gaps or len(supplied_gaps) != len(
+            submission.tool_gap_refs
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="skill evaluation contains unknown tool-gap evidence references",
+            )
+
+    @staticmethod
+    def _assert_evaluation_is_published(
+        cursor: Any,
+        evaluation: StoredSkillEvaluation,
+    ) -> None:
+        cursor.execute(
+            "SELECT payload FROM factory_published_skills WHERE evaluation_id = %s",
+            (str(evaluation.evidence.evidence_id),),
+        )
+        if cursor.fetchone() is None:
+            raise HTTPException(
+                status_code=409,
+                detail="capability promotion requires a Captain-published skill",
+            )
 
     @staticmethod
     def _assert_lease_is_next_action(lease: FactoryLease, projection: FactoryProjection) -> None:

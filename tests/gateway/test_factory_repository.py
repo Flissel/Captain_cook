@@ -5,13 +5,14 @@ from agenten.agent_factory.contracts import FactoryRole
 from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.service import FactoryCoordinator
 from gateway.factory_repository import GatewayFactoryLeases, GatewayFactoryRepository
-from tests.agent_factory.test_state_machine import block, job
+from tests.agent_factory.test_state_machine import accepted_evaluation, block, job
 
 
 class Store:
     def __init__(self) -> None:
         self.jobs = {}
         self.events = {}
+        self.evaluations = {}
 
     def record_factory_job(self, factory_job):
         self.jobs.setdefault(factory_job.job_id, factory_job)
@@ -23,6 +24,9 @@ class Store:
 
     def factory_job(self, job_id):
         return type("Projection", (), {"job": self.jobs[job_id], "blocks": tuple(self.events.get(job_id, ()))})()
+
+    def factory_skill_evaluation(self, job_id):
+        return self.evaluations.get(job_id)
 
 
 def test_gateway_adapter_runs_coordinator_against_gateway_store_shape() -> None:
@@ -56,3 +60,13 @@ def test_gateway_leases_resolve_only_the_current_role_attempt() -> None:
     )
 
     assert resolved.lease_id == lease.lease_id
+
+
+def test_gateway_adapter_reads_the_gateway_owned_skill_evaluation() -> None:
+    store = Store()
+    factory_job = job()
+    evaluation = accepted_evaluation()
+    store.jobs[factory_job.job_id] = factory_job
+    store.evaluations[factory_job.job_id] = evaluation
+
+    assert GatewayFactoryRepository(store).evaluation_for_job(factory_job.job_id) == evaluation

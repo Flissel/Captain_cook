@@ -21,6 +21,22 @@ TRACE = {
     "trace_id": "trace-1",
 }
 
+FACTORY_TRACE = {
+    "job_id": "00000000-0000-0000-0000-000000000003",
+    "correlation_id": "00000000-0000-0000-0000-000000000002",
+    "subject_version": 1,
+    "request_id": "00000000-0000-0000-0000-000000000103",
+    "lease_id": "factory-lease-skill-evaluation",
+}
+
+
+def artifact(name: str, digest: str = "a" * 64) -> dict[str, str]:
+    return {
+        "uri": f"artifact://skill-evaluation/{name}",
+        "sha256": digest,
+        "media_type": "application/json",
+    }
+
 
 EVENT_CASES = (
     (
@@ -146,13 +162,111 @@ EVENT_CASES = (
         },
         "capability_id",
     ),
+    (
+        "hermes_skill_evaluation_requested",
+        {**FACTORY_TRACE, "skill_id": "factory_skill_evaluator", "skill_version": 1},
+        {
+            "request_id": FACTORY_TRACE["request_id"],
+            "released_skill_id": "factory_skill_evaluator",
+            "released_skill_version": 1,
+            "request_ref": artifact("request"),
+        },
+        "released_skill_id",
+    ),
+    (
+        "hermes_skill_candidate_built",
+        {**FACTORY_TRACE, "candidate_id": "factory_skill_evaluator_candidate"},
+        {
+            "candidate_id": "factory_skill_evaluator_candidate",
+            "content_ref": artifact("candidate", "b" * 64),
+            "content_sha256": "b" * 64,
+        },
+        "candidate_id",
+    ),
+    (
+        "hermes_skill_test_recorded",
+        {
+            **FACTORY_TRACE,
+            "candidate_id": "factory_skill_evaluator_candidate",
+            "evaluation_id": "00000000-0000-0000-0000-000000000105",
+        },
+        {
+            "check_id": "real-case",
+            "kind": "test",
+            "status": "passed",
+            "evidence_ref": artifact("test-check"),
+        },
+        "check_id",
+    ),
+    (
+        "hermes_tool_gap_recorded",
+        {
+            **FACTORY_TRACE,
+            "evaluation_id": "00000000-0000-0000-0000-000000000105",
+        },
+        {
+            "gap_id": "missing-diagnostic-tool",
+            "severity": "optional",
+            "status": "unresolved",
+            "evidence_ref": artifact("tool-gap-evidence"),
+        },
+        "gap_id",
+    ),
+    (
+        "hermes_skill_evaluation_submitted",
+        {
+            **FACTORY_TRACE,
+            "candidate_id": "factory_skill_evaluator_candidate",
+            "evaluation_id": "00000000-0000-0000-0000-000000000105",
+        },
+        {
+            "evaluation_id": "00000000-0000-0000-0000-000000000105",
+            "outcome": "passed",
+            "evidence_ref": artifact("evaluation"),
+        },
+        "outcome",
+    ),
+    (
+        "hermes_skill_published",
+        {
+            **FACTORY_TRACE,
+            "candidate_id": "factory_skill_evaluator_candidate",
+            "evaluation_id": "00000000-0000-0000-0000-000000000105",
+            "skill_id": "factory_skill_evaluator",
+            "skill_version": 2,
+        },
+        {
+            "skill_id": "factory_skill_evaluator",
+            "version": 2,
+            "evaluation_id": "00000000-0000-0000-0000-000000000105",
+            "content_ref": artifact("candidate", "b" * 64),
+            "content_sha256": "b" * 64,
+        },
+        "skill_id",
+    ),
+    (
+        "hermes_ready_to_use_validated",
+        {
+            **FACTORY_TRACE,
+            "evaluation_id": "00000000-0000-0000-0000-000000000105",
+            "skill_id": "factory_skill_evaluator",
+            "skill_version": 2,
+        },
+        {
+            "capability_id": "support_triage",
+            "capability_version": 1,
+            "evaluation_id": "00000000-0000-0000-0000-000000000105",
+            "promotion_event_id": "00000000-0000-0000-0000-000000000106",
+        },
+        "capability_id",
+    ),
 )
 
 
 @pytest.mark.parametrize(("event_type", "trace_fields", "payload", "identifier"), EVENT_CASES)
 def test_delivery_event_envelope_accepts_each_discriminated_payload(
     event_type: str,
-    trace_fields: dict[str, str],
+    trace_fields: dict[str, object],
     payload: dict[str, object],
     identifier: str,
 ) -> None:
@@ -174,7 +288,7 @@ def test_delivery_event_envelope_accepts_each_discriminated_payload(
 @pytest.mark.parametrize(("event_type", "trace_fields", "payload", "identifier"), EVENT_CASES)
 def test_delivery_event_payload_requires_its_event_specific_identifier(
     event_type: str,
-    trace_fields: dict[str, str],
+    trace_fields: dict[str, object],
     payload: dict[str, object],
     identifier: str,
 ) -> None:
@@ -189,6 +303,31 @@ def test_delivery_event_payload_requires_its_event_specific_identifier(
                 "payload": {
                     "event_type": event_type,
                     **{key: value for key, value in payload.items() if key != identifier},
+                },
+            }
+        )
+
+
+def test_hermes_skill_event_requires_its_factory_trace_context() -> None:
+    with pytest.raises(ValidationError, match="lease_id"):
+        DeliveryEventEnvelope.model_validate(
+            {
+                "event_id": uuid4(),
+                "event_type": "hermes_skill_evaluation_requested",
+                "occurred_at": NOW,
+                "actor": "captain",
+                "trace": {
+                    **TRACE,
+                    **{key: value for key, value in FACTORY_TRACE.items() if key != "lease_id"},
+                    "skill_id": "factory_skill_evaluator",
+                    "skill_version": 1,
+                },
+                "payload": {
+                    "event_type": "hermes_skill_evaluation_requested",
+                    "request_id": FACTORY_TRACE["request_id"],
+                    "released_skill_id": "factory_skill_evaluator",
+                    "released_skill_version": 1,
+                    "request_ref": artifact("request"),
                 },
             }
         )

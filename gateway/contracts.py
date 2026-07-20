@@ -19,10 +19,14 @@ from pydantic import (
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
+    ArtifactRef,
     CapabilityGrant,
     CapabilityGrantRevocation,
 )
 from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease
+from agenten.agent_factory.skill_evaluation import (
+    HermesSkillEvaluationEvidence,
+)
 from agenten.agent_factory.state_machine import FactoryLifecycleStatus, FactoryProjection
 
 
@@ -42,6 +46,13 @@ DeliveryEventType: TypeAlias = Literal[
     "evaluation",
     "release_decision",
     "registry_mirror",
+    "hermes_skill_evaluation_requested",
+    "hermes_skill_candidate_built",
+    "hermes_skill_test_recorded",
+    "hermes_tool_gap_recorded",
+    "hermes_skill_evaluation_submitted",
+    "hermes_skill_published",
+    "hermes_ready_to_use_validated",
 ]
 ReleaseStatus: TypeAlias = Literal["blocked", "ready"]
 
@@ -68,6 +79,59 @@ class FactoryWriteReceipt(_FrozenContract):
     replayed: bool
 
 
+class FactorySkillWriteReceipt(_FrozenContract):
+    record_id: str = Field(min_length=1)
+    replayed: bool
+
+
+class FactoryToolGapReference(_FrozenContract):
+    gap_id: str = Field(min_length=1)
+    evidence_ref: ArtifactRef
+
+
+class FactorySkillEvaluationSubmission(_FrozenContract):
+    schema_name: Literal["captain.factory-skill-evaluation-submission.v1"] = Field(
+        default="captain.factory-skill-evaluation-submission.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    evidence: HermesSkillEvaluationEvidence
+    evidence_ref: ArtifactRef
+    receipt_ref: ArtifactRef
+    candidate_ref: ArtifactRef | None = None
+    tool_gap_refs: tuple[FactoryToolGapReference, ...] = ()
+
+
+class PublishedHermesSkill(_FrozenContract):
+    schema_name: Literal["captain.published-hermes-skill.v1"] = Field(
+        default="captain.published-hermes-skill.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    skill_id: str = Field(min_length=1)
+    version: int = Field(ge=1, strict=True)
+    candidate_id: str = Field(min_length=1)
+    evaluation_id: UUID
+    content_ref: ArtifactRef
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    published_at: datetime
+    producer: Literal["captain"]
+    status: Literal["published"]
+
+    @field_validator("published_at")
+    @classmethod
+    def require_utc_timestamp(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("published_at must be UTC")
+        return value.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def require_matching_content_digest(self) -> PublishedHermesSkill:
+        if self.content_sha256 != self.content_ref.sha256:
+            raise ValueError("published skill content digest must match content_ref")
+        return self
+
+
 class FactoryJobProjection(_FrozenContract):
     job: AgentFactoryJob
     blocks: tuple[FactoryEvidenceBlock, ...]
@@ -86,6 +150,15 @@ class TraceContext(_FrozenContract):
     artifact_id: str | None = Field(default=None, min_length=1)
     session_id: str | None = Field(default=None, min_length=1)
     case_id: str | None = Field(default=None, min_length=1)
+    job_id: UUID | None = None
+    correlation_id: UUID | None = None
+    subject_version: int | None = Field(default=None, ge=1, strict=True)
+    request_id: UUID | None = None
+    lease_id: str | None = Field(default=None, min_length=1)
+    candidate_id: str | None = Field(default=None, min_length=1)
+    evaluation_id: UUID | None = None
+    skill_id: str | None = Field(default=None, min_length=1)
+    skill_version: int | None = Field(default=None, ge=1, strict=True)
 
 
 class CodexTaskPayload(_FrozenContract):
@@ -373,6 +446,73 @@ class RegistryMirrorPayload(_FrozenContract):
     outcome: Literal["mirrored", "failed"]
 
 
+class HermesSkillEvaluationRequestedPayload(_FrozenContract):
+    event_type: Literal["hermes_skill_evaluation_requested"]
+    request_id: UUID
+    released_skill_id: str = Field(min_length=1)
+    released_skill_version: int = Field(ge=1, strict=True)
+    request_ref: ArtifactRef
+
+
+class HermesSkillCandidateBuiltPayload(_FrozenContract):
+    event_type: Literal["hermes_skill_candidate_built"]
+    candidate_id: str = Field(min_length=1)
+    content_ref: ArtifactRef
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def require_matching_content_digest(self) -> HermesSkillCandidateBuiltPayload:
+        if self.content_sha256 != self.content_ref.sha256:
+            raise ValueError("candidate content digest must match content_ref")
+        return self
+
+
+class HermesSkillTestRecordedPayload(_FrozenContract):
+    event_type: Literal["hermes_skill_test_recorded"]
+    check_id: str = Field(min_length=1)
+    kind: Literal["build", "test"]
+    status: Literal["passed", "failed", "skipped"]
+    evidence_ref: ArtifactRef
+
+
+class HermesToolGapRecordedPayload(_FrozenContract):
+    event_type: Literal["hermes_tool_gap_recorded"]
+    gap_id: str = Field(min_length=1)
+    severity: Literal["required", "optional"]
+    status: Literal["unresolved", "resolved"]
+    evidence_ref: ArtifactRef
+
+
+class HermesSkillEvaluationSubmittedPayload(_FrozenContract):
+    event_type: Literal["hermes_skill_evaluation_submitted"]
+    evaluation_id: UUID
+    outcome: Literal["passed", "redo", "blocked_tool_gap", "unresolved", "failed"]
+    evidence_ref: ArtifactRef
+
+
+class HermesSkillPublishedPayload(_FrozenContract):
+    event_type: Literal["hermes_skill_published"]
+    skill_id: str = Field(min_length=1)
+    version: int = Field(ge=1, strict=True)
+    evaluation_id: UUID
+    content_ref: ArtifactRef
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def require_matching_content_digest(self) -> HermesSkillPublishedPayload:
+        if self.content_sha256 != self.content_ref.sha256:
+            raise ValueError("published skill content digest must match content_ref")
+        return self
+
+
+class HermesReadyToUseValidatedPayload(_FrozenContract):
+    event_type: Literal["hermes_ready_to_use_validated"]
+    capability_id: str = Field(min_length=1)
+    capability_version: int = Field(ge=1, strict=True)
+    evaluation_id: UUID
+    promotion_event_id: UUID
+
+
 DeliveryEventPayload: TypeAlias = Annotated[
     CodexTaskPayload
     | CodexSessionPayload
@@ -388,7 +528,14 @@ DeliveryEventPayload: TypeAlias = Annotated[
     | E2ERunPayload
     | EvaluationPayload
     | ReleaseDecisionPayload
-    | RegistryMirrorPayload,
+    | RegistryMirrorPayload
+    | HermesSkillEvaluationRequestedPayload
+    | HermesSkillCandidateBuiltPayload
+    | HermesSkillTestRecordedPayload
+    | HermesToolGapRecordedPayload
+    | HermesSkillEvaluationSubmittedPayload
+    | HermesSkillPublishedPayload
+    | HermesReadyToUseValidatedPayload,
     Field(discriminator="event_type"),
 ]
 
@@ -422,6 +569,34 @@ class DeliveryEventEnvelope(_FrozenContract):
             "evaluation": ("batch_id", "case_id"),
             "release_decision": (),
             "registry_mirror": ("artifact_id",),
+            "hermes_skill_evaluation_requested": (
+                "job_id", "correlation_id", "subject_version", "request_id",
+                "lease_id", "skill_id", "skill_version",
+            ),
+            "hermes_skill_candidate_built": (
+                "job_id", "correlation_id", "subject_version", "request_id",
+                "lease_id", "candidate_id",
+            ),
+            "hermes_skill_test_recorded": (
+                "job_id", "correlation_id", "subject_version", "request_id",
+                "lease_id", "candidate_id", "evaluation_id",
+            ),
+            "hermes_tool_gap_recorded": (
+                "job_id", "correlation_id", "subject_version", "request_id",
+                "lease_id", "evaluation_id",
+            ),
+            "hermes_skill_evaluation_submitted": (
+                "job_id", "correlation_id", "subject_version", "request_id",
+                "lease_id", "evaluation_id",
+            ),
+            "hermes_skill_published": (
+                "job_id", "correlation_id", "subject_version", "request_id",
+                "lease_id", "candidate_id", "evaluation_id", "skill_id", "skill_version",
+            ),
+            "hermes_ready_to_use_validated": (
+                "job_id", "correlation_id", "subject_version", "request_id",
+                "lease_id", "evaluation_id", "skill_id", "skill_version",
+            ),
         }
         missing = [
             field_name
@@ -446,6 +621,29 @@ class DeliveryEventEnvelope(_FrozenContract):
             raise ValueError("trace artifact_id must match artifact_built payload")
         if isinstance(self.payload, ValidationRunPayload) and self.trace.case_id not in self.payload.case_ids:
             raise ValueError("trace case_id must appear in validation_run case_ids")
+        if isinstance(self.payload, HermesSkillEvaluationRequestedPayload):
+            if self.trace.request_id != self.payload.request_id:
+                raise ValueError("trace request_id must match skill evaluation request")
+            if (
+                self.trace.skill_id != self.payload.released_skill_id
+                or self.trace.skill_version != self.payload.released_skill_version
+            ):
+                raise ValueError("trace skill identity must match released skill")
+        if isinstance(self.payload, HermesSkillCandidateBuiltPayload):
+            if self.trace.candidate_id != self.payload.candidate_id:
+                raise ValueError("trace candidate_id must match skill candidate")
+        if isinstance(
+            self.payload,
+            (
+                HermesSkillEvaluationSubmittedPayload,
+                HermesSkillPublishedPayload,
+                HermesReadyToUseValidatedPayload,
+            ),
+        ) and self.trace.evaluation_id != self.payload.evaluation_id:
+            raise ValueError("trace evaluation_id must match skill evaluation")
+        if isinstance(self.payload, HermesSkillPublishedPayload):
+            if self.trace.skill_id != self.payload.skill_id or self.trace.skill_version != self.payload.version:
+                raise ValueError("trace skill identity must match published skill")
         return self
 
 
