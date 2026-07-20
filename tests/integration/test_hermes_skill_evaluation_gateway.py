@@ -105,6 +105,14 @@ def test_captain_skill_evaluation_operational_chain_is_explicit() -> None:
         "Missing prerequisites are a skip or block, never a green Gate E."
         in normalized_architecture
     )
+    assert (
+        "Gate E verifies the generic provider-backed delivery release policy"
+        in normalized_architecture
+    )
+    assert (
+        "does not execute the Task 7 Hermes skill fixture or Factory promotion chain"
+        in normalized_architecture
+    )
 
 
 @dataclass(frozen=True)
@@ -207,6 +215,16 @@ class _DeterministicGatewayStore:
             submission.e2e_evidence,
             submission.decision,
         )
+        assert_recordable = getattr(
+            GatewayStore,
+            "_assert_factory_release_decision_recordable",
+            None,
+        )
+        if assert_recordable is not None:
+            projection = FactoryCoordinator(
+                GatewayFactoryRepository(self)
+            ).projection(job_id)
+            assert_recordable(projection)
         self.release_decisions.setdefault(job_id, []).append(submission)
         return SimpleNamespace(replayed=False)
 
@@ -661,6 +679,12 @@ async def test_sealed_candidate_reaches_only_captain_owned_publication_and_promo
     assert projection.status is FactoryLifecycleStatus.READY_TO_USE
     assert projection.evaluation_id == gateway_evaluation.evidence.evidence_id
     assert projection.evaluation_ref == gateway_evaluation.evidence_ref
+
+    with pytest.raises(HTTPException, match="sealed after capability promotion"):
+        store.record_factory_release_decision(blocked_submission)
+
+    replayed = coordinator.projection(bundle.job.job_id)
+    assert replayed.status is FactoryLifecycleStatus.READY_TO_USE
 
 
 @pytest.mark.asyncio

@@ -22,10 +22,13 @@ records the final promotion.  The `hermes-agent/` submodule is a leased worker
 runtime and never a shared-registry writer.
 
 The deterministic integration path uses sealed candidate archives and the
-Gateway repository.  Provider-backed Gate E is separate: it needs the Captain
-test database, a released fixture skill, and the configured local n8n MCP
-broker.  Missing live prerequisites are reported as skips or blocks, never as
-deterministic success.
+Gateway repository. Provider-backed Gate E is separate. Gate E verifies the
+generic provider-backed delivery release policy: three distinct clean delivery
+batches with Codex, artifact, deploy, live validation, and registry-mirror
+evidence. It does not execute the Task 7 Hermes skill fixture or Factory
+promotion chain. The Task 7 chain is covered by the deterministic integration
+and, when explicitly configured, the isolated MariaDB integration. Missing
+prerequisites are reported as skips or blocks, never as deterministic success.
 
 `CAPABILITY_PROMOTED` consumes the latest Gateway-accepted
 `FactoryReleaseDecision`.  The Gateway recomputes that decision from the stored
@@ -60,8 +63,9 @@ explicitly opt in:
 pwsh -NoProfile -File scripts/run-gate-e.ps1
 ```
 
-Gate E requires the prepared Captain test database, released skill fixture,
-Codex/provider configuration, and the approved local n8n MCP broker. Missing
+Gate E requires the prepared Captain test database, Codex/provider
+configuration, and the approved local n8n MCP broker. It provides generic
+delivery release evidence, not Task 7 Factory-chain evidence. Missing
 prerequisites are a skip or block, never a green Gate E.
 
 The Agent-Factory path is split into three independently composed process

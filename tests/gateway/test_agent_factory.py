@@ -327,6 +327,8 @@ def _register_through_tool_lease(storage: MariaDBStorage) -> tuple[AgentFactoryJ
 def _release_submission(
     factory_job: AgentFactoryJob,
     submission: FactorySkillEvaluationSubmission,
+    *,
+    normal_successes: int = 3,
 ) -> FactoryReleaseDecisionSubmission:
     e2e = (
         E2ERunEvidence(
@@ -344,7 +346,7 @@ def _release_submission(
                 outcome=E2EOutcome.SUCCEEDED,
                 evidence_ref=_artifact(f"normal-e2e-{number}"),
             )
-            for number in range(2, 5)
+            for number in range(2, normal_successes + 2)
         ),
     )
     evaluation = GatewayStore._stored_factory_evaluation(submission)
@@ -553,6 +555,11 @@ def test_captain_publication_then_promotion_is_authoritative(
         }
     )
     release_submission = _release_submission(factory_job, submission)
+    blocked_release_submission = _release_submission(
+        factory_job,
+        submission,
+        normal_successes=2,
+    )
 
     with TestClient(application(storage, actor=GatewayRole.WORKER)) as hermes:
         assert hermes.post(
@@ -581,12 +588,20 @@ def test_captain_publication_then_promotion_is_authoritative(
             "/v1/factory/blocks",
             json=promotion.model_dump(mode="json", by_alias=True),
         )
+        late_decision = captain.post(
+            "/v1/factory/release-decisions",
+            json=blocked_release_submission.model_dump(mode="json", by_alias=True),
+        )
         projection = captain.get(f"/v1/factory/jobs/{factory_job.job_id}")
         evaluation = captain.get(f"/v1/factory/evaluations/{factory_job.job_id}")
 
     assert decision.status_code == 201
     assert published.status_code == 201
     assert promoted.status_code == 201
+    assert late_decision.status_code == 409
+    assert late_decision.json()["detail"] == (
+        "Factory release decisions are sealed after capability promotion"
+    )
     assert projection.json()["projection"]["status"] == "ready_to_use"
     assert evaluation.json()["evidence"]["evidence_id"] == str(
         submission.evidence.evidence_id

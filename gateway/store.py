@@ -35,7 +35,14 @@ from agenten.agent_factory.skill_evaluation import (
     ReleasedHermesSkill,
 )
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
-from agenten.agent_factory.state_machine import FactoryActionKind, FactoryLifecycleError, FactoryProjection, apply_block, next_action
+from agenten.agent_factory.state_machine import (
+    FactoryActionKind,
+    FactoryLifecycleError,
+    FactoryLifecycleStatus,
+    FactoryProjection,
+    apply_block,
+    next_action,
+)
 from blockchain.Blockchain_modell import Block
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.contracts import (
@@ -1004,6 +1011,9 @@ class GatewayStore:
                 )
                 evaluation = self._stored_factory_evaluation(evaluation_submission)
                 job = AgentFactoryJob.model_validate(job_block["data"])
+                self._assert_factory_release_decision_recordable(
+                    self._factory_projection(cursor, job)
+                )
                 self._assert_factory_release_decision(
                     job,
                     evaluation,
@@ -1536,6 +1546,16 @@ class GatewayStore:
             raise HTTPException(
                 status_code=409,
                 detail="Factory release decision does not match the Gateway-recomputed decision",
+            )
+
+    @staticmethod
+    def _assert_factory_release_decision_recordable(
+        projection: FactoryProjection,
+    ) -> None:
+        if projection.status is FactoryLifecycleStatus.READY_TO_USE:
+            raise HTTPException(
+                status_code=409,
+                detail="Factory release decisions are sealed after capability promotion",
             )
 
     @staticmethod
