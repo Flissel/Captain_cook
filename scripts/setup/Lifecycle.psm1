@@ -407,18 +407,70 @@ function Initialize-MinibookIdentity {
     Install-MinibookSkill -Source (Join-Path $Root 'minibook/skills/minibook/SKILL.md') -DestinationDirectory (Join-Path $hermesHome 'skills/minibook')
 }
 
+function Get-SetupPreflightConfiguration {
+    param(
+        [Parameter(Mandatory)][string] $Root,
+        [AllowNull()][object] $Configuration
+    )
+
+    $allowedKeys = @(
+        'MINIBOOK_BACKEND_URL', 'MINIBOOK_PUBLIC_URL',
+        'MAILPIT_WEB_PORT', 'MAILPIT_SMTP_PORT', 'MARIADB_PORT',
+        'N8N_MODE', 'N8N_URL'
+    )
+    $selected = @{}
+    $sources = if ($null -ne $Configuration) {
+        @($Configuration)
+    }
+    else {
+        @(
+            Read-DotEnv -Path (Join-Path $Root '.env.example')
+            Read-DotEnv -Path (Join-Path $Root '.env')
+        )
+    }
+    foreach ($source in $sources) {
+        if ($source -isnot [Collections.IDictionary]) {
+            throw 'Die Preflight-Konfiguration hat kein gültiges Format.'
+        }
+        foreach ($key in $allowedKeys) {
+            if ($source.Contains($key)) { $selected[$key] = [string]$source[$key] }
+        }
+    }
+    $selected
+}
+
 function Invoke-DefaultSetupStage {
     param([string] $Stage, [hashtable] $Context)
     $root = [string]$Context.Root
     switch ($Stage) {
         'Preflight' {
-            $checks = @((Test-SetupPlatform), (Test-SetupDiskSpace -Path $root), (Test-SetupNetwork))
-            foreach ($name in @('git','python','node','docker')) {
-                if (-not (Get-Command $name -ErrorAction SilentlyContinue)) { return [pscustomobject]@{Status='Failed';Message="$name fehlt. Starte setup.ps1 interaktiv, um es zu installieren."} }
+            try {
+                $configurationSource = if ($Context.ContainsKey('Configuration')) {
+                    $Context.Configuration
+                }
+                elseif ($Context.ContainsKey('PreflightConfigurationProvider') -and
+                    $Context.PreflightConfigurationProvider -is [scriptblock]) {
+                    & $Context.PreflightConfigurationProvider $root
+                }
+                else {
+                    $null
+                }
+                $configuration = Get-SetupPreflightConfiguration -Root $root -Configuration $configurationSource
             }
-            $checks += Test-DockerRuntime
-            $failed = @($checks | Where-Object Status -ne 'Ready')
-            if ($failed.Count) { return [pscustomobject]@{Status='Failed';Message=($failed.Message -join ' ')} }
+            catch {
+                return [pscustomobject]@{
+                    Status = 'Failed'
+                    Message = 'Die nicht geheime Preflight-Konfiguration konnte nicht geladen werden.'
+                }
+            }
+            $parameters = @{ Root = $root; Configuration = $configuration }
+            if ($Context.ContainsKey('PreflightResultProvider')) {
+                $parameters.ResultProvider = $Context.PreflightResultProvider
+            }
+            $result = Test-SetupPreflight @parameters
+            if ($result.Status -cne 'Ready') {
+                return [pscustomobject]@{ Status = 'Failed'; Message = $result.Message }
+            }
         }
         'Configuration' {
             $result = Initialize-SetupConfiguration -Root $root

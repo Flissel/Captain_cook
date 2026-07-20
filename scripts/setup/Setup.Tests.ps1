@@ -946,6 +946,146 @@ Describe 'Preflight' {
         $result.Data.OwningProcess | Should -Be 4242
     }
 
+    It 'accepts a healthy configured Captain listener on an idempotent lifecycle rerun' {
+        Set-Content -LiteralPath (Join-Path $TestDrive '.env.example') -Value @(
+            'MINIBOOK_BACKEND_URL=http://localhost:3456'
+            'MINIBOOK_PUBLIC_URL=http://localhost:3457'
+            'MAILPIT_WEB_PORT=8025'
+            'MAILPIT_SMTP_PORT=1025'
+            'MARIADB_PORT=3306'
+            'N8N_MODE=owned'
+        )
+        Set-Content -LiteralPath (Join-Path $TestDrive '.env') -Value @(
+            'MINIBOOK_BACKEND_URL=http://localhost:4456'
+            'MINIBOOK_PUBLIC_URL=http://localhost:4457'
+            'N8N_MODE=external'
+            'MARIADB_PASSWORD=must-not-enter-preflight-results'
+        )
+        $observed = [pscustomobject]@{ Configuration = $null; Results = $null; OwnershipCalls = 0 }
+        $requirementProvider = {
+            New-SetupResult -Component 'Requirements' -Status 'Ready' -Message 'requirements ready' -Remediation 'None'
+        }
+        $connectionProvider = {
+            param($port)
+            if ($port -eq 4456) { [pscustomobject]@{ OwningProcess = 4242 } }
+        }
+        $ownershipProvider = {
+            param($root, $expectedOwner, $connection, $endpoint)
+            $observed.OwnershipCalls++
+            $expectedOwner -eq 'minibook-backend' -and
+                $connection.OwningProcess -eq 4242 -and
+                $endpoint.AbsoluteUri -eq 'http://localhost:4456/health'
+        }
+        $resultProvider = {
+            param($root, $configuration)
+            $observed.Configuration = $configuration
+            $observed.Results = @(Get-PreflightResults -Root $root -Configuration $configuration `
+                -RequirementResultProvider $requirementProvider `
+                -PortConnectionProvider $connectionProvider `
+                -PortOwnershipProvider $ownershipProvider)
+            $observed.Results
+        }
+
+        $result = Invoke-DefaultSetupStage -Stage 'Preflight' -Context @{
+            Root = $TestDrive
+            PreflightResultProvider = $resultProvider
+        }
+
+        $result.Status | Should -Be 'Complete'
+        $observed.Configuration.MINIBOOK_BACKEND_URL | Should -Be 'http://localhost:4456'
+        $observed.Configuration.ContainsKey('MARIADB_PASSWORD') | Should -BeFalse
+        $observed.Results.Component | Should -Contain 'Port 4456'
+        $observed.Results.Component | Should -Not -Contain 'Port 3456'
+        ($observed.Results | Where-Object Component -eq 'Port 4456').Status | Should -Be 'Ready'
+        $observed.OwnershipCalls | Should -Be 1
+    }
+
+    It 'ignores the owned n8n port when lifecycle selects external n8n' {
+        Set-Content -LiteralPath (Join-Path $TestDrive '.env.example') -Value @(
+            'MINIBOOK_BACKEND_URL=http://localhost:3456'
+            'MINIBOOK_PUBLIC_URL=http://localhost:3457'
+            'MAILPIT_WEB_PORT=8025'
+            'MAILPIT_SMTP_PORT=1025'
+            'MARIADB_PORT=3306'
+            'N8N_MODE=owned'
+            'N8N_URL=http://localhost:5678'
+        )
+        Set-Content -LiteralPath (Join-Path $TestDrive '.env') -Value @(
+            'N8N_MODE=external'
+            'N8N_URL=http://localhost:15678'
+            'MARIADB_ROOT_PASSWORD=must-not-enter-preflight-results'
+        )
+        $checkedPorts = [Collections.Generic.List[int]]::new()
+        $observed = [pscustomobject]@{ Configuration = $null; Results = $null }
+        $requirementProvider = {
+            New-SetupResult -Component 'Requirements' -Status 'Ready' -Message 'requirements ready' -Remediation 'None'
+        }
+        $connectionProvider = {
+            param($port)
+            $checkedPorts.Add($port)
+            if ($port -eq 5678) { [pscustomobject]@{ OwningProcess = 9191 } }
+        }
+        $resultProvider = {
+            param($root, $configuration)
+            $observed.Configuration = $configuration
+            $observed.Results = @(Get-PreflightResults -Root $root -Configuration $configuration `
+                -RequirementResultProvider $requirementProvider `
+                -PortConnectionProvider $connectionProvider `
+                -PortOwnershipProvider { throw 'No occupied relevant port should require ownership validation.' })
+            $observed.Results
+        }
+
+        $result = Invoke-DefaultSetupStage -Stage 'Preflight' -Context @{
+            Root = $TestDrive
+            PreflightResultProvider = $resultProvider
+        }
+
+        $result.Status | Should -Be 'Complete'
+        $observed.Configuration.N8N_MODE | Should -Be 'external'
+        $observed.Configuration.N8N_URL | Should -Be 'http://localhost:15678'
+        $observed.Configuration.ContainsKey('MARIADB_ROOT_PASSWORD') | Should -BeFalse
+        $checkedPorts | Should -Not -Contain 5678
+        $observed.Results.Component | Should -Not -Contain 'Port 5678'
+    }
+
+    It 'fails closed for a configured port listener with an unknown owner' {
+        Set-Content -LiteralPath (Join-Path $TestDrive '.env.example') -Value @(
+            'MINIBOOK_BACKEND_URL=http://localhost:3456'
+            'MINIBOOK_PUBLIC_URL=http://localhost:3457'
+            'MAILPIT_WEB_PORT=8025'
+            'MAILPIT_SMTP_PORT=1025'
+            'MARIADB_PORT=3306'
+            'N8N_MODE=external'
+        )
+        Set-Content -LiteralPath (Join-Path $TestDrive '.env') -Value 'MINIBOOK_BACKEND_URL=http://localhost:4456'
+        $observed = [pscustomobject]@{ Results = $null }
+        $requirementProvider = {
+            New-SetupResult -Component 'Requirements' -Status 'Ready' -Message 'requirements ready' -Remediation 'None'
+        }
+        $resultProvider = {
+            param($root, $configuration)
+            $observed.Results = @(Get-PreflightResults -Root $root -Configuration $configuration `
+                -RequirementResultProvider $requirementProvider `
+                -PortConnectionProvider {
+                    param($port)
+                    if ($port -eq 4456) { [pscustomobject]@{ OwningProcess = 4242 } }
+                } `
+                -PortOwnershipProvider { $false })
+            $observed.Results
+        }
+
+        $result = Invoke-DefaultSetupStage -Stage 'Preflight' -Context @{
+            Root = $TestDrive
+            PreflightResultProvider = $resultProvider
+        }
+
+        $result.Status | Should -Be 'Failed'
+        $portResult = $observed.Results | Where-Object Component -eq 'Port 4456'
+        $portResult.Status | Should -Be 'Invalid'
+        $portResult.Remediation | Should -Be 'Manual'
+        $portResult.Data.OwningProcess | Should -Be 4242
+    }
+
     It 'uses only approved winget package identifiers' {
         $calls = [Collections.Generic.List[object]]::new()
 
@@ -985,6 +1125,113 @@ Describe 'Preflight' {
 
         $result.Status | Should -Be 'Invalid'
         $result.Remediation | Should -Be 'Install'
+    }
+
+    It 'rejects an executable below its minimum version' {
+        $command = [pscustomobject]@{ Source = 'C:\\tools\\python.exe' }
+
+        $result = Test-SetupExecutable -Name 'Python' -MinimumVersion '3.11' `
+            -Resolver { $command } -VersionProvider { [version]'3.10' }
+
+        $result.Status | Should -Be 'Invalid'
+        $result.Remediation | Should -Be 'Install'
+        $result.Data.Version | Should -Be '3.10'
+    }
+
+    It 'aggregates every preflight result using the planned severity order' {
+        $results = @(
+            New-SetupResult -Component 'Network' -Status 'Failed' -Message 'network unavailable' -Remediation 'Retry'
+            New-SetupResult -Component 'Port 3456' -Status 'Invalid' -Message 'port occupied' -Remediation 'Manual'
+            New-SetupResult -Component 'Python' -Status 'Missing' -Message 'python missing' -Remediation 'Install'
+            New-SetupResult -Component 'Node' -Status 'RestartRequired' -Message 'restart shell' -Remediation 'Restart'
+            New-SetupResult -Component 'Docker' -Status 'Skipped' -Message 'docker skipped' -Remediation 'Manual'
+        )
+
+        $result = Test-SetupPreflight -Root $TestDrive -Configuration @{} `
+            -ResultProvider { param($root, $configuration) $results }
+
+        $result.Status | Should -Be 'RestartRequired'
+        $result.Remediation | Should -Be 'Restart'
+        $result.Data.Results.Count | Should -Be 5
+        $result.Data.Results.Component | Should -Be @('Network', 'Port 3456', 'Python', 'Node', 'Docker')
+    }
+
+    It 'selects Missing ahead of lower-impact aggregate failures' {
+        $results = @(
+            New-SetupResult -Component 'Network' -Status 'Failed' -Message 'network unavailable' -Remediation 'Retry'
+            New-SetupResult -Component 'Port 3456' -Status 'Invalid' -Message 'port occupied' -Remediation 'Manual'
+            New-SetupResult -Component 'Python' -Status 'Missing' -Message 'python missing' -Remediation 'Install'
+        )
+
+        $result = Test-SetupPreflight -Root $TestDrive -Configuration @{} `
+            -ResultProvider { param($root, $configuration) $results }
+
+        $result.Status | Should -Be 'Missing'
+        $result.Remediation | Should -Be 'Install'
+    }
+
+    It 'fails closed when the aggregate provider returns a malformed result' {
+        $result = Test-SetupPreflight -Root $TestDrive -Configuration @{} `
+            -ResultProvider { [pscustomobject]@{ Status = 'Ready'; Message = 'incomplete' } }
+
+        $result.PSObject.Properties.Name | Should -Be @('Component', 'Status', 'Message', 'Remediation', 'Data')
+        $result.Status | Should -Be 'Failed'
+        $result.Remediation | Should -Be 'Retry'
+        $result.Data.Results.Count | Should -Be 0
+    }
+
+    It 'returns Ready only when every aggregate preflight result is ready' {
+        $results = @(
+            New-SetupResult -Component 'Python' -Status 'Ready' -Message 'python ready' -Remediation 'None'
+            New-SetupResult -Component 'Port 3456' -Status 'Ready' -Message 'port free' -Remediation 'None'
+        )
+
+        $result = Test-SetupPreflight -Root $TestDrive -Configuration @{} `
+            -ResultProvider { param($root, $configuration) $results }
+
+        $result.Status | Should -Be 'Ready'
+        $result.Remediation | Should -Be 'None'
+        $result.Data.Results.Count | Should -Be 2
+    }
+
+    It 'returns RestartRequired when a newly installed executable is not visible' {
+        $result = Confirm-InstalledPrerequisite -Name 'Python' -Resolver { $null }
+
+        $result.Status | Should -Be 'RestartRequired'
+        $result.Remediation | Should -Be 'Restart'
+    }
+
+    It 'confirms a newly installed executable that is visible' {
+        $result = Confirm-InstalledPrerequisite -Name 'Python' `
+            -Resolver { [pscustomobject]@{ Source = 'C:\\tools\\python.exe' } }
+
+        $result.Status | Should -Be 'Ready'
+        $result.Data.Path | Should -Be 'C:\\tools\\python.exe'
+    }
+
+    It 'uses the aggregate contract in the real Preflight stage' {
+        $results = @(
+            New-SetupResult -Component 'Python' -Status 'Invalid' -Message 'wrong version' -Remediation 'Install'
+            New-SetupResult -Component 'Port 3456' -Status 'Invalid' -Message 'port occupied' -Remediation 'Manual'
+        )
+
+        $result = Invoke-DefaultSetupStage -Stage 'Preflight' -Context @{
+            Root = $TestDrive
+            Configuration = @{}
+            PreflightResultProvider = { param($root, $configuration) $results }
+        }
+
+        $result.Status | Should -Be 'Failed'
+        $result.Message | Should -Match 'wrong version'
+        $result.Message | Should -Match 'port occupied'
+    }
+
+    It 'confirms installed prerequisites in the root setup entry point' {
+        $source = Get-Content "$PSScriptRoot/../../setup.ps1" -Raw
+
+        $source | Should -Match 'Confirm-InstalledPrerequisite\s+-Name\s+\$item\.Key'
+        $source | Should -Match 'Write-Host\s+\$confirmation\.Remediation'
+        $source | Should -Match '\$confirmation\.Status\s+-eq\s+''RestartRequired''.*exit\s+1'
     }
 }
 

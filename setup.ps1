@@ -21,6 +21,10 @@ foreach ($item in $prerequisites.GetEnumerator()) {
     $installed = Install-SetupPrerequisite -Name $item.Key -ConfirmInstall { $true }
     Write-Host $installed.Message
     if ($installed.Status -ne 'Ready') { exit 1 }
+    $confirmation = Confirm-InstalledPrerequisite -Name $item.Key
+    Write-Host $confirmation.Remediation
+    if ($confirmation.Status -eq 'RestartRequired') { Write-Host $confirmation.Message; exit 1 }
+    if ($confirmation.Status -ne 'Ready') { exit 1 }
 }
 
 $checkpointPath = Join-Path $root '.captain-cook/checkpoint.json'
