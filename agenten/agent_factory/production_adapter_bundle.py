@@ -757,7 +757,16 @@ class ProductionHermesCreationAnalysis:
                 "job before Minibook starts. Read only the authoritative artifact_paths, "
                 "never same-named workspace files. Capabilities listed in "
                 "provided_capabilities are already implemented and must not be reported as "
-                "missing. Return exactly one JSON object matching "
+                "missing. A local tool requested by the canonical input is a build "
+                "requirement, not a TODO_TOOL gap, when Codex can implement and test it "
+                "inside the candidate. An integration is likewise buildable when the "
+                "Captain n8n capability can implement it without an undeclared external "
+                "API or credential. Declare TODO_TOOL only when a required external "
+                "dependency cannot be satisfied by a provided capability, tested local "
+                "code, or the approved n8n path. Package assembly, executable tests, the "
+                "sandbox, and Captain evidence validate that planned tools actually exist; "
+                "this analysis must not claim that validation. Return exactly one JSON "
+                "object matching "
                 "response_schema. Declare every missing tool as TODO_TOOL.v1; use [] only "
                 "when your actual analysis finds no gaps. Do not include credentials."
             ),
@@ -786,6 +795,12 @@ class ProductionHermesCreationAnalysis:
                     "constraint": "Captain-approved integration intent only",
                 },
             ],
+            "tool_gap_policy": {
+                "buildable_local_tool": "do_not_emit_as_gap",
+                "buildable_captain_n8n_integration": "do_not_emit_as_gap",
+                "missing_required_external_api_or_credential": "emit_required_unresolved",
+                "missing_optional_enrichment": "emit_optional_unresolved",
+            },
             "released_skill_path": str(self._released_skill_path),
             "released_skill": creation_job.released_skill.model_dump(mode="json", by_alias=True),
             "creation_job": creation_job.model_dump(mode="json", by_alias=True),

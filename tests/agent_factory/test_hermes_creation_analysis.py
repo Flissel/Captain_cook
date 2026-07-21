@@ -163,6 +163,12 @@ async def test_creation_analysis_materializes_exact_hermes_evidence_and_replays(
             "codex.run": "ready",
             "n8n.workflow.execute": "unavailable",
         }
+        assert request["tool_gap_policy"] == {
+            "buildable_local_tool": "do_not_emit_as_gap",
+            "buildable_captain_n8n_integration": "do_not_emit_as_gap",
+            "missing_required_external_api_or_credential": "emit_required_unresolved",
+            "missing_optional_enrichment": "emit_optional_unresolved",
+        }
         calls.append(prompt)
         usage_file.write_text(json.dumps(_usage()), encoding="utf-8")
         return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
