@@ -14,10 +14,13 @@ from agenten.agent_factory.outcome_contracts import (
     FactoryTerminalState,
     validate_execution_outcome_binding,
 )
+from agenten.agent_factory.skill_evaluation import ToolGapMarker
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
+    ArtifactRef,
     RuntimeOperation,
+    RuntimeStatus,
 )
 
 
@@ -224,6 +227,63 @@ def test_package_recursively_rejects_credentials_in_artifact_references() -> Non
         CapabilityPackageManifestV1.model_validate(payload)
 
 
+def test_package_scans_already_validated_artifact_ref_models() -> None:
+    payload = _fixture("capability_package_manifest.v1.json")
+    payload["source_ref"] = ArtifactRef(
+        uri="artifact://capability-source/credential=not-redacted",
+        sha256="f" * 64,
+        media_type="application/zip",
+    )
+
+    with pytest.raises(ValidationError, match="private"):
+        CapabilityPackageManifestV1.model_validate(payload)
+
+
+def test_package_scans_already_validated_tool_gap_models() -> None:
+    payload = _fixture("capability_package_manifest.v1.json")
+    payload["tool_gaps"] = [
+        ToolGapMarker.model_validate(
+            {
+                "schema": "TODO_TOOL.v1",
+                "gap_id": "crm-lookup-gap",
+                "severity": "optional",
+                "input_contract_ref": {
+                    "uri": "artifact://tool-contracts/input",
+                    "sha256": "c" * 64,
+                    "media_type": "application/json",
+                },
+                "output_contract_ref": {
+                    "uri": "artifact://tool-contracts/output",
+                    "sha256": "d" * 64,
+                    "media_type": "application/json",
+                },
+                "least_privilege_capability": "crm.read",
+                "implementation_options": [],
+                "acceptance_assertion_ids": ["output-01"],
+                "evidence_ref": {
+                    "uri": "artifact://file:C:\\captain\\tool-gap.json",
+                    "sha256": "e" * 64,
+                    "media_type": "application/json",
+                },
+                "status": "resolved",
+            }
+        )
+    ]
+
+    with pytest.raises(ValidationError, match="local path"):
+        CapabilityPackageManifestV1.model_validate(payload)
+
+
+def test_package_accepts_safe_already_validated_artifact_ref_models() -> None:
+    payload = _fixture("capability_package_manifest.v1.json")
+    payload["source_ref"] = ArtifactRef.model_validate(payload["source_ref"])
+
+    assert (
+        CapabilityPackageManifestV1.model_validate(payload).source_ref
+        == payload["source_ref"]
+    )
+
+
 def test_execution_outcome_fixture_is_strict_frozen_and_round_trips() -> None:
     payload = _fixture("execution_outcome.v1.json")
 
@@ -311,6 +371,67 @@ def test_execution_outcome_binds_to_authoritative_runtime_command_and_result() -
         )
         is outcome
     )
+
+
+@pytest.mark.parametrize(
+    ("status", "error"),
+    (
+        (RuntimeStatus.FAILED, "runtime execution failed"),
+        (RuntimeStatus.POLICY_FAILED, "runtime policy failed"),
+        (RuntimeStatus.INFRASTRUCTURE_FAILED, "runtime infrastructure failed"),
+        (RuntimeStatus.CANCELLED, None),
+    ),
+)
+def test_failed_runtime_result_cannot_authorize_successful_execution_outcome(
+    status: RuntimeStatus,
+    error: str | None,
+) -> None:
+    outcome, command, result = _runtime_binding()
+    result_payload = result.model_dump(mode="json", by_alias=True)
+    result_payload.update({"status": status, "error": error})
+
+    with pytest.raises(ValueError, match="successful execution outcome"):
+        validate_execution_outcome_binding(
+            outcome,
+            command=command,
+            result=AgentRuntimeResult.model_validate(result_payload),
+            expected_capability_id=outcome.capability_id,
+            expected_capability_version=outcome.capability_version,
+            expected_team_version=outcome.team_version,
+        )
+
+
+@pytest.mark.parametrize("status", (RuntimeStatus.ACCEPTED, RuntimeStatus.RUNNING))
+def test_nonterminal_runtime_result_cannot_authorize_a_final_execution_outcome(
+    status: RuntimeStatus,
+) -> None:
+    outcome, command, result = _runtime_binding()
+
+    with pytest.raises(ValueError, match="terminal runtime result"):
+        validate_execution_outcome_binding(
+            outcome,
+            command=command,
+            result=result.model_copy(update={"status": status}),
+            expected_capability_id=outcome.capability_id,
+            expected_capability_version=outcome.capability_version,
+            expected_team_version=outcome.team_version,
+        )
+
+
+def test_successful_execution_outcome_requires_every_assertion_to_pass() -> None:
+    outcome, command, result = _runtime_binding()
+    outcome_payload = outcome.model_dump(mode="json", by_alias=True)
+    outcome_payload["assertion_outcomes"][0]["status"] = "failed"
+
+    with pytest.raises(ValueError, match="passed assertions"):
+        validate_execution_outcome_binding(
+            ExecutionOutcomeV1.model_validate(outcome_payload),
+            command=command,
+            result=result,
+            expected_capability_id=outcome.capability_id,
+            expected_capability_version=outcome.capability_version,
+            expected_team_version=outcome.team_version,
+        )
 
 
 @pytest.mark.parametrize(

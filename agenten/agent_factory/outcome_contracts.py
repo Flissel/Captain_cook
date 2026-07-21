@@ -26,6 +26,7 @@ from agenten.agent_runtime.contracts import (
     ArtifactRef,
     IDENTIFIER_PATTERN,
     IntegrationIntent,
+    RuntimeStatus,
 )
 
 
@@ -308,6 +309,17 @@ def validate_execution_outcome_binding(
         raise ValueError("runtime result subject version does not match command")
     if result.operation is not command.payload.operation:
         raise ValueError("runtime result operation does not match command")
+    if result.status in {RuntimeStatus.ACCEPTED, RuntimeStatus.RUNNING}:
+        raise ValueError("execution outcome requires a terminal runtime result")
+    if outcome.status == "succeeded":
+        if result.status is not RuntimeStatus.SUCCEEDED:
+            raise ValueError(
+                "only a succeeded runtime result may authorize a successful execution outcome"
+            )
+        if any(
+            assertion.status != "passed" for assertion in outcome.assertion_outcomes
+        ):
+            raise ValueError("successful execution outcome requires passed assertions")
     if outcome.capability_id != expected_capability_id:
         raise ValueError("execution outcome capability identity does not match authority")
     if outcome.capability_version != expected_capability_version:
@@ -347,6 +359,12 @@ def _unique_artifact_refs(
 
 
 def _reject_private_content(value: object, location: str) -> None:
+    if isinstance(value, BaseModel):
+        _reject_private_content(
+            value.model_dump(mode="json", by_alias=True),
+            location,
+        )
+        return
     if isinstance(value, Mapping):
         for key, nested in value.items():
             key_text = str(key)
