@@ -1151,6 +1151,8 @@ async def main():
             i += 1
         elif argv[i] == "--max-runtime-seconds" and i + 1 < len(argv):
             i += 2
+        elif argv[i] == "--result-file" and i + 1 < len(argv):
+            i += 2
         elif argv[i].startswith("--"):
             i += 1  # skip unknown flags
         else:

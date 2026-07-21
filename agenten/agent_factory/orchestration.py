@@ -25,6 +25,11 @@ from agenten.agent_factory.skill_evaluation import (
 )
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from agenten.agent_runtime.contracts import ArtifactRef
+from agenten.agent_factory.forge_contracts import (
+    CreationProgressV1,
+    CreationResultV1,
+    CreationSubmissionReceipt,
+)
 
 if TYPE_CHECKING:
     from agenten.agent_factory.candidate_evaluation import (
@@ -63,8 +68,12 @@ class HermesFactoryPort(Protocol):
 class MinibookForgePort(Protocol):
     """Submit the approved build to Minibook's existing SwarmPipeline."""
 
-    async def submit(self, request: FactoryDispatch) -> None:
-        """Submit only; Forge must later post an immutable evidence block."""
+    async def submit(self, request: FactoryDispatch) -> CreationSubmissionReceipt | CreationResultV1:
+        """Persist a job or complete the offline compatibility execution."""
+
+    async def status(self, creation_job_id: UUID) -> CreationProgressV1: ...
+
+    async def result(self, creation_job_id: UUID) -> CreationResultV1: ...
 
 
 class FactoryCandidateValidationPort(Protocol):
