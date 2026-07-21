@@ -205,9 +205,10 @@ def factory_repo_fixture(
             "    return Swarm([], termination_condition=termination)\n"
         ),
         "agenten/workflows/existing_specialist_team.py": (
-            "from autogen_agentchat.teams import Swarm\n\n"
-            "def build_existing_team():\n"
-            "    return Swarm([])\n"
+            "from autogen_agentchat.teams import Swarm as AgentSwarm\n\n"
+            "def build_workflow():\n"
+            "    workflow = AgentSwarm([])\n"
+            "    return workflow\n"
         ),
         "agenten/workflows/cli.py": (
             "from autogen_agentchat.teams import Swarm\n\n"
@@ -236,12 +237,26 @@ def factory_repo_fixture(
             "    return 'ordinary report'\n"
         ),
         "agenten/tools/decorated_lookup.py": (
+            "from agenten.contracts.customer import DecoratedLookupInput\n"
+            "from autogen_core.tools import tool\n\n"
+            "@tool\n"
+            "def lookup_customer(value: DecoratedLookupInput) -> str:\n"
+            "    return value.customer_id\n"
+        ),
+        "agenten/contracts/customer.py": (
             "from pydantic import BaseModel\n\n"
             "class DecoratedLookupInput(BaseModel):\n"
-            "    customer_id: str\n\n"
-            "@tool\n"
-            "def lookup_customer(value: DecoratedLookupInput):\n"
-            "    return value.customer_id\n"
+            "    customer_id: str\n"
+        ),
+        "agenten/workflows/build_report_only.py": (
+            "from autogen_agentchat.teams import Swarm\n\n"
+            "def build_report():\n"
+            "    return 'ordinary report'\n"
+        ),
+        "agenten/workflows/fake_swarm.py": (
+            "from local_fake.teams import Swarm\n\n"
+            "def build_workflow():\n"
+            "    return Swarm([])\n"
         ),
         "prompts/support.md": "# System prompt\nUse customer context and typed handoffs.\n",
         "tests/test_existing_team.py": (
@@ -440,6 +455,8 @@ def test_discovery_finds_semantic_reuse_without_reading_secrets(tmp_path: Path) 
     assert [query.ecosystem for query in docs.queries] == ["autogen"]
     assert catalog.requests[0][0] == "support_triage"
     assert "agenten.not_a_tool" not in inventory.reusable_component_ids
+    assert "agenten.workflows.build_report_only" not in inventory.reusable_component_ids
+    assert "agenten.workflows.fake_swarm" not in inventory.reusable_component_ids
     assert not any("agenten/not_a_tool.py" in ref.uri for ref in inventory.entrypoint_refs)
     assert ".env" not in repository.read_paths
     assert ".ENV.production" not in repository.read_paths
@@ -464,7 +481,7 @@ def test_discovery_finds_semantic_reuse_without_reading_secrets(tmp_path: Path) 
     )
     search_evidence = evidence.read(search_ref)
     assert any(item["symbol"] == "build_team" for item in search_evidence)
-    assert any(item["symbol"] == "build_existing_team" for item in search_evidence)
+    assert any(item["symbol"] == "build_workflow" for item in search_evidence)
     assert any(item["symbol"] == "lookup_customer" for item in search_evidence)
 
     documentation = evidence.read(inventory.documentation_refs[0])

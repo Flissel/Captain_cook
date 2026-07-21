@@ -805,6 +805,30 @@ def _python_categories(content: str, observed_symbols: set[str | None]) -> set[s
     categories: set[str] = set()
     contract_classes: set[str] = set()
     tool_symbols: set[str] = set()
+    decorated_typed_tool_symbols: set[str] = set()
+    team_constructors: set[str] = set()
+    team_module_aliases: set[str] = set()
+    imported_schema_symbols: set[str] = set()
+    imported_schema_modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module is not None:
+            module_parts = set(node.module.split("."))
+            for alias in node.names:
+                local_name = alias.asname or alias.name
+                if node.module.startswith("autogen") and "teams" in module_parts:
+                    team_constructors.add(local_name)
+                if alias.name == "teams" and node.module.startswith("autogen"):
+                    team_module_aliases.add(local_name)
+                if _is_schema_import(node.module):
+                    imported_schema_symbols.add(local_name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                local_name = alias.asname or alias.name.split(".")[0]
+                module_parts = set(alias.name.split("."))
+                if alias.name.startswith("autogen") and "teams" in module_parts:
+                    team_module_aliases.add(local_name)
+                if _is_schema_import(alias.name):
+                    imported_schema_modules.add(local_name)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             if any(alias.name.startswith("autogen") for alias in node.names):
@@ -813,19 +837,27 @@ def _python_categories(content: str, observed_symbols: set[str | None]) -> set[s
             if node.module is not None and node.module.startswith("autogen"):
                 categories.add("autogen")
         elif isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
-            is_team_builder = node.name.startswith("build_") and node.name.endswith(
-                "_team"
-            )
             if (
-                node.name in {"main", "run"} or is_team_builder
-            ) and node.name in observed_symbols:
+                node.name.startswith("build_") or node.name in {"main", "run"}
+            ) and node.name in observed_symbols and _function_returns_autogen_team(
+                node,
+                team_constructors=team_constructors,
+                team_module_aliases=team_module_aliases,
+            ):
                 categories.add("entrypoint")
-            if any(
+            is_tool_decorated = any(
                 _qualified_name(item).split(".")[-1]
                 in {"function_tool", "tool", "typed_tool"}
                 for item in node.decorator_list
-            ):
+            )
+            if is_tool_decorated:
                 tool_symbols.add(node.name)
+                if _has_imported_schema_parameter(
+                    node,
+                    imported_schema_symbols=imported_schema_symbols,
+                    imported_schema_modules=imported_schema_modules,
+                ):
+                    decorated_typed_tool_symbols.add(node.name)
         elif isinstance(node, ast.ClassDef):
             base_names = {_qualified_name(base) for base in node.bases}
             if base_names & {"BaseModel", "TypedDict"}:
@@ -856,9 +888,127 @@ def _python_categories(content: str, observed_symbols: set[str | None]) -> set[s
                 categories.add("memory")
         elif isinstance(node, ast.If) and _is_main_guard(node.test):
             categories.add("entrypoint")
-    if contract_classes & observed_symbols and tool_symbols & observed_symbols:
+    has_local_typed_tool = bool(
+        contract_classes & observed_symbols and tool_symbols & observed_symbols
+    )
+    has_imported_typed_tool = bool(
+        decorated_typed_tool_symbols & observed_symbols
+    )
+    if has_local_typed_tool or has_imported_typed_tool:
         categories.add("typed_tool")
     return categories
+
+
+def _is_schema_import(module: str) -> bool:
+    if module == "pydantic" or module.startswith("pydantic."):
+        return True
+    if module.startswith("autogen"):
+        return False
+    semantic_parts = {"contracts", "models", "schemas", "types"}
+    return bool(set(module.lower().split(".")) & semantic_parts)
+
+
+def _function_returns_autogen_team(
+    function: ast.AsyncFunctionDef | ast.FunctionDef,
+    *,
+    team_constructors: set[str],
+    team_module_aliases: set[str],
+) -> bool:
+    team_variables: set[str] = set()
+    nodes = tuple(_function_body_nodes(function))
+    for node in nodes:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = node.value
+            if value is not None and _is_autogen_team_call(
+                value,
+                team_constructors=team_constructors,
+                team_module_aliases=team_module_aliases,
+            ):
+                team_variables.update(_assignment_names(node))
+    return any(
+        isinstance(node, ast.Return)
+        and node.value is not None
+        and (
+            _is_autogen_team_call(
+                node.value,
+                team_constructors=team_constructors,
+                team_module_aliases=team_module_aliases,
+            )
+            or (isinstance(node.value, ast.Name) and node.value.id in team_variables)
+        )
+        for node in nodes
+    )
+
+
+def _function_body_nodes(
+    function: ast.AsyncFunctionDef | ast.FunctionDef,
+) -> tuple[ast.AST, ...]:
+    pending = list(reversed(function.body))
+    nodes: list[ast.AST] = []
+    while pending:
+        node = pending.pop()
+        nodes.append(node)
+        if isinstance(node, (ast.AsyncFunctionDef, ast.ClassDef, ast.FunctionDef, ast.Lambda)):
+            continue
+        pending.extend(reversed(tuple(ast.iter_child_nodes(node))))
+    return tuple(nodes)
+
+
+def _is_autogen_team_call(
+    node: ast.AST,
+    *,
+    team_constructors: set[str],
+    team_module_aliases: set[str],
+) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    call_name = _qualified_name(node.func)
+    if call_name in team_constructors:
+        return True
+    root_name = call_name.split(".", maxsplit=1)[0]
+    return "." in call_name and root_name in team_module_aliases
+
+
+def _has_imported_schema_parameter(
+    function: ast.AsyncFunctionDef | ast.FunctionDef,
+    *,
+    imported_schema_symbols: set[str],
+    imported_schema_modules: set[str],
+) -> bool:
+    arguments = (
+        *function.args.posonlyargs,
+        *function.args.args,
+        *function.args.kwonlyargs,
+    )
+    if function.args.vararg is not None:
+        arguments += (function.args.vararg,)
+    if function.args.kwarg is not None:
+        arguments += (function.args.kwarg,)
+    return any(
+        argument.annotation is not None
+        and _annotation_uses_imported_schema(
+            argument.annotation,
+            imported_schema_symbols=imported_schema_symbols,
+            imported_schema_modules=imported_schema_modules,
+        )
+        for argument in arguments
+    )
+
+
+def _annotation_uses_imported_schema(
+    annotation: ast.AST,
+    *,
+    imported_schema_symbols: set[str],
+    imported_schema_modules: set[str],
+) -> bool:
+    for node in ast.walk(annotation):
+        if isinstance(node, ast.Name) and node.id in imported_schema_symbols:
+            return True
+        if isinstance(node, ast.Attribute):
+            root_name = _qualified_name(node).split(".", maxsplit=1)[0]
+            if root_name in imported_schema_modules:
+                return True
+    return False
 
 
 def _qualified_name(node: ast.AST) -> str:
