@@ -53,6 +53,7 @@ from agenten.agent_factory.execution_budget import (
 )
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.leases import validate_factory_lease
+from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference
 from agenten.agent_factory.hermes_cli import (
     FactorySkillReplayRecord,
     FactorySkillReplayStore,
@@ -270,6 +271,7 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
         self._clock = clock
         self._usage_receipts: list[FactoryUsageReceiptV1] = []
         self._provider_dispatched = False
+        self._provider_effects_with_unknown_usage: set[UUID] = set()
 
     @property
     def usage_receipts(self) -> tuple[FactoryUsageReceiptV1, ...]:
@@ -282,6 +284,12 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
     @property
     def provider_dispatched(self) -> bool:
         return self._provider_dispatched
+
+    @property
+    def provider_effect_dispatched_with_unknown_usage(self) -> bool:
+        """Whether a dispatched provider effect still lacks authoritative usage."""
+
+        return bool(self._provider_effects_with_unknown_usage)
 
     async def create(
         self,
@@ -296,6 +304,7 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
         reservation, pricing_quote = self._reserve()
         try:
             self._provider_dispatched = True
+            self._provider_effects_with_unknown_usage.add(reservation.reservation_id)
             result = await self._delegate.create(
                 messages,
                 tools=tools,
@@ -325,6 +334,7 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
         finalized = False
         try:
             self._provider_dispatched = True
+            self._provider_effects_with_unknown_usage.add(reservation.reservation_id)
             async for item in self._delegate.create_stream(
                 messages,
                 tools=tools,
@@ -430,6 +440,7 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
         )
         self._budget.record_usage(self._job, reservation, receipt)
         self._usage_receipts.append(receipt)
+        self._provider_effects_with_unknown_usage.discard(reservation.reservation_id)
 
     async def close(self) -> None:
         await self._delegate.close()
@@ -560,6 +571,7 @@ class FactoryN8nExecutionEvidenceV1(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     tool_name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    approved_tool_ref: OpaqueN8nToolReference
     runtime_command: AgentRuntimeCommand
     capability_grant: CapabilityGrant
     runtime_result: AgentRuntimeResult
@@ -574,7 +586,12 @@ class FactoryN8nExecutionEvidenceV1(BaseModel):
         grant = self.capability_grant
         runtime = self.runtime_result
         if (
-            grant.profile is not CapabilityProfile.N8N_BUILDER
+            self.approved_tool_ref.tool_name != self.tool_name
+            or command.subject_id != self.approved_tool_ref.tool_name
+            or command.payload.subtask_id != self.approved_tool_ref.tool_name
+            or command.payload.prompt_ref.sha256
+            != _opaque_n8n_tool_reference_digest(self.approved_tool_ref)
+            or grant.profile is not CapabilityProfile.N8N_BUILDER
             or "mcp.n8n" not in grant.capabilities
             or grant.mcp_servers != ("n8n-mcp",)
             or command.event_id != grant.command_id
@@ -605,8 +622,35 @@ class FactoryN8nToolAuthorizationV1(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     tool_name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    approved_tool_ref: OpaqueN8nToolReference
     runtime_command: AgentRuntimeCommand
     capability_grant: CapabilityGrant
+
+    @model_validator(mode="after")
+    def require_captain_work_node_binding(self) -> "FactoryN8nToolAuthorizationV1":
+        if (
+            self.approved_tool_ref.tool_name != self.tool_name
+            or self.runtime_command.subject_id != self.approved_tool_ref.tool_name
+            or self.runtime_command.payload.subtask_id
+            != self.approved_tool_ref.tool_name
+            or self.runtime_command.payload.prompt_ref.sha256
+            != _opaque_n8n_tool_reference_digest(self.approved_tool_ref)
+        ):
+            raise ValueError(
+                "n8n authorization does not match the Captain-approved work node"
+            )
+        return self
+
+
+def _opaque_n8n_tool_reference_digest(
+    reference: OpaqueN8nToolReference,
+) -> str:
+    encoded = json.dumps(
+        reference.model_dump(mode="json", by_alias=True),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class FactoryN8nToolAdapterPort(Protocol):
@@ -642,6 +686,7 @@ class CaptainN8nGrantAuthority:
     ) -> CapabilityGrant:
         claim = FactoryN8nToolAuthorizationV1(
             tool_name=evidence.tool_name,
+            approved_tool_ref=evidence.approved_tool_ref,
             runtime_command=evidence.runtime_command,
             capability_grant=evidence.capability_grant,
         )
@@ -690,6 +735,7 @@ class CaptainAuthorizedN8nTool(BaseTool[BaseModel, Any]):
         self,
         *,
         name: str,
+        approved_tool_ref: OpaqueN8nToolReference,
         adapter: FactoryN8nToolAdapterPort,
         authority: FactoryN8nGrantAuthorityPort,
         clock: Callable[[], datetime],
@@ -702,6 +748,7 @@ class CaptainAuthorizedN8nTool(BaseTool[BaseModel, Any]):
             delegate.description,
         )
         self._name_from_manifest = name
+        self._approved_tool_ref_from_manifest = approved_tool_ref
         self._adapter = adapter
         self._delegate = delegate
         self._authority = authority
@@ -716,7 +763,10 @@ class CaptainAuthorizedN8nTool(BaseTool[BaseModel, Any]):
         claim = FactoryN8nToolAuthorizationV1.model_validate(
             raw_claim.model_dump(mode="python")
         )
-        if claim.tool_name != self._name_from_manifest:
+        if (
+            claim.tool_name != self._name_from_manifest
+            or claim.approved_tool_ref != self._approved_tool_ref_from_manifest
+        ):
             raise ValueError("n8n authorization claim belongs to a different tool")
         await self._authority.authorize_command(claim, now=self._clock())
         return await self._delegate.run(args, cancellation_token)
@@ -887,6 +937,10 @@ class HostAutoGenTeamRunner:
     def paid_effect_started(self) -> bool:
         return self._model_client.provider_dispatched
 
+    @property
+    def provider_effect_dispatched_with_unknown_usage(self) -> bool:
+        return self._model_client.provider_effect_dispatched_with_unknown_usage
+
     async def run(
         self,
         *,
@@ -905,7 +959,11 @@ class HostAutoGenTeamRunner:
             workspace,
             manifest,
         ):
-            n8n_tool_names = {tool.name for tool in candidate.candidate.n8n_tools}
+            n8n_tools = {
+                tool.name: tool.opaque_reference()
+                for tool in candidate.candidate.n8n_tools
+            }
+            n8n_tool_names = set(n8n_tools)
             required_n8n_tools = {
                 tool
                 for agent in manifest.agents
@@ -924,6 +982,7 @@ class HostAutoGenTeamRunner:
                     {
                         name: CaptainAuthorizedN8nTool(
                             name=name,
+                            approved_tool_ref=n8n_tools[name],
                             adapter=self._n8n_adapter,
                             authority=self._n8n_authority,
                             clock=self._clock,
@@ -1284,39 +1343,37 @@ class TeamExecutionService:
                 timeout=remaining,
             )
         except asyncio.CancelledError:
-            await asyncio.shield(
-                self._replay_store.fail(pending, failure_kind="cancelled")
-            )
+            if (
+                isinstance(self._runner, HostAutoGenTeamRunner)
+                and self._runner.provider_effect_dispatched_with_unknown_usage
+            ):
+                return await asyncio.shield(
+                    self._record_provider_cost_unresolved(
+                        pending,
+                        invocation,
+                        candidate,
+                        case_ref=case_ref,
+                        preflight_ref=preflight_ref,
+                        error_type="CancelledError",
+                    )
+                )
+            await asyncio.shield(self._replay_store.abandon(pending))
             raise
         except Exception as exc:
             if (
                 isinstance(self._runner, HostAutoGenTeamRunner)
-                and not self._runner.paid_effect_started
+                and not self._runner.provider_effect_dispatched_with_unknown_usage
             ):
                 await asyncio.shield(self._replay_store.abandon(pending))
                 raise
-            failure_ref = await self._evidence_store.persist(
-                self._job,
-                json.dumps(
-                    {
-                        "schema": "hermes.factory-provider-failure.v1",
-                        "status": "unresolved",
-                        "reason": "provider_cost_unresolved",
-                        "error_type": type(exc).__name__,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8"),
-            )
-            unresolved = self._unresolved_evidence(
+            return await self._record_provider_cost_unresolved(
+                pending,
                 invocation,
                 candidate,
                 case_ref=case_ref,
                 preflight_ref=preflight_ref,
-                failure_ref=failure_ref,
+                error_type=type(exc).__name__,
             )
-            await self._complete_replay(pending, unresolved)
-            return unresolved
         try:
             self._require_run_bindings(
                 invocation,
@@ -1350,6 +1407,39 @@ class TeamExecutionService:
             artifact=evidence,
             transcript_ref=evidence.artifact_ref,
         )
+
+    async def _record_provider_cost_unresolved(
+        self,
+        pending: FactorySkillReplayRecord,
+        invocation: FactorySkillInvocationV1,
+        candidate: ResolvedFactoryCandidate,
+        *,
+        case_ref: PrivateHoldoutRef,
+        preflight_ref: ArtifactRef,
+        error_type: str,
+    ) -> TeamExecutionEvidenceV1:
+        failure_ref = await self._evidence_store.persist(
+            self._job,
+            json.dumps(
+                {
+                    "schema": "hermes.factory-provider-failure.v1",
+                    "status": "unresolved",
+                    "reason": "provider_cost_unresolved",
+                    "error_type": error_type,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+        )
+        unresolved = self._unresolved_evidence(
+            invocation,
+            candidate,
+            case_ref=case_ref,
+            preflight_ref=preflight_ref,
+            failure_ref=failure_ref,
+        )
+        await self._complete_replay(pending, unresolved)
+        return unresolved
 
     def _active_time(
         self,

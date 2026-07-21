@@ -29,7 +29,7 @@ from agenten.agent_factory.execution_budget import (
 from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.hermes_cli import InMemoryFactorySkillReplayStore
-from agenten.agent_factory.n8n_tools import TypedN8nTool
+from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference, TypedN8nTool
 from agenten.agent_factory.outcome_contracts import AssertionOutcome, ExecutionOutcomeV1
 from agenten.agent_factory.orchestration import FactoryDispatch
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
@@ -176,6 +176,15 @@ def _artifact(
         sha256=digest,
         media_type=media_type,
     )
+
+
+def _n8n_tool_command_ref(reference: OpaqueN8nToolReference) -> ArtifactRef:
+    encoded = json.dumps(
+        reference.model_dump(mode="json", by_alias=True),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return _artifact("n8n-command", hashlib.sha256(encoded).hexdigest())
 
 
 def _job_v3(
@@ -690,6 +699,7 @@ async def test_budgeted_model_client_reserves_before_every_provider_call(
     await client.create([UserMessage(content="two", source="user")])
 
     assert len(client.usage_receipts) == 2
+    assert client.provider_effect_dispatched_with_unknown_usage is False
     assert skill_authority.calls == 2
     assert pricing_authority.calls == 2
     assert len({item.reservation_id for item in client.usage_receipts}) == 2
@@ -723,6 +733,7 @@ async def test_dispatched_provider_failure_keeps_unknown_cost_reservation_active
         await client.create([UserMessage(content="dispatch", source="user")])
 
     projection = budget.projection(job.job_id)
+    assert client.provider_effect_dispatched_with_unknown_usage is True
     assert projection.consumed_usd == Decimal("0")
     assert projection.reserved_usd == Decimal("0.50")
 
@@ -787,6 +798,7 @@ async def test_cancellation_after_provider_dispatch_keeps_reservation_active(
     call.cancel()
     with pytest.raises(asyncio.CancelledError):
         await call
+    assert client.provider_effect_dispatched_with_unknown_usage is True
     assert budget.projection(job.job_id).reserved_usd == Decimal("0.50")
 
 
@@ -1205,6 +1217,12 @@ def test_n8n_execution_requires_separate_scope_and_matching_digest() -> None:
     with pytest.raises(ValueError, match="n8n execution evidence"):
         FactoryN8nExecutionEvidenceV1(
             tool_name="support_triage",
+            approved_tool_ref=TypedN8nTool(
+                name="support_triage",
+                description="Captain-approved support triage",
+                input_schema_ref="artifact://factory-support-input",
+                output_schema_ref="artifact://factory-support-output",
+            ).opaque_reference(),
             runtime_command=command,
             capability_grant=grant,
             runtime_result=runtime,
@@ -1225,21 +1243,27 @@ def test_n8n_execution_requires_separate_scope_and_matching_digest() -> None:
 async def test_n8n_authority_rejects_unknown_revoked_and_noncanonical_grants() -> None:
     command_id = UUID("70000000-0000-0000-0000-000000000036")
     job = _job_v3()
+    approved_tool_ref = TypedN8nTool(
+        name="support_triage",
+        description="Captain-approved support triage",
+        input_schema_ref="artifact://factory-support-input",
+        output_schema_ref="artifact://factory-support-output",
+    ).opaque_reference()
     command = AgentRuntimeCommand(
         schema_name="captain.agent-runtime-command.v1",
         event_id=command_id,
         correlation_id=job.correlation_id,
         occurred_at=NOW,
         producer="captain",
-        subject_id="n8n-tool-call",
+        subject_id="support_triage",
         subject_version=1,
         payload=AgentRuntimeCommandPayload(
             operation=RuntimeOperation.CODEX_RUN,
             project_id="factory-team",
             batch_id="factory-team-batch",
-            subtask_id="n8n-tool-call",
+            subtask_id="support_triage",
             workspace_ref="workspace://factory/n8n-tool-call",
-            prompt_ref=_artifact("n8n-command", "d" * 64),
+            prompt_ref=_n8n_tool_command_ref(approved_tool_ref),
             integration_intent=IntegrationIntent.N8N,
             capability_profile=CapabilityProfile.N8N_BUILDER,
             limits=RuntimeLimits(wall_seconds=60, max_iterations=2),
@@ -1251,7 +1275,7 @@ async def test_n8n_authority_rejects_unknown_revoked_and_noncanonical_grants() -
         command_id=command_id,
         batch_id="factory-team-batch",
         batch_version=1,
-        subtask_id="n8n-tool-call",
+        subtask_id="support_triage",
         workspace_ref="workspace://factory/n8n-tool-call",
         profile=CapabilityProfile.N8N_BUILDER,
         capabilities=tuple(sorted(PROFILE_CAPABILITIES[CapabilityProfile.N8N_BUILDER])),
@@ -1262,6 +1286,7 @@ async def test_n8n_authority_rejects_unknown_revoked_and_noncanonical_grants() -
     workflow_ref = _artifact("factory-workflow", "a" * 64)
     evidence = FactoryN8nExecutionEvidenceV1(
         tool_name="support_triage",
+        approved_tool_ref=approved_tool_ref,
         runtime_command=command,
         capability_grant=grant,
         runtime_result=AgentRuntimeResult(
@@ -1271,7 +1296,7 @@ async def test_n8n_authority_rejects_unknown_revoked_and_noncanonical_grants() -
             correlation_id=job.correlation_id,
             occurred_at=NOW + timedelta(seconds=1),
             producer="agent-runtime",
-            subject_id="n8n-tool-call",
+            subject_id="support_triage",
             subject_version=1,
             grant_id=grant.grant_id,
             operation=RuntimeOperation.CODEX_RUN,
@@ -1334,6 +1359,7 @@ async def test_n8n_authority_rejects_unknown_revoked_and_noncanonical_grants() -
         def authorization(self, name: str) -> FactoryN8nToolAuthorizationV1:
             return FactoryN8nToolAuthorizationV1(
                 tool_name=name,
+                approved_tool_ref=evidence.approved_tool_ref,
                 runtime_command=command,
                 capability_grant=self.current_grant,
             )
@@ -1344,6 +1370,7 @@ async def test_n8n_authority_rejects_unknown_revoked_and_noncanonical_grants() -
     adapter = Adapter()
     authorized_tool = CaptainAuthorizedN8nTool(
         name="support_triage",
+        approved_tool_ref=evidence.approved_tool_ref,
         adapter=adapter,  # type: ignore[arg-type]
         authority=authority,
         clock=lambda: NOW + timedelta(seconds=1),
@@ -1371,6 +1398,100 @@ async def test_n8n_authority_rejects_unknown_revoked_and_noncanonical_grants() -
         )
     assert underlying_calls == 0
 
+
+@pytest.mark.asyncio
+async def test_canonical_tool_a_work_node_cannot_authorize_candidate_tool_b() -> None:
+    command_id = UUID("70000000-0000-0000-0000-000000000037")
+    job = _job_v3()
+    tool_a_ref = TypedN8nTool(
+        name="tool_a",
+        description="Captain-approved work node",
+        input_schema_ref="artifact://tool-a-input",
+        output_schema_ref="artifact://tool-a-output",
+    ).opaque_reference()
+    tool_b_ref = TypedN8nTool(
+        name="tool_b",
+        description="Candidate-requested work node",
+        input_schema_ref="artifact://tool-b-input",
+        output_schema_ref="artifact://tool-b-output",
+    ).opaque_reference()
+    command = AgentRuntimeCommand(
+        schema_name="captain.agent-runtime-command.v1",
+        event_id=command_id,
+        correlation_id=job.correlation_id,
+        occurred_at=NOW,
+        producer="captain",
+        subject_id="tool_a",
+        subject_version=1,
+        payload=AgentRuntimeCommandPayload(
+            operation=RuntimeOperation.CODEX_RUN,
+            project_id="factory-team",
+            batch_id="factory-team-batch",
+            subtask_id="tool_a",
+            workspace_ref="workspace://factory/tool-a",
+            prompt_ref=_n8n_tool_command_ref(tool_a_ref),
+            integration_intent=IntegrationIntent.N8N,
+            capability_profile=CapabilityProfile.N8N_BUILDER,
+            limits=RuntimeLimits(wall_seconds=60, max_iterations=2),
+        ),
+    )
+    grant = CapabilityGrant(
+        schema_name="captain.capability-grant.v1",
+        grant_id="grant-n8n-tool-a",
+        command_id=command_id,
+        batch_id="factory-team-batch",
+        batch_version=1,
+        subtask_id="tool_a",
+        workspace_ref="workspace://factory/tool-a",
+        profile=CapabilityProfile.N8N_BUILDER,
+        capabilities=tuple(sorted(PROFILE_CAPABILITIES[CapabilityProfile.N8N_BUILDER])),
+        mcp_servers=("n8n-mcp",),
+        issued_at=NOW,
+        expires_at=NOW + timedelta(minutes=5),
+    )
+
+    class State:
+        async def get_grant(self, current_id: UUID) -> CapabilityGrant | None:
+            return grant if current_id == command_id else None
+
+        async def get_grant_revocation(
+            self, current_id: UUID
+        ) -> CapabilityGrantRevocation | None:
+            return None
+
+    underlying_tool_b_calls = 0
+
+    async def tool_b_effect(ticket: str) -> str:
+        nonlocal underlying_tool_b_calls
+        underlying_tool_b_calls += 1
+        return ticket
+
+    class Adapter:
+        def tool(self, name: str) -> object:
+            return FunctionTool(tool_b_effect, description="tool B effect", name=name)
+
+        def authorization(self, name: str) -> FactoryN8nToolAuthorizationV1:
+            return FactoryN8nToolAuthorizationV1(
+                tool_name="tool_a",
+                approved_tool_ref=tool_a_ref,
+                runtime_command=command,
+                capability_grant=grant,
+            )
+
+        def observed_evidence(self) -> tuple[FactoryN8nExecutionEvidenceV1, ...]:
+            return ()
+
+    authorized_tool = CaptainAuthorizedN8nTool(
+        name="tool_b",
+        approved_tool_ref=tool_b_ref,
+        adapter=Adapter(),  # type: ignore[arg-type]
+        authority=CaptainN8nGrantAuthority(State()),  # type: ignore[arg-type]
+        clock=lambda: NOW + timedelta(seconds=1),
+    )
+
+    with pytest.raises(ValueError, match="different tool|work node"):
+        await authorized_tool.run_json({"ticket": "case-b"}, CancellationToken())
+    assert underlying_tool_b_calls == 0
 
 @pytest.mark.asyncio
 async def test_timeout_cancels_runner_and_records_unresolved_evidence(
@@ -1419,6 +1540,10 @@ async def test_pre_effect_host_configuration_failure_abandons_replay_claim(
         def paid_effect_started(self) -> bool:
             return False
 
+        @property
+        def provider_effect_dispatched_with_unknown_usage(self) -> bool:
+            return False
+
         async def run(self, **_: object) -> FactoryTeamRunResult:
             self.calls += 1
             raise ValueError("holdout resolver is not configured")
@@ -1443,32 +1568,118 @@ async def test_pre_effect_host_configuration_failure_abandons_replay_claim(
 
 
 @pytest.mark.asyncio
-async def test_caller_cancellation_propagates_and_marks_replay_failed(
+async def test_pre_dispatch_caller_cancellation_abandons_replay_for_retry(
     tmp_path: Path,
 ) -> None:
     job = _job_v3()
     started = asyncio.Event()
 
-    class Runner:
+    class Runner(HostAutoGenTeamRunner):
         max_cost_usd = Decimal("1.00")
 
-        async def run(self, **_: object) -> FactoryTeamRunResult:
-            started.set()
-            await asyncio.Event().wait()
-            raise AssertionError("unreachable")
+        def __init__(self) -> None:
+            self.calls = 0
 
+        @property
+        def provider_effect_dispatched_with_unknown_usage(self) -> bool:
+            return False
+
+        async def run(self, **_: object) -> FactoryTeamRunResult:
+            self.calls += 1
+            started.set()
+            if self.calls == 1:
+                await asyncio.Event().wait()
+            raise ValueError("pre-dispatch configuration failure")
+
+    runner = Runner()
+    service = TeamExecutionService(
+        job=job,
+        preflight=_SuccessfulPreflight(),
+        runner=runner,
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
+        replay_store=InMemoryFactorySkillReplayStore(),
+        clock=lambda: NOW,
+    )
     execution = asyncio.create_task(
-        TeamExecutionService(
-            job=job,
-            preflight=_SuccessfulPreflight(),
-            runner=Runner(),
-            evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
-            replay_store=InMemoryFactorySkillReplayStore(),
-            clock=lambda: NOW,
-        ).execute(_invocation(job), _candidate(tmp_path), job.private_holdout_refs[0])
+        service.execute(_invocation(job), _candidate(tmp_path), job.private_holdout_refs[0])
     )
     await started.wait()
     execution.cancel()
 
     with pytest.raises(asyncio.CancelledError):
         await execution
+    with pytest.raises(ValueError, match="pre-dispatch"):
+        await service.execute(
+            _invocation(job), _candidate(tmp_path), job.private_holdout_refs[0]
+        )
+    assert runner.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_post_dispatch_cancellation_completes_unresolved_replay(
+    tmp_path: Path,
+) -> None:
+    job = _job_v3()
+    started = asyncio.Event()
+
+    class BlockingReplay(ReplayChatCompletionClient):
+        async def create(self, *args: object, **kwargs: object) -> object:
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    budget = InMemoryFactoryBudgetLedger()
+    model_client = BudgetedChatCompletionClient(
+        job=job,
+        invocation=_invocation(job),
+        attempt=1,
+        delegate=BlockingReplay(["unused"]),
+        budget=budget,
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "provider-evidence"),
+        provider="deterministic-replay",
+        model="approved-model-id",
+        max_cost_per_call=Decimal("0.50"),
+        paid_effect_authority=_PaidEffectAuthority(),
+        pricing_authority=_PricingAuthority(_pricing_quote(job)),
+        clock=lambda: NOW,
+    )
+
+    class PostDispatchHost(HostAutoGenTeamRunner):
+        def __init__(self) -> None:
+            self._model_client = model_client
+            self.calls = 0
+
+        async def run(self, **_: object) -> FactoryTeamRunResult:
+            self.calls += 1
+            await self._model_client.create(
+                [UserMessage(content="dispatch", source="user")]
+            )
+            raise AssertionError("unreachable")
+
+    runner = PostDispatchHost()
+    service = TeamExecutionService(
+        job=job,
+        preflight=_SuccessfulPreflight(),
+        runner=runner,
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
+        replay_store=InMemoryFactorySkillReplayStore(),
+        clock=lambda: NOW,
+    )
+    invocation = _invocation(job)
+    execution = asyncio.create_task(
+        service.execute(invocation, _candidate(tmp_path), job.private_holdout_refs[0])
+    )
+    await started.wait()
+    execution.cancel()
+
+    evidence = await execution
+    replayed = await service.execute(
+        invocation, _candidate(tmp_path), job.private_holdout_refs[0]
+    )
+
+    assert evidence.status == "unresolved"
+    assert evidence.termination_reason == "provider_cost_unresolved"
+    assert replayed == evidence
+    assert runner.calls == 1
+    assert model_client.provider_effect_dispatched_with_unknown_usage is True
+    assert budget.projection(job.job_id).reserved_usd == Decimal("0.50")
