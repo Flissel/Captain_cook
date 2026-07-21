@@ -1,0 +1,38 @@
+"""Gateway-owned lazy construction for the isolated live-demo store."""
+
+from __future__ import annotations
+
+from urllib.parse import unquote, urlsplit
+from typing import Any
+
+from blockchain.mariadb_storage import MariaDBStorage
+from gateway.store import GatewayStore
+
+
+class LazyGatewayStore:
+    """Delay MariaDB connection/schema work until the first Gateway operation."""
+
+    def __init__(self, dsn: str) -> None:
+        parsed = urlsplit(dsn)
+        database = unquote(parsed.path.lstrip("/"))
+        if (
+            parsed.scheme not in {"mysql", "mariadb"}
+            or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+            or database != "captain_test"
+        ):
+            raise ValueError("production Factory store requires loopback captain_test")
+        self._dsn = dsn
+        self._database = database
+        self._store: GatewayStore | None = None
+
+    @property
+    def configured_database(self) -> str:
+        return self._database
+
+    def _resolved(self) -> GatewayStore:
+        if self._store is None:
+            self._store = GatewayStore(MariaDBStorage(self._dsn))
+        return self._store
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._resolved(), name)

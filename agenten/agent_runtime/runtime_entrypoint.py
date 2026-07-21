@@ -180,8 +180,31 @@ def compose_gateway_backed_runtime_app(
 ) -> FastAPI:
     """Compose existing real adapters around Gateway-owned runtime state."""
 
+    service = compose_gateway_backed_runtime_executor(
+        settings=settings,
+        client=client,
+        hermes=hermes,
+        codex=codex,
+        artifacts=artifacts,
+    )
+    return create_runtime_app(
+        executor=service,
+        token=settings.runtime_token.get_secret_value(),
+    )
+
+
+def compose_gateway_backed_runtime_executor(
+    *,
+    settings: RuntimeEntrypointSettings,
+    client: httpx.AsyncClient,
+    hermes: HermesPlannerPort,
+    codex: CodexExecutionPort,
+    artifacts: ArtifactPort,
+) -> AgentRuntimeService:
+    """Build the executor separately so the capability-evidence API can share it."""
+
     gateway_token = settings.gateway_token.get_secret_value()
-    service = AgentRuntimeService(
+    return AgentRuntimeService(
         state=GatewayBackedRuntimeState(
             base_url=settings.gateway_url,
             token=gateway_token,
@@ -193,25 +216,35 @@ def compose_gateway_backed_runtime_app(
         capabilities=_CaptainCapabilityPolicy(),
         clock=_UtcClock(),
     )
-    return create_runtime_app(
-        executor=service,
-        token=settings.runtime_token.get_secret_value(),
-    )
 
 
-def preflight_runtime() -> None:
-    """Validate settings and fail closed while required production ports are absent."""
+def preflight_runtime() -> FastAPI:
+    """Compose every lazy production port without starting provider effects."""
 
-    RuntimeEntrypointSettings.from_env()
-    raise RuntimeConfigurationError(
-        "production Hermes, Codex, and artifact runtime ports are unavailable"
-    )
+    settings = RuntimeEntrypointSettings.from_env()
+    try:
+        from agenten.agent_factory.production_adapter_bundle import (
+            build_runtime_app_from_environment,
+        )
+
+        return build_runtime_app_from_environment(settings, os.environ)
+    except RuntimeConfigurationError:
+        raise
+    except Exception as exc:
+        marker = str(exc)
+        if marker.startswith("TODO_TOOL:"):
+            raise RuntimeConfigurationError(marker) from None
+        raise RuntimeConfigurationError("production runtime composition failed") from None
 
 
 def main() -> None:
-    """Fail closed until production Hermes, Codex, and artifact ports are installed."""
+    """Run one authenticated process; every provider adapter remains lazy."""
 
-    preflight_runtime()
+    import uvicorn
+
+    settings = RuntimeEntrypointSettings.from_env()
+    app = preflight_runtime()
+    uvicorn.run(app, host=settings.host, port=settings.port, workers=1)
 
 
 if __name__ == "__main__":

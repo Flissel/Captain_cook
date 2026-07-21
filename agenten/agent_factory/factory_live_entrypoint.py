@@ -1238,12 +1238,11 @@ class SystemFactoryLivePreflightProbe:
 
     def verify_hermes(self, expected_skill_digests: Mapping[str, str]) -> None:
         _require_exact_skill_digests(expected_skill_digests)
-        enabled = self._run(("hermes", "skills", "list", "--enabled-only"))
         bundle = self._run(
             ("hermes", "bundles", "show", "captain-agent-factory-loop")
         )
         for name in FACTORY_SKILL_NAMES:
-            if enabled.count(name) != 1 or bundle.count(name) != 1:
+            if bundle.count(name) != 1:
                 raise FactoryLiveConfigurationError(
                     "Hermes does not expose the exact released Factory skills"
                 )
@@ -1265,6 +1264,7 @@ class SystemFactoryLivePreflightProbe:
             raise FactoryLiveConfigurationError(
                 "Hermes is not bound to the released Factory skill directory"
             )
+        _require_installed_factory_skill_directories(expected_root)
 
     def verify_n8n(self) -> None:
         required = (
@@ -1393,6 +1393,24 @@ def _require_exact_skill_digests(value: Mapping[str, str]) -> None:
         for digest in value.values()
     ):
         raise ValueError("Factory skill digests must be lowercase SHA-256 values")
+
+
+def _require_installed_factory_skill_directories(root: Path) -> None:
+    """Validate the exact released on-disk skill set without parsing CLI tables."""
+
+    resolved_root = root.resolve()
+    for name in FACTORY_SKILL_NAMES:
+        skill_directory = (resolved_root / name).resolve()
+        try:
+            skill_directory.relative_to(resolved_root)
+        except ValueError:
+            raise FactoryLiveConfigurationError(
+                "Hermes Factory skill directory escapes its configured root"
+            ) from None
+        if not skill_directory.is_dir() or not (skill_directory / "SKILL.md").is_file():
+            raise FactoryLiveConfigurationError(
+                "Hermes does not expose the exact released Factory skills"
+            )
 
 
 def _write_json(path: Path, payload: Mapping[str, object]) -> None:

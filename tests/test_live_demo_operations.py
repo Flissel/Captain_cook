@@ -194,7 +194,8 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "com.docker.compose.project=captain-n8n-builder" in source
     assert "application/json, text/event-stream" in PREFLIGHT.read_text(encoding="utf-8")
     assert "bootstrap -RecoverDemoCredentials:$RecoverDemoCredentials" in source
-    assert "OPENAI" not in source.upper()
+    assert "OPENAI_API_KEY" in source
+    assert "Write-Output $values" not in source
     assert source.index("Initialize-CaptainN8n $values") < source.index("mariadb-test")
     lowered = source.lower()
     assert "down -v" not in lowered
