@@ -1683,3 +1683,74 @@ async def test_post_dispatch_cancellation_completes_unresolved_replay(
     assert runner.calls == 1
     assert model_client.provider_effect_dispatched_with_unknown_usage is True
     assert budget.projection(job.job_id).reserved_usd == Decimal("0.50")
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_recorded_usage_completes_unresolved_replay(
+    tmp_path: Path,
+) -> None:
+    job = _job_v3()
+    usage_recorded = asyncio.Event()
+    budget = InMemoryFactoryBudgetLedger()
+    model_client = BudgetedChatCompletionClient(
+        job=job,
+        invocation=_invocation(job),
+        attempt=1,
+        delegate=build_replay_model_client(["provider-complete"]),
+        budget=budget,
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "provider-evidence"),
+        provider="deterministic-replay",
+        model="approved-model-id",
+        max_cost_per_call=Decimal("0.50"),
+        paid_effect_authority=_PaidEffectAuthority(),
+        pricing_authority=_PricingAuthority(_pricing_quote(job)),
+        clock=lambda: NOW,
+    )
+
+    class RecordedUsageHost(HostAutoGenTeamRunner):
+        def __init__(self) -> None:
+            self._model_client = model_client
+            self.calls = 0
+
+        async def run(self, **_: object) -> FactoryTeamRunResult:
+            self.calls += 1
+            await self._model_client.create(
+                [UserMessage(content="dispatch", source="user")]
+            )
+            usage_recorded.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    runner = RecordedUsageHost()
+    service = TeamExecutionService(
+        job=job,
+        preflight=_SuccessfulPreflight(),
+        runner=runner,
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
+        replay_store=InMemoryFactorySkillReplayStore(),
+        clock=lambda: NOW,
+    )
+    invocation = _invocation(job)
+    execution = asyncio.create_task(
+        service.execute(invocation, _candidate(tmp_path), job.private_holdout_refs[0])
+    )
+    await usage_recorded.wait()
+    execution.cancel()
+
+    evidence = await execution
+    replayed = await service.execute(
+        invocation, _candidate(tmp_path), job.private_holdout_refs[0]
+    )
+
+    assert evidence.status == "unresolved"
+    assert evidence.termination_reason == "provider_cost_unresolved"
+    assert evidence.usage_receipt_refs == tuple(
+        receipt.evidence_ref for receipt in model_client.usage_receipts
+    )
+    assert replayed == evidence
+    assert runner.calls == 1
+    assert model_client.any_provider_effect_started is True
+    assert model_client.provider_effect_dispatched_with_unknown_usage is False
+    projection = budget.projection(job.job_id)
+    assert projection.consumed_usd == Decimal("0.10")
+    assert projection.reserved_usd == Decimal("0")

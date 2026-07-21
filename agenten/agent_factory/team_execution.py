@@ -286,6 +286,12 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
         return self._provider_dispatched
 
     @property
+    def any_provider_effect_started(self) -> bool:
+        """Whether this invocation dispatched at least one paid provider effect."""
+
+        return self._provider_dispatched
+
+    @property
     def provider_effect_dispatched_with_unknown_usage(self) -> bool:
         """Whether a dispatched provider effect still lacks authoritative usage."""
 
@@ -941,6 +947,20 @@ class HostAutoGenTeamRunner:
     def provider_effect_dispatched_with_unknown_usage(self) -> bool:
         return self._model_client.provider_effect_dispatched_with_unknown_usage
 
+    @property
+    def any_provider_effect_started(self) -> bool:
+        model_client = getattr(self, "_model_client", None)
+        return bool(
+            model_client is not None and model_client.any_provider_effect_started
+        )
+
+    @property
+    def provider_usage_receipts(self) -> tuple[FactoryUsageReceiptV1, ...]:
+        model_client = getattr(self, "_model_client", None)
+        if model_client is None:
+            return ()
+        return model_client.usage_receipts
+
     async def run(
         self,
         *,
@@ -1345,7 +1365,7 @@ class TeamExecutionService:
         except asyncio.CancelledError:
             if (
                 isinstance(self._runner, HostAutoGenTeamRunner)
-                and self._runner.provider_effect_dispatched_with_unknown_usage
+                and self._runner.any_provider_effect_started
             ):
                 return await asyncio.shield(
                     self._record_provider_cost_unresolved(
@@ -1355,6 +1375,7 @@ class TeamExecutionService:
                         case_ref=case_ref,
                         preflight_ref=preflight_ref,
                         error_type="CancelledError",
+                        usage_receipts=self._runner.provider_usage_receipts,
                     )
                 )
             await asyncio.shield(self._replay_store.abandon(pending))
@@ -1362,7 +1383,7 @@ class TeamExecutionService:
         except Exception as exc:
             if (
                 isinstance(self._runner, HostAutoGenTeamRunner)
-                and not self._runner.provider_effect_dispatched_with_unknown_usage
+                and not self._runner.any_provider_effect_started
             ):
                 await asyncio.shield(self._replay_store.abandon(pending))
                 raise
@@ -1373,6 +1394,11 @@ class TeamExecutionService:
                 case_ref=case_ref,
                 preflight_ref=preflight_ref,
                 error_type=type(exc).__name__,
+                usage_receipts=(
+                    self._runner.provider_usage_receipts
+                    if isinstance(self._runner, HostAutoGenTeamRunner)
+                    else ()
+                ),
             )
         try:
             self._require_run_bindings(
@@ -1417,6 +1443,7 @@ class TeamExecutionService:
         case_ref: PrivateHoldoutRef,
         preflight_ref: ArtifactRef,
         error_type: str,
+        usage_receipts: tuple[FactoryUsageReceiptV1, ...] = (),
     ) -> TeamExecutionEvidenceV1:
         failure_ref = await self._evidence_store.persist(
             self._job,
@@ -1437,6 +1464,7 @@ class TeamExecutionService:
             case_ref=case_ref,
             preflight_ref=preflight_ref,
             failure_ref=failure_ref,
+            usage_receipts=usage_receipts,
         )
         await self._complete_replay(pending, unresolved)
         return unresolved
@@ -1615,6 +1643,7 @@ class TeamExecutionService:
         case_ref: PrivateHoldoutRef,
         preflight_ref: ArtifactRef,
         failure_ref: ArtifactRef,
+        usage_receipts: tuple[FactoryUsageReceiptV1, ...] = (),
     ) -> TeamExecutionEvidenceV1:
         command_id = uuid5(
             NAMESPACE_URL,
@@ -1624,7 +1653,8 @@ class TeamExecutionService:
             NAMESPACE_URL,
             f"factory-team-provider-result|{invocation.invocation_id}",
         )
-        evidence_refs = (preflight_ref, failure_ref)
+        usage_refs = tuple(receipt.evidence_ref for receipt in usage_receipts)
+        evidence_refs = _unique_refs((preflight_ref, failure_ref, *usage_refs))
         assertions = tuple(
             AssertionOutcome(
                 assertion_id=assertion_id,
@@ -1664,6 +1694,7 @@ class TeamExecutionService:
             candidate_ref=candidate.candidate.source_archive_ref,
             holdout_ref=case_ref,
             execution_outcome=outcome,
+            usage_receipt_refs=usage_refs,
             termination_reason="provider_cost_unresolved",
             status="unresolved",
         )
