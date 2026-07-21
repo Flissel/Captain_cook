@@ -76,16 +76,16 @@ function Initialize-LocalEnvironment {
     Set-Missing $values 'CODEX_EXECUTABLE' { 'codex' }
     Set-Missing $values 'LLM_PROVIDER' { 'openai' }
     Set-Missing $values 'OPENAI_MODEL' { 'gpt-4o-mini' }
-    Set-Missing $values 'CAPTAIN_FACTORY_SKILL_ROOT' { 'agenten/agent_factory/skills' }
+    Set-Missing $values 'CAPTAIN_FACTORY_SKILL_ROOT' { [IO.Path]::GetFullPath((Join-Path $root 'agenten/agent_factory/skills')) }
     Set-Missing $values 'CAPTAIN_FACTORY_WORKSPACE_REF' { 'workspace://captain-cook/live-demo' }
     Set-Missing $values 'CAPTAIN_FACTORY_PROVIDER' { 'openai' }
     Set-Missing $values 'CAPTAIN_FACTORY_MODEL' { 'gpt-4o-mini' }
     Set-Missing $values 'CAPTAIN_FACTORY_MAX_COST_USD' { '1.00' }
     Set-Missing $values 'CAPTAIN_FACTORY_MAX_COST_PER_CALL_USD' { '0.25' }
     Set-Missing $values 'CAPTAIN_FACTORY_RUNTIME_SECONDS' { '600' }
-    Set-Missing $values 'CAPTAIN_RUNTIME_ARTIFACT_ROOT' { 'artifacts/capability-factory' }
+    Set-Missing $values 'CAPTAIN_RUNTIME_ARTIFACT_ROOT' { [IO.Path]::GetFullPath((Join-Path $root 'artifacts/capability-factory')) }
     Set-Missing $values 'MINIBOOK_CREATION_ARTIFACTS' { [string]$values['CAPTAIN_RUNTIME_ARTIFACT_ROOT'] }
-    Set-Missing $values 'MINIBOOK_CREATION_DB' { '.captain-cook/minibook-creation.sqlite3' }
+    Set-Missing $values 'MINIBOOK_CREATION_DB' { [IO.Path]::GetFullPath((Join-Path $root '.captain-cook/minibook-creation.sqlite3')) }
     $runtimeArtifactValue = [string]$values['CAPTAIN_RUNTIME_ARTIFACT_ROOT']
     $runtimeArtifactRoot = if ([IO.Path]::IsPathFullyQualified($runtimeArtifactValue)) {
         [IO.Path]::GetFullPath($runtimeArtifactValue)
