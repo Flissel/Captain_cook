@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
 from agenten.agent_factory.codebase_discovery import (
     CodebaseDiscoveryService,
     FilesystemRepositoryInspection,
+    SourceMatch,
+    WorktreeObservation,
 )
+from agenten.agent_factory.forge_contracts import DocumentationEvidence, DocumentationQuery
 from agenten.agent_factory.input_compiler import (
     AcceptanceAssertion,
     CompiledFactorySpecification,
@@ -27,6 +31,7 @@ JOB_ID = "00000000-0000-0000-0000-000000000501"
 CORRELATION_ID = "00000000-0000-0000-0000-000000000502"
 INVOCATION_ID = "00000000-0000-0000-0000-000000000503"
 ASSERTION_ID = "assert-aaaaaaaaaaaa"
+SECOND_ASSERTION_ID = "assert-cccccccccccc"
 
 
 def artifact(name: str, *, media_type: str = "application/json") -> ArtifactRef:
@@ -42,10 +47,74 @@ class RecordingDocumentationPort:
     def __init__(self) -> None:
         self.queries: list[object] = []
 
-    def resolve(self, query: object) -> tuple[ArtifactRef, ...]:
+    def resolve(self, query: DocumentationQuery) -> DocumentationEvidence:
         self.queries.append(query)
-        ecosystem = str(getattr(query, "ecosystem"))
-        return (artifact(f"context7-{ecosystem}"),)
+        query_payload = query.model_dump(mode="json")
+        query_sha256 = hashlib.sha256(
+            json.dumps(query_payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        source_ref = artifact(f"context7-{query.ecosystem}", media_type="text/html")
+        return DocumentationEvidence(
+            query=query,
+            query_sha256=query_sha256,
+            retrieved_version=("0.7.5" if query.ecosystem == "autogen" else "1.100.0"),
+            retrieved_at=NOW,
+            source_refs=(source_ref.model_dump(mode="json"),),
+            content_sha256=source_ref.sha256,
+        )
+
+
+class RecordingPackageMetadata:
+    def __init__(self, version: str = "0.7.5") -> None:
+        self.version = version
+        self.requests: list[str] = []
+
+    def installed_version(self, distribution: str) -> str:
+        self.requests.append(distribution)
+        return self.version
+
+
+class RecordingGitWorktrees:
+    def __init__(
+        self,
+        observations: tuple[WorktreeObservation, ...] | None = None,
+    ) -> None:
+        self.observations = observations or (
+            WorktreeObservation(
+                revision=REVISION,
+                relative_name=".",
+                branch="fixture-branch",
+                dirty=True,
+            ),
+        )
+        self.roots: list[Path] = []
+
+    def observe(self, root: Path) -> tuple[WorktreeObservation, ...]:
+        self.roots.append(root)
+        return self.observations
+
+
+class DisorderedRepository:
+    def __init__(
+        self,
+        delegate: FilesystemRepositoryInspection,
+        observations: tuple[WorktreeObservation, ...],
+    ) -> None:
+        self._delegate = delegate
+        self._observations = observations
+
+    def revision(self) -> str:
+        return self._delegate.revision()
+
+    def worktrees(self) -> tuple[WorktreeObservation, ...]:
+        return self._observations
+
+    def search(self, pattern: str, globs: tuple[str, ...]) -> tuple[SourceMatch, ...]:
+        matches = self._delegate.search(pattern, globs)
+        return tuple(reversed(matches)) + matches[:2]
+
+    def read_text(self, relative_path: PurePosixPath) -> str:
+        return self._delegate.read_text(relative_path)
 
 
 class RecordingToolCatalog:
@@ -87,7 +156,7 @@ def factory_repo_fixture(
 ) -> Path:
     root = tmp_path / "fixture-repository"
     files = {
-        "requirements.txt": "autogen-agentchat==0.7.5\nautogen-ext[openai]==0.7.5\n",
+        "requirements.txt": "autogen-agentchat>=0.1.0\nautogen-ext[openai]>=0.1.0\n",
         "agenten/workflows/existing_team.py": (
             "from autogen_agentchat.teams import Swarm\n"
             "from autogen_agentchat.conditions import TextMentionTermination\n"
@@ -107,6 +176,14 @@ def factory_repo_fixture(
             "class CustomerLookupTool:\n"
             "    name = 'customer_lookup'\n"
         ),
+        "agenten/not_a_tool.py": (
+            "class BaseModel:\n"
+            "    pass\n\n"
+            "def tool():\n"
+            "    return 'ordinary helper'\n\n"
+            "def build_report():\n"
+            "    return 'ordinary report'\n"
+        ),
         "prompts/support.md": "# System prompt\nUse customer context and typed handoffs.\n",
         "tests/test_existing_team.py": (
             "from agenten.workflows.existing_team import build_team\n\n"
@@ -121,6 +198,8 @@ def factory_repo_fixture(
             "TODO_TOOL.v1 markers are JSON contracts.\n"
         ),
         ".env": "DO_NOT_READ=private-fixture\nautogen-agentchat==99.99.99\n",
+        ".ENV.production": "DO_NOT_READ=case-insensitive-fixture\n",
+        "secrets/customer_api_key.txt": "AutoGen model_client must-not-be-read\n",
     }
     if integration_intent == "n8n":
         files["n8n/customer-sync.json"] = json.dumps(
@@ -149,7 +228,10 @@ def factory_repo_fixture(
 
 
 def compiled_spec(
-    *, capability_key: str = "support_triage", integration_intent: str = "none"
+    *,
+    capability_key: str = "support_triage",
+    integration_intent: str = "none",
+    assertion_count: int = 1,
 ) -> CompiledFactorySpecification:
     nodes = [FactoryWorkNode(node_id="architecture", kind="architecture")]
     if integration_intent == "n8n":
@@ -160,20 +242,32 @@ def compiled_spec(
                 dependencies=("architecture",),
             )
         )
+    assertions = [
+        AcceptanceAssertion(
+            assertion_id=ASSERTION_ID,
+            source_path=("Acceptance outcomes", "support"),
+            observable_setup="Given a support request",
+            observable_action="Run the generated team",
+            observable_expected="Return the typed supported response",
+            kind="business",
+        ),
+    ]
+    if assertion_count == 2:
+        assertions.append(
+            AcceptanceAssertion(
+                assertion_id=SECOND_ASSERTION_ID,
+                source_path=("Acceptance outcomes", "audit"),
+                observable_setup="Given a completed support request",
+                observable_action="Inspect the generated evidence",
+                observable_expected="Return a typed audit record",
+                kind="business",
+            )
+        )
     return CompiledFactorySpecification(
         source_ref=artifact("compiled-input"),
         subject_version=1,
         capability_key=capability_key,
-        assertions=(
-            AcceptanceAssertion(
-                assertion_id=ASSERTION_ID,
-                source_path=("Acceptance outcomes", "support"),
-                observable_setup="Given a support request",
-                observable_action="Run the generated team",
-                observable_expected="Return the typed supported response",
-                kind="business",
-            ),
-        ),
+        assertions=tuple(assertions),
         private_holdout_refs=(
             {
                 "holdout_id": "holdout-bbbbbbbbbbbb",
@@ -187,7 +281,11 @@ def compiled_spec(
     )
 
 
-def invocation(specification: CompiledFactorySpecification) -> FactorySkillInvocationV1:
+def invocation(
+    specification: CompiledFactorySpecification,
+    *,
+    capabilities: tuple[str, ...] = ("repository.read", "context7.read"),
+) -> FactorySkillInvocationV1:
     return FactorySkillInvocationV1.model_validate(
         {
             "schema": "captain.factory-skill-invocation.v1",
@@ -219,7 +317,7 @@ def invocation(specification: CompiledFactorySpecification) -> FactorySkillInvoc
                 "attempt": 1,
                 "role": "agent_architect",
                 "capability_profile": "factory-architect",
-                "capabilities": ["repository.read", "context7.read"],
+                "capabilities": capabilities,
                 "workspace_ref": "workspace://factory/discovery",
                 "issued_at": NOW,
                 "expires_at": NOW + timedelta(minutes=10),
@@ -235,6 +333,8 @@ def service(
     *,
     docs: RecordingDocumentationPort | None = None,
     matches: tuple[str, ...] = ("released.customer_lookup",),
+    git_worktrees: RecordingGitWorktrees | None = None,
+    package_metadata: RecordingPackageMetadata | None = None,
 ) -> tuple[
     CodebaseDiscoveryService,
     FilesystemRepositoryInspection,
@@ -242,7 +342,11 @@ def service(
     RecordingToolCatalog,
     RecordingEvidenceStore,
 ]:
-    repository = FilesystemRepositoryInspection(root, revision=REVISION)
+    repository = FilesystemRepositoryInspection(
+        root,
+        expected_revision=REVISION,
+        git_worktrees=git_worktrees or RecordingGitWorktrees(),
+    )
     documentation = docs or RecordingDocumentationPort()
     catalog = RecordingToolCatalog(matches)
     evidence = RecordingEvidenceStore()
@@ -252,6 +356,7 @@ def service(
             documentation=documentation,
             tool_catalog=catalog,
             evidence_store=evidence,
+            package_metadata=package_metadata or RecordingPackageMetadata(),
             clock=lambda: NOW + timedelta(minutes=1),
         ),
         repository,
@@ -277,8 +382,36 @@ def test_discovery_finds_semantic_reuse_without_reading_secrets(tmp_path: Path) 
     assert inventory.tool_catalog_match_ids == ("released.customer_lookup",)
     assert [query.ecosystem for query in docs.queries] == ["autogen"]
     assert catalog.requests[0][0] == "support_triage"
+    assert "agenten.not_a_tool" not in inventory.reusable_component_ids
+    assert not any("agenten/not_a_tool.py" in ref.uri for ref in inventory.entrypoint_refs)
     assert ".env" not in repository.read_paths
-    assert all(".env" not in ref.uri for ref in inventory.evidence_refs + inventory.source_refs)
+    assert ".ENV.production" not in repository.read_paths
+    assert "secrets/customer_api_key.txt" not in repository.read_paths
+    assert all(
+        ".env" not in ref.uri.lower()
+        for ref in inventory.evidence_refs + inventory.source_refs
+    )
+
+    worktrees_ref = next(ref for ref in inventory.evidence_refs if "/worktrees/" in ref.uri)
+    assert evidence.read(worktrees_ref) == [
+        {
+            "branch": "fixture-branch",
+            "dirty": True,
+            "relative_name": ".",
+            "revision": REVISION,
+        }
+    ]
+    search_ref = next(
+        ref for ref in inventory.evidence_refs if "/semantic-search/" in ref.uri
+    )
+    search_evidence = evidence.read(search_ref)
+    assert any(item["symbol"] == "build_team" for item in search_evidence)
+
+    documentation = evidence.read(inventory.documentation_refs[0])
+    assert documentation["query"]["ecosystem"] == "autogen"
+    assert documentation["query"]["installed_version"] == "0.7.5"
+    assert documentation["retrieved_version"] == "0.7.5"
+    assert len(documentation["query_sha256"]) == 64
 
     summary = evidence.read(inventory.artifact_ref)
     assert set(summary["categories"]) >= {
@@ -299,13 +432,20 @@ def test_n8n_docs_are_queried_only_for_declared_integration(tmp_path: Path) -> N
     root = factory_repo_fixture(tmp_path, integration_intent="n8n")
     specification = compiled_spec(integration_intent="n8n")
     docs = RecordingDocumentationPort()
-    discovery, _, _, _, _ = service(root, docs=docs)
+    discovery, _, _, _, service_evidence = service(root, docs=docs)
 
     inventory = discovery.discover(invocation(specification), specification)
 
     assert [query.ecosystem for query in docs.queries] == ["autogen", "n8n"]
-    assert any("context7-n8n" in ref.uri for ref in inventory.documentation_refs)
     assert any("n8n/customer-sync.json" in ref.uri for ref in inventory.source_refs)
+    provenance = [
+        evidence
+        for ref in inventory.documentation_refs
+        if (evidence := service_evidence.read(ref))["query"]["ecosystem"] == "n8n"
+    ]
+    assert provenance[0]["query"]["installed_version"] == "declared-intent"
+    assert provenance[0]["retrieved_version"] == "1.100.0"
+    assert len(provenance[0]["query_sha256"]) == 64
 
 
 @pytest.mark.parametrize(
@@ -366,11 +506,168 @@ def test_optional_todo_tool_remains_separately_classified(tmp_path: Path) -> Non
     assert marker.status == "unresolved"
 
 
+@pytest.mark.parametrize(
+    ("capabilities", "missing"),
+    [
+        (("context7.read",), "repository.read"),
+        (("repository.read",), "context7.read"),
+    ],
+)
+def test_discovery_rejects_missing_lease_capability_before_effects(
+    tmp_path: Path,
+    capabilities: tuple[str, ...],
+    missing: str,
+) -> None:
+    root = factory_repo_fixture(tmp_path)
+    specification = compiled_spec()
+    discovery, repository, docs, catalog, _ = service(root)
+
+    with pytest.raises(PermissionError, match=missing):
+        discovery.discover(
+            invocation(specification, capabilities=capabilities),
+            specification,
+        )
+
+    assert repository.read_paths == ()
+    assert docs.queries == []
+    assert catalog.requests == []
+
+
+def test_filesystem_adapter_uses_real_git_state_and_rejects_revision_mismatch(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "git-repository"
+    root.mkdir()
+    (root / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    commands = (
+        ("init", "-q"),
+        ("config", "user.email", "factory@example.invalid"),
+        ("config", "user.name", "Factory Test"),
+        ("add", "tracked.txt"),
+        ("commit", "-q", "-m", "test: seed fixture"),
+    )
+    for args in commands:
+        subprocess.run(
+            ["git", "-C", str(root), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    revision = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    repository = FilesystemRepositoryInspection(root, expected_revision=revision)
+    clean = repository.worktrees()
+
+    assert clean[0].revision == revision
+    assert clean[0].branch
+    assert clean[0].dirty is False
+
+    (root / "tracked.txt").write_text("changed\n", encoding="utf-8")
+    dirty = FilesystemRepositoryInspection(root, expected_revision=revision).worktrees()
+    assert dirty[0].dirty is True
+
+    with pytest.raises(ValueError, match="revision mismatch"):
+        FilesystemRepositoryInspection(root, expected_revision="f" * 40)
+
+
+def test_service_sorts_and_deduplicates_port_observations(tmp_path: Path) -> None:
+    root = factory_repo_fixture(tmp_path)
+    primary = WorktreeObservation(
+        revision=REVISION,
+        relative_name=".",
+        branch="fixture-branch",
+        dirty=True,
+    )
+    secondary = WorktreeObservation(
+        revision=REVISION,
+        relative_name="secondary",
+        branch="secondary-branch",
+        dirty=False,
+    )
+    base = FilesystemRepositoryInspection(
+        root,
+        expected_revision=REVISION,
+        git_worktrees=RecordingGitWorktrees((primary,)),
+    )
+    repository = DisorderedRepository(base, (secondary, primary, secondary))
+    docs = RecordingDocumentationPort()
+    catalog = RecordingToolCatalog(("released.customer_lookup",))
+    evidence = RecordingEvidenceStore()
+    discovery = CodebaseDiscoveryService(
+        repository=repository,
+        documentation=docs,
+        tool_catalog=catalog,
+        evidence_store=evidence,
+        package_metadata=RecordingPackageMetadata(),
+        clock=lambda: NOW + timedelta(minutes=1),
+    )
+    specification = compiled_spec()
+
+    inventory = discovery.discover(invocation(specification), specification)
+
+    worktree_ref = next(ref for ref in inventory.evidence_refs if "/worktrees/" in ref.uri)
+    worktrees = evidence.read(worktree_ref)
+    assert [item["relative_name"] for item in worktrees] == [".", "secondary"]
+    search_ref = next(
+        ref for ref in inventory.evidence_refs if "/semantic-search/" in ref.uri
+    )
+    matches = evidence.read(search_ref)
+    identities = [
+        (item["relative_path"], item["line"], item["symbol"], item["content_sha256"])
+        for item in matches
+    ]
+    assert identities == sorted(set(identities))
+
+
+def test_required_gap_options_cover_every_blocked_assertion(tmp_path: Path) -> None:
+    root = factory_repo_fixture(tmp_path, integration_intent="n8n")
+    specification = compiled_spec(
+        capability_key="missing_crm_api",
+        integration_intent="n8n",
+        assertion_count=2,
+    )
+    discovery, _, _, _, evidence = service(root, matches=())
+
+    inventory = discovery.discover(invocation(specification), specification)
+
+    marker = ToolGapMarker.model_validate(evidence.read(inventory.gap_refs[0]))
+    assert {
+        option.acceptance_assertion_id for option in marker.implementation_options
+    } == set(specification.assertion_ids)
+
+
 def test_repository_reader_rejects_secrets_and_scope_escape(tmp_path: Path) -> None:
     root = factory_repo_fixture(tmp_path)
-    repository = FilesystemRepositoryInspection(root, revision=REVISION)
+    repository = FilesystemRepositoryInspection(
+        root,
+        expected_revision=REVISION,
+        git_worktrees=RecordingGitWorktrees(),
+    )
 
     with pytest.raises(ValueError, match="excluded"):
         repository.read_text(Path(".env"))
+    with pytest.raises(ValueError, match="excluded"):
+        repository.read_text(Path(".ENV.production"))
+    with pytest.raises(ValueError, match="excluded"):
+        repository.read_text(Path("secrets/customer_api_key.txt"))
     with pytest.raises(ValueError, match="relative|scope"):
         repository.read_text(Path("../outside.py"))
+
+
+def test_repository_rejects_symlink_before_resolving_secret_target(tmp_path: Path) -> None:
+    root = factory_repo_fixture(tmp_path)
+    link = root / "public_source.py"
+    link.symlink_to(root / ".env")
+    repository = FilesystemRepositoryInspection(
+        root,
+        expected_revision=REVISION,
+        git_worktrees=RecordingGitWorktrees(),
+    )
+
+    with pytest.raises(ValueError, match="symlink"):
+        repository.read_text(Path("public_source.py"))

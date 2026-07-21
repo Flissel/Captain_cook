@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
+import importlib.metadata
 import json
 import re
+import subprocess
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -15,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agenten.agent_runtime.contracts import ArtifactRef, SHA256_PATTERN
 
-from .forge_contracts import DocumentationQuery
+from .forge_contracts import DocumentationEvidence, DocumentationQuery
 from .input_compiler import CompiledFactorySpecification
 from .skill_evaluation import ToolGapMarker, ToolImplementationOption
 from .skill_workflow_contracts import CodebaseInventoryV1, FactorySkillInvocationV1
@@ -52,12 +55,9 @@ _SEMANTIC_PATTERN = (
     r"user[_ -]?prompt|memory|termination|handoff|BaseModel|tool|n8n|test_|"
     r"\$schema|architecture|TODO_TOOL\.v1|def\s+(?:build|main|run))"
 )
-_AUTOGEN_VERSION_PATTERN = re.compile(
-    r"(?im)^\s*autogen-(?:agentchat|core|ext)(?:\[[^\]]+\])?\s*"
-    r"(?:==|~=|>=)\s*([0-9]+(?:\.[0-9]+){1,3})"
-)
-_PYTHON_SYMBOL_PATTERN = re.compile(
-    r"^\s*(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)"
+_SECRET_PATH_PATTERN = re.compile(
+    r"(?i)(?:^|[._-])(?:api[_-]?key|credentials?|password|secrets?|tokens?)"
+    r"(?:$|[._-])"
 )
 
 
@@ -104,7 +104,15 @@ class RepositoryInspectionPort(Protocol):
 
 
 class DocumentationDiscoveryPort(Protocol):
-    def resolve(self, query: DocumentationQuery) -> tuple[ArtifactRef, ...]: ...
+    def resolve(self, query: DocumentationQuery) -> DocumentationEvidence: ...
+
+
+class GitWorktreeInspectionPort(Protocol):
+    def observe(self, root: Path) -> tuple[WorktreeObservation, ...]: ...
+
+
+class PackageMetadataPort(Protocol):
+    def installed_version(self, distribution: str) -> str: ...
 
 
 class ToolCatalogPort(Protocol):
@@ -119,18 +127,80 @@ class DiscoveryEvidenceStore(Protocol):
     def seal(self, kind: str, payload: object) -> ArtifactRef: ...
 
 
+class SubprocessGitWorktreeInspection:
+    """Observe the assigned worktree through fixed argv-only Git commands."""
+
+    def observe(self, root: Path) -> tuple[WorktreeObservation, ...]:
+        top_level = Path(self._run(root, "rev-parse", "--show-toplevel")).resolve()
+        if top_level != root.resolve():
+            raise ValueError("Git top-level does not match assigned repository root")
+        revision = self._run(root, "rev-parse", "HEAD")
+        branch = self._run(root, "branch", "--show-current") or None
+        dirty = bool(self._run(root, "status", "--porcelain=v1"))
+        return (
+            WorktreeObservation(
+                revision=revision,
+                relative_name=".",
+                branch=branch,
+                dirty=dirty,
+            ),
+        )
+
+    @staticmethod
+    def _run(root: Path, *arguments: str) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+            shell=False,
+        )
+        return completed.stdout.strip()
+
+
+class ImportlibPackageMetadata:
+    """Read the installed runtime version from Python distribution metadata."""
+
+    def installed_version(self, distribution: str) -> str:
+        try:
+            return importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError as exc:
+            raise ValueError(f"installed package metadata is missing for {distribution}") from exc
+
+
 class FilesystemRepositoryInspection:
     """Read-only filesystem adapter constrained to one assigned repository root."""
 
-    def __init__(self, root: Path, *, revision: str) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        expected_revision: str,
+        git_worktrees: GitWorktreeInspectionPort | None = None,
+    ) -> None:
         resolved_root = root.resolve()
         if not resolved_root.is_dir():
             raise ValueError("repository root must be an existing directory")
-        if re.fullmatch(_REVISION_PATTERN, revision) is None:
-            raise ValueError("repository revision must be a full lowercase commit digest")
+        if re.fullmatch(_REVISION_PATTERN, expected_revision) is None:
+            raise ValueError("expected revision must be a full lowercase commit digest")
         self._root = resolved_root
-        self._revision = revision
         self._read_paths: set[str] = set()
+        observer = git_worktrees or SubprocessGitWorktreeInspection()
+        observations = tuple(observer.observe(self._root))
+        if not observations:
+            raise ValueError("Git worktree observation must not be empty")
+        current = next(
+            (item for item in observations if item.relative_name == "."),
+            None,
+        )
+        if current is None:
+            raise ValueError("Git worktree observation must include the assigned worktree")
+        if current.revision != expected_revision:
+            raise ValueError("caller revision mismatch with observed Git HEAD")
+        if any(item.revision != expected_revision for item in observations):
+            raise ValueError("observed worktree revision mismatch")
+        self._revision = current.revision
+        self._worktrees = observations
 
     @property
     def read_paths(self) -> tuple[str, ...]:
@@ -142,14 +212,7 @@ class FilesystemRepositoryInspection:
         return self._revision
 
     def worktrees(self) -> tuple[WorktreeObservation, ...]:
-        return (
-            WorktreeObservation(
-                revision=self._revision,
-                relative_name=".",
-                branch=None,
-                dirty=False,
-            ),
-        )
+        return self._worktrees
 
     def search(self, pattern: str, globs: tuple[str, ...]) -> tuple[SourceMatch, ...]:
         compiled = re.compile(pattern)
@@ -157,15 +220,15 @@ class FilesystemRepositoryInspection:
         for relative_path in self._candidate_paths(globs):
             content = self.read_text(PurePosixPath(relative_path))
             digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            symbols_by_line = _python_symbols_by_line(relative_path, content)
             for line_number, line in enumerate(content.splitlines(), start=1):
                 if compiled.search(line) is None:
                     continue
-                symbol_match = _PYTHON_SYMBOL_PATTERN.match(line)
                 matches.append(
                     SourceMatch(
                         relative_path=relative_path,
                         line=line_number,
-                        symbol=symbol_match.group(1) if symbol_match else None,
+                        symbol=symbols_by_line.get(line_number),
                         content_sha256=digest,
                     )
                 )
@@ -185,12 +248,19 @@ class FilesystemRepositoryInspection:
         normalized = _safe_relative_path(str(relative_path).replace("\\", "/"))
         if _is_excluded(PurePosixPath(normalized)):
             raise ValueError("repository path is excluded from inspection")
-        target = (self._root / Path(*PurePosixPath(normalized).parts)).resolve()
+        unresolved = self._root / Path(*PurePosixPath(normalized).parts)
+        if unresolved.is_symlink() or any(
+            parent.is_symlink()
+            for parent in unresolved.parents
+            if parent != self._root and self._root in parent.parents
+        ):
+            raise ValueError("repository symlinks are excluded from inspection")
+        target = unresolved.resolve()
         try:
             target.relative_to(self._root)
         except ValueError as exc:
             raise ValueError("repository path escapes assigned scope") from exc
-        if target.is_symlink() or not target.is_file():
+        if not target.is_file():
             raise ValueError("repository path must identify an in-scope regular file")
         self._read_paths.add(normalized)
         return target.read_text(encoding="utf-8")
@@ -219,6 +289,7 @@ class CodebaseDiscoveryService:
         documentation: DocumentationDiscoveryPort,
         tool_catalog: ToolCatalogPort,
         evidence_store: DiscoveryEvidenceStore,
+        package_metadata: PackageMetadataPort | None = None,
         *,
         clock: Callable[[], datetime],
     ) -> None:
@@ -226,6 +297,7 @@ class CodebaseDiscoveryService:
         self._documentation = documentation
         self._tool_catalog = tool_catalog
         self._evidence_store = evidence_store
+        self._package_metadata = package_metadata or ImportlibPackageMetadata()
         self._clock = clock
 
     def discover(
@@ -238,15 +310,22 @@ class CodebaseDiscoveryService:
         if re.fullmatch(_REVISION_PATTERN, revision) is None:
             raise ValueError("repository returned an invalid revision")
 
-        matches = self._repository.search(_SEMANTIC_PATTERN, _SEARCH_GLOBS)
+        worktrees = _sorted_worktrees(self._repository.worktrees())
+        if not worktrees or any(item.revision != revision for item in worktrees):
+            raise ValueError("repository worktree evidence does not match observed revision")
+        matches = _sorted_matches(
+            self._repository.search(_SEMANTIC_PATTERN, _SEARCH_GLOBS)
+        )
         contents = {
             path: self._repository.read_text(PurePosixPath(path))
             for path in sorted({match.relative_path for match in matches})
         }
-        categories = self._categorize(contents)
+        categories = self._categorize(contents, matches)
         reusable_ids = self._reusable_component_ids(categories)
         source_refs = self._source_refs(categories, contents)
-        autogen_version = self._autogen_version(contents)
+        autogen_version = self._package_metadata.installed_version("autogen-agentchat")
+        if not autogen_version.strip():
+            raise ValueError("installed AutoGen package metadata returned a blank version")
         documentation_refs = self._documentation_refs(
             specification=specification,
             autogen_version=autogen_version,
@@ -269,7 +348,7 @@ class CodebaseDiscoveryService:
 
         worktree_ref = self._evidence_store.seal(
             "worktrees",
-            [item.model_dump(mode="json") for item in self._repository.worktrees()],
+            [item.model_dump(mode="json") for item in worktrees],
         )
         search_ref = self._evidence_store.seal(
             "semantic-search",
@@ -281,6 +360,9 @@ class CodebaseDiscoveryService:
             "categories": sorted(categories),
             "paths": sorted(contents),
             "reusable_component_ids": list(reusable_ids),
+            "symbols": sorted(
+                {item.symbol for item in matches if item.symbol is not None}
+            ),
             "tool_catalog_match_ids": list(tool_matches),
             "gap_count": len(gap_refs),
         }
@@ -329,38 +411,35 @@ class CodebaseDiscoveryService:
             raise ValueError("compiled specification source does not match invocation")
         if invocation.acceptance_assertion_ids != specification.assertion_ids:
             raise ValueError("compiled specification assertions do not match invocation")
+        required_capabilities = {"repository.read", "context7.read"}
+        missing = sorted(required_capabilities - set(invocation.lease.capabilities))
+        if missing:
+            raise PermissionError(
+                f"discovery lease is missing required capability {missing[0]}"
+            )
 
     @staticmethod
-    def _categorize(contents: dict[str, str]) -> dict[str, tuple[str, ...]]:
+    def _categorize(
+        contents: dict[str, str],
+        matches: tuple[SourceMatch, ...],
+    ) -> dict[str, tuple[str, ...]]:
         categories: dict[str, set[str]] = {}
+        observed_symbols = {
+            path: {match.symbol for match in matches if match.relative_path == path}
+            for path in contents
+        }
         for path, content in contents.items():
-            lowered = content.lower()
             path_lower = path.lower()
-            tests = {
-                "autogen": "autogen" in lowered,
-                "entrypoint": bool(
-                    re.search(r"(?m)^\s*(?:async\s+)?def\s+(?:build\w*|main|run)\s*\(", content)
-                    or "if __name__" in lowered
-                ),
-                "model_client": "model_client" in lowered or "chatcompletionclient" in lowered,
-                "prompt": "prompt" in lowered or "/prompts/" in f"/{path_lower}",
-                "memory": "memory" in lowered,
-                "termination": "termination" in lowered,
-                "handoff": "handoff" in lowered,
-                "typed_tool": (
-                    path_lower.endswith(".py")
-                    and "tool" in lowered
-                    and ("basemodel" in lowered or "typeddict" in lowered)
-                ),
-                "n8n": "n8n" in lowered or "/n8n/" in f"/{path_lower}",
-                "test": path_lower.startswith("tests/") or "/test_" in f"/{path_lower}",
-                "schema": "$schema" in lowered or "/schemas/" in f"/{path_lower}",
-                "architecture": "architecture" in path_lower,
-                "tool_gap": path_lower.endswith(".json") and "todo_tool.v1" in lowered,
-            }
-            for category, present in tests.items():
-                if present:
-                    categories.setdefault(category, set()).add(path)
+            present_categories = _path_categories(path_lower, content)
+            if path_lower.endswith(".py"):
+                present_categories.update(
+                    _python_categories(
+                        content,
+                        observed_symbols.get(path, set()),
+                    )
+                )
+            for category in present_categories:
+                categories.setdefault(category, set()).add(path)
         return {
             category: tuple(sorted(paths))
             for category, paths in sorted(categories.items())
@@ -405,20 +484,6 @@ class CodebaseDiscoveryService:
             for path in categories.get(category, ())
         )
 
-    @staticmethod
-    def _autogen_version(contents: dict[str, str]) -> str:
-        versions = {
-            match.group(1)
-            for path, content in contents.items()
-            if path == "pyproject.toml" or path.startswith("requirements")
-            for match in _AUTOGEN_VERSION_PATTERN.finditer(content)
-        }
-        if not versions:
-            raise ValueError("installed AutoGen version was not discovered")
-        if len(versions) != 1:
-            raise ValueError("conflicting AutoGen versions were discovered")
-        return versions.pop()
-
     def _documentation_refs(
         self,
         *,
@@ -439,14 +504,31 @@ class CodebaseDiscoveryService:
                 DocumentationQuery(
                     ecosystem="n8n",
                     package_id="n8n",
-                    installed_version="declared",
+                    installed_version="declared-intent",
                     query="n8n typed workflow contracts and execution APIs",
                     required=True,
                 )
             )
-        return _unique_refs(
-            tuple(ref for query in queries for ref in self._documentation.resolve(query))
-        )
+        references: list[ArtifactRef] = []
+        for query in queries:
+            evidence = self._documentation.resolve(query)
+            expected_query_sha256 = _documentation_query_sha256(query)
+            if evidence.query != query:
+                raise ValueError("documentation evidence query does not match request")
+            if evidence.query_sha256 != expected_query_sha256:
+                raise ValueError("documentation evidence query digest does not match request")
+            if query.ecosystem == "autogen" and (
+                evidence.retrieved_version.split(".")[:2]
+                != autogen_version.split(".")[:2]
+            ):
+                raise ValueError("AutoGen documentation version does not match runtime")
+            references.append(
+                self._evidence_store.seal(
+                    f"documentation-{query.ecosystem}",
+                    evidence.model_dump(mode="json"),
+                )
+            )
+        return _unique_refs(tuple(references))
 
     def _gap_refs(
         self,
@@ -457,12 +539,11 @@ class CodebaseDiscoveryService:
     ) -> tuple[ArtifactRef, ...]:
         markers: list[ToolGapMarker] = []
         accepted = set(specification.assertion_ids)
-        for path in sorted(set(self._categorize(contents).get("tool_gap", ()))):
+        for path, payload in _tool_gap_payloads(contents):
             try:
-                payload = json.loads(contents[path])
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"invalid TODO_TOOL.v1 JSON at {path}") from exc
-            marker = ToolGapMarker.model_validate(payload)
+                marker = ToolGapMarker.model_validate(payload)
+            except ValueError as exc:
+                raise ValueError(f"invalid TODO_TOOL.v1 marker at {path}") from exc
             if set(marker.acceptance_assertion_ids) - accepted:
                 raise ValueError("TODO_TOOL.v1 contains unknown Captain assertions")
             markers.append(marker)
@@ -485,33 +566,47 @@ class CodebaseDiscoveryService:
         self,
         specification: CompiledFactorySpecification,
     ) -> ToolGapMarker:
-        assertion_id = specification.assertion_ids[0]
-        options = [
-            ToolImplementationOption(
-                option_id="reuse-released-tool",
-                description="Reuse a Captain-released tool with the required typed contract.",
-                acceptance_assertion_id=assertion_id,
+        blueprints = [
+            (
+                "reuse-released-tool",
+                "Reuse a Captain-released tool with the required typed contract.",
             ),
-            ToolImplementationOption(
-                option_id="implement-typed-local-adapter",
-                description=(
-                    "Implement a typed local adapter with schema, auth, health, and "
-                    "idempotency tests."
-                ),
-                acceptance_assertion_id=assertion_id,
+            (
+                "implement-typed-local-adapter",
+                "Implement a typed local adapter with schema, auth, health, and "
+                "idempotency tests.",
             ),
         ]
         if _has_n8n_intent(specification):
-            options.append(
-                ToolImplementationOption(
-                    option_id="implement-typed-n8n-integration",
-                    description=(
-                        "Provide a typed n8n integration under an approved "
-                        "capability lease."
-                    ),
-                    acceptance_assertion_id=assertion_id,
+            blueprints.append(
+                (
+                    "implement-typed-n8n-integration",
+                    "Provide a typed n8n integration under an approved capability lease.",
                 )
             )
+        if len(specification.assertion_ids) > 3:
+            raise ValueError(
+                "TODO_TOOL.v1 cannot bind more than three blocked assertions"
+            )
+        while len(blueprints) < len(specification.assertion_ids):
+            index = len(blueprints) + 1
+            blueprints.append(
+                (
+                    f"implement-typed-local-adapter-{index}",
+                    "Implement a typed local adapter with schema, auth, health, and "
+                    "idempotency tests.",
+                )
+            )
+        options = [
+            ToolImplementationOption(
+                option_id=option_id,
+                description=description,
+                acceptance_assertion_id=specification.assertion_ids[
+                    index % len(specification.assertion_ids)
+                ],
+            )
+            for index, (option_id, description) in enumerate(blueprints)
+        ]
         rationale_ref = self._evidence_store.seal(
             "required-tool-gap-rationale",
             {
@@ -557,9 +652,190 @@ def _safe_relative_path(value: str, *, allow_dot: bool = False) -> str:
 
 
 def _is_excluded(path: PurePosixPath) -> bool:
-    return any(part in _EXCLUDED_PARTS for part in path.parts) or any(
-        part == ".env" or part.startswith(".env.") for part in path.parts
+    lowered_parts = tuple(part.lower() for part in path.parts)
+    return any(part in _EXCLUDED_PARTS for part in lowered_parts) or any(
+        part.startswith(".env") or _SECRET_PATH_PATTERN.search(part) is not None
+        for part in lowered_parts
     )
+
+
+def _python_symbols_by_line(relative_path: str, content: str) -> dict[int, str]:
+    if not relative_path.lower().endswith(".py"):
+        return {}
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return {}
+    definitions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.AsyncFunctionDef, ast.ClassDef, ast.FunctionDef))
+    ]
+    definitions.sort(
+        key=lambda node: (
+            -((getattr(node, "end_lineno", node.lineno) or node.lineno) - node.lineno),
+            node.lineno,
+        )
+    )
+    symbols: dict[int, str] = {}
+    for node in definitions:
+        end_line = getattr(node, "end_lineno", node.lineno) or node.lineno
+        for line_number in range(node.lineno, end_line + 1):
+            symbols[line_number] = node.name
+    return symbols
+
+
+def _path_categories(path_lower: str, content: str) -> set[str]:
+    categories: set[str] = set()
+    path = PurePosixPath(path_lower)
+    parts = path.parts
+    if (parts and parts[0] == "tests") or path.name.startswith("test_"):
+        categories.add("test")
+    if "prompts" in parts:
+        categories.add("prompt")
+    if "architecture" in path.name:
+        categories.add("architecture")
+    if path_lower.endswith(".json"):
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            if "$schema" in payload:
+                categories.add("schema")
+            if payload.get("schema") == "TODO_TOOL.v1":
+                categories.add("tool_gap")
+            if "n8n" in parts or _json_contains_n8n_type(payload):
+                categories.add("n8n")
+    return categories
+
+
+def _python_categories(content: str, observed_symbols: set[str | None]) -> set[str]:
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return set()
+    categories: set[str] = set()
+    contract_classes: set[str] = set()
+    tool_symbols: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name.startswith("autogen") for alias in node.names):
+                categories.add("autogen")
+        elif isinstance(node, ast.ImportFrom):
+            if node.module is not None and node.module.startswith("autogen"):
+                categories.add("autogen")
+        elif isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            if node.name in {"build_team", "main", "run"} and node.name in observed_symbols:
+                categories.add("entrypoint")
+            if any(_qualified_name(item).endswith("tool") for item in node.decorator_list):
+                tool_symbols.add(node.name)
+        elif isinstance(node, ast.ClassDef):
+            base_names = {_qualified_name(base) for base in node.bases}
+            if base_names & {"BaseModel", "TypedDict"}:
+                contract_classes.add(node.name)
+            if node.name.endswith("Tool"):
+                tool_symbols.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            target_names = _assignment_names(node)
+            if any(name.endswith("PROMPT") for name in target_names):
+                categories.add("prompt")
+            if any("MEMORY" in name for name in target_names):
+                categories.add("memory")
+            if any(name in {"HANDOFF", "HANDOFFS"} for name in target_names):
+                categories.add("handoff")
+            if "model_client" in {name.lower() for name in target_names}:
+                categories.add("model_client")
+        elif isinstance(node, ast.Call):
+            call_name = _qualified_name(node.func)
+            if call_name.endswith("ChatCompletionClient"):
+                categories.add("model_client")
+            if call_name.endswith("Termination") or call_name.endswith(
+                "TerminationCondition"
+            ):
+                categories.add("termination")
+            if call_name.endswith("Handoff"):
+                categories.add("handoff")
+            if call_name.endswith("Memory"):
+                categories.add("memory")
+    if contract_classes & observed_symbols and tool_symbols & observed_symbols:
+        categories.add("typed_tool")
+    return categories
+
+
+def _qualified_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _qualified_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else node.attr
+    if isinstance(node, ast.Call):
+        return _qualified_name(node.func)
+    return ""
+
+
+def _assignment_names(node: ast.Assign | ast.AnnAssign) -> set[str]:
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    return {
+        target.id
+        for target in targets
+        if isinstance(target, ast.Name)
+    }
+
+
+def _json_contains_n8n_type(payload: object) -> bool:
+    if isinstance(payload, dict):
+        return any(
+            (key == "type" and isinstance(value, str) and value.startswith("n8n-"))
+            or _json_contains_n8n_type(value)
+            for key, value in payload.items()
+        )
+    if isinstance(payload, list):
+        return any(_json_contains_n8n_type(item) for item in payload)
+    return False
+
+
+def _tool_gap_payloads(contents: dict[str, str]) -> tuple[tuple[str, object], ...]:
+    payloads: list[tuple[str, object]] = []
+    for path, content in sorted(contents.items()):
+        if not path.lower().endswith(".json"):
+            continue
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError as exc:
+            if "TODO_TOOL.v1" in content:
+                raise ValueError(f"invalid TODO_TOOL.v1 JSON at {path}") from exc
+            continue
+        if isinstance(payload, dict) and payload.get("schema") == "TODO_TOOL.v1":
+            payloads.append((path, payload))
+    return tuple(payloads)
+
+
+def _sorted_worktrees(
+    observations: tuple[WorktreeObservation, ...],
+) -> tuple[WorktreeObservation, ...]:
+    unique = {
+        (item.relative_name, item.revision, item.branch or "", item.dirty): item
+        for item in observations
+    }
+    return tuple(unique[key] for key in sorted(unique))
+
+
+def _sorted_matches(matches: tuple[SourceMatch, ...]) -> tuple[SourceMatch, ...]:
+    unique = {
+        (item.relative_path, item.line, item.symbol or "", item.content_sha256): item
+        for item in matches
+    }
+    return tuple(unique[key] for key in sorted(unique))
+
+
+def _documentation_query_sha256(query: DocumentationQuery) -> str:
+    payload = json.dumps(
+        query.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _source_ref(category: str, path: str, content: str) -> ArtifactRef:
