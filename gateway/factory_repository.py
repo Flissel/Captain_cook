@@ -28,6 +28,13 @@ from agenten.agent_factory.execution_budget import (
     FactoryUsageReceiptV1,
     ReleaseReason,
 )
+from agenten.agent_factory.factory_live_runner import (
+    FactoryLiveEffectClaim,
+    FactoryLiveEffectLedger,
+    FactoryLiveEffectOutcomeV1,
+    FactoryLiveEffectRequestV1,
+    FactoryLiveEffectWriteReceipt,
+)
 from agenten.agent_factory.leases import FactoryLeaseDenied, FactoryLeasePort, validate_factory_lease
 from agenten.agent_factory.release_gate import FactoryReleaseDecision
 from agenten.agent_factory.service import FactoryRepository, FactoryRepositoryError
@@ -302,6 +309,37 @@ class GatewayFactoryBudgetLedger(FactoryBudgetPort):
             ):
                 raise BudgetExhausted(detail) from exc
             raise ValueError(detail) from exc
+
+
+class GatewayFactoryLiveEffectLedger(FactoryLiveEffectLedger):
+    """Persist pre-effect claims and completions through the sole-writer Gateway."""
+
+    def __init__(self, store: GatewayStore) -> None:
+        self._store = store
+
+    def claim(
+        self,
+        request: FactoryLiveEffectRequestV1,
+    ) -> FactoryLiveEffectClaim:
+        return self._translate(
+            lambda: self._store.claim_factory_live_effect(request)
+        )
+
+    def complete(
+        self,
+        request: FactoryLiveEffectRequestV1,
+        outcome: FactoryLiveEffectOutcomeV1,
+    ) -> FactoryLiveEffectWriteReceipt:
+        return self._translate(
+            lambda: self._store.complete_factory_live_effect(request, outcome)
+        )
+
+    @staticmethod
+    def _translate(operation):
+        try:
+            return operation()
+        except HTTPException as exc:
+            raise ValueError(str(exc.detail)) from exc
 
 
 def _execution_policy_digest(policy) -> str:

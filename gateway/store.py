@@ -8,7 +8,7 @@ import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Callable, Protocol, TypeVar
+from typing import Any, Callable, Literal, Protocol, TypeVar
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import HTTPException
@@ -39,6 +39,13 @@ from agenten.agent_factory.execution_budget import (
     FactoryBudgetReservationV1,
     FactoryBudgetWriteReceipt,
     FactoryUsageReceiptV1,
+)
+from agenten.agent_factory.factory_live_runner import (
+    FactoryLiveEffectClaim,
+    FactoryLiveEffectOutcomeV1,
+    FactoryLiveEffectRecord,
+    FactoryLiveEffectRequestV1,
+    FactoryLiveEffectWriteReceipt,
 )
 from agenten.agent_factory.leases import FactoryLeaseDenied, validate_factory_lease
 from agenten.agent_factory.release_gate import (
@@ -338,6 +345,25 @@ class GatewayStore:
                         payload JSON NOT NULL,
                         INDEX idx_factory_workflow_job (job_id, block_index),
                         CONSTRAINT fk_factory_workflow_artifact_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS factory_live_effect_events (
+                        event_id CHAR(36) NOT NULL PRIMARY KEY,
+                        effect_id CHAR(36) NOT NULL,
+                        job_id CHAR(36) NOT NULL,
+                        claim_key CHAR(64) NULL,
+                        event_kind VARCHAR(16) NOT NULL,
+                        content_sha256 CHAR(64) NOT NULL,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        UNIQUE KEY uq_factory_live_effect_kind (effect_id, event_kind),
+                        UNIQUE KEY uq_factory_live_effect_claim (job_id, claim_key),
+                        INDEX idx_factory_live_effect_job (job_id, block_index),
+                        CONSTRAINT fk_factory_live_effect_block
                             FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
                     ) ENGINE=InnoDB
                     """
@@ -1066,6 +1092,166 @@ class GatewayStore:
                     ),
                 )
         return FactoryWorkflowArtifactWriteReceipt(invocation_id=artifact.invocation_id, content_sha256=digest, replayed=False)
+
+    def claim_factory_live_effect(
+        self,
+        request: FactoryLiveEffectRequestV1,
+    ) -> FactoryLiveEffectClaim:
+        """Atomically reserve one external effect before dispatch."""
+
+        canonical = request.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                existing = self._factory_live_effect_record(
+                    cursor,
+                    request.effect_id,
+                    job_id=request.job_id,
+                    idempotency_key=request.idempotency_key,
+                    for_update=True,
+                )
+                if existing is not None:
+                    if existing.request != request:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="factory live effect claim already exists with different content",
+                        )
+                    return FactoryLiveEffectClaim(record=existing, acquired=False)
+                job_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_job",
+                    field="job_id",
+                    value=str(request.job_id),
+                    for_update=True,
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job not found")
+                job = parse_factory_job(job_block["data"])
+                if not isinstance(job, AgentFactoryJobV3):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="factory live effects require AgentFactoryJobV3",
+                    )
+                projection = self._factory_projection(cursor, job)
+                self._assert_factory_effects_open(projection, effect="live effects")
+                replay_after_job_lock = self._factory_live_effect_record(
+                    cursor,
+                    request.effect_id,
+                    job_id=request.job_id,
+                    idempotency_key=request.idempotency_key,
+                    for_update=True,
+                )
+                if replay_after_job_lock is not None:
+                    if replay_after_job_lock.request != request:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="factory live effect claim already exists with different content",
+                        )
+                    return FactoryLiveEffectClaim(
+                        record=replay_after_job_lock,
+                        acquired=False,
+                    )
+                workflow_artifacts = self._factory_workflow_artifacts_for_job(
+                    cursor,
+                    job.job_id,
+                    for_update=True,
+                )
+                self._assert_factory_live_effect_request(
+                    job,
+                    projection,
+                    request,
+                    workflow_artifacts,
+                )
+                self._assert_factory_live_invocation(
+                    cursor,
+                    job,
+                    request,
+                    now=_utcnow(),
+                )
+                self._insert_factory_live_effect_event(
+                    cursor,
+                    event_id=request.effect_id,
+                    effect_id=request.effect_id,
+                    job_id=request.job_id,
+                    event_kind="claim",
+                    schema_name=request.schema_name,
+                    canonical=canonical,
+                    parent_index=job_block["index"],
+                )
+        return FactoryLiveEffectClaim(
+            record=FactoryLiveEffectRecord(request=request),
+            acquired=True,
+        )
+
+    def complete_factory_live_effect(
+        self,
+        request: FactoryLiveEffectRequestV1,
+        outcome: FactoryLiveEffectOutcomeV1,
+    ) -> FactoryLiveEffectWriteReceipt:
+        """Append one exact evidence result to a previously persisted claim."""
+
+        completed = FactoryLiveEffectRecord(request=request, outcome=outcome)
+        canonical = outcome.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                existing = self._factory_live_effect_record(
+                    cursor,
+                    request.effect_id,
+                    for_update=True,
+                )
+                if existing is None or existing.request != request:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="factory live effect completion is missing its exact claim",
+                    )
+                if existing.outcome is not None:
+                    if existing.outcome != outcome:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="factory live effect already completed with different content",
+                        )
+                    return FactoryLiveEffectWriteReceipt(
+                        record=existing,
+                        replayed=True,
+                    )
+                job_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_job",
+                    field="job_id",
+                    value=str(request.job_id),
+                    for_update=True,
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job not found")
+                job = parse_factory_job(job_block["data"])
+                if not isinstance(job, AgentFactoryJobV3):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="factory live effects require AgentFactoryJobV3",
+                    )
+                projection = self._factory_projection(cursor, job)
+                self._assert_factory_effects_open(projection, effect="live effects")
+                workflow_artifacts = self._factory_workflow_artifacts_for_job(
+                    cursor,
+                    job.job_id,
+                    for_update=True,
+                )
+                self._assert_factory_live_effect_request(
+                    job,
+                    projection,
+                    request,
+                    workflow_artifacts,
+                )
+                self._insert_factory_live_effect_event(
+                    cursor,
+                    event_id=outcome.outcome_id,
+                    effect_id=request.effect_id,
+                    job_id=request.job_id,
+                    event_kind="outcome",
+                    schema_name=outcome.schema_name,
+                    canonical=canonical,
+                    parent_index=job_block["index"],
+                )
+        return FactoryLiveEffectWriteReceipt(record=completed, replayed=False)
 
     def factory_workflow_artifacts(
         self,
@@ -2278,6 +2464,171 @@ class GatewayStore:
             sql += " FOR UPDATE"
         cursor.execute(sql, (str(event_id),))
         return cursor.fetchone()
+
+    @staticmethod
+    def _assert_factory_live_effect_request(
+        job: AgentFactoryJobV3,
+        projection: FactoryProjection,
+        request: FactoryLiveEffectRequestV1,
+        workflow_artifacts: tuple[FactoryWorkflowArtifact, ...] = (),
+    ) -> None:
+        allowed_input_refs = {
+            job.input_ref,
+            job.compiled_spec_ref,
+            job.dependency_graph_ref,
+            *(artifact.artifact_ref for artifact in workflow_artifacts),
+        }
+        if (
+            request.job_id != job.job_id
+            or request.correlation_id != job.correlation_id
+            or request.subject_version != job.subject_version
+            or request.attempt != projection.attempt
+            or request.attempt > job.max_behavioral_iterations
+            or request.input_ref not in allowed_input_refs
+            or not job.execution_policy.live_execution
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect claim does not match its Gateway projection",
+            )
+
+    def _factory_live_effect_record(
+        self,
+        cursor: Any,
+        effect_id: UUID,
+        *,
+        job_id: UUID | None = None,
+        idempotency_key: str | None = None,
+        for_update: bool,
+    ) -> FactoryLiveEffectRecord | None:
+        if job_id is not None and idempotency_key is not None:
+            sql = (
+                "SELECT event_kind, payload FROM factory_live_effect_events "
+                "WHERE effect_id = %s OR (job_id = %s AND claim_key = %s) "
+                "ORDER BY block_index"
+            )
+            parameters = (str(effect_id), str(job_id), idempotency_key)
+        else:
+            sql = (
+                "SELECT event_kind, payload FROM factory_live_effect_events "
+                "WHERE effect_id = %s ORDER BY block_index"
+            )
+            parameters = (str(effect_id),)
+        if for_update:
+            sql += " FOR UPDATE"
+        cursor.execute(sql, parameters)
+        rows = cursor.fetchall()
+        if not rows:
+            return None
+        claims = tuple(row for row in rows if row["event_kind"] == "claim")
+        outcomes = tuple(row for row in rows if row["event_kind"] == "outcome")
+        if len(claims) != 1 or len(outcomes) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect ledger is ambiguous",
+            )
+        request = FactoryLiveEffectRequestV1.model_validate(
+            self._decode_json(claims[0]["payload"])
+        )
+        outcome = (
+            FactoryLiveEffectOutcomeV1.model_validate(
+                self._decode_json(outcomes[0]["payload"])
+            )
+            if outcomes
+            else None
+        )
+        return FactoryLiveEffectRecord(request=request, outcome=outcome)
+
+    def _assert_factory_live_invocation(
+        self,
+        cursor: Any,
+        job: AgentFactoryJobV3,
+        request: FactoryLiveEffectRequestV1,
+        *,
+        now: datetime,
+    ) -> None:
+        invocation = request.invocation
+        self._assert_released_skill(cursor, invocation.released_skill)
+        assignment = self._factory_skill_assignment_for_step(
+            cursor,
+            job.job_id,
+            invocation.step,
+            for_update=True,
+        )
+        if assignment is None or assignment.released_skill != invocation.released_skill:
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect lacks its exact released skill assignment",
+            )
+        lease_block = self._runtime_block_by_json_value(
+            cursor,
+            block_type="agent_factory_lease",
+            field="lease_id",
+            value=invocation.lease.lease_id,
+            for_update=True,
+        )
+        if lease_block is None or FactoryLease.model_validate(
+            lease_block["data"]
+        ) != invocation.lease:
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect lacks its exact Factory lease",
+            )
+        try:
+            validate_factory_lease(
+                invocation.lease,
+                job=job,
+                role=invocation.lease.role,
+                attempt=request.attempt,
+                now=now,
+            )
+        except FactoryLeaseDenied as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    def _insert_factory_live_effect_event(
+        self,
+        cursor: Any,
+        *,
+        event_id: UUID,
+        effect_id: UUID,
+        job_id: UUID,
+        event_kind: Literal["claim", "outcome"],
+        schema_name: str,
+        canonical: dict[str, Any],
+        parent_index: int,
+    ) -> None:
+        digest = hashlib.sha256(
+            json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        index = self._next_index(cursor)
+        block = self._new_block(
+            cursor,
+            index=index,
+            block_type="factory_live_effect",
+            data=canonical,
+            status="accepted",
+            parent_index=parent_index,
+            metadata={"schema": schema_name, "event_kind": event_kind},
+        )
+        self._insert(cursor, block)
+        cursor.execute(
+            """INSERT INTO factory_live_effect_events
+               (event_id, effect_id, job_id, claim_key, event_kind,
+                content_sha256, block_index, payload)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+            (
+                str(event_id),
+                str(effect_id),
+                str(job_id),
+                canonical["idempotency_key"] if event_kind == "claim" else None,
+                event_kind,
+                digest,
+                index,
+                json.dumps(canonical, sort_keys=True),
+            ),
+        )
 
     def _factory_reservation(
         self,
