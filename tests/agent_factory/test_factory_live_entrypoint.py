@@ -587,8 +587,8 @@ async def test_environment_gate_rejects_spoofed_all_true_adapter(
         "CAPTAIN_FACTORY_JOB_ID": "00000000-0000-0000-0000-000000000301",
         "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:8091",
         "CAPTAIN_RUNTIME_TOKEN": "runtime-token",
-        "CAPABILITY_FACTORY_ADAPTER_MANIFEST": str(adapter_manifest),
-        "CAPABILITY_FACTORY_ADAPTER_SHA256": "0" * 64,
+        "FACTORY_LIVE_RUNTIME_ADAPTER_MANIFEST": str(adapter_manifest),
+        "FACTORY_LIVE_RUNTIME_ADAPTER_SHA256": "0" * 64,
         "TEST_MARIADB_DSN": "mysql://captain:secret@127.0.0.1:3306/captain_test",
     }.items():
         monkeypatch.setenv(name, value)
@@ -609,8 +609,8 @@ def test_factory_live_environment_aliases_are_documented() -> None:
 
     for alias in (
         "CAPTAIN_FACTORY_JOB_ID=",
-        "CAPABILITY_FACTORY_ADAPTER_MANIFEST=",
-        "CAPABILITY_FACTORY_ADAPTER_SHA256=",
+        "FACTORY_LIVE_RUNTIME_ADAPTER_MANIFEST=",
+        "FACTORY_LIVE_RUNTIME_ADAPTER_SHA256=",
     ):
         assert alias in example
 

@@ -208,7 +208,7 @@ def _write_attested_adapter(root: Path) -> tuple[Path, str]:
     manifest.write_text(
         json.dumps(
             {
-                "schema": "captain.capability-factory-adapter-manifest.v2",
+                "schema": "captain.factory-live-runtime-adapter-manifest.v1",
                 "module_path": module.name,
                 "module_sha256": module_sha256,
                 "factory_symbol": "build_factory_live_runtime",
@@ -233,8 +233,8 @@ def test_gateway_environment_attests_runtime_and_reuses_package_c_manifest(
             "CAPTAIN_FACTORY_JOB_ID": str(job.job_id),
             "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:8091",
             "CAPTAIN_RUNTIME_TOKEN": "runtime-token-value",
-            "CAPABILITY_FACTORY_ADAPTER_MANIFEST": manifest.name,
-            "CAPABILITY_FACTORY_ADAPTER_SHA256": digest,
+            "FACTORY_LIVE_RUNTIME_ADAPTER_MANIFEST": manifest.name,
+            "FACTORY_LIVE_RUNTIME_ADAPTER_SHA256": digest,
         },
         workspace_root=tmp_path,
     )
@@ -258,8 +258,8 @@ def test_gateway_environment_fails_closed_without_exposing_token(
                 "CAPTAIN_FACTORY_JOB_ID": "00000000-0000-0000-0000-000000000001",
                 "CAPTAIN_RUNTIME_URL": "http://provider.example.invalid:8091",
                 "CAPTAIN_RUNTIME_TOKEN": token,
-                "CAPABILITY_FACTORY_ADAPTER_MANIFEST": manifest.name,
-                "CAPABILITY_FACTORY_ADAPTER_SHA256": "0" * 64,
+                "FACTORY_LIVE_RUNTIME_ADAPTER_MANIFEST": manifest.name,
+                "FACTORY_LIVE_RUNTIME_ADAPTER_SHA256": "0" * 64,
             },
             workspace_root=tmp_path,
         )

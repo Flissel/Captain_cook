@@ -205,7 +205,19 @@ async def test_gateway_backed_state_loads_the_released_batch_with_captain_auth()
         requests.append(request)
         return httpx.Response(
             200,
-            json=expected.model_dump(mode="json"),
+            json={
+                "admission": {
+                    "schema": "captain.runtime-batch-admission.v1",
+                    "command_id": str(command().event_id),
+                    "batch_id": expected.batch_id,
+                    "batch_version": 1,
+                    "batch_block_index": 7,
+                    "batch_block_hash": "a" * 64,
+                    "release_fence": 8,
+                    "admitted_at": command().occurred_at.isoformat(),
+                },
+                "batch": expected.model_dump(mode="json"),
+            },
             request=request,
         )
 
@@ -218,7 +230,7 @@ async def test_gateway_backed_state_loads_the_released_batch_with_captain_auth()
         observed = await state.get_released_batch(command())
 
     assert observed == expected
-    assert requests[0].url.path == "/batches/batch-1/bundle"
+    assert requests[0].url.path == f"/v1/runtime/operations/{command().event_id}/released-batch"
     assert requests[0].headers["authorization"] == "Bearer gateway-state-secret"
 
 

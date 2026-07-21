@@ -479,8 +479,8 @@ def load_factory_live_environment(
         "CAPTAIN_FACTORY_JOB_ID",
         "CAPTAIN_RUNTIME_URL",
         "CAPTAIN_RUNTIME_TOKEN",
-        "CAPABILITY_FACTORY_ADAPTER_MANIFEST",
-        "CAPABILITY_FACTORY_ADAPTER_SHA256",
+        "FACTORY_LIVE_RUNTIME_ADAPTER_MANIFEST",
+        "FACTORY_LIVE_RUNTIME_ADAPTER_SHA256",
     )
     values = {name: environ.get(name, "").strip() for name in aliases}
     if any(not value for value in values.values()):
@@ -488,13 +488,13 @@ def load_factory_live_environment(
     try:
         job_id = UUID(values["CAPTAIN_FACTORY_JOB_ID"])
         runtime_url = _runtime_url(values["CAPTAIN_RUNTIME_URL"])
-        manifest_digest = values["CAPABILITY_FACTORY_ADAPTER_SHA256"]
+        manifest_digest = values["FACTORY_LIVE_RUNTIME_ADAPTER_SHA256"]
         if _SHA256.fullmatch(manifest_digest) is None:
             raise ValueError("digest")
         root = workspace_root.resolve()
         manifest_path = _workspace_path(
             root,
-            values["CAPABILITY_FACTORY_ADAPTER_MANIFEST"],
+            values["FACTORY_LIVE_RUNTIME_ADAPTER_MANIFEST"],
         )
         manifest_bytes = manifest_path.read_bytes()
         if len(manifest_bytes) > 65_536:
@@ -552,7 +552,7 @@ def _manifest_contract(
     if (
         not isinstance(payload, dict)
         or set(payload) != {"schema", "module_path", "module_sha256", "factory_symbol"}
-        or payload.get("schema") != "captain.capability-factory-adapter-manifest.v2"
+        or payload.get("schema") != "captain.factory-live-runtime-adapter-manifest.v1"
         or not isinstance(payload.get("module_path"), str)
         or not isinstance(payload.get("module_sha256"), str)
         or _SHA256.fullmatch(payload["module_sha256"]) is None

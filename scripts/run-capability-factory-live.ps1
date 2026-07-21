@@ -31,7 +31,7 @@ function Read-LocalEnvironment([string]$Path) {
         'CAPTAIN_RUNTIME_URL', 'TEST_MARIADB_DSN', 'MINIBOOK_BACKEND_URL',
         'MINIBOOK_API_KEY', 'MINIBOOK_PROJECTION_API_KEY',
         'CAPTAIN_CAPABILITY_SANDBOX_IMAGE',
-        'CAPABILITY_FACTORY_ADAPTER_MANIFEST', 'CAPABILITY_FACTORY_ADAPTER_SHA256'
+        'CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_MANIFEST', 'CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_SHA256'
     )
     $values = [ordered]@{}
     foreach ($line in [IO.File]::ReadAllLines($Path)) {
@@ -97,7 +97,7 @@ try {
     foreach ($name in @(
         'CAPTAIN_GATEWAY_TOKEN', 'WORKER_GATEWAY_TOKEN', 'CAPTAIN_RUNTIME_TOKEN',
         'MINIBOOK_API_KEY', 'MINIBOOK_PROJECTION_API_KEY',
-        'CAPABILITY_FACTORY_ADAPTER_MANIFEST', 'CAPABILITY_FACTORY_ADAPTER_SHA256'
+        'CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_MANIFEST', 'CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_SHA256'
     )) { $null = Require-Value $values $name }
     if ($SandboxImage -notmatch '^(?:[a-z0-9.-]+(?::[0-9]+)?/)?captain-[a-z0-9._/-]+@sha256:[0-9a-f]{64}$') {
         throw 'A Captain-owned digest-pinned capability sandbox image is required.'

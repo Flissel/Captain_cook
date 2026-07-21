@@ -2350,7 +2350,7 @@ def _write_adapter_manifest(
     module_path.write_bytes(module_content)
     manifest_content = json.dumps(
         {
-            "schema": "captain.capability-factory-adapter-manifest.v2",
+            "schema": "captain.capability-factory-entrypoint-adapter-manifest.v1",
             "module_path": "adapters/capability_adapter.py",
             "module_sha256": (
                 module_sha256
@@ -2387,8 +2387,8 @@ def _static_preflight_config(
             "CAPTAIN_GATEWAY_TOKEN": "gateway-secret-value",
             "CAPTAIN_RUNTIME_TOKEN": "runtime-secret-value",
             "MINIBOOK_PROJECTION_API_KEY": "projection-secret-value",
-            "CAPABILITY_FACTORY_ADAPTER_MANIFEST": manifest_path.name,
-            "CAPABILITY_FACTORY_ADAPTER_SHA256": hashlib.sha256(
+            "CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_MANIFEST": manifest_path.name,
+            "CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_SHA256": hashlib.sha256(
                 manifest_content
             ).hexdigest(),
         },
@@ -2622,8 +2622,8 @@ def test_cli_uses_safe_paths_service_urls_and_environment_only_secrets(
         "CAPTAIN_GATEWAY_TOKEN": "gateway-secret-value",
         "CAPTAIN_RUNTIME_TOKEN": "runtime-secret-value",
         "MINIBOOK_PROJECTION_API_KEY": "projection-secret-value",
-        "CAPABILITY_FACTORY_ADAPTER_MANIFEST": "adapter-manifest.json",
-        "CAPABILITY_FACTORY_ADAPTER_SHA256": hashlib.sha256(
+        "CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_MANIFEST": "adapter-manifest.json",
+        "CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_SHA256": hashlib.sha256(
             adapter_manifest_content
         ).hexdigest(),
     }
@@ -2718,7 +2718,7 @@ async def test_static_preflight_rejects_adapter_path_outside_workspace(
 ) -> None:
     manifest_content = json.dumps(
         {
-            "schema": "captain.capability-factory-adapter-manifest.v2",
+            "schema": "captain.capability-factory-entrypoint-adapter-manifest.v1",
             "module_path": "../outside-adapter.py",
             "module_sha256": "a" * 64,
             "factory_symbol": "build_entrypoint",
@@ -2788,8 +2788,8 @@ def test_live_gate_declares_exact_order_and_preserves_vibemind() -> None:
     positions = tuple(script.index(marker) for marker in markers)
     assert positions == tuple(sorted(positions))
     assert "$env:CAPABILITY_FACTORY_LIVE_REQUIRED = '1'" in script
-    assert "CAPABILITY_FACTORY_ADAPTER_MANIFEST" in script
-    assert "CAPABILITY_FACTORY_ADAPTER_SHA256" in script
+    assert "CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_MANIFEST" in script
+    assert "CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_SHA256" in script
     assert "CAPABILITY_FACTORY_ADAPTER_FACTORY" not in script
     assert script.index('$null = Invoke-PythonFactory ($commonArguments + \'--preflight-only\')') < script.index("# STEP 3:")
     assert script.index('$RuntimeUrl/health') < script.index('$runJson = Invoke-PythonFactory')

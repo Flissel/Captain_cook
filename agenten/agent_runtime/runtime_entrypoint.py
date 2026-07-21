@@ -6,7 +6,6 @@ import os
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Literal
-from urllib.parse import quote
 from uuid import UUID
 
 import httpx
@@ -100,12 +99,11 @@ class GatewayBackedRuntimeState:
         await self._runtime.accept_command(command)
 
     async def get_released_batch(self, command: AgentRuntimeCommand) -> WorkBatch:
-        batch_id = command.payload.batch_id
-        if batch_id is None:
+        if command.payload.batch_id is None:
             raise GatewayRuntimeError("runtime command has no released batch binding")
         try:
             response = await self._client.get(
-                f"{self._base_url}/batches/{quote(batch_id, safe='')}/bundle",
+                f"{self._base_url}/v1/runtime/operations/{command.event_id}/released-batch",
                 headers={"Authorization": f"Bearer {self._token}"},
             )
         except httpx.HTTPError:
@@ -115,10 +113,17 @@ class GatewayBackedRuntimeState:
                 f"read released batch failed with gateway status {response.status_code}"
             )
         try:
-            batch = WorkBatch.model_validate(response.json())
+            from gateway.contracts import RuntimeReleasedBatchSnapshot
+
+            snapshot = RuntimeReleasedBatchSnapshot.model_validate(response.json())
         except (TypeError, ValueError, ValidationError):
             raise GatewayRuntimeError("read released batch returned an invalid response") from None
-        if batch.batch_id != batch_id:
+        batch = snapshot.batch
+        if (
+            snapshot.admission.command_id != command.event_id
+            or snapshot.admission.batch_id != command.payload.batch_id
+            or batch.batch_id != command.payload.batch_id
+        ):
             raise GatewayRuntimeError("released batch does not match the runtime command")
         return batch
 

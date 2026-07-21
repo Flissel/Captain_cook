@@ -1062,17 +1062,18 @@ def parse_capability_factory_args(
         ) from exc
     source = os.environ if environ is None else environ
     adapter_manifest_value = source.get(
-        "CAPABILITY_FACTORY_ADAPTER_MANIFEST",
+        "CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_MANIFEST",
         "",
     ).strip()
     adapter_manifest_sha256 = source.get(
-        "CAPABILITY_FACTORY_ADAPTER_SHA256",
+        "CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_SHA256",
         "",
     ).strip()
     if not adapter_manifest_value or not adapter_manifest_sha256:
         raise CapabilityFactoryConfigurationError(
             "required static adapter manifest aliases are missing: "
-            "CAPABILITY_FACTORY_ADAPTER_MANIFEST, CAPABILITY_FACTORY_ADAPTER_SHA256"
+            "CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_MANIFEST, "
+            "CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_SHA256"
         )
     adapter_manifest_path = _safe_workspace_path(
         root,
@@ -1227,7 +1228,7 @@ def _validate_static_adapter_manifest(
         or set(payload)
         != {"schema", "module_path", "module_sha256", "factory_symbol"}
         or payload.get("schema")
-        != "captain.capability-factory-adapter-manifest.v2"
+        != "captain.capability-factory-entrypoint-adapter-manifest.v1"
         or not isinstance(payload.get("module_path"), str)
         or not payload["module_path"].strip()
         or not isinstance(payload.get("module_sha256"), str)
