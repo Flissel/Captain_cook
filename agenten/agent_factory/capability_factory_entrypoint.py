@@ -1851,10 +1851,14 @@ class CapabilityFactoryEntrypoint:
                 or existing.outcome.result_id != operation.result.event_id
                 or existing.claim_owner_id != claim.owner_id
                 or existing.claim_fencing_token != claim.fencing_token
-                or provider_execution.result != operation.result
                 or provider_execution.outcome != existing.outcome
             ):
                 raise RuntimeError("Gateway execution readback is incomplete")
+            self._validate_gateway_observation(
+                provider_execution,
+                operation.result,
+                claim,
+            )
             bundle = CapabilityExecutionBundle(
                 command=operation.command,
                 grant=operation.grant or plan.grant,
@@ -1871,9 +1875,13 @@ class CapabilityFactoryEntrypoint:
                 claim is None
                 or claim.status != "completed"
                 or provider_execution is None
-                or provider_execution.result != operation.result
             ):
                 raise RuntimeError("Gateway runtime result has no completed execution claim")
+            self._validate_gateway_observation(
+                provider_execution,
+                operation.result,
+                claim,
+            )
             bundle = CapabilityExecutionBundle(
                 command=operation.command,
                 grant=operation.grant or plan.grant,
@@ -1912,16 +1920,31 @@ class CapabilityFactoryEntrypoint:
             self._gateway.record_capability_grant(plan.grant)
 
         self._require_effect_budget(job, "runtime execution claim")
-        claim_receipt = self._gateway.claim_runtime_execution(
-            RuntimeExecutionClaimRequest(
-                schema_name="captain.runtime-execution-claim-request.v1",
-                command_id=plan.command.event_id,
-                owner_id=plan.claim_owner_id,
-                lease_seconds=min(plan.command.payload.limits.wall_seconds, 900),
-                capability_id=authority.capability_id,
-                capability_version=authority.capability_version,
+        try:
+            claim_receipt = self._gateway.claim_runtime_execution(
+                RuntimeExecutionClaimRequest(
+                    schema_name="captain.runtime-execution-claim-request.v1",
+                    command_id=plan.command.event_id,
+                    owner_id=plan.claim_owner_id,
+                    lease_seconds=min(plan.command.payload.limits.wall_seconds, 900),
+                    capability_id=authority.capability_id,
+                    capability_version=authority.capability_version,
+                )
             )
-        )
+        except Exception:
+            # Store and HTTP adapters expose different conflict types. Treat
+            # one as a completion race only after exact authoritative readback.
+            if provider_execution is None:
+                raise
+            raced_bundle = self._completed_gateway_bundle(
+                plan,
+                provider_execution,
+            )
+            if raced_bundle is None:
+                raise
+            self._validate_execution_bundle(job, authority, raced_bundle)
+            self._record_execution(job, raced_bundle)
+            return self._project_execution(job, authority, raced_bundle)
         if claim_receipt.claim_credential is None:
             if (
                 claim_receipt.claim.status == "active"
@@ -1943,10 +1966,14 @@ class CapabilityFactoryEntrypoint:
                 effect_id=provider_effect_id,
             )
         self._validate_provider_execution(plan, runtime)
+        gateway_result = self._gateway_observation_result(
+            runtime,
+            claim_receipt.claim,
+        )
         bundle = CapabilityExecutionBundle(
             command=plan.command,
             grant=plan.grant,
-            result=runtime.result,
+            result=gateway_result,
             outcome=runtime.outcome,
             claim_owner_id=claim_receipt.claim.owner_id,
             claim_fencing_token=claim_receipt.claim.fencing_token,
@@ -1959,6 +1986,11 @@ class CapabilityFactoryEntrypoint:
             execution_fencing_token=claim_receipt.claim.fencing_token,
             execution_claim_credential=claim_receipt.claim_credential,
         )
+        readback_bundle = self._completed_gateway_bundle(plan, runtime)
+        if readback_bundle is None:
+            raise RuntimeError("Gateway runtime result readback is incomplete")
+        bundle = readback_bundle
+        self._validate_execution_bundle(job, authority, bundle)
         self._record_execution(job, bundle)
         return self._project_execution(job, authority, bundle)
 
@@ -1984,6 +2016,69 @@ class CapabilityFactoryEntrypoint:
             raise CapabilityProviderIdempotencyError(
                 "runtime provider receipt does not prove durable idempotency"
             )
+
+    @staticmethod
+    def _gateway_observation_result(
+        runtime: CapabilityRuntimeExecution,
+        claim: RuntimeExecutionClaim,
+    ) -> AgentRuntimeResult:
+        receipt_digest = canonical_contract_sha256(runtime.provider_receipt)
+        receipt_ref = ArtifactRef(
+            uri=f"artifact://provider-effect-receipt/{receipt_digest}",
+            sha256=receipt_digest,
+            media_type="application/json",
+        )
+        evidence_refs = runtime.result.evidence_refs
+        if receipt_ref not in evidence_refs:
+            evidence_refs = (*evidence_refs, receipt_ref)
+        return runtime.result.model_copy(
+            update={
+                "occurred_at": claim.claimed_at,
+                "evidence_refs": evidence_refs,
+            }
+        )
+
+    def _validate_gateway_observation(
+        self,
+        runtime: CapabilityRuntimeExecution,
+        observed: AgentRuntimeResult,
+        claim: RuntimeExecutionClaim,
+    ) -> None:
+        if observed != self._gateway_observation_result(runtime, claim):
+            raise CapabilityProviderIdempotencyError(
+                "Gateway runtime result does not bind the durable provider effect"
+            )
+
+    def _completed_gateway_bundle(
+        self,
+        plan: CapabilityExecutionPlan,
+        runtime: CapabilityRuntimeExecution,
+    ) -> CapabilityExecutionBundle | None:
+        operation = self._gateway.find_runtime_operation(plan.command.event_id)
+        claim = self._gateway.runtime_execution_claim(plan.command.event_id)
+        if (
+            operation is None
+            or operation.result is None
+            or claim is None
+            or claim.status != "completed"
+        ):
+            return None
+        if (
+            operation.command != plan.command
+            or operation.grant is None
+            or operation.grant != plan.grant
+            or operation.revocation is not None
+        ):
+            raise RuntimeError("Gateway runtime readback disagrees with the execution plan")
+        self._validate_gateway_observation(runtime, operation.result, claim)
+        return CapabilityExecutionBundle(
+            command=operation.command,
+            grant=operation.grant,
+            result=operation.result,
+            outcome=runtime.outcome,
+            claim_owner_id=claim.owner_id,
+            claim_fencing_token=claim.fencing_token,
+        )
 
     def _validate_execution_bundle(
         self,

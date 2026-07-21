@@ -43,8 +43,11 @@ recovery. Provider adapters must declare durable idempotency and persist a
 control. Captain looks that receipt up before any re-effect and verifies the
 provider operation ID, request/result digests, result status, and explicit
 idempotency guarantee. An unexpired claim returns typed `retry_pending`; after
-expiry the Gateway issues a higher fence and records the already-produced
-provider result without calling the provider again. No claim credential or
+expiry the Gateway issues a higher fence and records a fresh result-observation
+envelope inside that lease without calling the provider again. The observation
+keeps the command/result identity and business output, binds the immutable
+provider receipt as content-addressed evidence, and leaves the receipt's
+original result digest unchanged. No claim credential or
 provider secret enters a checkpoint, receipt, or summary. Deadline checks run
 before each later mutation and before requesting lifecycle evidence, so an
 expired post-publication run cannot begin runtime work and an expired
@@ -81,8 +84,12 @@ or instantiating its module. The manifest names one Python module path under
 the workspace root, its SHA-256, and one factory symbol; preflight reads and
 hashes the source bytes and proves the top-level symbol through Python AST.
 Only the full run loads that attested local module and factory, writes the evidence manifest, and
-prints redacted targets, timings, IDs, and digests. Missing or altered
-production adapters fail before database attestation or service startup.
+prints redacted targets, timings, IDs, and digests. Static manifest, path,
+source-digest, syntax, and factory-symbol failures occur before database
+attestation or service startup. Runtime dependency resolution, top-level module
+execution, and factory instantiation occur only in the full invocation after
+database attestation and service health checks; they fail closed before any
+factory effect, but are not part of the side-effect-free preflight claim.
 
 The provider-backed gate is
 `scripts/run-capability-factory-live.ps1`. It validates configuration first,
