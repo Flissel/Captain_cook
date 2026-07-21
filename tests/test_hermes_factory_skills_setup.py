@@ -21,6 +21,36 @@ SKILL_NAMES = (
     "captain-factory-improve-team",
     "captain-factory-report-captain",
 )
+TEXT_ASSET_SUFFIXES = {
+    ".bash",
+    ".cjs",
+    ".conf",
+    ".css",
+    ".csv",
+    ".html",
+    ".ini",
+    ".js",
+    ".json",
+    ".jsonl",
+    ".jsx",
+    ".md",
+    ".mjs",
+    ".ps1",
+    ".psd1",
+    ".psm1",
+    ".py",
+    ".pyi",
+    ".scss",
+    ".sh",
+    ".toml",
+    ".ts",
+    ".tsx",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".zsh",
+}
 
 
 def _write_fake_hermes(tmp_path: Path) -> Path:
@@ -227,6 +257,17 @@ def _copy_skill_repository(tmp_path: Path) -> Path:
     return repository
 
 
+def _rewrite_skill_text_line_endings(repository: Path, newline: bytes) -> None:
+    skill_root = repository / "agenten" / "agent_factory" / "skills"
+    for path in skill_root.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in TEXT_ASSET_SUFFIXES:
+            continue
+        canonical = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        path.write_bytes(canonical.replace(b"\n", newline))
+
+
 def test_configure_script_preserves_external_dirs_and_is_idempotent(
     tmp_path: Path,
 ) -> None:
@@ -265,6 +306,7 @@ def test_configure_script_rejects_changed_or_missing_released_skill(
 ) -> None:
     env, hermes_home = _environment(tmp_path)
     repository = _copy_skill_repository(tmp_path)
+    _rewrite_skill_text_line_endings(repository, b"\n")
     changed = (
         repository
         / "agenten"
@@ -282,6 +324,99 @@ def test_configure_script_rejects_changed_or_missing_released_skill(
     assert result.returncode != 0
     assert "digest mismatch" in (result.stdout + result.stderr).lower()
     assert not (hermes_home / "config.yaml").exists()
+
+
+@pytest.mark.parametrize(
+    "newline", (b"\n", b"\r\n", b"\r"), ids=("lf", "crlf", "cr")
+)
+def test_configure_script_accepts_released_text_assets_across_line_endings(
+    tmp_path: Path,
+    newline: bytes,
+) -> None:
+    env, hermes_home = _environment(tmp_path)
+    repository = _copy_skill_repository(tmp_path)
+    _rewrite_skill_text_line_endings(repository, newline)
+
+    result = subprocess.run(
+        _command(repository), env=env, text=True, capture_output=True, check=True
+    )
+
+    assert "configured" in result.stdout.lower()
+    assert (hermes_home / "skill-bundles" / "captain-agent-factory-loop.yaml").is_file()
+
+
+def _directory_manifest_digest(directory: Path) -> str:
+    command = """
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+        $env:CAPTAIN_DIGEST_SCRIPT, [ref]$tokens, [ref]$errors
+    )
+    $functionAst = $ast.Find(
+        {
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Get-DirectoryManifestDigest'
+        },
+        $true
+    )
+    if ($null -eq $functionAst) {
+        throw 'Digest function was not found.'
+    }
+    $extensionsAst = $ast.Find(
+        {
+            param($node)
+            $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                $node.Left.Extent.Text -eq '$textAssetExtensions'
+        },
+        $true
+    )
+    if ($null -eq $extensionsAst) {
+        throw 'Text asset extension assignment was not found.'
+    }
+    Invoke-Expression $extensionsAst.Extent.Text
+    Invoke-Expression $functionAst.Extent.Text
+    Get-DirectoryManifestDigest -Directory $env:CAPTAIN_DIGEST_DIRECTORY
+    """
+    env = dict(os.environ)
+    env["CAPTAIN_DIGEST_SCRIPT"] = str(SCRIPT)
+    env["CAPTAIN_DIGEST_DIRECTORY"] = str(directory)
+    result = subprocess.run(
+        ("pwsh", "-NoProfile", "-Command", command),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def test_python_skill_asset_digest_is_line_ending_independent(tmp_path: Path) -> None:
+    lf_root = tmp_path / "lf"
+    crlf_root = tmp_path / "crlf"
+    for root, content in (
+        (lf_root, b"print('skill helper')\n"),
+        (crlf_root, b"print('skill helper')\r\n"),
+    ):
+        helper = root / "scripts" / "helper.py"
+        helper.parent.mkdir(parents=True)
+        helper.write_bytes(content)
+
+    assert _directory_manifest_digest(lf_root) == _directory_manifest_digest(crlf_root)
+
+
+def test_unknown_template_binary_digest_remains_byte_exact(tmp_path: Path) -> None:
+    lf_root = tmp_path / "lf"
+    cr_root = tmp_path / "cr"
+    for root, content in (
+        (lf_root, b"\x00payload\nbytes\xff"),
+        (cr_root, b"\x00payload\rbytes\xff"),
+    ):
+        payload = root / "templates" / "payload.bin"
+        payload.parent.mkdir(parents=True)
+        payload.write_bytes(content)
+
+    assert _directory_manifest_digest(lf_root) != _directory_manifest_digest(cr_root)
 
 
 @pytest.mark.parametrize("source", ("local", "external"))

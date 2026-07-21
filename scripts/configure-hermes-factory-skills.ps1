@@ -20,9 +20,16 @@ $skillNames = @(
     'captain-factory-improve-team'
     'captain-factory-report-captain'
 )
+$textAssetExtensions = @(
+    '.bash', '.cjs', '.conf', '.css', '.csv', '.html', '.ini', '.js', '.json',
+    '.jsonl', '.jsx', '.md', '.mjs', '.ps1', '.psd1', '.psm1', '.py', '.pyi',
+    '.scss', '.sh', '.toml', '.ts', '.tsx', '.txt', '.xml', '.yaml', '.yml',
+    '.zsh'
+)
 
 # Captain-owned release manifest. Each value hashes the sorted relative path and
-# SHA-256 of every file in that skill directory.
+# SHA-256 of every file in that skill directory. Known text assets normalize
+# CRLF and standalone CR to LF before hashing; binary files remain byte-exact.
 $releasedSkillDigests = @{
     'captain-factory-discover' = '669c5b3208ab0779194fd79a70b3a8258eb6869767338fcf629b42cdcaddf19d'
     'captain-factory-brief-codex' = 'ab15e81bf383fe64ab9b1a7c018f5577025fcbed3eaec47ffdb1d1692808648b'
@@ -108,7 +115,26 @@ function Get-DirectoryManifestDigest {
     $entries = Get-ChildItem -LiteralPath $root -File -Recurse |
         ForEach-Object {
             $relative = [System.IO.Path]::GetRelativePath($root, $_.FullName).Replace('\', '/')
-            $fileHash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            $extension = [System.IO.Path]::GetExtension($_.Name).ToLowerInvariant()
+            $isTextAsset = $extension -in $textAssetExtensions
+            $fileBytes = [System.IO.File]::ReadAllBytes($_.FullName)
+            if ($isTextAsset) {
+                $canonicalBytes = [System.Collections.Generic.List[byte]]::new($fileBytes.Length)
+                for ($index = 0; $index -lt $fileBytes.Length; $index++) {
+                    if ($fileBytes[$index] -eq 13) {
+                        if (($index + 1) -lt $fileBytes.Length -and $fileBytes[$index + 1] -eq 10) {
+                            $index++
+                        }
+                        $canonicalBytes.Add(10)
+                    }
+                    else {
+                        $canonicalBytes.Add($fileBytes[$index])
+                    }
+                }
+                $fileBytes = $canonicalBytes.ToArray()
+            }
+            $fileHashBytes = [System.Security.Cryptography.SHA256]::HashData($fileBytes)
+            $fileHash = [Convert]::ToHexString($fileHashBytes).ToLowerInvariant()
             "$relative=$fileHash"
         } |
         Sort-Object
@@ -190,11 +216,14 @@ function Remove-HermesBundle {
     throw "Hermes command failed: hermes bundles delete $Name`n$outputText"
 }
 
-function Read-HermesSkillName {
-    param([Parameter(Mandatory)][string]$SkillFile)
+function Invoke-SafeYamlProjection {
+    param(
+        [Parameter(Mandatory)][ValidateSet('skill-name', 'bundle')][string]$Mode,
+        [Parameter(Mandatory)][string]$YamlFile
+    )
 
     if (-not (Get-Command $PythonExecutable -ErrorAction SilentlyContinue)) {
-        throw "Python 3.11 executable was not found; cannot safely parse skill frontmatter."
+        throw "Python 3.11 executable was not found; cannot safely parse YAML metadata."
     }
 
     $pythonArguments = @()
@@ -211,41 +240,78 @@ import yaml
 
 result = {"ok": False}
 try:
-    skill_file = Path(sys.argv[1])
-    lines = skill_file.read_text(encoding="utf-8-sig").splitlines()
-    metadata = {}
-    if lines and lines[0].strip() == "---":
-        closing_index = next(
-            index for index, line in enumerate(lines[1:], start=1)
-            if line.strip() == "---"
-        )
-        metadata = yaml.safe_load("\n".join(lines[1:closing_index])) or {}
+    mode = sys.argv[1]
+    yaml_file = Path(sys.argv[2])
+    if mode == "skill-name":
+        lines = yaml_file.read_text(encoding="utf-8-sig").splitlines()
+        metadata = {}
+        if lines and lines[0].strip() == "---":
+            closing_index = next(
+                index for index, line in enumerate(lines[1:], start=1)
+                if line.strip() == "---"
+            )
+            metadata = yaml.safe_load("\n".join(lines[1:closing_index])) or {}
+            if not isinstance(metadata, dict):
+                raise ValueError("frontmatter must be a mapping")
+        name = metadata.get("name", yaml_file.parent.name)
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("skill name must be a non-empty string")
+        result = {"ok": True, "name": name.strip()}
+    elif mode == "bundle":
+        metadata = yaml.safe_load(yaml_file.read_text(encoding="utf-8-sig"))
         if not isinstance(metadata, dict):
-            raise ValueError("frontmatter must be a mapping")
-    name = metadata.get("name", skill_file.parent.name)
-    if not isinstance(name, str) or not name.strip():
-        raise ValueError("skill name must be a non-empty string")
-    result = {"ok": True, "name": name.strip()}
+            raise ValueError("bundle manifest must be a mapping")
+        name = metadata.get("name")
+        description = metadata.get("description")
+        instruction = metadata.get("instruction")
+        skills = metadata.get("skills")
+        if not all(isinstance(value, str) for value in (name, description, instruction)):
+            raise ValueError("bundle metadata must be strings")
+        if not isinstance(skills, list) or not all(isinstance(skill, str) for skill in skills):
+            raise ValueError("bundle skills must be a string list")
+        result = {
+            "ok": True,
+            "name": name,
+            "description": description,
+            "instruction": instruction,
+            "skills": skills,
+        }
 except Exception:
     pass
 print(json.dumps(result, separators=(",", ":")))
 '@
 
-    $output = & $PythonExecutable @pythonArguments '-c' $parserSource $SkillFile 2>$null
+    $output = & $PythonExecutable @pythonArguments '-c' $parserSource $Mode $YamlFile 2>$null
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) {
-        throw "Python 3.11 with PyYAML is required to safely parse skill frontmatter: $SkillFile"
+        throw "Python 3.11 with PyYAML is required to safely parse YAML metadata: $YamlFile"
     }
     try {
         $parsed = ([string]::Join([Environment]::NewLine, @($output))) | ConvertFrom-Json
     }
     catch {
-        throw "Could not safely parse skill frontmatter: $SkillFile"
+        throw "Could not safely parse YAML metadata: $YamlFile"
     }
-    if (-not $parsed.ok -or -not ($parsed.name -is [string]) -or -not $parsed.name.Trim()) {
+    if (-not $parsed.ok) {
+        throw "Could not safely parse YAML metadata: $YamlFile"
+    }
+    return $parsed
+}
+
+function Read-HermesSkillName {
+    param([Parameter(Mandatory)][string]$SkillFile)
+
+    $parsed = Invoke-SafeYamlProjection -Mode 'skill-name' -YamlFile $SkillFile
+    if (-not ($parsed.name -is [string]) -or -not $parsed.name.Trim()) {
         throw "Could not safely parse skill frontmatter: $SkillFile"
     }
     return $parsed.name.Trim()
+}
+
+function Read-HermesBundleManifest {
+    param([Parameter(Mandatory)][string]$BundleFile)
+
+    return Invoke-SafeYamlProjection -Mode 'bundle' -YamlFile $BundleFile
 }
 
 function Get-HermesSkillCandidates {
@@ -344,17 +410,22 @@ if ($Remove) {
 if (-not (Test-Path -LiteralPath $bundleManifestPath -PathType Leaf)) {
     throw "Repository bundle manifest is missing: $bundleManifestPath"
 }
-$bundleManifest = Get-Content -Raw -LiteralPath $bundleManifestPath
-$manifestSkills = @(
-    [regex]::Matches($bundleManifest, '(?m)^\s*-\s+(captain-factory-[a-z-]+)\s*$') |
-        ForEach-Object { $_.Groups[1].Value }
-)
+$bundleManifest = Read-HermesBundleManifest -BundleFile $bundleManifestPath
+$manifestSkills = @($bundleManifest.skills | ForEach-Object { [string]$_ })
 if ([string]::Join('|', $manifestSkills) -ne [string]::Join('|', $skillNames)) {
     throw 'Repository bundle manifest does not contain the exact released six-skill order.'
 }
-foreach ($requiredText in @($bundleName, $bundleDescription, $bundleInstruction)) {
-    if (-not $bundleManifest.Contains($requiredText)) {
-        throw "Repository bundle manifest is missing required metadata: $requiredText"
+foreach ($requiredMetadata in @(
+    @{ Name = 'name'; Expected = $bundleName },
+    @{ Name = 'description'; Expected = $bundleDescription },
+    @{ Name = 'instruction'; Expected = $bundleInstruction }
+)) {
+    if (-not [string]::Equals(
+        [string]$bundleManifest.($requiredMetadata.Name),
+        $requiredMetadata.Expected,
+        [StringComparison]::Ordinal
+    )) {
+        throw "Repository bundle manifest has invalid $($requiredMetadata.Name) metadata."
     }
 }
 
