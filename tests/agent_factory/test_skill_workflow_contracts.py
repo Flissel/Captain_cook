@@ -455,6 +455,9 @@ def test_codex_assignment_is_bound_to_the_invocation(
         "/Users/tester/secret.txt",
         "/tmp/secret.txt",
         "/var/log/secret.txt",
+        "/mnt/build/secret.txt",
+        "/data/factory/secret.txt",
+        "/usr/local/bin/secret",
     ],
 )
 def test_workflow_artifacts_reject_absolute_user_and_system_paths(path: str) -> None:
@@ -469,6 +472,9 @@ def test_workflow_artifacts_reject_absolute_user_and_system_paths(path: str) -> 
         "artifact://workflow/var/result",
         "artifact://workflow/root/result",
         "artifact://workflow/Users/result",
+        "artifact://workflow/mnt/result",
+        "artifact://workflow/data/result",
+        "artifact://workflow/usr/local/result",
         "artifact://sha256/" + "d" * 64,
     ],
 )
