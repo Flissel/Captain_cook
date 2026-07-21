@@ -154,6 +154,23 @@ async def _run_sanitized_live_gate(
     return result
 
 
+def _validate_n8n_evidence(
+    report: Mapping[str, Any],
+    *,
+    with_n8n: bool,
+) -> None:
+    if not with_n8n:
+        assert report.get("n8n_evidence") in (None, {})
+        return
+    n8n_evidence = _mapping(report.get("n8n_evidence"))
+    assert re.fullmatch(
+        r"^[0-9a-f]{64}$",
+        _required_text(n8n_evidence, "workflow_digest"),
+    )
+    _required_text(n8n_evidence, "n8n_mcp_call_id")
+    _required_text(n8n_evidence, "n8n_execution_id")
+
+
 @pytest.mark.asyncio
 async def test_hermes_six_skill_factory_live() -> None:
     if os.environ.get("CAPTAIN_FACTORY_PREREQUISITES_CONFIRMED") != "1":
@@ -217,14 +234,7 @@ async def test_hermes_six_skill_factory_live() -> None:
 
     with_n8n = os.environ.get("CAPTAIN_FACTORY_WITH_N8N") == "1"
     assert report.get("with_n8n") is with_n8n
-    if with_n8n:
-        n8n_evidence = _mapping(report.get("n8n_evidence"))
-        assert re.fullmatch(
-            r"^[0-9a-f]{64}$",
-            _required_text(n8n_evidence, "workflow_digest"),
-        )
-        _required_text(n8n_evidence, "n8n_mcp_call_id")
-        _required_text(n8n_evidence, "n8n_execution_id")
+    _validate_n8n_evidence(report, with_n8n=with_n8n)
 
     report_directory = Path(os.environ["CAPTAIN_FACTORY_REPORT_DIRECTORY"]).resolve()
     repository_root = Path(__file__).resolve().parents[2]

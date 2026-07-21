@@ -134,7 +134,9 @@ replace this with a fixture or claim the reporter itself called live services.
 
 Run the six-skill live gate only after deterministic and database-resetting
 tests. The wrapper requires an explicit positive USD ceiling and an approved
-model. It checks the exact `captain_test` database, the running Docker test
+model. The ceiling accepts at most two fractional decimal places and is
+rejected before formatting, so the wrapper never rounds or widens a supplied
+budget. It checks the exact `captain_test` database, the running Docker test
 service, the six enabled Hermes skills and bundle, Codex authentication, and a
 runtime preflight without printing command output or secret values. It starts
 only the marked six-skill live test:
@@ -147,7 +149,10 @@ pwsh -NoProfile -File scripts/run-hermes-factory-live-gate.ps1 `
 The wrapper loads only its explicit variable allowlist from local `.env` and
 `.env.captain-n8n` files. Existing process variables always win; dedicated
 `CAPTAIN_N8N_*` values then come from `.env.captain-n8n`, with root `.env` as
-the fallback. File contents and loaded values are never printed.
+the fallback. This n8n loading occurs only with `-WithN8n`. Without the switch,
+the wrapper removes inherited `CAPTAIN_N8N_*` variables before preflight and
+pytest and requires the live report to omit `n8n_evidence`. File contents and
+loaded values are never printed.
 
 Demo mode runs exactly one paid case and may emit `demo_ready` only. After its
 evidence is reviewed, release mode requires a controlled recovery followed by

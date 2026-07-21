@@ -22,12 +22,9 @@ $skillNames = @(
 )
 $entrypointModule = 'agenten.agent_factory.factory_live_entrypoint'
 $root = (Resolve-Path -LiteralPath (Split-Path -Parent $PSScriptRoot)).Path
-$rootEnvironmentAllowlist = @(
+$baseEnvironmentAllowlist = @(
     'TEST_MARIADB_DSN'
     'CAPTAIN_FACTORY_MODEL'
-    'CAPTAIN_N8N_URL'
-    'CAPTAIN_N8N_API_KEY'
-    'CAPTAIN_N8N_MCP_TOKEN'
 )
 $n8nEnvironmentAllowlist = @(
     'CAPTAIN_N8N_URL'
@@ -266,14 +263,33 @@ function Assert-RedactedReport {
     return $digest
 }
 
-Import-AllowlistedEnvironmentFile -Path (Join-Path $root '.env.captain-n8n') `
-    -AllowedNames $n8nEnvironmentAllowlist
-Import-AllowlistedEnvironmentFile -Path (Join-Path $root '.env') `
-    -AllowedNames $rootEnvironmentAllowlist
-
 if ($MaxCostUsd -le 0) {
     throw 'MaxCostUsd must be a positive amount.'
 }
+$decimalBits = [decimal]::GetBits($MaxCostUsd)
+$fractionalDigits = ($decimalBits[3] -shr 16) -band 0xFF
+if ($fractionalDigits -gt 2) {
+    throw 'MaxCostUsd must have at most two fractional decimal places.'
+}
+
+if ($WithN8n) {
+    Import-AllowlistedEnvironmentFile -Path (Join-Path $root '.env.captain-n8n') `
+        -AllowedNames $n8nEnvironmentAllowlist
+    Import-AllowlistedEnvironmentFile -Path (Join-Path $root '.env') `
+        -AllowedNames ($baseEnvironmentAllowlist + $n8nEnvironmentAllowlist)
+}
+else {
+    foreach ($name in $n8nEnvironmentAllowlist) {
+        [Environment]::SetEnvironmentVariable(
+            $name,
+            $null,
+            [EnvironmentVariableTarget]::Process
+        )
+    }
+    Import-AllowlistedEnvironmentFile -Path (Join-Path $root '.env') `
+        -AllowedNames $baseEnvironmentAllowlist
+}
+
 if ([string]::IsNullOrWhiteSpace($Model)) {
     $Model = [string]$env:CAPTAIN_FACTORY_MODEL
 }

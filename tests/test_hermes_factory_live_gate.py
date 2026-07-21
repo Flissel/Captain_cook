@@ -44,6 +44,7 @@ def _run_copied_wrapper(
     *,
     environment: dict[str, str],
     with_n8n: bool = False,
+    max_cost_usd: str = "1.00",
 ) -> subprocess.CompletedProcess[str]:
     scripts = tmp_path / "scripts"
     scripts.mkdir()
@@ -59,7 +60,7 @@ def _run_copied_wrapper(
         "-Mode",
         "demo",
         "-MaxCostUsd",
-        "1.00",
+        max_cost_usd,
         "-Model",
         "fixture-model",
     ]
@@ -104,6 +105,9 @@ def _write_fake_live_gate_commands(directory: Path, leak_probe: str) -> None:
     (directory / "python.cmd").write_text(
         "@echo off\n"
         "setlocal EnableDelayedExpansion\n"
+        'if defined CAPTAIN_N8N_URL >"%CD%\\n8n-child-env-present.txt" echo present\n'
+        'if defined CAPTAIN_N8N_API_KEY >"%CD%\\n8n-child-env-present.txt" echo present\n'
+        'if defined CAPTAIN_N8N_MCP_TOKEN >"%CD%\\n8n-child-env-present.txt" echo present\n'
         'set "output="\n'
         'set "previous="\n'
         "for %%A in (%*) do (\n"
@@ -130,6 +134,30 @@ def test_live_gate_wrapper_has_the_exact_paid_gate_parameters() -> None:
     assert "[decimal]$MaxCostUsd" in source
     assert "[string]$Model" in source
     assert "[switch]$WithN8n" in source
+
+
+@pytest.mark.parametrize("max_cost_usd", ("1.001", "0.999"))
+def test_live_gate_rejects_more_than_two_cost_decimals_before_formatting(
+    tmp_path: Path,
+    max_cost_usd: str,
+) -> None:
+    environment = os.environ.copy()
+    environment.pop("TEST_MARIADB_DSN", None)
+
+    result = _run_copied_wrapper(
+        tmp_path,
+        environment=environment,
+        max_cost_usd=max_cost_usd,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "at most two fractional decimal places" in output
+    assert "TEST_MARIADB_DSN is required" not in output
+    source = WRAPPER.read_text(encoding="utf-8")
+    assert source.index("[decimal]::GetBits($MaxCostUsd)") < source.index(
+        "$MaxCostUsd.ToString('0.00'"
+    )
 
 
 def test_live_gate_wrapper_is_fail_closed_and_runs_only_the_factory_live_file() -> None:
@@ -300,6 +328,67 @@ def test_process_n8n_environment_overrides_dedicated_and_root_files(
     assert "CAPTAIN_N8N_API_KEY is required" not in output
     assert file_secret not in output
     assert process_secret not in output
+
+
+def test_non_n8n_gate_removes_inherited_and_file_n8n_values_from_children(
+    tmp_path: Path,
+) -> None:
+    fake_commands = tmp_path / "fake-bin"
+    _write_fake_live_gate_commands(fake_commands, "sanitized-provider-failure")
+    (tmp_path / ".env").write_text(
+        "CAPTAIN_N8N_URL=https://root.invalid\n"
+        "CAPTAIN_N8N_API_KEY=root-key\n"
+        "CAPTAIN_N8N_MCP_TOKEN=root-token\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".env.captain-n8n").write_text(
+        "CAPTAIN_N8N_URL=https://dedicated.invalid\n"
+        "CAPTAIN_N8N_API_KEY=dedicated-key\n"
+        "CAPTAIN_N8N_MCP_TOKEN=dedicated-token\n",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["TEST_MARIADB_DSN"] = (
+        "mysql+pymysql://captain:fixture@127.0.0.1:3306/captain_test"
+    )
+    environment["CAPTAIN_N8N_URL"] = "https://process.invalid"
+    environment["CAPTAIN_N8N_API_KEY"] = "process-key"
+    environment["CAPTAIN_N8N_MCP_TOKEN"] = "process-token"
+    environment["PATH"] = str(fake_commands)
+
+    result = _run_copied_wrapper(tmp_path, environment=environment)
+
+    assert result.returncode != 0
+    assert not (tmp_path / "n8n-child-env-present.txt").exists()
+
+
+def test_n8n_gate_loads_dedicated_values_for_children(tmp_path: Path) -> None:
+    fake_commands = tmp_path / "fake-bin"
+    _write_fake_live_gate_commands(fake_commands, "sanitized-provider-failure")
+    (tmp_path / ".env.captain-n8n").write_text(
+        "CAPTAIN_N8N_URL=https://dedicated.invalid\n"
+        "CAPTAIN_N8N_API_KEY=dedicated-key\n"
+        "CAPTAIN_N8N_MCP_TOKEN=dedicated-token\n",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["TEST_MARIADB_DSN"] = (
+        "mysql+pymysql://captain:fixture@127.0.0.1:3306/captain_test"
+    )
+    for name in ("CAPTAIN_N8N_URL", "CAPTAIN_N8N_API_KEY", "CAPTAIN_N8N_MCP_TOKEN"):
+        environment.pop(name, None)
+    environment["PATH"] = str(fake_commands)
+
+    result = _run_copied_wrapper(
+        tmp_path,
+        environment=environment,
+        with_n8n=True,
+    )
+
+    assert result.returncode != 0
+    assert (tmp_path / "n8n-child-env-present.txt").read_text(
+        encoding="utf-8"
+    ).strip() == "present"
 
 
 def test_wrapper_suppresses_failed_pytest_output_and_emits_only_a_generic_error(
@@ -570,6 +659,23 @@ def test_live_contract_requires_unique_codex_sessions_and_lowercase_n8n_digest()
     assert "_exact_usd" in source
     assert "_gateway_promotion" in source
     assert "^[0-9a-f]{64}$" in source
+
+
+def test_live_contract_rejects_n8n_evidence_without_opt_in() -> None:
+    live_contract = _load_live_contract_module()
+    assert live_contract._validate_n8n_evidence({}, with_n8n=False) is None
+
+    with pytest.raises(AssertionError):
+        live_contract._validate_n8n_evidence(
+            {
+                "n8n_evidence": {
+                    "workflow_digest": "a" * 64,
+                    "n8n_mcp_call_id": "call-1",
+                    "n8n_execution_id": "execution-1",
+                }
+            },
+            with_n8n=False,
+        )
 
 
 def test_submission_inventory_includes_factory_live_operations_files() -> None:
