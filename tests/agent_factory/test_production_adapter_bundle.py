@@ -178,6 +178,8 @@ def test_live_scripts_forward_provider_and_both_manifest_contracts() -> None:
         assert f"'{name}'" in services
     for name in required:
         assert f"'{name}'" in capability
+    required_live_aliases = capability.split("foreach ($name in @(", 1)[1].split("))", 1)[0]
+    assert "'CONTEXT7_API_KEY'" not in required_live_aliases
 
 
 def test_hermes_preflight_does_not_parse_truncated_human_skill_table() -> None:
