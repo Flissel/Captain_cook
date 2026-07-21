@@ -2121,7 +2121,7 @@ class GatewayStore:
                 self._assert_lease_is_next_action(
                     lease,
                     projection,
-                    now=self._now(),
+                    now=lease.issued_at,
                 )
                 try:
                     validate_factory_lease(lease, job=job, role=lease.role, attempt=projection.attempt, now=lease.issued_at)
@@ -5863,8 +5863,6 @@ class GatewayStore:
         )
         self._assert_frozen_capability_authority(claim, authority=authority)
         return catalog, package_row
-
-    @staticmethod
 
     def recover(self, request: RecoveryDecisionEvent) -> dict[str, Any]:
         try:
