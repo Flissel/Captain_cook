@@ -247,18 +247,18 @@ function Assert-RuntimeConfiguration($Values) {
     & $python -c 'from agenten.agent_runtime.runtime_entrypoint import preflight_runtime; preflight_runtime()' *> $null
     if ($LASTEXITCODE -ne 0) { throw 'Production Runtime configuration is unavailable; no services were started.' }
 }
-function Invoke-StartServices([switch]$Recover, [string]$SourceEnv) {
+function Invoke-StartServices([switch]$RecoverDemoCredentials, [string]$SourceEnv) {
     $values = Initialize-LocalEnvironment
     Set-ProcessEnvironment $values
     Assert-RuntimeConfiguration $values
-    Initialize-CaptainN8n $values -Recover:$Recover -SourceEnv $SourceEnv
+    Initialize-CaptainN8n $values -Recover:$RecoverDemoCredentials -SourceEnv $SourceEnv
     docker compose --project-name $project --env-file $rootEnv --file $testCompose up -d --wait mariadb-test
     if ($LASTEXITCODE -ne 0) { throw 'Isolated captain_test MariaDB failed to start.' }
     Start-Gateway $values
     Start-Runtime $values
     docker compose --env-file $rootEnv up -d --wait mailpit
     if ($LASTEXITCODE -ne 0) { throw 'Captain Mailpit failed to start.' }
-    & (Join-Path $PSScriptRoot 'minibook-demo.ps1') bootstrap -RecoverDemoCredentials:$Recover
+    & (Join-Path $PSScriptRoot 'minibook-demo.ps1') bootstrap -RecoverDemoCredentials:$RecoverDemoCredentials
     Invoke-Health
 }
 function Invoke-Health {
