@@ -70,7 +70,10 @@ def runtime_result_projection(
         return None
     subject_digest = bytearray(
         hashlib.sha256(
-            f"captain-runtime-subject:{validated.subject_id}".encode("utf-8")
+            (
+                "captain-runtime-subject:"
+                f"{validated.correlation_id}:{validated.subject_id}"
+            ).encode("utf-8")
         )
         .digest()[:16]
     )

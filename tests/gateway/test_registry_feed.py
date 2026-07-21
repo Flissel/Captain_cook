@@ -189,6 +189,45 @@ def test_runtime_result_builds_stable_redacted_projection_with_command_causation
         assert secret not in serialized
 
 
+def test_runtime_projection_subject_is_stable_and_namespaced_by_correlation() -> None:
+    base = {
+        "schema": "captain.agent-runtime-result.v1",
+        "command_id": "50000000-0000-4000-8000-000000000001",
+        "occurred_at": "2026-07-20T12:01:00Z",
+        "producer": "agent-runtime",
+        "subject_id": "subtask-1",
+        "subject_version": 3,
+        "grant_id": "grant-private",
+        "operation": "codex.run",
+        "status": "succeeded",
+        "session_id": None,
+        "artifact_refs": [],
+        "evidence_refs": [],
+        "error": None,
+    }
+    first_document = {
+        **base,
+        "event_id": "40000000-0000-4000-8000-000000000001",
+        "correlation_id": "60000000-0000-4000-8000-000000000001",
+    }
+    second_document = {
+        **base,
+        "event_id": "40000000-0000-4000-8000-000000000002",
+        "correlation_id": "60000000-0000-4000-8000-000000000002",
+    }
+
+    first = registry_feed.runtime_result_projection(first_document)
+    first_replay = registry_feed.runtime_result_projection(first_document)
+    second = registry_feed.runtime_result_projection(second_document)
+
+    assert first is not None
+    assert second is not None
+    assert first.subject_id == first_replay.subject_id
+    assert first.subject_id != second.subject_id
+    assert first.event_id == UUID(str(first_document["event_id"]))
+    assert second.event_id == UUID(str(second_document["event_id"]))
+
+
 @pytest.mark.parametrize(
     ("producer", "operation", "status", "error"),
     (
