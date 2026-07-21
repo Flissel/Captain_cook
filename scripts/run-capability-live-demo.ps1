@@ -17,7 +17,7 @@ param(
     [string]$CredentialSourceEnv = (Join-Path (Split-Path -Parent $PSScriptRoot) '.env'),
     [string]$SharedArtifactDirectory,
     [ValidateRange(60, 86400)]
-    [int]$WallClockBudgetSeconds = 1800,
+    [int]$WallClockBudgetSeconds = 600,
     [switch]$RecordVideo,
     [string]$RecordingWindowTitle,
     [string]$FfmpegPath = 'ffmpeg'
@@ -288,6 +288,17 @@ $CapabilityRunnerPath = Resolve-Leaf $CapabilityRunnerPath 'Capability runner'
 $ServiceRunnerPath = Resolve-Leaf $ServiceRunnerPath 'Service runner'
 $EvidenceDirectory = Resolve-EvidenceDirectory $EvidenceDirectory
 $selectedInputs = Resolve-SelectedInputs $ManifestPath $InputIds
+
+$configuredRuntimeSeconds = [Environment]::GetEnvironmentVariable('CAPTAIN_FACTORY_RUNTIME_SECONDS', 'Process')
+if ([string]::IsNullOrWhiteSpace($configuredRuntimeSeconds)) {
+    $configuredRuntimeSeconds = Get-DotEnvValue $CredentialSourceEnv 'CAPTAIN_FACTORY_RUNTIME_SECONDS'
+}
+if ($LiveProviders -and -not [string]::IsNullOrWhiteSpace($configuredRuntimeSeconds)) {
+    $parsedRuntimeSeconds = 0
+    if (-not [int]::TryParse($configuredRuntimeSeconds, [ref]$parsedRuntimeSeconds) -or $parsedRuntimeSeconds -ne $WallClockBudgetSeconds) {
+        throw 'Factory runtime budget disagrees with the live orchestrator budget.'
+    }
+}
 
 if (-not $LiveProviders) {
     [ordered]@{

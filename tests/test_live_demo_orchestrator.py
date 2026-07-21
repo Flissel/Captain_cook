@@ -130,6 +130,9 @@ def test_orchestrator_source_is_explicit_fail_closed_and_redacted() -> None:
     assert "desktop" not in source.lower()
     assert "OPENAI" not in source.upper()
     assert "Get-ChildItem Env:" not in source
+    assert "[int]$WallClockBudgetSeconds = 600" in source
+    assert "CAPTAIN_FACTORY_RUNTIME_SECONDS" in source
+    assert "Factory runtime budget disagrees with the live orchestrator budget" in source
 
 
 def test_without_provider_opt_in_only_validates_and_invokes_nothing(tmp_path: Path) -> None:
@@ -151,6 +154,33 @@ def test_without_provider_opt_in_only_validates_and_invokes_nothing(tmp_path: Pa
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
     assert "live providers were not requested" in output
+    assert list(state.iterdir()) == []
+
+
+def test_live_run_rejects_runtime_budget_mismatch_before_service_start(
+    tmp_path: Path,
+) -> None:
+    fake_service = tmp_path / "fake-services.ps1"
+    fake_capability = tmp_path / "fake-capability.ps1"
+    _write_fake_service_runner(fake_service)
+    _write_fake_capability_runner(fake_capability)
+    state = tmp_path / "state"
+    state.mkdir()
+    environment = os.environ.copy()
+    environment["FAKE_STATE_DIR"] = str(state)
+    environment["CAPTAIN_FACTORY_RUNTIME_SECONDS"] = "601"
+
+    result = _run(
+        "-LiveProviders",
+        "-ConfirmProviderCost",
+        "-CapabilityRunnerPath", str(fake_capability),
+        "-ServiceRunnerPath", str(fake_service),
+        env=environment,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Factory runtime budget disagrees" in output
     assert list(state.iterdir()) == []
 
 
