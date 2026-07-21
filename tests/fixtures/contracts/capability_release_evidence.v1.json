@@ -19,6 +19,7 @@
     {
       "assertion_id": "output-01",
       "status": "passed",
+      "integration_intent": "none",
       "evidence_refs": [
         {
           "uri": "artifact://assertion-evidence/output-01/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
@@ -30,5 +31,16 @@
   ],
   "recovery_id": "controlled-recovery-01",
   "recovery_assertion_id": "output-01",
-  "holdout_ids": ["private-case-01"]
+  "private_holdout_evidence": [
+    {
+      "holdout_id": "private-case-01",
+      "assertion_id": "output-01",
+      "status": "passed",
+      "evidence_ref": {
+        "uri": "artifact://holdout-evidence/private-case-01/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "media_type": "application/json"
+      }
+    }
+  ]
 }
