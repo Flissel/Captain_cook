@@ -45,6 +45,8 @@ from gateway.contracts import (
     RuntimeExecutionClaim,
     RuntimeExecutionClaimReceipt,
     RuntimeExecutionClaimRequest,
+    RuntimeResultRecoveryObservation,
+    RuntimeResultRecoveryRequest,
     RuntimeReleasedBatchSnapshot,
     FactoryJobProjection,
     FactoryReleaseDecisionSubmission,
@@ -638,6 +640,65 @@ def create_app(
                 }
             )
         return receipt
+
+    @app.post(
+        "/v1/runtime/result-recoveries",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def recover_runtime_result(
+        request: RuntimeResultRecoveryRequest,
+        response: Response,
+        execution_owner_id: str = Header(
+            alias="X-Runtime-Owner-ID",
+            min_length=1,
+        ),
+        execution_fencing_token: int = Header(
+            alias="X-Runtime-Fencing-Token",
+            ge=1,
+        ),
+        execution_claim_credential: str = Header(
+            alias="X-Runtime-Claim-Credential",
+            min_length=20,
+        ),
+        _: GatewayRole = Depends(require_captain),
+    ) -> RuntimeWriteReceipt:
+        receipt = get_store().recover_runtime_result(
+            request,
+            execution_owner_id=execution_owner_id,
+            execution_fencing_token=execution_fencing_token,
+            execution_claim_credential=execution_claim_credential,
+        )
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        else:
+            result = request.result
+            enqueue_runtime_projection(
+                {
+                    "event_type": "runtime_result_recorded",
+                    "event_id": str(result.event_id),
+                    "operation_id": str(result.command_id),
+                    "correlation_id": str(result.correlation_id),
+                    "subject_id": result.subject_id,
+                    "subject_version": result.subject_version,
+                    "operation": result.operation.value,
+                    "status": result.status.value,
+                    "session_id": result.session_id,
+                }
+            )
+        return receipt
+
+    @app.get("/v1/runtime/result-recoveries/{operation_id}")
+    async def get_runtime_result_recovery(
+        operation_id: UUID,
+        _: GatewayRole = Depends(require_reader),
+    ) -> RuntimeResultRecoveryObservation:
+        observation = get_store().runtime_result_recovery(operation_id)
+        if observation is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="runtime result recovery observation not found",
+            )
+        return observation
 
     @app.get("/v1/runtime/operations/{operation_id}")
     async def get_runtime_operation(

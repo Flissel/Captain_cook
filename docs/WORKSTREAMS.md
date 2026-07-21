@@ -45,8 +45,12 @@ Forge/republication, mutation, tool-gap,
 holdout, post-effect deadline, artifact, and two-success failure paths. A
 separately selected `live`/`db_mutating` `captain_test` test, using only an
 explicitly exported DSN, exercises the production
-`GatewayStore` atomic publication and command/grant/claim/result/execution
-transactions, including rollback and reconstructed-store replay.
+`GatewayStore` atomic publication and
+command/grant/claim/result/recovery-observation/execution transactions,
+including rollback and reconstructed-store replay. Provider recovery never
+rewrites `AgentRuntimeResult`; the original bytes and result ID remain the
+capability-execution authority while a distinct Captain observation binds the
+receipt digest and both claim fences.
 
 Release evidence remains Captain-owned. Forge supplies a candidate; a Captain
 Evidence Issuer supplies the controlled-recovery and normal-run records;

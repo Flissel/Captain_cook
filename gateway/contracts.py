@@ -7,7 +7,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, Sequence, TypeAlias
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from pydantic import (
     BaseModel,
@@ -25,6 +25,8 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrant,
     CapabilityGrantRevocation,
     IntegrationIntent,
+    ProviderEffectReceipt,
+    SHA256_PATTERN,
 )
 from agenten.agent_factory.contracts import (
     FactoryJob,
@@ -124,6 +126,92 @@ def canonical_contract_sha256(model: BaseModel) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(content).hexdigest()
+
+
+class RuntimeResultRecoveryObservation(_FrozenContract):
+    """Captain's distinct observation that admits one immutable provider result."""
+
+    schema_name: Literal["captain.runtime-result-recovery-observation.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    event_id: UUID
+    observed_at: datetime
+    command_id: UUID
+    original_result_id: UUID
+    original_result_digest: str = Field(pattern=SHA256_PATTERN)
+    provider_effect_id: UUID
+    provider_receipt_digest: str = Field(pattern=SHA256_PATTERN)
+    original_claim_fence: int = Field(ge=1, strict=True)
+    recovery_claim_fence: int = Field(ge=1, strict=True)
+    correlation_id: UUID
+    causation_id: UUID
+
+    @field_validator("observed_at")
+    @classmethod
+    def require_utc_observation(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("recovery observation timestamp must be UTC")
+        return value.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def require_causal_fence_progression(self) -> "RuntimeResultRecoveryObservation":
+        if self.causation_id != self.original_result_id:
+            raise ValueError("recovery observation causation must be the original result")
+        if self.event_id == self.original_result_id:
+            raise ValueError("recovery observation must have a distinct event id")
+        if self.recovery_claim_fence <= self.original_claim_fence:
+            raise ValueError("recovery claim fence must advance the original claim fence")
+        expected_event_id = uuid5(
+            self.original_result_id,
+            (
+                "runtime-result-recovery:"
+                f"{self.original_claim_fence}:{self.recovery_claim_fence}"
+            ),
+        )
+        if self.event_id != expected_event_id:
+            raise ValueError("recovery observation event id is not deterministic")
+        return self
+
+
+class RuntimeResultRecoveryRequest(_FrozenContract):
+    """Original provider evidence plus Captain's separate recovery observation."""
+
+    schema_name: Literal["captain.runtime-result-recovery-request.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    result: AgentRuntimeResult
+    provider_receipt: ProviderEffectReceipt
+    observation: RuntimeResultRecoveryObservation
+
+    @model_validator(mode="after")
+    def require_exact_evidence_bindings(self) -> "RuntimeResultRecoveryRequest":
+        result = self.result
+        receipt = self.provider_receipt
+        observation = self.observation
+        result_digest = canonical_contract_sha256(result)
+        receipt_digest = canonical_contract_sha256(receipt)
+        if (
+            observation.command_id != result.command_id
+            or observation.original_result_id != result.event_id
+            or observation.correlation_id != result.correlation_id
+        ):
+            raise ValueError("recovery observation does not match the original result")
+        if observation.original_result_digest != result_digest:
+            raise ValueError("recovery observation original result digest does not match")
+        if (
+            not receipt.idempotency_guaranteed
+            or receipt.command_id != result.command_id
+            or receipt.result_digest != result_digest
+            or receipt.status != result.status.value
+        ):
+            raise ValueError("provider receipt does not bind the original result")
+        if observation.provider_effect_id != receipt.effect_id:
+            raise ValueError("recovery observation provider effect does not match")
+        if observation.provider_receipt_digest != receipt_digest:
+            raise ValueError("recovery observation provider receipt digest does not match")
+        return self
 
 
 class CapabilityReleaseRequest(_FrozenContract):

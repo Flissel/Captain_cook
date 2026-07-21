@@ -96,6 +96,8 @@ from gateway.contracts import (
     RuntimeExecutionClaim,
     RuntimeExecutionClaimReceipt,
     RuntimeExecutionClaimRequest,
+    RuntimeResultRecoveryObservation,
+    RuntimeResultRecoveryRequest,
     RuntimeReleasedBatchSnapshot,
     canonical_contract_sha256,
     project_batch,
@@ -777,6 +779,49 @@ class GatewayStore:
             return RuntimeWriteReceipt(operation_id=replay.operation_id, replayed=True)
         return RuntimeWriteReceipt(operation_id=result.command_id, replayed=False)
 
+    def recover_runtime_result(
+        self,
+        request: RuntimeResultRecoveryRequest,
+        *,
+        execution_owner_id: str,
+        execution_fencing_token: int,
+        execution_claim_credential: str,
+    ) -> RuntimeWriteReceipt:
+        request = RuntimeResultRecoveryRequest.model_validate(
+            request.model_dump(mode="json", by_alias=True)
+        )
+        try:
+            self._retry_write(
+                lambda: self._recover_runtime_result_once(
+                    request,
+                    execution_owner_id=execution_owner_id,
+                    execution_fencing_token=execution_fencing_token,
+                    execution_claim_credential=execution_claim_credential,
+                )
+            )
+        except _RuntimeReplay as replay:
+            return RuntimeWriteReceipt(operation_id=replay.operation_id, replayed=True)
+        return RuntimeWriteReceipt(
+            operation_id=request.observation.command_id,
+            replayed=False,
+        )
+
+    def runtime_result_recovery(
+        self,
+        operation_id: UUID,
+    ) -> RuntimeResultRecoveryObservation | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="runtime_result_recovery_observation",
+                    field="command_id",
+                    value=str(operation_id),
+                )
+        if block is None:
+            return None
+        return RuntimeResultRecoveryObservation.model_validate(block["data"])
+
     def record_capability_grant_revocation(
         self,
         revocation: CapabilityGrantRevocation,
@@ -1008,6 +1053,219 @@ class GatewayStore:
                             str(result.command_id),
                             claim.fencing_token,
                         ),
+                    )
+
+    def _recover_runtime_result_once(
+        self,
+        request: RuntimeResultRecoveryRequest,
+        *,
+        execution_owner_id: str,
+        execution_fencing_token: int,
+        execution_claim_credential: str,
+    ) -> None:
+        result = request.result
+        observation = request.observation
+        canonical_result = result.model_dump(mode="json", by_alias=True)
+        canonical_observation = observation.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                self._lock_ledger_state(cursor)
+                command_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_command",
+                    field="event_id",
+                    value=str(result.command_id),
+                    for_update=True,
+                )
+                if command_block is None:
+                    raise HTTPException(status_code=409, detail="runtime command not found")
+                command = AgentRuntimeCommand.model_validate(command_block["data"])
+                self._assert_result_matches_command(result, command)
+
+                cursor.execute(
+                    """SELECT payload, credential_sha256, block_index
+                       FROM runtime_execution_claims
+                       WHERE command_id = %s FOR UPDATE""",
+                    (str(result.command_id),),
+                )
+                claim_row = cursor.fetchone()
+                if claim_row is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime recovery requires a current execution claim",
+                    )
+                current_claim = RuntimeExecutionClaim.model_validate(
+                    self._decode_json(claim_row["payload"])
+                )
+                current_claim_block = self._row_by_index(
+                    cursor,
+                    int(claim_row["block_index"]),
+                    for_update=True,
+                )
+                if current_claim_block is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="current runtime execution claim ledger block is missing",
+                    )
+                ledger_current_claim = RuntimeExecutionClaim.model_validate(
+                    current_claim_block["data"]
+                )
+                expected_ledger_current = current_claim.model_copy(
+                    update={"status": "active", "completed_at": None}
+                )
+                if (
+                    current_claim_block["block_type"] != "runtime_execution_claim"
+                    or current_claim_block["parent_index"] != command_block["index"]
+                    or ledger_current_claim != expected_ledger_current
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="current runtime execution claim disagrees with the ledger",
+                    )
+
+                original_claim_block = self._runtime_execution_claim_block(
+                    cursor,
+                    command_id=result.command_id,
+                    fencing_token=observation.original_claim_fence,
+                    for_update=True,
+                )
+                if original_claim_block is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="original runtime execution claim ledger block is missing",
+                    )
+                original_claim = RuntimeExecutionClaim.model_validate(
+                    original_claim_block["data"]
+                )
+                self._assert_runtime_result_recovery_claims(
+                    request,
+                    original_claim=original_claim,
+                    current_claim=current_claim,
+                    command_block_index=int(command_block["index"]),
+                    original_claim_parent_index=original_claim_block["parent_index"],
+                )
+                self._assert_execution_claim_completion_authority(
+                    current_claim,
+                    owner_id=execution_owner_id,
+                    fencing_token=execution_fencing_token,
+                    credential=execution_claim_credential,
+                    credential_sha256=str(claim_row["credential_sha256"] or ""),
+                )
+
+                existing_result = self._runtime_result_block(
+                    cursor,
+                    result,
+                    for_update=True,
+                )
+                existing_observation = self._runtime_recovery_observation_block(
+                    cursor,
+                    observation,
+                    for_update=True,
+                )
+                if existing_result is not None or existing_observation is not None:
+                    if (
+                        existing_result is not None
+                        and existing_observation is not None
+                        and existing_result["data"] == canonical_result
+                        and existing_observation["data"] == canonical_observation
+                        and current_claim.status == "completed"
+                    ):
+                        raise _RuntimeReplay(result.command_id)
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime result recovery already has different or incomplete content",
+                    )
+
+                completion_time = self._now()
+                if observation.observed_at > completion_time:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime recovery observation is after Gateway completion time",
+                    )
+                self._assert_execution_claim_fence(
+                    current_claim,
+                    owner_id=execution_owner_id,
+                    fencing_token=execution_fencing_token,
+                    now=completion_time,
+                )
+
+                grant_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_grant",
+                    field="grant_id",
+                    value=result.grant_id,
+                    for_update=True,
+                )
+                if grant_block is None:
+                    raise HTTPException(status_code=409, detail="runtime grant not found")
+                grant = CapabilityGrant.model_validate(grant_block["data"])
+                if grant.command_id != command.event_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime grant belongs to a different command",
+                    )
+                revocation_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_grant_revocation",
+                    field="grant_id",
+                    value=grant.grant_id,
+                    for_update=True,
+                )
+                if revocation_block is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="revoked runtime grant cannot recover a result",
+                    )
+
+                result_index = self._next_index(cursor)
+                result_block = self._new_block(
+                    cursor,
+                    index=result_index,
+                    block_type="agent_runtime_result",
+                    data=canonical_result,
+                    status=result.status.value,
+                    parent_index=command_block["index"],
+                    metadata={"schema": "captain.agent-runtime-result.v1"},
+                )
+                self._insert(cursor, result_block)
+                observation_index = self._next_index(cursor)
+                observation_block = self._new_block(
+                    cursor,
+                    index=observation_index,
+                    block_type="runtime_result_recovery_observation",
+                    data=canonical_observation,
+                    status="observed",
+                    parent_index=result_index,
+                    metadata={
+                        "schema": "captain.runtime-result-recovery-observation.v1",
+                        "original_claim_block_index": int(original_claim_block["index"]),
+                        "recovery_claim_block_index": int(current_claim_block["index"]),
+                    },
+                )
+                self._insert(cursor, observation_block)
+                completed = current_claim.model_copy(
+                    update={
+                        "status": "completed",
+                        "completed_at": completion_time,
+                    }
+                )
+                cursor.execute(
+                    """UPDATE runtime_execution_claims
+                       SET status = 'completed', payload = %s
+                       WHERE command_id = %s AND fencing_token = %s""",
+                    (
+                        json.dumps(
+                            completed.model_dump(mode="json", by_alias=True),
+                            sort_keys=True,
+                        ),
+                        str(result.command_id),
+                        current_claim.fencing_token,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime recovery claim fence changed during completion",
                     )
 
     def runtime_operation(self, operation_id: UUID) -> RuntimeOperationProjection:
@@ -1576,6 +1834,53 @@ class GatewayStore:
                 status_code=409,
                 detail="runtime result occurred_at is outside the claim lease window",
             )
+
+    @staticmethod
+    def _assert_runtime_result_recovery_claims(
+        request: RuntimeResultRecoveryRequest,
+        *,
+        original_claim: RuntimeExecutionClaim,
+        current_claim: RuntimeExecutionClaim,
+        command_block_index: int,
+        original_claim_parent_index: int | None,
+    ) -> None:
+        observation = request.observation
+        expected_effect_id = uuid5(request.result.command_id, "durable-provider-effect")
+        if (
+            original_claim_parent_index != command_block_index
+            or original_claim.command_id != request.result.command_id
+            or current_claim.command_id != request.result.command_id
+            or original_claim.fencing_token != observation.original_claim_fence
+            or current_claim.fencing_token != observation.recovery_claim_fence
+            or current_claim.fencing_token <= original_claim.fencing_token
+            or original_claim.status != "active"
+            or original_claim.expires_at > current_claim.claimed_at
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="runtime recovery claim lineage is invalid",
+            )
+        if (
+            GatewayStore._claim_capability_authority(original_claim)
+            != GatewayStore._claim_capability_authority(current_claim)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="runtime recovery changed frozen capability authority",
+            )
+        if request.provider_receipt.effect_id != expected_effect_id:
+            raise HTTPException(
+                status_code=409,
+                detail="runtime recovery provider effect id is not deterministic",
+            )
+        GatewayStore._assert_result_occurred_within_claim(
+            original_claim,
+            occurred_at=request.result.occurred_at,
+        )
+        GatewayStore._assert_result_occurred_within_claim(
+            current_claim,
+            occurred_at=observation.observed_at,
+        )
 
     @staticmethod
     def _assert_capability_execution_binding(
@@ -3414,6 +3719,51 @@ class GatewayStore:
             second_value=str(result.command_id),
             for_update=for_update,
         )
+
+    def _runtime_recovery_observation_block(
+        self,
+        cursor: Any,
+        observation: RuntimeResultRecoveryObservation,
+        *,
+        for_update: bool,
+    ) -> dict[str, Any] | None:
+        return self._runtime_block_by_two_json_values(
+            cursor,
+            block_type="runtime_result_recovery_observation",
+            first_field="event_id",
+            first_value=str(observation.event_id),
+            second_field="command_id",
+            second_value=str(observation.command_id),
+            for_update=for_update,
+        )
+
+    def _runtime_execution_claim_block(
+        self,
+        cursor: Any,
+        *,
+        command_id: UUID,
+        fencing_token: int,
+        for_update: bool,
+    ) -> dict[str, Any] | None:
+        sql = """
+            SELECT `index`, parent_index, block_type, data, status, children,
+                   metadata, hash, previous_hash
+            FROM blocks
+            WHERE block_type = 'runtime_execution_claim'
+              AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.command_id')) = %s
+              AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.fencing_token')) = %s
+            ORDER BY `index` LIMIT 2
+        """
+        if for_update:
+            sql += " FOR UPDATE"
+        cursor.execute(sql, (str(command_id), str(fencing_token)))
+        rows = cursor.fetchall()
+        if len(rows) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail="runtime execution claim fence is duplicated in the ledger",
+            )
+        return self.storage._decode_row(rows[0]) if rows else None
 
     def _runtime_block_by_json_value(
         self,

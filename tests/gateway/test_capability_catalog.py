@@ -4,7 +4,7 @@ import hashlib
 import json
 from datetime import timedelta
 from types import SimpleNamespace
-from uuid import UUID
+from uuid import UUID, uuid5
 
 import pytest
 from fastapi import HTTPException, Request
@@ -26,6 +26,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
     ArtifactRef,
+    ProviderEffectReceipt,
 )
 from agenten.agent_runtime.capabilities import derive_grant
 from agenten.validation.contracts import WorkBatch
@@ -46,7 +47,10 @@ from gateway.contracts import (
     RuntimeExecutionClaim,
     RuntimeExecutionClaimRequest,
     RuntimeExecutionClaimReceipt,
+    RuntimeResultRecoveryObservation,
+    RuntimeResultRecoveryRequest,
     RuntimeReleasedBatchSnapshot,
+    RuntimeWriteReceipt,
     canonical_contract_sha256,
 )
 from gateway.settings import GatewaySettings
@@ -235,6 +239,65 @@ def test_execution_claim_request_has_bounded_utc_lease_and_owner_identity() -> N
                 "lease_seconds": 3600,
             }
         )
+
+
+def _runtime_result_recovery_request() -> RuntimeResultRecoveryRequest:
+    result = _runtime_result()
+    effect_id = uuid5(result.command_id, "durable-provider-effect")
+    receipt = ProviderEffectReceipt(
+        provider_operation_id=f"provider-operation:{effect_id}",
+        effect_id=effect_id,
+        command_id=result.command_id,
+        request_digest="a" * 64,
+        result_digest=canonical_contract_sha256(result),
+        status=result.status.value,
+        idempotency_guaranteed=True,
+    )
+    observation = RuntimeResultRecoveryObservation(
+        schema_name="captain.runtime-result-recovery-observation.v1",
+        event_id=uuid5(result.event_id, "runtime-result-recovery:1:2"),
+        observed_at=NOW,
+        command_id=result.command_id,
+        original_result_id=result.event_id,
+        original_result_digest=canonical_contract_sha256(result),
+        provider_effect_id=effect_id,
+        provider_receipt_digest=canonical_contract_sha256(receipt),
+        original_claim_fence=1,
+        recovery_claim_fence=2,
+        correlation_id=result.correlation_id,
+        causation_id=result.event_id,
+    )
+    return RuntimeResultRecoveryRequest(
+        schema_name="captain.runtime-result-recovery-request.v1",
+        result=result,
+        provider_receipt=receipt,
+        observation=observation,
+    )
+
+
+def test_runtime_result_recovery_request_binds_immutable_result_and_provider_receipt() -> None:
+    request = _runtime_result_recovery_request()
+    result = request.result
+    observation = request.observation
+    effect_id = request.provider_receipt.effect_id
+
+    assert request.result.model_dump_json(by_alias=True) == result.model_dump_json(
+        by_alias=True
+    )
+    payload = request.model_dump(mode="json", by_alias=True)
+    payload["observation"]["original_result_digest"] = "0" * 64
+    with pytest.raises(ValidationError, match="result digest"):
+        RuntimeResultRecoveryRequest.model_validate(payload)
+
+    payload = request.model_dump(mode="json", by_alias=True)
+    payload["observation"]["provider_effect_id"] = str(uuid5(effect_id, "changed"))
+    with pytest.raises(ValidationError, match="provider effect"):
+        RuntimeResultRecoveryRequest.model_validate(payload)
+
+    payload = observation.model_dump(mode="json", by_alias=True)
+    payload["event_id"] = str(result.event_id)
+    with pytest.raises(ValidationError, match="distinct event id"):
+        RuntimeResultRecoveryObservation.model_validate(payload)
 
 
 def _runtime_command() -> AgentRuntimeCommand:
@@ -754,6 +817,66 @@ def test_result_time_must_fall_inside_the_execution_claim_lease() -> None:
         )
 
 
+def test_runtime_result_recovery_requires_historical_claim_and_distinct_current_lease() -> None:
+    request = _runtime_result_recovery_request()
+    authority = _runtime_capability_authority()
+    original_claim = RuntimeExecutionClaim(
+        **authority.model_dump(),
+        command_id=request.result.command_id,
+        claim_id=UUID("00000000-0000-0000-0000-000000000811"),
+        owner_id="runtime-a",
+        fencing_token=1,
+        claimed_at=request.result.occurred_at - timedelta(seconds=30),
+        expires_at=request.result.occurred_at + timedelta(seconds=30),
+        status="active",
+    )
+    current_claim = RuntimeExecutionClaim(
+        **authority.model_dump(),
+        command_id=request.result.command_id,
+        claim_id=UUID("00000000-0000-0000-0000-000000000812"),
+        owner_id="runtime-b",
+        fencing_token=2,
+        claimed_at=original_claim.expires_at,
+        expires_at=original_claim.expires_at + timedelta(minutes=1),
+        status="active",
+    )
+    request = RuntimeResultRecoveryRequest.model_validate(
+        {
+            **request.model_dump(mode="json", by_alias=True),
+            "observation": {
+                **request.observation.model_dump(mode="json", by_alias=True),
+                "observed_at": current_claim.claimed_at.isoformat(),
+            },
+        }
+    )
+
+    GatewayStore._assert_runtime_result_recovery_claims(
+        request,
+        original_claim=original_claim,
+        current_claim=current_claim,
+        command_block_index=71,
+        original_claim_parent_index=71,
+    )
+    with pytest.raises(HTTPException, match="lineage"):
+        GatewayStore._assert_runtime_result_recovery_claims(
+            request,
+            original_claim=original_claim,
+            current_claim=current_claim,
+            command_block_index=71,
+            original_claim_parent_index=72,
+        )
+    with pytest.raises(HTTPException, match="frozen capability"):
+        GatewayStore._assert_runtime_result_recovery_claims(
+            request,
+            original_claim=original_claim,
+            current_claim=current_claim.model_copy(
+                update={"catalog_fence": current_claim.catalog_fence + 1}
+            ),
+            command_block_index=71,
+            original_claim_parent_index=71,
+        )
+
+
 def test_runtime_claim_rejects_prepublish_commands_and_freezes_exact_catalog() -> None:
     authority = _runtime_capability_authority()
     release = release_request()
@@ -943,7 +1066,9 @@ class _AuthorityStore:
             self.execution_request,
             catalog_fence=1,
         )
+        self.recovery_request = _runtime_result_recovery_request()
         self.release_calls = 0
+        self.recovery_calls = 0
         self.nonrelease_terminal = self.release.decision.model_copy(
             update={
                 "decision_id": UUID("00000000-0000-0000-0000-000000000799"),
@@ -993,6 +1118,29 @@ class _AuthorityStore:
     def capability_execution(self, command_id):
         return self.execution if command_id == self.execution.command_id else None
 
+    def recover_runtime_result(
+        self,
+        request,
+        *,
+        execution_owner_id,
+        execution_fencing_token,
+        execution_claim_credential,
+    ):
+        assert request == self.recovery_request
+        assert execution_owner_id == "runtime-a"
+        assert execution_fencing_token == 2
+        assert execution_claim_credential == "one-time-recovery-credential"
+        self.recovery_calls += 1
+        return RuntimeWriteReceipt(
+            operation_id=request.result.command_id,
+            replayed=self.recovery_calls > 1,
+        )
+
+    def runtime_result_recovery(self, command_id):
+        if command_id != self.recovery_request.result.command_id:
+            return None
+        return self.recovery_request.observation
+
 
 class _Mirror:
     def enqueue_nowait(self, _):
@@ -1021,9 +1169,20 @@ def _application(store: _AuthorityStore, actor: GatewayRole):
 def test_authority_routes_are_captain_write_and_reader_read_scoped() -> None:
     store = _AuthorityStore()
     release = store.release.model_dump(mode="json", by_alias=True)
+    recovery = store.recovery_request.model_dump(mode="json", by_alias=True)
+    recovery_headers = {
+        "X-Runtime-Owner-ID": "runtime-a",
+        "X-Runtime-Fencing-Token": "2",
+        "X-Runtime-Claim-Credential": "one-time-recovery-credential",
+    }
     with TestClient(_application(store, GatewayRole.WORKER)) as worker:
         assert worker.post("/v1/factory/terminal-decisions", json=release).status_code == 403
         assert worker.post("/v1/capabilities", json=release).status_code == 403
+        assert worker.post(
+            "/v1/runtime/result-recoveries",
+            json=recovery,
+            headers=recovery_headers,
+        ).status_code == 403
         assert worker.get(
             f"/v1/factory/terminal-decisions/{store.release.decision.job_id}"
         ).status_code == 200
@@ -1038,10 +1197,28 @@ def test_authority_routes_are_captain_write_and_reader_read_scoped() -> None:
             "/v1/capability-executions",
             json=store.execution_request.model_dump(mode="json", by_alias=True),
         )
+        recovered = captain.post(
+            "/v1/runtime/result-recoveries",
+            json=recovery,
+            headers=recovery_headers,
+        )
+        recovery_replay = captain.post(
+            "/v1/runtime/result-recoveries",
+            json=recovery,
+            headers=recovery_headers,
+        )
+        recovery_readback = captain.get(
+            f"/v1/runtime/result-recoveries/{store.recovery_request.result.command_id}"
+        )
 
     assert first.status_code == 201
     assert replay.status_code == 200
     assert execution.status_code == 201
+    assert recovered.status_code == 201
+    assert recovery_replay.status_code == 200
+    assert recovery_readback.json()["event_id"] == str(
+        store.recovery_request.observation.event_id
+    )
 
 
 def test_nonrelease_terminal_decision_has_its_own_captain_api() -> None:
