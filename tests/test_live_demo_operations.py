@@ -206,6 +206,7 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "CAPTAIN_FACTORY_PRICING_VERSION" in source
     assert "CAPTAIN_FACTORY_INPUT_COST_PER_MILLION_USD" in source
     assert "CAPTAIN_FACTORY_OUTPUT_COST_PER_MILLION_USD" in source
+    assert "CAPTAIN_FACTORY_N8N_WORKFLOW_ID" in source
     assert "function Start-CaptainN8nBroker" in source
     assert "http://host.docker.internal:" in source
     assert "& $n8n broker-start" in source
