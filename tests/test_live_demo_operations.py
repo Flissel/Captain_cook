@@ -218,7 +218,16 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert source.index("Start-CaptainN8nBroker $values") < source.index("Start-Runtime $values")
     assert "Captain Runtime and Minibook capability artifact roots differ" in source
     assert "Write-Output $values" not in source
-    assert source.index("Initialize-CaptainN8n $values") < source.index("mariadb-test")
+    start_body = source.split("function Invoke-StartServices", 1)[1].split(
+        "function Invoke-Health", 1
+    )[0]
+    assert start_body.index("up -d --wait mariadb-test") < start_body.index(
+        "Assert-RuntimeConfiguration $values"
+    )
+    assert start_body.index("Assert-RuntimeConfiguration $values") < start_body.index(
+        "Initialize-CaptainN8n $values"
+    )
+    assert "stop mariadb-test" in start_body
     lowered = source.lower()
     assert "down -v" not in lowered
     assert "volume rm" not in lowered

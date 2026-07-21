@@ -334,10 +334,15 @@ function Assert-RuntimeConfiguration($Values) {
 function Invoke-StartServices([switch]$RecoverDemoCredentials, [string]$SourceEnv) {
     $values = Initialize-LocalEnvironment
     Set-ProcessEnvironment $values
-    Assert-RuntimeConfiguration $values
-    Initialize-CaptainN8n $values -Recover:$RecoverDemoCredentials -SourceEnv $SourceEnv
     docker compose --project-name $project --env-file $rootEnv --file $testCompose up -d --wait mariadb-test
     if ($LASTEXITCODE -ne 0) { throw 'Isolated captain_test MariaDB failed to start.' }
+    try {
+        Assert-RuntimeConfiguration $values
+    } catch {
+        docker compose --project-name $project --env-file $rootEnv --file $testCompose stop mariadb-test *> $null
+        throw
+    }
+    Initialize-CaptainN8n $values -Recover:$RecoverDemoCredentials -SourceEnv $SourceEnv
     Start-Gateway $values
     Start-CaptainN8nBroker $values
     Start-Runtime $values
