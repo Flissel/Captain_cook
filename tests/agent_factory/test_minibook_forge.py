@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+from datetime import datetime, timezone
 
 import httpx
 import pytest
 
 from agenten.agent_factory.forge_contracts import CreationJobV1
+from agenten.agent_factory.contracts import AgentFactoryJob
 from agenten.agent_factory.minibook_forge import (
     MinibookForgeHttpClient,
     MinibookForgeHttpSettings,
@@ -15,7 +17,22 @@ from agenten.agent_factory.minibook_forge import (
 )
 from agenten.agent_factory.orchestration import FactoryDispatch
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
-from tests.agent_factory.test_state_machine import job
+
+
+def job() -> AgentFactoryJob:
+    return AgentFactoryJob.model_validate({
+        "schema": "captain.agent-factory-job.v1",
+        "event_id": "00000000-0000-0000-0000-000000000001",
+        "correlation_id": "00000000-0000-0000-0000-000000000002",
+        "occurred_at": datetime(2026, 7, 21, tzinfo=timezone.utc),
+        "producer": "captain",
+        "job_id": "00000000-0000-0000-0000-000000000003",
+        "subject_version": 1,
+        "input_ref": {"uri": "artifact://factory/input", "sha256": "a" * 64, "media_type": "text/markdown"},
+        "required_capability": "support_triage",
+        "acceptance_assertion_ids": ["schema_valid", "real_case_green"],
+        "max_behavioral_iterations": 5,
+    })
 
 
 class Materializer:
