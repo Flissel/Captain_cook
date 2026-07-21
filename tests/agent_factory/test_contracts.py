@@ -5,17 +5,21 @@ from uuid import UUID
 
 import pytest
 from pydantic import ValidationError
+import json
+from pathlib import Path
 
 from agenten.agent_runtime.contracts import CapabilityProfile
 
 from agenten.agent_factory.contracts import (
     AgentFactoryJob,
+    AgentFactoryJobV2,
     FactoryBlockStatus,
     FactoryEvidenceBlock,
     FactoryPhase,
     FactoryRole,
     FactoryLease,
     PromotedCapability,
+    parse_factory_job,
 )
 
 
@@ -86,6 +90,30 @@ def test_factory_job_rejects_duplicate_assertions_and_non_utc_time() -> None:
         AgentFactoryJob.model_validate(
             {**job_payload(), "acceptance_assertion_ids": ["schema_valid", "schema_valid"]}
         )
+
+
+def test_factory_job_v1_remains_readable_and_v2_fixture_is_strict() -> None:
+    assert isinstance(parse_factory_job(job_payload()), AgentFactoryJob)
+    fixture = Path(__file__).parents[1] / "fixtures" / "agent_factory" / "agent_factory_job.v2.json"
+    payload = json.loads(fixture.read_text(encoding="utf-8"))
+    job = parse_factory_job(payload)
+    assert isinstance(job, AgentFactoryJobV2)
+    assert job.schema_name == "captain.agent-factory-job.v2"
+    assert job.max_behavioral_iterations == 5
+    assert job.deadline_at > job.occurred_at
+
+    with pytest.raises(ValidationError, match="deadline"):
+        AgentFactoryJobV2.model_validate({**payload, "deadline_at": payload["occurred_at"]})
+    duplicate_assertions = {**payload, "acceptance_assertion_ids": [payload["acceptance_assertion_ids"][0]] * 2}
+    with pytest.raises(ValidationError, match="duplicates"):
+        AgentFactoryJobV2.model_validate(duplicate_assertions)
+    duplicate_holdouts = {**payload, "private_holdout_refs": [payload["private_holdout_refs"][0]] * 2}
+    with pytest.raises(ValidationError, match="duplicates"):
+        AgentFactoryJobV2.model_validate(duplicate_holdouts)
+    mismatch = dict(payload)
+    mismatch["compiled_spec_ref"] = {**payload["compiled_spec_ref"], "sha256": "f" * 64}
+    with pytest.raises(ValidationError, match="digest"):
+        AgentFactoryJobV2.model_validate(mismatch)
 
     with pytest.raises(ValidationError, match="UTC"):
         AgentFactoryJob.model_validate(

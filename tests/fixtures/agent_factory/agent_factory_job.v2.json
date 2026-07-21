@@ -1,0 +1,18 @@
+{
+  "schema": "captain.agent-factory-job.v2",
+  "event_id": "10000000-0000-0000-0000-000000000001",
+  "correlation_id": "10000000-0000-0000-0000-000000000002",
+  "causation_id": null,
+  "occurred_at": "2026-07-21T12:00:00Z",
+  "producer": "captain",
+  "job_id": "10000000-0000-0000-0000-000000000003",
+  "subject_version": 1,
+  "input_ref": {"uri": "artifact://factory-input/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "media_type": "text/markdown"},
+  "compiled_spec_ref": {"uri": "artifact://compiled-factory-spec/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "media_type": "application/json"},
+  "dependency_graph_ref": {"uri": "artifact://factory-work-graph/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "media_type": "application/json"},
+  "required_capability": "customer_support_triage",
+  "acceptance_assertion_ids": ["assert-111111111111"],
+  "private_holdout_refs": [{"schema_name": "captain.private-holdout-ref.v1", "holdout_id": "holdout-222222222222", "uri": "holdout://holdout-222222222222", "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}],
+  "max_behavioral_iterations": 5,
+  "deadline_at": "2026-07-21T12:15:00Z"
+}

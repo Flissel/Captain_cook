@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -15,6 +15,7 @@ from agenten.agent_runtime.contracts import (
     IDENTIFIER_PATTERN,
     IntegrationIntent,
 )
+from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 
 
 class _FrozenContract(BaseModel):
@@ -87,6 +88,65 @@ class AgentFactoryJob(_FrozenContract):
         if any(not assertion for assertion in value):
             raise ValueError("acceptance_assertion_ids must not contain blanks")
         return value
+
+
+class AgentFactoryJobV2(_FrozenContract):
+    schema_name: Literal["captain.agent-factory-job.v2"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    event_id: UUID
+    correlation_id: UUID
+    causation_id: UUID | None = None
+    occurred_at: datetime
+    producer: Literal["captain"]
+    job_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    input_ref: ArtifactRef
+    compiled_spec_ref: ArtifactRef
+    dependency_graph_ref: ArtifactRef
+    required_capability: str = Field(pattern=IDENTIFIER_PATTERN)
+    acceptance_assertion_ids: tuple[str, ...] = Field(min_length=1)
+    private_holdout_refs: tuple[PrivateHoldoutRef, ...] = Field(min_length=1)
+    max_behavioral_iterations: Literal[5] = 5
+    deadline_at: datetime
+
+    @field_validator("occurred_at", "deadline_at")
+    @classmethod
+    def require_utc_timestamp(cls, value: datetime) -> datetime:
+        return _require_utc(value)
+
+    @field_validator("acceptance_assertion_ids")
+    @classmethod
+    def require_unique_assertions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("acceptance_assertion_ids must not contain duplicates")
+        return value
+
+    @model_validator(mode="after")
+    def validate_compiled_bindings(self) -> "AgentFactoryJobV2":
+        if self.deadline_at <= self.occurred_at:
+            raise ValueError("deadline_at must be after occurred_at")
+        holdout_ids = tuple(ref.holdout_id for ref in self.private_holdout_refs)
+        if len(holdout_ids) != len(set(holdout_ids)):
+            raise ValueError("private_holdout_refs must not contain duplicates")
+        for ref in (self.input_ref, self.compiled_spec_ref, self.dependency_graph_ref):
+            if ref.uri.rsplit("/", 1)[-1] != ref.sha256:
+                raise ValueError("artifact URI digest mismatch")
+        return self
+
+
+FactoryJob = AgentFactoryJob | AgentFactoryJobV2
+
+
+def parse_factory_job(value: Any) -> FactoryJob:
+    if not isinstance(value, dict):
+        raise ValueError("factory job payload must be an object")
+    schema = value.get("schema", value.get("schema_name"))
+    if schema == "captain.agent-factory-job.v1":
+        return AgentFactoryJob.model_validate(value)
+    if schema == "captain.agent-factory-job.v2":
+        return AgentFactoryJobV2.model_validate(value)
+    raise ValueError("unsupported factory job schema")
 
 
 class FactoryLease(_FrozenContract):
