@@ -12,22 +12,37 @@ from uuid import UUID
 
 import pytest
 
-from agenten.agent_factory.contracts import FactoryPhase, FactoryRole
+from agenten.agent_factory.contracts import (
+    FactoryEvidenceBlock,
+    FactoryPhase,
+    FactoryRole,
+)
 from agenten.agent_factory.candidate_evaluation import (
     FactoryCandidateEvaluationResult,
     FactoryEvaluationCheck,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
-from agenten.agent_factory.hermes_cli import HermesCliFactory, HermesCliSettings
+from agenten.agent_factory.hermes_cli import (
+    FactorySkillReplayRecord,
+    FilesystemFactorySkillReplayStore,
+    FilesystemReleasedFactorySkillCatalog,
+    HermesCliFactory,
+    HermesCliSettings,
+)
 from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
+from agenten.agent_factory.skill_sequence import FactoryImprovementAuthorizationV1
 from agenten.agent_factory.skill_evaluation import (
     HermesSkillEvaluationEvidence,
     HermesSkillEvaluationRequest,
     HermesSkillUsageReceipt,
     ReleasedHermesSkill,
 )
-from agenten.agent_factory.skill_workflow_contracts import FactorySkillStep
+from agenten.agent_factory.skill_workflow_contracts import (
+    FactorySkillInvocationV1,
+    FactorySkillStep,
+    TeamEvaluationV1,
+)
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from tests.agent_factory.test_skill_evaluation_contracts import (
     evidence_payload,
@@ -104,6 +119,32 @@ def _catalog_for(skill_root: Path, *steps: FactorySkillStep) -> ReleasedCatalog:
             }
         )
     return ReleasedCatalog(releases)
+
+
+def test_filesystem_released_catalog_loads_exact_job_step_release(
+    tmp_path: Path,
+) -> None:
+    factory_job = job()
+    skill_root = tmp_path / "skills"
+    catalog_data = _catalog_for(skill_root, FactorySkillStep.DISCOVER)
+    released = catalog_data.releases[FactorySkillStep.DISCOVER]
+    release_path = (
+        tmp_path
+        / "catalog"
+        / str(factory_job.job_id)
+        / f"{FactorySkillStep.DISCOVER.value}.json"
+    )
+    release_path.parent.mkdir(parents=True)
+    release_path.write_text(
+        released.model_dump_json(by_alias=True),
+        encoding="utf-8",
+    )
+
+    observed = FilesystemReleasedFactorySkillCatalog(
+        tmp_path / "catalog"
+    ).released_for(factory_job, FactorySkillStep.DISCOVER)
+
+    assert observed == released
 
 
 def _invocation_from_prompt(prompt: str) -> dict[str, object]:
@@ -263,6 +304,51 @@ def _architect_dispatch() -> tuple[FactoryDispatch, object]:
     )
 
 
+def _improvement_authorization() -> FactoryImprovementAuthorizationV1:
+    evaluation_data = evaluation_payload(
+        failure_class="behavioral_failure",
+        recommendation="RETRY_BUILD",
+        prior_green_regression_ids=["schema_valid"],
+    )
+    assertion_outcomes = evaluation_data["assertion_outcomes"]
+    assert isinstance(assertion_outcomes, list)
+    second_outcome = assertion_outcomes[1]
+    assert isinstance(second_outcome, dict)
+    second_outcome["status"] = "failed"
+    evaluation = TeamEvaluationV1.model_validate(evaluation_data)
+    prior_candidate = ArtifactRef.model_validate(
+        revision_payload()["parent_candidate_ref"]
+    )
+    request_data = block(FactoryPhase.IMPROVEMENT_REQUESTED).model_dump(
+        mode="json",
+        by_alias=True,
+    )
+    request_data.update(
+        {
+            "job_id": str(evaluation.job_id),
+            "correlation_id": str(evaluation.correlation_id),
+            "subject_version": evaluation.subject_version,
+            "attempt": evaluation.attempt,
+            "occurred_at": evaluation.occurred_at.isoformat(),
+            "artifact_refs": [prior_candidate.model_dump(mode="json")],
+            "evidence_refs": [evaluation.artifact_ref.model_dump(mode="json")],
+        }
+    )
+    return FactoryImprovementAuthorizationV1(
+        schema_name="captain.factory-improvement-authorization.v1",
+        authorization_ref=ArtifactRef(
+            uri="artifact://factory/improvement-request",
+            sha256="8" * 64,
+            media_type="application/json",
+        ),
+        authorized_attempt=2,
+        request_block=FactoryEvidenceBlock.model_validate(request_data),
+        failed_evaluation=evaluation,
+        prior_candidate_ref=prior_candidate,
+        prior_green_assertion_ids=("schema_valid",),
+    )
+
+
 @pytest.mark.asyncio
 async def test_dispatch_rejects_changed_released_skill_bytes_before_hermes(
     tmp_path: Path,
@@ -281,6 +367,44 @@ async def test_dispatch_rejects_changed_released_skill_bytes_before_hermes(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
 
     with pytest.raises(FactoryDispatchError, match="digest"):
+        await HermesCliFactory(
+            settings=HermesCliSettings(skill_root=tmp_path),
+            released_skill_catalog=catalog,
+            clock=lambda: lease.issued_at,
+        ).dispatch(request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content_uri",
+    [
+        "artifact://other-root/captain-factory-discover/v1",
+        "artifact://released-skills/captain-factory-discover/v2",
+    ],
+)
+async def test_dispatch_rejects_release_metadata_outside_exact_skill_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    content_uri: str,
+) -> None:
+    request, lease = _architect_dispatch()
+    catalog = _catalog_for(tmp_path, FactorySkillStep.DISCOVER)
+    released = catalog.releases[FactorySkillStep.DISCOVER]
+    released_data = released.model_dump(mode="json", by_alias=True)
+    released_data["content_ref"] = {
+        **released_data["content_ref"],
+        "uri": content_uri,
+    }
+    catalog.releases[FactorySkillStep.DISCOVER] = ReleasedHermesSkill.model_validate(
+        released_data
+    )
+
+    async def create_process(*_: str, **__: object) -> object:
+        raise AssertionError("Hermes must not run for inconsistent release metadata")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    with pytest.raises(FactoryDispatchError, match="metadata"):
         await HermesCliFactory(
             settings=HermesCliSettings(skill_root=tmp_path),
             released_skill_catalog=catalog,
@@ -339,6 +463,35 @@ async def test_dispatch_rejects_expired_lease_before_hermes(
             released_skill_catalog=catalog,
             clock=lambda: lease.expires_at,
         ).dispatch(request)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_rejects_action_that_does_not_match_role(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, lease = _architect_dispatch()
+    mismatched = FactoryDispatch(
+        job=request.job,
+        action=request.action.model_copy(
+            update={"kind": FactoryActionKind.DISPATCH_QUALITY_WARDEN}
+        ),
+        role=request.role,
+        lease=request.lease,
+    )
+    catalog = _catalog_for(tmp_path, FactorySkillStep.DISCOVER)
+
+    async def create_process(*_: str, **__: object) -> object:
+        raise AssertionError("Hermes must not run for a mismatched action")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    with pytest.raises(FactoryDispatchError, match="action.*role"):
+        await HermesCliFactory(
+            settings=HermesCliSettings(skill_root=tmp_path),
+            released_skill_catalog=catalog,
+            clock=lambda: lease.issued_at,
+        ).dispatch(mismatched)
 
 
 @pytest.mark.asyncio
@@ -555,7 +708,14 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    factory_job = job()
+    authorization = _improvement_authorization()
+    factory_job = job().model_copy(
+        update={
+            "job_id": authorization.request_block.job_id,
+            "correlation_id": authorization.request_block.correlation_id,
+            "subject_version": authorization.request_block.subject_version,
+        }
+    )
     lease = issue_factory_lease(
         job=factory_job,
         role=FactoryRole.TOOL_INTEGRATOR,
@@ -572,7 +732,7 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
         ),
         role=FactoryRole.TOOL_INTEGRATOR,
         lease=lease,
-        improvement_authorized=True,
+        improvement_authorization=authorization,
     )
     catalog = _catalog_for(
         tmp_path,
@@ -589,7 +749,14 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
 
         async def communicate(self) -> tuple[bytes, bytes]:
             invocations.append(_invocation_from_prompt(self.prompt))
-            return json.dumps(_typed_payload(self.prompt)).encode(), b""
+            payload = _typed_payload(self.prompt)
+            if invocations[-1]["step"] == "brief_codex":
+                payload["context_refs"] = [
+                    authorization.authorization_ref.model_dump(mode="json"),
+                    authorization.failed_evaluation.artifact_ref.model_dump(mode="json"),
+                    authorization.prior_candidate_ref.model_dump(mode="json"),
+                ]
+            return json.dumps(payload).encode(), b""
 
     async def create_process(*command: str, **__: object) -> Process:
         return Process(command[-1])
@@ -606,6 +773,9 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
         "improve_team",
         "brief_codex",
     ]
+    assert invocations[0]["input_ref"] == authorization.authorization_ref.model_dump(
+        mode="json"
+    )
     assert invocations[1]["input_ref"] == revision_payload()["artifact_ref"]
     assert evidence.phase is FactoryPhase.TOOL_CANDIDATE_TESTED
     assert len(evidence.artifact_refs) == 2
@@ -635,18 +805,44 @@ async def test_dispatch_replay_uses_identical_invocation_and_idempotency_key(
         return Process(command[-1])
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
-    factory = HermesCliFactory(
-        settings=HermesCliSettings(skill_root=tmp_path),
+    settings = HermesCliSettings(
+        skill_root=tmp_path,
+        evidence_root=tmp_path / "evidence",
+    )
+    replay_store = FilesystemFactorySkillReplayStore(tmp_path / "replays")
+    first_factory = HermesCliFactory(
+        settings=settings,
         released_skill_catalog=catalog,
+        replay_store=replay_store,
         clock=lambda: lease.issued_at,
     )
 
-    first = await factory.dispatch(request)
-    second = await factory.dispatch(request)
+    first = await first_factory.dispatch(request)
+    second = await HermesCliFactory(
+        settings=settings,
+        released_skill_catalog=catalog,
+        replay_store=FilesystemFactorySkillReplayStore(tmp_path / "replays"),
+        clock=lambda: lease.issued_at,
+    ).dispatch(request)
 
-    assert invocations[0]["invocation_id"] == invocations[1]["invocation_id"]
-    assert invocations[0]["idempotency_key"] == invocations[1]["idempotency_key"]
+    assert len(invocations) == 1
     assert first == second
+
+    invocation = FactorySkillInvocationV1.model_validate(invocations[0])
+    accepted = await replay_store.accepted(invocation)
+    assert accepted is not None
+    with pytest.raises(FactoryDispatchError, match="replay output conflicts"):
+        await replay_store.accept(
+            FactorySkillReplayRecord(
+                invocation=invocation,
+                artifact=accepted.artifact,
+                transcript_ref=ArtifactRef(
+                    uri="artifact://factory-evidence/conflicting",
+                    sha256="f" * 64,
+                    media_type="application/json",
+                ),
+            )
+        )
 
 
 @pytest.mark.asyncio

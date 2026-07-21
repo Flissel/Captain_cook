@@ -33,8 +33,12 @@ from agenten.agent_factory.skill_evaluation import (
     HermesSkillUsageReceipt,
     ReleasedHermesSkill,
 )
-from agenten.agent_factory.skill_sequence import SkillSequencePolicy
+from agenten.agent_factory.skill_sequence import (
+    FactoryImprovementAuthorizationV1,
+    SkillSequencePolicy,
+)
 from agenten.agent_factory.skill_store import reject_sensitive_data
+from agenten.agent_factory.state_machine import FactoryActionKind
 from agenten.agent_factory.skill_workflow_contracts import (
     CandidateRevisionV1,
     CodebaseInventoryV1,
@@ -71,6 +75,34 @@ class ReleasedFactorySkillCatalog(Protocol):
     ) -> ReleasedHermesSkill: ...
 
 
+class FilesystemReleasedFactorySkillCatalog:
+    """Load Captain release envelopes from an exact job/step catalog path."""
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+
+    def released_for(
+        self,
+        job: FactoryJob,
+        step: FactorySkillStep,
+    ) -> ReleasedHermesSkill:
+        root = self._root.resolve()
+        path = (root / str(job.job_id) / f"{step.value}.json").resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise FactoryDispatchError(
+                "released factory skill catalog path is outside its root"
+            ) from exc
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return ReleasedHermesSkill.model_validate(value)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise FactoryDispatchError(
+                f"released factory skill metadata is unavailable for {step.value}"
+            ) from exc
+
+
 class HermesCliFactory(HermesFactoryPort):
     """Run one hermetic Hermes query and accept only a typed evidence response."""
 
@@ -80,12 +112,14 @@ class HermesCliFactory(HermesFactoryPort):
         evidence_store: FactoryEvidenceStore | None = None,
         released_skill_catalog: ReleasedFactorySkillCatalog | None = None,
         sequence_policy: SkillSequencePolicy | None = None,
+        replay_store: FactorySkillReplayStore | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._settings = settings
         self._evidence_store = evidence_store or FilesystemFactoryEvidenceStore(settings.evidence_root)
         self._released_skill_catalog = released_skill_catalog
         self._sequence_policy = sequence_policy or SkillSequencePolicy()
+        self._replay_store = replay_store or InMemoryFactorySkillReplayStore()
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
@@ -99,14 +133,7 @@ class HermesCliFactory(HermesFactoryPort):
             role=request.role,
             attempt=request.action.attempt,
         )
-        if (
-            request.role is FactoryRole.TOOL_INTEGRATOR
-            and request.action.attempt > 1
-            and not request.improvement_authorized
-        ):
-            raise FactoryDispatchError(
-                "improve_team requires Captain IMPROVEMENT_REQUESTED authority"
-            )
+        improvement = _validated_improvement_authorization(request)
 
         deadline = _deadline(
             min(
@@ -114,7 +141,11 @@ class HermesCliFactory(HermesFactoryPort):
                 (request.lease.expires_at - now).total_seconds(),
             )
         )
-        input_ref = request.job.input_ref
+        input_ref = (
+            improvement.authorization_ref
+            if improvement is not None
+            else request.job.input_ref
+        )
         artifacts: list[_FactoryWorkflowArtifact] = []
         transcript_refs: list[ArtifactRef] = []
         for step in steps:
@@ -135,6 +166,14 @@ class HermesCliFactory(HermesFactoryPort):
             _validate_serialized_prompt_value(
                 invocation.model_dump(mode="json", by_alias=True)
             )
+            accepted = await self._replay_store.accepted(invocation)
+            if accepted is not None:
+                artifacts.append(accepted.artifact)
+                transcript_refs.append(accepted.transcript_ref)
+                input_ref = accepted.artifact.artifact_ref
+                if not _may_continue_after(accepted.artifact):
+                    break
+                continue
             stdout = await self._run_skill_prompt(
                 _factory_skill_prompt(invocation, skill_name=skill_name),
                 max_seconds=_remaining_deadline_seconds(deadline),
@@ -144,12 +183,24 @@ class HermesCliFactory(HermesFactoryPort):
                 raise FactoryDispatchError(
                     f"Hermes {step.value} artifact does not match the Captain invocation"
                 )
-            transcript_refs.append(
-                await self._evidence_store.persist(
-                    request.job,
-                    artifact.model_dump_json(by_alias=True).encode("utf-8"),
+            if improvement is not None:
+                _require_improvement_artifact_binding(
+                    artifact,
+                    authorization=improvement,
+                )
+            transcript_ref = await self._evidence_store.persist(
+                request.job,
+                artifact.model_dump_json(by_alias=True).encode("utf-8"),
+            )
+            accepted = await self._replay_store.accept(
+                FactorySkillReplayRecord(
+                    invocation=invocation,
+                    artifact=artifact,
+                    transcript_ref=transcript_ref,
                 )
             )
+            transcript_refs.append(accepted.transcript_ref)
+            artifact = accepted.artifact
             artifacts.append(artifact)
             input_ref = artifact.artifact_ref
             if not _may_continue_after(artifact):
@@ -159,6 +210,33 @@ class HermesCliFactory(HermesFactoryPort):
             artifacts=tuple(artifacts),
             transcript_refs=tuple(transcript_refs),
         )
+
+    def validate_dispatch_configuration(self, request: FactoryDispatch) -> None:
+        """Fail before external setup when a released sequence cannot be resolved."""
+
+        if request.role is None or request.lease is None:
+            raise FactoryDispatchError(
+                "Hermes factory dispatch requires a role and active lease"
+            )
+        if self._released_skill_catalog is None:
+            raise FactoryDispatchError("released factory skill catalog is not configured")
+        now = self._clock()
+        _validate_factory_dispatch(request, now=now)
+        _validated_improvement_authorization(request)
+        for step in self._sequence_policy.steps_for(
+            role=request.role,
+            attempt=request.action.attempt,
+        ):
+            released_skill = self._released_skill_catalog.released_for(
+                request.job,
+                step,
+            )
+            _require_released_skill_directory(
+                self._settings.skill_root,
+                skill_name=_STEP_SKILL_NAMES[step],
+                released_skill=released_skill,
+                now=now,
+            )
 
     async def evaluate_skill(
         self,
@@ -284,6 +362,141 @@ _FactoryWorkflowArtifact = (
     | FactoryFeedbackV1
 )
 
+
+@dataclass(frozen=True)
+class FactorySkillReplayRecord:
+    invocation: FactorySkillInvocationV1
+    artifact: _FactoryWorkflowArtifact
+    transcript_ref: ArtifactRef
+
+    def __post_init__(self) -> None:
+        if self.artifact.invocation != self.invocation:
+            raise FactoryDispatchError(
+                "factory skill replay artifact conflicts with its invocation"
+            )
+
+
+class FactorySkillReplayStore(Protocol):
+    async def accepted(
+        self,
+        invocation: FactorySkillInvocationV1,
+    ) -> FactorySkillReplayRecord | None: ...
+
+    async def accept(
+        self,
+        record: FactorySkillReplayRecord,
+    ) -> FactorySkillReplayRecord: ...
+
+
+class InMemoryFactorySkillReplayStore:
+    """Strict in-process replay store; production may inject a durable adapter."""
+
+    def __init__(self) -> None:
+        self._records: dict[str, FactorySkillReplayRecord] = {}
+
+    async def accepted(
+        self,
+        invocation: FactorySkillInvocationV1,
+    ) -> FactorySkillReplayRecord | None:
+        record = self._records.get(invocation.idempotency_key)
+        if record is not None and record.invocation != invocation:
+            raise FactoryDispatchError("factory skill replay invocation conflicts")
+        return record
+
+    async def accept(
+        self,
+        record: FactorySkillReplayRecord,
+    ) -> FactorySkillReplayRecord:
+        existing = self._records.get(record.invocation.idempotency_key)
+        if existing is not None:
+            if existing != record:
+                raise FactoryDispatchError("factory skill replay output conflicts")
+            return existing
+        self._records[record.invocation.idempotency_key] = record
+        return record
+
+
+class FilesystemFactorySkillReplayStore:
+    """Durable, write-once accepted outputs keyed by invocation idempotency."""
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+
+    async def accepted(
+        self,
+        invocation: FactorySkillInvocationV1,
+    ) -> FactorySkillReplayRecord | None:
+        path = self._path_for(invocation.idempotency_key)
+        if not path.is_file():
+            return None
+        record = await asyncio.to_thread(self._read_record, path)
+        if record.invocation != invocation:
+            raise FactoryDispatchError("factory skill replay invocation conflicts")
+        return record
+
+    async def accept(
+        self,
+        record: FactorySkillReplayRecord,
+    ) -> FactorySkillReplayRecord:
+        path = self._path_for(record.invocation.idempotency_key)
+        content = _factory_skill_replay_content(record)
+        try:
+            await asyncio.to_thread(
+                FilesystemFactoryEvidenceStore._write_once,
+                path,
+                content,
+            )
+        except (OSError, ValueError) as exc:
+            raise FactoryDispatchError("factory skill replay output conflicts") from exc
+        accepted = await asyncio.to_thread(self._read_record, path)
+        if accepted != record:
+            raise FactoryDispatchError("factory skill replay output conflicts")
+        return accepted
+
+    def _path_for(self, idempotency_key: str) -> Path:
+        return self._root / f"{idempotency_key}.json"
+
+    @staticmethod
+    def _read_record(path: Path) -> FactorySkillReplayRecord:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("replay record must be an object")
+            invocation = FactorySkillInvocationV1.model_validate(value["invocation"])
+            model = _STEP_RESULT_MODELS[invocation.step]
+            artifact = model.model_validate(value["artifact"])
+            if not isinstance(
+                artifact,
+                (
+                    CodebaseInventoryV1,
+                    CodexBuildBriefV1,
+                    TeamExecutionEvidenceV1,
+                    TeamEvaluationV1,
+                    CandidateRevisionV1,
+                    FactoryFeedbackV1,
+                ),
+            ):
+                raise ValueError("unsupported replay artifact")
+            return FactorySkillReplayRecord(
+                invocation=invocation,
+                artifact=artifact,
+                transcript_ref=ArtifactRef.model_validate(value["transcript_ref"]),
+            )
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise FactoryDispatchError("factory skill replay record is invalid") from exc
+
+
+def _factory_skill_replay_content(record: FactorySkillReplayRecord) -> bytes:
+    return _canonical_json(
+        {
+            "schema": "captain.factory-skill-replay.v1",
+            "invocation": record.invocation.model_dump(mode="json", by_alias=True),
+            "artifact": record.artifact.model_dump(mode="json", by_alias=True),
+            "transcript_ref": record.transcript_ref.model_dump(mode="json"),
+        }
+    ).encode("utf-8")
+
+
 _STEP_SKILL_NAMES: dict[FactorySkillStep, str] = {
     FactorySkillStep.DISCOVER: "captain-factory-discover",
     FactorySkillStep.BRIEF_CODEX: "captain-factory-brief-codex",
@@ -307,6 +520,14 @@ def _validate_factory_dispatch(request: FactoryDispatch, *, now: datetime) -> No
     assert request.role is not None
     assert request.lease is not None
     lease = request.lease
+    expected_action = {
+        FactoryRole.AGENT_ARCHITECT: FactoryActionKind.DISPATCH_AGENT_ARCHITECT,
+        FactoryRole.TOOL_INTEGRATOR: FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,
+        FactoryRole.REAL_CASE_TESTER: FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
+        FactoryRole.QUALITY_WARDEN: FactoryActionKind.DISPATCH_QUALITY_WARDEN,
+    }[request.role]
+    if request.action.kind is not expected_action:
+        raise FactoryDispatchError("factory action does not match the leased role")
     if now.tzinfo is None or now.utcoffset() != timezone.utc.utcoffset(now):
         raise FactoryDispatchError("Hermes factory dispatch requires a UTC clock")
     if request.action.job_id not in {None, request.job.job_id}:
@@ -323,6 +544,65 @@ def _validate_factory_dispatch(request: FactoryDispatch, *, now: datetime) -> No
         raise FactoryDispatchError("Hermes factory dispatch requires an active lease")
 
 
+def _validated_improvement_authorization(
+    request: FactoryDispatch,
+) -> FactoryImprovementAuthorizationV1 | None:
+    authorization = request.improvement_authorization
+    is_retry = (
+        request.role is FactoryRole.TOOL_INTEGRATOR
+        and request.action.attempt > 1
+    )
+    if is_retry and authorization is None:
+        raise FactoryDispatchError(
+            "improve_team requires Captain IMPROVEMENT_REQUESTED authority"
+        )
+    if not is_retry and authorization is not None:
+        raise FactoryDispatchError("improvement authority is invalid outside a retry")
+    if authorization is None:
+        return None
+    request_block = authorization.request_block
+    if (
+        authorization.authorized_attempt != request.action.attempt
+        or request_block.job_id != request.job.job_id
+        or request_block.correlation_id != request.job.correlation_id
+        or request_block.subject_version != request.job.subject_version
+    ):
+        raise FactoryDispatchError("improvement authority does not match the factory dispatch")
+    return authorization
+
+
+def _require_improvement_artifact_binding(
+    artifact: _FactoryWorkflowArtifact,
+    *,
+    authorization: FactoryImprovementAuthorizationV1,
+) -> None:
+    if isinstance(artifact, CandidateRevisionV1):
+        failed_ids = tuple(
+            outcome.assertion_id
+            for outcome in authorization.failed_evaluation.assertion_outcomes
+            if outcome.status == "failed"
+        )
+        if (
+            artifact.parent_candidate_ref != authorization.prior_candidate_ref
+            or artifact.failed_assertion_ids != failed_ids
+            or artifact.regression_assertion_ids
+            != authorization.prior_green_assertion_ids
+        ):
+            raise FactoryDispatchError(
+                "improve_team artifact does not bind the authorized failed candidate"
+            )
+    if isinstance(artifact, CodexBuildBriefV1):
+        required_refs = {
+            authorization.authorization_ref,
+            authorization.failed_evaluation.artifact_ref,
+            authorization.prior_candidate_ref,
+        }
+        if not required_refs.issubset(set(artifact.context_refs)):
+            raise FactoryDispatchError(
+                "Codex brief does not bind the authorized improvement evidence"
+            )
+
+
 def _require_released_skill_directory(
     skill_root: Path,
     *,
@@ -332,6 +612,14 @@ def _require_released_skill_directory(
 ) -> None:
     if released_skill.skill_id != skill_name:
         raise FactoryDispatchError("Captain released the wrong skill for the requested step")
+    expected_ref = f"artifact://released-skills/{skill_name}/v{released_skill.version}"
+    if (
+        released_skill.content_ref.uri != expected_ref
+        or released_skill.content_ref.media_type != "application/json"
+    ):
+        raise FactoryDispatchError(
+            "released factory skill metadata does not match its directory and version"
+        )
     if released_skill.released_at > now:
         raise FactoryDispatchError("Captain skill release is stale for this dispatch")
     root = skill_root.resolve()
@@ -349,13 +637,17 @@ def _require_released_skill_directory(
 
 def _skill_directory_digest(directory: Path) -> str:
     manifest: list[dict[str, object]] = []
+    entries = sorted(
+        directory.rglob("*"),
+        key=lambda item: item.relative_to(directory).as_posix(),
+    )
+    if any(item.is_symlink() for item in entries):
+        raise FactoryDispatchError("released factory skill cannot contain symlinks")
     files = sorted(
-        (item for item in directory.rglob("*") if item.is_file()),
+        (item for item in entries if item.is_file()),
         key=lambda item: item.relative_to(directory).as_posix(),
     )
     for path in files:
-        if path.is_symlink():
-            raise FactoryDispatchError("released factory skill cannot contain symlinks")
         content = path.read_bytes()
         manifest.append(
             {

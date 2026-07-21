@@ -7,6 +7,7 @@ from uuid import UUID
 import pytest
 
 from agenten.agent_factory.codex_brief import CodexBriefBuilder
+from agenten.agent_factory.contracts import FactoryEvidenceBlock, FactoryPhase
 from agenten.agent_factory.execution_policy import (
     FactoryExecutionMode,
     FactoryExecutionPolicyV1,
@@ -14,9 +15,11 @@ from agenten.agent_factory.execution_policy import (
     FactorySandboxMode,
 )
 from agenten.agent_factory.forge_contracts import FactoryBuildAssignmentV1
+from agenten.agent_factory.skill_sequence import FactoryImprovementAuthorizationV1
 from agenten.agent_factory.skill_workflow_contracts import (
     CodebaseInventoryV1,
     FactorySkillInvocationV1,
+    TeamEvaluationV1,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
 from tests.agent_factory.test_skill_workflow_contracts import (
@@ -25,7 +28,9 @@ from tests.agent_factory.test_skill_workflow_contracts import (
     inventory_payload,
     invocation_payload,
     lease_payload,
+    evaluation_payload,
 )
+from tests.agent_factory.test_state_machine import block
 
 
 class PromptArtifactStore:
@@ -60,6 +65,53 @@ def policy() -> FactoryExecutionPolicyV1:
     )
 
 
+def retry_authorization() -> FactoryImprovementAuthorizationV1:
+    evaluation_data = evaluation_payload(
+        failure_class="behavioral_failure",
+        recommendation="RETRY_BUILD",
+        prior_green_regression_ids=["schema_valid"],
+    )
+    outcomes = evaluation_data["assertion_outcomes"]
+    assert isinstance(outcomes, list)
+    failed = outcomes[1]
+    assert isinstance(failed, dict)
+    failed["status"] = "failed"
+    evaluation = TeamEvaluationV1.model_validate(evaluation_data)
+    prior_candidate = ArtifactRef(
+        uri="artifact://workflow/prior-candidate",
+        sha256="9" * 64,
+        media_type="application/zip",
+    )
+    request_data = block(FactoryPhase.IMPROVEMENT_REQUESTED).model_dump(
+        mode="json",
+        by_alias=True,
+    )
+    request_data.update(
+        {
+            "job_id": str(evaluation.job_id),
+            "correlation_id": str(evaluation.correlation_id),
+            "subject_version": evaluation.subject_version,
+            "attempt": evaluation.attempt,
+            "occurred_at": evaluation.occurred_at.isoformat(),
+            "artifact_refs": [prior_candidate.model_dump(mode="json")],
+            "evidence_refs": [evaluation.artifact_ref.model_dump(mode="json")],
+        }
+    )
+    return FactoryImprovementAuthorizationV1(
+        schema_name="captain.factory-improvement-authorization.v1",
+        authorization_ref=ArtifactRef(
+            uri="artifact://factory/improvement-request",
+            sha256="8" * 64,
+            media_type="application/json",
+        ),
+        authorized_attempt=2,
+        request_block=FactoryEvidenceBlock.model_validate(request_data),
+        failed_evaluation=evaluation,
+        prior_candidate_ref=prior_candidate,
+        prior_green_assertion_ids=("schema_valid",),
+    )
+
+
 def test_codex_brief_contains_goal_gates_and_only_opaque_refs() -> None:
     store = PromptArtifactStore()
     invocation = FactorySkillInvocationV1.model_validate(
@@ -87,7 +139,12 @@ def test_codex_brief_contains_goal_gates_and_only_opaque_refs() -> None:
     assert "C:\\Users" not in rendered
     assert "OPENAI_API_KEY" not in rendered
     assert brief.build_assignment == assignment
-    assert brief.required_test_command_ids == invocation.lease.capabilities
+    assert brief.required_test_command_ids == (
+        "python.compileall",
+        "pytest.not-live",
+        "pytest.live.demo",
+    )
+    assert brief.required_test_command_ids != invocation.lease.capabilities
 
 
 def test_codex_brief_is_deterministic_and_keeps_context_opaque() -> None:
@@ -146,3 +203,47 @@ def test_codex_brief_requires_compiled_n8n_intent_and_separate_authority(
             CodebaseInventoryV1.model_validate(inventory_payload()),
             policy(),
         )
+
+
+def test_retry_brief_binds_failed_evaluation_candidate_and_prior_green() -> None:
+    authorization = retry_authorization()
+    invocation_data = invocation_payload(
+        "brief_codex",
+        attempt=2,
+        lease=lease_payload(
+            "tool_integrator",
+            "factory-tool-integrator",
+            attempt=2,
+        ),
+    )
+    invocation = FactorySkillInvocationV1.model_validate(invocation_data)
+    assignment_data = build_assignment_payload()
+    assignment_data["attempt"] = 2
+    assignment = FactoryBuildAssignmentV1.model_validate(assignment_data)
+    inventory_data = inventory_payload()
+    inventory_invocation = inventory_data["invocation"]
+    assert isinstance(inventory_invocation, dict)
+    inventory_invocation["attempt"] = 2
+    inventory_invocation["lease"] = lease_payload(
+        "agent_architect",
+        "factory-architect",
+        attempt=2,
+    )
+    inventory_data["attempt"] = 2
+    inventory = CodebaseInventoryV1.model_validate(inventory_data)
+    store = PromptArtifactStore()
+
+    brief = CodexBriefBuilder(artifact_store=store).build(
+        invocation,
+        assignment,
+        inventory,
+        policy(),
+        improvement_authorization=authorization,
+    )
+
+    assert authorization.authorization_ref in brief.context_refs
+    assert authorization.failed_evaluation.artifact_ref in brief.context_refs
+    assert authorization.prior_candidate_ref in brief.context_refs
+    rendered = store.read(brief.prompt_ref)
+    assert '"prior green assertions": [\n      "schema_valid"' in rendered
+    assert authorization.prior_candidate_ref.uri in rendered

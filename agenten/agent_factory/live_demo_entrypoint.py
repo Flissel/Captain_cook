@@ -6,19 +6,24 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 from pydantic import ValidationError
 
 from agenten.agent_factory.contracts import AgentFactoryJob, FactoryLease, FactoryRole
-from agenten.agent_factory.hermes_cli import HermesCliFactory, HermesCliSettings
+from agenten.agent_factory.hermes_cli import (
+    FilesystemFactorySkillReplayStore,
+    FilesystemReleasedFactorySkillCatalog,
+    HermesCliFactory,
+    HermesCliSettings,
+)
 from agenten.agent_factory.live_demo_one_shot import LiveDemoEvidenceSummary, LiveDemoOneShot
 from agenten.agent_factory.live_demo_runtime_chain import (
     LiveDemoRuntimeChain,
     LiveDemoRuntimeRelease,
 )
-from agenten.agent_factory.orchestration import FactoryDispatch
+from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
 from agenten.agent_factory.state_machine import FactoryAction
 from agenten.agent_runtime.contracts import AgentRuntimeCommand
 from agenten.agent_runtime.gateway_client import GatewayRuntimeClient
@@ -62,6 +67,42 @@ def load_live_demo_release(path: Path) -> LiveDemoRuntimeRelease:
         raise LiveDemoConfigurationError("live demo release document is invalid") from None
 
 
+def build_live_demo_hermes(
+    *,
+    dispatch: FactoryDispatch,
+    hermes_executable: str,
+    skill_root: Path,
+    released_skill_root: Path,
+    evidence_root: Path,
+    clock: Callable[[], datetime],
+) -> HermesCliFactory:
+    """Build and preflight the production Hermes adapter without live effects."""
+
+    settings = HermesCliSettings(
+        executable=hermes_executable,
+        skill_root=skill_root,
+        evidence_root=evidence_root,
+        released_skill_root=released_skill_root,
+    )
+    factory = HermesCliFactory(
+        settings=settings,
+        released_skill_catalog=FilesystemReleasedFactorySkillCatalog(
+            released_skill_root
+        ),
+        replay_store=FilesystemFactorySkillReplayStore(
+            evidence_root / "skill-replays"
+        ),
+        clock=clock,
+    )
+    try:
+        factory.validate_dispatch_configuration(dispatch)
+    except FactoryDispatchError as exc:
+        raise LiveDemoConfigurationError(
+            "released factory skills failed startup validation"
+        ) from exc
+    return factory
+
+
 async def run_live_demo_a2(
     *,
     release_path: Path,
@@ -69,6 +110,9 @@ async def run_live_demo_a2(
     gateway_url: str,
     runtime_url: str,
     hermes_executable: str = "hermes",
+    skill_root: Path = Path("agenten/agent_factory/skills"),
+    released_skill_root: Path = Path("agenten/agent_factory/released-skills"),
+    evidence_root: Path = Path("artifacts/agent-factory/evidence"),
 ) -> LiveDemoEvidenceSummary:
     """Run only with concrete external adapters and persist redacted JSON evidence."""
 
@@ -79,14 +123,21 @@ async def run_live_demo_a2(
     if not runtime_token:
         raise LiveDemoConfigurationError("CAPTAIN_RUNTIME_TOKEN is required")
     release = load_live_demo_release(release_path)
+    clock = lambda: datetime.now(timezone.utc)
+    hermes = build_live_demo_hermes(
+        dispatch=release.dispatch,
+        hermes_executable=hermes_executable,
+        skill_root=skill_root,
+        released_skill_root=released_skill_root,
+        evidence_root=evidence_root,
+        clock=clock,
+    )
     async with httpx.AsyncClient(timeout=30.0) as http:
         runner = LiveDemoOneShot(
             chain=LiveDemoRuntimeChain(
-                hermes=HermesCliFactory(
-                    HermesCliSettings(executable=hermes_executable)
-                ),
+                hermes=hermes,
                 runtime_service=AgentRuntimeHttpExecutor(runtime_url, runtime_token, http),
-                clock=lambda: datetime.now(timezone.utc),
+                clock=clock,
             ),
             runtime_state=GatewayRuntimeClient(gateway_url, gateway_token, http),
             projection_feed=GatewayProjectionFeedClient(

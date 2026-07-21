@@ -15,6 +15,7 @@ from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillInvocationV1,
     FactorySkillStep,
 )
+from agenten.agent_factory.skill_sequence import FactoryImprovementAuthorizationV1
 from agenten.agent_factory.skill_store import reject_sensitive_data
 from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent
 
@@ -23,6 +24,24 @@ class CodexPromptArtifactStore(Protocol):
     """Persist one immutable prompt without exposing its body in contracts."""
 
     def persist(self, job_id: UUID, content: bytes) -> ArtifactRef: ...
+
+
+class FactoryBuildTestCommandPolicy:
+    """Select exact command identities from the assignment and execution mode."""
+
+    def required_for(
+        self,
+        assignment: FactoryBuildAssignmentV1,
+        policy: FactoryExecutionPolicyV1,
+    ) -> tuple[str, ...]:
+        command_ids = ["python.compileall", "pytest.not-live"]
+        command_ids.extend(
+            f"pytest.integration.{kind}"
+            for kind in sorted({item.kind for item in assignment.integrations})
+        )
+        if policy.live_execution:
+            command_ids.append(f"pytest.live.{policy.mode.value}")
+        return tuple(command_ids)
 
 
 class CodexBriefBuilder:
@@ -35,8 +54,16 @@ class CodexBriefBuilder:
         "secret.read",
     )
 
-    def __init__(self, *, artifact_store: CodexPromptArtifactStore) -> None:
+    def __init__(
+        self,
+        *,
+        artifact_store: CodexPromptArtifactStore,
+        test_command_policy: FactoryBuildTestCommandPolicy | None = None,
+    ) -> None:
         self._artifact_store = artifact_store
+        self._test_command_policy = (
+            test_command_policy or FactoryBuildTestCommandPolicy()
+        )
 
     def build(
         self,
@@ -44,12 +71,22 @@ class CodexBriefBuilder:
         assignment: FactoryBuildAssignmentV1,
         inventory: CodebaseInventoryV1,
         policy: FactoryExecutionPolicyV1,
+        *,
+        improvement_authorization: FactoryImprovementAuthorizationV1 | None = None,
     ) -> CodexBuildBriefV1:
         if invocation.step is not FactorySkillStep.BRIEF_CODEX:
             raise ValueError("Codex brief requires the brief_codex skill step")
         self._require_inventory_binding(invocation, inventory)
         self._require_n8n_authority(invocation, assignment)
+        self._require_improvement_binding(invocation, improvement_authorization)
 
+        improvement_refs: tuple[ArtifactRef, ...] = ()
+        if improvement_authorization is not None:
+            improvement_refs = (
+                improvement_authorization.authorization_ref,
+                improvement_authorization.failed_evaluation.artifact_ref,
+                improvement_authorization.prior_candidate_ref,
+            )
         context_refs = _unique_refs(
             (
                 inventory.artifact_ref,
@@ -60,9 +97,10 @@ class CodexBriefBuilder:
                     assignment.dependency_graph_ref.model_dump(mode="json")
                 ),
                 *inventory.documentation_refs,
+                *improvement_refs,
             )
         )
-        test_ids = tuple(sorted(invocation.lease.capabilities))
+        test_ids = self._test_command_policy.required_for(assignment, policy)
         prompt = self._render(
             invocation=invocation,
             assignment=assignment,
@@ -70,6 +108,7 @@ class CodexBriefBuilder:
             policy=policy,
             context_refs=context_refs,
             test_ids=test_ids,
+            improvement_authorization=improvement_authorization,
         )
         prompt_ref = self._artifact_store.persist(
             invocation.job_id,
@@ -86,7 +125,9 @@ class CodexBriefBuilder:
             occurred_at=invocation.lease.issued_at,
             producer="hermes",
             artifact_ref=prompt_ref,
-            evidence_refs=(prompt_ref, inventory.artifact_ref),
+            evidence_refs=_unique_refs(
+                (prompt_ref, inventory.artifact_ref, *improvement_refs[:2])
+            ),
             acceptance_assertion_ids=invocation.acceptance_assertion_ids,
             build_assignment=assignment,
             prompt_ref=prompt_ref,
@@ -95,6 +136,26 @@ class CodexBriefBuilder:
             required_test_command_ids=test_ids,
             forbidden_effect_ids=self._FORBIDDEN_EFFECT_IDS,
         )
+
+    @staticmethod
+    def _require_improvement_binding(
+        invocation: FactorySkillInvocationV1,
+        authorization: FactoryImprovementAuthorizationV1 | None,
+    ) -> None:
+        if invocation.attempt > 1 and authorization is None:
+            raise ValueError("retry Codex brief requires improvement authorization")
+        if invocation.attempt == 1 and authorization is not None:
+            raise ValueError("initial Codex brief cannot carry improvement authorization")
+        if authorization is None:
+            return
+        request = authorization.request_block
+        if (
+            authorization.authorized_attempt != invocation.attempt
+            or request.job_id != invocation.job_id
+            or request.correlation_id != invocation.correlation_id
+            or request.subject_version != invocation.subject_version
+        ):
+            raise ValueError("improvement authorization does not match Codex invocation")
 
     @staticmethod
     def _require_inventory_binding(
@@ -133,7 +194,22 @@ class CodexBriefBuilder:
         policy: FactoryExecutionPolicyV1,
         context_refs: tuple[ArtifactRef, ...],
         test_ids: tuple[str, ...],
+        improvement_authorization: FactoryImprovementAuthorizationV1 | None,
     ) -> str:
+        prior_green_ids = (
+            []
+            if improvement_authorization is None
+            else list(improvement_authorization.prior_green_assertion_ids)
+        )
+        failed_assertion_ids = (
+            []
+            if improvement_authorization is None
+            else [
+                outcome.assertion_id
+                for outcome in improvement_authorization.failed_evaluation.assertion_outcomes
+                if outcome.status == "failed"
+            ]
+        )
         document = {
             "Goal": (
                 "Implement the dependency-ready node described by "
@@ -141,7 +217,8 @@ class CodexBriefBuilder:
             ),
             "Measurable outcome": {
                 "acceptance_assertion_ids": list(invocation.acceptance_assertion_ids),
-                "prior green assertions": [],
+                "prior green assertions": prior_green_ids,
+                "failed assertion IDs": failed_assertion_ids,
             },
             "selected reusable components": list(inventory.reusable_component_ids),
             "authorized workspace roots": [assignment.workspace_ref],
@@ -168,6 +245,11 @@ class CodexBriefBuilder:
                 for query in assignment.documentation_queries
             ],
             "context refs": [ref.uri for ref in context_refs],
+            "prior candidate ref": (
+                None
+                if improvement_authorization is None
+                else improvement_authorization.prior_candidate_ref.uri
+            ),
             "integration IDs": [item.integration_id for item in assignment.integrations],
             "live and sandbox policy": {
                 "live_execution": policy.live_execution,

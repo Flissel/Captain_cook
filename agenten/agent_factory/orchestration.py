@@ -10,7 +10,12 @@ import time
 from typing import TYPE_CHECKING, Awaitable, Protocol, TypeVar
 from uuid import UUID
 
-from agenten.agent_factory.contracts import FactoryEvidenceBlock, FactoryJob, FactoryLease, FactoryRole
+from agenten.agent_factory.contracts import (
+    FactoryEvidenceBlock,
+    FactoryJob,
+    FactoryLease,
+    FactoryRole,
+)
 from agenten.agent_factory.leases import FactoryLeasePort
 from agenten.agent_factory.service import FactoryCoordinator
 from agenten.agent_factory.skill_evaluation import (
@@ -23,7 +28,12 @@ from agenten.agent_factory.skill_evaluation import (
     ToolGapMarker,
     required_tool_gaps,
 )
-from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
+from agenten.agent_factory.skill_sequence import FactoryImprovementAuthorizationV1
+from agenten.agent_factory.state_machine import (
+    FactoryAction,
+    FactoryActionKind,
+    FactoryProjection,
+)
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.forge_contracts import (
     CreationProgressV1,
@@ -52,11 +62,21 @@ class FactoryDispatch:
     action: FactoryAction
     role: FactoryRole | None
     lease: FactoryLease | None
-    improvement_authorized: bool = False
+    improvement_authorization: FactoryImprovementAuthorizationV1 | None = None
 
 
 class FactoryClock(Protocol):
     def now(self) -> datetime: ...
+
+
+class FactoryImprovementAuthorizationPort(Protocol):
+    def active(
+        self,
+        job: FactoryJob,
+        action: FactoryAction,
+        projection: FactoryProjection,
+        now: datetime,
+    ) -> FactoryImprovementAuthorizationV1: ...
 
 
 class HermesFactoryPort(Protocol):
@@ -492,6 +512,7 @@ class FactoryDispatcher:
         candidate_validator: FactoryCandidateValidationPort | None = None,
         leases: FactoryLeasePort,
         clock: FactoryClock,
+        improvements: FactoryImprovementAuthorizationPort | None = None,
     ) -> None:
         self._coordinator = coordinator
         self._hermes = hermes
@@ -499,6 +520,7 @@ class FactoryDispatcher:
         self._candidate_validator = candidate_validator
         self._leases = leases
         self._clock = clock
+        self._improvements = improvements
 
     async def dispatch_next(self, job_id: UUID) -> FactoryAction:
         action = self._coordinator.next_action(job_id)
@@ -506,16 +528,25 @@ class FactoryDispatcher:
         job = projection.job
         if action.kind in _ROLE_ACTIONS:
             role = _ROLE_ACTIONS[action.kind]
+            now = self._clock.now()
+            improvement_authorization = None
+            if role is FactoryRole.TOOL_INTEGRATOR and action.attempt > 1:
+                if self._improvements is None:
+                    raise FactoryDispatchError(
+                        "retry dispatch requires improvement authorization evidence"
+                    )
+                improvement_authorization = self._improvements.active(
+                    job,
+                    action,
+                    projection,
+                    now,
+                )
             request = FactoryDispatch(
                 job=job,
                 action=action,
                 role=role,
-                lease=self._leases.active(job, role, action.attempt, self._clock.now()),
-                improvement_authorized=(
-                    role is FactoryRole.TOOL_INTEGRATOR
-                    and action.attempt > 1
-                    and projection.attempt == action.attempt
-                ),
+                lease=self._leases.active(job, role, action.attempt, now),
+                improvement_authorization=improvement_authorization,
             )
             if action.kind is FactoryActionKind.DISPATCH_BUILD_VALIDATOR:
                 if self._candidate_validator is None:
