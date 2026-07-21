@@ -62,6 +62,73 @@ def test_factory_workflow_bundle_is_non_authoritative_operator_aid() -> None:
     }
 
 
+def test_report_classifies_tool_credential_infrastructure_and_adapter_gaps() -> None:
+    path = Path(
+        "agenten/agent_factory/skills/captain-factory-report-captain/"
+        "references/recommendations.md"
+    )
+    text = path.read_text(encoding="utf-8").lower()
+
+    for phrase in (
+        "required todo_tool.v1",
+        "blocked_tool_required",
+        "optional todo_tool.v1",
+        "every released assertion is green",
+        "blocked_credential_required",
+        "blocked_infrastructure",
+        "self-built adapter",
+    ):
+        assert phrase in text
+
+
+def test_execute_team_fails_closed_on_live_and_budget_uncertainty() -> None:
+    path = Path("agenten/agent_factory/skills/captain-factory-execute-team/SKILL.md")
+    text = path.read_text(encoding="utf-8").lower()
+
+    for phrase in (
+        "live_execution=false",
+        "missing reservation",
+        "unknown or contradictory cost",
+        "budget_exhausted",
+        "stop all new paid effects",
+    ):
+        assert phrase in text
+
+
+@pytest.mark.parametrize(
+    "skill_name", ("captain-factory-execute-team", "captain-factory-improve-team")
+)
+def test_n8n_effects_require_declared_intent_and_scoped_lease(skill_name: str) -> None:
+    path = Path("agenten/agent_factory/skills") / skill_name / "SKILL.md"
+    text = path.read_text(encoding="utf-8").lower()
+
+    for phrase in (
+        "integration_intent=n8n",
+        "short-lived",
+        "n8n-builder",
+        "n8n-mcp",
+        "isolated draft",
+        "activation",
+        "production adoption",
+        "service administration",
+        "volume management",
+    ):
+        assert phrase in text
+
+
+def test_brief_codex_consumes_required_builtin_skills() -> None:
+    path = Path("agenten/agent_factory/skills/captain-factory-brief-codex/SKILL.md")
+    text = path.read_text(encoding="utf-8").lower()
+
+    for builtin in (
+        "plan",
+        "test-driven-development",
+        "systematic-debugging",
+        "requesting-code-review",
+    ):
+        assert f"`{builtin}`" in text
+
+
 def test_factory_skill_is_digestible_and_contains_release_boundaries() -> None:
     content = (SKILL_DIR / "SKILL.md").read_bytes()
     digest = hashlib.sha256(content).hexdigest()

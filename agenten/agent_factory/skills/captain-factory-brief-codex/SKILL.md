@@ -18,7 +18,10 @@ assertions, expose secrets, or claim ready_to_use.
    [assignment template](templates/codex-assignment.md).
 2. Delegate only through `codex.run`. Use digest-bound `codex.resume` only for
    the same prompt and session digest.
-3. Require code, tests, manifests, digests, and command evidence; seal candidate
+3. Load and follow the builtin `plan`, `test-driven-development`,
+   `systematic-debugging`, and `requesting-code-review` skills as mandatory
+   instructions for the assignment and its evidence.
+4. Require code, tests, manifests, digests, and command evidence; seal candidate
    inputs and outputs before validation. Do not grant an approval bypass.
-4. Return `CodexBuildBriefV1`; retain prompt/context digests rather than raw
+5. Return `CodexBuildBriefV1`; retain prompt/context digests rather than raw
    secret-bearing bodies.
