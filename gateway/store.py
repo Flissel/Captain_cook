@@ -1443,65 +1443,75 @@ class GatewayStore:
                     projection=projection,
                 )
 
-                cursor.execute(
-                    """SELECT block_index, payload FROM factory_capability_catalog
-                       WHERE capability_id = %s FOR UPDATE""",
-                    (request.capability_id,),
-                )
-                catalog_row = cursor.fetchone()
-                if catalog_row is None:
-                    raise HTTPException(status_code=409, detail="capability is not published")
-                catalog = CapabilityCatalogRecord.model_validate(
-                    self._decode_json(catalog_row["payload"])
-                )
-                cursor.execute(
-                    """SELECT block_index, catalog_payload
-                       FROM factory_capability_packages
-                       WHERE capability_id = %s AND capability_version = %s
-                       FOR UPDATE""",
-                    (request.capability_id, request.capability_version),
-                )
-                package_row = cursor.fetchone()
-                if package_row is None:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="published capability package not found",
+                if existing is not None:
+                    catalog, _ = self._locked_claim_capability_release(
+                        cursor,
+                        existing,
                     )
-                package_catalog = CapabilityCatalogRecord.model_validate(
-                    self._decode_json(package_row["catalog_payload"])
-                )
-                if package_catalog != catalog:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="capability package is not the current catalog head",
+                    authority = self._claim_capability_authority(existing)
+                else:
+                    cursor.execute(
+                        """SELECT block_index, payload FROM factory_capability_catalog
+                           WHERE capability_id = %s FOR UPDATE""",
+                        (request.capability_id,),
                     )
-                catalog_block = self._row_by_index(
-                    cursor,
-                    int(catalog_row["block_index"]),
-                    for_update=True,
-                )
-                package_block = self._row_by_index(
-                    cursor,
-                    int(package_row["block_index"]),
-                    for_update=True,
-                )
-                if catalog_block is None or package_block is None:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="capability release ledger authority is incomplete",
+                    catalog_row = cursor.fetchone()
+                    if catalog_row is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="capability is not published",
+                        )
+                    catalog = CapabilityCatalogRecord.model_validate(
+                        self._decode_json(catalog_row["payload"])
                     )
-                authority = RuntimeCapabilityAuthority(
-                    capability_id=catalog.capability_id,
-                    capability_version=catalog.capability_version,
-                    team_version=catalog.team_version,
-                    catalog_fence=catalog.catalog_fence,
-                    catalog_block_index=int(catalog_block["index"]),
-                    catalog_block_hash=str(catalog_block["hash"]),
-                    package_block_index=int(package_block["index"]),
-                    package_block_hash=str(package_block["hash"]),
-                    package_ref=catalog.package_ref,
-                    published_at=catalog.published_at,
-                )
+                    cursor.execute(
+                        """SELECT block_index, catalog_payload
+                           FROM factory_capability_packages
+                           WHERE capability_id = %s AND capability_version = %s
+                           FOR UPDATE""",
+                        (request.capability_id, request.capability_version),
+                    )
+                    package_row = cursor.fetchone()
+                    if package_row is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="published capability package not found",
+                        )
+                    package_catalog = CapabilityCatalogRecord.model_validate(
+                        self._decode_json(package_row["catalog_payload"])
+                    )
+                    if package_catalog != catalog:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="capability package is not the current catalog head",
+                        )
+                    catalog_block = self._row_by_index(
+                        cursor,
+                        int(catalog_row["block_index"]),
+                        for_update=True,
+                    )
+                    package_block = self._row_by_index(
+                        cursor,
+                        int(package_row["block_index"]),
+                        for_update=True,
+                    )
+                    if catalog_block is None or package_block is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="capability release ledger authority is incomplete",
+                        )
+                    authority = RuntimeCapabilityAuthority(
+                        capability_id=catalog.capability_id,
+                        capability_version=catalog.capability_version,
+                        team_version=catalog.team_version,
+                        catalog_fence=catalog.catalog_fence,
+                        catalog_block_index=int(catalog_block["index"]),
+                        catalog_block_hash=str(catalog_block["hash"]),
+                        package_block_index=int(package_block["index"]),
+                        package_block_hash=str(package_block["hash"]),
+                        package_ref=catalog.package_ref,
+                        published_at=catalog.published_at,
+                    )
                 self._assert_runtime_capability_claimable(
                     request=request,
                     command=command,
@@ -1597,15 +1607,22 @@ class GatewayStore:
         effective_now = now.astimezone(timezone.utc)
         if result_recorded or (existing is not None and existing.status == "completed"):
             raise HTTPException(status_code=409, detail="runtime execution is already completed")
+        effective_authority = authority
         if existing is not None:
             if existing.command_id != request.command_id:
                 raise HTTPException(status_code=409, detail="execution claim belongs to another command")
+            effective_authority = GatewayStore._claim_capability_authority(existing)
+        if (
+            request.capability_id != effective_authority.capability_id
+            or request.capability_version != effective_authority.capability_version
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="execution claim request changed frozen capability authority",
+            )
+        if existing is not None:
             if existing.expires_at > effective_now:
                 if existing.owner_id == request.owner_id:
-                    GatewayStore._assert_frozen_capability_authority(
-                        existing,
-                        authority=authority,
-                    )
                     return RuntimeExecutionClaimReceipt(
                         claim=existing,
                         replayed=True,
@@ -1622,7 +1639,7 @@ class GatewayStore:
             fencing_token = 1
             recovered = False
         claim = RuntimeExecutionClaim(
-            **authority.model_dump(),
+            **effective_authority.model_dump(),
             command_id=request.command_id,
             claim_id=uuid5(
                 NAMESPACE_URL,
@@ -1658,6 +1675,65 @@ class GatewayStore:
             package_ref=claim.package_ref,
             published_at=claim.published_at,
         )
+
+    def _locked_claim_capability_release(
+        self,
+        cursor: Any,
+        claim: RuntimeExecutionClaim,
+    ) -> tuple[CapabilityCatalogRecord, dict[str, Any]]:
+        cursor.execute(
+            """SELECT block_index, payload, catalog_payload
+               FROM factory_capability_packages
+               WHERE capability_id = %s AND capability_version = %s
+               FOR UPDATE""",
+            (claim.capability_id, claim.capability_version),
+        )
+        package_row = cursor.fetchone()
+        if package_row is None:
+            raise HTTPException(
+                status_code=409,
+                detail="frozen capability package not found",
+            )
+        catalog = CapabilityCatalogRecord.model_validate(
+            self._decode_json(package_row["catalog_payload"])
+        )
+        catalog_block = self._row_by_index(
+            cursor,
+            claim.catalog_block_index,
+            for_update=True,
+        )
+        package_block = self._row_by_index(
+            cursor,
+            claim.package_block_index,
+            for_update=True,
+        )
+        if (
+            int(package_row["block_index"]) != claim.package_block_index
+            or catalog_block is None
+            or package_block is None
+            or catalog_block["block_type"] != "capability_catalog_head"
+            or package_block["block_type"] != "capability_package_published"
+            or int(catalog_block["parent_index"]) != claim.package_block_index
+            or catalog_block["data"] != catalog.model_dump(mode="json", by_alias=True)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="frozen capability release ledger authority is incomplete",
+            )
+        authority = RuntimeCapabilityAuthority(
+            capability_id=catalog.capability_id,
+            capability_version=catalog.capability_version,
+            team_version=catalog.team_version,
+            catalog_fence=catalog.catalog_fence,
+            catalog_block_index=int(catalog_block["index"]),
+            catalog_block_hash=str(catalog_block["hash"]),
+            package_block_index=int(package_block["index"]),
+            package_block_hash=str(package_block["hash"]),
+            package_ref=catalog.package_ref,
+            published_at=catalog.published_at,
+        )
+        self._assert_frozen_capability_authority(claim, authority=authority)
+        return catalog, package_row
 
     @staticmethod
     def _assert_frozen_capability_authority(
@@ -2575,68 +2651,9 @@ class GatewayStore:
                         status_code=409,
                         detail="capability execution requires a completed runtime claim",
                     )
-                cursor.execute(
-                    """SELECT block_index, payload FROM factory_capability_catalog
-                       WHERE capability_id = %s FOR UPDATE""",
-                    (claim.capability_id,),
-                )
-                catalog_row = cursor.fetchone()
-                if catalog_row is None:
-                    raise HTTPException(status_code=409, detail="capability is not published")
-                catalog = CapabilityCatalogRecord.model_validate(
-                    self._decode_json(catalog_row["payload"])
-                )
-                cursor.execute(
-                    """SELECT block_index, payload, catalog_payload
-                       FROM factory_capability_packages
-                       WHERE capability_id = %s AND capability_version = %s
-                       FOR UPDATE""",
-                    (claim.capability_id, claim.capability_version),
-                )
-                package_row = cursor.fetchone()
-                if package_row is None:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="published capability package not found",
-                    )
-                package_catalog = CapabilityCatalogRecord.model_validate(
-                    self._decode_json(package_row["catalog_payload"])
-                )
-                if package_catalog != catalog:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="capability execution package is not the current catalog head",
-                    )
-                catalog_block = self._row_by_index(
+                catalog, package_row = self._locked_claim_capability_release(
                     cursor,
-                    int(catalog_row["block_index"]),
-                    for_update=True,
-                )
-                package_block = self._row_by_index(
-                    cursor,
-                    int(package_row["block_index"]),
-                    for_update=True,
-                )
-                if catalog_block is None or package_block is None:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="capability execution release authority is incomplete",
-                    )
-                current_authority = RuntimeCapabilityAuthority(
-                    capability_id=catalog.capability_id,
-                    capability_version=catalog.capability_version,
-                    team_version=catalog.team_version,
-                    catalog_fence=catalog.catalog_fence,
-                    catalog_block_index=int(catalog_block["index"]),
-                    catalog_block_hash=str(catalog_block["hash"]),
-                    package_block_index=int(package_block["index"]),
-                    package_block_hash=str(package_block["hash"]),
-                    package_ref=catalog.package_ref,
-                    published_at=catalog.published_at,
-                )
-                self._assert_frozen_capability_authority(
                     claim,
-                    authority=current_authority,
                 )
                 stored_package = self._decode_json(package_row["payload"])
                 release_payload = (

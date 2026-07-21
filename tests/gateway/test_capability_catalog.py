@@ -766,6 +766,49 @@ def test_execution_claim_policy_is_restart_safe_owner_bound_and_fenced() -> None
         )
 
 
+def test_execution_claim_recovery_keeps_its_frozen_catalog_after_head_upgrade() -> None:
+    authority = _runtime_capability_authority()
+    request = RuntimeExecutionClaimRequest(
+        schema_name="captain.runtime-execution-claim-request.v1",
+        command_id=_runtime_command().event_id,
+        owner_id="runtime-a",
+        lease_seconds=60,
+        capability_id=authority.capability_id,
+        capability_version=authority.capability_version,
+    )
+    first = GatewayStore._resolve_runtime_execution_claim(
+        existing=None,
+        request=request,
+        now=NOW,
+        result_recorded=False,
+        credential_factory=lambda: "first-one-time-credential",
+        authority=authority,
+    )
+    upgraded_head = authority.model_copy(
+        update={
+            "capability_version": authority.capability_version + 1,
+            "catalog_fence": authority.catalog_fence + 1,
+            "catalog_block_index": authority.catalog_block_index + 2,
+            "catalog_block_hash": "d" * 64,
+            "package_block_index": authority.package_block_index + 2,
+            "package_block_hash": "e" * 64,
+        }
+    )
+
+    recovered = GatewayStore._resolve_runtime_execution_claim(
+        existing=first.claim,
+        request=request.model_copy(update={"owner_id": "runtime-b"}),
+        now=NOW + timedelta(seconds=61),
+        result_recorded=False,
+        credential_factory=lambda: "recovery-one-time-credential",
+        authority=upgraded_head,
+    )
+
+    assert GatewayStore._claim_capability_authority(recovered.claim) == authority
+    assert recovered.claim.fencing_token == 2
+    assert recovered.recovered is True
+
+
 def test_execution_completion_requires_one_time_credential_and_fence() -> None:
     authority = _runtime_capability_authority()
     request = RuntimeExecutionClaimRequest(

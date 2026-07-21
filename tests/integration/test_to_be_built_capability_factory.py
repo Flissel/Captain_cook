@@ -656,12 +656,14 @@ class ScriptedGatewayStore:
     runtime_authority_order: list[str] = field(default_factory=list)
     crash_after_publication_once: bool = False
     crash_after_execution_once: bool = False
+    crash_before_job_registration_once: bool = False
     crash_after_claim_once: bool = False
     crash_after_result_once: bool = False
     result_committed_before_reclaim_once: AgentRuntimeResult | None = None
     add_decoy_projection: bool = False
     _crashed_after_publication: bool = False
     _crashed_after_execution: bool = False
+    _crashed_before_job_registration: bool = False
     _crashed_after_claim: bool = False
     _crashed_after_result: bool = False
     _committed_result_before_reclaim: bool = False
@@ -669,6 +671,12 @@ class ScriptedGatewayStore:
     advance_clock_after_execution: timedelta | None = None
 
     def record_factory_job(self, job: AgentFactoryJobV2) -> object:
+        if (
+            self.crash_before_job_registration_once
+            and not self._crashed_before_job_registration
+        ):
+            self._crashed_before_job_registration = True
+            raise SimulatedProcessCrash("before Gateway job registration")
         existing = self.jobs.get(job.job_id)
         if existing is not None and existing != job:
             raise AssertionError("changed factory job replay")
@@ -1554,6 +1562,43 @@ async def test_complete_factory_release_chain_recovers_twice_without_duplicate_e
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_identity_recovers_before_gateway_job_registration(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    harness.creation.crash_after_submit_once = False
+    harness.releases.crash_after_run_once = None
+    harness.gateway.crash_before_job_registration_once = True
+
+    with pytest.raises(SimulatedProcessCrash, match="before Gateway job registration"):
+        await harness.entrypoint().run(
+            input_path=harness.input_path,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            wall_clock_budget_seconds=600,
+        )
+
+    checkpoint_path = next(harness.checkpoint_dir.glob("*.json"))
+    checkpoint_bytes = checkpoint_path.read_bytes()
+    checkpoint = CapabilityFactoryCheckpoint.model_validate_json(checkpoint_bytes)
+    assert not harness.gateway.jobs
+    harness.clock.value += timedelta(seconds=5)
+
+    completed = await harness.entrypoint().run(
+        input_path=harness.input_path,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+        wall_clock_budget_seconds=600,
+    )
+
+    registered = harness.gateway.jobs[checkpoint.factory_job_id]
+    assert completed.execution_state == "completed"
+    assert registered.occurred_at == checkpoint.occurred_at
+    assert registered.deadline_at == checkpoint.deadline_at
+    assert checkpoint_path.read_bytes() == checkpoint_bytes
+
+
+@pytest.mark.asyncio
 async def test_catalog_hit_reuses_frozen_authority_without_forge_or_republication(
     tmp_path: Path,
 ) -> None:
@@ -1700,6 +1745,66 @@ async def test_result_commit_crash_uses_durable_receipt_without_provider_reexecu
     assert len(harness.gateway.runtime_results) == 1
     assert len(harness.gateway.execution_effects) == 1
     assert len(harness.minibook.posts) == 1
+
+
+@pytest.mark.parametrize(
+    "origin_field",
+    (
+        "origin_claim_id",
+        "origin_claim_fencing_token",
+        "origin_claim_digest",
+    ),
+)
+@pytest.mark.asyncio
+async def test_normal_result_restart_rejects_receipt_from_another_claim(
+    tmp_path: Path,
+    origin_field: str,
+) -> None:
+    harness = _harness(tmp_path)
+    harness.creation.crash_after_submit_once = False
+    harness.releases.crash_after_run_once = None
+    harness.gateway.crash_after_result_once = True
+
+    with pytest.raises(SimulatedProcessCrash, match="runtime result"):
+        await harness.entrypoint().run(
+            input_path=harness.input_path,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            wall_clock_budget_seconds=600,
+        )
+
+    effect_id, provider_execution = next(iter(harness.runtime.executions.items()))
+    completed_claim = harness.gateway.runtime_claims[
+        provider_execution.result.command_id
+    ]
+    invalid_origin = {
+        "origin_claim_id": uuid5(completed_claim.claim_id, "wrong-origin"),
+        "origin_claim_fencing_token": completed_claim.fencing_token + 1,
+        "origin_claim_digest": "f" * 64,
+    }
+    changed_receipt = provider_execution.provider_receipt.model_copy(
+        update={origin_field: invalid_origin[origin_field]}
+    )
+    provider_executions = dict(harness.runtime.executions)
+    provider_executions[effect_id] = provider_execution.model_copy(
+        update={"provider_receipt": changed_receipt}
+    )
+    harness.runtime = ScriptedRuntimePort(
+        harness.gateway,
+        effects=harness.runtime.effects,
+        executions=provider_executions,
+    )
+
+    with pytest.raises(
+        CapabilityProviderIdempotencyError,
+        match="execution claim",
+    ):
+        await harness.entrypoint().run(
+            input_path=harness.input_path,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            wall_clock_budget_seconds=600,
+        )
 
 
 @pytest.mark.asyncio
