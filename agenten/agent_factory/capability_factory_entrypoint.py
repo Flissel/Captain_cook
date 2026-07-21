@@ -25,6 +25,14 @@ from typing import Literal, Mapping, Protocol
 from urllib.parse import urlsplit
 from uuid import UUID, uuid5
 
+# ``python -m`` executes this module as ``__main__``.  Static production
+# adapters import its canonical package name, so bind both names to the same
+# module before an adapter can import the entrypoint base class.
+if __name__ == "__main__":
+    sys.modules.setdefault(
+        "agenten.agent_factory.capability_factory_entrypoint", sys.modules[__name__]
+    )
+
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from agenten.agent_factory.capability_resolution import (
