@@ -1,0 +1,419 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from uuid import NAMESPACE_URL, UUID, uuid5
+
+import pytest
+
+from agenten.agent_factory.factory_live_runner import (
+    FactoryInfrastructureFailure,
+    FactoryLiveEffectKind,
+    FactoryLiveEffectOutcomeV1,
+    FactoryLiveEffectRequestV1,
+    FactoryLiveRunner,
+    InMemoryFactoryLiveEffectLedger,
+)
+from agenten.agent_factory.contracts import FactoryRole
+from agenten.agent_factory.leases import issue_factory_lease
+from agenten.agent_factory.service import InMemoryFactoryRepository
+from agenten.agent_factory.skill_workflow_contracts import FactorySkillInvocationV1
+from agenten.agent_factory.state_machine import FactoryProjection
+from agenten.agent_runtime.contracts import ArtifactRef
+from tests.agent_factory.test_release_gate import (
+    workflow_budget,
+    workflow_evaluation,
+    workflow_job,
+    workflow_receipts,
+    workflow_run,
+)
+from tests.agent_factory.test_skill_workflow_contracts import invocation_payload
+
+
+NOW = datetime(2026, 7, 21, 10, 5, tzinfo=timezone.utc)
+
+
+def artifact(name: str) -> ArtifactRef:
+    return ArtifactRef(
+        uri=f"artifact://{name}",
+        sha256=(name.encode("utf-8").hex() + "0" * 64)[:64],
+        media_type="application/json",
+    )
+
+
+def effect_request(
+    job,
+    *,
+    attempt: int = 1,
+    kind: FactoryLiveEffectKind = FactoryLiveEffectKind.PROVIDER,
+    key_char: str | None = None,
+    now: datetime = NOW,
+) -> FactoryLiveEffectRequestV1:
+    effect_id = uuid5(
+        NAMESPACE_URL,
+        f"factory-live|{job.job_id}|{attempt}|{kind.value}",
+    )
+    step = "brief_codex" if kind is FactoryLiveEffectKind.CODEX else "execute_team"
+    invocation = FactorySkillInvocationV1.model_validate(invocation_payload(step))
+    role = (
+        FactoryRole.TOOL_INTEGRATOR
+        if kind is FactoryLiveEffectKind.CODEX
+        else FactoryRole.REAL_CASE_TESTER
+    )
+    invocation = invocation.model_copy(
+        update={
+            "lease": issue_factory_lease(
+                job=job,
+                role=role,
+                attempt=attempt,
+                workspace_ref="workspace://factory/live-runner",
+                now=now,
+            )
+        }
+    )
+    if key_char is not None:
+        invocation = invocation.model_copy(
+            update={
+                "invocation_id": uuid5(
+                    NAMESPACE_URL,
+                    f"factory-live-invocation|{key_char}",
+                ),
+                "idempotency_key": key_char * 64,
+            }
+        )
+    return FactoryLiveEffectRequestV1(
+        schema_name="captain.factory-live-effect-request.v1",
+        effect_id=effect_id,
+        job_id=job.job_id,
+        correlation_id=job.correlation_id,
+        subject_version=job.subject_version,
+        attempt=attempt,
+        kind=kind,
+        idempotency_key=invocation.idempotency_key,
+        input_ref=invocation.input_ref,
+        invocation=invocation,
+    )
+
+
+def effect_outcome(
+    request: FactoryLiveEffectRequestV1,
+    *,
+    status: str = "succeeded",
+) -> FactoryLiveEffectOutcomeV1:
+    return FactoryLiveEffectOutcomeV1(
+        schema_name="captain.factory-live-effect-outcome.v1",
+        outcome_id=uuid5(NAMESPACE_URL, f"factory-live-outcome|{request.effect_id}"),
+        effect_id=request.effect_id,
+        job_id=request.job_id,
+        correlation_id=request.correlation_id,
+        subject_version=request.subject_version,
+        attempt=request.attempt,
+        status=status,
+        evidence_ref=artifact(f"effect-{request.effect_id}"),
+        completed_at=NOW + timedelta(seconds=1),
+    )
+
+
+class Repository(InMemoryFactoryRepository):
+    def __init__(self, job, *, artifacts=(), budget=None, receipts=()) -> None:
+        super().__init__()
+        self.register(job)
+        self._artifacts = tuple(artifacts)
+        self._budget = budget
+        self._receipts = tuple(receipts)
+
+    def workflow_artifacts(self, job_id: UUID):
+        self.job(job_id)
+        return self._artifacts
+
+    def workflow_budget_projection(self, job_id: UUID):
+        self.job(job_id)
+        return self._budget
+
+    def workflow_usage_receipts(self, job_id: UUID):
+        self.job(job_id)
+        return self._receipts
+
+
+class Plan:
+    def __init__(self, *effects: FactoryLiveEffectRequestV1) -> None:
+        self._effects = effects
+
+    def effects_for(self, *, job, mode, projection, workflow_artifacts):
+        return self._effects
+
+
+class Executor:
+    def __init__(self, request, *, start, recover=None) -> None:
+        self.request = request
+        self.start_result = start
+        self.recover_result = recover
+        self.start_calls = 0
+        self.recover_calls = 0
+
+    async def execute(self, request):
+        assert request == self.request
+        self.start_calls += 1
+        if isinstance(self.start_result, BaseException):
+            raise self.start_result
+        return self.start_result
+
+    async def recover(self, request):
+        assert request == self.request
+        self.recover_calls += 1
+        if isinstance(self.recover_result, BaseException):
+            raise self.recover_result
+        return self.recover_result
+
+
+class MultiExecutor:
+    def __init__(self) -> None:
+        self.execute_calls = []
+
+    async def execute(self, request):
+        self.execute_calls.append(request)
+        return effect_outcome(request)
+
+    async def recover(self, request):
+        raise AssertionError("recovery was not expected")
+
+
+def test_effect_request_requires_exact_released_invocation_binding() -> None:
+    job = workflow_job(mode="demo")
+    request = effect_request(job)
+    payload = request.model_dump(mode="json", by_alias=True)
+    invocation = payload["invocation"]
+    assert isinstance(invocation, dict)
+    invocation["attempt"] = 2
+
+    with pytest.raises(ValueError, match="attempt mismatch|invocation binding"):
+        FactoryLiveEffectRequestV1.model_validate(payload)
+
+
+def test_effect_claim_rejects_a_second_effect_id_for_the_same_idempotency_key() -> None:
+    job = workflow_job(mode="demo")
+    request = effect_request(job)
+    ledger = InMemoryFactoryLiveEffectLedger()
+    ledger.claim(request)
+    duplicate_identity = request.model_copy(
+        update={"effect_id": uuid5(NAMESPACE_URL, "different-effect-id")}
+    )
+
+    with pytest.raises(ValueError, match="idempotency_key"):
+        ledger.claim(duplicate_identity)
+
+
+def test_effect_claim_rejects_changed_identity_for_the_same_invocation() -> None:
+    job = workflow_job(mode="demo")
+    request = effect_request(job)
+    ledger = InMemoryFactoryLiveEffectLedger()
+    first = ledger.claim(request)
+    replay = ledger.claim(request)
+    changed_input = job.compiled_spec_ref
+    changed_invocation = request.invocation.model_copy(
+        update={
+            "idempotency_key": "e" * 64,
+            "input_ref": changed_input,
+            "input_sha256": changed_input.sha256,
+        }
+    )
+    changed = request.model_copy(
+        update={
+            "effect_id": uuid5(NAMESPACE_URL, "changed-invocation-effect-id"),
+            "idempotency_key": changed_invocation.idempotency_key,
+            "input_ref": changed_input,
+            "invocation": changed_invocation,
+        }
+    )
+
+    assert first.acquired is True
+    assert replay.acquired is False
+    with pytest.raises(ValueError, match="invocation_id"):
+        ledger.claim(changed)
+
+
+def test_generic_runner_cannot_claim_n8n_without_the_separate_runtime_path() -> None:
+    with pytest.raises(ValueError, match="n8n"):
+        FactoryLiveEffectKind("n8n")
+
+
+def runner(job, ledger, plan, executor, *, repository=None) -> FactoryLiveRunner:
+    return FactoryLiveRunner(
+        repository=repository or Repository(job),
+        effect_ledger=ledger,
+        plan=plan,
+        executor=executor,
+        clock=lambda: NOW,
+    )
+
+
+@pytest.mark.asyncio
+async def test_restart_after_reservation_recovers_without_starting_provider_twice() -> None:
+    job = workflow_job(mode="demo")
+    request = effect_request(job)
+    ledger = InMemoryFactoryLiveEffectLedger()
+    crashed = Executor(request, start=RuntimeError("process crashed"))
+
+    with pytest.raises(RuntimeError, match="process crashed"):
+        await runner(job, ledger, Plan(request), crashed).run(job.job_id, mode="demo")
+
+    recovered = Executor(
+        request,
+        start=AssertionError("must not start again"),
+        recover=effect_outcome(request),
+    )
+    report = await runner(job, ledger, Plan(request), recovered).run(
+        job.job_id,
+        mode="demo",
+    )
+
+    assert crashed.start_calls == 1
+    assert recovered.start_calls == 0
+    assert recovered.recover_calls == 1
+    assert report.attempt == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", tuple(FactoryLiveEffectKind))
+async def test_restart_after_evidence_replays_without_any_external_effect(
+    kind: FactoryLiveEffectKind,
+) -> None:
+    job = workflow_job(mode="demo")
+    request = effect_request(job, kind=kind)
+    ledger = InMemoryFactoryLiveEffectLedger()
+    first = Executor(request, start=effect_outcome(request))
+    await runner(job, ledger, Plan(request), first).run(job, mode="demo")
+
+    replay = Executor(
+        request,
+        start=AssertionError("must not start"),
+        recover=AssertionError("must not recover"),
+    )
+    report = await runner(job, ledger, Plan(request), replay).run(job, mode="demo")
+
+    assert first.start_calls == 1
+    assert replay.start_calls == 0
+    assert replay.recover_calls == 0
+    assert report.effects[0].replayed is True
+
+
+@pytest.mark.asyncio
+async def test_behavioral_retry_advances_attempt_but_infrastructure_recovery_does_not() -> None:
+    job = workflow_job(mode="demo")
+    request = effect_request(job)
+    behavioral = Executor(
+        request,
+        start=effect_outcome(request, status="behavioral_failure"),
+    )
+    behavioral_report = await runner(
+        job,
+        InMemoryFactoryLiveEffectLedger(),
+        Plan(request),
+        behavioral,
+    ).run(job, mode="demo")
+
+    infrastructure = Executor(
+        request,
+        start=FactoryInfrastructureFailure("provider unavailable"),
+    )
+    infrastructure_report = await runner(
+        job,
+        InMemoryFactoryLiveEffectLedger(),
+        Plan(request),
+        infrastructure,
+    ).run(job, mode="demo")
+
+    assert behavioral_report.status == "behavioral_retry_required"
+    assert behavioral_report.next_attempt == 2
+    assert infrastructure_report.status == "infrastructure_recovery_required"
+    assert infrastructure_report.attempt == 1
+    assert infrastructure_report.next_attempt == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_revalidates_deadline_immediately_before_each_new_effect() -> None:
+    job = workflow_job(mode="demo")
+    first = effect_request(job, kind=FactoryLiveEffectKind.CODEX, key_char="c")
+    second = effect_request(job, kind=FactoryLiveEffectKind.PROVIDER, key_char="d")
+    moments = iter(
+        (
+            NOW,
+            NOW,
+            job.deadline_at,
+        )
+    )
+    executor = MultiExecutor()
+    live_runner = FactoryLiveRunner(
+        repository=Repository(job),
+        effect_ledger=InMemoryFactoryLiveEffectLedger(),
+        plan=Plan(first, second),
+        executor=executor,
+        clock=lambda: next(moments),
+    )
+
+    with pytest.raises(ValueError, match="active JobV3 deadline"):
+        await live_runner.run(job, mode="demo")
+
+    assert executor.execute_calls == [first]
+
+
+def test_behavioral_failure_at_iteration_ceiling_is_blocked() -> None:
+    job = workflow_job(mode="demo")
+    projection = FactoryProjection.from_job(job).model_copy(update={"attempt": 5})
+
+    report = FactoryLiveRunner._behavioral_report(
+        job,
+        "demo",
+        projection,
+        [],
+    )
+
+    assert report.status == "blocked"
+    assert report.next_attempt == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "run_count", "expected"),
+    (("demo", 1, "demo_ready"), ("release", 3, "ready")),
+)
+async def test_report_preserves_demo_ready_and_never_claims_ready_to_use(
+    mode: str,
+    run_count: int,
+    expected: str,
+) -> None:
+    job = workflow_job(mode=mode)
+    runs = tuple(workflow_run(number) for number in range(1, run_count + 1))
+    repository = Repository(
+        job,
+        artifacts=(*runs, workflow_evaluation(runs)),
+        budget=workflow_budget(),
+        receipts=workflow_receipts(runs),
+    )
+    executor = Executor(effect_request(job), start=AssertionError("no effect planned"))
+
+    report = await runner(
+        job,
+        InMemoryFactoryLiveEffectLedger(),
+        Plan(),
+        executor,
+        repository=repository,
+    ).run(job, mode=mode)
+
+    assert report.status == expected
+    assert report.release_decision is not None
+    assert report.release_decision.status == expected
+    assert "ready_to_use" not in report.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_mode_that_does_not_match_captain_job() -> None:
+    job = workflow_job(mode="demo")
+    executor = Executor(effect_request(job), start=AssertionError("not authorized"))
+
+    with pytest.raises(ValueError, match="mode does not match"):
+        await runner(
+            job,
+            InMemoryFactoryLiveEffectLedger(),
+            Plan(),
+            executor,
+        ).run(job, mode="release")
