@@ -480,9 +480,23 @@ if ($LASTEXITCODE -ne 0 -or $mariaDbContainers.Count -ne 1) {
     throw 'Exactly one running mariadb-test service is required.'
 }
 
-$enabledSkills = & hermes skills list --enabled-only 2>&1
-if ($LASTEXITCODE -ne 0) {
-    throw 'Hermes enabled-skill discovery failed.'
+$previousColumns = $env:COLUMNS
+try {
+    # Rich shortens long skill names at narrow terminal widths. The live gate
+    # must validate the complete released identifiers, independent of its host.
+    $env:COLUMNS = '240'
+    $enabledSkills = & hermes skills list --enabled-only 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Hermes enabled-skill discovery failed.'
+    }
+}
+finally {
+    if ($null -eq $previousColumns) {
+        Remove-Item Env:COLUMNS -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:COLUMNS = $previousColumns
+    }
 }
 $enabledSkillText = [string]::Join([Environment]::NewLine, @($enabledSkills))
 foreach ($skillName in $skillNames) {
