@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from uuid import UUID
 
 import pytest
@@ -20,6 +21,10 @@ from agenten.agent_factory.release_gate import (
     evaluate_factory_release,
 )
 from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationEvidence
+from agenten.agent_factory.execution_budget import (
+    FactoryUsageReceiptV1,
+    InMemoryFactoryBudgetLedger,
+)
 from agenten.agent_runtime.contracts import ArtifactRef
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.app import create_app
@@ -27,12 +32,15 @@ from gateway.auth import GatewayRole, require_actor
 from gateway.contracts import (
     FactorySkillEvaluationSubmission,
     FactoryReleaseDecisionSubmission,
+    FactoryUsageSubmissionV2,
     PublishedHermesSkill,
 )
 from gateway.settings import GatewaySettings
 from gateway.store import GatewayStore
 from tests.agent_factory.test_state_machine import block, job
 from tests.agent_factory.test_skill_evaluation_contracts import evidence_payload
+from tests.agent_factory.test_execution_budget import job_v3, usage_payload
+from tests.gateway.test_factory_budget import record_usage_lease
 from tests.support.mariadb import assert_isolated_test_database
 
 
@@ -98,6 +106,49 @@ def test_factory_job_and_block_are_idempotent_and_restart_safe(storage: MariaDBS
     assert recovered.status_code == 200
     assert recovered.json()["projection"]["phase"] == "forge_requested"
     assert [item["phase"] for item in recovered.json()["blocks"]] == ["forge_requested"]
+
+
+def test_factory_budget_routes_keep_reservations_captain_owned_and_usage_worker_owned(
+    storage: MariaDBStorage,
+    job_v3,
+) -> None:
+    reservation = InMemoryFactoryBudgetLedger().reserve(
+        job_v3,
+        attempt=1,
+        requested_usd=Decimal("1.00"),
+        now=job_v3.occurred_at,
+    )
+    reservation_payload = reservation.model_dump(mode="json", by_alias=True)
+    with TestClient(application(storage)) as captain:
+        assert captain.post(
+            "/v1/factory/jobs",
+            json=job_v3.model_dump(mode="json", by_alias=True),
+        ).status_code == 202
+    store = GatewayStore(storage)
+    lease = record_usage_lease(store, job_v3)
+    with TestClient(application(storage, actor=GatewayRole.WORKER)) as worker:
+        assert worker.post(
+            "/v1/factory/budget/reservations", json=reservation_payload
+        ).status_code == 403
+    with TestClient(application(storage)) as captain:
+        assert captain.post(
+            "/v1/factory/budget/reservations", json=reservation_payload
+        ).status_code == 201
+        usage = FactoryUsageReceiptV1.model_validate(usage_payload(reservation))
+        usage_submission = FactoryUsageSubmissionV2(
+            subject_version=job_v3.subject_version,
+            lease_id=lease.lease_id,
+            receipt=usage,
+        )
+        assert captain.post(
+            "/v1/factory/budget/usage",
+            json=usage_submission.model_dump(mode="json", by_alias=True),
+        ).status_code == 403
+    with TestClient(application(storage, actor=GatewayRole.WORKER)) as worker:
+        assert worker.post(
+            "/v1/factory/budget/usage",
+            json=usage_submission.model_dump(mode="json", by_alias=True),
+        ).status_code == 201
 
 
 def test_factory_gateway_rejects_invalid_phase_before_ledger_write(storage: MariaDBStorage) -> None:

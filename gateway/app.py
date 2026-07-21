@@ -22,7 +22,12 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrant,
     CapabilityGrantRevocation,
 )
-from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease, FactoryPhase
+from agenten.agent_factory.contracts import FactoryEvidenceBlock, FactoryJob, FactoryLease, FactoryPhase
+from agenten.agent_factory.execution_budget import (
+    FactoryBudgetProjection,
+    FactoryBudgetReservationV1,
+    FactoryBudgetWriteReceipt,
+)
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from gateway.auth import (
     GatewayRole,
@@ -42,6 +47,11 @@ from gateway.contracts import (
     RuntimeOperationProjection,
     RuntimeWriteReceipt,
     FactoryJobProjection,
+    FactoryBudgetReleaseRequest,
+    FactoryBudgetReservationWriteReceipt,
+    FactoryWorkflowArtifact,
+    FactoryWorkflowArtifactWriteReceipt,
+    FactoryUsageSubmissionV2,
     FactoryReleaseDecisionSubmission,
     FactoryWriteReceipt,
     FactorySkillEvaluationSubmission,
@@ -220,6 +230,11 @@ def create_app(
         exc: RequestValidationError,
     ):
         path = request.url.path
+        if request.method == "POST" and path.startswith("/v1/factory/"):
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "invalid factory request"},
+            )
         if (
             request.method == "POST"
             and path.startswith("/batches/")
@@ -279,10 +294,68 @@ def create_app(
 
     @app.post("/v1/factory/jobs", status_code=status.HTTP_202_ACCEPTED)
     async def accept_factory_job(
-        job: AgentFactoryJob,
+        job: FactoryJob,
         _: GatewayRole = Depends(require_captain),
     ) -> FactoryWriteReceipt:
         return get_store().record_factory_job(job)
+
+    @app.post("/v1/factory/budget/reservations", status_code=status.HTTP_201_CREATED)
+    async def reserve_factory_budget(
+        reservation: FactoryBudgetReservationV1,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> FactoryBudgetReservationWriteReceipt:
+        receipt = get_store().reserve_factory_budget(reservation)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
+
+    @app.post("/v1/factory/budget/usage", status_code=status.HTTP_201_CREATED)
+    async def record_factory_usage(
+        usage: FactoryUsageSubmissionV2,
+        response: Response,
+        _: GatewayRole = Depends(require_worker),
+    ) -> FactoryBudgetWriteReceipt:
+        receipt = get_store().record_factory_usage(usage)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
+
+    @app.post("/v1/factory/budget/releases", status_code=status.HTTP_201_CREATED)
+    async def release_factory_budget(
+        release: FactoryBudgetReleaseRequest,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> FactoryBudgetWriteReceipt:
+        receipt = get_store().release_factory_budget(release)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
+
+    @app.get("/v1/factory/jobs/{job_id}/budget")
+    async def get_factory_budget(
+        job_id: UUID,
+        _: GatewayRole = Depends(require_reader),
+    ) -> FactoryBudgetProjection:
+        return get_store().factory_budget(job_id)
+
+    @app.post("/v1/factory/workflow-artifacts", status_code=status.HTTP_201_CREATED)
+    async def record_factory_workflow_artifact(
+        artifact: FactoryWorkflowArtifact,
+        response: Response,
+        _: GatewayRole = Depends(require_worker),
+    ) -> FactoryWorkflowArtifactWriteReceipt:
+        receipt = get_store().record_factory_workflow_artifact(artifact)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
+
+    @app.get("/v1/factory/jobs/{job_id}/workflow-artifacts")
+    async def get_factory_workflow_artifacts(
+        job_id: UUID,
+        _: GatewayRole = Depends(require_reader),
+    ) -> tuple[FactoryWorkflowArtifact, ...]:
+        return get_store().factory_workflow_artifacts(job_id)
 
     @app.post("/v1/factory/blocks", status_code=status.HTTP_201_CREATED)
     async def record_factory_block(

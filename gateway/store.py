@@ -7,6 +7,7 @@ import json
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Callable, Protocol, TypeVar
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -22,7 +23,22 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrant,
     CapabilityGrantRevocation,
 )
-from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease, FactoryPhase, FactoryRole
+from agenten.agent_factory.contracts import (
+    AgentFactoryJobV3,
+    FactoryEvidenceBlock,
+    FactoryJob,
+    FactoryLease,
+    FactoryPhase,
+    FactoryRole,
+    parse_factory_job,
+)
+from agenten.agent_factory.execution_budget import (
+    BudgetExhausted,
+    FactoryBudgetProjection,
+    FactoryBudgetReservationV1,
+    FactoryBudgetWriteReceipt,
+    FactoryUsageReceiptV1,
+)
 from agenten.agent_factory.leases import FactoryLeaseDenied, validate_factory_lease
 from agenten.agent_factory.release_gate import (
     E2ERunEvidence,
@@ -35,6 +51,11 @@ from agenten.agent_factory.skill_evaluation import (
     ReleasedHermesSkill,
 )
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
+from agenten.agent_factory.skill_workflow_contracts import (
+    FactoryFeedbackRecommendation,
+    FactorySkillStep,
+    TeamEvaluationV1,
+)
 from agenten.agent_factory.state_machine import (
     FactoryActionKind,
     FactoryLifecycleError,
@@ -62,11 +83,17 @@ from gateway.contracts import (
     RuntimeOperationProjection,
     RuntimeWriteReceipt,
     FactoryJobProjection,
+    FactoryBudgetReleaseRequest,
+    FactoryBudgetReservationWriteReceipt,
+    FactoryWorkflowArtifact,
+    FactoryWorkflowArtifactWriteReceipt,
+    FactoryUsageSubmissionV2,
     FactoryReleaseDecisionSubmission,
     FactoryWriteReceipt,
     FactorySkillEvaluationSubmission,
     FactorySkillWriteReceipt,
     PublishedHermesSkill,
+    parse_factory_workflow_artifact,
     ReviewDecisionEvent,
     project_batch,
     project_release,
@@ -252,6 +279,41 @@ class GatewayStore:
                         payload JSON NOT NULL,
                         INDEX idx_factory_release_decision_job (job_id, block_index),
                         CONSTRAINT fk_factory_release_decision_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS factory_budget_events (
+                        event_id CHAR(36) NOT NULL PRIMARY KEY,
+                        reservation_id CHAR(36) NOT NULL,
+                        job_id CHAR(36) NOT NULL,
+                        event_kind VARCHAR(16) NOT NULL,
+                        content_sha256 CHAR(64) NOT NULL,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        INDEX idx_factory_budget_job (job_id, block_index),
+                        INDEX idx_factory_budget_reservation (reservation_id, block_index),
+                        CONSTRAINT fk_factory_budget_event_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS factory_workflow_artifacts (
+                        invocation_id CHAR(36) NOT NULL PRIMARY KEY,
+                        job_id CHAR(36) NOT NULL,
+                        correlation_id CHAR(36) NOT NULL,
+                        subject_version INT NOT NULL,
+                        attempt INT NOT NULL,
+                        schema_name VARCHAR(96) NOT NULL,
+                        content_sha256 CHAR(64) NOT NULL,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        INDEX idx_factory_workflow_job (job_id, block_index),
+                        CONSTRAINT fk_factory_workflow_artifact_block
                             FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
                     ) ENGINE=InnoDB
                     """
@@ -724,7 +786,7 @@ class GatewayStore:
             ),
         )
 
-    def record_factory_job(self, job: AgentFactoryJob) -> FactoryWriteReceipt:
+    def record_factory_job(self, job: FactoryJob) -> FactoryWriteReceipt:
         canonical = job.model_dump(mode="json", by_alias=True)
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
@@ -747,10 +809,233 @@ class GatewayStore:
                     data=canonical,
                     status="accepted",
                     parent_index=None,
-                    metadata={"schema": "captain.agent-factory-job.v1"},
+                    metadata={"schema": job.schema_name},
                 )
                 self._insert(cursor, block)
         return FactoryWriteReceipt(event_id=job.event_id, replayed=False)
+
+    def reserve_factory_budget(
+        self,
+        reservation: FactoryBudgetReservationV1,
+    ) -> FactoryBudgetReservationWriteReceipt:
+        canonical = reservation.model_dump(mode="json", by_alias=True)
+        digest = self._canonical_model_sha256(reservation)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                replay = self._factory_budget_event(cursor, reservation.reservation_id, for_update=True)
+                if replay is not None:
+                    if self._decode_json(replay["payload"]) != canonical:
+                        raise HTTPException(status_code=409, detail="budget reservation already exists with different content")
+                    return FactoryBudgetReservationWriteReceipt(
+                        event_id=reservation.reservation_id,
+                        job_id=reservation.job_id,
+                        replayed=True,
+                        reservation=reservation,
+                    )
+                job, job_block = self._factory_budget_job(cursor, reservation.job_id)
+                self._assert_budget_reservation(job, reservation)
+                self._assert_factory_effects_open(
+                    self._factory_projection(cursor, job), effect="paid effects"
+                )
+                projection = self._factory_budget_projection(cursor, job, for_update=True)
+                if reservation.requested_usd > projection.remaining_usd:
+                    raise HTTPException(status_code=409, detail="factory USD budget is exhausted")
+                self._insert_factory_budget_event(
+                    cursor,
+                    event_id=reservation.reservation_id,
+                    reservation_id=reservation.reservation_id,
+                    job_id=reservation.job_id,
+                    event_kind="reservation",
+                    digest=digest,
+                    payload=canonical,
+                    parent_index=job_block["index"],
+                    schema_name=reservation.schema_name,
+                )
+        return FactoryBudgetReservationWriteReceipt(
+            event_id=reservation.reservation_id,
+            job_id=reservation.job_id,
+            replayed=False,
+            reservation=reservation,
+        )
+
+    def record_factory_usage(
+        self,
+        submission: FactoryUsageSubmissionV2,
+    ) -> FactoryBudgetWriteReceipt:
+        receipt = submission.receipt
+        canonical = submission.model_dump(mode="json", by_alias=True)
+        digest, schema_name = self._factory_budget_payload_identity(submission)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                replay = self._factory_budget_event(cursor, receipt.receipt_id, for_update=True)
+                if replay is not None:
+                    if self._decode_json(replay["payload"]) != canonical:
+                        raise HTTPException(status_code=409, detail="factory usage receipt already exists with different content")
+                    return FactoryBudgetWriteReceipt(event_id=receipt.receipt_id, job_id=receipt.job_id, replayed=True)
+                job, job_block = self._factory_budget_job(cursor, receipt.job_id)
+                reservation = self._factory_reservation(cursor, receipt.reservation_id, for_update=True)
+                if reservation is None:
+                    raise HTTPException(status_code=409, detail="factory budget reservation not found")
+                self._assert_budget_usage(job, reservation, receipt)
+                self._assert_budget_usage_lease(
+                    cursor, job, submission
+                )
+                if self._reservation_is_closed(cursor, receipt.reservation_id):
+                    raise HTTPException(status_code=409, detail="factory budget reservation is no longer active")
+                projection = self._factory_budget_projection(cursor, job, for_update=True)
+                if receipt.cost_usd > reservation.requested_usd or receipt.cost_usd > projection.remaining_usd + reservation.requested_usd:
+                    raise HTTPException(status_code=409, detail="factory usage exceeds its reservation or job budget")
+                self._insert_factory_budget_event(
+                    cursor,
+                    event_id=receipt.receipt_id,
+                    reservation_id=receipt.reservation_id,
+                    job_id=receipt.job_id,
+                    event_kind="usage",
+                    digest=digest,
+                    payload=canonical,
+                    parent_index=job_block["index"],
+                    schema_name=schema_name,
+                )
+        return FactoryBudgetWriteReceipt(event_id=receipt.receipt_id, job_id=receipt.job_id, replayed=False)
+
+    def release_factory_budget(
+        self,
+        request: FactoryBudgetReleaseRequest,
+    ) -> FactoryBudgetWriteReceipt:
+        canonical = request.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                replay = self._factory_budget_event(cursor, request.release_id, for_update=True)
+                if replay is not None:
+                    if self._decode_json(replay["payload"]) != canonical:
+                        raise HTTPException(status_code=409, detail="factory budget release already exists with different content")
+                    return FactoryBudgetWriteReceipt(event_id=request.release_id, job_id=request.job_id, replayed=True)
+                job, job_block = self._factory_budget_job(cursor, request.job_id)
+                reservation = self._factory_reservation(cursor, request.reservation_id, for_update=True)
+                if reservation is None:
+                    raise HTTPException(status_code=409, detail="factory budget reservation not found")
+                if (
+                    request.job_id != reservation.job_id
+                    or request.correlation_id != reservation.correlation_id
+                    or request.subject_version != reservation.subject_version
+                    or request.attempt != reservation.attempt
+                    or request.released_at < reservation.reserved_at
+                ):
+                    raise HTTPException(status_code=409, detail="factory budget release binding mismatch")
+                if self._reservation_is_closed(cursor, request.reservation_id):
+                    raise HTTPException(status_code=409, detail="factory budget reservation is no longer active")
+                self._insert_factory_budget_event(
+                    cursor,
+                    event_id=request.release_id,
+                    reservation_id=request.reservation_id,
+                    job_id=request.job_id,
+                    event_kind="release",
+                    digest=hashlib.sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                    payload=canonical,
+                    parent_index=job_block["index"],
+                    schema_name=request.schema_name,
+                )
+        return FactoryBudgetWriteReceipt(event_id=request.release_id, job_id=request.job_id, replayed=False)
+
+    def factory_budget(self, job_id: UUID) -> FactoryBudgetProjection:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                job, _ = self._factory_budget_job(
+                    cursor, job_id, missing_status=404, for_update=False
+                )
+                return self._factory_budget_projection(cursor, job)
+
+    def record_factory_workflow_artifact(
+        self,
+        artifact: FactoryWorkflowArtifact,
+    ) -> FactoryWorkflowArtifactWriteReceipt:
+        canonical = artifact.model_dump(mode="json", by_alias=True)
+        digest = self._canonical_model_sha256(artifact)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT payload, content_sha256 FROM factory_workflow_artifacts WHERE invocation_id = %s FOR UPDATE",
+                    (str(artifact.invocation_id),),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    if self._decode_json(existing["payload"]) != canonical:
+                        raise HTTPException(status_code=409, detail="factory workflow invocation already exists with different content")
+                    return FactoryWorkflowArtifactWriteReceipt(invocation_id=artifact.invocation_id, content_sha256=digest, replayed=True)
+                job_block = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_factory_job", field="job_id", value=str(artifact.job_id), for_update=True
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job not found")
+                job = parse_factory_job(job_block["data"])
+                self._assert_workflow_artifact(job, artifact)
+                projection = self._factory_projection(cursor, job)
+                self._assert_factory_effects_open(
+                    projection,
+                    effect="workflow artifacts",
+                )
+                self._assert_released_skill(
+                    cursor, artifact.invocation.released_skill
+                )
+                prior_artifacts = self._factory_workflow_artifacts_for_job(
+                    cursor, artifact.job_id, for_update=True
+                )
+                self._assert_workflow_sequence(
+                    projection, artifact, prior_artifacts
+                )
+                lease_block = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_factory_lease", field="lease_id", value=artifact.invocation.lease.lease_id, for_update=True
+                )
+                if lease_block is None or FactoryLease.model_validate(lease_block["data"]) != artifact.invocation.lease:
+                    raise HTTPException(status_code=409, detail="missing matching factory workflow lease")
+                try:
+                    validate_factory_lease(
+                        artifact.invocation.lease,
+                        job=job,
+                        role=artifact.invocation.lease.role,
+                        attempt=artifact.attempt,
+                        now=artifact.occurred_at,
+                    )
+                except FactoryLeaseDenied as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                index = self._next_index(cursor)
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="factory_workflow_artifact",
+                    data=canonical,
+                    status="accepted",
+                    parent_index=job_block["index"],
+                    metadata={"schema": artifact.schema_name},
+                )
+                self._insert(cursor, block)
+                cursor.execute(
+                    """INSERT INTO factory_workflow_artifacts
+                       (invocation_id, job_id, correlation_id, subject_version, attempt,
+                        schema_name, content_sha256, block_index, payload)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        str(artifact.invocation_id), str(artifact.job_id), str(artifact.correlation_id),
+                        artifact.subject_version, artifact.attempt, artifact.schema_name, digest,
+                        index, json.dumps(canonical, sort_keys=True),
+                    ),
+                )
+        return FactoryWorkflowArtifactWriteReceipt(invocation_id=artifact.invocation_id, content_sha256=digest, replayed=False)
+
+    def factory_workflow_artifacts(
+        self,
+        job_id: UUID,
+    ) -> tuple[FactoryWorkflowArtifact, ...]:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                self._factory_budget_job(
+                    cursor,
+                    job_id,
+                    missing_status=404,
+                    require_v3=False,
+                    for_update=False,
+                )
+                return self._factory_workflow_artifacts_for_job(cursor, job_id)
 
     def record_released_factory_skill(
         self,
@@ -839,7 +1124,7 @@ class GatewayStore:
                 )
                 if job_block is None:
                     raise HTTPException(status_code=409, detail="factory job not found")
-                job = AgentFactoryJob.model_validate(job_block["data"])
+                job = parse_factory_job(job_block["data"])
                 self._assert_factory_evaluation_job(evidence, job)
                 lease_block = self._runtime_block_by_json_value(
                     cursor,
@@ -1010,7 +1295,7 @@ class GatewayStore:
                     self._decode_json(evaluation_row["payload"])
                 )
                 evaluation = self._stored_factory_evaluation(evaluation_submission)
-                job = AgentFactoryJob.model_validate(job_block["data"])
+                job = parse_factory_job(job_block["data"])
                 self._assert_factory_release_decision_recordable(
                     self._factory_projection(cursor, job)
                 )
@@ -1095,7 +1380,7 @@ class GatewayStore:
                 self._assert_publication_qualification(
                     publication,
                     submission,
-                    AgentFactoryJob.model_validate(job_block["data"]),
+                    parse_factory_job(job_block["data"]),
                 )
                 index = self._next_index(cursor)
                 block = self._new_block(
@@ -1149,7 +1434,7 @@ class GatewayStore:
                     if existing["data"] == canonical:
                         return FactoryWriteReceipt(event_id=evidence.event_id, replayed=True)
                     raise HTTPException(status_code=409, detail="factory event_id already exists with different content")
-                projection = self._factory_projection(cursor, AgentFactoryJob.model_validate(job_block["data"]))
+                projection = self._factory_projection(cursor, parse_factory_job(job_block["data"]))
                 lease = None
                 if evidence.lease_id is not None:
                     lease_block = self._runtime_block_by_json_value(
@@ -1211,7 +1496,7 @@ class GatewayStore:
                 )
                 if job_block is None:
                     raise HTTPException(status_code=404, detail="factory job not found")
-                job = AgentFactoryJob.model_validate(job_block["data"])
+                job = parse_factory_job(job_block["data"])
                 blocks = self._factory_blocks(cursor, job_id)
                 leases = self._factory_leases(cursor, job_id)
                 projection = FactoryProjection.from_job(job)
@@ -1243,7 +1528,7 @@ class GatewayStore:
                 )
                 if job_block is None:
                     raise HTTPException(status_code=409, detail="factory job not found")
-                job = AgentFactoryJob.model_validate(job_block["data"])
+                job = parse_factory_job(job_block["data"])
                 projection = self._factory_projection(cursor, job)
                 self._assert_lease_is_next_action(lease, projection)
                 try:
@@ -1266,7 +1551,7 @@ class GatewayStore:
                 self._insert(cursor, block)
         return FactoryWriteReceipt(event_id=job.event_id, replayed=False)
 
-    def _factory_projection(self, cursor: Any, job: AgentFactoryJob) -> FactoryProjection:
+    def _factory_projection(self, cursor: Any, job: FactoryJob) -> FactoryProjection:
         projection = FactoryProjection.from_job(job)
         for evidence in self._factory_blocks(cursor, job.job_id, for_update=True):
             evaluation = (
@@ -1286,6 +1571,391 @@ class GatewayStore:
                 release_decision=release_decision,
             )
         return projection
+
+    def _factory_budget_job(
+        self,
+        cursor: Any,
+        job_id: UUID,
+        *,
+        missing_status: int = 409,
+        require_v3: bool = True,
+        for_update: bool = True,
+    ) -> tuple[FactoryJob, dict[str, Any]]:
+        job_block = self._runtime_block_by_json_value(
+            cursor,
+            block_type="agent_factory_job",
+            field="job_id",
+            value=str(job_id),
+            for_update=for_update,
+        )
+        if job_block is None:
+            raise HTTPException(status_code=missing_status, detail="factory job not found")
+        try:
+            job = parse_factory_job(job_block["data"])
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=409, detail="stored factory job is invalid") from exc
+        if require_v3 and not isinstance(job, AgentFactoryJobV3):
+            raise HTTPException(status_code=409, detail="paid effects require a V3 factory job")
+        return job, job_block
+
+    @staticmethod
+    def _assert_budget_reservation(
+        job: FactoryJob,
+        reservation: FactoryBudgetReservationV1,
+    ) -> None:
+        if not isinstance(job, AgentFactoryJobV3):
+            raise HTTPException(status_code=409, detail="paid effects require a V3 factory job")
+        policy_digest = GatewayStore._factory_execution_policy_sha256(job)
+        if (
+            not job.execution_policy.live_execution
+            or reservation.job_id != job.job_id
+            or reservation.correlation_id != job.correlation_id
+            or reservation.subject_version != job.subject_version
+            or reservation.execution_policy_sha256 != policy_digest
+            or reservation.attempt > job.max_behavioral_iterations
+            or reservation.reserved_at < job.occurred_at
+            or reservation.reserved_at >= job.deadline_at
+            or reservation.expires_at != job.deadline_at
+        ):
+            raise HTTPException(status_code=409, detail="factory budget reservation does not match its V3 job policy")
+
+    @staticmethod
+    def _assert_budget_usage(
+        job: FactoryJob,
+        reservation: FactoryBudgetReservationV1,
+        receipt: FactoryUsageReceiptV1,
+    ) -> None:
+        if not isinstance(job, AgentFactoryJobV3):
+            raise HTTPException(status_code=409, detail="paid effects require a V3 factory job")
+        if (
+            receipt.reservation_id != reservation.reservation_id
+            or receipt.job_id != job.job_id
+            or receipt.correlation_id != job.correlation_id
+            or receipt.attempt != reservation.attempt
+        ):
+            raise HTTPException(status_code=409, detail="factory usage receipt binding mismatch")
+        if receipt.model not in job.execution_policy.allowed_models:
+            raise HTTPException(status_code=409, detail="factory usage receipt names an unapproved model")
+        if receipt.started_at < reservation.reserved_at or receipt.ended_at > reservation.expires_at:
+            raise HTTPException(status_code=409, detail="factory usage receipt is outside its reservation window")
+
+    def _assert_budget_usage_lease(
+        self,
+        cursor: Any,
+        job: FactoryJob,
+        submission: FactoryUsageSubmissionV2,
+    ) -> None:
+        receipt = submission.receipt
+        lease_block = self._runtime_block_by_json_value(
+            cursor,
+            block_type="agent_factory_lease",
+            field="lease_id",
+            value=submission.lease_id,
+            for_update=True,
+        )
+        if lease_block is None:
+            raise HTTPException(
+                status_code=409,
+                detail="factory usage requires a matching active lease",
+            )
+        lease = FactoryLease.model_validate(lease_block["data"])
+        if (
+            lease.role is not FactoryRole.REAL_CASE_TESTER
+            or "model.invoke" not in lease.capabilities
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="factory usage lease does not authorize the paid model effect",
+            )
+        if (
+            submission.subject_version != job.subject_version
+            or lease.lease_id != submission.lease_id
+            or lease.job_id != job.job_id
+            or lease.correlation_id != job.correlation_id
+            or lease.subject_version != submission.subject_version
+            or lease.attempt != receipt.attempt
+            or receipt.ended_at >= lease.expires_at
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="factory usage lease or subject binding mismatch",
+            )
+        try:
+            validate_factory_lease(
+                lease,
+                job=job,
+                role=lease.role,
+                attempt=receipt.attempt,
+                now=receipt.started_at,
+            )
+        except FactoryLeaseDenied as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @staticmethod
+    def _assert_workflow_artifact(
+        job: FactoryJob,
+        artifact: FactoryWorkflowArtifact,
+    ) -> None:
+        if (
+            artifact.job_id != job.job_id
+            or artifact.correlation_id != job.correlation_id
+            or artifact.subject_version != job.subject_version
+            or artifact.attempt > job.max_behavioral_iterations
+            or artifact.invocation.input_ref != job.input_ref
+            or artifact.acceptance_assertion_ids != job.acceptance_assertion_ids
+            or artifact.invocation.released_skill.capability
+            != job.required_capability
+        ):
+            raise HTTPException(status_code=409, detail="factory workflow artifact job binding mismatch")
+
+    @staticmethod
+    def _assert_workflow_sequence(
+        projection: FactoryProjection,
+        artifact: FactoryWorkflowArtifact,
+        prior_artifacts: tuple[FactoryWorkflowArtifact, ...],
+    ) -> None:
+        step = artifact.invocation.step
+        required_phase = {
+            FactorySkillStep.DISCOVER: {FactoryPhase.FORGE_REQUESTED},
+            FactorySkillStep.IMPROVE_TEAM: {FactoryPhase.IMPROVEMENT_REQUESTED},
+            FactorySkillStep.BRIEF_CODEX: {FactoryPhase.BLUEPRINT_CREATED},
+            FactorySkillStep.EXECUTE_TEAM: {FactoryPhase.BUILD_PASSED},
+            FactorySkillStep.EVALUATE_TEAM: {FactoryPhase.REAL_CASE_EVIDENCE},
+            FactorySkillStep.REPORT_CAPTAIN: {FactoryPhase.QUALITY_REVIEWED},
+        }[step]
+        if projection.phase not in required_phase:
+            raise HTTPException(
+                status_code=409,
+                detail="workflow artifact does not match the current factory phase",
+            )
+        if artifact.attempt != projection.attempt:
+            raise HTTPException(
+                status_code=409,
+                detail="workflow artifact attempt is not the current factory attempt",
+            )
+        if step is FactorySkillStep.IMPROVE_TEAM and artifact.attempt == 1:
+            raise HTTPException(
+                status_code=409,
+                detail="improve_team is allowed only on a later attempt",
+            )
+        if step is FactorySkillStep.IMPROVE_TEAM and not any(
+            isinstance(candidate, TeamEvaluationV1)
+            and candidate.attempt == artifact.attempt - 1
+            and candidate.failure_class is not None
+            and candidate.recommendation
+            == FactoryFeedbackRecommendation.RETRY_BUILD
+            for candidate in prior_artifacts
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="improve_team requires the prior attempt failed evaluation",
+            )
+        expected = (
+            (
+                FactorySkillStep.IMPROVE_TEAM,
+                FactorySkillStep.BRIEF_CODEX,
+                FactorySkillStep.EXECUTE_TEAM,
+                FactorySkillStep.EVALUATE_TEAM,
+                FactorySkillStep.REPORT_CAPTAIN,
+            )
+            if artifact.attempt > 1
+            else (
+                FactorySkillStep.DISCOVER,
+                FactorySkillStep.BRIEF_CODEX,
+                FactorySkillStep.EXECUTE_TEAM,
+                FactorySkillStep.EVALUATE_TEAM,
+                FactorySkillStep.REPORT_CAPTAIN,
+            )
+        )
+        prior_steps = tuple(
+            candidate.invocation.step
+            for candidate in prior_artifacts
+            if candidate.attempt == artifact.attempt
+        )
+        position = expected.index(step)
+        if prior_steps != expected[:position]:
+            raise HTTPException(
+                status_code=409,
+                detail="workflow artifact is missing its exact prior workflow artifact sequence",
+            )
+
+    def _factory_workflow_artifacts_for_job(
+        self,
+        cursor: Any,
+        job_id: UUID,
+        *,
+        for_update: bool = False,
+    ) -> tuple[FactoryWorkflowArtifact, ...]:
+        sql = (
+            "SELECT payload FROM factory_workflow_artifacts "
+            "WHERE job_id = %s ORDER BY block_index"
+        )
+        if for_update:
+            sql += " FOR UPDATE"
+        cursor.execute(sql, (str(job_id),))
+        return tuple(
+            parse_factory_workflow_artifact(self._decode_json(row["payload"]))
+            for row in cursor.fetchall()
+        )
+
+    @staticmethod
+    def _assert_factory_effects_open(
+        projection: FactoryProjection,
+        *,
+        effect: str,
+    ) -> None:
+        if projection.status in {
+            FactoryLifecycleStatus.READY_TO_USE,
+            FactoryLifecycleStatus.ESCALATED,
+        }:
+            raise HTTPException(
+                status_code=409,
+                detail=f"terminal factory job refuses new {effect}",
+            )
+
+    def _factory_budget_event(
+        self,
+        cursor: Any,
+        event_id: UUID,
+        *,
+        for_update: bool,
+    ) -> dict[str, Any] | None:
+        sql = "SELECT event_id, reservation_id, job_id, event_kind, content_sha256, payload FROM factory_budget_events WHERE event_id = %s"
+        if for_update:
+            sql += " FOR UPDATE"
+        cursor.execute(sql, (str(event_id),))
+        return cursor.fetchone()
+
+    def _factory_reservation(
+        self,
+        cursor: Any,
+        reservation_id: UUID,
+        *,
+        for_update: bool,
+    ) -> FactoryBudgetReservationV1 | None:
+        sql = "SELECT payload FROM factory_budget_events WHERE reservation_id = %s AND event_kind = 'reservation' ORDER BY block_index LIMIT 1"
+        if for_update:
+            sql += " FOR UPDATE"
+        cursor.execute(sql, (str(reservation_id),))
+        row = cursor.fetchone()
+        return (
+            FactoryBudgetReservationV1.model_validate(self._decode_json(row["payload"]))
+            if row is not None
+            else None
+        )
+
+    @staticmethod
+    def _reservation_is_closed(cursor: Any, reservation_id: UUID) -> bool:
+        cursor.execute(
+            "SELECT 1 FROM factory_budget_events WHERE reservation_id = %s AND event_kind IN ('usage', 'release') LIMIT 1 FOR UPDATE",
+            (str(reservation_id),),
+        )
+        return cursor.fetchone() is not None
+
+    def _factory_budget_projection(
+        self,
+        cursor: Any,
+        job: FactoryJob,
+        *,
+        for_update: bool = False,
+    ) -> FactoryBudgetProjection:
+        if not isinstance(job, AgentFactoryJobV3):
+            raise HTTPException(status_code=409, detail="paid effects require a V3 factory job")
+        sql = "SELECT event_kind, payload FROM factory_budget_events WHERE job_id = %s ORDER BY block_index"
+        if for_update:
+            sql += " FOR UPDATE"
+        cursor.execute(sql, (str(job.job_id),))
+        active: dict[UUID, Decimal] = {}
+        consumed = Decimal("0")
+        for row in cursor.fetchall():
+            payload = self._decode_json(row["payload"])
+            if row["event_kind"] == "reservation":
+                reservation = FactoryBudgetReservationV1.model_validate(payload)
+                active[reservation.reservation_id] = reservation.requested_usd
+            elif row["event_kind"] == "usage":
+                receipt = self._factory_usage_receipt(payload)
+                consumed += receipt.cost_usd
+                active.pop(receipt.reservation_id, None)
+            else:
+                active.pop(UUID(payload["reservation_id"]), None)
+        limit = job.execution_policy.max_cost_usd
+        reserved = sum(active.values(), start=Decimal("0"))
+        return FactoryBudgetProjection(
+            job_id=job.job_id,
+            limit_usd=limit,
+            consumed_usd=consumed,
+            reserved_usd=reserved,
+            remaining_usd=limit - consumed - reserved,
+            active_reservation_ids=tuple(active),
+        )
+
+    @staticmethod
+    def _factory_usage_receipt(payload: object) -> FactoryUsageReceiptV1:
+        decoded = GatewayStore._decode_json(payload)
+        if isinstance(decoded, dict) and decoded.get("schema") == (
+            "captain.factory-usage-submission.v2"
+        ):
+            return FactoryUsageSubmissionV2.model_validate(decoded).receipt
+        return FactoryUsageReceiptV1.model_validate(decoded)
+
+    @staticmethod
+    def _factory_budget_payload_identity(
+        payload: FactoryUsageSubmissionV2 | FactoryUsageReceiptV1,
+    ) -> tuple[str, str]:
+        return GatewayStore._canonical_model_sha256(payload), payload.schema_name
+
+    def _insert_factory_budget_event(
+        self,
+        cursor: Any,
+        *,
+        event_id: UUID,
+        reservation_id: UUID,
+        job_id: UUID,
+        event_kind: str,
+        digest: str,
+        payload: dict[str, Any],
+        parent_index: int,
+        schema_name: str,
+    ) -> None:
+        index = self._next_index(cursor)
+        block = self._new_block(
+            cursor,
+            index=index,
+            block_type="factory_budget_event",
+            data=payload,
+            status="accepted",
+            parent_index=parent_index,
+            metadata={"schema": schema_name, "event_kind": event_kind},
+        )
+        self._insert(cursor, block)
+        cursor.execute(
+            """INSERT INTO factory_budget_events
+               (event_id, reservation_id, job_id, event_kind, content_sha256, block_index, payload)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            (
+                str(event_id), str(reservation_id), str(job_id), event_kind, digest,
+                index, json.dumps(payload, sort_keys=True),
+            ),
+        )
+
+    @staticmethod
+    def _factory_execution_policy_sha256(job: AgentFactoryJobV3) -> str:
+        payload = job.execution_policy.model_dump(mode="json", by_alias=True)
+        rendered = format(job.execution_policy.max_cost_usd, "f")
+        payload["max_cost_usd"] = (
+            "0"
+            if job.execution_policy.max_cost_usd == 0
+            else rendered.rstrip("0").rstrip(".")
+            if "." in rendered
+            else rendered
+        )
+        content = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(content).hexdigest()
 
     def _factory_blocks(
         self, cursor: Any, job_id: UUID, *, for_update: bool = False
@@ -1462,7 +2132,7 @@ class GatewayStore:
     @staticmethod
     def _assert_factory_evaluation_job(
         evidence: HermesSkillEvaluationEvidence,
-        job: AgentFactoryJob,
+        job: FactoryJob,
     ) -> None:
         request = evidence.request
         if request.released_skill.capability != job.required_capability:
@@ -1563,7 +2233,7 @@ class GatewayStore:
     def _assert_publication_qualification(
         publication: PublishedHermesSkill,
         submission: FactorySkillEvaluationSubmission,
-        job: AgentFactoryJob,
+        job: FactoryJob,
     ) -> None:
         evidence = submission.evidence
         GatewayStore._assert_factory_evaluation_job(evidence, job)
@@ -1591,7 +2261,7 @@ class GatewayStore:
 
     @staticmethod
     def _assert_factory_release_decision(
-        job: AgentFactoryJob,
+        job: FactoryJob,
         evaluation: StoredSkillEvaluation,
         evidence: tuple[E2ERunEvidence, ...],
         decision: FactoryReleaseDecision,
