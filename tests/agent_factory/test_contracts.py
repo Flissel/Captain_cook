@@ -13,6 +13,7 @@ from agenten.agent_runtime.contracts import CapabilityProfile
 from agenten.agent_factory.contracts import (
     AgentFactoryJob,
     AgentFactoryJobV2,
+    AgentFactoryJobV3,
     FactoryBlockStatus,
     FactoryEvidenceBlock,
     FactoryPhase,
@@ -118,6 +119,42 @@ def test_factory_job_v1_remains_readable_and_v2_fixture_is_strict() -> None:
     with pytest.raises(ValidationError, match="UTC"):
         AgentFactoryJob.model_validate(
             {**job_payload(), "occurred_at": datetime(2026, 7, 19, 10)}
+        )
+
+
+def test_factory_job_v3_is_additive_strict_and_preserves_older_parsing() -> None:
+    fixture = Path(__file__).parents[1] / "fixtures" / "agent_factory" / "agent_factory_job.v2.json"
+    v2_payload = json.loads(fixture.read_text(encoding="utf-8"))
+    v3_payload = v2_payload | {
+        "schema": "captain.agent-factory-job.v3",
+        "execution_policy": {
+            "schema": "captain.factory-execution-policy.v1",
+            "mode": "release",
+            "live_execution": True,
+            "max_cost_usd": "5.00",
+            "max_runtime_seconds": 900,
+            "required_live_runs": 3,
+            "allowed_models": ["approved-model-id"],
+            "live_capabilities": ["model.invoke", "docker.run"],
+            "sandbox_mode": "workspace_write",
+        },
+    }
+
+    assert isinstance(parse_factory_job(job_payload()), AgentFactoryJob)
+    assert isinstance(parse_factory_job(v2_payload), AgentFactoryJobV2)
+    parsed = parse_factory_job(v3_payload)
+    assert isinstance(parsed, AgentFactoryJobV3)
+    assert parsed.max_behavioral_iterations == 5
+
+    with pytest.raises(ValidationError):
+        AgentFactoryJobV3.model_validate(v3_payload | {"unexpected": True})
+    with pytest.raises((TypeError, ValidationError)):
+        AgentFactoryJobV3.model_validate(
+            v3_payload
+            | {
+                "execution_policy": v3_payload["execution_policy"]
+                | {"max_cost_usd": 5.0}
+            }
         )
 
 

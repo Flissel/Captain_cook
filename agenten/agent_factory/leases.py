@@ -6,7 +6,12 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
-from agenten.agent_factory.contracts import AgentFactoryJob, FactoryLease, FactoryRole
+from agenten.agent_factory.contracts import (
+    AgentFactoryJobV3,
+    FactoryJob,
+    FactoryLease,
+    FactoryRole,
+)
 from agenten.agent_runtime.capabilities import PROFILE_CAPABILITIES
 from agenten.agent_runtime.contracts import CapabilityProfile
 from agenten.agent_runtime.contracts import IntegrationIntent
@@ -27,13 +32,15 @@ class FactoryLeaseDenied(RuntimeError):
 
 
 class FactoryLeasePort(Protocol):
-    def active(self, job: AgentFactoryJob, role: FactoryRole, attempt: int, now: datetime) -> FactoryLease:
+    def active(
+        self, job: FactoryJob, role: FactoryRole, attempt: int, now: datetime
+    ) -> FactoryLease:
         """Return an exact, unexpired lease or raise FactoryLeaseDenied."""
 
 
 def issue_factory_lease(
     *,
-    job: AgentFactoryJob,
+    job: FactoryJob,
     role: FactoryRole,
     attempt: int,
     workspace_ref: str,
@@ -56,7 +63,7 @@ def issue_factory_lease(
         role=role,
         capability_profile=profile,
         integration_intent=integration_intent,
-        capabilities=tuple(sorted(PROFILE_CAPABILITIES[profile])),
+        capabilities=tuple(sorted(expected_factory_capabilities(job, role, profile))),
         workspace_ref=workspace_ref,
         issued_at=issued_at,
         expires_at=issued_at + FACTORY_LEASE_DURATION,
@@ -66,7 +73,7 @@ def issue_factory_lease(
 def validate_factory_lease(
     lease: FactoryLease,
     *,
-    job: AgentFactoryJob,
+    job: FactoryJob,
     role: FactoryRole,
     attempt: int,
     now: datetime,
@@ -80,10 +87,23 @@ def validate_factory_lease(
         raise FactoryLeaseDenied("factory lease belongs to a different role")
     if lease.issued_at > checked_at or lease.expires_at <= checked_at:
         raise FactoryLeaseDenied("factory lease is not active")
-    expected = PROFILE_CAPABILITIES[lease.capability_profile]
+    expected = expected_factory_capabilities(job, role, lease.capability_profile)
     if frozenset(lease.capabilities) != expected:
         raise FactoryLeaseDenied("factory lease capabilities do not match role profile")
     return lease
+
+
+def expected_factory_capabilities(
+    job: FactoryJob,
+    role: FactoryRole,
+    profile: CapabilityProfile,
+) -> frozenset[str]:
+    expected = set(PROFILE_CAPABILITIES[profile])
+    if isinstance(job, AgentFactoryJobV3) and role is FactoryRole.REAL_CASE_TESTER:
+        expected.update(
+            capability.value for capability in job.execution_policy.live_capabilities
+        )
+    return frozenset(expected)
 
 
 def _require_utc(value: datetime) -> datetime:

@@ -9,13 +9,14 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from agenten.agent_factory.execution_policy import FactoryExecutionPolicyV1
+from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_runtime.contracts import (
     ArtifactRef,
     CapabilityProfile,
     IDENTIFIER_PATTERN,
     IntegrationIntent,
 )
-from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 
 
 class _FrozenContract(BaseModel):
@@ -135,18 +136,30 @@ class AgentFactoryJobV2(_FrozenContract):
         return self
 
 
-FactoryJob = AgentFactoryJob | AgentFactoryJobV2
+class AgentFactoryJobV3(AgentFactoryJobV2):
+    schema_name: Literal["captain.agent-factory-job.v3"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    execution_policy: FactoryExecutionPolicyV1
+
+
+FactoryJob = AgentFactoryJob | AgentFactoryJobV2 | AgentFactoryJobV3
 
 
 def parse_factory_job(value: Any) -> FactoryJob:
     if not isinstance(value, dict):
         raise ValueError("factory job payload must be an object")
     schema = value.get("schema", value.get("schema_name"))
-    if schema == "captain.agent-factory-job.v1":
-        return AgentFactoryJob.model_validate(value)
-    if schema == "captain.agent-factory-job.v2":
-        return AgentFactoryJobV2.model_validate(value)
-    raise ValueError("unsupported factory job schema")
+    models = {
+        "captain.agent-factory-job.v1": AgentFactoryJob,
+        "captain.agent-factory-job.v2": AgentFactoryJobV2,
+        "captain.agent-factory-job.v3": AgentFactoryJobV3,
+    }
+    try:
+        model = models[schema]
+    except KeyError as exc:
+        raise ValueError("unsupported factory job schema") from exc
+    return model.model_validate(value)
 
 
 class FactoryLease(_FrozenContract):
