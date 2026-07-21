@@ -225,6 +225,7 @@ def test_production_builder_needs_no_manual_dependency_injection(
 ) -> None:
     job = workflow_job(mode="demo")
     monkeypatch.setenv("CAPTAIN_FACTORY_ARTIFACT_ROOT", str(tmp_path / "factory-cas"))
+    monkeypatch.delenv("CAPTAIN_RUNTIME_ARTIFACT_ROOT", raising=False)
     composition = SimpleNamespace(
         job=job,
         repository=Catalog(),
