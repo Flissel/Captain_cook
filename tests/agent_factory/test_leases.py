@@ -143,7 +143,7 @@ def test_v3_real_case_tester_receives_exact_explicit_live_capabilities() -> None
     ) == lease
 
 
-def test_v3_offline_and_non_tester_roles_receive_no_live_capabilities() -> None:
+def test_v3_live_hermes_roles_receive_only_model_invoke_live_capability() -> None:
     live_job = v3_job(live=True)
     offline_lease = issue_factory_lease(
         job=v3_job(live=False),
@@ -168,6 +168,13 @@ def test_v3_offline_and_non_tester_roles_receive_no_live_capabilities() -> None:
         "computer.use",
     ):
         assert capability not in offline_lease.capabilities
+    assert "model.invoke" in tool_lease.capabilities
+    for capability in (
+        "docker.run",
+        "database.captain_test",
+        "browser.use",
+        "computer.use",
+    ):
         assert capability not in tool_lease.capabilities
 
 

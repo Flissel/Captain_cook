@@ -120,10 +120,15 @@ def expected_factory_capabilities(
     profile: CapabilityProfile,
 ) -> frozenset[str]:
     expected = set(PROFILE_CAPABILITIES[profile])
-    if isinstance(job, AgentFactoryJobV3) and role is FactoryRole.REAL_CASE_TESTER:
-        expected.update(
+    if isinstance(job, AgentFactoryJobV3) and job.execution_policy.live_execution:
+        if "model.invoke" in {
             capability.value for capability in job.execution_policy.live_capabilities
-        )
+        }:
+            expected.add("model.invoke")
+        if role is FactoryRole.REAL_CASE_TESTER:
+            expected.update(
+                capability.value for capability in job.execution_policy.live_capabilities
+            )
     return frozenset(expected)
 
 

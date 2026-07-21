@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from asyncio import Lock
 from typing import Protocol
 from uuid import UUID
 
@@ -49,6 +50,40 @@ FactoryWorkflowArtifact = (
     | CandidateRevisionV1
     | FactoryFeedbackV1
 )
+
+
+class FactoryWorkflowArtifactSink(Protocol):
+    """Idempotently persist a typed Hermes artifact before lifecycle evidence."""
+
+    async def persist(self, artifact: FactoryWorkflowArtifact) -> bool:
+        """Return true for a new write and false for an identical replay."""
+
+
+@dataclass
+class InMemoryFactoryWorkflowArtifactSink:
+    """Deterministic idempotent sink used only by offline tests."""
+
+    _by_invocation: dict[UUID, FactoryWorkflowArtifact] = field(default_factory=dict)
+    _lock: Lock = field(default_factory=Lock)
+
+    async def persist(self, artifact: FactoryWorkflowArtifact) -> bool:
+        async with self._lock:
+            existing = self._by_invocation.get(artifact.invocation_id)
+            if existing is not None:
+                if existing != artifact:
+                    raise FactoryRepositoryError(
+                        "workflow invocation already exists with different content"
+                    )
+                return False
+            self._by_invocation[artifact.invocation_id] = artifact
+            return True
+
+    def artifacts(self, job_id: UUID) -> tuple[FactoryWorkflowArtifact, ...]:
+        return tuple(
+            artifact
+            for artifact in self._by_invocation.values()
+            if artifact.job_id == job_id
+        )
 
 
 class FactoryRepository(Protocol):

@@ -31,7 +31,10 @@ from gateway.contracts import FactoryBudgetReservationWriteReceipt
 from gateway.contracts import FactoryUsageSubmissionV2
 from gateway.app import create_app
 from gateway.auth import GatewayRole, require_actor
-from gateway.factory_repository import GatewayFactoryBudgetLedger
+from gateway.factory_repository import (
+    GatewayFactoryBudgetLedger,
+    GatewayFactoryWorkflowArtifactSink,
+)
 from gateway.settings import GatewaySettings
 from gateway.store import GatewayStore
 from blockchain.mariadb_storage import MariaDBStorage
@@ -94,6 +97,7 @@ class BudgetStore:
             subject_version=request.subject_version,
             execution_policy_sha256=request.execution_policy_sha256,
             attempt=request.attempt,
+            invocation_id=request.invocation_id,
             requested_usd=request.requested_usd,
             reserved_at=request.reserved_at,
             expires_at=request.expires_at,
@@ -283,18 +287,53 @@ def test_gateway_usage_submission_requires_exact_active_ledger_lease(job_v3) -> 
     store._assert_budget_usage_lease(
         Cursor(budget_store.lease), job_v3, submission
     )
-    wrong_effect_lease = issue_factory_lease(
+    architect_lease = issue_factory_lease(
         job=job_v3,
         role=FactoryRole.AGENT_ARCHITECT,
         attempt=2,
         workspace_ref="workspace://factory/budget-test",
         now=job_v3.occurred_at,
     )
+    architect_submission = submission.model_copy(
+        update={
+            "lease_id": architect_lease.lease_id,
+            "receipt": submission.receipt.model_copy(
+                update={"lease_id": architect_lease.lease_id}
+            ),
+        }
+    )
+    store._assert_budget_usage_lease(
+        Cursor(architect_lease),
+        job_v3,
+        architect_submission,
+    )
+    wrong_effect_lease = architect_lease.model_copy(
+        update={
+            "capabilities": tuple(
+                capability
+                for capability in architect_lease.capabilities
+                if capability != "model.invoke"
+            )
+        }
+    )
     with pytest.raises(HTTPException, match="paid model effect"):
         store._assert_budget_usage_lease(
             Cursor(wrong_effect_lease),
             job_v3,
             submission.model_copy(update={"lease_id": wrong_effect_lease.lease_id}),
+        )
+    mismatched_receipt_lease = architect_submission.model_copy(
+        update={
+            "receipt": architect_submission.receipt.model_copy(
+                update={"lease_id": budget_store.lease.lease_id}
+            )
+        }
+    )
+    with pytest.raises(HTTPException, match="subject binding"):
+        store._assert_budget_usage_lease(
+            Cursor(architect_lease),
+            job_v3,
+            mismatched_receipt_lease,
         )
     with pytest.raises(HTTPException, match="subject binding"):
         store._assert_budget_usage_lease(
@@ -311,6 +350,56 @@ def test_gateway_usage_submission_requires_exact_active_ledger_lease(job_v3) -> 
     assert GatewayStore._factory_usage_receipt(
         submission.model_dump(mode="json", by_alias=True)
     ) == submission.receipt
+
+
+def test_gateway_usage_rejects_receipt_for_another_reserved_invocation(job_v3) -> None:
+    reservation = GatewayFactoryBudgetLedger(BudgetStore(job_v3)).reserve(
+        job_v3,
+        attempt=1,
+        requested_usd=Decimal("1.00"),
+        now=NOW,
+        invocation_id=UUID("10000000-0000-0000-0000-000000000001"),
+    )
+    receipt = FactoryUsageReceiptV1.model_validate(
+        usage_payload(reservation)
+    ).model_copy(
+        update={"invocation_id": UUID("10000000-0000-0000-0000-000000000002")}
+    )
+
+    with pytest.raises(HTTPException, match="binding mismatch"):
+        GatewayStore._assert_budget_usage(job_v3, reservation, receipt)
+
+
+def test_gateway_budget_replays_accept_historical_payloads_without_new_null_fields(
+    job_v3,
+) -> None:
+    budget_store = BudgetStore(job_v3)
+    reservation = GatewayFactoryBudgetLedger(budget_store).reserve(
+        job_v3,
+        attempt=2,
+        requested_usd=Decimal("1.00"),
+        now=NOW,
+    )
+    historical_reservation = reservation.model_dump(mode="json", by_alias=True)
+    historical_reservation.pop("invocation_id")
+    receipt = FactoryUsageReceiptV1.model_validate(usage_payload(reservation))
+    submission = FactoryUsageSubmissionV2(
+        subject_version=job_v3.subject_version,
+        lease_id=budget_store.lease.lease_id,
+        receipt=receipt,
+    )
+    historical_submission = submission.model_dump(mode="json", by_alias=True)
+    historical_submission["receipt"].pop("lease_id")
+    historical_submission["receipt"].pop("invocation_id")
+
+    assert GatewayStore._factory_budget_replay_matches(
+        historical_reservation,
+        reservation,
+    )
+    assert GatewayStore._factory_budget_replay_matches(
+        historical_submission,
+        submission,
+    )
 
 
 def test_gateway_budget_adapter_translates_http_conflicts_to_budget_domain_error(
@@ -597,31 +686,65 @@ def test_mariadb_budget_refuses_a_missing_job(job_v3) -> None:
         storage.clear()
 
 
-def test_mariadb_workflow_artifact_is_append_only_and_restart_readable(
+@pytest.mark.asyncio
+async def test_mariadb_workflow_artifact_is_append_only_and_restart_readable(
     mariadb_store: GatewayStore,
     job_v3,
 ) -> None:
-    artifact = CodebaseInventoryV1.model_validate(inventory_payload())
-    factory_job = job_v3.model_copy(
-        update={
-            "job_id": artifact.job_id,
-            "correlation_id": artifact.correlation_id,
+    artifact_payload = inventory_payload()
+    invocation_payload = artifact_payload["invocation"]
+    assert isinstance(invocation_payload, dict)
+    input_digest = "a" * 64
+    invocation_payload["input_ref"] = {
+        "uri": f"artifact://factory-input/{input_digest}",
+        "sha256": input_digest,
+        "media_type": "application/json",
+    }
+    artifact = CodebaseInventoryV1.model_validate(artifact_payload)
+
+    factory_job_payload = job_v3.model_dump(mode="json", by_alias=True)
+    factory_job_payload.update(
+        {
+            "job_id": str(artifact.job_id),
+            "correlation_id": str(artifact.correlation_id),
             "subject_version": artifact.subject_version,
-            "occurred_at": artifact.invocation.lease.issued_at,
-            "deadline_at": artifact.invocation.lease.expires_at + timedelta(minutes=5),
-            "input_ref": artifact.invocation.input_ref,
-            "acceptance_assertion_ids": artifact.acceptance_assertion_ids,
+            "occurred_at": artifact.invocation.lease.issued_at.isoformat(),
+            "deadline_at": (
+                artifact.invocation.lease.issued_at
+                + timedelta(
+                    seconds=job_v3.execution_policy.max_runtime_seconds
+                )
+            ).isoformat(),
+            "input_ref": artifact.invocation.input_ref.model_dump(mode="json"),
+            "acceptance_assertion_ids": list(
+                artifact.acceptance_assertion_ids
+            ),
             "required_capability": artifact.invocation.released_skill.capability,
         }
     )
-    forge = block(FactoryPhase.FORGE_REQUESTED).model_copy(
-        update={
-            "job_id": factory_job.job_id,
-            "correlation_id": factory_job.correlation_id,
+    factory_job = type(job_v3).model_validate(factory_job_payload)
+    invocation_payload["lease"] = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.AGENT_ARCHITECT,
+        attempt=1,
+        workspace_ref=artifact.invocation.lease.workspace_ref,
+        now=factory_job.occurred_at,
+    ).model_dump(mode="json", by_alias=True)
+    artifact = CodebaseInventoryV1.model_validate(artifact_payload)
+
+    forge_payload = block(FactoryPhase.FORGE_REQUESTED).model_dump(
+        mode="json",
+        by_alias=True,
+    )
+    forge_payload.update(
+        {
+            "job_id": str(factory_job.job_id),
+            "correlation_id": str(factory_job.correlation_id),
             "subject_version": factory_job.subject_version,
-            "occurred_at": factory_job.occurred_at,
+            "occurred_at": factory_job.occurred_at.isoformat(),
         }
     )
+    forge = type(block(FactoryPhase.FORGE_REQUESTED)).model_validate(forge_payload)
     mariadb_store.record_factory_job(factory_job)
     mariadb_store.record_factory_block(forge)
     mariadb_store.record_factory_lease(artifact.invocation.lease)
@@ -645,59 +768,99 @@ def test_mariadb_workflow_artifact_is_append_only_and_restart_readable(
     assignment_write = mariadb_store.record_factory_skill_assignment(assignment)
     assignment_replay = mariadb_store.record_factory_skill_assignment(assignment)
 
-    alternate_skill = artifact.invocation.released_skill.model_copy(
-        update={
+    alternate_skill_payload = artifact.invocation.released_skill.model_dump(
+        mode="json",
+        by_alias=True,
+    )
+    alternate_content_ref = dict(alternate_skill_payload["content_ref"])
+    alternate_content_ref["sha256"] = "e" * 64
+    alternate_skill_payload.update(
+        {
             "version": 2,
-            "content_ref": artifact.invocation.released_skill.content_ref.model_copy(
-                update={"sha256": "e" * 64}
-            ),
+            "content_ref": alternate_content_ref,
             "content_sha256": "e" * 64,
         }
     )
+    alternate_skill = type(artifact.invocation.released_skill).model_validate(
+        alternate_skill_payload
+    )
     mariadb_store.record_released_factory_skill(alternate_skill)
-    alternate_assignment = assignment.model_copy(
-        update={"released_skill": alternate_skill}
+    alternate_assignment_payload = assignment.model_dump(
+        mode="json",
+        by_alias=True,
+    )
+    alternate_assignment_payload["released_skill"] = alternate_skill.model_dump(
+        mode="json",
+        by_alias=True,
+    )
+    alternate_assignment = type(assignment).model_validate(
+        alternate_assignment_payload
     )
     with pytest.raises(HTTPException, match="different content"):
         mariadb_store.record_factory_skill_assignment(alternate_assignment)
-    alternate_artifact = artifact.model_copy(
-        update={
-            "invocation": artifact.invocation.model_copy(
-                update={"released_skill": alternate_skill}
-            )
-        }
+
+    alternate_artifact_payload = artifact.model_dump(mode="json", by_alias=True)
+    alternate_invocation_payload = dict(alternate_artifact_payload["invocation"])
+    alternate_invocation_payload["released_skill"] = alternate_skill.model_dump(
+        mode="json",
+        by_alias=True,
+    )
+    alternate_artifact_payload["invocation"] = alternate_invocation_payload
+    alternate_artifact = CodebaseInventoryV1.model_validate(
+        alternate_artifact_payload
     )
     with pytest.raises(HTTPException, match="skill assignment"):
         mariadb_store.record_factory_workflow_artifact(alternate_artifact)
 
-    fabricated_skill = artifact.invocation.released_skill.model_copy(
-        update={"content_sha256": "f" * 64}
-    )
-    fabricated_invocation = artifact.invocation.model_copy(
-        update={
-            "invocation_id": UUID("00000000-0000-0000-0000-000000000399"),
-            "released_skill": fabricated_skill,
+    fabricated_skill_payload = dict(alternate_skill_payload)
+    fabricated_content_ref = dict(fabricated_skill_payload["content_ref"])
+    fabricated_content_ref["sha256"] = "f" * 64
+    fabricated_skill_payload.update(
+        {
+            "version": 3,
+            "content_ref": fabricated_content_ref,
+            "content_sha256": "f" * 64,
         }
     )
-    fabricated = artifact.model_copy(
-        update={
-            "invocation": fabricated_invocation,
-            "invocation_id": fabricated_invocation.invocation_id,
+    fabricated_skill = type(artifact.invocation.released_skill).model_validate(
+        fabricated_skill_payload
+    )
+    fabricated_artifact_payload = artifact.model_dump(mode="json", by_alias=True)
+    fabricated_invocation_payload = dict(fabricated_artifact_payload["invocation"])
+    fabricated_invocation_payload.update(
+        {
+            "invocation_id": "00000000-0000-0000-0000-000000000399",
+            "released_skill": fabricated_skill.model_dump(
+                mode="json",
+                by_alias=True,
+            ),
         }
     )
+    fabricated_artifact_payload.update(
+        {
+            "invocation": fabricated_invocation_payload,
+            "invocation_id": "00000000-0000-0000-0000-000000000399",
+        }
+    )
+    fabricated = CodebaseInventoryV1.model_validate(fabricated_artifact_payload)
     with pytest.raises(HTTPException, match="unknown released skill"):
         mariadb_store.record_factory_workflow_artifact(fabricated)
 
-    first = mariadb_store.record_factory_workflow_artifact(artifact)
-    replay = mariadb_store.record_factory_workflow_artifact(artifact)
+    sink = GatewayFactoryWorkflowArtifactSink(mariadb_store)
+    first = await sink.persist(artifact)
+    replay = await sink.persist(artifact)
+    conflicting_payload = artifact.model_dump(mode="json", by_alias=True)
+    conflicting_payload["autogen_version"] = "0.7.6"
+    conflicting = CodebaseInventoryV1.model_validate(conflicting_payload)
     with pytest.raises(HTTPException, match="different content"):
-        mariadb_store.record_factory_workflow_artifact(
-            artifact.model_copy(update={"autogen_version": "0.7.6"})
-        )
+        mariadb_store.record_factory_workflow_artifact(conflicting)
 
     restarted = GatewayStore(mariadb_store.storage)
-    assert first.replayed is False
-    assert replay.replayed is True
+    restarted_sink = GatewayFactoryWorkflowArtifactSink(restarted)
+    restarted_replay = await restarted_sink.persist(artifact)
+    assert first is True
+    assert replay is False
+    assert restarted_replay is False
     assert assignment_write.replayed is False
     assert assignment_replay.replayed is True
     assert restarted.factory_skill_assignment(

@@ -147,6 +147,49 @@ async def test_dispatches_candidate_build_validator_after_agent_code_evidence() 
     assert hermes.requests == []
 
 
+@pytest.mark.asyncio
+async def test_quality_warden_uses_hermes_even_when_candidate_validator_exists() -> None:
+    factory_job = job()
+
+    class Coordinator:
+        def __init__(self) -> None:
+            self.recorded = []
+
+        def next_action(self, _job_id):
+            from agenten.agent_factory.state_machine import FactoryAction
+
+            return FactoryAction(
+                kind=FactoryActionKind.DISPATCH_QUALITY_WARDEN,
+                attempt=1,
+                job_id=factory_job.job_id,
+            )
+
+        def projection(self, _job_id):
+            from types import SimpleNamespace
+
+            return SimpleNamespace(job=factory_job)
+
+        def record(self, evidence):
+            self.recorded.append(evidence)
+
+    class QualityHermes(Hermes):
+        async def dispatch(self, request: object):
+            self.requests.append(request)
+            return block(FactoryPhase.QUALITY_REVIEWED)
+
+    coordinator = Coordinator()
+    hermes, forge, validator = QualityHermes(), Forge(), CandidateValidator()
+
+    action = await dispatcher(coordinator, hermes, forge, validator).dispatch_next(
+        factory_job.job_id
+    )
+
+    assert action.kind is FactoryActionKind.DISPATCH_QUALITY_WARDEN
+    assert hermes.requests[0].role is FactoryRole.QUALITY_WARDEN
+    assert validator.requests == []
+    assert coordinator.recorded[0].phase is FactoryPhase.QUALITY_REVIEWED
+
+
 def _retry_authorization(factory_job) -> FactoryImprovementAuthorizationV1:
     evaluation_data = evaluation_payload(
         failure_class="behavioral_failure",
