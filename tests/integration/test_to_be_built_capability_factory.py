@@ -31,7 +31,6 @@ from agenten.agent_factory.capability_factory_entrypoint import (
     DockerCommandResult,
     FileCapabilityFactoryCheckpointStore,
     InMemoryCapabilityFactoryCheckpointStore,
-    ProviderEffectReceipt,
     parse_capability_factory_args,
     run_capability_factory_cli,
     write_redacted_evidence_manifest,
@@ -71,6 +70,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeResult,
     ArtifactRef,
     CapabilityGrant,
+    ProviderEffectReceipt,
 )
 from agenten.delivery.projector import MinibookProjector
 from agenten.delivery.projection_cursor import ProjectionCursorStore
@@ -83,6 +83,8 @@ from gateway.contracts import (
     FactoryReleaseDecisionSubmission,
     RuntimeExecutionClaim,
     RuntimeExecutionClaimReceipt,
+    RuntimeResultRecoveryObservation,
+    RuntimeResultRecoveryRequest,
     RuntimeOperationProjection,
     canonical_contract_sha256,
 )
@@ -639,7 +641,13 @@ class ScriptedGatewayStore:
     runtime_commands: dict[UUID, AgentRuntimeCommand] = field(default_factory=dict)
     runtime_grants: dict[UUID, CapabilityGrant] = field(default_factory=dict)
     runtime_claims: dict[UUID, RuntimeExecutionClaim] = field(default_factory=dict)
+    runtime_claim_history: dict[tuple[UUID, int], RuntimeExecutionClaim] = field(
+        default_factory=dict
+    )
     runtime_results: dict[UUID, AgentRuntimeResult] = field(default_factory=dict)
+    runtime_recoveries: dict[UUID, RuntimeResultRecoveryObservation] = field(
+        default_factory=dict
+    )
     executions: dict[UUID, CapabilityExecutionRecord] = field(default_factory=dict)
     projection_events_by_correlation: dict[UUID, list[object]] = field(default_factory=dict)
     release_effects: list[UUID] = field(default_factory=list)
@@ -824,6 +832,7 @@ class ScriptedGatewayStore:
             status="active",
         )
         self.runtime_claims[command_id] = claim
+        self.runtime_claim_history[(command_id, fencing_token)] = claim
         self.runtime_authority_order.append("claim")
         if self.crash_after_claim_once and not self._crashed_after_claim:
             self._crashed_after_claim = True
@@ -862,6 +871,43 @@ class ScriptedGatewayStore:
             raise SimulatedProcessCrash("after runtime result")
         return SimpleNamespace(replayed=existing is not None)
 
+    def recover_runtime_result(
+        self,
+        request: RuntimeResultRecoveryRequest,
+        *,
+        execution_owner_id: str,
+        execution_fencing_token: int,
+        execution_claim_credential: str,
+    ) -> object:
+        observation = request.observation
+        claim = self.runtime_claims[observation.command_id]
+        original_claim = self.runtime_claim_history[
+            (observation.command_id, observation.original_claim_fence)
+        ]
+        assert execution_owner_id == claim.owner_id
+        assert execution_fencing_token == claim.fencing_token
+        assert execution_claim_credential == "deterministic-runtime-claim-credential"
+        assert observation.recovery_claim_fence == claim.fencing_token
+        assert claim.claimed_at <= observation.observed_at < claim.expires_at
+        assert (
+            original_claim.claimed_at
+            <= request.result.occurred_at
+            < original_claim.expires_at
+        )
+        existing_result = self.runtime_results.get(observation.command_id)
+        existing_observation = self.runtime_recoveries.get(observation.command_id)
+        if existing_result is not None or existing_observation is not None:
+            if existing_result != request.result or existing_observation != observation:
+                raise AssertionError("changed runtime result recovery replay")
+            return SimpleNamespace(replayed=True)
+        self.runtime_results[observation.command_id] = request.result
+        self.runtime_recoveries[observation.command_id] = observation
+        self.runtime_claims[observation.command_id] = claim.model_copy(
+            update={"status": "completed", "completed_at": observation.observed_at}
+        )
+        self.runtime_authority_order.extend(("result", "result-recovery"))
+        return SimpleNamespace(replayed=False)
+
     def runtime_operation(self, operation_id: UUID) -> RuntimeOperationProjection:
         return RuntimeOperationProjection(
             operation_id=operation_id,
@@ -880,6 +926,12 @@ class ScriptedGatewayStore:
 
     def runtime_execution_claim(self, operation_id: UUID) -> RuntimeExecutionClaim | None:
         return self.runtime_claims.get(operation_id)
+
+    def runtime_result_recovery(
+        self,
+        operation_id: UUID,
+    ) -> RuntimeResultRecoveryObservation | None:
+        return self.runtime_recoveries.get(operation_id)
 
     def record_capability_execution(
         self,
@@ -1698,21 +1750,25 @@ async def test_provider_effect_crash_recovers_from_durable_receipt_without_dupli
     provider_receipt = provider_execution.provider_receipt
     receipt_digest = canonical_contract_sha256(provider_receipt)
     assert recovered_claim.fencing_token == 2
-    assert (
-        recovered_claim.claimed_at
-        <= gateway_result.occurred_at
-        < recovered_claim.expires_at
+    assert gateway_result == provider_result
+    assert gateway_result.model_dump_json(by_alias=True) == provider_result.model_dump_json(
+        by_alias=True
     )
-    assert gateway_result.event_id == provider_result.event_id
-    assert gateway_result.command_id == provider_result.command_id
-    assert gateway_result.artifact_refs == provider_result.artifact_refs
+    recovery = harness.gateway.runtime_recoveries[command_id]
+    assert gateway_result.occurred_at < recovered_claim.claimed_at
+    assert recovery.event_id != provider_result.event_id
+    assert recovered_claim.claimed_at <= recovery.observed_at < recovered_claim.expires_at
+    assert recovery.command_id == provider_result.command_id
+    assert recovery.original_result_id == provider_result.event_id
+    assert recovery.original_result_digest == canonical_contract_sha256(provider_result)
+    assert recovery.provider_effect_id == provider_receipt.effect_id
+    assert recovery.provider_receipt_digest == receipt_digest
+    assert recovery.original_claim_fence == 1
+    assert recovery.recovery_claim_fence == 2
+    assert recovery.correlation_id == provider_result.correlation_id
+    assert recovery.causation_id == provider_result.event_id
     assert provider_receipt.result_digest == canonical_contract_sha256(
         provider_result
-    )
-    assert any(
-        reference.uri == f"artifact://provider-effect-receipt/{receipt_digest}"
-        and reference.sha256 == receipt_digest
-        for reference in gateway_result.evidence_refs
     )
     checkpoint_text = next(harness.checkpoint_dir.glob("*.json")).read_text(
         encoding="utf-8"
@@ -1742,25 +1798,7 @@ async def test_provider_result_race_before_reclaim_uses_gateway_readback(
     provider_execution = next(iter(provider_executions.values()))
     command_id = provider_execution.result.command_id
     claim = harness.gateway.runtime_claims[command_id]
-    receipt_digest = canonical_contract_sha256(
-        provider_execution.provider_receipt
-    )
-    receipt_ref = ArtifactRef(
-        uri=f"artifact://provider-effect-receipt/{receipt_digest}",
-        sha256=receipt_digest,
-        media_type="application/json",
-    )
-    harness.gateway.result_committed_before_reclaim_once = (
-        provider_execution.result.model_copy(
-            update={
-                "occurred_at": claim.claimed_at,
-                "evidence_refs": (
-                    *provider_execution.result.evidence_refs,
-                    receipt_ref,
-                ),
-            }
-        )
-    )
+    harness.gateway.result_committed_before_reclaim_once = provider_execution.result
     harness.clock.value = claim.expires_at + timedelta(microseconds=1)
     harness.runtime = ScriptedRuntimePort(
         harness.gateway,

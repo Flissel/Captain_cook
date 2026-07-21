@@ -100,19 +100,21 @@ def test_capability_authority_transactions_survive_restart(
         storage.clear()
 
 
-def test_recovered_claim_records_fresh_provider_observation(
+def test_recovered_claim_preserves_result_and_records_distinct_observation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dsn = _explicit_isolated_test_dsn()
     from fastapi import HTTPException
 
-    from agenten.agent_factory.capability_factory_entrypoint import (
+    from agenten.agent_runtime.contracts import (
+        AgentRuntimeResult,
         ProviderEffectReceipt,
     )
-    from agenten.agent_runtime.contracts import AgentRuntimeResult, ArtifactRef
     from blockchain.mariadb_storage import MariaDBStorage
     from gateway.contracts import (
         RuntimeExecutionClaimRequest,
+        RuntimeResultRecoveryObservation,
+        RuntimeResultRecoveryRequest,
         canonical_contract_sha256,
     )
     from gateway.store import GatewayStore
@@ -167,17 +169,29 @@ def test_recovered_claim_records_fresh_provider_observation(
             status=provider_result.status.value,
             idempotency_guaranteed=True,
         )
-        receipt_digest = canonical_contract_sha256(provider_receipt)
-        receipt_ref = ArtifactRef(
-            uri=f"artifact://provider-effect-receipt/{receipt_digest}",
-            sha256=receipt_digest,
-            media_type="application/json",
+        original_result_json = provider_result.model_dump_json(by_alias=True)
+        recovery_observation = RuntimeResultRecoveryObservation(
+            schema_name="captain.runtime-result-recovery-observation.v1",
+            event_id=uuid5(
+                provider_result.event_id,
+                "runtime-result-recovery:1:2",
+            ),
+            observed_at=recovered.claim.claimed_at,
+            command_id=command_id,
+            original_result_id=provider_result.event_id,
+            original_result_digest=canonical_contract_sha256(provider_result),
+            provider_effect_id=effect_id,
+            provider_receipt_digest=canonical_contract_sha256(provider_receipt),
+            original_claim_fence=first.claim.fencing_token,
+            recovery_claim_fence=recovered.claim.fencing_token,
+            correlation_id=provider_result.correlation_id,
+            causation_id=provider_result.event_id,
         )
-        observation = provider_result.model_copy(
-            update={
-                "occurred_at": recovered.claim.claimed_at,
-                "evidence_refs": (*provider_result.evidence_refs, receipt_ref),
-            }
+        recovery_request = RuntimeResultRecoveryRequest(
+            schema_name="captain.runtime-result-recovery-request.v1",
+            result=provider_result,
+            provider_receipt=provider_receipt,
+            observation=recovery_observation,
         )
         completion_store = GatewayStore(
             storage,
@@ -192,37 +206,73 @@ def test_recovered_claim_records_fresh_provider_observation(
                 execution_claim_credential=recovered.claim_credential,
             )
 
-        result_receipt = completion_store.record_runtime_result(
-            observation,
+        result_receipt = completion_store.recover_runtime_result(
+            recovery_request,
             execution_owner_id=recovered.claim.owner_id,
             execution_fencing_token=recovered.claim.fencing_token,
             execution_claim_credential=recovered.claim_credential,
         )
+        replay = completion_store.recover_runtime_result(
+            recovery_request,
+            execution_owner_id=recovered.claim.owner_id,
+            execution_fencing_token=recovered.claim.fencing_token,
+            execution_claim_credential=recovered.claim_credential,
+        )
+        changed_observation = recovery_observation.model_copy(
+            update={
+                "observed_at": recovery_observation.observed_at
+                + timedelta(seconds=1)
+            }
+        )
+        with pytest.raises(HTTPException, match="different or incomplete"):
+            completion_store.recover_runtime_result(
+                recovery_request.model_copy(
+                    update={"observation": changed_observation}
+                ),
+                execution_owner_id=recovered.claim.owner_id,
+                execution_fencing_token=recovered.claim.fencing_token,
+                execution_claim_credential=recovered.claim_credential,
+            )
         execution = gateway_acceptance._execution_request(
             release,
             command_payload,
-            observation.model_dump(mode="json", by_alias=True),
+            provider_result.model_dump(mode="json", by_alias=True),
         ).model_copy(
             update={"claim_fencing_token": recovered.claim.fencing_token}
         )
         execution_receipt = completion_store.record_capability_execution(execution)
         persisted_result = completion_store.runtime_operation(command_id).result
+        persisted_observation = completion_store.runtime_result_recovery(command_id)
         persisted_claim = completion_store.runtime_execution_claim(command_id)
 
         assert result_receipt.replayed is False
+        assert replay.replayed is True
         assert execution_receipt.replayed is False
-        assert persisted_result == observation
+        assert persisted_result == provider_result
+        assert persisted_result is not None
+        assert persisted_result.model_dump_json(by_alias=True) == original_result_json
+        assert persisted_observation == recovery_observation
+        assert persisted_observation.event_id != provider_result.event_id
         assert persisted_claim is not None
         assert persisted_claim.status == "completed"
         assert persisted_claim.fencing_token == 2
         assert (
             persisted_claim.claimed_at
-            <= observation.occurred_at
+            <= persisted_observation.observed_at
             < persisted_claim.expires_at
         )
+        assert (
+            first.claim.claimed_at
+            <= persisted_result.occurred_at
+            < first.claim.expires_at
+        )
+        assert persisted_result.occurred_at < recovered.claim.claimed_at
+        assert execution.outcome.result_id == provider_result.event_id
         assert provider_receipt.result_digest == canonical_contract_sha256(
             provider_result
         )
-        assert receipt_ref in observation.evidence_refs
+        assert persisted_observation.provider_receipt_digest == canonical_contract_sha256(
+            provider_receipt
+        )
     finally:
         storage.clear()

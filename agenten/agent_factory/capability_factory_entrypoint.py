@@ -90,6 +90,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeResult,
     ArtifactRef,
     CapabilityGrant,
+    ProviderEffectReceipt,
 )
 from agenten.delivery.minibook_events import MinibookProjectionEvent
 from agenten.delivery.projector import MinibookProjector
@@ -103,6 +104,8 @@ from gateway.contracts import (
     RuntimeExecutionClaimRequest,
     RuntimeExecutionClaim,
     RuntimeOperationProjection,
+    RuntimeResultRecoveryObservation,
+    RuntimeResultRecoveryRequest,
     canonical_contract_sha256,
 )
 from gateway.capability_catalog import CapabilityCatalogRecord
@@ -215,30 +218,6 @@ class CapabilityExecutionPlan(BaseModel):
     command: AgentRuntimeCommand
     grant: CapabilityGrant
     claim_owner_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-
-
-class ProviderEffectReceipt(BaseModel):
-    """Durable provider identity written before control returns to Captain."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    provider_operation_id: str = Field(
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
-    )
-    effect_id: UUID
-    command_id: UUID
-    request_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
-    result_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
-    status: Literal[
-        "accepted",
-        "running",
-        "succeeded",
-        "failed",
-        "infrastructure_failed",
-        "policy_failed",
-        "cancelled",
-    ]
-    idempotency_guaranteed: bool
 
 
 class CapabilityRuntimeExecution(BaseModel):
@@ -447,6 +426,20 @@ class CapabilityFactoryGatewayPort(Protocol):
         execution_fencing_token: int,
         execution_claim_credential: str,
     ) -> object: ...
+
+    def recover_runtime_result(
+        self,
+        request: RuntimeResultRecoveryRequest,
+        *,
+        execution_owner_id: str,
+        execution_fencing_token: int,
+        execution_claim_credential: str,
+    ) -> object: ...
+
+    def runtime_result_recovery(
+        self,
+        operation_id: UUID,
+    ) -> RuntimeResultRecoveryObservation | None: ...
 
     def find_runtime_operation(
         self,
@@ -1854,7 +1847,7 @@ class CapabilityFactoryEntrypoint:
                 or provider_execution.outcome != existing.outcome
             ):
                 raise RuntimeError("Gateway execution readback is incomplete")
-            self._validate_gateway_observation(
+            self._validate_gateway_result_readback(
                 provider_execution,
                 operation.result,
                 claim,
@@ -1877,7 +1870,7 @@ class CapabilityFactoryEntrypoint:
                 or provider_execution is None
             ):
                 raise RuntimeError("Gateway runtime result has no completed execution claim")
-            self._validate_gateway_observation(
+            self._validate_gateway_result_readback(
                 provider_execution,
                 operation.result,
                 claim,
@@ -1911,6 +1904,7 @@ class CapabilityFactoryEntrypoint:
                     command_id=plan.command.event_id,
                     expires_at=claim.expires_at,
                 )
+        original_claim = claim
 
         if operation is None:
             self._require_effect_budget(job, "runtime command admission")
@@ -1966,26 +1960,39 @@ class CapabilityFactoryEntrypoint:
                 effect_id=provider_effect_id,
             )
         self._validate_provider_execution(plan, runtime)
-        gateway_result = self._gateway_observation_result(
-            runtime,
-            claim_receipt.claim,
-        )
         bundle = CapabilityExecutionBundle(
             command=plan.command,
             grant=plan.grant,
-            result=gateway_result,
+            result=runtime.result,
             outcome=runtime.outcome,
             claim_owner_id=claim_receipt.claim.owner_id,
             claim_fencing_token=claim_receipt.claim.fencing_token,
         )
         self._validate_execution_bundle(job, authority, bundle)
         self._require_effect_budget(job, "runtime result recording")
-        self._gateway.record_runtime_result(
-            bundle.result,
-            execution_owner_id=claim_receipt.claim.owner_id,
-            execution_fencing_token=claim_receipt.claim.fencing_token,
-            execution_claim_credential=claim_receipt.claim_credential,
-        )
+        if provider_execution is not None:
+            if original_claim is None:
+                raise CapabilityProviderIdempotencyError(
+                    "durable provider effect has no historical execution claim"
+                )
+            recovery = self._runtime_result_recovery_request(
+                runtime,
+                original_claim=original_claim,
+                recovery_claim=claim_receipt.claim,
+            )
+            self._gateway.recover_runtime_result(
+                recovery,
+                execution_owner_id=claim_receipt.claim.owner_id,
+                execution_fencing_token=claim_receipt.claim.fencing_token,
+                execution_claim_credential=claim_receipt.claim_credential,
+            )
+        else:
+            self._gateway.record_runtime_result(
+                bundle.result,
+                execution_owner_id=claim_receipt.claim.owner_id,
+                execution_fencing_token=claim_receipt.claim.fencing_token,
+                execution_claim_credential=claim_receipt.claim_credential,
+            )
         readback_bundle = self._completed_gateway_bundle(plan, runtime)
         if readback_bundle is None:
             raise RuntimeError("Gateway runtime result readback is incomplete")
@@ -2018,35 +2025,73 @@ class CapabilityFactoryEntrypoint:
             )
 
     @staticmethod
-    def _gateway_observation_result(
+    def _runtime_result_recovery_request(
         runtime: CapabilityRuntimeExecution,
-        claim: RuntimeExecutionClaim,
-    ) -> AgentRuntimeResult:
-        receipt_digest = canonical_contract_sha256(runtime.provider_receipt)
-        receipt_ref = ArtifactRef(
-            uri=f"artifact://provider-effect-receipt/{receipt_digest}",
-            sha256=receipt_digest,
-            media_type="application/json",
+        *,
+        original_claim: RuntimeExecutionClaim,
+        recovery_claim: RuntimeExecutionClaim,
+    ) -> RuntimeResultRecoveryRequest:
+        result = runtime.result
+        observation = RuntimeResultRecoveryObservation(
+            schema_name="captain.runtime-result-recovery-observation.v1",
+            event_id=uuid5(
+                result.event_id,
+                (
+                    "runtime-result-recovery:"
+                    f"{original_claim.fencing_token}:{recovery_claim.fencing_token}"
+                ),
+            ),
+            observed_at=recovery_claim.claimed_at,
+            command_id=result.command_id,
+            original_result_id=result.event_id,
+            original_result_digest=canonical_contract_sha256(result),
+            provider_effect_id=runtime.provider_receipt.effect_id,
+            provider_receipt_digest=canonical_contract_sha256(runtime.provider_receipt),
+            original_claim_fence=original_claim.fencing_token,
+            recovery_claim_fence=recovery_claim.fencing_token,
+            correlation_id=result.correlation_id,
+            causation_id=result.event_id,
         )
-        evidence_refs = runtime.result.evidence_refs
-        if receipt_ref not in evidence_refs:
-            evidence_refs = (*evidence_refs, receipt_ref)
-        return runtime.result.model_copy(
-            update={
-                "occurred_at": claim.claimed_at,
-                "evidence_refs": evidence_refs,
-            }
+        return RuntimeResultRecoveryRequest(
+            schema_name="captain.runtime-result-recovery-request.v1",
+            result=result,
+            provider_receipt=runtime.provider_receipt,
+            observation=observation,
         )
 
-    def _validate_gateway_observation(
+    def _validate_gateway_result_readback(
         self,
         runtime: CapabilityRuntimeExecution,
         observed: AgentRuntimeResult,
         claim: RuntimeExecutionClaim,
     ) -> None:
-        if observed != self._gateway_observation_result(runtime, claim):
+        if observed != runtime.result:
             raise CapabilityProviderIdempotencyError(
-                "Gateway runtime result does not bind the durable provider effect"
+                "Gateway changed the immutable provider runtime result"
+            )
+        recovery = self._gateway.runtime_result_recovery(observed.command_id)
+        if recovery is None:
+            if not claim.claimed_at <= observed.occurred_at < claim.expires_at:
+                raise CapabilityProviderIdempotencyError(
+                    "Gateway runtime result is outside its execution claim"
+                )
+            return
+        receipt = runtime.provider_receipt
+        if (
+            recovery.event_id == observed.event_id
+            or recovery.command_id != observed.command_id
+            or recovery.original_result_id != observed.event_id
+            or recovery.original_result_digest != canonical_contract_sha256(observed)
+            or recovery.provider_effect_id != receipt.effect_id
+            or recovery.provider_receipt_digest != canonical_contract_sha256(receipt)
+            or recovery.recovery_claim_fence != claim.fencing_token
+            or recovery.original_claim_fence >= recovery.recovery_claim_fence
+            or recovery.correlation_id != observed.correlation_id
+            or recovery.causation_id != observed.event_id
+            or not claim.claimed_at <= recovery.observed_at < claim.expires_at
+        ):
+            raise CapabilityProviderIdempotencyError(
+                "Gateway recovery observation does not bind the immutable provider result"
             )
 
     def _completed_gateway_bundle(
@@ -2070,7 +2115,7 @@ class CapabilityFactoryEntrypoint:
             or operation.revocation is not None
         ):
             raise RuntimeError("Gateway runtime readback disagrees with the execution plan")
-        self._validate_gateway_observation(runtime, operation.result, claim)
+        self._validate_gateway_result_readback(runtime, operation.result, claim)
         return CapabilityExecutionBundle(
             command=operation.command,
             grant=operation.grant,
