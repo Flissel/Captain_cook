@@ -84,6 +84,7 @@ def test_preflight_rejects_mutable_sandbox_reference_before_network(tmp_path: Pa
         "CAPTAIN_N8N_API_KEY": "n8n-rest-secret",
         "CAPTAIN_N8N_MCP_TOKEN": "n8n-mcp-secret",
         "CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET": "broker-signing-secret",
+        "CAPTAIN_FACTORY_N8N_WORKFLOW_ID": "workflow-fixture",
         "MINIBOOK_API_KEY": "minibook-secret",
         "MINIBOOK_PROJECTION_API_KEY": "projection-secret",
     }
