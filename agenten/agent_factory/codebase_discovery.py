@@ -62,6 +62,7 @@ _SECRET_PATH_PATTERN = re.compile(
 _RUNNABLE_AUTOGEN_TEAM_TYPES_BY_SERIES = {
     "0.7": frozenset(
         {
+            "GraphFlow",
             "MagenticOneGroupChat",
             "RoundRobinGroupChat",
             "SelectorGroupChat",

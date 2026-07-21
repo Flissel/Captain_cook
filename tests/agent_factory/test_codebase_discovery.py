@@ -263,6 +263,11 @@ def factory_repo_fixture(
             "def build_graph():\n"
             "    return DiGraphBuilder()\n"
         ),
+        "agenten/workflows/graph_flow.py": (
+            "from autogen_agentchat.teams import GraphFlow\n\n"
+            "def build_workflow():\n"
+            "    return GraphFlow()\n"
+        ),
         "prompts/support.md": "# System prompt\nUse customer context and typed handoffs.\n",
         "tests/test_existing_team.py": (
             "from agenten.workflows.existing_team import build_team\n\n"
@@ -453,6 +458,7 @@ def test_discovery_finds_semantic_reuse_without_reading_secrets(tmp_path: Path) 
     assert "agenten.tools.customer_lookup" in inventory.reusable_component_ids
     assert "agenten.tools.decorated_lookup" in inventory.reusable_component_ids
     assert "agenten.workflows.graph_builder" in inventory.reusable_component_ids
+    assert "agenten.workflows.graph_flow" in inventory.reusable_component_ids
     assert any("agenten/workflows/existing_team.py" in ref.uri for ref in inventory.entrypoint_refs)
     assert any("tests/test_existing_team.py" in ref.uri for ref in inventory.test_refs)
     assert any("schemas/team.schema.json" in ref.uri for ref in inventory.schema_refs)
@@ -465,6 +471,10 @@ def test_discovery_finds_semantic_reuse_without_reading_secrets(tmp_path: Path) 
     assert "agenten.workflows.fake_swarm" not in inventory.reusable_component_ids
     assert not any(
         "agenten/workflows/graph_builder.py" in ref.uri
+        for ref in inventory.entrypoint_refs
+    )
+    assert any(
+        "agenten/workflows/graph_flow.py" in ref.uri
         for ref in inventory.entrypoint_refs
     )
     assert not any("agenten/not_a_tool.py" in ref.uri for ref in inventory.entrypoint_refs)
