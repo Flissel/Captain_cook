@@ -104,6 +104,7 @@ class AssertionOutcome(_FrozenContract):
 class CapabilityAssertionResult(_FrozenContract):
     assertion_id: str = Field(pattern=IDENTIFIER_PATTERN)
     status: Literal["passed", "failed"]
+    integration_intent: IntegrationIntent
     evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
 
     @field_validator("evidence_refs")
@@ -113,6 +114,13 @@ class CapabilityAssertionResult(_FrozenContract):
         value: tuple[ArtifactRef, ...],
     ) -> tuple[ArtifactRef, ...]:
         return _unique_artifact_refs(value, "assertion result evidence refs")
+
+
+class PrivateHoldoutEvidence(_FrozenContract):
+    holdout_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    assertion_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    status: Literal["passed", "failed"]
+    evidence_ref: ArtifactRef
 
 
 class CapabilityReleaseEvidenceV1(_FrozenContract):
@@ -143,7 +151,7 @@ class CapabilityReleaseEvidenceV1(_FrozenContract):
         default=None,
         pattern=IDENTIFIER_PATTERN,
     )
-    holdout_ids: tuple[str, ...] = ()
+    private_holdout_evidence: tuple[PrivateHoldoutEvidence, ...] = ()
 
     @model_validator(mode="before")
     @classmethod
@@ -161,10 +169,15 @@ class CapabilityReleaseEvidenceV1(_FrozenContract):
         _require_unique_nonblank(assertion_ids, "release evidence assertion IDs")
         return value
 
-    @field_validator("holdout_ids")
+    @field_validator("private_holdout_evidence")
     @classmethod
-    def require_unique_holdouts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        return _require_unique_nonblank(value, "release evidence holdout IDs")
+    def require_unique_holdouts(
+        cls,
+        value: tuple[PrivateHoldoutEvidence, ...],
+    ) -> tuple[PrivateHoldoutEvidence, ...]:
+        holdout_ids = tuple(item.holdout_id for item in value)
+        _require_unique_nonblank(holdout_ids, "release evidence holdout IDs")
+        return value
 
     @model_validator(mode="after")
     def require_kind_semantics(self) -> "CapabilityReleaseEvidenceV1":

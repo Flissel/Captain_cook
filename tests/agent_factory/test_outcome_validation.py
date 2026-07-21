@@ -28,7 +28,7 @@ from agenten.agent_factory.outcome_validation import (
     CapabilityPackageValidator,
 )
 from agenten.agent_factory.skill_evaluation import HermesSkillUsageReceipt
-from agenten.agent_runtime.contracts import ArtifactRef
+from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent
 
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
@@ -70,6 +70,7 @@ class RecordingContentStore:
 class RecordingTrustedSandboxRunner:
     requests: list[CapabilitySandboxRequest] = field(default_factory=list)
     result_updates: dict[str, object] = field(default_factory=dict)
+    termination_updates: dict[str, object] = field(default_factory=dict)
     cancelled_execution_ids: list[UUID] = field(default_factory=list)
     termination_waits: list[UUID] = field(default_factory=list)
 
@@ -82,6 +83,9 @@ class RecordingTrustedSandboxRunner:
             imported_modules=request.module_names,
             executed_test_paths=request.test_paths,
             sandbox_identity="sandbox://validator-test/isolated-python",
+            process_identity=f"sandbox-handle://{request.execution_id}",
+            process_identity_verified=True,
+            extracted_tree_sha256=request.extracted_tree_sha256,
             workspace_was_read_only=True,
             network_was_disabled=True,
             resource_limits_were_enforced=True,
@@ -97,12 +101,20 @@ class RecordingTrustedSandboxRunner:
         execution_id: UUID,
     ) -> CapabilitySandboxTermination:
         self.termination_waits.append(execution_id)
-        return CapabilitySandboxTermination(
+        request = next(
+            item for item in self.requests if item.execution_id == execution_id
+        )
+        termination = CapabilitySandboxTermination(
             execution_id=execution_id,
+            request_digest=request.request_digest,
             sandbox_identity="sandbox://validator-test/isolated-python",
+            process_identity=f"sandbox-handle://{execution_id}",
+            process_identity_verified=True,
+            extracted_tree_sha256=request.extracted_tree_sha256,
             terminated=True,
             process_tree_terminated=True,
         )
+        return termination.model_copy(update=self.termination_updates)
 
 
 @dataclass
@@ -303,6 +315,8 @@ def _validation_case(
     assertion_evidence_refs = tuple(
         _ref(content, "application/json") for content in assertion_evidence_contents
     )
+    holdout_evidence_content = b'{"holdout":"private","status":"passed"}'
+    holdout_evidence_ref = _ref(holdout_evidence_content, "application/json")
     release_evidence = tuple(
         CapabilityReleaseEvidenceV1.model_validate(
             {
@@ -334,6 +348,7 @@ def _validation_case(
                     {
                         "assertion_id": job.acceptance_assertion_ids[0],
                         "status": "passed",
+                        "integration_intent": "none",
                         "evidence_refs": [assertion_evidence_refs[run_number - 1]],
                     }
                 ],
@@ -343,8 +358,15 @@ def _validation_case(
                 "recovery_assertion_id": (
                     job.acceptance_assertion_ids[0] if run_number == 1 else None
                 ),
-                "holdout_ids": (
-                    [job.private_holdout_refs[0].holdout_id]
+                "private_holdout_evidence": (
+                    [
+                        {
+                            "holdout_id": job.private_holdout_refs[0].holdout_id,
+                            "assertion_id": job.acceptance_assertion_ids[0],
+                            "status": "passed",
+                            "evidence_ref": holdout_evidence_ref,
+                        }
+                    ]
                     if run_number == 1
                     else []
                 ),
@@ -384,6 +406,7 @@ def _validation_case(
         str(candidate_ref["uri"]): candidate_bytes,
         str(skill_receipt_ref["uri"]): skill_receipt_bytes,
         str(skill_detail_ref["uri"]): skill_detail,
+        str(holdout_evidence_ref["uri"]): holdout_evidence_content,
     }
     all_content.update(
         {
@@ -466,6 +489,11 @@ async def test_validator_independently_accepts_a_bound_digest_verified_package()
                 for result in evidence.assertion_results
                 for reference in result.evidence_refs
             ),
+            *(
+                holdout.evidence_ref
+                for evidence in case.release_evidence
+                for holdout in evidence.private_holdout_evidence
+            ),
             case.candidate.runbook_ref,
         )
         if reference is not None
@@ -487,6 +515,59 @@ async def test_validator_independently_accepts_a_bound_digest_verified_package()
     assert request.max_memory_bytes >= 1
     assert request.kill_process_tree_on_cancel is True
     assert request.require_process_identity is True
+    canonical_workspace = str(request.workspace.resolve()).replace("\\", "/").casefold()
+    canonical_python_root = (
+        str(request.python_path_root.resolve()).replace("\\", "/").casefold()
+    )
+    digest_payload = {
+        "execution_id": str(request.execution_id),
+        "process_identity": request.process_identity,
+        "correlation_id": str(request.correlation_id),
+        "workspace": canonical_workspace,
+        "python_path_root": canonical_python_root,
+        "package_sha256": request.package_archive_sha256,
+        "tree_sha256": request.extracted_tree_sha256,
+        "module_names": request.module_names,
+        "test_paths": request.test_paths,
+        "timeout_seconds": request.timeout_seconds,
+        "workspace_access": request.workspace_access,
+        "network_access": request.network_access,
+        "max_memory_bytes": request.max_memory_bytes,
+        "max_processes": request.max_processes,
+        "kill_process_tree_on_cancel": request.kill_process_tree_on_cancel,
+        "require_process_identity": request.require_process_identity,
+    }
+    assert request.request_digest == hashlib.sha256(
+        json.dumps(digest_payload, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_validator_propagates_n8n_intent_and_requires_n8n_package_root() -> None:
+    case = _validation_case()
+    for index, evidence in enumerate(case.release_evidence):
+        result = evidence.assertion_results[0]
+        _replace_release_record(
+            case,
+            index,
+            {
+                "assertion_results": (
+                    result.model_copy(
+                        update={"integration_intent": IntegrationIntent.N8N}
+                    ),
+                )
+            },
+        )
+
+    with pytest.raises(CapabilityPackageValidationError, match="n8n/"):
+        await _validator(case).validate(
+            job=case.job,
+            creation_result=case.creation_result,
+            candidate=case.candidate,
+            release_evidence_refs=case.release_evidence_refs,
+        )
 
 
 @pytest.mark.asyncio
@@ -529,6 +610,41 @@ async def test_validator_rejects_missing_sandbox_isolation_attestations() -> Non
             creation_result=case.creation_result,
         candidate=case.candidate,
         release_evidence_refs=case.release_evidence_refs,
+        )
+
+
+@pytest.mark.asyncio
+async def test_validator_requires_verified_matching_process_identity() -> None:
+    case = _validation_case()
+    case.runner.result_updates = {"process_identity_verified": False}
+
+    with pytest.raises(CapabilityPackageValidationError, match="process identity"):
+        await _validator(case).validate(
+            job=case.job,
+            creation_result=case.creation_result,
+            candidate=case.candidate,
+            release_evidence_refs=case.release_evidence_refs,
+        )
+
+
+@pytest.mark.asyncio
+async def test_timeout_rejects_termination_for_a_different_process_identity() -> None:
+    case = _validation_case()
+    runner = CancellationResistantTrustedSandboxRunner(
+        termination_updates={"process_identity": "sandbox-handle://foreign"}
+    )
+
+    with pytest.raises(CapabilityPackageValidationError, match="cancellation"):
+        await CapabilityPackageValidator(
+            content_store=case.store,
+            sandbox_runner=runner,
+            command_timeout_seconds=1,
+            termination_timeout_seconds=0.25,
+        ).validate(
+            job=case.job,
+            creation_result=case.creation_result,
+            candidate=case.candidate,
+            release_evidence_refs=case.release_evidence_refs,
         )
 
 
@@ -647,6 +763,7 @@ async def test_validator_rejects_semanticless_release_evidence_blobs() -> None:
                     CapabilityAssertionResult(
                         assertion_id="foreign-assertion",
                         status="passed",
+                        integration_intent=IntegrationIntent.NONE,
                         evidence_refs=(
                             ArtifactRef(
                                 uri="artifact://validator-test/foreign-assertion",
@@ -709,7 +826,7 @@ async def test_validator_requires_exactly_three_distinct_successes_after_recover
 @pytest.mark.parametrize(
     ("updates", "message"),
     (
-        ({"holdout_ids": ()}, "private holdout"),
+        ({"private_holdout_evidence": ()}, "private holdout"),
         ({"outcome": "failed"}, "succeeded"),
     ),
 )
@@ -727,6 +844,29 @@ async def test_validator_binds_recovery_holdout_and_success_semantics(
             creation_result=case.creation_result,
         candidate=case.candidate,
         release_evidence_refs=case.release_evidence_refs,
+        )
+
+
+@pytest.mark.asyncio
+async def test_validator_never_derives_a_passed_holdout_or_reuses_recovery_ref() -> None:
+    case = _validation_case()
+    holdout = case.release_evidence[0].private_holdout_evidence[0]
+    _replace_release_record(
+        case,
+        0,
+        {
+            "private_holdout_evidence": (
+                holdout.model_copy(update={"status": "failed"}),
+            )
+        },
+    )
+
+    with pytest.raises(CapabilityPackageValidationError, match="holdout.*passed"):
+        await _validator(case).validate(
+            job=case.job,
+            creation_result=case.creation_result,
+            candidate=case.candidate,
+            release_evidence_refs=case.release_evidence_refs,
         )
 
 

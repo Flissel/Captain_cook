@@ -47,6 +47,9 @@ class CapabilitySandboxRequest(BaseModel):
 
     request_digest: str = Field(pattern=SHA256_PATTERN)
     execution_id: UUID
+    process_identity: str = Field(
+        pattern=r"^(?:sandbox-handle|process)://[A-Za-z0-9._:/-]+$"
+    )
     correlation_id: UUID
     workspace: Path
     python_path_root: Path
@@ -75,6 +78,11 @@ class CapabilitySandboxResult(BaseModel):
     imported_modules: tuple[str, ...]
     executed_test_paths: tuple[str, ...]
     sandbox_identity: str = Field(pattern=r"^sandbox://[A-Za-z0-9._:/-]+$")
+    process_identity: str = Field(
+        pattern=r"^(?:sandbox-handle|process)://[A-Za-z0-9._:/-]+$"
+    )
+    process_identity_verified: Literal[True]
+    extracted_tree_sha256: str = Field(pattern=SHA256_PATTERN)
     workspace_was_read_only: Literal[True]
     network_was_disabled: Literal[True]
     resource_limits_were_enforced: Literal[True]
@@ -85,7 +93,13 @@ class CapabilitySandboxTermination(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     execution_id: UUID
+    request_digest: str = Field(pattern=SHA256_PATTERN)
     sandbox_identity: str = Field(pattern=r"^sandbox://[A-Za-z0-9._:/-]+$")
+    process_identity: str = Field(
+        pattern=r"^(?:sandbox-handle|process)://[A-Za-z0-9._:/-]+$"
+    )
+    process_identity_verified: Literal[True]
+    extracted_tree_sha256: str = Field(pattern=SHA256_PATTERN)
     terminated: Literal[True]
     process_tree_terminated: Literal[True]
 
@@ -192,6 +206,11 @@ class CapabilityPackageValidator:
                 for result in item.assertion_results
                 for reference in result.evidence_refs
             ),
+            *(
+                holdout.evidence_ref
+                for item in release_evidence
+                for holdout in item.private_holdout_evidence
+            ),
             *skill_receipt.evidence_refs,
         )
         content = await self._read_verified(
@@ -210,12 +229,17 @@ class CapabilityPackageValidator:
             raise CapabilityPackageValidationError(
                 "release evidence tree digest does not match extracted package"
             )
-        return _build_captain_manifest(
-            candidate,
-            release_evidence_refs,
-            release_evidence,
-            job,
-        )
+        try:
+            return _build_captain_manifest(
+                candidate,
+                release_evidence_refs,
+                release_evidence,
+                job,
+            )
+        except ValidationError as exc:
+            raise CapabilityPackageValidationError(
+                f"Captain package construction failed: {exc}"
+            ) from exc
 
     @staticmethod
     def _validate_authority(
@@ -408,6 +432,17 @@ class CapabilityPackageValidator:
                 raise CapabilityPackageValidationError(
                     "release evidence assertions do not match Captain assertions"
                 )
+        for assertion_id in job.acceptance_assertion_ids:
+            intents = {
+                result.integration_intent
+                for item in evidence
+                for result in item.assertion_results
+                if result.assertion_id == assertion_id
+            }
+            if len(intents) != 1:
+                raise CapabilityPackageValidationError(
+                    "release evidence assertion integration intents do not match"
+                )
         recovery_record = recovery[0]
         if any(item.outcome != "succeeded" for item in normal):
             raise CapabilityPackageValidationError(
@@ -423,12 +458,26 @@ class CapabilityPackageValidator:
             )
 
         expected_holdouts = {item.holdout_id for item in job.private_holdout_refs}
-        actual_holdouts = {
-            holdout_id for item in evidence for holdout_id in item.holdout_ids
-        }
-        if actual_holdouts != expected_holdouts:
+        holdout_evidence = tuple(
+            holdout
+            for item in evidence
+            for holdout in item.private_holdout_evidence
+        )
+        actual_holdouts = {item.holdout_id for item in holdout_evidence}
+        if (
+            actual_holdouts != expected_holdouts
+            or len(holdout_evidence) != len(expected_holdouts)
+        ):
             raise CapabilityPackageValidationError(
                 "typed release evidence does not bind every Captain private holdout"
+            )
+        if any(
+            item.status != "passed"
+            or item.assertion_id not in job.acceptance_assertion_ids
+            for item in holdout_evidence
+        ):
+            raise CapabilityPackageValidationError(
+                "private holdout evidence must be passed and assertion-bound"
             )
         assertion_evidence_identities = [
             _reference_identity(reference)
@@ -711,9 +760,14 @@ class CapabilityPackageValidator:
                 key=lambda item: (item.count("."), item),
             )
         )
+        execution_id = uuid4()
+        process_identity = f"sandbox-handle://{execution_id}"
         request_payload = {
-            "execution_id": None,
+            "execution_id": str(execution_id),
+            "process_identity": process_identity,
             "correlation_id": str(job.correlation_id),
+            "workspace": _canonical_workspace_identity(workspace),
+            "python_path_root": _canonical_workspace_identity(workspace),
             "package_sha256": package.source_ref.sha256,
             "tree_sha256": tree_digest,
             "module_names": module_names,
@@ -726,8 +780,6 @@ class CapabilityPackageValidator:
             "kill_process_tree_on_cancel": True,
             "require_process_identity": True,
         }
-        execution_id = uuid4()
-        request_payload["execution_id"] = str(execution_id)
         request_digest = hashlib.sha256(
             json.dumps(
                 request_payload,
@@ -738,6 +790,7 @@ class CapabilityPackageValidator:
         request = CapabilitySandboxRequest(
             request_digest=request_digest,
             execution_id=execution_id,
+            process_identity=process_identity,
             correlation_id=job.correlation_id,
             workspace=workspace,
             python_path_root=workspace,
@@ -764,6 +817,11 @@ class CapabilityPackageValidator:
                 )
                 if (
                     termination.execution_id != execution_id
+                    or termination.request_digest != request.request_digest
+                    or termination.process_identity != request.process_identity
+                    or termination.process_identity_verified is not True
+                    or termination.extracted_tree_sha256
+                    != request.extracted_tree_sha256
                     or termination.terminated is not True
                     or termination.process_tree_terminated is not True
                 ):
@@ -798,9 +856,12 @@ class CapabilityPackageValidator:
         if (
             result.execution_id != request.execution_id
             or result.request_digest != request.request_digest
+            or result.process_identity != request.process_identity
+            or result.process_identity_verified is not True
+            or result.extracted_tree_sha256 != request.extracted_tree_sha256
         ):
             raise CapabilityPackageValidationError(
-                "trusted sandbox result request digest does not match"
+                "trusted sandbox result request digest or process identity does not match"
             )
         if (
             result.workspace_was_read_only is not True
@@ -846,6 +907,12 @@ def _build_captain_manifest(
         AssertionOutcome(
             assertion_id=assertion_id,
             status="passed",
+            integration_intent=next(
+                result.integration_intent
+                for item in release_evidence
+                for result in item.assertion_results
+                if result.assertion_id == assertion_id
+            ),
             evidence_refs=_unique_references(
                 reference
                 for item in release_evidence
@@ -856,14 +923,19 @@ def _build_captain_manifest(
         )
         for assertion_id in job.acceptance_assertion_ids
     )
+    holdout_evidence = tuple(
+        holdout
+        for item in release_evidence
+        for holdout in item.private_holdout_evidence
+    )
     private_holdout_receipts = tuple(
         PrivateHoldoutReceipt(
-            holdout_id=holdout.holdout_id,
-            assertion_id=recovery_assertion_id,
-            status="passed",
-            evidence_ref=recovery_result.evidence_refs[0],
+            holdout_id=evidence.holdout_id,
+            assertion_id=evidence.assertion_id,
+            status=evidence.status,
+            evidence_ref=evidence.evidence_ref,
         )
-        for holdout in job.private_holdout_refs
+        for evidence in holdout_evidence
     )
     recovery_index = release_evidence.index(recovery)
     return CapabilityPackageManifestV1(
@@ -1078,6 +1150,10 @@ def _canonical_module_name(path: str) -> str:
             "AutoGen module path is not importable"
         )
     return ".".join(parts)
+
+
+def _canonical_workspace_identity(path: Path) -> str:
+    return str(path.resolve()).replace("\\", "/").casefold()
 
 
 def _consume_task_result(task: asyncio.Task[object]) -> None:

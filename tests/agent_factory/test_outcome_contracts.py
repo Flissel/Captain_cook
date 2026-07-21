@@ -14,6 +14,7 @@ from agenten.agent_factory.outcome_contracts import (
     FactoryTerminalDecision,
     FactoryTerminalState,
     ForgeCapabilityPackageCandidateV1,
+    PrivateHoldoutEvidence,
     validate_execution_outcome_binding,
 )
 from agenten.agent_factory.skill_evaluation import ToolGapMarker
@@ -537,6 +538,8 @@ def test_capability_release_evidence_fixture_is_strict_frozen_and_round_trips() 
 
     assert evidence.model_dump(mode="json", by_alias=True) == payload
     assert evidence.assertion_ids == ("output-01",)
+    assert evidence.assertion_results[0].integration_intent.value == "none"
+    assert evidence.private_holdout_evidence[0].status == "passed"
     with pytest.raises(ValidationError, match="frozen"):
         evidence.run_number = 2
     with pytest.raises(ValidationError, match="extra"):
@@ -569,9 +572,23 @@ def test_capability_release_evidence_requires_unique_assertions_holdouts_and_ref
         CapabilityReleaseEvidenceV1.model_validate(payload)
 
     payload = _fixture("capability_release_evidence.v1.json")
-    payload["holdout_ids"].append(payload["holdout_ids"][0])
+    payload["private_holdout_evidence"].append(
+        payload["private_holdout_evidence"][0]
+    )
     with pytest.raises(ValidationError, match="holdout"):
         CapabilityReleaseEvidenceV1.model_validate(payload)
+
+
+def test_private_holdout_evidence_is_typed_strict_and_frozen() -> None:
+    payload = _fixture("capability_release_evidence.v1.json")[
+        "private_holdout_evidence"
+    ][0]
+
+    evidence = PrivateHoldoutEvidence.model_validate(payload)
+
+    assert evidence.assertion_id == "output-01"
+    with pytest.raises(ValidationError, match="extra"):
+        PrivateHoldoutEvidence.model_validate({**payload, "producer": "forge"})
 
     payload = _fixture("capability_release_evidence.v1.json")
     payload["assertion_results"][0]["evidence_refs"].append(
