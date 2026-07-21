@@ -76,7 +76,7 @@ class IntegrationRequirementV1(_FrozenContract):
 
 
 class ToolGapMarkerV1(_FrozenContract):
-    schema_name: Literal["TODO_TOOL.v1"] = Field(alias="schema", serialization_alias="schema")
+    schema_name: Literal["TODO_TOOL.v1"] = Field(default="TODO_TOOL.v1", alias="schema", serialization_alias="schema")
     gap_id: str = Field(pattern=IDENTIFIER_PATTERN)
     severity: Literal["required", "optional"]
     evidence_ref: ArtifactRef
@@ -125,7 +125,7 @@ class CreationFailure(_FrozenContract):
 
 
 class CreationJobV1(_FrozenContract):
-    schema_name: Literal["minibook.creation-job.v1"] = Field(alias="schema", serialization_alias="schema")
+    schema_name: Literal["minibook.creation-job.v1"] = Field(default="minibook.creation-job.v1", alias="schema", serialization_alias="schema")
     creation_job_id: UUID
     factory_job_id: UUID
     correlation_id: UUID
@@ -163,7 +163,7 @@ class CreationSubmissionReceipt(_FrozenContract):
 
 
 class CreationProgressV1(_FrozenContract):
-    schema_name: Literal["minibook.creation-progress.v1"] = Field(alias="schema", serialization_alias="schema")
+    schema_name: Literal["minibook.creation-progress.v1"] = Field(default="minibook.creation-progress.v1", alias="schema", serialization_alias="schema")
     creation_job_id: UUID
     subject_version: int = Field(ge=1, strict=True)
     attempt: int = Field(ge=1, le=5, strict=True)
@@ -173,7 +173,7 @@ class CreationProgressV1(_FrozenContract):
 
 
 class CreationResultV1(_FrozenContract):
-    schema_name: Literal["minibook.creation-result.v1"] = Field(alias="schema", serialization_alias="schema")
+    schema_name: Literal["minibook.creation-result.v1"] = Field(default="minibook.creation-result.v1", alias="schema", serialization_alias="schema")
     creation_job_id: UUID
     correlation_id: UUID
     subject_version: int = Field(ge=1, strict=True)
@@ -202,7 +202,7 @@ class CreationResultV1(_FrozenContract):
 
 
 class FactoryBuildAssignmentV1(_FrozenContract):
-    schema_name: Literal["hermes.factory-build-assignment.v1"] = Field(alias="schema", serialization_alias="schema")
+    schema_name: Literal["hermes.factory-build-assignment.v1"] = Field(default="hermes.factory-build-assignment.v1", alias="schema", serialization_alias="schema")
     assignment_id: UUID
     creation_job_id: UUID
     correlation_id: UUID
