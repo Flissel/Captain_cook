@@ -188,6 +188,7 @@ def evaluate_factory_workflow_release(
     accepted_receipt_refs = {
         receipt.evidence_ref
         for receipt in usage_receipts
+        if receipt.attempt == evaluation.attempt
     }
     if (
         not usage_receipts

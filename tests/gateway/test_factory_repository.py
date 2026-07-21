@@ -15,9 +15,14 @@ from agenten.agent_factory.contracts import FactoryRole
 from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.execution_budget import FactoryBudgetProjection
 from agenten.agent_factory.release_gate import E2EKind, E2EOutcome, E2ERunEvidence
-from agenten.agent_factory.service import FactoryCoordinator, InMemoryFactoryRepository
+from agenten.agent_factory.service import (
+    FactoryCoordinator,
+    FactoryRepositoryError,
+    InMemoryFactoryRepository,
+)
 from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationEvidence
 from agenten.agent_factory.skill_workflow_contracts import (
+    FACTORY_SKILL_ID_BY_STEP,
     CodebaseInventoryV1,
     FactorySkillStep,
 )
@@ -64,6 +69,8 @@ class Store:
         self.workflow_artifacts = {}
         self.budgets = {}
         self.usage_receipts = {}
+        self.released_skills = []
+        self.skill_assignments = []
 
     def record_factory_job(self, factory_job):
         self.jobs.setdefault(factory_job.job_id, factory_job)
@@ -90,6 +97,21 @@ class Store:
 
     def factory_usage_receipts(self, job_id):
         return tuple(self.usage_receipts.get(job_id, ()))
+
+    def record_released_factory_skill(self, skill):
+        self.released_skills.append(skill)
+        return type("Receipt", (), {"replayed": False})()
+
+    def record_factory_skill_assignment(self, assignment):
+        self.skill_assignments.append(assignment)
+        return type("Receipt", (), {"replayed": False})()
+
+    def factory_skill_assignment(self, job_id, step):
+        return next(
+            assignment
+            for assignment in self.skill_assignments
+            if assignment.job_id == job_id and assignment.step is step
+        )
 
 
 def test_gateway_adapter_runs_coordinator_against_gateway_store_shape() -> None:
@@ -191,6 +213,57 @@ def test_gateway_repository_exposes_budget_and_usage_as_read_only_evidence(job_v
 
     assert repository.workflow_budget_projection(job_v3.job_id) == budget
     assert repository.workflow_usage_receipts(job_v3.job_id) == ()
+
+
+def test_gateway_repository_seeds_all_six_exact_job_skill_assignments() -> None:
+    factory_job = workflow_job(mode="release")
+    base_skill = parse_factory_workflow_artifact(
+        inventory_payload()
+    ).invocation.released_skill
+
+    class Catalog:
+        def released_for(self, _job, step: FactorySkillStep):
+            digest = hashlib.sha256(step.value.encode()).hexdigest()
+            return base_skill.model_copy(
+                update={
+                    "skill_id": FACTORY_SKILL_ID_BY_STEP[step],
+                    "content_ref": base_skill.content_ref.model_copy(
+                        update={
+                            "uri": (
+                                "artifact://released-skills/"
+                                f"{FACTORY_SKILL_ID_BY_STEP[step]}/v1"
+                            ),
+                            "sha256": digest,
+                        }
+                    ),
+                    "content_sha256": digest,
+                }
+            )
+
+    store = Store()
+    repository = GatewayFactoryRepository(store)
+    repository.register(factory_job)
+    repository.seed_released_skill_assignments(factory_job, Catalog())
+
+    assert tuple(item.step for item in store.skill_assignments) == tuple(
+        FactorySkillStep
+    )
+    assert tuple(
+        item.released_skill.skill_id for item in store.skill_assignments
+    ) == tuple(FACTORY_SKILL_ID_BY_STEP.values())
+    assert tuple(item.released_skill for item in store.skill_assignments) == tuple(
+        store.released_skills
+    )
+    assert repository.released_for(
+        factory_job,
+        FactorySkillStep.DISCOVER,
+    ) == store.skill_assignments[0].released_skill
+
+    changed_envelope = factory_job.model_copy(
+        update={"max_behavioral_iterations": 4}
+    )
+    with pytest.raises(FactoryRepositoryError, match="job envelope"):
+        repository.released_for(changed_envelope, FactorySkillStep.DISCOVER)
 
 
 def test_gateway_recomputes_v3_release_from_persisted_workflow_evidence() -> None:
@@ -443,6 +516,57 @@ def test_gateway_rejects_foreign_skill_with_the_same_factory_capability() -> Non
             foreign_inventory,
             (),
         )
+
+
+def test_gateway_requires_exact_persisted_job_step_skill_assignment() -> None:
+    assignment_type = getattr(
+        gateway_contracts,
+        "FactorySkillAssignmentV1",
+        None,
+    )
+    assert assignment_type is not None, "Gateway skill assignment contract is missing"
+    validator = getattr(GatewayStore, "_assert_workflow_skill_assignment", None)
+    assert validator is not None, "Gateway skill assignment validator is missing"
+    inventory = parse_factory_workflow_artifact(inventory_payload())
+    assignment = assignment_type(
+        job_id=inventory.job_id,
+        step=FactorySkillStep.DISCOVER,
+        released_skill=inventory.invocation.released_skill,
+    )
+
+    class Cursor:
+        def __init__(self, payload) -> None:
+            self.payload = payload
+
+        def execute(self, *_args) -> None:
+            return None
+
+        def fetchone(self):
+            return None if self.payload is None else {"payload": self.payload}
+
+    cursor = Cursor(assignment.model_dump(mode="json", by_alias=True))
+    validator(GatewayStore.__new__(GatewayStore), cursor, inventory)
+
+    alternate_skill = inventory.invocation.released_skill.model_copy(
+        update={
+            "version": 2,
+            "content_ref": inventory.invocation.released_skill.content_ref.model_copy(
+                update={"sha256": "f" * 64}
+            ),
+            "content_sha256": "f" * 64,
+        }
+    )
+    alternate = inventory.model_copy(
+        update={
+            "invocation": inventory.invocation.model_copy(
+                update={"released_skill": alternate_skill}
+            )
+        }
+    )
+    with pytest.raises(HTTPException, match="skill assignment"):
+        validator(GatewayStore.__new__(GatewayStore), cursor, alternate)
+    with pytest.raises(HTTPException, match="skill assignment"):
+        validator(GatewayStore.__new__(GatewayStore), Cursor(None), inventory)
 
 
 def test_gateway_workflow_sequence_rejects_improvement_on_first_attempt() -> None:

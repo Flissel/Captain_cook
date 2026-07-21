@@ -96,6 +96,7 @@ from gateway.contracts import (
     FactoryWorkflowArtifactWriteReceipt,
     FactoryUsageSubmissionV2,
     FactoryReleaseDecisionSubmission,
+    FactorySkillAssignmentV1,
     FactoryWriteReceipt,
     FactorySkillEvaluationSubmission,
     FactorySkillWriteReceipt,
@@ -286,6 +287,22 @@ class GatewayStore:
                         payload JSON NOT NULL,
                         INDEX idx_factory_release_decision_job (job_id, block_index),
                         CONSTRAINT fk_factory_release_decision_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS factory_skill_assignments (
+                        job_id CHAR(36) NOT NULL,
+                        step VARCHAR(32) NOT NULL,
+                        skill_id VARCHAR(128) NOT NULL,
+                        skill_version INT NOT NULL,
+                        content_sha256 CHAR(64) NOT NULL,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        PRIMARY KEY (job_id, step),
+                        CONSTRAINT fk_factory_skill_assignment_block
                             FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
                     ) ENGINE=InnoDB
                     """
@@ -980,6 +997,16 @@ class GatewayStore:
         digest = self._canonical_model_sha256(artifact)
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
+                job_block = self._runtime_block_by_json_value(
+                    cursor, block_type="agent_factory_job", field="job_id", value=str(artifact.job_id), for_update=True
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job not found")
+                job = parse_factory_job(job_block["data"])
+                self._assert_released_skill(
+                    cursor, artifact.invocation.released_skill
+                )
+                self._assert_workflow_skill_assignment(cursor, artifact)
                 cursor.execute(
                     "SELECT payload, content_sha256 FROM factory_workflow_artifacts WHERE invocation_id = %s FOR UPDATE",
                     (str(artifact.invocation_id),),
@@ -989,19 +1016,10 @@ class GatewayStore:
                     if self._decode_json(existing["payload"]) != canonical:
                         raise HTTPException(status_code=409, detail="factory workflow invocation already exists with different content")
                     return FactoryWorkflowArtifactWriteReceipt(invocation_id=artifact.invocation_id, content_sha256=digest, replayed=True)
-                job_block = self._runtime_block_by_json_value(
-                    cursor, block_type="agent_factory_job", field="job_id", value=str(artifact.job_id), for_update=True
-                )
-                if job_block is None:
-                    raise HTTPException(status_code=409, detail="factory job not found")
-                job = parse_factory_job(job_block["data"])
                 projection = self._factory_projection(cursor, job)
                 self._assert_factory_effects_open(
                     projection,
                     effect="workflow artifacts",
-                )
-                self._assert_released_skill(
-                    cursor, artifact.invocation.released_skill
                 )
                 prior_artifacts = self._factory_workflow_artifacts_for_job(
                     cursor, artifact.job_id, for_update=True
@@ -1111,6 +1129,104 @@ class GatewayStore:
         return FactorySkillWriteReceipt(
             record_id=f"{skill.skill_id}:{skill.version}", replayed=False
         )
+
+    def record_factory_skill_assignment(
+        self,
+        assignment: FactorySkillAssignmentV1,
+    ) -> FactorySkillWriteReceipt:
+        canonical = assignment.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                job_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_job",
+                    field="job_id",
+                    value=str(assignment.job_id),
+                    for_update=True,
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job not found")
+                job = parse_factory_job(job_block["data"])
+                if (
+                    not isinstance(job, AgentFactoryJobV3)
+                    or assignment.released_skill.capability
+                    != job.required_capability
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="factory skill assignment does not match its V3 job",
+                    )
+                self._assert_released_skill(cursor, assignment.released_skill)
+                existing = self._factory_skill_assignment_for_step(
+                    cursor,
+                    assignment.job_id,
+                    assignment.step,
+                    for_update=True,
+                )
+                if existing is not None:
+                    if existing == assignment:
+                        return FactorySkillWriteReceipt(
+                            record_id=(
+                                f"{assignment.job_id}:{assignment.step.value}"
+                            ),
+                            replayed=True,
+                        )
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "factory skill assignment already exists with different content"
+                        ),
+                    )
+                index = self._next_index(cursor)
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="factory_skill_assignment",
+                    data=canonical,
+                    status="assigned",
+                    parent_index=job_block["index"],
+                    metadata={"schema": assignment.schema_name},
+                )
+                self._insert(cursor, block)
+                cursor.execute(
+                    """INSERT INTO factory_skill_assignments
+                       (job_id, step, skill_id, skill_version, content_sha256,
+                        block_index, payload)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        str(assignment.job_id),
+                        assignment.step.value,
+                        assignment.released_skill.skill_id,
+                        assignment.released_skill.version,
+                        assignment.released_skill.content_sha256,
+                        index,
+                        json.dumps(canonical, sort_keys=True),
+                    ),
+                )
+        return FactorySkillWriteReceipt(
+            record_id=f"{assignment.job_id}:{assignment.step.value}",
+            replayed=False,
+        )
+
+    def factory_skill_assignment(
+        self,
+        job_id: UUID,
+        step: FactorySkillStep,
+    ) -> FactorySkillAssignmentV1:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                assignment = self._factory_skill_assignment_for_step(
+                    cursor,
+                    job_id,
+                    step,
+                    for_update=False,
+                )
+                if assignment is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="factory skill assignment not found",
+                    )
+                return assignment
 
     def record_factory_skill_evaluation(
         self,
@@ -1973,6 +2089,51 @@ class GatewayStore:
             parse_factory_workflow_artifact(self._decode_json(row["payload"]))
             for row in cursor.fetchall()
         )
+
+    def _factory_skill_assignment_for_step(
+        self,
+        cursor: Any,
+        job_id: UUID,
+        step: FactorySkillStep,
+        *,
+        for_update: bool,
+    ) -> FactorySkillAssignmentV1 | None:
+        sql = (
+            "SELECT payload FROM factory_skill_assignments "
+            "WHERE job_id = %s AND step = %s"
+        )
+        if for_update:
+            sql += " FOR UPDATE"
+        cursor.execute(sql, (str(job_id), step.value))
+        row = cursor.fetchone()
+        return (
+            FactorySkillAssignmentV1.model_validate(
+                self._decode_json(row["payload"])
+            )
+            if row is not None
+            else None
+        )
+
+    def _assert_workflow_skill_assignment(
+        self,
+        cursor: Any,
+        artifact: FactoryWorkflowArtifact,
+    ) -> None:
+        assignment = self._factory_skill_assignment_for_step(
+            cursor,
+            artifact.job_id,
+            artifact.invocation.step,
+            for_update=True,
+        )
+        if (
+            assignment is None
+            or assignment.released_skill
+            != artifact.invocation.released_skill
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="factory workflow artifact does not match its skill assignment",
+            )
 
     def _factory_workflow_review(
         self,

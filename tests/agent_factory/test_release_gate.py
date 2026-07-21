@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID
@@ -280,18 +281,46 @@ def workflow_job(*, mode: str) -> AgentFactoryJobV3:
     )
 
 
-def workflow_run(number: int) -> TeamExecutionEvidenceV1:
+def workflow_run(
+    number: int,
+    *,
+    attempt: int = 1,
+) -> TeamExecutionEvidenceV1:
     payload = execution_payload(
         run_number=number,
-        artifact_ref=workflow_artifact(f"run-{number}", f"{number}" * 64),
-        evidence_refs=[workflow_artifact(f"run-evidence-{number}", f"{number + 3}" * 64)],
-        usage_receipt_refs=[workflow_artifact(f"usage-{number}", f"{number + 6}" * 64)],
+        artifact_ref=workflow_artifact(
+            f"run-{attempt}-{number}",
+            hashlib.sha256(f"run-{attempt}-{number}".encode()).hexdigest(),
+        ),
+        evidence_refs=[
+            workflow_artifact(
+                f"run-evidence-{attempt}-{number}",
+                hashlib.sha256(
+                    f"run-evidence-{attempt}-{number}".encode()
+                ).hexdigest(),
+            )
+        ],
+        usage_receipt_refs=[
+            workflow_artifact(
+                f"usage-{attempt}-{number}",
+                hashlib.sha256(f"usage-{attempt}-{number}".encode()).hexdigest(),
+            )
+        ],
     )
+    payload["attempt"] = attempt
     invocation = payload["invocation"]
     assert isinstance(invocation, dict)
-    invocation_id = f"00000000-0000-0000-0000-{320 + number:012d}"
+    invocation["attempt"] = attempt
+    lease = invocation["lease"]
+    assert isinstance(lease, dict)
+    lease["attempt"] = attempt
+    invocation_id = (
+        f"00000000-0000-0000-0000-{320 + (attempt - 1) * 10 + number:012d}"
+    )
     invocation["invocation_id"] = invocation_id
-    invocation["idempotency_key"] = f"{number}" * 64
+    invocation["idempotency_key"] = hashlib.sha256(
+        f"invocation-{attempt}-{number}".encode()
+    ).hexdigest()
     payload["invocation_id"] = invocation_id
     outcome = payload["execution_outcome"]
     assert isinstance(outcome, dict)
@@ -302,28 +331,36 @@ def workflow_run(number: int) -> TeamExecutionEvidenceV1:
 
 def workflow_evaluation(
     runs: tuple[TeamExecutionEvidenceV1, ...],
+    *,
+    budget: FactoryBudgetProjection | None = None,
 ):
-    invocation = FactorySkillInvocationV1.model_validate(
-        invocation_payload("evaluate_team")
-    )
-    budget = workflow_budget()
+    payload = invocation_payload("evaluate_team")
+    payload["attempt"] = runs[0].attempt
+    lease = payload["lease"]
+    assert isinstance(lease, dict)
+    lease["attempt"] = runs[0].attempt
+    invocation = FactorySkillInvocationV1.model_validate(payload)
+    projection = budget or workflow_budget()
     return TeamEvaluationService(
         clock=lambda: WORKFLOW_NOW + timedelta(minutes=2)
     ).evaluate(
         invocation,
         runs[0].candidate_ref,
         runs,
-        budget_projection=budget,
+        budget_projection=projection,
     )
 
 
-def workflow_budget() -> FactoryBudgetProjection:
+def workflow_budget(
+    consumed_usd: str = "0.75",
+) -> FactoryBudgetProjection:
+    consumed = Decimal(consumed_usd)
     return FactoryBudgetProjection(
         job_id=UUID(JOB_ID),
         limit_usd="5.00",
-        consumed_usd="0.75",
+        consumed_usd=consumed,
         reserved_usd="0",
-        remaining_usd="4.25",
+        remaining_usd=Decimal("5.00") - consumed,
     )
 
 
@@ -335,10 +372,12 @@ def workflow_receipts(
         FactoryUsageReceiptV1(
             schema_name="captain.factory-usage-receipt.v1",
             receipt_id=UUID(
-                f"00000000-0000-0000-0000-{410 + run.run_number:012d}"
+                f"00000000-0000-0000-0000-"
+                f"{410 + (run.attempt - 1) * 10 + run.run_number:012d}"
             ),
             reservation_id=UUID(
-                f"00000000-0000-0000-0000-{420 + run.run_number:012d}"
+                f"00000000-0000-0000-0000-"
+                f"{510 + (run.attempt - 1) * 10 + run.run_number:012d}"
             ),
             job_id=run.job_id,
             correlation_id=run.correlation_id,
@@ -487,6 +526,33 @@ def test_workflow_release_accepts_disjoint_exact_receipt_union() -> None:
     )
 
     assert decision.status == "ready"
+
+
+def test_workflow_release_scopes_exact_receipt_coverage_to_current_attempt() -> None:
+    historical_run = workflow_run(1, attempt=1)
+    current_runs = tuple(
+        workflow_run(number, attempt=2) for number in range(1, 4)
+    )
+    historical_receipts = workflow_receipts((historical_run,))
+    current_receipts = workflow_receipts(current_runs)
+    total_budget = workflow_budget("1.50")
+
+    decision = evaluate_factory_workflow_release(
+        workflow_job(mode="release"),
+        current_runs,
+        workflow_evaluation(current_runs, budget=total_budget),
+        budget_projection=total_budget,
+        usage_receipts=(*historical_receipts, *current_receipts),
+    )
+
+    assert decision.status == "ready"
+    assert {
+        receipt.evidence_ref for receipt in historical_receipts
+    }.isdisjoint(
+        reference
+        for run in current_runs
+        for reference in run.usage_receipt_refs
+    )
 
 
 def test_workflow_release_rejects_changed_candidate_binding() -> None:

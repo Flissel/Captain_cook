@@ -31,12 +31,15 @@ from agenten.agent_factory.execution_budget import (
 from agenten.agent_factory.release_gate import E2ERunEvidence, FactoryReleaseDecision
 from agenten.agent_factory.skill_evaluation import (
     HermesSkillEvaluationEvidence,
+    ReleasedHermesSkill,
 )
 from agenten.agent_factory.skill_workflow_contracts import (
+    FACTORY_SKILL_ID_BY_STEP,
     CandidateRevisionV1,
     CodebaseInventoryV1,
     CodexBuildBriefV1,
     FactoryFeedbackV1,
+    FactorySkillStep,
     TeamEvaluationV1,
     TeamExecutionEvidenceV1,
 )
@@ -95,6 +98,25 @@ class FactoryWriteReceipt(_FrozenContract):
 class FactorySkillWriteReceipt(_FrozenContract):
     record_id: str = Field(min_length=1)
     replayed: bool
+
+
+class FactorySkillAssignmentV1(_FrozenContract):
+    """Immutable Captain assignment of one exact released skill to one job step."""
+
+    schema_name: Literal["captain.factory-skill-assignment.v1"] = Field(
+        default="captain.factory-skill-assignment.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    job_id: UUID
+    step: FactorySkillStep
+    released_skill: ReleasedHermesSkill
+
+    @model_validator(mode="after")
+    def require_exact_step_skill(self) -> "FactorySkillAssignmentV1":
+        if self.released_skill.skill_id != FACTORY_SKILL_ID_BY_STEP[self.step]:
+            raise ValueError("factory skill assignment skill ID does not match step")
+        return self
 
 
 class FactoryBudgetReservationWriteReceipt(_FrozenContract):

@@ -13,6 +13,8 @@ from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 from pydantic import SecretStr, ValidationError
 
+import gateway.contracts as gateway_contracts
+
 from agenten.agent_factory.execution_budget import (
     BudgetExhausted,
     FactoryBudgetProjection,
@@ -627,6 +629,47 @@ def test_mariadb_workflow_artifact_is_append_only_and_restart_readable(
         artifact.invocation.released_skill
     )
 
+    with pytest.raises(HTTPException, match="skill assignment"):
+        mariadb_store.record_factory_workflow_artifact(artifact)
+    assignment_type = getattr(
+        gateway_contracts,
+        "FactorySkillAssignmentV1",
+        None,
+    )
+    assert assignment_type is not None
+    assignment = assignment_type(
+        job_id=factory_job.job_id,
+        step=artifact.invocation.step,
+        released_skill=artifact.invocation.released_skill,
+    )
+    assignment_write = mariadb_store.record_factory_skill_assignment(assignment)
+    assignment_replay = mariadb_store.record_factory_skill_assignment(assignment)
+
+    alternate_skill = artifact.invocation.released_skill.model_copy(
+        update={
+            "version": 2,
+            "content_ref": artifact.invocation.released_skill.content_ref.model_copy(
+                update={"sha256": "e" * 64}
+            ),
+            "content_sha256": "e" * 64,
+        }
+    )
+    mariadb_store.record_released_factory_skill(alternate_skill)
+    alternate_assignment = assignment.model_copy(
+        update={"released_skill": alternate_skill}
+    )
+    with pytest.raises(HTTPException, match="different content"):
+        mariadb_store.record_factory_skill_assignment(alternate_assignment)
+    alternate_artifact = artifact.model_copy(
+        update={
+            "invocation": artifact.invocation.model_copy(
+                update={"released_skill": alternate_skill}
+            )
+        }
+    )
+    with pytest.raises(HTTPException, match="skill assignment"):
+        mariadb_store.record_factory_workflow_artifact(alternate_artifact)
+
     fabricated_skill = artifact.invocation.released_skill.model_copy(
         update={"content_sha256": "f" * 64}
     )
@@ -655,6 +698,12 @@ def test_mariadb_workflow_artifact_is_append_only_and_restart_readable(
     restarted = GatewayStore(mariadb_store.storage)
     assert first.replayed is False
     assert replay.replayed is True
+    assert assignment_write.replayed is False
+    assert assignment_replay.replayed is True
+    assert restarted.factory_skill_assignment(
+        factory_job.job_id,
+        artifact.invocation.step,
+    ) == assignment
     assert restarted.factory_workflow_artifacts(factory_job.job_id) == (artifact,)
 
 

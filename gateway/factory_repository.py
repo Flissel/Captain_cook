@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from decimal import Decimal
+from typing import Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import HTTPException
@@ -31,9 +32,23 @@ from agenten.agent_factory.leases import FactoryLeaseDenied, FactoryLeasePort, v
 from agenten.agent_factory.release_gate import FactoryReleaseDecision
 from agenten.agent_factory.service import FactoryRepository, FactoryRepositoryError
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
+from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
+from agenten.agent_factory.skill_workflow_contracts import FactorySkillStep
 from gateway.store import GatewayStore
-from gateway.contracts import FactoryBudgetReleaseRequest, FactoryUsageSubmissionV2
+from gateway.contracts import (
+    FactoryBudgetReleaseRequest,
+    FactorySkillAssignmentV1,
+    FactoryUsageSubmissionV2,
+)
 from gateway.contracts import FactoryWorkflowArtifact
+
+
+class FactorySkillAssignmentSource(Protocol):
+    def released_for(
+        self,
+        job: FactoryJob,
+        step: FactorySkillStep,
+    ) -> ReleasedHermesSkill: ...
 
 
 class GatewayFactoryRepository(FactoryRepository):
@@ -75,6 +90,49 @@ class GatewayFactoryRepository(FactoryRepository):
         job_id: UUID,
     ) -> tuple[FactoryUsageReceiptV1, ...]:
         return self._translate(lambda: self._store.factory_usage_receipts(job_id))
+
+    def seed_released_skill_assignments(
+        self,
+        job: AgentFactoryJobV3,
+        source: FactorySkillAssignmentSource,
+    ) -> None:
+        """Persist all exact job-step envelopes from an explicit Captain source."""
+
+        self._require_exact_job(job)
+        resolved = tuple(
+            (step, source.released_for(job, step))
+            for step in FactorySkillStep
+        )
+        for step, skill in resolved:
+            self._translate(lambda skill=skill: self._store.record_released_factory_skill(skill))
+            assignment = FactorySkillAssignmentV1(
+                job_id=job.job_id,
+                step=step,
+                released_skill=skill,
+            )
+            self._translate(
+                lambda assignment=assignment: self._store.record_factory_skill_assignment(
+                    assignment
+                )
+            )
+
+    def released_for(
+        self,
+        job: FactoryJob,
+        step: FactorySkillStep,
+    ) -> ReleasedHermesSkill:
+        self._require_exact_job(job)
+        assignment = self._translate(
+            lambda: self._store.factory_skill_assignment(job.job_id, step)
+        )
+        return assignment.released_skill
+
+    def _require_exact_job(self, job: FactoryJob) -> None:
+        stored = self._translate(lambda: self._store.factory_job(job.job_id).job)
+        if stored != job:
+            raise FactoryRepositoryError(
+                "factory skill assignment job envelope does not match Gateway"
+            )
 
     @staticmethod
     def _translate(operation):
