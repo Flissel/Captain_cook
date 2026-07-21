@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import hashlib
 import json
 from pathlib import Path
 from uuid import UUID
@@ -219,7 +220,7 @@ def test_optional_tool_gap_remains_on_ready_captain_decision() -> None:
     assert decision.tool_gaps[0].status == "unresolved"
 
 
-def accepted_manifest() -> CapabilityPackageManifestV1:
+def _base_manifest() -> CapabilityPackageManifestV1:
     payload = json.loads(
         (Path(__file__).parents[1] / "fixtures" / "contracts" / "capability_package_manifest.v1.json").read_text(
             encoding="utf-8"
@@ -264,9 +265,38 @@ def accepted_manifest() -> CapabilityPackageManifestV1:
     return CapabilityPackageManifestV1.model_validate(payload)
 
 
-def capability_e2e(*, successes: int = 3) -> tuple[CapabilityReleaseEvidenceV1, ...]:
+def _release_evidence_ref(record: CapabilityReleaseEvidenceV1) -> ArtifactRef:
+    content = record.model_dump_json(by_alias=True).encode("utf-8")
+    digest = hashlib.sha256(content).hexdigest()
+    return ArtifactRef(
+        uri=f"artifact://release-evidence/{digest}",
+        sha256=digest,
+        media_type="application/json",
+    )
+
+
+def accepted_manifest(
+    *,
+    e2e: tuple[CapabilityReleaseEvidenceV1, ...] | None = None,
+) -> CapabilityPackageManifestV1:
+    manifest = _base_manifest()
+    records = e2e if e2e is not None else capability_e2e(manifest=manifest)
+    return manifest.model_copy(
+        update={
+            "release_evidence_refs": tuple(
+                _release_evidence_ref(record) for record in records
+            )
+        }
+    )
+
+
+def capability_e2e(
+    *,
+    successes: int = 3,
+    manifest: CapabilityPackageManifestV1 | None = None,
+) -> tuple[CapabilityReleaseEvidenceV1, ...]:
     factory_job = v2_job()
-    manifest = accepted_manifest()
+    effective_manifest = manifest or _base_manifest()
     assertion_results = tuple(
         CapabilityAssertionResult(
             assertion_id=assertion_id,
@@ -283,14 +313,14 @@ def capability_e2e(*, successes: int = 3) -> tuple[CapabilityReleaseEvidenceV1, 
             run_id=f"release-run-{number}",
             run_number=number,
             factory_job_id=factory_job.job_id,
-            creation_job_id=manifest.creation_job_id,
+            creation_job_id=effective_manifest.creation_job_id,
             correlation_id=factory_job.correlation_id,
             subject_version=factory_job.subject_version,
             attempt=1,
             capability_id=factory_job.required_capability,
-            capability_version=manifest.capability_version,
+            capability_version=effective_manifest.capability_version,
             candidate_manifest_sha256="d" * 64,
-            package_archive_sha256=manifest.source_ref.sha256,
+            package_archive_sha256=effective_manifest.source_ref.sha256,
             extracted_tree_sha256="e" * 64,
             kind=kind,
             outcome=outcome,
@@ -555,7 +585,7 @@ def test_fifth_successful_attempt_can_reach_ready_to_use() -> None:
     decision = derive_terminal_decision(
         factory_job,
         projection.model_copy(update={"phase": FactoryPhase.QUALITY_REVIEWED}),
-        accepted_manifest(),
+        accepted_manifest(e2e=runs),
         accepted_evaluation(),
         runs,
         NOW,
@@ -563,6 +593,30 @@ def test_fifth_successful_attempt_can_reach_ready_to_use() -> None:
 
     assert decision is not None
     assert decision.state is FactoryTerminalState.READY_TO_USE
+
+
+def test_release_evidence_substitution_cannot_reuse_foreign_manifest_refs() -> None:
+    factory_job = v2_job()
+    records = capability_e2e()
+    manifest = accepted_manifest(e2e=records)
+    substituted = (
+        *records[:2],
+        records[2].model_copy(update={"run_id": "substituted-release-run"}),
+        *records[3:],
+    )
+
+    decision = derive_terminal_decision(
+        factory_job,
+        FactoryProjection.from_job(factory_job),
+        manifest,
+        accepted_evaluation(),
+        substituted,
+        NOW,
+    )
+
+    assert decision is not None
+    assert decision.state is FactoryTerminalState.BLOCKED
+    assert decision.reasons == (FactoryTerminalReasonCode.E2E_BLOCKED.value,)
 
 
 def test_job_projection_binding_is_checked_before_existing_terminal_replay() -> None:

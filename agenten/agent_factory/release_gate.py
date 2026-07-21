@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+import hashlib
 from typing import TYPE_CHECKING, Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -599,6 +600,8 @@ def _accepted_capability_e2e(
     validation: CapabilityPackageManifestV1,
     evidence: tuple[CapabilityReleaseEvidenceV1, ...],
 ) -> bool:
+    if not _release_evidence_matches_manifest(validation, evidence):
+        return False
     ordered = tuple(sorted(evidence, key=lambda item: item.run_number))
     if len(ordered) < 4:
         return False
@@ -637,6 +640,23 @@ def _accepted_capability_e2e(
     ):
         return False
     return max(item.run_number for item in recovery) < tail[0].run_number
+
+
+def _release_evidence_matches_manifest(
+    validation: CapabilityPackageManifestV1,
+    evidence: tuple[CapabilityReleaseEvidenceV1, ...],
+) -> bool:
+    references = validation.release_evidence_refs
+    if len(references) != len(evidence):
+        return False
+    for reference, record in zip(references, evidence, strict=True):
+        if reference.media_type != "application/json":
+            return False
+        content = record.model_dump_json(by_alias=True).encode("utf-8")
+        digest = hashlib.sha256(content).hexdigest()
+        if reference.sha256 != digest or reference.uri.rsplit("/", 1)[-1] != digest:
+            return False
+    return True
 
 
 def _terminal_decision(
