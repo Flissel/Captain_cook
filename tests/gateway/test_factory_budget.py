@@ -31,7 +31,10 @@ from gateway.contracts import FactoryBudgetReservationWriteReceipt
 from gateway.contracts import FactoryUsageSubmissionV2
 from gateway.app import create_app
 from gateway.auth import GatewayRole, require_actor
-from gateway.factory_repository import GatewayFactoryBudgetLedger
+from gateway.factory_repository import (
+    GatewayFactoryBudgetLedger,
+    GatewayFactoryWorkflowArtifactSink,
+)
 from gateway.settings import GatewaySettings
 from gateway.store import GatewayStore
 from blockchain.mariadb_storage import MariaDBStorage
@@ -683,31 +686,65 @@ def test_mariadb_budget_refuses_a_missing_job(job_v3) -> None:
         storage.clear()
 
 
-def test_mariadb_workflow_artifact_is_append_only_and_restart_readable(
+@pytest.mark.asyncio
+async def test_mariadb_workflow_artifact_is_append_only_and_restart_readable(
     mariadb_store: GatewayStore,
     job_v3,
 ) -> None:
-    artifact = CodebaseInventoryV1.model_validate(inventory_payload())
-    factory_job = job_v3.model_copy(
-        update={
-            "job_id": artifact.job_id,
-            "correlation_id": artifact.correlation_id,
+    artifact_payload = inventory_payload()
+    invocation_payload = artifact_payload["invocation"]
+    assert isinstance(invocation_payload, dict)
+    input_digest = "a" * 64
+    invocation_payload["input_ref"] = {
+        "uri": f"artifact://factory-input/{input_digest}",
+        "sha256": input_digest,
+        "media_type": "application/json",
+    }
+    artifact = CodebaseInventoryV1.model_validate(artifact_payload)
+
+    factory_job_payload = job_v3.model_dump(mode="json", by_alias=True)
+    factory_job_payload.update(
+        {
+            "job_id": str(artifact.job_id),
+            "correlation_id": str(artifact.correlation_id),
             "subject_version": artifact.subject_version,
-            "occurred_at": artifact.invocation.lease.issued_at,
-            "deadline_at": artifact.invocation.lease.expires_at + timedelta(minutes=5),
-            "input_ref": artifact.invocation.input_ref,
-            "acceptance_assertion_ids": artifact.acceptance_assertion_ids,
+            "occurred_at": artifact.invocation.lease.issued_at.isoformat(),
+            "deadline_at": (
+                artifact.invocation.lease.issued_at
+                + timedelta(
+                    seconds=job_v3.execution_policy.max_runtime_seconds
+                )
+            ).isoformat(),
+            "input_ref": artifact.invocation.input_ref.model_dump(mode="json"),
+            "acceptance_assertion_ids": list(
+                artifact.acceptance_assertion_ids
+            ),
             "required_capability": artifact.invocation.released_skill.capability,
         }
     )
-    forge = block(FactoryPhase.FORGE_REQUESTED).model_copy(
-        update={
-            "job_id": factory_job.job_id,
-            "correlation_id": factory_job.correlation_id,
+    factory_job = type(job_v3).model_validate(factory_job_payload)
+    invocation_payload["lease"] = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.AGENT_ARCHITECT,
+        attempt=1,
+        workspace_ref=artifact.invocation.lease.workspace_ref,
+        now=factory_job.occurred_at,
+    ).model_dump(mode="json", by_alias=True)
+    artifact = CodebaseInventoryV1.model_validate(artifact_payload)
+
+    forge_payload = block(FactoryPhase.FORGE_REQUESTED).model_dump(
+        mode="json",
+        by_alias=True,
+    )
+    forge_payload.update(
+        {
+            "job_id": str(factory_job.job_id),
+            "correlation_id": str(factory_job.correlation_id),
             "subject_version": factory_job.subject_version,
-            "occurred_at": factory_job.occurred_at,
+            "occurred_at": factory_job.occurred_at.isoformat(),
         }
     )
+    forge = type(block(FactoryPhase.FORGE_REQUESTED)).model_validate(forge_payload)
     mariadb_store.record_factory_job(factory_job)
     mariadb_store.record_factory_block(forge)
     mariadb_store.record_factory_lease(artifact.invocation.lease)
@@ -731,59 +768,99 @@ def test_mariadb_workflow_artifact_is_append_only_and_restart_readable(
     assignment_write = mariadb_store.record_factory_skill_assignment(assignment)
     assignment_replay = mariadb_store.record_factory_skill_assignment(assignment)
 
-    alternate_skill = artifact.invocation.released_skill.model_copy(
-        update={
+    alternate_skill_payload = artifact.invocation.released_skill.model_dump(
+        mode="json",
+        by_alias=True,
+    )
+    alternate_content_ref = dict(alternate_skill_payload["content_ref"])
+    alternate_content_ref["sha256"] = "e" * 64
+    alternate_skill_payload.update(
+        {
             "version": 2,
-            "content_ref": artifact.invocation.released_skill.content_ref.model_copy(
-                update={"sha256": "e" * 64}
-            ),
+            "content_ref": alternate_content_ref,
             "content_sha256": "e" * 64,
         }
     )
+    alternate_skill = type(artifact.invocation.released_skill).model_validate(
+        alternate_skill_payload
+    )
     mariadb_store.record_released_factory_skill(alternate_skill)
-    alternate_assignment = assignment.model_copy(
-        update={"released_skill": alternate_skill}
+    alternate_assignment_payload = assignment.model_dump(
+        mode="json",
+        by_alias=True,
+    )
+    alternate_assignment_payload["released_skill"] = alternate_skill.model_dump(
+        mode="json",
+        by_alias=True,
+    )
+    alternate_assignment = type(assignment).model_validate(
+        alternate_assignment_payload
     )
     with pytest.raises(HTTPException, match="different content"):
         mariadb_store.record_factory_skill_assignment(alternate_assignment)
-    alternate_artifact = artifact.model_copy(
-        update={
-            "invocation": artifact.invocation.model_copy(
-                update={"released_skill": alternate_skill}
-            )
-        }
+
+    alternate_artifact_payload = artifact.model_dump(mode="json", by_alias=True)
+    alternate_invocation_payload = dict(alternate_artifact_payload["invocation"])
+    alternate_invocation_payload["released_skill"] = alternate_skill.model_dump(
+        mode="json",
+        by_alias=True,
+    )
+    alternate_artifact_payload["invocation"] = alternate_invocation_payload
+    alternate_artifact = CodebaseInventoryV1.model_validate(
+        alternate_artifact_payload
     )
     with pytest.raises(HTTPException, match="skill assignment"):
         mariadb_store.record_factory_workflow_artifact(alternate_artifact)
 
-    fabricated_skill = artifact.invocation.released_skill.model_copy(
-        update={"content_sha256": "f" * 64}
-    )
-    fabricated_invocation = artifact.invocation.model_copy(
-        update={
-            "invocation_id": UUID("00000000-0000-0000-0000-000000000399"),
-            "released_skill": fabricated_skill,
+    fabricated_skill_payload = dict(alternate_skill_payload)
+    fabricated_content_ref = dict(fabricated_skill_payload["content_ref"])
+    fabricated_content_ref["sha256"] = "f" * 64
+    fabricated_skill_payload.update(
+        {
+            "version": 3,
+            "content_ref": fabricated_content_ref,
+            "content_sha256": "f" * 64,
         }
     )
-    fabricated = artifact.model_copy(
-        update={
-            "invocation": fabricated_invocation,
-            "invocation_id": fabricated_invocation.invocation_id,
+    fabricated_skill = type(artifact.invocation.released_skill).model_validate(
+        fabricated_skill_payload
+    )
+    fabricated_artifact_payload = artifact.model_dump(mode="json", by_alias=True)
+    fabricated_invocation_payload = dict(fabricated_artifact_payload["invocation"])
+    fabricated_invocation_payload.update(
+        {
+            "invocation_id": "00000000-0000-0000-0000-000000000399",
+            "released_skill": fabricated_skill.model_dump(
+                mode="json",
+                by_alias=True,
+            ),
         }
     )
+    fabricated_artifact_payload.update(
+        {
+            "invocation": fabricated_invocation_payload,
+            "invocation_id": "00000000-0000-0000-0000-000000000399",
+        }
+    )
+    fabricated = CodebaseInventoryV1.model_validate(fabricated_artifact_payload)
     with pytest.raises(HTTPException, match="unknown released skill"):
         mariadb_store.record_factory_workflow_artifact(fabricated)
 
-    first = mariadb_store.record_factory_workflow_artifact(artifact)
-    replay = mariadb_store.record_factory_workflow_artifact(artifact)
+    sink = GatewayFactoryWorkflowArtifactSink(mariadb_store)
+    first = await sink.persist(artifact)
+    replay = await sink.persist(artifact)
+    conflicting_payload = artifact.model_dump(mode="json", by_alias=True)
+    conflicting_payload["autogen_version"] = "0.7.6"
+    conflicting = CodebaseInventoryV1.model_validate(conflicting_payload)
     with pytest.raises(HTTPException, match="different content"):
-        mariadb_store.record_factory_workflow_artifact(
-            artifact.model_copy(update={"autogen_version": "0.7.6"})
-        )
+        mariadb_store.record_factory_workflow_artifact(conflicting)
 
     restarted = GatewayStore(mariadb_store.storage)
-    assert first.replayed is False
-    assert replay.replayed is True
+    restarted_sink = GatewayFactoryWorkflowArtifactSink(restarted)
+    restarted_replay = await restarted_sink.persist(artifact)
+    assert first is True
+    assert replay is False
+    assert restarted_replay is False
     assert assignment_write.replayed is False
     assert assignment_replay.replayed is True
     assert restarted.factory_skill_assignment(

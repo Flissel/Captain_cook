@@ -492,6 +492,78 @@ async def test_restart_recovers_paid_result_when_replay_completion_crashes(
     assert len(sink.artifacts(request.job.job_id)) == 1
 
 
+@pytest.mark.asyncio
+async def test_restart_recovers_raw_paid_result_when_first_persist_hard_crashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request()
+    budget = InMemoryFactoryBudgetLedger()
+    replay_root = tmp_path / "paid-replays"
+    sink = InMemoryFactoryWorkflowArtifactSink()
+    process_calls = 0
+
+    class HardCrash(BaseException):
+        pass
+
+    class CrashOnFirstPersist:
+        async def persist(self, _job: object, _content: bytes) -> ArtifactRef:
+            raise HardCrash("crash at first evidence persist")
+
+    class Process:
+        returncode = 0
+
+        def __init__(self, command: tuple[str, ...]) -> None:
+            self.command = command
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            usage_path = Path(self.command[self.command.index("--usage-file") + 1])
+            usage_path.write_text(json.dumps(_usage_report()), encoding="utf-8")
+            return json.dumps(_typed_payload(self.command[-1])).encode(), b""
+
+    async def create_process(*command: str, **_: object) -> Process:
+        nonlocal process_calls
+        process_calls += 1
+        return Process(command)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    with pytest.raises(HardCrash, match="first evidence persist"):
+        await HermesCliFactory(
+            settings=HermesCliSettings(skill_root=tmp_path),
+            evidence_store=CrashOnFirstPersist(),
+            released_skill_catalog=_catalog_for(tmp_path, FactorySkillStep.DISCOVER),
+            replay_store=FilesystemFactorySkillReplayStore(replay_root),
+            budget=budget,
+            workflow_artifact_sink=sink,
+            clock=lambda: NOW,
+        ).dispatch(request)
+
+    replay_files = tuple(replay_root.glob("*.json"))
+    assert len(replay_files) == 1
+    staged = json.loads(replay_files[0].read_text(encoding="utf-8"))
+    assert staged["state"] == "paid_result_ready"
+    assert staged["paid_stdout"]
+    assert staged["paid_usage"]
+    assert staged["budget_reservation"] is not None
+
+    recovered = await HermesCliFactory(
+        settings=HermesCliSettings(skill_root=tmp_path),
+        evidence_store=_EvidenceStore(),
+        released_skill_catalog=_catalog_for(tmp_path, FactorySkillStep.DISCOVER),
+        replay_store=FilesystemFactorySkillReplayStore(replay_root),
+        budget=budget,
+        workflow_artifact_sink=sink,
+        clock=lambda: NOW,
+    ).dispatch(request)
+
+    assert recovered.phase is FactoryPhase.BLUEPRINT_CREATED
+    assert recovered.status is FactoryBlockStatus.SUCCEEDED
+    assert process_calls == 1
+    assert budget.projection(request.job.job_id).consumed_usd == Decimal("0.02")
+    assert budget.projection(request.job.job_id).reserved_usd == Decimal("0")
+    assert len(sink.artifacts(request.job.job_id)) == 1
+
+
 def test_gateway_budget_accepts_usage_bound_to_exact_paid_hermes_lease() -> None:
     request = _request()
     assert request.lease is not None

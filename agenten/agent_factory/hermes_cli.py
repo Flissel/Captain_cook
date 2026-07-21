@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -269,7 +270,7 @@ class HermesCliFactory(HermesFactoryPort):
                 invocation.model_dump(mode="json", by_alias=True)
             )
             claim = await self._replay_store.claim(invocation)
-            if not claim.acquired:
+            if not claim.acquired and claim.record.state in {"result_ready", "completed"}:
                 accepted = claim.record
                 assert accepted.artifact is not None
                 assert accepted.transcript_ref is not None
@@ -291,13 +292,21 @@ class HermesCliFactory(HermesFactoryPort):
                 if not _may_continue_after(accepted.artifact):
                     break
                 continue
+            replay_record = claim.record
             try:
                 if isinstance(request.job, AgentFactoryJobV3):
-                    paid_result = await self._run_paid_skill_prompt(
+                    if claim.acquired:
+                        replay_record = await self._run_and_stage_paid_skill_prompt(
+                            request,
+                            pending=replay_record,
+                            invocation=invocation,
+                            prompt=_factory_skill_prompt(invocation, skill_name=skill_name),
+                            max_seconds=_remaining_deadline_seconds(deadline),
+                        )
+                    paid_result = await self._materialize_paid_skill_prompt(
                         request,
                         invocation=invocation,
-                        prompt=_factory_skill_prompt(invocation, skill_name=skill_name),
-                        max_seconds=_remaining_deadline_seconds(deadline),
+                        prepared=replay_record,
                     )
                     stdout = paid_result.stdout
                     step_accounting_refs = paid_result.accounting_refs
@@ -323,17 +332,20 @@ class HermesCliFactory(HermesFactoryPort):
                     artifact.model_dump_json(by_alias=True).encode("utf-8"),
                 )
             except asyncio.CancelledError:
-                await asyncio.shield(
-                    self._replay_store.fail(
-                        claim.record,
-                        failure_kind="cancelled",
+                if replay_record.state == "pending":
+                    await asyncio.shield(
+                        self._replay_store.fail(
+                            replay_record,
+                            failure_kind="cancelled",
+                        )
                     )
-                )
                 raise
             except Exception as exc:
+                if replay_record.state != "pending":
+                    raise
                 try:
                     await self._replay_store.fail(
-                        claim.record,
+                        replay_record,
                         failure_kind=type(exc).__name__,
                     )
                 except Exception as replay_exc:
@@ -341,7 +353,6 @@ class HermesCliFactory(HermesFactoryPort):
                         "factory skill failure state could not be persisted"
                     ) from replay_exc
                 raise
-            replay_record = claim.record
             if paid_result is not None:
                 replay_record = await self._replay_store.stage_result(
                     replay_record,
@@ -415,14 +426,15 @@ class HermesCliFactory(HermesFactoryPort):
             record.usage_receipt,
         )
 
-    async def _run_paid_skill_prompt(
+    async def _run_and_stage_paid_skill_prompt(
         self,
         request: FactoryDispatch,
         *,
+        pending: "FactorySkillReplayRecord",
         invocation: FactorySkillInvocationV1,
         prompt: str,
         max_seconds: float,
-    ) -> _HermesPaidPromptResult:
+    ) -> "FactorySkillReplayRecord":
         assert isinstance(request.job, AgentFactoryJobV3)
         assert request.lease is not None
         assert self._budget is not None
@@ -444,14 +456,46 @@ class HermesCliFactory(HermesFactoryPort):
                     usage_file=usage_path,
                 )
                 usage_bytes = usage_path.read_bytes()
-            usage = _parse_paid_usage(usage_bytes)
+                ended_at = self._clock()
+                return await self._replay_store.stage_paid_result(
+                    pending,
+                    stdout=stdout,
+                    usage=usage_bytes,
+                    budget_reservation=reservation,
+                    started_at=started_at,
+                    ended_at=ended_at,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise FactoryDispatchError("provider_cost_unresolved") from exc
+
+    async def _materialize_paid_skill_prompt(
+        self,
+        request: FactoryDispatch,
+        *,
+        invocation: FactorySkillInvocationV1,
+        prepared: "FactorySkillReplayRecord",
+    ) -> _HermesPaidPromptResult:
+        assert isinstance(request.job, AgentFactoryJobV3)
+        assert request.lease is not None
+        if (
+            prepared.state != "paid_result_ready"
+            or prepared.paid_stdout is None
+            or prepared.paid_usage is None
+            or prepared.budget_reservation is None
+            or prepared.paid_started_at is None
+            or prepared.paid_ended_at is None
+        ):
+            raise FactoryDispatchError("prepared paid Hermes replay is incomplete")
+        try:
+            usage = _parse_paid_usage(prepared.paid_usage)
             if usage.model not in request.job.execution_policy.allowed_models:
                 raise ValueError("Hermes used a model outside Captain policy")
-            ended_at = self._clock()
             if (
-                ended_at < started_at
-                or ended_at >= request.lease.expires_at
-                or ended_at > reservation.expires_at
+                prepared.paid_ended_at < prepared.paid_started_at
+                or prepared.paid_ended_at >= request.lease.expires_at
+                or prepared.paid_ended_at > prepared.budget_reservation.expires_at
             ):
                 raise ValueError("paid usage is outside the active lease")
             canonical_usage = _canonical_json(
@@ -464,10 +508,10 @@ class HermesCliFactory(HermesFactoryPort):
             receipt = _factory_usage_receipt(
                 request,
                 invocation=invocation,
-                reservation=reservation,
+                reservation=prepared.budget_reservation,
                 usage=usage,
-                started_at=started_at,
-                ended_at=ended_at,
+                started_at=prepared.paid_started_at,
+                ended_at=prepared.paid_ended_at,
                 evidence_ref=usage_ref,
             )
             receipt_ref = await self._evidence_store.persist(
@@ -475,9 +519,9 @@ class HermesCliFactory(HermesFactoryPort):
                 receipt.model_dump_json(by_alias=True).encode("utf-8"),
             )
             return _HermesPaidPromptResult(
-                stdout=stdout,
+                stdout=prepared.paid_stdout,
                 accounting_refs=(usage_ref, receipt_ref),
-                reservation=reservation,
+                reservation=prepared.budget_reservation,
                 receipt=receipt,
             )
         except asyncio.CancelledError:
@@ -659,12 +703,16 @@ class FactorySkillReplayRecord:
     invocation: FactorySkillInvocationV1
     invocation_sha256: str
     claim_token: str
-    state: Literal["pending", "result_ready", "completed", "failed"]
+    state: Literal["pending", "paid_result_ready", "result_ready", "completed", "failed"]
     artifact: _FactoryWorkflowArtifact | None = None
     transcript_ref: ArtifactRef | None = None
     accounting_refs: tuple[ArtifactRef, ...] = ()
     budget_reservation: FactoryBudgetReservationV1 | None = None
     usage_receipt: FactoryUsageReceiptV1 | None = None
+    paid_stdout: bytes | None = None
+    paid_usage: bytes | None = None
+    paid_started_at: datetime | None = None
+    paid_ended_at: datetime | None = None
     failure_kind: str | None = None
 
     def __post_init__(self) -> None:
@@ -680,6 +728,10 @@ class FactorySkillReplayRecord:
                 self.budget_reservation,
                 self.usage_receipt,
                 self.failure_kind,
+                self.paid_stdout,
+                self.paid_usage,
+                self.paid_started_at,
+                self.paid_ended_at,
             )
         ) or self.state == "pending" and self.accounting_refs:
             raise FactoryDispatchError("pending factory skill replay contains an outcome")
@@ -688,6 +740,15 @@ class FactorySkillReplayRecord:
             or self.transcript_ref is None
             or self.failure_kind is not None
             or (self.budget_reservation is None) != (self.usage_receipt is None)
+            or any(
+                item is not None
+                for item in (
+                    self.paid_stdout,
+                    self.paid_usage,
+                    self.paid_started_at,
+                    self.paid_ended_at,
+                )
+            )
         ):
             raise FactoryDispatchError("completed factory skill replay is incomplete")
         if self.state == "result_ready" and (
@@ -697,8 +758,30 @@ class FactorySkillReplayRecord:
             or self.budget_reservation is None
             or self.usage_receipt is None
             or self.failure_kind is not None
+            or any(
+                item is not None
+                for item in (
+                    self.paid_stdout,
+                    self.paid_usage,
+                    self.paid_started_at,
+                    self.paid_ended_at,
+                )
+            )
         ):
             raise FactoryDispatchError("prepared paid factory replay is incomplete")
+        if self.state == "paid_result_ready" and (
+            self.artifact is not None
+            or self.transcript_ref is not None
+            or self.accounting_refs
+            or self.budget_reservation is None
+            or self.usage_receipt is not None
+            or self.paid_stdout is None
+            or self.paid_usage is None
+            or self.paid_started_at is None
+            or self.paid_ended_at is None
+            or self.failure_kind is not None
+        ):
+            raise FactoryDispatchError("raw paid factory replay is incomplete")
         if self.state == "failed" and (
             self.artifact is not None
             or self.transcript_ref is not None
@@ -706,6 +789,15 @@ class FactorySkillReplayRecord:
             or self.budget_reservation is not None
             or self.usage_receipt is not None
             or self.failure_kind is None
+            or any(
+                item is not None
+                for item in (
+                    self.paid_stdout,
+                    self.paid_usage,
+                    self.paid_started_at,
+                    self.paid_ended_at,
+                )
+            )
         ):
             raise FactoryDispatchError("failed factory skill replay is incomplete")
         if self.artifact is not None and self.artifact.invocation != self.invocation:
@@ -725,6 +817,17 @@ class FactorySkillReplayStore(Protocol):
         self,
         invocation: FactorySkillInvocationV1,
     ) -> FactorySkillReplayClaim: ...
+
+    async def stage_paid_result(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        stdout: bytes,
+        usage: bytes,
+        budget_reservation: FactoryBudgetReservationV1,
+        started_at: datetime,
+        ended_at: datetime,
+    ) -> FactorySkillReplayRecord: ...
 
     async def stage_result(
         self,
@@ -797,6 +900,28 @@ class InMemoryFactorySkillReplayStore:
         )
         return await self._transition(pending, prepared)
 
+    async def stage_paid_result(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        stdout: bytes,
+        usage: bytes,
+        budget_reservation: FactoryBudgetReservationV1,
+        started_at: datetime,
+        ended_at: datetime,
+    ) -> FactorySkillReplayRecord:
+        return await self._transition(
+            pending,
+            _prepared_paid_replay_record(
+                pending,
+                stdout=stdout,
+                usage=usage,
+                budget_reservation=budget_reservation,
+                started_at=started_at,
+                ended_at=ended_at,
+            ),
+        )
+
     async def complete(
         self,
         pending: FactorySkillReplayRecord,
@@ -842,7 +967,11 @@ class InMemoryFactorySkillReplayStore:
     ) -> FactorySkillReplayRecord:
         async with self._lock:
             existing = self._records.get(pending.invocation.idempotency_key)
-            if existing != pending or existing.state not in {"pending", "result_ready"}:
+            if existing != pending or existing.state not in {
+                "pending",
+                "paid_result_ready",
+                "result_ready",
+            }:
                 raise FactoryDispatchError("factory skill replay claim is no longer pending")
             self._records[pending.invocation.idempotency_key] = outcome
             return outcome
@@ -889,6 +1018,28 @@ class FilesystemFactorySkillReplayStore:
             usage_receipt=usage_receipt,
         )
         return await self._transition(pending, prepared)
+
+    async def stage_paid_result(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        stdout: bytes,
+        usage: bytes,
+        budget_reservation: FactoryBudgetReservationV1,
+        started_at: datetime,
+        ended_at: datetime,
+    ) -> FactorySkillReplayRecord:
+        return await self._transition(
+            pending,
+            _prepared_paid_replay_record(
+                pending,
+                stdout=stdout,
+                usage=usage,
+                budget_reservation=budget_reservation,
+                started_at=started_at,
+                ended_at=ended_at,
+            ),
+        )
 
     async def complete(
         self,
@@ -1006,6 +1157,10 @@ class FilesystemFactorySkillReplayStore:
             accounting_refs: tuple[ArtifactRef, ...] = ()
             budget_reservation = None
             usage_receipt = None
+            paid_stdout = None
+            paid_usage = None
+            paid_started_at = None
+            paid_ended_at = None
             if state in {"result_ready", "completed"}:
                 model = _STEP_RESULT_MODELS[invocation.step]
                 artifact = model.model_validate(value["artifact"])
@@ -1022,6 +1177,14 @@ class FilesystemFactorySkillReplayStore:
                     usage_receipt = FactoryUsageReceiptV1.model_validate(
                         value["usage_receipt"]
                     )
+            elif state == "paid_result_ready":
+                paid_stdout = base64.b64decode(value["paid_stdout"], validate=True)
+                paid_usage = base64.b64decode(value["paid_usage"], validate=True)
+                budget_reservation = FactoryBudgetReservationV1.model_validate(
+                    value["budget_reservation"]
+                )
+                paid_started_at = datetime.fromisoformat(value["paid_started_at"])
+                paid_ended_at = datetime.fromisoformat(value["paid_ended_at"])
             return FactorySkillReplayRecord(
                 invocation=invocation,
                 invocation_sha256=value["invocation_sha256"],
@@ -1032,6 +1195,10 @@ class FilesystemFactorySkillReplayStore:
                 accounting_refs=accounting_refs,
                 budget_reservation=budget_reservation,
                 usage_receipt=usage_receipt,
+                paid_stdout=paid_stdout,
+                paid_usage=paid_usage,
+                paid_started_at=paid_started_at,
+                paid_ended_at=paid_ended_at,
                 failure_kind=value.get("failure_kind"),
             )
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
@@ -1069,6 +1236,26 @@ def _factory_skill_replay_content(record: FactorySkillReplayRecord) -> bytes:
                 None
                 if record.usage_receipt is None
                 else record.usage_receipt.model_dump(mode="json", by_alias=True)
+            ),
+            "paid_stdout": (
+                None
+                if record.paid_stdout is None
+                else base64.b64encode(record.paid_stdout).decode("ascii")
+            ),
+            "paid_usage": (
+                None
+                if record.paid_usage is None
+                else base64.b64encode(record.paid_usage).decode("ascii")
+            ),
+            "paid_started_at": (
+                None
+                if record.paid_started_at is None
+                else record.paid_started_at.isoformat()
+            ),
+            "paid_ended_at": (
+                None
+                if record.paid_ended_at is None
+                else record.paid_ended_at.isoformat()
             ),
             "failure_kind": record.failure_kind,
         }
@@ -1132,7 +1319,7 @@ def _prepared_replay_record(
     budget_reservation: FactoryBudgetReservationV1,
     usage_receipt: FactoryUsageReceiptV1,
 ) -> FactorySkillReplayRecord:
-    if pending.state != "pending":
+    if pending.state != "paid_result_ready":
         raise FactoryDispatchError("factory skill replay claim is no longer pending")
     return FactorySkillReplayRecord(
         invocation=pending.invocation,
@@ -1144,6 +1331,30 @@ def _prepared_replay_record(
         accounting_refs=accounting_refs,
         budget_reservation=budget_reservation,
         usage_receipt=usage_receipt,
+    )
+
+
+def _prepared_paid_replay_record(
+    pending: FactorySkillReplayRecord,
+    *,
+    stdout: bytes,
+    usage: bytes,
+    budget_reservation: FactoryBudgetReservationV1,
+    started_at: datetime,
+    ended_at: datetime,
+) -> FactorySkillReplayRecord:
+    if pending.state != "pending":
+        raise FactoryDispatchError("factory skill replay claim is no longer pending")
+    return FactorySkillReplayRecord(
+        invocation=pending.invocation,
+        invocation_sha256=pending.invocation_sha256,
+        claim_token=pending.claim_token,
+        state="paid_result_ready",
+        budget_reservation=budget_reservation,
+        paid_stdout=stdout,
+        paid_usage=usage,
+        paid_started_at=started_at,
+        paid_ended_at=ended_at,
     )
 
 

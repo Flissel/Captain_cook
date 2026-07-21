@@ -915,6 +915,14 @@ class GatewayStore:
         self,
         reservation: FactoryBudgetReservationV1,
     ) -> FactoryBudgetReservationWriteReceipt:
+        return self._retry_write(
+            lambda: self._reserve_factory_budget_once(reservation)
+        )
+
+    def _reserve_factory_budget_once(
+        self,
+        reservation: FactoryBudgetReservationV1,
+    ) -> FactoryBudgetReservationWriteReceipt:
         canonical = reservation.model_dump(mode="json", by_alias=True)
         digest = self._canonical_model_sha256(reservation)
         with self.storage.transaction() as connection:
