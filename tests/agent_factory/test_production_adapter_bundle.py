@@ -35,21 +35,9 @@ def test_production_bundle_exports_both_attested_factory_symbols() -> None:
     assert "build_factory_live_runtime" in commands[AdapterManifestKind.FACTORY_LIVE_RUNTIME]
 
 
-def test_factory_live_runtime_is_typed_and_fails_closed_before_provider_effect() -> None:
-    graph = build_factory_live_runtime(SimpleNamespace())
-
-    assert isinstance(graph, FactoryLiveExternalRuntimeGraph)
-    with pytest.raises(
-        ProductionToolRequired,
-        match="TODO_TOOL:factory_live_prepared_dispatch_bridge",
-    ):
-        graph.prepared_dispatch.prepare(
-            job=None,
-            action=None,
-            expected_skill_digests={},
-            projection=None,
-            workflow_artifacts=(),
-        )
+def test_factory_live_runtime_fails_closed_without_gateway_composition() -> None:
+    with pytest.raises(ValueError, match="paid runtime composition is incomplete"):
+        build_factory_live_runtime(SimpleNamespace())
 
 
 def test_runtime_artifact_port_requires_exact_content_address(tmp_path: Path) -> None:

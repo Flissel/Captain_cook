@@ -619,9 +619,12 @@ def build_factory_live_runtime(context: object):
         or not isinstance(skill_digests, Mapping)
     ):
         raise ValueError("Factory paid runtime composition is incomplete")
-    root = Path(
-        os.environ.get("CAPTAIN_FACTORY_ARTIFACT_ROOT", "artifacts/capability-factory")
-    )
+    factory_root = os.environ.get("CAPTAIN_FACTORY_ARTIFACT_ROOT", "").strip()
+    runtime_root = os.environ.get("CAPTAIN_RUNTIME_ARTIFACT_ROOT", "").strip()
+    if factory_root and runtime_root:
+        if Path(factory_root).resolve() != Path(runtime_root).resolve():
+            raise ValueError("Factory paid runtime and Package C artifact roots differ")
+    root = Path(factory_root or runtime_root or "artifacts/capability-factory")
     if not root.is_absolute():
         root = Path.cwd() / root
     artifacts = ContentAddressedArtifactStore(root)

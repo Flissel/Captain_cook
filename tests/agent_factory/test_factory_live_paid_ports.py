@@ -249,6 +249,25 @@ def test_production_builder_needs_no_manual_dependency_injection(
     assert (tmp_path / "factory-cas" / "content" / "sha256").is_dir()
 
 
+def test_production_builder_rejects_split_package_c_artifact_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CAPTAIN_FACTORY_ARTIFACT_ROOT", str(tmp_path / "factory"))
+    monkeypatch.setenv("CAPTAIN_RUNTIME_ARTIFACT_ROOT", str(tmp_path / "runtime"))
+    composition = SimpleNamespace(
+        job=workflow_job(mode="demo"),
+        repository=Catalog(),
+        leases=object(),
+        budget=object(),
+        workflow_sink=object(),
+        skill_digests={"captain-factory-brief-codex": "a" * 64},
+    )
+
+    with pytest.raises(ValueError, match="artifact roots differ"):
+        build_factory_live_runtime(SimpleNamespace(composition=composition))
+
+
 def test_improvement_request_binds_real_prior_candidate_for_valid_retry() -> None:
     from agenten.agent_factory.factory_live_entrypoint import _known_improvement_refs
 

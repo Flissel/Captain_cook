@@ -622,20 +622,20 @@ def build_capability_factory_entrypoint(config: Any) -> CapabilityFactoryEntrypo
 
 
 def build_factory_live_runtime(context: Any) -> FactoryLiveExternalRuntimeGraph:
-    """Return a typed graph; missing provider effects retain TODO_TOOL identity."""
+    """Delegate to the real attestable paid Factory effect graph."""
 
-    del context
-    return FactoryLiveExternalRuntimeGraph(
-        prepared_dispatch=_TodoPreparedDispatch(),
-        materializer=_TodoMaterializer(),
-        clock=lambda: datetime.now(timezone.utc),
+    from agenten.agent_factory.factory_live_paid_ports import (
+        build_factory_live_runtime as build_paid_runtime,
     )
+
+    return build_paid_runtime(context)
 
 
 def production_manifest_commands(workspace_root: Path) -> dict[AdapterManifestKind, str]:
     root = workspace_root.resolve()
     script = root / "scripts" / "generate-capability-adapter-manifest.py"
     module = root / "agenten" / "agent_factory" / "production_adapter_bundle.py"
+    paid_module = root / "agenten" / "agent_factory" / "factory_live_paid_ports.py"
     output = root / ".captain-cook" / "adapters"
     prefix = f'python "{script}" --workspace-root "{root}" --module "{module}"'
     return {
@@ -644,7 +644,8 @@ def production_manifest_commands(workspace_root: Path) -> dict[AdapterManifestKi
             f'--target "{output / "capability-entrypoint.manifest.json"}" --kind entrypoint'
         ),
         AdapterManifestKind.FACTORY_LIVE_RUNTIME: (
-            f'{prefix} --factory-symbol build_factory_live_runtime '
+            f'python "{script}" --workspace-root "{root}" --module "{paid_module}" '
+            f'--factory-symbol build_factory_live_runtime '
             f'--target "{output / "factory-live-runtime.manifest.json"}" '
             "--kind factory_live_runtime"
         ),
