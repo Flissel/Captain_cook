@@ -1305,9 +1305,33 @@ class GatewayStore:
                 if job_block is None:
                     raise HTTPException(status_code=409, detail="factory job not found")
                 cursor.execute(
-                    "SELECT effect_id, event_kind, content_sha256, payload "
-                    "FROM factory_live_effect_events WHERE job_id = %s "
-                    "ORDER BY block_index",
+                    """SELECT events.effect_id, events.event_kind,
+                              events.content_sha256, events.payload,
+                              events.block_index,
+                              ledger.block_type AS ledger_block_type,
+                              ledger.data AS ledger_data,
+                              ledger.status AS ledger_status,
+                              ledger.metadata AS ledger_metadata,
+                              ledger.hash AS ledger_hash,
+                              ledger.previous_hash AS ledger_previous_hash,
+                              ledger.parent_index AS ledger_parent_index,
+                              prior_block.hash AS previous_block_hash,
+                              (SELECT following.previous_hash
+                                 FROM blocks AS following
+                                WHERE following.`index` > ledger.`index`
+                                ORDER BY following.`index` LIMIT 1)
+                                  AS next_previous_hash
+                         FROM factory_live_effect_events AS events
+                         JOIN blocks AS ledger
+                           ON ledger.`index` = events.block_index
+                    LEFT JOIN blocks AS prior_block
+                           ON prior_block.`index` = (
+                                SELECT MAX(candidate.`index`)
+                                  FROM blocks AS candidate
+                                 WHERE candidate.`index` < ledger.`index`
+                           )
+                        WHERE events.job_id = %s
+                     ORDER BY events.block_index""",
                     (str(job_id),),
                 )
                 rows = cursor.fetchall()
@@ -2614,11 +2638,18 @@ class GatewayStore:
             and invocation_id is not None
         ):
             sql = (
-                "SELECT event_kind, content_sha256, payload "
-                "FROM factory_live_effect_events "
-                "WHERE effect_id = %s OR (job_id = %s AND claim_key = %s) "
-                "OR (job_id = %s AND invocation_id = %s) "
-                "ORDER BY block_index"
+                "SELECT events.event_kind, events.content_sha256, events.payload, "
+                "events.block_index, ledger.block_type AS ledger_block_type, "
+                "ledger.data AS ledger_data, ledger.status AS ledger_status, "
+                "ledger.metadata AS ledger_metadata, ledger.hash AS ledger_hash, "
+                "ledger.previous_hash AS ledger_previous_hash, "
+                "ledger.parent_index AS ledger_parent_index "
+                "FROM factory_live_effect_events AS events "
+                "JOIN blocks AS ledger ON ledger.`index` = events.block_index "
+                "WHERE events.effect_id = %s "
+                "OR (events.job_id = %s AND events.claim_key = %s) "
+                "OR (events.job_id = %s AND events.invocation_id = %s) "
+                "ORDER BY events.block_index"
             )
             parameters = (
                 str(effect_id),
@@ -2629,9 +2660,15 @@ class GatewayStore:
             )
         else:
             sql = (
-                "SELECT event_kind, content_sha256, payload "
-                "FROM factory_live_effect_events "
-                "WHERE effect_id = %s ORDER BY block_index"
+                "SELECT events.event_kind, events.content_sha256, events.payload, "
+                "events.block_index, ledger.block_type AS ledger_block_type, "
+                "ledger.data AS ledger_data, ledger.status AS ledger_status, "
+                "ledger.metadata AS ledger_metadata, ledger.hash AS ledger_hash, "
+                "ledger.previous_hash AS ledger_previous_hash, "
+                "ledger.parent_index AS ledger_parent_index "
+                "FROM factory_live_effect_events AS events "
+                "JOIN blocks AS ledger ON ledger.`index` = events.block_index "
+                "WHERE events.effect_id = %s ORDER BY events.block_index"
             )
             parameters = (str(effect_id),)
         if for_update:
@@ -2661,18 +2698,72 @@ class GatewayStore:
 
     @staticmethod
     def _factory_live_effect_payload(row: dict[str, Any]) -> object:
-        payload = GatewayStore._decode_json(row["payload"])
-        digest = hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
-                "utf-8"
-            )
-        ).hexdigest()
-        if digest != row["content_sha256"]:
+        side_payload = GatewayStore._decode_json(row["payload"])
+        ledger_payload = GatewayStore._decode_json(row["ledger_data"])
+        metadata = GatewayStore._decode_json(row["ledger_metadata"])
+        if not isinstance(ledger_payload, dict) or not isinstance(metadata, dict):
             raise HTTPException(
                 status_code=409,
-                detail="factory live effect payload digest mismatch",
+                detail="factory live effect Ledger block has malformed JSON",
             )
-        return payload
+        block = Block(
+            index=int(row["block_index"]),
+            block_type=str(row["ledger_block_type"]),
+            data=ledger_payload,
+            status=str(row["ledger_status"]),
+            previous_hash=str(row["ledger_previous_hash"]),
+            parent_index=row["ledger_parent_index"],
+            metadata=metadata,
+            hash=str(row["ledger_hash"]),
+        )
+        if block.block_type != "factory_live_effect" or block.status != "accepted":
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect Ledger block type or status mismatch",
+            )
+        if block.compute_hash() != block.hash:
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect Ledger block hash mismatch",
+            )
+        previous_hash = row.get("previous_block_hash")
+        if "previous_block_hash" in row:
+            expected_previous = "0" if previous_hash is None else str(previous_hash)
+            if block.previous_hash != expected_previous:
+                raise HTTPException(
+                    status_code=409,
+                    detail="factory live effect Ledger block previous link mismatch",
+                )
+        next_previous_hash = row.get("next_previous_hash")
+        if next_previous_hash is not None and str(next_previous_hash) != block.hash:
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect Ledger block next link mismatch",
+            )
+        if metadata.get("event_kind") != row["event_kind"]:
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect Ledger block event kind mismatch",
+            )
+        schema = ledger_payload.get("schema")
+        if schema is not None and metadata.get("schema") != schema:
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect Ledger block schema mismatch",
+            )
+        digest = hashlib.sha256(
+            json.dumps(
+                ledger_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if side_payload != ledger_payload or digest != row["content_sha256"]:
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect side table differs from Ledger block",
+            )
+        return ledger_payload
 
     def _assert_factory_live_invocation(
         self,

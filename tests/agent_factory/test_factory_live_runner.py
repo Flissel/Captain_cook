@@ -11,6 +11,7 @@ from agenten.agent_factory.factory_live_runner import (
     FactoryLiveEffectKind,
     FactoryLiveEffectOutcomeV1,
     FactoryLiveEffectRequestV1,
+    FactoryLiveRunReport,
     FactoryLiveRunner,
     InMemoryFactoryLiveEffectLedger,
 )
@@ -295,11 +296,15 @@ def test_history_reconstructs_reserved_effect_after_process_crash() -> None:
     history = restarted.history(job.job_id)
 
     assert len(history) == 1
-    assert history[0].effect_id == request.effect_id
-    assert history[0].status == "reserved"
-    assert history[0].provider_started is None
-    assert history[0].evidence_ref is None
-    assert history[0].reason == (
+    assert isinstance(history[0], FactoryLiveRunReport)
+    assert history[0].status == "infrastructure_recovery_required"
+    assert history[0].attempt == 1
+    assert history[0].next_attempt == 1
+    assert history[0].effects[0].effect_id == request.effect_id
+    assert history[0].effects[0].status == "reserved"
+    assert history[0].effects[0].provider_started is None
+    assert history[0].effects[0].evidence_ref is None
+    assert history[0].effects[0].reason == (
         "reserved external effect requires authoritative recovery evidence"
     )
 
@@ -338,6 +343,16 @@ async def test_history_after_recovery_is_durable_and_exact_replay_is_not_duplica
     )
     assert all(record.outcome is not None for record in history)
     assert recovered.recover_calls == 1
+    rebuilt = runner(
+        job,
+        ledger,
+        Plan(),
+        Executor(second, start=AssertionError("history must not execute")),
+    ).history(job.job_id)
+    assert all(isinstance(report, FactoryLiveRunReport) for report in rebuilt)
+    assert tuple(
+        effect.effect_id for report in rebuilt for effect in report.effects
+    ) == (first.effect_id, second.effect_id)
 
 
 @pytest.mark.asyncio

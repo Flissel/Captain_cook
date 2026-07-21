@@ -19,9 +19,11 @@ from agenten.agent_factory.factory_live_runner import (
     FactoryLiveBlockReason,
     FactoryLiveEffectClaim,
     FactoryLiveEffectKind,
+    FactoryLiveEffectOutcomeV1,
     FactoryLiveEffectRecord,
     FactoryLiveEffectWriteReceipt,
 )
+from blockchain.Blockchain_modell import Block
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.contracts import FactorySkillAssignmentV1
 from gateway.factory_repository import GatewayFactoryLiveEffectLedger
@@ -124,14 +126,84 @@ def test_gateway_history_preserves_exact_non_dispatched_block_reason() -> None:
 
 
 def test_gateway_effect_payload_digest_rejects_tampering() -> None:
-    payload = {"status": "budget_exhausted", "reason": "original"}
+    ledger_payload = {"status": "budget_exhausted", "reason": "original"}
+    block = Block(
+        index=0,
+        block_type="factory_live_effect",
+        data=ledger_payload,
+        status="accepted",
+        previous_hash="0",
+        metadata={"event_kind": "outcome"},
+    )
+    side_payload = {"status": "budget_exhausted", "reason": "rewritten"}
     row = {
-        "payload": json.dumps(payload, sort_keys=True),
-        "content_sha256": "0" * 64,
+        "payload": json.dumps(side_payload, sort_keys=True),
+        "content_sha256": hashlib.sha256(
+            json.dumps(
+                side_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        "block_index": block.index,
+        "ledger_data": json.dumps(block.data, sort_keys=True),
+        "ledger_block_type": block.block_type,
+        "ledger_status": block.status,
+        "ledger_metadata": json.dumps(block.metadata, sort_keys=True),
+        "ledger_hash": block.hash,
+        "ledger_previous_hash": block.previous_hash,
+        "ledger_parent_index": block.parent_index,
+        "previous_block_hash": None,
+        "next_previous_hash": None,
+        "event_kind": "outcome",
     }
 
-    with pytest.raises(HTTPException, match="digest mismatch"):
+    with pytest.raises(HTTPException, match="Ledger block"):
         GatewayStore._factory_live_effect_payload(row)
+
+
+def test_gateway_effect_payload_reads_historical_block_without_reason_field() -> None:
+    request = effect_request(workflow_job(mode="demo"))
+    old_payload = effect_outcome(request).model_dump(mode="json", by_alias=True)
+    old_payload.pop("reason")
+    block = Block(
+        index=0,
+        block_type="factory_live_effect",
+        data=old_payload,
+        status="accepted",
+        previous_hash="0",
+        metadata={
+            "schema": "captain.factory-live-effect-outcome.v1",
+            "event_kind": "outcome",
+        },
+    )
+    digest = hashlib.sha256(
+        json.dumps(old_payload, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    row = {
+        "payload": json.dumps(old_payload, sort_keys=True),
+        "content_sha256": digest,
+        "block_index": block.index,
+        "ledger_data": json.dumps(block.data, sort_keys=True),
+        "ledger_block_type": block.block_type,
+        "ledger_status": block.status,
+        "ledger_metadata": json.dumps(block.metadata, sort_keys=True),
+        "ledger_hash": block.hash,
+        "ledger_previous_hash": block.previous_hash,
+        "ledger_parent_index": block.parent_index,
+        "previous_block_hash": None,
+        "next_previous_hash": None,
+        "event_kind": "outcome",
+    }
+
+    restored = FactoryLiveEffectOutcomeV1.model_validate(
+        GatewayStore._factory_live_effect_payload(row)
+    )
+
+    assert restored.status == "succeeded"
+    assert restored.reason is None
 
 
 def test_gateway_effect_adapter_translates_store_conflicts() -> None:
@@ -267,7 +339,7 @@ def test_mariadb_effect_history_survives_restart_in_authoritative_order(
     assert history[1].outcome is None
 
 
-def test_mariadb_effect_history_reads_pre_reason_success_rows(
+def test_mariadb_effect_history_rejects_side_table_rewrite(
     mariadb_store: GatewayStore,
 ) -> None:
     _, request = prepared_mariadb_effect(mariadb_store)
@@ -284,7 +356,7 @@ def test_mariadb_effect_history_reads_pre_reason_success_rows(
             )
             row = cursor.fetchone()
             payload = GatewayStore._decode_json(row["payload"])
-            payload.pop("reason")
+            payload["reason"] = "side table rewrite"
             digest = hashlib.sha256(
                 json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
                     "utf-8"
@@ -297,12 +369,10 @@ def test_mariadb_effect_history_reads_pre_reason_success_rows(
                 (json.dumps(payload, sort_keys=True), digest, str(request.effect_id)),
             )
 
-    history = GatewayFactoryLiveEffectLedger(
-        GatewayStore(mariadb_store.storage)
-    ).history(request.job_id)
-    assert history[0].outcome is not None
-    assert history[0].outcome.status == "succeeded"
-    assert history[0].outcome.reason is None
+    with pytest.raises(ValueError, match="Ledger block"):
+        GatewayFactoryLiveEffectLedger(
+            GatewayStore(mariadb_store.storage)
+        ).history(request.job_id)
 
 
 def test_mariadb_effect_changed_replay_conflicts(

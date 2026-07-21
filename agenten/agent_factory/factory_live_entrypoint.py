@@ -41,6 +41,7 @@ from agenten.agent_factory.contracts import (
     FactoryRole,
 )
 from agenten.agent_factory.factory_live_runner import (
+    FactoryLiveBlockReason,
     FactoryLiveEffectKind,
     FactoryLiveRunReport,
 )
@@ -537,6 +538,40 @@ class FactorySixSkillLiveCoordinator:
                 job,
                 mode,
                 "infrastructure_recovery_required",
+                skill_steps,
+                tuple(reports),
+            )
+        blocked_statuses = frozenset(reason.value for reason in FactoryLiveBlockReason)
+        blocked_effects = tuple(
+            (index, effect)
+            for index, effect in enumerate(report.effects)
+            if effect.status in blocked_statuses
+        )
+        if blocked_effects:
+            index, blocked = blocked_effects[0]
+            observed_prefix = tuple(effect.kind for effect in report.effects)
+            if (
+                report.status != "blocked"
+                or len(blocked_effects) != 1
+                or index != len(report.effects) - 1
+                or observed_prefix != expected_kinds[: len(observed_prefix)]
+                or any(
+                    effect.status != "succeeded"
+                    for effect in report.effects[:index]
+                )
+                or blocked.provider_started is not False
+                or blocked.reason is None
+                or report.reasons != (blocked.reason,)
+                or report.attempt != action.attempt
+                or report.next_attempt != action.attempt
+            ):
+                raise ValueError(
+                    "Factory non-dispatched block lacks exact Captain bindings"
+                )
+            return self._result(
+                job,
+                mode,
+                "blocked",
                 skill_steps,
                 tuple(reports),
             )

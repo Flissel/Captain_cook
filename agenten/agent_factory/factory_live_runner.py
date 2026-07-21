@@ -359,11 +359,12 @@ class FactoryLiveRunner:
         self._executor = executor
         self._clock = clock
 
-    def history(self, job_id: UUID) -> tuple[FactoryLiveEffectReport, ...]:
-        """Reconstruct ordered, durable effect state from the authority ledger."""
+    def history(self, job_id: UUID) -> tuple[FactoryLiveRunReport, ...]:
+        """Reconstruct typed run reports from the authority-owned effect stream."""
 
         job = self._resolve_job(job_id)
-        reports: list[FactoryLiveEffectReport] = []
+        mode = job.execution_policy.mode.value
+        reports: list[FactoryLiveRunReport] = []
         for record in self._effect_ledger.history(job_id):
             request = record.request
             if (
@@ -372,23 +373,64 @@ class FactoryLiveRunner:
                 or request.subject_version != job.subject_version
             ):
                 raise ValueError("factory live effect history binding mismatch")
+            projection = FactoryProjection.from_job(job).model_copy(
+                update={"attempt": request.attempt}
+            )
             if record.outcome is None:
+                reason = (
+                    "reserved external effect requires authoritative recovery evidence"
+                )
+                effect = FactoryLiveEffectReport(
+                    effect_id=request.effect_id,
+                    kind=request.kind,
+                    attempt=request.attempt,
+                    status="reserved",
+                    evidence_ref=None,
+                    reason=reason,
+                    provider_started=None,
+                    replayed=True,
+                )
                 reports.append(
-                    FactoryLiveEffectReport(
-                        effect_id=request.effect_id,
-                        kind=request.kind,
-                        attempt=request.attempt,
-                        status="reserved",
-                        evidence_ref=None,
-                        reason=(
-                            "reserved external effect requires authoritative recovery evidence"
-                        ),
-                        provider_started=None,
-                        replayed=True,
+                    self._infrastructure_report(
+                        job,
+                        mode,
+                        projection,
+                        [effect],
+                        reason,
+                    )
+                )
+                continue
+            outcome = record.outcome
+            effect = _effect_report(request, outcome, replayed=True)
+            if outcome.status == "behavioral_failure":
+                reports.append(
+                    self._behavioral_report(job, mode, projection, [effect])
+                )
+            elif outcome.status in _NON_DISPATCHED_STATUSES:
+                reports.append(
+                    self._blocked_report(
+                        job,
+                        mode,
+                        projection,
+                        [effect],
+                        outcome.reason,
                     )
                 )
             else:
-                reports.append(_effect_report(request, record.outcome, replayed=True))
+                decision = self._release_decision(job, request.attempt)
+                reports.append(
+                    FactoryLiveRunReport(
+                        job_id=job.job_id,
+                        correlation_id=job.correlation_id,
+                        mode=mode,
+                        status=decision.status,
+                        attempt=request.attempt,
+                        next_attempt=request.attempt,
+                        effects=(effect,),
+                        release_decision=decision,
+                        reasons=decision.reasons,
+                    )
+                )
         return tuple(reports)
 
     async def run(
