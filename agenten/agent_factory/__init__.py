@@ -9,6 +9,8 @@ from .contracts import (
     FactoryRole,
     PromotedCapability,
 )
+from .input_contracts import FactoryInputDocumentV2
+from .input_document import FactoryInputError, load_factory_input, parse_factory_input_bytes
 from .service import FactoryCoordinator, FactoryRepository, InMemoryFactoryRepository
 
 __all__ = [
@@ -22,4 +24,8 @@ __all__ = [
     "FactoryCoordinator",
     "FactoryRepository",
     "InMemoryFactoryRepository",
+    "FactoryInputDocumentV2",
+    "FactoryInputError",
+    "load_factory_input",
+    "parse_factory_input_bytes",
 ]
