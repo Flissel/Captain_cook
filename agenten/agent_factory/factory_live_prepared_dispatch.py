@@ -136,6 +136,14 @@ class PreparedFactoryLivePlan:
             UUID,
             tuple[FactoryLivePreparedDispatch, FactoryLiveEffectRequestV1],
         ] = {}
+        self._last_plan: tuple[
+            AgentFactoryJobV3,
+            Literal["demo", "release"],
+            FactoryProjection,
+            tuple[object, ...],
+            FactoryAction,
+            tuple[FactoryLiveEffectRequestV1, ...],
+        ] | None = None
         self._skill_policy = SkillSequencePolicy()
 
     def effects_for(
@@ -155,6 +163,23 @@ class PreparedFactoryLivePlan:
             raise ValueError("Factory prepared plan action does not match the projection")
         if action.kind is FactoryActionKind.VALIDATE_FOR_PROMOTION:
             return ()
+        if self._last_plan is not None:
+            (
+                cached_job,
+                cached_mode,
+                cached_projection,
+                cached_artifacts,
+                cached_action,
+                cached_requests,
+            ) = self._last_plan
+            if (
+                cached_job == job
+                and cached_mode == mode
+                and cached_projection == projection
+                and cached_artifacts == workflow_artifacts
+                and cached_action == action
+            ):
+                return cached_requests
         prepared = self._dispatch.prepare(
             job=job,
             action=action,
@@ -183,6 +208,14 @@ class PreparedFactoryLivePlan:
             if existing is not None and existing != current:
                 raise ValueError("Factory effect identity conflicts with its prepared request")
             self._prepared_by_effect_id[request.effect_id] = current
+        self._last_plan = (
+            job,
+            mode,
+            projection,
+            workflow_artifacts,
+            action,
+            prepared.requests,
+        )
         return prepared.requests
 
     def require_prepared(
