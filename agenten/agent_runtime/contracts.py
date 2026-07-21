@@ -74,6 +74,9 @@ class ProviderEffectReceipt(_FrozenContract):
     )
     effect_id: UUID
     command_id: UUID
+    origin_claim_id: UUID
+    origin_claim_fencing_token: int = Field(ge=1, strict=True)
+    origin_claim_digest: str = Field(pattern=SHA256_PATTERN)
     request_digest: str = Field(pattern=SHA256_PATTERN)
     result_digest: str = Field(pattern=SHA256_PATTERN)
     status: Literal[

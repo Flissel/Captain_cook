@@ -1904,8 +1904,6 @@ class CapabilityFactoryEntrypoint:
                     command_id=plan.command.event_id,
                     expires_at=claim.expires_at,
                 )
-        original_claim = claim
-
         if operation is None:
             self._require_effect_budget(job, "runtime command admission")
             self._gateway.accept_runtime_command(plan.command)
@@ -1959,7 +1957,13 @@ class CapabilityFactoryEntrypoint:
                 claim_receipt,
                 effect_id=provider_effect_id,
             )
-        self._validate_provider_execution(plan, runtime)
+        self._validate_provider_execution(
+            plan,
+            runtime,
+            effect_claim=(
+                claim_receipt.claim if provider_execution is None else None
+            ),
+        )
         bundle = CapabilityExecutionBundle(
             command=plan.command,
             grant=plan.grant,
@@ -1971,13 +1975,8 @@ class CapabilityFactoryEntrypoint:
         self._validate_execution_bundle(job, authority, bundle)
         self._require_effect_budget(job, "runtime result recording")
         if provider_execution is not None:
-            if original_claim is None:
-                raise CapabilityProviderIdempotencyError(
-                    "durable provider effect has no historical execution claim"
-                )
             recovery = self._runtime_result_recovery_request(
                 runtime,
-                original_claim=original_claim,
                 recovery_claim=claim_receipt.claim,
             )
             self._gateway.recover_runtime_result(
@@ -2005,6 +2004,8 @@ class CapabilityFactoryEntrypoint:
         self,
         plan: CapabilityExecutionPlan,
         runtime: CapabilityRuntimeExecution,
+        *,
+        effect_claim: RuntimeExecutionClaim | None = None,
     ) -> None:
         receipt = runtime.provider_receipt
         expected_effect_id = uuid5(
@@ -2023,31 +2024,43 @@ class CapabilityFactoryEntrypoint:
             raise CapabilityProviderIdempotencyError(
                 "runtime provider receipt does not prove durable idempotency"
             )
+        if effect_claim is not None and (
+            receipt.origin_claim_id != effect_claim.claim_id
+            or receipt.origin_claim_fencing_token != effect_claim.fencing_token
+            or receipt.origin_claim_digest
+            != canonical_contract_sha256(effect_claim)
+        ):
+            raise CapabilityProviderIdempotencyError(
+                "runtime provider receipt does not bind its execution claim"
+            )
 
     @staticmethod
     def _runtime_result_recovery_request(
         runtime: CapabilityRuntimeExecution,
         *,
-        original_claim: RuntimeExecutionClaim,
         recovery_claim: RuntimeExecutionClaim,
     ) -> RuntimeResultRecoveryRequest:
         result = runtime.result
+        receipt = runtime.provider_receipt
         observation = RuntimeResultRecoveryObservation(
             schema_name="captain.runtime-result-recovery-observation.v1",
             event_id=uuid5(
                 result.event_id,
                 (
                     "runtime-result-recovery:"
-                    f"{original_claim.fencing_token}:{recovery_claim.fencing_token}"
+                    f"{receipt.origin_claim_fencing_token}:"
+                    f"{recovery_claim.fencing_token}"
                 ),
             ),
             observed_at=recovery_claim.claimed_at,
             command_id=result.command_id,
             original_result_id=result.event_id,
             original_result_digest=canonical_contract_sha256(result),
-            provider_effect_id=runtime.provider_receipt.effect_id,
-            provider_receipt_digest=canonical_contract_sha256(runtime.provider_receipt),
-            original_claim_fence=original_claim.fencing_token,
+            original_claim_id=receipt.origin_claim_id,
+            original_claim_digest=receipt.origin_claim_digest,
+            provider_effect_id=receipt.effect_id,
+            provider_receipt_digest=canonical_contract_sha256(receipt),
+            original_claim_fence=receipt.origin_claim_fencing_token,
             recovery_claim_fence=recovery_claim.fencing_token,
             correlation_id=result.correlation_id,
             causation_id=result.event_id,
@@ -2055,7 +2068,7 @@ class CapabilityFactoryEntrypoint:
         return RuntimeResultRecoveryRequest(
             schema_name="captain.runtime-result-recovery-request.v1",
             result=result,
-            provider_receipt=runtime.provider_receipt,
+            provider_receipt=receipt,
             observation=observation,
         )
 
@@ -2082,9 +2095,13 @@ class CapabilityFactoryEntrypoint:
             or recovery.command_id != observed.command_id
             or recovery.original_result_id != observed.event_id
             or recovery.original_result_digest != canonical_contract_sha256(observed)
+            or recovery.original_claim_id != receipt.origin_claim_id
+            or recovery.original_claim_digest != receipt.origin_claim_digest
             or recovery.provider_effect_id != receipt.effect_id
             or recovery.provider_receipt_digest != canonical_contract_sha256(receipt)
             or recovery.recovery_claim_fence != claim.fencing_token
+            or recovery.original_claim_fence
+            != receipt.origin_claim_fencing_token
             or recovery.original_claim_fence >= recovery.recovery_claim_fence
             or recovery.correlation_id != observed.correlation_id
             or recovery.causation_id != observed.event_id

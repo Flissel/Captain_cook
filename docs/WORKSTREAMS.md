@@ -50,7 +50,8 @@ command/grant/claim/result/recovery-observation/execution transactions,
 including rollback and reconstructed-store replay. Provider recovery never
 rewrites `AgentRuntimeResult`; the original bytes and result ID remain the
 capability-execution authority while a distinct Captain observation binds the
-receipt digest and both claim fences.
+receipt digest, the effect-origin claim ID/fence/digest, and the active recovery
+fence. Intervening expired recovery claims never replace that receipt origin.
 
 Release evidence remains Captain-owned. Forge supplies a candidate; a Captain
 Evidence Issuer supplies the controlled-recovery and normal-run records;
