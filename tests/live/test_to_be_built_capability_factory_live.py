@@ -11,7 +11,9 @@ import pytest
 
 from agenten.agent_factory.capability_factory_entrypoint import (
     CapabilityFactoryRunSummary,
+    DockerCapabilitySandboxRunner,
 )
+from agenten.agent_factory.outcome_validation import CapabilitySandboxRequest
 from agenten.agent_factory.outcome_contracts import FactoryTerminalDecision
 from agenten.delivery.minibook_client import MinibookClient
 from agenten.delivery.projection_cursor import ProjectionCursorStore
@@ -31,6 +33,59 @@ def _required_environment(name: str) -> str:
     if os.environ.get("CAPABILITY_FACTORY_LIVE_REQUIRED") == "1":
         pytest.fail(f"live capability factory prerequisite is missing: {name}")
     pytest.skip(f"live capability factory prerequisite is missing: {name}")
+
+
+@pytest.mark.asyncio
+async def test_pinned_capability_sandbox_runs_real_isolated_import_and_pytest(
+    tmp_path: Path,
+) -> None:
+    image = _required_environment("CAPTAIN_CAPABILITY_SANDBOX_IMAGE")
+    (tmp_path / "capability").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "capability" / "team.py").write_text(
+        "CAPABILITY_ID = 'sandbox-live-smoke'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "tests" / "test_team.py").write_text(
+        "from capability.team import CAPABILITY_ID\n\n"
+        "def test_identity(): assert CAPABILITY_ID == 'sandbox-live-smoke'\n",
+        encoding="utf-8",
+    )
+    entries = []
+    for path in tmp_path.rglob("*"):
+        if path.is_file():
+            content = path.read_bytes()
+            entries.append(
+                (
+                    path.relative_to(tmp_path).as_posix(),
+                    hashlib.sha256(content).hexdigest(),
+                    len(content),
+                )
+            )
+    tree_digest = hashlib.sha256(
+        json.dumps(sorted(entries), separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    execution_id = UUID("a06a2896-7b72-4d8f-88e9-55446f8bac3d")
+    result = await DockerCapabilitySandboxRunner(image=image).validate(
+        CapabilitySandboxRequest(
+            request_digest="d" * 64,
+            execution_id=execution_id,
+            process_identity=f"sandbox-handle://{execution_id}",
+            correlation_id=execution_id,
+            workspace=tmp_path,
+            python_path_root=tmp_path,
+            module_names=("capability.team",),
+            test_paths=("tests/test_team.py",),
+            extracted_tree_sha256=tree_digest,
+            package_archive_sha256="e" * 64,
+            timeout_seconds=60,
+        )
+    )
+
+    assert result.status == "passed"
+    assert result.workspace_was_read_only is True
+    assert result.network_was_disabled is True
+    assert result.resource_limits_were_enforced is True
 
 
 @pytest.mark.asyncio

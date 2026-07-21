@@ -10,10 +10,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import importlib
 import json
 import os
 import re
-from datetime import datetime
+import sys
+import time
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Protocol
@@ -66,6 +69,7 @@ from agenten.agent_factory.release_gate import (
     E2EKind,
     E2EOutcome,
     E2ERunEvidence,
+    FactoryReleaseDecision,
     FactoryTerminalReasonCode,
     derive_terminal_decision,
     evaluate_factory_release,
@@ -76,15 +80,26 @@ from agenten.agent_factory.service import (
     FactoryRepositoryError,
 )
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
-from agenten.agent_runtime.contracts import AgentRuntimeCommand, AgentRuntimeResult, ArtifactRef
+from agenten.agent_runtime.contracts import (
+    AgentRuntimeCommand,
+    AgentRuntimeResult,
+    ArtifactRef,
+    CapabilityGrant,
+)
 from agenten.delivery.minibook_events import MinibookProjectionEvent
 from agenten.delivery.projector import MinibookProjector
 from gateway.contracts import (
+    CapabilityExecutionRecord,
     CapabilityExecutionRequest,
     CapabilityReleaseRequest,
     CapabilityWriteReceipt,
+    FactoryReleaseDecisionSubmission,
+    RuntimeExecutionClaimReceipt,
+    RuntimeExecutionClaimRequest,
+    RuntimeOperationProjection,
     canonical_contract_sha256,
 )
+from gateway.capability_catalog import CapabilityCatalogRecord
 
 
 class CapabilityFactoryInputMutation(ValueError):
@@ -93,6 +108,10 @@ class CapabilityFactoryInputMutation(ValueError):
 
 class CapabilityFactoryConfigurationError(ValueError):
     """Production composition was not given a safe, complete configuration."""
+
+
+class CapabilityFactoryDeadlineExceeded(RuntimeError):
+    """A post-publication effect was stopped because the immutable budget expired."""
 
 
 class CapabilitySandboxIsolationError(RuntimeError):
@@ -126,6 +145,7 @@ class CapabilityFactoryCliConfig(BaseModel):
     correlation_id: UUID
     subject_version: int = Field(default=1, ge=1, strict=True)
     wall_clock_budget_seconds: int = Field(default=600, ge=1, le=86_400, strict=True)
+    preflight_only: bool = False
     gateway_token: SecretStr
     runtime_token: SecretStr
     minibook_projection_api_key: SecretStr
@@ -157,10 +177,30 @@ class CapabilityExecutionBundle(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     command: AgentRuntimeCommand
+    grant: CapabilityGrant
     result: AgentRuntimeResult
     outcome: ExecutionOutcomeV1
     claim_owner_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
     claim_fencing_token: int = Field(ge=1, strict=True)
+
+
+class CapabilityExecutionPlan(BaseModel):
+    """Deterministic command and least-privilege grant prepared before claiming."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    command: AgentRuntimeCommand
+    grant: CapabilityGrant
+    claim_owner_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+class CapabilityRuntimeExecution(BaseModel):
+    """Provider result produced only after Gateway issued the execution claim."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    result: AgentRuntimeResult
+    outcome: ExecutionOutcomeV1
 
 
 class CapabilityFactoryRunSummary(BaseModel):
@@ -223,13 +263,31 @@ class CaptainEvidenceIssuerPort(Protocol):
 
 
 class CapabilityRuntimePort(Protocol):
-    async def execute(self, release: CapabilityReleaseRequest) -> CapabilityExecutionBundle: ...
+    async def prepare(
+        self,
+        job: AgentFactoryJobV2,
+        authority: CapabilityCatalogRecord,
+    ) -> CapabilityExecutionPlan: ...
+
+    async def execute(
+        self,
+        plan: CapabilityExecutionPlan,
+        authority: CapabilityCatalogRecord,
+        claim: RuntimeExecutionClaimReceipt,
+    ) -> CapabilityRuntimeExecution: ...
+
+
+class CapabilityAuthorityCatalogPort(CapabilityCatalogPort, Protocol):
+    def compatible_record(
+        self,
+        job: AgentFactoryJobV2,
+    ) -> CapabilityCatalogRecord | None: ...
 
 
 class CapabilityFactoryGatewayPort(Protocol):
     def record_factory_release_decision(
         self,
-        decision: FactoryReleaseDecision,
+        submission: FactoryReleaseDecisionSubmission,
     ) -> object: ...
 
     def publish_capability_release(
@@ -237,12 +295,47 @@ class CapabilityFactoryGatewayPort(Protocol):
         request: CapabilityReleaseRequest,
     ) -> CapabilityWriteReceipt: ...
 
-    def record_runtime_operation(self, bundle: CapabilityExecutionBundle) -> None: ...
+    def factory_terminal_decision(
+        self,
+        job_id: UUID,
+    ) -> FactoryTerminalDecision | None: ...
+
+    def capability(
+        self,
+        capability_id: str,
+        *,
+        version: int | None = None,
+    ) -> CapabilityCatalogRecord | None: ...
+
+    def accept_runtime_command(self, command: AgentRuntimeCommand) -> object: ...
+
+    def record_capability_grant(self, grant: CapabilityGrant) -> object: ...
+
+    def claim_runtime_execution(
+        self,
+        request: RuntimeExecutionClaimRequest,
+    ) -> RuntimeExecutionClaimReceipt: ...
+
+    def record_runtime_result(
+        self,
+        result: AgentRuntimeResult,
+        *,
+        execution_owner_id: str,
+        execution_fencing_token: int,
+        execution_claim_credential: str,
+    ) -> object: ...
+
+    def runtime_operation(self, operation_id: UUID) -> RuntimeOperationProjection: ...
 
     def record_capability_execution(
         self,
         request: CapabilityExecutionRequest,
     ) -> CapabilityWriteReceipt: ...
+
+    def capability_execution(
+        self,
+        command_id: UUID,
+    ) -> CapabilityExecutionRecord | None: ...
 
     def projection_events(
         self,
@@ -357,13 +450,11 @@ class DockerCliCommandRunner:
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=timeout_seconds,
-            )
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.communicate()
+            stdout, stderr = await process.communicate()
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.terminate()
+                await process.communicate()
             raise
         if len(stdout) > 1_048_576 or len(stderr) > 1_048_576:
             raise CapabilitySandboxIsolationError(
@@ -396,6 +487,7 @@ import sys
 
 modules = tuple(json.loads(sys.argv[1]))
 tests = tuple(json.loads(sys.argv[2]))
+sys.path.insert(0, "/workspace")
 try:
     for module_name in modules:
         spec = importlib.util.find_spec(module_name)
@@ -691,10 +783,11 @@ class DockerCapabilitySandboxRunner:
             )
         tmpfs = _mapping(host, "Tmpfs")
         tmp_options = tmpfs.get("/tmp")
-        if not isinstance(tmp_options, str) or not {
-            "noexec",
-            "nosuid",
-        }.issubset(set(tmp_options.split(","))):
+        if (
+            not isinstance(tmp_options, str)
+            or set(tmp_options.split(","))
+            != {"rw", "noexec", "nosuid", "size=67108864"}
+        ):
             raise CapabilitySandboxIsolationError(
                 "sandbox writable temporary storage was not safely bounded"
             )
@@ -776,6 +869,7 @@ def parse_capability_factory_args(
     parser.add_argument("--correlation-id")
     parser.add_argument("--subject-version", type=int, default=1)
     parser.add_argument("--wall-clock-budget-seconds", type=int, default=600)
+    parser.add_argument("--preflight-only", action="store_true")
     namespace = parser.parse_args(arguments)
 
     root = (workspace_root or Path.cwd()).resolve()
@@ -834,6 +928,7 @@ def parse_capability_factory_args(
             correlation_id=correlation_id,
             subject_version=namespace.subject_version,
             wall_clock_budget_seconds=namespace.wall_clock_budget_seconds,
+            preflight_only=namespace.preflight_only,
             **secret_values,
         )
     except ValueError as exc:
@@ -868,6 +963,109 @@ def write_redacted_evidence_manifest(
                 "content-addressed evidence manifest has conflicting bytes"
             )
     return target
+
+
+def _load_production_entrypoint(
+    config: CapabilityFactoryCliConfig,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> CapabilityFactoryEntrypoint:
+    source = os.environ if environ is None else environ
+    reference = source.get("CAPABILITY_FACTORY_ADAPTER_FACTORY", "").strip()
+    if not reference:
+        raise CapabilityFactoryConfigurationError(
+            "production adapter bundle is missing: "
+            "CAPABILITY_FACTORY_ADAPTER_FACTORY must name module:factory"
+        )
+    if re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*",
+        reference,
+    ) is None:
+        raise CapabilityFactoryConfigurationError(
+            "production adapter bundle reference must use module:factory"
+        )
+    module_name, factory_name = reference.split(":", 1)
+    try:
+        module = importlib.import_module(module_name)
+        factory = getattr(module, factory_name)
+        entrypoint = factory(config)
+    except (ImportError, AttributeError, TypeError) as exc:
+        raise CapabilityFactoryConfigurationError(
+            "production capability-factory adapter bundle could not be loaded"
+        ) from exc
+    if not isinstance(entrypoint, CapabilityFactoryEntrypoint):
+        raise CapabilityFactoryConfigurationError(
+            "production adapter factory returned an invalid entrypoint"
+        )
+    return entrypoint
+
+
+async def run_capability_factory_cli(
+    config: CapabilityFactoryCliConfig,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> Mapping[str, object]:
+    """Run the configured production composition and return redacted evidence only."""
+
+    entrypoint = _load_production_entrypoint(config, environ=environ)
+    if config.preflight_only:
+        return {
+            "schema": "captain.capability-factory-cli-result.v1",
+            "status": "preflight_ok",
+            "targets": {
+                "gateway": config.gateway_url,
+                "runtime": config.runtime_url,
+                "minibook": config.minibook_url,
+            },
+        }
+    started_at = datetime.now(timezone.utc)
+    started = time.perf_counter()
+    summary = await entrypoint.run(
+        input_path=config.input_path,
+        correlation_id=config.correlation_id,
+        subject_version=config.subject_version,
+        wall_clock_budget_seconds=config.wall_clock_budget_seconds,
+    )
+    manifest_path = write_redacted_evidence_manifest(summary, config.artifact_dir)
+    finished_at = datetime.now(timezone.utc)
+    return {
+        "schema": "captain.capability-factory-cli-result.v1",
+        "status": summary.terminal_state.value,
+        "summary": summary.model_dump(mode="json", by_alias=True),
+        "manifest": str(manifest_path.relative_to(config.workspace_root)),
+        "targets": {
+            "gateway": config.gateway_url,
+            "runtime": config.runtime_url,
+            "minibook": config.minibook_url,
+        },
+        "timings": {
+            "started_at": started_at.isoformat(),
+            "finished_at": finished_at.isoformat(),
+            "duration_seconds": round(time.perf_counter() - started, 6),
+        },
+        "digests": {
+            "input_sha256": hashlib.sha256(config.input_path.read_bytes()).hexdigest(),
+            "manifest_sha256": manifest_path.stem,
+        },
+    }
+
+
+def main(arguments: tuple[str, ...] | None = None) -> int:
+    try:
+        config = parse_capability_factory_args(
+            tuple(sys.argv[1:] if arguments is None else arguments)
+        )
+        result = asyncio.run(run_capability_factory_cli(config))
+    except CapabilityFactoryConfigurationError as exc:
+        sys.stderr.write(f"capability factory blocked: {exc}\n")
+        return 2
+    except Exception:
+        sys.stderr.write(
+            "capability factory failed closed; inspect redacted service logs for details\n"
+        )
+        return 1
+    sys.stdout.write(json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n")
+    return 0
 
 
 def _safe_workspace_path(root: Path, raw: str, label: str) -> Path:
@@ -984,7 +1182,7 @@ class CapabilityFactoryEntrypoint:
         checkpoint_store: CapabilityFactoryCheckpointStore,
         holdout_store: PrivateHoldoutStore,
         repository: FactoryRepository,
-        catalog: CapabilityCatalogPort,
+        catalog: CapabilityAuthorityCatalogPort,
         released_skill: ReleasedSkillRefV1,
         creation: CapabilityCreationPort,
         content_store: ReadOnlyCapabilityContentStore,
@@ -1037,6 +1235,17 @@ class CapabilityFactoryEntrypoint:
                 input_sha256=job.input_ref.sha256,
             )
         )
+        authority = self._catalog.compatible_record(job)
+        if authority is not None:
+            _require_catalog_authority(job, authority)
+            execution, projection_events = await self._execute_authority(job, authority)
+            return _reuse_summary(
+                job,
+                authority,
+                execution=execution,
+                projection_events=projection_events,
+            )
+
         coordinator = FactoryCoordinator(self._repository, clock=self._clock)
         coordinator.register(job)
         resolution = CapabilityResolver(self._catalog).resolve(job)
@@ -1110,6 +1319,16 @@ class CapabilityFactoryEntrypoint:
             )
             run_receipts.append(run)
 
+        if self._clock.now() >= job.deadline_at:
+            return self._seal_nonready(
+                coordinator,
+                job,
+                creation_job.creation_job_id,
+                validation=None,
+                evaluation=coordinator.evaluation_for_job(job.job_id),
+                evidence=tuple(item.record for item in run_receipts),
+            )
+
         evidence = tuple(item.record for item in run_receipts)
         try:
             package = await CapabilityPackageValidator(
@@ -1138,6 +1357,16 @@ class CapabilityFactoryEntrypoint:
                 evidence=evidence,
             )
 
+        if self._clock.now() >= job.deadline_at:
+            return self._seal_nonready(
+                coordinator,
+                job,
+                creation_job.creation_job_id,
+                validation=package,
+                evaluation=coordinator.evaluation_for_job(job.job_id),
+                evidence=evidence,
+            )
+
         evaluation = coordinator.evaluation_for_job(job.job_id)
         provisional = derive_terminal_decision(
             job,
@@ -1157,58 +1386,92 @@ class CapabilityFactoryEntrypoint:
                 evidence=evidence,
             )
 
-        for block in await self._evidence_issuer.lifecycle_blocks(
+        lifecycle_blocks = await self._evidence_issuer.lifecycle_blocks(
             job,
             tuple(run_receipts),
-        ):
+        )
+        for block in lifecycle_blocks:
+            if self._clock.now() >= job.deadline_at:
+                return self._seal_nonready(
+                    coordinator,
+                    job,
+                    creation_job.creation_job_id,
+                    validation=package,
+                    evaluation=evaluation,
+                    evidence=evidence,
+                )
             coordinator.record(block)
         old_evidence = tuple(_legacy_e2e(item) for item in run_receipts)
         release_decision = evaluate_factory_release(job, old_evidence, evaluation)
-        self._gateway.record_factory_release_decision(release_decision)
-        promotion = _promotion_block(job, package, evaluation, self._clock.now())
-        coordinator.record(promotion)
-        coordinator.record_terminal_decision(
-            job.job_id,
-            validation=package,
-            evaluation=evaluation,
-            e2e=evidence,
+        if self._clock.now() >= job.deadline_at:
+            return self._seal_nonready(
+                coordinator,
+                job,
+                creation_job.creation_job_id,
+                validation=package,
+                evaluation=evaluation,
+                evidence=evidence,
+            )
+        self._gateway.record_factory_release_decision(
+            FactoryReleaseDecisionSubmission(
+                decision=release_decision,
+                e2e_evidence=old_evidence,
+            )
         )
-        terminal = coordinator.terminal_decision_for_job(job.job_id)
+        promotion = _promotion_block(job, package, evaluation, self._clock.now())
+        if self._clock.now() >= job.deadline_at:
+            return self._seal_nonready(
+                coordinator,
+                job,
+                creation_job.creation_job_id,
+                validation=package,
+                evaluation=evaluation,
+                evidence=evidence,
+            )
+        coordinator.record(promotion)
+        terminal = derive_terminal_decision(
+            job,
+            coordinator.projection(job.job_id),
+            package,
+            evaluation,
+            evidence,
+            self._clock.now(),
+        )
         if terminal is None or terminal.state is not FactoryTerminalState.READY_TO_USE:
-            raise RuntimeError("Gateway did not persist the ready_to_use terminal decision")
+            raise RuntimeError("ready_to_use was not derivable after promotion")
 
         release = _release_request(job, terminal, package, evidence, promotion)
+        if self._clock.now() >= job.deadline_at:
+            return self._seal_nonready(
+                coordinator,
+                job,
+                creation_job.creation_job_id,
+                validation=package,
+                evaluation=evaluation,
+                evidence=evidence,
+            )
         self._gateway.publish_capability_release(release)
-        bundle = await self._runtime.execute(release)
-        validate_execution_outcome_binding(
-            bundle.outcome,
-            command=bundle.command,
-            result=bundle.result,
-            expected_capability_id=package.capability_id,
-            expected_capability_version=package.capability_version,
-            expected_team_version=release.team_version,
+        self._require_effect_budget(job, "post-publication runtime continuation")
+        terminal = self._gateway.factory_terminal_decision(job.job_id)
+        authority = self._gateway.capability(
+            package.capability_id,
+            version=package.capability_version,
         )
-        self._gateway.record_runtime_operation(bundle)
-        execution = CapabilityExecutionRequest(
-            schema_name="captain.capability-execution-request.v1",
-            event_id=uuid5(bundle.command.event_id, "capability-execution-record"),
-            causation_id=bundle.result.event_id,
-            occurred_at=bundle.result.occurred_at,
-            producer="captain",
-            outcome=bundle.outcome,
-            outcome_ref=_canonical_ref(bundle.outcome, "execution-outcome"),
-            claim_owner_id=bundle.claim_owner_id,
-            claim_fencing_token=bundle.claim_fencing_token,
-        )
-        self._gateway.record_capability_execution(execution)
-        projection_events = tuple(
-            event
-            for event in self._gateway.projection_events(job.correlation_id)
-            if event.correlation_id == job.correlation_id
-        )
-        if not projection_events:
-            raise RuntimeError("Gateway projection feed has no correlated execution event")
-        self._projector.rebuild(projection_events)
+        if (
+            terminal is None
+            or terminal.model_copy(update={"decided_at": release.decision.decided_at})
+            != release.decision
+        ):
+            raise RuntimeError("Gateway terminal readback disagrees with atomic publication")
+        if (
+            authority is None
+            or authority.terminal_decision_id != terminal.decision_id
+            or authority.package_ref != release.package_ref
+            or authority.promoted_capability != release.promoted_capability
+            or authority.status != "ready_to_use"
+        ):
+            raise RuntimeError("Gateway catalog readback disagrees with atomic publication")
+        bundle, projection_events = await self._execute_authority(job, authority)
         return _summary(
             job,
             terminal,
@@ -1218,6 +1481,127 @@ class CapabilityFactoryEntrypoint:
             execution=bundle,
             projection_events=projection_events,
         )
+
+    async def _execute_authority(
+        self,
+        job: AgentFactoryJobV2,
+        authority: CapabilityCatalogRecord,
+    ) -> tuple[CapabilityExecutionBundle, tuple[MinibookProjectionEvent, ...]]:
+        self._require_effect_budget(job, "runtime plan preparation")
+        plan = await self._runtime.prepare(job, authority)
+        if (
+            plan.command.correlation_id != job.correlation_id
+            or plan.grant.command_id != plan.command.event_id
+            or plan.grant.batch_id != plan.command.payload.batch_id
+            or plan.grant.subtask_id != plan.command.payload.subtask_id
+            or plan.grant.workspace_ref != plan.command.payload.workspace_ref
+            or plan.grant.profile != plan.command.payload.capability_profile
+        ):
+            raise ValueError("runtime execution plan does not match the factory invocation")
+
+        existing = self._gateway.capability_execution(plan.command.event_id)
+        if existing is not None:
+            operation = self._gateway.runtime_operation(plan.command.event_id)
+            if operation.result is None or existing.outcome.result_id != operation.result.event_id:
+                raise RuntimeError("Gateway execution readback is incomplete")
+            bundle = CapabilityExecutionBundle(
+                command=operation.command,
+                grant=operation.grant or plan.grant,
+                result=operation.result,
+                outcome=existing.outcome,
+                claim_owner_id=existing.claim_owner_id,
+                claim_fencing_token=existing.claim_fencing_token,
+            )
+        else:
+            self._require_effect_budget(job, "runtime command admission")
+            self._gateway.accept_runtime_command(plan.command)
+            self._require_effect_budget(job, "runtime grant recording")
+            self._gateway.record_capability_grant(plan.grant)
+            self._require_effect_budget(job, "runtime execution claim")
+            claim = self._gateway.claim_runtime_execution(
+                RuntimeExecutionClaimRequest(
+                    schema_name="captain.runtime-execution-claim-request.v1",
+                    command_id=plan.command.event_id,
+                    owner_id=plan.claim_owner_id,
+                    lease_seconds=min(plan.command.payload.limits.wall_seconds, 900),
+                    capability_id=authority.capability_id,
+                    capability_version=authority.capability_version,
+                )
+            )
+            if claim.claim_credential is None:
+                raise RuntimeError(
+                    "runtime claim replay cannot recover its one-time credential"
+                )
+            self._require_effect_budget(job, "provider execution")
+            runtime = await self._runtime.execute(plan, authority, claim)
+            bundle = CapabilityExecutionBundle(
+                command=plan.command,
+                grant=plan.grant,
+                result=runtime.result,
+                outcome=runtime.outcome,
+                claim_owner_id=claim.claim.owner_id,
+                claim_fencing_token=claim.claim.fencing_token,
+            )
+            validate_execution_outcome_binding(
+                bundle.outcome,
+                command=bundle.command,
+                result=bundle.result,
+                expected_capability_id=authority.capability_id,
+                expected_capability_version=authority.capability_version,
+                expected_team_version=authority.team_version,
+            )
+            if bundle.command.correlation_id != job.correlation_id:
+                raise ValueError(
+                    "runtime command correlation does not match factory invocation"
+                )
+            self._require_effect_budget(job, "runtime result recording")
+            self._gateway.record_runtime_result(
+                bundle.result,
+                execution_owner_id=claim.claim.owner_id,
+                execution_fencing_token=claim.claim.fencing_token,
+                execution_claim_credential=claim.claim_credential,
+            )
+
+        validate_execution_outcome_binding(
+            bundle.outcome,
+            command=bundle.command,
+            result=bundle.result,
+            expected_capability_id=authority.capability_id,
+            expected_capability_version=authority.capability_version,
+            expected_team_version=authority.team_version,
+        )
+        if bundle.command.correlation_id != job.correlation_id:
+            raise ValueError("runtime command correlation does not match factory invocation")
+        if existing is None:
+            self._require_effect_budget(job, "capability execution recording")
+            execution = CapabilityExecutionRequest(
+                schema_name="captain.capability-execution-request.v1",
+                event_id=uuid5(bundle.command.event_id, "capability-execution-record"),
+                causation_id=bundle.result.event_id,
+                occurred_at=bundle.result.occurred_at,
+                producer="captain",
+                outcome=bundle.outcome,
+                outcome_ref=_canonical_ref(bundle.outcome, "execution-outcome"),
+                claim_owner_id=bundle.claim_owner_id,
+                claim_fencing_token=bundle.claim_fencing_token,
+            )
+            self._gateway.record_capability_execution(execution)
+        self._require_effect_budget(job, "Minibook projection")
+        projection_events = tuple(
+            event
+            for event in self._gateway.projection_events(job.correlation_id)
+            if event.correlation_id == job.correlation_id
+        )
+        if not projection_events:
+            raise RuntimeError("Gateway projection feed has no correlated execution event")
+        self._projector.rebuild(projection_events)
+        return bundle, projection_events
+
+    def _require_effect_budget(self, job: AgentFactoryJobV2, effect: str) -> None:
+        if self._clock.now() >= job.deadline_at:
+            raise CapabilityFactoryDeadlineExceeded(
+                f"factory deadline expired before {effect}"
+            )
 
     def _resume_job(self, proposed: AgentFactoryJobV2) -> AgentFactoryJobV2:
         try:
@@ -1535,3 +1919,52 @@ def _summary(
         unresolved_required_tool_gaps=required_gaps,
         unresolved_optional_tool_gaps=optional_gaps,
     )
+
+
+def _require_catalog_authority(
+    job: AgentFactoryJobV2,
+    authority: CapabilityCatalogRecord,
+) -> None:
+    promoted = authority.promoted_capability
+    if (
+        authority.status != "ready_to_use"
+        or authority.unresolved_required_gap_ids
+        or authority.capability_id != job.required_capability
+        or authority.capability_version < job.subject_version
+        or authority.schema_major != 1
+        or authority.accepted_assertion_ids != job.acceptance_assertion_ids
+        or authority.integration_intents
+        or authority.tool_contracts
+        or promoted.capability_id != authority.capability_id
+        or promoted.version != authority.capability_version
+        or promoted.status != "ready_to_use"
+        or promoted.promotion_block_ref is None
+    ):
+        raise RuntimeError("Gateway returned incompatible capability catalog authority")
+
+
+def _reuse_summary(
+    job: AgentFactoryJobV2,
+    authority: CapabilityCatalogRecord,
+    *,
+    execution: CapabilityExecutionBundle,
+    projection_events: tuple[MinibookProjectionEvent, ...],
+) -> CapabilityFactoryRunSummary:
+    return CapabilityFactoryRunSummary(
+        correlation_id=job.correlation_id,
+        factory_job_id=job.job_id,
+        creation_job_id=None,
+        terminal_decision_id=authority.terminal_decision_id,
+        terminal_state=FactoryTerminalState.READY_TO_USE,
+        capability_id=authority.capability_id,
+        capability_version=authority.capability_version,
+        execution_command_id=execution.command.event_id,
+        execution_result_id=execution.result.event_id,
+        projection_event_ids=tuple(item.event_id for item in projection_events),
+        package_sha256=authority.package_ref.sha256,
+        unresolved_required_tool_gaps=authority.unresolved_required_gap_ids,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
