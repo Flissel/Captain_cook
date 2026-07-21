@@ -3,23 +3,28 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 from uuid import UUID, uuid5
 
 import pytest
 
 from agenten.agent_factory.capability_factory_entrypoint import (
     CapabilityFactoryConfigurationError,
+    CapabilityFactoryDeadlineExceeded,
     CapabilityExecutionBundle,
+    CapabilityExecutionPlan,
     CapabilityFactoryCheckpoint,
     CapabilityFactoryEntrypoint,
     CapabilityFactoryInputMutation,
     CapabilityFactoryRunSummary,
     CapabilityReleaseRunReceipt,
+    CapabilityRuntimeExecution,
     CapabilitySandboxIsolationError,
     DockerCapabilitySandboxRunner,
     DockerCommandResult,
@@ -62,6 +67,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
     ArtifactRef,
+    CapabilityGrant,
 )
 from agenten.delivery.projector import MinibookProjector
 from agenten.delivery.projection_cursor import ProjectionCursorStore
@@ -71,9 +77,14 @@ from gateway.contracts import (
     CapabilityExecutionRequest,
     CapabilityReleaseRequest,
     CapabilityWriteReceipt,
+    FactoryReleaseDecisionSubmission,
+    RuntimeExecutionClaim,
+    RuntimeExecutionClaimReceipt,
+    RuntimeOperationProjection,
 )
 from gateway.factory_repository import GatewayFactoryRepository
 from gateway.registry_feed import runtime_result_projection
+from gateway.store import GatewayStore
 from tests.agent_factory.test_skill_evaluation_contracts import evidence_payload
 
 
@@ -86,6 +97,36 @@ FIXTURE_INPUT = (
     / "agent_factory"
     / "TO_BE_BUILT.valid.md"
 )
+
+
+def _isolated_test_dsn() -> str | None:
+    value = os.environ.get("TEST_MARIADB_DSN", "").strip()
+    if not value:
+        candidates = (
+            Path(__file__).parents[2] / ".env",
+            Path.home() / "Desktop" / "Captain_cook" / ".env",
+        )
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            for line in candidate.read_text(encoding="utf-8").splitlines():
+                if line.startswith("TEST_MARIADB_DSN="):
+                    value = line.split("=", 1)[1].strip()
+                    break
+            if value:
+                break
+    if not value:
+        return None
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"mysql", "mariadb"}
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.path.strip("/") != "captain_test"
+    ):
+        pytest.fail(
+            "TEST_MARIADB_DSN must target loopback database exactly captain_test"
+        )
+    return value
 
 
 class SimulatedProcessCrash(RuntimeError):
@@ -121,9 +162,13 @@ class MemoryContentStore:
 @dataclass
 class VerifiedScriptedSandboxRunner:
     requests: list[CapabilitySandboxRequest] = field(default_factory=list)
+    clock: MutableClock | None = None
+    advance_clock_after_validate: timedelta | None = None
 
     async def validate(self, request: CapabilitySandboxRequest) -> CapabilitySandboxResult:
         self.requests.append(request)
+        if self.clock is not None and self.advance_clock_after_validate is not None:
+            self.clock.value += self.advance_clock_after_validate
         return CapabilitySandboxResult(
             execution_id=request.execution_id,
             request_digest=request.request_digest,
@@ -608,11 +653,22 @@ class ScriptedGatewayStore:
     terminal_decisions: dict[UUID, object] = field(default_factory=dict)
     catalog_records: dict[str, CapabilityCatalogRecord] = field(default_factory=dict)
     releases: dict[UUID, CapabilityReleaseRequest] = field(default_factory=dict)
-    runtime_operations: dict[UUID, CapabilityExecutionBundle] = field(default_factory=dict)
+    runtime_commands: dict[UUID, AgentRuntimeCommand] = field(default_factory=dict)
+    runtime_grants: dict[UUID, CapabilityGrant] = field(default_factory=dict)
+    runtime_claims: dict[UUID, RuntimeExecutionClaim] = field(default_factory=dict)
+    runtime_results: dict[UUID, AgentRuntimeResult] = field(default_factory=dict)
     executions: dict[UUID, CapabilityExecutionRecord] = field(default_factory=dict)
     projection_events_by_correlation: dict[UUID, list[object]] = field(default_factory=dict)
     release_effects: list[UUID] = field(default_factory=list)
     execution_effects: list[UUID] = field(default_factory=list)
+    authority_order: list[str] = field(default_factory=list)
+    runtime_authority_order: list[str] = field(default_factory=list)
+    crash_after_publication_once: bool = False
+    crash_after_execution_once: bool = False
+    _crashed_after_publication: bool = False
+    _crashed_after_execution: bool = False
+    advance_clock_after_publication: timedelta | None = None
+    advance_clock_after_execution: timedelta | None = None
 
     def record_factory_job(self, job: AgentFactoryJobV2) -> object:
         existing = self.jobs.get(job.job_id)
@@ -633,6 +689,8 @@ class ScriptedGatewayStore:
         if existing is not None and existing != block:
             raise AssertionError("changed factory block replay")
         records[block.event_id] = block
+        if block.phase is FactoryPhase.CAPABILITY_PROMOTED and existing is None:
+            self.authority_order.append("promotion")
         return SimpleNamespace(replayed=existing is not None)
 
     def factory_skill_evaluation(self, job_id: UUID) -> StoredSkillEvaluation | None:
@@ -641,7 +699,11 @@ class ScriptedGatewayStore:
     def factory_release_decision(self, job_id: UUID) -> FactoryReleaseDecision | None:
         return self.release_decisions.get(job_id)
 
-    def record_factory_release_decision(self, decision: FactoryReleaseDecision) -> object:
+    def record_factory_release_decision(
+        self,
+        submission: FactoryReleaseDecisionSubmission,
+    ) -> object:
+        decision = submission.decision
         existing = self.release_decisions.get(decision.job_id)
         if existing is not None and existing != decision:
             raise AssertionError("changed release decision replay")
@@ -649,6 +711,7 @@ class ScriptedGatewayStore:
         return SimpleNamespace(replayed=existing is not None)
 
     def record_factory_terminal_decision(self, decision: object) -> object:
+        assert decision.state != "ready_to_use"  # type: ignore[attr-defined]
         job_id = decision.job_id  # type: ignore[attr-defined]
         existing = self.terminal_decisions.get(job_id)
         if existing is not None and existing != decision:
@@ -676,20 +739,122 @@ class ScriptedGatewayStore:
             )
         self.releases[request.package.factory_job_id] = request
         self.release_effects.append(request.event_id)
+        assert request.package.factory_job_id not in self.terminal_decisions
+        assert self.authority_order[-1] == "promotion"
+        self.terminal_decisions[request.package.factory_job_id] = request.decision
         self.catalog_records[request.package.capability_id] = CapabilityCatalogRecord.from_release(
             request,
             catalog_fence=1,
         )
+        self.authority_order.append("atomic-publication")
+        if self.advance_clock_after_publication is not None:
+            self.clock.value += self.advance_clock_after_publication
+        if self.crash_after_publication_once and not self._crashed_after_publication:
+            self._crashed_after_publication = True
+            raise SimulatedProcessCrash("after atomic publication")
         return CapabilityWriteReceipt(
             record_id=f"{request.package.capability_id}:{request.package.capability_version}",
             replayed=False,
         )
 
-    def record_runtime_operation(self, bundle: CapabilityExecutionBundle) -> None:
-        existing = self.runtime_operations.get(bundle.command.event_id)
-        if existing is not None and existing != bundle:
-            raise AssertionError("changed runtime operation replay")
-        self.runtime_operations[bundle.command.event_id] = bundle
+    def capability(
+        self,
+        capability_id: str,
+        *,
+        version: int | None = None,
+    ) -> CapabilityCatalogRecord | None:
+        record = self.catalog_records.get(capability_id)
+        if record is None or (version is not None and record.capability_version != version):
+            return None
+        return record
+
+    def accept_runtime_command(self, command: AgentRuntimeCommand) -> object:
+        existing = self.runtime_commands.get(command.event_id)
+        if existing is not None and existing != command:
+            raise AssertionError("changed runtime command replay")
+        self.runtime_commands[command.event_id] = command
+        if existing is None:
+            self.runtime_authority_order.append("command")
+        return SimpleNamespace(replayed=existing is not None)
+
+    def record_capability_grant(self, grant: CapabilityGrant) -> object:
+        existing = self.runtime_grants.get(grant.command_id)
+        if existing is not None and existing != grant:
+            raise AssertionError("changed runtime grant replay")
+        self.runtime_grants[grant.command_id] = grant
+        if existing is None:
+            self.runtime_authority_order.append("grant")
+        return SimpleNamespace(replayed=existing is not None)
+
+    def claim_runtime_execution(self, request: object) -> RuntimeExecutionClaimReceipt:
+        command_id = request.command_id  # type: ignore[attr-defined]
+        existing = self.runtime_claims.get(command_id)
+        if existing is not None:
+            return RuntimeExecutionClaimReceipt(
+                claim=existing,
+                replayed=True,
+                recovered=False,
+                claim_credential=None,
+            )
+        authority = self.catalog_records[request.capability_id]  # type: ignore[attr-defined]
+        claim = RuntimeExecutionClaim(
+            capability_id=authority.capability_id,
+            capability_version=authority.capability_version,
+            team_version=authority.team_version,
+            catalog_fence=authority.catalog_fence,
+            catalog_block_index=101,
+            catalog_block_hash="c" * 64,
+            package_block_index=100,
+            package_block_hash="b" * 64,
+            package_ref=authority.package_ref,
+            published_at=authority.published_at,
+            command_id=command_id,
+            claim_id=uuid5(command_id, "runtime-execution-claim:1"),
+            owner_id=request.owner_id,  # type: ignore[attr-defined]
+            fencing_token=1,
+            claimed_at=self.clock.now(),
+            expires_at=self.clock.now() + timedelta(seconds=request.lease_seconds),  # type: ignore[attr-defined]
+            status="active",
+        )
+        self.runtime_claims[command_id] = claim
+        self.runtime_authority_order.append("claim")
+        return RuntimeExecutionClaimReceipt(
+            claim=claim,
+            replayed=False,
+            recovered=False,
+            claim_credential="deterministic-runtime-claim-credential",
+        )
+
+    def record_runtime_result(
+        self,
+        result: AgentRuntimeResult,
+        *,
+        execution_owner_id: str,
+        execution_fencing_token: int,
+        execution_claim_credential: str,
+    ) -> object:
+        claim = self.runtime_claims[result.command_id]
+        assert execution_owner_id == claim.owner_id
+        assert execution_fencing_token == claim.fencing_token
+        assert execution_claim_credential == "deterministic-runtime-claim-credential"
+        existing = self.runtime_results.get(result.command_id)
+        if existing is not None and existing != result:
+            raise AssertionError("changed runtime result replay")
+        self.runtime_results[result.command_id] = result
+        self.runtime_claims[result.command_id] = claim.model_copy(
+            update={"status": "completed", "completed_at": result.occurred_at}
+        )
+        if existing is None:
+            self.runtime_authority_order.append("result")
+        return SimpleNamespace(replayed=existing is not None)
+
+    def runtime_operation(self, operation_id: UUID) -> RuntimeOperationProjection:
+        return RuntimeOperationProjection(
+            operation_id=operation_id,
+            command=self.runtime_commands[operation_id],
+            grant=self.runtime_grants.get(operation_id),
+            result=self.runtime_results.get(operation_id),
+        )
 
     def record_capability_execution(
         self,
@@ -703,18 +868,25 @@ class ScriptedGatewayStore:
                 record_id=str(request.outcome.command_id),
                 replayed=True,
             )
-        bundle = self.runtime_operations[request.outcome.command_id]
         record = CapabilityExecutionRecord.from_request(request, catalog_fence=1)
         self.executions[request.outcome.command_id] = record
         self.execution_effects.append(request.event_id)
         projection = runtime_result_projection(
-            bundle.result.model_dump(mode="json", by_alias=True)
+            self.runtime_results[request.outcome.command_id].model_dump(
+                mode="json", by_alias=True
+            )
         )
         assert projection is not None
         self.projection_events_by_correlation.setdefault(
-            bundle.result.correlation_id,
+            request.outcome.correlation_id,
             [],
         ).append(projection)
+        self.runtime_authority_order.append("execution")
+        if self.advance_clock_after_execution is not None:
+            self.clock.value += self.advance_clock_after_execution
+        if self.crash_after_execution_once and not self._crashed_after_execution:
+            self._crashed_after_execution = True
+            raise SimulatedProcessCrash("after capability execution")
         return CapabilityWriteReceipt(
             record_id=str(request.outcome.command_id),
             replayed=False,
@@ -722,6 +894,9 @@ class ScriptedGatewayStore:
 
     def projection_events(self, correlation_id: UUID) -> tuple[object, ...]:
         return tuple(self.projection_events_by_correlation.get(correlation_id, ()))
+
+    def capability_execution(self, command_id: UUID) -> CapabilityExecutionRecord | None:
+        return self.executions.get(command_id)
 
 
 @dataclass
@@ -874,17 +1049,19 @@ class ScriptedReleaseRunPort:
 class ScriptedRuntimePort:
     gateway: ScriptedGatewayStore
     effects: list[UUID] = field(default_factory=list)
-    bundles: dict[UUID, CapabilityExecutionBundle] = field(default_factory=dict)
+    plans: dict[UUID, CapabilityExecutionPlan] = field(default_factory=dict)
+    executions: dict[UUID, CapabilityRuntimeExecution] = field(default_factory=dict)
+    advance_clock_after_execute: timedelta | None = None
 
-    async def execute(
+    async def prepare(
         self,
-        release: CapabilityReleaseRequest,
-    ) -> CapabilityExecutionBundle:
-        command_id = uuid5(release.package.correlation_id, "capability-execution-command")
-        existing = self.bundles.get(command_id)
+        job: AgentFactoryJobV2,
+        authority: CapabilityCatalogRecord,
+    ) -> CapabilityExecutionPlan:
+        command_id = uuid5(job.correlation_id, "capability-execution-command")
+        existing = self.plans.get(command_id)
         if existing is not None:
             return existing
-        result_id = uuid5(command_id, "capability-execution-result")
         prompt_ref = ArtifactRef(
             uri=f"artifact://runtime-prompt/{'a' * 64}",
             sha256="a" * 64,
@@ -894,12 +1071,12 @@ class ScriptedRuntimePort:
             {
                 "schema": "captain.agent-runtime-command.v1",
                 "event_id": command_id,
-                "correlation_id": release.package.correlation_id,
-                "causation_id": release.event_id,
-                "occurred_at": release.occurred_at,
+                "correlation_id": job.correlation_id,
+                "causation_id": authority.terminal_decision_id,
+                "occurred_at": self.gateway.clock.now(),
                 "producer": "captain",
                 "subject_id": "capability-execution",
-                "subject_version": release.package.subject_version,
+                "subject_version": job.subject_version,
                 "payload": {
                     "operation": "codex.run",
                     "project_id": "capability-factory",
@@ -913,6 +1090,46 @@ class ScriptedRuntimePort:
                 },
             }
         )
+        grant = CapabilityGrant.model_validate(
+            {
+                "schema": "captain.capability-grant.v1",
+                "grant_id": "capability-release-grant",
+                "command_id": command.event_id,
+                "batch_id": command.payload.batch_id,
+                "batch_version": command.subject_version,
+                "subtask_id": command.payload.subtask_id,
+                "workspace_ref": command.payload.workspace_ref,
+                "profile": command.payload.capability_profile,
+                "capabilities": ["codex.run"],
+                "mcp_servers": [],
+                "issued_at": self.gateway.clock.now(),
+                "expires_at": self.gateway.clock.now() + timedelta(minutes=5),
+            }
+        )
+        plan = CapabilityExecutionPlan(
+            command=command,
+            grant=grant,
+            claim_owner_id="capability-factory-runtime",
+        )
+        self.plans[command_id] = plan
+        return plan
+
+    async def execute(
+        self,
+        plan: CapabilityExecutionPlan,
+        authority: CapabilityCatalogRecord,
+        claim: RuntimeExecutionClaimReceipt,
+    ) -> CapabilityRuntimeExecution:
+        command = plan.command
+        command_id = command.event_id
+        existing = self.executions.get(command_id)
+        if existing is not None:
+            return existing
+        assert claim.claim.command_id == command_id
+        assert claim.claim.capability_id == authority.capability_id
+        assert claim.claim.capability_version == authority.capability_version
+        assert claim.claim_credential is not None
+        result_id = uuid5(command_id, "capability-execution-result")
         artifact_ref = ArtifactRef(
             uri=f"artifact://runtime-result/{'b' * 64}",
             sha256="b" * 64,
@@ -923,12 +1140,12 @@ class ScriptedRuntimePort:
                 "schema": "captain.agent-runtime-result.v1",
                 "event_id": result_id,
                 "command_id": command_id,
-                "correlation_id": release.package.correlation_id,
-                "occurred_at": release.occurred_at + timedelta(seconds=1),
+                "correlation_id": command.correlation_id,
+                "occurred_at": self.gateway.clock.now() + timedelta(seconds=1),
                 "producer": "agent-runtime",
                 "subject_id": command.subject_id,
                 "subject_version": command.subject_version,
-                "grant_id": "capability-release-grant",
+                "grant_id": plan.grant.grant_id,
                 "operation": "codex.run",
                 "status": "succeeded",
                 "session_id": "capability-release-session",
@@ -950,14 +1167,14 @@ class ScriptedRuntimePort:
                     ),
                 ),
             )
-            for assertion_id in release.accepted_assertion_ids
+            for assertion_id in authority.accepted_assertion_ids
         )
         outcome = ExecutionOutcomeV1(
             schema_name="captain.execution-outcome.v1",
-            capability_id=release.package.capability_id,
-            capability_version=release.package.capability_version,
-            team_version=release.team_version,
-            correlation_id=release.package.correlation_id,
+            capability_id=authority.capability_id,
+            capability_version=authority.capability_version,
+            team_version=authority.team_version,
+            correlation_id=command.correlation_id,
             command_id=command_id,
             result_id=result_id,
             business_output={"status": "completed"},
@@ -967,17 +1184,15 @@ class ScriptedRuntimePort:
             evidence_refs=(artifact_ref,),
             status="succeeded",
         )
-        bundle = CapabilityExecutionBundle(
-            command=command,
+        execution = CapabilityRuntimeExecution(
             result=result,
             outcome=outcome,
-            claim_owner_id="capability-factory-runtime",
-            claim_fencing_token=1,
         )
-        self.bundles[command_id] = bundle
+        self.executions[command_id] = execution
         self.effects.append(command_id)
-        self.gateway.record_runtime_operation(bundle)
-        return bundle
+        if self.advance_clock_after_execute is not None:
+            self.gateway.clock.value += self.advance_clock_after_execute
+        return execution
 
 
 @dataclass
@@ -1016,7 +1231,7 @@ class FullChainHarness:
     input_path: Path
     clock: MutableClock
     content_store: MemoryContentStore
-    checkpoint_store: InMemoryCapabilityFactoryCheckpointStore
+    checkpoint_dir: Path
     gateway: ScriptedGatewayStore
     creation: ScriptedCreationPort
     releases: ScriptedReleaseRunPort
@@ -1029,7 +1244,7 @@ class FullChainHarness:
     def entrypoint(self) -> CapabilityFactoryEntrypoint:
         repository = GatewayFactoryRepository(self.gateway)  # real Package-C adapter
         return CapabilityFactoryEntrypoint(
-            checkpoint_store=self.checkpoint_store,
+            checkpoint_store=FileCapabilityFactoryCheckpointStore(self.checkpoint_dir),
             holdout_store=InMemoryPrivateHoldoutStore(),
             repository=repository,
             catalog=GatewayCapabilityCatalog(self.gateway),
@@ -1074,7 +1289,7 @@ def _harness(tmp_path: Path) -> FullChainHarness:
         creation=creation,
         crash_after_run_once=3,
     )
-    sandbox = VerifiedScriptedSandboxRunner()
+    sandbox = VerifiedScriptedSandboxRunner(clock=clock)
     runtime = ScriptedRuntimePort(gateway)
     minibook = ScriptedMinibookClient()
     projector = MinibookProjector(
@@ -1086,7 +1301,7 @@ def _harness(tmp_path: Path) -> FullChainHarness:
         input_path=input_path,
         clock=clock,
         content_store=content_store,
-        checkpoint_store=InMemoryCapabilityFactoryCheckpointStore(),
+        checkpoint_dir=tmp_path / "factory-checkpoints",
         gateway=gateway,
         creation=creation,
         releases=releases,
@@ -1160,6 +1375,171 @@ async def test_complete_factory_release_chain_recovers_twice_without_duplicate_e
     assert len(harness.gateway.execution_effects) == 1
     assert len(harness.minibook.posts) == 1
     assert len(harness.gateway.blocks_by_job[job.job_id]) == 8
+    assert harness.gateway.authority_order == ["promotion", "atomic-publication"]
+    assert harness.gateway.runtime_authority_order == [
+        "command",
+        "grant",
+        "claim",
+        "result",
+        "execution",
+    ]
+
+
+def test_deterministic_chain_exercises_production_gateway_authority_methods(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dsn = _isolated_test_dsn()
+    if dsn is None:
+        pytest.skip(
+            "production GatewayStore authority proof requires isolated TEST_MARIADB_DSN"
+        )
+
+    from blockchain.mariadb_storage import MariaDBStorage
+    from tests.gateway import test_agent_factory as gateway_acceptance
+
+    monkeypatch.setattr(gateway_acceptance, "TEST_DSN", dsn)
+    storage = MariaDBStorage(dsn)
+    storage.clear()
+    try:
+        release = gateway_acceptance._prepare_v2_capability_release(
+            storage,
+            promote=True,
+        )
+        store = GatewayStore(
+            storage,
+            clock=lambda: gateway_acceptance.TEST_GATEWAY_NOW,
+        )
+        insert = store._insert
+
+        def crash_inside_publication(cursor: object, block: dict[str, object]) -> None:
+            insert(cursor, block)
+            if block["block_type"] == "capability_package_published":
+                raise SimulatedProcessCrash("inside atomic publication")
+
+        monkeypatch.setattr(store, "_insert", crash_inside_publication)
+        with pytest.raises(SimulatedProcessCrash, match="atomic publication"):
+            store.publish_capability_release(release)
+        assert store.factory_terminal_decision(release.package.factory_job_id) is None
+        assert store.capability(release.package.capability_id) is None
+
+        monkeypatch.setattr(store, "_insert", insert)
+        published = store.publish_capability_release(release)
+        restarted = GatewayStore(
+            storage,
+            clock=lambda: gateway_acceptance.TEST_GATEWAY_NOW,
+        )
+        replayed = restarted.publish_capability_release(release)
+        authority = restarted.capability(
+            release.package.capability_id,
+            version=release.package.capability_version,
+        )
+        assert published.replayed is False
+        assert replayed.replayed is True
+        assert authority is not None
+        assert authority.terminal_decision_id == release.decision.decision_id
+        assert authority.package_ref == release.package_ref
+
+        command, result = gateway_acceptance._seed_runtime_result(storage, release)
+        execution = gateway_acceptance._execution_request(release, command, result)
+        recorded = restarted.record_capability_execution(execution)
+        execution_replay = GatewayStore(storage).record_capability_execution(execution)
+        readback = restarted.capability_execution(execution.outcome.command_id)
+        assert recorded.replayed is False
+        assert execution_replay.replayed is True
+        assert readback is not None
+        assert readback.outcome == execution.outcome
+    finally:
+        storage.clear()
+
+
+@pytest.mark.asyncio
+async def test_catalog_hit_reuses_frozen_authority_without_forge_or_republication(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    for _ in range(2):
+        with pytest.raises(SimulatedProcessCrash):
+            await harness.entrypoint().run(
+                input_path=harness.input_path,
+                correlation_id=CORRELATION_ID,
+                subject_version=1,
+                wall_clock_budget_seconds=600,
+            )
+    created = await harness.entrypoint().run(
+        input_path=harness.input_path,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+        wall_clock_budget_seconds=600,
+    )
+    creation_effects = tuple(harness.creation.submission_effects)
+    release_run_effects = tuple(harness.releases.effects)
+    publication_effects = tuple(harness.gateway.release_effects)
+    sandbox_effects = tuple(harness.sandbox.requests)
+    reuse_correlation = UUID("f8bb07d4-ebf0-4544-a5c2-9d215886aa44")
+
+    reused = await harness.entrypoint().run(
+        input_path=harness.input_path,
+        correlation_id=reuse_correlation,
+        subject_version=1,
+        wall_clock_budget_seconds=600,
+    )
+
+    assert reused.terminal_state == "ready_to_use"
+    assert reused.creation_job_id is None
+    assert reused.capability_id == created.capability_id
+    assert reused.capability_version == created.capability_version
+    assert reused.correlation_id == reuse_correlation
+    assert reused.execution_command_id in harness.gateway.executions
+    assert harness.gateway.executions[reused.execution_command_id].correlation_id == reuse_correlation
+    assert tuple(harness.creation.submission_effects) == creation_effects
+    assert tuple(harness.releases.effects) == release_run_effects
+    assert tuple(harness.gateway.release_effects) == publication_effects
+    assert tuple(harness.sandbox.requests) == sandbox_effects
+    assert len(harness.runtime.effects) == 2
+    assert len(harness.gateway.execution_effects) == 2
+    assert len(harness.minibook.posts) == 2
+
+
+@pytest.mark.asyncio
+async def test_disk_checkpoint_recovers_after_publication_and_execution_commits(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    harness.creation.crash_after_submit_once = False
+    harness.releases.crash_after_run_once = None
+    harness.gateway.crash_after_publication_once = True
+    harness.gateway.crash_after_execution_once = True
+
+    with pytest.raises(SimulatedProcessCrash, match="atomic publication"):
+        await harness.entrypoint().run(
+            input_path=harness.input_path,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            wall_clock_budget_seconds=600,
+        )
+
+    with pytest.raises(SimulatedProcessCrash, match="capability execution"):
+        await harness.entrypoint().run(
+            input_path=harness.input_path,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            wall_clock_budget_seconds=600,
+        )
+
+    summary = await harness.entrypoint().run(
+        input_path=harness.input_path,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+        wall_clock_budget_seconds=600,
+    )
+
+    assert summary.terminal_state == "ready_to_use"
+    assert len(tuple(harness.checkpoint_dir.glob("*.json"))) == 1
+    assert len(harness.creation.submission_effects) == 1
+    assert len(harness.gateway.release_effects) == 1
+    assert len(harness.runtime.effects) == 1
+    assert len(harness.gateway.execution_effects) == 1
+    assert len(harness.minibook.posts) == 1
 
 
 @pytest.mark.asyncio
@@ -1255,6 +1635,73 @@ async def test_expired_budget_stops_before_completion_and_release_effects(
     assert not harness.releases.effects
     assert not harness.gateway.release_effects
     assert not harness.runtime.effects
+    assert not harness.minibook.posts
+
+
+@pytest.mark.asyncio
+async def test_deadline_after_atomic_publication_stops_before_runtime_effects(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    harness.creation.crash_after_submit_once = False
+    harness.releases.crash_after_run_once = None
+    harness.gateway.advance_clock_after_publication = timedelta(seconds=601)
+
+    with pytest.raises(CapabilityFactoryDeadlineExceeded, match="post-publication"):
+        await harness.entrypoint().run(
+            input_path=harness.input_path,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            wall_clock_budget_seconds=600,
+        )
+
+    assert len(harness.gateway.release_effects) == 1
+    assert not harness.gateway.runtime_commands
+    assert not harness.runtime.effects
+    assert not harness.minibook.posts
+
+
+@pytest.mark.asyncio
+async def test_deadline_after_provider_execution_stops_before_result_mutation(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    harness.creation.crash_after_submit_once = False
+    harness.releases.crash_after_run_once = None
+    harness.runtime.advance_clock_after_execute = timedelta(seconds=601)
+
+    with pytest.raises(CapabilityFactoryDeadlineExceeded, match="runtime result"):
+        await harness.entrypoint().run(
+            input_path=harness.input_path,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            wall_clock_budget_seconds=600,
+        )
+
+    assert len(harness.runtime.effects) == 1
+    assert not harness.gateway.runtime_results
+    assert not harness.gateway.execution_effects
+    assert not harness.minibook.posts
+
+
+@pytest.mark.asyncio
+async def test_deadline_after_execution_commit_stops_before_projection_mutation(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    harness.creation.crash_after_submit_once = False
+    harness.releases.crash_after_run_once = None
+    harness.gateway.advance_clock_after_execution = timedelta(seconds=601)
+
+    with pytest.raises(CapabilityFactoryDeadlineExceeded, match="Minibook"):
+        await harness.entrypoint().run(
+            input_path=harness.input_path,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            wall_clock_budget_seconds=600,
+        )
+
+    assert len(harness.gateway.execution_effects) == 1
     assert not harness.minibook.posts
 
 
@@ -1465,6 +1912,8 @@ async def test_docker_sandbox_attests_only_inspected_isolation(tmp_path: Path) -
         create.index("--security-opt") :
     ][:2]
     assert ("--pull", "never") == create[create.index("--pull") :][:2]
+    assert "/tmp:rw,noexec,nosuid,size=67108864" in create
+    assert any('sys.path.insert(0, "/workspace")' in item for item in create)
     assert any(item.endswith(",readonly") for item in create)
 
 

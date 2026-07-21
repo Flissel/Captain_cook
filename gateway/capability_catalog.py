@@ -108,6 +108,15 @@ class GatewayCapabilityCatalog(CapabilityCatalogPort):
         self,
         job: AgentFactoryJobV2,
     ) -> PromotedCapability | None:
+        record = self.compatible_record(job)
+        return record.promoted_capability if record is not None else None
+
+    def compatible_record(
+        self,
+        job: AgentFactoryJobV2,
+    ) -> CapabilityCatalogRecord | None:
+        """Return the complete frozen authority needed by an execution replay."""
+
         record = self._repository.find_ready_capability(job.required_capability)
         if record is None:
             return None
@@ -128,4 +137,4 @@ class GatewayCapabilityCatalog(CapabilityCatalogPort):
             or promoted.status != "ready_to_use"
         ):
             return None
-        return promoted
+        return record

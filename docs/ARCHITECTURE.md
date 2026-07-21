@@ -12,6 +12,17 @@ projector. External creation, provider execution, Gateway HTTP, Runtime HTTP,
 and Minibook HTTP effects remain injected ports. The deterministic integration
 test scripts only those external ports; it does not claim provider execution.
 
+`ready_to_use` has one write path: after the promotion block, the composition
+derives the candidate decision in memory and calls
+`GatewayStore.publish_capability_release` once. That transaction owns the
+terminal decision, published package, and full frozen
+`CapabilityCatalogRecord`; the composition must read all three back before
+execution. It never writes a READY terminal through the non-release terminal
+API. A compatible catalog hit reuses that complete record, skips Forge,
+release E2E, sandbox validation, and republication, and runs the new
+correlation through command admission, capability grant, fenced execution
+claim, provider result, and `CapabilityExecutionRequest` recording.
+
 The entrypoint binds correlation ID, Factory job ID, subject version, and the
 exact input SHA-256 in an append-only checkpoint before the first external
 effect. Replays use the same creation/run/command IDs. Changed input bytes fail
@@ -20,6 +31,12 @@ only port permitted to return `captain.capability-release-evidence.v1`; the
 composition rechecks every job, creation, candidate, run-order, producer, and
 digest binding before policy evaluation. Recovery is distinct from the three
 normal successes and never counts toward that streak.
+The file checkpoint and service adapters are reconstructed in restart tests;
+crashes after creation submission, release evidence, committed atomic
+publication, and committed capability execution expose exactly one external
+effect after recovery. Deadline checks run before each later mutation, so an
+expired post-publication run cannot begin runtime work and an expired
+post-execution run cannot mutate Minibook.
 
 Forge archives are independently validated in a disposable Captain-owned
 Docker sandbox. The production runner accepts only a digest-pinned
@@ -32,23 +49,39 @@ inspect`; an unavailable image or any inspection mismatch is an isolation
 failure, never synthetic evidence. The package tree is hashed again before
 container creation, and Python bytecode/cache output is directed away from the
 host workspace.
+The isolated interpreter explicitly inserts `/workspace` into `sys.path`
+before module discovery, and Docker inspection must report the exact
+`rw,noexec,nosuid,size=67108864` tmpfs. The package validator, not an inner
+Docker CLI timer, owns timeout and verified process-tree cancellation. An
+actual Docker import/pytest smoke test is live-only and remains blocked when
+the configured digest is not already local.
 
 CLI configuration resolves input, artifact, and checkpoint paths under the
 workspace; accepts credential-free HTTP service URLs; and reads bearer/API
 credentials only from environment aliases. Its evidence manifest contains
 only typed IDs and digests, is canonical JSON named by its own SHA-256, and is
 written under the gitignored `artifacts/capability-factory/` directory.
+The module is executable with `python -m`; it loads an explicitly configured
+production adapter factory, runs the composition, writes the manifest, and
+prints only redacted targets, timings, IDs, and digests. Missing production
+adapters fail preflight before any service is started.
 
 The provider-backed gate is
 `scripts/run-capability-factory-live.ps1`. It validates configuration first,
 requires loopback MariaDB database exactly `captain_test`, and only then may
-start Captain-owned services. It must observe one recovery, three distinct
+start a dedicated Gateway process bound to that DSN. It never starts or adopts
+an external workflow service. It must observe one recovery, three distinct
 normal successes, Gateway terminal/catalog/execution records, an ordered feed,
 and a Minibook rebuild before a `ready_to_use` claim. The current production
 gate remains blocked: the Runtime has no production Hermes/Codex/artifact port
 bundle, no production capability-factory creation/Evidence-Issuer HTTP adapter
 bundle is installed, and no reviewed digest-pinned capability-sandbox image is
 configured. Deterministic success does not satisfy those live prerequisites.
+Separately, the guarded MariaDB acceptance proof executes production
+`GatewayStore` methods against `captain_test`: an injected mid-publication
+crash rolls the transaction back, a reconstructed store replays the single
+publication, and production command/grant/claim/result/execution writes replay
+from their authoritative readbacks.
 
 ## Hermes skill-evaluation release path
 
