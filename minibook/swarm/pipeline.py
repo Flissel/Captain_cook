@@ -100,6 +100,14 @@ def _fix_truncated_tools_py(code: str) -> str:
     return code
 
 
+LEGACY_PIPELINE_AGENT_ORDER = (
+    "manager", "catalog", "architect", "coder", "reviewer", "tester",
+    "validator", "builder", "executor", "output_evaluation",
+    "todo_implementation", "toolforge", "feedback_loop",
+    "evaluation_report", "export",
+)
+
+
 class SwarmPipeline:
     """Orchestrates the 11-agent code generation swarm via Minibook."""
 

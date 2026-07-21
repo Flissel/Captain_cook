@@ -45,6 +45,7 @@ from swarm.llm import call_gpt4o, call_gpt4o_json, call_gpt4o_with_tools
 from swarm.docker_ops import stop_mcp_gateway
 from swarm.code_processing import load_cascade_context, write_output
 from swarm.pipeline import SwarmPipeline
+from swarm.pipeline_adapter import PIPELINE_STEP_ORDER, SwarmPipelineAdapter
 from swarm.forge_agents import ForgeState, load_forge_state, save_forge_state
 from swarm.forge_orchestrator import ForgeOrchestrator, ForgeAPI
 from swarm.input_designer import InputDesignPipeline
