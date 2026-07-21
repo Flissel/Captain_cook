@@ -1,0 +1,55 @@
+{
+  "schema_name": "captain.demo-input-manifest.v1",
+  "inputs": [
+    {
+      "input_id": "sales_pipeline_brief",
+      "title": "Enterprise Sales Pipeline Briefing Team",
+      "path": "sales_pipeline_brief/TO_BE_BUILT.md",
+      "pattern": "sequential",
+      "expected_demo_behavior": "A ranked opportunity brief identifies the top account, supporting signals, risks, and next seller action",
+      "required_tools": ["account_snapshot_reader", "opportunity_scoring_rules"],
+      "optional_tools": ["industry_signal_reader"],
+      "holdout_policy": "Private cases vary account completeness, contradictory buying signals, and score ties without exposing expected rankings to the team."
+    },
+    {
+      "input_id": "incident_command",
+      "title": "Production Incident Command Team",
+      "path": "incident_command/TO_BE_BUILT.md",
+      "pattern": "selector_group_chat",
+      "expected_demo_behavior": "The selector consults only relevant specialists and returns a severity, evidence summary, mitigation, and escalation owner",
+      "required_tools": ["alert_context_reader", "service_dependency_map", "audit_log_query"],
+      "optional_tools": ["status_page_draft"],
+      "holdout_policy": "Private cases vary the failing subsystem, ambiguous alerts, and missing telemetry while preserving the same severity and authority rules."
+    },
+    {
+      "input_id": "claims_resolution",
+      "title": "Insurance Claims Resolution Swarm",
+      "path": "claims_resolution/TO_BE_BUILT.md",
+      "pattern": "handoff_swarm",
+      "expected_demo_behavior": "The claim follows the intake-to-specialist-to-settlement path with an auditable coverage decision and no unauthorized payment",
+      "required_tools": ["policy_lookup", "claim_evidence_reader"],
+      "optional_tools": ["ocr_extractor"],
+      "holdout_policy": "Private cases change coverage clauses, fraud indicators, and evidence quality; workers receive only assertion identifiers and redacted failure feedback."
+    },
+    {
+      "input_id": "proposal_refinement",
+      "title": "Regulated Proposal Refinement Team",
+      "path": "proposal_refinement/TO_BE_BUILT.md",
+      "pattern": "reflection_retry",
+      "expected_demo_behavior": "A materially improved proposal passes evidence and risk review within the bounded attempt budget",
+      "required_tools": ["requirements_matrix", "evidence_catalog"],
+      "optional_tools": ["style_linter"],
+      "holdout_policy": "Private cases inject unsupported claims, conflicting requirements, and subtle authority violations without disclosing the hidden defect locations."
+    },
+    {
+      "input_id": "renewal_orchestration",
+      "title": "Customer Renewal Orchestration Team",
+      "path": "renewal_orchestration/TO_BE_BUILT.md",
+      "pattern": "tool_led_n8n",
+      "expected_demo_behavior": "The workflow reads the account, obtains a candidate meeting slot, creates a draft-only outreach artifact, and records idempotent evidence",
+      "required_tools": ["n8n_mcp_discovery", "native_crm_node", "native_calendar_node"],
+      "optional_tools": ["native_email_draft_node"],
+      "holdout_policy": "Private cases vary duplicate triggers, stale CRM data, calendar conflicts, and provider timeouts while keeping credentials and expected recovery traces private."
+    }
+  ]
+}
