@@ -168,6 +168,35 @@ function Start-CaptainN8nBroker($Values) {
 function Set-ProcessEnvironment($Values) {
     foreach ($item in $Values.GetEnumerator()) { [Environment]::SetEnvironmentVariable([string]$item.Key,[string]$item.Value,'Process') }
 }
+function Repair-CaptainN8nPersistenceForRecovery {
+    if (-not (Test-Path $n8nEnv -PathType Leaf)) { return }
+    $volumeName = 'captain-n8n-builder_captain_n8n_data'
+    & docker volume inspect $volumeName *> $null
+    if ($LASTEXITCODE -ne 0) { return }
+    $rawConfig = & docker run --rm --entrypoint cat -v "${volumeName}:/data:ro" n8nio/n8n:2.29.10 /data/config 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$rawConfig)) { throw 'Existing Captain n8n config could not be inspected for safe recovery.' }
+    try { $persistedKey = [string](($rawConfig | ConvertFrom-Json).encryptionKey) } catch { throw 'Existing Captain n8n config is invalid.' }
+    if ([string]::IsNullOrWhiteSpace($persistedKey)) { throw 'Existing Captain n8n config has no encryption key.' }
+    $builderKeys = @('CAPTAIN_N8N_PORT','CAPTAIN_N8N_ENCRYPTION_KEY','CAPTAIN_N8N_POSTGRES_PASSWORD','CAPTAIN_N8N_POSTGRES_USER','CAPTAIN_N8N_POSTGRES_DB','CAPTAIN_N8N_OWNER_PASSWORD','CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','CAPTAIN_N8N_MCP_BROKER_URL','CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET')
+    $builderValues = Read-Env $n8nEnv $builderKeys
+    if ($builderValues.Contains('CAPTAIN_N8N_ENCRYPTION_KEY') -and [string]$builderValues['CAPTAIN_N8N_ENCRYPTION_KEY'] -eq $persistedKey) { return }
+    $builderValues['CAPTAIN_N8N_ENCRYPTION_KEY'] = $persistedKey
+    foreach ($required in @('CAPTAIN_N8N_POSTGRES_PASSWORD','CAPTAIN_N8N_POSTGRES_USER','CAPTAIN_N8N_POSTGRES_DB')) {
+        if (-not $builderValues.Contains($required) -or [string]::IsNullOrWhiteSpace([string]$builderValues[$required])) { throw "Safe Captain n8n recovery requires $required." }
+    }
+    $databaseUser = [string]$builderValues['CAPTAIN_N8N_POSTGRES_USER']
+    $databaseName = [string]$builderValues['CAPTAIN_N8N_POSTGRES_DB']
+    if ($databaseUser -notmatch '^[A-Za-z_][A-Za-z0-9_]*$' -or $databaseName -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { throw 'Captain n8n database identifiers are unsafe.' }
+    $postgresContainer = @(& docker ps --filter 'label=com.docker.compose.project=captain-n8n-builder' --filter 'label=com.docker.compose.service=postgres' --format '{{.ID}}') | Select-Object -First 1
+    if (-not $postgresContainer) { throw 'Captain n8n Postgres must be running for credential recovery.' }
+    $escapedPassword = ([string]$builderValues['CAPTAIN_N8N_POSTGRES_PASSWORD']).Replace("'", "''")
+    "ALTER ROLE `"$databaseUser`" WITH PASSWORD '$escapedPassword';" | & docker exec -i $postgresContainer psql -v ON_ERROR_STOP=1 -U $databaseUser -d $databaseName *> $null
+    if ($LASTEXITCODE -ne 0) { throw 'Captain n8n Postgres credential synchronization failed.' }
+    Save-Env $builderValues $n8nEnv
+    & docker compose -p captain-n8n-builder --env-file $n8nEnv -f (Join-Path $root 'docker-compose.captain-n8n.yml') up -d --force-recreate n8n *> $null
+    if ($LASTEXITCODE -ne 0) { throw 'Captain n8n could not be recreated with its persisted encryption key.' }
+    Write-Host '[ready] Captain n8n persisted encryption and database credentials recovered (values redacted)'
+}
 function Recover-CaptainN8nEnvironment($Values, [string]$SourceEnv) {
     if ($SourceEnv -and [IO.Path]::GetFullPath($SourceEnv) -ne [IO.Path]::GetFullPath($rootEnv)) {
         if (-not (Test-Path $SourceEnv -PathType Leaf)) { throw 'The explicit credential source .env does not exist.' }
@@ -181,7 +210,7 @@ function Recover-CaptainN8nEnvironment($Values, [string]$SourceEnv) {
     }
     $baseUrl = 'http://127.0.0.1:5679'
     $authenticated = $false
-    foreach ($attempt in 1..30) { try {
+    foreach ($attempt in 1..60) { try {
         $rest = Invoke-WebRequest "$baseUrl/api/v1/workflows?limit=1" -Headers @{'X-N8N-API-KEY'=[string]$Values['N8N_API_KEY']} -UseBasicParsing -TimeoutSec 5
         $body = '{"jsonrpc":"2.0","id":"credential-recovery","method":"tools/list","params":{}}'
         $mcp = Invoke-WebRequest "$baseUrl/mcp-server/http" -Method Post -Headers @{Authorization="Bearer $([string]$Values['N8N_MCP_TOKEN'])";Accept='application/json, text/event-stream'} -Body $body -ContentType 'application/json' -UseBasicParsing -TimeoutSec 5
@@ -190,12 +219,16 @@ function Recover-CaptainN8nEnvironment($Values, [string]$SourceEnv) {
         Start-Sleep -Seconds 1
     }
     if (-not $authenticated) { throw 'Captain n8n recovery credentials failed REST or MCP authentication.' }
-    $builderValues = Read-Env $n8nEnv @('CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET')
+    $builderKeys = @('CAPTAIN_N8N_PORT','CAPTAIN_N8N_ENCRYPTION_KEY','CAPTAIN_N8N_POSTGRES_PASSWORD','CAPTAIN_N8N_POSTGRES_USER','CAPTAIN_N8N_POSTGRES_DB','CAPTAIN_N8N_OWNER_PASSWORD','CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET')
+    $builderValues = Read-Env $n8nEnv $builderKeys
     $signingSecret = if ($builderValues.Contains('CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET') -and -not [string]::IsNullOrWhiteSpace([string]$builderValues['CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET'])) {
         [string]$builderValues['CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET']
     } else { New-Secret }
     $recovered = [ordered]@{
         CAPTAIN_N8N_PORT='5679'; CAPTAIN_N8N_API_KEY=[string]$Values['N8N_API_KEY']; CAPTAIN_N8N_MCP_TOKEN=[string]$Values['N8N_MCP_TOKEN']; CAPTAIN_N8N_MCP_BROKER_URL='http://127.0.0.1:5680'; CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET=$signingSecret
+    }
+    foreach ($name in @('CAPTAIN_N8N_ENCRYPTION_KEY','CAPTAIN_N8N_POSTGRES_PASSWORD','CAPTAIN_N8N_POSTGRES_USER','CAPTAIN_N8N_POSTGRES_DB','CAPTAIN_N8N_OWNER_PASSWORD')) {
+        if ($builderValues.Contains($name) -and -not [string]::IsNullOrWhiteSpace([string]$builderValues[$name])) { $recovered[$name] = [string]$builderValues[$name] }
     }
     Save-Env $recovered $n8nEnv
     foreach ($item in $recovered.GetEnumerator()) { $Values[$item.Key] = $item.Value }
@@ -205,6 +238,7 @@ function Recover-CaptainN8nEnvironment($Values, [string]$SourceEnv) {
 }
 function Initialize-CaptainN8n($Values, [switch]$Recover, [string]$SourceEnv) {
     $n8n = Join-Path $PSScriptRoot 'captain-n8n.ps1'
+    if ($Recover) { Repair-CaptainN8nPersistenceForRecovery }
     $running = @(& docker ps --filter 'label=com.docker.compose.project=captain-n8n-builder' --filter 'label=com.docker.compose.service=n8n' --format '{{.ID}}')
     $existing = @(& docker ps -a --filter 'label=com.docker.compose.project=captain-n8n-builder' --filter 'label=com.docker.compose.service=n8n' --format '{{.ID}}')
     if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the Captain n8n project.' }

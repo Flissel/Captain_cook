@@ -209,6 +209,12 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "CAPTAIN_FACTORY_PRICING_OUTPUT_COST_PER_MILLION_USD" in source
     assert "CAPTAIN_FACTORY_PRICING_MINIMUM_COST_USD" in source
     assert "CAPTAIN_FACTORY_N8N_WORKFLOW_ID" in source
+    assert "function Repair-CaptainN8nPersistenceForRecovery" in source
+    assert "captain-n8n-builder_captain_n8n_data" in source
+    assert "CAPTAIN_N8N_ENCRYPTION_KEY" in source
+    assert "ALTER ROLE" in source
+    assert "--force-recreate n8n" in source
+    assert "volumes preserved" in source
     assert "function Set-ProductionAdapterManifests" in source
     assert "generate-capability-adapter-manifest.py" in source
     assert "function Start-CaptainN8nBroker" in source
