@@ -273,6 +273,15 @@ class HermesCliFactory(HermesFactoryPort):
                 accepted = claim.record
                 assert accepted.artifact is not None
                 assert accepted.transcript_ref is not None
+                if accepted.state == "result_ready":
+                    accepted = await self._replay_store.complete(
+                        accepted,
+                        artifact=accepted.artifact,
+                        transcript_ref=accepted.transcript_ref,
+                        accounting_refs=accepted.accounting_refs,
+                        budget_reservation=accepted.budget_reservation,
+                        usage_receipt=accepted.usage_receipt,
+                    )
                 self._record_completed_usage(request, accepted)
                 artifacts.append(accepted.artifact)
                 transcript_refs.append(accepted.transcript_ref)
@@ -332,8 +341,18 @@ class HermesCliFactory(HermesFactoryPort):
                         "factory skill failure state could not be persisted"
                     ) from replay_exc
                 raise
+            replay_record = claim.record
+            if paid_result is not None:
+                replay_record = await self._replay_store.stage_result(
+                    replay_record,
+                    artifact=artifact,
+                    transcript_ref=transcript_ref,
+                    accounting_refs=step_accounting_refs,
+                    budget_reservation=paid_result.reservation,
+                    usage_receipt=paid_result.receipt,
+                )
             accepted = await self._replay_store.complete(
-                claim.record,
+                replay_record,
                 artifact=artifact,
                 transcript_ref=transcript_ref,
                 accounting_refs=step_accounting_refs,
@@ -640,7 +659,7 @@ class FactorySkillReplayRecord:
     invocation: FactorySkillInvocationV1
     invocation_sha256: str
     claim_token: str
-    state: Literal["pending", "completed", "failed"]
+    state: Literal["pending", "result_ready", "completed", "failed"]
     artifact: _FactoryWorkflowArtifact | None = None
     transcript_ref: ArtifactRef | None = None
     accounting_refs: tuple[ArtifactRef, ...] = ()
@@ -671,6 +690,15 @@ class FactorySkillReplayRecord:
             or (self.budget_reservation is None) != (self.usage_receipt is None)
         ):
             raise FactoryDispatchError("completed factory skill replay is incomplete")
+        if self.state == "result_ready" and (
+            self.artifact is None
+            or self.transcript_ref is None
+            or not self.accounting_refs
+            or self.budget_reservation is None
+            or self.usage_receipt is None
+            or self.failure_kind is not None
+        ):
+            raise FactoryDispatchError("prepared paid factory replay is incomplete")
         if self.state == "failed" and (
             self.artifact is not None
             or self.transcript_ref is not None
@@ -697,6 +725,17 @@ class FactorySkillReplayStore(Protocol):
         self,
         invocation: FactorySkillInvocationV1,
     ) -> FactorySkillReplayClaim: ...
+
+    async def stage_result(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        artifact: _FactoryWorkflowArtifact,
+        transcript_ref: ArtifactRef,
+        accounting_refs: tuple[ArtifactRef, ...],
+        budget_reservation: FactoryBudgetReservationV1,
+        usage_receipt: FactoryUsageReceiptV1,
+    ) -> FactorySkillReplayRecord: ...
 
     async def complete(
         self,
@@ -737,6 +776,26 @@ class InMemoryFactorySkillReplayStore:
             pending = _pending_replay_record(invocation)
             self._records[invocation.idempotency_key] = pending
             return FactorySkillReplayClaim(record=pending, acquired=True)
+
+    async def stage_result(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        artifact: _FactoryWorkflowArtifact,
+        transcript_ref: ArtifactRef,
+        accounting_refs: tuple[ArtifactRef, ...],
+        budget_reservation: FactoryBudgetReservationV1,
+        usage_receipt: FactoryUsageReceiptV1,
+    ) -> FactorySkillReplayRecord:
+        prepared = _prepared_replay_record(
+            pending,
+            artifact=artifact,
+            transcript_ref=transcript_ref,
+            accounting_refs=accounting_refs,
+            budget_reservation=budget_reservation,
+            usage_receipt=usage_receipt,
+        )
+        return await self._transition(pending, prepared)
 
     async def complete(
         self,
@@ -783,7 +842,7 @@ class InMemoryFactorySkillReplayStore:
     ) -> FactorySkillReplayRecord:
         async with self._lock:
             existing = self._records.get(pending.invocation.idempotency_key)
-            if existing != pending or existing.state != "pending":
+            if existing != pending or existing.state not in {"pending", "result_ready"}:
                 raise FactoryDispatchError("factory skill replay claim is no longer pending")
             self._records[pending.invocation.idempotency_key] = outcome
             return outcome
@@ -810,6 +869,26 @@ class FilesystemFactorySkillReplayStore:
             return FactorySkillReplayClaim(record=pending, acquired=True)
         existing = await asyncio.to_thread(self._read_record, path)
         return _existing_replay_claim(existing, invocation)
+
+    async def stage_result(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        artifact: _FactoryWorkflowArtifact,
+        transcript_ref: ArtifactRef,
+        accounting_refs: tuple[ArtifactRef, ...],
+        budget_reservation: FactoryBudgetReservationV1,
+        usage_receipt: FactoryUsageReceiptV1,
+    ) -> FactorySkillReplayRecord:
+        prepared = _prepared_replay_record(
+            pending,
+            artifact=artifact,
+            transcript_ref=transcript_ref,
+            accounting_refs=accounting_refs,
+            budget_reservation=budget_reservation,
+            usage_receipt=usage_receipt,
+        )
+        return await self._transition(pending, prepared)
 
     async def complete(
         self,
@@ -927,7 +1006,7 @@ class FilesystemFactorySkillReplayStore:
             accounting_refs: tuple[ArtifactRef, ...] = ()
             budget_reservation = None
             usage_receipt = None
-            if state == "completed":
+            if state in {"result_ready", "completed"}:
                 model = _STEP_RESULT_MODELS[invocation.step]
                 artifact = model.model_validate(value["artifact"])
                 transcript_ref = ArtifactRef.model_validate(value["transcript_ref"])
@@ -1021,13 +1100,45 @@ def _completed_replay_record(
     budget_reservation: FactoryBudgetReservationV1 | None = None,
     usage_receipt: FactoryUsageReceiptV1 | None = None,
 ) -> FactorySkillReplayRecord:
+    if pending.state not in {"pending", "result_ready"}:
+        raise FactoryDispatchError("factory skill replay claim is no longer pending")
+    if pending.state == "result_ready" and (
+        pending.artifact != artifact
+        or pending.transcript_ref != transcript_ref
+        or pending.accounting_refs != accounting_refs
+        or pending.budget_reservation != budget_reservation
+        or pending.usage_receipt != usage_receipt
+    ):
+        raise FactoryDispatchError("prepared paid factory replay result conflicts")
+    return FactorySkillReplayRecord(
+        invocation=pending.invocation,
+        invocation_sha256=pending.invocation_sha256,
+        claim_token=pending.claim_token,
+        state="completed",
+        artifact=artifact,
+        transcript_ref=transcript_ref,
+        accounting_refs=accounting_refs,
+        budget_reservation=budget_reservation,
+        usage_receipt=usage_receipt,
+    )
+
+
+def _prepared_replay_record(
+    pending: FactorySkillReplayRecord,
+    *,
+    artifact: _FactoryWorkflowArtifact,
+    transcript_ref: ArtifactRef,
+    accounting_refs: tuple[ArtifactRef, ...],
+    budget_reservation: FactoryBudgetReservationV1,
+    usage_receipt: FactoryUsageReceiptV1,
+) -> FactorySkillReplayRecord:
     if pending.state != "pending":
         raise FactoryDispatchError("factory skill replay claim is no longer pending")
     return FactorySkillReplayRecord(
         invocation=pending.invocation,
         invocation_sha256=pending.invocation_sha256,
         claim_token=pending.claim_token,
-        state="completed",
+        state="result_ready",
         artifact=artifact,
         transcript_ref=transcript_ref,
         accounting_refs=accounting_refs,

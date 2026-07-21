@@ -11,7 +11,11 @@ from uuid import UUID
 
 import pytest
 
-from agenten.agent_factory.contracts import FactoryRole
+from agenten.agent_factory.contracts import (
+    FactoryBlockStatus,
+    FactoryPhase,
+    FactoryRole,
+)
 from agenten.agent_factory.execution_budget import (
     FactoryUsageReceiptV1,
     InMemoryFactoryBudgetLedger,
@@ -410,6 +414,81 @@ async def test_lost_usage_ack_recovers_from_completed_replay_without_second_paid
     assert process_calls == 1
     assert budget.record_calls == 2
     assert durable_budget.projection(request.job.job_id).consumed_usd == Decimal("0.02")
+    assert len(sink.artifacts(request.job.job_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_recovers_paid_result_when_replay_completion_crashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request()
+    budget = InMemoryFactoryBudgetLedger()
+    replay_root = tmp_path / "paid-replays"
+    durable_replay = FilesystemFactorySkillReplayStore(replay_root)
+    sink = InMemoryFactoryWorkflowArtifactSink()
+    process_calls = 0
+
+    class CrashAtComplete:
+        def __getattr__(self, name: str):
+            return getattr(durable_replay, name)
+
+        async def complete(self, *args: object, **kwargs: object):
+            raise OSError("crash at replay complete")
+
+    class Process:
+        returncode = 0
+
+        def __init__(self, command: tuple[str, ...]) -> None:
+            self.command = command
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            usage_path = Path(self.command[self.command.index("--usage-file") + 1])
+            usage_path.write_text(json.dumps(_usage_report()), encoding="utf-8")
+            return json.dumps(_typed_payload(self.command[-1])).encode(), b""
+
+    async def create_process(*command: str, **_: object) -> Process:
+        nonlocal process_calls
+        process_calls += 1
+        return Process(command)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    with pytest.raises(OSError, match="crash at replay complete"):
+        await HermesCliFactory(
+            settings=HermesCliSettings(skill_root=tmp_path),
+            evidence_store=_EvidenceStore(),
+            released_skill_catalog=_catalog_for(tmp_path, FactorySkillStep.DISCOVER),
+            replay_store=CrashAtComplete(),
+            budget=budget,
+            workflow_artifact_sink=sink,
+            clock=lambda: NOW,
+        ).dispatch(request)
+
+    replay_files = tuple(replay_root.glob("*.json"))
+    assert len(replay_files) == 1
+    prepared = json.loads(replay_files[0].read_text(encoding="utf-8"))
+    assert prepared["state"] == "result_ready"
+    assert prepared["artifact"] is not None
+    assert prepared["budget_reservation"] is not None
+    assert prepared["usage_receipt"] is not None
+
+    recovered = await HermesCliFactory(
+        settings=HermesCliSettings(skill_root=tmp_path),
+        evidence_store=_EvidenceStore(),
+        released_skill_catalog=_catalog_for(tmp_path, FactorySkillStep.DISCOVER),
+        replay_store=FilesystemFactorySkillReplayStore(replay_root),
+        budget=budget,
+        workflow_artifact_sink=sink,
+        clock=lambda: NOW,
+    ).dispatch(request)
+
+    assert recovered.artifact_refs
+    assert recovered.phase is FactoryPhase.BLUEPRINT_CREATED
+    assert recovered.status is FactoryBlockStatus.SUCCEEDED
+    assert recovered.lease_id == request.lease.lease_id
+    assert process_calls == 1
+    assert budget.projection(request.job.job_id).consumed_usd == Decimal("0.02")
+    assert budget.projection(request.job.job_id).reserved_usd == Decimal("0")
     assert len(sink.artifacts(request.job.job_id)) == 1
 
 
