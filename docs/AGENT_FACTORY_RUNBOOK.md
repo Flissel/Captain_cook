@@ -144,6 +144,11 @@ pwsh -NoProfile -File scripts/run-hermes-factory-live-gate.ps1 `
   -Mode demo -MaxCostUsd 5.00 -Model $env:CAPTAIN_FACTORY_MODEL
 ```
 
+The wrapper loads only its explicit variable allowlist from local `.env` and
+`.env.captain-n8n` files. Existing process variables always win; dedicated
+`CAPTAIN_N8N_*` values then come from `.env.captain-n8n`, with root `.env` as
+the fallback. File contents and loaded values are never printed.
+
 Demo mode runs exactly one paid case and may emit `demo_ready` only. After its
 evidence is reviewed, release mode requires a controlled recovery followed by
 three distinct successful provider traces. A declared integration additionally
@@ -153,10 +158,11 @@ does not start, stop, adopt, or modify the VibeMind-owned n8n deployment.
 
 The final report is written below the operating-system temporary directory, in
 a new run-specific directory, as `sha256-<digest>.json`. It is never written to
-tracked `artifacts/`. The wrapper recomputes the digest and rejects secret-like
-keys, authorization material, absolute user paths, an incorrect mode, and an
-incorrect terminal status. It prints the report digest but not the report body
-or host path.
+tracked `artifacts/`. Before parsing either preflight or final report, the
+wrapper rejects secret-like keys (including access tokens, raw prompts,
+private material, and paths), Bearer material, and absolute host paths. It then
+recomputes the final digest and rejects an incorrect mode or terminal status.
+It prints the report digest but not the report body or host path.
 
 ### Runtime merge contract
 
@@ -208,7 +214,18 @@ it must never call `pytest.skip`. Provider traces contain distinct trace and
 Codex session IDs plus exact decimal USD receipts. Release output additionally
 contains recovery evidence. With n8n enabled, it also binds the workflow
 digest, MCP call ID, and real execution ID. The report contains neither raw
-prompts/holdouts nor secrets or absolute host paths.
+prompts/holdouts nor secrets or absolute host paths. Codex session IDs are
+distinct per provider trace, every USD cost is a plain JSON decimal string,
+and an n8n workflow digest is exactly one lowercase SHA-256 value.
+
+Release mode must re-read the Gateway projection before it emits the report.
+Its exact `gateway_promotion` block contains `projection_status=ready_to_use`,
+a complete canonical `FactoryReleaseDecision` with `status=ready`, and a
+complete canonical Captain `FactoryEvidenceBlock` for the succeeded
+`capability_promoted` phase. Both contracts must bind to the report's job and
+correlation, while the promotion block also binds subject version and attempt
+and carries nonempty evidence references. A terminal-status string alone is
+not release evidence.
 
 ## Expected projections
 

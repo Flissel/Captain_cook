@@ -22,6 +22,63 @@ $skillNames = @(
 )
 $entrypointModule = 'agenten.agent_factory.factory_live_entrypoint'
 $root = (Resolve-Path -LiteralPath (Split-Path -Parent $PSScriptRoot)).Path
+$rootEnvironmentAllowlist = @(
+    'TEST_MARIADB_DSN'
+    'CAPTAIN_FACTORY_MODEL'
+    'CAPTAIN_N8N_URL'
+    'CAPTAIN_N8N_API_KEY'
+    'CAPTAIN_N8N_MCP_TOKEN'
+)
+$n8nEnvironmentAllowlist = @(
+    'CAPTAIN_N8N_URL'
+    'CAPTAIN_N8N_API_KEY'
+    'CAPTAIN_N8N_MCP_TOKEN'
+)
+
+function Import-AllowlistedEnvironmentFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string[]]$AllowedNames
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return
+    }
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        $trimmed = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith('#')) {
+            continue
+        }
+        $match = [regex]::Match(
+            $trimmed,
+            '^(?:export\s+)?(?<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?<value>.*)$'
+        )
+        if (-not $match.Success) {
+            throw 'An allowlisted environment file contains an invalid assignment.'
+        }
+        $name = $match.Groups['name'].Value
+        if ($AllowedNames -cnotcontains $name) {
+            continue
+        }
+        $existing = Get-Item -LiteralPath ("Env:" + $name) -ErrorAction SilentlyContinue
+        if ($null -ne $existing) {
+            continue
+        }
+        $value = $match.Groups['value'].Value.Trim()
+        if (
+            $value.Length -ge 2 -and
+            (($value.StartsWith("'") -and $value.EndsWith("'")) -or
+             ($value.StartsWith('"') -and $value.EndsWith('"')))
+        ) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        [Environment]::SetEnvironmentVariable(
+            $name,
+            $value,
+            [EnvironmentVariableTarget]::Process
+        )
+    }
+}
 
 function Assert-CommandAvailable {
     param([Parameter(Mandatory)][string]$Name)
@@ -70,6 +127,83 @@ function Assert-IsolatedDatabase {
     }
 }
 
+function Assert-RedactedJsonFile {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $raw = Get-Content -Raw -LiteralPath $Path
+    if (
+        $raw -match '(?i)"(?:api[_-]?key|access[_-]?token|token|authorization|password|secret|raw[_-]?prompt|private(?:[_-][a-z0-9]+)*|(?:[a-z0-9]+[_-])*path)"\s*:' -or
+        $raw -match '(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+' -or
+        $raw -match '(?i)(?:[A-Z]:[\\/]|\\\\[^\\]|/(?:home|Users|tmp|var|etc)/)'
+    ) {
+        throw 'A gate JSON file contains forbidden sensitive material.'
+    }
+    return $raw
+}
+
+function Assert-ExactPropertyNames {
+    param(
+        [Parameter(Mandatory)][object]$Value,
+        [Parameter(Mandatory)][string[]]$ExpectedNames,
+        [Parameter(Mandatory)][string]$Label
+    )
+
+    if ($null -eq $Value) {
+        throw "$Label is missing."
+    }
+    $actual = @($Value.psobject.Properties.Name | Sort-Object)
+    $expected = @($ExpectedNames | Sort-Object)
+    if ([string]::Join('|', $actual) -cne [string]::Join('|', $expected)) {
+        throw "$Label does not match the exact live-report contract."
+    }
+}
+
+function Assert-GatewayPromotion {
+    param(
+        [Parameter(Mandatory)][object]$Payload,
+        [Parameter(Mandatory)][object]$GatewayPromotion
+    )
+
+    Assert-ExactPropertyNames -Value $GatewayPromotion -ExpectedNames @(
+        'projection_status', 'release_decision', 'promotion_block'
+    ) -Label 'gateway_promotion'
+    Assert-ExactPropertyNames -Value $GatewayPromotion.release_decision -ExpectedNames @(
+        'job_id', 'correlation_id', 'status', 'reasons', 'evaluation_id',
+        'evaluation_ref', 'tool_gaps'
+    ) -Label 'gateway_promotion.release_decision'
+    Assert-ExactPropertyNames -Value $GatewayPromotion.promotion_block -ExpectedNames @(
+        'schema', 'event_id', 'job_id', 'correlation_id', 'causation_id', 'occurred_at',
+        'producer', 'subject_version', 'attempt', 'phase', 'role', 'status',
+        'artifact_refs', 'evidence_refs', 'assertion_ids', 'lease_id'
+    ) -Label 'gateway_promotion.promotion_block'
+
+    $decision = $GatewayPromotion.release_decision
+    $block = $GatewayPromotion.promotion_block
+    if (
+        [string]$GatewayPromotion.projection_status -cne 'ready_to_use' -or
+        [string]$decision.status -cne 'ready' -or
+        [string]$block.schema -cne 'captain.agent-factory-block.v1' -or
+        [string]$block.phase -cne 'capability_promoted' -or
+        [string]$block.producer -cne 'captain' -or
+        [string]$block.status -cne 'succeeded'
+    ) {
+        throw 'Release mode requires an authoritative Captain Gateway promotion.'
+    }
+    if (
+        [string]$decision.job_id -cne [string]$Payload.job_id -or
+        [string]$decision.correlation_id -cne [string]$Payload.correlation_id -or
+        [string]$block.job_id -cne [string]$Payload.job_id -or
+        [string]$block.correlation_id -cne [string]$Payload.correlation_id -or
+        [int]$block.subject_version -ne [int]$Payload.subject_version -or
+        [int]$block.attempt -ne [int]$Payload.attempt
+    ) {
+        throw 'Gateway promotion evidence is not bound to the live Factory report.'
+    }
+    if (@($block.evidence_refs).Count -eq 0) {
+        throw 'The Captain promotion block requires nonempty evidence_refs.'
+    }
+}
+
 function Assert-RedactedReport {
     param(
         [Parameter(Mandatory)][string]$Directory,
@@ -85,13 +219,7 @@ function Assert-RedactedReport {
     if ($report.BaseName -cne "sha256-$digest") {
         throw 'The live report filename does not match its SHA-256 digest.'
     }
-    $raw = Get-Content -Raw -LiteralPath $report.FullName
-    if (
-        $raw -match '(?i)"(?:api[_-]?key|token|authorization|password|secret)"\s*:' -or
-        $raw -match '(?i)(?:[A-Z]:\\Users\\|/home/|/Users/)'
-    ) {
-        throw 'The live report contains a secret-like field or an absolute user path.'
-    }
+    $raw = Assert-RedactedJsonFile -Path $report.FullName
     try {
         $payload = $raw | ConvertFrom-Json -Depth 100
     }
@@ -107,8 +235,24 @@ function Assert-RedactedReport {
     if ($ExpectedMode -eq 'release' -and [string]$payload.terminal_status -cne 'ready_to_use') {
         throw 'Release mode requires the Captain ready_to_use terminal projection.'
     }
+    $gatewayPromotion = $null
+    $gatewayPromotionProperty = $payload.psobject.Properties['gateway_promotion']
+    if ($null -ne $gatewayPromotionProperty) {
+        $gatewayPromotion = $gatewayPromotionProperty.Value
+    }
+    if ($ExpectedMode -eq 'demo' -and $null -ne $gatewayPromotion) {
+        throw 'Demo mode cannot contain a Gateway promotion.'
+    }
+    if ($ExpectedMode -eq 'release') {
+        Assert-GatewayPromotion -Payload $payload -GatewayPromotion $gatewayPromotion
+    }
     return $digest
 }
+
+Import-AllowlistedEnvironmentFile -Path (Join-Path $root '.env.captain-n8n') `
+    -AllowedNames $n8nEnvironmentAllowlist
+Import-AllowlistedEnvironmentFile -Path (Join-Path $root '.env') `
+    -AllowedNames $rootEnvironmentAllowlist
 
 if ($MaxCostUsd -le 0) {
     throw 'MaxCostUsd must be a positive amount.'
@@ -196,8 +340,9 @@ if ($LASTEXITCODE -ne 0) {
 if (-not (Test-Path -LiteralPath $preflightPath -PathType Leaf)) {
     throw 'Factory live preflight did not emit its redacted confirmation.'
 }
+$preflightRaw = Assert-RedactedJsonFile -Path $preflightPath
 try {
-    $preflight = Get-Content -Raw -LiteralPath $preflightPath | ConvertFrom-Json -Depth 100
+    $preflight = $preflightRaw | ConvertFrom-Json -Depth 100
 }
 catch {
     throw 'Factory live preflight confirmation is invalid JSON.'

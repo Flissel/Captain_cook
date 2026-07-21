@@ -4,11 +4,19 @@ import hashlib
 import importlib
 import json
 import os
+import re
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Mapping
 
 import pytest
+
+from agenten.agent_factory.contracts import (
+    FactoryBlockStatus,
+    FactoryEvidenceBlock,
+    FactoryPhase,
+)
+from agenten.agent_factory.release_gate import FactoryReleaseDecision
 
 
 pytestmark = pytest.mark.live
@@ -31,25 +39,98 @@ def _required_text(payload: Mapping[str, Any], key: str) -> str:
     return value
 
 
+def _exact_usd(value: object, label: str) -> Decimal:
+    assert isinstance(value, str), f"{label} must be a JSON decimal string"
+    assert re.fullmatch(r"(?:0|[1-9][0-9]*)\.[0-9]+", value), (
+        f"{label} must use non-negative plain decimal notation"
+    )
+    try:
+        amount = Decimal(value)
+    except InvalidOperation:
+        pytest.fail(f"{label} is not an exact decimal receipt")
+    assert amount.is_finite() and amount >= 0, f"{label} must be finite and non-negative"
+    return amount
+
+
+def _exact_model_payload(value: object, model_type: type[Any]) -> Any:
+    assert isinstance(value, Mapping), "Gateway evidence must be structured JSON"
+    raw = dict(value)
+    validated = model_type.model_validate(raw)
+    assert raw == validated.model_dump(mode="json", by_alias=True), (
+        "Gateway evidence must contain the complete canonical contract"
+    )
+    return validated
+
+
+def _gateway_promotion(
+    value: object,
+    report_binding: Mapping[str, Any],
+) -> None:
+    assert isinstance(value, Mapping), "release requires a structured Gateway promotion"
+    assert set(value) == {"projection_status", "release_decision", "promotion_block"}
+    assert value.get("projection_status") == "ready_to_use"
+
+    decision = _exact_model_payload(
+        value.get("release_decision"),
+        FactoryReleaseDecision,
+    )
+    promotion_block = _exact_model_payload(
+        value.get("promotion_block"),
+        FactoryEvidenceBlock,
+    )
+    assert decision.status == "ready"
+    assert promotion_block.phase is FactoryPhase.CAPABILITY_PROMOTED
+    assert promotion_block.producer == "captain"
+    assert promotion_block.status is FactoryBlockStatus.SUCCEEDED
+    assert promotion_block.evidence_refs
+
+    job_id = _required_text(report_binding, "job_id")
+    correlation_id = _required_text(report_binding, "correlation_id")
+    subject_version = report_binding.get("subject_version")
+    attempt = report_binding.get("attempt")
+    assert isinstance(subject_version, int) and not isinstance(subject_version, bool)
+    assert isinstance(attempt, int) and not isinstance(attempt, bool)
+    assert str(decision.job_id) == job_id
+    assert str(decision.correlation_id) == correlation_id
+    assert str(promotion_block.job_id) == job_id
+    assert str(promotion_block.correlation_id) == correlation_id
+    assert promotion_block.subject_version == subject_version
+    assert promotion_block.attempt == attempt
+
+
 def _assert_redacted(value: object) -> None:
-    forbidden_keys = {
-        "api_key",
-        "authorization",
-        "password",
-        "secret",
-        "token",
-    }
     if isinstance(value, Mapping):
-        assert not ({str(key).lower() for key in value} & forbidden_keys)
-        for nested in value.values():
+        for key, nested in value.items():
+            normalized_key = str(key).lower().replace("-", "_")
+            if (
+                normalized_key in {
+                    "api_key",
+                    "access_token",
+                    "authorization",
+                    "password",
+                    "secret",
+                    "token",
+                    "raw_prompt",
+                    "private",
+                    "path",
+                }
+                or normalized_key.startswith("private_")
+                or normalized_key.endswith("_path")
+            ):
+                raise AssertionError("live report contains a forbidden sensitive field")
             _assert_redacted(nested)
     elif isinstance(value, list):
         for nested in value:
             _assert_redacted(nested)
     elif isinstance(value, str):
         normalized = value.replace("\\", "/")
-        assert ":/Users/" not in normalized
-        assert not normalized.startswith(("/home/", "/Users/"))
+        if re.search(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", value):
+            raise AssertionError("live report contains bearer authorization material")
+        if re.search(
+            r"(?i)(?<![a-z])[a-z]:/|(?<!:)//|/(?:home|Users|tmp|var|etc)/",
+            normalized,
+        ):
+            raise AssertionError("live report contains an absolute host path")
 
 
 @pytest.mark.asyncio
@@ -72,6 +153,7 @@ async def test_hermes_six_skill_factory_live() -> None:
     except pytest.skip.Exception:
         pytest.fail("the live runtime may not skip after prerequisites are confirmed")
     report = _mapping(result)
+    _assert_redacted(report)
 
     assert report.get("schema") == "captain.hermes-six-skill-factory-live-report.v1"
     mode = os.environ["CAPTAIN_FACTORY_GATE_MODE"]
@@ -87,39 +169,42 @@ async def test_hermes_six_skill_factory_live() -> None:
     assert isinstance(provider_traces, list)
     assert len(provider_traces) == expected_run_count
     trace_ids: list[str] = []
+    codex_session_ids: list[str] = []
     total_cost = Decimal("0")
     for raw_trace in provider_traces:
         trace = _mapping(raw_trace)
         trace_ids.append(_required_text(trace, "trace_id"))
-        _required_text(trace, "codex_session_id")
+        codex_session_ids.append(_required_text(trace, "codex_session_id"))
         _required_text(trace, "provider")
         assert trace.get("model") == os.environ["CAPTAIN_FACTORY_MODEL"]
         assert trace.get("status") == "succeeded"
-        try:
-            cost = Decimal(str(trace["cost_usd"]))
-        except (InvalidOperation, KeyError) as error:
-            pytest.fail(f"provider trace has no exact USD receipt: {type(error).__name__}")
-        assert cost.is_finite() and cost >= 0
+        cost = _exact_usd(trace.get("cost_usd"), "provider trace cost_usd")
         total_cost += cost
     assert len(trace_ids) == len(set(trace_ids))
-    assert total_cost == Decimal(str(report.get("total_cost_usd")))
+    assert len(codex_session_ids) == len(set(codex_session_ids))
+    assert total_cost == _exact_usd(report.get("total_cost_usd"), "total_cost_usd")
     assert total_cost <= Decimal(os.environ["CAPTAIN_FACTORY_MAX_COST_USD"])
 
     if mode == "demo":
         assert report.get("terminal_status") == "demo_ready"
         assert report.get("terminal_status") != "ready_to_use"
         assert report.get("recovery") in (None, {})
+        assert report.get("gateway_promotion") in (None, {})
     else:
         recovery = _mapping(report.get("recovery"))
         assert recovery.get("status") == "recovered"
         _required_text(recovery, "evidence_digest")
+        _gateway_promotion(report.get("gateway_promotion"), report)
         assert report.get("terminal_status") == "ready_to_use"
 
     with_n8n = os.environ.get("CAPTAIN_FACTORY_WITH_N8N") == "1"
     assert report.get("with_n8n") is with_n8n
     if with_n8n:
         n8n_evidence = _mapping(report.get("n8n_evidence"))
-        assert len(_required_text(n8n_evidence, "workflow_digest")) == 64
+        assert re.fullmatch(
+            r"^[0-9a-f]{64}$",
+            _required_text(n8n_evidence, "workflow_digest"),
+        )
         _required_text(n8n_evidence, "n8n_mcp_call_id")
         _required_text(n8n_evidence, "n8n_execution_id")
 
@@ -133,5 +218,5 @@ async def test_hermes_six_skill_factory_live() -> None:
     digest = hashlib.sha256(report_bytes).hexdigest()
     assert report_path.name == f"sha256-{digest}.json"
     persisted = json.loads(report_bytes.decode("utf-8"))
-    assert persisted == report
     _assert_redacted(persisted)
+    assert persisted == report
