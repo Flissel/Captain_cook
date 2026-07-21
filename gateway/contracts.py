@@ -23,10 +23,19 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrant,
     CapabilityGrantRevocation,
 )
-from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease
+from agenten.agent_factory.contracts import FactoryEvidenceBlock, FactoryJob, FactoryLease
+from agenten.agent_factory.execution_budget import FactoryBudgetReservationV1
 from agenten.agent_factory.release_gate import E2ERunEvidence, FactoryReleaseDecision
 from agenten.agent_factory.skill_evaluation import (
     HermesSkillEvaluationEvidence,
+)
+from agenten.agent_factory.skill_workflow_contracts import (
+    CandidateRevisionV1,
+    CodebaseInventoryV1,
+    CodexBuildBriefV1,
+    FactoryFeedbackV1,
+    TeamEvaluationV1,
+    TeamExecutionEvidenceV1,
 )
 from agenten.agent_factory.state_machine import FactoryLifecycleStatus, FactoryProjection
 
@@ -82,6 +91,76 @@ class FactoryWriteReceipt(_FrozenContract):
 
 class FactorySkillWriteReceipt(_FrozenContract):
     record_id: str = Field(min_length=1)
+    replayed: bool
+
+
+class FactoryBudgetReservationWriteReceipt(_FrozenContract):
+    event_id: UUID
+    job_id: UUID
+    replayed: bool
+    reservation: FactoryBudgetReservationV1
+
+
+class FactoryBudgetReleaseRequest(_FrozenContract):
+    schema_name: Literal["captain.factory-budget-release.v1"] = Field(
+        default="captain.factory-budget-release.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    release_id: UUID
+    reservation_id: UUID
+    job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    released_at: datetime
+    reason: Literal["provider_failed", "cancelled", "unused"]
+
+    @field_validator("released_at")
+    @classmethod
+    def require_utc_timestamp(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("released_at must be UTC")
+        return value.astimezone(timezone.utc)
+
+
+FactoryWorkflowArtifact: TypeAlias = (
+    CodebaseInventoryV1
+    | CodexBuildBriefV1
+    | TeamExecutionEvidenceV1
+    | TeamEvaluationV1
+    | CandidateRevisionV1
+    | FactoryFeedbackV1
+)
+
+_FACTORY_WORKFLOW_ARTIFACT_TYPES = {
+    "hermes.factory-codebase-inventory.v1": CodebaseInventoryV1,
+    "hermes.factory-codex-build-assignment.v1": CodexBuildBriefV1,
+    "hermes.factory-team-execution-evidence.v1": TeamExecutionEvidenceV1,
+    "hermes.factory-team-evaluation.v1": TeamEvaluationV1,
+    "hermes.factory-candidate-revision.v1": CandidateRevisionV1,
+    "hermes.factory-feedback.v1": FactoryFeedbackV1,
+}
+
+
+def parse_factory_workflow_artifact(value: object) -> FactoryWorkflowArtifact:
+    if isinstance(
+        value,
+        tuple(_FACTORY_WORKFLOW_ARTIFACT_TYPES.values()),
+    ):
+        return value
+    if not isinstance(value, Mapping):
+        raise ValueError("factory workflow artifact must be an object")
+    schema_name = value.get("schema", value.get("schema_name"))
+    contract = _FACTORY_WORKFLOW_ARTIFACT_TYPES.get(schema_name)
+    if contract is None:
+        raise ValueError("unsupported factory workflow artifact schema")
+    return contract.model_validate(value)
+
+
+class FactoryWorkflowArtifactWriteReceipt(_FrozenContract):
+    invocation_id: UUID
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     replayed: bool
 
 
@@ -144,7 +223,7 @@ class PublishedHermesSkill(_FrozenContract):
 
 
 class FactoryJobProjection(_FrozenContract):
-    job: AgentFactoryJob
+    job: FactoryJob
     blocks: tuple[FactoryEvidenceBlock, ...]
     leases: tuple[FactoryLease, ...]
     projection: FactoryProjection

@@ -15,8 +15,13 @@ from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.release_gate import E2EKind, E2EOutcome, E2ERunEvidence
 from agenten.agent_factory.service import FactoryCoordinator
 from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationEvidence
+from agenten.agent_factory.skill_workflow_contracts import CodebaseInventoryV1
 from agenten.agent_runtime.contracts import ArtifactRef
-from gateway.contracts import FactorySkillEvaluationSubmission, PublishedHermesSkill
+from gateway.contracts import (
+    FactorySkillEvaluationSubmission,
+    PublishedHermesSkill,
+    parse_factory_workflow_artifact,
+)
 from gateway.factory_repository import GatewayFactoryLeases, GatewayFactoryRepository
 from gateway.store import GatewayStore
 from tests.agent_factory.test_state_machine import (
@@ -26,6 +31,15 @@ from tests.agent_factory.test_state_machine import (
     block,
     job,
 )
+from tests.agent_factory.test_execution_budget import job_v3
+from tests.agent_factory.test_skill_workflow_contracts import (
+    brief_payload,
+    evaluation_payload,
+    execution_payload,
+    feedback_payload,
+    inventory_payload,
+    revision_payload,
+)
 
 
 class Store:
@@ -34,6 +48,7 @@ class Store:
         self.events = {}
         self.evaluations = {}
         self.decisions = {}
+        self.workflow_artifacts = {}
 
     def record_factory_job(self, factory_job):
         self.jobs.setdefault(factory_job.job_id, factory_job)
@@ -51,6 +66,9 @@ class Store:
 
     def factory_release_decision(self, job_id):
         return self.decisions.get(job_id)
+
+    def factory_workflow_artifacts(self, job_id):
+        return tuple(self.workflow_artifacts.get(job_id, ()))
 
 
 def test_gateway_adapter_runs_coordinator_against_gateway_store_shape() -> None:
@@ -104,6 +122,49 @@ def test_gateway_adapter_reads_the_gateway_accepted_release_decision() -> None:
     store.decisions[factory_job.job_id] = decision
 
     assert GatewayFactoryRepository(store).release_decision_for_job(factory_job.job_id) == decision
+
+
+def test_gateway_repository_round_trips_a_v3_job_without_schema_loss(job_v3) -> None:
+    store = Store()
+    repository = GatewayFactoryRepository(store)
+
+    repository.register(job_v3)
+
+    assert repository.job(job_v3.job_id) == job_v3
+    assert repository.job(job_v3.job_id).schema_name == "captain.agent-factory-job.v3"
+
+
+def test_gateway_repository_exposes_workflow_artifacts_read_only() -> None:
+    artifact = CodebaseInventoryV1.model_validate(inventory_payload())
+    store = Store()
+    store.workflow_artifacts[artifact.job_id] = [artifact]
+
+    recovered = GatewayFactoryRepository(store).workflow_artifacts(artifact.job_id)
+
+    assert recovered == (artifact,)
+
+
+@pytest.mark.parametrize(
+    "payload_builder",
+    (
+        inventory_payload,
+        brief_payload,
+        execution_payload,
+        evaluation_payload,
+        revision_payload,
+        feedback_payload,
+    ),
+)
+def test_gateway_parser_preserves_each_workflow_artifact_schema(payload_builder) -> None:
+    payload = payload_builder()
+
+    artifact = parse_factory_workflow_artifact(payload)
+    recovered = parse_factory_workflow_artifact(
+        artifact.model_dump(mode="json", by_alias=True)
+    )
+
+    assert recovered == artifact
+    assert artifact.schema_name == payload["schema"]
 
 
 def _canonical_ref(model, name: str) -> ArtifactRef:
