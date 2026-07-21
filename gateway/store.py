@@ -24,7 +24,6 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrantRevocation,
 )
 from agenten.agent_factory.contracts import (
-    AgentFactoryJob,
     AgentFactoryJobV3,
     FactoryEvidenceBlock,
     FactoryJob,
@@ -52,6 +51,7 @@ from agenten.agent_factory.skill_evaluation import (
     ReleasedHermesSkill,
 )
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
+from agenten.agent_factory.skill_workflow_contracts import FactorySkillStep
 from agenten.agent_factory.state_machine import (
     FactoryActionKind,
     FactoryLifecycleError,
@@ -83,6 +83,7 @@ from gateway.contracts import (
     FactoryBudgetReservationWriteReceipt,
     FactoryWorkflowArtifact,
     FactoryWorkflowArtifactWriteReceipt,
+    FactoryUsageSubmissionV2,
     FactoryReleaseDecisionSubmission,
     FactoryWriteReceipt,
     FactorySkillEvaluationSubmission,
@@ -855,9 +856,10 @@ class GatewayStore:
 
     def record_factory_usage(
         self,
-        receipt: FactoryUsageReceiptV1,
+        submission: FactoryUsageSubmissionV2,
     ) -> FactoryBudgetWriteReceipt:
-        canonical = receipt.model_dump(mode="json", by_alias=True)
+        receipt = submission.receipt
+        canonical = submission.model_dump(mode="json", by_alias=True)
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
                 replay = self._factory_budget_event(cursor, receipt.receipt_id, for_update=True)
@@ -870,6 +872,9 @@ class GatewayStore:
                 if reservation is None:
                     raise HTTPException(status_code=409, detail="factory budget reservation not found")
                 self._assert_budget_usage(job, reservation, receipt)
+                self._assert_budget_usage_lease(
+                    cursor, job, submission
+                )
                 if self._reservation_is_closed(cursor, receipt.reservation_id):
                     raise HTTPException(status_code=409, detail="factory budget reservation is no longer active")
                 projection = self._factory_budget_projection(cursor, job, for_update=True)
@@ -959,9 +964,19 @@ class GatewayStore:
                     raise HTTPException(status_code=409, detail="factory job not found")
                 job = parse_factory_job(job_block["data"])
                 self._assert_workflow_artifact(job, artifact)
+                projection = self._factory_projection(cursor, job)
                 self._assert_factory_effects_open(
-                    self._factory_projection(cursor, job),
+                    projection,
                     effect="workflow artifacts",
+                )
+                self._assert_released_skill(
+                    cursor, artifact.invocation.released_skill
+                )
+                prior_artifacts = self._factory_workflow_artifacts_for_job(
+                    cursor, artifact.job_id, for_update=True
+                )
+                self._assert_workflow_sequence(
+                    projection, artifact, prior_artifacts
                 )
                 lease_block = self._runtime_block_by_json_value(
                     cursor, block_type="agent_factory_lease", field="lease_id", value=artifact.invocation.lease.lease_id, for_update=True
@@ -1015,14 +1030,7 @@ class GatewayStore:
                     require_v3=False,
                     for_update=False,
                 )
-                cursor.execute(
-                    "SELECT payload FROM factory_workflow_artifacts WHERE job_id = %s ORDER BY block_index",
-                    (str(job_id),),
-                )
-                return tuple(
-                    parse_factory_workflow_artifact(self._decode_json(row["payload"]))
-                    for row in cursor.fetchall()
-                )
+                return self._factory_workflow_artifacts_for_job(cursor, job_id)
 
     def record_released_factory_skill(
         self,
@@ -1486,9 +1494,7 @@ class GatewayStore:
                 job = parse_factory_job(job_block["data"])
                 blocks = self._factory_blocks(cursor, job_id)
                 leases = self._factory_leases(cursor, job_id)
-                projection = FactoryProjection.from_job(
-                    self._factory_lifecycle_job(job)
-                )
+                projection = FactoryProjection.from_job(job)
                 for evidence in blocks:
                     evaluation = (
                         self._factory_skill_evaluation_for_job(cursor, job_id)
@@ -1541,7 +1547,7 @@ class GatewayStore:
         return FactoryWriteReceipt(event_id=job.event_id, replayed=False)
 
     def _factory_projection(self, cursor: Any, job: FactoryJob) -> FactoryProjection:
-        projection = FactoryProjection.from_job(self._factory_lifecycle_job(job))
+        projection = FactoryProjection.from_job(job)
         for evidence in self._factory_blocks(cursor, job.job_id, for_update=True):
             evaluation = (
                 self._factory_skill_evaluation_for_job(cursor, job.job_id)
@@ -1560,26 +1566,6 @@ class GatewayStore:
                 release_decision=release_decision,
             )
         return projection
-
-    @staticmethod
-    def _factory_lifecycle_job(job: FactoryJob) -> AgentFactoryJob:
-        if isinstance(job, AgentFactoryJob):
-            return job
-        return AgentFactoryJob.model_validate(
-            {
-                "schema": "captain.agent-factory-job.v1",
-                "event_id": job.event_id,
-                "correlation_id": job.correlation_id,
-                "occurred_at": job.occurred_at,
-                "producer": job.producer,
-                "job_id": job.job_id,
-                "subject_version": job.subject_version,
-                "input_ref": job.input_ref,
-                "required_capability": job.required_capability,
-                "acceptance_assertion_ids": job.acceptance_assertion_ids,
-                "max_behavioral_iterations": job.max_behavioral_iterations,
-            }
-        )
 
     def _factory_budget_job(
         self,
@@ -1648,6 +1634,58 @@ class GatewayStore:
         if receipt.started_at < reservation.reserved_at or receipt.ended_at > reservation.expires_at:
             raise HTTPException(status_code=409, detail="factory usage receipt is outside its reservation window")
 
+    def _assert_budget_usage_lease(
+        self,
+        cursor: Any,
+        job: FactoryJob,
+        submission: FactoryUsageSubmissionV2,
+    ) -> None:
+        receipt = submission.receipt
+        lease_block = self._runtime_block_by_json_value(
+            cursor,
+            block_type="agent_factory_lease",
+            field="lease_id",
+            value=submission.lease_id,
+            for_update=True,
+        )
+        if lease_block is None:
+            raise HTTPException(
+                status_code=409,
+                detail="factory usage requires a matching active lease",
+            )
+        lease = FactoryLease.model_validate(lease_block["data"])
+        if (
+            lease.role is not FactoryRole.REAL_CASE_TESTER
+            or "model.invoke" not in lease.capabilities
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="factory usage lease does not authorize the paid model effect",
+            )
+        if (
+            submission.subject_version != job.subject_version
+            or lease.lease_id != submission.lease_id
+            or lease.job_id != job.job_id
+            or lease.correlation_id != job.correlation_id
+            or lease.subject_version != submission.subject_version
+            or lease.attempt != receipt.attempt
+            or receipt.ended_at >= lease.expires_at
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="factory usage lease or subject binding mismatch",
+            )
+        try:
+            validate_factory_lease(
+                lease,
+                job=job,
+                role=lease.role,
+                attempt=receipt.attempt,
+                now=receipt.started_at,
+            )
+        except FactoryLeaseDenied as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @staticmethod
     def _assert_workflow_artifact(
         job: FactoryJob,
@@ -1660,8 +1698,92 @@ class GatewayStore:
             or artifact.attempt > job.max_behavioral_iterations
             or artifact.invocation.input_ref != job.input_ref
             or artifact.acceptance_assertion_ids != job.acceptance_assertion_ids
+            or artifact.invocation.released_skill.capability
+            != job.required_capability
         ):
             raise HTTPException(status_code=409, detail="factory workflow artifact job binding mismatch")
+
+    @staticmethod
+    def _assert_workflow_sequence(
+        projection: FactoryProjection,
+        artifact: FactoryWorkflowArtifact,
+        prior_artifacts: tuple[FactoryWorkflowArtifact, ...],
+    ) -> None:
+        step = artifact.invocation.step
+        required_phase = {
+            FactorySkillStep.DISCOVER: {
+                FactoryPhase.FORGE_REQUESTED,
+                FactoryPhase.IMPROVEMENT_REQUESTED,
+            },
+            FactorySkillStep.IMPROVE_TEAM: {FactoryPhase.IMPROVEMENT_REQUESTED},
+            FactorySkillStep.BRIEF_CODEX: {FactoryPhase.BLUEPRINT_CREATED},
+            FactorySkillStep.EXECUTE_TEAM: {FactoryPhase.BUILD_PASSED},
+            FactorySkillStep.EVALUATE_TEAM: {FactoryPhase.REAL_CASE_EVIDENCE},
+            FactorySkillStep.REPORT_CAPTAIN: {FactoryPhase.QUALITY_REVIEWED},
+        }[step]
+        if projection.phase not in required_phase:
+            raise HTTPException(
+                status_code=409,
+                detail="workflow artifact does not match the current factory phase",
+            )
+        if artifact.attempt != projection.attempt:
+            raise HTTPException(
+                status_code=409,
+                detail="workflow artifact attempt is not the current factory attempt",
+            )
+        if step is FactorySkillStep.IMPROVE_TEAM and artifact.attempt == 1:
+            raise HTTPException(
+                status_code=409,
+                detail="improve_team is allowed only on a later attempt",
+            )
+        expected = (
+            (
+                FactorySkillStep.DISCOVER,
+                FactorySkillStep.IMPROVE_TEAM,
+                FactorySkillStep.BRIEF_CODEX,
+                FactorySkillStep.EXECUTE_TEAM,
+                FactorySkillStep.EVALUATE_TEAM,
+                FactorySkillStep.REPORT_CAPTAIN,
+            )
+            if artifact.attempt > 1
+            else (
+                FactorySkillStep.DISCOVER,
+                FactorySkillStep.BRIEF_CODEX,
+                FactorySkillStep.EXECUTE_TEAM,
+                FactorySkillStep.EVALUATE_TEAM,
+                FactorySkillStep.REPORT_CAPTAIN,
+            )
+        )
+        prior_steps = tuple(
+            candidate.invocation.step
+            for candidate in prior_artifacts
+            if candidate.attempt == artifact.attempt
+        )
+        position = expected.index(step)
+        if prior_steps != expected[:position]:
+            raise HTTPException(
+                status_code=409,
+                detail="workflow artifact is missing its exact prior workflow artifact sequence",
+            )
+
+    def _factory_workflow_artifacts_for_job(
+        self,
+        cursor: Any,
+        job_id: UUID,
+        *,
+        for_update: bool = False,
+    ) -> tuple[FactoryWorkflowArtifact, ...]:
+        sql = (
+            "SELECT payload FROM factory_workflow_artifacts "
+            "WHERE job_id = %s ORDER BY block_index"
+        )
+        if for_update:
+            sql += " FOR UPDATE"
+        cursor.execute(sql, (str(job_id),))
+        return tuple(
+            parse_factory_workflow_artifact(self._decode_json(row["payload"]))
+            for row in cursor.fetchall()
+        )
 
     @staticmethod
     def _assert_factory_effects_open(
@@ -1738,7 +1860,7 @@ class GatewayStore:
                 reservation = FactoryBudgetReservationV1.model_validate(payload)
                 active[reservation.reservation_id] = reservation.requested_usd
             elif row["event_kind"] == "usage":
-                receipt = FactoryUsageReceiptV1.model_validate(payload)
+                receipt = self._factory_usage_receipt(payload)
                 consumed += receipt.cost_usd
                 active.pop(receipt.reservation_id, None)
             else:
@@ -1753,6 +1875,15 @@ class GatewayStore:
             remaining_usd=limit - consumed - reserved,
             active_reservation_ids=tuple(active),
         )
+
+    @staticmethod
+    def _factory_usage_receipt(payload: object) -> FactoryUsageReceiptV1:
+        decoded = GatewayStore._decode_json(payload)
+        if isinstance(decoded, dict) and decoded.get("schema") == (
+            "captain.factory-usage-submission.v2"
+        ):
+            return FactoryUsageSubmissionV2.model_validate(decoded).receipt
+        return FactoryUsageReceiptV1.model_validate(decoded)
 
     def _insert_factory_budget_event(
         self,
@@ -1982,7 +2113,7 @@ class GatewayStore:
     @staticmethod
     def _assert_factory_evaluation_job(
         evidence: HermesSkillEvaluationEvidence,
-        job: AgentFactoryJob,
+        job: FactoryJob,
     ) -> None:
         request = evidence.request
         if request.released_skill.capability != job.required_capability:
@@ -2083,7 +2214,7 @@ class GatewayStore:
     def _assert_publication_qualification(
         publication: PublishedHermesSkill,
         submission: FactorySkillEvaluationSubmission,
-        job: AgentFactoryJob,
+        job: FactoryJob,
     ) -> None:
         evidence = submission.evidence
         GatewayStore._assert_factory_evaluation_job(evidence, job)
@@ -2111,7 +2242,7 @@ class GatewayStore:
 
     @staticmethod
     def _assert_factory_release_decision(
-        job: AgentFactoryJob,
+        job: FactoryJob,
         evaluation: StoredSkillEvaluation,
         evidence: tuple[E2ERunEvidence, ...],
         decision: FactoryReleaseDecision,

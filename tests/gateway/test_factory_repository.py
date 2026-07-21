@@ -13,9 +13,13 @@ from agenten.agent_factory.contracts import FactoryPhase
 from agenten.agent_factory.contracts import FactoryRole
 from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.release_gate import E2EKind, E2EOutcome, E2ERunEvidence
-from agenten.agent_factory.service import FactoryCoordinator
+from agenten.agent_factory.service import FactoryCoordinator, InMemoryFactoryRepository
 from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationEvidence
-from agenten.agent_factory.skill_workflow_contracts import CodebaseInventoryV1
+from agenten.agent_factory.skill_workflow_contracts import (
+    CodebaseInventoryV1,
+    FactorySkillStep,
+)
+from agenten.agent_factory.state_machine import FactoryLifecycleStatus, FactoryProjection
 from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.contracts import (
     FactorySkillEvaluationSubmission,
@@ -134,6 +138,17 @@ def test_gateway_repository_round_trips_a_v3_job_without_schema_loss(job_v3) -> 
     assert repository.job(job_v3.job_id).schema_name == "captain.agent-factory-job.v3"
 
 
+def test_factory_repository_port_and_coordinator_preserve_v3_jobs(job_v3) -> None:
+    coordinator = FactoryCoordinator(InMemoryFactoryRepository())
+
+    coordinator.register(job_v3)
+
+    assert coordinator.projection(job_v3.job_id).job == job_v3
+    assert coordinator.projection(job_v3.job_id).job.execution_policy == (
+        job_v3.execution_policy
+    )
+
+
 def test_gateway_repository_exposes_workflow_artifacts_read_only() -> None:
     artifact = CodebaseInventoryV1.model_validate(inventory_payload())
     store = Store()
@@ -165,6 +180,86 @@ def test_gateway_parser_preserves_each_workflow_artifact_schema(payload_builder)
 
     assert recovered == artifact
     assert artifact.schema_name == payload["schema"]
+
+
+def test_gateway_workflow_sequence_requires_current_phase_and_prior_artifact() -> None:
+    factory_job = job()
+    inventory = parse_factory_workflow_artifact(inventory_payload())
+    brief = parse_factory_workflow_artifact(brief_payload())
+    execution = parse_factory_workflow_artifact(execution_payload())
+    evaluation = parse_factory_workflow_artifact(evaluation_payload())
+    feedback = parse_factory_workflow_artifact(feedback_payload())
+    forge_requested = FactoryProjection.from_job(factory_job).model_copy(
+        update={
+            "status": FactoryLifecycleStatus.RUNNING,
+            "phase": FactoryPhase.FORGE_REQUESTED,
+        }
+    )
+    blueprint_created = forge_requested.model_copy(
+        update={"phase": FactoryPhase.BLUEPRINT_CREATED}
+    )
+
+    GatewayStore._assert_workflow_sequence(forge_requested, inventory, ())
+    with pytest.raises(HTTPException, match="prior workflow artifact"):
+        GatewayStore._assert_workflow_sequence(blueprint_created, brief, ())
+    GatewayStore._assert_workflow_sequence(
+        blueprint_created, brief, (inventory,)
+    )
+    GatewayStore._assert_workflow_sequence(
+        blueprint_created.model_copy(update={"phase": FactoryPhase.BUILD_PASSED}),
+        execution,
+        (inventory, brief),
+    )
+    GatewayStore._assert_workflow_sequence(
+        blueprint_created.model_copy(
+            update={"phase": FactoryPhase.REAL_CASE_EVIDENCE}
+        ),
+        evaluation,
+        (inventory, brief, execution),
+    )
+    GatewayStore._assert_workflow_sequence(
+        blueprint_created.model_copy(
+            update={"phase": FactoryPhase.QUALITY_REVIEWED}
+        ),
+        feedback,
+        (inventory, brief, execution, evaluation),
+    )
+    with pytest.raises(HTTPException, match="current factory phase"):
+        GatewayStore._assert_workflow_sequence(
+            blueprint_created, inventory, ()
+        )
+
+
+def test_gateway_workflow_sequence_rejects_improvement_on_first_attempt() -> None:
+    factory_job = job()
+    revision = parse_factory_workflow_artifact(revision_payload())
+    improvement_requested = FactoryProjection.from_job(factory_job).model_copy(
+        update={
+            "status": FactoryLifecycleStatus.RUNNING,
+            "phase": FactoryPhase.IMPROVEMENT_REQUESTED,
+        }
+    )
+
+    assert revision.invocation.step is FactorySkillStep.IMPROVE_TEAM
+    with pytest.raises(HTTPException, match="later attempt"):
+        GatewayStore._assert_workflow_sequence(
+            improvement_requested, revision, ()
+        )
+
+    discover = parse_factory_workflow_artifact(inventory_payload())
+    discover_invocation = discover.invocation.model_copy(update={"attempt": 2})
+    discover = discover.model_copy(
+        update={"attempt": 2, "invocation": discover_invocation}
+    )
+    revision_invocation = revision.invocation.model_copy(update={"attempt": 2})
+    revision = revision.model_copy(
+        update={"attempt": 2, "invocation": revision_invocation}
+    )
+    GatewayStore._assert_workflow_sequence(
+        improvement_requested.model_copy(update={"attempt": 2}),
+        revision,
+        (discover,),
+    )
 
 
 def _canonical_ref(model, name: str) -> ArtifactRef:

@@ -8,7 +8,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryPhase
+from .contracts import FactoryEvidenceBlock, FactoryJob, FactoryPhase
 from .release_gate import (
     FactoryReleaseDecision,
     evaluation_requires_improvement,
@@ -62,7 +62,7 @@ class FactoryProjection(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    job: AgentFactoryJob
+    job: FactoryJob
     status: FactoryLifecycleStatus
     phase: FactoryPhase | None = None
     attempt: int = Field(ge=1, le=5)
@@ -73,7 +73,7 @@ class FactoryProjection(BaseModel):
     tool_gaps: tuple[ToolGapMarker, ...] = ()
 
     @classmethod
-    def from_job(cls, job: AgentFactoryJob) -> "FactoryProjection":
+    def from_job(cls, job: FactoryJob) -> "FactoryProjection":
         return cls(job=job, status=FactoryLifecycleStatus.PENDING, attempt=1)
 
 

@@ -32,6 +32,7 @@ from gateway.auth import GatewayRole, require_actor
 from gateway.contracts import (
     FactorySkillEvaluationSubmission,
     FactoryReleaseDecisionSubmission,
+    FactoryUsageSubmissionV2,
     PublishedHermesSkill,
 )
 from gateway.settings import GatewaySettings
@@ -39,6 +40,7 @@ from gateway.store import GatewayStore
 from tests.agent_factory.test_state_machine import block, job
 from tests.agent_factory.test_skill_evaluation_contracts import evidence_payload
 from tests.agent_factory.test_execution_budget import job_v3, usage_payload
+from tests.gateway.test_factory_budget import record_usage_lease
 from tests.support.mariadb import assert_isolated_test_database
 
 
@@ -122,6 +124,8 @@ def test_factory_budget_routes_keep_reservations_captain_owned_and_usage_worker_
             "/v1/factory/jobs",
             json=job_v3.model_dump(mode="json", by_alias=True),
         ).status_code == 202
+    store = GatewayStore(storage)
+    lease = record_usage_lease(store, job_v3)
     with TestClient(application(storage, actor=GatewayRole.WORKER)) as worker:
         assert worker.post(
             "/v1/factory/budget/reservations", json=reservation_payload
@@ -131,14 +135,19 @@ def test_factory_budget_routes_keep_reservations_captain_owned_and_usage_worker_
             "/v1/factory/budget/reservations", json=reservation_payload
         ).status_code == 201
         usage = FactoryUsageReceiptV1.model_validate(usage_payload(reservation))
+        usage_submission = FactoryUsageSubmissionV2(
+            subject_version=job_v3.subject_version,
+            lease_id=lease.lease_id,
+            receipt=usage,
+        )
         assert captain.post(
             "/v1/factory/budget/usage",
-            json=usage.model_dump(mode="json", by_alias=True),
+            json=usage_submission.model_dump(mode="json", by_alias=True),
         ).status_code == 403
     with TestClient(application(storage, actor=GatewayRole.WORKER)) as worker:
         assert worker.post(
             "/v1/factory/budget/usage",
-            json=usage.model_dump(mode="json", by_alias=True),
+            json=usage_submission.model_dump(mode="json", by_alias=True),
         ).status_code == 201
 
 

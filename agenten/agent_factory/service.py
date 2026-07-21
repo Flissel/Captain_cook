@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 from uuid import UUID
 
-from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock
+from agenten.agent_factory.contracts import FactoryEvidenceBlock, FactoryJob
 from agenten.agent_factory.release_gate import FactoryReleaseDecision
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
 from agenten.agent_factory.state_machine import (
@@ -25,10 +25,10 @@ class FactoryRepositoryError(RuntimeError):
 class FactoryRepository(Protocol):
     """Append-only storage port implemented by Captain's gateway adapter."""
 
-    def register(self, job: AgentFactoryJob) -> None:
+    def register(self, job: FactoryJob) -> None:
         """Persist a newly authorized Captain job."""
 
-    def job(self, job_id: UUID) -> AgentFactoryJob:
+    def job(self, job_id: UUID) -> FactoryJob:
         """Return the authorized job or raise FactoryRepositoryError."""
 
     def append(self, block: FactoryEvidenceBlock) -> bool:
@@ -48,7 +48,7 @@ class FactoryRepository(Protocol):
 class InMemoryFactoryRepository:
     """Deterministic test adapter; production must use the gateway ledger port."""
 
-    _jobs: dict[UUID, AgentFactoryJob] = field(default_factory=dict)
+    _jobs: dict[UUID, FactoryJob] = field(default_factory=dict)
     _blocks: dict[UUID, list[FactoryEvidenceBlock]] = field(default_factory=dict)
     _event_ids: dict[UUID, FactoryEvidenceBlock] = field(default_factory=dict)
     _evaluations_by_job: dict[UUID, StoredSkillEvaluation] = field(default_factory=dict)
@@ -56,7 +56,7 @@ class InMemoryFactoryRepository:
         default_factory=dict
     )
 
-    def register(self, job: AgentFactoryJob) -> None:
+    def register(self, job: FactoryJob) -> None:
         existing = self._jobs.get(job.job_id)
         if existing is not None:
             if existing != job:
@@ -65,7 +65,7 @@ class InMemoryFactoryRepository:
         self._jobs[job.job_id] = job
         self._blocks[job.job_id] = []
 
-    def job(self, job_id: UUID) -> AgentFactoryJob:
+    def job(self, job_id: UUID) -> FactoryJob:
         try:
             return self._jobs[job_id]
         except KeyError as exc:
@@ -101,7 +101,7 @@ class FactoryCoordinator:
     def __init__(self, repository: FactoryRepository):
         self._repository = repository
 
-    def register(self, job: AgentFactoryJob) -> None:
+    def register(self, job: FactoryJob) -> None:
         self._repository.register(job)
 
     def record(self, block: FactoryEvidenceBlock) -> bool:

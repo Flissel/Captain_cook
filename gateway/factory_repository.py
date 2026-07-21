@@ -19,6 +19,7 @@ from agenten.agent_factory.contracts import (
     FactoryRole,
 )
 from agenten.agent_factory.execution_budget import (
+    BudgetExhausted,
     FactoryBudgetPort,
     FactoryBudgetProjection,
     FactoryBudgetReservationV1,
@@ -31,7 +32,7 @@ from agenten.agent_factory.release_gate import FactoryReleaseDecision
 from agenten.agent_factory.service import FactoryRepository, FactoryRepositoryError
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
 from gateway.store import GatewayStore
-from gateway.contracts import FactoryBudgetReleaseRequest
+from gateway.contracts import FactoryBudgetReleaseRequest, FactoryUsageSubmissionV2
 from gateway.contracts import FactoryWorkflowArtifact
 
 
@@ -140,7 +141,9 @@ class GatewayFactoryBudgetLedger(FactoryBudgetPort):
             reserved_at=now,
             expires_at=job.deadline_at,
         )
-        return self._store.reserve_factory_budget(reservation).reservation
+        return self._translate_budget(
+            lambda: self._store.reserve_factory_budget(reservation).reservation
+        )
 
     def record_usage(
         self,
@@ -148,8 +151,38 @@ class GatewayFactoryBudgetLedger(FactoryBudgetPort):
         reservation: FactoryBudgetReservationV1,
         receipt: FactoryUsageReceiptV1,
     ) -> FactoryBudgetWriteReceipt:
-        del job, reservation
-        return self._store.record_factory_usage(receipt)
+        if (
+            receipt.reservation_id != reservation.reservation_id
+            or receipt.job_id != job.job_id
+            or receipt.correlation_id != job.correlation_id
+            or receipt.attempt != reservation.attempt
+        ):
+            raise ValueError("factory usage receipt binding mismatch")
+        leases = self._translate_budget(
+            lambda: self._store.factory_job(job.job_id).leases
+        )
+        candidates = tuple(
+            lease
+            for lease in leases
+            if lease.job_id == job.job_id
+            and lease.correlation_id == job.correlation_id
+            and lease.subject_version == job.subject_version
+            and lease.attempt == receipt.attempt
+            and lease.role is FactoryRole.REAL_CASE_TESTER
+            and "model.invoke" in lease.capabilities
+            and lease.issued_at <= receipt.started_at
+            and receipt.ended_at < lease.expires_at
+        )
+        if len(candidates) != 1:
+            raise ValueError("usage requires one exact active factory lease")
+        submission = FactoryUsageSubmissionV2(
+            subject_version=job.subject_version,
+            lease_id=candidates[0].lease_id,
+            receipt=receipt,
+        )
+        return self._translate_budget(
+            lambda: self._store.record_factory_usage(submission)
+        )
 
     def release(
         self,
@@ -163,21 +196,41 @@ class GatewayFactoryBudgetLedger(FactoryBudgetPort):
             NAMESPACE_URL,
             f"factory-budget-release|{reservation.reservation_id}|{reason}",
         )
-        return self._store.release_factory_budget(
-            FactoryBudgetReleaseRequest(
-                release_id=release_id,
-                reservation_id=reservation.reservation_id,
-                job_id=job.job_id,
-                correlation_id=job.correlation_id,
-                subject_version=job.subject_version,
-                attempt=reservation.attempt,
-                released_at=now,
-                reason=reason,
+        return self._translate_budget(
+            lambda: self._store.release_factory_budget(
+                FactoryBudgetReleaseRequest(
+                    release_id=release_id,
+                    reservation_id=reservation.reservation_id,
+                    job_id=job.job_id,
+                    correlation_id=job.correlation_id,
+                    subject_version=job.subject_version,
+                    attempt=reservation.attempt,
+                    released_at=now,
+                    reason=reason,
+                )
             )
         )
 
     def projection(self, job_id: UUID) -> FactoryBudgetProjection:
-        return self._store.factory_budget(job_id)
+        return self._translate_budget(lambda: self._store.factory_budget(job_id))
+
+    @staticmethod
+    def _translate_budget(operation):
+        try:
+            return operation()
+        except HTTPException as exc:
+            detail = str(exc.detail)
+            if exc.status_code == 409 and any(
+                marker in detail.lower()
+                for marker in (
+                    "budget",
+                    "paid effects",
+                    "unapproved model",
+                    "reservation window",
+                )
+            ):
+                raise BudgetExhausted(detail) from exc
+            raise ValueError(detail) from exc
 
 
 def _execution_policy_digest(policy) -> str:

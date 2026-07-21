@@ -24,7 +24,10 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrantRevocation,
 )
 from agenten.agent_factory.contracts import FactoryEvidenceBlock, FactoryJob, FactoryLease
-from agenten.agent_factory.execution_budget import FactoryBudgetReservationV1
+from agenten.agent_factory.execution_budget import (
+    FactoryBudgetReservationV1,
+    FactoryUsageReceiptV1,
+)
 from agenten.agent_factory.release_gate import E2ERunEvidence, FactoryReleaseDecision
 from agenten.agent_factory.skill_evaluation import (
     HermesSkillEvaluationEvidence,
@@ -122,6 +125,17 @@ class FactoryBudgetReleaseRequest(_FrozenContract):
         if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
             raise ValueError("released_at must be UTC")
         return value.astimezone(timezone.utc)
+
+
+class FactoryUsageSubmissionV2(_FrozenContract):
+    schema_name: Literal["captain.factory-usage-submission.v2"] = Field(
+        default="captain.factory-usage-submission.v2",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    subject_version: int = Field(ge=1, strict=True)
+    lease_id: str = Field(min_length=1)
+    receipt: FactoryUsageReceiptV1
 
 
 FactoryWorkflowArtifact: TypeAlias = (

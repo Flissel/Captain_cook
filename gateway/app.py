@@ -27,7 +27,6 @@ from agenten.agent_factory.execution_budget import (
     FactoryBudgetProjection,
     FactoryBudgetReservationV1,
     FactoryBudgetWriteReceipt,
-    FactoryUsageReceiptV1,
 )
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from gateway.auth import (
@@ -52,6 +51,7 @@ from gateway.contracts import (
     FactoryBudgetReservationWriteReceipt,
     FactoryWorkflowArtifact,
     FactoryWorkflowArtifactWriteReceipt,
+    FactoryUsageSubmissionV2,
     FactoryReleaseDecisionSubmission,
     FactoryWriteReceipt,
     FactorySkillEvaluationSubmission,
@@ -230,6 +230,11 @@ def create_app(
         exc: RequestValidationError,
     ):
         path = request.url.path
+        if request.method == "POST" and path.startswith("/v1/factory/"):
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "invalid factory request"},
+            )
         if (
             request.method == "POST"
             and path.startswith("/batches/")
@@ -307,7 +312,7 @@ def create_app(
 
     @app.post("/v1/factory/budget/usage", status_code=status.HTTP_201_CREATED)
     async def record_factory_usage(
-        usage: FactoryUsageReceiptV1,
+        usage: FactoryUsageSubmissionV2,
         response: Response,
         _: GatewayRole = Depends(require_worker),
     ) -> FactoryBudgetWriteReceipt:
