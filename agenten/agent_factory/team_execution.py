@@ -1320,9 +1320,12 @@ class TeamExecutionService:
         invocation: FactorySkillInvocationV1,
         candidate: ResolvedFactoryCandidate,
         case_ref: PrivateHoldoutRef,
+        *,
+        run_number: int | None = None,
     ) -> TeamExecutionEvidenceV1:
         now = self._active_time(invocation, case_ref)
         invocation = _holdout_scoped_invocation(invocation, case_ref)
+        selected_run_number = self._validated_run_number(case_ref, run_number)
         remaining = min(
             (self._job.deadline_at - now).total_seconds(),
             (invocation.lease.expires_at - now).total_seconds(),
@@ -1338,6 +1341,7 @@ class TeamExecutionService:
                 candidate,
                 case_ref=case_ref,
                 preflight_ref=preflight_ref,
+                run_number=selected_run_number,
             )
         if not self._job.execution_policy.live_execution:
             raise ValueError("offline factory policy forbids paid team execution")
@@ -1375,6 +1379,7 @@ class TeamExecutionService:
                         case_ref=case_ref,
                         preflight_ref=preflight_ref,
                         error_type="CancelledError",
+                        run_number=selected_run_number,
                         usage_receipts=self._runner.provider_usage_receipts,
                     )
                 )
@@ -1394,6 +1399,7 @@ class TeamExecutionService:
                 case_ref=case_ref,
                 preflight_ref=preflight_ref,
                 error_type=type(exc).__name__,
+                run_number=selected_run_number,
                 usage_receipts=(
                     self._runner.provider_usage_receipts
                     if isinstance(self._runner, HostAutoGenTeamRunner)
@@ -1407,11 +1413,20 @@ class TeamExecutionService:
                 run,
                 topology=preflight.team_execution_manifest,
             )
+            observation_ref = await self._persist_run_observation(
+                invocation,
+                candidate,
+                case_ref=case_ref,
+                run_number=selected_run_number,
+                run=run,
+            )
             evidence = self._run_evidence(
                 invocation,
                 candidate,
                 case_ref=case_ref,
                 preflight_ref=preflight_ref,
+                observation_ref=observation_ref,
+                run_number=selected_run_number,
                 run=run,
             )
         except Exception:
@@ -1443,6 +1458,7 @@ class TeamExecutionService:
         case_ref: PrivateHoldoutRef,
         preflight_ref: ArtifactRef,
         error_type: str,
+        run_number: int,
         usage_receipts: tuple[FactoryUsageReceiptV1, ...] = (),
     ) -> TeamExecutionEvidenceV1:
         failure_ref = await self._evidence_store.persist(
@@ -1464,6 +1480,7 @@ class TeamExecutionService:
             case_ref=case_ref,
             preflight_ref=preflight_ref,
             failure_ref=failure_ref,
+            run_number=run_number,
             usage_receipts=usage_receipts,
         )
         await self._complete_replay(pending, unresolved)
@@ -1505,6 +1522,7 @@ class TeamExecutionService:
         *,
         case_ref: PrivateHoldoutRef,
         preflight_ref: ArtifactRef,
+        run_number: int,
     ) -> TeamExecutionEvidenceV1:
         command_id = uuid5(
             NAMESPACE_URL,
@@ -1549,7 +1567,7 @@ class TeamExecutionService:
             artifact_ref=preflight_ref,
             evidence_refs=(preflight_ref,),
             acceptance_assertion_ids=invocation.acceptance_assertion_ids,
-            run_number=self._run_number(case_ref),
+            run_number=run_number,
             candidate_ref=candidate.candidate.source_archive_ref,
             holdout_ref=case_ref,
             execution_outcome=outcome,
@@ -1643,6 +1661,7 @@ class TeamExecutionService:
         case_ref: PrivateHoldoutRef,
         preflight_ref: ArtifactRef,
         failure_ref: ArtifactRef,
+        run_number: int,
         usage_receipts: tuple[FactoryUsageReceiptV1, ...] = (),
     ) -> TeamExecutionEvidenceV1:
         command_id = uuid5(
@@ -1690,7 +1709,7 @@ class TeamExecutionService:
             artifact_ref=failure_ref,
             evidence_refs=evidence_refs,
             acceptance_assertion_ids=invocation.acceptance_assertion_ids,
-            run_number=self._run_number(case_ref),
+            run_number=run_number,
             candidate_ref=candidate.candidate.source_archive_ref,
             holdout_ref=case_ref,
             execution_outcome=outcome,
@@ -1706,18 +1725,22 @@ class TeamExecutionService:
         *,
         case_ref: PrivateHoldoutRef,
         preflight_ref: ArtifactRef,
+        observation_ref: ArtifactRef,
+        run_number: int,
         run: FactoryTeamRunResult,
     ) -> TeamExecutionEvidenceV1:
         outcome = run.execution_outcome
-        artifact_ref = outcome.output_ref
-        if artifact_ref is None:
+        output_ref = outcome.output_ref
+        if output_ref is None:
             if not run.runtime_result.artifact_refs:
                 raise ValueError("team run is missing a public output artifact")
-            artifact_ref = run.runtime_result.artifact_refs[0]
+            output_ref = run.runtime_result.artifact_refs[0]
         usage_refs = tuple(receipt.evidence_ref for receipt in run.usage_receipts)
         evidence_refs = _unique_refs(
             (
                 preflight_ref,
+                observation_ref,
+                output_ref,
                 *run.runtime_result.artifact_refs,
                 *run.runtime_result.evidence_refs,
                 *outcome.evidence_refs,
@@ -1737,10 +1760,10 @@ class TeamExecutionService:
             attempt=invocation.attempt,
             occurred_at=self._clock(),
             producer="hermes",
-            artifact_ref=artifact_ref,
+            artifact_ref=observation_ref,
             evidence_refs=evidence_refs,
             acceptance_assertion_ids=invocation.acceptance_assertion_ids,
-            run_number=self._run_number(case_ref),
+            run_number=run_number,
             candidate_ref=candidate.candidate.source_archive_ref,
             holdout_ref=case_ref,
             execution_outcome=outcome,
@@ -1751,6 +1774,63 @@ class TeamExecutionService:
             termination_reason=run.termination_reason,
             status=run.status,
         )
+
+    async def _persist_run_observation(
+        self,
+        invocation: FactorySkillInvocationV1,
+        candidate: ResolvedFactoryCandidate,
+        *,
+        case_ref: PrivateHoldoutRef,
+        run_number: int,
+        run: FactoryTeamRunResult,
+    ) -> ArtifactRef:
+        output_ref = run.execution_outcome.output_ref
+        if output_ref is None:
+            if not run.runtime_result.artifact_refs:
+                raise ValueError("team run is missing a public output artifact")
+            output_ref = run.runtime_result.artifact_refs[0]
+        payload = {
+            "schema": "hermes.factory-team-run-observation.v1",
+            "job_id": str(invocation.job_id),
+            "correlation_id": str(invocation.correlation_id),
+            "subject_version": invocation.subject_version,
+            "attempt": invocation.attempt,
+            "run_number": run_number,
+            "invocation_id": str(invocation.invocation_id),
+            "idempotency_key": invocation.idempotency_key,
+            "candidate_ref": candidate.candidate.source_archive_ref.model_dump(
+                mode="json"
+            ),
+            "holdout_ref": case_ref.model_dump(mode="json", by_alias=True),
+            "output_ref": output_ref.model_dump(mode="json"),
+            "runtime_event_id": str(run.runtime_result.event_id),
+            "status": run.status,
+            "termination_reason": run.termination_reason,
+        }
+        return await self._evidence_store.persist(
+            self._job,
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+        )
+
+    def _validated_run_number(
+        self,
+        case_ref: PrivateHoldoutRef,
+        run_number: int | None,
+    ) -> int:
+        if run_number is None:
+            return self._run_number(case_ref)
+        selected = run_number
+        if (
+            isinstance(selected, bool)
+            or not isinstance(selected, int)
+            or not 1 <= selected <= self._job.execution_policy.required_live_runs
+        ):
+            raise ValueError("team execution run number is not Captain-authorized")
+        return selected
 
     def _run_number(self, case_ref: PrivateHoldoutRef) -> int:
         """Use the Captain-authorized holdout order as stable run identity."""
@@ -1794,6 +1874,33 @@ class TeamExecutionCandidateAdapter:
             invocation,
             candidate,
             self._holdout_for(request.job),
+        )
+
+    async def execute_run(
+        self,
+        request: FactoryDispatch,
+        candidate: ResolvedFactoryCandidate,
+        *,
+        run_number: int,
+    ) -> TeamExecutionEvidenceV1:
+        """Execute one Captain-authorized release run with a stable run identity."""
+
+        if not isinstance(request.job, AgentFactoryJobV3):
+            raise ValueError("team execution requires AgentFactoryJobV3")
+        holdout = self._holdout_for(request.job)
+        invocation = _run_scoped_invocation(
+            self.invocation_for(request),
+            holdout,
+            run_number,
+            required_live_runs=request.job.execution_policy.required_live_runs,
+        )
+        if request.lease is None or invocation.lease != request.lease:
+            raise ValueError("team invocation must preserve the dispatch lease")
+        return await self._service_for(request.job, invocation).execute(
+            invocation,
+            candidate,
+            holdout,
+            run_number=run_number,
         )
 
     def invocation_for(
@@ -2049,6 +2156,42 @@ def _holdout_scoped_invocation(
             ),
             "idempotency_key": scoped_key,
             "execution_scope_ref": case_ref,
+        }
+    )
+
+
+def _run_scoped_invocation(
+    invocation: FactorySkillInvocationV1,
+    case_ref: PrivateHoldoutRef,
+    run_number: int,
+    *,
+    required_live_runs: int,
+) -> FactorySkillInvocationV1:
+    if (
+        isinstance(run_number, bool)
+        or not isinstance(run_number, int)
+        or not 1 <= run_number <= required_live_runs
+    ):
+        raise ValueError("team execution run number is not Captain-authorized")
+    scoped = _holdout_scoped_invocation(invocation, case_ref)
+    binding = json.dumps(
+        {
+            "base_idempotency_key": scoped.idempotency_key,
+            "holdout_id": case_ref.holdout_id,
+            "holdout_sha256": case_ref.sha256,
+            "run_number": run_number,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    scoped_key = hashlib.sha256(binding.encode("utf-8")).hexdigest()
+    return scoped.model_copy(
+        update={
+            "invocation_id": uuid5(
+                NAMESPACE_URL,
+                f"captain.factory-team-run:{scoped_key}",
+            ),
+            "idempotency_key": scoped_key,
         }
     )
 

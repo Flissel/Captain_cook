@@ -1131,6 +1131,11 @@ async def test_live_composition_executes_each_explicit_authorized_holdout_scope(
     assert tuple(item.run_number for item in evidence) == (1, 2, 3)
     assert len({item.invocation_id for item in evidence}) == 3
     assert len({item.invocation.idempotency_key for item in evidence}) == 3
+    assert len({item.artifact_ref for item in evidence}) == 3
+    assert all(
+        item.execution_outcome.output_ref in item.evidence_refs
+        for item in evidence
+    )
 
 
 @pytest.mark.asyncio
