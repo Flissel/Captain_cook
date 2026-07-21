@@ -210,6 +210,43 @@ def test_plan_builds_requests_from_the_exact_gateway_action_and_typed_port() -> 
     assert planned[0].idempotency_key == planned[0].invocation.idempotency_key
 
 
+def test_plan_returns_no_effects_for_gateway_promotion_validation() -> None:
+    job = workflow_job(mode="demo")
+    action = FactoryAction(
+        kind=FactoryActionKind.VALIDATE_FOR_PROMOTION,
+        attempt=1,
+        job_id=job.job_id,
+    )
+    prepared_action = FactoryAction(
+        kind=FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,
+        attempt=1,
+        job_id=job.job_id,
+    )
+    source = ActionSource(action)
+    port = PreparedPort(
+        FactoryLivePreparedDispatch(
+            action=prepared_action,
+            requests=(codex_request(job),),
+        )
+    )
+    plan = PreparedFactoryLivePlan(
+        actions=source,
+        dispatch=port,
+        expected_skill_digests=SKILL_DIGESTS,
+    )
+
+    planned = plan.effects_for(
+        job=job,
+        mode="demo",
+        projection=FactoryProjection.from_job(job),
+        workflow_artifacts=(),
+    )
+
+    assert planned == ()
+    assert source.calls == [job.job_id]
+    assert port.prepare_calls == []
+
+
 def test_prepared_dispatch_rejects_requests_for_a_different_action() -> None:
     job = workflow_job(mode="demo")
     request = codex_request(job)

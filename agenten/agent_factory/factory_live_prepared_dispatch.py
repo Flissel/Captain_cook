@@ -153,6 +153,8 @@ class PreparedFactoryLivePlan:
         action = self._actions.next_action(job.job_id)
         if action.job_id != job.job_id or action.attempt != projection.attempt:
             raise ValueError("Factory prepared plan action does not match the projection")
+        if action.kind is FactoryActionKind.VALIDATE_FOR_PROMOTION:
+            return ()
         prepared = self._dispatch.prepare(
             job=job,
             action=action,
