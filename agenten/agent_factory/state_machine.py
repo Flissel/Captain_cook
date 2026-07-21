@@ -16,6 +16,7 @@ from .release_gate import (
     factory_evaluation_block_reason,
     factory_release_decision_block_reason,
     factory_workflow_release_decision_block_reason,
+    factory_workflow_validation_decision_block_reason,
 )
 from .skill_evaluation import ToolGapMarker
 from .skill_store import StoredSkillEvaluation
@@ -264,7 +265,7 @@ def next_action(
                     raise FactoryLifecycleError(
                         "workflow promotion recommendation is missing Captain assertions"
                     )
-                decision_reason = factory_workflow_release_decision_block_reason(
+                decision_reason = factory_workflow_validation_decision_block_reason(
                     projection.job,
                     workflow_evaluation,
                     workflow_release_decision,

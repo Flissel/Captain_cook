@@ -517,12 +517,41 @@ def factory_workflow_release_decision_block_reason(
 ) -> str | None:
     """Require a Captain V3 decision bound only to workflow evaluation evidence."""
 
+    if job.execution_policy.mode is FactoryExecutionMode.DEMO:
+        return "demo Factory jobs cannot be promoted to ready_to_use"
     if decision is None:
         return "missing accepted Factory workflow release decision"
     if decision.status != "ready":
         return "Factory workflow release decision is blocked: " + ", ".join(
             decision.reasons
         )
+    return _factory_workflow_decision_binding_reason(job, evaluation, decision)
+
+
+def factory_workflow_validation_decision_block_reason(
+    job: AgentFactoryJobV3,
+    evaluation: TeamEvaluationV1 | None,
+    decision: FactoryReleaseDecision | None,
+) -> str | None:
+    """Allow mode-correct validation without granting demo promotion authority."""
+
+    if decision is None:
+        return "missing accepted Factory workflow release decision"
+    expected = (
+        "demo_ready"
+        if job.execution_policy.mode is FactoryExecutionMode.DEMO
+        else "ready"
+    )
+    if decision.status != expected:
+        return "Factory workflow validation decision has the wrong mode status"
+    return _factory_workflow_decision_binding_reason(job, evaluation, decision)
+
+
+def _factory_workflow_decision_binding_reason(
+    job: AgentFactoryJobV3,
+    evaluation: TeamEvaluationV1 | None,
+    decision: FactoryReleaseDecision,
+) -> str | None:
     if decision.job_id != job.job_id or decision.correlation_id != job.correlation_id:
         return "Factory workflow release decision does not match the factory job"
     if evaluation is None:

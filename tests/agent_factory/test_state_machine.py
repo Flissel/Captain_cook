@@ -497,6 +497,14 @@ def test_v3_quality_feedback_routes_only_through_existing_captain_actions() -> N
         workflow_release_decision=demo_ready,
     ).kind is FactoryActionKind.APPEND_ESCALATED
 
+    demo_state = state.model_copy(update={"job": job_v3(mode="demo")})
+    assert next_action(
+        demo_state,
+        workflow_evaluation=evaluation,
+        feedback=feedback,
+        workflow_release_decision=demo_ready,
+    ).kind is FactoryActionKind.VALIDATE_FOR_PROMOTION
+
 
 def test_v3_promotion_uses_only_the_workflow_release_decision() -> None:
     evaluation = workflow_evaluation()
@@ -548,6 +556,17 @@ def test_v3_promotion_uses_only_the_workflow_release_decision() -> None:
 
     assert promoted.status is FactoryLifecycleStatus.READY_TO_USE
     assert promoted.workflow_evaluation_ref == evaluation.artifact_ref
+
+    demo_state = state.model_copy(update={"job": job_v3(mode="demo")})
+    demo_ready = ready.model_copy(update={"status": "demo_ready"})
+    with pytest.raises(FactoryLifecycleError, match="demo"):
+        apply_block(
+            demo_state,
+            promotion,
+            workflow_evaluation=evaluation,
+            feedback=feedback,
+            release_decision=demo_ready,
+        )
 
 
 def test_v3_failed_feedback_requests_improvement_and_missing_feedback_fails_closed() -> None:
