@@ -1499,6 +1499,22 @@ async def test_paid_negative_holdout_is_behavioral_failed_with_usage_receipt(
     assert len(result.usage_receipts) == 1
 
 
+def test_candidate_preflight_preserves_valid_n8n_tool_context(
+    tmp_path: Path,
+) -> None:
+    candidate = _sealed_team_candidate(tmp_path)
+
+    result = FactoryCandidateEvaluator().validate(candidate, max_seconds=10)
+
+    assert result.status == "succeeded"
+    assert result.team_execution_manifest is not None
+    assert {
+        tool
+        for agent in result.team_execution_manifest.agents
+        for tool in agent.tools
+    } == {"support_triage"}
+
+
 def test_n8n_execution_requires_separate_scope_and_matching_digest() -> None:
     command_id = UUID("70000000-0000-0000-0000-000000000026")
     grant = CapabilityGrant(

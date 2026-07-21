@@ -312,13 +312,16 @@ class FactoryCandidateEvaluator:
                         name="build", status="passed", detail="compile and build succeeded"
                     )
                 )
-            return FactoryCandidateEvaluationResult(
-                status="succeeded",
-                trace_id=manifest.candidate_id,
-                tool_names=tool_names,
-                checks=tuple(checks),
-                candidate_manifest=manifest,
-                team_execution_manifest=topology,
+            return FactoryCandidateEvaluationResult.model_validate(
+                {
+                    "status": "succeeded",
+                    "trace_id": manifest.candidate_id,
+                    "tool_names": tool_names,
+                    "checks": tuple(checks),
+                    "candidate_manifest": manifest,
+                    "team_execution_manifest": topology,
+                },
+                context={"allowed_tools": set(tool_names)},
             )
         except (FileNotFoundError, OSError, zipfile.BadZipFile) as exc:
             checks.append(
@@ -332,13 +335,16 @@ class FactoryCandidateEvaluator:
                 FactoryEvaluationCheck(name="validation", status="failed", detail=str(exc))
             )
             status = "failed"
-        return FactoryCandidateEvaluationResult(
-            status=status,
-            trace_id=manifest.candidate_id,
-            tool_names=tool_names,
-            checks=tuple(checks),
-            candidate_manifest=manifest,
-            team_execution_manifest=topology,
+        return FactoryCandidateEvaluationResult.model_validate(
+            {
+                "status": status,
+                "trace_id": manifest.candidate_id,
+                "tool_names": tool_names,
+                "checks": tuple(checks),
+                "candidate_manifest": manifest,
+                "team_execution_manifest": topology,
+            },
+            context={"allowed_tools": set(tool_names)},
         )
 
     @contextmanager
