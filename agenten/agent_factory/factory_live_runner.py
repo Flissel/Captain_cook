@@ -565,8 +565,14 @@ class FactoryLiveRunner:
             workflow_artifacts=artifacts,
         )
         requests = self._bind_planned_run(authoritative, planned_requests)
+        preflight_now = self._clock()
         for request in requests:
             self._validate_request(authoritative, projection, request)
+            self._validate_dispatch_authority(
+                authoritative,
+                request,
+                now=preflight_now,
+            )
         effect_reports: list[FactoryLiveEffectReport] = []
         for request in requests:
             claim = self._effect_ledger.claim(request)
@@ -770,7 +776,15 @@ class FactoryLiveRunner:
         job: AgentFactoryJobV3,
         request: FactoryLiveEffectRequestV1,
     ) -> None:
-        now = self._clock()
+        self._validate_dispatch_authority(job, request, now=self._clock())
+
+    @staticmethod
+    def _validate_dispatch_authority(
+        job: AgentFactoryJobV3,
+        request: FactoryLiveEffectRequestV1,
+        *,
+        now: datetime,
+    ) -> None:
         if now.tzinfo is None or now.utcoffset() != timezone.utc.utcoffset(now):
             raise ValueError("factory live runner clock must be UTC")
         if not job.occurred_at <= now < job.deadline_at:
