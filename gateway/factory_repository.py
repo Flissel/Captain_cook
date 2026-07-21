@@ -8,9 +8,10 @@ from fastapi import HTTPException
 
 from datetime import datetime
 
-from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease, FactoryRole
+from agenten.agent_factory.contracts import FactoryEvidenceBlock, FactoryJob, FactoryLease, FactoryRole
 from agenten.agent_factory.leases import FactoryLeaseDenied, FactoryLeasePort, validate_factory_lease
 from agenten.agent_factory.release_gate import FactoryReleaseDecision
+from agenten.agent_factory.outcome_contracts import FactoryTerminalDecision
 from agenten.agent_factory.service import FactoryRepository, FactoryRepositoryError
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
 from gateway.store import GatewayStore
@@ -22,10 +23,10 @@ class GatewayFactoryRepository(FactoryRepository):
     def __init__(self, store: GatewayStore) -> None:
         self._store = store
 
-    def register(self, job: AgentFactoryJob) -> None:
+    def register(self, job: FactoryJob) -> None:
         self._translate(lambda: self._store.record_factory_job(job))
 
-    def job(self, job_id: UUID) -> AgentFactoryJob:
+    def job(self, job_id: UUID) -> FactoryJob:
         return self._translate(lambda: self._store.factory_job(job_id).job)
 
     def append(self, block: FactoryEvidenceBlock) -> bool:
@@ -40,6 +41,23 @@ class GatewayFactoryRepository(FactoryRepository):
 
     def release_decision_for_job(self, job_id: UUID) -> FactoryReleaseDecision | None:
         return self._translate(lambda: self._store.factory_release_decision(job_id))
+
+    def append_terminal_decision(self, decision: FactoryTerminalDecision) -> bool:
+        receipt = self._translate(
+            lambda: self._store.record_factory_terminal_decision(decision)
+        )
+        return not receipt.replayed
+
+    def terminal_decision_for_job(
+        self,
+        job_id: UUID,
+    ) -> FactoryTerminalDecision | None:
+        lookup = getattr(self._store, "factory_terminal_decision", None)
+        if lookup is None:
+            return None
+        return self._translate(
+            lambda: lookup(job_id)
+        )
 
     @staticmethod
     def _translate(operation):
@@ -57,7 +75,7 @@ class GatewayFactoryLeases(FactoryLeasePort):
 
     def active(
         self,
-        job: AgentFactoryJob,
+        job: FactoryJob,
         role: FactoryRole,
         attempt: int,
         now: datetime,

@@ -106,6 +106,24 @@ def test_gateway_adapter_reads_the_gateway_accepted_release_decision() -> None:
     assert GatewayFactoryRepository(store).release_decision_for_job(factory_job.job_id) == decision
 
 
+def test_gateway_adapter_persists_and_reads_terminal_decisions() -> None:
+    store = Store()
+    factory_job = job()
+    terminal = type("Terminal", (), {"job_id": factory_job.job_id})()
+    store.jobs[factory_job.job_id] = factory_job
+    store.terminal = terminal
+    store.record_factory_terminal_decision = lambda value: type(
+        "Receipt", (), {"replayed": value is terminal}
+    )()
+    store.factory_terminal_decision = lambda job_id: (
+        store.terminal if job_id == factory_job.job_id else None
+    )
+    repository = GatewayFactoryRepository(store)
+
+    assert repository.append_terminal_decision(terminal) is False
+    assert repository.terminal_decision_for_job(factory_job.job_id) is terminal
+
+
 def _canonical_ref(model, name: str) -> ArtifactRef:
     content = json.dumps(
         model.model_dump(mode="json", by_alias=True),

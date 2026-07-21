@@ -22,7 +22,8 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrant,
     CapabilityGrantRevocation,
 )
-from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease, FactoryPhase
+from agenten.agent_factory.contracts import FactoryEvidenceBlock, FactoryJob, FactoryLease, FactoryPhase
+from agenten.agent_factory.outcome_contracts import FactoryTerminalDecision
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from gateway.auth import (
     GatewayRole,
@@ -41,12 +42,24 @@ from gateway.contracts import (
     ReviewDecisionEvent,
     RuntimeOperationProjection,
     RuntimeWriteReceipt,
+    RuntimeExecutionClaim,
+    RuntimeExecutionClaimReceipt,
+    RuntimeExecutionClaimRequest,
+    RuntimeReleasedBatchSnapshot,
     FactoryJobProjection,
     FactoryReleaseDecisionSubmission,
     FactoryWriteReceipt,
     FactorySkillEvaluationSubmission,
     FactorySkillWriteReceipt,
     PublishedHermesSkill,
+    CapabilityExecutionRecord,
+    CapabilityExecutionRequest,
+    CapabilityReleaseRequest,
+    CapabilityWriteReceipt,
+)
+from gateway.capability_catalog import (
+    CapabilityCatalogRecord,
+    CapabilityCompatibilityRequest,
 )
 from gateway.mirror import MirrorQueue
 from gateway.registry_feed import mirror_captain_projection
@@ -114,6 +127,9 @@ CAPTAIN_SKILL_EVENT_TYPES = frozenset(
         "hermes_skill_evaluation_requested",
         "hermes_skill_published",
         "hermes_ready_to_use_validated",
+        "factory_terminal_decided",
+        "capability_package_published",
+        "capability_execution_recorded",
     }
 )
 HERMES_SKILL_EVENT_TYPES = frozenset(
@@ -173,12 +189,13 @@ def require_skill_event_writer(event: DeliveryEventEnvelope, actor: GatewayRole)
 def create_app(
     *,
     storage: MariaDBStorage | None = None,
+    gateway_store: GatewayStore | None = None,
     mirror: Mirror | None = None,
     settings: GatewaySettings | None = None,
 ) -> FastAPI:
     mirror = mirror or MirrorQueue(mirror_captain_projection)
     store_lock = Lock()
-    store: GatewayStore | None = (
+    store: GatewayStore | None = gateway_store or (
         GatewayStore(
             storage,
             claim_ttl=timedelta(seconds=settings.claim_ttl_seconds),
@@ -279,7 +296,7 @@ def create_app(
 
     @app.post("/v1/factory/jobs", status_code=status.HTTP_202_ACCEPTED)
     async def accept_factory_job(
-        job: AgentFactoryJob,
+        job: FactoryJob,
         _: GatewayRole = Depends(require_captain),
     ) -> FactoryWriteReceipt:
         return get_store().record_factory_job(job)
@@ -380,6 +397,107 @@ def create_app(
         _: GatewayRole = Depends(require_reader),
     ) -> FactoryJobProjection:
         return get_store().factory_job(job_id)
+
+    def publish_capability_release(
+        request: CapabilityReleaseRequest,
+        response: Response,
+    ) -> CapabilityWriteReceipt:
+        receipt = get_store().publish_capability_release(request)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
+
+    @app.post(
+        "/v1/factory/terminal-decisions",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def record_factory_terminal_decision(
+        request: CapabilityReleaseRequest | FactoryTerminalDecision,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> CapabilityWriteReceipt:
+        if isinstance(request, CapabilityReleaseRequest):
+            return publish_capability_release(request, response)
+        receipt = get_store().record_factory_terminal_decision(request)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
+
+    @app.get("/v1/factory/terminal-decisions/{job_id}")
+    async def get_factory_terminal_decision(
+        job_id: UUID,
+        _: GatewayRole = Depends(require_reader),
+    ) -> Any:
+        decision = get_store().factory_terminal_decision(job_id)
+        if decision is None:
+            raise HTTPException(status_code=404, detail="factory terminal decision not found")
+        return decision
+
+    @app.post("/v1/capabilities", status_code=status.HTTP_201_CREATED)
+    async def record_capability_release(
+        request: CapabilityReleaseRequest,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> CapabilityWriteReceipt:
+        return publish_capability_release(request, response)
+
+    @app.get("/v1/capabilities/compatible")
+    async def get_compatible_capability(
+        capability_id: str = Query(min_length=1),
+        minimum_version: int = Query(ge=1),
+        schema_major: int = Query(ge=1),
+        accepted_assertion_id: list[str] = Query(default=[]),
+        integration_intent: list[str] = Query(default=[]),
+        tool_contract: list[str] = Query(default=[]),
+        _: GatewayRole = Depends(require_reader),
+    ) -> Any:
+        try:
+            request = CapabilityCompatibilityRequest(
+                capability_id=capability_id,
+                minimum_version=minimum_version,
+                schema_major=schema_major,
+                accepted_assertion_ids=tuple(accepted_assertion_id),
+                integration_intents=tuple(integration_intent),
+                tool_contracts=tuple(tool_contract),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="invalid compatibility query") from exc
+        record = get_store().compatible_capability(request)
+        if record is None:
+            raise HTTPException(status_code=404, detail="compatible capability not found")
+        return record
+
+    @app.get("/v1/capabilities/{capability_id}")
+    async def get_capability(
+        capability_id: str,
+        version: int | None = Query(default=None, ge=1),
+        _: GatewayRole = Depends(require_reader),
+    ) -> CapabilityCatalogRecord:
+        record = get_store().capability(capability_id, version=version)
+        if record is None:
+            raise HTTPException(status_code=404, detail="capability not found")
+        return record
+
+    @app.post("/v1/capability-executions", status_code=status.HTTP_201_CREATED)
+    async def record_capability_execution(
+        request: CapabilityExecutionRequest,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> CapabilityWriteReceipt:
+        receipt = get_store().record_capability_execution(request)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
+
+    @app.get("/v1/capability-executions/{command_id}")
+    async def get_capability_execution(
+        command_id: UUID,
+        _: GatewayRole = Depends(require_reader),
+    ) -> CapabilityExecutionRecord:
+        record = get_store().capability_execution(command_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="capability execution not found")
+        return record
 
     @app.get("/api/v1/projections/minibook/events")
     async def minibook_projection_feed(
@@ -484,9 +602,19 @@ def create_app(
     async def record_runtime_result(
         result: AgentRuntimeResult,
         response: Response,
+        execution_owner_id: str | None = Header(default=None, alias="X-Runtime-Owner-ID"),
+        execution_fencing_token: int | None = Header(
+            default=None,
+            alias="X-Runtime-Fencing-Token",
+            ge=1,
+        ),
         _: GatewayRole = Depends(require_actor),
     ) -> RuntimeWriteReceipt:
-        receipt = get_store().record_runtime_result(result)
+        receipt = get_store().record_runtime_result(
+            result,
+            execution_owner_id=execution_owner_id,
+            execution_fencing_token=execution_fencing_token,
+        )
         if receipt.replayed:
             response.status_code = status.HTTP_200_OK
         else:
@@ -511,6 +639,37 @@ def create_app(
         _: GatewayRole = Depends(require_reader),
     ) -> RuntimeOperationProjection:
         return get_store().runtime_operation(operation_id)
+
+    @app.get("/v1/runtime/operations/{operation_id}/released-batch")
+    async def get_released_runtime_batch(
+        operation_id: UUID,
+        _: GatewayRole = Depends(require_reader),
+    ) -> RuntimeReleasedBatchSnapshot:
+        return get_store().released_runtime_batch(operation_id)
+
+    @app.post(
+        "/v1/runtime/execution-claims",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def claim_runtime_execution(
+        request: RuntimeExecutionClaimRequest,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> RuntimeExecutionClaimReceipt:
+        receipt = get_store().claim_runtime_execution(request)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
+
+    @app.get("/v1/runtime/execution-claims/{operation_id}")
+    async def get_runtime_execution_claim(
+        operation_id: UUID,
+        _: GatewayRole = Depends(require_reader),
+    ) -> RuntimeExecutionClaim:
+        claim = get_store().runtime_execution_claim(operation_id)
+        if claim is None:
+            raise HTTPException(status_code=404, detail="runtime execution claim not found")
+        return claim
 
     @app.post("/v1/delivery/events")
     async def append_delivery_event(
