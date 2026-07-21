@@ -226,6 +226,30 @@ def test_receipt_replay_cannot_change_job_budget_identity(
         ledger.record_usage(changed_job, reservation, receipt)
 
 
+def test_usage_rejects_changed_policy_under_unchanged_job_identity(
+    job_v3: AgentFactoryJobV3,
+) -> None:
+    ledger = InMemoryFactoryBudgetLedger()
+    reservation = ledger.reserve(
+        job_v3, attempt=1, requested_usd=Decimal("2.00"), now=NOW
+    )
+    expanded_policy = job_v3.execution_policy.model_copy(
+        update={
+            "allowed_models": (
+                "approved-model-id",
+                "unreleased-model-id",
+            )
+        }
+    )
+    changed_job = job_v3.model_copy(update={"execution_policy": expanded_policy})
+    receipt = FactoryUsageReceiptV1.model_validate(
+        usage_payload(reservation, model="unreleased-model-id")
+    )
+
+    with pytest.raises(ValueError, match="execution policy"):
+        ledger.record_usage(changed_job, reservation, receipt)
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [

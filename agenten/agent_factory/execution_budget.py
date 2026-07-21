@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -19,7 +21,8 @@ from pydantic import (
 )
 
 from agenten.agent_factory.contracts import AgentFactoryJobV3
-from agenten.agent_runtime.contracts import ArtifactRef
+from agenten.agent_factory.execution_policy import FactoryExecutionPolicyV1
+from agenten.agent_runtime.contracts import ArtifactRef, SHA256_PATTERN
 
 
 _BUDGET_NAMESPACE = UUID("337539e1-8858-4d99-b253-665803c59a48")
@@ -87,6 +90,7 @@ class FactoryBudgetReservationV1(_FrozenContract):
     job_id: UUID
     correlation_id: UUID
     subject_version: int = Field(ge=1, strict=True)
+    execution_policy_sha256: str = Field(pattern=SHA256_PATTERN)
     attempt: int = Field(ge=1, le=5, strict=True)
     requested_usd: Decimal
     reserved_at: datetime
@@ -228,6 +232,7 @@ class InMemoryFactoryBudgetLedger:
             if requested > projection.remaining_usd:
                 raise BudgetExhausted("factory USD budget is exhausted")
             sequence = len(self._events) + 1
+            policy_digest = _execution_policy_digest(job.execution_policy)
             reservation_id = uuid5(
                 _BUDGET_NAMESPACE,
                 "|".join(
@@ -235,6 +240,7 @@ class InMemoryFactoryBudgetLedger:
                         "reserve",
                         str(job.job_id),
                         str(job.subject_version),
+                        policy_digest,
                         str(attempt),
                         _canonical_usd_text(requested),
                         checked_at.isoformat(),
@@ -248,6 +254,7 @@ class InMemoryFactoryBudgetLedger:
                 job_id=job.job_id,
                 correlation_id=job.correlation_id,
                 subject_version=job.subject_version,
+                execution_policy_sha256=policy_digest,
                 attempt=attempt,
                 requested_usd=requested,
                 reserved_at=checked_at,
@@ -350,6 +357,7 @@ class InMemoryFactoryBudgetLedger:
 
     def _projection_for_job(self, job: AgentFactoryJobV3) -> FactoryBudgetProjection:
         limit = _canonical_usd(job.execution_policy.max_cost_usd)
+        policy_digest = _execution_policy_digest(job.execution_policy)
         reservations = tuple(
             event
             for event in self._events
@@ -368,9 +376,10 @@ class InMemoryFactoryBudgetLedger:
         if (
             first.reservation.correlation_id != job.correlation_id
             or first.reservation.subject_version != job.subject_version
+            or first.reservation.execution_policy_sha256 != policy_digest
             or first.limit_usd != limit
         ):
-            raise ValueError("factory budget job identity changed")
+            raise ValueError("factory budget job identity or execution policy changed")
         return self._derive_projection(job.job_id)
 
     def _derive_projection(self, job_id: UUID) -> FactoryBudgetProjection:
@@ -423,14 +432,18 @@ class InMemoryFactoryBudgetLedger:
             raise ValueError("budget reservation was not issued by this ledger")
         if event.reservation != reservation:
             raise ValueError("reservation_id already exists with different content")
+        policy_digest = _execution_policy_digest(job.execution_policy)
         if (
             reservation.job_id != job.job_id
             or reservation.correlation_id != job.correlation_id
             or reservation.subject_version != job.subject_version
+            or reservation.execution_policy_sha256 != policy_digest
             or event.limit_usd
             != _canonical_usd(job.execution_policy.max_cost_usd)
         ):
-            raise ValueError("budget reservation does not match the factory job identity")
+            raise ValueError(
+                "budget reservation does not match the factory job identity or execution policy"
+            )
         return event.reservation
 
     @staticmethod
@@ -515,6 +528,18 @@ def _canonical_usd_text(value: Decimal) -> str:
     if "." in rendered:
         return rendered.rstrip("0").rstrip(".")
     return rendered
+
+
+def _execution_policy_digest(policy: FactoryExecutionPolicyV1) -> str:
+    payload = policy.model_dump(mode="json", by_alias=True)
+    payload["max_cost_usd"] = _canonical_usd_text(policy.max_cost_usd)
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _require_utc(value: datetime) -> datetime:
