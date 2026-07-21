@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from uuid import NAMESPACE_URL, uuid5
 
 import pytest
+from fastapi import HTTPException
 
 from tests.agent_factory.test_factory_live_runner import effect_outcome, effect_request
 from tests.agent_factory.test_release_gate import workflow_job
@@ -13,10 +16,15 @@ from tests.gateway.test_factory_budget import record_usage_lease
 from tests.support.mariadb import assert_isolated_test_database
 
 from agenten.agent_factory.factory_live_runner import (
+    FactoryLiveBlockReason,
     FactoryLiveEffectClaim,
+    FactoryLiveEffectKind,
+    FactoryLiveEffectOutcomeV1,
+    FactoryLiveEffectRequestV1,
     FactoryLiveEffectRecord,
     FactoryLiveEffectWriteReceipt,
 )
+from blockchain.Blockchain_modell import Block
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.contracts import FactorySkillAssignmentV1
 from gateway.factory_repository import GatewayFactoryLiveEffectLedger
@@ -52,6 +60,11 @@ class PersistentEffectStore:
         self.records[request.effect_id] = record
         return FactoryLiveEffectWriteReceipt(record=record, replayed=False)
 
+    def factory_live_effect_history(self, job_id):
+        return tuple(
+            record for record in self.records.values() if record.request.job_id == job_id
+        )
+
 
 def test_gateway_effect_claim_and_completion_survive_adapter_restart() -> None:
     job = workflow_job(mode="demo")
@@ -70,6 +83,151 @@ def test_gateway_effect_claim_and_completion_survive_adapter_restart() -> None:
     assert completed.replayed is False
     assert after_evidence.acquired is False
     assert after_evidence.record.outcome == outcome
+
+
+def test_gateway_effect_adapter_exposes_authoritative_ordered_history() -> None:
+    job = workflow_job(mode="demo")
+    first = effect_request(job, kind=FactoryLiveEffectKind.CODEX, key_char="c")
+    second = effect_request(job, kind=FactoryLiveEffectKind.PROVIDER, key_char="d")
+    store = PersistentEffectStore()
+    adapter = GatewayFactoryLiveEffectLedger(store)
+
+    adapter.claim(first)
+    adapter.complete(first, effect_outcome(first))
+    adapter.claim(second)
+
+    history = GatewayFactoryLiveEffectLedger(store).history(job.job_id)
+    assert tuple(record.request.effect_id for record in history) == (
+        first.effect_id,
+        second.effect_id,
+    )
+    assert history[0].outcome is not None
+    assert history[1].outcome is None
+
+
+def test_gateway_history_preserves_exact_non_dispatched_block_reason() -> None:
+    job = workflow_job(mode="demo")
+    request = effect_request(job)
+    store = PersistentEffectStore()
+    adapter = GatewayFactoryLiveEffectLedger(store)
+    outcome = effect_outcome(
+        request,
+        status=FactoryLiveBlockReason.BUDGET_EXHAUSTED.value,
+        reason="budget reservation refused before provider dispatch",
+    )
+
+    adapter.claim(request)
+    adapter.complete(request, outcome)
+    replay = adapter.complete(request, outcome)
+    history = GatewayFactoryLiveEffectLedger(store).history(job.job_id)
+
+    assert replay.replayed is True
+    assert len(history) == 1
+    assert history[0].outcome == outcome
+
+
+def test_gateway_effect_payload_digest_rejects_tampering() -> None:
+    effect_id = str(uuid5(NAMESPACE_URL, "tampered-effect"))
+    job_id = str(uuid5(NAMESPACE_URL, "tampered-effect-job"))
+    ledger_payload = {
+        "effect_id": effect_id,
+        "job_id": job_id,
+        "status": "budget_exhausted",
+        "reason": "original",
+    }
+    block = Block(
+        index=0,
+        block_type="factory_live_effect",
+        data=ledger_payload,
+        status="accepted",
+        previous_hash="0",
+        metadata={"event_kind": "outcome"},
+    )
+    side_payload = {
+        "effect_id": effect_id,
+        "job_id": job_id,
+        "status": "budget_exhausted",
+        "reason": "rewritten",
+    }
+    row = {
+        "payload": json.dumps(side_payload, sort_keys=True),
+        "content_sha256": hashlib.sha256(
+            json.dumps(
+                side_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        "block_index": block.index,
+        "projection_block_index": block.index,
+        "projection_effect_id": effect_id,
+        "projection_job_id": job_id,
+        "projection_invocation_id": None,
+        "projection_claim_key": None,
+        "ledger_data": json.dumps(block.data, sort_keys=True),
+        "ledger_block_type": block.block_type,
+        "ledger_status": block.status,
+        "ledger_metadata": json.dumps(block.metadata, sort_keys=True),
+        "ledger_hash": block.hash,
+        "ledger_previous_hash": block.previous_hash,
+        "ledger_parent_index": block.parent_index,
+        "previous_block_hash": None,
+        "next_previous_hash": None,
+        "event_kind": "outcome",
+    }
+
+    with pytest.raises(HTTPException, match="Ledger block"):
+        GatewayStore._factory_live_effect_payload(row)
+
+
+def test_gateway_effect_payload_reads_historical_block_without_reason_field() -> None:
+    request = effect_request(workflow_job(mode="demo"))
+    old_payload = effect_outcome(request).model_dump(mode="json", by_alias=True)
+    old_payload.pop("reason")
+    old_payload.pop("completion_origin")
+    block = Block(
+        index=0,
+        block_type="factory_live_effect",
+        data=old_payload,
+        status="accepted",
+        previous_hash="0",
+        metadata={
+            "schema": "captain.factory-live-effect-outcome.v1",
+            "event_kind": "outcome",
+        },
+    )
+    digest = hashlib.sha256(
+        json.dumps(old_payload, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    row = {
+        "payload": json.dumps(old_payload, sort_keys=True),
+        "content_sha256": digest,
+        "block_index": block.index,
+        "projection_block_index": block.index,
+        "projection_effect_id": old_payload["effect_id"],
+        "projection_job_id": old_payload["job_id"],
+        "projection_invocation_id": None,
+        "projection_claim_key": None,
+        "ledger_data": json.dumps(block.data, sort_keys=True),
+        "ledger_block_type": block.block_type,
+        "ledger_status": block.status,
+        "ledger_metadata": json.dumps(block.metadata, sort_keys=True),
+        "ledger_hash": block.hash,
+        "ledger_previous_hash": block.previous_hash,
+        "ledger_parent_index": block.parent_index,
+        "previous_block_hash": None,
+        "next_previous_hash": None,
+        "event_kind": "outcome",
+    }
+
+    restored = FactoryLiveEffectOutcomeV1.model_validate(
+        GatewayStore._factory_live_effect_payload(row)
+    )
+
+    assert restored.status == "succeeded"
+    assert restored.reason is None
 
 
 def test_gateway_effect_adapter_translates_store_conflicts() -> None:
@@ -159,6 +317,230 @@ def test_mariadb_effect_claim_is_atomic_and_restart_safe(
     ).claim(request)
     assert recovered.acquired is False
     assert recovered.record.outcome == outcome
+
+
+def test_mariadb_effect_history_survives_restart_in_authoritative_order(
+    mariadb_store: GatewayStore,
+) -> None:
+    job, first = prepared_mariadb_effect(mariadb_store)
+    second_invocation = first.invocation.model_copy(
+        update={
+            "invocation_id": uuid5(
+                NAMESPACE_URL,
+                f"second-provider-invocation|{job.job_id}",
+            ),
+            "idempotency_key": "c" * 64,
+        }
+    )
+    second = first.model_copy(
+        update={
+            "effect_id": uuid5(NAMESPACE_URL, f"second-provider-effect|{job.job_id}"),
+            "idempotency_key": second_invocation.idempotency_key,
+            "invocation": second_invocation,
+        }
+    )
+    adapter = GatewayFactoryLiveEffectLedger(mariadb_store)
+    adapter.claim(first)
+    adapter.complete(first, effect_outcome(first))
+    adapter.claim(second)
+
+    restarted = GatewayFactoryLiveEffectLedger(GatewayStore(mariadb_store.storage))
+    history = restarted.history(job.job_id)
+
+    assert tuple(record.request.effect_id for record in history) == (
+        first.effect_id,
+        second.effect_id,
+    )
+    assert history[0].outcome is not None
+    assert history[1].outcome is None
+
+
+def test_mariadb_effect_history_rejects_side_table_rewrite(
+    mariadb_store: GatewayStore,
+) -> None:
+    _, request = prepared_mariadb_effect(mariadb_store)
+    adapter = GatewayFactoryLiveEffectLedger(mariadb_store)
+    adapter.claim(request)
+    adapter.complete(request, effect_outcome(request))
+
+    with mariadb_store.storage.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT payload FROM factory_live_effect_events "
+                "WHERE effect_id = %s AND event_kind = 'outcome'",
+                (str(request.effect_id),),
+            )
+            row = cursor.fetchone()
+            payload = GatewayStore._decode_json(row["payload"])
+            payload["reason"] = "side table rewrite"
+            digest = hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            cursor.execute(
+                "UPDATE factory_live_effect_events "
+                "SET payload = %s, content_sha256 = %s "
+                "WHERE effect_id = %s AND event_kind = 'outcome'",
+                (json.dumps(payload, sort_keys=True), digest, str(request.effect_id)),
+            )
+
+    with pytest.raises(ValueError, match="Ledger block"):
+        GatewayFactoryLiveEffectLedger(
+            GatewayStore(mariadb_store.storage)
+        ).history(request.job_id)
+
+
+@pytest.mark.parametrize("identity_column", ("claim_key", "invocation_id"))
+def test_mariadb_effect_identity_projection_rewrite_fails_closed(
+    mariadb_store: GatewayStore,
+    identity_column: str,
+) -> None:
+    job, request = prepared_mariadb_effect(mariadb_store)
+    adapter = GatewayFactoryLiveEffectLedger(mariadb_store)
+    adapter.claim(request)
+    replacement = (
+        "f" * 64
+        if identity_column == "claim_key"
+        else str(uuid5(NAMESPACE_URL, "rewritten-side-invocation"))
+    )
+    update_sql = {
+        "claim_key": (
+            "UPDATE factory_live_effect_events SET claim_key = %s "
+            "WHERE effect_id = %s AND event_kind = 'claim'"
+        ),
+        "invocation_id": (
+            "UPDATE factory_live_effect_events SET invocation_id = %s "
+            "WHERE effect_id = %s AND event_kind = 'claim'"
+        ),
+    }[identity_column]
+    with mariadb_store.storage.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                update_sql,
+                (replacement, str(request.effect_id)),
+            )
+
+    with pytest.raises(ValueError, match="projection"):
+        adapter.history(job.job_id)
+
+    if identity_column == "claim_key":
+        changed_invocation = request.invocation.model_copy(
+            update={
+                "invocation_id": uuid5(
+                    NAMESPACE_URL,
+                    "changed-invocation-after-claim-key-rewrite",
+                )
+            }
+        )
+    else:
+        changed_invocation = request.invocation.model_copy(
+            update={"idempotency_key": "e" * 64}
+        )
+    changed = FactoryLiveEffectRequestV1.model_validate(
+        request.model_dump(mode="json", by_alias=True)
+        | {
+            "effect_id": str(
+                uuid5(
+                    NAMESPACE_URL,
+                    f"changed-effect-after-{identity_column}-rewrite",
+                )
+            ),
+            "idempotency_key": changed_invocation.idempotency_key,
+            "invocation": changed_invocation.model_dump(mode="json", by_alias=True),
+        }
+    )
+
+    with pytest.raises(ValueError, match="projection"):
+        adapter.claim(changed)
+
+    with mariadb_store.storage.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) AS event_count FROM blocks "
+                "WHERE block_type = 'factory_live_effect' "
+                "AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.job_id')) = %s",
+                (str(job.job_id),),
+            )
+            assert int(cursor.fetchone()["event_count"]) == 1
+
+
+def test_mariadb_effect_history_rejects_deleted_outcome_projection(
+    mariadb_store: GatewayStore,
+) -> None:
+    job, request = prepared_mariadb_effect(mariadb_store)
+    adapter = GatewayFactoryLiveEffectLedger(mariadb_store)
+    adapter.claim(request)
+    adapter.complete(request, effect_outcome(request))
+
+    with mariadb_store.storage.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM factory_live_effect_events "
+                "WHERE effect_id = %s AND event_kind = 'outcome'",
+                (str(request.effect_id),),
+            )
+
+    with pytest.raises(ValueError, match="projection"):
+        GatewayFactoryLiveEffectLedger(
+            GatewayStore(mariadb_store.storage)
+        ).history(job.job_id)
+    with pytest.raises(ValueError, match="projection"):
+        GatewayFactoryLiveEffectLedger(
+            GatewayStore(mariadb_store.storage)
+        ).claim(request)
+
+
+def test_mariadb_effect_history_rejects_additional_side_projection(
+    mariadb_store: GatewayStore,
+) -> None:
+    job, request = prepared_mariadb_effect(mariadb_store)
+    adapter = GatewayFactoryLiveEffectLedger(mariadb_store)
+    adapter.claim(request)
+    with mariadb_store.storage.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT `index` FROM blocks WHERE block_type = 'agent_factory_job' "
+                "AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.job_id')) = %s",
+                (str(job.job_id),),
+            )
+            unrelated_block_index = int(cursor.fetchone()["index"])
+            extra_effect_id = uuid5(
+                NAMESPACE_URL,
+                f"extra-side-projection|{job.job_id}",
+            )
+            payload = request.model_copy(
+                update={"effect_id": extra_effect_id}
+            ).model_dump(mode="json", by_alias=True)
+            cursor.execute(
+                """INSERT INTO factory_live_effect_events
+                   (event_id, effect_id, job_id, invocation_id, claim_key,
+                    event_kind, content_sha256, block_index, payload)
+                   VALUES (%s, %s, %s, NULL, NULL, 'outcome', %s, %s, %s)""",
+                (
+                    str(extra_effect_id),
+                    str(extra_effect_id),
+                    str(job.job_id),
+                    hashlib.sha256(
+                        json.dumps(
+                            payload,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                    unrelated_block_index,
+                    json.dumps(payload, sort_keys=True),
+                ),
+            )
+
+    with pytest.raises(ValueError, match="projection"):
+        GatewayFactoryLiveEffectLedger(
+            GatewayStore(mariadb_store.storage)
+        ).history(job.job_id)
+    with pytest.raises(ValueError, match="projection"):
+        GatewayFactoryLiveEffectLedger(
+            GatewayStore(mariadb_store.storage)
+        ).claim(request)
 
 
 def test_mariadb_effect_changed_replay_conflicts(

@@ -1244,6 +1244,9 @@ class GatewayStore:
                 existing = self._factory_live_effect_record(
                     cursor,
                     request.effect_id,
+                    job_id=request.job_id,
+                    idempotency_key=request.idempotency_key,
+                    invocation_id=request.invocation.invocation_id,
                     for_update=True,
                 )
                 if existing is None or existing.request != request:
@@ -1300,6 +1303,131 @@ class GatewayStore:
                     parent_index=job_block["index"],
                 )
         return FactoryLiveEffectWriteReceipt(record=completed, replayed=False)
+
+    def factory_live_effect_history(
+        self,
+        job_id: UUID,
+    ) -> tuple[FactoryLiveEffectRecord, ...]:
+        """Return the authoritative effect stream in original claim order."""
+
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                job_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_job",
+                    field="job_id",
+                    value=str(job_id),
+                    for_update=False,
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job not found")
+                cursor.execute(
+                    """SELECT events.effect_id AS projection_effect_id,
+                              events.job_id AS projection_job_id,
+                              events.invocation_id AS projection_invocation_id,
+                              events.claim_key AS projection_claim_key,
+                              events.event_kind,
+                              events.content_sha256, events.payload,
+                              ledger.`index` AS block_index,
+                              events.block_index AS projection_block_index,
+                              ledger.block_type AS ledger_block_type,
+                              ledger.data AS ledger_data,
+                              ledger.status AS ledger_status,
+                              ledger.metadata AS ledger_metadata,
+                              ledger.hash AS ledger_hash,
+                              ledger.previous_hash AS ledger_previous_hash,
+                              ledger.parent_index AS ledger_parent_index,
+                              prior_block.hash AS previous_block_hash,
+                              (SELECT following.previous_hash
+                                 FROM blocks AS following
+                                WHERE following.`index` > ledger.`index`
+                                ORDER BY following.`index` LIMIT 1)
+                                  AS next_previous_hash
+                         FROM blocks AS ledger
+                    LEFT JOIN factory_live_effect_events AS events
+                           ON events.block_index = ledger.`index`
+                    LEFT JOIN blocks AS prior_block
+                           ON prior_block.`index` = (
+                                SELECT MAX(candidate.`index`)
+                                  FROM blocks AS candidate
+                                 WHERE candidate.`index` < ledger.`index`
+                           )
+                        WHERE ledger.block_type = 'factory_live_effect'
+                          AND JSON_UNQUOTE(JSON_EXTRACT(
+                                  ledger.data, '$.job_id'
+                              )) = %s
+                     ORDER BY ledger.`index`""",
+                    (str(job_id),),
+                )
+                rows = cursor.fetchall()
+                cursor.execute(
+                    "SELECT block_index FROM factory_live_effect_events "
+                    "WHERE job_id = %s ORDER BY block_index",
+                    (str(job_id),),
+                )
+                projection_indices = tuple(
+                    int(row["block_index"]) for row in cursor.fetchall()
+                )
+
+        ledger_indices = tuple(int(row["block_index"]) for row in rows)
+        if projection_indices != ledger_indices:
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect side-table projection is incomplete or additional",
+            )
+
+        grouped: dict[UUID, list[dict[str, object]]] = {}
+        for row in rows:
+            payload = self._factory_live_effect_payload(row)
+            if not isinstance(payload, dict) or "effect_id" not in payload:
+                raise HTTPException(
+                    status_code=409,
+                    detail="factory live effect Ledger block lacks effect_id",
+                )
+            effect_id = UUID(str(payload["effect_id"]))
+            grouped.setdefault(effect_id, []).append(row)
+
+        history: list[FactoryLiveEffectRecord] = []
+        for effect_id, events in grouped.items():
+            if events[0]["event_kind"] != "claim":
+                raise HTTPException(
+                    status_code=409,
+                    detail="factory live effect history has outcome before claim",
+                )
+            claims = tuple(event for event in events if event["event_kind"] == "claim")
+            outcomes = tuple(
+                event for event in events if event["event_kind"] == "outcome"
+            )
+            if len(claims) != 1 or len(outcomes) > 1 or (
+                len(claims) + len(outcomes) != len(events)
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="factory live effect history is ambiguous",
+                )
+            request = FactoryLiveEffectRequestV1.model_validate(
+                self._factory_live_effect_payload(claims[0])
+            )
+            if request.effect_id != effect_id or request.job_id != job_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="factory live effect history binding mismatch",
+                )
+            outcome = (
+                FactoryLiveEffectOutcomeV1.model_validate(
+                    self._factory_live_effect_payload(outcomes[0])
+                )
+                if outcomes
+                else None
+            )
+            try:
+                history.append(FactoryLiveEffectRecord(request=request, outcome=outcome))
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="factory live effect history binding mismatch",
+                ) from exc
+        return tuple(history)
 
     def factory_workflow_artifacts(
         self,
@@ -2555,16 +2683,37 @@ class GatewayStore:
         invocation_id: UUID | None = None,
         for_update: bool,
     ) -> FactoryLiveEffectRecord | None:
+        if job_id is not None:
+            self._assert_factory_live_effect_projection_complete(cursor, job_id)
         if (
             job_id is not None
             and idempotency_key is not None
             and invocation_id is not None
         ):
             sql = (
-                "SELECT event_kind, payload FROM factory_live_effect_events "
-                "WHERE effect_id = %s OR (job_id = %s AND claim_key = %s) "
-                "OR (job_id = %s AND invocation_id = %s) "
-                "ORDER BY block_index"
+                "SELECT events.effect_id AS projection_effect_id, "
+                "events.job_id AS projection_job_id, "
+                "events.invocation_id AS projection_invocation_id, "
+                "events.claim_key AS projection_claim_key, "
+                "events.event_kind, events.content_sha256, events.payload, "
+                "ledger.`index` AS block_index, "
+                "events.block_index AS projection_block_index, "
+                "ledger.block_type AS ledger_block_type, "
+                "ledger.data AS ledger_data, ledger.status AS ledger_status, "
+                "ledger.metadata AS ledger_metadata, ledger.hash AS ledger_hash, "
+                "ledger.previous_hash AS ledger_previous_hash, "
+                "ledger.parent_index AS ledger_parent_index "
+                "FROM blocks AS ledger "
+                "LEFT JOIN factory_live_effect_events AS events "
+                "ON events.block_index = ledger.`index` "
+                "WHERE ledger.block_type = 'factory_live_effect' AND ("
+                "JSON_UNQUOTE(JSON_EXTRACT(ledger.data, '$.effect_id')) = %s "
+                "OR (JSON_UNQUOTE(JSON_EXTRACT(ledger.data, '$.job_id')) = %s "
+                "AND JSON_UNQUOTE(JSON_EXTRACT(ledger.data, '$.idempotency_key')) = %s) "
+                "OR (JSON_UNQUOTE(JSON_EXTRACT(ledger.data, '$.job_id')) = %s "
+                "AND JSON_UNQUOTE(JSON_EXTRACT(ledger.data, "
+                "'$.invocation.invocation_id')) = %s)) "
+                "ORDER BY ledger.`index`"
             )
             parameters = (
                 str(effect_id),
@@ -2575,8 +2724,24 @@ class GatewayStore:
             )
         else:
             sql = (
-                "SELECT event_kind, payload FROM factory_live_effect_events "
-                "WHERE effect_id = %s ORDER BY block_index"
+                "SELECT events.effect_id AS projection_effect_id, "
+                "events.job_id AS projection_job_id, "
+                "events.invocation_id AS projection_invocation_id, "
+                "events.claim_key AS projection_claim_key, "
+                "events.event_kind, events.content_sha256, events.payload, "
+                "ledger.`index` AS block_index, "
+                "events.block_index AS projection_block_index, "
+                "ledger.block_type AS ledger_block_type, "
+                "ledger.data AS ledger_data, ledger.status AS ledger_status, "
+                "ledger.metadata AS ledger_metadata, ledger.hash AS ledger_hash, "
+                "ledger.previous_hash AS ledger_previous_hash, "
+                "ledger.parent_index AS ledger_parent_index "
+                "FROM blocks AS ledger "
+                "LEFT JOIN factory_live_effect_events AS events "
+                "ON events.block_index = ledger.`index` "
+                "WHERE ledger.block_type = 'factory_live_effect' "
+                "AND JSON_UNQUOTE(JSON_EXTRACT(ledger.data, '$.effect_id')) = %s "
+                "ORDER BY ledger.`index`"
             )
             parameters = (str(effect_id),)
         if for_update:
@@ -2593,16 +2758,158 @@ class GatewayStore:
                 detail="factory live effect ledger is ambiguous",
             )
         request = FactoryLiveEffectRequestV1.model_validate(
-            self._decode_json(claims[0]["payload"])
+            self._factory_live_effect_payload(claims[0])
         )
         outcome = (
             FactoryLiveEffectOutcomeV1.model_validate(
-                self._decode_json(outcomes[0]["payload"])
+                self._factory_live_effect_payload(outcomes[0])
             )
             if outcomes
             else None
         )
         return FactoryLiveEffectRecord(request=request, outcome=outcome)
+
+    @staticmethod
+    def _assert_factory_live_effect_projection_complete(
+        cursor: Any,
+        job_id: UUID,
+    ) -> None:
+        cursor.execute(
+            "SELECT `index` FROM blocks "
+            "WHERE block_type = 'factory_live_effect' "
+            "AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.job_id')) = %s "
+            "ORDER BY `index`",
+            (str(job_id),),
+        )
+        ledger_indices = tuple(int(row["index"]) for row in cursor.fetchall())
+        cursor.execute(
+            "SELECT block_index FROM factory_live_effect_events "
+            "WHERE job_id = %s ORDER BY block_index",
+            (str(job_id),),
+        )
+        projection_indices = tuple(
+            int(row["block_index"]) for row in cursor.fetchall()
+        )
+        if ledger_indices != projection_indices:
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect side-table projection is incomplete or additional",
+            )
+
+    @staticmethod
+    def _factory_live_effect_payload(row: dict[str, Any]) -> object:
+        if (
+            row.get("projection_block_index") is None
+            or row.get("projection_effect_id") is None
+            or row.get("projection_job_id") is None
+            or row.get("event_kind") is None
+            or row.get("payload") is None
+            or row.get("content_sha256") is None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect side-table projection is missing",
+            )
+        side_payload = GatewayStore._decode_json(row["payload"])
+        ledger_payload = GatewayStore._decode_json(row["ledger_data"])
+        metadata = GatewayStore._decode_json(row["ledger_metadata"])
+        if not isinstance(ledger_payload, dict) or not isinstance(metadata, dict):
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect Ledger block has malformed JSON",
+            )
+        block = Block(
+            index=int(row["block_index"]),
+            block_type=str(row["ledger_block_type"]),
+            data=ledger_payload,
+            status=str(row["ledger_status"]),
+            previous_hash=str(row["ledger_previous_hash"]),
+            parent_index=row["ledger_parent_index"],
+            metadata=metadata,
+            hash=str(row["ledger_hash"]),
+        )
+        if block.block_type != "factory_live_effect" or block.status != "accepted":
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect Ledger block type or status mismatch",
+            )
+        if block.compute_hash() != block.hash:
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect Ledger block hash mismatch",
+            )
+        previous_hash = row.get("previous_block_hash")
+        if "previous_block_hash" in row:
+            expected_previous = "0" if previous_hash is None else str(previous_hash)
+            if block.previous_hash != expected_previous:
+                raise HTTPException(
+                    status_code=409,
+                    detail="factory live effect Ledger block previous link mismatch",
+                )
+        next_previous_hash = row.get("next_previous_hash")
+        if next_previous_hash is not None and str(next_previous_hash) != block.hash:
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect Ledger block next link mismatch",
+            )
+        if metadata.get("event_kind") != row["event_kind"]:
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect Ledger block event kind mismatch",
+            )
+        if (
+            int(row["projection_block_index"]) != int(row["block_index"])
+            or not isinstance(ledger_payload.get("effect_id"), str)
+            or str(row["projection_effect_id"]) != ledger_payload["effect_id"]
+            or not isinstance(ledger_payload.get("job_id"), str)
+            or str(row["projection_job_id"]) != ledger_payload["job_id"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect side-table projection binding mismatch",
+            )
+        if row["event_kind"] == "claim":
+            invocation = ledger_payload.get("invocation")
+            if (
+                not isinstance(invocation, dict)
+                or not isinstance(invocation.get("invocation_id"), str)
+                or row.get("projection_invocation_id")
+                != invocation["invocation_id"]
+                or not isinstance(ledger_payload.get("idempotency_key"), str)
+                or row.get("projection_claim_key")
+                != ledger_payload["idempotency_key"]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="factory live effect side-table identity projection mismatch",
+                )
+        elif (
+            row.get("projection_invocation_id") is not None
+            or row.get("projection_claim_key") is not None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect outcome carries claim identity projection",
+            )
+        schema = ledger_payload.get("schema")
+        if schema is not None and metadata.get("schema") != schema:
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect Ledger block schema mismatch",
+            )
+        digest = hashlib.sha256(
+            json.dumps(
+                ledger_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if side_payload != ledger_payload or digest != row["content_sha256"]:
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect side table differs from Ledger block",
+            )
+        return ledger_payload
 
     def _assert_factory_live_invocation(
         self,

@@ -10,6 +10,7 @@ import pytest
 
 from agenten.agent_factory.contracts import FactoryPhase
 from agenten.agent_factory.factory_live_runner import (
+    FactoryLiveBlockReason,
     FactoryLiveEffectKind,
     FactoryLiveEffectReport,
     FactoryLiveRunReport,
@@ -594,6 +595,40 @@ class ScriptedLiveRunner:
         return report
 
 
+class NonDispatchedBlockedRunner:
+    def __init__(self, job, reason: FactoryLiveBlockReason) -> None:
+        self.job = job
+        self.reason = reason
+        self.calls = 0
+
+    def history(self, _job_id):
+        return ()
+
+    async def run(self, supplied_job, *, mode):
+        assert supplied_job == self.job
+        self.calls += 1
+        return FactoryLiveRunReport(
+            job_id=self.job.job_id,
+            correlation_id=self.job.correlation_id,
+            mode=mode,
+            status="blocked",
+            attempt=1,
+            next_attempt=1,
+            effects=(
+                FactoryLiveEffectReport(
+                    effect_id=UUID(int=900 + self.calls),
+                    kind=FactoryLiveEffectKind.CODEX,
+                    attempt=1,
+                    status=self.reason.value,
+                    reason=f"exact {self.reason.value} reason",
+                    provider_started=False,
+                    replayed=False,
+                ),
+            ),
+            reasons=(f"exact {self.reason.value} reason",),
+        )
+
+
 def _coordinator_actions() -> tuple[FactoryActionKind, ...]:
     return (
         FactoryActionKind.APPEND_FORGE_REQUESTED,
@@ -606,6 +641,50 @@ def _coordinator_actions() -> tuple[FactoryActionKind, ...]:
         FactoryActionKind.VALIDATE_FOR_PROMOTION,
         FactoryActionKind.COMPLETE,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", tuple(FactoryLiveBlockReason))
+async def test_six_skill_coordinator_returns_non_dispatched_blocks_without_attempt(
+    reason: FactoryLiveBlockReason,
+) -> None:
+    from agenten.agent_factory.factory_live_entrypoint import (
+        FactorySixSkillLiveCoordinator,
+    )
+
+    job = workflow_job(mode="demo")
+    repository = WorkflowRepository()
+    lifecycle = ScriptedCoordinator(
+        job,
+        (FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,),
+    )
+    timeline: list[str] = []
+    dispatcher = ScriptedDispatcher(
+        lifecycle,
+        repository,
+        required_live_runs=1,
+        timeline=timeline,
+    )
+    live_runner = NonDispatchedBlockedRunner(job, reason)
+    coordinator = FactorySixSkillLiveCoordinator(
+        coordinator=lifecycle,
+        repository=repository,
+        dispatcher=dispatcher,
+        live_runner=live_runner,
+        clock=lambda: job.occurred_at,
+    )
+
+    result = await coordinator.run(job, "demo")
+
+    assert result.status == "blocked"
+    assert result.attempt == 1
+    assert result.runner_reports[-1].status == "blocked"
+    assert result.runner_reports[-1].effects[-1].status == reason.value
+    assert result.runner_reports[-1].effects[-1].provider_started is False
+    assert result.runner_reports[-1].reasons == (
+        f"exact {reason.value} reason",
+    )
+    assert dispatcher.dispatch_calls == 0
 
 
 @pytest.mark.asyncio
