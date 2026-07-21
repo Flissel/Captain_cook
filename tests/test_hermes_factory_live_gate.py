@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -71,6 +73,51 @@ def _run_copied_wrapper(
         text=True,
         timeout=30,
         check=False,
+    )
+
+
+def _write_fake_live_gate_commands(directory: Path, leak_probe: str) -> None:
+    directory.mkdir()
+    (directory / "docker.cmd").write_text(
+        '@echo off\nif "%1"=="ps" echo fixture-container\nexit /b 0\n',
+        encoding="utf-8",
+    )
+    skill_lines = "\n".join(f"echo {skill}" for skill in SKILLS)
+    (directory / "hermes.cmd").write_text(
+        f"@echo off\n{skill_lines}\nexit /b 0\n",
+        encoding="utf-8",
+    )
+    (directory / "codex.cmd").write_text(
+        "@echo off\nexit /b 0\n",
+        encoding="utf-8",
+    )
+    preflight = {
+        "schema": "captain.hermes-six-skill-factory-preflight.v1",
+        "prerequisites_confirmed": True,
+        "database_name": "captain_test",
+        "services_verified": True,
+        "codex_authenticated": True,
+        "skills_verified": True,
+        "skill_digests": {skill: "a" * 64 for skill in SKILLS},
+    }
+    preflight_json = json.dumps(preflight, separators=(",", ":"))
+    (directory / "python.cmd").write_text(
+        "@echo off\n"
+        "setlocal EnableDelayedExpansion\n"
+        'set "output="\n'
+        'set "previous="\n'
+        "for %%A in (%*) do (\n"
+        '  if "!previous!"=="--output" set "output=%%~A"\n'
+        '  set "previous=%%~A"\n'
+        ")\n"
+        "if defined output (\n"
+        f'  >"!output!" echo {preflight_json}\n'
+        "  exit /b 0\n"
+        ")\n"
+        f"echo {leak_probe}\n"
+        f">&2 echo {leak_probe}\n"
+        "exit /b 17\n",
+        encoding="utf-8",
     )
 
 
@@ -255,6 +302,26 @@ def test_process_n8n_environment_overrides_dedicated_and_root_files(
     assert process_secret not in output
 
 
+def test_wrapper_suppresses_failed_pytest_output_and_emits_only_a_generic_error(
+    tmp_path: Path,
+) -> None:
+    leak_probe = "provider-secret-from-pytest-output"
+    fake_commands = tmp_path / "fake-bin"
+    _write_fake_live_gate_commands(fake_commands, leak_probe)
+    environment = os.environ.copy()
+    environment["TEST_MARIADB_DSN"] = (
+        "mysql+pymysql://captain:fixture@127.0.0.1:3306/captain_test"
+    )
+    environment["PATH"] = str(fake_commands)
+
+    result = _run_copied_wrapper(tmp_path, environment=environment)
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Factory live validation failed without releasing test output." in output
+    assert leak_probe not in output
+
+
 def test_live_gate_rejects_a_non_isolated_database_without_printing_the_dsn() -> None:
     secret = "fixture-password-must-not-be-printed"
     environment = os.environ.copy()
@@ -348,6 +415,31 @@ def test_live_report_redaction_contract_rejects_sensitive_keys_and_values(
         live_contract._assert_redacted(payload)
 
 
+def test_live_runner_exception_is_sanitized_outside_the_original_exception_context() -> None:
+    live_contract = _load_live_contract_module()
+    leak_probe = "provider-secret-from-runtime-exception"
+
+    async def leaking_runner() -> None:
+        raise RuntimeError(leak_probe)
+
+    with pytest.raises(pytest.fail.Exception) as captured:
+        asyncio.run(live_contract._run_sanitized_live_gate(leaking_runner))
+
+    assert leak_probe not in str(captured.value)
+    assert captured.value.__context__ is None
+    assert captured.value.__cause__ is None
+
+    async def leaking_pytest_runner() -> None:
+        pytest.fail(leak_probe)
+
+    with pytest.raises(pytest.fail.Exception) as pytest_captured:
+        asyncio.run(live_contract._run_sanitized_live_gate(leaking_pytest_runner))
+
+    assert leak_probe not in str(pytest_captured.value)
+    assert pytest_captured.value.__context__ is None
+    assert pytest_captured.value.__cause__ is None
+
+
 def test_live_report_requires_exact_decimal_strings_and_exact_gateway_refs() -> None:
     live_contract = _load_live_contract_module()
     job_id = "00000000-0000-0000-0000-000000000101"
@@ -357,6 +449,7 @@ def test_live_report_requires_exact_decimal_strings_and_exact_gateway_refs() -> 
         "sha256": "a" * 64,
         "media_type": "application/json",
     }
+    evaluation_ref = {**artifact_ref, "sha256": "d" * 64}
     gateway_promotion = {
         "projection_status": "ready_to_use",
         "release_decision": {
@@ -364,8 +457,8 @@ def test_live_report_requires_exact_decimal_strings_and_exact_gateway_refs() -> 
             "correlation_id": correlation_id,
             "status": "ready",
             "reasons": ["release evidence verified"],
-            "evaluation_id": None,
-            "evaluation_ref": None,
+            "evaluation_id": "00000000-0000-0000-0000-000000000104",
+            "evaluation_ref": evaluation_ref,
             "tool_gaps": [],
         },
         "promotion_block": {
@@ -381,7 +474,7 @@ def test_live_report_requires_exact_decimal_strings_and_exact_gateway_refs() -> 
             "phase": "capability_promoted",
             "role": None,
             "status": "succeeded",
-            "artifact_refs": [],
+            "artifact_refs": [evaluation_ref],
             "evidence_refs": [artifact_ref],
             "assertion_ids": ["release_evidence_complete"],
             "lease_id": None,
@@ -436,6 +529,37 @@ def test_live_report_requires_exact_decimal_strings_and_exact_gateway_refs() -> 
             },
             report_binding,
         )
+    with pytest.raises(AssertionError):
+        live_contract._gateway_promotion(
+            {
+                **gateway_promotion,
+                "promotion_block": {
+                    **gateway_promotion["promotion_block"],
+                    "artifact_refs": [{**artifact_ref, "sha256": "e" * 64}],
+                },
+            },
+            report_binding,
+        )
+    with pytest.raises(AssertionError):
+        live_contract._gateway_promotion(
+            {
+                **gateway_promotion,
+                "release_decision": {
+                    **gateway_promotion["release_decision"],
+                    "evaluation_id": None,
+                    "evaluation_ref": None,
+                },
+            },
+            report_binding,
+        )
+
+
+def test_powershell_gateway_check_binds_evaluation_to_promotion_artifacts() -> None:
+    source = WRAPPER.read_text(encoding="utf-8")
+
+    assert "$decision.evaluation_id" in source
+    assert "$decision.evaluation_ref" in source
+    assert "$block.artifact_refs" in source
 
 
 def test_live_contract_requires_unique_codex_sessions_and_lowercase_n8n_digest() -> None:

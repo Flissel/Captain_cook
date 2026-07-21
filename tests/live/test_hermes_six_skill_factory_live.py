@@ -5,6 +5,7 @@ import importlib
 import json
 import os
 import re
+from collections.abc import Awaitable, Callable
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Mapping
@@ -83,6 +84,9 @@ def _gateway_promotion(
     assert promotion_block.producer == "captain"
     assert promotion_block.status is FactoryBlockStatus.SUCCEEDED
     assert promotion_block.evidence_refs
+    assert decision.evaluation_id is not None
+    assert decision.evaluation_ref is not None
+    assert decision.evaluation_ref in promotion_block.artifact_refs
 
     job_id = _required_text(report_binding, "job_id")
     correlation_id = _required_text(report_binding, "correlation_id")
@@ -133,6 +137,23 @@ def _assert_redacted(value: object) -> None:
             raise AssertionError("live report contains an absolute host path")
 
 
+async def _run_sanitized_live_gate(
+    runner: Callable[[], Awaitable[object]],
+) -> object:
+    failure_message: str | None = None
+    result: object = None
+    try:
+        result = await runner()
+    except BaseException as error:
+        if isinstance(error, pytest.skip.Exception):
+            failure_message = "the live runtime may not skip after prerequisites are confirmed"
+        else:
+            failure_message = "the live runtime failed after prerequisites were confirmed"
+    if failure_message is not None:
+        pytest.fail(failure_message, pytrace=False)
+    return result
+
+
 @pytest.mark.asyncio
 async def test_hermes_six_skill_factory_live() -> None:
     if os.environ.get("CAPTAIN_FACTORY_PREREQUISITES_CONFIRMED") != "1":
@@ -148,10 +169,7 @@ async def test_hermes_six_skill_factory_live() -> None:
     if not callable(runner):
         pytest.fail("factory live runtime entrypoint is missing the agreed async runner")
 
-    try:
-        result = await runner()
-    except pytest.skip.Exception:
-        pytest.fail("the live runtime may not skip after prerequisites are confirmed")
+    result = await _run_sanitized_live_gate(runner)
     report = _mapping(result)
     _assert_redacted(report)
 

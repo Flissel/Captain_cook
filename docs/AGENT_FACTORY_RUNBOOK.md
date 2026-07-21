@@ -210,7 +210,10 @@ The marked live test imports and awaits
 mapping or a Pydantic model whose JSON dump equals the one persisted
 `captain.hermes-six-skill-factory-live-report.v1` report. It must propagate
 missing evidence or execution failure; after the wrapper confirms prerequisites
-it must never call `pytest.skip`. Provider traces contain distinct trace and
+it must never call `pytest.skip`. The live test converts any runner exception
+outside its original exception context to a generic traceback-free failure,
+and the wrapper suppresses both pytest output streams; neither surface may
+print provider errors or secrets. Provider traces contain distinct trace and
 Codex session IDs plus exact decimal USD receipts. Release output additionally
 contains recovery evidence. With n8n enabled, it also binds the workflow
 digest, MCP call ID, and real execution ID. The report contains neither raw
@@ -224,7 +227,9 @@ a complete canonical `FactoryReleaseDecision` with `status=ready`, and a
 complete canonical Captain `FactoryEvidenceBlock` for the succeeded
 `capability_promoted` phase. Both contracts must bind to the report's job and
 correlation, while the promotion block also binds subject version and attempt
-and carries nonempty evidence references. A terminal-status string alone is
+and carries nonempty evidence references. The release decision's evaluation ID
+and reference are mandatory, and the exact evaluation reference must occur in
+the promotion block's artifact references. A terminal-status string alone is
 not release evidence.
 
 ## Expected projections

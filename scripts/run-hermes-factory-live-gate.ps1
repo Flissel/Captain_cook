@@ -202,6 +202,23 @@ function Assert-GatewayPromotion {
     if (@($block.evidence_refs).Count -eq 0) {
         throw 'The Captain promotion block requires nonempty evidence_refs.'
     }
+    if (
+        $null -eq $decision.evaluation_id -or
+        [string]::IsNullOrWhiteSpace([string]$decision.evaluation_id) -or
+        $null -eq $decision.evaluation_ref
+    ) {
+        throw 'The Gateway release decision requires accepted evaluation evidence.'
+    }
+    $matchingEvaluationRefs = @(
+        $block.artifact_refs | Where-Object {
+            [string]$_.uri -ceq [string]$decision.evaluation_ref.uri -and
+            [string]$_.sha256 -ceq [string]$decision.evaluation_ref.sha256 -and
+            [string]$_.media_type -ceq [string]$decision.evaluation_ref.media_type
+        }
+    )
+    if ($matchingEvaluationRefs.Count -eq 0) {
+        throw 'The Captain promotion block must contain the accepted evaluation reference.'
+    }
 }
 
 function Assert-RedactedReport {
@@ -380,9 +397,16 @@ $pytestArguments = @(
     '-m', 'pytest', '-q', '--no-cov', '-m', 'live',
     'tests/live/test_hermes_six_skill_factory_live.py', '-rs'
 )
-& $python @pytestArguments
-if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
+$pytestExitCode = 1
+try {
+    & $python @pytestArguments *> $null
+    $pytestExitCode = $LASTEXITCODE
+}
+catch {
+    $pytestExitCode = 1
+}
+if ($pytestExitCode -ne 0) {
+    throw 'Factory live validation failed without releasing test output.'
 }
 
 $reportDigest = Assert-RedactedReport -Directory $reportDirectory -ExpectedMode $Mode
