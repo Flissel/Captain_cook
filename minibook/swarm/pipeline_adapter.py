@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import re
 import zipfile
 from pathlib import Path
 from enum import Enum
@@ -60,25 +62,54 @@ class ContentAddressedCreationArtifacts:
     """Small immutable artifact store owned by the opt-in creation runtime."""
 
     def __init__(self, root: Path) -> None:
-        self.root = root
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.root = root.resolve()
+        self._content_root = self.root / "content" / "sha256"
+        self._content_root.mkdir(parents=True, exist_ok=True)
 
-    def put(self, content: bytes, media_type: str) -> ArtifactRef:
+    def put(
+        self,
+        content: bytes,
+        media_type: str,
+        *,
+        namespace: str = "minibook-creation",
+    ) -> ArtifactRef:
+        if not isinstance(content, bytes):
+            raise TypeError("artifact content must be bytes")
+        if re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", namespace) is None:
+            raise ValueError("artifact namespace is invalid")
         digest = hashlib.sha256(content).hexdigest()
-        path = self.root / digest
+        path = self._content_root / digest[:2] / digest
+        path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
             if path.read_bytes() != content:
                 raise ValueError("artifact digest collision")
         else:
-            path.write_bytes(content)
+            try:
+                with path.open("xb") as stream:
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except FileExistsError:
+                if path.read_bytes() != content:
+                    raise ValueError("immutable artifact content changed")
         return ArtifactRef(
-            uri=f"artifact://sha256/{digest}",
+            uri=f"artifact://capability-factory/{namespace}/{digest}",
             sha256=digest,
             media_type=media_type,
         )
 
     def read(self, reference: ArtifactRef) -> bytes:
-        content = (self.root / reference.sha256).read_bytes()
+        if (
+            not reference.uri.startswith("artifact://capability-factory/")
+            or reference.uri.rsplit("/", 1)[-1] != reference.sha256
+        ):
+            raise ValueError("artifact reference is outside the capability store")
+        try:
+            content = (
+                self._content_root / reference.sha256[:2] / reference.sha256
+            ).read_bytes()
+        except OSError as exc:
+            raise ValueError("artifact content is unavailable") from exc
         if hashlib.sha256(content).hexdigest() != reference.sha256:
             raise ValueError("artifact content digest changed")
         return content
@@ -152,7 +183,9 @@ class ExportArtifactSnapshotter:
         encoded = json.dumps(
             state, sort_keys=True, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
-        return self.artifacts.put(encoded, "application/json")
+        return self.artifacts.put(
+            encoded, "application/json", namespace="creation-pipeline-state"
+        )
 
     @staticmethod
     def _files(root: Path) -> list[tuple[str, bytes]]:
@@ -169,6 +202,162 @@ class ExportArtifactSnapshotter:
             raise ValueError("export contains no files")
         return files
 
+    @staticmethod
+    def _artifact_kind(path: str) -> str | None:
+        if path == "team-manifest.json":
+            return "team_manifest"
+        if path == "RUNBOOK.md":
+            return "runbook"
+        if path.startswith("autogen/") and path.endswith(".py"):
+            return "autogen_source"
+        if path.startswith("skills/"):
+            return "skill"
+        if path.startswith("tests/test_") and path.endswith(".py"):
+            return "test"
+        if path.startswith("evidence/"):
+            return "evidence"
+        if path.startswith("n8n/") and path.endswith(".json"):
+            return "n8n_workflow"
+        if path.startswith("adapters/") and path.endswith(".py"):
+            return "local_adapter"
+        return None
+
+    @staticmethod
+    def _media_type(path: str) -> str:
+        suffix = Path(path).suffix.lower()
+        return {
+            ".json": "application/json",
+            ".md": "text/markdown",
+            ".py": "text/x-python",
+            ".yaml": "application/yaml",
+            ".yml": "application/yaml",
+        }.get(suffix, "application/octet-stream")
+
+    def _required_gap(self, gap_id: str, detail: str) -> dict[str, Any]:
+        gap = {
+            "schema": "TODO_TOOL.v1",
+            "gap_id": gap_id,
+            "severity": "required",
+            "status": "unresolved",
+            "required_output": detail,
+        }
+        gap_ref = self.artifacts.put(
+            json.dumps(gap, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+            "application/json",
+            namespace="creation-tool-gap",
+        )
+        marker = ToolGapMarkerV1(
+            gap_id=gap_id,
+            severity="required",
+            evidence_ref=gap_ref,
+            status="unresolved",
+        )
+        return {"tool_gaps": (marker,)}
+
+    @staticmethod
+    def _team_manifest(content: bytes) -> dict[str, Any]:
+        try:
+            manifest = json.loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("team manifest is not valid JSON") from exc
+        expected = {
+            "schema",
+            "capability_id",
+            "capability_version",
+            "autogen_modules",
+            "test_paths",
+        }
+        if not isinstance(manifest, dict) or set(manifest) != expected:
+            raise ValueError("team manifest fields are incomplete")
+        if manifest["schema"] != "autogen-team.v1":
+            raise ValueError("team manifest schema is unsupported")
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", manifest["capability_id"] or "") is None:
+            raise ValueError("team manifest capability identity is invalid")
+        if not isinstance(manifest["capability_version"], int) or isinstance(
+            manifest["capability_version"], bool
+        ) or manifest["capability_version"] < 1:
+            raise ValueError("team manifest capability version is invalid")
+        for field in ("autogen_modules", "test_paths"):
+            values = manifest[field]
+            if (
+                not isinstance(values, list)
+                or not values
+                or any(not isinstance(item, str) or not item for item in values)
+                or len(values) != len(set(values))
+            ):
+                raise ValueError(f"team manifest {field} is invalid")
+        return manifest
+
+    def _tool_gaps(
+        self, job: CreationJobV1, content: bytes
+    ) -> tuple[list[dict[str, Any]], tuple[ToolGapMarkerV1, ...]]:
+        try:
+            envelope = json.loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("tool gap declaration is not valid JSON") from exc
+        if (
+            not isinstance(envelope, dict)
+            or set(envelope) != {"schema", "tool_gaps"}
+            or envelope["schema"] != "minibook.creation-tool-gaps.v1"
+            or not isinstance(envelope["tool_gaps"], list)
+        ):
+            raise ValueError("tool gap declaration is invalid")
+        rich: list[dict[str, Any]] = []
+        creation: list[ToolGapMarkerV1] = []
+        required_fields = {
+            "schema",
+            "gap_id",
+            "severity",
+            "input_contract_ref",
+            "output_contract_ref",
+            "least_privilege_capability",
+            "implementation_options",
+            "acceptance_assertion_ids",
+            "evidence_ref",
+            "status",
+        }
+        for item in envelope["tool_gaps"]:
+            if not isinstance(item, dict) or set(item) != required_fields:
+                raise ValueError("tool gap fields are incomplete")
+            if item["schema"] != "TODO_TOOL.v1":
+                raise ValueError("tool gap schema is unsupported")
+            if item["severity"] not in {"required", "optional"} or item["status"] not in {
+                "unresolved",
+                "resolved",
+            }:
+                raise ValueError("tool gap status is invalid")
+            assertions = item["acceptance_assertion_ids"]
+            if (
+                not isinstance(assertions, list)
+                or not assertions
+                or not set(assertions).issubset(set(job.public_assertion_ids))
+            ):
+                raise ValueError("tool gap assertions exceed released assertions")
+            references = {
+                field: ArtifactRef.model_validate(item[field])
+                for field in (
+                    "input_contract_ref",
+                    "output_contract_ref",
+                    "evidence_ref",
+                )
+            }
+            for reference in references.values():
+                self.artifacts.read(reference)
+            normalized = dict(item)
+            normalized.update(
+                {field: reference.model_dump(mode="json") for field, reference in references.items()}
+            )
+            rich.append(normalized)
+            creation.append(
+                ToolGapMarkerV1(
+                    gap_id=str(item["gap_id"]),
+                    severity=item["severity"],
+                    evidence_ref=references["evidence_ref"],
+                    status=item["status"],
+                )
+            )
+        return rich, tuple(creation)
+
     def _capture_export(
         self, job: CreationJobV1, pipeline: Any
     ) -> dict[str, Any]:
@@ -178,75 +367,128 @@ class ExportArtifactSnapshotter:
         export_path = Path(str(export.get("path", ""))).resolve()
         if not export_path.is_dir():
             raise ValueError("legacy pipeline export path is unavailable")
-        files = self._files(export_path)
-        manifest = {
-            "schema": "minibook.creation-export-manifest.v1",
-            "creation_job_id": str(job.creation_job_id),
-            "files": [
+        all_files = self._files(export_path)
+        files = [
+            (name, content, self._artifact_kind(name))
+            for name, content in all_files
+            if self._artifact_kind(name) is not None
+        ]
+        by_path = {name: content for name, content, _kind in files}
+        required = {
+            "team-manifest.json",
+            "RUNBOOK.md",
+            "evidence/tool-gaps.json",
+            "evidence/hermes-skill-usage-receipt.json",
+        }
+        missing = sorted(required - set(by_path))
+        if "evidence/hermes-skill-usage-receipt.json" in missing:
+            return self._required_gap(
+                "hermes-skill-usage-receipt",
+                "evidence/hermes-skill-usage-receipt.json",
+            )
+        if missing:
+            return self._required_gap(
+                "forge-capability-candidate-contract",
+                "missing package paths: " + ", ".join(missing),
+            )
+        if not any(name.startswith("autogen/") for name in by_path) or not any(
+            name.startswith("skills/") for name in by_path
+        ) or not any(name.startswith("tests/") for name in by_path):
+            return self._required_gap(
+                "forge-capability-candidate-contract",
+                "autogen, skills, and tests package roots",
+            )
+        try:
+            team_manifest = self._team_manifest(by_path["team-manifest.json"])
+            autogen_paths = {name for name, _content, kind in files if kind == "autogen_source"}
+            test_paths = {name for name, _content, kind in files if kind == "test"}
+            if set(team_manifest["autogen_modules"]) != autogen_paths:
+                raise ValueError("team manifest modules do not match export bytes")
+            if set(team_manifest["test_paths"]) != test_paths:
+                raise ValueError("team manifest tests do not match export bytes")
+            rich_gaps, creation_gaps = self._tool_gaps(
+                job, by_path["evidence/tool-gaps.json"]
+            )
+            receipt_bytes = by_path["evidence/hermes-skill-usage-receipt.json"]
+            self._validate_receipt(job, receipt_bytes)
+        except ValueError as exc:
+            return self._required_gap(
+                "forge-capability-candidate-contract", str(exc)
+            )
+
+        package_artifacts: list[dict[str, Any]] = []
+        references: dict[str, ArtifactRef] = {}
+        for name, content, kind in files:
+            assert kind is not None
+            reference = self.artifacts.put(
+                content,
+                self._media_type(name),
+                namespace="candidate-file",
+            )
+            references[name] = reference
+            package_artifacts.append(
                 {
                     "path": name,
-                    "sha256": hashlib.sha256(content).hexdigest(),
-                    "size": len(content),
+                    "kind": kind,
+                    "reference": reference.model_dump(mode="json"),
                 }
-                for name, content in files
-            ],
-        }
-        manifest_bytes = json.dumps(
-            manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        ).encode("utf-8")
+            )
+        if len({item["reference"]["sha256"] for item in package_artifacts}) != len(
+            package_artifacts
+        ):
+            return self._required_gap(
+                "forge-capability-candidate-contract",
+                "package files must have unique content digests",
+            )
         package_buffer = io.BytesIO()
         with zipfile.ZipFile(
             package_buffer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
         ) as archive:
-            for name, content in files:
+            for name, content, _kind in files:
                 info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
                 info.create_system = 3
                 info.external_attr = 0o644 << 16
                 info.compress_type = zipfile.ZIP_DEFLATED
                 archive.writestr(info, content)
-            info = zipfile.ZipInfo(
-                "creation-export-manifest.json", date_time=(1980, 1, 1, 0, 0, 0)
-            )
-            info.create_system = 3
-            info.external_attr = 0o644 << 16
-            info.compress_type = zipfile.ZIP_DEFLATED
-            archive.writestr(info, manifest_bytes)
-        package_ref = self.artifacts.put(package_buffer.getvalue(), "application/zip")
-        manifest_ref = self.artifacts.put(manifest_bytes, "application/json")
-
-        receipt_path = export_path / "evidence" / "hermes-skill-usage-receipt.json"
-        if not receipt_path.is_file():
-            gap = {
-                "schema": "TODO_TOOL.v1",
-                "gap_id": "hermes-skill-usage-receipt",
-                "severity": "required",
-                "status": "unresolved",
-                "required_output": "evidence/hermes-skill-usage-receipt.json",
-            }
-            gap_ref = self.artifacts.put(
-                json.dumps(gap, sort_keys=True, separators=(",", ":")).encode("utf-8"),
-                "application/json",
-            )
-            marker = ToolGapMarkerV1(
-                gap_id="hermes-skill-usage-receipt",
-                severity="required",
-                evidence_ref=gap_ref,
-                status="unresolved",
-            )
-            return {
-                "package_manifest_ref": manifest_ref,
-                "artifact_bindings": {"export_package": package_ref},
-                "tool_gaps": (marker,),
-            }
-
-        receipt_bytes = receipt_path.read_bytes()
-        self._validate_receipt(job, receipt_bytes)
-        receipt_ref = self.artifacts.put(receipt_bytes, "application/json")
+        package_ref = self.artifacts.put(
+            package_buffer.getvalue(),
+            "application/zip",
+            namespace="candidate-source",
+        )
+        receipt_ref = self.artifacts.put(
+            receipt_bytes,
+            "application/json",
+            namespace="skill-usage",
+        )
+        candidate = {
+            "schema": "forge.capability-package-candidate.v1",
+            "capability_id": team_manifest["capability_id"],
+            "capability_version": team_manifest["capability_version"],
+            "factory_job_id": str(job.factory_job_id),
+            "creation_job_id": str(job.creation_job_id),
+            "correlation_id": str(job.correlation_id),
+            "subject_version": job.subject_version,
+            "attempt": job.attempt,
+            "source_ref": package_ref.model_dump(mode="json"),
+            "team_manifest_ref": references["team-manifest.json"].model_dump(mode="json"),
+            "artifacts": package_artifacts,
+            "skill_usage_receipt_ref": receipt_ref.model_dump(mode="json"),
+            "tool_gaps": rich_gaps,
+            "runbook_ref": references["RUNBOOK.md"].model_dump(mode="json"),
+        }
+        candidate_bytes = json.dumps(
+            candidate, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        candidate_ref = self.artifacts.put(
+            candidate_bytes,
+            "application/json",
+            namespace="candidate",
+        )
         return {
-            "package_manifest_ref": manifest_ref,
-            "artifact_bindings": {"export_package": package_ref},
+            "package_manifest_ref": candidate_ref,
+            "artifact_bindings": {"source_archive": package_ref},
             "skill_usage_receipt_ref": receipt_ref,
-            "tool_gaps": (),
+            "tool_gaps": creation_gaps,
         }
 
     @staticmethod
@@ -436,6 +678,22 @@ class SwarmPipelineAdapter:
         self, job: CreationJobV1, snapshot: dict[str, Any]
     ) -> CreationResultV1:
         state = SwarmSnapshot.model_validate(snapshot)
+        if state.package_manifest_ref is None and state.tool_gaps:
+            failure_refs = tuple(gap.evidence_ref for gap in state.tool_gaps)
+            return CreationResultV1(
+                creation_job_id=job.creation_job_id,
+                correlation_id=job.correlation_id,
+                subject_version=job.subject_version,
+                attempt=job.attempt,
+                status="blocked",
+                evidence_refs=failure_refs,
+                tool_gaps=state.tool_gaps,
+                failure=CreationFailure(
+                    code="tool_unresolved",
+                    summary="creation package contract is unresolved",
+                    evidence_refs=failure_refs,
+                ),
+            )
         if state.package_manifest_ref is None:
             return CreationResultV1(
                 creation_job_id=job.creation_job_id,
@@ -448,7 +706,10 @@ class SwarmPipelineAdapter:
                     summary="creation package evidence incomplete",
                 ),
             )
-        if state.skill_usage_receipt_ref is None:
+        if state.skill_usage_receipt_ref is None or any(
+            gap.severity == "required" and gap.status == "unresolved"
+            for gap in state.tool_gaps
+        ):
             failure_refs = tuple(gap.evidence_ref for gap in state.tool_gaps)
             return CreationResultV1(
                 creation_job_id=job.creation_job_id,

@@ -7,6 +7,10 @@ from typing import Any
 import pytest
 
 from minibook.swarm.contracts import CreationJobV1
+from agenten.agent_factory.capability_live_adapters import ContentAddressedArtifactStore
+from agenten.agent_factory.outcome_contracts import ForgeCapabilityPackageCandidateV1
+from agenten.agent_runtime.contracts import ArtifactRef as CaptainArtifactRef
+from minibook.swarm.contracts import ArtifactRef as MinibookArtifactRef
 from minibook.swarm.pipeline_adapter import (
     ContentAddressedCreationArtifacts,
     ExportArtifactSnapshotter,
@@ -138,10 +142,48 @@ def _export_tree(path: Path, *, with_receipt: bool) -> None:
     (path / "src").mkdir(parents=True)
     (path / "src/main.py").write_text("print('ready')\n", encoding="utf-8")
     (path / "project.yml").write_text("name: ready\n", encoding="utf-8")
+    (path / "autogen").mkdir()
+    (path / "autogen/team.py").write_text("TEAM_READY = True\n", encoding="utf-8")
+    (path / "skills/factory").mkdir(parents=True)
+    (path / "skills/factory/SKILL.md").write_text("# Factory skill\n", encoding="utf-8")
+    (path / "tests").mkdir()
+    (path / "tests/test_team.py").write_text(
+        "def test_team_ready():\n    assert True\n", encoding="utf-8"
+    )
+    (path / "evidence").mkdir()
+    (path / "evidence/assertions.json").write_text(
+        json.dumps(
+            {
+                "schema": "minibook.creation-assertions.v1",
+                "assertion_ids": list(job().public_assertion_ids),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    (path / "evidence/tool-gaps.json").write_text(
+        json.dumps(
+            {"schema": "minibook.creation-tool-gaps.v1", "tool_gaps": []},
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    (path / "RUNBOOK.md").write_text("# Runbook\n", encoding="utf-8")
+    (path / "team-manifest.json").write_text(
+        json.dumps(
+            {
+                "schema": "autogen-team.v1",
+                "capability_id": "requested-team",
+                "capability_version": 1,
+                "autogen_modules": ["autogen/team.py"],
+                "test_paths": ["tests/test_team.py"],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
     if with_receipt:
-        evidence = path / "evidence"
-        evidence.mkdir()
-        (evidence / "hermes-skill-usage-receipt.json").write_text(
+        (path / "evidence/hermes-skill-usage-receipt.json").write_text(
             json.dumps(_hermes_receipt(), sort_keys=True), encoding="utf-8"
         )
 
@@ -167,10 +209,27 @@ async def test_export_snapshot_uses_real_content_and_hermes_receipt(tmp_path: Pa
     assert result.status == "succeeded"
     assert result.package_manifest_ref is not None
     assert result.skill_usage_receipt_ref is not None
-    assert artifacts.read(result.package_manifest_ref)
+    candidate = ForgeCapabilityPackageCandidateV1.model_validate_json(
+        artifacts.read(result.package_manifest_ref)
+    )
+    assert candidate.factory_job_id == job().factory_job_id
+    assert candidate.creation_job_id == job().creation_job_id
+    assert candidate.capability_id == "requested-team"
+    assert candidate.skill_usage_receipt_ref == CaptainArtifactRef.model_validate(
+        result.skill_usage_receipt_ref.model_dump(mode="json")
+    )
     assert json.loads(artifacts.read(result.skill_usage_receipt_ref))["producer"] == "hermes"
     assert len(result.artifact_refs) == 1
     assert artifacts.read(result.artifact_refs[0]).startswith(b"PK")
+    captain = ContentAddressedArtifactStore(tmp_path / "artifacts")
+    references = (
+        candidate.source_ref,
+        candidate.team_manifest_ref,
+        candidate.skill_usage_receipt_ref,
+        candidate.runbook_ref,
+        *(item.reference for item in candidate.artifacts),
+    )
+    assert all(captain.read_bytes(reference) for reference in references)
 
 
 @pytest.mark.asyncio
@@ -205,7 +264,7 @@ async def test_export_without_hermes_receipt_is_required_todo_tool(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_export_rejects_receipt_for_another_factory_job(tmp_path: Path) -> None:
+async def test_export_blocks_receipt_for_another_factory_job(tmp_path: Path) -> None:
     export = tmp_path / "export"
     _export_tree(export, with_receipt=True)
     receipt_path = export / "evidence/hermes-skill-usage-receipt.json"
@@ -222,10 +281,13 @@ async def test_export_rejects_receipt_for_another_factory_job(tmp_path: Path) ->
     )
     prior = SwarmSnapshot(creation_job_id=job().creation_job_id)
 
-    with pytest.raises(ValueError, match="factory job"):
-        await adapter.run_step(
-            job(), SwarmStep.EXPORT.value, prior.model_dump(), "effect", None
-        )
+    outcome = await adapter.run_step(
+        job(), SwarmStep.EXPORT.value, prior.model_dump(), "effect", None
+    )
+    result = adapter.assemble_result(job(), outcome.snapshot)
+
+    assert result.status == "blocked"
+    assert result.tool_gaps[0].gap_id == "forge-capability-candidate-contract"
 
 
 @pytest.mark.asyncio
@@ -267,3 +329,46 @@ async def test_export_effect_receipt_replays_structured_snapshot_without_dispatc
 
     assert result.status == "blocked"
     assert result.tool_gaps[0].gap_id == "hermes-skill-usage-receipt"
+
+
+def test_creation_artifacts_read_captain_seeded_input_ref(tmp_path: Path) -> None:
+    root = tmp_path / "shared-artifacts"
+    captain = ContentAddressedArtifactStore(root)
+    captain_ref = captain.put(
+        b"Build the requested team",
+        "text/markdown",
+        namespace="creation-input",
+    )
+    minibook = ContentAddressedCreationArtifacts(root)
+
+    assert minibook.read(
+        MinibookArtifactRef.model_validate(captain_ref.model_dump(mode="json"))
+    ) == b"Build the requested team"
+
+
+def test_captain_reads_minibook_exported_artifact_refs(tmp_path: Path) -> None:
+    root = tmp_path / "shared-artifacts"
+    minibook = ContentAddressedCreationArtifacts(root)
+    minibook_ref = minibook.put(
+        b'{"schema":"minibook.creation-export-manifest.v1"}',
+        "application/json",
+        namespace="creation-export-manifest",
+    )
+    captain = ContentAddressedArtifactStore(root)
+
+    assert captain.read_bytes(
+        CaptainArtifactRef.model_validate(minibook_ref.model_dump(mode="json"))
+    ) == b'{"schema":"minibook.creation-export-manifest.v1"}'
+
+
+def test_creation_artifacts_reject_uri_outside_shared_capability_store(
+    tmp_path: Path,
+) -> None:
+    store = ContentAddressedCreationArtifacts(tmp_path / "artifacts")
+    reference = store.put(b"content", "application/octet-stream")
+    changed = reference.model_copy(
+        update={"uri": f"artifact://other-store/{reference.sha256}"}
+    )
+
+    with pytest.raises(ValueError, match="outside the capability store"):
+        store.read(changed)
