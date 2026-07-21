@@ -50,21 +50,30 @@ def _runtime_result() -> AgentRuntimeResult:
     return AgentRuntimeResult.model_validate(_fixture("agent_runtime_result.v1.json"))
 
 
-def _bound_execution_outcome() -> ExecutionOutcomeV1:
+def _runtime_binding() -> tuple[
+    ExecutionOutcomeV1,
+    AgentRuntimeCommand,
+    AgentRuntimeResult,
+]:
+    outcome = ExecutionOutcomeV1.model_validate(
+        _fixture("execution_outcome.v1.json")
+    )
     command = _runtime_command()
     result = _runtime_result()
-    payload = _fixture("execution_outcome.v1.json")
-    payload.update(
-        {
-            "capability_id": command.subject_id,
-            "capability_version": command.subject_version,
-            "team_version": result.subject_version,
-            "correlation_id": str(command.correlation_id),
-            "command_id": str(command.event_id),
-            "result_id": str(result.event_id),
+    command = command.model_copy(
+        update={
+            "event_id": outcome.command_id,
+            "correlation_id": outcome.correlation_id,
         }
     )
-    return ExecutionOutcomeV1.model_validate(payload)
+    result = result.model_copy(
+        update={
+            "event_id": outcome.result_id,
+            "command_id": outcome.command_id,
+            "correlation_id": outcome.correlation_id,
+        }
+    )
+    return outcome, command, result
 
 
 def test_capability_package_fixture_is_strict_frozen_and_round_trips() -> None:
@@ -232,6 +241,7 @@ def test_execution_outcome_fixture_is_strict_frozen_and_round_trips() -> None:
         {"credentials": {"CRM_API_KEY": "not-redacted"}},
         {"notes": "authorization: Bearer abcdefghijklmnop"},
         {"holdout_body": "private case"},
+        {"holdout": {"instructions": "private case"}},
         {"holdout_case": {"input": "private case"}},
         {"private_case": {"input": "private case"}},
         {"case_body": "private case"},
@@ -242,6 +252,9 @@ def test_execution_outcome_fixture_is_strict_frozen_and_round_trips() -> None:
         {"output_path": "/etc/captain/config.json"},
         {"notes": "read result from /opt/captain/result.json"},
         {"output_path": "/workspace/result.json"},
+        {"artifact": "file:///etc/captain/config.json"},
+        {"artifact": "FILE://localhost/C:/captain/config.json"},
+        {"artifact": "file:C:\\captain\\config.json"},
     ),
 )
 def test_execution_outcome_recursively_rejects_private_or_local_content(
@@ -283,13 +296,18 @@ def test_escalation_reference_is_bound_to_escalated_status() -> None:
 
 
 def test_execution_outcome_binds_to_authoritative_runtime_command_and_result() -> None:
-    outcome = _bound_execution_outcome()
+    outcome, command, result = _runtime_binding()
+
+    assert outcome.capability_id != command.subject_id
 
     assert (
         validate_execution_outcome_binding(
             outcome,
-            command=_runtime_command(),
-            result=_runtime_result(),
+            command=command,
+            result=result,
+            expected_capability_id=outcome.capability_id,
+            expected_capability_version=outcome.capability_version,
+            expected_team_version=outcome.team_version,
         )
         is outcome
     )
@@ -311,13 +329,17 @@ def test_execution_outcome_rejects_unbound_runtime_identity(
     value: object,
     message: str,
 ) -> None:
-    outcome = _bound_execution_outcome().model_copy(update={field: value})
+    outcome, command, result = _runtime_binding()
+    outcome = outcome.model_copy(update={field: value})
 
     with pytest.raises(ValueError, match=message):
         validate_execution_outcome_binding(
             outcome,
-            command=_runtime_command(),
-            result=_runtime_result(),
+            command=command,
+            result=result,
+            expected_capability_id="support_triage",
+            expected_capability_version=1,
+            expected_team_version=1,
         )
 
 
@@ -335,11 +357,15 @@ def test_execution_outcome_rejects_result_not_bound_to_command(
     updates: dict[str, object],
     message: str,
 ) -> None:
+    outcome, command, result = _runtime_binding()
     with pytest.raises(ValueError, match=message):
         validate_execution_outcome_binding(
-            _bound_execution_outcome(),
-            command=_runtime_command(),
-            result=_runtime_result().model_copy(update=updates),
+            outcome,
+            command=command,
+            result=result.model_copy(update=updates),
+            expected_capability_id=outcome.capability_id,
+            expected_capability_version=outcome.capability_version,
+            expected_team_version=outcome.team_version,
         )
 
 

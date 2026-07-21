@@ -35,7 +35,8 @@ _SECRET_KEY_PATTERN = re.compile(
     r"private[_-]?key|secrets?|tokens?)(?:$|[_-])"
 )
 _PRIVATE_BODY_KEY_PATTERN = re.compile(
-    r"(?i)(?:holdout.*(?:body|case)|raw.*holdout|private.*case|case.*body|transcripts?)"
+    r"(?i)(?:^holdouts?$|holdout.*(?:body|case)|raw.*holdout|private.*case|"
+    r"case.*body|transcripts?)"
 )
 _SECRET_VALUE_PATTERN = re.compile(
     r"(?i)(?:\bsk-(?:proj-)?[a-z0-9_-]{8,}|\bbearer\s+\S+|"
@@ -44,6 +45,7 @@ _SECRET_VALUE_PATTERN = re.compile(
 _ABSOLUTE_LOCAL_PATH_PATTERN = re.compile(
     r"(?i)(?<![A-Za-z0-9:/])(?:[a-z]:[\\/]|\\\\|/(?!/))"
 )
+_LOCAL_FILE_URI_PATTERN = re.compile(r"(?i)\bfile\s*:")
 
 
 class _FrozenContract(BaseModel):
@@ -290,8 +292,11 @@ def validate_execution_outcome_binding(
     *,
     command: AgentRuntimeCommand,
     result: AgentRuntimeResult,
+    expected_capability_id: str,
+    expected_capability_version: int,
+    expected_team_version: int,
 ) -> ExecutionOutcomeV1:
-    """Bind an execution outcome to one authoritative runtime command/result pair."""
+    """Bind runtime IDs and separately supplied authoritative capability identity."""
 
     if result.command_id != command.event_id:
         raise ValueError("runtime result command identity does not match command")
@@ -303,12 +308,12 @@ def validate_execution_outcome_binding(
         raise ValueError("runtime result subject version does not match command")
     if result.operation is not command.payload.operation:
         raise ValueError("runtime result operation does not match command")
-    if outcome.capability_id != command.subject_id:
-        raise ValueError("execution outcome capability identity does not match command subject")
-    if outcome.capability_version != command.subject_version:
-        raise ValueError("execution outcome capability version does not match command subject")
-    if outcome.team_version != result.subject_version:
-        raise ValueError("execution outcome team version does not match runtime result")
+    if outcome.capability_id != expected_capability_id:
+        raise ValueError("execution outcome capability identity does not match authority")
+    if outcome.capability_version != expected_capability_version:
+        raise ValueError("execution outcome capability version does not match authority")
+    if outcome.team_version != expected_team_version:
+        raise ValueError("execution outcome team version does not match authority")
     if outcome.correlation_id != command.correlation_id:
         raise ValueError("execution outcome correlation does not match runtime command")
     if outcome.command_id != command.event_id:
@@ -359,5 +364,7 @@ def _reject_private_content(value: object, location: str) -> None:
     if isinstance(value, str):
         if _SECRET_VALUE_PATTERN.search(value):
             raise ValueError(f"{location} contains a private value")
+        if _LOCAL_FILE_URI_PATTERN.search(value):
+            raise ValueError(f"{location} contains an unrestricted local path")
         if _ABSOLUTE_LOCAL_PATH_PATTERN.search(value):
             raise ValueError(f"{location} contains an unrestricted local path")
