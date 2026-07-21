@@ -14,6 +14,7 @@ from .constants import (
     anthropic_client, openai_client,
 )
 from .knowledge import _handle_rag_tool_call
+from .cost_budget import LlmBudgetExceeded, reserve_openai_chat_completion
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +38,17 @@ def _extract_text(response) -> str:
         if block.type == "text":
             return block.text
     return ""
+
+
+async def _budgeted_openai_chat_completion(**kwargs):
+    max_output_tokens = kwargs.get("max_completion_tokens", kwargs.get("max_tokens"))
+    if not isinstance(max_output_tokens, int):
+        raise ValueError("OpenAI completion has no explicit output-token limit")
+    reserve_openai_chat_completion(
+        payload=kwargs,
+        max_output_tokens=max_output_tokens,
+    )
+    return await openai_client.chat.completions.create(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +78,7 @@ async def _anthropic_text(system_prompt: str, user_content: str, max_tokens: int
 
 async def _openai_text(system_prompt: str, user_content: str, max_tokens: int) -> str:
     try:
-        response = await openai_client.chat.completions.create(
+        response = await _budgeted_openai_chat_completion(
             model=DEFAULT_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -76,6 +88,8 @@ async def _openai_text(system_prompt: str, user_content: str, max_tokens: int) -
             temperature=0.4,
         )
         return response.choices[0].message.content
+    except LlmBudgetExceeded:
+        raise
     except Exception as e:
         return f"[OpenAI Error: {e}]"
 
@@ -117,7 +131,7 @@ async def _anthropic_json(system_prompt: str, user_content: str, max_tokens: int
 
 async def _openai_json(system_prompt: str, user_content: str, max_tokens: int) -> dict:
     try:
-        response = await openai_client.chat.completions.create(
+        response = await _budgeted_openai_chat_completion(
             model=DEFAULT_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -129,6 +143,8 @@ async def _openai_json(system_prompt: str, user_content: str, max_tokens: int) -
         )
         text = response.choices[0].message.content
         return json.loads(text)
+    except LlmBudgetExceeded:
+        raise
     except json.JSONDecodeError as e:
         print(f"  [!] OpenAI JSON parse error: {e}")
         return {}
@@ -234,7 +250,9 @@ async def _openai_with_tools(system_prompt: str, user_content: str,
             kwargs["tool_choice"] = "auto"
 
         try:
-            response = await openai_client.chat.completions.create(**kwargs)
+            response = await _budgeted_openai_chat_completion(**kwargs)
+        except LlmBudgetExceeded:
+            raise
         except Exception as e:
             return f"[OpenAI Error: {e}]"
 
@@ -257,11 +275,13 @@ async def _openai_with_tools(system_prompt: str, user_content: str,
             print(f"  [RAG] Tool call: {tc.function.name}({args}) -> {len(result)} chars")
 
     try:
-        response = await openai_client.chat.completions.create(
+        response = await _budgeted_openai_chat_completion(
             model=DEFAULT_MODEL, messages=messages,
             **_oai_token_kwarg(max_tokens), temperature=0.4,
         )
         return response.choices[0].message.content or ""
+    except LlmBudgetExceeded:
+        raise
     except Exception as e:
         return f"[OpenAI Error: {e}]"
 
@@ -314,7 +334,7 @@ async def _openai_vision(system_prompt: str, user_text: str, image_path: Path,
     try:
         mime = _image_mime(image_path)
         b64 = base64.b64encode(image_path.read_bytes()).decode()
-        response = await openai_client.chat.completions.create(
+        response = await _budgeted_openai_chat_completion(
             model=DEFAULT_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -329,6 +349,8 @@ async def _openai_vision(system_prompt: str, user_text: str, image_path: Path,
             temperature=0.3,
         )
         return response.choices[0].message.content
+    except LlmBudgetExceeded:
+        raise
     except Exception as e:
         return f"[OpenAI Vision Error: {e}]"
 
@@ -379,7 +401,7 @@ async def _openai_vision_json(system_prompt: str, user_text: str, image_path: Pa
     try:
         mime = _image_mime(image_path)
         b64 = base64.b64encode(image_path.read_bytes()).decode()
-        response = await openai_client.chat.completions.create(
+        response = await _budgeted_openai_chat_completion(
             model=DEFAULT_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -396,6 +418,8 @@ async def _openai_vision_json(system_prompt: str, user_text: str, image_path: Pa
         )
         text = response.choices[0].message.content
         return json.loads(text)
+    except LlmBudgetExceeded:
+        raise
     except json.JSONDecodeError as e:
         print(f"  [!] OpenAI Vision JSON parse error: {e}")
         return {}

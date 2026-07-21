@@ -28,29 +28,32 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import yaml
 import aiohttp
 
 # --- Re-exports from swarm package (backward compatibility) ---
-from swarm.constants import (
+from minibook.swarm.constants import (
     CascadeContext, MINIBOOK_URL, OUTPUT_DIR, CREDS_FILE,
     FORGE_API_PORT, LLM_PROVIDER,
 )
-from swarm.knowledge import AGENT_ROLES, FORGE_AGENT_ROLES
-from swarm.api_client import (
+from minibook.swarm.knowledge import AGENT_ROLES, FORGE_AGENT_ROLES
+from minibook.swarm.api_client import (
     api_post, api_get, load_credentials, save_credentials, register_agent,
     register_agent_in_registry,
 )
-from swarm.llm import call_gpt4o, call_gpt4o_json, call_gpt4o_with_tools
-from swarm.docker_ops import stop_mcp_gateway
-from swarm.code_processing import load_cascade_context, write_output
-from swarm.pipeline import SwarmPipeline
-from swarm.pipeline_adapter import PIPELINE_STEP_ORDER, SwarmPipelineAdapter
-from swarm.forge_agents import ForgeState, load_forge_state, save_forge_state
-from swarm.forge_orchestrator import ForgeOrchestrator, ForgeAPI
-from swarm.input_designer import InputDesignPipeline
-from swarm.local_services import default_npm_command, ensure_frontend_dependencies
-from swarm.runtime_options import parse_runtime_options
+from minibook.swarm.llm import call_gpt4o, call_gpt4o_json, call_gpt4o_with_tools
+from minibook.swarm.docker_ops import stop_mcp_gateway
+from minibook.swarm.code_processing import load_cascade_context, write_output
+from minibook.swarm.pipeline import SwarmPipeline
+from minibook.swarm.pipeline_adapter import PIPELINE_STEP_ORDER, SwarmPipelineAdapter
+from minibook.swarm.forge_agents import ForgeState, load_forge_state, save_forge_state
+from minibook.swarm.forge_orchestrator import ForgeOrchestrator, ForgeAPI
+from minibook.swarm.input_designer import InputDesignPipeline
+from minibook.swarm.local_services import default_npm_command, ensure_frontend_dependencies
+from minibook.swarm.runtime_options import parse_runtime_options
 
 
 # --- Setup ---
@@ -1202,7 +1205,7 @@ async def main():
                 image_path = pngs[0] if pngs else None
             if image_path:
                 print(f"[InputFile] Auto-detected org chart image: {image_path}")
-        from swarm.input_parser import parse_input_file_llm
+        from minibook.swarm.input_parser import parse_input_file_llm
         manifest = await parse_input_file_llm(input_path, image_path)
         if not task:
             org_name = manifest.get("org_name", "AI Agent Organisation")
@@ -1348,7 +1351,7 @@ async def company_main():
     print(f"  Profile: {profile_path}")
     print("=" * 70)
 
-    from swarm.company_builder import parse_company_profile, OrgBoard, CrossTeamLinker
+    from minibook.swarm.company_builder import parse_company_profile, OrgBoard, CrossTeamLinker
 
     async with aiohttp.ClientSession() as session:
         await _ensure_minibook(session)
@@ -1434,7 +1437,7 @@ async def design_main():
         await _ensure_minibook(session)
 
         # Register InputDesign agents
-        from swarm.knowledge import INPUT_DESIGN_ROLES
+        from minibook.swarm.knowledge import INPUT_DESIGN_ROLES
         creds = load_credentials()
         agents = {}
         for name in INPUT_DESIGN_ROLES:

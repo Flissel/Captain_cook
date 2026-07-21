@@ -169,9 +169,16 @@ def test_creation_runtime_is_not_constructed_without_opt_in() -> None:
 @pytest.mark.asyncio
 async def test_production_factory_injects_real_session_agents_project_and_input(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from minibook.swarm.creation_runtime import ProductionSwarmPipelineFactory
     from minibook.swarm.pipeline_adapter import ContentAddressedCreationArtifacts
+    from minibook.swarm import constants
+    from minibook.swarm.cost_budget import reserve_openai_chat_completion
+
+    monkeypatch.setenv("CAPTAIN_FACTORY_MAX_COST_USD", "1.00")
+    monkeypatch.setattr(constants, "LLM_PROVIDER", "openai")
+    monkeypatch.setattr(constants, "DEFAULT_MODEL", "gpt-4o-mini")
 
     calls: list[object] = []
 
@@ -186,6 +193,10 @@ async def test_production_factory_injects_real_session_agents_project_and_input(
 
     async def setup_agents(session: Session) -> dict[str, object]:
         calls.append(("agents", session))
+        calls.append(("budget", reserve_openai_chat_completion(
+            payload={"messages": [{"role": "user", "content": "probe"}]},
+            max_output_tokens=10,
+        )))
         return {"SwarmManager": {"api_key": "not-persisted"}}
 
     async def setup_project(
@@ -224,6 +235,7 @@ async def test_production_factory_injects_real_session_agents_project_and_input(
     assert calls[0] == "session-open"
     assert calls[-1] == "session-close"
     assert ("input", creation_job().input_ref.sha256) in calls
+    assert any(isinstance(call, tuple) and call[0] == "budget" and call[1] > 0 for call in calls)
     assert any(
         isinstance(call, tuple)
         and call[0] == "pipeline"

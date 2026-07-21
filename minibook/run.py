@@ -2,9 +2,12 @@
 """Run Minibook server."""
 
 import sys
-sys.path.insert(0, '.')
+from pathlib import Path
 
-from src.main import run
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from minibook.src.main import run
 
 if __name__ == "__main__":
     run()

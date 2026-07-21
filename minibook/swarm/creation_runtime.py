@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import AsyncIterator, Callable, Mapping
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -19,6 +19,7 @@ from .pipeline_adapter import (
     translate_creation_failure,
 )
 from .runner import CreationRunner, PipelineStepPort
+from .cost_budget import llm_cost_budget
 
 
 class CreationPipelineFactory(Protocol):
@@ -159,33 +160,44 @@ class ProductionSwarmPipelineFactory:
 
     @asynccontextmanager
     async def open(self, job: CreationJobV1) -> AsyncIterator[PipelineStepPort]:
+        from .constants import DEFAULT_MODEL, LLM_PROVIDER
+
+        maximum_cost = os.environ.get("CAPTAIN_FACTORY_MAX_COST_USD", "").strip()
+        if maximum_cost and LLM_PROVIDER != "openai":
+            raise RuntimeError("cost-attested Minibook creation requires the OpenAI provider")
+        budget_scope = (
+            llm_cost_budget(max_usd=maximum_cost, model=DEFAULT_MODEL)
+            if maximum_cost
+            else nullcontext()
+        )
         session_factory, setup_agents, setup_project, pipeline_type = self._dependencies()
-        async with session_factory() as session:
-            agents = await setup_agents(session)
-            project_name = f"Factory: {job.creation_job_id}"
-            project_id = await setup_project(session, agents, project_name)
-            if self._input_resolver is None:
-                task = self.artifacts.read(job.input_ref).decode("utf-8")
-            else:
-                task = self._input_resolver(job.input_ref)
-            if not task.strip():
-                raise ValueError("creation input artifact is empty")
-            pipeline = pipeline_type(
-                agents,
-                project_id,
-                task,
-                interactive=False,
-            )
-            snapshotter = ExportArtifactSnapshotter(self.artifacts)
+        with budget_scope:
+            async with session_factory() as session:
+                agents = await setup_agents(session)
+                project_name = f"Factory: {job.creation_job_id}"
+                project_id = await setup_project(session, agents, project_name)
+                if self._input_resolver is None:
+                    task = self.artifacts.read(job.input_ref).decode("utf-8")
+                else:
+                    task = self._input_resolver(job.input_ref)
+                if not task.strip():
+                    raise ValueError("creation input artifact is empty")
+                pipeline = pipeline_type(
+                    agents,
+                    project_id,
+                    task,
+                    interactive=False,
+                )
+                snapshotter = ExportArtifactSnapshotter(self.artifacts)
 
-            def restore(snapshot):
-                return snapshotter.restore(pipeline, snapshot)
+                def restore(snapshot):
+                    return snapshotter.restore(pipeline, snapshot)
 
-            yield SwarmPipelineAdapter(
-                restore,
-                session=session,
-                snapshotter=snapshotter,
-            )
+                yield SwarmPipelineAdapter(
+                    restore,
+                    session=session,
+                    snapshotter=snapshotter,
+                )
 
 
 @dataclass(frozen=True)

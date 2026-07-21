@@ -198,6 +198,9 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "MINIBOOK_CREATION_DB" in source
     assert "MINIBOOK_CREATION_ARTIFACTS" in source
     assert "CAPTAIN_RUNTIME_ARTIFACT_ROOT" in source
+    assert "OPENAI_MODEL" in source and "gpt-4o-mini" in source
+    assert "CAPTAIN_FACTORY_MAX_COST_USD" in source
+    assert "CAPTAIN_FACTORY_MAX_COST_PER_CALL_USD" in source
     assert "Captain Runtime and Minibook capability artifact roots differ" in source
     assert "Write-Output $values" not in source
     assert source.index("Initialize-CaptainN8n $values") < source.index("mariadb-test")
