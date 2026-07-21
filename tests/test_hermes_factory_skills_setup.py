@@ -63,6 +63,49 @@ def _write_fake_hermes(tmp_path: Path) -> Path:
                 return [value] if isinstance(value, str) else list(value)
 
 
+            def resolved_external_dirs(config: dict) -> list[Path]:
+                roots = []
+                for value in external_dirs(config):
+                    root = Path(os.path.expandvars(value)).expanduser()
+                    roots.append(root.resolve() if root.is_absolute() else (home / root).resolve())
+                return roots
+
+
+            def discovered_skills(root: Path):
+                if not root.is_dir():
+                    return
+                for skill_file in sorted(root.rglob("SKILL.md")):
+                    relative_parts = skill_file.relative_to(root).parts
+                    if any(
+                        part
+                        in {
+                            ".git",
+                            ".github",
+                            ".hub",
+                            ".archive",
+                            ".venv",
+                            "venv",
+                            "node_modules",
+                            "site-packages",
+                            "__pycache__",
+                            ".tox",
+                            ".nox",
+                            ".pytest_cache",
+                            ".mypy_cache",
+                            ".ruff_cache",
+                        }
+                        for part in relative_parts
+                    ):
+                        continue
+                    content = skill_file.read_text(encoding="utf-8-sig")
+                    frontmatter = {}
+                    if content.startswith("---"):
+                        parts = content.split("---", 2)
+                        if len(parts) == 3:
+                            frontmatter = yaml.safe_load(parts[1]) or {}
+                    yield str(frontmatter.get("name") or skill_file.parent.name), skill_file
+
+
             home.mkdir(parents=True, exist_ok=True)
             with (home / "calls.log").open("a", encoding="utf-8") as log:
                 log.write(json.dumps(args) + "\\n")
@@ -83,14 +126,17 @@ def _write_fake_hermes(tmp_path: Path) -> Path:
             elif args[:2] == ["skills", "list"]:
                 config = load_config()
                 disabled = set(config.get("skills", {}).get("disabled", []))
-                for directory in external_dirs(config):
-                    root = Path(directory)
-                    if not root.is_dir():
-                        continue
-                    for skill in sorted(root.iterdir()):
-                        if skill.name in disabled or not (skill / "SKILL.md").is_file():
+                seen = set()
+                for source, root in [("local", home / "skills")] + [
+                    ("external", path) for path in resolved_external_dirs(config)
+                ]:
+                    for name, skill_file in discovered_skills(root) or ():
+                        if name in seen:
                             continue
-                        print(f"{skill.name} | external | enabled | {skill.resolve()}")
+                        seen.add(name)
+                        if name in disabled:
+                            continue
+                        print(f"{name} | {source} | enabled | {skill_file.parent.resolve()}")
             elif args[:2] == ["bundles", "create"]:
                 name = args[2]
                 skills = [args[index + 1] for index, value in enumerate(args) if value == "--skill"]
@@ -121,7 +167,11 @@ def _write_fake_hermes(tmp_path: Path) -> Path:
                     print(f"- {skill}")
             elif args[:2] == ["bundles", "delete"]:
                 name = args[2]
-                (home / "skill-bundles" / f"{name}.yaml").unlink()
+                bundle_path = home / "skill-bundles" / f"{name}.yaml"
+                if not bundle_path.exists():
+                    print(f"Bundle not found: /{name}", file=sys.stderr)
+                    raise SystemExit(1)
+                bundle_path.unlink()
                 print(f"Deleted bundle: /{name}")
             else:
                 raise SystemExit(f"unsupported fake Hermes command: {args}")
@@ -227,23 +277,52 @@ def test_configure_script_rejects_changed_or_missing_released_skill(
     assert not (hermes_home / "config.yaml").exists()
 
 
-def test_configure_script_rejects_shadowed_skill(tmp_path: Path) -> None:
+@pytest.mark.parametrize("source", ("local", "external"))
+def test_configure_script_rejects_nested_frontmatter_shadow(
+    tmp_path: Path, source: str
+) -> None:
     env, hermes_home = _environment(tmp_path)
-    shadow_root = tmp_path / "shadow-skills"
-    shadow = shadow_root / SKILL_NAMES[0]
+    shadow_root = (
+        hermes_home / "skills" if source == "local" else tmp_path / "shadow-skills"
+    )
+    shadow = shadow_root / "nested" / "alias-directory"
     shadow.mkdir(parents=True)
-    (shadow / "SKILL.md").write_text("---\nname: shadow\n---\n", encoding="utf-8")
-    hermes_home.mkdir()
-    (hermes_home / "config.yaml").write_text(
-        yaml.safe_dump({"skills": {"external_dirs": [str(shadow_root.resolve())]}}),
+    (shadow / "SKILL.md").write_text(
+        f"---\nname: {SKILL_NAMES[0]}\ndescription: shadow\n---\n",
         encoding="utf-8",
     )
+    if source == "external":
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump({"skills": {"external_dirs": [str(shadow_root.resolve())]}}),
+            encoding="utf-8",
+        )
 
     result = subprocess.run(_command(ROOT), env=env, text=True, capture_output=True)
 
     assert result.returncode != 0
     assert "shadow" in (result.stdout + result.stderr).lower()
     assert not (hermes_home / "skill-bundles").exists()
+
+
+def test_configure_script_preserves_hermes_home_relative_external_dir(
+    tmp_path: Path,
+) -> None:
+    env, hermes_home = _environment(tmp_path)
+    relative = Path("team-skills")
+    (hermes_home / relative).mkdir(parents=True)
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump({"skills": {"external_dirs": [relative.as_posix()]}}),
+        encoding="utf-8",
+    )
+
+    subprocess.run(_command(ROOT), env=env, text=True, capture_output=True, check=True)
+
+    config = yaml.safe_load((hermes_home / "config.yaml").read_text(encoding="utf-8"))
+    assert config["skills"]["external_dirs"] == [
+        relative.as_posix(),
+        str((ROOT / "agenten" / "agent_factory" / "skills").resolve()),
+    ]
 
 
 def test_configure_script_rejects_disabled_skill_before_bundle(tmp_path: Path) -> None:
@@ -285,6 +364,34 @@ def test_remove_deletes_only_repository_path_and_factory_bundle(tmp_path: Path) 
         hermes_home / "skill-bundles" / "captain-agent-factory-loop.yaml"
     ).exists()
     assert "removed" in removed.stdout.lower()
+
+    removed_again = subprocess.run(
+        _command(ROOT, remove=True),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    config = yaml.safe_load((hermes_home / "config.yaml").read_text(encoding="utf-8"))
+    assert config["skills"]["external_dirs"] == [str(unrelated)]
+    assert "already removed" in removed_again.stdout.lower()
+
+
+def test_remove_succeeds_when_key_path_and_bundle_are_absent(tmp_path: Path) -> None:
+    env, hermes_home = _environment(tmp_path)
+
+    result = subprocess.run(
+        _command(ROOT, remove=True),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert "already removed" in result.stdout.lower()
+    calls = (hermes_home / "calls.log").read_text(encoding="utf-8")
+    assert '["bundles", "delete", "captain-agent-factory-loop"]' in calls
+    assert not (hermes_home / "config.yaml").exists()
 
 
 def test_runbook_documents_setup_verification_and_scoped_rollback() -> None:

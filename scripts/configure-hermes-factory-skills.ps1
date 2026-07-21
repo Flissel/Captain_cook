@@ -41,18 +41,26 @@ function Invoke-Hermes {
     return [string]::Join([Environment]::NewLine, @($output))
 }
 
-function ConvertTo-AbsolutePath {
-    param([Parameter(Mandatory)][string]$Value)
+function Resolve-ExternalDirectoryPath {
+    param(
+        [Parameter(Mandatory)][string]$Value,
+        [Parameter(Mandatory)][string]$HermesHome
+    )
 
     $expanded = [Environment]::ExpandEnvironmentVariables($Value.Trim())
     if ($expanded -eq '~' -or $expanded.StartsWith("~$([System.IO.Path]::DirectorySeparatorChar)")) {
         $profileRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
         $expanded = Join-Path $profileRoot $expanded.Substring(1).TrimStart('\', '/')
     }
+    if (-not [System.IO.Path]::IsPathFullyQualified($expanded)) {
+        $expanded = Join-Path $HermesHome $expanded
+    }
     return [System.IO.Path]::GetFullPath($expanded)
 }
 
-function Read-ExternalDirectories {
+function Read-ExternalDirectoryEntries {
+    param([Parameter(Mandatory)][string]$HermesHome)
+
     $raw = (Invoke-Hermes -Arguments @('config', 'get', 'skills.external_dirs', '--json')).Trim()
     if (-not $raw) {
         throw 'Hermes returned an empty skills.external_dirs value.'
@@ -65,13 +73,26 @@ function Read-ExternalDirectories {
     }
 
     if ($raw.StartsWith('[')) {
-        return @($decoded | ForEach-Object { ConvertTo-AbsolutePath -Value ([string]$_) })
+        return @(
+            $decoded | ForEach-Object {
+                $value = [string]$_
+                [pscustomobject]@{
+                    Raw = $value
+                    Resolved = Resolve-ExternalDirectoryPath -Value $value -HermesHome $HermesHome
+                }
+            }
+        )
     }
     if ($raw.StartsWith('"') -and $decoded -is [string]) {
         if ($decoded.Trim().StartsWith('[')) {
             throw 'Hermes skills.external_dirs is a JSON array encoded as a string; refusing an unsafe merge.'
         }
-        return @((ConvertTo-AbsolutePath -Value $decoded))
+        return @(
+            [pscustomobject]@{
+                Raw = $decoded
+                Resolved = Resolve-ExternalDirectoryPath -Value $decoded -HermesHome $HermesHome
+            }
+        )
     }
     if ($null -eq $decoded) {
         return @()
@@ -130,7 +151,10 @@ function Assert-JsonArrayConfigSupport {
 }
 
 function Set-ExternalDirectories {
-    param([Parameter(Mandatory)][string[]]$Directories)
+    param(
+        [Parameter(Mandatory)][string[]]$Directories,
+        [Parameter(Mandatory)][string]$HermesHome
+    )
 
     Assert-JsonArrayConfigSupport
     $externalDirsJson = ConvertTo-Json -InputObject @($Directories) -Compress
@@ -139,15 +163,94 @@ function Set-ExternalDirectories {
     if (-not $roundTripRaw.StartsWith('[')) {
         throw 'Hermes did not persist skills.external_dirs as an array.'
     }
-    $roundTrip = @(Read-ExternalDirectories)
+    $roundTrip = @(Read-ExternalDirectoryEntries -HermesHome $HermesHome)
     if ($roundTrip.Count -ne $Directories.Count) {
         throw 'Hermes did not preserve every skills.external_dirs entry.'
     }
     for ($index = 0; $index -lt $Directories.Count; $index++) {
-        if (-not [string]::Equals($roundTrip[$index], $Directories[$index], [StringComparison]::OrdinalIgnoreCase)) {
+        if (-not [string]::Equals($roundTrip[$index].Raw, $Directories[$index], [StringComparison]::Ordinal)) {
             throw 'Hermes changed the ordered skills.external_dirs merge.'
         }
     }
+}
+
+function Remove-HermesBundle {
+    param([Parameter(Mandatory)][string]$Name)
+
+    $output = & $HermesExecutable 'bundles' 'delete' $Name 2>&1
+    $exitCode = $LASTEXITCODE
+    $outputText = [string]::Join([Environment]::NewLine, @($output))
+    if ($exitCode -eq 0) {
+        return $true
+    }
+    if ($outputText -match '(?i)(bundle\s+not\s+found|does\s+not\s+exist|unknown\s+bundle)') {
+        return $false
+    }
+    throw "Hermes command failed: hermes bundles delete $Name`n$outputText"
+}
+
+function Get-HermesSkillCandidates {
+    param([Parameter(Mandatory)][string]$Root)
+
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+        return @()
+    }
+
+    $excludedDirectories = @(
+        '.git', '.github', '.hub', '.archive', '.venv', 'venv', 'node_modules',
+        'site-packages', '__pycache__', '.tox', '.nox', '.pytest_cache',
+        '.mypy_cache', '.ruff_cache'
+    )
+    $supportDirectories = @('references', 'templates', 'assets', 'scripts')
+    $candidates = @()
+    foreach ($skillFile in @(Get-ChildItem -LiteralPath $Root -File -Recurse -Filter 'SKILL.md' | Sort-Object FullName)) {
+        $relativePath = [System.IO.Path]::GetRelativePath($Root, $skillFile.FullName)
+        $parts = @($relativePath -split '[\\/]')
+        $skip = $false
+        for ($index = 0; $index -lt ($parts.Count - 1); $index++) {
+            if ($excludedDirectories -contains $parts[$index]) {
+                $skip = $true
+                break
+            }
+            if ($supportDirectories -contains $parts[$index]) {
+                $ancestor = $Root
+                for ($ancestorIndex = 0; $ancestorIndex -lt $index; $ancestorIndex++) {
+                    $ancestor = Join-Path $ancestor $parts[$ancestorIndex]
+                }
+                if (Test-Path -LiteralPath (Join-Path $ancestor 'SKILL.md') -PathType Leaf) {
+                    $skip = $true
+                    break
+                }
+            }
+        }
+        if ($skip) {
+            continue
+        }
+
+        $skillName = $skillFile.Directory.Name
+        $content = Get-Content -Raw -LiteralPath $skillFile.FullName
+        $frontmatterMatch = [regex]::Match(
+            $content,
+            '(?s)\A(?:\uFEFF)?---\s*\r?\n(?<frontmatter>.*?)\r?\n---(?:\s*\r?\n|\z)'
+        )
+        if ($frontmatterMatch.Success) {
+            $nameMatch = [regex]::Match(
+                $frontmatterMatch.Groups['frontmatter'].Value,
+                '(?m)^\s*name\s*:\s*(?<name>[^#\r\n]+?)\s*$'
+            )
+            if ($nameMatch.Success) {
+                $parsedName = $nameMatch.Groups['name'].Value.Trim().Trim([char[]]@([char]39, [char]34))
+                if ($parsedName) {
+                    $skillName = $parsedName
+                }
+            }
+        }
+        $candidates += [pscustomobject]@{
+            Name = $skillName
+            Path = $skillFile.Directory.FullName
+        }
+    }
+    return $candidates
 }
 
 $resolvedRepositoryRoot = (Resolve-Path -LiteralPath $RepositoryRoot).Path
@@ -158,22 +261,41 @@ if (-not (Get-Command $HermesExecutable -ErrorAction SilentlyContinue)) {
     throw "Hermes executable was not found: $HermesExecutable"
 }
 
-$externalDirectories = @(Read-ExternalDirectories)
-$otherDirectories = @(
-    $externalDirectories | Where-Object {
-        -not [string]::Equals($_, $skillRoot, [StringComparison]::OrdinalIgnoreCase)
+$configuredHermesHome = [Environment]::GetEnvironmentVariable('HERMES_HOME', 'Process')
+if (-not $configuredHermesHome) {
+    $configuredHermesHome = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)) '.hermes'
+}
+$configuredHermesHome = [System.IO.Path]::GetFullPath($configuredHermesHome)
+
+$externalDirectoryEntries = @(Read-ExternalDirectoryEntries -HermesHome $configuredHermesHome)
+$otherDirectoryEntries = @(
+    $externalDirectoryEntries | Where-Object {
+        -not [string]::Equals($_.Resolved, $skillRoot, [StringComparison]::OrdinalIgnoreCase)
     }
 )
+$otherDirectories = @($otherDirectoryEntries | ForEach-Object { $_.Raw })
+$targetCount = @(
+    $externalDirectoryEntries | Where-Object {
+        [string]::Equals($_.Resolved, $skillRoot, [StringComparison]::OrdinalIgnoreCase)
+    }
+).Count
 
 if ($Remove) {
-    if ($otherDirectories.Count -eq 0) {
-        Invoke-Hermes -Arguments @('config', 'unset', 'skills.external_dirs') | Out-Null
+    if ($targetCount -gt 0) {
+        if ($otherDirectories.Count -eq 0) {
+            Invoke-Hermes -Arguments @('config', 'unset', 'skills.external_dirs') | Out-Null
+        }
+        else {
+            Set-ExternalDirectories -Directories $otherDirectories -HermesHome $configuredHermesHome
+        }
+    }
+    $bundleRemoved = Remove-HermesBundle -Name $bundleName
+    if ($targetCount -eq 0 -and -not $bundleRemoved) {
+        Write-Output "Already removed $skillRoot and /$bundleName; unrelated external directories were preserved."
     }
     else {
-        Set-ExternalDirectories -Directories $otherDirectories
+        Write-Output "Removed $skillRoot and /$bundleName; unrelated external directories were preserved."
     }
-    Invoke-Hermes -Arguments @('bundles', 'delete', $bundleName) | Out-Null
-    Write-Output "Removed $skillRoot and /$bundleName; unrelated external directories were preserved."
     exit 0
 }
 
@@ -206,28 +328,31 @@ foreach ($skillName in $skillNames) {
     }
 }
 
-$candidateShadowRoots = @($otherDirectories)
-$configuredHermesHome = [Environment]::GetEnvironmentVariable('HERMES_HOME', 'Process')
-if (-not $configuredHermesHome) {
-    $configuredHermesHome = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)) '.hermes'
-}
-$candidateShadowRoots += (Join-Path ([System.IO.Path]::GetFullPath($configuredHermesHome)) 'skills')
+$candidateShadowRoots = @(
+    [pscustomobject]@{
+        Source = 'local'
+        Path = Join-Path $configuredHermesHome 'skills'
+    }
+)
+$candidateShadowRoots += @(
+    $otherDirectoryEntries | ForEach-Object {
+        [pscustomobject]@{
+            Source = 'external'
+            Path = $_.Resolved
+        }
+    }
+)
 foreach ($shadowRoot in $candidateShadowRoots) {
-    foreach ($skillName in $skillNames) {
-        if (Test-Path -LiteralPath (Join-Path $shadowRoot "$skillName\SKILL.md") -PathType Leaf) {
-            throw "Released skill $skillName is shadowed by another path: $shadowRoot"
+    foreach ($candidate in @(Get-HermesSkillCandidates -Root $shadowRoot.Path)) {
+        if ($skillNames -contains $candidate.Name) {
+            throw "Released skill $($candidate.Name) is shadowed by a $($shadowRoot.Source) skill at $($candidate.Path)."
         }
     }
 }
 
-$targetCount = @(
-    $externalDirectories | Where-Object {
-        [string]::Equals($_, $skillRoot, [StringComparison]::OrdinalIgnoreCase)
-    }
-).Count
 $configurationChanged = $targetCount -ne 1
 if ($configurationChanged) {
-    Set-ExternalDirectories -Directories @($otherDirectories + $skillRoot)
+    Set-ExternalDirectories -Directories @($otherDirectories + $skillRoot) -HermesHome $configuredHermesHome
 }
 
 $skillsOutput = Invoke-Hermes -Arguments @('skills', 'list', '--enabled-only')
