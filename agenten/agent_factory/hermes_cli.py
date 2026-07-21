@@ -9,12 +9,13 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Protocol
-from uuid import NAMESPACE_URL, uuid5
+from typing import TYPE_CHECKING, Callable, Literal, Protocol
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from pydantic import BaseModel, ValidationError
 
@@ -119,7 +120,13 @@ class HermesCliFactory(HermesFactoryPort):
         self._evidence_store = evidence_store or FilesystemFactoryEvidenceStore(settings.evidence_root)
         self._released_skill_catalog = released_skill_catalog
         self._sequence_policy = sequence_policy or SkillSequencePolicy()
-        self._replay_store = replay_store or InMemoryFactorySkillReplayStore()
+        self._replay_store = (
+            replay_store
+            if replay_store is not None
+            else FilesystemFactorySkillReplayStore(
+                settings.evidence_root / "skill-replays"
+            )
+        )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
@@ -166,39 +173,62 @@ class HermesCliFactory(HermesFactoryPort):
             _validate_serialized_prompt_value(
                 invocation.model_dump(mode="json", by_alias=True)
             )
-            accepted = await self._replay_store.accepted(invocation)
-            if accepted is not None:
+            claim = await self._replay_store.claim(invocation)
+            if not claim.acquired:
+                accepted = claim.record
+                assert accepted.artifact is not None
+                assert accepted.transcript_ref is not None
                 artifacts.append(accepted.artifact)
                 transcript_refs.append(accepted.transcript_ref)
                 input_ref = accepted.artifact.artifact_ref
                 if not _may_continue_after(accepted.artifact):
                     break
                 continue
-            stdout = await self._run_skill_prompt(
-                _factory_skill_prompt(invocation, skill_name=skill_name),
-                max_seconds=_remaining_deadline_seconds(deadline),
-            )
-            artifact = _parse_workflow_artifact(stdout, step=step)
-            if artifact.invocation != invocation:
-                raise FactoryDispatchError(
-                    f"Hermes {step.value} artifact does not match the Captain invocation"
+            try:
+                stdout = await self._run_skill_prompt(
+                    _factory_skill_prompt(invocation, skill_name=skill_name),
+                    max_seconds=_remaining_deadline_seconds(deadline),
                 )
-            if improvement is not None:
-                _require_improvement_artifact_binding(
-                    artifact,
-                    authorization=improvement,
+                artifact = _parse_workflow_artifact(stdout, step=step)
+                if artifact.invocation != invocation:
+                    raise FactoryDispatchError(
+                        f"Hermes {step.value} artifact does not match the Captain invocation"
+                    )
+                if improvement is not None:
+                    _require_improvement_artifact_binding(
+                        artifact,
+                        authorization=improvement,
+                    )
+                transcript_ref = await self._evidence_store.persist(
+                    request.job,
+                    artifact.model_dump_json(by_alias=True).encode("utf-8"),
                 )
-            transcript_ref = await self._evidence_store.persist(
-                request.job,
-                artifact.model_dump_json(by_alias=True).encode("utf-8"),
-            )
-            accepted = await self._replay_store.accept(
-                FactorySkillReplayRecord(
-                    invocation=invocation,
-                    artifact=artifact,
-                    transcript_ref=transcript_ref,
+            except asyncio.CancelledError:
+                await asyncio.shield(
+                    self._replay_store.fail(
+                        claim.record,
+                        failure_kind="cancelled",
+                    )
                 )
+                raise
+            except Exception as exc:
+                try:
+                    await self._replay_store.fail(
+                        claim.record,
+                        failure_kind=type(exc).__name__,
+                    )
+                except Exception as replay_exc:
+                    raise FactoryDispatchError(
+                        "factory skill failure state could not be persisted"
+                    ) from replay_exc
+                raise
+            accepted = await self._replay_store.complete(
+                claim.record,
+                artifact=artifact,
+                transcript_ref=transcript_ref,
             )
+            assert accepted.artifact is not None
+            assert accepted.transcript_ref is not None
             transcript_refs.append(accepted.transcript_ref)
             artifact = accepted.artifact
             artifacts.append(artifact)
@@ -363,98 +393,241 @@ _FactoryWorkflowArtifact = (
 )
 
 
+class FactorySkillReplayPendingError(FactoryDispatchError):
+    """A prior claimant may have executed the effect and requires recovery."""
+
+    def __init__(self, record: "FactorySkillReplayRecord") -> None:
+        super().__init__("factory skill replay is pending and requires recovery")
+        self.record = record
+
+
 @dataclass(frozen=True)
 class FactorySkillReplayRecord:
     invocation: FactorySkillInvocationV1
-    artifact: _FactoryWorkflowArtifact
-    transcript_ref: ArtifactRef
+    invocation_sha256: str
+    claim_token: str
+    state: Literal["pending", "completed", "failed"]
+    artifact: _FactoryWorkflowArtifact | None = None
+    transcript_ref: ArtifactRef | None = None
+    failure_kind: str | None = None
 
     def __post_init__(self) -> None:
-        if self.artifact.invocation != self.invocation:
+        if self.invocation_sha256 != _factory_invocation_digest(self.invocation):
+            raise FactoryDispatchError("factory skill replay invocation digest conflicts")
+        if not self.claim_token:
+            raise FactoryDispatchError("factory skill replay claim token is missing")
+        if self.state == "pending" and any(
+            item is not None
+            for item in (self.artifact, self.transcript_ref, self.failure_kind)
+        ):
+            raise FactoryDispatchError("pending factory skill replay contains an outcome")
+        if self.state == "completed" and (
+            self.artifact is None
+            or self.transcript_ref is None
+            or self.failure_kind is not None
+        ):
+            raise FactoryDispatchError("completed factory skill replay is incomplete")
+        if self.state == "failed" and (
+            self.artifact is not None
+            or self.transcript_ref is not None
+            or self.failure_kind is None
+        ):
+            raise FactoryDispatchError("failed factory skill replay is incomplete")
+        if self.artifact is not None and self.artifact.invocation != self.invocation:
             raise FactoryDispatchError(
                 "factory skill replay artifact conflicts with its invocation"
             )
 
 
+@dataclass(frozen=True)
+class FactorySkillReplayClaim:
+    record: FactorySkillReplayRecord
+    acquired: bool
+
+
 class FactorySkillReplayStore(Protocol):
-    async def accepted(
+    async def claim(
         self,
         invocation: FactorySkillInvocationV1,
-    ) -> FactorySkillReplayRecord | None: ...
+    ) -> FactorySkillReplayClaim: ...
 
-    async def accept(
+    async def complete(
         self,
-        record: FactorySkillReplayRecord,
+        pending: FactorySkillReplayRecord,
+        *,
+        artifact: _FactoryWorkflowArtifact,
+        transcript_ref: ArtifactRef,
+    ) -> FactorySkillReplayRecord: ...
+
+    async def fail(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        failure_kind: str,
     ) -> FactorySkillReplayRecord: ...
 
 
 class InMemoryFactorySkillReplayStore:
-    """Strict in-process replay store; production may inject a durable adapter."""
+    """Process-local replay store for explicitly injected deterministic tests."""
 
     def __init__(self) -> None:
         self._records: dict[str, FactorySkillReplayRecord] = {}
+        self._lock = asyncio.Lock()
 
-    async def accepted(
+    async def claim(
         self,
         invocation: FactorySkillInvocationV1,
-    ) -> FactorySkillReplayRecord | None:
-        record = self._records.get(invocation.idempotency_key)
-        if record is not None and record.invocation != invocation:
-            raise FactoryDispatchError("factory skill replay invocation conflicts")
-        return record
+    ) -> FactorySkillReplayClaim:
+        async with self._lock:
+            existing = self._records.get(invocation.idempotency_key)
+            if existing is not None:
+                return _existing_replay_claim(existing, invocation)
+            pending = _pending_replay_record(invocation)
+            self._records[invocation.idempotency_key] = pending
+            return FactorySkillReplayClaim(record=pending, acquired=True)
 
-    async def accept(
+    async def complete(
         self,
-        record: FactorySkillReplayRecord,
+        pending: FactorySkillReplayRecord,
+        *,
+        artifact: _FactoryWorkflowArtifact,
+        transcript_ref: ArtifactRef,
     ) -> FactorySkillReplayRecord:
-        existing = self._records.get(record.invocation.idempotency_key)
-        if existing is not None:
-            if existing != record:
-                raise FactoryDispatchError("factory skill replay output conflicts")
-            return existing
-        self._records[record.invocation.idempotency_key] = record
-        return record
+        completed = _completed_replay_record(
+            pending,
+            artifact=artifact,
+            transcript_ref=transcript_ref,
+        )
+        return await self._transition(pending, completed)
+
+    async def fail(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        failure_kind: str,
+    ) -> FactorySkillReplayRecord:
+        return await self._transition(
+            pending,
+            _failed_replay_record(pending, failure_kind=failure_kind),
+        )
+
+    async def _transition(
+        self,
+        pending: FactorySkillReplayRecord,
+        outcome: FactorySkillReplayRecord,
+    ) -> FactorySkillReplayRecord:
+        async with self._lock:
+            existing = self._records.get(pending.invocation.idempotency_key)
+            if existing != pending or existing.state != "pending":
+                raise FactoryDispatchError("factory skill replay claim is no longer pending")
+            self._records[pending.invocation.idempotency_key] = outcome
+            return outcome
 
 
 class FilesystemFactorySkillReplayStore:
-    """Durable, write-once accepted outputs keyed by invocation idempotency."""
+    """Durable state machine with an atomic claim before each external effect."""
 
     def __init__(self, root: Path) -> None:
         self._root = root
 
-    async def accepted(
+    async def claim(
         self,
         invocation: FactorySkillInvocationV1,
-    ) -> FactorySkillReplayRecord | None:
+    ) -> FactorySkillReplayClaim:
         path = self._path_for(invocation.idempotency_key)
-        if not path.is_file():
-            return None
-        record = await asyncio.to_thread(self._read_record, path)
-        if record.invocation != invocation:
-            raise FactoryDispatchError("factory skill replay invocation conflicts")
-        return record
+        pending = _pending_replay_record(invocation)
+        acquired = await asyncio.to_thread(
+            self._create_exclusive,
+            path,
+            _factory_skill_replay_content(pending),
+        )
+        if acquired:
+            return FactorySkillReplayClaim(record=pending, acquired=True)
+        existing = await asyncio.to_thread(self._read_record, path)
+        return _existing_replay_claim(existing, invocation)
 
-    async def accept(
+    async def complete(
         self,
-        record: FactorySkillReplayRecord,
+        pending: FactorySkillReplayRecord,
+        *,
+        artifact: _FactoryWorkflowArtifact,
+        transcript_ref: ArtifactRef,
     ) -> FactorySkillReplayRecord:
-        path = self._path_for(record.invocation.idempotency_key)
-        content = _factory_skill_replay_content(record)
-        try:
-            await asyncio.to_thread(
-                FilesystemFactoryEvidenceStore._write_once,
-                path,
-                content,
-            )
-        except (OSError, ValueError) as exc:
-            raise FactoryDispatchError("factory skill replay output conflicts") from exc
-        accepted = await asyncio.to_thread(self._read_record, path)
-        if accepted != record:
-            raise FactoryDispatchError("factory skill replay output conflicts")
-        return accepted
+        completed = _completed_replay_record(
+            pending,
+            artifact=artifact,
+            transcript_ref=transcript_ref,
+        )
+        return await self._transition(pending, completed)
+
+    async def fail(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        failure_kind: str,
+    ) -> FactorySkillReplayRecord:
+        return await self._transition(
+            pending,
+            _failed_replay_record(pending, failure_kind=failure_kind),
+        )
+
+    async def _transition(
+        self,
+        pending: FactorySkillReplayRecord,
+        outcome: FactorySkillReplayRecord,
+    ) -> FactorySkillReplayRecord:
+        path = self._path_for(pending.invocation.idempotency_key)
+        await asyncio.to_thread(self._replace_pending, path, pending, outcome)
+        return outcome
 
     def _path_for(self, idempotency_key: str) -> Path:
         return self._root / f"{idempotency_key}.json"
+
+    @staticmethod
+    def _create_exclusive(path: Path, content: bytes) -> bool:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                return False
+            return True
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @classmethod
+    def _replace_pending(
+        cls,
+        path: Path,
+        pending: FactorySkillReplayRecord,
+        outcome: FactorySkillReplayRecord,
+    ) -> None:
+        if cls._read_record(path) != pending:
+            raise FactoryDispatchError("factory skill replay claim is no longer pending")
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(_factory_skill_replay_content(outcome))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _read_record(path: Path) -> FactorySkillReplayRecord:
@@ -463,24 +636,21 @@ class FilesystemFactorySkillReplayStore:
             if not isinstance(value, dict):
                 raise ValueError("replay record must be an object")
             invocation = FactorySkillInvocationV1.model_validate(value["invocation"])
-            model = _STEP_RESULT_MODELS[invocation.step]
-            artifact = model.model_validate(value["artifact"])
-            if not isinstance(
-                artifact,
-                (
-                    CodebaseInventoryV1,
-                    CodexBuildBriefV1,
-                    TeamExecutionEvidenceV1,
-                    TeamEvaluationV1,
-                    CandidateRevisionV1,
-                    FactoryFeedbackV1,
-                ),
-            ):
-                raise ValueError("unsupported replay artifact")
+            state = value["state"]
+            artifact = None
+            transcript_ref = None
+            if state == "completed":
+                model = _STEP_RESULT_MODELS[invocation.step]
+                artifact = model.model_validate(value["artifact"])
+                transcript_ref = ArtifactRef.model_validate(value["transcript_ref"])
             return FactorySkillReplayRecord(
                 invocation=invocation,
+                invocation_sha256=value["invocation_sha256"],
+                claim_token=value["claim_token"],
+                state=state,
                 artifact=artifact,
-                transcript_ref=ArtifactRef.model_validate(value["transcript_ref"]),
+                transcript_ref=transcript_ref,
+                failure_kind=value.get("failure_kind"),
             )
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise FactoryDispatchError("factory skill replay record is invalid") from exc
@@ -489,12 +659,92 @@ class FilesystemFactorySkillReplayStore:
 def _factory_skill_replay_content(record: FactorySkillReplayRecord) -> bytes:
     return _canonical_json(
         {
-            "schema": "captain.factory-skill-replay.v1",
+            "schema": "captain.factory-skill-replay.v2",
+            "state": record.state,
+            "invocation_sha256": record.invocation_sha256,
+            "claim_token": record.claim_token,
             "invocation": record.invocation.model_dump(mode="json", by_alias=True),
-            "artifact": record.artifact.model_dump(mode="json", by_alias=True),
-            "transcript_ref": record.transcript_ref.model_dump(mode="json"),
+            "artifact": (
+                None
+                if record.artifact is None
+                else record.artifact.model_dump(mode="json", by_alias=True)
+            ),
+            "transcript_ref": (
+                None
+                if record.transcript_ref is None
+                else record.transcript_ref.model_dump(mode="json")
+            ),
+            "failure_kind": record.failure_kind,
         }
     ).encode("utf-8")
+
+
+def _factory_invocation_digest(invocation: FactorySkillInvocationV1) -> str:
+    content = _canonical_json(invocation.model_dump(mode="json", by_alias=True))
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _pending_replay_record(
+    invocation: FactorySkillInvocationV1,
+) -> FactorySkillReplayRecord:
+    return FactorySkillReplayRecord(
+        invocation=invocation,
+        invocation_sha256=_factory_invocation_digest(invocation),
+        claim_token=uuid4().hex,
+        state="pending",
+    )
+
+
+def _completed_replay_record(
+    pending: FactorySkillReplayRecord,
+    *,
+    artifact: _FactoryWorkflowArtifact,
+    transcript_ref: ArtifactRef,
+) -> FactorySkillReplayRecord:
+    if pending.state != "pending":
+        raise FactoryDispatchError("factory skill replay claim is no longer pending")
+    return FactorySkillReplayRecord(
+        invocation=pending.invocation,
+        invocation_sha256=pending.invocation_sha256,
+        claim_token=pending.claim_token,
+        state="completed",
+        artifact=artifact,
+        transcript_ref=transcript_ref,
+    )
+
+
+def _failed_replay_record(
+    pending: FactorySkillReplayRecord,
+    *,
+    failure_kind: str,
+) -> FactorySkillReplayRecord:
+    if pending.state != "pending":
+        raise FactoryDispatchError("factory skill replay claim is no longer pending")
+    if not failure_kind or len(failure_kind) > 100:
+        raise FactoryDispatchError("factory skill replay failure kind is invalid")
+    return FactorySkillReplayRecord(
+        invocation=pending.invocation,
+        invocation_sha256=pending.invocation_sha256,
+        claim_token=pending.claim_token,
+        state="failed",
+        failure_kind=failure_kind,
+    )
+
+
+def _existing_replay_claim(
+    existing: FactorySkillReplayRecord,
+    invocation: FactorySkillInvocationV1,
+) -> FactorySkillReplayClaim:
+    if (
+        existing.invocation_sha256 != _factory_invocation_digest(invocation)
+        or existing.invocation != invocation
+    ):
+        raise FactoryDispatchError("factory skill replay invocation conflicts")
+    if existing.state == "pending":
+        raise FactorySkillReplayPendingError(existing)
+    if existing.state == "failed":
+        raise FactoryDispatchError("factory skill replay previously failed")
+    return FactorySkillReplayClaim(record=existing, acquired=False)
 
 
 _STEP_SKILL_NAMES: dict[FactorySkillStep, str] = {
@@ -673,12 +923,10 @@ def _factory_invocation(
     binding = _canonical_json(
         {
             "job_id": str(request.job.job_id),
+            "correlation_id": str(request.job.correlation_id),
             "subject_version": request.job.subject_version,
             "attempt": request.action.attempt,
             "step": step.value,
-            "released_skill_sha256": released_skill.content_sha256,
-            "input_sha256": input_ref.sha256,
-            "lease_id": request.lease.lease_id,
         }
     )
     idempotency_key = hashlib.sha256(binding.encode("utf-8")).hexdigest()
