@@ -21,6 +21,8 @@ from pydantic import (
 
 from agenten.agent_factory.skill_evaluation import ToolGapMarker
 from agenten.agent_runtime.contracts import (
+    AgentRuntimeCommand,
+    AgentRuntimeResult,
     ArtifactRef,
     IDENTIFIER_PATTERN,
     IntegrationIntent,
@@ -32,13 +34,15 @@ _SECRET_KEY_PATTERN = re.compile(
     r"(?i)(?:^|[_-])(?:api[_-]?key|authorization|credentials?|password|"
     r"private[_-]?key|secrets?|tokens?)(?:$|[_-])"
 )
-_PRIVATE_BODY_KEY_PATTERN = re.compile(r"(?i)(?:holdout.*body|transcripts?)")
+_PRIVATE_BODY_KEY_PATTERN = re.compile(
+    r"(?i)(?:holdout.*(?:body|case)|raw.*holdout|private.*case|case.*body|transcripts?)"
+)
 _SECRET_VALUE_PATTERN = re.compile(
     r"(?i)(?:\bsk-(?:proj-)?[a-z0-9_-]{8,}|\bbearer\s+\S+|"
     r"\b(?:api[_ -]?key|authorization|credential|password|secret|token)\b\s*[:=])"
 )
 _ABSOLUTE_LOCAL_PATH_PATTERN = re.compile(
-    r"(?i)(?<![A-Za-z0-9])(?:[a-z]:[\\/]|\\\\|/(?:home|users|mnt|tmp)/)"
+    r"(?i)(?<![A-Za-z0-9:/])(?:[a-z]:[\\/]|\\\\|/(?!/))"
 )
 
 
@@ -179,6 +183,19 @@ class CapabilityPackageManifestV1(_FrozenContract):
 
         assertion_ids = tuple(item.assertion_id for item in self.assertion_outcomes)
         _require_unique_nonblank(assertion_ids, "assertion outcome IDs")
+        known_assertion_ids = set(assertion_ids)
+        if any(
+            receipt.assertion_id not in known_assertion_ids
+            for receipt in self.private_holdout_receipts
+        ):
+            raise ValueError("private holdout receipt contains an unknown assertion")
+        if self.recovery_receipt.assertion_id not in known_assertion_ids:
+            raise ValueError("controlled recovery receipt contains an unknown assertion")
+        if any(
+            set(marker.acceptance_assertion_ids) - known_assertion_ids
+            for marker in self.tool_gaps
+        ):
+            raise ValueError("tool gap contains an unknown assertion")
         holdout_ids = tuple(item.holdout_id for item in self.private_holdout_receipts)
         _require_unique_nonblank(holdout_ids, "private holdout receipt IDs")
         _unique_artifact_refs(self.release_evidence_refs, "release evidence refs")
@@ -266,6 +283,39 @@ class FactoryTerminalDecision(_FrozenContract):
         if value.utcoffset() != timezone.utc.utcoffset(value):
             raise ValueError("decided_at must be UTC")
         return value.astimezone(timezone.utc)
+
+
+def validate_execution_outcome_binding(
+    outcome: ExecutionOutcomeV1,
+    *,
+    command: AgentRuntimeCommand,
+    result: AgentRuntimeResult,
+) -> ExecutionOutcomeV1:
+    """Bind an execution outcome to one authoritative runtime command/result pair."""
+
+    if result.command_id != command.event_id:
+        raise ValueError("runtime result command identity does not match command")
+    if result.correlation_id != command.correlation_id:
+        raise ValueError("runtime result correlation does not match command")
+    if result.subject_id != command.subject_id:
+        raise ValueError("runtime result subject does not match command")
+    if result.subject_version != command.subject_version:
+        raise ValueError("runtime result subject version does not match command")
+    if result.operation is not command.payload.operation:
+        raise ValueError("runtime result operation does not match command")
+    if outcome.capability_id != command.subject_id:
+        raise ValueError("execution outcome capability identity does not match command subject")
+    if outcome.capability_version != command.subject_version:
+        raise ValueError("execution outcome capability version does not match command subject")
+    if outcome.team_version != result.subject_version:
+        raise ValueError("execution outcome team version does not match runtime result")
+    if outcome.correlation_id != command.correlation_id:
+        raise ValueError("execution outcome correlation does not match runtime command")
+    if outcome.command_id != command.event_id:
+        raise ValueError("execution outcome command identity does not match runtime command")
+    if outcome.result_id != result.event_id:
+        raise ValueError("execution outcome result identity does not match runtime result")
+    return outcome
 
 
 def _contains_root(paths: tuple[str, ...], root: str) -> bool:

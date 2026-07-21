@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 from pydantic import ValidationError
@@ -11,6 +12,12 @@ from agenten.agent_factory.outcome_contracts import (
     ExecutionOutcomeV1,
     FactoryTerminalDecision,
     FactoryTerminalState,
+    validate_execution_outcome_binding,
+)
+from agenten.agent_runtime.contracts import (
+    AgentRuntimeCommand,
+    AgentRuntimeResult,
+    RuntimeOperation,
 )
 
 
@@ -31,6 +38,33 @@ def _artifact(path: str, digest: str, *, kind: str = "evidence") -> dict[str, ob
             "media_type": "application/octet-stream",
         },
     }
+
+
+def _runtime_command() -> AgentRuntimeCommand:
+    return AgentRuntimeCommand.model_validate(
+        _fixture("agent_runtime_command.v1.json")
+    )
+
+
+def _runtime_result() -> AgentRuntimeResult:
+    return AgentRuntimeResult.model_validate(_fixture("agent_runtime_result.v1.json"))
+
+
+def _bound_execution_outcome() -> ExecutionOutcomeV1:
+    command = _runtime_command()
+    result = _runtime_result()
+    payload = _fixture("execution_outcome.v1.json")
+    payload.update(
+        {
+            "capability_id": command.subject_id,
+            "capability_version": command.subject_version,
+            "team_version": result.subject_version,
+            "correlation_id": str(command.correlation_id),
+            "command_id": str(command.event_id),
+            "result_id": str(result.event_id),
+        }
+    )
+    return ExecutionOutcomeV1.model_validate(payload)
 
 
 def test_capability_package_fixture_is_strict_frozen_and_round_trips() -> None:
@@ -116,6 +150,61 @@ def test_package_rejects_raw_private_holdout_body() -> None:
         CapabilityPackageManifestV1.model_validate(payload)
 
 
+@pytest.mark.parametrize(
+    ("receipt", "assertion_id"),
+    (
+        ("private_holdout_receipts", "unknown-holdout-assertion"),
+        ("recovery_receipt", "unknown-recovery-assertion"),
+    ),
+)
+def test_package_rejects_receipts_for_unknown_assertions(
+    receipt: str,
+    assertion_id: str,
+) -> None:
+    payload = _fixture("capability_package_manifest.v1.json")
+    target = payload[receipt]
+    if isinstance(target, list):
+        target[0]["assertion_id"] = assertion_id
+    else:
+        target["assertion_id"] = assertion_id
+
+    with pytest.raises(ValidationError, match="unknown assertion"):
+        CapabilityPackageManifestV1.model_validate(payload)
+
+
+def test_package_rejects_tool_gaps_for_unknown_assertions() -> None:
+    payload = _fixture("capability_package_manifest.v1.json")
+    payload["tool_gaps"] = [
+        {
+            "schema": "TODO_TOOL.v1",
+            "gap_id": "crm-lookup-gap",
+            "severity": "optional",
+            "input_contract_ref": {
+                "uri": "artifact://tool-contracts/input",
+                "sha256": "c" * 64,
+                "media_type": "application/json",
+            },
+            "output_contract_ref": {
+                "uri": "artifact://tool-contracts/output",
+                "sha256": "d" * 64,
+                "media_type": "application/json",
+            },
+            "least_privilege_capability": "crm.read",
+            "implementation_options": [],
+            "acceptance_assertion_ids": ["unknown-tool-assertion"],
+            "evidence_ref": {
+                "uri": "artifact://tool-gap/evidence",
+                "sha256": "e" * 64,
+                "media_type": "application/json",
+            },
+            "status": "resolved",
+        }
+    ]
+
+    with pytest.raises(ValidationError, match="unknown assertion"):
+        CapabilityPackageManifestV1.model_validate(payload)
+
+
 def test_package_recursively_rejects_credentials_in_artifact_references() -> None:
     payload = _fixture("capability_package_manifest.v1.json")
     payload["release_evidence_refs"][0]["uri"] = (
@@ -143,10 +232,16 @@ def test_execution_outcome_fixture_is_strict_frozen_and_round_trips() -> None:
         {"credentials": {"CRM_API_KEY": "not-redacted"}},
         {"notes": "authorization: Bearer abcdefghijklmnop"},
         {"holdout_body": "private case"},
+        {"holdout_case": {"input": "private case"}},
+        {"private_case": {"input": "private case"}},
+        {"case_body": "private case"},
         {"transcript": "full model conversation"},
         {"output_path": "C:\\Users\\User\\workspace\\result.json"},
         {"notes": "read result from C:\\Users\\User\\workspace\\result.json"},
         {"output_path": "/home/runner/work/result.json"},
+        {"output_path": "/etc/captain/config.json"},
+        {"notes": "read result from /opt/captain/result.json"},
+        {"output_path": "/workspace/result.json"},
     ),
 )
 def test_execution_outcome_recursively_rejects_private_or_local_content(
@@ -185,6 +280,67 @@ def test_escalation_reference_is_bound_to_escalated_status() -> None:
         "media_type": "application/json",
     }
     assert ExecutionOutcomeV1.model_validate(payload).status == "escalated"
+
+
+def test_execution_outcome_binds_to_authoritative_runtime_command_and_result() -> None:
+    outcome = _bound_execution_outcome()
+
+    assert (
+        validate_execution_outcome_binding(
+            outcome,
+            command=_runtime_command(),
+            result=_runtime_result(),
+        )
+        is outcome
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("capability_id", "different-capability", "capability identity"),
+        ("capability_version", 4, "capability version"),
+        ("team_version", 4, "team version"),
+        ("correlation_id", UUID("00000000-0000-0000-0000-000000000099"), "correlation"),
+        ("command_id", UUID("00000000-0000-0000-0000-000000000098"), "command"),
+        ("result_id", UUID("00000000-0000-0000-0000-000000000097"), "result"),
+    ),
+)
+def test_execution_outcome_rejects_unbound_runtime_identity(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    outcome = _bound_execution_outcome().model_copy(update={field: value})
+
+    with pytest.raises(ValueError, match=message):
+        validate_execution_outcome_binding(
+            outcome,
+            command=_runtime_command(),
+            result=_runtime_result(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    (
+        ({"command_id": UUID("00000000-0000-0000-0000-000000000098")}, "command"),
+        ({"correlation_id": UUID("00000000-0000-0000-0000-000000000099")}, "correlation"),
+        ({"subject_id": "different-capability"}, "subject"),
+        ({"subject_version": 4}, "subject version"),
+        ({"operation": RuntimeOperation.CODEX_RESUME}, "operation"),
+    ),
+)
+def test_execution_outcome_rejects_result_not_bound_to_command(
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        validate_execution_outcome_binding(
+            _bound_execution_outcome(),
+            command=_runtime_command(),
+            result=_runtime_result().model_copy(update=updates),
+        )
 
 
 def test_terminal_decision_uses_only_the_closed_factory_state_vocabulary() -> None:
