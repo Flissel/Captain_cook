@@ -8,6 +8,7 @@ from pydantic import SecretStr
 from gateway import registry_feed
 from gateway.app import create_app
 from gateway.settings import GatewaySettings
+from gateway.store import GatewayStore
 
 
 def test_successful_batch_is_mirrored_as_validated_without_forum_credentials(monkeypatch) -> None:
@@ -122,7 +123,66 @@ def test_factory_promotion_builds_redacted_v2_projection_with_correlation() -> N
     assert "private" not in serialized
 
 
-def test_projection_feed_is_captain_authenticated_and_paginated(monkeypatch) -> None:
+def test_runtime_result_builds_stable_redacted_projection_with_command_causation() -> None:
+    projection = getattr(registry_feed, "runtime_result_projection", None)
+    assert callable(projection), "runtime result projection is not implemented"
+    result = {
+        "schema": "captain.agent-runtime-result.v1",
+        "event_id": "40000000-0000-4000-8000-000000000001",
+        "command_id": "50000000-0000-4000-8000-000000000001",
+        "correlation_id": "60000000-0000-4000-8000-000000000001",
+        "occurred_at": datetime(2026, 7, 20, 12, 1, tzinfo=timezone.utc).isoformat(),
+        "producer": "hermes-runtime",
+        "subject_id": "private-workspace-subtask",
+        "subject_version": 3,
+        "grant_id": "private-grant",
+        "operation": "codex.run",
+        "status": "succeeded",
+        "session_id": "private-session",
+        "artifact_refs": [
+            {
+                "uri": "artifact://private/workspace/result.json",
+                "sha256": "a" * 64,
+                "media_type": "application/json",
+            }
+        ],
+        "evidence_refs": [
+            {
+                "uri": "artifact://private/provider/transcript.json",
+                "sha256": "b" * 64,
+                "media_type": "application/json",
+            }
+        ],
+        "error": None,
+    }
+
+    first = projection(result)
+    replay = projection(result)
+
+    assert first == replay
+    assert first.event_id == UUID(result["event_id"])
+    assert first.causation_id == UUID(result["command_id"])
+    assert first.correlation_id == UUID(result["correlation_id"])
+    assert first.event_type == "codex.result"
+    assert first.payload.model_dump(exclude_none=True) == {
+        "view": "build",
+        "template_id": "runtime_build_recorded",
+        "status_id": "built",
+        "actor_role_id": "codex_worker",
+        "artifact_digest": f"sha256:{'a' * 64}",
+    }
+    serialized = first.model_dump_json(by_alias=True)
+    for secret in (
+        "private-workspace-subtask",
+        "private-grant",
+        "private-session",
+        "artifact://private",
+        "provider",
+    ):
+        assert secret not in serialized
+
+
+def test_projection_feed_is_captain_authenticated_and_globally_paginated(monkeypatch) -> None:
     block = {
         "event_id": "10000000-0000-4000-8000-000000000001",
         "job_id": "20000000-0000-4000-8000-000000000001",
@@ -135,15 +195,35 @@ def test_projection_feed_is_captain_authenticated_and_paginated(monkeypatch) -> 
         "correlation_id": "30000000-0000-4000-8000-000000000001",
         "required_capability": "support_triage",
     }
+    runtime_result = {
+        "schema": "captain.agent-runtime-result.v1",
+        "event_id": "40000000-0000-4000-8000-000000000001",
+        "command_id": "50000000-0000-4000-8000-000000000001",
+        "correlation_id": "30000000-0000-4000-8000-000000000001",
+        "occurred_at": datetime(2026, 7, 20, 12, 1, tzinfo=timezone.utc).isoformat(),
+        "producer": "agent-runtime",
+        "subject_id": "subtask-private",
+        "subject_version": 8,
+        "grant_id": "grant-private",
+        "operation": "codex.run",
+        "status": "succeeded",
+        "session_id": "session-private",
+        "artifact_refs": [],
+        "evidence_refs": [],
+        "error": None,
+    }
 
     class Store:
         def __init__(self, *_args, **_kwargs) -> None:
             pass
 
-        def factory_projection_feed(self, *, after_index: int, limit: int):
+        def minibook_projection_feed(self, *, after_index: int, limit: int):
             assert after_index == 4
-            assert limit == 1
-            return [(5, block, job)], True
+            assert limit == 2
+            return [
+                (5, "agent_factory_block", block, job),
+                (7, "agent_runtime_result", runtime_result, None),
+            ], True
 
     class Mirror:
         def enqueue_nowait(self, _payload) -> None:
@@ -161,11 +241,11 @@ def test_projection_feed_is_captain_authenticated_and_paginated(monkeypatch) -> 
     )
     with TestClient(app) as client:
         assert client.get(
-            "/api/v1/projections/minibook/events?cursor=4&limit=1",
+            "/api/v1/projections/minibook/events?cursor=4&limit=2",
             headers={"Authorization": "Bearer worker-token"},
         ).status_code == 403
         response = client.get(
-            "/api/v1/projections/minibook/events?cursor=4&limit=1",
+            "/api/v1/projections/minibook/events?cursor=4&limit=2",
             headers={"Authorization": "Bearer captain-token"},
         )
 
@@ -174,8 +254,115 @@ def test_projection_feed_is_captain_authenticated_and_paginated(monkeypatch) -> 
         "events": [
             registry_feed.factory_promotion_projection(block, job).model_dump(
                 mode="json", by_alias=True
-            )
+            ),
+            registry_feed.runtime_result_projection(runtime_result).model_dump(
+                mode="json", by_alias=True
+            ),
         ],
-        "cursor": "5",
+        "cursor": "7",
         "has_more": True,
     }
+
+
+def test_store_pages_admitted_mixed_records_by_one_global_ledger_cursor() -> None:
+    promotion_job = {
+        "correlation_id": "30000000-0000-4000-8000-000000000001",
+    }
+    ledger = [
+        {
+            "index": 2,
+            "block_type": "agent_factory_block",
+            "data": {"phase": "capability_promoted", "status": "succeeded"},
+            "parent_data": promotion_job,
+        },
+        {
+            "index": 3,
+            "block_type": "unrelated_block",
+            "data": {"secret": "not-admitted"},
+            "parent_data": None,
+        },
+        {
+            "index": 4,
+            "block_type": "agent_runtime_result",
+            "data": {"schema": "captain.agent-runtime-result.v1"},
+            "parent_data": None,
+        },
+        {
+            "index": 5,
+            "block_type": "agent_factory_block",
+            "data": {"phase": "capability_promoted", "status": "succeeded"},
+            "parent_data": promotion_job,
+        },
+    ]
+    executed: list[tuple[str, tuple[int, int]]] = []
+
+    class Cursor:
+        rows: list[dict[str, object]] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, sql: str, params: tuple[int, int]) -> None:
+            executed.append((sql, params))
+            after_index, fetch_limit = params
+            admitted = [
+                row
+                for row in ledger
+                if int(row["index"]) > after_index
+                and row["block_type"] in {
+                    "agent_factory_block",
+                    "agent_runtime_result",
+                }
+            ]
+            self.rows = admitted[:fetch_limit]
+
+        def fetchall(self):
+            return self.rows
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def cursor(self) -> Cursor:
+            return Cursor()
+
+    class Storage:
+        def transaction(self) -> Connection:
+            return Connection()
+
+        @staticmethod
+        def _decode_row(row: dict[str, object]) -> dict[str, object]:
+            return row
+
+    feed = getattr(GatewayStore, "minibook_projection_feed", None)
+    assert callable(feed), "one globally ordered Minibook feed query is not implemented"
+    store = object.__new__(GatewayStore)
+    store.storage = Storage()
+    cursor = -1
+    observed: list[tuple[int, str]] = []
+    while True:
+        records, has_more = store.minibook_projection_feed(
+            after_index=cursor,
+            limit=1,
+        )
+        assert len(records) == 1
+        index, block_type, _, _ = records[0]
+        assert index > cursor
+        cursor = index
+        observed.append((index, block_type))
+        if not has_more:
+            break
+
+    assert observed == [
+        (2, "agent_factory_block"),
+        (4, "agent_runtime_result"),
+        (5, "agent_factory_block"),
+    ]
+    assert all(params[1] == 2 for _, params in executed)
+    assert all("ORDER BY event.`index`" in sql for sql, _ in executed)

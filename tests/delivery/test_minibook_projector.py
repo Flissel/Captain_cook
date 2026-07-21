@@ -102,6 +102,54 @@ def test_replay_is_idempotent_and_subject_versions_are_monotonic(
         ) == 1
 
 
+def test_mixed_promotion_and_runtime_result_replay_and_zero_rebuild_are_stable(
+    tmp_path: Path,
+    projection_api: tuple[TestClient, MinibookClient],
+) -> None:
+    _, client = projection_api
+    runtime_result = load_events()[4]
+    promotion = MinibookProjectionEvent.model_validate(
+        {
+            "schema": "captain.minibook-projection.v2",
+            "event_id": "70000000-0000-4000-8000-000000000001",
+            "correlation_id": str(runtime_result.correlation_id),
+            "causation_id": str(runtime_result.event_id),
+            "occurred_at": "2026-07-18T08:09:00Z",
+            "producer": "captain-gateway",
+            "subject_id": "subject:80000000-0000-4000-8000-000000000001",
+            "subject_version": 1,
+            "event_type": "capability.promoted",
+            "payload": {
+                "view": "validation",
+                "template_id": "factory_capability_ready_to_use",
+                "status_id": "ready_to_use",
+                "actor_role_id": "captain_gateway",
+            },
+        }
+    )
+    mixed = [promotion, runtime_result]
+    cursor_path = tmp_path / "mixed-cursor.db"
+    projector = MinibookProjector(client, ProjectionCursorStore(cursor_path))
+
+    assert [result.outcome for result in projector.rebuild(mixed)] == [
+        "projected",
+        "projected",
+    ]
+    assert [result.outcome for result in projector.rebuild(mixed)] == [
+        "duplicate",
+        "duplicate",
+    ]
+    original_posts = client.list_posts(projector.ensure_projection_project()["id"])
+
+    cursor_path.unlink()
+    rebuilt = MinibookProjector(client, ProjectionCursorStore(cursor_path))
+    assert [result.outcome for result in rebuilt.rebuild(mixed)] == [
+        "projected",
+        "projected",
+    ]
+    assert client.list_posts(rebuilt.ensure_projection_project()["id"]) == original_posts
+
+
 def test_out_of_order_event_is_quarantined_without_remote_overwrite(
     tmp_path: Path,
     projection_api: tuple[TestClient, MinibookClient],
