@@ -124,16 +124,82 @@ function Assert-IsolatedDatabase {
     }
 }
 
+function Get-KnownSecretValues {
+    param(
+        [Parameter(Mandatory)][string]$DatabaseDsn,
+        [Parameter(Mandatory)][bool]$IncludeN8n
+    )
+
+    $values = [System.Collections.Generic.List[string]]::new()
+    [void]$values.Add($DatabaseDsn)
+    $uriValues = [System.Collections.Generic.List[string]]::new()
+    [void]$uriValues.Add($DatabaseDsn)
+    if ($IncludeN8n) {
+        foreach ($name in $n8nEnvironmentAllowlist) {
+            $item = Get-Item -LiteralPath ("Env:" + $name) -ErrorAction SilentlyContinue
+            if ($null -ne $item -and -not [string]::IsNullOrWhiteSpace([string]$item.Value)) {
+                [void]$values.Add([string]$item.Value)
+                if ($name -ceq 'CAPTAIN_N8N_URL') {
+                    [void]$uriValues.Add([string]$item.Value)
+                }
+            }
+        }
+    }
+    foreach ($uriValue in $uriValues) {
+        $match = [regex]::Match(
+            $uriValue,
+            '^[A-Za-z][A-Za-z0-9+.-]*://(?<userinfo>[^/@]+)@'
+        )
+        if ($match.Success) {
+            $userinfo = $match.Groups['userinfo'].Value
+            $separator = $userinfo.IndexOf(':')
+            if ($separator -ge 0 -and $separator -lt ($userinfo.Length - 1)) {
+                $password = [System.Uri]::UnescapeDataString(
+                    $userinfo.Substring($separator + 1)
+                )
+                if (-not [string]::IsNullOrWhiteSpace($password)) {
+                    [void]$values.Add($password)
+                }
+            }
+        }
+    }
+    return @($values | Select-Object -Unique)
+}
+
 function Assert-RedactedJsonFile {
-    param([Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string[]]$ForbiddenValues = @()
+    )
 
     $raw = Get-Content -Raw -LiteralPath $Path
+    try {
+        $payload = $raw | ConvertFrom-Json -Depth 100
+        $serialized = $payload | ConvertTo-Json -Depth 100 -Compress
+    }
+    catch {
+        throw 'A gate JSON file is not valid JSON.'
+    }
     if (
-        $raw -match '(?i)"(?:api[_-]?key|access[_-]?token|token|authorization|password|secret|raw[_-]?prompt|private(?:[_-][a-z0-9]+)*|(?:[a-z0-9]+[_-])*path)"\s*:' -or
-        $raw -match '(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+' -or
-        $raw -match '(?i)(?:[A-Z]:[\\/]|\\\\[^\\]|/(?:home|Users|tmp|var|etc)/)'
+        $serialized -match '(?i)"(?:api[_-]?key|access[_-]?token|token|authorization|password|secret|raw[_-]?prompt|private(?:[_-][a-z0-9]+)*|(?:[a-z0-9]+[_-])*path)"\s*:' -or
+        $serialized -match '(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+' -or
+        $serialized -match '(?i)(?<![A-Z])[A-Z]:[\\/]' -or
+        $serialized -match '(?i)(?:\\\\[^\\]|/(?:home|Users|tmp|var|etc)/)' -or
+        $serialized -match '(?i)(?<![A-Za-z0-9])sk-(?:proj-)?[A-Za-z0-9_-]{8,}' -or
+        $serialized -match '(?i)\b[A-Z][A-Z0-9+.-]*://[^/\s:@]+:[^/\s@]+@' -or
+        $serialized -match '(?i)[?&#](?:api[_-]?key|access[_-]?token|token|authorization|password|secret)=[^&#\s]+'
     ) {
         throw 'A gate JSON file contains forbidden sensitive material.'
+    }
+    foreach ($forbiddenValue in $ForbiddenValues) {
+        if ([string]::IsNullOrWhiteSpace($forbiddenValue)) {
+            continue
+        }
+        $encoded = $forbiddenValue | ConvertTo-Json -Compress
+        $encodedValue = $encoded.Substring(1, $encoded.Length - 2)
+        if ($serialized.Contains($encodedValue, [StringComparison]::Ordinal)) {
+            throw 'A gate JSON file contains forbidden sensitive material.'
+        }
     }
     return $raw
 }
@@ -221,7 +287,8 @@ function Assert-GatewayPromotion {
 function Assert-RedactedReport {
     param(
         [Parameter(Mandatory)][string]$Directory,
-        [Parameter(Mandatory)][string]$ExpectedMode
+        [Parameter(Mandatory)][string]$ExpectedMode,
+        [string[]]$ForbiddenValues = @()
     )
 
     $reports = @(Get-ChildItem -LiteralPath $Directory -Filter 'sha256-*.json' -File)
@@ -233,7 +300,8 @@ function Assert-RedactedReport {
     if ($report.BaseName -cne "sha256-$digest") {
         throw 'The live report filename does not match its SHA-256 digest.'
     }
-    $raw = Assert-RedactedJsonFile -Path $report.FullName
+    $raw = Assert-RedactedJsonFile -Path $report.FullName `
+        -ForbiddenValues $ForbiddenValues
     try {
         $payload = $raw | ConvertFrom-Json -Depth 100
     }
@@ -242,6 +310,85 @@ function Assert-RedactedReport {
     }
     if ([string]$payload.mode -cne $ExpectedMode) {
         throw 'The live report mode does not match the requested gate mode.'
+    }
+    $expectedReportProperties = @(
+        'schema', 'mode', 'prerequisites_confirmed', 'live_execution', 'model',
+        'database_name', 'context7_provenance_digest', 'job_id', 'correlation_id',
+        'subject_version', 'attempt', 'provider_traces', 'total_cost_usd',
+        'terminal_status', 'with_n8n'
+    )
+    if ($ExpectedMode -eq 'release') {
+        $expectedReportProperties += @('recovery', 'gateway_promotion')
+    }
+    if ($payload.with_n8n -eq $true) {
+        $expectedReportProperties += 'n8n_evidence'
+    }
+    Assert-ExactPropertyNames -Value $payload `
+        -ExpectedNames $expectedReportProperties -Label 'live report'
+    if (
+        [string]$payload.schema -cne 'captain.hermes-six-skill-factory-live-report.v1' -or
+        $payload.prerequisites_confirmed -ne $true -or
+        $payload.live_execution -ne $true -or
+        [string]$payload.model -cne $Model -or
+        [string]$payload.database_name -cne 'captain_test' -or
+        [string]$payload.context7_provenance_digest -notmatch '^[0-9a-f]{64}$' -or
+        $payload.with_n8n -isnot [bool] -or
+        [string]$payload.total_cost_usd -notmatch '^(?:0|[1-9][0-9]*)\.[0-9]+$'
+    ) {
+        throw 'The live report violates the exact live-report contract.'
+    }
+    $providerTraces = @($payload.provider_traces)
+    $expectedTraceCount = $(if ($ExpectedMode -eq 'demo') { 1 } else { 3 })
+    if ($providerTraces.Count -ne $expectedTraceCount) {
+        throw 'The live report violates the exact live-report contract.'
+    }
+    foreach ($trace in $providerTraces) {
+        Assert-ExactPropertyNames -Value $trace -ExpectedNames @(
+            'trace_id', 'codex_session_id', 'hermes_session_id', 'provider', 'model',
+            'status', 'cost_usd', 'usage_receipt_ref', 'budget_receipt_ref'
+        ) -Label 'provider trace'
+        foreach ($referenceName in @('usage_receipt_ref', 'budget_receipt_ref')) {
+            $reference = $trace.psobject.Properties[$referenceName].Value
+            Assert-ExactPropertyNames -Value $reference -ExpectedNames @(
+                'uri', 'sha256', 'media_type'
+            ) -Label $referenceName
+            if (
+                [string]$reference.uri -notmatch '^artifact://' -or
+                [string]$reference.sha256 -notmatch '^[0-9a-f]{64}$'
+            ) {
+                throw 'The live report violates the exact live-report contract.'
+            }
+        }
+        if (
+            [string]::IsNullOrWhiteSpace([string]$trace.trace_id) -or
+            [string]::IsNullOrWhiteSpace([string]$trace.codex_session_id) -or
+            [string]::IsNullOrWhiteSpace([string]$trace.hermes_session_id) -or
+            [string]::IsNullOrWhiteSpace([string]$trace.provider) -or
+            [string]$trace.model -cne $Model -or
+            [string]$trace.status -cne 'succeeded' -or
+            [string]$trace.cost_usd -notmatch '^(?:0|[1-9][0-9]*)\.[0-9]+$'
+        ) {
+            throw 'The live report violates the exact live-report contract.'
+        }
+    }
+    if ($ExpectedMode -eq 'release') {
+        Assert-ExactPropertyNames -Value $payload.recovery -ExpectedNames @(
+            'status', 'evidence_digest'
+        ) -Label 'recovery'
+        if (
+            [string]$payload.recovery.status -cne 'recovered' -or
+            [string]$payload.recovery.evidence_digest -notmatch '^[0-9a-f]{64}$'
+        ) {
+            throw 'The live report violates the exact live-report contract.'
+        }
+    }
+    if ($payload.with_n8n -eq $true) {
+        Assert-ExactPropertyNames -Value $payload.n8n_evidence -ExpectedNames @(
+            'workflow_digest', 'n8n_mcp_call_id', 'n8n_execution_id'
+        ) -Label 'n8n_evidence'
+        if ([string]$payload.n8n_evidence.workflow_digest -notmatch '^[0-9a-f]{64}$') {
+            throw 'The live report violates the exact live-report contract.'
+        }
     }
     if ($ExpectedMode -eq 'demo' -and [string]$payload.terminal_status -cne 'demo_ready') {
         throw 'Demo mode may emit demo_ready only.'
@@ -304,6 +451,8 @@ if ($WithN8n) {
         Get-RequiredEnvironmentValue -Name $name | Out-Null
     }
 }
+$knownSecretValues = Get-KnownSecretValues -DatabaseDsn $databaseDsn `
+    -IncludeN8n $WithN8n.IsPresent
 
 foreach ($command in @('docker', 'hermes', 'codex')) {
     Assert-CommandAvailable -Name $command
@@ -373,7 +522,8 @@ if ($LASTEXITCODE -ne 0) {
 if (-not (Test-Path -LiteralPath $preflightPath -PathType Leaf)) {
     throw 'Factory live preflight did not emit its redacted confirmation.'
 }
-$preflightRaw = Assert-RedactedJsonFile -Path $preflightPath
+$preflightRaw = Assert-RedactedJsonFile -Path $preflightPath `
+    -ForbiddenValues $knownSecretValues
 try {
     $preflight = $preflightRaw | ConvertFrom-Json -Depth 100
 }
@@ -425,6 +575,7 @@ if ($pytestExitCode -ne 0) {
     throw 'Factory live validation failed without releasing test output.'
 }
 
-$reportDigest = Assert-RedactedReport -Directory $reportDirectory -ExpectedMode $Mode
+$reportDigest = Assert-RedactedReport -Directory $reportDirectory -ExpectedMode $Mode `
+    -ForbiddenValues $knownSecretValues
 Write-Output "Hermes six-skill Factory $Mode gate passed; report sha256=$reportDigest."
 exit 0

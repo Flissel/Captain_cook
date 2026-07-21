@@ -163,9 +163,14 @@ does not start, stop, adopt, or modify the VibeMind-owned n8n deployment.
 
 The final report is written below the operating-system temporary directory, in
 a new run-specific directory, as `sha256-<digest>.json`. It is never written to
-tracked `artifacts/`. Before parsing either preflight or final report, the
-wrapper rejects secret-like keys (including access tokens, raw prompts,
-private material, and paths), Bearer material, and absolute host paths. It then
+tracked `artifacts/`. For both preflight and final report, the wrapper parses
+and canonically serializes the JSON before it rejects secret-like
+keys (including access tokens, raw prompts, private material, and paths),
+Bearer material, credential-bearing URLs, token-shaped values, absolute host
+paths, and every known DSN/password or opted-in n8n credential value. Normal
+URI schemes such as `artifact://`, `https://`, and `holdout://` remain valid.
+The final report must match the exact extra-forbid external schema, including
+the complete provider traces and receipt references. The wrapper then
 recomputes the final digest and rejects an incorrect mode or terminal status.
 It prints the report digest but not the report body or host path.
 

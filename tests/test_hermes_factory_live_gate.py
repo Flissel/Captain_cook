@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
 import json
 import os
@@ -77,7 +78,12 @@ def _run_copied_wrapper(
     )
 
 
-def _write_fake_live_gate_commands(directory: Path, leak_probe: str) -> None:
+def _write_fake_live_gate_commands(
+    directory: Path,
+    leak_probe: str,
+    *,
+    live_report: dict[str, object] | None = None,
+) -> None:
     directory.mkdir()
     (directory / "docker.cmd").write_text(
         '@echo off\nif "%1"=="ps" echo fixture-container\nexit /b 0\n',
@@ -102,6 +108,21 @@ def _write_fake_live_gate_commands(directory: Path, leak_probe: str) -> None:
         "skill_digests": {skill: "a" * 64 for skill in SKILLS},
     }
     preflight_json = json.dumps(preflight, separators=(",", ":"))
+    if live_report is None:
+        pytest_action = (
+            f"echo {leak_probe}\n"
+            f">&2 echo {leak_probe}\n"
+            "exit /b 17\n"
+        )
+    else:
+        report_json = json.dumps(live_report, separators=(",", ":"))
+        report_bytes = (report_json + "\r\n").encode("ascii")
+        report_digest = hashlib.sha256(report_bytes).hexdigest()
+        pytest_action = (
+            f'>"%CAPTAIN_FACTORY_REPORT_DIRECTORY%\\sha256-{report_digest}.json" '
+            f"echo {report_json}\n"
+            "exit /b 0\n"
+        )
     (directory / "python.cmd").write_text(
         "@echo off\n"
         "setlocal EnableDelayedExpansion\n"
@@ -118,11 +139,49 @@ def _write_fake_live_gate_commands(directory: Path, leak_probe: str) -> None:
         f'  >"!output!" echo {preflight_json}\n'
         "  exit /b 0\n"
         ")\n"
-        f"echo {leak_probe}\n"
-        f">&2 echo {leak_probe}\n"
-        "exit /b 17\n",
+        f"{pytest_action}",
         encoding="utf-8",
     )
+
+
+def _valid_demo_live_report() -> dict[str, object]:
+    return {
+        "schema": "captain.hermes-six-skill-factory-live-report.v1",
+        "mode": "demo",
+        "prerequisites_confirmed": True,
+        "live_execution": True,
+        "model": "fixture-model",
+        "database_name": "captain_test",
+        "context7_provenance_digest": "1" * 64,
+        "job_id": "00000000-0000-0000-0000-000000000201",
+        "correlation_id": "00000000-0000-0000-0000-000000000202",
+        "subject_version": 1,
+        "attempt": 1,
+        "provider_traces": [
+            {
+                "trace_id": "artifact://provider-traces/demo-1",
+                "codex_session_id": "https://codex.invalid/sessions/demo-1",
+                "hermes_session_id": "holdout://hermes-sessions/demo-1",
+                "provider": "https://api.openai.com",
+                "model": "fixture-model",
+                "status": "succeeded",
+                "cost_usd": "0.10",
+                "usage_receipt_ref": {
+                    "uri": "artifact://usage-receipts/demo-1",
+                    "sha256": "2" * 64,
+                    "media_type": "application/json",
+                },
+                "budget_receipt_ref": {
+                    "uri": "artifact://budget-receipts/demo-1",
+                    "sha256": "3" * 64,
+                    "media_type": "application/json",
+                },
+            }
+        ],
+        "total_cost_usd": "0.10",
+        "terminal_status": "demo_ready",
+        "with_n8n": False,
+    }
 
 
 def test_live_gate_wrapper_has_the_exact_paid_gate_parameters() -> None:
@@ -275,7 +334,7 @@ def test_dedicated_n8n_env_overrides_root_fallback_without_live_calls(
     )
     environment = os.environ.copy()
     environment["TEST_MARIADB_DSN"] = (
-        "mysql+pymysql://captain:fixture@127.0.0.1:3306/captain_test"
+        "mysql+pymysql://captain:db-password-not-in-output@127.0.0.1:3306/captain_test"
     )
     environment["CAPTAIN_N8N_URL"] = "https://n8n.invalid"
     environment["CAPTAIN_N8N_MCP_TOKEN"] = "opaque-fixture-token"
@@ -309,7 +368,7 @@ def test_process_n8n_environment_overrides_dedicated_and_root_files(
     )
     environment = os.environ.copy()
     environment["TEST_MARIADB_DSN"] = (
-        "mysql+pymysql://captain:fixture@127.0.0.1:3306/captain_test"
+        "mysql+pymysql://captain:db-password-not-in-output@127.0.0.1:3306/captain_test"
     )
     environment["CAPTAIN_N8N_URL"] = "https://n8n.invalid"
     environment["CAPTAIN_N8N_API_KEY"] = process_secret
@@ -349,7 +408,7 @@ def test_non_n8n_gate_removes_inherited_and_file_n8n_values_from_children(
     )
     environment = os.environ.copy()
     environment["TEST_MARIADB_DSN"] = (
-        "mysql+pymysql://captain:fixture@127.0.0.1:3306/captain_test"
+        "mysql+pymysql://captain:db-password-not-in-output@127.0.0.1:3306/captain_test"
     )
     environment["CAPTAIN_N8N_URL"] = "https://process.invalid"
     environment["CAPTAIN_N8N_API_KEY"] = "process-key"
@@ -373,7 +432,7 @@ def test_n8n_gate_loads_dedicated_values_for_children(tmp_path: Path) -> None:
     )
     environment = os.environ.copy()
     environment["TEST_MARIADB_DSN"] = (
-        "mysql+pymysql://captain:fixture@127.0.0.1:3306/captain_test"
+        "mysql+pymysql://captain:db-password-not-in-output@127.0.0.1:3306/captain_test"
     )
     for name in ("CAPTAIN_N8N_URL", "CAPTAIN_N8N_API_KEY", "CAPTAIN_N8N_MCP_TOKEN"):
         environment.pop(name, None)
@@ -399,7 +458,7 @@ def test_wrapper_suppresses_failed_pytest_output_and_emits_only_a_generic_error(
     _write_fake_live_gate_commands(fake_commands, leak_probe)
     environment = os.environ.copy()
     environment["TEST_MARIADB_DSN"] = (
-        "mysql+pymysql://captain:fixture@127.0.0.1:3306/captain_test"
+        "mysql+pymysql://captain:db-password-not-in-output@127.0.0.1:3306/captain_test"
     )
     environment["PATH"] = str(fake_commands)
 
@@ -409,6 +468,52 @@ def test_wrapper_suppresses_failed_pytest_output_and_emits_only_a_generic_error(
     assert result.returncode != 0
     assert "Factory live validation failed without releasing test output." in output
     assert leak_probe not in output
+
+
+def test_wrapper_accepts_a_valid_content_addressed_report_with_uri_schemes(
+    tmp_path: Path,
+) -> None:
+    fake_commands = tmp_path / "fake-bin"
+    _write_fake_live_gate_commands(
+        fake_commands,
+        "unused-leak-probe",
+        live_report=_valid_demo_live_report(),
+    )
+    environment = os.environ.copy()
+    environment["TEST_MARIADB_DSN"] = (
+        "mysql+pymysql://captain:db-password-not-in-output@127.0.0.1:3306/captain_test"
+    )
+    environment["PATH"] = str(fake_commands)
+
+    result = _run_copied_wrapper(tmp_path, environment=environment)
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "gate passed; report sha256=" in output
+
+
+def test_wrapper_rejects_an_unknown_report_field_after_successful_pytest(
+    tmp_path: Path,
+) -> None:
+    report = {**_valid_demo_live_report(), "unexpected": "benign-but-unknown"}
+    fake_commands = tmp_path / "fake-bin"
+    _write_fake_live_gate_commands(
+        fake_commands,
+        "unused-leak-probe",
+        live_report=report,
+    )
+    environment = os.environ.copy()
+    environment["TEST_MARIADB_DSN"] = (
+        "mysql+pymysql://captain:db-password-not-in-output@127.0.0.1:3306/captain_test"
+    )
+    environment["PATH"] = str(fake_commands)
+
+    result = _run_copied_wrapper(tmp_path, environment=environment)
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "exact live-report contract" in output
+    assert "benign-but-unknown" not in output
 
 
 def test_live_gate_rejects_a_non_isolated_database_without_printing_the_dsn() -> None:
@@ -491,6 +596,8 @@ def test_preflight_and_final_report_are_redacted_before_json_is_consumed_or_prin
         {"private": "redacted"},
         {"nested": {"private_holdout": "redacted"}},
         {"header": "Bearer credential"},
+        {"diagnostic": "sk-proj-fixture-secret"},
+        {"message": "https://captain:credential@service.invalid/status"},
         {"path": "relative-is-still-host-metadata"},
         {"message": r"C:\\Users\\someone\\secret.txt"},
     ),
@@ -502,6 +609,96 @@ def test_live_report_redaction_contract_rejects_sensitive_keys_and_values(
 
     with pytest.raises(AssertionError):
         live_contract._assert_redacted(payload)
+
+
+def test_live_report_rejects_every_known_allowlisted_secret_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    live_contract = _load_live_contract_module()
+    dsn = "mysql+pymysql://captain:db-fixture-password@127.0.0.1:3306/captain_test"
+    n8n_url = "https://n8n-user:n8n-url-password@n8n.invalid"
+    monkeypatch.setenv("TEST_MARIADB_DSN", dsn)
+    monkeypatch.setenv("CAPTAIN_N8N_URL", n8n_url)
+    monkeypatch.setenv("CAPTAIN_N8N_API_KEY", "n8n-api-fixture-value")
+    monkeypatch.setenv("CAPTAIN_N8N_MCP_TOKEN", "n8n-mcp-fixture-value")
+
+    forbidden_values = live_contract._known_secret_values_from_environment()
+    for secret in (
+        dsn,
+        "db-fixture-password",
+        n8n_url,
+        "n8n-url-password",
+        "n8n-api-fixture-value",
+        "n8n-mcp-fixture-value",
+    ):
+        with pytest.raises(AssertionError):
+            live_contract._assert_redacted(
+                {"message": f"prefix-{secret}-suffix"},
+                forbidden_values=forbidden_values,
+            )
+
+
+@pytest.mark.parametrize(
+    ("secret_source", "report_target", "with_n8n"),
+    (
+        ("dsn_password", "provider", False),
+        ("n8n_api_key", "n8n_mcp_call_id", True),
+        ("n8n_mcp_token", "n8n_execution_id", True),
+    ),
+)
+def test_wrapper_rejects_known_secret_values_in_schema_valid_report_fields(
+    tmp_path: Path,
+    secret_source: str,
+    report_target: str,
+    with_n8n: bool,
+) -> None:
+    secrets = {
+        "dsn_password": "db-known-fixture-value",
+        "n8n_api_key": "api-known-fixture-value",
+        "n8n_mcp_token": "mcp-known-fixture-value",
+    }
+    secret = secrets[secret_source]
+    report = _valid_demo_live_report()
+    trace = report["provider_traces"][0]
+    assert isinstance(trace, dict)
+    if report_target == "provider":
+        trace["provider"] = secret
+    else:
+        report["with_n8n"] = True
+        report["n8n_evidence"] = {
+            "workflow_digest": "4" * 64,
+            "n8n_mcp_call_id": (
+                secret if report_target == "n8n_mcp_call_id" else "call-redacted"
+            ),
+            "n8n_execution_id": (
+                secret if report_target == "n8n_execution_id" else "execution-redacted"
+            ),
+        }
+    fake_commands = tmp_path / "fake-bin"
+    _write_fake_live_gate_commands(
+        fake_commands,
+        "unused-leak-probe",
+        live_report=report,
+    )
+    environment = os.environ.copy()
+    environment["TEST_MARIADB_DSN"] = (
+        "mysql+pymysql://captain:db-known-fixture-value@127.0.0.1:3306/captain_test"
+    )
+    environment["CAPTAIN_N8N_URL"] = "https://n8n.invalid"
+    environment["CAPTAIN_N8N_API_KEY"] = secrets["n8n_api_key"]
+    environment["CAPTAIN_N8N_MCP_TOKEN"] = secrets["n8n_mcp_token"]
+    environment["PATH"] = str(fake_commands)
+
+    result = _run_copied_wrapper(
+        tmp_path,
+        environment=environment,
+        with_n8n=with_n8n,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "forbidden sensitive material" in output
+    assert secret not in output
 
 
 def test_live_runner_exception_is_sanitized_outside_the_original_exception_context() -> None:
@@ -527,6 +724,20 @@ def test_live_runner_exception_is_sanitized_outside_the_original_exception_conte
     assert leak_probe not in str(pytest_captured.value)
     assert pytest_captured.value.__context__ is None
     assert pytest_captured.value.__cause__ is None
+
+
+def test_live_report_is_serialized_through_an_exact_extra_forbid_schema() -> None:
+    live_contract = _load_live_contract_module()
+    valid_report = _valid_demo_live_report()
+
+    assert live_contract._serialize_live_report(valid_report) == valid_report
+    with pytest.raises(pytest.fail.Exception) as captured:
+        live_contract._serialize_live_report(
+            {**valid_report, "unexpected": "must-not-be-accepted"}
+        )
+
+    assert "must-not-be-accepted" not in str(captured.value)
+    assert captured.value.__context__ is None
 
 
 def test_live_report_requires_exact_decimal_strings_and_exact_gateway_refs() -> None:

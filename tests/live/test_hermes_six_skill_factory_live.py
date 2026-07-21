@@ -5,12 +5,15 @@ import importlib
 import json
 import os
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
+from urllib.parse import unquote, urlsplit
+from uuid import UUID
 
 import pytest
+from pydantic import BaseModel, ConfigDict, Field
 
 from agenten.agent_factory.contracts import (
     FactoryBlockStatus,
@@ -18,9 +21,76 @@ from agenten.agent_factory.contracts import (
     FactoryPhase,
 )
 from agenten.agent_factory.release_gate import FactoryReleaseDecision
+from agenten.agent_runtime.contracts import ArtifactRef
 
 
 pytestmark = pytest.mark.live
+
+
+class _StrictReportModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class _ProviderTrace(_StrictReportModel):
+    trace_id: str = Field(min_length=1, max_length=200)
+    codex_session_id: str = Field(min_length=1, max_length=200)
+    hermes_session_id: str = Field(min_length=1, max_length=200)
+    provider: str = Field(min_length=1, max_length=100)
+    model: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+    status: Literal["succeeded"]
+    cost_usd: str = Field(pattern=r"^(?:0|[1-9][0-9]*)\.[0-9]+$")
+    usage_receipt_ref: ArtifactRef
+    budget_receipt_ref: ArtifactRef
+
+
+class _RecoveryEvidence(_StrictReportModel):
+    status: Literal["recovered"]
+    evidence_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class _N8nEvidence(_StrictReportModel):
+    workflow_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    n8n_mcp_call_id: str = Field(min_length=1, max_length=200)
+    n8n_execution_id: str = Field(min_length=1, max_length=200)
+
+
+class _GatewayPromotion(_StrictReportModel):
+    projection_status: Literal["ready_to_use"]
+    release_decision: FactoryReleaseDecision
+    promotion_block: FactoryEvidenceBlock
+
+
+class _LiveGateReport(_StrictReportModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        populate_by_name=True,
+    )
+
+    schema_name: Literal["captain.hermes-six-skill-factory-live-report.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    mode: Literal["demo", "release"]
+    prerequisites_confirmed: Literal[True]
+    live_execution: Literal[True]
+    model: str
+    database_name: Literal["captain_test"]
+    context7_provenance_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    provider_traces: tuple[_ProviderTrace, ...]
+    total_cost_usd: str = Field(pattern=r"^(?:0|[1-9][0-9]*)\.[0-9]+$")
+    terminal_status: Literal["demo_ready", "ready_to_use"]
+    recovery: _RecoveryEvidence | None = None
+    gateway_promotion: _GatewayPromotion | None = None
+    with_n8n: bool
+    n8n_evidence: _N8nEvidence | None = None
+
+
+_LiveGateReport.model_rebuild(_types_namespace=globals())
 
 
 def _mapping(value: object) -> Mapping[str, Any]:
@@ -32,6 +102,23 @@ def _mapping(value: object) -> Mapping[str, Any]:
         if isinstance(dumped, Mapping):
             return dumped
     pytest.fail("factory live entrypoint must return a mapping or Pydantic model")
+
+
+def _serialize_live_report(value: object) -> dict[str, Any]:
+    raw = _mapping(value)
+    invalid = False
+    validated: _LiveGateReport | None = None
+    try:
+        validated = _LiveGateReport.model_validate(raw)
+    except BaseException:
+        invalid = True
+    if invalid or validated is None:
+        pytest.fail("factory live report violates the exact external schema", pytrace=False)
+    return validated.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
 
 
 def _required_text(payload: Mapping[str, Any], key: str) -> str:
@@ -102,7 +189,35 @@ def _gateway_promotion(
     assert promotion_block.attempt == attempt
 
 
-def _assert_redacted(value: object) -> None:
+def _known_secret_values_from_environment() -> tuple[str, ...]:
+    values: set[str] = set()
+    database_dsn = os.environ.get("TEST_MARIADB_DSN")
+    if database_dsn:
+        values.add(database_dsn)
+    n8n_url = os.environ.get("CAPTAIN_N8N_URL")
+    if n8n_url:
+        values.add(n8n_url)
+    for name in ("CAPTAIN_N8N_API_KEY", "CAPTAIN_N8N_MCP_TOKEN"):
+        value = os.environ.get(name)
+        if value:
+            values.add(value)
+    for uri_value in (database_dsn, n8n_url):
+        if not uri_value:
+            continue
+        try:
+            password = urlsplit(uri_value).password
+        except ValueError:
+            password = None
+        if password:
+            values.add(unquote(password))
+    return tuple(sorted(values, key=lambda item: (-len(item), item)))
+
+
+def _assert_redacted(
+    value: object,
+    *,
+    forbidden_values: Collection[str] = (),
+) -> None:
     if isinstance(value, Mapping):
         for key, nested in value.items():
             normalized_key = str(key).lower().replace("-", "_")
@@ -122,14 +237,31 @@ def _assert_redacted(value: object) -> None:
                 or normalized_key.endswith("_path")
             ):
                 raise AssertionError("live report contains a forbidden sensitive field")
-            _assert_redacted(nested)
+            _assert_redacted(nested, forbidden_values=forbidden_values)
     elif isinstance(value, list):
         for nested in value:
-            _assert_redacted(nested)
+            _assert_redacted(nested, forbidden_values=forbidden_values)
     elif isinstance(value, str):
         normalized = value.replace("\\", "/")
+        if any(secret and secret in value for secret in forbidden_values):
+            raise AssertionError("live report contains a configured secret value")
         if re.search(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", value):
             raise AssertionError("live report contains bearer authorization material")
+        if re.search(
+            r"(?i)(?<![a-z0-9])sk-(?:proj-)?[a-z0-9_-]{8,}",
+            value,
+        ):
+            raise AssertionError("live report contains token-like secret material")
+        if re.search(
+            r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@",
+            value,
+        ):
+            raise AssertionError("live report contains URL credentials")
+        if re.search(
+            r"(?i)[?&#](?:api[_-]?key|access[_-]?token|token|authorization|password|secret)=[^&#\s]+",
+            value,
+        ):
+            raise AssertionError("live report contains URL credential parameters")
         if re.search(
             r"(?i)(?<![a-z])[a-z]:/|(?<!:)//|/(?:home|Users|tmp|var|etc)/",
             normalized,
@@ -187,8 +319,9 @@ async def test_hermes_six_skill_factory_live() -> None:
         pytest.fail("factory live runtime entrypoint is missing the agreed async runner")
 
     result = await _run_sanitized_live_gate(runner)
-    report = _mapping(result)
-    _assert_redacted(report)
+    forbidden_values = _known_secret_values_from_environment()
+    report = _serialize_live_report(result)
+    _assert_redacted(report, forbidden_values=forbidden_values)
 
     assert report.get("schema") == "captain.hermes-six-skill-factory-live-report.v1"
     mode = os.environ["CAPTAIN_FACTORY_GATE_MODE"]
@@ -245,6 +378,6 @@ async def test_hermes_six_skill_factory_live() -> None:
     report_bytes = report_path.read_bytes()
     digest = hashlib.sha256(report_bytes).hexdigest()
     assert report_path.name == f"sha256-{digest}.json"
-    persisted = json.loads(report_bytes.decode("utf-8"))
-    _assert_redacted(persisted)
+    persisted = _serialize_live_report(json.loads(report_bytes.decode("utf-8")))
+    _assert_redacted(persisted, forbidden_values=forbidden_values)
     assert persisted == report
