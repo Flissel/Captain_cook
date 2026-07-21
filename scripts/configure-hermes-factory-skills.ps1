@@ -22,7 +22,8 @@ $skillNames = @(
 )
 
 # Captain-owned release manifest. Each value hashes the sorted relative path and
-# SHA-256 of every file in that skill directory.
+# SHA-256 of every file in that skill directory. Known text assets normalize
+# CRLF and standalone CR to LF before hashing; binary files remain byte-exact.
 $releasedSkillDigests = @{
     'captain-factory-discover' = '669c5b3208ab0779194fd79a70b3a8258eb6869767338fcf629b42cdcaddf19d'
     'captain-factory-brief-codex' = 'ab15e81bf383fe64ab9b1a7c018f5577025fcbed3eaec47ffdb1d1692808648b'
@@ -108,7 +109,31 @@ function Get-DirectoryManifestDigest {
     $entries = Get-ChildItem -LiteralPath $root -File -Recurse |
         ForEach-Object {
             $relative = [System.IO.Path]::GetRelativePath($root, $_.FullName).Replace('\', '/')
-            $fileHash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            $pathParts = @($relative -split '/')
+            $extension = [System.IO.Path]::GetExtension($_.Name).ToLowerInvariant()
+            $isTextAsset = (
+                [string]::Equals($_.Name, 'SKILL.md', [StringComparison]::OrdinalIgnoreCase) -or
+                $extension -in @('.md', '.yaml', '.yml') -or
+                $pathParts -contains 'templates'
+            )
+            $fileBytes = [System.IO.File]::ReadAllBytes($_.FullName)
+            if ($isTextAsset) {
+                $canonicalBytes = [System.Collections.Generic.List[byte]]::new($fileBytes.Length)
+                for ($index = 0; $index -lt $fileBytes.Length; $index++) {
+                    if ($fileBytes[$index] -eq 13) {
+                        if (($index + 1) -lt $fileBytes.Length -and $fileBytes[$index + 1] -eq 10) {
+                            $index++
+                        }
+                        $canonicalBytes.Add(10)
+                    }
+                    else {
+                        $canonicalBytes.Add($fileBytes[$index])
+                    }
+                }
+                $fileBytes = $canonicalBytes.ToArray()
+            }
+            $fileHashBytes = [System.Security.Cryptography.SHA256]::HashData($fileBytes)
+            $fileHash = [Convert]::ToHexString($fileHashBytes).ToLowerInvariant()
             "$relative=$fileHash"
         } |
         Sort-Object

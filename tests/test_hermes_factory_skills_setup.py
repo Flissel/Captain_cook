@@ -227,6 +227,23 @@ def _copy_skill_repository(tmp_path: Path) -> Path:
     return repository
 
 
+def _rewrite_skill_text_line_endings(repository: Path, newline: bytes) -> None:
+    skill_root = repository / "agenten" / "agent_factory" / "skills"
+    for path in skill_root.rglob("*"):
+        if not path.is_file():
+            continue
+        relative_parts = path.relative_to(skill_root).parts
+        is_text_asset = (
+            path.name == "SKILL.md"
+            or path.suffix.lower() in {".md", ".yaml", ".yml"}
+            or "templates" in relative_parts[:-1]
+        )
+        if not is_text_asset:
+            continue
+        canonical = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        path.write_bytes(canonical.replace(b"\n", newline))
+
+
 def test_configure_script_preserves_external_dirs_and_is_idempotent(
     tmp_path: Path,
 ) -> None:
@@ -265,6 +282,7 @@ def test_configure_script_rejects_changed_or_missing_released_skill(
 ) -> None:
     env, hermes_home = _environment(tmp_path)
     repository = _copy_skill_repository(tmp_path)
+    _rewrite_skill_text_line_endings(repository, b"\n")
     changed = (
         repository
         / "agenten"
@@ -282,6 +300,23 @@ def test_configure_script_rejects_changed_or_missing_released_skill(
     assert result.returncode != 0
     assert "digest mismatch" in (result.stdout + result.stderr).lower()
     assert not (hermes_home / "config.yaml").exists()
+
+
+@pytest.mark.parametrize("newline", (b"\n", b"\r\n"), ids=("lf", "crlf"))
+def test_configure_script_accepts_released_text_assets_across_line_endings(
+    tmp_path: Path,
+    newline: bytes,
+) -> None:
+    env, hermes_home = _environment(tmp_path)
+    repository = _copy_skill_repository(tmp_path)
+    _rewrite_skill_text_line_endings(repository, newline)
+
+    result = subprocess.run(
+        _command(repository), env=env, text=True, capture_output=True, check=True
+    )
+
+    assert "configured" in result.stdout.lower()
+    assert (hermes_home / "skill-bundles" / "captain-agent-factory-loop.yaml").is_file()
 
 
 @pytest.mark.parametrize("source", ("local", "external"))
