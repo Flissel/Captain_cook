@@ -42,6 +42,7 @@ def test_pinned_hermes_runtime_exposes_required_surfaces() -> None:
 
 
 def test_readiness_verifier_emits_only_redacted_readiness_fields() -> None:
+    pinned_commit = pinned_parent_gitlink(ROOT, "hermes-agent")
     result = subprocess.run(
         [
             "powershell",
@@ -57,7 +58,7 @@ def test_readiness_verifier_emits_only_redacted_readiness_fields() -> None:
     )
 
     assert result.stdout.splitlines() == [
-        "hermes_commit=969ae7ef1dbec015ae0740c96cb0b327e6d41755",
+        f"hermes_commit={pinned_commit}",
         "entrypoints=hermes_cli/captain_planner.py,hermes_cli/mcp_config.py",
         "tests=passed",
         "n8n_server=n8n-mcp",
