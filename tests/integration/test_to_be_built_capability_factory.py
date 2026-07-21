@@ -1,0 +1,1585 @@
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import zipfile
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from uuid import UUID, uuid5
+
+import pytest
+
+from agenten.agent_factory.capability_factory_entrypoint import (
+    CapabilityFactoryConfigurationError,
+    CapabilityExecutionBundle,
+    CapabilityFactoryCheckpoint,
+    CapabilityFactoryEntrypoint,
+    CapabilityFactoryInputMutation,
+    CapabilityFactoryRunSummary,
+    CapabilityReleaseRunReceipt,
+    CapabilitySandboxIsolationError,
+    DockerCapabilitySandboxRunner,
+    DockerCommandResult,
+    FileCapabilityFactoryCheckpointStore,
+    InMemoryCapabilityFactoryCheckpointStore,
+    parse_capability_factory_args,
+    write_redacted_evidence_manifest,
+)
+from agenten.agent_factory.contracts import (
+    AgentFactoryJobV2,
+    FactoryBlockStatus,
+    FactoryEvidenceBlock,
+    FactoryPhase,
+    FactoryRole,
+)
+from agenten.agent_factory.forge_contracts import (
+    CreationJobV1,
+    CreationResultV1,
+    CreationSubmissionReceipt,
+    ReleasedSkillRefV1,
+)
+from agenten.agent_factory.holdout_store import InMemoryPrivateHoldoutStore
+from agenten.agent_factory.outcome_contracts import (
+    AssertionOutcome,
+    CapabilityAssertionResult,
+    CapabilityReleaseEvidenceV1,
+    ExecutionOutcomeV1,
+    ForgeCapabilityPackageCandidateV1,
+)
+from agenten.agent_factory.outcome_validation import (
+    CapabilitySandboxRequest,
+    CapabilitySandboxResult,
+    CapabilitySandboxTermination,
+)
+from agenten.agent_factory.release_gate import FactoryReleaseDecision
+from agenten.agent_factory.service import FactoryCoordinator
+from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationEvidence
+from agenten.agent_factory.skill_store import StoredSkillEvaluation
+from agenten.agent_runtime.contracts import (
+    AgentRuntimeCommand,
+    AgentRuntimeResult,
+    ArtifactRef,
+)
+from agenten.delivery.projector import MinibookProjector
+from agenten.delivery.projection_cursor import ProjectionCursorStore
+from gateway.capability_catalog import CapabilityCatalogRecord, GatewayCapabilityCatalog
+from gateway.contracts import (
+    CapabilityExecutionRecord,
+    CapabilityExecutionRequest,
+    CapabilityReleaseRequest,
+    CapabilityWriteReceipt,
+)
+from gateway.factory_repository import GatewayFactoryRepository
+from gateway.registry_feed import runtime_result_projection
+from tests.agent_factory.test_skill_evaluation_contracts import evidence_payload
+
+
+CORRELATION_ID = UUID("6b169405-f9f0-4d24-84bc-a7f098d2d8f1")
+FACTORY_JOB_ID = UUID("1fcbdac4-31e1-48a2-b57b-f066896f09dd")
+NOW = datetime(2026, 7, 21, 14, 0, tzinfo=timezone.utc)
+FIXTURE_INPUT = (
+    Path(__file__).parents[1]
+    / "fixtures"
+    / "agent_factory"
+    / "TO_BE_BUILT.valid.md"
+)
+
+
+class SimulatedProcessCrash(RuntimeError):
+    pass
+
+
+@dataclass
+class MutableClock:
+    value: datetime = NOW
+
+    def now(self) -> datetime:
+        return self.value
+
+
+@dataclass
+class MemoryContentStore:
+    content_by_uri: dict[str, bytes] = field(default_factory=dict)
+
+    def put(self, content: bytes, media_type: str, *, namespace: str = "factory") -> ArtifactRef:
+        digest = hashlib.sha256(content).hexdigest()
+        reference = ArtifactRef(
+            uri=f"artifact://{namespace}/{digest}",
+            sha256=digest,
+            media_type=media_type,
+        )
+        self.content_by_uri[reference.uri] = content
+        return reference
+
+    async def read(self, reference: ArtifactRef) -> bytes:
+        return self.content_by_uri[reference.uri]
+
+
+@dataclass
+class VerifiedScriptedSandboxRunner:
+    requests: list[CapabilitySandboxRequest] = field(default_factory=list)
+
+    async def validate(self, request: CapabilitySandboxRequest) -> CapabilitySandboxResult:
+        self.requests.append(request)
+        return CapabilitySandboxResult(
+            execution_id=request.execution_id,
+            request_digest=request.request_digest,
+            status="passed",
+            imported_modules=request.module_names,
+            executed_test_paths=request.test_paths,
+            sandbox_identity="sandbox://scripted/verified-isolation",
+            process_identity=request.process_identity,
+            process_identity_verified=True,
+            extracted_tree_sha256=request.extracted_tree_sha256,
+            workspace_was_read_only=True,
+            network_was_disabled=True,
+            resource_limits_were_enforced=True,
+            process_tree_termination_capable=True,
+        )
+
+    async def cancel(self, execution_id: UUID) -> None:
+        return None
+
+    async def await_termination(self, execution_id: UUID) -> CapabilitySandboxTermination:
+        request = next(item for item in self.requests if item.execution_id == execution_id)
+        return CapabilitySandboxTermination(
+            execution_id=execution_id,
+            request_digest=request.request_digest,
+            sandbox_identity="sandbox://scripted/verified-isolation",
+            process_identity=request.process_identity,
+            process_identity_verified=True,
+            extracted_tree_sha256=request.extracted_tree_sha256,
+            terminated=True,
+            process_tree_terminated=True,
+        )
+
+
+def _canonical_ref(model: object, name: str) -> ArtifactRef:
+    content = json.dumps(
+        model.model_dump(mode="json", by_alias=True),  # type: ignore[attr-defined]
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(content).hexdigest()
+    return ArtifactRef(
+        uri=f"artifact://gateway/{name}/{digest}",
+        sha256=digest,
+        media_type="application/json",
+    )
+
+
+def _zip_bytes(files: dict[str, bytes]) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path, content in files.items():
+            archive.writestr(path, content)
+    return output.getvalue()
+
+
+def test_checkpoint_binding_is_idempotent_and_rejects_changed_input_bytes() -> None:
+    store = InMemoryCapabilityFactoryCheckpointStore()
+    checkpoint = CapabilityFactoryCheckpoint(
+        correlation_id=CORRELATION_ID,
+        factory_job_id=FACTORY_JOB_ID,
+        subject_version=1,
+        input_sha256="a" * 64,
+    )
+
+    assert store.bind(checkpoint) == checkpoint
+    assert store.bind(checkpoint) == checkpoint
+
+    with pytest.raises(CapabilityFactoryInputMutation, match="input bytes"):
+        store.bind(checkpoint.model_copy(update={"input_sha256": "b" * 64}))
+
+
+def test_file_checkpoint_binding_survives_process_restart(tmp_path: Path) -> None:
+    checkpoint = CapabilityFactoryCheckpoint(
+        correlation_id=CORRELATION_ID,
+        factory_job_id=FACTORY_JOB_ID,
+        subject_version=1,
+        input_sha256="a" * 64,
+    )
+
+    assert FileCapabilityFactoryCheckpointStore(tmp_path).bind(checkpoint) == checkpoint
+    restarted = FileCapabilityFactoryCheckpointStore(tmp_path)
+    assert restarted.bind(checkpoint) == checkpoint
+
+    with pytest.raises(CapabilityFactoryInputMutation, match="input bytes"):
+        restarted.bind(checkpoint.model_copy(update={"input_sha256": "b" * 64}))
+
+
+def _accepted_evaluation(
+    job: AgentFactoryJobV2,
+    *,
+    released_skill_ref: ArtifactRef,
+    skill_evidence_ref: ArtifactRef,
+) -> StoredSkillEvaluation:
+    evidence = HermesSkillEvaluationEvidence.model_validate(evidence_payload())
+    released_skill = evidence.request.released_skill.model_copy(
+        update={
+            "capability": job.required_capability,
+            "content_ref": released_skill_ref,
+            "content_sha256": released_skill_ref.sha256,
+            "released_at": job.occurred_at,
+        }
+    )
+    lease = evidence.request.lease.model_copy(
+        update={
+            "job_id": job.job_id,
+            "correlation_id": job.correlation_id,
+            "subject_version": job.subject_version,
+            "issued_at": job.occurred_at,
+            "expires_at": job.deadline_at,
+        }
+    )
+    request = evidence.request.model_copy(
+        update={
+            "job_id": job.job_id,
+            "correlation_id": job.correlation_id,
+            "subject_version": job.subject_version,
+            "acceptance_assertion_ids": job.acceptance_assertion_ids,
+            "released_skill": released_skill,
+            "lease": lease,
+            "occurred_at": job.occurred_at,
+        }
+    )
+    receipt = evidence.receipt.model_copy(
+        update={
+            "job_id": job.job_id,
+            "correlation_id": job.correlation_id,
+            "lease_id": lease.lease_id,
+            "released_skill": released_skill,
+            "used_skill_id": released_skill.skill_id,
+            "used_skill_version": released_skill.version,
+            "used_skill_sha256": released_skill.content_sha256,
+            "assertion_ids": job.acceptance_assertion_ids,
+            "occurred_at": job.occurred_at + timedelta(seconds=1),
+            "evidence_refs": (skill_evidence_ref,),
+        }
+    )
+    assert evidence.candidate is not None
+    candidate = evidence.candidate.model_copy(
+        update={
+            "parent_released_skill": released_skill,
+            "created_at": job.occurred_at + timedelta(seconds=2),
+        }
+    )
+    checks = tuple(
+        check.model_copy(
+            update={
+                "occurred_at": job.occurred_at + timedelta(seconds=3),
+                "assertion_ids": (
+                    job.acceptance_assertion_ids if check.kind == "test" else ()
+                ),
+            }
+        )
+        for check in evidence.checks
+    )
+    evidence = evidence.model_copy(
+        update={
+            "job_id": job.job_id,
+            "correlation_id": job.correlation_id,
+            "subject_version": job.subject_version,
+            "occurred_at": job.occurred_at + timedelta(seconds=4),
+            "request": request,
+            "receipt": receipt,
+            "candidate": candidate,
+            "checks": checks,
+            "assertion_ids": job.acceptance_assertion_ids,
+            "outcome": "passed",
+            "tool_gaps": (),
+        }
+    )
+    return StoredSkillEvaluation(
+        evidence=evidence,
+        evidence_ref=_canonical_ref(evidence, "accepted-skill-evaluation"),
+        receipt_ref=_canonical_ref(receipt, "accepted-skill-receipt"),
+        tool_gaps=(),
+        tool_gap_refs=(),
+        candidate_ref=_canonical_ref(candidate, "retained-skill-candidate"),
+    )
+
+
+def _block(
+    job: AgentFactoryJobV2,
+    phase: FactoryPhase,
+    *,
+    occurred_at: datetime,
+    assertions: tuple[str, ...] = (),
+    evidence_refs: tuple[ArtifactRef, ...] = (),
+) -> FactoryEvidenceBlock:
+    role = {
+        FactoryPhase.BLUEPRINT_CREATED: FactoryRole.AGENT_ARCHITECT,
+        FactoryPhase.TOOL_CANDIDATE_TESTED: FactoryRole.TOOL_INTEGRATOR,
+        FactoryPhase.AGENT_CODE_CREATED: FactoryRole.TOOL_INTEGRATOR,
+        FactoryPhase.BUILD_PASSED: FactoryRole.TOOL_INTEGRATOR,
+        FactoryPhase.REAL_CASE_EVIDENCE: FactoryRole.REAL_CASE_TESTER,
+        FactoryPhase.QUALITY_REVIEWED: FactoryRole.QUALITY_WARDEN,
+    }.get(phase)
+    producer = "hermes" if role is not None else "captain"
+    phase_ref = ArtifactRef(
+        uri=f"artifact://factory-stage/{hashlib.sha256((str(job.job_id) + phase.value).encode()).hexdigest()}",
+        sha256=hashlib.sha256((str(job.job_id) + phase.value).encode()).hexdigest(),
+        media_type="application/json",
+    )
+    return FactoryEvidenceBlock(
+        schema_name="captain.agent-factory-block.v1",
+        event_id=uuid5(job.event_id, f"factory-stage:{phase.value}:1"),
+        job_id=job.job_id,
+        correlation_id=job.correlation_id,
+        causation_id=job.event_id,
+        occurred_at=occurred_at,
+        producer=producer,
+        subject_version=job.subject_version,
+        attempt=1,
+        phase=phase,
+        role=role,
+        status=FactoryBlockStatus.SUCCEEDED,
+        evidence_refs=evidence_refs or (phase_ref,),
+        assertion_ids=assertions,
+        lease_id=f"lease-{phase.value}-1" if role is not None else None,
+    )
+
+
+@dataclass
+class DynamicPackage:
+    job: AgentFactoryJobV2
+    creation_job_id: UUID
+    store: MemoryContentStore
+    released_skill_ref: ArtifactRef
+    required_gap: bool = False
+    rejected_archive: bool = False
+    failed_holdout: bool = False
+
+    def __post_init__(self) -> None:
+        files = {
+            "team-manifest.json": json.dumps(
+                {
+                    "schema": "autogen-team.v1",
+                    "capability_id": self.job.required_capability,
+                    "capability_version": 1,
+                    "autogen_modules": ["autogen/__init__.py", "autogen/team.py"],
+                    "test_paths": ["tests/test_team.py"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+            "autogen/__init__.py": b"from .team import CAPABILITY_ID\n",
+            "autogen/team.py": (
+                f"CAPABILITY_ID = {self.job.required_capability!r}\n"
+            ).encode("utf-8"),
+            "skills/autogen-agent-factory/SKILL.md": self.store.content_by_uri[
+                self.released_skill_ref.uri
+            ],
+            "tests/test_team.py": (
+                "from autogen.team import CAPABILITY_ID\n\n"
+                f"def test_identity():\n    assert CAPABILITY_ID == {self.job.required_capability!r}\n"
+            ).encode("utf-8"),
+            "evidence/summary.json": b'{"status":"candidate"}\n',
+            "RUNBOOK.md": b"# Capability runbook\n",
+        }
+        self.files = files
+        archive = _zip_bytes(files)
+        self.source_ref = self.store.put(archive, "application/zip", namespace="package")
+        kind_by_path = {
+            "team-manifest.json": "team_manifest",
+            "autogen/__init__.py": "autogen_source",
+            "autogen/team.py": "autogen_source",
+            "skills/autogen-agent-factory/SKILL.md": "skill",
+            "tests/test_team.py": "test",
+            "evidence/summary.json": "evidence",
+            "RUNBOOK.md": "runbook",
+        }
+        media_by_path = {
+            "team-manifest.json": "application/json",
+            "autogen/__init__.py": "text/x-python",
+            "autogen/team.py": "text/x-python",
+            "skills/autogen-agent-factory/SKILL.md": "text/markdown",
+            "tests/test_team.py": "text/x-python",
+            "evidence/summary.json": "application/json",
+            "RUNBOOK.md": "text/markdown",
+        }
+        artifact_items = []
+        refs_by_path: dict[str, ArtifactRef] = {}
+        for path, content in files.items():
+            reference = (
+                self.released_skill_ref
+                if path == "skills/autogen-agent-factory/SKILL.md"
+                else self.store.put(content, media_by_path[path], namespace="package-file")
+            )
+            refs_by_path[path] = reference
+            artifact_items.append(
+                {"path": path, "kind": kind_by_path[path], "reference": reference}
+            )
+        self.artifact_refs = refs_by_path
+        skill_evidence_ref = self.store.put(
+            b'{"check":"released-skill-use","status":"passed"}',
+            "application/json",
+            namespace="skill-evidence",
+        )
+        evaluation = _accepted_evaluation(
+            self.job,
+            released_skill_ref=self.released_skill_ref,
+            skill_evidence_ref=skill_evidence_ref,
+        )
+        self.evaluation = evaluation
+        receipt = evaluation.evidence.receipt
+        receipt_bytes = receipt.model_dump_json(by_alias=True).encode("utf-8")
+        self.skill_receipt_ref = self.store.put(
+            receipt_bytes,
+            "application/json",
+            namespace="skill-receipt",
+        )
+        tool_gaps: list[dict[str, object]] = []
+        creation_gaps: list[dict[str, object]] = []
+        if self.required_gap:
+            input_ref = self.store.put(b'{"schema":"object"}', "application/json", namespace="gap")
+            output_ref = self.store.put(b'{"schema":"object","type":"result"}', "application/json", namespace="gap")
+            evidence_ref = self.store.put(b'{"status":"unresolved"}', "application/json", namespace="gap")
+            gap = {
+                "schema": "TODO_TOOL.v1",
+                "gap_id": "missing-required-provider",
+                "severity": "required",
+                "input_contract_ref": input_ref,
+                "output_contract_ref": output_ref,
+                "least_privilege_capability": "provider.execute",
+                "implementation_options": [
+                    {
+                        "option_id": "provide-approved-provider",
+                        "description": "Configure the required approved provider.",
+                        "acceptance_assertion_id": self.job.acceptance_assertion_ids[0],
+                    }
+                ],
+                "acceptance_assertion_ids": [self.job.acceptance_assertion_ids[0]],
+                "evidence_ref": evidence_ref,
+                "status": "unresolved",
+            }
+            tool_gaps.append(gap)
+            creation_gaps.append(
+                {
+                    "schema": "TODO_TOOL.v1",
+                    "gap_id": gap["gap_id"],
+                    "severity": gap["severity"],
+                    "evidence_ref": evidence_ref.model_dump(mode="json"),
+                    "status": "unresolved",
+                }
+            )
+
+        self.candidate = ForgeCapabilityPackageCandidateV1.model_validate(
+            {
+                "schema": "forge.capability-package-candidate.v1",
+                "capability_id": self.job.required_capability,
+                "capability_version": 1,
+                "factory_job_id": self.job.job_id,
+                "creation_job_id": self.creation_job_id,
+                "correlation_id": self.job.correlation_id,
+                "subject_version": self.job.subject_version,
+                "attempt": 1,
+                "source_ref": self.source_ref,
+                "team_manifest_ref": refs_by_path["team-manifest.json"],
+                "artifacts": artifact_items,
+                "skill_usage_receipt_ref": self.skill_receipt_ref,
+                "tool_gaps": tool_gaps,
+                "runbook_ref": refs_by_path["RUNBOOK.md"],
+            }
+        )
+        candidate_bytes = self.candidate.model_dump_json(by_alias=True).encode("utf-8")
+        self.candidate_ref = self.store.put(
+            candidate_bytes,
+            "application/json",
+            namespace="candidate",
+        )
+        if self.rejected_archive:
+            bad_bytes = self.store.content_by_uri[self.source_ref.uri] + b"tampered"
+            self.store.content_by_uri[self.source_ref.uri] = bad_bytes
+        self.creation_result = CreationResultV1.model_validate(
+            {
+                "schema": "minibook.creation-result.v1",
+                "creation_job_id": self.creation_job_id,
+                "correlation_id": self.job.correlation_id,
+                "subject_version": self.job.subject_version,
+                "attempt": 1,
+                "status": "succeeded",
+                "package_manifest_ref": self.candidate_ref.model_dump(mode="json"),
+                "artifact_refs": [self.source_ref.model_dump(mode="json")],
+                "evidence_refs": [],
+                "tool_gaps": creation_gaps,
+                "skill_usage_receipt_ref": self.skill_receipt_ref.model_dump(mode="json"),
+            }
+        )
+        tree_entries = sorted(
+            (path, hashlib.sha256(content).hexdigest(), len(content))
+            for path, content in files.items()
+        )
+        self.tree_sha256 = hashlib.sha256(
+            json.dumps(tree_entries, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def release_run(self, run_number: int) -> CapabilityReleaseRunReceipt:
+        run_id = "controlled-recovery-01" if run_number == 1 else f"normal-e2e-{run_number - 1:02d}"
+        assertion_results = []
+        for assertion_id in self.job.acceptance_assertion_ids:
+            evidence_bytes = json.dumps(
+                {
+                    "schema": "captain.capability-assertion-evidence.v1",
+                    "run_id": run_id,
+                    "assertion_id": assertion_id,
+                    "status": "passed",
+                    "producer": "captain",
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            evidence_ref = self.store.put(
+                evidence_bytes,
+                "application/json",
+                namespace=f"assertion-run-{run_number}",
+            )
+            assertion_results.append(
+                CapabilityAssertionResult(
+                    assertion_id=assertion_id,
+                    status="passed",
+                    integration_intent="none",
+                    evidence_refs=(evidence_ref,),
+                )
+            )
+        holdouts = []
+        if run_number == 1:
+            for holdout in self.job.private_holdout_refs:
+                holdout_ref = self.store.put(
+                    json.dumps(
+                        {"holdout_id": holdout.holdout_id, "status": "recorded"},
+                        separators=(",", ":"),
+                    ).encode("utf-8"),
+                    "application/json",
+                    namespace="holdout-evidence",
+                )
+                holdouts.append(
+                    {
+                        "holdout_id": holdout.holdout_id,
+                        "assertion_id": self.job.acceptance_assertion_ids[0],
+                        "status": "failed" if self.failed_holdout else "passed",
+                        "evidence_ref": holdout_ref,
+                    }
+                )
+        record = CapabilityReleaseEvidenceV1(
+            schema_name="captain.capability-release-evidence.v1",
+            run_id=run_id,
+            run_number=run_number,
+            factory_job_id=self.job.job_id,
+            creation_job_id=self.creation_job_id,
+            correlation_id=self.job.correlation_id,
+            subject_version=self.job.subject_version,
+            attempt=1,
+            capability_id=self.job.required_capability,
+            capability_version=1,
+            candidate_manifest_sha256=self.candidate_ref.sha256,
+            package_archive_sha256=self.source_ref.sha256,
+            extracted_tree_sha256=self.tree_sha256,
+            kind="recovery" if run_number == 1 else "normal",
+            outcome="expected_failure_recovered" if run_number == 1 else "succeeded",
+            producer="captain",
+            assertion_results=tuple(assertion_results),
+            recovery_id="controlled-recovery-01" if run_number == 1 else None,
+            recovery_assertion_id=(
+                self.job.acceptance_assertion_ids[0] if run_number == 1 else None
+            ),
+            private_holdout_evidence=tuple(holdouts),
+        )
+        content = record.model_dump_json(by_alias=True).encode("utf-8")
+        reference = self.store.put(
+            content,
+            "application/json",
+            namespace="release-evidence",
+        )
+        return CapabilityReleaseRunReceipt(record=record, reference=reference)
+
+
+@dataclass
+class ScriptedGatewayStore:
+    clock: MutableClock
+    jobs: dict[UUID, AgentFactoryJobV2] = field(default_factory=dict)
+    blocks_by_job: dict[UUID, dict[UUID, FactoryEvidenceBlock]] = field(default_factory=dict)
+    evaluations: dict[UUID, StoredSkillEvaluation] = field(default_factory=dict)
+    release_decisions: dict[UUID, FactoryReleaseDecision] = field(default_factory=dict)
+    terminal_decisions: dict[UUID, object] = field(default_factory=dict)
+    catalog_records: dict[str, CapabilityCatalogRecord] = field(default_factory=dict)
+    releases: dict[UUID, CapabilityReleaseRequest] = field(default_factory=dict)
+    runtime_operations: dict[UUID, CapabilityExecutionBundle] = field(default_factory=dict)
+    executions: dict[UUID, CapabilityExecutionRecord] = field(default_factory=dict)
+    projection_events_by_correlation: dict[UUID, list[object]] = field(default_factory=dict)
+    release_effects: list[UUID] = field(default_factory=list)
+    execution_effects: list[UUID] = field(default_factory=list)
+
+    def record_factory_job(self, job: AgentFactoryJobV2) -> object:
+        existing = self.jobs.get(job.job_id)
+        if existing is not None and existing != job:
+            raise AssertionError("changed factory job replay")
+        self.jobs[job.job_id] = job
+        return SimpleNamespace(replayed=existing is not None)
+
+    def factory_job(self, job_id: UUID) -> object:
+        return SimpleNamespace(
+            job=self.jobs[job_id],
+            blocks=tuple(self.blocks_by_job.get(job_id, {}).values()),
+        )
+
+    def record_factory_block(self, block: FactoryEvidenceBlock) -> object:
+        records = self.blocks_by_job.setdefault(block.job_id, {})
+        existing = records.get(block.event_id)
+        if existing is not None and existing != block:
+            raise AssertionError("changed factory block replay")
+        records[block.event_id] = block
+        return SimpleNamespace(replayed=existing is not None)
+
+    def factory_skill_evaluation(self, job_id: UUID) -> StoredSkillEvaluation | None:
+        return self.evaluations.get(job_id)
+
+    def factory_release_decision(self, job_id: UUID) -> FactoryReleaseDecision | None:
+        return self.release_decisions.get(job_id)
+
+    def record_factory_release_decision(self, decision: FactoryReleaseDecision) -> object:
+        existing = self.release_decisions.get(decision.job_id)
+        if existing is not None and existing != decision:
+            raise AssertionError("changed release decision replay")
+        self.release_decisions[decision.job_id] = decision
+        return SimpleNamespace(replayed=existing is not None)
+
+    def record_factory_terminal_decision(self, decision: object) -> object:
+        job_id = decision.job_id  # type: ignore[attr-defined]
+        existing = self.terminal_decisions.get(job_id)
+        if existing is not None and existing != decision:
+            raise AssertionError("changed terminal decision replay")
+        self.terminal_decisions[job_id] = decision
+        return SimpleNamespace(replayed=existing is not None)
+
+    def factory_terminal_decision(self, job_id: UUID) -> object | None:
+        return self.terminal_decisions.get(job_id)
+
+    def find_ready_capability(self, capability_id: str) -> CapabilityCatalogRecord | None:
+        return self.catalog_records.get(capability_id)
+
+    def publish_capability_release(
+        self,
+        request: CapabilityReleaseRequest,
+    ) -> CapabilityWriteReceipt:
+        existing = self.releases.get(request.package.factory_job_id)
+        if existing is not None:
+            if existing != request:
+                raise AssertionError("changed capability release replay")
+            return CapabilityWriteReceipt(
+                record_id=f"{request.package.capability_id}:{request.package.capability_version}",
+                replayed=True,
+            )
+        self.releases[request.package.factory_job_id] = request
+        self.release_effects.append(request.event_id)
+        self.catalog_records[request.package.capability_id] = CapabilityCatalogRecord.from_release(
+            request,
+            catalog_fence=1,
+        )
+        return CapabilityWriteReceipt(
+            record_id=f"{request.package.capability_id}:{request.package.capability_version}",
+            replayed=False,
+        )
+
+    def record_runtime_operation(self, bundle: CapabilityExecutionBundle) -> None:
+        existing = self.runtime_operations.get(bundle.command.event_id)
+        if existing is not None and existing != bundle:
+            raise AssertionError("changed runtime operation replay")
+        self.runtime_operations[bundle.command.event_id] = bundle
+
+    def record_capability_execution(
+        self,
+        request: CapabilityExecutionRequest,
+    ) -> CapabilityWriteReceipt:
+        existing = self.executions.get(request.outcome.command_id)
+        if existing is not None:
+            if existing.outcome != request.outcome:
+                raise AssertionError("changed execution replay")
+            return CapabilityWriteReceipt(
+                record_id=str(request.outcome.command_id),
+                replayed=True,
+            )
+        bundle = self.runtime_operations[request.outcome.command_id]
+        record = CapabilityExecutionRecord.from_request(request, catalog_fence=1)
+        self.executions[request.outcome.command_id] = record
+        self.execution_effects.append(request.event_id)
+        projection = runtime_result_projection(
+            bundle.result.model_dump(mode="json", by_alias=True)
+        )
+        assert projection is not None
+        self.projection_events_by_correlation.setdefault(
+            bundle.result.correlation_id,
+            [],
+        ).append(projection)
+        return CapabilityWriteReceipt(
+            record_id=str(request.outcome.command_id),
+            replayed=False,
+        )
+
+    def projection_events(self, correlation_id: UUID) -> tuple[object, ...]:
+        return tuple(self.projection_events_by_correlation.get(correlation_id, ()))
+
+
+@dataclass
+class ScriptedCreationPort:
+    store: MemoryContentStore
+    gateway: ScriptedGatewayStore
+    released_skill_ref: ArtifactRef
+    crash_after_submit_once: bool = False
+    required_gap: bool = False
+    rejected_archive: bool = False
+    failed_holdout: bool = False
+    advance_clock_after_result: timedelta | None = None
+    prepared: dict[UUID, DynamicPackage] = field(default_factory=dict)
+    submission_effects: list[UUID] = field(default_factory=list)
+    submitted_jobs: dict[UUID, CreationJobV1] = field(default_factory=dict)
+    _crashed_after_submit: bool = False
+
+    async def preparation_blocks(
+        self,
+        job: AgentFactoryJobV2,
+        creation_job: CreationJobV1,
+    ) -> tuple[FactoryEvidenceBlock, FactoryEvidenceBlock]:
+        package = self.prepared.get(creation_job.creation_job_id)
+        if package is None:
+            package = DynamicPackage(
+                job=job,
+                creation_job_id=creation_job.creation_job_id,
+                store=self.store,
+                released_skill_ref=self.released_skill_ref,
+                required_gap=self.required_gap,
+                rejected_archive=self.rejected_archive,
+                failed_holdout=self.failed_holdout,
+            )
+            self.prepared[creation_job.creation_job_id] = package
+            self.gateway.evaluations[job.job_id] = package.evaluation
+        return (
+            _block(
+                job,
+                FactoryPhase.BLUEPRINT_CREATED,
+                occurred_at=job.occurred_at + timedelta(seconds=5),
+            ),
+            _block(
+                job,
+                FactoryPhase.TOOL_CANDIDATE_TESTED,
+                occurred_at=job.occurred_at + timedelta(seconds=6),
+            ),
+        )
+
+    async def submit(self, creation_job: CreationJobV1) -> CreationSubmissionReceipt:
+        existing = self.submitted_jobs.get(creation_job.creation_job_id)
+        if existing is not None and existing != creation_job:
+            raise AssertionError("changed CreationJob replay")
+        if existing is None:
+            self.submitted_jobs[creation_job.creation_job_id] = creation_job
+            self.submission_effects.append(creation_job.creation_job_id)
+            if self.crash_after_submit_once and not self._crashed_after_submit:
+                self._crashed_after_submit = True
+                raise SimulatedProcessCrash("after creation submission")
+        return CreationSubmissionReceipt(
+            creation_job_id=creation_job.creation_job_id,
+            status="queued",
+            subject_version=creation_job.subject_version,
+            replayed=existing is not None,
+        )
+
+    async def result(self, creation_job_id: UUID) -> CreationResultV1:
+        result = self.prepared[creation_job_id].creation_result
+        if self.advance_clock_after_result is not None:
+            self.gateway.clock.value += self.advance_clock_after_result
+        return result
+
+    async def completion_block(
+        self,
+        job: AgentFactoryJobV2,
+        result: CreationResultV1,
+    ) -> FactoryEvidenceBlock:
+        return _block(
+            job,
+            FactoryPhase.AGENT_CODE_CREATED,
+            occurred_at=job.occurred_at + timedelta(seconds=7),
+            evidence_refs=(
+                ArtifactRef.model_validate(
+                    result.package_manifest_ref.model_dump(mode="json")
+                ),
+            ),
+        )
+
+
+@dataclass
+class ScriptedReleaseRunPort:
+    creation: ScriptedCreationPort
+    crash_after_run_once: int | None = None
+    max_success_runs: int = 3
+    effects: list[str] = field(default_factory=list)
+    receipts: dict[tuple[UUID, int], CapabilityReleaseRunReceipt] = field(default_factory=dict)
+    _crashed: bool = False
+
+    async def run(
+        self,
+        job: AgentFactoryJobV2,
+        creation_result: CreationResultV1,
+        candidate: ForgeCapabilityPackageCandidateV1,
+        run_number: int,
+    ) -> CapabilityReleaseRunReceipt | None:
+        if run_number > self.max_success_runs + 1:
+            return None
+        key = (job.job_id, run_number)
+        existing = self.receipts.get(key)
+        if existing is None:
+            package = self.creation.prepared[creation_result.creation_job_id]
+            existing = package.release_run(run_number)
+            self.receipts[key] = existing
+            self.effects.append(existing.record.run_id)
+            if self.crash_after_run_once == run_number and not self._crashed:
+                self._crashed = True
+                raise SimulatedProcessCrash(f"after release run {run_number}")
+        return existing
+
+    async def lifecycle_blocks(
+        self,
+        job: AgentFactoryJobV2,
+        receipts: tuple[CapabilityReleaseRunReceipt, ...],
+    ) -> tuple[FactoryEvidenceBlock, FactoryEvidenceBlock, FactoryEvidenceBlock]:
+        refs = tuple(item.reference for item in receipts)
+        return (
+            _block(
+                job,
+                FactoryPhase.BUILD_PASSED,
+                occurred_at=job.occurred_at + timedelta(seconds=8),
+                evidence_refs=refs,
+            ),
+            _block(
+                job,
+                FactoryPhase.REAL_CASE_EVIDENCE,
+                occurred_at=job.occurred_at + timedelta(seconds=9),
+                assertions=job.acceptance_assertion_ids,
+                evidence_refs=refs,
+            ),
+            _block(
+                job,
+                FactoryPhase.QUALITY_REVIEWED,
+                occurred_at=job.occurred_at + timedelta(seconds=10),
+                assertions=job.acceptance_assertion_ids,
+                evidence_refs=refs,
+            ),
+        )
+
+
+@dataclass
+class ScriptedRuntimePort:
+    gateway: ScriptedGatewayStore
+    effects: list[UUID] = field(default_factory=list)
+    bundles: dict[UUID, CapabilityExecutionBundle] = field(default_factory=dict)
+
+    async def execute(
+        self,
+        release: CapabilityReleaseRequest,
+    ) -> CapabilityExecutionBundle:
+        command_id = uuid5(release.package.correlation_id, "capability-execution-command")
+        existing = self.bundles.get(command_id)
+        if existing is not None:
+            return existing
+        result_id = uuid5(command_id, "capability-execution-result")
+        prompt_ref = ArtifactRef(
+            uri=f"artifact://runtime-prompt/{'a' * 64}",
+            sha256="a" * 64,
+            media_type="text/markdown",
+        )
+        command = AgentRuntimeCommand.model_validate(
+            {
+                "schema": "captain.agent-runtime-command.v1",
+                "event_id": command_id,
+                "correlation_id": release.package.correlation_id,
+                "causation_id": release.event_id,
+                "occurred_at": release.occurred_at,
+                "producer": "captain",
+                "subject_id": "capability-execution",
+                "subject_version": release.package.subject_version,
+                "payload": {
+                    "operation": "codex.run",
+                    "project_id": "capability-factory",
+                    "batch_id": "capability-release",
+                    "subtask_id": "capability-execution",
+                    "workspace_ref": "workspace://capability-factory/execution",
+                    "prompt_ref": prompt_ref,
+                    "integration_intent": "none",
+                    "capability_profile": "code-builder",
+                    "limits": {"wall_seconds": 60, "max_iterations": 1},
+                },
+            }
+        )
+        artifact_ref = ArtifactRef(
+            uri=f"artifact://runtime-result/{'b' * 64}",
+            sha256="b" * 64,
+            media_type="application/json",
+        )
+        result = AgentRuntimeResult.model_validate(
+            {
+                "schema": "captain.agent-runtime-result.v1",
+                "event_id": result_id,
+                "command_id": command_id,
+                "correlation_id": release.package.correlation_id,
+                "occurred_at": release.occurred_at + timedelta(seconds=1),
+                "producer": "agent-runtime",
+                "subject_id": command.subject_id,
+                "subject_version": command.subject_version,
+                "grant_id": "capability-release-grant",
+                "operation": "codex.run",
+                "status": "succeeded",
+                "session_id": "capability-release-session",
+                "artifact_refs": [artifact_ref],
+                "evidence_refs": [artifact_ref],
+                "error": None,
+            }
+        )
+        assertion_outcomes = tuple(
+            AssertionOutcome(
+                assertion_id=assertion_id,
+                status="passed",
+                integration_intent="none",
+                evidence_refs=(
+                    ArtifactRef(
+                        uri=f"artifact://execution/{hashlib.sha256(assertion_id.encode()).hexdigest()}",
+                        sha256=hashlib.sha256(assertion_id.encode()).hexdigest(),
+                        media_type="application/json",
+                    ),
+                ),
+            )
+            for assertion_id in release.accepted_assertion_ids
+        )
+        outcome = ExecutionOutcomeV1(
+            schema_name="captain.execution-outcome.v1",
+            capability_id=release.package.capability_id,
+            capability_version=release.package.capability_version,
+            team_version=release.team_version,
+            correlation_id=release.package.correlation_id,
+            command_id=command_id,
+            result_id=result_id,
+            business_output={"status": "completed"},
+            assertion_outcomes=assertion_outcomes,
+            tool_versions=("captain.runtime@1",),
+            workflow_versions=("capability.factory@1",),
+            evidence_refs=(artifact_ref,),
+            status="succeeded",
+        )
+        bundle = CapabilityExecutionBundle(
+            command=command,
+            result=result,
+            outcome=outcome,
+            claim_owner_id="capability-factory-runtime",
+            claim_fencing_token=1,
+        )
+        self.bundles[command_id] = bundle
+        self.effects.append(command_id)
+        self.gateway.record_runtime_operation(bundle)
+        return bundle
+
+
+@dataclass
+class ScriptedMinibookClient:
+    projects: list[dict[str, object]] = field(default_factory=list)
+    posts: dict[str, dict[str, object]] = field(default_factory=dict)
+
+    def ensure_projection_project(self, *, external_id: str) -> dict[str, object]:
+        if not self.projects:
+            self.projects.append(
+                {
+                    "id": external_id,
+                    "name": MinibookProjector.PROJECTION_PROJECT,
+                }
+            )
+        return self.projects[0]
+
+    def list_projects(self) -> list[dict[str, object]]:
+        return list(self.projects)
+
+    def upsert_projection_post(self, project_id: str, *, event: object) -> dict[str, object]:
+        event_id = str(event.event_id)  # type: ignore[attr-defined]
+        post = self.posts.get(event_id)
+        if post is None:
+            post = {
+                "id": f"post-{len(self.posts) + 1}",
+                "project_id": project_id,
+                "event_id": event_id,
+            }
+            self.posts[event_id] = post
+        return post
+
+
+@dataclass
+class FullChainHarness:
+    input_path: Path
+    clock: MutableClock
+    content_store: MemoryContentStore
+    checkpoint_store: InMemoryCapabilityFactoryCheckpointStore
+    gateway: ScriptedGatewayStore
+    creation: ScriptedCreationPort
+    releases: ScriptedReleaseRunPort
+    sandbox: VerifiedScriptedSandboxRunner
+    runtime: ScriptedRuntimePort
+    minibook: ScriptedMinibookClient
+    projector: MinibookProjector
+    released_skill: ReleasedSkillRefV1
+
+    def entrypoint(self) -> CapabilityFactoryEntrypoint:
+        repository = GatewayFactoryRepository(self.gateway)  # real Package-C adapter
+        return CapabilityFactoryEntrypoint(
+            checkpoint_store=self.checkpoint_store,
+            holdout_store=InMemoryPrivateHoldoutStore(),
+            repository=repository,
+            catalog=GatewayCapabilityCatalog(self.gateway),
+            released_skill=self.released_skill,
+            creation=self.creation,
+            content_store=self.content_store,
+            sandbox_runner=self.sandbox,
+            evidence_issuer=self.releases,
+            gateway=self.gateway,
+            runtime=self.runtime,
+            projector=self.projector,
+            clock=self.clock,
+        )
+
+
+def _harness(tmp_path: Path) -> FullChainHarness:
+    input_path = tmp_path / "TO_BE_BUILT.md"
+    input_path.write_bytes(FIXTURE_INPUT.read_bytes())
+    clock = MutableClock()
+    content_store = MemoryContentStore()
+    skill_ref = content_store.put(
+        b"# Released Agent Factory skill\n",
+        "text/markdown",
+        namespace="released-skill",
+    )
+    released_skill = ReleasedSkillRefV1.model_validate(
+        {
+            "skill_id": "autogen-agent-factory",
+            "version": 1,
+            "content_ref": skill_ref.model_dump(mode="json"),
+            "content_sha256": skill_ref.sha256,
+        }
+    )
+    gateway = ScriptedGatewayStore(clock)
+    creation = ScriptedCreationPort(
+        store=content_store,
+        gateway=gateway,
+        released_skill_ref=skill_ref,
+        crash_after_submit_once=True,
+    )
+    releases = ScriptedReleaseRunPort(
+        creation=creation,
+        crash_after_run_once=3,
+    )
+    sandbox = VerifiedScriptedSandboxRunner()
+    runtime = ScriptedRuntimePort(gateway)
+    minibook = ScriptedMinibookClient()
+    projector = MinibookProjector(
+        minibook,  # type: ignore[arg-type]
+        ProjectionCursorStore(tmp_path / "projection-cursor.sqlite3"),
+        owner_id="task-6-projector",
+    )
+    return FullChainHarness(
+        input_path=input_path,
+        clock=clock,
+        content_store=content_store,
+        checkpoint_store=InMemoryCapabilityFactoryCheckpointStore(),
+        gateway=gateway,
+        creation=creation,
+        releases=releases,
+        sandbox=sandbox,
+        runtime=runtime,
+        minibook=minibook,
+        projector=projector,
+        released_skill=released_skill,
+    )
+
+
+@pytest.mark.asyncio
+async def test_complete_factory_release_chain_recovers_twice_without_duplicate_effects(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+
+    with pytest.raises(SimulatedProcessCrash, match="creation submission"):
+        await harness.entrypoint().run(
+            input_path=harness.input_path,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            wall_clock_budget_seconds=600,
+        )
+
+    with pytest.raises(SimulatedProcessCrash, match="release run 3"):
+        await harness.entrypoint().run(
+            input_path=harness.input_path,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            wall_clock_budget_seconds=600,
+        )
+
+    summary = await harness.entrypoint().run(
+        input_path=harness.input_path,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+        wall_clock_budget_seconds=600,
+    )
+
+    job = next(iter(harness.gateway.jobs.values()))
+    creation_job = next(iter(harness.creation.submitted_jobs.values()))
+    assert job.required_capability == "customer_support_triage"
+    assert job.input_ref.sha256 == hashlib.sha256(harness.input_path.read_bytes()).hexdigest()
+    assert summary.factory_job_id == job.job_id
+    assert summary.creation_job_id == creation_job.creation_job_id
+    assert summary.terminal_state == "ready_to_use"
+    assert summary.capability_id == job.required_capability
+    assert summary.capability_version == 1
+    assert summary.recovery_id == "controlled-recovery-01"
+    assert summary.e2e_batch_ids == (
+        "normal-e2e-01",
+        "normal-e2e-02",
+        "normal-e2e-03",
+    )
+    assert summary.execution_command_id in harness.gateway.executions
+    assert summary.execution_result_id == harness.gateway.executions[
+        summary.execution_command_id
+    ].result_id
+    assert len(summary.projection_event_ids) == 1
+    assert len(harness.creation.submission_effects) == 1
+    assert harness.releases.effects == [
+        "controlled-recovery-01",
+        "normal-e2e-01",
+        "normal-e2e-02",
+        "normal-e2e-03",
+    ]
+    assert len(harness.sandbox.requests) == 1
+    assert len(harness.runtime.effects) == 1
+    assert len(harness.gateway.release_effects) == 1
+    assert len(harness.gateway.execution_effects) == 1
+    assert len(harness.minibook.posts) == 1
+    assert len(harness.gateway.blocks_by_job[job.job_id]) == 8
+
+
+@pytest.mark.asyncio
+async def test_factory_resume_rejects_mutated_input_before_duplicate_effects(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+
+    with pytest.raises(SimulatedProcessCrash, match="creation submission"):
+        await harness.entrypoint().run(
+            input_path=harness.input_path,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            wall_clock_budget_seconds=600,
+        )
+
+    harness.input_path.write_bytes(harness.input_path.read_bytes() + b"\n")
+
+    with pytest.raises(CapabilityFactoryInputMutation, match="input bytes"):
+        await harness.entrypoint().run(
+            input_path=harness.input_path,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            wall_clock_budget_seconds=600,
+        )
+
+    assert len(harness.gateway.jobs) == 1
+    assert len(harness.creation.submission_effects) == 1
+    assert not harness.gateway.release_effects
+    assert not harness.gateway.execution_effects
+
+
+@pytest.mark.asyncio
+async def test_required_tool_gap_blocks_release_and_execution(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    harness.creation.crash_after_submit_once = False
+    harness.releases.crash_after_run_once = None
+    harness.creation.required_gap = True
+
+    summary = await harness.entrypoint().run(
+        input_path=harness.input_path,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+        wall_clock_budget_seconds=600,
+    )
+
+    assert summary.terminal_state == "blocked"
+    assert summary.unresolved_required_tool_gaps == ("missing-required-provider",)
+    assert not harness.gateway.release_effects
+    assert not harness.runtime.effects
+    assert not harness.minibook.posts
+
+
+@pytest.mark.asyncio
+async def test_failed_private_holdout_rejects_package(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    harness.creation.crash_after_submit_once = False
+    harness.releases.crash_after_run_once = None
+    harness.creation.failed_holdout = True
+
+    summary = await harness.entrypoint().run(
+        input_path=harness.input_path,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+        wall_clock_budget_seconds=600,
+    )
+
+    assert summary.terminal_state == "rejected"
+    assert not harness.gateway.release_effects
+    assert not harness.runtime.effects
+    assert not harness.minibook.posts
+
+
+@pytest.mark.asyncio
+async def test_expired_budget_stops_before_completion_and_release_effects(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    harness.creation.crash_after_submit_once = False
+    harness.releases.crash_after_run_once = None
+    harness.creation.advance_clock_after_result = timedelta(seconds=601)
+
+    summary = await harness.entrypoint().run(
+        input_path=harness.input_path,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+        wall_clock_budget_seconds=600,
+    )
+
+    job = next(iter(harness.gateway.jobs.values()))
+    assert summary.terminal_state == "escalated"
+    assert len(harness.gateway.blocks_by_job[job.job_id]) == 3
+    assert not harness.releases.effects
+    assert not harness.gateway.release_effects
+    assert not harness.runtime.effects
+    assert not harness.minibook.posts
+
+
+@pytest.mark.asyncio
+async def test_rejected_artifact_digest_rejects_package(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    harness.creation.crash_after_submit_once = False
+    harness.releases.crash_after_run_once = None
+    harness.creation.rejected_archive = True
+
+    summary = await harness.entrypoint().run(
+        input_path=harness.input_path,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+        wall_clock_budget_seconds=600,
+    )
+
+    assert summary.terminal_state == "rejected"
+    assert not harness.gateway.release_effects
+    assert not harness.runtime.effects
+    assert not harness.minibook.posts
+
+
+@pytest.mark.asyncio
+async def test_only_two_normal_successes_block_release(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    harness.creation.crash_after_submit_once = False
+    harness.releases.crash_after_run_once = None
+    harness.releases.max_success_runs = 2
+
+    summary = await harness.entrypoint().run(
+        input_path=harness.input_path,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+        wall_clock_budget_seconds=600,
+    )
+
+    assert summary.terminal_state == "blocked"
+    assert summary.recovery_id == "controlled-recovery-01"
+    assert summary.e2e_batch_ids == ("normal-e2e-01", "normal-e2e-02")
+    assert not harness.sandbox.requests
+    assert not harness.gateway.release_effects
+    assert not harness.runtime.effects
+    assert not harness.minibook.posts
+
+
+SANDBOX_IMAGE = (
+    "captain-capability-sandbox@sha256:"
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+)
+
+
+@dataclass
+class RecordingDockerCommandRunner:
+    network_mode: str = "none"
+    commands: list[tuple[str, ...]] = field(default_factory=list)
+    started: bool = False
+
+    async def run(
+        self,
+        arguments: tuple[str, ...],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> DockerCommandResult:
+        self.commands.append(arguments)
+        if arguments[:2] == ("image", "inspect"):
+            return DockerCommandResult(
+                returncode=0,
+                stdout=json.dumps(
+                    [
+                        {
+                            "Id": "sha256:" + "1" * 64,
+                            "RepoDigests": [SANDBOX_IMAGE],
+                        }
+                    ]
+                ),
+                stderr="",
+            )
+        if arguments[0] == "create":
+            return DockerCommandResult(
+                returncode=0,
+                stdout="f" * 64 + "\n",
+                stderr="",
+            )
+        if arguments[0] == "start":
+            self.started = True
+            return DockerCommandResult(returncode=0, stdout="", stderr="")
+        if arguments[0] == "inspect":
+            workspace = next(
+                item.split("source=", 1)[1].split(",target=", 1)[0]
+                for command in self.commands
+                for item in command
+                if item.startswith("type=bind,source=")
+            )
+            return DockerCommandResult(
+                returncode=0,
+                stdout=json.dumps(
+                    [
+                        {
+                            "Id": "f" * 64,
+                            "Name": "/captain-capability-" + str(CORRELATION_ID),
+                            "Config": {
+                                "Image": SANDBOX_IMAGE,
+                                "User": "65532:65532",
+                                "WorkingDir": "/workspace",
+                                "Entrypoint": ["python"],
+                                "Labels": {
+                                    "captain.owner": "capability-factory",
+                                    "captain.disposable": "true",
+                                },
+                            },
+                            "HostConfig": {
+                                "NetworkMode": self.network_mode,
+                                "ReadonlyRootfs": True,
+                                "Memory": 512 * 1024 * 1024,
+                                "PidsLimit": 8,
+                                "CapDrop": ["ALL"],
+                                "SecurityOpt": ["no-new-privileges"],
+                                "Init": True,
+                                "Tmpfs": {
+                                    "/tmp": "rw,noexec,nosuid,size=67108864"
+                                },
+                            },
+                            "Mounts": [
+                                {
+                                    "Type": "bind",
+                                    "Source": workspace,
+                                    "Destination": "/workspace",
+                                    "RW": False,
+                                }
+                            ],
+                            "State": {
+                                "Status": "exited" if self.started else "created",
+                                "ExitCode": 0,
+                                "Running": False,
+                            },
+                        }
+                    ]
+                ),
+                stderr="",
+            )
+        if arguments[:2] == ("rm", "-f"):
+            return DockerCommandResult(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected docker arguments: {arguments[0]}")
+
+
+def _sandbox_request(tmp_path: Path) -> CapabilitySandboxRequest:
+    (tmp_path / "autogen").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "autogen" / "team.py").write_text(
+        "CAPABILITY_ID = 'customer_support_triage'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "tests" / "test_team.py").write_text(
+        "def test_team(): assert True\n",
+        encoding="utf-8",
+    )
+    execution_id = CORRELATION_ID
+    entries = []
+    for path in tmp_path.rglob("*"):
+        if path.is_file():
+            data = path.read_bytes()
+            entries.append(
+                (
+                    path.relative_to(tmp_path).as_posix(),
+                    hashlib.sha256(data).hexdigest(),
+                    len(data),
+                )
+            )
+    tree_digest = hashlib.sha256(
+        json.dumps(sorted(entries), separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return CapabilitySandboxRequest(
+        request_digest="a" * 64,
+        execution_id=execution_id,
+        process_identity=f"sandbox-handle://{execution_id}",
+        correlation_id=CORRELATION_ID,
+        workspace=tmp_path,
+        python_path_root=tmp_path,
+        module_names=("autogen.team",),
+        test_paths=("tests/test_team.py",),
+        extracted_tree_sha256=tree_digest,
+        package_archive_sha256="c" * 64,
+        timeout_seconds=30,
+    )
+
+
+@pytest.mark.asyncio
+async def test_docker_sandbox_attests_only_inspected_isolation(tmp_path: Path) -> None:
+    command_runner = RecordingDockerCommandRunner()
+    request = _sandbox_request(tmp_path)
+    runner = DockerCapabilitySandboxRunner(
+        image=SANDBOX_IMAGE,
+        command_runner=command_runner,
+    )
+
+    result = await runner.validate(request)
+
+    assert result.status == "passed"
+    assert result.process_identity == request.process_identity
+    assert result.sandbox_identity == "sandbox://docker/" + "f" * 64
+    create = next(command for command in command_runner.commands if command[0] == "create")
+    assert ("--network", "none") == create[create.index("--network") :][:2]
+    assert "--read-only" in create
+    assert "--init" in create
+    assert ("--cap-drop", "ALL") == create[create.index("--cap-drop") :][:2]
+    assert ("--security-opt", "no-new-privileges") == create[
+        create.index("--security-opt") :
+    ][:2]
+    assert ("--pull", "never") == create[create.index("--pull") :][:2]
+    assert any(item.endswith(",readonly") for item in create)
+
+
+@pytest.mark.asyncio
+async def test_docker_sandbox_fails_closed_when_inspection_disagrees(tmp_path: Path) -> None:
+    command_runner = RecordingDockerCommandRunner(network_mode="bridge")
+    runner = DockerCapabilitySandboxRunner(
+        image=SANDBOX_IMAGE,
+        command_runner=command_runner,
+    )
+
+    with pytest.raises(CapabilitySandboxIsolationError, match="network"):
+        await runner.validate(_sandbox_request(tmp_path))
+
+    assert not command_runner.started
+
+
+def test_cli_uses_safe_paths_service_urls_and_environment_only_secrets(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "TO_BE_BUILT.md"
+    input_path.write_bytes(FIXTURE_INPUT.read_bytes())
+    environment = {
+        "CAPTAIN_GATEWAY_TOKEN": "gateway-secret-value",
+        "CAPTAIN_RUNTIME_TOKEN": "runtime-secret-value",
+        "MINIBOOK_PROJECTION_API_KEY": "projection-secret-value",
+    }
+
+    config = parse_capability_factory_args(
+        (
+            "--input",
+            "TO_BE_BUILT.md",
+            "--artifact-dir",
+            "artifacts/capability-factory",
+            "--checkpoint-dir",
+            ".superpowers/sdd/checkpoints",
+            "--gateway-url",
+            "http://127.0.0.1:8080",
+            "--runtime-url",
+            "http://127.0.0.1:8081",
+            "--minibook-url",
+            "http://127.0.0.1:8082",
+            "--sandbox-image",
+            SANDBOX_IMAGE,
+            "--correlation-id",
+            str(CORRELATION_ID),
+        ),
+        environ=environment,
+        workspace_root=tmp_path,
+    )
+
+    assert config.input_path == input_path.resolve()
+    assert config.artifact_dir.is_relative_to(tmp_path.resolve())
+    assert config.checkpoint_dir.is_relative_to(tmp_path.resolve())
+    assert config.gateway_url == "http://127.0.0.1:8080"
+    assert config.sandbox_image == SANDBOX_IMAGE
+    rendered = repr(config)
+    assert "gateway-secret-value" not in rendered
+    assert "runtime-secret-value" not in rendered
+    assert "projection-secret-value" not in rendered
+
+
+def test_cli_rejects_credential_flags_and_unsafe_paths_without_echo(
+    tmp_path: Path,
+) -> None:
+    secret = "must-not-appear-in-error"
+    with pytest.raises(CapabilityFactoryConfigurationError) as credential_error:
+        parse_capability_factory_args(
+            ("--gateway-token", secret),
+            environ={},
+            workspace_root=tmp_path,
+        )
+    assert secret not in str(credential_error.value)
+
+    with pytest.raises(CapabilityFactoryConfigurationError, match="workspace"):
+        parse_capability_factory_args(
+            ("--input", "../outside.md"),
+            environ={},
+            workspace_root=tmp_path,
+        )
+
+
+def test_redacted_evidence_manifest_is_content_addressed(tmp_path: Path) -> None:
+    summary = CapabilityFactoryRunSummary(
+        correlation_id=CORRELATION_ID,
+        factory_job_id=FACTORY_JOB_ID,
+        creation_job_id=uuid5(FACTORY_JOB_ID, "creation"),
+        terminal_decision_id=uuid5(FACTORY_JOB_ID, "terminal"),
+        terminal_state="blocked",
+        capability_id="customer_support_triage",
+        recovery_id="controlled-recovery-01",
+        e2e_batch_ids=("normal-e2e-01", "normal-e2e-02"),
+        release_evidence_sha256=("d" * 64, "e" * 64, "f" * 64),
+    )
+
+    path = write_redacted_evidence_manifest(summary, tmp_path)
+    content = path.read_bytes()
+
+    assert path.name == hashlib.sha256(content).hexdigest() + ".json"
+    assert json.loads(content)["summary"]["terminal_state"] == "blocked"
+    assert str(tmp_path).encode("utf-8") not in content
+    assert b"http://" not in content
+    assert b"token" not in content.lower()
+
+
+def test_live_gate_declares_exact_order_and_preserves_vibemind() -> None:
+    script = (
+        Path(__file__).parents[2] / "scripts" / "run-capability-factory-live.ps1"
+    ).read_text(encoding="utf-8")
+    markers = tuple(f"# STEP {number}:" for number in range(1, 11))
+
+    positions = tuple(script.index(marker) for marker in markers)
+    assert positions == tuple(sorted(positions))
+    assert "$env:CAPABILITY_FACTORY_LIVE_REQUIRED = '1'" in script
+    assert "docker compose down" not in script.casefold()
+    assert "down --volumes" not in script.casefold()
+    assert "down -v" not in script.casefold()
+    assert "vibemind" not in script.casefold()

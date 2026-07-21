@@ -29,6 +29,32 @@ submodule never writes the shared registry. n8n capabilities are limited to a
 Captain-issued `integration_intent=n8n` tool-integrator lease and opaque MCP
 references.
 
+### Package-C capability outcome release
+
+`codex/package-c-capability-outcomes` owns the final composition and live gate,
+not the underlying Package-A/B contracts. Its deterministic acceptance test
+runs the real parser, compiler, Factory state/policy, independent package
+validator, Gateway repository/catalog, execution binding, and Minibook
+projector around scripted external ports. It proves restart after creation
+submission and after the second normal E2E success with stable IDs and no
+duplicate effects, plus mutation, tool-gap, holdout, deadline, artifact, and
+two-success failure paths.
+
+Release evidence remains Captain-owned. Forge supplies a candidate; a Captain
+Evidence Issuer supplies the controlled-recovery and normal-run records;
+Captain independently validates the sealed package and derives/persists the
+only terminal decision. Minibook remains a read-only rebuildable projection.
+The production sandbox must be a disposable, digest-pinned Captain image with
+inspectable isolation. A scripted runner is test evidence only.
+
+The live gate runs only after deterministic and database-resetting gates. It
+requires `captain_test`, reads credentials from the gitignored environment,
+does not adopt or mutate externally owned n8n services or volumes, and treats
+every missing provider, API, adapter, image, credential, skip, or projection
+record as blocked. Until the production Runtime ports, capability-factory HTTP
+adapters, and reviewed sandbox image exist, this branch makes no live
+`ready_to_use` claim.
+
 ```text
 feat/devpost-demo-readiness
         │
@@ -61,6 +87,7 @@ gateway-backed, single-worker end-to-end run is green.
 | `feat/release-evidence` | Quality Warden | Demo sandbox, release verifier, Devpost assets, reproducibility checks | A clean clone can inspect evidence and complete the documented demo path without rebuilding every dependency |
 | `feat/demo-polish` | Quality Warden | Recording captures, copy review, public-repo audit | Video, README, and submission checklist match actual commands and no credential or unimplemented claim appears |
 | `codex/agent-runtime-architecture` | Architect / Delivery Builder | Hermes-plan ingestion, Captain-owned DAG release, swarm runtime tools, scoped Codex/n8n leases, restart checkpoints, and one redacted evidence manifest | Deterministic control-plane suite plus both required real Codex/n8n live cases pass with zero skips; branch is rebased or merged only after a worktree-aware integration audit |
+| `codex/package-c-capability-outcomes` | Architect / Quality Warden | Restart-safe capability-factory composition, Captain release evidence, isolated package validation, Gateway publication/execution, projection verification, and one redacted content-addressed manifest | Deterministic full chain and all negative/restart cases pass; live release remains blocked unless recovery plus three provider-backed successes, Gateway execution, and Minibook rebuild all pass against `captain_test` |
 
 ## Householder model
 
