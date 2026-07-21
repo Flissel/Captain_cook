@@ -355,6 +355,26 @@ def build_runtime_app_from_environment(
     return app
 
 
+def build_runtime_app_with_v3_evidence(
+    settings: RuntimeEntrypointSettings,
+    environ: Mapping[str, str],
+    *,
+    context: Any,
+) -> Any:
+    """Compose the authenticated runtime with the explicit V2-to-V3 bridge."""
+
+    from agenten.agent_factory.capability_v3_evidence_bridge import (
+        build_capability_evidence_backend,
+    )
+
+    backend = build_capability_evidence_backend(context=context)
+    return build_runtime_app_from_environment(
+        settings,
+        environ,
+        evidence_backend=backend,
+    )
+
+
 class _TodoCapabilityRuntime:
     async def prepare(self, job: Any, authority: Any) -> CapabilityExecutionPlan:
         del job, authority

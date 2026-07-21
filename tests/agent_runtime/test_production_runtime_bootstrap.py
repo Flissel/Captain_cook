@@ -3,12 +3,17 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 
 from agenten.agent_factory.production_adapter_bundle import (
     ProductionToolRequired,
     build_runtime_app_from_environment,
+    build_runtime_app_with_v3_evidence,
+)
+from agenten.agent_factory.capability_v3_evidence_bridge import (
+    CapabilityV3BridgeConfigurationError,
 )
 from agenten.agent_runtime.runtime_entrypoint import RuntimeEntrypointSettings
 
@@ -104,3 +109,21 @@ def test_runtime_bootstrap_accepts_explicit_production_evidence_bridge(
     )
 
     assert app.state.capability_evidence_backend is backend
+
+
+def test_runtime_v3_builder_imports_bridge_and_preserves_recovery_todo() -> None:
+    settings = RuntimeEntrypointSettings.from_env(
+        {
+            "CAPTAIN_RUNTIME_TOKEN": "runtime-secret",
+            "CAPTAIN_GATEWAY_TOKEN": "gateway-secret",
+            "CAPTAIN_GATEWAY_URL": "http://127.0.0.1:8090",
+        }
+    )
+    context = SimpleNamespace(controlled_recovery=None)
+
+    try:
+        build_runtime_app_with_v3_evidence(settings, {}, context=context)
+    except CapabilityV3BridgeConfigurationError as exc:
+        assert "TODO_TOOL.v1 required capability=controlled_provider_recovery" in str(exc)
+    else:
+        raise AssertionError("missing controlled recovery port was accepted")
