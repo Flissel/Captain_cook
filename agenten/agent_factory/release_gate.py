@@ -142,8 +142,6 @@ def derive_terminal_decision(
 ) -> FactoryTerminalDecision | None:
     """Derive Captain's terminal state in one explicit fail-closed priority order."""
 
-    if projection.terminal_decision is not None:
-        return projection.terminal_decision
     if (
         projection.job != job
         or projection.job.job_id != job.job_id
@@ -156,6 +154,8 @@ def derive_terminal_decision(
             (),
             now,
         )
+    if projection.terminal_decision is not None:
+        return projection.terminal_decision
 
     if isinstance(validation, CapabilityValidationFailure):
         return _terminal_decision(
@@ -231,7 +231,13 @@ def derive_terminal_decision(
             now,
         )
 
-    if _behavioral_budget_exhausted(job, projection, evaluation):
+    if _behavioral_budget_exhausted(
+        job,
+        projection,
+        validation,
+        evaluation,
+        e2e,
+    ):
         return _terminal_decision(
             job,
             FactoryTerminalState.ESCALATED,
@@ -528,14 +534,23 @@ def _projection_evidence(projection: "FactoryProjection") -> tuple[ArtifactRef, 
 def _behavioral_budget_exhausted(
     job: FactoryJob,
     projection: "FactoryProjection",
+    validation: CapabilityPackageManifestV1 | None,
     evaluation: StoredSkillEvaluation | None,
+    e2e: tuple[CapabilityReleaseEvidenceV1, ...],
 ) -> bool:
     if projection.attempt < job.max_behavioral_iterations:
         return False
-    return (
-        projection.phase in {FactoryPhase.BUILD_FAILED, FactoryPhase.QUALITY_REVIEWED}
-        or evaluation_requires_improvement(job, evaluation)
-    )
+    if projection.phase is FactoryPhase.BUILD_FAILED or evaluation_requires_improvement(
+        job, evaluation
+    ):
+        return True
+    if projection.phase is not FactoryPhase.QUALITY_REVIEWED:
+        return False
+    if validation is None or factory_evaluation_block_reason(job, evaluation) is not None:
+        return True
+    if _failed_assertion_references(job, validation, e2e) is not None:
+        return True
+    return not _accepted_capability_e2e(job, projection, validation, e2e)
 
 
 def _validation_due(projection: "FactoryProjection") -> bool:

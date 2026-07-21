@@ -168,6 +168,7 @@ def _validation_case(
         b"    assert CAPABILITY_ID == 'customer_support_triage'\n"
     ),
     team_manifest_updates: dict[str, object] | None = None,
+    required_tool_gap: bool = False,
 ) -> ValidationCase:
     job_payload = _fixture("agent_factory/agent_factory_job.v2.json")
     job = AgentFactoryJobV2.model_validate(job_payload)
@@ -230,6 +231,49 @@ def _validation_case(
     artifact_ref_by_path = {
         str(item["path"]): item["reference"] for item in artifacts
     }
+    gap_contents = {
+        "input": b'{"schema":"object"}',
+        "output": b'{"schema":"object"}',
+        "evidence": b'{"status":"unresolved"}',
+    }
+    gap_refs = {
+        name: _ref(content, "application/json")
+        for name, content in gap_contents.items()
+    }
+    tool_gaps = (
+        [
+            {
+                "schema": "TODO_TOOL.v1",
+                "gap_id": "missing-required-provider",
+                "severity": "required",
+                "input_contract_ref": gap_refs["input"],
+                "output_contract_ref": gap_refs["output"],
+                "least_privilege_capability": "provider.execute",
+                "implementation_options": [
+                    {
+                        "option_id": "provide-approved-provider",
+                        "description": "Configure the required approved provider.",
+                        "acceptance_assertion_id": job.acceptance_assertion_ids[0],
+                    }
+                ],
+                "acceptance_assertion_ids": [job.acceptance_assertion_ids[0]],
+                "evidence_ref": gap_refs["evidence"],
+                "status": "unresolved",
+            }
+        ]
+        if required_tool_gap
+        else []
+    )
+    creation_tool_gaps = [
+        {
+            "schema": gap["schema"],
+            "gap_id": gap["gap_id"],
+            "severity": gap["severity"],
+            "evidence_ref": gap["evidence_ref"],
+            "status": gap["status"],
+        }
+        for gap in tool_gaps
+    ]
 
     skill_detail = b'{"check":"released-skill-use","status":"passed"}'
     skill_detail_ref = _ref(skill_detail, "application/json")
@@ -282,7 +326,7 @@ def _validation_case(
         "team_manifest_ref": artifact_ref_by_path["team-manifest.json"],
         "artifacts": artifacts,
         "skill_usage_receipt_ref": skill_receipt_ref,
-        "tool_gaps": [],
+        "tool_gaps": tool_gaps,
         "runbook_ref": artifact_ref_by_path["RUNBOOK.md"],
     }
     candidate = ForgeCapabilityPackageCandidateV1.model_validate(candidate_payload)
@@ -394,7 +438,7 @@ def _validation_case(
             "package_manifest_ref": candidate_ref,
             "artifact_refs": [source_ref],
             "evidence_refs": [],
-            "tool_gaps": [],
+            "tool_gaps": creation_tool_gaps,
             "skill_usage_receipt_ref": skill_receipt_ref,
             "failure": None,
         }
@@ -408,6 +452,13 @@ def _validation_case(
         str(skill_detail_ref["uri"]): skill_detail,
         str(holdout_evidence_ref["uri"]): holdout_evidence_content,
     }
+    if required_tool_gap:
+        all_content.update(
+            {
+                str(gap_refs[name]["uri"]): content
+                for name, content in gap_contents.items()
+            }
+        )
     all_content.update(
         {
             str(item["reference"]["uri"]): files[str(item["path"])]
@@ -445,6 +496,25 @@ def _validation_case(
         skill_receipt=skill_receipt,
         files=files,
     )
+
+
+@pytest.mark.asyncio
+async def test_validator_preserves_structurally_valid_required_tool_gap_for_terminal_policy() -> None:
+    case = _validation_case(required_tool_gap=True)
+
+    manifest = await CapabilityPackageValidator(
+        content_store=case.store,
+        sandbox_runner=case.runner,
+    ).validate(
+        job=case.job,
+        creation_result=case.creation_result,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
+    )
+
+    assert len(manifest.tool_gaps) == 1
+    assert manifest.tool_gaps[0].severity == "required"
+    assert manifest.tool_gaps[0].status == "unresolved"
 
 
 def _validator(case: ValidationCase) -> CapabilityPackageValidator:

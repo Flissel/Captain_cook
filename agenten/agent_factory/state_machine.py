@@ -93,6 +93,7 @@ def apply_block(
     *,
     evaluation: StoredSkillEvaluation | None = None,
     release_decision: FactoryReleaseDecision | None = None,
+    now: datetime | None = None,
 ) -> FactoryProjection:
     """Apply one new immutable block after enforcing lifecycle ordering."""
 
@@ -113,6 +114,24 @@ def apply_block(
         FactoryLifecycleStatus.REJECTED,
     }:
         raise FactoryLifecycleError("terminal factory projection cannot accept blocks")
+
+    if (
+        isinstance(projection.job, AgentFactoryJobV2)
+        and now is not None
+        and now >= projection.job.deadline_at
+    ):
+        if block.phase is not FactoryPhase.ESCALATED or block.status.value != "succeeded":
+            raise FactoryLifecycleError(
+                "v2 factory deadline permits only the derived Captain escalation"
+            )
+        return projection.model_copy(
+            update={
+                "status": FactoryLifecycleStatus.ESCALATED,
+                "phase": block.phase,
+                "block_ids": (*projection.block_ids, block.event_id),
+                "evidence_refs": _append_evidence_refs(projection, block),
+            }
+        )
 
     allowed = _allowed_next_phases(projection)
     if block.phase not in allowed:

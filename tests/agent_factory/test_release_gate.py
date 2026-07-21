@@ -545,3 +545,52 @@ def test_e2e_evidence_must_bind_the_current_behavioral_attempt() -> None:
     assert decision is not None
     assert decision.state is FactoryTerminalState.BLOCKED
     assert decision.reasons == (FactoryTerminalReasonCode.E2E_BLOCKED.value,)
+
+
+def test_fifth_successful_attempt_can_reach_ready_to_use() -> None:
+    factory_job = v2_job()
+    projection = FactoryProjection.from_job(factory_job).model_copy(update={"attempt": 5})
+    runs = tuple(record.model_copy(update={"attempt": 5}) for record in capability_e2e())
+
+    decision = derive_terminal_decision(
+        factory_job,
+        projection.model_copy(update={"phase": FactoryPhase.QUALITY_REVIEWED}),
+        accepted_manifest(),
+        accepted_evaluation(),
+        runs,
+        NOW,
+    )
+
+    assert decision is not None
+    assert decision.state is FactoryTerminalState.READY_TO_USE
+
+
+def test_job_projection_binding_is_checked_before_existing_terminal_replay() -> None:
+    original_job = v2_job()
+    existing = derive_terminal_decision(
+        original_job,
+        FactoryProjection.from_job(original_job),
+        accepted_manifest(),
+        accepted_evaluation(),
+        capability_e2e(),
+        NOW,
+    )
+    assert existing is not None
+    projection = FactoryProjection.from_job(original_job).model_copy(
+        update={"terminal_decision": existing}
+    )
+    foreign_job = original_job.model_copy(update={"job_id": UUID(int=998)})
+
+    decision = derive_terminal_decision(
+        foreign_job,
+        projection,
+        accepted_manifest(),
+        accepted_evaluation(),
+        capability_e2e(),
+        NOW + timedelta(minutes=1),
+    )
+
+    assert decision is not None
+    assert decision.job_id == foreign_job.job_id
+    assert decision.state is FactoryTerminalState.REJECTED
+    assert decision.reasons == (FactoryTerminalReasonCode.AUTHORITY_VIOLATION.value,)

@@ -299,13 +299,6 @@ class CapabilityPackageValidator:
                 "creation result does not bind the skill usage receipt"
             )
 
-        if any(
-            marker.severity == "required" and marker.status == "unresolved"
-            for marker in candidate.tool_gaps
-        ):
-            raise CapabilityPackageValidationError(
-                "package contains an unresolved required tool gap"
-            )
         creation_gaps = {
             (gap.gap_id, gap.severity, gap.status, _reference_identity(gap.evidence_ref))
             for gap in creation_result.tool_gaps

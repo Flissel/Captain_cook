@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 import pytest
 
 from agenten.agent_factory.service import (
@@ -9,15 +11,23 @@ from agenten.agent_factory.service import (
 )
 from agenten.agent_factory.state_machine import FactoryActionKind, FactoryLifecycleError
 from agenten.agent_factory.outcome_contracts import FactoryTerminalDecision, FactoryTerminalState
-from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.contracts import FactoryPhase
 from tests.agent_factory.test_state_machine import (
     accepted_evaluation,
     accepted_release_decision,
     block,
     job,
-    artifact,
+    v2_job,
 )
+from tests.agent_factory.test_release_gate import accepted_manifest, capability_e2e
+
+
+class Clock:
+    def __init__(self, current: datetime):
+        self.current = current
+
+    def now(self) -> datetime:
+        return self.current
 
 
 class EvaluationLookupRepository(InMemoryFactoryRepository):
@@ -136,35 +146,41 @@ def test_coordinator_routes_failed_skill_evaluation_through_improvement() -> Non
 
 def test_terminal_decision_replay_is_idempotent_but_changed_replay_conflicts() -> None:
     repository = InMemoryFactoryRepository()
-    coordinator = FactoryCoordinator(repository)
-    factory_job = job()
+    clock = Clock(job().occurred_at)
+    coordinator = FactoryCoordinator(repository, clock=clock)
+    factory_job = v2_job()
     coordinator.register(factory_job)
-    decision = FactoryTerminalDecision(
-        schema_name="captain.factory-terminal-decision.v1",
-        decision_id=factory_job.event_id,
-        job_id=factory_job.job_id,
-        correlation_id=factory_job.correlation_id,
-        subject_version=factory_job.subject_version,
-        state=FactoryTerminalState.BLOCKED,
-        reasons=("missing_provider",),
-        evidence_refs=(ArtifactRef.model_validate(artifact("provider-block")),),
-        decided_at=factory_job.occurred_at,
-    )
+    assert coordinator.record_terminal_decision(
+        factory_job.job_id,
+        validation=accepted_manifest(),
+        evaluation=accepted_evaluation(),
+        e2e=capability_e2e(),
+    ) is True
+    decision = coordinator.projection(factory_job.job_id).terminal_decision
+    assert decision is not None
 
-    assert coordinator.record_terminal_decision(decision) is True
-    assert coordinator.record_terminal_decision(decision) is False
+    clock.current += timedelta(minutes=1)
+    assert coordinator.record_terminal_decision(
+        factory_job.job_id,
+        validation=accepted_manifest(),
+        evaluation=accepted_evaluation(),
+        e2e=capability_e2e(),
+    ) is False
     assert coordinator.projection(factory_job.job_id).terminal_decision == decision
-    assert coordinator.next_action(factory_job.job_id, now=factory_job.occurred_at).kind is FactoryActionKind.NO_ACTION
+    assert coordinator.next_action(factory_job.job_id).kind is FactoryActionKind.NO_ACTION
 
-    changed = decision.model_copy(
-        update={"state": FactoryTerminalState.REJECTED, "reasons": ("authority_violation",)}
-    )
     with pytest.raises(FactoryRepositoryError, match="different content"):
-        coordinator.record_terminal_decision(changed)
+        coordinator.record_terminal_decision(
+            factory_job.job_id,
+            validation=accepted_manifest(),
+            evaluation=accepted_evaluation(),
+            e2e=capability_e2e(successes=2),
+        )
 
 
 def test_terminal_decision_must_be_captain_bound_to_registered_job() -> None:
-    coordinator = FactoryCoordinator(InMemoryFactoryRepository())
+    repository = InMemoryFactoryRepository()
+    coordinator = FactoryCoordinator(repository)
     factory_job = job()
     coordinator.register(factory_job)
     foreign = FactoryTerminalDecision(
@@ -179,4 +195,28 @@ def test_terminal_decision_must_be_captain_bound_to_registered_job() -> None:
     )
 
     with pytest.raises(FactoryRepositoryError, match="does not match"):
-        coordinator.record_terminal_decision(foreign)
+        repository.append_terminal_decision(foreign)
+
+
+def test_v2_record_path_uses_injected_clock_and_allows_only_derived_escalation_after_deadline() -> None:
+    clock = Clock(job().occurred_at + timedelta(minutes=16))
+    coordinator = FactoryCoordinator(InMemoryFactoryRepository(), clock=clock)
+    factory_job = v2_job()
+    coordinator.register(factory_job)
+
+    with pytest.raises(FactoryLifecycleError, match="deadline"):
+        coordinator.record(block(FactoryPhase.FORGE_REQUESTED))
+
+    escalation = block(FactoryPhase.ESCALATED)
+    assert coordinator.record(escalation) is True
+    assert coordinator.projection(factory_job.job_id).status.value == "escalated"
+
+
+def test_v1_record_path_remains_iteration_only_with_clock_after_any_deadline() -> None:
+    coordinator = FactoryCoordinator(
+        InMemoryFactoryRepository(),
+        clock=Clock(job().occurred_at + timedelta(days=3650)),
+    )
+    coordinator.register(job())
+
+    assert coordinator.record(block(FactoryPhase.FORGE_REQUESTED)) is True
