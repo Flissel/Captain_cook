@@ -222,6 +222,8 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "function Start-CaptainN8nBroker" in source
     assert "http://host.docker.internal:" in source
     assert "& $n8n broker-start" in source
+    assert source.count("executable=$python") >= 2
+    assert "executable=$process.Path" not in source
     assert source.index("Start-Gateway $values") < source.index("Start-CaptainN8nBroker $values")
     assert source.index("Start-CaptainN8nBroker $values") < source.index("Start-Runtime $values")
     assert "Captain Runtime and Minibook capability artifact roots differ" in source

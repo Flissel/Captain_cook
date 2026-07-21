@@ -294,7 +294,7 @@ function Start-Gateway($Values) {
     if (-not (Test-Path $python -PathType Leaf)) { throw 'A concrete Python 3.11 executable is required for the managed Gateway.' }
     Set-ProcessEnvironment $Values
     $process = Start-Process $python -ArgumentList '-m','gateway.app' -WorkingDirectory $root -WindowStyle Hidden -PassThru
-    @{pid=$process.Id;started_at=$process.StartTime.ToUniversalTime().ToString('o');executable=$process.Path} | ConvertTo-Json -Compress | Set-Content $gatewayPid -Encoding utf8
+    @{pid=$process.Id;started_at=$process.StartTime.ToUniversalTime().ToString('o');executable=$python} | ConvertTo-Json -Compress | Set-Content $gatewayPid -Encoding utf8
     foreach ($attempt in 1..60) { try { if ((Invoke-WebRequest "$($Values['CAPTAIN_GATEWAY_URL'])/healthz" -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200) { Write-Host '[ready] Gateway database=captain_test'; return } } catch {}; Start-Sleep -Milliseconds 500 }
     throw 'Gateway did not become healthy against captain_test.'
 }
@@ -341,7 +341,7 @@ function Start-Runtime($Values) {
     if (-not (Test-Path $python -PathType Leaf)) { throw 'A concrete Python 3.11 executable is required for the managed Runtime.' }
     Set-ProcessEnvironment $Values
     $process = Start-Process $python -ArgumentList '-m','agenten.agent_runtime.runtime_entrypoint' -WorkingDirectory $root -WindowStyle Hidden -PassThru
-    @{pid=$process.Id;started_at=$process.StartTime.ToUniversalTime().ToString('o');executable=$process.Path} | ConvertTo-Json -Compress | Set-Content $runtimePid -Encoding utf8
+    @{pid=$process.Id;started_at=$process.StartTime.ToUniversalTime().ToString('o');executable=$python} | ConvertTo-Json -Compress | Set-Content $runtimePid -Encoding utf8
     foreach ($attempt in 1..60) {
         if (-not (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) { break }
         try { if ((Invoke-WebRequest "$runtimeUrl/health" -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200) { Write-Host '[ready] authenticated Runtime boundary'; return } } catch {}
