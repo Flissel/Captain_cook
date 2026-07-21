@@ -15,6 +15,7 @@ from agenten.agent_runtime.contracts import ArtifactRef, IDENTIFIER_PATTERN, SHA
 
 from .contracts import FactoryLease, FactoryRole
 from .forge_contracts import FactoryBuildAssignmentV1
+from .holdout_contracts import PrivateHoldoutRef
 from .outcome_contracts import AssertionOutcome, ExecutionOutcomeV1
 from .skill_evaluation import ReleasedHermesSkill, ToolGapMarker
 
@@ -90,6 +91,7 @@ class FactorySkillInvocationV1(_FrozenContract):
     lease: FactoryLease
     idempotency_key: str = Field(pattern=SHA256_PATTERN)
     acceptance_assertion_ids: tuple[str, ...] = Field(min_length=1)
+    execution_scope_ref: PrivateHoldoutRef | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -290,6 +292,7 @@ class TeamExecutionEvidenceV1(_WorkflowArtifactBase):
     )
     run_number: int = Field(ge=1, strict=True)
     candidate_ref: ArtifactRef
+    holdout_ref: PrivateHoldoutRef
     execution_outcome: ExecutionOutcomeV1
     usage_receipt_refs: tuple[ArtifactRef, ...] = ()
     handoff_evidence_refs: tuple[ArtifactRef, ...] = ()
@@ -312,12 +315,14 @@ class TeamExecutionEvidenceV1(_WorkflowArtifactBase):
 
     @model_validator(mode="after")
     def require_successful_runtime_outcome(self) -> "TeamExecutionEvidenceV1":
+        if self.invocation.execution_scope_ref != self.holdout_ref:
+            raise ValueError("execution holdout does not match invocation scope")
         if self.execution_outcome.correlation_id != self.correlation_id:
             raise ValueError("execution outcome correlation does not match invocation")
         outcome_ids = tuple(item.assertion_id for item in self.execution_outcome.assertion_outcomes)
         _require_unique_ids(outcome_ids, "execution assertion IDs")
-        if set(outcome_ids) - set(self.acceptance_assertion_ids):
-            raise ValueError("execution outcome contains non-Captain assertion IDs")
+        if outcome_ids != self.acceptance_assertion_ids:
+            raise ValueError("execution outcome must exactly match Captain assertion IDs")
         if self.status == "succeeded":
             if self.execution_outcome.status != "succeeded" or any(
                 item.status != "passed" for item in self.execution_outcome.assertion_outcomes

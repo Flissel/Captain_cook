@@ -206,11 +206,18 @@ def execution_outcome_payload(status: str = "succeeded") -> dict[str, object]:
 
 
 def execution_payload(**overrides: object) -> dict[str, object]:
+    holdout_ref = {
+        "schema_name": "captain.private-holdout-ref.v1",
+        "holdout_id": "holdout-222222222222",
+        "uri": "holdout://holdout-222222222222",
+        "sha256": "2" * 64,
+    }
     payload = common_payload(
         "execute_team",
         schema="hermes.factory-team-execution-evidence.v1",
         run_number=1,
         candidate_ref=artifact("candidate", "d" * 64),
+        holdout_ref=holdout_ref,
         execution_outcome=execution_outcome_payload(),
         usage_receipt_refs=[artifact("usage", "e" * 64)],
         handoff_evidence_refs=[artifact("handoffs", "f" * 64)],
@@ -219,6 +226,9 @@ def execution_payload(**overrides: object) -> dict[str, object]:
         termination_reason="task_completed",
         status="succeeded",
     )
+    invocation = payload["invocation"]
+    assert isinstance(invocation, dict)
+    invocation["execution_scope_ref"] = holdout_ref
     payload.update(overrides)
     return payload
 

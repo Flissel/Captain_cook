@@ -35,10 +35,15 @@ from agenten.agent_factory.contracts import (
     FactoryRole,
 )
 from agenten.agent_factory.evidence_store import FactoryEvidenceStore
+from agenten.agent_factory.leases import validate_factory_lease
 from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference, TypedN8nTool
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
 from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationRequest
-from agenten.agent_factory.skill_workflow_contracts import TeamExecutionEvidenceV1
+from agenten.agent_factory.skill_workflow_contracts import (
+    FactorySkillInvocationV1,
+    FactorySkillStep,
+    TeamExecutionEvidenceV1,
+)
 from agenten.agent_factory.state_machine import FactoryActionKind
 from agenten.agent_runtime.contracts import ArtifactRef
 
@@ -97,7 +102,12 @@ class FactoryAutoGenTeamManifestV1(_FrozenModel):
     max_handoffs: int = Field(ge=0, le=50, strict=True)
     max_tool_calls: int = Field(ge=0, le=100, strict=True)
     termination_conditions: tuple[str, ...] = Field(min_length=1)
-    entrypoint_command: tuple[str, ...] = Field(min_length=2)
+    entrypoint_command: tuple[str, ...] = Field(
+        min_length=2,
+        description=(
+            "Legacy candidate metadata only; the host runner never executes this command."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -127,7 +137,20 @@ class FactoryAutoGenTeamManifestV1(_FrozenModel):
     def require_unique_termination_conditions(
         cls, value: tuple[str, ...]
     ) -> tuple[str, ...]:
-        if len(value) != len(set(value)) or any(not item.strip() for item in value):
+        allowed = {
+            "task_completed",
+            "max_messages",
+            "max_handoffs",
+            "max_tool_calls",
+            "provider_cost_unresolved",
+        }
+        if (
+            len(value) != len(set(value))
+            or any(item not in allowed for item in value)
+            or not set(value).intersection(
+                {"task_completed", "max_messages", "max_handoffs", "max_tool_calls"}
+            )
+        ):
             raise ValueError("termination conditions must be unique named entries")
         return value
 
@@ -753,6 +776,11 @@ class StaticFactoryCandidateProvider(FactoryCandidateProvider):
 class FactoryTeamExecutionPort(Protocol):
     """Production real-case boundary, implemented with TeamExecutionService."""
 
+    def invocation_for(
+        self,
+        request: FactoryDispatch,
+    ) -> FactorySkillInvocationV1: ...
+
     async def execute(
         self,
         request: FactoryDispatch,
@@ -780,6 +808,13 @@ class CandidateEvaluationFactory:
         phase, role = _validation_phase(request.action.kind)
         if request.role is not role or request.lease is None or request.lease.role is not role:
             raise FactoryDispatchError("candidate validation requires the matching active factory lease")
+        validate_factory_lease(
+            request.lease,
+            job=request.job,
+            role=role,
+            attempt=request.action.attempt,
+            now=request.lease.issued_at,
+        )
         if request.action.kind is FactoryActionKind.DISPATCH_REAL_CASE_TESTER:
             if self._team_execution is None:
                 raise FactoryDispatchError(
@@ -789,6 +824,7 @@ class CandidateEvaluationFactory:
             resolved = self._provider.candidate_for(request.job)
             if request.action.kind is FactoryActionKind.DISPATCH_REAL_CASE_TESTER:
                 assert self._team_execution is not None
+                expected_invocation = self._team_execution.invocation_for(request)
                 team_evidence = await self._team_execution.execute(request, resolved)
                 sealed = await self._evidence_store.persist(
                     request.job,
@@ -796,7 +832,13 @@ class CandidateEvaluationFactory:
                         by_alias=True, exclude_none=True
                     ).encode("utf-8"),
                 )
-                return _team_execution_block(request, resolved, team_evidence, sealed)
+                return _team_execution_block(
+                    request,
+                    resolved,
+                    team_evidence,
+                    sealed,
+                    expected_invocation=expected_invocation,
+                )
             result = self._evaluator.evaluate(
                 job=request.job,
                 candidate=resolved.candidate,
@@ -873,6 +915,8 @@ def _team_execution_block(
     resolved: ResolvedFactoryCandidate,
     evidence: TeamExecutionEvidenceV1,
     sealed: ArtifactRef,
+    *,
+    expected_invocation: FactorySkillInvocationV1,
 ) -> FactoryEvidenceBlock:
     assert request.lease is not None
     if (
@@ -881,6 +925,14 @@ def _team_execution_block(
         or evidence.subject_version != request.job.subject_version
         or evidence.attempt != request.action.attempt
         or evidence.invocation.lease != request.lease
+        or evidence.invocation != expected_invocation
+        or evidence.invocation.step is not FactorySkillStep.EXECUTE_TEAM
+        or evidence.invocation.acceptance_assertion_ids
+        != request.job.acceptance_assertion_ids
+        or evidence.acceptance_assertion_ids
+        != request.job.acceptance_assertion_ids
+        or evidence.candidate_ref != resolved.candidate.source_archive_ref
+        or evidence.holdout_ref not in request.job.private_holdout_refs
     ):
         raise FactoryDispatchError(
             "TeamExecutionService evidence does not match the factory dispatch"

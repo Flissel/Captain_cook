@@ -981,16 +981,16 @@ class CandidatePreflightPort(Protocol):
     ) -> FactoryCandidateEvaluationResult: ...
 ```
 
-Adapt the existing Candidate Evaluator for compile/import/build preflight. The real runner starts the candidate's sealed entrypoint in the evaluator workspace and requires typed output. It does not import generated code into Captain's process.
+Adapt the existing Candidate Evaluator for compile/import/build preflight. The live runner host-materializes only the digest-verified sealed manifest, prompts, and declared artifacts, then instantiates the approved AutoGen team under Captain-owned instrumentation. Candidate `entrypoint_command` metadata is non-authoritative and is never executed in the paid path; candidate stdout cannot define runtime outcome, assertions, usage, or billing.
 
 - [ ] **Step 3: Implement reserve-run-record-release sequencing**
 
 1. Revalidate candidate and skill digests.
 2. Run compile/import/deterministic smoke tests.
 3. Refuse live execution when policy is offline.
-4. Reserve the runner's declared maximum cost through `FactoryBudgetPort`.
-5. Execute with remaining time and allowed models.
-6. Persist provider receipts and release unused reservation.
+4. Before every provider call, revalidate the released `captain-factory-execute-team` skill and resolve a Captain-authoritative, job/policy/provider/model-bound pricing quote.
+5. Reserve that provider call's maximum cost through `FactoryBudgetPort`, then execute with remaining time and allowed models.
+6. Persist one provider receipt per call. After dispatch without authoritative usage, leave the reservation active for reconciliation; never infer zero cost from cancellation or failure.
 7. Validate runtime IDs, assertion IDs, handoffs, termination, tool evidence, and optional n8n execution evidence.
 8. Seal `TeamExecutionEvidenceV1`.
 

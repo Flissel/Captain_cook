@@ -722,6 +722,10 @@ async def test_real_case_dispatch_never_accepts_candidate_owned_offline_evaluato
         pass
 
     class TeamExecution:
+        def invocation_for(self, request: FactoryDispatch) -> object:
+            assert request.lease == lease
+            return object()
+
         async def execute(
             self,
             request: FactoryDispatch,

@@ -26,6 +26,7 @@ from agenten.agent_factory.execution_budget import (
     InMemoryFactoryBudgetLedger,
 )
 from agenten.agent_factory.leases import issue_factory_lease
+from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.hermes_cli import InMemoryFactorySkillReplayStore
 from agenten.agent_factory.n8n_tools import TypedN8nTool
 from agenten.agent_factory.outcome_contracts import AssertionOutcome, ExecutionOutcomeV1
@@ -36,7 +37,11 @@ from agenten.agent_factory.skill_workflow_contracts import (
 )
 from agenten.agent_factory.team_execution import (
     BudgetedChatCompletionClient,
+    CaptainN8nGrantAuthority,
+    CaptainReleasedSkillAuthority,
     FactoryN8nExecutionEvidenceV1,
+    FactoryHoldoutAssertionDecisionV1,
+    FactoryHoldoutEvaluationReceiptV1,
     FactoryPricingQuoteV1,
     FactoryTeamRunResult,
     HostAutoGenTeamRunner,
@@ -49,6 +54,7 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeResult,
     ArtifactRef,
     CapabilityGrant,
+    CapabilityGrantRevocation,
     CapabilityProfile,
     IntegrationIntent,
     RuntimeOperation,
@@ -56,6 +62,7 @@ from agenten.agent_runtime.contracts import (
     RuntimeStatus,
 )
 from agenten.targets.n8n import N8nExecutionEvidence
+from agenten.agent_runtime.capabilities import PROFILE_CAPABILITIES
 from agenten.llm.model_client import build_replay_model_client
 from autogen_core.models import ModelFamily, ModelInfo, UserMessage
 from autogen_ext.models.replay import ReplayChatCompletionClient
@@ -63,6 +70,54 @@ from autogen_agentchat.teams import Swarm
 
 
 NOW = datetime(2026, 7, 21, 13, tzinfo=timezone.utc)
+
+
+def _policy_digest(job: AgentFactoryJobV3) -> str:
+    encoded = json.dumps(
+        job.execution_policy.model_dump(mode="json", by_alias=True),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _pricing_quote(job: AgentFactoryJobV3) -> FactoryPricingQuoteV1:
+    return FactoryPricingQuoteV1(
+        quote_id="deterministic-price-v1",
+        job_id=job.job_id,
+        subject_version=job.subject_version,
+        execution_policy_sha256=_policy_digest(job),
+        provider="deterministic-replay",
+        model="approved-model-id",
+        version="2026-07-21",
+        effective_at=NOW,
+        max_cost_per_call="0.50",
+        input_cost_per_million="0",
+        output_cost_per_million="0",
+        minimum_cost_usd="0.10",
+        evidence_ref=_artifact("factory-pricing", "4" * 64),
+    )
+
+
+class _PaidEffectAuthority:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def authorize(self, **kwargs: object) -> ReleasedHermesSkill:
+        self.calls += 1
+        invocation = kwargs["invocation"]
+        assert isinstance(invocation, FactorySkillInvocationV1)
+        return invocation.released_skill
+
+
+class _PricingAuthority:
+    def __init__(self, quote: FactoryPricingQuoteV1) -> None:
+        self.quote = quote
+        self.calls = 0
+
+    def resolve(self, **_: object) -> FactoryPricingQuoteV1:
+        self.calls += 1
+        return self.quote
 
 
 def _artifact(
@@ -397,7 +452,21 @@ async def test_failed_preflight_never_reserves_or_calls_provider(
 async def test_live_run_reserves_records_usage_handoffs_and_termination(
     tmp_path: Path,
 ) -> None:
-    job = _job_v3()
+    base_job = _job_v3()
+    second_holdout = PrivateHoldoutRef(
+        schema_name="captain.private-holdout-ref.v1",
+        holdout_id="holdout-333333333333",
+        uri="holdout://holdout-333333333333",
+        sha256="3" * 64,
+    )
+    job = base_job.model_copy(
+        update={
+            "private_holdout_refs": (
+                *base_job.private_holdout_refs,
+                second_holdout,
+            )
+        }
+    )
     candidate = _candidate(tmp_path)
     invocation = _invocation(job)
     budget = InMemoryFactoryBudgetLedger()
@@ -533,16 +602,18 @@ async def test_live_run_reserves_records_usage_handoffs_and_termination(
     replayed = await service.execute(
         invocation, candidate, job.private_holdout_refs[0]
     )
+    second_case = await service.execute(invocation, candidate, second_holdout)
 
     assert evidence.status == "succeeded"
     assert evidence.termination_reason == "task_completed"
     assert evidence.usage_receipt_refs == (_artifact("factory-usage", "8" * 64),)
     assert evidence.handoff_evidence_refs == (handoff_ref,)
     assert evidence.tool_evidence_refs == (tool_ref,)
-    assert len(runner.calls) == 1
+    assert len(runner.calls) == 2
     assert replayed == evidence
+    assert second_case.holdout_ref == second_holdout
     projection = budget.projection(job.job_id)
-    assert projection.consumed_usd == Decimal("0.42")
+    assert projection.consumed_usd == Decimal("0.84")
     assert projection.reserved_usd == Decimal("0")
 
 
@@ -552,8 +623,12 @@ async def test_budgeted_model_client_reserves_before_every_provider_call(
 ) -> None:
     job = _job_v3()
     budget = InMemoryFactoryBudgetLedger()
+    invocation = _invocation(job)
+    skill_authority = _PaidEffectAuthority()
+    pricing_authority = _PricingAuthority(_pricing_quote(job))
     client = BudgetedChatCompletionClient(
         job=job,
+        invocation=invocation,
         attempt=1,
         delegate=build_replay_model_client(["first", "second"]),
         budget=budget,
@@ -561,17 +636,8 @@ async def test_budgeted_model_client_reserves_before_every_provider_call(
         provider="deterministic-replay",
         model="approved-model-id",
         max_cost_per_call=Decimal("0.50"),
-        pricing_quote=FactoryPricingQuoteV1(
-            quote_id="deterministic-price-v1",
-            provider="deterministic-replay",
-            model="approved-model-id",
-            version="2026-07-21",
-            effective_at=NOW,
-            input_cost_per_million="0",
-            output_cost_per_million="0",
-            minimum_cost_usd="0.10",
-            evidence_ref=_artifact("factory-pricing", "4" * 64),
-        ),
+        paid_effect_authority=skill_authority,
+        pricing_authority=pricing_authority,
         clock=lambda: NOW,
     )
 
@@ -579,6 +645,8 @@ async def test_budgeted_model_client_reserves_before_every_provider_call(
     await client.create([UserMessage(content="two", source="user")])
 
     assert len(client.usage_receipts) == 2
+    assert skill_authority.calls == 2
+    assert pricing_authority.calls == 2
     assert len({item.reservation_id for item in client.usage_receipts}) == 2
     assert budget.projection(job.job_id).consumed_usd == Decimal("0.20")
     assert budget.projection(job.job_id).reserved_usd == Decimal("0")
@@ -590,8 +658,10 @@ async def test_dispatched_provider_failure_keeps_unknown_cost_reservation_active
 ) -> None:
     job = _job_v3()
     budget = InMemoryFactoryBudgetLedger()
+    invocation = _invocation(job)
     client = BudgetedChatCompletionClient(
         job=job,
+        invocation=invocation,
         attempt=1,
         delegate=build_replay_model_client([]),
         budget=budget,
@@ -599,17 +669,8 @@ async def test_dispatched_provider_failure_keeps_unknown_cost_reservation_active
         provider="deterministic-replay",
         model="approved-model-id",
         max_cost_per_call=Decimal("0.50"),
-        pricing_quote=FactoryPricingQuoteV1(
-            quote_id="deterministic-price-v1",
-            provider="deterministic-replay",
-            model="approved-model-id",
-            version="2026-07-21",
-            effective_at=NOW,
-            input_cost_per_million="0",
-            output_cost_per_million="0",
-            minimum_cost_usd="0.10",
-            evidence_ref=_artifact("factory-pricing", "4" * 64),
-        ),
+        paid_effect_authority=_PaidEffectAuthority(),
+        pricing_authority=_PricingAuthority(_pricing_quote(job)),
         clock=lambda: NOW,
     )
 
@@ -619,6 +680,157 @@ async def test_dispatched_provider_failure_keeps_unknown_cost_reservation_active
     projection = budget.projection(job.job_id)
     assert projection.consumed_usd == Decimal("0")
     assert projection.reserved_usd == Decimal("0.50")
+
+
+def test_budgeted_model_client_rejects_cross_job_invocation(tmp_path: Path) -> None:
+    job = _job_v3()
+    other_job = job.model_copy(
+        update={
+            "job_id": UUID("70000000-0000-0000-0000-000000000099"),
+            "correlation_id": UUID("70000000-0000-0000-0000-000000000098"),
+        }
+    )
+    with pytest.raises(ValueError, match="current job"):
+        BudgetedChatCompletionClient(
+            job=job,
+            invocation=_invocation(other_job),
+            attempt=1,
+            delegate=build_replay_model_client(["unused"]),
+            budget=InMemoryFactoryBudgetLedger(),
+            evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "cross-job"),
+            provider="deterministic-replay",
+            model="approved-model-id",
+            max_cost_per_call=Decimal("0.50"),
+            paid_effect_authority=_PaidEffectAuthority(),
+            pricing_authority=_PricingAuthority(_pricing_quote(job)),
+            clock=lambda: NOW,
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_provider_dispatch_keeps_reservation_active(
+    tmp_path: Path,
+) -> None:
+    job = _job_v3()
+    started = asyncio.Event()
+
+    class BlockingReplay(ReplayChatCompletionClient):
+        async def create(self, *args: object, **kwargs: object) -> object:
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    budget = InMemoryFactoryBudgetLedger()
+    client = BudgetedChatCompletionClient(
+        job=job,
+        invocation=_invocation(job),
+        attempt=1,
+        delegate=BlockingReplay(["unused"]),
+        budget=budget,
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "cancelled-provider"),
+        provider="deterministic-replay",
+        model="approved-model-id",
+        max_cost_per_call=Decimal("0.50"),
+        paid_effect_authority=_PaidEffectAuthority(),
+        pricing_authority=_PricingAuthority(_pricing_quote(job)),
+        clock=lambda: NOW,
+    )
+    call = asyncio.create_task(
+        client.create([UserMessage(content="dispatch", source="user")])
+    )
+    await started.wait()
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert budget.projection(job.job_id).reserved_usd == Decimal("0.50")
+
+
+def test_holdout_decision_rejects_truthy_string_false() -> None:
+    with pytest.raises(ValueError):
+        FactoryHoldoutAssertionDecisionV1(
+            assertion_id="real_case_green",
+            passed="false",  # type: ignore[arg-type]
+            provenance_code="deterministic_rule",
+        )
+
+
+def test_captain_skill_authority_rejects_wrong_capability_and_digest(
+    tmp_path: Path,
+) -> None:
+    job = _job_v3()
+    directory = tmp_path / "skills" / "captain-factory-execute-team"
+    directory.mkdir(parents=True)
+    (directory / "SKILL.md").write_text("approved host workflow\n", encoding="utf-8")
+    entries = [
+        {
+            "path": "SKILL.md",
+            "sha256": hashlib.sha256(
+                (directory / "SKILL.md").read_bytes()
+            ).hexdigest(),
+            "size": (directory / "SKILL.md").stat().st_size,
+        }
+    ]
+    digest = hashlib.sha256(
+        json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    released = ReleasedHermesSkill(
+        schema_name="captain.released-hermes-skill.v1",
+        skill_id="captain-factory-execute-team",
+        version=1,
+        capability="factory_workflow",
+        content_ref=ArtifactRef(
+            uri="artifact://released-skills/captain-factory-execute-team/v1",
+            sha256=digest,
+            media_type="application/json",
+        ),
+        content_sha256=digest,
+        status="released",
+        released_at=NOW,
+        producer="captain",
+    )
+
+    class Catalog:
+        current = released
+
+        def released_for(self, *_: object) -> ReleasedHermesSkill:
+            return self.current
+
+    catalog = Catalog()
+    authority = CaptainReleasedSkillAuthority(
+        catalog=catalog,  # type: ignore[arg-type]
+        skill_root=tmp_path / "skills",
+    )
+    invocation = _invocation(job).model_copy(update={"released_skill": released})
+    assert authority.authorize(job=job, invocation=invocation, now=NOW) == released
+
+    wrong_capability = released.model_copy(update={"capability": "model_invoke"})
+    catalog.current = wrong_capability
+    with pytest.raises(ValueError, match="not authorized"):
+        authority.authorize(
+            job=job,
+            invocation=invocation.model_copy(
+                update={"released_skill": wrong_capability}
+            ),
+            now=NOW,
+        )
+
+    wrong_digest = released.model_copy(
+        update={
+            "content_ref": ArtifactRef(
+                uri="artifact://released-skills/captain-factory-execute-team/v1",
+                sha256="f" * 64,
+                media_type="application/json",
+            ),
+            "content_sha256": "f" * 64,
+        }
+    )
+    catalog.current = wrong_digest
+    with pytest.raises(ValueError, match="digest"):
+        authority.authorize(
+            job=job,
+            invocation=invocation.model_copy(update={"released_skill": wrong_digest}),
+            now=NOW,
+        )
 
 
 @pytest.mark.asyncio
@@ -661,16 +873,52 @@ async def test_provider_failure_keeps_dispatched_unknown_cost_reserved(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "lease_update",
+    [
+        {"lease_id": "factory-forged-authority"},
+        {"capabilities": ("tests.run",)},
+    ],
+)
+async def test_team_execution_rejects_forged_lease_authority(
+    tmp_path: Path,
+    lease_update: dict[str, object],
+) -> None:
+    job = _job_v3()
+    invocation = _invocation(job)
+    forged = invocation.model_copy(
+        update={"lease": invocation.lease.model_copy(update=lease_update)}
+    )
+
+    class Runner:
+        async def run(self, **_: object) -> FactoryTeamRunResult:
+            raise AssertionError("forged lease must fail before the runner")
+
+    with pytest.raises(Exception, match="lease"):
+        await TeamExecutionService(
+            job=job,
+            preflight=_SuccessfulPreflight(),
+            runner=Runner(),
+            evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "forged-lease"),
+            replay_store=InMemoryFactorySkillReplayStore(),
+            clock=lambda: NOW,
+        ).execute(forged, _candidate(tmp_path), job.private_holdout_refs[0])
+
+
+@pytest.mark.asyncio
 async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entrypoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     holdout_body = b"Resolve the private support case."
     job = _job_v3(holdout_body=holdout_body)
+    sealed_candidate = _sealed_team_candidate(tmp_path)
     budget = InMemoryFactoryBudgetLedger()
     evidence_store = FilesystemFactoryEvidenceStore(tmp_path / "host-evidence")
+    invocation = _invocation(job)
     model_client = BudgetedChatCompletionClient(
         job=job,
+        invocation=invocation,
         attempt=1,
         delegate=ReplayChatCompletionClient(
             ["TERMINATE"],
@@ -687,17 +935,8 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
         provider="deterministic-replay",
         model="approved-model-id",
         max_cost_per_call=Decimal("0.50"),
-        pricing_quote=FactoryPricingQuoteV1(
-            quote_id="deterministic-price-v1",
-            provider="deterministic-replay",
-            model="approved-model-id",
-            version="2026-07-21",
-            effective_at=NOW,
-            input_cost_per_million="0",
-            output_cost_per_million="0",
-            minimum_cost_usd="0.10",
-            evidence_ref=_artifact("factory-pricing", "4" * 64),
-        ),
+        paid_effect_authority=_PaidEffectAuthority(),
+        pricing_authority=_PricingAuthority(_pricing_quote(job)),
         clock=lambda: NOW,
     )
 
@@ -712,6 +951,10 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
         def observed_evidence(self) -> tuple[FactoryN8nExecutionEvidenceV1, ...]:
             return ()
 
+    class TrustedN8nAuthority:
+        async def authorize(self, evidence: object, *, now: datetime) -> object:
+            raise AssertionError("no n8n call should be observed in this run")
+
     class Holdouts:
         async def resolve(self, reference: object) -> ResolvedFactoryHoldoutCase:
             assert reference == job.private_holdout_refs[0]
@@ -725,10 +968,26 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
             reference: object,
             result: object,
             assertion_ids: tuple[str, ...],
-        ) -> dict[str, bool]:
+        ) -> FactoryHoldoutEvaluationReceiptV1:
             assert reference == job.private_holdout_refs[0]
             assert result is not None
-            return {assertion_id: True for assertion_id in assertion_ids}
+            return FactoryHoldoutEvaluationReceiptV1(
+                schema_name="captain.factory-holdout-evaluation-receipt.v1",
+                holdout_ref=job.private_holdout_refs[0],
+                candidate_ref=sealed_candidate.candidate.source_archive_ref,
+                assertion_ids=assertion_ids,
+                decisions=tuple(
+                    FactoryHoldoutAssertionDecisionV1(
+                        assertion_id=assertion_id,
+                        passed=True,
+                        provenance_code="deterministic_rule",
+                    )
+                    for assertion_id in assertion_ids
+                ),
+                evaluator_id="captain_test_evaluator",
+                evaluator_version="1",
+                evaluated_at=NOW,
+            )
 
     untrusted_runner = HostAutoGenTeamRunner(
         model_client=model_client,
@@ -738,11 +997,11 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
         tools={"support_triage": support_triage},
         clock=lambda: NOW,
     )
-    with pytest.raises(ValueError, match="trusted n8n adapter"):
+    with pytest.raises(ValueError, match="trusted n8n adapter and grant authority"):
         await untrusted_runner.run(
             job=job,
             invocation=_invocation(job),
-            candidate=_sealed_team_candidate(tmp_path),
+            candidate=sealed_candidate,
             case_ref=job.private_holdout_refs[0],
             lease=_invocation(job).lease,
             allowed_models=job.execution_policy.allowed_models,
@@ -756,6 +1015,7 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
         holdouts=Holdouts(),  # type: ignore[arg-type]
         tools={},
         n8n_adapter=TrustedN8nAdapter(),  # type: ignore[arg-type]
+        n8n_authority=TrustedN8nAuthority(),  # type: ignore[arg-type]
         clock=lambda: NOW,
     )
     captured_tokens: list[object] = []
@@ -770,7 +1030,7 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
     result = await runner.run(
         job=job,
         invocation=_invocation(job),
-        candidate=_sealed_team_candidate(tmp_path),
+        candidate=sealed_candidate,
         case_ref=job.private_holdout_refs[0],
         lease=_invocation(job).lease,
         allowed_models=job.execution_policy.allowed_models,
@@ -782,6 +1042,12 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
     assert result.termination_reason == "task_completed"
     assert result.conversation_pattern == "swarm"
     assert captured_tokens[0] is not None
+    persisted = [
+        path.read_text(encoding="utf-8")
+        for path in (tmp_path / "host-evidence").rglob("*.json")
+    ]
+    assert any("factory-holdout-evaluation-receipt.v1" in item for item in persisted)
+    assert all(holdout_body.decode("utf-8") not in item for item in persisted)
 
     timeout_tokens: list[object] = []
 
@@ -795,7 +1061,7 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
         await runner.run(
             job=job,
             invocation=_invocation(job),
-            candidate=_sealed_team_candidate(tmp_path),
+            candidate=sealed_candidate,
             case_ref=job.private_holdout_refs[0],
             lease=_invocation(job).lease,
             allowed_models=job.execution_policy.allowed_models,
@@ -815,7 +1081,7 @@ def test_n8n_execution_requires_separate_scope_and_matching_digest() -> None:
         subtask_id="n8n-tool-call",
         workspace_ref="workspace://factory/n8n-tool-call",
         profile=CapabilityProfile.N8N_BUILDER,
-        capabilities=("mcp.n8n", "n8n.workflow.read", "n8n.workflow.write"),
+        capabilities=tuple(sorted(PROFILE_CAPABILITIES[CapabilityProfile.N8N_BUILDER])),
         mcp_servers=("n8n-mcp",),
         issued_at=NOW,
         expires_at=NOW + timedelta(minutes=5),
@@ -874,6 +1140,114 @@ def test_n8n_execution_requires_separate_scope_and_matching_digest() -> None:
 
 
 @pytest.mark.asyncio
+async def test_n8n_authority_rejects_unknown_revoked_and_noncanonical_grants() -> None:
+    command_id = UUID("70000000-0000-0000-0000-000000000036")
+    job = _job_v3()
+    command = AgentRuntimeCommand(
+        schema_name="captain.agent-runtime-command.v1",
+        event_id=command_id,
+        correlation_id=job.correlation_id,
+        occurred_at=NOW,
+        producer="captain",
+        subject_id="n8n-tool-call",
+        subject_version=1,
+        payload=AgentRuntimeCommandPayload(
+            operation=RuntimeOperation.CODEX_RUN,
+            project_id="factory-team",
+            batch_id="factory-team-batch",
+            subtask_id="n8n-tool-call",
+            workspace_ref="workspace://factory/n8n-tool-call",
+            prompt_ref=_artifact("n8n-command", "d" * 64),
+            integration_intent=IntegrationIntent.N8N,
+            capability_profile=CapabilityProfile.N8N_BUILDER,
+            limits=RuntimeLimits(wall_seconds=60, max_iterations=2),
+        ),
+    )
+    grant = CapabilityGrant(
+        schema_name="captain.capability-grant.v1",
+        grant_id="grant-n8n-team-tool",
+        command_id=command_id,
+        batch_id="factory-team-batch",
+        batch_version=1,
+        subtask_id="n8n-tool-call",
+        workspace_ref="workspace://factory/n8n-tool-call",
+        profile=CapabilityProfile.N8N_BUILDER,
+        capabilities=tuple(sorted(PROFILE_CAPABILITIES[CapabilityProfile.N8N_BUILDER])),
+        mcp_servers=("n8n-mcp",),
+        issued_at=NOW,
+        expires_at=NOW + timedelta(minutes=5),
+    )
+    workflow_ref = _artifact("factory-workflow", "a" * 64)
+    evidence = FactoryN8nExecutionEvidenceV1(
+        tool_name="support_triage",
+        runtime_command=command,
+        capability_grant=grant,
+        runtime_result=AgentRuntimeResult(
+            schema_name="captain.agent-runtime-result.v1",
+            event_id=UUID("70000000-0000-0000-0000-000000000035"),
+            command_id=command_id,
+            correlation_id=job.correlation_id,
+            occurred_at=NOW + timedelta(seconds=1),
+            producer="agent-runtime",
+            subject_id="n8n-tool-call",
+            subject_version=1,
+            grant_id=grant.grant_id,
+            operation=RuntimeOperation.CODEX_RUN,
+            status=RuntimeStatus.SUCCEEDED,
+        ),
+        mcp_call_id="mcp-call-authoritative",
+        workflow_ref=workflow_ref,
+        execution=N8nExecutionEvidence(
+            execution_id="n8n-execution-authoritative",
+            workflow_id="workflow-authoritative",
+            artifact_digest=workflow_ref.sha256,
+            correlation_id=str(job.correlation_id),
+            status="success",
+        ),
+        evidence_ref=_artifact("n8n-execution", "c" * 64),
+    )
+
+    class State:
+        stored: CapabilityGrant | None = None
+        revocation: CapabilityGrantRevocation | None = None
+
+        async def get_grant(self, command_id: UUID) -> CapabilityGrant | None:
+            return self.stored
+
+        async def get_grant_revocation(
+            self, command_id: UUID
+        ) -> CapabilityGrantRevocation | None:
+            return self.revocation
+
+    state = State()
+    authority = CaptainN8nGrantAuthority(state)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="unknown"):
+        await authority.authorize(evidence, now=NOW + timedelta(seconds=1))
+
+    state.stored = grant
+    assert await authority.authorize(
+        evidence, now=NOW + timedelta(seconds=1)
+    ) == grant
+    state.revocation = CapabilityGrantRevocation(
+        schema_name="captain.capability-grant-revocation.v1",
+        revocation_id=uuid4(),
+        grant_id=grant.grant_id,
+        command_id=command_id,
+        revoked_at=NOW + timedelta(milliseconds=500),
+        reason="policy_violation",
+    )
+    with pytest.raises(Exception, match="revoked"):
+        await authority.authorize(evidence, now=NOW + timedelta(seconds=1))
+
+    state.revocation = None
+    noncanonical = grant.model_copy(update={"capabilities": ("mcp.n8n",)})
+    state.stored = noncanonical
+    forged = evidence.model_copy(update={"capability_grant": noncanonical})
+    with pytest.raises(Exception, match="exactly match"):
+        await authority.authorize(forged, now=NOW + timedelta(seconds=1))
+
+
+@pytest.mark.asyncio
 async def test_timeout_cancels_runner_and_records_unresolved_evidence(
     tmp_path: Path,
 ) -> None:
@@ -904,6 +1278,43 @@ async def test_timeout_cancels_runner_and_records_unresolved_evidence(
     assert evidence.status == "unresolved"
     assert evidence.termination_reason == "provider_cost_unresolved"
     assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_pre_effect_host_configuration_failure_abandons_replay_claim(
+    tmp_path: Path,
+) -> None:
+    job = _job_v3()
+
+    class PreEffectHost(HostAutoGenTeamRunner):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        @property
+        def paid_effect_started(self) -> bool:
+            return False
+
+        async def run(self, **_: object) -> FactoryTeamRunResult:
+            self.calls += 1
+            raise ValueError("holdout resolver is not configured")
+
+    runner = PreEffectHost()
+    service = TeamExecutionService(
+        job=job,
+        preflight=_SuccessfulPreflight(),
+        runner=runner,
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "pre-effect"),
+        replay_store=InMemoryFactorySkillReplayStore(),
+        clock=lambda: NOW,
+    )
+    for _ in range(2):
+        with pytest.raises(ValueError, match="holdout resolver"):
+            await service.execute(
+                _invocation(job),
+                _candidate(tmp_path),
+                job.private_holdout_refs[0],
+            )
+    assert runner.calls == 2
 
 
 @pytest.mark.asyncio
