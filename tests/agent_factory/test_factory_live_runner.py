@@ -122,6 +122,24 @@ def effect_outcome(
     )
 
 
+def run_bound_request(
+    request: FactoryLiveEffectRequestV1,
+    *,
+    run_id: UUID,
+    run_effect_index: int,
+    run_effect_count: int,
+) -> FactoryLiveEffectRequestV1:
+    payload = request.model_dump(mode="json", by_alias=True)
+    payload.update(
+        {
+            "run_id": str(run_id),
+            "run_effect_index": run_effect_index,
+            "run_effect_count": run_effect_count,
+        }
+    )
+    return FactoryLiveEffectRequestV1.model_validate(payload)
+
+
 class Repository(InMemoryFactoryRepository):
     def __init__(self, job, *, artifacts=(), budget=None, receipts=()) -> None:
         super().__init__()
@@ -350,9 +368,79 @@ async def test_history_after_recovery_is_durable_and_exact_replay_is_not_duplica
         Executor(second, start=AssertionError("history must not execute")),
     ).history(job.job_id)
     assert all(isinstance(report, FactoryLiveRunReport) for report in rebuilt)
+    assert tuple(report.status for report in rebuilt[-2:]) == (
+        "infrastructure_recovery_required",
+        "blocked",
+    )
+    assert rebuilt[-1].effects[0].effect_id == second.effect_id
+    assert rebuilt[-1].effects[0].completion_origin == "recover"
+
+
+@pytest.mark.asyncio
+async def test_recovered_multi_effect_run_survives_a_second_restart_with_grouping() -> None:
+    job = workflow_job(mode="demo")
+    run_id = uuid5(NAMESPACE_URL, f"factory-live-run|{job.job_id}|grouped")
+    first = run_bound_request(
+        effect_request(job, kind=FactoryLiveEffectKind.CODEX, key_char="c"),
+        run_id=run_id,
+        run_effect_index=1,
+        run_effect_count=2,
+    )
+    second = run_bound_request(
+        effect_request(job, kind=FactoryLiveEffectKind.CODEX, key_char="d").model_copy(
+            update={
+                "effect_id": uuid5(
+                    NAMESPACE_URL,
+                    f"factory-live|{job.job_id}|grouped|second",
+                )
+            }
+        ),
+        run_id=run_id,
+        run_effect_index=2,
+        run_effect_count=2,
+    )
+    ledger = InMemoryFactoryLiveEffectLedger()
+    ledger.claim(first)
+    ledger.complete(first, effect_outcome(first))
+    ledger.claim(second)
+
+    before_recovery = runner(
+        job,
+        ledger,
+        Plan(first, second),
+        Executor(
+            second,
+            start=AssertionError("must recover"),
+            recover=effect_outcome(second),
+        ),
+    )
+    open_history = before_recovery.history(job.job_id)
+    assert len(open_history) == 1
+    assert open_history[0].status == "infrastructure_recovery_required"
+    assert tuple(effect.effect_id for effect in open_history[0].effects) == (
+        first.effect_id,
+        second.effect_id,
+    )
+
+    recovered = await before_recovery.run(job, mode="demo")
+    assert recovered.effects[-1].completion_origin == "recover"
+
+    after_second_restart = runner(
+        job,
+        ledger,
+        Plan(),
+        Executor(second, start=AssertionError("history must not execute")),
+    ).history(job.job_id)
+    assert tuple(report.status for report in after_second_restart[:-1]) == (
+        "infrastructure_recovery_required",
+    )
+    assert tuple(effect.effect_id for effect in after_second_restart[-1].effects) == (
+        first.effect_id,
+        second.effect_id,
+    )
     assert tuple(
-        effect.effect_id for report in rebuilt for effect in report.effects
-    ) == (first.effect_id, second.effect_id)
+        effect.completion_origin for effect in after_second_restart[-1].effects
+    ) == ("execute", "recover")
 
 
 @pytest.mark.asyncio
@@ -481,11 +569,13 @@ def test_historical_success_outcome_without_new_optional_fields_stays_readable()
     request = effect_request(job)
     old_payload = effect_outcome(request).model_dump(mode="json", by_alias=True)
     old_payload.pop("reason")
+    old_payload.pop("completion_origin")
 
     restored = FactoryLiveEffectOutcomeV1.model_validate(old_payload)
 
     assert restored.status == "succeeded"
     assert restored.reason is None
+    assert restored.completion_origin == "execute"
 
 
 @pytest.mark.asyncio

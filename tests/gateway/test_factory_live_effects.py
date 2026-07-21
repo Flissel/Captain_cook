@@ -126,7 +126,12 @@ def test_gateway_history_preserves_exact_non_dispatched_block_reason() -> None:
 
 
 def test_gateway_effect_payload_digest_rejects_tampering() -> None:
-    ledger_payload = {"status": "budget_exhausted", "reason": "original"}
+    effect_id = str(uuid5(NAMESPACE_URL, "tampered-effect"))
+    ledger_payload = {
+        "effect_id": effect_id,
+        "status": "budget_exhausted",
+        "reason": "original",
+    }
     block = Block(
         index=0,
         block_type="factory_live_effect",
@@ -135,7 +140,11 @@ def test_gateway_effect_payload_digest_rejects_tampering() -> None:
         previous_hash="0",
         metadata={"event_kind": "outcome"},
     )
-    side_payload = {"status": "budget_exhausted", "reason": "rewritten"}
+    side_payload = {
+        "effect_id": effect_id,
+        "status": "budget_exhausted",
+        "reason": "rewritten",
+    }
     row = {
         "payload": json.dumps(side_payload, sort_keys=True),
         "content_sha256": hashlib.sha256(
@@ -146,6 +155,8 @@ def test_gateway_effect_payload_digest_rejects_tampering() -> None:
             ).encode("utf-8")
         ).hexdigest(),
         "block_index": block.index,
+        "projection_block_index": block.index,
+        "projection_effect_id": effect_id,
         "ledger_data": json.dumps(block.data, sort_keys=True),
         "ledger_block_type": block.block_type,
         "ledger_status": block.status,
@@ -166,6 +177,7 @@ def test_gateway_effect_payload_reads_historical_block_without_reason_field() ->
     request = effect_request(workflow_job(mode="demo"))
     old_payload = effect_outcome(request).model_dump(mode="json", by_alias=True)
     old_payload.pop("reason")
+    old_payload.pop("completion_origin")
     block = Block(
         index=0,
         block_type="factory_live_effect",
@@ -186,6 +198,8 @@ def test_gateway_effect_payload_reads_historical_block_without_reason_field() ->
         "payload": json.dumps(old_payload, sort_keys=True),
         "content_sha256": digest,
         "block_index": block.index,
+        "projection_block_index": block.index,
+        "projection_effect_id": old_payload["effect_id"],
         "ledger_data": json.dumps(block.data, sort_keys=True),
         "ledger_block_type": block.block_type,
         "ledger_status": block.status,
@@ -299,29 +313,21 @@ def test_mariadb_effect_history_survives_restart_in_authoritative_order(
     mariadb_store: GatewayStore,
 ) -> None:
     job, first = prepared_mariadb_effect(mariadb_store)
-    second = effect_request(
-        job,
-        kind=FactoryLiveEffectKind.CODEX,
-        key_char="c",
-        now=first.invocation.occurred_at,
-    )
-    second_invocation = second.invocation.model_copy(
+    second_invocation = first.invocation.model_copy(
         update={
-            "input_ref": job.input_ref,
-            "input_sha256": job.input_ref.sha256,
-            "released_skill": first.invocation.released_skill,
+            "invocation_id": uuid5(
+                NAMESPACE_URL,
+                f"second-provider-invocation|{job.job_id}",
+            ),
+            "idempotency_key": "c" * 64,
         }
     )
-    second = second.model_copy(
-        update={"input_ref": job.input_ref, "invocation": second_invocation}
-    )
-    mariadb_store.record_factory_lease(second_invocation.lease)
-    mariadb_store.record_factory_skill_assignment(
-        FactorySkillAssignmentV1(
-            job_id=job.job_id,
-            step=second_invocation.step,
-            released_skill=second_invocation.released_skill,
-        )
+    second = first.model_copy(
+        update={
+            "effect_id": uuid5(NAMESPACE_URL, f"second-provider-effect|{job.job_id}"),
+            "idempotency_key": second_invocation.idempotency_key,
+            "invocation": second_invocation,
+        }
     )
     adapter = GatewayFactoryLiveEffectLedger(mariadb_store)
     adapter.claim(first)
@@ -373,6 +379,32 @@ def test_mariadb_effect_history_rejects_side_table_rewrite(
         GatewayFactoryLiveEffectLedger(
             GatewayStore(mariadb_store.storage)
         ).history(request.job_id)
+
+
+def test_mariadb_effect_history_rejects_deleted_outcome_projection(
+    mariadb_store: GatewayStore,
+) -> None:
+    job, request = prepared_mariadb_effect(mariadb_store)
+    adapter = GatewayFactoryLiveEffectLedger(mariadb_store)
+    adapter.claim(request)
+    adapter.complete(request, effect_outcome(request))
+
+    with mariadb_store.storage.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM factory_live_effect_events "
+                "WHERE effect_id = %s AND event_kind = 'outcome'",
+                (str(request.effect_id),),
+            )
+
+    with pytest.raises(ValueError, match="projection"):
+        GatewayFactoryLiveEffectLedger(
+            GatewayStore(mariadb_store.storage)
+        ).history(job.job_id)
+    with pytest.raises(ValueError, match="projection"):
+        GatewayFactoryLiveEffectLedger(
+            GatewayStore(mariadb_store.storage)
+        ).claim(request)
 
 
 def test_mariadb_effect_changed_replay_conflicts(
