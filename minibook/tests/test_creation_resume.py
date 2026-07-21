@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import pytest
 
@@ -127,3 +128,13 @@ def test_result_is_unavailable_until_terminal(tmp_path: Path) -> None:
     progress = store.progress(job.creation_job_id)
     assert progress.status == "queued"
     assert progress.version == 1
+
+
+def test_finish_rejects_result_identity_drift(tmp_path: Path) -> None:
+    store = CreationJobStore(tmp_path / "creation.sqlite3")
+    job = creation_job()
+    store.submit(job)
+    result = ScriptedPipeline(store).assemble_result(job, {})
+
+    with pytest.raises(CreationConflictError, match="identity"):
+        store.finish(result.model_copy(update={"correlation_id": UUID(int=0)}))

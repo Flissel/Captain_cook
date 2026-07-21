@@ -201,6 +201,155 @@ class CreationResultV1(_FrozenContract):
         return self
 
 
+class FactoryEvidenceBlockV1(_FrozenContract):
+    """Hermes-authored evidence projected by Minibook, never Captain authority."""
+
+    schema_name: Literal["captain.agent-factory-block.v1"] = Field(
+        default="captain.agent-factory-block.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    event_id: UUID
+    job_id: UUID
+    correlation_id: UUID
+    causation_id: UUID
+    occurred_at: datetime
+    producer: Literal["hermes"]
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    phase: Literal[
+        "blueprint_created",
+        "tool_candidate_tested",
+        "agent_code_created",
+    ]
+    role: Literal["agent_architect", "tool_integrator"]
+    status: Literal["succeeded"]
+    artifact_refs: tuple[ArtifactRef, ...] = ()
+    evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
+    assertion_ids: tuple[str, ...] = ()
+    lease_id: str = Field(pattern=IDENTIFIER_PATTERN)
+
+    @field_validator("occurred_at")
+    @classmethod
+    def require_evidence_timestamp_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("evidence timestamp must be UTC")
+        return value
+
+    @field_validator("assertion_ids")
+    @classmethod
+    def require_unique_evidence_assertions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)) or any(not item for item in value):
+            raise ValueError("evidence assertion ids must be unique and nonblank")
+        return value
+
+    @model_validator(mode="after")
+    def require_role_and_content_addresses(self) -> "FactoryEvidenceBlockV1":
+        expected_role = {
+            "blueprint_created": "agent_architect",
+            "tool_candidate_tested": "tool_integrator",
+            "agent_code_created": "tool_integrator",
+        }[self.phase]
+        if self.role != expected_role:
+            raise ValueError("factory evidence role does not match its phase")
+        for reference in (*self.artifact_refs, *self.evidence_refs):
+            _require_content_address(reference)
+        return self
+
+
+class CreationPreparationEvidenceV1(_FrozenContract):
+    schema_name: Literal["minibook.creation-preparation-evidence.v1"] = Field(
+        default="minibook.creation-preparation-evidence.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    creation_job: CreationJobV1
+    blocks: tuple[FactoryEvidenceBlockV1, FactoryEvidenceBlockV1]
+
+    @model_validator(mode="after")
+    def require_exact_preparation_chain(self) -> "CreationPreparationEvidenceV1":
+        job = self.creation_job
+        if tuple(block.phase for block in self.blocks) != (
+            "blueprint_created",
+            "tool_candidate_tested",
+        ):
+            raise ValueError("preparation evidence requires blueprint then tool evidence")
+        if self.blocks[0].occurred_at >= self.blocks[1].occurred_at:
+            raise ValueError("preparation evidence timestamps must be monotonic")
+        if self.blocks[1].occurred_at >= job.deadline_at:
+            raise ValueError("preparation evidence must precede the creation deadline")
+        if len({block.event_id for block in self.blocks}) != 2:
+            raise ValueError("preparation evidence event ids must be unique")
+        for block in self.blocks:
+            _require_block_job_binding(job, block)
+        return self
+
+
+class CreationCompletionEvidenceV1(_FrozenContract):
+    schema_name: Literal["minibook.creation-completion-evidence.v1"] = Field(
+        default="minibook.creation-completion-evidence.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    result: CreationResultV1
+    block: FactoryEvidenceBlockV1
+
+    @model_validator(mode="after")
+    def require_success_content_chain(self) -> "CreationCompletionEvidenceV1":
+        result = self.result
+        block = self.block
+        if result.status != "succeeded":
+            raise ValueError("completion evidence requires a succeeded result")
+        if block.phase != "agent_code_created":
+            raise ValueError("completion evidence requires agent code evidence")
+        assert result.package_manifest_ref is not None
+        assert result.skill_usage_receipt_ref is not None
+        references = (
+            result.package_manifest_ref,
+            result.skill_usage_receipt_ref,
+            *result.artifact_refs,
+            *result.evidence_refs,
+        )
+        if result.private_skill_candidate_ref is not None:
+            references = (*references, result.private_skill_candidate_ref)
+        for reference in references:
+            _require_content_address(reference)
+        if block.evidence_refs != (
+            result.package_manifest_ref,
+            result.skill_usage_receipt_ref,
+        ):
+            raise ValueError("completion block must bind package and skill receipt")
+        return self
+
+
+class CreationEvidenceReceiptV1(_FrozenContract):
+    creation_job_id: UUID
+    replayed: bool = False
+
+
+def _require_content_address(reference: ArtifactRef) -> None:
+    if (
+        "?" in reference.uri
+        or "#" in reference.uri
+        or reference.uri.rstrip("/").rsplit("/", 1)[-1] != reference.sha256
+    ):
+        raise ValueError("evidence refs must be content-addressed")
+
+
+def _require_block_job_binding(
+    job: CreationJobV1,
+    block: FactoryEvidenceBlockV1,
+) -> None:
+    if (
+        block.job_id != job.factory_job_id
+        or block.correlation_id != job.correlation_id
+        or block.causation_id != job.causation_id
+        or block.subject_version != job.subject_version
+        or block.attempt != job.attempt
+    ):
+        raise ValueError("factory evidence is not bound to the creation job")
+
+
 class FactoryBuildAssignmentV1(_FrozenContract):
     schema_name: Literal["hermes.factory-build-assignment.v1"] = Field(default="hermes.factory-build-assignment.v1", alias="schema", serialization_alias="schema")
     assignment_id: UUID

@@ -133,7 +133,12 @@ if _creation_db:
     from minibook.swarm.api import create_creation_router
     from minibook.swarm.job_store import CreationJobStore
 
-    app.include_router(create_creation_router(CreationJobStore(Path(_creation_db))))
+    app.include_router(
+        create_creation_router(
+            CreationJobStore(Path(_creation_db)),
+            api_key=os.environ.get("MINIBOOK_API_KEY"),
+        )
+    )
 else:
     @app.get("/api/v1/creation-capabilities")
     def creation_capabilities() -> dict[str, object]:

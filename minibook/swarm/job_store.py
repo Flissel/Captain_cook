@@ -8,7 +8,9 @@ from typing import Any
 from uuid import UUID
 
 from .contracts import (
+    CreationCompletionEvidenceV1,
     CreationJobV1,
+    CreationPreparationEvidenceV1,
     CreationProgressV1,
     CreationResultV1,
     CreationSubmissionReceipt,
@@ -64,8 +66,112 @@ class CreationJobStore:
                 CREATE TABLE IF NOT EXISTS creation_results (
                     job_id TEXT PRIMARY KEY, payload TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS creation_preparation_evidence (
+                    job_id TEXT PRIMARY KEY, payload TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS creation_completion_evidence (
+                    job_id TEXT PRIMARY KEY, payload TEXT NOT NULL
+                );
                 """
             )
+
+    def record_preparation(
+        self,
+        evidence: CreationPreparationEvidenceV1,
+    ) -> bool:
+        job_id = str(evidence.creation_job.creation_job_id)
+        encoded = _json(evidence)
+        with self._connect() as db:
+            existing = db.execute(
+                "SELECT payload FROM creation_preparation_evidence WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["payload"] != encoded:
+                    raise CreationConflictError(
+                        "creation preparation evidence already differs"
+                    )
+                return True
+            db.execute(
+                "INSERT INTO creation_preparation_evidence VALUES (?, ?)",
+                (job_id, encoded),
+            )
+        return False
+
+    def preparation(self, job_id: UUID) -> CreationPreparationEvidenceV1:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT payload FROM creation_preparation_evidence WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+        if row is None:
+            raise CreationNotFoundError(str(job_id))
+        return CreationPreparationEvidenceV1.model_validate_json(row["payload"])
+
+    def record_completion(
+        self,
+        evidence: CreationCompletionEvidenceV1,
+    ) -> bool:
+        result = evidence.result
+        job = self.job(result.creation_job_id)
+        self._require_result_identity(job, result)
+        try:
+            preparation = self.preparation(result.creation_job_id)
+        except CreationNotFoundError as exc:
+            raise CreationConflictError(
+                "completion evidence requires durable preparation evidence"
+            ) from exc
+        persisted = self.result(result.creation_job_id)
+        if persisted is None or persisted != result:
+            raise CreationConflictError(
+                "completion evidence requires the exact persisted creation result"
+            )
+        block = evidence.block
+        if (
+            block.job_id != job.factory_job_id
+            or block.correlation_id != job.correlation_id
+            or block.causation_id != job.causation_id
+            or block.subject_version != job.subject_version
+            or block.attempt != job.attempt
+        ):
+            raise CreationConflictError(
+                "completion evidence is not bound to the creation job"
+            )
+        if (
+            block.occurred_at <= preparation.blocks[-1].occurred_at
+            or block.occurred_at >= job.deadline_at
+            or block.event_id in {item.event_id for item in preparation.blocks}
+        ):
+            raise CreationConflictError(
+                "completion evidence does not extend the immutable preparation chain"
+            )
+        encoded = _json(evidence)
+        with self._connect() as db:
+            existing = db.execute(
+                "SELECT payload FROM creation_completion_evidence WHERE job_id = ?",
+                (str(result.creation_job_id),),
+            ).fetchone()
+            if existing is not None:
+                if existing["payload"] != encoded:
+                    raise CreationConflictError(
+                        "creation completion evidence already differs"
+                    )
+                return True
+            db.execute(
+                "INSERT INTO creation_completion_evidence VALUES (?, ?)",
+                (str(result.creation_job_id), encoded),
+            )
+        return False
+
+    def completion(self, job_id: UUID) -> CreationCompletionEvidenceV1:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT payload FROM creation_completion_evidence WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+        if row is None:
+            raise CreationNotFoundError(str(job_id))
+        return CreationCompletionEvidenceV1.model_validate_json(row["payload"])
 
     def submit(self, job: CreationJobV1) -> CreationSubmissionReceipt:
         job_id = str(job.creation_job_id)
@@ -204,8 +310,10 @@ class CreationJobStore:
         return self.progress(job_id)
 
     def finish(self, result: CreationResultV1) -> CreationResultV1:
-        encoded = _json(result)
         job_id = str(result.creation_job_id)
+        job = self.job(result.creation_job_id)
+        self._require_result_identity(job, result)
+        encoded = _json(result)
         with self._connect() as db:
             existing = db.execute(
                 "SELECT payload FROM creation_results WHERE job_id = ?", (job_id,)
@@ -221,6 +329,16 @@ class CreationJobStore:
                 (job_id, head["version"] + 1, result.status, head["checkpoint"], head["snapshot"]),
             )
         return result
+
+    @staticmethod
+    def _require_result_identity(job: CreationJobV1, result: CreationResultV1) -> None:
+        if (
+            result.creation_job_id != job.creation_job_id
+            or result.correlation_id != job.correlation_id
+            or result.subject_version != job.subject_version
+            or result.attempt != job.attempt
+        ):
+            raise CreationConflictError("creation result identity changed")
 
     def result(self, job_id: UUID) -> CreationResultV1 | None:
         self.job(job_id)
