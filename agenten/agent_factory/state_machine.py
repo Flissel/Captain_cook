@@ -15,6 +15,7 @@ from .release_gate import (
     evaluation_tool_gaps,
     factory_evaluation_block_reason,
     factory_release_decision_block_reason,
+    factory_workflow_release_decision_block_reason,
 )
 from .skill_evaluation import ToolGapMarker
 from .skill_store import StoredSkillEvaluation
@@ -133,26 +134,49 @@ def apply_block(
             raise FactoryLifecycleError("behavioral iteration ceiling reached")
         attempt += 1
     elif block.phase is FactoryPhase.CAPABILITY_PROMOTED:
-        evaluation_reason = factory_evaluation_block_reason(projection.job, evaluation)
-        if evaluation_reason is not None:
-            raise FactoryLifecycleError(evaluation_reason)
-        decision_reason = factory_release_decision_block_reason(
-            projection.job,
-            evaluation,
-            release_decision,
-        )
-        if decision_reason is not None:
-            raise FactoryLifecycleError(decision_reason)
-        assert evaluation is not None
         required = set(projection.job.acceptance_assertion_ids)
         if not required.issubset(assertions):
             raise FactoryLifecycleError("promotion is missing required assertions")
         status = FactoryLifecycleStatus.READY_TO_USE
-        evaluation_update = {
-            "evaluation_id": evaluation.evidence.evidence_id,
-            "evaluation_ref": evaluation.evidence_ref,
-            "tool_gaps": evaluation_tool_gaps(evaluation),
-        }
+        if isinstance(projection.job, AgentFactoryJobV3):
+            _validate_workflow_feedback(
+                projection,
+                workflow_evaluation=workflow_evaluation,
+                feedback=feedback,
+            )
+            decision_reason = factory_workflow_release_decision_block_reason(
+                projection.job,
+                workflow_evaluation,
+                release_decision,
+            )
+            if decision_reason is not None:
+                raise FactoryLifecycleError(decision_reason)
+            assert workflow_evaluation is not None
+            assert feedback is not None
+            evaluation_update = {
+                "workflow_evaluation_ref": workflow_evaluation.artifact_ref,
+                "feedback_ref": feedback.artifact_ref,
+                "feedback_recommendation": feedback.recommendation,
+            }
+        else:
+            evaluation_reason = factory_evaluation_block_reason(
+                projection.job, evaluation
+            )
+            if evaluation_reason is not None:
+                raise FactoryLifecycleError(evaluation_reason)
+            decision_reason = factory_release_decision_block_reason(
+                projection.job,
+                evaluation,
+                release_decision,
+            )
+            if decision_reason is not None:
+                raise FactoryLifecycleError(decision_reason)
+            assert evaluation is not None
+            evaluation_update = {
+                "evaluation_id": evaluation.evidence.evidence_id,
+                "evaluation_ref": evaluation.evidence_ref,
+                "tool_gaps": evaluation_tool_gaps(evaluation),
+            }
     elif block.phase is FactoryPhase.ESCALATED:
         status = FactoryLifecycleStatus.ESCALATED
     elif block.phase is FactoryPhase.QUALITY_REVIEWED and (
@@ -196,6 +220,7 @@ def next_action(
     evaluation: StoredSkillEvaluation | None = None,
     workflow_evaluation: TeamEvaluationV1 | None = None,
     feedback: FactoryFeedbackV1 | None = None,
+    workflow_release_decision: FactoryReleaseDecision | None = None,
 ) -> FactoryAction:
     """Return the one allowed next side effect for a derived projection."""
 
@@ -239,8 +264,18 @@ def next_action(
                     raise FactoryLifecycleError(
                         "workflow promotion recommendation is missing Captain assertions"
                     )
+                decision_reason = factory_workflow_release_decision_block_reason(
+                    projection.job,
+                    workflow_evaluation,
+                    workflow_release_decision,
+                )
+                if decision_reason is None:
+                    return FactoryAction(
+                        kind=FactoryActionKind.VALIDATE_FOR_PROMOTION,
+                        attempt=projection.attempt,
+                    )
                 return FactoryAction(
-                    kind=FactoryActionKind.VALIDATE_FOR_PROMOTION,
+                    kind=FactoryActionKind.APPEND_ESCALATED,
                     attempt=projection.attempt,
                 )
             if feedback.recommendation is FactoryFeedbackRecommendation.RETRY_BUILD:

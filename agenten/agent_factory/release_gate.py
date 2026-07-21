@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from enum import Enum
 from typing import Literal
 from uuid import UUID
@@ -9,7 +10,10 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryJob
-from agenten.agent_factory.execution_budget import FactoryBudgetProjection
+from agenten.agent_factory.execution_budget import (
+    FactoryBudgetProjection,
+    FactoryUsageReceiptV1,
+)
 from agenten.agent_factory.execution_policy import FactoryExecutionMode
 from agenten.agent_factory.skill_evaluation import ToolGapMarker
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
@@ -128,12 +132,19 @@ def evaluate_factory_workflow_release(
     evaluation: TeamEvaluationV1,
     *,
     budget_projection: FactoryBudgetProjection | None = None,
+    usage_receipts: tuple[FactoryUsageReceiptV1, ...] = (),
 ) -> FactoryReleaseDecision:
     """Validate V3 live workflow evidence without granting promotion authority."""
 
     blocked = _workflow_evaluation_block_reason(job, evidence, evaluation)
     if blocked is not None:
         return _workflow_blocked(job, evaluation, blocked)
+    if budget_projection is None:
+        return _workflow_blocked(
+            job,
+            evaluation,
+            "missing Gateway workflow budget projection",
+        )
     required_runs = job.execution_policy.required_live_runs
     if len(evidence) != required_runs:
         label = "one" if required_runs == 1 else "three"
@@ -142,19 +153,59 @@ def evaluate_factory_workflow_release(
             evaluation,
             f"missing exactly {label} successful live workflow run(s)",
         )
-    if budget_projection is not None:
-        if (
-            budget_projection.job_id != job.job_id
-            or budget_projection.limit_usd != job.execution_policy.max_cost_usd
-            or budget_projection.consumed_usd > job.execution_policy.max_cost_usd
-            or budget_projection.reserved_usd != 0
-            or budget_projection.active_reservation_ids
-        ):
-            return _workflow_blocked(
-                job,
-                evaluation,
-                "workflow budget projection is not release-complete",
-            )
+    if (
+        budget_projection.job_id != job.job_id
+        or budget_projection.limit_usd != job.execution_policy.max_cost_usd
+        or budget_projection.consumed_usd > job.execution_policy.max_cost_usd
+        or budget_projection.reserved_usd != 0
+        or budget_projection.active_reservation_ids
+    ):
+        return _workflow_blocked(
+            job,
+            evaluation,
+            "workflow budget projection is not release-complete",
+        )
+    run_receipt_refs = {
+        reference
+        for run in evidence
+        for reference in run.usage_receipt_refs
+    }
+    receipt_identity_is_unique = all(
+        len(values) == len(set(values))
+        for values in (
+            tuple(receipt.receipt_id for receipt in usage_receipts),
+            tuple(receipt.reservation_id for receipt in usage_receipts),
+            tuple(receipt.evidence_ref for receipt in usage_receipts),
+        )
+    )
+    receipts_are_bound = all(
+        receipt.job_id == job.job_id
+        and receipt.correlation_id == job.correlation_id
+        and receipt.attempt <= evaluation.attempt
+        and receipt.model in job.execution_policy.allowed_models
+        for receipt in usage_receipts
+    )
+    current_receipts = {
+        receipt.evidence_ref
+        for receipt in usage_receipts
+        if receipt.attempt == evaluation.attempt
+    }
+    if (
+        not usage_receipts
+        or not receipt_identity_is_unique
+        or not receipts_are_bound
+        or not run_receipt_refs.issubset(current_receipts)
+        or sum(
+            (receipt.cost_usd for receipt in usage_receipts),
+            start=Decimal("0"),
+        )
+        != budget_projection.consumed_usd
+    ):
+        return _workflow_blocked(
+            job,
+            evaluation,
+            "workflow usage receipts do not cover the Gateway budget projection",
+        )
     run_numbers = tuple(item.run_number for item in evidence)
     if len(run_numbers) != len(set(run_numbers)):
         return _workflow_blocked(job, evaluation, "workflow run numbers must be unique")
@@ -448,6 +499,33 @@ def _workflow_evaluation_block_reason(
         or any(item.status != "passed" for item in evaluation.assertion_outcomes)
     ):
         return "workflow evaluation did not recommend the candidate"
+    return None
+
+
+def factory_workflow_release_decision_block_reason(
+    job: AgentFactoryJobV3,
+    evaluation: TeamEvaluationV1 | None,
+    decision: FactoryReleaseDecision | None,
+) -> str | None:
+    """Require a Captain V3 decision bound only to workflow evaluation evidence."""
+
+    if decision is None:
+        return "missing accepted Factory workflow release decision"
+    if decision.status != "ready":
+        return "Factory workflow release decision is blocked: " + ", ".join(
+            decision.reasons
+        )
+    if decision.job_id != job.job_id or decision.correlation_id != job.correlation_id:
+        return "Factory workflow release decision does not match the factory job"
+    if evaluation is None:
+        return "missing accepted workflow evaluation evidence"
+    if (
+        decision.evaluation_id != evaluation.invocation_id
+        or decision.evaluation_ref != evaluation.artifact_ref
+    ):
+        return "Factory workflow release decision does not match the workflow evaluation"
+    if decision.tool_gaps:
+        return "Factory workflow release decision contains unvalidated tool gaps"
     return None
 
 

@@ -6,7 +6,10 @@ from uuid import UUID
 import pytest
 
 from agenten.agent_factory.contracts import AgentFactoryJobV3
-from agenten.agent_factory.execution_budget import FactoryBudgetProjection
+from agenten.agent_factory.execution_budget import (
+    FactoryBudgetProjection,
+    FactoryUsageReceiptV1,
+)
 from agenten.agent_factory.release_gate import (
     E2EKind,
     E2EOutcome,
@@ -323,6 +326,35 @@ def workflow_budget() -> FactoryBudgetProjection:
     )
 
 
+def workflow_receipts(
+    runs: tuple[TeamExecutionEvidenceV1, ...],
+) -> tuple[FactoryUsageReceiptV1, ...]:
+    cost = "0.75" if len(runs) == 1 else "0.25"
+    return tuple(
+        FactoryUsageReceiptV1(
+            schema_name="captain.factory-usage-receipt.v1",
+            receipt_id=UUID(
+                f"00000000-0000-0000-0000-{410 + run.run_number:012d}"
+            ),
+            reservation_id=UUID(
+                f"00000000-0000-0000-0000-{420 + run.run_number:012d}"
+            ),
+            job_id=run.job_id,
+            correlation_id=run.correlation_id,
+            attempt=run.attempt,
+            provider="approved-provider",
+            model="approved-model-id",
+            input_units=100,
+            output_units=20,
+            cost_usd=cost,
+            started_at=WORKFLOW_NOW,
+            ended_at=WORKFLOW_NOW + timedelta(seconds=1),
+            evidence_ref=run.usage_receipt_refs[0],
+        )
+        for run in runs
+    )
+
+
 def test_workflow_release_keeps_demo_ready_distinct_from_ready() -> None:
     demo_runs = (workflow_run(1),)
     release_runs = tuple(workflow_run(number) for number in range(1, 4))
@@ -332,12 +364,14 @@ def test_workflow_release_keeps_demo_ready_distinct_from_ready() -> None:
         demo_runs,
         workflow_evaluation(demo_runs),
         budget_projection=workflow_budget(),
+        usage_receipts=workflow_receipts(demo_runs),
     )
     release = evaluate_factory_workflow_release(
         workflow_job(mode="release"),
         release_runs,
         workflow_evaluation(release_runs),
         budget_projection=workflow_budget(),
+        usage_receipts=workflow_receipts(release_runs),
     )
 
     assert demo.status == "demo_ready"
@@ -351,10 +385,43 @@ def test_workflow_release_requires_exact_live_run_count_and_usage_receipts() -> 
         runs,
         workflow_evaluation(runs),
         budget_projection=workflow_budget(),
+        usage_receipts=workflow_receipts(runs),
     )
 
     assert decision.status == "blocked"
     assert "three" in decision.reasons[0]
+
+
+def test_workflow_release_requires_a_gateway_budget_projection() -> None:
+    runs = (workflow_run(1),)
+
+    decision = evaluate_factory_workflow_release(
+        workflow_job(mode="demo"),
+        runs,
+        workflow_evaluation(runs),
+    )
+
+    assert decision.status == "blocked"
+    assert decision.reasons == (
+        "missing Gateway workflow budget projection",
+    )
+
+
+def test_workflow_release_requires_receipts_to_cover_the_budget_projection() -> None:
+    runs = (workflow_run(1),)
+
+    decision = evaluate_factory_workflow_release(
+        workflow_job(mode="demo"),
+        runs,
+        workflow_evaluation(runs),
+        budget_projection=workflow_budget(),
+        usage_receipts=(),
+    )
+
+    assert decision.status == "blocked"
+    assert decision.reasons == (
+        "workflow usage receipts do not cover the Gateway budget projection",
+    )
 
 
 def test_workflow_release_rejects_changed_candidate_binding() -> None:
@@ -372,6 +439,7 @@ def test_workflow_release_rejects_changed_candidate_binding() -> None:
         (*runs[:2], changed),
         workflow_evaluation(runs),
         budget_projection=workflow_budget(),
+        usage_receipts=workflow_receipts(runs),
     )
 
     assert decision.status == "blocked"

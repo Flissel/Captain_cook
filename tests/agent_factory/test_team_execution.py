@@ -513,11 +513,18 @@ async def test_live_run_reserves_records_usage_handoffs_and_termination(
         uri="holdout://holdout-333333333333",
         sha256="3" * 64,
     )
+    third_holdout = PrivateHoldoutRef(
+        schema_name="captain.private-holdout-ref.v1",
+        holdout_id="holdout-444444444444",
+        uri="holdout://holdout-444444444444",
+        sha256="4" * 64,
+    )
     job = base_job.model_copy(
         update={
             "private_holdout_refs": (
                 *base_job.private_holdout_refs,
                 second_holdout,
+                third_holdout,
             )
         }
     )
@@ -657,17 +664,34 @@ async def test_live_run_reserves_records_usage_handoffs_and_termination(
         invocation, candidate, job.private_holdout_refs[0]
     )
     second_case = await service.execute(invocation, candidate, second_holdout)
+    third_case = await service.execute(invocation, candidate, third_holdout)
 
     assert evidence.status == "succeeded"
     assert evidence.termination_reason == "task_completed"
     assert evidence.usage_receipt_refs == (_artifact("factory-usage", "8" * 64),)
     assert evidence.handoff_evidence_refs == (handoff_ref,)
     assert evidence.tool_evidence_refs == (tool_ref,)
-    assert len(runner.calls) == 2
+    assert len(runner.calls) == 3
     assert replayed == evidence
     assert second_case.holdout_ref == second_holdout
+    assert third_case.holdout_ref == third_holdout
+    assert tuple(
+        item.run_number for item in (evidence, second_case, third_case)
+    ) == (1, 2, 3)
+    assert len(
+        {
+            item.invocation_id
+            for item in (evidence, second_case, third_case)
+        }
+    ) == 3
+    assert len(
+        {
+            item.invocation.idempotency_key
+            for item in (evidence, second_case, third_case)
+        }
+    ) == 3
     projection = budget.projection(job.job_id)
-    assert projection.consumed_usd == Decimal("0.84")
+    assert projection.consumed_usd == Decimal("1.26")
     assert projection.reserved_usd == Decimal("0")
 
 

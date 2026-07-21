@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Protocol
 
 from agenten.agent_factory.execution_budget import FactoryBudgetProjection
+from agenten.agent_factory.outcome_contracts import AssertionOutcome
 from agenten.agent_factory.skill_workflow_contracts import (
     FactoryFeedbackRecommendation,
     FactorySkillInvocationV1,
@@ -54,7 +55,12 @@ class TeamEvaluationService:
     ) -> TeamEvaluationV1:
         """Evaluate released assertions before considering an optional judge."""
 
-        executions = execution if isinstance(execution, tuple) else (execution,)
+        executions = tuple(
+            sorted(
+                execution if isinstance(execution, tuple) else (execution,),
+                key=lambda item: item.run_number,
+            )
+        )
         now = self._validate_invocation(invocation)
         self._validate_bindings(
             invocation,
@@ -83,7 +89,10 @@ class TeamEvaluationService:
             if not isinstance(judge_ref, ArtifactRef):
                 raise ValueError("qualitative judge must return one redacted evidence ref")
 
-        assertion_outcomes = executions[-1].execution_outcome.assertion_outcomes
+        assertion_outcomes = _aggregate_assertion_outcomes(
+            invocation.acceptance_assertion_ids,
+            executions,
+        )
         prior_green = set(
             ()
             if prior_evaluation is None
@@ -92,6 +101,8 @@ class TeamEvaluationService:
         for item in assertion_outcomes:
             if item.status == "passed":
                 prior_green.add(item.assertion_id)
+            else:
+                prior_green.discard(item.assertion_id)
         regression_ids = tuple(
             assertion_id
             for assertion_id in invocation.acceptance_assertion_ids
@@ -261,6 +272,11 @@ class TeamEvaluationService:
     def _deterministic_result(
         executions: tuple[TeamExecutionEvidenceV1, ...],
     ) -> tuple[bool, str | None]:
+        termination_codes = {run.termination_reason for run in executions}
+        if "credential_required" in termination_codes:
+            return False, "credential_required"
+        if "infrastructure_failure" in termination_codes:
+            return False, "infrastructure_failure"
         if any(run.status == "unresolved" for run in executions):
             return False, "unresolved"
         if any(
@@ -334,3 +350,43 @@ def _unique_refs(references: Iterable[ArtifactRef]) -> tuple[ArtifactRef, ...]:
             reference,
         )
     return tuple(unique.values())
+
+
+def _aggregate_assertion_outcomes(
+    assertion_ids: tuple[str, ...],
+    executions: tuple[TeamExecutionEvidenceV1, ...],
+) -> tuple[AssertionOutcome, ...]:
+    """Retain the worst outcome for every assertion across all required runs."""
+
+    aggregated: list[AssertionOutcome] = []
+    for assertion_id in assertion_ids:
+        observed = tuple(
+            outcome
+            for run in executions
+            for outcome in run.execution_outcome.assertion_outcomes
+            if outcome.assertion_id == assertion_id
+        )
+        intents = {outcome.integration_intent for outcome in observed}
+        if len(intents) != 1:
+            raise ValueError(
+                "execution evidence changed an assertion integration intent"
+            )
+        status = (
+            "failed"
+            if any(outcome.status == "failed" for outcome in observed)
+            or any(run.status == "unresolved" for run in executions)
+            else "passed"
+        )
+        aggregated.append(
+            AssertionOutcome(
+                assertion_id=assertion_id,
+                status=status,
+                integration_intent=observed[0].integration_intent,
+                evidence_refs=_unique_refs(
+                    reference
+                    for outcome in observed
+                    for reference in outcome.evidence_refs
+                ),
+            )
+        )
+    return tuple(aggregated)

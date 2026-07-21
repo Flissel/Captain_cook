@@ -11,7 +11,14 @@ from agenten.agent_factory.contracts import (
     FactoryEvidenceBlock,
     FactoryJob,
 )
-from agenten.agent_factory.release_gate import FactoryReleaseDecision
+from agenten.agent_factory.execution_budget import (
+    FactoryBudgetProjection,
+    FactoryUsageReceiptV1,
+)
+from agenten.agent_factory.release_gate import (
+    FactoryReleaseDecision,
+    evaluate_factory_workflow_release,
+)
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
 from agenten.agent_factory.skill_workflow_contracts import (
     CandidateRevisionV1,
@@ -71,6 +78,18 @@ class FactoryRepository(Protocol):
     ) -> tuple[FactoryWorkflowArtifact, ...]:
         """Return read-only Gateway workflow artifacts in append order."""
 
+    def workflow_budget_projection(
+        self,
+        job_id: UUID,
+    ) -> FactoryBudgetProjection | None:
+        """Return the Gateway-owned V3 budget projection without granting writes."""
+
+    def workflow_usage_receipts(
+        self,
+        job_id: UUID,
+    ) -> tuple[FactoryUsageReceiptV1, ...]:
+        """Return Gateway-accepted provider receipts in append order."""
+
 
 @dataclass
 class InMemoryFactoryRepository:
@@ -83,9 +102,6 @@ class InMemoryFactoryRepository:
     _release_decisions_by_job: dict[UUID, FactoryReleaseDecision] = field(
         default_factory=dict
     )
-    _workflow_artifacts_by_job: dict[UUID, list[FactoryWorkflowArtifact]] = field(
-        default_factory=dict
-    )
 
     def register(self, job: FactoryJob) -> None:
         existing = self._jobs.get(job.job_id)
@@ -95,7 +111,6 @@ class InMemoryFactoryRepository:
             return
         self._jobs[job.job_id] = job
         self._blocks[job.job_id] = []
-        self._workflow_artifacts_by_job[job.job_id] = []
 
     def job(self, job_id: UUID) -> FactoryJob:
         try:
@@ -131,29 +146,21 @@ class InMemoryFactoryRepository:
         job_id: UUID,
     ) -> tuple[FactoryWorkflowArtifact, ...]:
         self.job(job_id)
-        return tuple(self._workflow_artifacts_by_job[job_id])
+        return ()
 
-    def record_workflow_artifact(self, artifact: FactoryWorkflowArtifact) -> bool:
-        """Deterministic test adapter for the Gateway artifact endpoint."""
+    def workflow_budget_projection(
+        self,
+        job_id: UUID,
+    ) -> FactoryBudgetProjection | None:
+        self.job(job_id)
+        return None
 
-        job = self.job(artifact.job_id)
-        if (
-            artifact.correlation_id != job.correlation_id
-            or artifact.subject_version != job.subject_version
-            or artifact.acceptance_assertion_ids != job.acceptance_assertion_ids
-        ):
-            raise FactoryRepositoryError(
-                "workflow artifact does not match the factory job"
-            )
-        for existing in self._workflow_artifacts_by_job[artifact.job_id]:
-            if existing.invocation_id == artifact.invocation_id:
-                if existing == artifact:
-                    return False
-                raise FactoryRepositoryError(
-                    "workflow invocation already exists with different content"
-                )
-        self._workflow_artifacts_by_job[artifact.job_id].append(artifact)
-        return True
+    def workflow_usage_receipts(
+        self,
+        job_id: UUID,
+    ) -> tuple[FactoryUsageReceiptV1, ...]:
+        self.job(job_id)
+        return ()
 
 
 class FactoryCoordinator:
@@ -173,24 +180,51 @@ class FactoryCoordinator:
             raise FactoryRepositoryError("event_id already exists with different content")
         projection = self.projection(block.job_id)
         promotion = block.phase.value == "capability_promoted"
-        evaluation = self.evaluation_for_job(block.job_id) if promotion else None
-        release_decision = self.release_decision_for_job(block.job_id) if promotion else None
+        legacy_promotion = promotion and not isinstance(
+            projection.job, AgentFactoryJobV3
+        )
+        evaluation = (
+            self.evaluation_for_job(block.job_id) if legacy_promotion else None
+        )
+        release_decision = (
+            self.release_decision_for_job(block.job_id)
+            if legacy_promotion
+            else None
+        )
         workflow_evaluation, feedback = (
             self._workflow_review(block.job_id, attempt=block.attempt)
             if isinstance(projection.job, AgentFactoryJobV3)
             else (None, None)
         )
+        workflow_release_decision = (
+            self._workflow_release_decision(
+                projection.job,
+                attempt=block.attempt,
+                evaluation=workflow_evaluation,
+            )
+            if isinstance(projection.job, AgentFactoryJobV3)
+            and block.phase.value == "capability_promoted"
+            else None
+        )
         apply_block(
             projection,
             block,
             evaluation=evaluation,
-            release_decision=release_decision,
             workflow_evaluation=(
                 workflow_evaluation
-                if block.phase.value == "quality_reviewed"
+                if block.phase.value in {"quality_reviewed", "capability_promoted"}
                 else None
             ),
-            feedback=(feedback if block.phase.value == "quality_reviewed" else None),
+            feedback=(
+                feedback
+                if block.phase.value in {"quality_reviewed", "capability_promoted"}
+                else None
+            ),
+            release_decision=(
+                workflow_release_decision
+                if isinstance(projection.job, AgentFactoryJobV3)
+                else release_decision
+            ),
         )
         return self._repository.append(block)
 
@@ -200,11 +234,13 @@ class FactoryCoordinator:
             evaluation = (
                 self.evaluation_for_job(job_id)
                 if stored_block.phase.value == "capability_promoted"
+                and not isinstance(projection.job, AgentFactoryJobV3)
                 else None
             )
             release_decision = (
                 self.release_decision_for_job(job_id)
                 if stored_block.phase.value == "capability_promoted"
+                and not isinstance(projection.job, AgentFactoryJobV3)
                 else None
             )
             workflow_evaluation, feedback = (
@@ -212,19 +248,35 @@ class FactoryCoordinator:
                 if isinstance(projection.job, AgentFactoryJobV3)
                 else (None, None)
             )
+            workflow_release_decision = (
+                self._workflow_release_decision(
+                    projection.job,
+                    attempt=stored_block.attempt,
+                    evaluation=workflow_evaluation,
+                )
+                if isinstance(projection.job, AgentFactoryJobV3)
+                and stored_block.phase.value == "capability_promoted"
+                else None
+            )
             projection = apply_block(
                 projection,
                 stored_block,
                 evaluation=evaluation,
-                release_decision=release_decision,
+                release_decision=(
+                    workflow_release_decision
+                    if isinstance(projection.job, AgentFactoryJobV3)
+                    else release_decision
+                ),
                 workflow_evaluation=(
                     workflow_evaluation
-                    if stored_block.phase.value == "quality_reviewed"
+                    if stored_block.phase.value
+                    in {"quality_reviewed", "capability_promoted"}
                     else None
                 ),
                 feedback=(
                     feedback
-                    if stored_block.phase.value == "quality_reviewed"
+                    if stored_block.phase.value
+                    in {"quality_reviewed", "capability_promoted"}
                     else None
                 ),
             )
@@ -242,11 +294,21 @@ class FactoryCoordinator:
             if isinstance(projection.job, AgentFactoryJobV3)
             else (None, None)
         )
+        workflow_release_decision = (
+            self._workflow_release_decision(
+                projection.job,
+                attempt=projection.attempt,
+                evaluation=workflow_evaluation,
+            )
+            if isinstance(projection.job, AgentFactoryJobV3)
+            else None
+        )
         return next_action(
             projection,
             evaluation=evaluation,
             workflow_evaluation=workflow_evaluation,
             feedback=feedback,
+            workflow_release_decision=workflow_release_decision,
         ).model_copy(update={"job_id": job_id})
 
     def blocks(self, job_id: UUID) -> tuple[FactoryEvidenceBlock, ...]:
@@ -272,6 +334,47 @@ class FactoryCoordinator:
         if lookup is None:
             return ()
         return lookup(job_id)
+
+    def workflow_budget_projection(
+        self,
+        job_id: UUID,
+    ) -> FactoryBudgetProjection | None:
+        lookup = getattr(self._repository, "workflow_budget_projection", None)
+        if lookup is None:
+            return None
+        return lookup(job_id)
+
+    def workflow_usage_receipts(
+        self,
+        job_id: UUID,
+    ) -> tuple[FactoryUsageReceiptV1, ...]:
+        lookup = getattr(self._repository, "workflow_usage_receipts", None)
+        if lookup is None:
+            return ()
+        return lookup(job_id)
+
+    def _workflow_release_decision(
+        self,
+        job: AgentFactoryJobV3,
+        *,
+        attempt: int,
+        evaluation: TeamEvaluationV1 | None,
+    ) -> FactoryReleaseDecision | None:
+        if evaluation is None:
+            return None
+        executions = tuple(
+            artifact
+            for artifact in self.workflow_artifacts(job.job_id)
+            if isinstance(artifact, TeamExecutionEvidenceV1)
+            and artifact.attempt == attempt
+        )
+        return evaluate_factory_workflow_release(
+            job,
+            executions,
+            evaluation,
+            budget_projection=self.workflow_budget_projection(job.job_id),
+            usage_receipts=self.workflow_usage_receipts(job.job_id),
+        )
 
     def _workflow_review(
         self,

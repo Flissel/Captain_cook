@@ -30,7 +30,12 @@ def _invocation() -> FactorySkillInvocationV1:
     return FactorySkillInvocationV1.model_validate(invocation_payload("evaluate_team"))
 
 
-def _execution(*, failed: bool = False) -> TeamExecutionEvidenceV1:
+def _execution(
+    *,
+    failed: bool = False,
+    run_number: int = 1,
+    termination_reason: str = "task_completed",
+) -> TeamExecutionEvidenceV1:
     outcome = execution_outcome_payload(status="failed" if failed else "succeeded")
     if failed:
         assertions = list(outcome["assertion_outcomes"])
@@ -42,7 +47,9 @@ def _execution(*, failed: bool = False) -> TeamExecutionEvidenceV1:
     return TeamExecutionEvidenceV1.model_validate(
         execution_payload(
             execution_outcome=outcome,
+            run_number=run_number,
             status="failed" if failed else "succeeded",
+            termination_reason=termination_reason,
         )
     )
 
@@ -171,3 +178,77 @@ def test_exhausted_budget_wins_before_behavioral_retry() -> None:
 
     assert evaluation.failure_class == "budget_exhausted"
     assert evaluation.recommendation.value == "BUDGET_EXHAUSTED"
+
+
+def test_multi_run_evaluation_keeps_an_early_failure_failed_and_repairable() -> None:
+    evaluation = TeamEvaluationService(clock=lambda: NOW).evaluate(
+        _invocation(),
+        _candidate(),
+        (
+            _execution(failed=True, run_number=1),
+            _execution(run_number=2),
+        ),
+        budget_projection=_budget(),
+    )
+
+    outcomes = {
+        outcome.assertion_id: outcome
+        for outcome in evaluation.assertion_outcomes
+    }
+    assert outcomes["schema_valid"].status == "passed"
+    assert outcomes["real_case_green"].status == "failed"
+    assert evaluation.failure_class == "behavioral_failure"
+    assert evaluation.recommendation.value == "RETRY_BUILD"
+    assert evaluation.prior_green_regression_ids == ("schema_valid",)
+
+
+@pytest.mark.parametrize(
+    ("termination_reason", "failure_class", "recommendation"),
+    (
+        (
+            "credential_required",
+            "credential_required",
+            "BLOCKED_CREDENTIAL_REQUIRED",
+        ),
+        (
+            "infrastructure_failure",
+            "infrastructure_failure",
+            "BLOCKED_INFRASTRUCTURE",
+        ),
+    ),
+)
+def test_typed_execution_reason_codes_reach_exact_block_classification(
+    termination_reason: str,
+    failure_class: str,
+    recommendation: str,
+) -> None:
+    evaluation = TeamEvaluationService(clock=lambda: NOW).evaluate(
+        _invocation(),
+        _candidate(),
+        _execution(failed=True, termination_reason=termination_reason),
+        budget_projection=_budget(),
+    )
+
+    assert evaluation.failure_class == failure_class
+    assert evaluation.recommendation.value == recommendation
+
+
+def test_multi_run_evaluation_is_canonical_regardless_of_input_order() -> None:
+    first = _execution(run_number=1)
+    second = _execution(run_number=2)
+    evaluator = TeamEvaluationService(clock=lambda: NOW)
+
+    forward = evaluator.evaluate(
+        _invocation(),
+        _candidate(),
+        (first, second),
+        budget_projection=_budget(),
+    )
+    reverse = evaluator.evaluate(
+        _invocation(),
+        _candidate(),
+        (second, first),
+        budget_projection=_budget(),
+    )
+
+    assert reverse == forward

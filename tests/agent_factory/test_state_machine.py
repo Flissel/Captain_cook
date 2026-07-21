@@ -26,6 +26,7 @@ from agenten.agent_factory.release_gate import (
     E2EKind,
     E2EOutcome,
     E2ERunEvidence,
+    FactoryReleaseDecision,
     evaluate_factory_release,
 )
 from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationEvidence
@@ -468,11 +469,85 @@ def test_v3_quality_feedback_routes_only_through_existing_captain_actions() -> N
 
     assert state.workflow_evaluation_ref == evaluation.artifact_ref
     assert state.feedback_ref == feedback.artifact_ref
+    ready = FactoryReleaseDecision(
+        job_id=job_v3().job_id,
+        correlation_id=job_v3().correlation_id,
+        status="ready",
+        reasons=("workflow release verified",),
+        evaluation_id=evaluation.invocation_id,
+        evaluation_ref=evaluation.artifact_ref,
+    )
     assert next_action(
         state,
         workflow_evaluation=evaluation,
         feedback=feedback,
+        workflow_release_decision=ready,
     ).kind is FactoryActionKind.VALIDATE_FOR_PROMOTION
+
+    demo_ready = ready.model_copy(
+        update={
+            "status": "demo_ready",
+            "reasons": ("one demo run verified",),
+        }
+    )
+    assert next_action(
+        state,
+        workflow_evaluation=evaluation,
+        feedback=feedback,
+        workflow_release_decision=demo_ready,
+    ).kind is FactoryActionKind.APPEND_ESCALATED
+
+
+def test_v3_promotion_uses_only_the_workflow_release_decision() -> None:
+    evaluation = workflow_evaluation()
+    feedback = FactoryFeedbackBuilder(clock=lambda: evaluation.occurred_at).build(
+        invocation=_report_invocation(evaluation),
+        candidate_ref=workflow_candidate(),
+        evaluation=evaluation,
+        budget_projection=workflow_budget(),
+    )
+    state = FactoryProjection.from_job(job_v3()).model_copy(
+        update={
+            "status": FactoryLifecycleStatus.RUNNING,
+            "phase": FactoryPhase.QUALITY_REVIEWED,
+            "observed_assertion_ids": job_v3().acceptance_assertion_ids,
+            "workflow_evaluation_ref": evaluation.artifact_ref,
+            "feedback_ref": feedback.artifact_ref,
+            "feedback_recommendation": feedback.recommendation,
+        }
+    )
+    promotion = workflow_block(
+        FactoryPhase.CAPABILITY_PROMOTED,
+        assertions=job_v3().acceptance_assertion_ids,
+    )
+    legacy_evaluation = accepted_evaluation()
+
+    with pytest.raises(FactoryLifecycleError, match="workflow"):
+        apply_block(
+            state,
+            promotion,
+            evaluation=legacy_evaluation,
+            release_decision=accepted_release_decision(legacy_evaluation),
+        )
+
+    ready = FactoryReleaseDecision(
+        job_id=job_v3().job_id,
+        correlation_id=job_v3().correlation_id,
+        status="ready",
+        reasons=("workflow release verified",),
+        evaluation_id=evaluation.invocation_id,
+        evaluation_ref=evaluation.artifact_ref,
+    )
+    promoted = apply_block(
+        state,
+        promotion,
+        workflow_evaluation=evaluation,
+        feedback=feedback,
+        release_decision=ready,
+    )
+
+    assert promoted.status is FactoryLifecycleStatus.READY_TO_USE
+    assert promoted.workflow_evaluation_ref == evaluation.artifact_ref
 
 
 def test_v3_failed_feedback_requests_improvement_and_missing_feedback_fails_closed() -> None:

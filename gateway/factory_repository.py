@@ -64,6 +64,18 @@ class GatewayFactoryRepository(FactoryRepository):
     def workflow_artifacts(self, job_id: UUID) -> tuple[FactoryWorkflowArtifact, ...]:
         return self._translate(lambda: self._store.factory_workflow_artifacts(job_id))
 
+    def workflow_budget_projection(
+        self,
+        job_id: UUID,
+    ) -> FactoryBudgetProjection:
+        return self._translate(lambda: self._store.factory_budget(job_id))
+
+    def workflow_usage_receipts(
+        self,
+        job_id: UUID,
+    ) -> tuple[FactoryUsageReceiptV1, ...]:
+        return self._translate(lambda: self._store.factory_usage_receipts(job_id))
+
     @staticmethod
     def _translate(operation):
         try:

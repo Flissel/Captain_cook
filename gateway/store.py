@@ -20,6 +20,7 @@ from agenten.agent_runtime.capabilities import CapabilityDenied, validate_grant
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
+    ArtifactRef,
     CapabilityGrant,
     CapabilityGrantRevocation,
 )
@@ -44,6 +45,7 @@ from agenten.agent_factory.release_gate import (
     E2ERunEvidence,
     FactoryReleaseDecision,
     evaluate_factory_release,
+    evaluate_factory_workflow_release,
     factory_evaluation_block_reason,
 )
 from agenten.agent_factory.skill_evaluation import (
@@ -52,9 +54,13 @@ from agenten.agent_factory.skill_evaluation import (
 )
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
 from agenten.agent_factory.skill_workflow_contracts import (
+    CandidateRevisionV1,
+    CodebaseInventoryV1,
+    FactoryFeedbackV1,
     FactoryFeedbackRecommendation,
     FactorySkillStep,
     TeamEvaluationV1,
+    TeamExecutionEvidenceV1,
 )
 from agenten.agent_factory.state_machine import (
     FactoryActionKind,
@@ -945,6 +951,26 @@ class GatewayStore:
                 )
                 return self._factory_budget_projection(cursor, job)
 
+    def factory_usage_receipts(
+        self,
+        job_id: UUID,
+    ) -> tuple[FactoryUsageReceiptV1, ...]:
+        """Return every Gateway-accepted usage receipt in ledger order."""
+
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                self._factory_budget_job(
+                    cursor,
+                    job_id,
+                    missing_status=404,
+                    for_update=False,
+                )
+                return self._factory_usage_receipts_for_job(
+                    cursor,
+                    job_id,
+                    for_update=False,
+                )
+
     def record_factory_workflow_artifact(
         self,
         artifact: FactoryWorkflowArtifact,
@@ -968,7 +994,6 @@ class GatewayStore:
                 if job_block is None:
                     raise HTTPException(status_code=409, detail="factory job not found")
                 job = parse_factory_job(job_block["data"])
-                self._assert_workflow_artifact(job, artifact)
                 projection = self._factory_projection(cursor, job)
                 self._assert_factory_effects_open(
                     projection,
@@ -980,6 +1005,7 @@ class GatewayStore:
                 prior_artifacts = self._factory_workflow_artifacts_for_job(
                     cursor, artifact.job_id, for_update=True
                 )
+                self._assert_workflow_artifact(job, artifact, prior_artifacts)
                 self._assert_workflow_sequence(
                     projection, artifact, prior_artifacts
                 )
@@ -1446,9 +1472,43 @@ class GatewayStore:
                     )
                     if lease_block is not None:
                         lease = FactoryLease.model_validate(lease_block["data"])
+                job = projection.job
                 evaluation = None
                 release_decision = None
-                if evidence.phase is FactoryPhase.CAPABILITY_PROMOTED:
+                workflow_evaluation = None
+                feedback = None
+                if isinstance(job, AgentFactoryJobV3) and evidence.phase in {
+                    FactoryPhase.QUALITY_REVIEWED,
+                    FactoryPhase.CAPABILITY_PROMOTED,
+                }:
+                    workflow_evaluation, feedback = self._factory_workflow_review(
+                        cursor,
+                        job.job_id,
+                        attempt=evidence.attempt,
+                        for_update=True,
+                    )
+                    if evidence.phase is FactoryPhase.CAPABILITY_PROMOTED:
+                        release_decision = self._factory_workflow_release_decision(
+                            cursor,
+                            job,
+                            attempt=evidence.attempt,
+                            evaluation=workflow_evaluation,
+                            for_update=True,
+                        )
+                        if workflow_evaluation is not None and feedback is not None:
+                            required_refs = {
+                                workflow_evaluation.artifact_ref,
+                                feedback.artifact_ref,
+                            }
+                            if not required_refs.issubset(evidence.artifact_refs):
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail=(
+                                        "capability promotion must reference its workflow "
+                                        "evaluation and feedback"
+                                    ),
+                                )
+                elif evidence.phase is FactoryPhase.CAPABILITY_PROMOTED:
                     evaluation = self._factory_skill_evaluation_for_job(cursor, evidence.job_id)
                     if evaluation is None:
                         raise HTTPException(
@@ -1471,6 +1531,8 @@ class GatewayStore:
                         evidence,
                         evaluation=evaluation,
                         release_decision=release_decision,
+                        workflow_evaluation=workflow_evaluation,
+                        feedback=feedback,
                     )
                 except FactoryLifecycleError as exc:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -1501,21 +1563,24 @@ class GatewayStore:
                 leases = self._factory_leases(cursor, job_id)
                 projection = FactoryProjection.from_job(job)
                 for evidence in blocks:
-                    evaluation = (
-                        self._factory_skill_evaluation_for_job(cursor, job_id)
-                        if evidence.phase is FactoryPhase.CAPABILITY_PROMOTED
-                        else None
-                    )
-                    release_decision = (
-                        self._factory_release_decision_for_job(cursor, job_id)
-                        if evidence.phase is FactoryPhase.CAPABILITY_PROMOTED
-                        else None
+                    (
+                        evaluation,
+                        release_decision,
+                        workflow_evaluation,
+                        feedback,
+                    ) = self._factory_block_context(
+                        cursor,
+                        job,
+                        evidence,
+                        for_update=False,
                     )
                     projection = apply_block(
                         projection,
                         evidence,
                         evaluation=evaluation,
                         release_decision=release_decision,
+                        workflow_evaluation=workflow_evaluation,
+                        feedback=feedback,
                     )
         return FactoryJobProjection(job=job, blocks=blocks, leases=leases, projection=projection)
 
@@ -1554,21 +1619,24 @@ class GatewayStore:
     def _factory_projection(self, cursor: Any, job: FactoryJob) -> FactoryProjection:
         projection = FactoryProjection.from_job(job)
         for evidence in self._factory_blocks(cursor, job.job_id, for_update=True):
-            evaluation = (
-                self._factory_skill_evaluation_for_job(cursor, job.job_id)
-                if evidence.phase is FactoryPhase.CAPABILITY_PROMOTED
-                else None
-            )
-            release_decision = (
-                self._factory_release_decision_for_job(cursor, job.job_id)
-                if evidence.phase is FactoryPhase.CAPABILITY_PROMOTED
-                else None
+            (
+                evaluation,
+                release_decision,
+                workflow_evaluation,
+                feedback,
+            ) = self._factory_block_context(
+                cursor,
+                job,
+                evidence,
+                for_update=True,
             )
             projection = apply_block(
                 projection,
                 evidence,
                 evaluation=evaluation,
                 release_decision=release_decision,
+                workflow_evaluation=workflow_evaluation,
+                feedback=feedback,
             )
         return projection
 
@@ -1695,18 +1763,77 @@ class GatewayStore:
     def _assert_workflow_artifact(
         job: FactoryJob,
         artifact: FactoryWorkflowArtifact,
+        prior_artifacts: tuple[FactoryWorkflowArtifact, ...],
     ) -> None:
         if (
             artifact.job_id != job.job_id
             or artifact.correlation_id != job.correlation_id
             or artifact.subject_version != job.subject_version
             or artifact.attempt > job.max_behavioral_iterations
-            or artifact.invocation.input_ref != job.input_ref
             or artifact.acceptance_assertion_ids != job.acceptance_assertion_ids
             or artifact.invocation.released_skill.capability
             != job.required_capability
         ):
             raise HTTPException(status_code=409, detail="factory workflow artifact job binding mismatch")
+        expected_input = GatewayStore._workflow_input_ref(
+            job,
+            artifact,
+            prior_artifacts,
+        )
+        if artifact.invocation.input_ref != expected_input:
+            raise HTTPException(
+                status_code=409,
+                detail="factory workflow artifact input binding mismatch",
+            )
+        if isinstance(job, AgentFactoryJobV3) and isinstance(
+            artifact, TeamExecutionEvidenceV1
+        ):
+            try:
+                run_number = job.private_holdout_refs.index(artifact.holdout_ref) + 1
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="workflow execution holdout is not authorized by the Factory job",
+                ) from exc
+            if artifact.run_number != run_number:
+                raise HTTPException(
+                    status_code=409,
+                    detail="workflow execution run number does not match the authorized holdout order",
+                )
+
+    @staticmethod
+    def _workflow_input_ref(
+        job: FactoryJob,
+        artifact: FactoryWorkflowArtifact,
+        prior_artifacts: tuple[FactoryWorkflowArtifact, ...],
+    ) -> ArtifactRef:
+        current = tuple(
+            candidate
+            for candidate in prior_artifacts
+            if candidate.attempt == artifact.attempt
+        )
+        step = artifact.invocation.step
+        if step is FactorySkillStep.REPORT_CAPTAIN:
+            evaluations = tuple(
+                candidate
+                for candidate in current
+                if isinstance(candidate, TeamEvaluationV1)
+            )
+            if len(evaluations) != 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail="report_captain requires one exact evaluation predecessor",
+                )
+            return evaluations[0].artifact_ref
+        if step is FactorySkillStep.BRIEF_CODEX:
+            predecessors = tuple(
+                candidate
+                for candidate in current
+                if isinstance(candidate, (CodebaseInventoryV1, CandidateRevisionV1))
+            )
+            if len(predecessors) == 1:
+                return predecessors[0].artifact_ref
+        return job.input_ref
 
     @staticmethod
     def _assert_workflow_sequence(
@@ -1721,7 +1848,7 @@ class GatewayStore:
             FactorySkillStep.BRIEF_CODEX: {FactoryPhase.BLUEPRINT_CREATED},
             FactorySkillStep.EXECUTE_TEAM: {FactoryPhase.BUILD_PASSED},
             FactorySkillStep.EVALUATE_TEAM: {FactoryPhase.REAL_CASE_EVIDENCE},
-            FactorySkillStep.REPORT_CAPTAIN: {FactoryPhase.QUALITY_REVIEWED},
+            FactorySkillStep.REPORT_CAPTAIN: {FactoryPhase.REAL_CASE_EVIDENCE},
         }[step]
         if projection.phase not in required_phase:
             raise HTTPException(
@@ -1750,30 +1877,70 @@ class GatewayStore:
                 status_code=409,
                 detail="improve_team requires the prior attempt failed evaluation",
             )
-        expected = (
-            (
-                FactorySkillStep.IMPROVE_TEAM,
-                FactorySkillStep.BRIEF_CODEX,
-                FactorySkillStep.EXECUTE_TEAM,
-                FactorySkillStep.EVALUATE_TEAM,
-                FactorySkillStep.REPORT_CAPTAIN,
-            )
+        prefix = (
+            FactorySkillStep.IMPROVE_TEAM
             if artifact.attempt > 1
-            else (
-                FactorySkillStep.DISCOVER,
-                FactorySkillStep.BRIEF_CODEX,
-                FactorySkillStep.EXECUTE_TEAM,
-                FactorySkillStep.EVALUATE_TEAM,
-                FactorySkillStep.REPORT_CAPTAIN,
-            )
+            else FactorySkillStep.DISCOVER,
+            FactorySkillStep.BRIEF_CODEX,
         )
         prior_steps = tuple(
             candidate.invocation.step
             for candidate in prior_artifacts
             if candidate.attempt == artifact.attempt
         )
-        position = expected.index(step)
-        if prior_steps != expected[:position]:
+        sequence_valid = False
+        if step is prefix[0]:
+            sequence_valid = not prior_steps
+        elif step is FactorySkillStep.BRIEF_CODEX:
+            sequence_valid = prior_steps == prefix[:1]
+        elif step is FactorySkillStep.EXECUTE_TEAM:
+            sequence_valid = (
+                prior_steps[:2] == prefix
+                and all(
+                    prior_step is FactorySkillStep.EXECUTE_TEAM
+                    for prior_step in prior_steps[2:]
+                )
+            )
+            executions = tuple(
+                candidate
+                for candidate in prior_artifacts
+                if candidate.attempt == artifact.attempt
+                and isinstance(candidate, TeamExecutionEvidenceV1)
+            )
+            if isinstance(artifact, TeamExecutionEvidenceV1):
+                all_executions = (*executions, artifact)
+                sequence_valid = sequence_valid and all(
+                    len(values) == len(set(values))
+                    for values in (
+                        tuple(item.run_number for item in all_executions),
+                        tuple(item.invocation_id for item in all_executions),
+                        tuple(
+                            item.invocation.idempotency_key
+                            for item in all_executions
+                        ),
+                        tuple(item.holdout_ref for item in all_executions),
+                    )
+                )
+        elif step is FactorySkillStep.EVALUATE_TEAM:
+            sequence_valid = (
+                prior_steps[:2] == prefix
+                and bool(prior_steps[2:])
+                and all(
+                    prior_step is FactorySkillStep.EXECUTE_TEAM
+                    for prior_step in prior_steps[2:]
+                )
+            )
+        elif step is FactorySkillStep.REPORT_CAPTAIN:
+            sequence_valid = (
+                prior_steps[:2] == prefix
+                and len(prior_steps) >= 4
+                and all(
+                    prior_step is FactorySkillStep.EXECUTE_TEAM
+                    for prior_step in prior_steps[2:-1]
+                )
+                and prior_steps[-1] is FactorySkillStep.EVALUATE_TEAM
+            )
+        if not sequence_valid:
             raise HTTPException(
                 status_code=409,
                 detail="workflow artifact is missing its exact prior workflow artifact sequence",
@@ -1797,6 +1964,122 @@ class GatewayStore:
             parse_factory_workflow_artifact(self._decode_json(row["payload"]))
             for row in cursor.fetchall()
         )
+
+    def _factory_workflow_review(
+        self,
+        cursor: Any,
+        job_id: UUID,
+        *,
+        attempt: int,
+        for_update: bool,
+    ) -> tuple[TeamEvaluationV1 | None, FactoryFeedbackV1 | None]:
+        artifacts = self._factory_workflow_artifacts_for_job(
+            cursor,
+            job_id,
+            for_update=for_update,
+        )
+        evaluations = tuple(
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, TeamEvaluationV1)
+            and artifact.attempt == attempt
+        )
+        feedback_items = tuple(
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, FactoryFeedbackV1)
+            and artifact.attempt == attempt
+        )
+        if len(evaluations) > 1 or len(feedback_items) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail="factory workflow review is ambiguous for the current attempt",
+            )
+        return (
+            evaluations[0] if evaluations else None,
+            feedback_items[0] if feedback_items else None,
+        )
+
+    def _factory_workflow_release_decision(
+        self,
+        cursor: Any,
+        job: AgentFactoryJobV3,
+        *,
+        attempt: int,
+        evaluation: TeamEvaluationV1 | None,
+        for_update: bool,
+    ) -> FactoryReleaseDecision | None:
+        if evaluation is None:
+            return None
+        artifacts = self._factory_workflow_artifacts_for_job(
+            cursor,
+            job.job_id,
+            for_update=for_update,
+        )
+        executions = tuple(
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, TeamExecutionEvidenceV1)
+            and artifact.attempt == attempt
+        )
+        return evaluate_factory_workflow_release(
+            job,
+            executions,
+            evaluation,
+            budget_projection=self._factory_budget_projection(
+                cursor,
+                job,
+                for_update=for_update,
+            ),
+            usage_receipts=self._factory_usage_receipts_for_job(
+                cursor,
+                job.job_id,
+                for_update=for_update,
+            ),
+        )
+
+    def _factory_block_context(
+        self,
+        cursor: Any,
+        job: FactoryJob,
+        evidence: FactoryEvidenceBlock,
+        *,
+        for_update: bool,
+    ) -> tuple[
+        StoredSkillEvaluation | None,
+        FactoryReleaseDecision | None,
+        TeamEvaluationV1 | None,
+        FactoryFeedbackV1 | None,
+    ]:
+        evaluation = None
+        release_decision = None
+        workflow_evaluation = None
+        feedback = None
+        if isinstance(job, AgentFactoryJobV3) and evidence.phase in {
+            FactoryPhase.QUALITY_REVIEWED,
+            FactoryPhase.CAPABILITY_PROMOTED,
+        }:
+            workflow_evaluation, feedback = self._factory_workflow_review(
+                cursor,
+                job.job_id,
+                attempt=evidence.attempt,
+                for_update=for_update,
+            )
+            if evidence.phase is FactoryPhase.CAPABILITY_PROMOTED:
+                release_decision = self._factory_workflow_release_decision(
+                    cursor,
+                    job,
+                    attempt=evidence.attempt,
+                    evaluation=workflow_evaluation,
+                    for_update=for_update,
+                )
+        elif evidence.phase is FactoryPhase.CAPABILITY_PROMOTED:
+            evaluation = self._factory_skill_evaluation_for_job(cursor, job.job_id)
+            release_decision = self._factory_release_decision_for_job(
+                cursor,
+                job.job_id,
+            )
+        return evaluation, release_decision, workflow_evaluation, feedback
 
     @staticmethod
     def _assert_factory_effects_open(
@@ -1851,6 +2134,25 @@ class GatewayStore:
             (str(reservation_id),),
         )
         return cursor.fetchone() is not None
+
+    def _factory_usage_receipts_for_job(
+        self,
+        cursor: Any,
+        job_id: UUID,
+        *,
+        for_update: bool,
+    ) -> tuple[FactoryUsageReceiptV1, ...]:
+        sql = (
+            "SELECT payload FROM factory_budget_events "
+            "WHERE job_id = %s AND event_kind = 'usage' ORDER BY block_index"
+        )
+        if for_update:
+            sql += " FOR UPDATE"
+        cursor.execute(sql, (str(job_id),))
+        return tuple(
+            self._factory_usage_receipt(row["payload"])
+            for row in cursor.fetchall()
+        )
 
     def _factory_budget_projection(
         self,
