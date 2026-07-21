@@ -115,7 +115,7 @@ def test_factory_budget_routes_keep_reservations_captain_owned_and_usage_worker_
     reservation = InMemoryFactoryBudgetLedger().reserve(
         job_v3,
         attempt=1,
-        requested_usd=Decimal("1.00"),
+        requested_usd=Decimal("2.00"),
         now=job_v3.occurred_at,
     )
     reservation_payload = reservation.model_dump(mode="json", by_alias=True)
