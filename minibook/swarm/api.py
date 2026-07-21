@@ -136,10 +136,11 @@ def create_creation_router(
         except CreationNotFoundError as exc:
             raise HTTPException(404, "Creation job not found") from exc
         if value is None:
-            raise HTTPException(
-                409,
+            _raise_pending_or_missing(
+                store,
+                job_id,
                 "Creation result is not available",
-                headers={"Retry-After": "1"},
+                None,
             )
         return value.model_dump(mode="json", by_alias=True)
 
@@ -191,10 +192,15 @@ def _raise_pending_or_missing(
     store: CreationJobStore,
     job_id: UUID,
     detail: str,
-    cause: CreationNotFoundError,
+    cause: CreationNotFoundError | None,
 ) -> None:
     try:
-        store.job(job_id)
+        progress = store.progress(job_id)
     except CreationNotFoundError:
         raise HTTPException(404, "Creation job not found") from cause
+    if progress.status in {"succeeded", "failed", "blocked", "cancelled"}:
+        raise HTTPException(
+            422,
+            f"{detail}; creation status is {progress.status}",
+        ) from cause
     raise HTTPException(409, detail, headers={"Retry-After": "1"}) from cause
