@@ -205,8 +205,9 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "CAPTAIN_FACTORY_MAX_COST_USD" in source
     assert "CAPTAIN_FACTORY_MAX_COST_PER_CALL_USD" in source
     assert "CAPTAIN_FACTORY_PRICING_VERSION" in source
-    assert "CAPTAIN_FACTORY_INPUT_COST_PER_MILLION_USD" in source
-    assert "CAPTAIN_FACTORY_OUTPUT_COST_PER_MILLION_USD" in source
+    assert "CAPTAIN_FACTORY_PRICING_INPUT_COST_PER_MILLION_USD" in source
+    assert "CAPTAIN_FACTORY_PRICING_OUTPUT_COST_PER_MILLION_USD" in source
+    assert "CAPTAIN_FACTORY_PRICING_MINIMUM_COST_USD" in source
     assert "CAPTAIN_FACTORY_N8N_WORKFLOW_ID" in source
     assert "function Set-ProductionAdapterManifests" in source
     assert "generate-capability-adapter-manifest.py" in source
