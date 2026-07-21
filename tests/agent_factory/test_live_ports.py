@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
@@ -203,6 +203,97 @@ def test_scoped_n8n_adapter_requires_declared_intent_and_typed_evidence() -> Non
         adapter.observed_evidence()
 
 
+def test_scoped_n8n_adapter_rejects_non_n8n_claim_before_tool_effect() -> None:
+    from agenten.agent_factory.live_n8n import ScopedCaptainN8nMcpAdapter
+    from agenten.agent_factory.n8n_tools import TypedN8nTool
+    from agenten.agent_factory.team_execution import FactoryN8nToolAuthorizationV1
+    from agenten.agent_runtime.capabilities import PROFILE_CAPABILITIES
+    from agenten.agent_runtime.contracts import (
+        AgentRuntimeCommand,
+        AgentRuntimeCommandPayload,
+        CapabilityGrant,
+        CapabilityProfile,
+        RuntimeLimits,
+        RuntimeOperation,
+    )
+    from tests.agent_factory.test_team_execution import _n8n_tool_command_ref
+
+    job = _job_v3()
+    lease = issue_factory_lease(
+        job=job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/n8n",
+        now=NOW,
+        integration_intent=IntegrationIntent.N8N,
+    )
+    tool_ref = TypedN8nTool(
+        name="support_triage",
+        description="Captain-approved support triage",
+        input_schema_ref="artifact://factory-support-input",
+        output_schema_ref="artifact://factory-support-output",
+    ).opaque_reference()
+    command = AgentRuntimeCommand(
+        schema_name="captain.agent-runtime-command.v1",
+        event_id=uuid4(),
+        correlation_id=job.correlation_id,
+        occurred_at=NOW,
+        producer="captain",
+        subject_id="support_triage",
+        subject_version=job.subject_version,
+        payload=AgentRuntimeCommandPayload(
+            operation=RuntimeOperation.CODEX_RUN,
+            project_id="factory-team",
+            batch_id="factory-team-batch",
+            subtask_id="support_triage",
+            workspace_ref=lease.workspace_ref,
+            prompt_ref=_n8n_tool_command_ref(tool_ref),
+            integration_intent=IntegrationIntent.NONE,
+            capability_profile=CapabilityProfile.CODE_BUILDER,
+            limits=RuntimeLimits(wall_seconds=60, max_iterations=2),
+        ),
+    )
+    grant = CapabilityGrant(
+        schema_name="captain.capability-grant.v1",
+        grant_id="grant-code-builder",
+        command_id=command.event_id,
+        batch_id=command.payload.batch_id,
+        batch_version=command.subject_version,
+        subtask_id=command.payload.subtask_id,
+        workspace_ref=command.payload.workspace_ref,
+        profile=CapabilityProfile.CODE_BUILDER,
+        capabilities=tuple(
+            sorted(PROFILE_CAPABILITIES[CapabilityProfile.CODE_BUILDER])
+        ),
+        mcp_servers=(),
+        issued_at=NOW,
+        expires_at=NOW + timedelta(minutes=5),
+    )
+    claim = FactoryN8nToolAuthorizationV1(
+        tool_name="support_triage",
+        approved_tool_ref=tool_ref,
+        runtime_command=command,
+        capability_grant=grant,
+    )
+
+    class Delegate:
+        def tool(self, _name: str) -> object:
+            raise AssertionError("tool effect must not be reached")
+
+        def authorization(self, _name: str) -> FactoryN8nToolAuthorizationV1:
+            return claim
+
+        def observed_evidence(self) -> tuple[object, ...]:
+            return ()
+
+    adapter = ScopedCaptainN8nMcpAdapter(
+        lease=lease,
+        delegate=Delegate(),  # type: ignore[arg-type]
+    )
+    with pytest.raises(ValueError, match="n8n authorization"):
+        adapter.authorization("support_triage")
+
+
 def test_live_composition_passes_only_explicit_authoritative_team_ports(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -211,6 +302,14 @@ def test_live_composition_passes_only_explicit_authoritative_team_ports(
     from agenten.agent_factory.live_composition import (
         FactoryLiveRuntimePorts,
         compose_live_factory_runtime,
+    )
+    from agenten.agent_factory.live_codex import BoundCodexBuildAdapter
+    from agenten.agent_factory.live_context7 import (
+        VerifiedContext7DocumentationAdapter,
+    )
+    from agenten.agent_factory.live_forge import SealedForgeCandidateProvider
+    from agenten.agent_factory.live_minibook import (
+        ReadOnlyMinibookProjectionAdapter,
     )
 
     job = _job_v3()
@@ -236,12 +335,16 @@ def test_live_composition_passes_only_explicit_authoritative_team_ports(
     n8n_adapter = object()
     n8n_authority = object()
     clock = lambda: NOW
+    codex_runtime = object()
+    context7 = object()
+    candidate_provider = object()
+    minibook = object()
     ports = FactoryLiveRuntimePorts(
         hermes=object(),  # type: ignore[arg-type]
-        codex=object(),  # type: ignore[arg-type]
-        context7=None,
-        candidate_provider=object(),  # type: ignore[arg-type]
-        minibook=None,
+        codex=codex_runtime,  # type: ignore[arg-type]
+        context7=context7,  # type: ignore[arg-type]
+        candidate_provider=candidate_provider,  # type: ignore[arg-type]
+        minibook=minibook,  # type: ignore[arg-type]
         model_client_for=model_client_for,  # type: ignore[arg-type]
         budget=budget,
         pricing_authority=pricing,
@@ -267,8 +370,14 @@ def test_live_composition_passes_only_explicit_authoritative_team_ports(
 
     assert components.team_execution is sentinel_adapter
     assert components.hermes is ports.hermes
-    assert components.codex is ports.codex
-    assert components.candidate_provider is ports.candidate_provider
+    assert isinstance(components.codex, BoundCodexBuildAdapter)
+    assert isinstance(components.context7, VerifiedContext7DocumentationAdapter)
+    assert isinstance(components.candidate_provider, SealedForgeCandidateProvider)
+    assert isinstance(components.minibook, ReadOnlyMinibookProjectionAdapter)
+    assert components.codex is not codex_runtime
+    assert components.context7 is not context7
+    assert components.candidate_provider is not candidate_provider
+    assert components.minibook is not minibook
     assert captured["job"] is job
     assert captured["evidence_store"] is evidence_store
     team_ports = captured["ports"]

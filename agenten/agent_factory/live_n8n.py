@@ -47,13 +47,28 @@ class ScopedCaptainN8nMcpAdapter:
         claim = self._delegate.authorization(name)
         if not isinstance(claim, FactoryN8nToolAuthorizationV1):
             raise ValueError("Captain n8n MCP returned an untyped authorization")
+        command = claim.runtime_command
+        grant = claim.capability_grant
         if (
             claim.tool_name != name
-            or claim.runtime_command.correlation_id != self._lease.correlation_id
-            or claim.runtime_command.subject_version != self._lease.subject_version
-            or claim.runtime_command.payload.workspace_ref != self._lease.workspace_ref
+            or command.correlation_id != self._lease.correlation_id
+            or command.subject_version != self._lease.subject_version
+            or command.payload.workspace_ref != self._lease.workspace_ref
         ):
             raise ValueError("Captain n8n MCP authorization is for a different tool")
+        if (
+            command.payload.integration_intent is not IntegrationIntent.N8N
+            or command.payload.capability_profile is not CapabilityProfile.N8N_BUILDER
+            or grant.profile is not CapabilityProfile.N8N_BUILDER
+            or "mcp.n8n" not in grant.capabilities
+            or grant.mcp_servers != ("n8n-mcp",)
+            or grant.command_id != command.event_id
+            or grant.batch_id != command.payload.batch_id
+            or grant.batch_version != command.subject_version
+            or grant.subtask_id != command.payload.subtask_id
+            or grant.workspace_ref != command.payload.workspace_ref
+        ):
+            raise ValueError("Captain n8n authorization lacks the required n8n grant")
         return claim
 
     def observed_evidence(self) -> tuple[FactoryN8nExecutionEvidenceV1, ...]:

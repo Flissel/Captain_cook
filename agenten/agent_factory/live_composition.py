@@ -33,8 +33,14 @@ from agenten.agent_factory.team_execution import (
 )
 from agenten.agent_runtime.ports import CodexExecutionPort
 
+from .live_codex import BoundCodexBuildAdapter
+from .live_context7 import VerifiedContext7DocumentationAdapter
+from .live_forge import SealedForgeCandidateProvider
 from .live_holdouts import CaptainPrivateHoldoutSelector
-from .live_minibook import MinibookProjectionReadPort
+from .live_minibook import (
+    MinibookProjectionReadPort,
+    ReadOnlyMinibookProjectionAdapter,
+)
 
 
 @dataclass(frozen=True)
@@ -69,10 +75,10 @@ class FactoryLiveRuntimeComponents:
     """Bound components consumed by the separate Task-11 runtime coordinator."""
 
     hermes: HermesFactoryPort
-    codex: CodexExecutionPort
-    context7: DocumentationDiscoveryPort | None
-    candidate_provider: FactoryCandidateProvider
-    minibook: MinibookProjectionReadPort | None
+    codex: BoundCodexBuildAdapter
+    context7: VerifiedContext7DocumentationAdapter | None
+    candidate_provider: SealedForgeCandidateProvider
+    minibook: ReadOnlyMinibookProjectionAdapter | None
     team_execution: TeamExecutionCandidateAdapter
 
 
@@ -129,9 +135,17 @@ def compose_live_factory_runtime(
     )
     return FactoryLiveRuntimeComponents(
         hermes=ports.hermes,
-        codex=ports.codex,
-        context7=ports.context7,
-        candidate_provider=ports.candidate_provider,
-        minibook=ports.minibook,
+        codex=BoundCodexBuildAdapter(runtime=ports.codex, clock=ports.clock),
+        context7=(
+            VerifiedContext7DocumentationAdapter(ports.context7)
+            if ports.context7 is not None
+            else None
+        ),
+        candidate_provider=SealedForgeCandidateProvider(ports.candidate_provider),
+        minibook=(
+            ReadOnlyMinibookProjectionAdapter(ports.minibook)
+            if ports.minibook is not None
+            else None
+        ),
         team_execution=team_execution,
     )
