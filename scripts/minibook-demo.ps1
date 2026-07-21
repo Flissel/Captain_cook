@@ -55,17 +55,23 @@ function Start-Service {
     $projectionKey = [string]$values['MINIBOOK_PROJECTION_API_KEY']
     if ([string]::IsNullOrWhiteSpace($projectionKey)) { throw 'Projection credential is required before starting Minibook.' }
     if (Test-Health) {
-        if (-not (Get-ManagedServiceProcess)) { throw 'Healthy Minibook endpoint is not the managed demo process.' }
-        Write-Host '[ready] Minibook local instance'; return
+        $managed = Get-ManagedServiceProcess
+        if (-not $managed) { throw 'Healthy Minibook endpoint is not the managed demo process.' }
+        Stop-Process -Id $managed.Id -ErrorAction Stop
+        Remove-Item $pidFile -Force
+        Write-Host '[ready] managed Minibook restarted for current configuration'
     }
     New-Item -ItemType Directory -Force $stateDir | Out-Null
     $python = Join-Path $root '.venv\Scripts\python.exe'; if (-not (Test-Path $python)) { $python = (Get-Command python).Source }
     $previousProjectionKey = [Environment]::GetEnvironmentVariable('MINIBOOK_PROJECTION_API_KEY','Process')
+    $previousMinibookUrl = [Environment]::GetEnvironmentVariable('MINIBOOK_URL','Process')
     try {
         [Environment]::SetEnvironmentVariable('MINIBOOK_PROJECTION_API_KEY',$projectionKey,'Process')
+        [Environment]::SetEnvironmentVariable('MINIBOOK_URL',$baseUrl,'Process')
         $process = Start-Process $python -ArgumentList 'run.py' -WorkingDirectory (Join-Path $root 'minibook') -WindowStyle Hidden -PassThru
     } finally {
         [Environment]::SetEnvironmentVariable('MINIBOOK_PROJECTION_API_KEY',$previousProjectionKey,'Process')
+        [Environment]::SetEnvironmentVariable('MINIBOOK_URL',$previousMinibookUrl,'Process')
     }
     $identity = @{ pid=$process.Id; started_at=$process.StartTime.ToUniversalTime().ToString('o'); executable=$python }
     [IO.File]::WriteAllText($pidFile, ($identity | ConvertTo-Json -Compress))
