@@ -36,13 +36,18 @@ normal successes and never counts toward that streak.
 Restart tests reconstruct the file-checkpoint, repository/catalog, entrypoint,
 and runtime composition adapters while retaining the scripted authoritative
 service state. Crashes after creation submission, release evidence, committed
-atomic publication, runtime claim, runtime result, and committed capability
-execution expose exactly one provider effect after recovery. An unexpired
-claim returns typed `retry_pending`; after expiry the Gateway issues a higher
-fence. A committed result is converted into the deterministic typed outcome
-without calling the provider again. No claim credential enters a checkpoint or
-summary. Deadline checks run before each later mutation and before requesting
-lifecycle evidence, so an expired post-publication run cannot begin runtime work and an expired
+atomic publication, runtime claim, durable provider effect, runtime result,
+and committed capability execution expose exactly one provider effect after
+recovery. Provider adapters must declare durable idempotency and persist a
+`ProviderEffectReceipt` keyed by the stable command/effect IDs before returning
+control. Captain looks that receipt up before any re-effect and verifies the
+provider operation ID, request/result digests, result status, and explicit
+idempotency guarantee. An unexpired claim returns typed `retry_pending`; after
+expiry the Gateway issues a higher fence and records the already-produced
+provider result without calling the provider again. No claim credential or
+provider secret enters a checkpoint, receipt, or summary. Deadline checks run
+before each later mutation and before requesting lifecycle evidence, so an
+expired post-publication run cannot begin runtime work and an expired
 post-execution run cannot mutate Minibook.
 
 Forge archives are independently validated in a disposable Captain-owned
@@ -71,9 +76,11 @@ credentials only from environment aliases. Its evidence manifest contains
 only typed IDs and digests, is canonical JSON named by its own SHA-256, and is
 written under the gitignored `artifacts/capability-factory/` directory.
 The module is executable with `python -m`. Preflight first parses and compiles
-the selected input and verifies a workspace-contained, SHA-256-pinned static
-adapter manifest without importing its module. Only the full run loads that
-manifest's production adapter factory, writes the evidence manifest, and
+the selected input and verifies a v2 static adapter manifest without importing
+or instantiating its module. The manifest names one Python module path under
+the workspace root, its SHA-256, and one factory symbol; preflight reads and
+hashes the source bytes and proves the top-level symbol through Python AST.
+Only the full run loads that attested local module and factory, writes the evidence manifest, and
 prints redacted targets, timings, IDs, and digests. Missing or altered
 production adapters fail before database attestation or service startup.
 
@@ -81,7 +88,8 @@ The provider-backed gate is
 `scripts/run-capability-factory-live.ps1`. It validates configuration first,
 requires loopback MariaDB database exactly `captain_test`, and only then may
 start a dedicated Gateway process bound to that DSN. Runtime and Minibook must
-also pass health checks before the full, mutating invocation. It never starts or adopts
+also pass health checks before the full, mutating invocation. It never starts
+or adopts
 an external workflow service. It must observe one recovery, three distinct
 normal successes, Gateway terminal/catalog/execution records, an ordered feed,
 and a Minibook rebuild before a `ready_to_use` claim. The current production
@@ -91,7 +99,8 @@ bundle is installed, and no reviewed digest-pinned capability-sandbox image is
 configured. Deterministic success does not satisfy those live prerequisites.
 Separately, an explicitly selected `live`/`db_mutating` MariaDB acceptance
 proof accepts only the process-exported `TEST_MARIADB_DSN`; ordinary non-live
-tests neither discover `.env` values nor clear a database. The live proof executes production
+tests neither discover `.env` values nor clear a database. The live proof
+executes production
 `GatewayStore` methods against `captain_test`: an injected mid-publication
 crash rolls the transaction back, a reconstructed store replays the single
 publication, and production command/grant/claim/result/execution writes replay

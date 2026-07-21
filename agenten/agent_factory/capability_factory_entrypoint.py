@@ -8,6 +8,7 @@ records, and the redacted projection hand-off.
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 import hashlib
 import importlib
@@ -123,6 +124,10 @@ class CapabilitySandboxIsolationError(RuntimeError):
     """Docker could not prove every required isolation property."""
 
 
+class CapabilityProviderIdempotencyError(RuntimeError):
+    """The provider adapter cannot prove durable, replay-safe execution."""
+
+
 class CapabilityFactoryCheckpoint(BaseModel):
     """Minimum immutable identity needed before any external factory effect."""
 
@@ -212,6 +217,30 @@ class CapabilityExecutionPlan(BaseModel):
     claim_owner_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
+class ProviderEffectReceipt(BaseModel):
+    """Durable provider identity written before control returns to Captain."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    provider_operation_id: str = Field(
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
+    )
+    effect_id: UUID
+    command_id: UUID
+    request_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    result_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    status: Literal[
+        "accepted",
+        "running",
+        "succeeded",
+        "failed",
+        "infrastructure_failed",
+        "policy_failed",
+        "cancelled",
+    ]
+    idempotency_guaranteed: bool
+
+
 class CapabilityRuntimeExecution(BaseModel):
     """Provider result produced only after Gateway issued the execution claim."""
 
@@ -219,6 +248,7 @@ class CapabilityRuntimeExecution(BaseModel):
 
     result: AgentRuntimeResult
     outcome: ExecutionOutcomeV1
+    provider_receipt: ProviderEffectReceipt
 
 
 class CapabilityExecutionRetryPending(BaseModel):
@@ -345,7 +375,22 @@ class CapabilityRuntimePort(Protocol):
         plan: CapabilityExecutionPlan,
         authority: CapabilityCatalogRecord,
         claim: RuntimeExecutionClaimReceipt,
+        *,
+        effect_id: UUID,
     ) -> CapabilityRuntimeExecution: ...
+
+    def guarantees_durable_idempotency(
+        self,
+        plan: CapabilityExecutionPlan,
+        authority: CapabilityCatalogRecord,
+    ) -> bool: ...
+
+    async def lookup_effect(
+        self,
+        *,
+        command_id: UUID,
+        effect_id: UUID,
+    ) -> CapabilityRuntimeExecution | None: ...
 
     async def derive_outcome(
         self,
@@ -1106,14 +1151,31 @@ def write_redacted_evidence_manifest(
 def _load_production_entrypoint(
     config: CapabilityFactoryCliConfig,
     *,
-    factory_reference: str,
+    attestation: _StaticAdapterAttestation,
 ) -> CapabilityFactoryEntrypoint:
-    module_name, factory_name = factory_reference.split(":", 1)
     try:
-        module = importlib.import_module(module_name)
-        factory = getattr(module, factory_name)
+        current_content = attestation.module_path.read_bytes()
+    except OSError as exc:
+        raise CapabilityFactoryConfigurationError(
+            "production adapter module could not be read"
+        ) from exc
+    if hashlib.sha256(current_content).hexdigest() != attestation.module_sha256:
+        raise CapabilityFactoryConfigurationError(
+            "production adapter module changed after static attestation"
+        )
+    try:
+        module_name = "_captain_capability_adapter_" + attestation.module_sha256
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            attestation.module_path,
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError("adapter module has no file loader")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        factory = getattr(module, attestation.factory_symbol)
         entrypoint = factory(config)
-    except (ImportError, AttributeError, TypeError) as exc:
+    except (ImportError, AttributeError, TypeError, ValueError) as exc:
         raise CapabilityFactoryConfigurationError(
             "production capability-factory adapter bundle could not be loaded"
         ) from exc
@@ -1124,7 +1186,16 @@ def _load_production_entrypoint(
     return entrypoint
 
 
-def _validate_static_adapter_manifest(config: CapabilityFactoryCliConfig) -> str:
+@dataclass(frozen=True)
+class _StaticAdapterAttestation:
+    module_path: Path
+    module_sha256: str
+    factory_symbol: str
+
+
+def _validate_static_adapter_manifest(
+    config: CapabilityFactoryCliConfig,
+) -> _StaticAdapterAttestation:
     """Verify a side-effect-free, digest-pinned adapter declaration."""
 
     try:
@@ -1149,20 +1220,75 @@ def _validate_static_adapter_manifest(config: CapabilityFactoryCliConfig) -> str
         ) from exc
     if (
         not isinstance(payload, dict)
-        or set(payload) != {"schema", "factory"}
+        or set(payload)
+        != {"schema", "module_path", "module_sha256", "factory_symbol"}
         or payload.get("schema")
-        != "captain.capability-factory-adapter-manifest.v1"
-        or not isinstance(payload.get("factory"), str)
+        != "captain.capability-factory-adapter-manifest.v2"
+        or not isinstance(payload.get("module_path"), str)
+        or not payload["module_path"].strip()
+        or not isinstance(payload.get("module_sha256"), str)
         or re.fullmatch(
-            r"[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*",
-            payload["factory"],
+            r"[0-9a-f]{64}",
+            payload["module_sha256"],
+        )
+        is None
+        or not isinstance(payload.get("factory_symbol"), str)
+        or re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*",
+            payload["factory_symbol"],
         )
         is None
     ):
         raise CapabilityFactoryConfigurationError(
             "static adapter manifest contract is invalid"
         )
-    return payload["factory"]
+    module_path = _safe_workspace_path(
+        config.workspace_root,
+        payload["module_path"],
+        "adapter module",
+    )
+    if module_path.suffix.casefold() != ".py" or not module_path.is_file():
+        raise CapabilityFactoryConfigurationError(
+            "static adapter module is not a readable Python workspace file"
+        )
+    try:
+        module_content = module_path.read_bytes()
+    except OSError as exc:
+        raise CapabilityFactoryConfigurationError(
+            "static adapter module could not be read"
+        ) from exc
+    if len(module_content) > 1_048_576:
+        raise CapabilityFactoryConfigurationError(
+            "static adapter module exceeds the control-plane size limit"
+        )
+    if hashlib.sha256(module_content).hexdigest() != payload["module_sha256"]:
+        raise CapabilityFactoryConfigurationError(
+            "static adapter module digest does not match"
+        )
+    try:
+        syntax_tree = ast.parse(
+            module_content.decode("utf-8"),
+            filename=str(module_path),
+        )
+    except (UnicodeDecodeError, SyntaxError) as exc:
+        raise CapabilityFactoryConfigurationError(
+            "static adapter module is not valid UTF-8 Python"
+        ) from exc
+    matching_symbols = tuple(
+        node
+        for node in syntax_tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == payload["factory_symbol"]
+    )
+    if len(matching_symbols) != 1:
+        raise CapabilityFactoryConfigurationError(
+            "static adapter factory symbol is missing or ambiguous"
+        )
+    return _StaticAdapterAttestation(
+        module_path=module_path,
+        module_sha256=payload["module_sha256"],
+        factory_symbol=payload["factory_symbol"],
+    )
 
 
 async def run_capability_factory_cli(
@@ -1176,7 +1302,7 @@ async def run_capability_factory_cli(
     FactoryInputCompiler(
         holdout_store=InMemoryPrivateHoldoutStore(),
     ).compile(document, config.subject_version)
-    factory_reference = _validate_static_adapter_manifest(config)
+    adapter_attestation = _validate_static_adapter_manifest(config)
     if config.preflight_only:
         return {
             "schema": "captain.capability-factory-cli-result.v1",
@@ -1189,7 +1315,7 @@ async def run_capability_factory_cli(
         }
     entrypoint = _load_production_entrypoint(
         config,
-        factory_reference=factory_reference,
+        attestation=adapter_attestation,
     )
     started_at = datetime.now(timezone.utc)
     started = time.perf_counter()
@@ -1688,6 +1814,22 @@ class CapabilityFactoryEntrypoint:
         ):
             raise ValueError("runtime execution plan does not match the factory invocation")
 
+        if not self._runtime.guarantees_durable_idempotency(plan, authority):
+            raise CapabilityProviderIdempotencyError(
+                "runtime provider does not guarantee durable idempotency"
+            )
+        self._require_effect_budget(job, "provider effect lookup")
+        provider_effect_id = uuid5(
+            plan.command.event_id,
+            "durable-provider-effect",
+        )
+        provider_execution = await self._runtime.lookup_effect(
+            command_id=plan.command.event_id,
+            effect_id=provider_effect_id,
+        )
+        if provider_execution is not None:
+            self._validate_provider_execution(plan, provider_execution)
+
         operation = self._gateway.find_runtime_operation(plan.command.event_id)
         existing = self._gateway.capability_execution(plan.command.event_id)
         if operation is not None:
@@ -1701,13 +1843,16 @@ class CapabilityFactoryEntrypoint:
         if existing is not None:
             claim = self._gateway.runtime_execution_claim(plan.command.event_id)
             if (
-                operation is None
+                provider_execution is None
+                or operation is None
                 or operation.result is None
                 or claim is None
                 or claim.status != "completed"
                 or existing.outcome.result_id != operation.result.event_id
                 or existing.claim_owner_id != claim.owner_id
                 or existing.claim_fencing_token != claim.fencing_token
+                or provider_execution.result != operation.result
+                or provider_execution.outcome != existing.outcome
             ):
                 raise RuntimeError("Gateway execution readback is incomplete")
             bundle = CapabilityExecutionBundle(
@@ -1722,18 +1867,18 @@ class CapabilityFactoryEntrypoint:
 
         if operation is not None and operation.result is not None:
             claim = self._gateway.runtime_execution_claim(plan.command.event_id)
-            if claim is None or claim.status != "completed":
+            if (
+                claim is None
+                or claim.status != "completed"
+                or provider_execution is None
+                or provider_execution.result != operation.result
+            ):
                 raise RuntimeError("Gateway runtime result has no completed execution claim")
-            outcome = await self._runtime.derive_outcome(
-                plan,
-                authority,
-                operation.result,
-            )
             bundle = CapabilityExecutionBundle(
                 command=operation.command,
                 grant=operation.grant or plan.grant,
                 result=operation.result,
-                outcome=outcome,
+                outcome=provider_execution.outcome,
                 claim_owner_id=claim.owner_id,
                 claim_fencing_token=claim.fencing_token,
             )
@@ -1746,6 +1891,10 @@ class CapabilityFactoryEntrypoint:
             if operation is not None
             else None
         )
+        if provider_execution is not None and claim is None:
+            raise CapabilityProviderIdempotencyError(
+                "durable provider effect has no Gateway execution claim"
+            )
         if claim is not None:
             if claim.status == "completed":
                 raise RuntimeError("completed runtime claim is missing its result")
@@ -1785,7 +1934,15 @@ class CapabilityFactoryEntrypoint:
             raise RuntimeError("Gateway returned an unusable runtime execution claim")
 
         self._require_effect_budget(job, "provider execution")
-        runtime = await self._runtime.execute(plan, authority, claim_receipt)
+        runtime = provider_execution
+        if runtime is None:
+            runtime = await self._runtime.execute(
+                plan,
+                authority,
+                claim_receipt,
+                effect_id=provider_effect_id,
+            )
+        self._validate_provider_execution(plan, runtime)
         bundle = CapabilityExecutionBundle(
             command=plan.command,
             grant=plan.grant,
@@ -1804,6 +1961,29 @@ class CapabilityFactoryEntrypoint:
         )
         self._record_execution(job, bundle)
         return self._project_execution(job, authority, bundle)
+
+    def _validate_provider_execution(
+        self,
+        plan: CapabilityExecutionPlan,
+        runtime: CapabilityRuntimeExecution,
+    ) -> None:
+        receipt = runtime.provider_receipt
+        expected_effect_id = uuid5(
+            plan.command.event_id,
+            "durable-provider-effect",
+        )
+        if (
+            not receipt.idempotency_guaranteed
+            or receipt.effect_id != expected_effect_id
+            or receipt.command_id != plan.command.event_id
+            or receipt.request_digest != canonical_contract_sha256(plan)
+            or receipt.result_digest != canonical_contract_sha256(runtime.result)
+            or receipt.status != runtime.result.status.value
+            or runtime.result.command_id != plan.command.event_id
+        ):
+            raise CapabilityProviderIdempotencyError(
+                "runtime provider receipt does not prove durable idempotency"
+            )
 
     def _validate_execution_bundle(
         self,
