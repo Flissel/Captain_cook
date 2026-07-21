@@ -95,14 +95,29 @@ def test_execute_team_fails_closed_on_live_and_budget_uncertainty() -> None:
         assert phrase in text
 
 
+def test_real_case_tester_never_receives_n8n_builder_or_mcp_lease() -> None:
+    path = Path("agenten/agent_factory/skills/captain-factory-execute-team/SKILL.md")
+    text = " ".join(path.read_text(encoding="utf-8").lower().split())
+
+    assert (
+        "the real case tester must never receive the `n8n-builder` profile or "
+        "an `n8n-mcp` lease"
+    ) in text
+    assert "consume only typed n8n execution evidence" in text
+    assert "short-lived with the `n8n-builder` profile" not in text
+
+
 @pytest.mark.parametrize(
-    "skill_name", ("captain-factory-execute-team", "captain-factory-improve-team")
+    "skill_name", ("captain-factory-brief-codex", "captain-factory-improve-team")
 )
-def test_n8n_effects_require_declared_intent_and_scoped_lease(skill_name: str) -> None:
+def test_only_tool_integrator_may_use_scoped_n8n_builder_lease(
+    skill_name: str,
+) -> None:
     path = Path("agenten/agent_factory/skills") / skill_name / "SKILL.md"
-    text = path.read_text(encoding="utf-8").lower()
+    text = " ".join(path.read_text(encoding="utf-8").lower().split())
 
     for phrase in (
+        "only the tool integrator",
         "integration_intent=n8n",
         "short-lived",
         "n8n-builder",
@@ -116,17 +131,17 @@ def test_n8n_effects_require_declared_intent_and_scoped_lease(skill_name: str) -
         assert phrase in text
 
 
-def test_brief_codex_consumes_required_builtin_skills() -> None:
+def test_brief_codex_selects_builtin_skills_by_assignment_phase() -> None:
     path = Path("agenten/agent_factory/skills/captain-factory-brief-codex/SKILL.md")
-    text = path.read_text(encoding="utf-8").lower()
+    text = " ".join(path.read_text(encoding="utf-8").lower().split())
 
-    for builtin in (
-        "plan",
-        "test-driven-development",
-        "systematic-debugging",
-        "requesting-code-review",
-    ):
-        assert f"`{builtin}`" in text
+    assert "for build work, load and follow `plan` and `test-driven-development`" in text
+    assert (
+        "load `systematic-debugging` only after a diagnosed failure and only for "
+        "its repair step"
+    ) in text
+    assert "load `requesting-code-review` before completion" in text
+    assert "skills as mandatory instructions" not in text
 
 
 def test_factory_skill_is_digestible_and_contains_release_boundaries() -> None:

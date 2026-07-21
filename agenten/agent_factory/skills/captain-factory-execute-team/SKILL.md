@@ -22,12 +22,11 @@ assertions, expose secrets, or claim ready_to_use.
    Treat unknown or contradictory cost as unresolved failure. On
    `BUDGET_EXHAUSTED`, stop all new paid effects.
 3. Capture structured conversation, handoffs, tool outcomes, termination,
-   assertions, timing, and a redacted cost receipt. Permit n8n only when the
-   compiled specification declares `integration_intent=n8n` and the lease is
-   short-lived with the `n8n-builder` profile and `n8n-mcp` scope. Limit work to
-   an isolated draft and typed evidence with matching workflow digest and
-   execution ID. Never allow activation, production adoption,
-   service administration, or volume management.
+   assertions, timing, and a redacted cost receipt. For
+   `integration_intent=n8n`, consume only typed n8n execution evidence with a
+   scoped tool reference, matching workflow digest, and execution ID. The Real
+   Case Tester must never receive the `n8n-builder` profile or an `n8n-mcp`
+   lease and must never create, modify, activate, adopt, or administer a workflow.
 4. Do not repair candidate code. Return `TeamExecutionEvidenceV1` according to
    the [evidence contract](references/evidence-contract.md); keep errors,
    missing receipts, and skipped calls explicit.

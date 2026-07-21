@@ -16,11 +16,11 @@ assertions, expose secrets, or claim ready_to_use.
    and evidence references using the [repair assignment](templates/repair-assignment.md).
 2. Change only evidence-implicated code, prompts, context, tools, model clients,
    memory, conversation/handoffs, termination, n8n workflow/nodes, tests, or
-   technical documentation. Permit n8n changes only when the compiled
-   specification declares `integration_intent=n8n` and a short-lived lease
-   grants the `n8n-builder` profile and `n8n-mcp` scope. Limit changes to an
-   isolated draft; never allow activation, production adoption,
-   service administration, or volume management.
+   technical documentation. Only the Tool Integrator may use a separate
+   short-lived `n8n-builder` profile and `n8n-mcp` lease when the compiled
+   specification declares `integration_intent=n8n`. Limit changes to an isolated
+   draft; never allow activation, production adoption, service administration,
+   or volume management.
 3. Rerun every prior green assertion. Seal the result as a child candidate with
    precise change-to-evidence mapping, then return it to build, execution, and
    independent evaluation.
