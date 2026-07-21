@@ -52,6 +52,29 @@ function New-Secret([int]$Bytes=32) {
 function Set-Missing($Values, [string]$Name, [scriptblock]$Factory) {
     if (-not $Values.Contains($Name) -or [string]::IsNullOrWhiteSpace([string]$Values[$Name])) { $Values[$Name] = & $Factory }
 }
+function Set-ProductionAdapterManifests($Values) {
+    $python = Join-Path $root '.venv\Scripts\python.exe'
+    $generator = Join-Path $root 'scripts/generate-capability-adapter-manifest.py'
+    $output = Join-Path $root '.captain-cook/adapters'
+    if (-not (Test-Path $python -PathType Leaf) -or -not (Test-Path $generator -PathType Leaf)) {
+        throw 'Adapter manifest generation requires the project Python runtime and generator.'
+    }
+    New-Item -ItemType Directory -Force $output | Out-Null
+    $specifications = @(
+        @{ Module='agenten/agent_factory/production_adapter_bundle.py'; Symbol='build_capability_factory_entrypoint'; Target='capability-entrypoint.manifest.json'; Kind='entrypoint'; Manifest='CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_MANIFEST'; Digest='CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_SHA256' },
+        @{ Module='agenten/agent_factory/factory_live_paid_ports.py'; Symbol='build_factory_live_runtime'; Target='factory-live-runtime.manifest.json'; Kind='factory_live_runtime'; Manifest='FACTORY_LIVE_RUNTIME_ADAPTER_MANIFEST'; Digest='FACTORY_LIVE_RUNTIME_ADAPTER_SHA256' }
+    )
+    foreach ($specification in $specifications) {
+        $target = Join-Path $output $specification.Target
+        $raw = & $python $generator --workspace-root $root --module (Join-Path $root $specification.Module) --factory-symbol $specification.Symbol --target $target --kind $specification.Kind
+        if ($LASTEXITCODE -ne 0) { throw 'Production adapter manifest generation failed.' }
+        try { $report = $raw | ConvertFrom-Json -ErrorAction Stop } catch { throw 'Production adapter manifest generator returned invalid evidence.' }
+        if ([string]::IsNullOrWhiteSpace([string]$report.manifest_sha256)) { throw 'Production adapter manifest digest is missing.' }
+        $Values[$specification.Manifest] = [IO.Path]::GetFullPath([string]$report.manifest_path)
+        $Values[$specification.Digest] = [string]$report.manifest_sha256
+    }
+    Write-Host '[ready] production adapter manifests regenerated (digests redacted)'
+}
 function Initialize-LocalEnvironment {
     $allowed = @('MARIADB_PASSWORD','MARIADB_ROOT_PASSWORD','MARIADB_TEST_PASSWORD','MARIADB_TEST_ROOT_PASSWORD','CAPTAIN_GATEWAY_TOKEN','WORKER_GATEWAY_TOKEN','CAPTAIN_RUNTIME_TOKEN','CAPTAIN_RUNTIME_EVIDENCE_MODE','MARIADB_TEST_PORT','GATEWAY_PORT','CAPTAIN_RUNTIME_PORT','TEST_MARIADB_DSN','LEDGER_DSN','CAPTAIN_GATEWAY_URL','CAPTAIN_RUNTIME_URL','MINIBOOK_API_KEY','MINIBOOK_PROJECTION_API_KEY','CAPTAIN_DEMO_MINIBOOK_API_KEY','MINIBOOK_CREATION_DB','MINIBOOK_CREATION_ARTIFACTS','CAPTAIN_CAPABILITY_SANDBOX_IMAGE','N8N_MODE','N8N_API_KEY','N8N_MCP_TOKEN','CAPTAIN_N8N_PORT','CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','CAPTAIN_N8N_MCP_BROKER_URL','CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET','CAPTAIN_N8N_URL','CAPTAIN_N8N_BATCH_ID','CAPTAIN_N8N_PROJECT_ID','CAPTAIN_N8N_WORKSPACE_REF','CAPTAIN_FACTORY_N8N_WORKFLOW_ID','OPENAI_API_KEY','OPENAI_MODEL','LLM_PROVIDER','CONTEXT7_API_KEY','HERMES_EXECUTABLE','CODEX_EXECUTABLE','CAPTAIN_RUNTIME_ARTIFACT_ROOT','CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_MANIFEST','CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_SHA256','FACTORY_LIVE_RUNTIME_ADAPTER_MANIFEST','FACTORY_LIVE_RUNTIME_ADAPTER_SHA256','CAPTAIN_FACTORY_JOB_ID','CAPTAIN_FACTORY_SKILL_ROOT','CAPTAIN_FACTORY_WORKSPACE_REF','CAPTAIN_FACTORY_PROVIDER','CAPTAIN_FACTORY_MODEL','CAPTAIN_FACTORY_MAX_COST_USD','CAPTAIN_FACTORY_MAX_COST_PER_CALL_USD','CAPTAIN_FACTORY_RUNTIME_SECONDS','CAPTAIN_FACTORY_PRICING_VERSION','CAPTAIN_FACTORY_PRICING_EFFECTIVE_AT','CAPTAIN_FACTORY_INPUT_COST_PER_MILLION_USD','CAPTAIN_FACTORY_OUTPUT_COST_PER_MILLION_USD','CAPTAIN_FACTORY_MINIMUM_COST_USD')
     $values = Read-Env $rootEnv $allowed
@@ -108,6 +131,7 @@ function Initialize-LocalEnvironment {
     if ($runtimeArtifactRoot -ne $minibookArtifactRoot) {
         throw 'Captain Runtime and Minibook capability artifact roots differ.'
     }
+    Set-ProductionAdapterManifests $values
     $escapedPassword = [Uri]::EscapeDataString([string]$values['MARIADB_TEST_PASSWORD'])
     $values['TEST_MARIADB_DSN'] = "mariadb://captain_test:${escapedPassword}@127.0.0.1:$($values['MARIADB_TEST_PORT'])/captain_test"
     $values['LEDGER_DSN'] = $values['TEST_MARIADB_DSN']
