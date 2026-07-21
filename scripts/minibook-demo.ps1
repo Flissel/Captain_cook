@@ -67,7 +67,7 @@ function Start-Service {
     } finally {
         [Environment]::SetEnvironmentVariable('MINIBOOK_PROJECTION_API_KEY',$previousProjectionKey,'Process')
     }
-    $identity = @{ pid=$process.Id; started_at=$process.StartTime.ToUniversalTime().ToString('o'); executable=$process.Path }
+    $identity = @{ pid=$process.Id; started_at=$process.StartTime.ToUniversalTime().ToString('o'); executable=$python }
     [IO.File]::WriteAllText($pidFile, ($identity | ConvertTo-Json -Compress))
     foreach ($attempt in 1..60) { if (Test-Health) { Write-Host '[ready] Minibook local instance'; return }; Start-Sleep -Milliseconds 500 }
     throw 'Minibook local instance did not become healthy.'
