@@ -15,7 +15,7 @@ from agenten.agent_factory.candidate_evaluation import (
     ResolvedFactoryCandidate,
     StaticFactoryCandidateProvider,
 )
-from agenten.agent_factory.contracts import AgentFactoryJob, FactoryLease, FactoryRole
+from agenten.agent_factory.contracts import FactoryLease, FactoryRole, parse_factory_job
 from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
 from agenten.agent_factory.leases import validate_factory_lease
 from agenten.agent_factory.orchestration import FactoryDispatch
@@ -33,7 +33,9 @@ _ACTION_ROLES: dict[FactoryActionKind, FactoryRole] = {
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        job = AgentFactoryJob.model_validate_json(Path(args.job).read_text(encoding="utf-8"))
+        job = parse_factory_job(
+            json.loads(Path(args.job).read_text(encoding="utf-8"))
+        )
         lease = FactoryLease.model_validate_json(Path(args.lease).read_text(encoding="utf-8"))
         candidate = FactoryCandidateManifest.model_validate_json(Path(args.candidate).read_text(encoding="utf-8"))
         action_kind = FactoryActionKind(args.action)
@@ -61,7 +63,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
         )
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError, KeyError, RuntimeError) as exc:
         print(json.dumps({"status": "failed", "error": type(exc).__name__}, sort_keys=True))
         return 1
     print(block.model_dump_json(by_alias=True))

@@ -466,6 +466,8 @@ class FactorySkillReplayStore(Protocol):
         failure_kind: str,
     ) -> FactorySkillReplayRecord: ...
 
+    async def abandon(self, pending: FactorySkillReplayRecord) -> None: ...
+
 
 class InMemoryFactorySkillReplayStore:
     """Process-local replay store for explicitly injected deterministic tests."""
@@ -510,6 +512,13 @@ class InMemoryFactorySkillReplayStore:
             pending,
             _failed_replay_record(pending, failure_kind=failure_kind),
         )
+
+    async def abandon(self, pending: FactorySkillReplayRecord) -> None:
+        async with self._lock:
+            existing = self._records.get(pending.invocation.idempotency_key)
+            if existing != pending or existing.state != "pending":
+                raise FactoryDispatchError("factory skill replay claim is no longer pending")
+            del self._records[pending.invocation.idempotency_key]
 
     async def _transition(
         self,
@@ -571,6 +580,10 @@ class FilesystemFactorySkillReplayStore:
             _failed_replay_record(pending, failure_kind=failure_kind),
         )
 
+    async def abandon(self, pending: FactorySkillReplayRecord) -> None:
+        path = self._path_for(pending.invocation.idempotency_key)
+        await asyncio.to_thread(self._remove_pending, path, pending)
+
     async def _transition(
         self,
         pending: FactorySkillReplayRecord,
@@ -628,6 +641,16 @@ class FilesystemFactorySkillReplayStore:
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
+
+    @classmethod
+    def _remove_pending(
+        cls,
+        path: Path,
+        pending: FactorySkillReplayRecord,
+    ) -> None:
+        if cls._read_record(path) != pending:
+            raise FactoryDispatchError("factory skill replay claim is no longer pending")
+        path.unlink()
 
     @staticmethod
     def _read_record(path: Path) -> FactorySkillReplayRecord:
