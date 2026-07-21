@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 import pytest
@@ -9,10 +9,10 @@ from agenten.agent_factory.contracts import (
     AgentFactoryJob,
     FactoryBlockStatus,
     FactoryEvidenceBlock,
-    FactoryLease,
     FactoryPhase,
     FactoryRole,
 )
+from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.live_demo_runtime_chain import (
     LiveDemoRuntimeChain,
     LiveDemoRuntimeChainError,
@@ -24,7 +24,6 @@ from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
     ArtifactRef,
-    CapabilityProfile,
     IntegrationIntent,
     RuntimeStatus,
 )
@@ -46,16 +45,13 @@ def _release() -> LiveDemoRuntimeRelease:
         input_ref=_ref("input"), required_capability="n8n-builder",
         acceptance_assertion_ids=("demo-chain",),
     )
-    lease = FactoryLease(
-        schema_name="captain.factory-lease.v1", lease_id="demo-live-lease",
-        job_id=job.job_id, correlation_id=CORRELATION_ID, subject_version=1,
-        attempt=1, role=FactoryRole.TOOL_INTEGRATOR,
-        capability_profile=CapabilityProfile.N8N_BUILDER,
-        integration_intent=IntegrationIntent.N8N,
-        capabilities=("codex.cancel", "codex.heartbeat", "codex.resume", "codex.run",
-                      "codex.status", "mcp.n8n", "tests.run", "workspace.write"),
+    lease = issue_factory_lease(
+        job=job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
         workspace_ref="workspace://demo/live",
-        issued_at=NOW, expires_at=NOW + timedelta(minutes=10),
+        now=NOW,
+        integration_intent=IntegrationIntent.N8N,
     )
     action = FactoryAction(kind=FactoryActionKind.DISPATCH_TOOL_INTEGRATOR, attempt=1)
     command = AgentRuntimeCommand.model_validate({
