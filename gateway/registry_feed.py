@@ -10,7 +10,11 @@ from uuid import UUID
 import aiohttp
 from pydantic import BaseModel, ConfigDict
 
-from agenten.agent_runtime.contracts import AgentRuntimeResult
+from agenten.agent_runtime.contracts import (
+    AgentRuntimeResult,
+    RuntimeOperation,
+    RuntimeStatus,
+)
 from agenten.delivery.minibook_events import MinibookProjectionEvent
 
 
@@ -51,10 +55,19 @@ def factory_promotion_projection(
     )
 
 
-def runtime_result_projection(result: dict[str, Any]) -> MinibookProjectionEvent:
-    """Build a stable allow-listed view without runtime-private text or paths."""
+def runtime_result_projection(
+    result: dict[str, Any],
+) -> MinibookProjectionEvent | None:
+    """Project only successful Codex builds representable by the v2 catalog."""
 
     validated = AgentRuntimeResult.model_validate(result)
+    if (
+        validated.producer != "agent-runtime"
+        or validated.status is not RuntimeStatus.SUCCEEDED
+        or validated.operation
+        not in {RuntimeOperation.CODEX_RUN, RuntimeOperation.CODEX_RESUME}
+    ):
+        return None
     subject_digest = bytearray(
         hashlib.sha256(
             f"captain-runtime-subject:{validated.subject_id}".encode("utf-8")

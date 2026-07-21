@@ -1,8 +1,11 @@
 import asyncio
 from datetime import datetime, timezone
+import json
+import sqlite3
 from uuid import UUID
 
 from fastapi.testclient import TestClient
+import pytest
 from pydantic import SecretStr
 
 from gateway import registry_feed
@@ -123,7 +126,10 @@ def test_factory_promotion_builds_redacted_v2_projection_with_correlation() -> N
     assert "private" not in serialized
 
 
-def test_runtime_result_builds_stable_redacted_projection_with_command_causation() -> None:
+@pytest.mark.parametrize("operation", ("codex.run", "codex.resume"))
+def test_runtime_result_builds_stable_redacted_projection_with_command_causation(
+    operation: str,
+) -> None:
     projection = getattr(registry_feed, "runtime_result_projection", None)
     assert callable(projection), "runtime result projection is not implemented"
     result = {
@@ -132,11 +138,11 @@ def test_runtime_result_builds_stable_redacted_projection_with_command_causation
         "command_id": "50000000-0000-4000-8000-000000000001",
         "correlation_id": "60000000-0000-4000-8000-000000000001",
         "occurred_at": datetime(2026, 7, 20, 12, 1, tzinfo=timezone.utc).isoformat(),
-        "producer": "hermes-runtime",
+        "producer": "agent-runtime",
         "subject_id": "private-workspace-subtask",
         "subject_version": 3,
         "grant_id": "private-grant",
-        "operation": "codex.run",
+        "operation": operation,
         "status": "succeeded",
         "session_id": "private-session",
         "artifact_refs": [
@@ -160,6 +166,7 @@ def test_runtime_result_builds_stable_redacted_projection_with_command_causation
     replay = projection(result)
 
     assert first == replay
+    assert first is not None
     assert first.event_id == UUID(result["event_id"])
     assert first.causation_id == UUID(result["command_id"])
     assert first.correlation_id == UUID(result["correlation_id"])
@@ -180,6 +187,50 @@ def test_runtime_result_builds_stable_redacted_projection_with_command_causation
         "provider",
     ):
         assert secret not in serialized
+
+
+@pytest.mark.parametrize(
+    ("producer", "operation", "status", "error"),
+    (
+        ("agent-runtime", "codex.run", "failed", "private provider failure"),
+        (
+            "agent-runtime",
+            "codex.run",
+            "infrastructure_failed",
+            "private infrastructure failure",
+        ),
+        ("agent-runtime", "codex.run", "policy_failed", "private policy failure"),
+        ("agent-runtime", "codex.run", "cancelled", None),
+        ("agent-runtime", "codex.status", "succeeded", None),
+        ("hermes-runtime", "codex.run", "succeeded", None),
+        ("hermes-runtime", "hermes.plan", "succeeded", None),
+    ),
+)
+def test_non_successful_or_non_codex_build_runtime_results_are_not_projected_as_built(
+    producer: str,
+    operation: str,
+    status: str,
+    error: str | None,
+) -> None:
+    result = {
+        "schema": "captain.agent-runtime-result.v1",
+        "event_id": "40000000-0000-4000-8000-000000000009",
+        "command_id": "50000000-0000-4000-8000-000000000009",
+        "correlation_id": "60000000-0000-4000-8000-000000000009",
+        "occurred_at": "2026-07-20T12:01:00Z",
+        "producer": producer,
+        "subject_id": "private-subtask",
+        "subject_version": 3,
+        "grant_id": "private-grant",
+        "operation": operation,
+        "status": status,
+        "session_id": None,
+        "artifact_refs": [],
+        "evidence_refs": [],
+        "error": error,
+    }
+
+    assert registry_feed.runtime_result_projection(result) is None
 
 
 def test_projection_feed_is_captain_authenticated_and_globally_paginated(monkeypatch) -> None:
@@ -212,6 +263,12 @@ def test_projection_feed_is_captain_authenticated_and_globally_paginated(monkeyp
         "evidence_refs": [],
         "error": None,
     }
+    failed_runtime_result = {
+        **runtime_result,
+        "event_id": "40000000-0000-4000-8000-000000000002",
+        "status": "failed",
+        "error": "provider text must not project",
+    }
 
     class Store:
         def __init__(self, *_args, **_kwargs) -> None:
@@ -223,6 +280,7 @@ def test_projection_feed_is_captain_authenticated_and_globally_paginated(monkeyp
             return [
                 (5, "agent_factory_block", block, job),
                 (7, "agent_runtime_result", runtime_result, None),
+                (8, "agent_runtime_result", failed_runtime_result, None),
             ], True
 
     class Mirror:
@@ -259,7 +317,7 @@ def test_projection_feed_is_captain_authenticated_and_globally_paginated(monkeyp
                 mode="json", by_alias=True
             ),
         ],
-        "cursor": "7",
+        "cursor": "8",
         "has_more": True,
     }
 
@@ -268,59 +326,81 @@ def test_store_pages_admitted_mixed_records_by_one_global_ledger_cursor() -> Non
     promotion_job = {
         "correlation_id": "30000000-0000-4000-8000-000000000001",
     }
-    ledger = [
-        {
-            "index": 2,
-            "block_type": "agent_factory_block",
-            "data": {"phase": "capability_promoted", "status": "succeeded"},
-            "parent_data": promotion_job,
-        },
-        {
-            "index": 3,
-            "block_type": "unrelated_block",
-            "data": {"secret": "not-admitted"},
-            "parent_data": None,
-        },
-        {
-            "index": 4,
-            "block_type": "agent_runtime_result",
-            "data": {"schema": "captain.agent-runtime-result.v1"},
-            "parent_data": None,
-        },
-        {
-            "index": 5,
-            "block_type": "agent_factory_block",
-            "data": {"phase": "capability_promoted", "status": "succeeded"},
-            "parent_data": promotion_job,
-        },
-    ]
-    executed: list[tuple[str, tuple[int, int]]] = []
+    database = sqlite3.connect(":memory:")
+    database.row_factory = sqlite3.Row
+    database.create_function("JSON_UNQUOTE", 1, lambda value: value)
+    database.execute(
+        """
+        CREATE TABLE blocks (
+            `index` INTEGER PRIMARY KEY,
+            parent_index INTEGER,
+            block_type TEXT NOT NULL,
+            data TEXT NOT NULL,
+            status TEXT,
+            children TEXT,
+            metadata TEXT,
+            hash TEXT,
+            previous_hash TEXT
+        )
+        """
+    )
+
+    def insert(
+        index: int,
+        block_type: str,
+        data: dict[str, object],
+        *,
+        parent_index: int | None = None,
+    ) -> None:
+        database.execute(
+            "INSERT INTO blocks(`index`, parent_index, block_type, data) VALUES (?, ?, ?, ?)",
+            (index, parent_index, block_type, json.dumps(data)),
+        )
+
+    insert(0, "agent_factory_job", promotion_job)
+    insert(
+        1,
+        "agent_factory_block",
+        {"phase": "capability_promoted", "status": "failed"},
+        parent_index=0,
+    )
+    insert(
+        2,
+        "agent_factory_block",
+        {"phase": "capability_promoted", "status": "succeeded"},
+        parent_index=0,
+    )
+    insert(3, "unrelated_block", {"secret": "not-admitted"})
+    insert(4, "agent_runtime_result", {"schema": "captain.agent-runtime-result.v1"})
+    insert(
+        5,
+        "agent_factory_block",
+        {"phase": "capability_promoted", "status": "succeeded"},
+        parent_index=0,
+    )
+    insert(
+        6,
+        "agent_factory_block",
+        {"phase": "candidate_built", "status": "succeeded"},
+        parent_index=0,
+    )
+    database.commit()
 
     class Cursor:
-        rows: list[dict[str, object]] = []
+        def __init__(self) -> None:
+            self.delegate = database.cursor()
 
         def __enter__(self):
             return self
 
         def __exit__(self, *_args):
-            return None
+            self.delegate.close()
 
         def execute(self, sql: str, params: tuple[int, int]) -> None:
-            executed.append((sql, params))
-            after_index, fetch_limit = params
-            admitted = [
-                row
-                for row in ledger
-                if int(row["index"]) > after_index
-                and row["block_type"] in {
-                    "agent_factory_block",
-                    "agent_runtime_result",
-                }
-            ]
-            self.rows = admitted[:fetch_limit]
+            self.delegate.execute(sql.replace("%s", "?"), params)
 
         def fetchall(self):
-            return self.rows
+            return self.delegate.fetchall()
 
     class Connection:
         def __enter__(self):
@@ -337,8 +417,10 @@ def test_store_pages_admitted_mixed_records_by_one_global_ledger_cursor() -> Non
             return Connection()
 
         @staticmethod
-        def _decode_row(row: dict[str, object]) -> dict[str, object]:
-            return row
+        def _decode_row(row: sqlite3.Row) -> dict[str, object]:
+            decoded = dict(row)
+            decoded["data"] = json.loads(str(decoded["data"]))
+            return decoded
 
     feed = getattr(GatewayStore, "minibook_projection_feed", None)
     assert callable(feed), "one globally ordered Minibook feed query is not implemented"
@@ -364,5 +446,4 @@ def test_store_pages_admitted_mixed_records_by_one_global_ledger_cursor() -> Non
         (4, "agent_runtime_result"),
         (5, "agent_factory_block"),
     ]
-    assert all(params[1] == 2 for _, params in executed)
-    assert all("ORDER BY event.`index`" in sql for sql, _ in executed)
+    database.close()

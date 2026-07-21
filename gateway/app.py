@@ -392,12 +392,16 @@ def create_app(
             after_index=after_index,
             limit=limit,
         )
-        events = tuple(
-            factory_promotion_projection(data, parent)
-            if block_type == "agent_factory_block" and parent is not None
-            else runtime_result_projection(data)
-            for _, block_type, data, parent in records
-        )
+        projected_events = []
+        for _, block_type, data, parent in records:
+            event = (
+                factory_promotion_projection(data, parent)
+                if block_type == "agent_factory_block" and parent is not None
+                else runtime_result_projection(data)
+            )
+            if event is not None:
+                projected_events.append(event)
+        events = tuple(projected_events)
         next_cursor = str(records[-1][0]) if records else str(after_index)
         return MinibookProjectionFeedPage(
             events=events,
