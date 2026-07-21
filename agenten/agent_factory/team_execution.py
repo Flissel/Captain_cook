@@ -1159,8 +1159,8 @@ class HostAutoGenTeamRunner:
                 item.assertion_id: item.passed
                 for item in holdout_receipt.decisions
             }
-            resolved_status: Literal["succeeded", "unresolved"] = (
-                "succeeded" if all(normalized_results.values()) else "unresolved"
+            resolved_status: Literal["succeeded", "failed"] = (
+                "succeeded" if all(normalized_results.values()) else "failed"
             )
             observation_ref = await self._evidence_store.persist(
                 job,

@@ -1385,6 +1385,120 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
     assert timeout_tokens[0].is_cancelled()  # type: ignore[attr-defined]
 
 
+@pytest.mark.asyncio
+async def test_paid_negative_holdout_is_behavioral_failed_with_usage_receipt(
+    tmp_path: Path,
+) -> None:
+    holdout_body = b"Reject this deterministic private case."
+    job = _job_v3(holdout_body=holdout_body)
+    candidate = _sealed_team_candidate(tmp_path)
+    invocation = _invocation(job)
+    model_client = BudgetedChatCompletionClient(
+        job=job,
+        invocation=invocation,
+        attempt=1,
+        delegate=ReplayChatCompletionClient(
+            ["TERMINATE"],
+            model_info=ModelInfo(
+                vision=False,
+                function_calling=True,
+                json_output=True,
+                family=ModelFamily.UNKNOWN,
+                structured_output=True,
+            ),
+        ),
+        budget=InMemoryFactoryBudgetLedger(),
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "negative-evidence"),
+        provider="deterministic-replay",
+        model="approved-model-id",
+        max_cost_per_call=Decimal("0.50"),
+        paid_effect_authority=_PaidEffectAuthority(),
+        pricing_authority=_PricingAuthority(_pricing_quote(job)),
+        clock=lambda: NOW,
+    )
+
+    async def support_triage(ticket: str) -> str:
+        return f"routed:{ticket}"
+
+    class TrustedN8nAdapter:
+        def tool(self, name: str) -> object:
+            return FunctionTool(
+                support_triage,
+                description="Route support case",
+                name=name,
+            )
+
+        def authorization(self, name: str) -> object:
+            raise AssertionError(f"unused n8n tool {name} requested authority")
+
+        def observed_evidence(self) -> tuple[FactoryN8nExecutionEvidenceV1, ...]:
+            return ()
+
+    class TrustedN8nAuthority:
+        async def authorize_command(self, claim: object, *, now: datetime) -> object:
+            raise AssertionError("unused n8n tool requested authority")
+
+        async def authorize(self, evidence: object, *, now: datetime) -> object:
+            raise AssertionError("no n8n call should be observed")
+
+    class RejectingHoldouts:
+        async def resolve(self, reference: object) -> ResolvedFactoryHoldoutCase:
+            assert reference == job.private_holdout_refs[0]
+            return ResolvedFactoryHoldoutCase(
+                reference=job.private_holdout_refs[0],
+                body=holdout_body,
+            )
+
+        async def evaluate(
+            self,
+            reference: object,
+            result: object,
+            assertion_ids: tuple[str, ...],
+        ) -> FactoryHoldoutEvaluationReceiptV1:
+            assert result is not None
+            return FactoryHoldoutEvaluationReceiptV1(
+                schema_name="captain.factory-holdout-evaluation-receipt.v1",
+                holdout_ref=job.private_holdout_refs[0],
+                candidate_ref=candidate.candidate.source_archive_ref,
+                assertion_ids=assertion_ids,
+                decisions=tuple(
+                    FactoryHoldoutAssertionDecisionV1(
+                        assertion_id=assertion_id,
+                        passed=False,
+                        provenance_code="deterministic_rule",
+                    )
+                    for assertion_id in assertion_ids
+                ),
+                evaluator_id="captain_test_evaluator",
+                evaluator_version="1",
+                evaluated_at=NOW,
+            )
+
+    result = await HostAutoGenTeamRunner(
+        model_client=model_client,
+        evaluator=FactoryCandidateEvaluator(),
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "host-negative"),
+        holdouts=RejectingHoldouts(),  # type: ignore[arg-type]
+        tools={},
+        n8n_adapter=TrustedN8nAdapter(),  # type: ignore[arg-type]
+        n8n_authority=TrustedN8nAuthority(),  # type: ignore[arg-type]
+        clock=lambda: NOW,
+    ).run(
+        job=job,
+        invocation=invocation,
+        candidate=candidate,
+        case_ref=job.private_holdout_refs[0],
+        lease=invocation.lease,
+        allowed_models=job.execution_policy.allowed_models,
+        max_seconds=10,
+    )
+
+    assert result.status == "failed"
+    assert result.runtime_result.status is RuntimeStatus.FAILED
+    assert result.execution_outcome.status == "failed"
+    assert len(result.usage_receipts) == 1
+
+
 def test_n8n_execution_requires_separate_scope_and_matching_digest() -> None:
     command_id = UUID("70000000-0000-0000-0000-000000000026")
     grant = CapabilityGrant(
