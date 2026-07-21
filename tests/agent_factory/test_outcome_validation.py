@@ -5,18 +5,27 @@ import io
 import json
 import stat
 import zipfile
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
 from agenten.agent_factory.contracts import AgentFactoryJobV2
 from agenten.agent_factory.forge_contracts import CreationResultV1
-from agenten.agent_factory.outcome_contracts import CapabilityPackageManifestV1
+from agenten.agent_factory.outcome_contracts import (
+    CapabilityAssertionResult,
+    CapabilityPackageManifestV1,
+    CapabilityReleaseEvidenceV1,
+)
 from agenten.agent_factory.outcome_validation import (
+    CapabilitySandboxRequest,
+    CapabilitySandboxResult,
     CapabilityPackageValidationError,
     CapabilityPackageValidator,
 )
+from agenten.agent_factory.skill_evaluation import HermesSkillUsageReceipt
 
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
@@ -54,18 +63,61 @@ class RecordingContentStore:
         return self.content_by_uri[uri]
 
 
+@dataclass
+class RecordingTrustedSandboxRunner:
+    requests: list[CapabilitySandboxRequest] = field(default_factory=list)
+    result_updates: dict[str, object] = field(default_factory=dict)
+
+    async def validate(self, request: CapabilitySandboxRequest) -> CapabilitySandboxResult:
+        self.requests.append(request)
+        result = CapabilitySandboxResult(
+            request_digest=request.request_digest,
+            status="passed",
+            imported_modules=request.module_names,
+            executed_test_paths=request.test_paths,
+            workspace_was_read_only=True,
+            network_was_disabled=True,
+            resource_limits_were_enforced=True,
+        )
+        return result.model_copy(update=self.result_updates)
+
+
+@dataclass
+class HangingTrustedSandboxRunner:
+    cancelled: bool = False
+
+    async def validate(self, request: CapabilitySandboxRequest) -> CapabilitySandboxResult:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.cancelled = True
+
+
+@dataclass
+class MutatingTrustedSandboxRunner(RecordingTrustedSandboxRunner):
+    async def validate(self, request: CapabilitySandboxRequest) -> CapabilitySandboxResult:
+        (request.workspace / "autogen" / "team.py").write_bytes(b"MUTATED = True\n")
+        return await super().validate(request)
+
+
 @dataclass(frozen=True)
 class ValidationCase:
     job: AgentFactoryJobV2
     creation_result: CreationResultV1
     package: CapabilityPackageManifestV1
     store: RecordingContentStore
+    runner: RecordingTrustedSandboxRunner
+    release_evidence: tuple[CapabilityReleaseEvidenceV1, ...]
+    skill_receipt: HermesSkillUsageReceipt
     files: dict[str, bytes]
 
 
 def _validation_case(
     *,
-    autogen_source: bytes = b"CAPABILITY_ID = 'customer_support_triage'\n",
+    autogen_source: bytes = (
+        b"from autogen.helpers import HELPER\n"
+        b"CAPABILITY_ID = 'customer_support_triage'\n"
+    ),
     package_test: bytes = (
         b"from autogen.team import CAPABILITY_ID\n\n"
         b"def test_generated_team_identity():\n"
@@ -80,7 +132,11 @@ def _validation_case(
         "schema": "autogen-team.v1",
         "capability_id": job.required_capability,
         "capability_version": 1,
-        "autogen_modules": ["autogen/__init__.py", "autogen/team.py"],
+        "autogen_modules": [
+            "autogen/__init__.py",
+            "autogen/helpers.py",
+            "autogen/team.py",
+        ],
         "test_paths": ["tests/test_support_triage.py"],
     }
     team_manifest.update(team_manifest_updates or {})
@@ -88,7 +144,8 @@ def _validation_case(
         "team-manifest.json": json.dumps(
             team_manifest, sort_keys=True, separators=(",", ":")
         ).encode("utf-8"),
-        "autogen/__init__.py": b"# Sealed generated package.\n",
+        "autogen/__init__.py": b"from .team import CAPABILITY_ID\n",
+        "autogen/helpers.py": b"HELPER = 'sealed'\n",
         "autogen/team.py": autogen_source,
         "skills/support_triage/SKILL.md": b"# Support triage skill\n",
         "tests/test_support_triage.py": package_test,
@@ -101,6 +158,7 @@ def _validation_case(
     kind_by_path = {
         "team-manifest.json": "team_manifest",
         "autogen/__init__.py": "autogen_source",
+        "autogen/helpers.py": "autogen_source",
         "autogen/team.py": "autogen_source",
         "skills/support_triage/SKILL.md": "skill",
         "tests/test_support_triage.py": "test",
@@ -110,6 +168,7 @@ def _validation_case(
     media_type_by_path = {
         "team-manifest.json": "application/json",
         "autogen/__init__.py": "text/x-python",
+        "autogen/helpers.py": "text/x-python",
         "autogen/team.py": "text/x-python",
         "skills/support_triage/SKILL.md": "text/markdown",
         "tests/test_support_triage.py": "text/x-python",
@@ -128,14 +187,100 @@ def _validation_case(
         str(item["path"]): item["reference"] for item in artifacts
     }
 
-    assertion_evidence = _ref(b'{"assertion":"passed"}', "application/json")
-    holdout_evidence = _ref(b'{"holdout":"passed"}', "application/json")
-    recovery_evidence = _ref(b'{"recovery":"passed"}', "application/json")
-    e2e_refs = [
-        _ref(f'{{"e2e":{index}}}'.encode(), "application/json")
-        for index in range(1, 4)
-    ]
-    skill_receipt = _ref(b'{"skill_usage":"accepted"}', "application/json")
+    downstream_contents = (
+        b'{"check":"recovery-and-private-holdout","status":"passed"}',
+        b'{"check":"normal-e2e-1","status":"passed"}',
+        b'{"check":"normal-e2e-2","status":"passed"}',
+        b'{"check":"normal-e2e-3","status":"passed"}',
+    )
+    downstream_refs = tuple(
+        _ref(content, "application/json") for content in downstream_contents
+    )
+    release_evidence = tuple(
+        CapabilityReleaseEvidenceV1.model_validate(
+            {
+                "schema": "captain.capability-release-evidence.v1",
+                "run_id": (
+                    "controlled-recovery-run-01"
+                    if run_number == 1
+                    else f"normal-e2e-run-{run_number - 1}"
+                ),
+                "run_number": run_number,
+                "factory_job_id": str(job.job_id),
+                "correlation_id": str(job.correlation_id),
+                "subject_version": job.subject_version,
+                "kind": "recovery" if run_number == 1 else "normal",
+                "outcome": (
+                    "expected_failure_recovered"
+                    if run_number == 1
+                    else "succeeded"
+                ),
+                "producer": "captain",
+                "assertion_results": [
+                    {
+                        "assertion_id": job.acceptance_assertion_ids[0],
+                        "status": "passed",
+                    }
+                ],
+                "recovery_id": (
+                    "controlled-recovery-01" if run_number == 1 else None
+                ),
+                "holdout_ids": (
+                    [job.private_holdout_refs[0].holdout_id]
+                    if run_number == 1
+                    else []
+                ),
+                "downstream_evidence_refs": [downstream_refs[run_number - 1]],
+            }
+        )
+        for run_number in range(1, 5)
+    )
+    release_evidence_bytes = tuple(
+        item.model_dump_json(by_alias=True).encode("utf-8")
+        for item in release_evidence
+    )
+    release_evidence_refs = tuple(
+        _ref(content, "application/json") for content in release_evidence_bytes
+    )
+
+    skill_detail = b'{"check":"released-skill-use","status":"passed"}'
+    skill_detail_ref = _ref(skill_detail, "application/json")
+    released_skill_ref = artifact_ref_by_path["skills/support_triage/SKILL.md"]
+    skill_receipt = HermesSkillUsageReceipt.model_validate(
+        {
+            "schema": "hermes.skill-usage-receipt.v1",
+            "receipt_id": "20000000-0000-4000-8000-000000000001",
+            "request_id": "20000000-0000-4000-8000-000000000002",
+            "job_id": str(job.job_id),
+            "correlation_id": str(job.correlation_id),
+            "lease_id": "factory-validation-lease-01",
+            "occurred_at": "2026-07-21T12:05:00Z",
+            "producer": "hermes",
+            "released_skill": {
+                "schema": "captain.released-hermes-skill.v1",
+                "skill_id": "autogen-agent-factory",
+                "version": 1,
+                "capability": job.required_capability,
+                "content_ref": released_skill_ref,
+                "content_sha256": released_skill_ref["sha256"],
+                "status": "released",
+                "released_at": "2026-07-21T11:55:00Z",
+                "producer": "captain",
+            },
+            "used_skill_id": "autogen-agent-factory",
+            "used_skill_version": 1,
+            "used_skill_sha256": released_skill_ref["sha256"],
+            "commands": [
+                {"command_id": "build", "max_seconds": 60},
+                {"command_id": "test", "max_seconds": 60},
+            ],
+            "evidence_refs": [skill_detail_ref],
+            "assertion_ids": list(job.acceptance_assertion_ids),
+            "outcome": "passed",
+        }
+    )
+    skill_receipt_bytes = skill_receipt.model_dump_json(by_alias=True).encode("utf-8")
+    skill_receipt_ref = _ref(skill_receipt_bytes, "application/json")
     package_payload = {
         "schema": "captain.capability-package.v1",
         "capability_id": job.required_capability,
@@ -152,7 +297,7 @@ def _validation_case(
                 "assertion_id": job.acceptance_assertion_ids[0],
                 "status": "passed",
                 "integration_intent": "none",
-                "evidence_refs": [assertion_evidence],
+                "evidence_refs": [downstream_refs[1]],
             }
         ],
         "private_holdout_receipts": [
@@ -160,17 +305,17 @@ def _validation_case(
                 "holdout_id": job.private_holdout_refs[0].holdout_id,
                 "assertion_id": job.acceptance_assertion_ids[0],
                 "status": "passed",
-                "evidence_ref": holdout_evidence,
+                "evidence_ref": downstream_refs[0],
             }
         ],
         "recovery_receipt": {
             "recovery_id": "controlled-recovery-01",
             "assertion_id": job.acceptance_assertion_ids[0],
             "status": "passed",
-            "evidence_ref": recovery_evidence,
+            "evidence_ref": release_evidence_refs[0],
         },
-        "release_evidence_refs": [recovery_evidence, *e2e_refs],
-        "skill_usage_receipt_ref": skill_receipt,
+        "release_evidence_refs": list(release_evidence_refs),
+        "skill_usage_receipt_ref": skill_receipt_ref,
         "tool_gaps": [],
         "runbook_ref": artifact_ref_by_path["RUNBOOK.md"],
     }
@@ -187,9 +332,9 @@ def _validation_case(
             "status": "succeeded",
             "package_manifest_ref": package_manifest_ref,
             "artifact_refs": [source_ref],
-            "evidence_refs": [assertion_evidence, holdout_evidence, recovery_evidence, *e2e_refs],
+            "evidence_refs": list(release_evidence_refs),
             "tool_gaps": [],
-            "skill_usage_receipt_ref": skill_receipt,
+            "skill_usage_receipt_ref": skill_receipt_ref,
             "failure": None,
         }
     )
@@ -198,10 +343,8 @@ def _validation_case(
     all_content: dict[str, bytes] = {
         str(source_ref["uri"]): archive,
         str(package_manifest_ref["uri"]): package_bytes,
-        str(skill_receipt["uri"]): b'{"skill_usage":"accepted"}',
-        str(assertion_evidence["uri"]): b'{"assertion":"passed"}',
-        str(holdout_evidence["uri"]): b'{"holdout":"passed"}',
-        str(recovery_evidence["uri"]): b'{"recovery":"passed"}',
+        str(skill_receipt_ref["uri"]): skill_receipt_bytes,
+        str(skill_detail_ref["uri"]): skill_detail,
     }
     all_content.update(
         {
@@ -211,8 +354,22 @@ def _validation_case(
     )
     all_content.update(
         {
-            str(reference["uri"]): f'{{"e2e":{index}}}'.encode()
-            for index, reference in enumerate(e2e_refs, start=1)
+            str(reference["uri"]): content
+            for reference, content in zip(
+                release_evidence_refs,
+                release_evidence_bytes,
+                strict=True,
+            )
+        }
+    )
+    all_content.update(
+        {
+            str(reference["uri"]): content
+            for reference, content in zip(
+                downstream_refs,
+                downstream_contents,
+                strict=True,
+            )
         }
     )
     return ValidationCase(
@@ -220,7 +377,17 @@ def _validation_case(
         creation_result=creation_result,
         package=package,
         store=RecordingContentStore(all_content),
+        runner=RecordingTrustedSandboxRunner(),
+        release_evidence=release_evidence,
+        skill_receipt=skill_receipt,
         files=files,
+    )
+
+
+def _validator(case: ValidationCase) -> CapabilityPackageValidator:
+    return CapabilityPackageValidator(
+        content_store=case.store,
+        sandbox_runner=case.runner,
     )
 
 
@@ -228,7 +395,7 @@ def _validation_case(
 async def test_validator_independently_accepts_a_bound_digest_verified_package() -> None:
     case = _validation_case()
 
-    validated = await CapabilityPackageValidator(content_store=case.store).validate(
+    validated = await _validator(case).validate(
         job=case.job,
         creation_result=case.creation_result,
         package=case.package,
@@ -250,11 +417,107 @@ async def test_validator_independently_accepts_a_bound_digest_verified_package()
             case.package.recovery_receipt.evidence_ref,
             *case.package.release_evidence_refs,
             case.package.skill_usage_receipt_ref,
+            *case.skill_receipt.evidence_refs,
+            *(
+                reference
+                for evidence in case.release_evidence
+                for reference in evidence.downstream_evidence_refs
+            ),
             case.package.runbook_ref,
         )
         if reference is not None
     }
     assert set(case.store.reads) == expected_uris
+    request = case.runner.requests[0]
+    assert request.python_path_root == request.workspace
+    assert request.module_names == (
+        "autogen",
+        "autogen.helpers",
+        "autogen.team",
+    )
+    assert request.test_paths == ("tests/test_support_triage.py",)
+    assert request.workspace_access == "read_only"
+    assert request.network_access == "disabled"
+    assert request.max_processes >= 1
+    assert request.max_memory_bytes >= 1
+    assert request.kill_process_tree_on_cancel is True
+    assert request.require_process_identity is True
+
+
+@pytest.mark.asyncio
+async def test_validator_fails_closed_without_an_explicit_trusted_sandbox() -> None:
+    case = _validation_case()
+
+    with pytest.raises(CapabilityPackageValidationError, match="trusted sandbox"):
+        await CapabilityPackageValidator(content_store=case.store).validate(
+            job=case.job,
+            creation_result=case.creation_result,
+            package=case.package,
+        )
+
+    assert case.store.reads == []
+
+
+@pytest.mark.asyncio
+async def test_validator_requires_trusted_runner_to_attest_the_exact_request() -> None:
+    case = _validation_case()
+    case.runner.result_updates = {"request_digest": "f" * 64}
+
+    with pytest.raises(CapabilityPackageValidationError, match="request digest"):
+        await _validator(case).validate(
+            job=case.job,
+            creation_result=case.creation_result,
+            package=case.package,
+        )
+
+
+@pytest.mark.asyncio
+async def test_validator_rejects_missing_sandbox_isolation_attestations() -> None:
+    case = _validation_case()
+    case.runner.result_updates = {"network_was_disabled": False}
+
+    with pytest.raises(CapabilityPackageValidationError, match="isolation"):
+        await _validator(case).validate(
+            job=case.job,
+            creation_result=case.creation_result,
+            package=case.package,
+        )
+
+
+@pytest.mark.asyncio
+async def test_validator_bounds_and_cancels_a_hung_trusted_runner() -> None:
+    case = _validation_case()
+    runner = HangingTrustedSandboxRunner()
+    validator = CapabilityPackageValidator(
+        content_store=case.store,
+        sandbox_runner=runner,
+        command_timeout_seconds=1,
+    )
+
+    with pytest.raises(CapabilityPackageValidationError, match="timed out"):
+        await validator.validate(
+            job=case.job,
+            creation_result=case.creation_result,
+            package=case.package,
+        )
+
+    assert runner.cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_validator_rehashes_the_effective_tree_after_sandbox_validation() -> None:
+    case = _validation_case()
+    runner = MutatingTrustedSandboxRunner()
+
+    with pytest.raises(CapabilityPackageValidationError, match="effective extracted tree"):
+        await CapabilityPackageValidator(
+            content_store=case.store,
+            sandbox_runner=runner,
+        ).validate(
+            job=case.job,
+            creation_result=case.creation_result,
+            package=case.package,
+        )
 
 
 @pytest.mark.asyncio
@@ -263,7 +526,151 @@ async def test_validator_does_not_trust_forge_succeeded_when_content_digest_is_w
     case.store.content_by_uri[case.package.source_ref.uri] += b"tampered"
 
     with pytest.raises(CapabilityPackageValidationError, match="digest"):
-        await CapabilityPackageValidator(content_store=case.store).validate(
+        await _validator(case).validate(
+            job=case.job,
+            creation_result=case.creation_result,
+            package=case.package,
+        )
+
+
+@pytest.mark.asyncio
+async def test_validator_rejects_nested_evidence_uri_with_conflicting_digest() -> None:
+    case = _validation_case()
+    nested_ref = case.release_evidence[2].downstream_evidence_refs[0]
+    conflicting_ref = nested_ref.model_copy(
+        update={"uri": case.package.source_ref.uri}
+    )
+    _replace_release_record(
+        case,
+        2,
+        {"downstream_evidence_refs": (conflicting_ref,)},
+    )
+
+    with pytest.raises(CapabilityPackageValidationError, match="conflicting"):
+        await _validator(case).validate(
+            job=case.job,
+            creation_result=case.creation_result,
+            package=case.package,
+        )
+
+
+@pytest.mark.asyncio
+async def test_validator_rejects_semanticless_release_evidence_blobs() -> None:
+    case = _validation_case()
+    _replace_release_blob(case, 1, b'{"status":"succeeded"}')
+
+    with pytest.raises(CapabilityPackageValidationError, match="typed release evidence"):
+        await _validator(case).validate(
+            job=case.job,
+            creation_result=case.creation_result,
+            package=case.package,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    (
+        (
+            {"factory_job_id": UUID("99999999-9999-4999-8999-999999999999")},
+            "release evidence factory job",
+        ),
+        (
+            {"correlation_id": UUID("99999999-9999-4999-8999-999999999999")},
+            "release evidence correlation",
+        ),
+        ({"subject_version": 2}, "release evidence subject version"),
+        (
+            {
+                "assertion_results": (
+                    CapabilityAssertionResult(
+                        assertion_id="foreign-assertion",
+                        status="passed",
+                    ),
+                )
+            },
+            "release evidence assertions",
+        ),
+    ),
+)
+async def test_validator_binds_typed_release_evidence_to_captain_authority(
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    case = _validation_case()
+    _replace_release_record(case, 1, updates)
+
+    with pytest.raises(CapabilityPackageValidationError, match=message):
+        await _validator(case).validate(
+            job=case.job,
+            creation_result=case.creation_result,
+            package=case.package,
+        )
+
+
+@pytest.mark.asyncio
+async def test_validator_requires_exactly_three_distinct_successes_after_recovery() -> None:
+    case = _validation_case()
+    _append_release_record(case)
+
+    with pytest.raises(CapabilityPackageValidationError, match="exactly three"):
+        await _validator(case).validate(
+            job=case.job,
+            creation_result=case.creation_result,
+            package=case.package,
+        )
+
+    case = _validation_case()
+    _replace_release_record(
+        case,
+        2,
+        {"run_id": case.release_evidence[1].run_id},
+    )
+    with pytest.raises(CapabilityPackageValidationError, match="run IDs"):
+        await _validator(case).validate(
+            job=case.job,
+            creation_result=case.creation_result,
+            package=case.package,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    (
+        ({"recovery_id": "foreign-recovery"}, "recovery ID"),
+        ({"holdout_ids": ()}, "private holdout"),
+        ({"outcome": "failed"}, "succeeded"),
+    ),
+)
+async def test_validator_binds_recovery_holdout_and_success_semantics(
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    case = _validation_case()
+    index = 0 if "outcome" not in updates else 1
+    _replace_release_record(case, index, updates)
+
+    with pytest.raises(CapabilityPackageValidationError, match=message):
+        await _validator(case).validate(
+            job=case.job,
+            creation_result=case.creation_result,
+            package=case.package,
+        )
+
+
+@pytest.mark.asyncio
+async def test_validator_parses_and_binds_the_skill_usage_receipt() -> None:
+    case = _validation_case()
+    _replace_skill_receipt(
+        case,
+        case.skill_receipt.model_copy(
+            update={"job_id": UUID("99999999-9999-4999-8999-999999999999")}
+        ),
+    )
+
+    with pytest.raises(CapabilityPackageValidationError, match="skill receipt job"):
+        await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
             package=case.package,
@@ -297,7 +704,7 @@ async def test_validator_rejects_foreign_job_relationships(
         creation_result = creation_result.model_copy(update=updates)
 
     with pytest.raises(CapabilityPackageValidationError, match=message):
-        await CapabilityPackageValidator(content_store=case.store).validate(
+        await _validator(case).validate(
             job=case.job,
             creation_result=creation_result,
             package=package,
@@ -315,7 +722,7 @@ async def test_validator_requires_exact_captain_assertion_and_holdout_receipts()
     )
 
     with pytest.raises(CapabilityPackageValidationError, match="acceptance assertions"):
-        await CapabilityPackageValidator(content_store=case.store).validate(
+        await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
             package=package,
@@ -330,7 +737,7 @@ async def test_validator_requires_creation_skill_receipt_and_source_archive_bind
     )
 
     with pytest.raises(CapabilityPackageValidationError, match="source archive|skill usage"):
-        await CapabilityPackageValidator(content_store=case.store).validate(
+        await _validator(case).validate(
             job=case.job,
             creation_result=creation_result,
             package=case.package,
@@ -353,7 +760,7 @@ async def test_validator_rejects_manifest_bytes_that_do_not_describe_the_package
     )
 
     with pytest.raises(CapabilityPackageValidationError, match="manifest.*package"):
-        await CapabilityPackageValidator(content_store=case.store).validate(
+        await _validator(case).validate(
             job=case.job,
             creation_result=creation_result,
             package=case.package,
@@ -363,7 +770,16 @@ async def test_validator_rejects_manifest_bytes_that_do_not_describe_the_package
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "unsafe_entry",
-    ("../escaped.py", "/absolute.py", "C:/escaped.py"),
+    (
+        "../escaped.py",
+        "/absolute.py",
+        "C:/escaped.py",
+        "autogen/team.py:payload",
+        "CON.py",
+        "autogen/aux.txt",
+        "autogen/trailing-dot.",
+        "autogen/trailing-space ",
+    ),
 )
 async def test_validator_rejects_archive_path_traversal(unsafe_entry: str) -> None:
     case = _validation_case()
@@ -371,7 +787,7 @@ async def test_validator_rejects_archive_path_traversal(unsafe_entry: str) -> No
     await _replace_source_archive(case, _zip_bytes(unsafe_files))
 
     with pytest.raises(CapabilityPackageValidationError, match="unsafe path"):
-        await CapabilityPackageValidator(content_store=case.store).validate(
+        await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
             package=case.package,
@@ -392,7 +808,7 @@ async def test_validator_rejects_archive_symlinks() -> None:
     await _replace_source_archive(case, output.getvalue())
 
     with pytest.raises(CapabilityPackageValidationError, match="symlink"):
-        await CapabilityPackageValidator(content_store=case.store).validate(
+        await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
             package=case.package,
@@ -406,7 +822,23 @@ async def test_validator_rejects_undeclared_archive_members() -> None:
     await _replace_source_archive(case, archive)
 
     with pytest.raises(CapabilityPackageValidationError, match="declared artifacts"):
-        await CapabilityPackageValidator(content_store=case.store).validate(
+        await _validator(case).validate(
+            job=case.job,
+            creation_result=case.creation_result,
+            package=case.package,
+        )
+
+
+@pytest.mark.asyncio
+async def test_validator_rejects_case_insensitive_archive_collisions() -> None:
+    case = _validation_case()
+    archive = _zip_bytes(
+        {**case.files, "AUTOGEN/TEAM.PY": b"COLLISION = True\n"}
+    )
+    await _replace_source_archive(case, archive)
+
+    with pytest.raises(CapabilityPackageValidationError, match="case-insensitive"):
+        await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
             package=case.package,
@@ -418,7 +850,7 @@ async def test_validator_rejects_team_manifest_schema_or_capability_mismatch() -
     case = _validation_case(team_manifest_updates={"capability_id": "foreign_capability"})
 
     with pytest.raises(CapabilityPackageValidationError, match="team manifest capability"):
-        await CapabilityPackageValidator(content_store=case.store).validate(
+        await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
             package=case.package,
@@ -427,10 +859,11 @@ async def test_validator_rejects_team_manifest_schema_or_capability_mismatch() -
 
 @pytest.mark.asyncio
 async def test_validator_imports_autogen_code_in_the_fresh_workspace() -> None:
-    case = _validation_case(autogen_source=b"raise RuntimeError('must import')\n")
+    case = _validation_case()
+    case.runner.result_updates = {"status": "failed", "failure_stage": "import"}
 
-    with pytest.raises(CapabilityPackageValidationError, match="AutoGen import"):
-        await CapabilityPackageValidator(content_store=case.store).validate(
+    with pytest.raises(CapabilityPackageValidationError, match="sandbox import"):
+        await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
             package=case.package,
@@ -439,10 +872,11 @@ async def test_validator_imports_autogen_code_in_the_fresh_workspace() -> None:
 
 @pytest.mark.asyncio
 async def test_validator_runs_only_manifest_allowlisted_package_tests() -> None:
-    case = _validation_case(package_test=b"def test_generated_failure():\n    assert False\n")
+    case = _validation_case()
+    case.runner.result_updates = {"status": "failed", "failure_stage": "test"}
 
-    with pytest.raises(CapabilityPackageValidationError, match="package tests"):
-        await CapabilityPackageValidator(content_store=case.store).validate(
+    with pytest.raises(CapabilityPackageValidationError, match="sandbox test"):
+        await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
             package=case.package,
@@ -456,11 +890,132 @@ async def test_validator_rejects_test_paths_not_exactly_declared_as_test_artifac
     )
 
     with pytest.raises(CapabilityPackageValidationError, match="allowlisted test paths"):
-        await CapabilityPackageValidator(content_store=case.store).validate(
+        await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
             package=case.package,
         )
+
+
+def _replace_release_record(
+    case: ValidationCase,
+    index: int,
+    updates: dict[str, object],
+) -> None:
+    evidence = case.release_evidence[index].model_copy(update=updates)
+    content = evidence.model_dump_json(by_alias=True).encode("utf-8")
+    old_ref = case.package.release_evidence_refs[index]
+    reference = old_ref.__class__.model_validate(_ref(content, "application/json"))
+    case.store.content_by_uri[reference.uri] = content
+    release_refs = list(case.package.release_evidence_refs)
+    release_refs[index] = reference
+    package_updates: dict[str, object] = {"release_evidence_refs": tuple(release_refs)}
+    if index == 0:
+        package_updates["recovery_receipt"] = case.package.recovery_receipt.model_copy(
+            update={"evidence_ref": reference}
+        )
+    object.__setattr__(
+        case,
+        "package",
+        case.package.model_copy(update=package_updates),
+    )
+    records = list(case.release_evidence)
+    records[index] = evidence
+    object.__setattr__(case, "release_evidence", tuple(records))
+    _refresh_sealed_package(case)
+
+
+def _replace_release_blob(case: ValidationCase, index: int, content: bytes) -> None:
+    old_ref = case.package.release_evidence_refs[index]
+    reference = old_ref.__class__.model_validate(_ref(content, "application/json"))
+    case.store.content_by_uri[reference.uri] = content
+    release_refs = list(case.package.release_evidence_refs)
+    release_refs[index] = reference
+    package_updates: dict[str, object] = {"release_evidence_refs": tuple(release_refs)}
+    if index == 0:
+        package_updates["recovery_receipt"] = case.package.recovery_receipt.model_copy(
+            update={"evidence_ref": reference}
+        )
+    object.__setattr__(
+        case,
+        "package",
+        case.package.model_copy(update=package_updates),
+    )
+    _refresh_sealed_package(case)
+
+
+def _append_release_record(case: ValidationCase) -> None:
+    evidence = case.release_evidence[-1].model_copy(
+        update={"run_id": "normal-e2e-run-04", "run_number": 5}
+    )
+    content = evidence.model_dump_json(by_alias=True).encode("utf-8")
+    reference = case.package.release_evidence_refs[-1].__class__.model_validate(
+        _ref(content, "application/json")
+    )
+    case.store.content_by_uri[reference.uri] = content
+    object.__setattr__(
+        case,
+        "package",
+        case.package.model_copy(
+            update={
+                "release_evidence_refs": (*case.package.release_evidence_refs, reference)
+            }
+        ),
+    )
+    object.__setattr__(
+        case,
+        "release_evidence",
+        (*case.release_evidence, evidence),
+    )
+    _refresh_sealed_package(case)
+
+
+def _replace_skill_receipt(
+    case: ValidationCase,
+    receipt: HermesSkillUsageReceipt,
+) -> None:
+    content = receipt.model_dump_json(by_alias=True).encode("utf-8")
+    reference = case.package.skill_usage_receipt_ref.__class__.model_validate(
+        _ref(content, "application/json")
+    )
+    case.store.content_by_uri[reference.uri] = content
+    object.__setattr__(
+        case,
+        "package",
+        case.package.model_copy(update={"skill_usage_receipt_ref": reference}),
+    )
+    creation_reference = case.creation_result.skill_usage_receipt_ref
+    assert creation_reference is not None
+    object.__setattr__(
+        case,
+        "creation_result",
+        case.creation_result.model_copy(
+            update={
+                "skill_usage_receipt_ref": creation_reference.__class__.model_validate(
+                    _ref(content, "application/json")
+                )
+            }
+        ),
+    )
+    object.__setattr__(case, "skill_receipt", receipt)
+    _refresh_sealed_package(case)
+
+
+def _refresh_sealed_package(case: ValidationCase) -> None:
+    package_bytes = case.package.model_dump_json(by_alias=True).encode("utf-8")
+    manifest_ref = case.creation_result.package_manifest_ref
+    assert manifest_ref is not None
+    updated_manifest_ref = manifest_ref.__class__.model_validate(
+        _ref(package_bytes, "application/json")
+    )
+    object.__setattr__(
+        case,
+        "creation_result",
+        case.creation_result.model_copy(
+            update={"package_manifest_ref": updated_manifest_ref}
+        ),
+    )
+    case.store.content_by_uri[updated_manifest_ref.uri] = package_bytes
 
 
 async def _replace_source_archive(case: ValidationCase, archive: bytes) -> None:
@@ -479,17 +1034,4 @@ async def _replace_source_archive(case: ValidationCase, archive: bytes) -> None:
         case.creation_result.model_copy(update={"artifact_refs": (creation_source_ref,)}),
     )
     case.store.content_by_uri[source_ref.uri] = archive
-    package_bytes = case.package.model_dump_json(by_alias=True).encode("utf-8")
-    manifest_ref = case.creation_result.package_manifest_ref
-    assert manifest_ref is not None
-    updated_manifest_ref = manifest_ref.model_copy(
-        update={"sha256": hashlib.sha256(package_bytes).hexdigest()}
-    )
-    object.__setattr__(
-        case,
-        "creation_result",
-        case.creation_result.model_copy(
-            update={"package_manifest_ref": updated_manifest_ref}
-        ),
-    )
-    case.store.content_by_uri[updated_manifest_ref.uri] = package_bytes
+    _refresh_sealed_package(case)

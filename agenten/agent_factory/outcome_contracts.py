@@ -101,6 +101,83 @@ class AssertionOutcome(_FrozenContract):
         return _unique_artifact_refs(value, "assertion evidence refs")
 
 
+class CapabilityAssertionResult(_FrozenContract):
+    assertion_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    status: Literal["passed", "failed"]
+
+
+class CapabilityReleaseEvidenceV1(_FrozenContract):
+    """Captain-authored semantic record for one recovery or normal E2E run."""
+
+    schema_name: Literal["captain.capability-release-evidence.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    run_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    run_number: int = Field(ge=1, strict=True)
+    factory_job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    kind: Literal["recovery", "normal"]
+    outcome: Literal["expected_failure_recovered", "succeeded", "failed"]
+    producer: Literal["captain"]
+    assertion_results: tuple[CapabilityAssertionResult, ...] = Field(min_length=1)
+    recovery_id: str | None = Field(default=None, pattern=IDENTIFIER_PATTERN)
+    holdout_ids: tuple[str, ...] = ()
+    downstream_evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_private_content(cls, value: object) -> object:
+        _reject_private_content(value, "capability release evidence")
+        return value
+
+    @field_validator("assertion_results")
+    @classmethod
+    def require_unique_assertions(
+        cls,
+        value: tuple[CapabilityAssertionResult, ...],
+    ) -> tuple[CapabilityAssertionResult, ...]:
+        assertion_ids = tuple(item.assertion_id for item in value)
+        _require_unique_nonblank(assertion_ids, "release evidence assertion IDs")
+        return value
+
+    @field_validator("holdout_ids")
+    @classmethod
+    def require_unique_holdouts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _require_unique_nonblank(value, "release evidence holdout IDs")
+
+    @field_validator("downstream_evidence_refs")
+    @classmethod
+    def require_unique_downstream_evidence(
+        cls,
+        value: tuple[ArtifactRef, ...],
+    ) -> tuple[ArtifactRef, ...]:
+        return _unique_artifact_refs(value, "downstream evidence refs")
+
+    @model_validator(mode="after")
+    def require_kind_semantics(self) -> "CapabilityReleaseEvidenceV1":
+        if self.kind == "recovery":
+            if self.recovery_id is None:
+                raise ValueError("recovery evidence requires recovery_id")
+            if self.outcome != "expected_failure_recovered":
+                raise ValueError(
+                    "recovery evidence requires expected_failure_recovered outcome"
+                )
+        else:
+            if self.recovery_id is not None:
+                raise ValueError("normal evidence cannot include recovery_id")
+            if self.outcome == "expected_failure_recovered":
+                raise ValueError(
+                    "normal evidence cannot use expected_failure_recovered outcome"
+                )
+        return self
+
+    @property
+    def assertion_ids(self) -> tuple[str, ...]:
+        return tuple(item.assertion_id for item in self.assertion_results)
+
+
 class PrivateHoldoutReceipt(_FrozenContract):
     """Opaque result identity for a Captain-owned private holdout."""
 
