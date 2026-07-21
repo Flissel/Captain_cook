@@ -130,6 +130,120 @@ python -m docs.live_evidence_reporter `
 Absent input skips; configured but unreadable or rejected input fails. Never
 replace this with a fixture or claim the reporter itself called live services.
 
+## Six-skill paid live gate
+
+Run the six-skill live gate only after deterministic and database-resetting
+tests. The wrapper requires an explicit positive USD ceiling and an approved
+model. The ceiling accepts at most two fractional decimal places and is
+rejected before formatting, so the wrapper never rounds or widens a supplied
+budget. It checks the exact `captain_test` database, the running Docker test
+service, the six enabled Hermes skills and bundle, Codex authentication, and a
+runtime preflight without printing command output or secret values. It starts
+only the marked six-skill live test:
+
+```powershell
+pwsh -NoProfile -File scripts/run-hermes-factory-live-gate.ps1 `
+  -Mode demo -MaxCostUsd 5.00 -Model $env:CAPTAIN_FACTORY_MODEL
+```
+
+The wrapper loads only its explicit variable allowlist from local `.env` and
+`.env.captain-n8n` files. Existing process variables always win; dedicated
+`CAPTAIN_N8N_*` values then come from `.env.captain-n8n`, with root `.env` as
+the fallback. This n8n loading occurs only with `-WithN8n`. Without the switch,
+the wrapper removes inherited `CAPTAIN_N8N_*` variables before preflight and
+pytest and requires the live report to omit `n8n_evidence`. File contents and
+loaded values are never printed.
+
+Demo mode runs exactly one paid case and may emit `demo_ready` only. After its
+evidence is reviewed, release mode requires a controlled recovery followed by
+three distinct successful provider traces. A declared integration additionally
+uses `-WithN8n`; this requires the Captain n8n URL, API-key reference, and MCP
+lease-token reference to be present in the process environment. The wrapper
+does not start, stop, adopt, or modify the VibeMind-owned n8n deployment.
+
+The final report is written below the operating-system temporary directory, in
+a new run-specific directory, as `sha256-<digest>.json`. It is never written to
+tracked `artifacts/`. For both preflight and final report, the wrapper parses
+and canonically serializes the JSON before it rejects secret-like
+keys (including access tokens, raw prompts, private material, and paths),
+Bearer material, credential-bearing URLs, token-shaped values, absolute host
+paths, and every known DSN/password or opted-in n8n credential value. Normal
+URI schemes such as `artifact://`, `https://`, and `holdout://` remain valid.
+URI userinfo and passwords are blocked in both their raw percent-encoded and
+decoded forms. The preflight and final report must match their exact
+extra-forbid external schemas, including the six-name `skill_digests` mapping
+and the complete provider traces and receipt references. The wrapper then
+recomputes the final digest and rejects an incorrect mode or terminal status.
+It prints the report digest but not the report body or host path.
+
+### Runtime merge contract
+
+The runtime portion must expose the module
+`agenten.agent_factory.factory_live_entrypoint` with both interfaces below.
+This operations branch intentionally does not implement the composition root.
+
+The wrapper invokes the CLI preflight before it marks prerequisites confirmed:
+
+```text
+python -m agenten.agent_factory.factory_live_entrypoint preflight
+  --mode demo|release
+  --max-cost-usd <positive decimal with cents>
+  --model <approved model id>
+  --repository-root <assigned repository root>
+  --report-directory <external run directory>
+  --output <external preflight.json>
+  [--with-n8n]
+```
+
+The preflight output schema is
+`captain.hermes-six-skill-factory-preflight.v1`. It must set
+`prerequisites_confirmed`, `services_verified`, `codex_authenticated`, and
+`skills_verified` to `true`, bind `database_name=captain_test`, and contain
+exactly the six released skill names mapped to their verified lowercase
+SHA-256 digests. The preflight must also prove Gateway/service reachability and
+configuration required by the composition-neutral Factory live runner. It may
+write a redacted diagnostic to the external output path, but must not print
+provider, database, Gateway, Hermes, Codex, or n8n credentials.
+
+After successful preflight, the wrapper sets these process-only inputs:
+
+```text
+CAPTAIN_FACTORY_PREREQUISITES_CONFIRMED=1
+CAPTAIN_FACTORY_GATE_MODE=demo|release
+CAPTAIN_FACTORY_MAX_COST_USD=<decimal>
+CAPTAIN_FACTORY_MODEL=<model id>
+CAPTAIN_FACTORY_WITH_N8N=0|1
+CAPTAIN_FACTORY_REPORT_DIRECTORY=<external run directory>
+CAPTAIN_FACTORY_PREFLIGHT_PATH=<external preflight.json>
+```
+
+The marked live test imports and awaits
+`run_factory_live_gate_from_environment()`. The function returns either a
+mapping or a Pydantic model whose JSON dump equals the one persisted
+`captain.hermes-six-skill-factory-live-report.v1` report. It must propagate
+missing evidence or execution failure; after the wrapper confirms prerequisites
+it must never call `pytest.skip`. The live test converts any runner exception
+outside its original exception context to a generic traceback-free failure,
+and the wrapper suppresses both pytest output streams; neither surface may
+print provider errors or secrets. Provider traces contain distinct trace and
+Codex session IDs plus exact decimal USD receipts. Release output additionally
+contains recovery evidence. With n8n enabled, it also binds the workflow
+digest, MCP call ID, and real execution ID. The report contains neither raw
+prompts/holdouts nor secrets or absolute host paths. Codex session IDs are
+distinct per provider trace, every USD cost is a plain JSON decimal string,
+and an n8n workflow digest is exactly one lowercase SHA-256 value.
+
+Release mode must re-read the Gateway projection before it emits the report.
+Its exact `gateway_promotion` block contains `projection_status=ready_to_use`,
+a complete canonical `FactoryReleaseDecision` with `status=ready`, and a
+complete canonical Captain `FactoryEvidenceBlock` for the succeeded
+`capability_promoted` phase. Both contracts must bind to the report's job and
+correlation, while the promotion block also binds subject version and attempt
+and carries nonempty evidence references. The release decision's evaluation ID
+and reference are mandatory, and the exact evaluation reference must occur in
+the promotion block's artifact references. A terminal-status string alone is
+not release evidence.
+
 ## Expected projections
 
 Minibook receives a redacted registry projection only after Captain records a
