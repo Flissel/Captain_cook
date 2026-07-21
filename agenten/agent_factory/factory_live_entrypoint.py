@@ -518,6 +518,21 @@ class FactorySixSkillLiveCoordinator:
                     tuple(observed_steps),
                     tuple(runner_reports),
                 )
+            if action.kind is FactoryActionKind.RECORD_ESCALATION:
+                self._coordinator.record(
+                    self._captain_block(
+                        job,
+                        phase=FactoryPhase.ESCALATED,
+                        attempt=action.attempt,
+                    )
+                )
+                return self._result(
+                    job,
+                    mode,
+                    "escalated",
+                    tuple(observed_steps),
+                    tuple(runner_reports),
+                )
             if action.kind is FactoryActionKind.WAIT_INFRASTRUCTURE:
                 return self._result(
                     job,

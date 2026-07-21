@@ -3559,9 +3559,9 @@ class GatewayStore:
         lease: FactoryLease,
         projection: FactoryProjection,
         *,
-        now: datetime,
+        now: datetime | None = None,
     ) -> None:
-        action = next_action(projection, now=now)
+        action = next_action(projection, now=lease.issued_at if now is None else now)
         role_actions = {
             FactoryRole.AGENT_ARCHITECT: frozenset({FactoryActionKind.DISPATCH_AGENT_ARCHITECT}),
             FactoryRole.TOOL_INTEGRATOR: frozenset(

@@ -260,6 +260,7 @@ class FactoryCoordinator:
     ):
         self._repository = repository
         self._clock = clock or _SystemFactoryCoordinatorClock()
+        self._deadline_clock = clock
 
     def register(self, job: FactoryJob) -> None:
         self._repository.register(job)
@@ -271,7 +272,7 @@ class FactoryCoordinator:
                 return False
             raise FactoryRepositoryError("event_id already exists with different content")
         projection = self.projection(block.job_id)
-        now = self._clock.now()
+        now = self._deadline_clock.now() if self._deadline_clock is not None else None
         promotion = block.phase.value == "capability_promoted"
         legacy_promotion = promotion and not isinstance(
             projection.job, AgentFactoryJobV3
@@ -307,7 +308,11 @@ class FactoryCoordinator:
             workflow_release_decision=workflow_release_decision,
             now=now,
         )
-        if isinstance(projection.job, AgentFactoryJobV2) and now >= projection.job.deadline_at:
+        if (
+            isinstance(projection.job, AgentFactoryJobV2)
+            and now is not None
+            and now >= projection.job.deadline_at
+        ):
             if (
                 action.kind is not FactoryActionKind.RECORD_ESCALATION
                 or block.phase is not FactoryPhase.ESCALATED
@@ -432,7 +437,13 @@ class FactoryCoordinator:
             workflow_evaluation=workflow_evaluation,
             feedback=feedback,
             workflow_release_decision=workflow_release_decision,
-            now=now or self._clock.now(),
+            now=(
+                now
+                if now is not None
+                else self._deadline_clock.now()
+                if self._deadline_clock is not None
+                else None
+            ),
         ).model_copy(update={"job_id": job_id})
 
     def record_terminal_decision(
