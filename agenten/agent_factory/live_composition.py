@@ -13,7 +13,7 @@ from autogen_core.models import ChatCompletionClient
 
 from agenten.agent_factory.candidate_evaluation import FactoryCandidateProvider
 from agenten.agent_factory.codebase_discovery import DocumentationDiscoveryPort
-from agenten.agent_factory.contracts import AgentFactoryJobV3
+from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryLease
 from agenten.agent_factory.evidence_store import FactoryEvidenceStore
 from agenten.agent_factory.execution_budget import FactoryBudgetPort
 from agenten.agent_factory.hermes_cli import (
@@ -23,24 +23,30 @@ from agenten.agent_factory.hermes_cli import (
 from agenten.agent_factory.orchestration import HermesFactoryPort
 from agenten.agent_factory.skill_workflow_contracts import FactorySkillInvocationV1
 from agenten.agent_factory.team_execution import (
-    FactoryHoldoutEvaluatorPort,
     FactoryLiveTeamExecutionPorts,
     FactoryN8nGrantAuthorityPort,
     FactoryN8nToolAdapterPort,
-    FactoryPricingAuthorityPort,
     TeamExecutionCandidateAdapter,
     compose_live_team_execution as _compose_live_team_execution,
 )
+from agenten.agent_runtime.contracts import IntegrationIntent
 from agenten.agent_runtime.ports import CodexExecutionPort
 
 from .live_codex import BoundCodexBuildAdapter
 from .live_context7 import VerifiedContext7DocumentationAdapter
 from .live_forge import SealedForgeCandidateProvider
-from .live_holdouts import CaptainPrivateHoldoutSelector
+from .live_holdouts import (
+    CaptainPrivateHoldoutAdapter,
+    CaptainPrivateHoldoutEvaluationPort,
+    CaptainPrivateHoldoutSelector,
+    CaptainPrivateHoldoutSourcePort,
+)
 from .live_minibook import (
     MinibookProjectionReadPort,
     ReadOnlyMinibookProjectionAdapter,
 )
+from .live_n8n import DisabledCaptainN8nMcpAdapter, ScopedCaptainN8nMcpAdapter
+from .live_pricing import CaptainPricingAuthorityAdapter, FactoryPricingQuoteSourcePort
 
 
 @dataclass(frozen=True)
@@ -56,10 +62,13 @@ class FactoryLiveRuntimePorts:
         [AgentFactoryJobV3, FactorySkillInvocationV1], ChatCompletionClient
     ]
     budget: FactoryBudgetPort
-    pricing_authority: FactoryPricingAuthorityPort
+    pricing_source: FactoryPricingQuoteSourcePort
     replay_store: FactorySkillReplayStore
-    holdouts: FactoryHoldoutEvaluatorPort
-    n8n_adapter: FactoryN8nToolAdapterPort
+    holdout_source: CaptainPrivateHoldoutSourcePort
+    holdout_evaluator: CaptainPrivateHoldoutEvaluationPort
+    integration_intent: IntegrationIntent
+    n8n_delegate: FactoryN8nToolAdapterPort | None
+    n8n_lease: FactoryLease | None
     n8n_authority: FactoryN8nGrantAuthorityPort
     released_skill_catalog: ReleasedFactorySkillCatalog
     skill_root: Path
@@ -97,10 +106,11 @@ def compose_live_factory_runtime(
         ports.candidate_provider,
         ports.model_client_for,
         ports.budget,
-        ports.pricing_authority,
+        ports.pricing_source,
         ports.replay_store,
-        ports.holdouts,
-        ports.n8n_adapter,
+        ports.holdout_source,
+        ports.holdout_evaluator,
+        ports.integration_intent,
         ports.n8n_authority,
         ports.released_skill_catalog,
         ports.skill_root,
@@ -108,9 +118,38 @@ def compose_live_factory_runtime(
     )
     if any(port is None for port in required):
         raise ValueError("live Factory composition requires every authoritative port")
+    if ports.integration_intent is IntegrationIntent.N8N:
+        if ports.n8n_delegate is None or ports.n8n_lease is None:
+            raise ValueError(
+                "integration_intent=n8n requires an n8n delegate and lease"
+            )
+        if (
+            ports.n8n_lease.job_id != job.job_id
+            or ports.n8n_lease.correlation_id != job.correlation_id
+            or ports.n8n_lease.subject_version != job.subject_version
+        ):
+            raise ValueError("n8n lease is not bound to the Captain job")
+        n8n_adapter: FactoryN8nToolAdapterPort = ScopedCaptainN8nMcpAdapter(
+            lease=ports.n8n_lease,
+            delegate=ports.n8n_delegate,
+        )
+    elif ports.integration_intent is IntegrationIntent.NONE:
+        if ports.n8n_delegate is not None or ports.n8n_lease is not None:
+            raise ValueError(
+                "n8n delegate and lease must be absent without integration_intent=n8n"
+            )
+        n8n_adapter = DisabledCaptainN8nMcpAdapter()
+    else:
+        raise ValueError("unsupported Factory integration intent")
     holdout_selector = CaptainPrivateHoldoutSelector(
         job=job,
         holdout_id=holdout_id,
+    )
+    pricing_authority = CaptainPricingAuthorityAdapter(ports.pricing_source)
+    holdouts = CaptainPrivateHoldoutAdapter(
+        job=job,
+        source=ports.holdout_source,
+        evaluator=ports.holdout_evaluator,
     )
     team_execution = _compose_live_team_execution(
         job=job,
@@ -118,10 +157,10 @@ def compose_live_factory_runtime(
         ports=FactoryLiveTeamExecutionPorts(
             model_client_for=ports.model_client_for,
             budget=ports.budget,
-            pricing_authority=ports.pricing_authority,
+            pricing_authority=pricing_authority,
             replay_store=ports.replay_store,
-            holdouts=ports.holdouts,
-            n8n_adapter=ports.n8n_adapter,
+            holdouts=holdouts,
+            n8n_adapter=n8n_adapter,
             n8n_authority=ports.n8n_authority,
             released_skill_catalog=ports.released_skill_catalog,
             skill_root=ports.skill_root,

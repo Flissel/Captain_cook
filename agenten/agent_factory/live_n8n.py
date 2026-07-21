@@ -16,6 +16,19 @@ from agenten.agent_factory.team_execution import (
 from agenten.agent_runtime.contracts import CapabilityProfile, IntegrationIntent
 
 
+class DisabledCaptainN8nMcpAdapter:
+    """Fail closed when the Factory run has no Captain n8n intent."""
+
+    def tool(self, _name: str) -> BaseTool[BaseModel, Any]:
+        raise ValueError("Captain n8n MCP is disabled for this Factory run")
+
+    def authorization(self, _name: str) -> FactoryN8nToolAuthorizationV1:
+        raise ValueError("Captain n8n MCP is disabled for this Factory run")
+
+    def observed_evidence(self) -> tuple[FactoryN8nExecutionEvidenceV1, ...]:
+        return ()
+
+
 class ScopedCaptainN8nMcpAdapter:
     """Expose an n8n adapter only for an explicit n8n integration intent."""
 

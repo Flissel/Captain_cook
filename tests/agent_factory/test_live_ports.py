@@ -308,9 +308,15 @@ def test_live_composition_passes_only_explicit_authoritative_team_ports(
         VerifiedContext7DocumentationAdapter,
     )
     from agenten.agent_factory.live_forge import SealedForgeCandidateProvider
+    from agenten.agent_factory.live_holdouts import CaptainPrivateHoldoutAdapter
     from agenten.agent_factory.live_minibook import (
         ReadOnlyMinibookProjectionAdapter,
     )
+    from agenten.agent_factory.live_n8n import (
+        DisabledCaptainN8nMcpAdapter,
+        ScopedCaptainN8nMcpAdapter,
+    )
+    from agenten.agent_factory.live_pricing import CaptainPricingAuthorityAdapter
 
     job = _job_v3()
     released, skill_root = _released_skill_fixture(tmp_path)
@@ -329,11 +335,20 @@ def test_live_composition_passes_only_explicit_authoritative_team_ports(
     monkeypatch.setattr(live_composition, "_compose_live_team_execution", compose)
     model_client_for = lambda *_: object()
     budget = InMemoryFactoryBudgetLedger()
-    pricing = _PricingAuthority(_pricing_quote(job))
+    pricing_source = object()
     replay = InMemoryFactorySkillReplayStore()
-    holdouts = object()
-    n8n_adapter = object()
+    holdout_source = object()
+    holdout_evaluator = object()
+    n8n_delegate = object()
     n8n_authority = object()
+    n8n_lease = issue_factory_lease(
+        job=job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/n8n",
+        now=NOW,
+        integration_intent=IntegrationIntent.N8N,
+    )
     clock = lambda: NOW
     codex_runtime = object()
     context7 = object()
@@ -347,10 +362,13 @@ def test_live_composition_passes_only_explicit_authoritative_team_ports(
         minibook=minibook,  # type: ignore[arg-type]
         model_client_for=model_client_for,  # type: ignore[arg-type]
         budget=budget,
-        pricing_authority=pricing,
+        pricing_source=pricing_source,  # type: ignore[arg-type]
         replay_store=replay,
-        holdouts=holdouts,  # type: ignore[arg-type]
-        n8n_adapter=n8n_adapter,  # type: ignore[arg-type]
+        holdout_source=holdout_source,  # type: ignore[arg-type]
+        holdout_evaluator=holdout_evaluator,  # type: ignore[arg-type]
+        integration_intent=IntegrationIntent.N8N,
+        n8n_delegate=n8n_delegate,  # type: ignore[arg-type]
+        n8n_lease=n8n_lease,
         n8n_authority=n8n_authority,  # type: ignore[arg-type]
         released_skill_catalog=Catalog(),  # type: ignore[arg-type]
         skill_root=skill_root,
@@ -383,10 +401,10 @@ def test_live_composition_passes_only_explicit_authoritative_team_ports(
     team_ports = captured["ports"]
     assert team_ports.model_client_for is model_client_for
     assert team_ports.budget is budget
-    assert team_ports.pricing_authority is pricing
+    assert isinstance(team_ports.pricing_authority, CaptainPricingAuthorityAdapter)
     assert team_ports.replay_store is replay
-    assert team_ports.holdouts is holdouts
-    assert team_ports.n8n_adapter is n8n_adapter
+    assert isinstance(team_ports.holdouts, CaptainPrivateHoldoutAdapter)
+    assert isinstance(team_ports.n8n_adapter, ScopedCaptainN8nMcpAdapter)
     assert team_ports.n8n_authority is n8n_authority
     assert team_ports.clock is clock
     assert captured["holdout_selector"](job) == job.private_holdout_refs[0]
@@ -396,6 +414,75 @@ def test_live_composition_passes_only_explicit_authoritative_team_ports(
             job=job,
             evidence_store=evidence_store,
             ports=replace(ports, codex=None),  # type: ignore[arg-type]
+            holdout_id=job.private_holdout_refs[0].holdout_id,
+        )
+
+    ordinary_lease = issue_factory_lease(
+        job=job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/n8n",
+        now=NOW,
+    )
+    with pytest.raises(ValueError, match="integration_intent=n8n"):
+        compose_live_factory_runtime(
+            job=job,
+            evidence_store=evidence_store,
+            ports=replace(ports, n8n_lease=ordinary_lease),
+            holdout_id=job.private_holdout_refs[0].holdout_id,
+        )
+
+    foreign_job = job.model_copy(
+        update={"job_id": uuid4(), "correlation_id": uuid4()}
+    )
+    foreign_lease = issue_factory_lease(
+        job=foreign_job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/n8n",
+        now=NOW,
+        integration_intent=IntegrationIntent.N8N,
+    )
+    with pytest.raises(ValueError, match="n8n lease.*Captain job"):
+        compose_live_factory_runtime(
+            job=job,
+            evidence_store=evidence_store,
+            ports=replace(ports, n8n_lease=foreign_lease),
+            holdout_id=job.private_holdout_refs[0].holdout_id,
+        )
+
+    disabled_components = compose_live_factory_runtime(
+        job=job,
+        evidence_store=evidence_store,
+        ports=replace(
+            ports,
+            integration_intent=IntegrationIntent.NONE,
+            n8n_delegate=None,
+            n8n_lease=None,
+        ),
+        holdout_id=job.private_holdout_refs[0].holdout_id,
+    )
+    assert disabled_components.team_execution is sentinel_adapter
+    disabled_n8n = captured["ports"].n8n_adapter
+    assert isinstance(disabled_n8n, DisabledCaptainN8nMcpAdapter)
+    assert disabled_n8n.observed_evidence() == ()
+    with pytest.raises(ValueError, match="disabled"):
+        disabled_n8n.authorization("support_triage")
+    with pytest.raises(ValueError, match="disabled"):
+        disabled_n8n.tool("support_triage")
+
+    with pytest.raises(ValueError, match="must be absent"):
+        compose_live_factory_runtime(
+            job=job,
+            evidence_store=evidence_store,
+            ports=replace(ports, integration_intent=IntegrationIntent.NONE),
+            holdout_id=job.private_holdout_refs[0].holdout_id,
+        )
+    with pytest.raises(ValueError, match="requires.*delegate.*lease"):
+        compose_live_factory_runtime(
+            job=job,
+            evidence_store=evidence_store,
+            ports=replace(ports, n8n_lease=None),
             holdout_id=job.private_holdout_refs[0].holdout_id,
         )
 
