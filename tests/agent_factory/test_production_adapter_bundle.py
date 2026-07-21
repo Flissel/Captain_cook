@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,11 +16,15 @@ from agenten.agent_factory.capability_factory_production import (
 )
 from agenten.agent_factory.production_adapter_bundle import (
     ContentAddressedRuntimeArtifactPort,
+    GatewayCapabilityFactoryPort,
     ProductionCapabilityFactoryEntrypoint,
     ProductionToolRequired,
     build_capability_factory_entrypoint,
     build_factory_live_runtime,
     production_manifest_commands,
+)
+from agenten.agent_factory.claim_aware_capability_runtime import (
+    ClaimAwareCapabilityRuntime,
 )
 from gateway.factory_live_runtime import FactoryLiveExternalRuntimeGraph
 
@@ -81,6 +86,7 @@ def test_capability_entrypoint_factory_is_real_but_blocks_unimplemented_effects(
     monkeypatch.setenv("TEST_MARIADB_DSN", "mariadb://u:p@127.0.0.1:33306/captain_test")
     monkeypatch.setenv("MINIBOOK_API_KEY", "minibook-secret")
     monkeypatch.setenv("CAPTAIN_RUNTIME_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("CODEX_EXECUTABLE", sys.executable)
 
     entrypoint = build_capability_factory_entrypoint(config)
 
@@ -88,6 +94,7 @@ def test_capability_entrypoint_factory_is_real_but_blocks_unimplemented_effects(
     assert isinstance(entrypoint, ProductionCapabilityFactoryEntrypoint)
     assert isinstance(entrypoint._creation, MinibookSwarmCreationHttpPort)
     assert isinstance(entrypoint._evidence_issuer, RuntimeCaptainEvidenceHttpPort)
+    assert isinstance(entrypoint._runtime, ClaimAwareCapabilityRuntime)
 
 
 def test_capability_entrypoint_rejects_split_runtime_and_creation_cas(
@@ -179,3 +186,34 @@ def test_hermes_preflight_does_not_parse_truncated_human_skill_table() -> None:
 
     assert '("hermes", "skills", "list", "--enabled-only")' not in source
     assert "_require_installed_factory_skill_directories" in source
+
+
+def test_gateway_factory_port_forwards_claim_authority_to_result_write() -> None:
+    class Store:
+        def __init__(self) -> None:
+            self.call = None
+
+        def record_runtime_result(self, result, **claim):
+            self.call = (result, claim)
+            return "receipt"
+
+    store = Store()
+    port = GatewayCapabilityFactoryPort(store)
+    result = object()
+
+    receipt = port.record_runtime_result(
+        result,
+        execution_owner_id="runtime-owner",
+        execution_fencing_token=7,
+        execution_claim_credential="one-time-claim-credential",
+    )
+
+    assert receipt == "receipt"
+    assert store.call == (
+        result,
+        {
+            "execution_owner_id": "runtime-owner",
+            "execution_fencing_token": 7,
+            "execution_claim_credential": "one-time-claim-credential",
+        },
+    )

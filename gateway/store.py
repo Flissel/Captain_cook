@@ -723,9 +723,31 @@ class GatewayStore:
     def record_runtime_result(
         self,
         result: AgentRuntimeResult,
+        *,
+        execution_owner_id: str | None = None,
+        execution_fencing_token: int | None = None,
+        execution_claim_credential: str | None = None,
     ) -> RuntimeWriteReceipt:
+        claim_values = (
+            execution_owner_id,
+            execution_fencing_token,
+            execution_claim_credential,
+        )
+        supplied = tuple(value is not None for value in claim_values)
+        if any(supplied) and not all(supplied):
+            raise HTTPException(
+                status_code=422,
+                detail="runtime execution claim authority must be supplied together",
+            )
         try:
-            self._retry_write(lambda: self._record_runtime_result_once(result))
+            self._retry_write(
+                lambda: self._record_runtime_result_once(
+                    result,
+                    execution_owner_id=execution_owner_id,
+                    execution_fencing_token=execution_fencing_token,
+                    execution_claim_credential=execution_claim_credential,
+                )
+            )
         except _RuntimeReplay as replay:
             return RuntimeWriteReceipt(operation_id=replay.operation_id, replayed=True)
         return RuntimeWriteReceipt(operation_id=result.command_id, replayed=False)
@@ -814,11 +836,18 @@ class GatewayStore:
                 )
                 self._insert(cursor, block)
 
-    def _record_runtime_result_once(self, result: AgentRuntimeResult) -> None:
+    def _record_runtime_result_once(
+        self,
+        result: AgentRuntimeResult,
+        *,
+        execution_owner_id: str | None,
+        execution_fencing_token: int | None,
+        execution_claim_credential: str | None,
+    ) -> None:
         canonical = result.model_dump(mode="json", by_alias=True)
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
-                index = self._next_index(cursor)
+                self._lock_ledger_state(cursor)
                 command_block = self._runtime_block_by_json_value(
                     cursor,
                     block_type="agent_runtime_command",
@@ -830,6 +859,73 @@ class GatewayStore:
                     raise HTTPException(status_code=409, detail="runtime command not found")
                 command = AgentRuntimeCommand.model_validate(command_block["data"])
                 self._assert_result_matches_command(result, command)
+
+                cursor.execute(
+                    """SELECT payload, credential_sha256, block_index
+                       FROM runtime_execution_claims
+                       WHERE command_id = %s FOR UPDATE""",
+                    (str(result.command_id),),
+                )
+                claim_row = cursor.fetchone()
+                claim_authority_supplied = execution_owner_id is not None
+                current_claim: RuntimeExecutionClaim | None = None
+                if claim_row is not None:
+                    current_claim = RuntimeExecutionClaim.model_validate(
+                        self._decode_json(claim_row["payload"])
+                    )
+                    if not claim_authority_supplied:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="runtime result requires current execution claim authority",
+                        )
+                    assert execution_owner_id is not None
+                    assert execution_fencing_token is not None
+                    assert execution_claim_credential is not None
+                    current_claim_block = self._row_by_index(
+                        cursor,
+                        int(claim_row["block_index"]),
+                        for_update=True,
+                    )
+                    if current_claim_block is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="current runtime execution claim ledger block is missing",
+                        )
+                    ledger_current_claim = RuntimeExecutionClaim.model_validate(
+                        current_claim_block["data"]
+                    )
+                    expected_ledger_current = current_claim.model_copy(
+                        update={"status": "active", "completed_at": None}
+                    )
+                    if (
+                        current_claim_block["block_type"]
+                        != "runtime_execution_claim"
+                        or current_claim_block["parent_index"]
+                        != command_block["index"]
+                        or ledger_current_claim != expected_ledger_current
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "current runtime execution claim disagrees with the ledger"
+                            ),
+                        )
+                    self._assert_execution_claim_completion_authority(
+                        current_claim,
+                        owner_id=execution_owner_id,
+                        fencing_token=execution_fencing_token,
+                        credential=execution_claim_credential,
+                        credential_sha256=str(claim_row["credential_sha256"] or ""),
+                    )
+                    self._assert_result_occurred_within_claim(
+                        current_claim,
+                        occurred_at=result.occurred_at,
+                    )
+                elif claim_authority_supplied:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime result has no current execution claim",
+                    )
 
                 grant_block = self._runtime_block_by_json_value(
                     cursor,
@@ -861,12 +957,29 @@ class GatewayStore:
 
                 existing = self._runtime_result_block(cursor, result, for_update=True)
                 if existing is not None:
-                    if existing["data"] == canonical:
+                    if existing["data"] == canonical and (
+                        current_claim is None or current_claim.status == "completed"
+                    ):
                         raise _RuntimeReplay(result.command_id)
                     raise HTTPException(
                         status_code=409,
                         detail="runtime command or result event already has different content",
                     )
+                completion_time: datetime | None = None
+                if current_claim is not None:
+                    completion_time = self._now()
+                    self._assert_execution_claim_fence(
+                        current_claim,
+                        owner_id=execution_owner_id,
+                        fencing_token=execution_fencing_token,
+                        now=completion_time,
+                    )
+                    if result.occurred_at > completion_time:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="runtime result is after Gateway completion time",
+                        )
+                index = self._next_index(cursor)
                 block = self._new_block(
                     cursor,
                     index=index,
@@ -877,6 +990,31 @@ class GatewayStore:
                     metadata={"schema": "captain.agent-runtime-result.v1"},
                 )
                 self._insert(cursor, block)
+                if current_claim is not None and completion_time is not None:
+                    completed = current_claim.model_copy(
+                        update={
+                            "status": "completed",
+                            "completed_at": completion_time,
+                        }
+                    )
+                    cursor.execute(
+                        """UPDATE runtime_execution_claims
+                           SET status = 'completed', payload = %s
+                           WHERE command_id = %s AND fencing_token = %s""",
+                        (
+                            json.dumps(
+                                completed.model_dump(mode="json", by_alias=True),
+                                sort_keys=True,
+                            ),
+                            str(result.command_id),
+                            current_claim.fencing_token,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="runtime execution claim fence changed during completion",
+                        )
 
     def runtime_operation(self, operation_id: UUID) -> RuntimeOperationProjection:
         with self.storage.transaction() as connection:

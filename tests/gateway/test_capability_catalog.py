@@ -1117,6 +1117,35 @@ def test_gateway_store_exposes_durable_capability_execution_round_trip() -> None
     assert callable(GatewayStore.capability_execution)
 
 
+def test_gateway_result_write_requires_complete_claim_authority() -> None:
+    store = object.__new__(GatewayStore)
+    calls: list[dict[str, object]] = []
+    store._retry_write = lambda operation: operation()
+    store._record_runtime_result_once = lambda _result, **claim: calls.append(claim)
+
+    with pytest.raises(HTTPException, match="supplied together"):
+        store.record_runtime_result(
+            _runtime_result(),
+            execution_owner_id="runtime-a",
+        )
+
+    receipt = store.record_runtime_result(
+        _runtime_result(),
+        execution_owner_id="runtime-a",
+        execution_fencing_token=2,
+        execution_claim_credential="one-time-recovery-credential",
+    )
+
+    assert receipt.replayed is False
+    assert calls == [
+        {
+            "execution_owner_id": "runtime-a",
+            "execution_fencing_token": 2,
+            "execution_claim_credential": "one-time-recovery-credential",
+        }
+    ]
+
+
 class _AuthorityStore:
     def __init__(self) -> None:
         self.release = release_request()
@@ -1132,6 +1161,7 @@ class _AuthorityStore:
         self.recovery_request = _runtime_result_recovery_request()
         self.release_calls = 0
         self.recovery_calls = 0
+        self.runtime_result_calls: list[tuple[object, dict[str, object]]] = []
         self.nonrelease_terminal = self.release.decision.model_copy(
             update={
                 "decision_id": UUID("00000000-0000-0000-0000-000000000799"),
@@ -1197,6 +1227,13 @@ class _AuthorityStore:
         return RuntimeWriteReceipt(
             operation_id=request.result.command_id,
             replayed=self.recovery_calls > 1,
+        )
+
+    def record_runtime_result(self, result, **claim):
+        self.runtime_result_calls.append((result, claim))
+        return RuntimeWriteReceipt(
+            operation_id=result.command_id,
+            replayed=len(self.runtime_result_calls) > 1,
         )
 
     def runtime_result_recovery(self, command_id):
@@ -1282,6 +1319,50 @@ def test_authority_routes_are_captain_write_and_reader_read_scoped() -> None:
     assert recovery_readback.json()["event_id"] == str(
         store.recovery_request.observation.event_id
     )
+
+
+def test_runtime_result_claim_headers_are_complete_captain_authority() -> None:
+    store = _AuthorityStore()
+    result = _runtime_result().model_dump(mode="json", by_alias=True)
+    headers = {
+        "X-Runtime-Owner-ID": "runtime-a",
+        "X-Runtime-Fencing-Token": "2",
+        "X-Runtime-Claim-Credential": "one-time-recovery-credential",
+    }
+
+    with TestClient(_application(store, GatewayRole.WORKER)) as worker:
+        denied = worker.post("/v1/runtime/results", json=result, headers=headers)
+    with TestClient(_application(store, GatewayRole.CAPTAIN)) as captain:
+        partial = captain.post(
+            "/v1/runtime/results",
+            json=result,
+            headers={"X-Runtime-Owner-ID": "runtime-a"},
+        )
+        created = captain.post("/v1/runtime/results", json=result, headers=headers)
+        replay = captain.post("/v1/runtime/results", json=result, headers=headers)
+
+    assert denied.status_code == 403
+    assert partial.status_code == 422
+    assert created.status_code == 201
+    assert replay.status_code == 200
+    assert store.runtime_result_calls == [
+        (
+            _runtime_result(),
+            {
+                "execution_owner_id": "runtime-a",
+                "execution_fencing_token": 2,
+                "execution_claim_credential": "one-time-recovery-credential",
+            },
+        ),
+        (
+            _runtime_result(),
+            {
+                "execution_owner_id": "runtime-a",
+                "execution_fencing_token": 2,
+                "execution_claim_credential": "one-time-recovery-credential",
+            },
+        ),
+    ]
 
 
 def test_nonrelease_terminal_decision_has_its_own_captain_api() -> None:

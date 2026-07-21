@@ -638,9 +638,51 @@ def create_app(
     async def record_runtime_result(
         result: AgentRuntimeResult,
         response: Response,
-        _: GatewayRole = Depends(require_actor),
+        execution_owner_id: str | None = Header(
+            default=None,
+            alias="X-Runtime-Owner-ID",
+            min_length=1,
+        ),
+        execution_fencing_token: int | None = Header(
+            default=None,
+            alias="X-Runtime-Fencing-Token",
+            ge=1,
+        ),
+        execution_claim_credential: str | None = Header(
+            default=None,
+            alias="X-Runtime-Claim-Credential",
+            min_length=20,
+        ),
+        actor: GatewayRole = Depends(require_actor),
     ) -> RuntimeWriteReceipt:
-        receipt = get_store().record_runtime_result(result)
+        claim_values = (
+            execution_owner_id,
+            execution_fencing_token,
+            execution_claim_credential,
+        )
+        supplied = tuple(value is not None for value in claim_values)
+        if any(supplied) and not all(supplied):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="runtime execution claim headers must be supplied together",
+            )
+        if all(supplied):
+            if actor is not GatewayRole.CAPTAIN:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="insufficient gateway role",
+                )
+            assert execution_owner_id is not None
+            assert execution_fencing_token is not None
+            assert execution_claim_credential is not None
+            receipt = get_store().record_runtime_result(
+                result,
+                execution_owner_id=execution_owner_id,
+                execution_fencing_token=execution_fencing_token,
+                execution_claim_credential=execution_claim_credential,
+            )
+        else:
+            receipt = get_store().record_runtime_result(result)
         if receipt.replayed:
             response.status_code = status.HTTP_200_OK
         else:

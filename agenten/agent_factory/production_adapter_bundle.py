@@ -22,10 +22,8 @@ from typing import Any
 from uuid import UUID
 
 from agenten.agent_factory.capability_factory_entrypoint import (
-    CapabilityExecutionPlan,
     CapabilityFactoryEntrypoint,
     CapabilityFactoryRunSummary,
-    CapabilityRuntimeExecution,
     DockerCapabilitySandboxRunner,
     FileCapabilityFactoryCheckpointStore,
 )
@@ -48,8 +46,9 @@ from agenten.agent_factory.forge_contracts import ArtifactRef as ForgeArtifactRe
 from agenten.agent_factory.forge_contracts import ReleasedSkillRefV1
 from agenten.agent_factory.holdout_store import InMemoryPrivateHoldoutStore
 from agenten.agent_factory.input_document import load_factory_input
-from agenten.agent_factory.outcome_contracts import (
-    ExecutionOutcomeV1,
+from agenten.agent_factory.claim_aware_capability_runtime import (
+    ClaimAwareCapabilityRuntime,
+    ContentAddressedCapabilityEffectStore,
 )
 from agenten.agent_factory.state_machine import FactoryAction
 import httpx
@@ -375,47 +374,8 @@ def build_runtime_app_with_v3_evidence(
     )
 
 
-class _TodoCapabilityRuntime:
-    async def prepare(self, job: Any, authority: Any) -> CapabilityExecutionPlan:
-        del job, authority
-        raise _todo("claim_aware_capability_runtime")
-
-    async def execute(
-        self,
-        plan: CapabilityExecutionPlan,
-        authority: Any,
-        claim: Any,
-        *,
-        effect_id: UUID,
-    ) -> CapabilityRuntimeExecution:
-        del plan, authority, claim, effect_id
-        raise _todo("claim_aware_capability_runtime")
-
-    def guarantees_durable_idempotency(self, plan: Any, authority: Any) -> bool:
-        del plan, authority
-        return False
-
-    async def lookup_effect(self, *, command_id: UUID, effect_id: UUID) -> None:
-        del command_id, effect_id
-        return None
-
-    async def derive_outcome(
-        self,
-        plan: CapabilityExecutionPlan,
-        authority: Any,
-        result: Any,
-    ) -> ExecutionOutcomeV1:
-        del plan, authority, result
-        raise _todo("claim_aware_capability_runtime")
-
-
 class GatewayCapabilityFactoryPort:
-    """Package-C adapter over the real GatewayStore authority.
-
-    The legacy result write cannot satisfy Package C's execution-claim fence.
-    That single operation therefore fails closed rather than silently dropping
-    the credential/fencing inputs.
-    """
+    """Package-C adapter preserving GatewayStore claim/fence authority."""
 
     def __init__(self, store: GatewayStore) -> None:
         self._store = store
@@ -424,8 +384,7 @@ class GatewayCapabilityFactoryPort:
         return getattr(self._store, name)
 
     def record_runtime_result(self, result: Any, **claim: Any) -> object:
-        del result, claim
-        raise _todo("gateway_claim_aware_runtime_result_endpoint")
+        return self._store.record_runtime_result(result, **claim)
 
     def projection_events(self, correlation_id: UUID) -> tuple[Any, ...]:
         cursor = -1
@@ -586,6 +545,11 @@ def build_capability_factory_entrypoint(config: Any) -> CapabilityFactoryEntrypo
     gateway = GatewayCapabilityFactoryPort(store)
     minibook_api_key = _required_environment("MINIBOOK_API_KEY")
     capability_http = httpx.AsyncClient(timeout=30.0)
+    runtime_artifacts = ContentAddressedRuntimeArtifactPort(artifact_root)
+    codex = StrictCodexCliExecution(
+        _resolved_executable(os.environ, "CODEX_EXECUTABLE", "codex"),
+        runtime_artifacts,
+    )
     minibook = MinibookClient(
         config.minibook_url,
         minibook_api_key,
@@ -611,7 +575,12 @@ def build_capability_factory_entrypoint(config: Any) -> CapabilityFactoryEntrypo
             capability_http,
         ),
         gateway=gateway,
-        runtime=_TodoCapabilityRuntime(),
+        runtime=ClaimAwareCapabilityRuntime(
+            executor=codex,
+            artifacts=content,
+            effects=ContentAddressedCapabilityEffectStore(artifact_root),
+            clock=lambda: datetime.now(timezone.utc),
+        ),
         projector=MinibookProjector(
             minibook,
             ProjectionCursorStore(artifact_root / "projection-cursor.sqlite3"),
