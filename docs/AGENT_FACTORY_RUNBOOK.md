@@ -130,6 +130,86 @@ python -m docs.live_evidence_reporter `
 Absent input skips; configured but unreadable or rejected input fails. Never
 replace this with a fixture or claim the reporter itself called live services.
 
+## Six-skill paid live gate
+
+Run the six-skill live gate only after deterministic and database-resetting
+tests. The wrapper requires an explicit positive USD ceiling and an approved
+model. It checks the exact `captain_test` database, the running Docker test
+service, the six enabled Hermes skills and bundle, Codex authentication, and a
+runtime preflight without printing command output or secret values. It starts
+only the marked six-skill live test:
+
+```powershell
+pwsh -NoProfile -File scripts/run-hermes-factory-live-gate.ps1 `
+  -Mode demo -MaxCostUsd 5.00 -Model $env:CAPTAIN_FACTORY_MODEL
+```
+
+Demo mode runs exactly one paid case and may emit `demo_ready` only. After its
+evidence is reviewed, release mode requires a controlled recovery followed by
+three distinct successful provider traces. A declared integration additionally
+uses `-WithN8n`; this requires the Captain n8n URL, API-key reference, and MCP
+lease-token reference to be present in the process environment. The wrapper
+does not start, stop, adopt, or modify the VibeMind-owned n8n deployment.
+
+The final report is written below the operating-system temporary directory, in
+a new run-specific directory, as `sha256-<digest>.json`. It is never written to
+tracked `artifacts/`. The wrapper recomputes the digest and rejects secret-like
+keys, authorization material, absolute user paths, an incorrect mode, and an
+incorrect terminal status. It prints the report digest but not the report body
+or host path.
+
+### Runtime merge contract
+
+The runtime portion must expose the module
+`agenten.agent_factory.factory_live_entrypoint` with both interfaces below.
+This operations branch intentionally does not implement the composition root.
+
+The wrapper invokes the CLI preflight before it marks prerequisites confirmed:
+
+```text
+python -m agenten.agent_factory.factory_live_entrypoint preflight
+  --mode demo|release
+  --max-cost-usd <positive decimal with cents>
+  --model <approved model id>
+  --repository-root <assigned repository root>
+  --report-directory <external run directory>
+  --output <external preflight.json>
+  [--with-n8n]
+```
+
+The preflight output schema is
+`captain.hermes-six-skill-factory-preflight.v1`. It must set
+`prerequisites_confirmed`, `services_verified`, `codex_authenticated`, and
+`skills_verified` to `true`, bind `database_name=captain_test`, and contain
+exactly the six released skill names mapped to their verified lowercase
+SHA-256 digests. The preflight must also prove Gateway/service reachability and
+configuration required by the composition-neutral Factory live runner. It may
+write a redacted diagnostic to the external output path, but must not print
+provider, database, Gateway, Hermes, Codex, or n8n credentials.
+
+After successful preflight, the wrapper sets these process-only inputs:
+
+```text
+CAPTAIN_FACTORY_PREREQUISITES_CONFIRMED=1
+CAPTAIN_FACTORY_GATE_MODE=demo|release
+CAPTAIN_FACTORY_MAX_COST_USD=<decimal>
+CAPTAIN_FACTORY_MODEL=<model id>
+CAPTAIN_FACTORY_WITH_N8N=0|1
+CAPTAIN_FACTORY_REPORT_DIRECTORY=<external run directory>
+CAPTAIN_FACTORY_PREFLIGHT_PATH=<external preflight.json>
+```
+
+The marked live test imports and awaits
+`run_factory_live_gate_from_environment()`. The function returns either a
+mapping or a Pydantic model whose JSON dump equals the one persisted
+`captain.hermes-six-skill-factory-live-report.v1` report. It must propagate
+missing evidence or execution failure; after the wrapper confirms prerequisites
+it must never call `pytest.skip`. Provider traces contain distinct trace and
+Codex session IDs plus exact decimal USD receipts. Release output additionally
+contains recovery evidence. With n8n enabled, it also binds the workflow
+digest, MCP call ID, and real execution ID. The report contains neither raw
+prompts/holdouts nor secrets or absolute host paths.
+
 ## Expected projections
 
 Minibook receives a redacted registry projection only after Captain records a

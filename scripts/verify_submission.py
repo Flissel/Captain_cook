@@ -15,6 +15,9 @@ REQUIRED_FILES = (
     "docs/WORKSTREAMS.md",
     "docs/MCP_SETUP.md",
     "docs/codex-sessions.md",
+    "docs/AGENT_FACTORY_RUNBOOK.md",
+    "scripts/run-hermes-factory-live-gate.ps1",
+    "tests/live/test_hermes_six_skill_factory_live.py",
 )
 REQUIRED_ARTIFACT_FIELDS = ("success", "problem_id", "done_count", "blocks")
 
