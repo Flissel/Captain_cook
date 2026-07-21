@@ -14,6 +14,7 @@ import pytest
 
 from agenten.agent_factory.candidate_evaluation import (
     FactoryCandidateEvaluationResult,
+    FactoryCandidateEvaluator,
     FactoryCandidateManifest,
     FactoryEvaluationCheck,
     ResolvedFactoryCandidate,
@@ -21,11 +22,11 @@ from agenten.agent_factory.candidate_evaluation import (
 from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryRole
 from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
 from agenten.agent_factory.execution_budget import (
-    FactoryBudgetReservationV1,
     FactoryUsageReceiptV1,
     InMemoryFactoryBudgetLedger,
 )
 from agenten.agent_factory.leases import issue_factory_lease
+from agenten.agent_factory.hermes_cli import InMemoryFactorySkillReplayStore
 from agenten.agent_factory.n8n_tools import TypedN8nTool
 from agenten.agent_factory.outcome_contracts import AssertionOutcome, ExecutionOutcomeV1
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
@@ -34,21 +35,31 @@ from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillStep,
 )
 from agenten.agent_factory.team_execution import (
+    BudgetedChatCompletionClient,
     FactoryN8nExecutionEvidenceV1,
+    FactoryPricingQuoteV1,
     FactoryTeamRunResult,
-    SealedAutoGenTeamRunner,
+    HostAutoGenTeamRunner,
+    ResolvedFactoryHoldoutCase,
     TeamExecutionService,
 )
 from agenten.agent_runtime.contracts import (
+    AgentRuntimeCommand,
+    AgentRuntimeCommandPayload,
     AgentRuntimeResult,
     ArtifactRef,
     CapabilityGrant,
     CapabilityProfile,
     IntegrationIntent,
     RuntimeOperation,
+    RuntimeLimits,
     RuntimeStatus,
 )
 from agenten.targets.n8n import N8nExecutionEvidence
+from agenten.llm.model_client import build_replay_model_client
+from autogen_core.models import ModelFamily, ModelInfo, UserMessage
+from autogen_ext.models.replay import ReplayChatCompletionClient
+from autogen_agentchat.teams import Swarm
 
 
 NOW = datetime(2026, 7, 21, 13, tzinfo=timezone.utc)
@@ -67,7 +78,11 @@ def _artifact(
     )
 
 
-def _job_v3(*, live_execution: bool = True) -> AgentFactoryJobV3:
+def _job_v3(
+    *,
+    live_execution: bool = True,
+    holdout_body: bytes | None = None,
+) -> AgentFactoryJobV3:
     policy = {
         "schema": "captain.factory-execution-policy.v1",
         "mode": "demo",
@@ -106,7 +121,11 @@ def _job_v3(*, live_execution: bool = True) -> AgentFactoryJobV3:
                     "schema_name": "captain.private-holdout-ref.v1",
                     "holdout_id": "holdout-222222222222",
                     "uri": "holdout://holdout-222222222222",
-                    "sha256": "d" * 64,
+                    "sha256": (
+                        hashlib.sha256(holdout_body).hexdigest()
+                        if holdout_body is not None
+                        else "d" * 64
+                    ),
                 }
             ],
             "max_behavioral_iterations": 5,
@@ -205,6 +224,7 @@ def _sealed_team_candidate(tmp_path: Path) -> ResolvedFactoryCandidate:
         "memory_policy": "buffered",
         "max_messages": 20,
         "max_handoffs": 4,
+        "max_tool_calls": 6,
         "termination_conditions": ["task_completed", "provider_cost_unresolved"],
         "entrypoint_command": ["python", "run_team.py"],
     }
@@ -347,13 +367,6 @@ async def test_failed_preflight_never_reserves_or_calls_provider(
                 candidate_manifest=resolved.candidate,
             )
 
-    class Budget:
-        reservations: list[Decimal] = []
-
-        def reserve(self, *_: object, **__: object) -> object:
-            self.reservations.append(Decimal("5.00"))
-            raise AssertionError("preflight failure must precede cost reservation")
-
     class Runner:
         max_cost_usd = Decimal("1.00")
         calls: list[object] = []
@@ -362,12 +375,10 @@ async def test_failed_preflight_never_reserves_or_calls_provider(
             self.calls.append(kwargs)
             raise AssertionError("preflight failure must precede provider execution")
 
-    budget = Budget()
     runner = Runner()
     evidence = await TeamExecutionService(
         job=job,
         preflight=Preflight(),
-        budget=budget,
         runner=runner,
         evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
         clock=lambda: NOW,
@@ -379,7 +390,6 @@ async def test_failed_preflight_never_reserves_or_calls_provider(
 
     assert evidence.status == "failed"
     assert evidence.termination_reason == "preflight_failed"
-    assert budget.reservations == []
     assert runner.calls == []
 
 
@@ -426,10 +436,14 @@ async def test_live_run_reserves_records_usage_handoffs_and_termination(
 
         async def run(
             self,
-            *,
-            reservation: FactoryBudgetReservationV1,
             **kwargs: object,
         ) -> FactoryTeamRunResult:
+            reservation = budget.reserve(
+                job,
+                attempt=invocation.attempt,
+                requested_usd=Decimal("1.00"),
+                now=NOW,
+            )
             assert budget.projection(job.job_id).reserved_usd == Decimal("1")
             assert kwargs["allowed_models"] == ("approved-model-id",)
             assert kwargs["max_seconds"] > 0
@@ -489,6 +503,7 @@ async def test_live_run_reserves_records_usage_handoffs_and_termination(
                 ended_at=reservation.reserved_at + timedelta(seconds=2),
                 evidence_ref=_artifact("factory-usage", "8" * 64),
             )
+            budget.record_usage(job, reservation, receipt)
             return FactoryTeamRunResult(
                 status="succeeded",
                 runtime_result=runtime,
@@ -496,18 +511,28 @@ async def test_live_run_reserves_records_usage_handoffs_and_termination(
                 usage_receipts=(receipt,),
                 handoff_evidence_refs=(handoff_ref,),
                 tool_evidence_refs=(tool_ref,),
+                conversation_pattern="swarm",
+                message_count=1,
+                handoff_count=0,
+                tool_call_count=0,
                 termination_reason="task_completed",
             )
 
     runner = Runner()
-    evidence = await TeamExecutionService(
+    service = TeamExecutionService(
         job=job,
         preflight=Preflight(),
-        budget=budget,
         runner=runner,
         evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
+        replay_store=InMemoryFactorySkillReplayStore(),
         clock=lambda: NOW,
-    ).execute(invocation, candidate, job.private_holdout_refs[0])
+    )
+    evidence = await service.execute(
+        invocation, candidate, job.private_holdout_refs[0]
+    )
+    replayed = await service.execute(
+        invocation, candidate, job.private_holdout_refs[0]
+    )
 
     assert evidence.status == "succeeded"
     assert evidence.termination_reason == "task_completed"
@@ -515,13 +540,89 @@ async def test_live_run_reserves_records_usage_handoffs_and_termination(
     assert evidence.handoff_evidence_refs == (handoff_ref,)
     assert evidence.tool_evidence_refs == (tool_ref,)
     assert len(runner.calls) == 1
+    assert replayed == evidence
     projection = budget.projection(job.job_id)
     assert projection.consumed_usd == Decimal("0.42")
     assert projection.reserved_usd == Decimal("0")
 
 
 @pytest.mark.asyncio
-async def test_provider_failure_releases_reservation_without_inventing_zero_cost(
+async def test_budgeted_model_client_reserves_before_every_provider_call(
+    tmp_path: Path,
+) -> None:
+    job = _job_v3()
+    budget = InMemoryFactoryBudgetLedger()
+    client = BudgetedChatCompletionClient(
+        job=job,
+        attempt=1,
+        delegate=build_replay_model_client(["first", "second"]),
+        budget=budget,
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "provider-evidence"),
+        provider="deterministic-replay",
+        model="approved-model-id",
+        max_cost_per_call=Decimal("0.50"),
+        pricing_quote=FactoryPricingQuoteV1(
+            quote_id="deterministic-price-v1",
+            provider="deterministic-replay",
+            model="approved-model-id",
+            version="2026-07-21",
+            effective_at=NOW,
+            input_cost_per_million="0",
+            output_cost_per_million="0",
+            minimum_cost_usd="0.10",
+            evidence_ref=_artifact("factory-pricing", "4" * 64),
+        ),
+        clock=lambda: NOW,
+    )
+
+    await client.create([UserMessage(content="one", source="user")])
+    await client.create([UserMessage(content="two", source="user")])
+
+    assert len(client.usage_receipts) == 2
+    assert len({item.reservation_id for item in client.usage_receipts}) == 2
+    assert budget.projection(job.job_id).consumed_usd == Decimal("0.20")
+    assert budget.projection(job.job_id).reserved_usd == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_dispatched_provider_failure_keeps_unknown_cost_reservation_active(
+    tmp_path: Path,
+) -> None:
+    job = _job_v3()
+    budget = InMemoryFactoryBudgetLedger()
+    client = BudgetedChatCompletionClient(
+        job=job,
+        attempt=1,
+        delegate=build_replay_model_client([]),
+        budget=budget,
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "unknown-cost"),
+        provider="deterministic-replay",
+        model="approved-model-id",
+        max_cost_per_call=Decimal("0.50"),
+        pricing_quote=FactoryPricingQuoteV1(
+            quote_id="deterministic-price-v1",
+            provider="deterministic-replay",
+            model="approved-model-id",
+            version="2026-07-21",
+            effective_at=NOW,
+            input_cost_per_million="0",
+            output_cost_per_million="0",
+            minimum_cost_usd="0.10",
+            evidence_ref=_artifact("factory-pricing", "4" * 64),
+        ),
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(Exception):
+        await client.create([UserMessage(content="dispatch", source="user")])
+
+    projection = budget.projection(job.job_id)
+    assert projection.consumed_usd == Decimal("0")
+    assert projection.reserved_usd == Decimal("0.50")
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_keeps_dispatched_unknown_cost_reserved(
     tmp_path: Path,
 ) -> None:
     job = _job_v3()
@@ -531,14 +632,20 @@ async def test_provider_failure_releases_reservation_without_inventing_zero_cost
         max_cost_usd = Decimal("1.00")
 
         async def run(self, **_: object) -> FactoryTeamRunResult:
+            budget.reserve(
+                job,
+                attempt=1,
+                requested_usd=Decimal("1.00"),
+                now=NOW,
+            )
             raise RuntimeError("provider failed before reporting usage")
 
     evidence = await TeamExecutionService(
         job=job,
         preflight=_SuccessfulPreflight(),
-        budget=budget,
         runner=Runner(),
         evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
+        replay_store=InMemoryFactorySkillReplayStore(),
         clock=lambda: NOW,
     ).execute(
         _invocation(job),
@@ -550,41 +657,151 @@ async def test_provider_failure_releases_reservation_without_inventing_zero_cost
     assert evidence.termination_reason == "provider_cost_unresolved"
     projection = budget.projection(job.job_id)
     assert projection.consumed_usd == Decimal("0")
-    assert projection.reserved_usd == Decimal("0")
+    assert projection.reserved_usd == Decimal("1.00")
 
 
 @pytest.mark.asyncio
-async def test_sealed_runner_executes_deterministic_team_outside_captain_process(
+async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entrypoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-generated-code")
-    job = _job_v3()
-    reservation = InMemoryFactoryBudgetLedger().reserve(
-        job,
+    holdout_body = b"Resolve the private support case."
+    job = _job_v3(holdout_body=holdout_body)
+    budget = InMemoryFactoryBudgetLedger()
+    evidence_store = FilesystemFactoryEvidenceStore(tmp_path / "host-evidence")
+    model_client = BudgetedChatCompletionClient(
+        job=job,
         attempt=1,
-        requested_usd=Decimal("1.00"),
-        now=NOW,
-    )
-    runner = SealedAutoGenTeamRunner(
-        max_cost_usd=Decimal("1.00"),
-        provider_environment={"FACTORY_PROVIDER_FAKE_MODE": "deterministic"},
+        delegate=ReplayChatCompletionClient(
+            ["TERMINATE"],
+            model_info=ModelInfo(
+                vision=False,
+                function_calling=True,
+                json_output=True,
+                family=ModelFamily.UNKNOWN,
+                structured_output=True,
+            ),
+        ),
+        budget=budget,
+        evidence_store=evidence_store,
+        provider="deterministic-replay",
+        model="approved-model-id",
+        max_cost_per_call=Decimal("0.50"),
+        pricing_quote=FactoryPricingQuoteV1(
+            quote_id="deterministic-price-v1",
+            provider="deterministic-replay",
+            model="approved-model-id",
+            version="2026-07-21",
+            effective_at=NOW,
+            input_cost_per_million="0",
+            output_cost_per_million="0",
+            minimum_cost_usd="0.10",
+            evidence_ref=_artifact("factory-pricing", "4" * 64),
+        ),
+        clock=lambda: NOW,
     )
 
+    async def support_triage(ticket: str) -> str:
+        return f"routed:{ticket}"
+
+    class TrustedN8nAdapter:
+        def tool(self, name: str) -> object:
+            assert name == "support_triage"
+            return support_triage
+
+        def observed_evidence(self) -> tuple[FactoryN8nExecutionEvidenceV1, ...]:
+            return ()
+
+    class Holdouts:
+        async def resolve(self, reference: object) -> ResolvedFactoryHoldoutCase:
+            assert reference == job.private_holdout_refs[0]
+            return ResolvedFactoryHoldoutCase(
+                reference=job.private_holdout_refs[0],
+                body=holdout_body,
+            )
+
+        async def evaluate(
+            self,
+            reference: object,
+            result: object,
+            assertion_ids: tuple[str, ...],
+        ) -> dict[str, bool]:
+            assert reference == job.private_holdout_refs[0]
+            assert result is not None
+            return {assertion_id: True for assertion_id in assertion_ids}
+
+    untrusted_runner = HostAutoGenTeamRunner(
+        model_client=model_client,
+        evaluator=FactoryCandidateEvaluator(),
+        evidence_store=evidence_store,
+        holdouts=Holdouts(),  # type: ignore[arg-type]
+        tools={"support_triage": support_triage},
+        clock=lambda: NOW,
+    )
+    with pytest.raises(ValueError, match="trusted n8n adapter"):
+        await untrusted_runner.run(
+            job=job,
+            invocation=_invocation(job),
+            candidate=_sealed_team_candidate(tmp_path),
+            case_ref=job.private_holdout_refs[0],
+            lease=_invocation(job).lease,
+            allowed_models=job.execution_policy.allowed_models,
+            max_seconds=10,
+        )
+
+    runner = HostAutoGenTeamRunner(
+        model_client=model_client,
+        evaluator=FactoryCandidateEvaluator(),
+        evidence_store=evidence_store,
+        holdouts=Holdouts(),  # type: ignore[arg-type]
+        tools={},
+        n8n_adapter=TrustedN8nAdapter(),  # type: ignore[arg-type]
+        clock=lambda: NOW,
+    )
+    captured_tokens: list[object] = []
+    original_run = Swarm.run
+
+    async def observed_run(self: Swarm, **kwargs: object) -> object:
+        captured_tokens.append(kwargs.get("cancellation_token"))
+        return await original_run(self, **kwargs)  # type: ignore[arg-type,return-value]
+
+    monkeypatch.setattr(Swarm, "run", observed_run)
+
     result = await runner.run(
+        job=job,
+        invocation=_invocation(job),
         candidate=_sealed_team_candidate(tmp_path),
         case_ref=job.private_holdout_refs[0],
         lease=_invocation(job).lease,
-        reservation=reservation,
         allowed_models=job.execution_policy.allowed_models,
         max_seconds=10,
     )
 
-    assert result.status == "unresolved"
-    assert result.usage_receipts == ()
-    assert result.termination_reason == "provider_cost_unresolved"
-    assert runner.last_manifest is not None
-    assert runner.last_manifest.conversation_pattern == "swarm"
+    assert result.status == "succeeded"
+    assert len(result.usage_receipts) == 1
+    assert result.termination_reason == "task_completed"
+    assert result.conversation_pattern == "swarm"
+    assert captured_tokens[0] is not None
+
+    timeout_tokens: list[object] = []
+
+    async def blocked_run(self: Swarm, **kwargs: object) -> object:
+        timeout_tokens.append(kwargs["cancellation_token"])
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(Swarm, "run", blocked_run)
+    with pytest.raises(asyncio.TimeoutError):
+        await runner.run(
+            job=job,
+            invocation=_invocation(job),
+            candidate=_sealed_team_candidate(tmp_path),
+            case_ref=job.private_holdout_refs[0],
+            lease=_invocation(job).lease,
+            allowed_models=job.execution_policy.allowed_models,
+            max_seconds=0.01,
+        )
+    assert timeout_tokens[0].is_cancelled()  # type: ignore[attr-defined]
 
 
 def test_n8n_execution_requires_separate_scope_and_matching_digest() -> None:
@@ -598,10 +815,30 @@ def test_n8n_execution_requires_separate_scope_and_matching_digest() -> None:
         subtask_id="n8n-tool-call",
         workspace_ref="workspace://factory/n8n-tool-call",
         profile=CapabilityProfile.N8N_BUILDER,
-        capabilities=("mcp.n8n",),
+        capabilities=("mcp.n8n", "n8n.workflow.read", "n8n.workflow.write"),
         mcp_servers=("n8n-mcp",),
         issued_at=NOW,
         expires_at=NOW + timedelta(minutes=5),
+    )
+    command = AgentRuntimeCommand(
+        schema_name="captain.agent-runtime-command.v1",
+        event_id=command_id,
+        correlation_id=_job_v3().correlation_id,
+        occurred_at=NOW,
+        producer="captain",
+        subject_id="n8n-tool-call",
+        subject_version=1,
+        payload=AgentRuntimeCommandPayload(
+            operation=RuntimeOperation.CODEX_RUN,
+            project_id="factory-team",
+            batch_id=grant.batch_id,
+            subtask_id=grant.subtask_id,
+            workspace_ref=grant.workspace_ref,
+            prompt_ref=_artifact("n8n-command", "d" * 64),
+            integration_intent=IntegrationIntent.N8N,
+            capability_profile=CapabilityProfile.N8N_BUILDER,
+            limits=RuntimeLimits(wall_seconds=60, max_iterations=2),
+        ),
     )
     runtime = AgentRuntimeResult(
         schema_name="captain.agent-runtime-result.v1",
@@ -620,6 +857,7 @@ def test_n8n_execution_requires_separate_scope_and_matching_digest() -> None:
     with pytest.raises(ValueError, match="n8n execution evidence"):
         FactoryN8nExecutionEvidenceV1(
             tool_name="support_triage",
+            runtime_command=command,
             capability_grant=grant,
             runtime_result=runtime,
             mcp_call_id="mcp-call-1",
@@ -636,13 +874,12 @@ def test_n8n_execution_requires_separate_scope_and_matching_digest() -> None:
 
 
 @pytest.mark.asyncio
-async def test_timeout_cancels_runner_and_releases_reserved_budget(
+async def test_timeout_cancels_runner_and_records_unresolved_evidence(
     tmp_path: Path,
 ) -> None:
     job = _job_v3()
     invocation = _invocation(job)
     near_expiry = invocation.lease.expires_at - timedelta(milliseconds=10)
-    budget = InMemoryFactoryBudgetLedger()
     cancelled = asyncio.Event()
 
     class Runner:
@@ -658,24 +895,22 @@ async def test_timeout_cancels_runner_and_releases_reserved_budget(
     evidence = await TeamExecutionService(
         job=job,
         preflight=_SuccessfulPreflight(),
-        budget=budget,
         runner=Runner(),
         evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
+        replay_store=InMemoryFactorySkillReplayStore(),
         clock=lambda: near_expiry,
     ).execute(invocation, _candidate(tmp_path), job.private_holdout_refs[0])
 
     assert evidence.status == "unresolved"
     assert evidence.termination_reason == "provider_cost_unresolved"
     assert cancelled.is_set()
-    assert budget.projection(job.job_id).reserved_usd == Decimal("0")
 
 
 @pytest.mark.asyncio
-async def test_caller_cancellation_propagates_after_budget_release(
+async def test_caller_cancellation_propagates_and_marks_replay_failed(
     tmp_path: Path,
 ) -> None:
     job = _job_v3()
-    budget = InMemoryFactoryBudgetLedger()
     started = asyncio.Event()
 
     class Runner:
@@ -690,9 +925,9 @@ async def test_caller_cancellation_propagates_after_budget_release(
         TeamExecutionService(
             job=job,
             preflight=_SuccessfulPreflight(),
-            budget=budget,
             runner=Runner(),
             evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
+            replay_store=InMemoryFactorySkillReplayStore(),
             clock=lambda: NOW,
         ).execute(_invocation(job), _candidate(tmp_path), job.private_holdout_refs[0])
     )
@@ -701,5 +936,3 @@ async def test_caller_cancellation_propagates_after_budget_release(
 
     with pytest.raises(asyncio.CancelledError):
         await execution
-
-    assert budget.projection(job.job_id).reserved_usd == Decimal("0")

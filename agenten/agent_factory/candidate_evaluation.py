@@ -12,7 +12,7 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import time
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from uuid import NAMESPACE_URL, uuid5
 import zipfile
 from contextlib import contextmanager
@@ -38,6 +38,7 @@ from agenten.agent_factory.evidence_store import FactoryEvidenceStore
 from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference, TypedN8nTool
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
 from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationRequest
+from agenten.agent_factory.skill_workflow_contracts import TeamExecutionEvidenceV1
 from agenten.agent_factory.state_machine import FactoryActionKind
 from agenten.agent_runtime.contracts import ArtifactRef
 
@@ -94,6 +95,7 @@ class FactoryAutoGenTeamManifestV1(_FrozenModel):
     memory_policy: str = Field(min_length=1, max_length=64)
     max_messages: int = Field(ge=1, le=100, strict=True)
     max_handoffs: int = Field(ge=0, le=50, strict=True)
+    max_tool_calls: int = Field(ge=0, le=100, strict=True)
     termination_conditions: tuple[str, ...] = Field(min_length=1)
     entrypoint_command: tuple[str, ...] = Field(min_length=2)
 
@@ -748,6 +750,16 @@ class StaticFactoryCandidateProvider(FactoryCandidateProvider):
             raise FileNotFoundError("no sealed candidate is registered for the factory job") from exc
 
 
+class FactoryTeamExecutionPort(Protocol):
+    """Production real-case boundary, implemented with TeamExecutionService."""
+
+    async def execute(
+        self,
+        request: FactoryDispatch,
+        candidate: ResolvedFactoryCandidate,
+    ) -> TeamExecutionEvidenceV1: ...
+
+
 class CandidateEvaluationFactory:
     """Emit leased Hermes lifecycle blocks from independently persisted evaluation evidence."""
 
@@ -757,17 +769,34 @@ class CandidateEvaluationFactory:
         provider: FactoryCandidateProvider,
         evidence_store: FactoryEvidenceStore,
         evaluator: FactoryCandidateEvaluator | None = None,
+        team_execution: FactoryTeamExecutionPort | None = None,
     ) -> None:
         self._provider = provider
         self._evidence_store = evidence_store
         self._evaluator = evaluator or FactoryCandidateEvaluator()
+        self._team_execution = team_execution
 
     async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
         phase, role = _validation_phase(request.action.kind)
         if request.role is not role or request.lease is None or request.lease.role is not role:
             raise FactoryDispatchError("candidate validation requires the matching active factory lease")
+        if request.action.kind is FactoryActionKind.DISPATCH_REAL_CASE_TESTER:
+            if self._team_execution is None:
+                raise FactoryDispatchError(
+                    "real-case dispatch requires a configured TeamExecutionService"
+                )
         try:
             resolved = self._provider.candidate_for(request.job)
+            if request.action.kind is FactoryActionKind.DISPATCH_REAL_CASE_TESTER:
+                assert self._team_execution is not None
+                team_evidence = await self._team_execution.execute(request, resolved)
+                sealed = await self._evidence_store.persist(
+                    request.job,
+                    team_evidence.model_dump_json(
+                        by_alias=True, exclude_none=True
+                    ).encode("utf-8"),
+                )
+                return _team_execution_block(request, resolved, team_evidence, sealed)
             result = self._evaluator.evaluate(
                 job=request.job,
                 candidate=resolved.candidate,
@@ -837,3 +866,56 @@ def _result_phase(phase: FactoryPhase, status: str) -> FactoryPhase:
     if phase is FactoryPhase.BUILD_PASSED and status != "succeeded":
         return FactoryPhase.BUILD_FAILED
     return phase
+
+
+def _team_execution_block(
+    request: FactoryDispatch,
+    resolved: ResolvedFactoryCandidate,
+    evidence: TeamExecutionEvidenceV1,
+    sealed: ArtifactRef,
+) -> FactoryEvidenceBlock:
+    assert request.lease is not None
+    if (
+        evidence.job_id != request.job.job_id
+        or evidence.correlation_id != request.job.correlation_id
+        or evidence.subject_version != request.job.subject_version
+        or evidence.attempt != request.action.attempt
+        or evidence.invocation.lease != request.lease
+    ):
+        raise FactoryDispatchError(
+            "TeamExecutionService evidence does not match the factory dispatch"
+        )
+    status = (
+        FactoryBlockStatus.SUCCEEDED
+        if evidence.status == "succeeded"
+        else FactoryBlockStatus.FAILED
+    )
+    return FactoryEvidenceBlock(
+        schema_name="captain.agent-factory-block.v1",
+        event_id=uuid5(
+            NAMESPACE_URL,
+            f"factory-team-execution|{request.job.job_id}|{request.action.attempt}|{sealed.sha256}",
+        ),
+        job_id=request.job.job_id,
+        correlation_id=request.job.correlation_id,
+        causation_id=request.job.event_id,
+        occurred_at=evidence.occurred_at,
+        producer="hermes",
+        subject_version=request.job.subject_version,
+        attempt=request.action.attempt,
+        phase=FactoryPhase.REAL_CASE_EVIDENCE,
+        role=FactoryRole.REAL_CASE_TESTER,
+        status=status,
+        artifact_refs=(
+            resolved.candidate.source_archive_ref,
+            resolved.candidate.team_manifest.reference,
+            evidence.artifact_ref,
+        ),
+        evidence_refs=(sealed, *evidence.evidence_refs),
+        assertion_ids=(
+            evidence.acceptance_assertion_ids
+            if evidence.status == "succeeded"
+            else ()
+        ),
+        lease_id=request.lease.lease_id,
+    )

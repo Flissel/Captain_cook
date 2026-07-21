@@ -22,7 +22,7 @@ from agenten.agent_factory.candidate_evaluation import (
 from agenten.agent_factory.contracts import FactoryPhase, FactoryRole
 from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
 from agenten.agent_factory.leases import issue_factory_lease
-from agenten.agent_factory.orchestration import FactoryDispatch
+from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.n8n_tools import (
@@ -95,6 +95,7 @@ def test_autogen_manifest_defaults_to_swarm_for_specialist_handoffs() -> None:
             "memory_policy": "buffered",
             "max_messages": 20,
             "max_handoffs": 4,
+            "max_tool_calls": 6,
             "termination_conditions": ["task_completed", "max_messages"],
             "entrypoint_command": ["python", "run_team.py"],
         },
@@ -145,6 +146,7 @@ def test_autogen_manifest_rejects_unknown_tools_and_handoffs(
                 "memory_policy": "none",
                 "max_messages": 10,
                 "max_handoffs": 2,
+                "max_tool_calls": 3,
                 "termination_conditions": ["task_completed"],
                 "entrypoint_command": ["python", "run_team.py"],
             },
@@ -641,6 +643,119 @@ async def test_validator_persists_build_evidence_for_a_leased_candidate(tmp_path
     assert block.status.value == "succeeded"
     assert block.assertion_ids == ()
     assert block.evidence_refs[0].uri.startswith("artifact://factory-evidence/")
+
+
+@pytest.mark.asyncio
+async def test_real_case_dispatch_never_accepts_candidate_owned_offline_evaluator(
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "candidate.zip"
+    team_ref, workflow_ref, input_ref, output_ref, source_ref = _write_candidate_archive(
+        archive_path
+    )
+    candidate = FactoryCandidateManifest(
+        candidate_id="support_triage_v1",
+        source_archive_ref=source_ref,
+        team_manifest={"reference": team_ref, "relative_path": "team_manifest.json"},
+        workflow_artifacts=(
+            {
+                "reference": workflow_ref,
+                "relative_path": "workflows/support_triage.json",
+            },
+        ),
+        tool_schema_artifacts=(
+            {
+                "reference": input_ref,
+                "relative_path": "schemas/support_triage.input.json",
+            },
+            {
+                "reference": output_ref,
+                "relative_path": "schemas/support_triage.output.json",
+            },
+        ),
+        n8n_tools=(
+            TypedN8nTool(
+                name="support_triage",
+                description="Route support.",
+                input_schema_ref=input_ref.uri,
+                output_schema_ref=output_ref.uri,
+            ),
+        ),
+        build_command=("python", "-m", "compileall", "-q", "."),
+        real_case_command=("python", "run_case.py"),
+        timeout_seconds=10,
+    )
+    factory_job = job()
+    lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.REAL_CASE_TESTER,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage",
+        now=factory_job.occurred_at,
+    )
+    validator = CandidateEvaluationFactory(
+        provider=StaticFactoryCandidateProvider(
+            {
+                factory_job.job_id: ResolvedFactoryCandidate(
+                    candidate=candidate,
+                    source_archive=archive_path,
+                )
+            }
+        ),
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
+    )
+
+    with pytest.raises(FactoryDispatchError, match="TeamExecutionService"):
+        await validator.dispatch(
+            FactoryDispatch(
+                job=factory_job,
+                action=FactoryAction(
+                    kind=FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
+                    attempt=1,
+                ),
+                role=FactoryRole.REAL_CASE_TESTER,
+                lease=lease,
+            )
+        )
+
+    class RoutedThroughTeamExecution(RuntimeError):
+        pass
+
+    class TeamExecution:
+        async def execute(
+            self,
+            request: FactoryDispatch,
+            resolved: ResolvedFactoryCandidate,
+        ) -> object:
+            assert request.action.kind is FactoryActionKind.DISPATCH_REAL_CASE_TESTER
+            assert resolved.candidate == candidate
+            raise RoutedThroughTeamExecution
+
+    routed = CandidateEvaluationFactory(
+        provider=StaticFactoryCandidateProvider(
+            {
+                factory_job.job_id: ResolvedFactoryCandidate(
+                    candidate=candidate,
+                    source_archive=archive_path,
+                )
+            }
+        ),
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "routed-evidence"),
+        team_execution=TeamExecution(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(RoutedThroughTeamExecution):
+        await routed.dispatch(
+            FactoryDispatch(
+                job=factory_job,
+                action=FactoryAction(
+                    kind=FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
+                    attempt=1,
+                ),
+                role=FactoryRole.REAL_CASE_TESTER,
+                lease=lease,
+            )
+        )
 
 
 @pytest.mark.asyncio
