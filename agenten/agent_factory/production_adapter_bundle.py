@@ -14,11 +14,14 @@ import hashlib
 import json
 import os
 import shutil
+import tempfile
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from agenten.agent_factory.capability_factory_entrypoint import (
@@ -43,7 +46,13 @@ from agenten.agent_factory.factory_live_runner import (
     FactoryLiveEffectRequestV1,
 )
 from agenten.agent_factory.forge_contracts import ArtifactRef as ForgeArtifactRef
-from agenten.agent_factory.forge_contracts import ReleasedSkillRefV1
+from agenten.agent_factory.forge_contracts import CreationJobV1, ReleasedSkillRefV1
+from agenten.agent_factory.hermes_cli import (
+    HermesCliFactory,
+    HermesCliSettings,
+    _parse_evidence_payload,
+    _parse_paid_usage,
+)
 from agenten.agent_factory.holdout_store import InMemoryPrivateHoldoutStore
 from agenten.agent_factory.input_document import load_factory_input
 from agenten.agent_factory.claim_aware_capability_runtime import (
@@ -51,9 +60,17 @@ from agenten.agent_factory.claim_aware_capability_runtime import (
     ContentAddressedCapabilityEffectStore,
 )
 from agenten.agent_factory.state_machine import FactoryAction
+from agenten.agent_factory.skill_evaluation import (
+    BoundedEvaluationCommand,
+    HermesSkillUsageReceipt,
+    ReleasedHermesSkill,
+    ToolGapMarker,
+    ToolImplementationOption,
+)
+from agenten.agent_factory.skill_store import reject_sensitive_data
 import httpx
 from fastapi import HTTPException, status
-from pydantic import SecretStr
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, SecretStr, model_validator
 
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
@@ -62,6 +79,7 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrant,
     HermesPlanResult,
 )
+from agenten.agent_factory.contracts import AgentFactoryJobV2
 from agenten.agent_runtime.runtime_entrypoint import (
     RuntimeEntrypointSettings,
     compose_gateway_backed_runtime_executor,
@@ -581,6 +599,355 @@ class _UtcClock:
         return datetime.now(timezone.utc)
 
 
+class _HermesCreationReceiptDeclaration(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    receipt_id: UUID
+    request_id: UUID
+    lease_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    occurred_at: datetime
+    commands: tuple[BoundedEvaluationCommand, ...] = Field(min_length=1, max_length=5)
+    assertion_ids: tuple[str, ...] = Field(min_length=1)
+    outcome: Literal["passed", "blocked_tool_gap"]
+
+
+class _HermesCreationGapDeclaration(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    schema_name: Literal["TODO_TOOL.v1"] = Field(alias="schema", serialization_alias="schema")
+    gap_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    severity: Literal["required", "optional"]
+    input_contract: dict[str, JsonValue] = Field(min_length=1)
+    output_contract: dict[str, JsonValue] = Field(min_length=1)
+    least_privilege_capability: str = Field(
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
+    implementation_options: tuple[ToolImplementationOption, ...] = Field(max_length=3)
+    acceptance_assertion_ids: tuple[str, ...] = Field(min_length=1)
+    evidence: dict[str, JsonValue] = Field(min_length=1)
+    status: Literal["unresolved", "resolved"]
+
+
+class _HermesCreationAnalysisPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    schema_name: Literal["captain.hermes-creation-analysis.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    creation_job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    receipt: _HermesCreationReceiptDeclaration
+    tool_gaps: tuple[_HermesCreationGapDeclaration, ...]
+
+    @model_validator(mode="after")
+    def require_consistent_outcome(self) -> "_HermesCreationAnalysisPayload":
+        gap_ids = tuple(item.gap_id for item in self.tool_gaps)
+        if len(gap_ids) != len(set(gap_ids)):
+            raise ValueError("Hermes creation tool gap IDs must be unique")
+        blocked = any(
+            item.severity == "required" and item.status == "unresolved"
+            for item in self.tool_gaps
+        )
+        expected = "blocked_tool_gap" if blocked else "passed"
+        if self.receipt.outcome != expected:
+            raise ValueError("Hermes creation outcome contradicts declared tool gaps")
+        return self
+
+
+@dataclass(frozen=True)
+class HermesCreationEvidenceMaterialization:
+    creation_job_id: UUID
+    skill_usage_receipt_ref: ArtifactRef
+    tool_gaps_ref: ArtifactRef
+    envelope_ref: ArtifactRef
+
+
+def _creation_json_bytes(value: BaseModel | Mapping[str, object]) -> bytes:
+    payload = (
+        value.model_dump(mode="json", by_alias=True)
+        if isinstance(value, BaseModel)
+        else value
+    )
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+class ProductionHermesCreationAnalysis:
+    """One paid Hermes analysis, then immutable CAS-only replay."""
+
+    def __init__(
+        self,
+        *,
+        artifacts: ContentAddressedArtifactStore,
+        hermes: HermesCliFactory,
+        released_skill_path: Path,
+        max_cost_per_call_usd: Decimal | str,
+        timeout_seconds: int,
+    ) -> None:
+        self._artifacts = artifacts
+        self._hermes = hermes
+        self._released_skill_path = released_skill_path.resolve()
+        try:
+            maximum = Decimal(str(max_cost_per_call_usd))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError("Hermes creation cost cap is invalid") from exc
+        if not maximum.is_finite() or maximum <= 0:
+            raise ValueError("Hermes creation cost cap is invalid")
+        if timeout_seconds < 1:
+            raise ValueError("Hermes creation timeout is invalid")
+        self._maximum = maximum
+        self._timeout_seconds = timeout_seconds
+
+    async def analyze(
+        self,
+        job: AgentFactoryJobV2,
+        creation_job: CreationJobV1,
+    ) -> HermesCreationEvidenceMaterialization:
+        replayed = self._replay(creation_job)
+        if replayed is not None:
+            return replayed
+        if not self._released_skill_path.is_dir():
+            raise ProductionToolRequired("TODO_TOOL:released_capability_factory_skill")
+        prompt = self._prompt(job, creation_job)
+        with tempfile.TemporaryDirectory(prefix="captain-hermes-creation-") as temporary:
+            usage_path = Path(temporary) / "usage.json"
+            stdout = await self._hermes._run_skill_prompt(
+                prompt,
+                max_seconds=float(self._timeout_seconds),
+                usage_file=usage_path,
+            )
+            try:
+                usage_bytes = usage_path.read_bytes()
+            except OSError as exc:
+                raise ValueError("Hermes creation paid usage receipt is unavailable") from exc
+        usage = _parse_paid_usage(usage_bytes)
+        if usage.estimated_cost_usd > self._maximum:
+            raise ValueError("Hermes creation provider cost exceeds per-call cap")
+        payload = _HermesCreationAnalysisPayload.model_validate(
+            _parse_evidence_payload(stdout)
+        )
+        self._require_binding(job, creation_job, payload)
+        reject_sensitive_data(
+            payload.model_dump(mode="json", by_alias=True),
+            "Hermes creation analysis",
+        )
+        return self._materialize(job, creation_job, payload, usage_bytes)
+
+    def _prompt(self, job: AgentFactoryJobV2, creation_job: CreationJobV1) -> str:
+        request = {
+            "instruction": (
+                "Use the released skill at released_skill_path. Analyze the exact creation "
+                "job before Minibook starts. Return exactly one JSON object matching "
+                "response_schema. Declare every missing tool as TODO_TOOL.v1; use [] only "
+                "when your actual analysis finds no gaps. Do not include credentials."
+            ),
+            "released_skill_path": str(self._released_skill_path),
+            "released_skill": creation_job.released_skill.model_dump(mode="json", by_alias=True),
+            "creation_job": creation_job.model_dump(mode="json", by_alias=True),
+            "factory_job_id": str(job.job_id),
+            "response_schema": _HermesCreationAnalysisPayload.model_json_schema(by_alias=True),
+        }
+        return json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _require_binding(
+        job: AgentFactoryJobV2,
+        creation_job: CreationJobV1,
+        payload: _HermesCreationAnalysisPayload,
+    ) -> None:
+        if (
+            payload.creation_job_id != creation_job.creation_job_id
+            or payload.correlation_id != job.correlation_id
+            or payload.subject_version != job.subject_version
+            or payload.receipt.assertion_ids != job.acceptance_assertion_ids
+            or payload.receipt.occurred_at < job.occurred_at
+            or payload.receipt.occurred_at >= job.deadline_at
+            or payload.receipt.commands
+            != (
+                BoundedEvaluationCommand(
+                    command_id="hermes.creation-analysis",
+                    max_seconds=payload.receipt.commands[0].max_seconds,
+                ),
+            )
+        ):
+            raise ValueError("Hermes creation analysis changed Captain authority")
+        allowed = set(job.acceptance_assertion_ids)
+        if any(
+            not set(gap.acceptance_assertion_ids).issubset(allowed)
+            for gap in payload.tool_gaps
+        ):
+            raise ValueError("Hermes creation tool gap exceeds Captain assertions")
+
+    def _materialize(
+        self,
+        job: AgentFactoryJobV2,
+        creation_job: CreationJobV1,
+        payload: _HermesCreationAnalysisPayload,
+        usage_bytes: bytes,
+    ) -> HermesCreationEvidenceMaterialization:
+        paid_ref = self._artifacts.put(
+            usage_bytes, "application/json", namespace="hermes-paid-usage"
+        )
+        gaps: list[ToolGapMarker] = []
+        for gap in payload.tool_gaps:
+            input_ref = self._artifacts.put(
+                _creation_json_bytes(gap.input_contract),
+                "application/json",
+                namespace="hermes-gap-input",
+            )
+            output_ref = self._artifacts.put(
+                _creation_json_bytes(gap.output_contract),
+                "application/json",
+                namespace="hermes-gap-output",
+            )
+            evidence_ref = self._artifacts.put(
+                _creation_json_bytes(gap.evidence),
+                "application/json",
+                namespace="hermes-gap-evidence",
+            )
+            gaps.append(
+                ToolGapMarker(
+                    schema="TODO_TOOL.v1",
+                    gap_id=gap.gap_id,
+                    severity=gap.severity,
+                    input_contract_ref=input_ref,
+                    output_contract_ref=output_ref,
+                    least_privilege_capability=gap.least_privilege_capability,
+                    implementation_options=gap.implementation_options,
+                    acceptance_assertion_ids=gap.acceptance_assertion_ids,
+                    evidence_ref=evidence_ref,
+                    status=gap.status,
+                )
+            )
+        gap_envelope = {
+            "schema": "minibook.creation-tool-gaps.v1",
+            "tool_gaps": [item.model_dump(mode="json", by_alias=True) for item in gaps],
+        }
+        gaps_ref = self._artifacts.put(
+            _creation_json_bytes(gap_envelope),
+            "application/json",
+            namespace="hermes-tool-gaps",
+        )
+        released = ReleasedHermesSkill(
+            schema="captain.released-hermes-skill.v1",
+            skill_id=creation_job.released_skill.skill_id,
+            version=creation_job.released_skill.version,
+            capability="autogen.agent-factory",
+            content_ref=ArtifactRef.model_validate(
+                creation_job.released_skill.content_ref.model_dump(mode="json")
+            ),
+            content_sha256=creation_job.released_skill.content_sha256,
+            status="released",
+            released_at=job.occurred_at,
+            producer="captain",
+        )
+        evidence_refs = tuple(dict.fromkeys((paid_ref, *(gap.evidence_ref for gap in gaps))))
+        receipt = HermesSkillUsageReceipt(
+            schema="hermes.skill-usage-receipt.v1",
+            receipt_id=payload.receipt.receipt_id,
+            request_id=payload.receipt.request_id,
+            job_id=job.job_id,
+            correlation_id=job.correlation_id,
+            lease_id=payload.receipt.lease_id,
+            occurred_at=payload.receipt.occurred_at,
+            producer="hermes",
+            released_skill=released,
+            used_skill_id=released.skill_id,
+            used_skill_version=released.version,
+            used_skill_sha256=released.content_sha256,
+            commands=payload.receipt.commands,
+            evidence_refs=evidence_refs,
+            assertion_ids=payload.receipt.assertion_ids,
+            outcome=payload.receipt.outcome,
+        )
+        receipt_ref = self._artifacts.put(
+            _creation_json_bytes(receipt),
+            "application/json",
+            namespace="hermes-receipt",
+        )
+        envelope = {
+            "schema": "captain.hermes-creation-evidence-binding.v1",
+            "creation_job_id": str(creation_job.creation_job_id),
+            "skill_usage_receipt_ref": receipt_ref.model_dump(mode="json"),
+            "tool_gaps_ref": gaps_ref.model_dump(mode="json"),
+        }
+        envelope_ref = self._artifacts.put(
+            _creation_json_bytes(envelope),
+            "application/json",
+            namespace="hermes-creation-evidence",
+        )
+        self._artifacts.bind(
+            "hermes-creation-evidence",
+            str(creation_job.creation_job_id),
+            envelope_ref,
+        )
+        return HermesCreationEvidenceMaterialization(
+            creation_job_id=creation_job.creation_job_id,
+            skill_usage_receipt_ref=receipt_ref,
+            tool_gaps_ref=gaps_ref,
+            envelope_ref=envelope_ref,
+        )
+
+    def _replay(
+        self, creation_job: CreationJobV1
+    ) -> HermesCreationEvidenceMaterialization | None:
+        envelope_ref = self._artifacts.binding(
+            "hermes-creation-evidence", str(creation_job.creation_job_id)
+        )
+        if envelope_ref is None:
+            return None
+        try:
+            envelope = json.loads(self._artifacts.read_bytes(envelope_ref))
+            if (
+                not isinstance(envelope, dict)
+                or set(envelope)
+                != {
+                    "schema",
+                    "creation_job_id",
+                    "skill_usage_receipt_ref",
+                    "tool_gaps_ref",
+                }
+                or envelope["schema"]
+                != "captain.hermes-creation-evidence-binding.v1"
+                or envelope["creation_job_id"] != str(creation_job.creation_job_id)
+            ):
+                raise ValueError
+            receipt_ref = ArtifactRef.model_validate(envelope["skill_usage_receipt_ref"])
+            gaps_ref = ArtifactRef.model_validate(envelope["tool_gaps_ref"])
+            HermesSkillUsageReceipt.model_validate_json(
+                self._artifacts.read_bytes(receipt_ref)
+            )
+            gap_payload = json.loads(self._artifacts.read_bytes(gaps_ref))
+            if (
+                not isinstance(gap_payload, dict)
+                or set(gap_payload) != {"schema", "tool_gaps"}
+                or gap_payload["schema"] != "minibook.creation-tool-gaps.v1"
+                or not isinstance(gap_payload["tool_gaps"], list)
+            ):
+                raise ValueError
+            for item in gap_payload["tool_gaps"]:
+                marker = ToolGapMarker.model_validate(item)
+                for reference in (
+                    marker.input_contract_ref,
+                    marker.output_contract_ref,
+                    marker.evidence_ref,
+                ):
+                    self._artifacts.read_bytes(reference)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("Hermes creation evidence replay is invalid") from exc
+        return HermesCreationEvidenceMaterialization(
+            creation_job_id=creation_job.creation_job_id,
+            skill_usage_receipt_ref=receipt_ref,
+            tool_gaps_ref=gaps_ref,
+            envelope_ref=envelope_ref,
+        )
+
+
 class ProductionCapabilityFactoryEntrypoint(CapabilityFactoryEntrypoint):
     """Package-C entrypoint that materializes its canonical input in shared CAS."""
 
@@ -774,6 +1141,38 @@ def build_capability_factory_entrypoint(config: Any) -> CapabilityFactoryEntrypo
     if shared_root != artifact_root:
         raise _todo("configuration:shared_capability_artifact_root")
     content = ContentAddressedArtifactStore(artifact_root)
+    released_skill_path = (
+        root
+        / "agenten"
+        / "agent_factory"
+        / "skills"
+        / "captain-agent-factory-loop"
+    ).resolve()
+    hermes_timeout_raw = os.environ.get("CAPTAIN_FACTORY_RUNTIME_SECONDS", "600").strip()
+    try:
+        hermes_timeout = int(hermes_timeout_raw)
+    except ValueError as exc:
+        raise _todo("configuration:CAPTAIN_FACTORY_RUNTIME_SECONDS") from exc
+    if hermes_timeout < 1:
+        raise _todo("configuration:CAPTAIN_FACTORY_RUNTIME_SECONDS")
+    hermes_creation_analysis = ProductionHermesCreationAnalysis(
+        artifacts=content,
+        hermes=HermesCliFactory(
+            HermesCliSettings(
+                executable=_resolved_executable(
+                    os.environ, "HERMES_EXECUTABLE", "hermes"
+                ),
+                model=os.environ.get("CAPTAIN_FACTORY_MODEL", "").strip() or None,
+                provider=os.environ.get("CAPTAIN_FACTORY_PROVIDER", "").strip() or None,
+                timeout_seconds=hermes_timeout,
+            )
+        ),
+        released_skill_path=released_skill_path,
+        max_cost_per_call_usd=_required_environment(
+            "CAPTAIN_FACTORY_MAX_COST_PER_CALL_USD"
+        ),
+        timeout_seconds=hermes_timeout,
+    )
     store = LazyGatewayStore(dsn)
     gateway = GatewayCapabilityFactoryPort(store)
     minibook_api_key = _required_environment("MINIBOOK_API_KEY")
@@ -790,6 +1189,7 @@ def build_capability_factory_entrypoint(config: Any) -> CapabilityFactoryEntrypo
     )
     return ProductionCapabilityFactoryEntrypoint(
         production_artifacts=content,
+        creation_analysis=hermes_creation_analysis,
         checkpoint_store=FileCapabilityFactoryCheckpointStore(config.checkpoint_dir),
         holdout_store=InMemoryPrivateHoldoutStore(),
         repository=GatewayFactoryRepository(store),

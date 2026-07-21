@@ -340,6 +340,16 @@ class CapabilityCreationPort(Protocol):
     ) -> FactoryEvidenceBlock: ...
 
 
+class HermesCreationAnalysisPort(Protocol):
+    """Materialize Hermes creation evidence before Minibook accepts the job."""
+
+    async def analyze(
+        self,
+        job: AgentFactoryJobV2,
+        creation_job: CreationJobV1,
+    ) -> object: ...
+
+
 class CaptainEvidenceIssuerPort(Protocol):
     """Captain-owned issuer for canonical recovery and normal E2E records."""
 
@@ -1519,6 +1529,7 @@ class CapabilityFactoryEntrypoint:
         runtime: CapabilityRuntimePort,
         projector: MinibookProjector,
         clock: CapabilityFactoryClock,
+        creation_analysis: HermesCreationAnalysisPort | None = None,
     ) -> None:
         self._checkpoint_store = checkpoint_store
         self._holdout_store = holdout_store
@@ -1533,6 +1544,7 @@ class CapabilityFactoryEntrypoint:
         self._runtime = runtime
         self._projector = projector
         self._clock = clock
+        self._creation_analysis = creation_analysis
 
     async def run(
         self,
@@ -1601,6 +1613,8 @@ class CapabilityFactoryEntrypoint:
             creation_key=resolution.creation_key,
             released_skill=self._released_skill,
         )
+        if self._creation_analysis is not None:
+            await self._creation_analysis.analyze(job, creation_job)
         coordinator.record(_captain_forge_requested(job))
         receipt = await self._creation.submit(creation_job)
         if (
