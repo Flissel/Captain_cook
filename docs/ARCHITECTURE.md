@@ -2,6 +2,54 @@
 
 ## Agent-Factory process boundaries
 
+### Capability package release chain
+
+`agenten.agent_factory.capability_factory_entrypoint` is the Package-C
+composition root for one immutable `TO_BE_BUILT.md` correlation. It uses the
+real input parser/compiler, `FactoryCoordinator`, package validator, Gateway
+repository/catalog, terminal policy, execution contracts, and Minibook
+projector. External creation, provider execution, Gateway HTTP, Runtime HTTP,
+and Minibook HTTP effects remain injected ports. The deterministic integration
+test scripts only those external ports; it does not claim provider execution.
+
+The entrypoint binds correlation ID, Factory job ID, subject version, and the
+exact input SHA-256 in an append-only checkpoint before the first external
+effect. Replays use the same creation/run/command IDs. Changed input bytes fail
+closed instead of creating a replacement job. Captain's Evidence Issuer is the
+only port permitted to return `captain.capability-release-evidence.v1`; the
+composition rechecks every job, creation, candidate, run-order, producer, and
+digest binding before policy evaluation. Recovery is distinct from the three
+normal successes and never counts toward that streak.
+
+Forge archives are independently validated in a disposable Captain-owned
+Docker sandbox. The production runner accepts only a digest-pinned
+`captain-*` image already present locally (`--pull never`), then inspects the
+created container before execution. It requires a non-root user, no network,
+a read-only root filesystem and exact read-only workspace bind, bounded tmpfs,
+memory/PID limits, all capabilities dropped, `no-new-privileges`, and an init
+process for exact-tree cancellation. Attestations are derived from `docker
+inspect`; an unavailable image or any inspection mismatch is an isolation
+failure, never synthetic evidence. The package tree is hashed again before
+container creation, and Python bytecode/cache output is directed away from the
+host workspace.
+
+CLI configuration resolves input, artifact, and checkpoint paths under the
+workspace; accepts credential-free HTTP service URLs; and reads bearer/API
+credentials only from environment aliases. Its evidence manifest contains
+only typed IDs and digests, is canonical JSON named by its own SHA-256, and is
+written under the gitignored `artifacts/capability-factory/` directory.
+
+The provider-backed gate is
+`scripts/run-capability-factory-live.ps1`. It validates configuration first,
+requires loopback MariaDB database exactly `captain_test`, and only then may
+start Captain-owned services. It must observe one recovery, three distinct
+normal successes, Gateway terminal/catalog/execution records, an ordered feed,
+and a Minibook rebuild before a `ready_to_use` claim. The current production
+gate remains blocked: the Runtime has no production Hermes/Codex/artifact port
+bundle, no production capability-factory creation/Evidence-Issuer HTTP adapter
+bundle is installed, and no reviewed digest-pinned capability-sandbox image is
+configured. Deterministic success does not satisfy those live prerequisites.
+
 ## Hermes skill-evaluation release path
 
 Captain/MariaDB is the lifecycle authority for Hermes skill evaluation.  Hermes

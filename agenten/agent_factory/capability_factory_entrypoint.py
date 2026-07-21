@@ -1,0 +1,1537 @@
+"""Restart-safe composition root for one Captain capability-factory release.
+
+External execution stays behind injected ports.  The composition itself owns
+Captain parsing, compilation, lifecycle policy, package validation, release
+records, and the redacted projection hand-off.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import json
+import os
+import re
+from datetime import datetime
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping, Protocol
+from urllib.parse import urlsplit
+from uuid import UUID, uuid5
+
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+
+from agenten.agent_factory.capability_resolution import (
+    CapabilityCatalogPort,
+    CapabilityResolver,
+)
+from agenten.agent_factory.contracts import (
+    AgentFactoryJobV2,
+    FactoryBlockStatus,
+    FactoryEvidenceBlock,
+    FactoryPhase,
+    PromotedCapability,
+)
+from agenten.agent_factory.forge_contracts import (
+    CreationJobV1,
+    CreationResultV1,
+    CreationSubmissionReceipt,
+    ReleasedSkillRefV1,
+)
+from agenten.agent_factory.holdout_store import PrivateHoldoutStore
+from agenten.agent_factory.input_compiler import FactoryInputCompiler
+from agenten.agent_factory.input_document import load_factory_input
+from agenten.agent_factory.job_builder import build_factory_job
+from agenten.agent_factory.outcome_contracts import (
+    CapabilityPackageManifestV1,
+    CapabilityReleaseEvidenceV1,
+    ExecutionOutcomeV1,
+    FactoryTerminalDecision,
+    FactoryTerminalState,
+    ForgeCapabilityPackageCandidateV1,
+    validate_execution_outcome_binding,
+)
+from agenten.agent_factory.outcome_validation import (
+    CapabilityPackageValidationError,
+    CapabilityPackageValidator,
+    CapabilitySandboxRequest,
+    CapabilitySandboxResult,
+    CapabilitySandboxTermination,
+    ReadOnlyCapabilityContentStore,
+    TrustedCapabilitySandboxRunner,
+)
+from agenten.agent_factory.release_gate import (
+    CapabilityValidationFailure,
+    E2EKind,
+    E2EOutcome,
+    E2ERunEvidence,
+    FactoryTerminalReasonCode,
+    derive_terminal_decision,
+    evaluate_factory_release,
+)
+from agenten.agent_factory.service import (
+    FactoryCoordinator,
+    FactoryRepository,
+    FactoryRepositoryError,
+)
+from agenten.agent_factory.skill_store import StoredSkillEvaluation
+from agenten.agent_runtime.contracts import AgentRuntimeCommand, AgentRuntimeResult, ArtifactRef
+from agenten.delivery.minibook_events import MinibookProjectionEvent
+from agenten.delivery.projector import MinibookProjector
+from gateway.contracts import (
+    CapabilityExecutionRequest,
+    CapabilityReleaseRequest,
+    CapabilityWriteReceipt,
+    canonical_contract_sha256,
+)
+
+
+class CapabilityFactoryInputMutation(ValueError):
+    """The same run identity was presented with different immutable input."""
+
+
+class CapabilityFactoryConfigurationError(ValueError):
+    """Production composition was not given a safe, complete configuration."""
+
+
+class CapabilitySandboxIsolationError(RuntimeError):
+    """Docker could not prove every required isolation property."""
+
+
+class CapabilityFactoryCheckpoint(BaseModel):
+    """Minimum immutable identity needed before any external factory effect."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    correlation_id: UUID
+    factory_job_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class CapabilityFactoryCliConfig(BaseModel):
+    """Redaction-safe CLI configuration; credential values never come from argv."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    workspace_root: Path
+    input_path: Path
+    artifact_dir: Path
+    checkpoint_dir: Path
+    gateway_url: str
+    runtime_url: str
+    minibook_url: str
+    sandbox_image: str
+    correlation_id: UUID
+    subject_version: int = Field(default=1, ge=1, strict=True)
+    wall_clock_budget_seconds: int = Field(default=600, ge=1, le=86_400, strict=True)
+    gateway_token: SecretStr
+    runtime_token: SecretStr
+    minibook_projection_api_key: SecretStr
+
+
+class CapabilityReleaseRunReceipt(BaseModel):
+    """One Captain-owned recovery or normal E2E record and its exact bytes."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    record: CapabilityReleaseEvidenceV1
+    reference: ArtifactRef
+
+    @model_validator(mode="after")
+    def require_canonical_reference(self) -> "CapabilityReleaseRunReceipt":
+        content = self.record.model_dump_json(by_alias=True).encode("utf-8")
+        if (
+            self.reference.media_type != "application/json"
+            or self.reference.sha256 != hashlib.sha256(content).hexdigest()
+            or self.reference.uri.rsplit("/", 1)[-1] != self.reference.sha256
+        ):
+            raise ValueError("release run reference is not canonical")
+        return self
+
+
+class CapabilityExecutionBundle(BaseModel):
+    """Typed runtime evidence returned before Captain records an execution."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    command: AgentRuntimeCommand
+    result: AgentRuntimeResult
+    outcome: ExecutionOutcomeV1
+    claim_owner_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    claim_fencing_token: int = Field(ge=1, strict=True)
+
+
+class CapabilityFactoryRunSummary(BaseModel):
+    """Redacted stable identity projection for one factory invocation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    correlation_id: UUID
+    factory_job_id: UUID
+    creation_job_id: UUID | None = None
+    terminal_decision_id: UUID
+    terminal_state: FactoryTerminalState
+    capability_id: str
+    capability_version: int | None = Field(default=None, ge=1)
+    recovery_id: str | None = None
+    e2e_batch_ids: tuple[str, ...] = ()
+    execution_command_id: UUID | None = None
+    execution_result_id: UUID | None = None
+    projection_event_ids: tuple[UUID, ...] = ()
+    package_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    release_evidence_sha256: tuple[str, ...] = ()
+    unresolved_required_tool_gaps: tuple[str, ...] = ()
+    unresolved_optional_tool_gaps: tuple[str, ...] = ()
+
+
+class CapabilityCreationPort(Protocol):
+    async def preparation_blocks(
+        self,
+        job: AgentFactoryJobV2,
+        creation_job: CreationJobV1,
+    ) -> tuple[FactoryEvidenceBlock, FactoryEvidenceBlock]: ...
+
+    async def submit(self, creation_job: CreationJobV1) -> CreationSubmissionReceipt: ...
+
+    async def result(self, creation_job_id: UUID) -> CreationResultV1: ...
+
+    async def completion_block(
+        self,
+        job: AgentFactoryJobV2,
+        result: CreationResultV1,
+    ) -> FactoryEvidenceBlock: ...
+
+
+class CaptainEvidenceIssuerPort(Protocol):
+    """Captain-owned issuer for canonical recovery and normal E2E records."""
+
+    async def run(
+        self,
+        job: AgentFactoryJobV2,
+        creation_result: CreationResultV1,
+        candidate: ForgeCapabilityPackageCandidateV1,
+        run_number: int,
+    ) -> CapabilityReleaseRunReceipt | None: ...
+
+    async def lifecycle_blocks(
+        self,
+        job: AgentFactoryJobV2,
+        receipts: tuple[CapabilityReleaseRunReceipt, ...],
+    ) -> tuple[FactoryEvidenceBlock, FactoryEvidenceBlock, FactoryEvidenceBlock]: ...
+
+
+class CapabilityRuntimePort(Protocol):
+    async def execute(self, release: CapabilityReleaseRequest) -> CapabilityExecutionBundle: ...
+
+
+class CapabilityFactoryGatewayPort(Protocol):
+    def record_factory_release_decision(
+        self,
+        decision: FactoryReleaseDecision,
+    ) -> object: ...
+
+    def publish_capability_release(
+        self,
+        request: CapabilityReleaseRequest,
+    ) -> CapabilityWriteReceipt: ...
+
+    def record_runtime_operation(self, bundle: CapabilityExecutionBundle) -> None: ...
+
+    def record_capability_execution(
+        self,
+        request: CapabilityExecutionRequest,
+    ) -> CapabilityWriteReceipt: ...
+
+    def projection_events(
+        self,
+        correlation_id: UUID,
+    ) -> tuple[MinibookProjectionEvent, ...]: ...
+
+
+class CapabilityFactoryClock(Protocol):
+    def now(self) -> datetime: ...
+
+
+class CapabilityFactoryCheckpointStore(Protocol):
+    def bind(
+        self,
+        checkpoint: CapabilityFactoryCheckpoint,
+    ) -> CapabilityFactoryCheckpoint: ...
+
+
+class InMemoryCapabilityFactoryCheckpointStore:
+    """Append-only deterministic checkpoint adapter used by offline composition."""
+
+    def __init__(self) -> None:
+        self._by_correlation: dict[UUID, CapabilityFactoryCheckpoint] = {}
+
+    def bind(self, checkpoint: CapabilityFactoryCheckpoint) -> CapabilityFactoryCheckpoint:
+        existing = self._by_correlation.get(checkpoint.correlation_id)
+        if existing is None:
+            self._by_correlation[checkpoint.correlation_id] = checkpoint
+            return checkpoint
+        if existing != checkpoint:
+            if existing.input_sha256 != checkpoint.input_sha256:
+                raise CapabilityFactoryInputMutation(
+                    "factory input bytes changed for the existing correlation"
+                )
+            raise CapabilityFactoryInputMutation(
+                "factory job identity changed for the existing correlation"
+            )
+        return existing
+
+
+class FileCapabilityFactoryCheckpointStore:
+    """Exclusive, append-only checkpoints that survive interpreter restarts."""
+
+    def __init__(self, directory: Path) -> None:
+        self._directory = directory.resolve()
+        self._directory.mkdir(parents=True, exist_ok=True)
+
+    def bind(self, checkpoint: CapabilityFactoryCheckpoint) -> CapabilityFactoryCheckpoint:
+        target = self._directory / f"{checkpoint.correlation_id}.json"
+        existing = self._read(target)
+        if existing is not None:
+            return _require_same_checkpoint(existing, checkpoint)
+        content = _canonical_json_bytes(checkpoint)
+        try:
+            with target.open("xb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except FileExistsError:
+            existing = self._read(target)
+            if existing is None:
+                raise CapabilityFactoryInputMutation(
+                    "factory checkpoint could not be read after a concurrent bind"
+                )
+            return _require_same_checkpoint(existing, checkpoint)
+        return checkpoint
+
+    @staticmethod
+    def _read(target: Path) -> CapabilityFactoryCheckpoint | None:
+        try:
+            content = target.read_bytes()
+        except FileNotFoundError:
+            return None
+        try:
+            return CapabilityFactoryCheckpoint.model_validate_json(content)
+        except ValueError as exc:
+            raise CapabilityFactoryInputMutation(
+                "factory checkpoint is incomplete or invalid"
+            ) from exc
+
+
+@dataclass(frozen=True)
+class DockerCommandResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+class DockerCommandRunner(Protocol):
+    async def run(
+        self,
+        arguments: tuple[str, ...],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> DockerCommandResult: ...
+
+
+class DockerCliCommandRunner:
+    """Bounded, argument-vector-only Docker CLI adapter."""
+
+    async def run(
+        self,
+        arguments: tuple[str, ...],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> DockerCommandResult:
+        process = await asyncio.create_subprocess_exec(
+            "docker",
+            *arguments,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.communicate()
+            raise
+        if len(stdout) > 1_048_576 or len(stderr) > 1_048_576:
+            raise CapabilitySandboxIsolationError(
+                "docker returned more output than the sandbox control limit"
+            )
+        return DockerCommandResult(
+            returncode=process.returncode or 0,
+            stdout=stdout.decode("utf-8", errors="replace"),
+            stderr=stderr.decode("utf-8", errors="replace"),
+        )
+
+
+@dataclass(frozen=True)
+class _DockerExecution:
+    request: CapabilitySandboxRequest
+    container_id: str
+
+
+_CAPTAIN_SANDBOX_IMAGE = re.compile(
+    r"^(?:(?:[a-z0-9.-]+(?::[0-9]+)?)/)?"
+    r"captain-[a-z0-9._/-]+@sha256:[0-9a-f]{64}$"
+)
+_DOCKER_CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
+_SANDBOX_SCRIPT = """
+import importlib
+import importlib.util
+import json
+import pathlib
+import sys
+
+modules = tuple(json.loads(sys.argv[1]))
+tests = tuple(json.loads(sys.argv[2]))
+try:
+    for module_name in modules:
+        spec = importlib.util.find_spec(module_name)
+        if spec is None or spec.origin is None:
+            raise ImportError(module_name)
+        source = pathlib.Path(spec.origin).read_text(encoding="utf-8")
+        compile(source, spec.origin, "exec")
+except Exception:
+    raise SystemExit(20)
+try:
+    for module_name in modules:
+        importlib.import_module(module_name)
+except Exception:
+    raise SystemExit(30)
+try:
+    import pytest
+    status = pytest.main(("-q", "-p", "no:cacheprovider", "--basetemp=/tmp/pytest", *tests))
+except Exception:
+    raise SystemExit(40)
+raise SystemExit(0 if status == 0 else 40)
+""".strip()
+
+
+class DockerCapabilitySandboxRunner:
+    """Run untrusted candidates only in an inspected, disposable Captain container."""
+
+    def __init__(
+        self,
+        *,
+        image: str,
+        command_runner: DockerCommandRunner | None = None,
+    ) -> None:
+        if _CAPTAIN_SANDBOX_IMAGE.fullmatch(image) is None:
+            raise CapabilityFactoryConfigurationError(
+                "sandbox image must be Captain-owned and digest-pinned"
+            )
+        self._image = image
+        self._commands = command_runner or DockerCliCommandRunner()
+        self._active: dict[UUID, _DockerExecution] = {}
+        self._terminations: dict[UUID, CapabilitySandboxTermination] = {}
+
+    async def validate(
+        self,
+        request: CapabilitySandboxRequest,
+    ) -> CapabilitySandboxResult:
+        workspace = request.workspace.resolve()
+        if (
+            not workspace.is_dir()
+            or request.python_path_root.resolve() != workspace
+            or request.process_identity != f"sandbox-handle://{request.execution_id}"
+        ):
+            raise CapabilitySandboxIsolationError(
+                "sandbox workspace or process identity is invalid"
+            )
+        if _workspace_tree_sha256(workspace) != request.extracted_tree_sha256:
+            raise CapabilitySandboxIsolationError(
+                "sandbox workspace tree digest does not match the request"
+            )
+        await self._verify_image(request.timeout_seconds)
+        name = f"captain-capability-{request.execution_id}"
+        mount = (
+            "type=bind,source="
+            f"{workspace},target=/workspace,readonly"
+        )
+        if "," in str(workspace) or "\n" in str(workspace) or "\r" in str(workspace):
+            raise CapabilitySandboxIsolationError(
+                "sandbox workspace cannot be encoded as a Docker bind mount"
+            )
+        create = await self._commands.run(
+            (
+                "create",
+                "--name",
+                name,
+                "--label",
+                "captain.owner=capability-factory",
+                "--label",
+                "captain.disposable=true",
+                "--pull",
+                "never",
+                "--network",
+                "none",
+                "--read-only",
+                "--init",
+                "--memory",
+                str(request.max_memory_bytes),
+                "--pids-limit",
+                str(request.max_processes),
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--user",
+                "65532:65532",
+                "--mount",
+                mount,
+                "--tmpfs",
+                "/tmp:rw,noexec,nosuid,size=67108864",
+                "--workdir",
+                "/workspace",
+                "--env",
+                "PYTHONDONTWRITEBYTECODE=1",
+                "--entrypoint",
+                "python",
+                self._image,
+                "-I",
+                "-B",
+                "-c",
+                _SANDBOX_SCRIPT,
+                json.dumps(request.module_names, separators=(",", ":")),
+                json.dumps(request.test_paths, separators=(",", ":")),
+            ),
+            timeout_seconds=min(float(request.timeout_seconds), 30.0),
+        )
+        container_id = create.stdout.strip()
+        if create.returncode != 0 or _DOCKER_CONTAINER_ID.fullmatch(container_id) is None:
+            raise CapabilitySandboxIsolationError(
+                "Docker could not create the disposable sandbox container"
+            )
+        execution = _DockerExecution(request=request, container_id=container_id)
+        self._active[request.execution_id] = execution
+        try:
+            created = await self._inspect(container_id, request.timeout_seconds)
+            self._require_isolation(created, execution, expected_name=name)
+            start = await self._commands.run(
+                ("start", "--attach", container_id),
+                timeout_seconds=float(request.timeout_seconds),
+            )
+            finished = await self._inspect(container_id, request.timeout_seconds)
+            self._require_isolation(finished, execution, expected_name=name)
+            state = _mapping(finished, "State")
+            if state.get("Running") is not False or state.get("Status") != "exited":
+                raise CapabilitySandboxIsolationError(
+                    "sandbox process termination was not inspectable"
+                )
+            exit_code = state.get("ExitCode")
+            if not isinstance(exit_code, int):
+                raise CapabilitySandboxIsolationError(
+                    "sandbox exit status was not inspectable"
+                )
+            if start.returncode not in {0, exit_code}:
+                raise CapabilitySandboxIsolationError(
+                    "Docker start status disagrees with container state"
+                )
+            status = "passed" if exit_code == 0 else "failed"
+            failure_stage = {20: "compile", 30: "import", 40: "test"}.get(exit_code)
+            if exit_code != 0 and failure_stage is None:
+                status = "isolation_failed"
+                failure_stage = "isolation"
+            return CapabilitySandboxResult(
+                execution_id=request.execution_id,
+                request_digest=request.request_digest,
+                status=status,
+                failure_stage=failure_stage,
+                imported_modules=request.module_names,
+                executed_test_paths=request.test_paths,
+                sandbox_identity=f"sandbox://docker/{container_id}",
+                process_identity=request.process_identity,
+                process_identity_verified=True,
+                extracted_tree_sha256=request.extracted_tree_sha256,
+                workspace_was_read_only=True,
+                network_was_disabled=True,
+                resource_limits_were_enforced=True,
+                process_tree_termination_capable=True,
+            )
+        finally:
+            await self._remove(container_id)
+            self._active.pop(request.execution_id, None)
+
+    async def cancel(self, execution_id: UUID) -> None:
+        execution = self._active.get(execution_id)
+        if execution is None:
+            if execution_id in self._terminations:
+                return
+            raise CapabilitySandboxIsolationError(
+                "sandbox cancellation has no verified process identity"
+            )
+        await self._commands.run(
+            ("kill", execution.container_id),
+            timeout_seconds=5.0,
+        )
+        inspected = await self._inspect(execution.container_id, 5.0)
+        state = _mapping(inspected, "State")
+        if state.get("Running") is not False:
+            raise CapabilitySandboxIsolationError(
+                "sandbox process tree remained active after cancellation"
+            )
+        self._terminations[execution_id] = CapabilitySandboxTermination(
+            execution_id=execution_id,
+            request_digest=execution.request.request_digest,
+            sandbox_identity=f"sandbox://docker/{execution.container_id}",
+            process_identity=execution.request.process_identity,
+            process_identity_verified=True,
+            extracted_tree_sha256=execution.request.extracted_tree_sha256,
+            terminated=True,
+            process_tree_terminated=True,
+        )
+        await self._remove(execution.container_id)
+        self._active.pop(execution_id, None)
+
+    async def await_termination(
+        self,
+        execution_id: UUID,
+    ) -> CapabilitySandboxTermination:
+        try:
+            return self._terminations[execution_id]
+        except KeyError as exc:
+            raise CapabilitySandboxIsolationError(
+                "sandbox termination has not been inspectably attested"
+            ) from exc
+
+    async def _verify_image(self, timeout_seconds: int) -> None:
+        result = await self._commands.run(
+            ("image", "inspect", self._image),
+            timeout_seconds=min(float(timeout_seconds), 30.0),
+        )
+        if result.returncode != 0:
+            raise CapabilitySandboxIsolationError(
+                "digest-pinned Captain sandbox image is not available locally"
+            )
+        inspected = _single_inspect_document(result.stdout)
+        repo_digests = inspected.get("RepoDigests")
+        if not isinstance(repo_digests, list) or self._image not in repo_digests:
+            raise CapabilitySandboxIsolationError(
+                "local sandbox image does not match its configured digest"
+            )
+
+    async def _inspect(self, container_id: str, timeout_seconds: float) -> Mapping[str, object]:
+        result = await self._commands.run(
+            ("inspect", container_id),
+            timeout_seconds=min(timeout_seconds, 30.0),
+        )
+        if result.returncode != 0:
+            raise CapabilitySandboxIsolationError(
+                "Docker could not inspect the sandbox container"
+            )
+        return _single_inspect_document(result.stdout)
+
+    def _require_isolation(
+        self,
+        inspected: Mapping[str, object],
+        execution: _DockerExecution,
+        *,
+        expected_name: str,
+    ) -> None:
+        request = execution.request
+        if (
+            inspected.get("Id") != execution.container_id
+            or inspected.get("Name") != f"/{expected_name}"
+        ):
+            raise CapabilitySandboxIsolationError(
+                "sandbox process identity was not verified by Docker"
+            )
+        config = _mapping(inspected, "Config")
+        labels = _mapping(config, "Labels")
+        if (
+            config.get("Image") != self._image
+            or config.get("User") != "65532:65532"
+            or config.get("WorkingDir") != "/workspace"
+            or config.get("Entrypoint") != ["python"]
+            or labels.get("captain.owner") != "capability-factory"
+            or labels.get("captain.disposable") != "true"
+        ):
+            raise CapabilitySandboxIsolationError(
+                "sandbox image, identity, or non-root execution was not attested"
+            )
+        host = _mapping(inspected, "HostConfig")
+        if host.get("NetworkMode") != "none":
+            raise CapabilitySandboxIsolationError(
+                "sandbox network isolation was not attested"
+            )
+        if host.get("ReadonlyRootfs") is not True:
+            raise CapabilitySandboxIsolationError(
+                "sandbox read-only root filesystem was not attested"
+            )
+        if (
+            host.get("Memory") != request.max_memory_bytes
+            or host.get("PidsLimit") != request.max_processes
+            or host.get("Init") is not True
+        ):
+            raise CapabilitySandboxIsolationError(
+                "sandbox resource or process-tree limits were not attested"
+            )
+        cap_drop = host.get("CapDrop")
+        security = host.get("SecurityOpt")
+        if (
+            not isinstance(cap_drop, list)
+            or "ALL" not in {str(item).upper() for item in cap_drop}
+            or not isinstance(security, list)
+            or not any(str(item).startswith("no-new-privileges") for item in security)
+        ):
+            raise CapabilitySandboxIsolationError(
+                "sandbox Linux privilege restrictions were not attested"
+            )
+        tmpfs = _mapping(host, "Tmpfs")
+        tmp_options = tmpfs.get("/tmp")
+        if not isinstance(tmp_options, str) or not {
+            "noexec",
+            "nosuid",
+        }.issubset(set(tmp_options.split(","))):
+            raise CapabilitySandboxIsolationError(
+                "sandbox writable temporary storage was not safely bounded"
+            )
+        mounts = inspected.get("Mounts")
+        if not isinstance(mounts, list):
+            raise CapabilitySandboxIsolationError(
+                "sandbox workspace mount was not inspectable"
+            )
+        workspace_mounts = [
+            item
+            for item in mounts
+            if isinstance(item, dict) and item.get("Destination") == "/workspace"
+        ]
+        if len(workspace_mounts) != 1:
+            raise CapabilitySandboxIsolationError(
+                "sandbox workspace mount identity was not unique"
+            )
+        mount = workspace_mounts[0]
+        source = mount.get("Source")
+        if (
+            mount.get("Type") != "bind"
+            or mount.get("RW") is not False
+            or not isinstance(source, str)
+            or Path(source).resolve() != request.workspace.resolve()
+        ):
+            raise CapabilitySandboxIsolationError(
+                "sandbox workspace was not attested as the exact read-only bind"
+            )
+
+    async def _remove(self, container_id: str) -> None:
+        result = await self._commands.run(
+            ("rm", "-f", container_id),
+            timeout_seconds=5.0,
+        )
+        if result.returncode != 0:
+            raise CapabilitySandboxIsolationError(
+                "disposable sandbox container cleanup was not verified"
+            )
+
+
+class _SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise CapabilityFactoryConfigurationError(
+            "invalid capability factory arguments"
+        )
+
+
+def parse_capability_factory_args(
+    arguments: tuple[str, ...],
+    *,
+    environ: Mapping[str, str] | None = None,
+    workspace_root: Path | None = None,
+) -> CapabilityFactoryCliConfig:
+    """Parse non-secret CLI values and resolve every filesystem path in-bounds."""
+
+    for item in arguments:
+        lowered = item.casefold()
+        if item.startswith("--") and any(
+            marker in lowered
+            for marker in ("token", "secret", "password", "credential", "api-key")
+        ):
+            raise CapabilityFactoryConfigurationError(
+                "credentials are accepted only through environment aliases"
+            )
+    parser = _SafeArgumentParser(prog="capability-factory")
+    parser.add_argument("--input", default="TO_BE_BUILT.md")
+    parser.add_argument("--artifact-dir", default="artifacts/capability-factory")
+    parser.add_argument(
+        "--checkpoint-dir",
+        default=".superpowers/sdd/capability-factory-checkpoints",
+    )
+    parser.add_argument("--gateway-url", default="http://127.0.0.1:8080")
+    parser.add_argument("--runtime-url", default="http://127.0.0.1:8081")
+    parser.add_argument("--minibook-url", default="http://127.0.0.1:8082")
+    parser.add_argument(
+        "--sandbox-image",
+        default="captain-capability-sandbox@sha256:" + "0" * 64,
+    )
+    parser.add_argument("--correlation-id")
+    parser.add_argument("--subject-version", type=int, default=1)
+    parser.add_argument("--wall-clock-budget-seconds", type=int, default=600)
+    namespace = parser.parse_args(arguments)
+
+    root = (workspace_root or Path.cwd()).resolve()
+    input_path = _safe_workspace_path(root, namespace.input, "input")
+    artifact_dir = _safe_workspace_path(root, namespace.artifact_dir, "artifact")
+    checkpoint_dir = _safe_workspace_path(root, namespace.checkpoint_dir, "checkpoint")
+    if not input_path.is_file():
+        raise CapabilityFactoryConfigurationError(
+            "factory input path is not a readable workspace file"
+        )
+    gateway_url = _safe_service_url(namespace.gateway_url, "Gateway")
+    runtime_url = _safe_service_url(namespace.runtime_url, "runtime")
+    minibook_url = _safe_service_url(namespace.minibook_url, "Minibook")
+    if _CAPTAIN_SANDBOX_IMAGE.fullmatch(namespace.sandbox_image) is None:
+        raise CapabilityFactoryConfigurationError(
+            "sandbox image must be Captain-owned and digest-pinned"
+        )
+    if namespace.correlation_id is None:
+        raise CapabilityFactoryConfigurationError(
+            "a correlation identity is required for restart-safe execution"
+        )
+    try:
+        correlation_id = UUID(namespace.correlation_id)
+    except (TypeError, ValueError) as exc:
+        raise CapabilityFactoryConfigurationError(
+            "correlation identity is invalid"
+        ) from exc
+    source = os.environ if environ is None else environ
+    aliases = {
+        "gateway_token": "CAPTAIN_GATEWAY_TOKEN",
+        "runtime_token": "CAPTAIN_RUNTIME_TOKEN",
+        "minibook_projection_api_key": "MINIBOOK_PROJECTION_API_KEY",
+    }
+    secret_values: dict[str, SecretStr] = {}
+    missing: list[str] = []
+    for field_name, alias in aliases.items():
+        value = source.get(alias)
+        if value is None or not value.strip():
+            missing.append(alias)
+        else:
+            secret_values[field_name] = SecretStr(value)
+    if missing:
+        raise CapabilityFactoryConfigurationError(
+            "required credential aliases are missing: " + ", ".join(sorted(missing))
+        )
+    try:
+        return CapabilityFactoryCliConfig(
+            workspace_root=root,
+            input_path=input_path,
+            artifact_dir=artifact_dir,
+            checkpoint_dir=checkpoint_dir,
+            gateway_url=gateway_url,
+            runtime_url=runtime_url,
+            minibook_url=minibook_url,
+            sandbox_image=namespace.sandbox_image,
+            correlation_id=correlation_id,
+            subject_version=namespace.subject_version,
+            wall_clock_budget_seconds=namespace.wall_clock_budget_seconds,
+            **secret_values,
+        )
+    except ValueError as exc:
+        raise CapabilityFactoryConfigurationError(
+            "capability factory numeric limits are invalid"
+        ) from exc
+
+
+def write_redacted_evidence_manifest(
+    summary: CapabilityFactoryRunSummary,
+    target_directory: Path,
+) -> Path:
+    """Persist only stable IDs/digests in canonical content-addressed JSON."""
+
+    payload = {
+        "schema": "captain.capability-factory-evidence-manifest.v1",
+        "summary": summary.model_dump(mode="json", by_alias=True),
+    }
+    content = _canonical_json_bytes(payload)
+    digest = hashlib.sha256(content).hexdigest()
+    directory = target_directory.resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{digest}.json"
+    try:
+        with target.open("xb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except FileExistsError:
+        if target.read_bytes() != content:
+            raise CapabilityFactoryInputMutation(
+                "content-addressed evidence manifest has conflicting bytes"
+            )
+    return target
+
+
+def _safe_workspace_path(root: Path, raw: str, label: str) -> Path:
+    candidate = Path(raw)
+    resolved = (candidate if candidate.is_absolute() else root / candidate).resolve()
+    if not resolved.is_relative_to(root):
+        raise CapabilityFactoryConfigurationError(
+            f"{label} path must remain inside the workspace"
+        )
+    return resolved
+
+
+def _safe_service_url(raw: str, label: str) -> str:
+    parsed = urlsplit(raw)
+    if (
+        any(character.isspace() for character in raw)
+        or raw != raw.strip()
+        or parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise CapabilityFactoryConfigurationError(
+            f"{label} URL must be an HTTP service URL without credentials or query data"
+        )
+    return raw.rstrip("/")
+
+
+def _canonical_json_bytes(value: BaseModel | Mapping[str, object]) -> bytes:
+    payload = (
+        value.model_dump(mode="json", by_alias=True)
+        if isinstance(value, BaseModel)
+        else value
+    )
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _require_same_checkpoint(
+    existing: CapabilityFactoryCheckpoint,
+    proposed: CapabilityFactoryCheckpoint,
+) -> CapabilityFactoryCheckpoint:
+    if existing == proposed:
+        return existing
+    if existing.input_sha256 != proposed.input_sha256:
+        raise CapabilityFactoryInputMutation(
+            "factory input bytes changed for the existing correlation"
+        )
+    raise CapabilityFactoryInputMutation(
+        "factory job identity changed for the existing correlation"
+    )
+
+
+def _workspace_tree_sha256(workspace: Path) -> str:
+    entries: list[tuple[str, str, int]] = []
+    for path in workspace.rglob("*"):
+        if path.is_symlink():
+            raise CapabilitySandboxIsolationError(
+                "sandbox workspace contains a symbolic link"
+            )
+        if path.is_file():
+            content = path.read_bytes()
+            entries.append(
+                (
+                    path.relative_to(workspace).as_posix(),
+                    hashlib.sha256(content).hexdigest(),
+                    len(content),
+                )
+            )
+    return hashlib.sha256(
+        json.dumps(sorted(entries), separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _single_inspect_document(content: str) -> Mapping[str, object]:
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise CapabilitySandboxIsolationError(
+            "Docker inspection did not return valid JSON"
+        ) from exc
+    if (
+        not isinstance(payload, list)
+        or len(payload) != 1
+        or not isinstance(payload[0], dict)
+    ):
+        raise CapabilitySandboxIsolationError(
+            "Docker inspection did not identify exactly one object"
+        )
+    return payload[0]
+
+
+def _mapping(parent: Mapping[str, object], key: str) -> Mapping[str, object]:
+    value = parent.get(key)
+    if not isinstance(value, dict):
+        raise CapabilitySandboxIsolationError(
+            f"Docker inspection omitted required {key} isolation data"
+        )
+    return value
+
+
+class CapabilityFactoryEntrypoint:
+    """Compose one deterministic Captain-owned create/validate/release chain."""
+
+    def __init__(
+        self,
+        *,
+        checkpoint_store: CapabilityFactoryCheckpointStore,
+        holdout_store: PrivateHoldoutStore,
+        repository: FactoryRepository,
+        catalog: CapabilityCatalogPort,
+        released_skill: ReleasedSkillRefV1,
+        creation: CapabilityCreationPort,
+        content_store: ReadOnlyCapabilityContentStore,
+        sandbox_runner: TrustedCapabilitySandboxRunner,
+        evidence_issuer: CaptainEvidenceIssuerPort,
+        gateway: CapabilityFactoryGatewayPort,
+        runtime: CapabilityRuntimePort,
+        projector: MinibookProjector,
+        clock: CapabilityFactoryClock,
+    ) -> None:
+        self._checkpoint_store = checkpoint_store
+        self._holdout_store = holdout_store
+        self._repository = repository
+        self._catalog = catalog
+        self._released_skill = released_skill
+        self._creation = creation
+        self._content_store = content_store
+        self._sandbox_runner = sandbox_runner
+        self._evidence_issuer = evidence_issuer
+        self._gateway = gateway
+        self._runtime = runtime
+        self._projector = projector
+        self._clock = clock
+
+    async def run(
+        self,
+        *,
+        input_path: Path,
+        correlation_id: UUID,
+        subject_version: int,
+        wall_clock_budget_seconds: int,
+    ) -> CapabilityFactoryRunSummary:
+        document = load_factory_input(input_path)
+        compiled = FactoryInputCompiler(holdout_store=self._holdout_store).compile(
+            document,
+            subject_version,
+        )
+        proposed_job = build_factory_job(
+            compiled,
+            correlation_id=correlation_id,
+            now=self._clock.now(),
+            wall_clock_budget_seconds=wall_clock_budget_seconds,
+        )
+        job = self._resume_job(proposed_job)
+        self._checkpoint_store.bind(
+            CapabilityFactoryCheckpoint(
+                correlation_id=job.correlation_id,
+                factory_job_id=job.job_id,
+                subject_version=job.subject_version,
+                input_sha256=job.input_ref.sha256,
+            )
+        )
+        coordinator = FactoryCoordinator(self._repository, clock=self._clock)
+        coordinator.register(job)
+        resolution = CapabilityResolver(self._catalog).resolve(job)
+        if resolution.kind != "create" or resolution.creation_key is None:
+            raise RuntimeError("released capability reuse execution is not configured")
+
+        creation_job = _creation_job(
+            job,
+            creation_key=resolution.creation_key,
+            released_skill=self._released_skill,
+        )
+        coordinator.record(_captain_forge_requested(job))
+        preparation = await self._creation.preparation_blocks(job, creation_job)
+        if len(preparation) != 2:
+            raise ValueError("creation preparation must return blueprint and tool evidence")
+        for block in preparation:
+            coordinator.record(block)
+
+        receipt = await self._creation.submit(creation_job)
+        if (
+            receipt.creation_job_id != creation_job.creation_job_id
+            or receipt.subject_version != job.subject_version
+        ):
+            raise ValueError("creation submission receipt does not match the factory job")
+        creation_result = await self._creation.result(creation_job.creation_job_id)
+        _require_creation_result(job, creation_job, creation_result)
+        if self._clock.now() >= job.deadline_at:
+            return self._seal_nonready(
+                coordinator,
+                job,
+                creation_job.creation_job_id,
+                validation=None,
+                evaluation=coordinator.evaluation_for_job(job.job_id),
+                evidence=(),
+            )
+        coordinator.record(await self._creation.completion_block(job, creation_result))
+
+        candidate = await self._read_candidate(creation_result)
+        run_receipts: list[CapabilityReleaseRunReceipt] = []
+        for run_number in range(1, 5):
+            if self._clock.now() >= job.deadline_at:
+                return self._seal_nonready(
+                    coordinator,
+                    job,
+                    creation_job.creation_job_id,
+                    validation=None,
+                    evaluation=coordinator.evaluation_for_job(job.job_id),
+                    evidence=tuple(item.record for item in run_receipts),
+                )
+            run = await self._evidence_issuer.run(
+                job,
+                creation_result,
+                candidate,
+                run_number,
+            )
+            if run is None:
+                return self._seal_nonready(
+                    coordinator,
+                    job,
+                    creation_job.creation_job_id,
+                    validation=None,
+                    evaluation=coordinator.evaluation_for_job(job.job_id),
+                    evidence=tuple(item.record for item in run_receipts),
+                )
+            _require_captain_release_receipt(
+                job,
+                creation_result,
+                candidate,
+                run,
+                run_number,
+            )
+            run_receipts.append(run)
+
+        evidence = tuple(item.record for item in run_receipts)
+        try:
+            package = await CapabilityPackageValidator(
+                content_store=self._content_store,
+                sandbox_runner=self._sandbox_runner,
+            ).validate(
+                job=job,
+                creation_result=creation_result,
+                candidate=candidate,
+                release_evidence_refs=tuple(item.reference for item in run_receipts),
+            )
+        except CapabilityPackageValidationError:
+            failure = CapabilityValidationFailure(
+                reason_code=FactoryTerminalReasonCode.DIGEST_VIOLATION,
+                evidence_ref=_fixed_evidence_ref(
+                    "capability-package-validation-failed",
+                    "validation-failure",
+                ),
+            )
+            return self._seal_nonready(
+                coordinator,
+                job,
+                creation_job.creation_job_id,
+                validation=failure,
+                evaluation=coordinator.evaluation_for_job(job.job_id),
+                evidence=evidence,
+            )
+
+        evaluation = coordinator.evaluation_for_job(job.job_id)
+        provisional = derive_terminal_decision(
+            job,
+            coordinator.projection(job.job_id),
+            package,
+            evaluation,
+            evidence,
+            self._clock.now(),
+        )
+        if provisional is None or provisional.state is not FactoryTerminalState.READY_TO_USE:
+            return self._seal_nonready(
+                coordinator,
+                job,
+                creation_job.creation_job_id,
+                validation=package,
+                evaluation=evaluation,
+                evidence=evidence,
+            )
+
+        for block in await self._evidence_issuer.lifecycle_blocks(
+            job,
+            tuple(run_receipts),
+        ):
+            coordinator.record(block)
+        old_evidence = tuple(_legacy_e2e(item) for item in run_receipts)
+        release_decision = evaluate_factory_release(job, old_evidence, evaluation)
+        self._gateway.record_factory_release_decision(release_decision)
+        promotion = _promotion_block(job, package, evaluation, self._clock.now())
+        coordinator.record(promotion)
+        coordinator.record_terminal_decision(
+            job.job_id,
+            validation=package,
+            evaluation=evaluation,
+            e2e=evidence,
+        )
+        terminal = coordinator.terminal_decision_for_job(job.job_id)
+        if terminal is None or terminal.state is not FactoryTerminalState.READY_TO_USE:
+            raise RuntimeError("Gateway did not persist the ready_to_use terminal decision")
+
+        release = _release_request(job, terminal, package, evidence, promotion)
+        self._gateway.publish_capability_release(release)
+        bundle = await self._runtime.execute(release)
+        validate_execution_outcome_binding(
+            bundle.outcome,
+            command=bundle.command,
+            result=bundle.result,
+            expected_capability_id=package.capability_id,
+            expected_capability_version=package.capability_version,
+            expected_team_version=release.team_version,
+        )
+        self._gateway.record_runtime_operation(bundle)
+        execution = CapabilityExecutionRequest(
+            schema_name="captain.capability-execution-request.v1",
+            event_id=uuid5(bundle.command.event_id, "capability-execution-record"),
+            causation_id=bundle.result.event_id,
+            occurred_at=bundle.result.occurred_at,
+            producer="captain",
+            outcome=bundle.outcome,
+            outcome_ref=_canonical_ref(bundle.outcome, "execution-outcome"),
+            claim_owner_id=bundle.claim_owner_id,
+            claim_fencing_token=bundle.claim_fencing_token,
+        )
+        self._gateway.record_capability_execution(execution)
+        projection_events = tuple(
+            event
+            for event in self._gateway.projection_events(job.correlation_id)
+            if event.correlation_id == job.correlation_id
+        )
+        if not projection_events:
+            raise RuntimeError("Gateway projection feed has no correlated execution event")
+        self._projector.rebuild(projection_events)
+        return _summary(
+            job,
+            terminal,
+            creation_job_id=creation_job.creation_job_id,
+            package=package,
+            evidence=evidence,
+            execution=bundle,
+            projection_events=projection_events,
+        )
+
+    def _resume_job(self, proposed: AgentFactoryJobV2) -> AgentFactoryJobV2:
+        try:
+            stored = self._repository.job(proposed.job_id)
+        except (FactoryRepositoryError, KeyError):
+            return proposed
+        if not isinstance(stored, AgentFactoryJobV2):
+            raise CapabilityFactoryInputMutation("factory job schema changed on resume")
+        if (
+            stored.correlation_id != proposed.correlation_id
+            or stored.subject_version != proposed.subject_version
+            or stored.input_ref != proposed.input_ref
+            or stored.compiled_spec_ref != proposed.compiled_spec_ref
+            or stored.dependency_graph_ref != proposed.dependency_graph_ref
+        ):
+            raise CapabilityFactoryInputMutation("factory input bytes changed on resume")
+        return stored
+
+    async def _read_candidate(
+        self,
+        result: CreationResultV1,
+    ) -> ForgeCapabilityPackageCandidateV1:
+        reference = result.package_manifest_ref
+        if reference is None:
+            raise ValueError("creation result is missing its package manifest")
+        runtime_reference = ArtifactRef.model_validate(reference.model_dump(mode="json"))
+        content = await self._content_store.read(runtime_reference)
+        if hashlib.sha256(content).hexdigest() != runtime_reference.sha256:
+            raise CapabilityPackageValidationError("candidate manifest digest mismatch")
+        return ForgeCapabilityPackageCandidateV1.model_validate_json(content)
+
+    def _seal_nonready(
+        self,
+        coordinator: FactoryCoordinator,
+        job: AgentFactoryJobV2,
+        creation_job_id: UUID,
+        *,
+        validation: CapabilityPackageManifestV1 | CapabilityValidationFailure | None,
+        evaluation: StoredSkillEvaluation | None,
+        evidence: tuple[CapabilityReleaseEvidenceV1, ...],
+    ) -> CapabilityFactoryRunSummary:
+        coordinator.record_terminal_decision(
+            job.job_id,
+            validation=validation,
+            evaluation=evaluation,
+            e2e=evidence,
+        )
+        terminal = coordinator.terminal_decision_for_job(job.job_id)
+        if terminal is None:
+            raise RuntimeError("Gateway did not persist the terminal decision")
+        package = validation if isinstance(validation, CapabilityPackageManifestV1) else None
+        return _summary(
+            job,
+            terminal,
+            creation_job_id=creation_job_id,
+            package=package,
+            evidence=evidence,
+            execution=None,
+            projection_events=(),
+        )
+
+
+def _creation_job(
+    job: AgentFactoryJobV2,
+    *,
+    creation_key: str,
+    released_skill: ReleasedSkillRefV1,
+) -> CreationJobV1:
+    idempotency_key = hashlib.sha256(
+        f"{job.job_id}:{creation_key}:1".encode("utf-8")
+    ).hexdigest()
+    return CreationJobV1.model_validate(
+        {
+            "schema": "minibook.creation-job.v1",
+            "creation_job_id": uuid5(job.job_id, f"creation:{creation_key}:1"),
+            "factory_job_id": job.job_id,
+            "correlation_id": job.correlation_id,
+            "causation_id": job.event_id,
+            "subject_version": job.subject_version,
+            "attempt": 1,
+            "idempotency_key": idempotency_key,
+            "input_ref": job.input_ref.model_dump(mode="json"),
+            "compiled_spec_ref": job.compiled_spec_ref.model_dump(mode="json"),
+            "dependency_graph_ref": job.dependency_graph_ref.model_dump(mode="json"),
+            "released_skill": released_skill.model_dump(mode="json"),
+            "public_assertion_ids": job.acceptance_assertion_ids,
+            "deadline_at": job.deadline_at,
+        }
+    )
+
+
+def _captain_forge_requested(job: AgentFactoryJobV2) -> FactoryEvidenceBlock:
+    return FactoryEvidenceBlock(
+        schema_name="captain.agent-factory-block.v1",
+        event_id=uuid5(job.event_id, "factory-stage:forge_requested:1"),
+        job_id=job.job_id,
+        correlation_id=job.correlation_id,
+        causation_id=job.event_id,
+        occurred_at=job.occurred_at,
+        producer="captain",
+        subject_version=job.subject_version,
+        attempt=1,
+        phase=FactoryPhase.FORGE_REQUESTED,
+        status=FactoryBlockStatus.SUCCEEDED,
+        evidence_refs=(_fixed_evidence_ref(str(job.job_id), "forge-requested"),),
+    )
+
+
+def _require_creation_result(
+    job: AgentFactoryJobV2,
+    creation_job: CreationJobV1,
+    result: CreationResultV1,
+) -> None:
+    if (
+        result.creation_job_id != creation_job.creation_job_id
+        or result.correlation_id != job.correlation_id
+        or result.subject_version != job.subject_version
+        or result.attempt != creation_job.attempt
+    ):
+        raise ValueError("creation result does not match the immutable factory job")
+
+
+def _require_captain_release_receipt(
+    job: AgentFactoryJobV2,
+    creation_result: CreationResultV1,
+    candidate: ForgeCapabilityPackageCandidateV1,
+    receipt: CapabilityReleaseRunReceipt,
+    run_number: int,
+) -> None:
+    record = receipt.record
+    expected_kind = "recovery" if run_number == 1 else "normal"
+    expected_outcome = "expected_failure_recovered" if run_number == 1 else "succeeded"
+    if (
+        record.producer != "captain"
+        or record.run_number != run_number
+        or record.factory_job_id != job.job_id
+        or record.creation_job_id != creation_result.creation_job_id
+        or record.correlation_id != job.correlation_id
+        or record.subject_version != job.subject_version
+        or record.capability_id != job.required_capability
+        or record.capability_version != candidate.capability_version
+        or record.candidate_manifest_sha256
+        != creation_result.package_manifest_ref.sha256
+        or record.package_archive_sha256 != candidate.source_ref.sha256
+        or record.kind != expected_kind
+        or record.outcome != expected_outcome
+    ):
+        raise ValueError(
+            "Captain Evidence Issuer returned a foreign or non-canonical release record"
+        )
+
+
+def _legacy_e2e(receipt: CapabilityReleaseRunReceipt) -> E2ERunEvidence:
+    record = receipt.record
+    return E2ERunEvidence(
+        run_number=record.run_number,
+        correlation_id=record.correlation_id,
+        kind=E2EKind.RECOVERY if record.kind == "recovery" else E2EKind.NORMAL,
+        outcome=(
+            E2EOutcome.EXPECTED_FAILURE
+            if record.kind == "recovery"
+            else E2EOutcome.SUCCEEDED
+        ),
+        evidence_ref=receipt.reference,
+    )
+
+
+def _promotion_block(
+    job: AgentFactoryJobV2,
+    package: CapabilityPackageManifestV1,
+    evaluation: StoredSkillEvaluation | None,
+    occurred_at: datetime,
+) -> FactoryEvidenceBlock:
+    if evaluation is None:
+        raise RuntimeError("capability promotion requires accepted evaluation evidence")
+    return FactoryEvidenceBlock(
+        schema_name="captain.agent-factory-block.v1",
+        event_id=uuid5(job.event_id, "factory-stage:capability_promoted:1"),
+        job_id=job.job_id,
+        correlation_id=job.correlation_id,
+        causation_id=job.event_id,
+        occurred_at=occurred_at,
+        producer="captain",
+        subject_version=job.subject_version,
+        attempt=1,
+        phase=FactoryPhase.CAPABILITY_PROMOTED,
+        status=FactoryBlockStatus.SUCCEEDED,
+        artifact_refs=(package.source_ref,),
+        evidence_refs=(*package.release_evidence_refs, evaluation.evidence_ref),
+        assertion_ids=tuple(item.assertion_id for item in package.assertion_outcomes),
+    )
+
+
+def _release_request(
+    job: AgentFactoryJobV2,
+    terminal: FactoryTerminalDecision,
+    package: CapabilityPackageManifestV1,
+    evidence: tuple[CapabilityReleaseEvidenceV1, ...],
+    promotion: FactoryEvidenceBlock,
+) -> CapabilityReleaseRequest:
+    code_ref = next(
+        item.reference for item in package.artifacts if item.kind == "autogen_source"
+    )
+    tool_refs = tuple(
+        item.reference
+        for item in package.artifacts
+        if item.kind in {"n8n_workflow", "local_adapter"}
+    )
+    promotion_ref = ArtifactRef(
+        uri=f"artifact://gateway/factory-promotion/{promotion.event_id}",
+        sha256=canonical_contract_sha256(promotion),
+        media_type="application/json",
+    )
+    intents = tuple(
+        sorted(
+            {
+                item.integration_intent
+                for item in package.assertion_outcomes
+                if item.integration_intent.value != "none"
+            },
+            key=lambda item: item.value,
+        )
+    )
+    return CapabilityReleaseRequest(
+        schema_name="captain.capability-release-request.v1",
+        event_id=uuid5(job.event_id, "capability-release-request"),
+        causation_id=promotion.event_id,
+        occurred_at=terminal.decided_at,
+        producer="captain",
+        decision=terminal,
+        decision_ref=_canonical_ref(terminal, "terminal-decision"),
+        package=package,
+        package_ref=_canonical_ref(package, "capability-package"),
+        release_evidence=evidence,
+        promoted_capability=PromotedCapability(
+            capability_id=package.capability_id,
+            version=package.capability_version,
+            status="ready_to_use",
+            blueprint_ref=package.team_manifest_ref,
+            code_ref=code_ref,
+            tool_refs=tool_refs,
+            promotion_block_ref=promotion_ref,
+        ),
+        schema_major=1,
+        team_version=package.capability_version,
+        accepted_assertion_ids=tuple(
+            item.assertion_id for item in package.assertion_outcomes
+        ),
+        integration_intents=intents,
+        tool_contracts=(),
+    )
+
+
+def _canonical_ref(model: BaseModel, name: str) -> ArtifactRef:
+    digest = canonical_contract_sha256(model)
+    return ArtifactRef(
+        uri=f"artifact://capability-factory/{name}/{digest}",
+        sha256=digest,
+        media_type="application/json",
+    )
+
+
+def _fixed_evidence_ref(material: str, name: str) -> ArtifactRef:
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return ArtifactRef(
+        uri=f"artifact://capability-factory/{name}/{digest}",
+        sha256=digest,
+        media_type="application/json",
+    )
+
+
+def _summary(
+    job: AgentFactoryJobV2,
+    terminal: FactoryTerminalDecision,
+    *,
+    creation_job_id: UUID,
+    package: CapabilityPackageManifestV1 | None,
+    evidence: tuple[CapabilityReleaseEvidenceV1, ...],
+    execution: CapabilityExecutionBundle | None,
+    projection_events: tuple[MinibookProjectionEvent, ...],
+) -> CapabilityFactoryRunSummary:
+    required_gaps = ()
+    optional_gaps = ()
+    if package is not None:
+        required_gaps = tuple(
+            gap.gap_id
+            for gap in package.tool_gaps
+            if gap.severity == "required" and gap.status == "unresolved"
+        )
+        optional_gaps = tuple(
+            gap.gap_id
+            for gap in package.tool_gaps
+            if gap.severity == "optional" and gap.status == "unresolved"
+        )
+    recovery = next((item for item in evidence if item.kind == "recovery"), None)
+    normals = tuple(item for item in evidence if item.kind == "normal")
+    return CapabilityFactoryRunSummary(
+        correlation_id=job.correlation_id,
+        factory_job_id=job.job_id,
+        creation_job_id=creation_job_id,
+        terminal_decision_id=terminal.decision_id,
+        terminal_state=terminal.state,
+        capability_id=job.required_capability,
+        capability_version=(package.capability_version if package is not None else None),
+        recovery_id=(recovery.recovery_id if recovery is not None else None),
+        e2e_batch_ids=tuple(item.run_id for item in normals),
+        execution_command_id=(execution.command.event_id if execution is not None else None),
+        execution_result_id=(execution.result.event_id if execution is not None else None),
+        projection_event_ids=tuple(item.event_id for item in projection_events),
+        package_sha256=(canonical_contract_sha256(package) if package is not None else None),
+        release_evidence_sha256=tuple(
+            hashlib.sha256(item.model_dump_json(by_alias=True).encode("utf-8")).hexdigest()
+            for item in evidence
+        ),
+        unresolved_required_tool_gaps=required_gaps,
+        unresolved_optional_tool_gaps=optional_gaps,
+    )
