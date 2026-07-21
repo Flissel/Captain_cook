@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -66,20 +67,23 @@ async def test_pinned_capability_sandbox_runs_real_isolated_import_and_pytest(
         json.dumps(sorted(entries), separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     execution_id = UUID("a06a2896-7b72-4d8f-88e9-55446f8bac3d")
-    result = await DockerCapabilitySandboxRunner(image=image).validate(
-        CapabilitySandboxRequest(
-            request_digest="d" * 64,
-            execution_id=execution_id,
-            process_identity=f"sandbox-handle://{execution_id}",
-            correlation_id=execution_id,
-            workspace=tmp_path,
-            python_path_root=tmp_path,
-            module_names=("capability.team",),
-            test_paths=("tests/test_team.py",),
-            extracted_tree_sha256=tree_digest,
-            package_archive_sha256="e" * 64,
-            timeout_seconds=60,
-        )
+    result = await asyncio.wait_for(
+        DockerCapabilitySandboxRunner(image=image).validate(
+            CapabilitySandboxRequest(
+                request_digest="d" * 64,
+                execution_id=execution_id,
+                process_identity=f"sandbox-handle://{execution_id}",
+                correlation_id=execution_id,
+                workspace=tmp_path,
+                python_path_root=tmp_path,
+                module_names=("capability.team",),
+                test_paths=("tests/test_team.py",),
+                extracted_tree_sha256=tree_digest,
+                package_archive_sha256="e" * 64,
+                timeout_seconds=60,
+            )
+        ),
+        timeout=75,
     )
 
     assert result.status == "passed"
@@ -106,10 +110,21 @@ async def test_provider_backed_capability_factory_release_and_projection(
     assert manifest["schema"] == "captain.capability-factory-evidence-manifest.v1"
     summary = CapabilityFactoryRunSummary.model_validate(manifest["summary"])
     assert summary.terminal_state == "ready_to_use"
-    assert summary.recovery_id is not None
-    assert len(summary.e2e_batch_ids) == 3
-    assert len(set(summary.e2e_batch_ids)) == 3
-    assert len(summary.release_evidence_sha256) == 4
+    assert summary.execution_state == "completed"
+    assert summary.release_authority_job_id is not None
+    if summary.execution_mode == "created":
+        assert summary.release_authority_job_id == summary.invocation_job_id
+        assert summary.creation_job_id is not None
+        assert summary.recovery_id is not None
+        assert len(summary.e2e_batch_ids) == 3
+        assert len(set(summary.e2e_batch_ids)) == 3
+        assert len(summary.release_evidence_sha256) == 4
+    else:
+        assert summary.execution_mode == "reused"
+        assert summary.creation_job_id is None
+        assert summary.recovery_id is None
+        assert summary.e2e_batch_ids == ()
+        assert summary.release_evidence_sha256 == ()
     assert summary.capability_version is not None
     assert summary.execution_command_id is not None
     assert summary.execution_result_id is not None
@@ -118,7 +133,7 @@ async def test_provider_backed_capability_factory_release_and_projection(
     headers = {"Authorization": f"Bearer {gateway_token}"}
     async with httpx.AsyncClient(timeout=20.0) as client:
         terminal_response = await client.get(
-            f"{gateway_url}/v1/factory/terminal-decisions/{summary.factory_job_id}",
+            f"{gateway_url}/v1/factory/terminal-decisions/{summary.release_authority_job_id}",
             headers=headers,
         )
         terminal_response.raise_for_status()
@@ -135,6 +150,7 @@ async def test_provider_backed_capability_factory_release_and_projection(
         capability = CapabilityCatalogRecord.model_validate(capability_response.json())
         assert capability.status == "ready_to_use"
         assert capability.capability_version == summary.capability_version
+        assert capability.release_authority_job_id == summary.release_authority_job_id
         assert capability.package_ref.sha256 == summary.package_sha256
 
         execution_response = await client.get(
@@ -159,6 +175,10 @@ async def test_provider_backed_capability_factory_release_and_projection(
     assert any(
         event.event_id in set(summary.projection_event_ids)
         and event.correlation_id == summary.correlation_id
+        and event.event_id == summary.execution_result_id
+        and event.causation_id == summary.execution_command_id
+        and event.event_type == "codex.result"
+        and event.payload.status_id == "built"
         for event in projection_events
     )
 

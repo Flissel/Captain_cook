@@ -38,9 +38,12 @@ validator, Gateway repository/catalog, execution binding, and Minibook
 projector around scripted external ports. It proves restart after creation
 submission and after the second normal E2E success with stable IDs and no
 duplicate effects, plus committed-publication and committed-execution crash
-recovery, catalog reuse without Forge/republication, mutation, tool-gap,
+recovery, committed-claim retry with a higher post-expiry fence,
+committed-result recovery without provider re-execution, catalog reuse without
+Forge/republication, mutation, tool-gap,
 holdout, post-effect deadline, artifact, and two-success failure paths. A
-guarded `captain_test` test separately exercises the production
+separately selected `live`/`db_mutating` `captain_test` test, using only an
+explicitly exported DSN, exercises the production
 `GatewayStore` atomic publication and command/grant/claim/result/execution
 transactions, including rollback and reconstructed-store replay.
 
@@ -48,15 +51,19 @@ Release evidence remains Captain-owned. Forge supplies a candidate; a Captain
 Evidence Issuer supplies the controlled-recovery and normal-run records;
 Captain independently validates the sealed package and derives/persists the
 only terminal decision through the atomic publication method; READY is never
-pre-written through the ordinary terminal API. A reused capability is bound to
-the complete frozen catalog record and a new correlation. Minibook remains a
-read-only rebuildable projection.
+pre-written through the ordinary terminal API. Every invocation is persisted
+before catalog resolution; a reused capability keeps a distinct invocation job
+and the original release-authority job/terminal decision from the frozen
+catalog record. Minibook receives only the exact successful result event and
+remains a read-only rebuildable projection.
 The production sandbox must be a disposable, digest-pinned Captain image with
 inspectable isolation. A scripted runner is test evidence only.
 
 The live gate runs only after deterministic and database-resetting gates. It
 requires `captain_test`, reads credentials from the gitignored environment,
-starts only a dedicated Gateway after adapter preflight, does not adopt or
+verifies a digest-pinned static adapter manifest without importing it, starts
+only a dedicated Gateway after that side-effect-free preflight, health-checks
+Runtime and Minibook before mutation, and does not adopt or
 mutate externally owned workflow services or volumes, and treats
 every missing provider, API, adapter, image, credential, skip, or projection
 record as blocked. Until the production Runtime ports, capability-factory HTTP

@@ -23,19 +23,26 @@ release E2E, sandbox validation, and republication, and runs the new
 correlation through command admission, capability grant, fenced execution
 claim, provider result, and `CapabilityExecutionRequest` recording.
 
-The entrypoint binds correlation ID, Factory job ID, subject version, and the
-exact input SHA-256 in an append-only checkpoint before the first external
-effect. Replays use the same creation/run/command IDs. Changed input bytes fail
-closed instead of creating a replacement job. Captain's Evidence Issuer is the
+The entrypoint binds correlation ID, invocation Factory job ID, subject version,
+exact input SHA-256, `occurred_at`, and immutable deadline in an append-only
+checkpoint before the first external effect. It registers that invocation
+idempotently before catalog resolution. Replays use the same
+creation/run/command IDs. Changed input bytes or timing fail closed instead of
+creating a replacement job. Captain's Evidence Issuer is the
 only port permitted to return `captain.capability-release-evidence.v1`; the
 composition rechecks every job, creation, candidate, run-order, producer, and
 digest binding before policy evaluation. Recovery is distinct from the three
 normal successes and never counts toward that streak.
-The file checkpoint and service adapters are reconstructed in restart tests;
-crashes after creation submission, release evidence, committed atomic
-publication, and committed capability execution expose exactly one external
-effect after recovery. Deadline checks run before each later mutation, so an
-expired post-publication run cannot begin runtime work and an expired
+Restart tests reconstruct the file-checkpoint, repository/catalog, entrypoint,
+and runtime composition adapters while retaining the scripted authoritative
+service state. Crashes after creation submission, release evidence, committed
+atomic publication, runtime claim, runtime result, and committed capability
+execution expose exactly one provider effect after recovery. An unexpired
+claim returns typed `retry_pending`; after expiry the Gateway issues a higher
+fence. A committed result is converted into the deterministic typed outcome
+without calling the provider again. No claim credential enters a checkpoint or
+summary. Deadline checks run before each later mutation and before requesting
+lifecycle evidence, so an expired post-publication run cannot begin runtime work and an expired
 post-execution run cannot mutate Minibook.
 
 Forge archives are independently validated in a disposable Captain-owned
@@ -51,9 +58,11 @@ container creation, and Python bytecode/cache output is directed away from the
 host workspace.
 The isolated interpreter explicitly inserts `/workspace` into `sys.path`
 before module discovery, and Docker inspection must report the exact
-`rw,noexec,nosuid,size=67108864` tmpfs. The package validator, not an inner
-Docker CLI timer, owns timeout and verified process-tree cancellation. An
-actual Docker import/pytest smoke test is live-only and remains blocked when
+`rw,noexec,nosuid,size=67108864` tmpfs. The Docker CLI adapter applies a
+bounded timeout to every command and verifies the exit status of process-tree
+termination; the package validator additionally owns its outer timeout and
+exact-identity cancellation contract. An actual Docker import/pytest smoke
+test is live-only, has its own outer bound, and remains blocked when
 the configured digest is not already local.
 
 CLI configuration resolves input, artifact, and checkpoint paths under the
@@ -61,15 +70,18 @@ workspace; accepts credential-free HTTP service URLs; and reads bearer/API
 credentials only from environment aliases. Its evidence manifest contains
 only typed IDs and digests, is canonical JSON named by its own SHA-256, and is
 written under the gitignored `artifacts/capability-factory/` directory.
-The module is executable with `python -m`; it loads an explicitly configured
-production adapter factory, runs the composition, writes the manifest, and
-prints only redacted targets, timings, IDs, and digests. Missing production
-adapters fail preflight before any service is started.
+The module is executable with `python -m`. Preflight first parses and compiles
+the selected input and verifies a workspace-contained, SHA-256-pinned static
+adapter manifest without importing its module. Only the full run loads that
+manifest's production adapter factory, writes the evidence manifest, and
+prints redacted targets, timings, IDs, and digests. Missing or altered
+production adapters fail before database attestation or service startup.
 
 The provider-backed gate is
 `scripts/run-capability-factory-live.ps1`. It validates configuration first,
 requires loopback MariaDB database exactly `captain_test`, and only then may
-start a dedicated Gateway process bound to that DSN. It never starts or adopts
+start a dedicated Gateway process bound to that DSN. Runtime and Minibook must
+also pass health checks before the full, mutating invocation. It never starts or adopts
 an external workflow service. It must observe one recovery, three distinct
 normal successes, Gateway terminal/catalog/execution records, an ordered feed,
 and a Minibook rebuild before a `ready_to_use` claim. The current production
@@ -77,7 +89,9 @@ gate remains blocked: the Runtime has no production Hermes/Codex/artifact port
 bundle, no production capability-factory creation/Evidence-Issuer HTTP adapter
 bundle is installed, and no reviewed digest-pinned capability-sandbox image is
 configured. Deterministic success does not satisfy those live prerequisites.
-Separately, the guarded MariaDB acceptance proof executes production
+Separately, an explicitly selected `live`/`db_mutating` MariaDB acceptance
+proof accepts only the process-exported `TEST_MARIADB_DSN`; ordinary non-live
+tests neither discover `.env` values nor clear a database. The live proof executes production
 `GatewayStore` methods against `captain_test`: an injected mid-publication
 crash rolls the transaction back, a reconstructed store replays the single
 publication, and production command/grant/claim/result/execution writes replay
