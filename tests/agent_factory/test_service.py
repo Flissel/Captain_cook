@@ -8,12 +8,15 @@ from agenten.agent_factory.service import (
     InMemoryFactoryRepository,
 )
 from agenten.agent_factory.state_machine import FactoryActionKind, FactoryLifecycleError
+from agenten.agent_factory.outcome_contracts import FactoryTerminalDecision, FactoryTerminalState
+from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.contracts import FactoryPhase
 from tests.agent_factory.test_state_machine import (
     accepted_evaluation,
     accepted_release_decision,
     block,
     job,
+    artifact,
 )
 
 
@@ -129,3 +132,51 @@ def test_coordinator_routes_failed_skill_evaluation_through_improvement() -> Non
 
     assert coordinator.next_action(factory_job.job_id).kind is FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED
     assert repository.lookup_job_ids == [factory_job.job_id]
+
+
+def test_terminal_decision_replay_is_idempotent_but_changed_replay_conflicts() -> None:
+    repository = InMemoryFactoryRepository()
+    coordinator = FactoryCoordinator(repository)
+    factory_job = job()
+    coordinator.register(factory_job)
+    decision = FactoryTerminalDecision(
+        schema_name="captain.factory-terminal-decision.v1",
+        decision_id=factory_job.event_id,
+        job_id=factory_job.job_id,
+        correlation_id=factory_job.correlation_id,
+        subject_version=factory_job.subject_version,
+        state=FactoryTerminalState.BLOCKED,
+        reasons=("missing_provider",),
+        evidence_refs=(ArtifactRef.model_validate(artifact("provider-block")),),
+        decided_at=factory_job.occurred_at,
+    )
+
+    assert coordinator.record_terminal_decision(decision) is True
+    assert coordinator.record_terminal_decision(decision) is False
+    assert coordinator.projection(factory_job.job_id).terminal_decision == decision
+    assert coordinator.next_action(factory_job.job_id, now=factory_job.occurred_at).kind is FactoryActionKind.NO_ACTION
+
+    changed = decision.model_copy(
+        update={"state": FactoryTerminalState.REJECTED, "reasons": ("authority_violation",)}
+    )
+    with pytest.raises(FactoryRepositoryError, match="different content"):
+        coordinator.record_terminal_decision(changed)
+
+
+def test_terminal_decision_must_be_captain_bound_to_registered_job() -> None:
+    coordinator = FactoryCoordinator(InMemoryFactoryRepository())
+    factory_job = job()
+    coordinator.register(factory_job)
+    foreign = FactoryTerminalDecision(
+        schema_name="captain.factory-terminal-decision.v1",
+        decision_id=factory_job.event_id,
+        job_id=factory_job.job_id,
+        correlation_id=type(factory_job.correlation_id)(int=999),
+        subject_version=factory_job.subject_version,
+        state=FactoryTerminalState.REJECTED,
+        reasons=("authority_violation",),
+        decided_at=factory_job.occurred_at,
+    )
+
+    with pytest.raises(FactoryRepositoryError, match="does not match"):
+        coordinator.record_terminal_decision(foreign)

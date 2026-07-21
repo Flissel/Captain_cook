@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryPhase
+from .contracts import AgentFactoryJobV2, FactoryEvidenceBlock, FactoryJob, FactoryPhase
+from .outcome_contracts import FactoryTerminalDecision, FactoryTerminalState
 from .release_gate import (
     FactoryReleaseDecision,
+    FactoryPolicyFinding,
     evaluation_requires_improvement,
     evaluation_tool_gaps,
     factory_evaluation_block_reason,
@@ -31,6 +34,8 @@ class FactoryLifecycleStatus(str, Enum):
     INFRASTRUCTURE_BLOCKED = "infrastructure_blocked"
     READY_TO_USE = "ready_to_use"
     ESCALATED = "escalated"
+    BLOCKED = "blocked"
+    REJECTED = "rejected"
 
 
 class FactoryActionKind(str, Enum):
@@ -47,6 +52,8 @@ class FactoryActionKind(str, Enum):
     APPEND_ESCALATED = "append_escalated"
     WAIT_INFRASTRUCTURE = "wait_infrastructure"
     COMPLETE = "complete"
+    NO_ACTION = "complete"
+    RECORD_ESCALATION = "append_escalated"
 
 
 class FactoryAction(BaseModel):
@@ -62,18 +69,21 @@ class FactoryProjection(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    job: AgentFactoryJob
+    job: FactoryJob
     status: FactoryLifecycleStatus
     phase: FactoryPhase | None = None
     attempt: int = Field(ge=1, le=5)
     observed_assertion_ids: tuple[str, ...] = ()
     block_ids: tuple[UUID, ...] = ()
+    evidence_refs: tuple[ArtifactRef, ...] = ()
     evaluation_id: UUID | None = None
     evaluation_ref: ArtifactRef | None = None
     tool_gaps: tuple[ToolGapMarker, ...] = ()
+    policy_findings: tuple[FactoryPolicyFinding, ...] = ()
+    terminal_decision: FactoryTerminalDecision | None = None
 
     @classmethod
-    def from_job(cls, job: AgentFactoryJob) -> "FactoryProjection":
+    def from_job(cls, job: FactoryJob) -> "FactoryProjection":
         return cls(job=job, status=FactoryLifecycleStatus.PENDING, attempt=1)
 
 
@@ -96,7 +106,12 @@ def apply_block(
         return projection
     if block.attempt != projection.attempt:
         raise FactoryLifecycleError("block attempt does not match projection")
-    if projection.status in {FactoryLifecycleStatus.READY_TO_USE, FactoryLifecycleStatus.ESCALATED}:
+    if projection.terminal_decision is not None or projection.status in {
+        FactoryLifecycleStatus.READY_TO_USE,
+        FactoryLifecycleStatus.ESCALATED,
+        FactoryLifecycleStatus.BLOCKED,
+        FactoryLifecycleStatus.REJECTED,
+    }:
         raise FactoryLifecycleError("terminal factory projection cannot accept blocks")
 
     allowed = _allowed_next_phases(projection)
@@ -111,6 +126,7 @@ def apply_block(
                 "status": FactoryLifecycleStatus.INFRASTRUCTURE_BLOCKED,
                 "phase": block.phase,
                 "block_ids": (*projection.block_ids, block.event_id),
+                "evidence_refs": _append_evidence_refs(projection, block),
             }
         )
 
@@ -153,6 +169,7 @@ def apply_block(
             "attempt": attempt,
             "observed_assertion_ids": assertions,
             "block_ids": (*projection.block_ids, block.event_id),
+            "evidence_refs": _append_evidence_refs(projection, block),
             **evaluation_update,
         }
     )
@@ -162,13 +179,24 @@ def next_action(
     projection: FactoryProjection,
     *,
     evaluation: StoredSkillEvaluation | None = None,
+    now: datetime | None = None,
 ) -> FactoryAction:
     """Return the one allowed next side effect for a derived projection."""
 
+    if projection.terminal_decision is not None:
+        return FactoryAction(kind=FactoryActionKind.NO_ACTION, attempt=projection.attempt)
+    if projection.status in {
+        FactoryLifecycleStatus.READY_TO_USE,
+        FactoryLifecycleStatus.ESCALATED,
+        FactoryLifecycleStatus.BLOCKED,
+        FactoryLifecycleStatus.REJECTED,
+    }:
+        return FactoryAction(kind=FactoryActionKind.NO_ACTION, attempt=projection.attempt)
+    effective_now = now or datetime.now(timezone.utc)
+    if isinstance(projection.job, AgentFactoryJobV2) and effective_now >= projection.job.deadline_at:
+        return FactoryAction(kind=FactoryActionKind.RECORD_ESCALATION, attempt=projection.attempt)
     if projection.status is FactoryLifecycleStatus.INFRASTRUCTURE_BLOCKED:
         return FactoryAction(kind=FactoryActionKind.WAIT_INFRASTRUCTURE, attempt=projection.attempt)
-    if projection.status in {FactoryLifecycleStatus.READY_TO_USE, FactoryLifecycleStatus.ESCALATED}:
-        return FactoryAction(kind=FactoryActionKind.COMPLETE, attempt=projection.attempt)
     if projection.status is FactoryLifecycleStatus.PENDING:
         return FactoryAction(kind=FactoryActionKind.APPEND_FORGE_REQUESTED, attempt=projection.attempt)
 
@@ -205,6 +233,34 @@ def next_action(
     raise FactoryLifecycleError(f"no next action for phase {phase!r}")
 
 
+def with_terminal_decision(
+    projection: FactoryProjection,
+    decision: FactoryTerminalDecision,
+) -> FactoryProjection:
+    """Seal a projection with one Captain-authored terminal decision."""
+
+    if (
+        decision.job_id != projection.job.job_id
+        or decision.correlation_id != projection.job.correlation_id
+        or decision.subject_version != projection.job.subject_version
+    ):
+        raise FactoryLifecycleError("terminal decision does not match projection")
+    existing = projection.terminal_decision
+    if existing is not None:
+        if existing == decision:
+            return projection
+        raise FactoryLifecycleError("terminal decision conflicts with sealed projection")
+    status = {
+        FactoryTerminalState.READY_TO_USE: FactoryLifecycleStatus.READY_TO_USE,
+        FactoryTerminalState.BLOCKED: FactoryLifecycleStatus.BLOCKED,
+        FactoryTerminalState.ESCALATED: FactoryLifecycleStatus.ESCALATED,
+        FactoryTerminalState.REJECTED: FactoryLifecycleStatus.REJECTED,
+    }[decision.state]
+    return projection.model_copy(
+        update={"status": status, "terminal_decision": decision}
+    )
+
+
 def _allowed_next_phases(projection: FactoryProjection) -> frozenset[FactoryPhase]:
     if projection.status is FactoryLifecycleStatus.PENDING:
         return frozenset({FactoryPhase.FORGE_REQUESTED})
@@ -226,3 +282,11 @@ def _allowed_next_phases(projection: FactoryProjection) -> frozenset[FactoryPhas
         return transitions[phase]  # type: ignore[index]
     except KeyError as exc:
         raise FactoryLifecycleError(f"no legal transition from {phase!r}") from exc
+
+
+def _append_evidence_refs(
+    projection: FactoryProjection,
+    block: FactoryEvidenceBlock,
+) -> tuple[ArtifactRef, ...]:
+    references = (*projection.evidence_refs, *block.artifact_refs, *block.evidence_refs)
+    return tuple(dict.fromkeys(references))

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
 from uuid import UUID
 
 import pytest
 
 from agenten.agent_factory.contracts import (
     AgentFactoryJob,
+    AgentFactoryJobV2,
     FactoryBlockStatus,
     FactoryEvidenceBlock,
     FactoryPhase,
@@ -20,6 +23,7 @@ from agenten.agent_factory.state_machine import (
     apply_block,
     next_action,
 )
+from agenten.agent_factory.outcome_contracts import FactoryTerminalDecision, FactoryTerminalState
 from agenten.agent_factory.release_gate import (
     E2EKind,
     E2EOutcome,
@@ -59,6 +63,28 @@ def job() -> AgentFactoryJob:
             "max_behavioral_iterations": 5,
         }
     )
+
+
+def v2_job(*, deadline_at: datetime | None = None) -> AgentFactoryJobV2:
+    payload = json.loads(
+        (Path(__file__).parents[1] / "fixtures" / "agent_factory" / "agent_factory_job.v2.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    legacy = job()
+    payload.update(
+        {
+            "event_id": str(legacy.event_id),
+            "correlation_id": str(legacy.correlation_id),
+            "occurred_at": legacy.occurred_at.isoformat(),
+            "job_id": str(legacy.job_id),
+            "subject_version": legacy.subject_version,
+            "required_capability": legacy.required_capability,
+            "acceptance_assertion_ids": list(legacy.acceptance_assertion_ids),
+            "deadline_at": (deadline_at or NOW + timedelta(minutes=15)).isoformat(),
+        }
+    )
+    return AgentFactoryJobV2.model_validate(payload)
 
 
 def block(
@@ -354,3 +380,60 @@ def test_failed_skill_evaluation_uses_existing_improvement_and_attempt_ceiling()
         next_action(quality_reviewed_projection(attempt=5), evaluation=failed).kind
         is FactoryActionKind.APPEND_ESCALATED
     )
+
+
+def test_v2_deadline_and_behavioral_iteration_budgets_are_independent() -> None:
+    before_deadline = NOW + timedelta(minutes=14)
+    after_deadline = NOW + timedelta(minutes=15)
+    active = FactoryProjection.from_job(v2_job())
+
+    assert next_action(active, now=before_deadline).kind is FactoryActionKind.APPEND_FORGE_REQUESTED
+    assert next_action(active, now=after_deadline).kind is FactoryActionKind.RECORD_ESCALATION
+
+    fifth_attempt = FactoryProjection.from_job(v2_job(deadline_at=NOW + timedelta(days=1))).model_copy(
+        update={"attempt": 5}
+    )
+    for phase in (
+        FactoryPhase.FORGE_REQUESTED,
+        FactoryPhase.BLUEPRINT_CREATED,
+        FactoryPhase.TOOL_CANDIDATE_TESTED,
+        FactoryPhase.AGENT_CODE_CREATED,
+        FactoryPhase.BUILD_FAILED,
+    ):
+        fifth_attempt = apply_block(fifth_attempt, block(phase, attempt=5))
+    assert next_action(fifth_attempt, now=NOW).kind is FactoryActionKind.RECORD_ESCALATION
+
+
+def test_historical_v1_job_remains_iteration_only_after_any_wall_clock_time() -> None:
+    projection = FactoryProjection.from_job(job())
+
+    assert next_action(projection, now=NOW + timedelta(days=3650)).kind is FactoryActionKind.APPEND_FORGE_REQUESTED
+
+
+def test_terminal_projection_has_no_further_action_or_mutation() -> None:
+    terminal = FactoryTerminalDecision(
+        schema_name="captain.factory-terminal-decision.v1",
+        decision_id=UUID(int=950),
+        job_id=job().job_id,
+        correlation_id=job().correlation_id,
+        subject_version=job().subject_version,
+        state=FactoryTerminalState.BLOCKED,
+        reasons=("missing_provider",),
+        evidence_refs=(ArtifactRef.model_validate(artifact("provider-block")),),
+        decided_at=NOW,
+    )
+    projection = FactoryProjection.from_job(v2_job()).model_copy(
+        update={"terminal_decision": terminal}
+    )
+
+    assert next_action(projection, now=NOW).kind is FactoryActionKind.NO_ACTION
+    with pytest.raises(FactoryLifecycleError, match="terminal"):
+        apply_block(projection, block(FactoryPhase.FORGE_REQUESTED))
+
+
+def test_existing_terminal_state_is_not_reclassified_after_v2_deadline() -> None:
+    projection = FactoryProjection.from_job(v2_job()).model_copy(
+        update={"status": FactoryLifecycleStatus.READY_TO_USE}
+    )
+
+    assert next_action(projection, now=NOW + timedelta(days=1)).kind is FactoryActionKind.NO_ACTION
