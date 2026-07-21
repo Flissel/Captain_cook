@@ -466,6 +466,23 @@ def test_workflow_artifacts_reject_absolute_user_and_system_paths(path: str) -> 
 
 
 @pytest.mark.parametrize(
+    "prose",
+    [
+        "failed at /mnt/private/project",
+        'failed at "/data/private/project"',
+        "failed at (/usr/root/private)",
+    ],
+)
+def test_workflow_artifacts_reject_absolute_posix_paths_embedded_in_prose(
+    prose: str,
+) -> None:
+    with pytest.raises(ValidationError, match="local.path"):
+        TeamExecutionEvidenceV1.model_validate(
+            execution_payload(termination_reason=prose)
+        )
+
+
+@pytest.mark.parametrize(
     "uri",
     [
         "artifact://workflow/tmp/result",
@@ -487,6 +504,24 @@ def test_workflow_artifacts_accept_opaque_uri_path_segments(uri: str) -> None:
     )
 
     assert inventory.source_refs[0].uri == uri
+
+
+@pytest.mark.parametrize(
+    "opaque_ref",
+    [
+        "artifact://workflow/mnt/private/project",
+        "holdout://factory/data/private/project",
+        "workspace://factory/usr/root/private",
+    ],
+)
+def test_workflow_artifacts_accept_complete_opaque_refs_in_prose(
+    opaque_ref: str,
+) -> None:
+    evidence = TeamExecutionEvidenceV1.model_validate(
+        execution_payload(termination_reason=opaque_ref)
+    )
+
+    assert evidence.termination_reason == opaque_ref
 
 
 @pytest.mark.parametrize(

@@ -30,7 +30,7 @@ _PRIVATE_VALUE_PATTERN = re.compile(
     r"\bfile\s*:)"
 )
 _LOCAL_PATH_PATTERN = re.compile(
-    r"(?i)(?:^/|(?:^|[\s\"'(=])(?:[A-Za-z]:[\\/]|\\\\))"
+    r"(?i)(?:^|[\s\"'(=])(?:/|[A-Za-z]:[\\/]|\\\\)"
 )
 _OPAQUE_URI_PATTERN = re.compile(r"^(?:artifact|holdout|workspace)://")
 
