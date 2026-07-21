@@ -18,26 +18,42 @@ $serviceName = 'captain-demo-service'
 function Read-Env {
     $values = [ordered]@{}
     if (Test-Path $envFile) { foreach ($line in [IO.File]::ReadAllLines($envFile)) {
-        if ($line -match '^CAPTAIN_DEMO_MINIBOOK_API_KEY=(.*)$') { $values['CAPTAIN_DEMO_MINIBOOK_API_KEY'] = $Matches[1] }
+        if ($line -match '^(CAPTAIN_DEMO_MINIBOOK_API_KEY|MINIBOOK_API_KEY|MINIBOOK_PROJECTION_API_KEY)=(.*)$') { $values[$Matches[1]] = $Matches[2] }
     }}
     $values
 }
 function Save-Env($values) {
-    $lines = [Collections.Generic.List[string]]::new(); $written = $false
+    $pending = [ordered]@{
+        CAPTAIN_DEMO_MINIBOOK_API_KEY = [string]$values['CAPTAIN_DEMO_MINIBOOK_API_KEY']
+        MINIBOOK_API_KEY = [string]$values['MINIBOOK_API_KEY']
+    }
+    $lines = [Collections.Generic.List[string]]::new()
     if (Test-Path $envFile) { foreach ($line in [IO.File]::ReadAllLines($envFile)) {
-        if ($line -match '^CAPTAIN_DEMO_MINIBOOK_API_KEY=') { $lines.Add("CAPTAIN_DEMO_MINIBOOK_API_KEY=$($values['CAPTAIN_DEMO_MINIBOOK_API_KEY'])"); $written=$true } else { $lines.Add($line) }
+        if ($line -match '^(CAPTAIN_DEMO_MINIBOOK_API_KEY|MINIBOOK_API_KEY)=') {
+            $name = $Matches[1]
+            $lines.Add(('{0}={1}' -f $name,$pending[$name])); $pending.Remove($name)
+        } else { $lines.Add($line) }
     }}
-    if (-not $written) { $lines.Add("CAPTAIN_DEMO_MINIBOOK_API_KEY=$($values['CAPTAIN_DEMO_MINIBOOK_API_KEY'])") }
+    foreach ($item in $pending.GetEnumerator()) { $lines.Add(('{0}={1}' -f $item.Key,$item.Value)) }
     [IO.File]::WriteAllLines($envFile, $lines, [Text.UTF8Encoding]::new($false))
 }
 function Test-Health {
     try { (Invoke-WebRequest "$baseUrl/health" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200 } catch { $false }
 }
 function Start-Service {
+    $values = Read-Env
+    $projectionKey = [string]$values['MINIBOOK_PROJECTION_API_KEY']
+    if ([string]::IsNullOrWhiteSpace($projectionKey)) { throw 'Projection credential is required before starting Minibook.' }
     if (Test-Health) { Write-Host '[ready] Minibook local instance'; return }
     New-Item -ItemType Directory -Force $stateDir | Out-Null
     $python = Join-Path $root '.venv\Scripts\python.exe'; if (-not (Test-Path $python)) { $python = (Get-Command python).Source }
-    $process = Start-Process $python -ArgumentList 'run.py' -WorkingDirectory (Join-Path $root 'minibook') -WindowStyle Hidden -PassThru
+    $previousProjectionKey = [Environment]::GetEnvironmentVariable('MINIBOOK_PROJECTION_API_KEY','Process')
+    try {
+        [Environment]::SetEnvironmentVariable('MINIBOOK_PROJECTION_API_KEY',$projectionKey,'Process')
+        $process = Start-Process $python -ArgumentList 'run.py' -WorkingDirectory (Join-Path $root 'minibook') -WindowStyle Hidden -PassThru
+    } finally {
+        [Environment]::SetEnvironmentVariable('MINIBOOK_PROJECTION_API_KEY',$previousProjectionKey,'Process')
+    }
     $identity = @{ pid=$process.Id; started_at=$process.StartTime.ToUniversalTime().ToString('o'); executable=$process.Path }
     [IO.File]::WriteAllText($pidFile, ($identity | ConvertTo-Json -Compress))
     foreach ($attempt in 1..60) { if (Test-Health) { Write-Host '[ready] Minibook local instance'; return }; Start-Sleep -Milliseconds 500 }
@@ -55,17 +71,24 @@ function Recover-ServiceCredential($values) {
         if ($me.name -ne $serviceName) { throw 'Recovered Minibook key belongs to another identity.' }
     } catch { throw 'Recovered Minibook key did not validate against the local service.' }
     $values['CAPTAIN_DEMO_MINIBOOK_API_KEY'] = $apiKey
+    $values['MINIBOOK_API_KEY'] = $apiKey
     Save-Env $values
     Write-Host '[ready] Minibook demo service credential recovered locally (credential redacted)'
 }
 function Bootstrap-Service {
     Start-Service
     $values = Read-Env
-    $apiKey = [string]$values['CAPTAIN_DEMO_MINIBOOK_API_KEY']
+    if ($values['CAPTAIN_DEMO_MINIBOOK_API_KEY'] -and $values['MINIBOOK_API_KEY'] -and $values['CAPTAIN_DEMO_MINIBOOK_API_KEY'] -ne $values['MINIBOOK_API_KEY']) {
+        throw 'Configured Minibook API key aliases do not match; refusing to choose one.'
+    }
+    $apiKey = if ($values['MINIBOOK_API_KEY']) { [string]$values['MINIBOOK_API_KEY'] } else { [string]$values['CAPTAIN_DEMO_MINIBOOK_API_KEY'] }
     if ($apiKey) {
         try {
             $me = Invoke-RestMethod "$baseUrl/api/v1/agents/me" -Headers @{Authorization="Bearer $apiKey"} -TimeoutSec 5
             if ($me.name -ne $serviceName) { throw 'Configured Minibook key belongs to another identity.' }
+            $values['CAPTAIN_DEMO_MINIBOOK_API_KEY'] = $apiKey
+            $values['MINIBOOK_API_KEY'] = $apiKey
+            Save-Env $values
             Write-Host '[ready] Minibook demo service account reused (credential redacted)'; return
         } catch { throw 'Configured CAPTAIN_DEMO_MINIBOOK_API_KEY is invalid; refusing to replace it.' }
     }
@@ -77,6 +100,7 @@ function Bootstrap-Service {
     }
     if (-not $created.api_key) { throw 'Minibook registration returned no API key.' }
     $values['CAPTAIN_DEMO_MINIBOOK_API_KEY'] = [string]$created.api_key
+    $values['MINIBOOK_API_KEY'] = [string]$created.api_key
     Save-Env $values
     Write-Host '[ready] Minibook demo service account created locally (credential redacted)'
 }

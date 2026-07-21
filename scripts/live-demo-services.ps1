@@ -53,7 +53,7 @@ function Set-Missing($Values, [string]$Name, [scriptblock]$Factory) {
     if (-not $Values.Contains($Name) -or [string]::IsNullOrWhiteSpace([string]$Values[$Name])) { $Values[$Name] = & $Factory }
 }
 function Initialize-LocalEnvironment {
-    $allowed = @('MARIADB_PASSWORD','MARIADB_ROOT_PASSWORD','MARIADB_TEST_PASSWORD','MARIADB_TEST_ROOT_PASSWORD','CAPTAIN_GATEWAY_TOKEN','WORKER_GATEWAY_TOKEN','CAPTAIN_RUNTIME_TOKEN','MARIADB_TEST_PORT','GATEWAY_PORT','CAPTAIN_RUNTIME_PORT','TEST_MARIADB_DSN','LEDGER_DSN','CAPTAIN_GATEWAY_URL','CAPTAIN_RUNTIME_URL','N8N_API_KEY','N8N_MCP_TOKEN','CAPTAIN_N8N_PORT','CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','CAPTAIN_N8N_MCP_BROKER_URL','CAPTAIN_N8N_URL')
+    $allowed = @('MARIADB_PASSWORD','MARIADB_ROOT_PASSWORD','MARIADB_TEST_PASSWORD','MARIADB_TEST_ROOT_PASSWORD','CAPTAIN_GATEWAY_TOKEN','WORKER_GATEWAY_TOKEN','CAPTAIN_RUNTIME_TOKEN','MARIADB_TEST_PORT','GATEWAY_PORT','CAPTAIN_RUNTIME_PORT','TEST_MARIADB_DSN','LEDGER_DSN','CAPTAIN_GATEWAY_URL','CAPTAIN_RUNTIME_URL','MINIBOOK_API_KEY','MINIBOOK_PROJECTION_API_KEY','CAPTAIN_DEMO_MINIBOOK_API_KEY','CAPTAIN_CAPABILITY_SANDBOX_IMAGE','N8N_API_KEY','N8N_MCP_TOKEN','CAPTAIN_N8N_PORT','CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','CAPTAIN_N8N_MCP_BROKER_URL','CAPTAIN_N8N_URL')
     $values = Read-Env $rootEnv $allowed
     Set-Missing $values 'MARIADB_PASSWORD' { New-Secret }
     Set-Missing $values 'MARIADB_ROOT_PASSWORD' { New-Secret }
@@ -62,6 +62,13 @@ function Initialize-LocalEnvironment {
     Set-Missing $values 'CAPTAIN_GATEWAY_TOKEN' { New-Secret }
     Set-Missing $values 'WORKER_GATEWAY_TOKEN' { New-Secret }
     Set-Missing $values 'CAPTAIN_RUNTIME_TOKEN' { New-Secret }
+    Set-Missing $values 'MINIBOOK_PROJECTION_API_KEY' { New-Secret }
+    if (-not $values.Contains('MINIBOOK_API_KEY') -and $values.Contains('CAPTAIN_DEMO_MINIBOOK_API_KEY')) {
+        $values['MINIBOOK_API_KEY'] = $values['CAPTAIN_DEMO_MINIBOOK_API_KEY']
+    }
+    if ($values.Contains('MINIBOOK_API_KEY') -and $values.Contains('CAPTAIN_DEMO_MINIBOOK_API_KEY') -and $values['MINIBOOK_API_KEY'] -ne $values['CAPTAIN_DEMO_MINIBOOK_API_KEY']) {
+        throw 'Configured Minibook API key aliases do not match; refusing to choose one.'
+    }
     Set-Missing $values 'MARIADB_TEST_PORT' { '33306' }
     Set-Missing $values 'GATEWAY_PORT' { '8090' }
     Set-Missing $values 'CAPTAIN_RUNTIME_PORT' { '8091' }

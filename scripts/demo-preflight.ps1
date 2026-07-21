@@ -51,7 +51,28 @@ function Test-Http([string]$Name, [string]$Uri, [hashtable]$Headers = @{}, [stri
     Write-Host "[ready] $Name"
 }
 
-$allowedNames = @('MAILPIT_WEB_PORT','MAILPIT_URL','MAILPIT_SMTP_PORT','CAPTAIN_N8N_URL','CAPTAIN_GATEWAY_URL','MINIBOOK_BACKEND_URL','CAPTAIN_N8N_API_KEY','N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','N8N_MCP_TOKEN','TEST_MARIADB_DSN')
+function Assert-CaptainSandboxImage([string]$Reference) {
+    if ($Reference -notmatch '^(?<name>(?:[a-z0-9.-]+(?::[0-9]+)?/)?captain-[a-z0-9._/-]+(?::[a-z0-9._-]+)?)@(?<digest>sha256:[0-9a-f]{64})$') {
+        throw 'A Captain-owned digest-pinned capability sandbox image is required.'
+    }
+
+    $expectedDigest = $Matches['digest']
+    $inspection = & docker image inspect $Reference 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw 'The pinned Captain capability sandbox image is unavailable locally; pulling is forbidden.'
+    }
+    $image = @($inspection | ConvertFrom-Json)[0]
+    $repoDigests = @($image.RepoDigests)
+    if ([string]$image.Id -ne $expectedDigest -and $repoDigests -notcontains $Reference) {
+        throw 'The local Captain capability sandbox image does not match its immutable digest.'
+    }
+    if ([string]$image.Config.Labels.'org.opencontainers.image.title' -ne 'captain-capability-sandbox') {
+        throw 'The pinned image is not the Captain capability sandbox.'
+    }
+    Write-Host '[ready] Captain capability sandbox image digest verified'
+}
+
+$allowedNames = @('MAILPIT_WEB_PORT','MAILPIT_URL','MAILPIT_SMTP_PORT','CAPTAIN_N8N_URL','CAPTAIN_GATEWAY_URL','MINIBOOK_BACKEND_URL','MINIBOOK_API_KEY','MINIBOOK_PROJECTION_API_KEY','CAPTAIN_CAPABILITY_SANDBOX_IMAGE','CAPTAIN_N8N_API_KEY','N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','N8N_MCP_TOKEN','TEST_MARIADB_DSN')
 $config = Read-SafeEnv $EnvFile $allowedNames
 # The running Captain Mailpit instance is intentionally published on 18025.
 $config['MAILPIT_WEB_PORT'] = '18025'
@@ -66,10 +87,11 @@ Save-SafeEnv $config $EnvFile
 Write-Host '[ready] local .env normalized (values redacted)'
 if ($NormalizeOnly) { exit 0 }
 
-foreach ($required in @('CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','TEST_MARIADB_DSN')) {
+foreach ($required in @('CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','MINIBOOK_API_KEY','MINIBOOK_PROJECTION_API_KEY','CAPTAIN_CAPABILITY_SANDBOX_IMAGE','TEST_MARIADB_DSN')) {
     if (-not $config.Contains($required) -or [string]::IsNullOrWhiteSpace([string]$config[$required])) { throw "Missing required local setting: $required" }
 }
 if ([string]$config['TEST_MARIADB_DSN'] -notmatch '/captain_test(?:\?|$)') { throw 'TEST_MARIADB_DSN must target the isolated captain_test database.' }
+Assert-CaptainSandboxImage ([string]$config['CAPTAIN_CAPABILITY_SANDBOX_IMAGE'])
 
 $captainN8nUrl = ([string]$config['CAPTAIN_N8N_URL']).TrimEnd('/')
 $mailpitUrl = ([string]$config['MAILPIT_URL']).TrimEnd('/')
@@ -80,6 +102,7 @@ $mcpBody = '{"jsonrpc":"2.0","id":"demo-preflight","method":"tools/list","params
 Test-Http 'Captain n8n MCP' "$captainN8nUrl/mcp-server/http" @{ Authorization="Bearer $([string]$config['CAPTAIN_N8N_MCP_TOKEN'])"; Accept='application/json, text/event-stream' } 'POST' $mcpBody
 Test-Http 'Mailpit' "$mailpitUrl/api/v1/info"
 Test-Http 'Minibook' "$minibookUrl/health"
+Test-Http 'Minibook API identity' "$minibookUrl/api/v1/agents/me" @{ Authorization="Bearer $([string]$config['MINIBOOK_API_KEY'])" }
 Test-Http 'Gateway' "$gatewayUrl/healthz"
 
 $dsn = [Uri]([string]$config['TEST_MARIADB_DSN'])
