@@ -77,6 +77,166 @@ class AdapterFactory:
         }
 
 
+class PreparedLifecycle:
+    def next_action(self, _job_id):
+        raise AssertionError("preflight must not advance the lifecycle")
+
+    def projection(self, _job_id):
+        raise AssertionError("preflight must not read a Factory job")
+
+    def record(self, _block):
+        raise AssertionError("preflight must not write lifecycle evidence")
+
+    def promotion_block(self, _job_id):
+        raise AssertionError("preflight must not read promotion evidence")
+
+
+class PreparedRepository:
+    def workflow_artifacts(self, _job_id):
+        raise AssertionError("preflight must not read workflow artifacts")
+
+
+class PreparedDispatcher:
+    def validate_next(self, _job, _action, _expected_skill_digests):
+        raise AssertionError("preflight must not stage a dispatch")
+
+    async def dispatch_next(self, _job_id):
+        raise AssertionError("preflight must not dispatch an external effect")
+
+
+class PreparedRunner:
+    def history(self, _job_id):
+        raise AssertionError("preflight must not read live history")
+
+    async def run(self, _job, *, mode):
+        raise AssertionError(f"preflight must not run live effects in {mode}")
+
+
+def test_preflight_prepares_and_verifies_typed_runtime_adapter(tmp_path: Path) -> None:
+    from agenten.agent_factory import factory_live_entrypoint as entrypoint
+
+    prepared_adapter_type = getattr(entrypoint, "PreparedFactoryLiveAdapter", None)
+    adapter_factory_type = getattr(entrypoint, "FactoryLiveAdapterFactory", None)
+    assert prepared_adapter_type is not None
+    assert adapter_factory_type is not None
+
+    repository_root = Path(__file__).resolve().parents[2]
+    report_directory = tmp_path / "external-report"
+    report_directory.mkdir()
+    output = report_directory / "preflight.json"
+    settings = entrypoint.FactoryLivePreflightSettings(
+        mode="demo",
+        max_cost_usd=Decimal("5.00"),
+        model="approved-model",
+        repository_root=repository_root,
+        report_directory=report_directory,
+        output=output,
+        database_dsn="mysql://captain:must-not-leak@127.0.0.1:3306/captain_test",
+        with_n8n=False,
+    )
+
+    class TypedAdapterFactory:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def prepare(self, supplied_settings, expected_skill_digests):
+            self.calls.append((supplied_settings, dict(expected_skill_digests)))
+            return prepared_adapter_type(
+                mode=supplied_settings.mode,
+                max_cost_usd=supplied_settings.max_cost_usd,
+                model=supplied_settings.model,
+                with_n8n=supplied_settings.with_n8n,
+                skill_digests=expected_skill_digests,
+                lifecycle=PreparedLifecycle(),
+                repository=PreparedRepository(),
+                dispatcher=PreparedDispatcher(),
+                live_runner=PreparedRunner(),
+            )
+
+    adapter_factory = TypedAdapterFactory()
+    preflight = entrypoint.run_factory_live_preflight(
+        settings,
+        probe=PreflightProbe(),
+        adapter_factory=adapter_factory,
+    )
+
+    assert len(adapter_factory.calls) == 1
+    assert adapter_factory.calls[0][0] is settings
+    assert adapter_factory.calls[0][1] == entrypoint._released_skill_directory_digests(
+        repository_root
+    )
+    assert preflight.runtime_adapters_verified is True
+    assert entrypoint.FactoryLivePreflight.model_validate_json(
+        output.read_text(encoding="utf-8")
+    ) == preflight
+    assert "must-not-leak" not in output.read_text(encoding="utf-8")
+
+
+def test_preflight_rejects_typed_adapter_bound_to_different_settings(
+    tmp_path: Path,
+) -> None:
+    from agenten.agent_factory import factory_live_entrypoint as entrypoint
+
+    repository_root = Path(__file__).resolve().parents[2]
+    report_directory = tmp_path / "external-report"
+    report_directory.mkdir()
+    settings = entrypoint.FactoryLivePreflightSettings(
+        mode="demo",
+        max_cost_usd=Decimal("5.00"),
+        model="approved-model",
+        repository_root=repository_root,
+        report_directory=report_directory,
+        output=report_directory / "preflight.json",
+        database_dsn="mysql://captain:must-not-leak@127.0.0.1:3306/captain_test",
+        with_n8n=False,
+    )
+
+    class WrongModelFactory:
+        def prepare(self, supplied_settings, expected_skill_digests):
+            return entrypoint.PreparedFactoryLiveAdapter(
+                mode=supplied_settings.mode,
+                max_cost_usd=supplied_settings.max_cost_usd,
+                model="different-model",
+                with_n8n=supplied_settings.with_n8n,
+                skill_digests=expected_skill_digests,
+                lifecycle=PreparedLifecycle(),
+                repository=PreparedRepository(),
+                dispatcher=PreparedDispatcher(),
+                live_runner=PreparedRunner(),
+            )
+
+    with pytest.raises(
+        entrypoint.FactoryLiveConfigurationError,
+        match="prepared dispatch adapter failed verification",
+    ) as failure:
+        entrypoint.run_factory_live_preflight(
+            settings,
+            probe=PreflightProbe(),
+            adapter_factory=WrongModelFactory(),
+        )
+
+    assert "different-model" not in str(failure.value)
+    assert "must-not-leak" not in str(failure.value)
+    assert not settings.output.exists()
+
+
+def test_prepared_adapter_rejects_an_incomplete_runtime_port() -> None:
+    from agenten.agent_factory import factory_live_entrypoint as entrypoint
+
+    with pytest.raises(TypeError, match="dispatcher port is incomplete"):
+        entrypoint.PreparedFactoryLiveAdapter(
+            mode="demo",
+            max_cost_usd=Decimal("5.00"),
+            model="approved-model",
+            with_n8n=False,
+            skill_digests={name: "a" * 64 for name in SKILLS},
+            lifecycle=PreparedLifecycle(),
+            repository=PreparedRepository(),
+            dispatcher=object(),
+            live_runner=PreparedRunner(),
+        )
+
+
 def test_preflight_rejects_self_attested_runtime_adapter(tmp_path: Path) -> None:
     from agenten.agent_factory.factory_live_entrypoint import (
         FactoryLiveConfigurationError,

@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -321,6 +322,64 @@ class FactoryLiveRunnerPort(Protocol):
         *,
         mode: Literal["demo", "release"],
     ) -> FactoryLiveRunReport: ...
+
+
+@dataclass(frozen=True)
+class PreparedFactoryLiveAdapter:
+    """Bound production ports returned only after adapter-owned preparation."""
+
+    mode: Literal["demo", "release"]
+    max_cost_usd: Decimal
+    model: str
+    with_n8n: bool
+    skill_digests: Mapping[str, str]
+    lifecycle: FactoryLiveLifecyclePort
+    repository: FactoryLiveWorkflowRepositoryPort
+    dispatcher: FactoryLiveDispatcherPort
+    live_runner: FactoryLiveRunnerPort
+
+    def __post_init__(self) -> None:
+        digests = dict(self.skill_digests)
+        _require_exact_skill_digests(digests)
+        object.__setattr__(self, "skill_digests", digests)
+        for label, port, methods in (
+            (
+                "lifecycle",
+                self.lifecycle,
+                ("next_action", "projection", "record", "promotion_block"),
+            ),
+            ("repository", self.repository, ("workflow_artifacts",)),
+            ("dispatcher", self.dispatcher, ("validate_next", "dispatch_next")),
+            ("live runner", self.live_runner, ("history", "run")),
+        ):
+            if any(not callable(getattr(port, method, None)) for method in methods):
+                raise TypeError(f"prepared Factory {label} port is incomplete")
+
+    def require_matches(
+        self,
+        settings: FactoryLivePreflightSettings,
+        expected_skill_digests: Mapping[str, str],
+    ) -> None:
+        """Reject a prepared graph that is not bound to this exact live gate."""
+
+        if (
+            self.mode != settings.mode
+            or self.max_cost_usd != settings.max_cost_usd
+            or self.model != settings.model
+            or self.with_n8n is not settings.with_n8n
+            or dict(self.skill_digests) != dict(expected_skill_digests)
+        ):
+            raise ValueError("prepared Factory adapter does not match live settings")
+
+
+class FactoryLiveAdapterFactory(Protocol):
+    """Build and verify the production graph without starting a live effect."""
+
+    def prepare(
+        self,
+        settings: FactoryLivePreflightSettings,
+        expected_skill_digests: Mapping[str, str],
+    ) -> PreparedFactoryLiveAdapter: ...
 
 
 class FactorySixSkillLiveResult(BaseModel):
@@ -817,11 +876,10 @@ def run_factory_live_preflight(
     settings: FactoryLivePreflightSettings,
     *,
     probe: FactoryLivePreflightProbe,
-    adapter_factory: object | None,
+    adapter_factory: FactoryLiveAdapterFactory | None,
 ) -> FactoryLivePreflight:
     """Verify real prerequisites and persist one redacted external confirmation."""
 
-    del adapter_factory
     observed_skill_digests = _released_skill_directory_digests(
         settings.repository_root
     )
@@ -837,9 +895,40 @@ def run_factory_live_preflight(
     probe.verify_hermes(observed_skill_digests)
     if settings.with_n8n:
         probe.verify_n8n()
-    raise FactoryLiveConfigurationError(
-        "production prepared dispatch adapter is unavailable"
+    if adapter_factory is None or not callable(
+        getattr(adapter_factory, "prepare", None)
+    ):
+        raise FactoryLiveConfigurationError(
+            "production prepared dispatch adapter is unavailable"
+        )
+    try:
+        prepared = adapter_factory.prepare(settings, observed_skill_digests)
+        if not isinstance(prepared, PreparedFactoryLiveAdapter):
+            raise TypeError("adapter factory returned an untyped runtime")
+        prepared.require_matches(settings, observed_skill_digests)
+    except Exception:
+        raise FactoryLiveConfigurationError(
+            "production prepared dispatch adapter failed verification"
+        ) from None
+    preflight = FactoryLivePreflight(
+        schema_name="captain.hermes-six-skill-factory-preflight.v1",
+        mode=settings.mode,
+        max_cost_usd=settings.max_cost_usd,
+        model=settings.model,
+        with_n8n=settings.with_n8n,
+        prerequisites_confirmed=True,
+        database_name="captain_test",
+        services_verified=True,
+        codex_authenticated=True,
+        skills_verified=True,
+        runtime_adapters_verified=True,
+        skill_digests=observed_skill_digests,
     )
+    _write_json(
+        settings.output,
+        preflight.model_dump(mode="json", by_alias=True),
+    )
+    return preflight
 
 
 async def run_factory_live_gate_from_environment() -> Mapping[str, object]:
