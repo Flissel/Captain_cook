@@ -1,9 +1,11 @@
-"""Gateway-owned lazy construction for the isolated live-demo store."""
+"""Gateway-owned constructors for the isolated local Captain test authority."""
 
 from __future__ import annotations
 
-from urllib.parse import unquote, urlsplit
+from collections.abc import Callable
+from datetime import datetime
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.store import GatewayStore
@@ -36,3 +38,21 @@ class LazyGatewayStore:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._resolved(), name)
+
+
+def build_local_captain_test_gateway_store(
+    dsn: str,
+    *,
+    clock: Callable[[], datetime],
+) -> GatewayStore:
+    """Build Gateway only for the isolated local ``captain_test`` database."""
+
+    parsed = urlsplit(dsn)
+    if (
+        parsed.scheme not in {"mysql", "mariadb"}
+        or (parsed.hostname or "").lower()
+        not in {"127.0.0.1", "localhost", "::1"}
+        or unquote(parsed.path.lstrip("/")) != "captain_test"
+    ):
+        raise ValueError("live capability evidence requires local captain_test")
+    return GatewayStore(MariaDBStorage(dsn), clock=clock)

@@ -1908,7 +1908,7 @@ class TeamExecutionCandidateAdapter:
         invocation = self.invocation_for(request)
         if request.lease is None or invocation.lease != request.lease:
             raise ValueError("team invocation must preserve the dispatch lease")
-        return await self._service_for(request.job, invocation).execute(
+        return await self.service_for(request.job, invocation).execute(
             invocation,
             candidate,
             self._holdout_for(request.job),
@@ -1934,7 +1934,7 @@ class TeamExecutionCandidateAdapter:
         )
         if request.lease is None or invocation.lease != request.lease:
             raise ValueError("team invocation must preserve the dispatch lease")
-        return await self._service_for(request.job, invocation).execute(
+        return await self.service_for(request.job, invocation).execute(
             invocation,
             candidate,
             holdout,
@@ -1952,6 +1952,20 @@ class TeamExecutionCandidateAdapter:
             invocation,
             self._holdout_for(request.job),
         )
+
+    def service_for(
+        self,
+        job: AgentFactoryJobV3,
+        invocation: FactorySkillInvocationV1,
+    ) -> TeamExecutionService:
+        """Resolve the host-owned service used by normal and recovery execution."""
+
+        if invocation.job_id != job.job_id:
+            raise ValueError("team execution service invocation belongs to a different job")
+        service = self._service_for(job, invocation)
+        if not callable(getattr(service, "execute", None)):
+            raise TypeError("team execution service factory returned an invalid service")
+        return service
 
     @staticmethod
     def _sole_holdout(job: AgentFactoryJobV3) -> PrivateHoldoutRef:
