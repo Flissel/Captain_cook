@@ -22,6 +22,7 @@ from agenten.agent_factory.capability_factory_entrypoint import (
     CapabilityFactoryEntrypoint,
     CapabilityFactoryInputMutation,
     CapabilityFactoryRunSummary,
+    CapabilityProviderIdempotencyError,
     CapabilityReleaseRunReceipt,
     CapabilityRuntimeExecution,
     CapabilitySandboxIsolationError,
@@ -30,6 +31,7 @@ from agenten.agent_factory.capability_factory_entrypoint import (
     DockerCommandResult,
     FileCapabilityFactoryCheckpointStore,
     InMemoryCapabilityFactoryCheckpointStore,
+    ProviderEffectReceipt,
     parse_capability_factory_args,
     run_capability_factory_cli,
     write_redacted_evidence_manifest,
@@ -82,6 +84,7 @@ from gateway.contracts import (
     RuntimeExecutionClaim,
     RuntimeExecutionClaimReceipt,
     RuntimeOperationProjection,
+    canonical_contract_sha256,
 )
 from gateway.factory_repository import GatewayFactoryRepository
 from gateway.registry_feed import runtime_result_projection
@@ -1066,6 +1069,30 @@ class ScriptedRuntimePort:
     plans: dict[UUID, CapabilityExecutionPlan] = field(default_factory=dict)
     executions: dict[UUID, CapabilityRuntimeExecution] = field(default_factory=dict)
     advance_clock_after_execute: timedelta | None = None
+    durable_idempotency_guaranteed: bool = True
+    crash_after_provider_effect_once: bool = False
+    _crashed_after_provider_effect: bool = False
+
+    def guarantees_durable_idempotency(
+        self,
+        plan: CapabilityExecutionPlan,
+        authority: CapabilityCatalogRecord,
+    ) -> bool:
+        return self.durable_idempotency_guaranteed
+
+    async def lookup_effect(
+        self,
+        *,
+        command_id: UUID,
+        effect_id: UUID,
+    ) -> CapabilityRuntimeExecution | None:
+        execution = self.executions.get(effect_id)
+        if (
+            execution is not None
+            and execution.provider_receipt.command_id != command_id
+        ):
+            raise AssertionError("provider command identity changed")
+        return execution
 
     async def prepare(
         self,
@@ -1133,16 +1160,19 @@ class ScriptedRuntimePort:
         plan: CapabilityExecutionPlan,
         authority: CapabilityCatalogRecord,
         claim: RuntimeExecutionClaimReceipt,
+        *,
+        effect_id: UUID,
     ) -> CapabilityRuntimeExecution:
         command = plan.command
         command_id = command.event_id
-        existing = self.executions.get(command_id)
+        existing = self.executions.get(effect_id)
         if existing is not None:
             return existing
         assert claim.claim.command_id == command_id
         assert claim.claim.capability_id == authority.capability_id
         assert claim.claim.capability_version == authority.capability_version
         assert claim.claim_credential is not None
+        assert effect_id == uuid5(command_id, "durable-provider-effect")
         result_id = uuid5(command_id, "capability-execution-result")
         artifact_ref = ArtifactRef(
             uri=f"artifact://runtime-result/{'b' * 64}",
@@ -1172,9 +1202,27 @@ class ScriptedRuntimePort:
         execution = CapabilityRuntimeExecution(
             result=result,
             outcome=outcome,
+            provider_receipt=ProviderEffectReceipt(
+                provider_operation_id=(
+                    "provider-operation:"
+                    + str(effect_id)
+                ),
+                effect_id=effect_id,
+                command_id=command_id,
+                request_digest=canonical_contract_sha256(plan),
+                result_digest=canonical_contract_sha256(result),
+                status=result.status.value,
+                idempotency_guaranteed=self.durable_idempotency_guaranteed,
+            ),
         )
-        self.executions[command_id] = execution
+        self.executions[effect_id] = execution
         self.effects.append(command_id)
+        if (
+            self.crash_after_provider_effect_once
+            and not self._crashed_after_provider_effect
+        ):
+            self._crashed_after_provider_effect = True
+            raise SimulatedProcessCrash("after durable provider effect")
         if self.advance_clock_after_execute is not None:
             self.gateway.clock.value += self.advance_clock_after_execute
         return execution
@@ -1490,9 +1538,11 @@ async def test_claim_commit_crash_returns_typed_retry_then_reacquires_after_expi
         )
 
     provider_effects = harness.runtime.effects
+    provider_executions = harness.runtime.executions
     harness.runtime = ScriptedRuntimePort(
         harness.gateway,
         effects=provider_effects,
+        executions=provider_executions,
     )
     pending = await harness.entrypoint().run(
         input_path=harness.input_path,
@@ -1530,7 +1580,7 @@ async def test_claim_commit_crash_returns_typed_retry_then_reacquires_after_expi
 
 
 @pytest.mark.asyncio
-async def test_result_commit_crash_derives_execution_without_provider_reexecution(
+async def test_result_commit_crash_uses_durable_receipt_without_provider_reexecution(
     tmp_path: Path,
 ) -> None:
     harness = _harness(tmp_path)
@@ -1547,9 +1597,11 @@ async def test_result_commit_crash_derives_execution_without_provider_reexecutio
         )
 
     provider_effects = harness.runtime.effects
+    provider_executions = harness.runtime.executions
     harness.runtime = ScriptedRuntimePort(
         harness.gateway,
         effects=provider_effects,
+        executions=provider_executions,
     )
     summary = await harness.entrypoint().run(
         input_path=harness.input_path,
@@ -1562,6 +1614,89 @@ async def test_result_commit_crash_derives_execution_without_provider_reexecutio
     assert len(harness.gateway.runtime_results) == 1
     assert len(harness.gateway.execution_effects) == 1
     assert len(harness.minibook.posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_effect_crash_recovers_from_durable_receipt_without_duplicate(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    harness.creation.crash_after_submit_once = False
+    harness.releases.crash_after_run_once = None
+    harness.runtime.crash_after_provider_effect_once = True
+
+    with pytest.raises(SimulatedProcessCrash, match="durable provider effect"):
+        await harness.entrypoint().run(
+            input_path=harness.input_path,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            wall_clock_budget_seconds=600,
+        )
+
+    provider_effects = harness.runtime.effects
+    provider_executions = harness.runtime.executions
+    assert len(provider_effects) == 1
+    assert len(provider_executions) == 1
+    assert not harness.gateway.runtime_results
+    command_id = provider_effects[0]
+    claim = harness.gateway.runtime_claims[command_id]
+
+    harness.runtime = ScriptedRuntimePort(
+        harness.gateway,
+        effects=provider_effects,
+        executions=provider_executions,
+    )
+    pending = await harness.entrypoint().run(
+        input_path=harness.input_path,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+        wall_clock_budget_seconds=600,
+    )
+    assert pending.execution_state == "retry_pending"
+    assert len(provider_effects) == 1
+
+    harness.clock.value = claim.expires_at + timedelta(microseconds=1)
+    harness.runtime = ScriptedRuntimePort(
+        harness.gateway,
+        effects=provider_effects,
+        executions=provider_executions,
+    )
+    completed = await harness.entrypoint().run(
+        input_path=harness.input_path,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+        wall_clock_budget_seconds=600,
+    )
+
+    assert completed.execution_state == "completed"
+    assert len(provider_effects) == 1
+    assert len(harness.gateway.runtime_results) == 1
+    assert len(harness.gateway.execution_effects) == 1
+    checkpoint_text = next(harness.checkpoint_dir.glob("*.json")).read_text(
+        encoding="utf-8"
+    )
+    assert "credential" not in checkpoint_text.casefold()
+
+
+@pytest.mark.asyncio
+async def test_runtime_without_durable_idempotency_is_refused_before_provider_effect(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    harness.creation.crash_after_submit_once = False
+    harness.releases.crash_after_run_once = None
+    harness.runtime.durable_idempotency_guaranteed = False
+
+    with pytest.raises(CapabilityProviderIdempotencyError, match="idempotency"):
+        await harness.entrypoint().run(
+            input_path=harness.input_path,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            wall_clock_budget_seconds=600,
+        )
+
+    assert not harness.runtime.effects
+    assert not harness.gateway.runtime_results
 
 
 @pytest.mark.asyncio
@@ -1859,6 +1994,65 @@ SANDBOX_IMAGE = (
 )
 
 
+def _write_adapter_manifest(
+    root: Path,
+    *,
+    source: str,
+    factory_symbol: str = "build_entrypoint",
+    module_sha256: str | None = None,
+) -> tuple[Path, bytes, Path]:
+    module_path = root / "adapters" / "capability_adapter.py"
+    module_path.parent.mkdir(parents=True, exist_ok=True)
+    module_content = source.encode("utf-8")
+    module_path.write_bytes(module_content)
+    manifest_content = json.dumps(
+        {
+            "schema": "captain.capability-factory-adapter-manifest.v2",
+            "module_path": "adapters/capability_adapter.py",
+            "module_sha256": (
+                module_sha256
+                if module_sha256 is not None
+                else hashlib.sha256(module_content).hexdigest()
+            ),
+            "factory_symbol": factory_symbol,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    manifest_path = root / "adapter-manifest.json"
+    manifest_path.write_bytes(manifest_content)
+    return manifest_path, manifest_content, module_path
+
+
+def _static_preflight_config(
+    root: Path,
+    manifest_path: Path,
+    manifest_content: bytes,
+) -> object:
+    input_path = root / "TO_BE_BUILT.md"
+    input_path.write_bytes(FIXTURE_INPUT.read_bytes())
+    return parse_capability_factory_args(
+        (
+            "--input",
+            "TO_BE_BUILT.md",
+            "--sandbox-image",
+            SANDBOX_IMAGE,
+            "--correlation-id",
+            str(CORRELATION_ID),
+            "--preflight-only",
+        ),
+        environ={
+            "CAPTAIN_GATEWAY_TOKEN": "gateway-secret-value",
+            "CAPTAIN_RUNTIME_TOKEN": "runtime-secret-value",
+            "MINIBOOK_PROJECTION_API_KEY": "projection-secret-value",
+            "CAPABILITY_FACTORY_ADAPTER_MANIFEST": manifest_path.name,
+            "CAPABILITY_FACTORY_ADAPTER_SHA256": hashlib.sha256(
+                manifest_content
+            ).hexdigest(),
+        },
+        workspace_root=root,
+    )
+
+
 @dataclass
 class RecordingDockerCommandRunner:
     network_mode: str = "none"
@@ -2075,15 +2269,12 @@ def test_cli_uses_safe_paths_service_urls_and_environment_only_secrets(
 ) -> None:
     input_path = tmp_path / "TO_BE_BUILT.md"
     input_path.write_bytes(FIXTURE_INPUT.read_bytes())
-    adapter_manifest = tmp_path / "adapter-manifest.json"
-    adapter_manifest_content = json.dumps(
-        {
-            "schema": "captain.capability-factory-adapter-manifest.v1",
-            "factory": "captain_adapter:build_entrypoint",
-        },
-        separators=(",", ":"),
-    ).encode("utf-8")
-    adapter_manifest.write_bytes(adapter_manifest_content)
+    adapter_manifest, adapter_manifest_content, adapter_module = (
+        _write_adapter_manifest(
+            tmp_path,
+            source="def build_entrypoint(config):\n    return config\n",
+        )
+    )
     environment = {
         "CAPTAIN_GATEWAY_TOKEN": "gateway-secret-value",
         "CAPTAIN_RUNTIME_TOKEN": "runtime-secret-value",
@@ -2123,6 +2314,7 @@ def test_cli_uses_safe_paths_service_urls_and_environment_only_secrets(
     assert config.gateway_url == "http://127.0.0.1:8080"
     assert config.sandbox_image == SANDBOX_IMAGE
     assert config.adapter_manifest_path == adapter_manifest.resolve()
+    assert adapter_module.is_relative_to(tmp_path.resolve())
     rendered = repr(config)
     assert "gateway-secret-value" not in rendered
     assert "runtime-secret-value" not in rendered
@@ -2132,53 +2324,70 @@ def test_cli_uses_safe_paths_service_urls_and_environment_only_secrets(
 @pytest.mark.asyncio
 async def test_static_preflight_never_imports_or_instantiates_adapter(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    input_path = tmp_path / "TO_BE_BUILT.md"
-    input_path.write_bytes(FIXTURE_INPUT.read_bytes())
     import_marker = tmp_path / "adapter-imported.txt"
-    (tmp_path / "unsafe_adapter.py").write_text(
-        "from pathlib import Path\n"
-        f"Path({str(import_marker)!r}).write_text('imported', encoding='utf-8')\n"
-        "def build_entrypoint(config): raise AssertionError('must not instantiate')\n",
-        encoding="utf-8",
-    )
-    manifest_content = json.dumps(
-        {
-            "schema": "captain.capability-factory-adapter-manifest.v1",
-            "factory": "unsafe_adapter:build_entrypoint",
-        },
-        separators=(",", ":"),
-    ).encode("utf-8")
-    manifest_path = tmp_path / "adapter-manifest.json"
-    manifest_path.write_bytes(manifest_content)
-    monkeypatch.syspath_prepend(str(tmp_path))
-    config = parse_capability_factory_args(
-        (
-            "--input",
-            "TO_BE_BUILT.md",
-            "--sandbox-image",
-            SANDBOX_IMAGE,
-            "--correlation-id",
-            str(CORRELATION_ID),
-            "--preflight-only",
+    manifest_path, manifest_content, _ = _write_adapter_manifest(
+        tmp_path,
+        source=(
+            "from pathlib import Path\n"
+            f"Path({str(import_marker)!r}).write_text('imported', encoding='utf-8')\n"
+            "def build_entrypoint(config): raise AssertionError('must not instantiate')\n"
         ),
-        environ={
-            "CAPTAIN_GATEWAY_TOKEN": "gateway-secret-value",
-            "CAPTAIN_RUNTIME_TOKEN": "runtime-secret-value",
-            "MINIBOOK_PROJECTION_API_KEY": "projection-secret-value",
-            "CAPABILITY_FACTORY_ADAPTER_MANIFEST": manifest_path.name,
-            "CAPABILITY_FACTORY_ADAPTER_SHA256": hashlib.sha256(
-                manifest_content
-            ).hexdigest(),
-        },
-        workspace_root=tmp_path,
     )
+    config = _static_preflight_config(tmp_path, manifest_path, manifest_content)
 
     result = await run_capability_factory_cli(config)
 
     assert result["status"] == "preflight_ok"
     assert not import_marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_static_preflight_rejects_adapter_module_digest_mismatch(
+    tmp_path: Path,
+) -> None:
+    manifest_path, manifest_content, _ = _write_adapter_manifest(
+        tmp_path,
+        source="def build_entrypoint(config):\n    return config\n",
+        module_sha256="0" * 64,
+    )
+    config = _static_preflight_config(tmp_path, manifest_path, manifest_content)
+
+    with pytest.raises(CapabilityFactoryConfigurationError, match="module digest"):
+        await run_capability_factory_cli(config)
+
+
+@pytest.mark.asyncio
+async def test_static_preflight_rejects_missing_factory_symbol(tmp_path: Path) -> None:
+    manifest_path, manifest_content, _ = _write_adapter_manifest(
+        tmp_path,
+        source="def another_symbol(config):\n    return config\n",
+    )
+    config = _static_preflight_config(tmp_path, manifest_path, manifest_content)
+
+    with pytest.raises(CapabilityFactoryConfigurationError, match="factory symbol"):
+        await run_capability_factory_cli(config)
+
+
+@pytest.mark.asyncio
+async def test_static_preflight_rejects_adapter_path_outside_workspace(
+    tmp_path: Path,
+) -> None:
+    manifest_content = json.dumps(
+        {
+            "schema": "captain.capability-factory-adapter-manifest.v2",
+            "module_path": "../outside-adapter.py",
+            "module_sha256": "a" * 64,
+            "factory_symbol": "build_entrypoint",
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    manifest_path = tmp_path / "adapter-manifest.json"
+    manifest_path.write_bytes(manifest_content)
+    config = _static_preflight_config(tmp_path, manifest_path, manifest_content)
+
+    with pytest.raises(CapabilityFactoryConfigurationError, match="workspace"):
+        await run_capability_factory_cli(config)
 
 
 def test_cli_rejects_credential_flags_and_unsafe_paths_without_echo(

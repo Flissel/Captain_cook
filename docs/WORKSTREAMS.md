@@ -39,6 +39,7 @@ projector around scripted external ports. It proves restart after creation
 submission and after the second normal E2E success with stable IDs and no
 duplicate effects, plus committed-publication and committed-execution crash
 recovery, committed-claim retry with a higher post-expiry fence,
+durable-provider-effect recovery before Gateway result recording,
 committed-result recovery without provider re-execution, catalog reuse without
 Forge/republication, mutation, tool-gap,
 holdout, post-effect deadline, artifact, and two-success failure paths. A
@@ -62,7 +63,9 @@ inspectable isolation. A scripted runner is test evidence only.
 The live gate runs only after deterministic and database-resetting gates. It
 requires `captain_test`, reads credentials from the gitignored environment,
 verifies a digest-pinned static adapter manifest without importing it, starts
-only a dedicated Gateway after that side-effect-free preflight, health-checks
+only a dedicated Gateway after that side-effect-free preflight. The manifest
+must bind a workspace-local Python module path, module SHA-256, and AST-proven
+factory symbol. The gate health-checks
 Runtime and Minibook before mutation, and does not adopt or
 mutate externally owned workflow services or volumes, and treats
 every missing provider, API, adapter, image, credential, skip, or projection
