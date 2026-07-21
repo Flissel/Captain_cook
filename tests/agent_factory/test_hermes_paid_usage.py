@@ -97,6 +97,16 @@ def test_paid_usage_accepts_hermes_total_that_includes_reasoning_tokens() -> Non
     assert usage.total_tokens == 125
 
 
+def test_paid_usage_accepts_multicall_total_that_includes_cache_tokens() -> None:
+    usage = HermesPaidUsageReceipt.model_validate(
+        _usage_report(total_tokens=135)
+    )
+
+    assert usage.cache_read_tokens == 10
+    assert usage.reasoning_tokens == 5
+    assert usage.total_tokens == 135
+
+
 class _EvidenceStore:
     def __init__(self) -> None:
         self.contents: list[bytes] = []

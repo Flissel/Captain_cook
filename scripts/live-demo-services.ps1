@@ -108,7 +108,7 @@ function Initialize-LocalEnvironment {
     Set-Missing $values 'CAPTAIN_FACTORY_HERMES_MODEL' { 'gpt-5.6-terra' }
     Set-Missing $values 'CAPTAIN_FACTORY_MODEL' { 'gpt-4o-mini' }
     Set-Missing $values 'CAPTAIN_FACTORY_MAX_COST_USD' { '1.00' }
-    Set-Missing $values 'CAPTAIN_FACTORY_MAX_COST_PER_CALL_USD' { '0.40' }
+    Set-Missing $values 'CAPTAIN_FACTORY_MAX_COST_PER_CALL_USD' { '0.50' }
     Set-Missing $values 'CAPTAIN_FACTORY_RUNTIME_SECONDS' { '600' }
     Set-Missing $values 'CAPTAIN_FACTORY_PRICING_VERSION' { 'openai-gpt-4o-mini-2026-07-21' }
     Set-Missing $values 'CAPTAIN_FACTORY_PRICING_EFFECTIVE_AT' { '2026-07-21T00:00:00Z' }

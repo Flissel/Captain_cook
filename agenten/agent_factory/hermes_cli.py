@@ -144,6 +144,15 @@ class HermesPaidUsageReceipt(BaseModel):
         accepted_totals = {
             self.input_tokens + self.output_tokens,
             self.input_tokens + self.output_tokens + self.reasoning_tokens,
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_read_tokens
+            + self.cache_write_tokens,
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_read_tokens
+            + self.cache_write_tokens
+            + self.reasoning_tokens,
         }
         if self.total_tokens not in accepted_totals:
             raise ValueError("paid usage token totals are contradictory")
