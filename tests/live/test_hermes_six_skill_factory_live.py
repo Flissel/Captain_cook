@@ -205,11 +205,18 @@ def _known_secret_values_from_environment() -> tuple[str, ...]:
         if not uri_value:
             continue
         try:
-            password = urlsplit(uri_value).password
+            parsed = urlsplit(uri_value)
         except ValueError:
-            password = None
-        if password:
-            values.add(unquote(password))
+            continue
+        if "@" in parsed.netloc:
+            raw_userinfo = parsed.netloc.rsplit("@", 1)[0]
+            if raw_userinfo:
+                values.add(raw_userinfo)
+                values.add(unquote(raw_userinfo))
+        raw_password = parsed.password
+        if raw_password:
+            values.add(raw_password)
+            values.add(unquote(raw_password))
     return tuple(sorted(values, key=lambda item: (-len(item), item)))
 
 

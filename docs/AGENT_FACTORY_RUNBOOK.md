@@ -169,8 +169,10 @@ keys (including access tokens, raw prompts, private material, and paths),
 Bearer material, credential-bearing URLs, token-shaped values, absolute host
 paths, and every known DSN/password or opted-in n8n credential value. Normal
 URI schemes such as `artifact://`, `https://`, and `holdout://` remain valid.
-The final report must match the exact extra-forbid external schema, including
-the complete provider traces and receipt references. The wrapper then
+URI userinfo and passwords are blocked in both their raw percent-encoded and
+decoded forms. The preflight and final report must match their exact
+extra-forbid external schemas, including the six-name `skill_digests` mapping
+and the complete provider traces and receipt references. The wrapper then
 recomputes the final digest and rejects an incorrect mode or terminal status.
 It prints the report digest but not the report body or host path.
 

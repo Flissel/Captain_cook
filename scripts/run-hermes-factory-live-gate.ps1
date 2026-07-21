@@ -152,13 +152,22 @@ function Get-KnownSecretValues {
         )
         if ($match.Success) {
             $userinfo = $match.Groups['userinfo'].Value
+            if (-not [string]::IsNullOrWhiteSpace($userinfo)) {
+                [void]$values.Add($userinfo)
+                $decodedUserinfo = [System.Uri]::UnescapeDataString($userinfo)
+                if (-not [string]::IsNullOrWhiteSpace($decodedUserinfo)) {
+                    [void]$values.Add($decodedUserinfo)
+                }
+            }
             $separator = $userinfo.IndexOf(':')
             if ($separator -ge 0 -and $separator -lt ($userinfo.Length - 1)) {
-                $password = [System.Uri]::UnescapeDataString(
-                    $userinfo.Substring($separator + 1)
-                )
-                if (-not [string]::IsNullOrWhiteSpace($password)) {
-                    [void]$values.Add($password)
+                $rawPassword = $userinfo.Substring($separator + 1)
+                if (-not [string]::IsNullOrWhiteSpace($rawPassword)) {
+                    [void]$values.Add($rawPassword)
+                    $decodedPassword = [System.Uri]::UnescapeDataString($rawPassword)
+                    if (-not [string]::IsNullOrWhiteSpace($decodedPassword)) {
+                        [void]$values.Add($decodedPassword)
+                    }
                 }
             }
         }
@@ -217,6 +226,9 @@ function Assert-ExactPropertyNames {
     $actual = @($Value.psobject.Properties.Name | Sort-Object)
     $expected = @($ExpectedNames | Sort-Object)
     if ([string]::Join('|', $actual) -cne [string]::Join('|', $expected)) {
+        if ($Label.StartsWith('preflight', [StringComparison]::Ordinal)) {
+            throw "$Label does not match the exact preflight contract."
+        }
         throw "$Label does not match the exact live-report contract."
     }
 }
@@ -530,6 +542,12 @@ try {
 catch {
     throw 'Factory live preflight confirmation is invalid JSON.'
 }
+Assert-ExactPropertyNames -Value $preflight -ExpectedNames @(
+    'schema', 'prerequisites_confirmed', 'database_name', 'services_verified',
+    'codex_authenticated', 'skills_verified', 'skill_digests'
+) -Label 'preflight'
+Assert-ExactPropertyNames -Value $preflight.skill_digests `
+    -ExpectedNames $skillNames -Label 'preflight.skill_digests'
 if (
     [string]$preflight.schema -cne 'captain.hermes-six-skill-factory-preflight.v1' -or
     $preflight.prerequisites_confirmed -ne $true -or
@@ -539,10 +557,6 @@ if (
     $preflight.skills_verified -ne $true
 ) {
     throw 'Factory live preflight did not confirm every required prerequisite.'
-}
-$digestProperties = @($preflight.skill_digests.psobject.Properties)
-if ($digestProperties.Count -ne 6) {
-    throw 'Factory live preflight must confirm exactly six released skill digests.'
 }
 foreach ($skillName in $skillNames) {
     $property = $preflight.skill_digests.psobject.Properties[$skillName]
