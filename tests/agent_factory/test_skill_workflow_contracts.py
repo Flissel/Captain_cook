@@ -449,17 +449,38 @@ def test_codex_assignment_is_bound_to_the_invocation(
     [
         r"C:\Users\User\secret.txt",
         "C:/Temp/secret.txt",
+        r"\\server\share\secret.txt",
+        "/root/secret.txt",
+        "/srv/secret.txt",
         "/Users/tester/secret.txt",
         "/tmp/secret.txt",
         "/var/log/secret.txt",
     ],
 )
 def test_workflow_artifacts_reject_absolute_user_and_system_paths(path: str) -> None:
-    source = artifact("unsafe-source", "d" * 64)
-    source["uri"] = f"artifact://workflow/{path}"
-
     with pytest.raises(ValidationError, match="private|local.path"):
-        CodebaseInventoryV1.model_validate(inventory_payload(source_refs=[source]))
+        CodebaseInventoryV1.model_validate(inventory_payload(autogen_version=path))
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "artifact://workflow/tmp/result",
+        "artifact://workflow/var/result",
+        "artifact://workflow/root/result",
+        "artifact://workflow/Users/result",
+        "artifact://sha256/" + "d" * 64,
+    ],
+)
+def test_workflow_artifacts_accept_opaque_uri_path_segments(uri: str) -> None:
+    source = artifact("opaque-source", "d" * 64)
+    source["uri"] = uri
+
+    inventory = CodebaseInventoryV1.model_validate(
+        inventory_payload(source_refs=[source])
+    )
+
+    assert inventory.source_refs[0].uri == uri
 
 
 @pytest.mark.parametrize(
@@ -506,23 +527,23 @@ def test_feedback_cannot_promote_a_bare_tool_gap_reference() -> None:
         )
 
 
-def test_feedback_promotion_requires_referenced_tool_gaps_to_be_resolved() -> None:
+def test_feedback_promotion_allows_optional_unresolved_gap_when_assertions_are_green() -> None:
     unresolved_optional = tool_gap_payload(severity="optional")
-    with pytest.raises(ValidationError, match="PROMOTE_CANDIDATE"):
+    feedback = FactoryFeedbackV1.model_validate(
+        feedback_payload(
+            tool_gaps=[unresolved_optional],
+            tool_gap_refs=[unresolved_optional["evidence_ref"]],
+        )
+    )
+
+    assert feedback.recommendation.value == "PROMOTE_CANDIDATE"
+    assert feedback.tool_gaps[0].status == "unresolved"
+
+    with pytest.raises(ValidationError, match="all Captain assertions"):
         FactoryFeedbackV1.model_validate(
             feedback_payload(
                 tool_gaps=[unresolved_optional],
                 tool_gap_refs=[unresolved_optional["evidence_ref"]],
+                assertion_ids=["schema_valid"],
             )
         )
-
-    resolved_optional = tool_gap_payload(severity="optional", status="resolved")
-    assert (
-        FactoryFeedbackV1.model_validate(
-            feedback_payload(
-                tool_gaps=[resolved_optional],
-                tool_gap_refs=[resolved_optional["evidence_ref"]],
-            )
-        ).recommendation.value
-        == "PROMOTE_CANDIDATE"
-    )

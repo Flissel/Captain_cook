@@ -27,9 +27,13 @@ _PRIVATE_KEY_PATTERN = re.compile(
 _PRIVATE_VALUE_PATTERN = re.compile(
     r"(?i)(?:\bsk-(?:proj-)?[a-z0-9_-]{8,}|\bbearer\s+\S+|"
     r"\b(?:api[_ -]?key|authorization|credential|password|secret|token)\b\s*[:=]|"
-    r"\bfile\s*:|(?:^|[^A-Za-z0-9])[A-Za-z]:[\\/]|\\\\|"
-    r"/(?:Users|home|tmp|var|etc|opt|workspace)(?:/|$))"
+    r"\bfile\s*:)"
 )
+_LOCAL_PATH_PATTERN = re.compile(
+    r"(?i)(?:^|[\s\"'(=])(?:[A-Za-z]:[\\/]|\\\\|"
+    r"/(?:root|srv|Users|home|tmp|var|etc|opt|workspace)(?:/|$))"
+)
+_OPAQUE_URI_PATTERN = re.compile(r"^(?:artifact|holdout|workspace)://")
 
 
 class _FrozenContract(BaseModel):
@@ -449,10 +453,16 @@ class FactoryFeedbackV1(_WorkflowArtifactBase):
         }
         if referenced != embedded:
             raise ValueError("tool gap refs must bind exactly to embedded TODO_TOOL.v1 markers")
-        if self.recommendation is FactoryFeedbackRecommendation.PROMOTE_CANDIDATE and any(
-            gap.status != "resolved" for gap in self.tool_gaps
-        ):
-            raise ValueError("PROMOTE_CANDIDATE requires every referenced TODO_TOOL.v1 to be resolved")
+        if self.recommendation is FactoryFeedbackRecommendation.PROMOTE_CANDIDATE:
+            if set(self.assertion_ids) != accepted:
+                raise ValueError("PROMOTE_CANDIDATE requires all Captain assertions")
+            if any(
+                gap.severity == "required" and gap.status == "unresolved"
+                for gap in self.tool_gaps
+            ):
+                raise ValueError(
+                    "PROMOTE_CANDIDATE cannot include a required unresolved TODO_TOOL.v1"
+                )
         return self
 
 
@@ -474,7 +484,13 @@ def _reject_private_content(value: object, context: str) -> None:
         if key is not None and _PRIVATE_KEY_PATTERN.search(key):
             raise ValueError(f"{context} contains private field {key}")
         if isinstance(item, str) and _PRIVATE_VALUE_PATTERN.search(item):
-            raise ValueError(f"{context} contains private or local-path content")
+            raise ValueError(f"{context} contains private content")
+        if (
+            isinstance(item, str)
+            and _OPAQUE_URI_PATTERN.match(item) is None
+            and _LOCAL_PATH_PATTERN.search(item)
+        ):
+            raise ValueError(f"{context} contains local-path content")
 
 
 def _walk(value: object, key: str | None = None) -> Sequence[tuple[str | None, object]]:
