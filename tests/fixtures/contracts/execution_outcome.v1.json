@@ -1,0 +1,39 @@
+{
+  "schema": "captain.execution-outcome.v1",
+  "capability_id": "support_triage",
+  "capability_version": 1,
+  "team_version": 1,
+  "correlation_id": "00000000-0000-0000-0000-000000000012",
+  "command_id": "00000000-0000-0000-0000-000000000031",
+  "result_id": "00000000-0000-0000-0000-000000000041",
+  "business_output": {
+    "ticket_id": "T-42",
+    "queue": "support"
+  },
+  "output_ref": null,
+  "assertion_outcomes": [
+    {
+      "assertion_id": "output-01",
+      "status": "passed",
+      "integration_intent": "none",
+      "evidence_refs": [
+        {
+          "uri": "artifact://execution-evidence/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "media_type": "application/json"
+        }
+      ]
+    }
+  ],
+  "tool_versions": ["support.lookup@1"],
+  "workflow_versions": ["support.triage@1"],
+  "evidence_refs": [
+    {
+      "uri": "artifact://execution-evidence/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "media_type": "application/json"
+    }
+  ],
+  "status": "succeeded",
+  "escalation_ref": null
+}
