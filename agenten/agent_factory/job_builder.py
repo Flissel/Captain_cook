@@ -1,13 +1,15 @@
-"""Deterministic Captain Factory-job v2 creation from compiled input."""
+"""Deterministic Captain Factory-job creation from compiled input."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from uuid import UUID, uuid5
 
-from agenten.agent_factory.contracts import AgentFactoryJobV2
+from agenten.agent_factory.contracts import AgentFactoryJobV2, AgentFactoryJobV3
+from agenten.agent_factory.execution_policy import FactoryExecutionPolicyV1
 from agenten.agent_factory.input_compiler import CompiledFactorySpecification
 from agenten.agent_runtime.contracts import ArtifactRef
 
@@ -56,5 +58,42 @@ def build_factory_job(
     )
 
 
+def build_factory_job_v3(
+    compiled: CompiledFactorySpecification,
+    *,
+    correlation_id: UUID,
+    now: datetime,
+    execution_policy: FactoryExecutionPolicyV1,
+) -> AgentFactoryJobV3:
+    v2 = build_factory_job(
+        compiled,
+        correlation_id=correlation_id,
+        now=now,
+        wall_clock_budget_seconds=execution_policy.max_runtime_seconds,
+    )
+    policy_payload = execution_policy.model_dump(mode="json", by_alias=True)
+    policy_payload["max_cost_usd"] = _canonical_decimal(
+        execution_policy.max_cost_usd
+    )
+    policy_json = _canonical_json(policy_payload)
+    policy_digest = hashlib.sha256(policy_json.encode("utf-8")).hexdigest()
+    identity = f"factory-job-v3|{v2.job_id}|{policy_digest}"
+    payload = v2.model_dump(mode="json", by_alias=True)
+    payload["schema"] = "captain.agent-factory-job.v3"
+    payload["job_id"] = str(uuid5(_JOB_NAMESPACE, identity))
+    payload["event_id"] = str(uuid5(correlation_id, identity))
+    payload["execution_policy"] = policy_payload
+    return AgentFactoryJobV3.model_validate(payload)
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _canonical_decimal(value: Decimal) -> str:
+    if value == 0:
+        return "0"
+    rendered = format(value, "f")
+    if "." in rendered:
+        return rendered.rstrip("0").rstrip(".")
+    return rendered
