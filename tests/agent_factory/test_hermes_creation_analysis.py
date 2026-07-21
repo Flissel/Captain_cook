@@ -111,7 +111,7 @@ async def test_creation_analysis_materializes_exact_hermes_evidence_and_replays(
             "request_id": "33333333-3333-4333-8333-333333333333",
             "lease_id": "hermes-creation-analysis",
             "occurred_at": NOW.isoformat(),
-            "commands": [{"command_id": "hermes.creation-analysis", "max_seconds": 60}],
+            "commands": [{"command_id": "artifact.read", "max_seconds": 60}],
             "assertion_ids": list(job.acceptance_assertion_ids),
             "outcome": "blocked_tool_gap",
         },
@@ -169,6 +169,10 @@ async def test_creation_analysis_materializes_exact_hermes_evidence_and_replays(
             "missing_required_external_api_or_credential": "emit_required_unresolved",
             "missing_optional_enrichment": "emit_optional_unresolved",
         }
+        assert request["authorized_receipt_commands"] == [
+            {"command_id": "artifact.read", "max_seconds": 60},
+            {"command_id": "hermes.creation-analysis", "max_seconds": 60},
+        ]
         calls.append(prompt)
         usage_file.write_text(json.dumps(_usage()), encoding="utf-8")
         return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()

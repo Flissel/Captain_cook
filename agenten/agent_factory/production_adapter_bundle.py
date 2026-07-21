@@ -801,6 +801,10 @@ class ProductionHermesCreationAnalysis:
                 "missing_required_external_api_or_credential": "emit_required_unresolved",
                 "missing_optional_enrichment": "emit_optional_unresolved",
             },
+            "authorized_receipt_commands": [
+                {"command_id": "artifact.read", "max_seconds": 60},
+                {"command_id": "hermes.creation-analysis", "max_seconds": 60},
+            ],
             "released_skill_path": str(self._released_skill_path),
             "released_skill": creation_job.released_skill.model_dump(mode="json", by_alias=True),
             "creation_job": creation_job.model_dump(mode="json", by_alias=True),
@@ -809,8 +813,8 @@ class ProductionHermesCreationAnalysis:
         }
         return json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
-    @staticmethod
     def _require_binding(
+        self,
         job: AgentFactoryJobV2,
         creation_job: CreationJobV1,
         payload: _HermesCreationAnalysisPayload,
@@ -822,12 +826,13 @@ class ProductionHermesCreationAnalysis:
             or payload.receipt.assertion_ids != job.acceptance_assertion_ids
             or payload.receipt.occurred_at < job.occurred_at
             or payload.receipt.occurred_at >= job.deadline_at
-            or payload.receipt.commands
-            != (
-                BoundedEvaluationCommand(
-                    command_id="hermes.creation-analysis",
-                    max_seconds=payload.receipt.commands[0].max_seconds,
-                ),
+            or not payload.receipt.commands
+            or len({item.command_id for item in payload.receipt.commands})
+            != len(payload.receipt.commands)
+            or any(
+                item.command_id not in {"artifact.read", "hermes.creation-analysis"}
+                or item.max_seconds > min(self._timeout_seconds, 60)
+                for item in payload.receipt.commands
             )
         ):
             raise ValueError("Hermes creation analysis changed Captain authority")
