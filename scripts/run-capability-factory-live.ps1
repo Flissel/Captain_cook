@@ -30,7 +30,8 @@ function Read-LocalEnvironment([string]$Path) {
         'CAPTAIN_GATEWAY_TOKEN', 'WORKER_GATEWAY_TOKEN', 'CAPTAIN_RUNTIME_TOKEN',
         'CAPTAIN_RUNTIME_URL', 'TEST_MARIADB_DSN', 'MINIBOOK_BACKEND_URL',
         'MINIBOOK_API_KEY', 'MINIBOOK_PROJECTION_API_KEY',
-        'CAPTAIN_CAPABILITY_SANDBOX_IMAGE', 'CAPABILITY_FACTORY_ADAPTER_FACTORY'
+        'CAPTAIN_CAPABILITY_SANDBOX_IMAGE',
+        'CAPABILITY_FACTORY_ADAPTER_MANIFEST', 'CAPABILITY_FACTORY_ADAPTER_SHA256'
     )
     $values = [ordered]@{}
     foreach ($line in [IO.File]::ReadAllLines($Path)) {
@@ -96,16 +97,11 @@ try {
     foreach ($name in @(
         'CAPTAIN_GATEWAY_TOKEN', 'WORKER_GATEWAY_TOKEN', 'CAPTAIN_RUNTIME_TOKEN',
         'MINIBOOK_API_KEY', 'MINIBOOK_PROJECTION_API_KEY',
-        'CAPABILITY_FACTORY_ADAPTER_FACTORY'
+        'CAPABILITY_FACTORY_ADAPTER_MANIFEST', 'CAPABILITY_FACTORY_ADAPTER_SHA256'
     )) { $null = Require-Value $values $name }
     if ($SandboxImage -notmatch '^(?:[a-z0-9.-]+(?::[0-9]+)?/)?captain-[a-z0-9._/-]+@sha256:[0-9a-f]{64}$') {
         throw 'A Captain-owned digest-pinned capability sandbox image is required.'
     }
-    & docker image inspect $SandboxImage *> $null
-    if ($LASTEXITCODE -ne 0) {
-        throw 'The pinned capability sandbox image is unavailable locally; pulling is forbidden.'
-    }
-
     $commonArguments = @(
         '--input', $selectedInput,
         '--artifact-dir', $artifactPath,
@@ -120,6 +116,10 @@ try {
 
     # STEP 2: fail closed before starting services when production adapters are absent.
     $null = Invoke-PythonFactory ($commonArguments + '--preflight-only')
+    & docker image inspect $SandboxImage *> $null
+    if ($LASTEXITCODE -ne 0) {
+        throw 'The pinned capability sandbox image is unavailable locally; pulling is forbidden.'
+    }
 
     # STEP 3: attest the exact isolated MariaDB identity without exposing its DSN.
     $env:LEDGER_DSN = Require-Value $values 'TEST_MARIADB_DSN'
@@ -161,7 +161,15 @@ if row is None or row["database_name"] != "captain_test":
     }
     if ($null -eq $health -or $health.status -ne 'ok') { throw 'Dedicated captain_test Gateway did not become healthy.' }
 
-    # STEP 5: execute recovery, three normal batches, publication, and one capability run.
+    # STEP 5: health-check every dependent service before the first factory mutation.
+    foreach ($target in @("$RuntimeUrl/health", "$MinibookUrl/health")) {
+        $response = Invoke-WebRequest -Uri $target -TimeoutSec 3
+        if ($response.StatusCode -lt 200 -or $response.StatusCode -ge 300) {
+            throw "Required factory service is unhealthy: $target"
+        }
+    }
+
+    # Execute creation/reuse, publication when needed, and one capability run.
     $runJson = Invoke-PythonFactory $commonArguments
     $run = $runJson | ConvertFrom-Json
     if ($run.status -ne 'ready_to_use') { throw 'Capability factory did not reach ready_to_use.' }

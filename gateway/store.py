@@ -1059,6 +1059,19 @@ class GatewayStore:
             ),
         )
 
+    def find_runtime_operation(
+        self,
+        operation_id: UUID,
+    ) -> RuntimeOperationProjection | None:
+        """Return a runtime operation when present without using 404 for recovery flow."""
+
+        try:
+            return self.runtime_operation(operation_id)
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+
     def released_runtime_batch(
         self,
         operation_id: UUID,

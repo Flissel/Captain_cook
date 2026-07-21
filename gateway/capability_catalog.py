@@ -44,6 +44,7 @@ class CapabilityCatalogRecord(BaseModel):
     team_version: int = Field(ge=1, strict=True)
     schema_major: int = Field(ge=1, strict=True)
     package_ref: ArtifactRef
+    release_authority_job_id: UUID
     terminal_decision_id: UUID
     promoted_capability: PromotedCapability
     accepted_assertion_ids: tuple[str, ...] = Field(min_length=1)
@@ -67,6 +68,7 @@ class CapabilityCatalogRecord(BaseModel):
             team_version=release.team_version,
             schema_major=release.schema_major,
             package_ref=release.package_ref,
+            release_authority_job_id=release.package.factory_job_id,
             terminal_decision_id=release.decision.decision_id,
             promoted_capability=release.promoted_capability,
             accepted_assertion_ids=release.accepted_assertion_ids,

@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import importlib
 import json
+import math
 import os
 import re
 import sys
@@ -19,7 +20,7 @@ import time
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Protocol
+from typing import Literal, Mapping, Protocol
 from urllib.parse import urlsplit
 from uuid import UUID, uuid5
 
@@ -42,7 +43,10 @@ from agenten.agent_factory.forge_contracts import (
     CreationSubmissionReceipt,
     ReleasedSkillRefV1,
 )
-from agenten.agent_factory.holdout_store import PrivateHoldoutStore
+from agenten.agent_factory.holdout_store import (
+    InMemoryPrivateHoldoutStore,
+    PrivateHoldoutStore,
+)
 from agenten.agent_factory.input_compiler import FactoryInputCompiler
 from agenten.agent_factory.input_document import load_factory_input
 from agenten.agent_factory.job_builder import build_factory_job
@@ -96,6 +100,7 @@ from gateway.contracts import (
     FactoryReleaseDecisionSubmission,
     RuntimeExecutionClaimReceipt,
     RuntimeExecutionClaimRequest,
+    RuntimeExecutionClaim,
     RuntimeOperationProjection,
     canonical_contract_sha256,
 )
@@ -127,6 +132,17 @@ class CapabilityFactoryCheckpoint(BaseModel):
     factory_job_id: UUID
     subject_version: int = Field(ge=1, strict=True)
     input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    occurred_at: datetime
+    deadline_at: datetime
+
+    @model_validator(mode="after")
+    def require_immutable_utc_timing(self) -> "CapabilityFactoryCheckpoint":
+        for value in (self.occurred_at, self.deadline_at):
+            if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+                raise ValueError("factory checkpoint timing must be UTC")
+        if self.deadline_at <= self.occurred_at:
+            raise ValueError("factory checkpoint deadline must follow occurred_at")
+        return self
 
 
 class CapabilityFactoryCliConfig(BaseModel):
@@ -142,6 +158,8 @@ class CapabilityFactoryCliConfig(BaseModel):
     runtime_url: str
     minibook_url: str
     sandbox_image: str
+    adapter_manifest_path: Path
+    adapter_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     correlation_id: UUID
     subject_version: int = Field(default=1, ge=1, strict=True)
     wall_clock_budget_seconds: int = Field(default=600, ge=1, le=86_400, strict=True)
@@ -203,6 +221,33 @@ class CapabilityRuntimeExecution(BaseModel):
     outcome: ExecutionOutcomeV1
 
 
+class CapabilityExecutionRetryPending(BaseModel):
+    """A committed active claim that cannot safely expose its credential again."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    command_id: UUID
+    expires_at: datetime
+
+    @model_validator(mode="after")
+    def require_utc_expiry(self) -> "CapabilityExecutionRetryPending":
+        if (
+            self.expires_at.tzinfo is None
+            or self.expires_at.utcoffset() != timezone.utc.utcoffset(self.expires_at)
+        ):
+            raise ValueError("runtime retry expiry must be UTC")
+        return self
+
+
+class CapabilityExecutionCompleted(BaseModel):
+    """A fully recorded runtime outcome and its exact public projection event."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    bundle: CapabilityExecutionBundle
+    projection_events: tuple[MinibookProjectionEvent, ...] = Field(min_length=1)
+
+
 class CapabilityFactoryRunSummary(BaseModel):
     """Redacted stable identity projection for one factory invocation."""
 
@@ -210,6 +255,11 @@ class CapabilityFactoryRunSummary(BaseModel):
 
     correlation_id: UUID
     factory_job_id: UUID
+    invocation_job_id: UUID
+    release_authority_job_id: UUID | None = None
+    execution_mode: Literal["created", "reused"]
+    execution_state: Literal["not_started", "retry_pending", "completed"]
+    retry_expires_at: datetime | None = None
     creation_job_id: UUID | None = None
     terminal_decision_id: UUID
     terminal_state: FactoryTerminalState
@@ -224,6 +274,27 @@ class CapabilityFactoryRunSummary(BaseModel):
     release_evidence_sha256: tuple[str, ...] = ()
     unresolved_required_tool_gaps: tuple[str, ...] = ()
     unresolved_optional_tool_gaps: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def require_consistent_execution_identity(self) -> "CapabilityFactoryRunSummary":
+        if self.factory_job_id != self.invocation_job_id:
+            raise ValueError("factory_job_id must identify the current invocation")
+        if self.execution_mode == "reused" and self.creation_job_id is not None:
+            raise ValueError("reused execution cannot expose a creation job")
+        if self.execution_state == "retry_pending":
+            if (
+                self.execution_command_id is None
+                or self.execution_result_id is not None
+                or self.retry_expires_at is None
+            ):
+                raise ValueError("retry-pending execution identity is incomplete")
+        elif self.retry_expires_at is not None:
+            raise ValueError("only retry-pending execution may expose retry expiry")
+        if self.execution_state == "completed" and (
+            self.execution_command_id is None or self.execution_result_id is None
+        ):
+            raise ValueError("completed execution identity is incomplete")
+        return self
 
 
 class CapabilityCreationPort(Protocol):
@@ -276,6 +347,13 @@ class CapabilityRuntimePort(Protocol):
         claim: RuntimeExecutionClaimReceipt,
     ) -> CapabilityRuntimeExecution: ...
 
+    async def derive_outcome(
+        self,
+        plan: CapabilityExecutionPlan,
+        authority: CapabilityCatalogRecord,
+        result: AgentRuntimeResult,
+    ) -> ExecutionOutcomeV1: ...
+
 
 class CapabilityAuthorityCatalogPort(CapabilityCatalogPort, Protocol):
     def compatible_record(
@@ -325,7 +403,15 @@ class CapabilityFactoryGatewayPort(Protocol):
         execution_claim_credential: str,
     ) -> object: ...
 
-    def runtime_operation(self, operation_id: UUID) -> RuntimeOperationProjection: ...
+    def find_runtime_operation(
+        self,
+        operation_id: UUID,
+    ) -> RuntimeOperationProjection | None: ...
+
+    def runtime_execution_claim(
+        self,
+        operation_id: UUID,
+    ) -> RuntimeExecutionClaim | None: ...
 
     def record_capability_execution(
         self,
@@ -365,15 +451,7 @@ class InMemoryCapabilityFactoryCheckpointStore:
         if existing is None:
             self._by_correlation[checkpoint.correlation_id] = checkpoint
             return checkpoint
-        if existing != checkpoint:
-            if existing.input_sha256 != checkpoint.input_sha256:
-                raise CapabilityFactoryInputMutation(
-                    "factory input bytes changed for the existing correlation"
-                )
-            raise CapabilityFactoryInputMutation(
-                "factory job identity changed for the existing correlation"
-            )
-        return existing
+        return _require_same_checkpoint(existing, checkpoint)
 
 
 class FileCapabilityFactoryCheckpointStore:
@@ -442,6 +520,11 @@ class DockerCliCommandRunner:
         *,
         timeout_seconds: float | None = None,
     ) -> DockerCommandResult:
+        limit = 30.0 if timeout_seconds is None else timeout_seconds
+        if not math.isfinite(limit) or limit <= 0:
+            raise CapabilitySandboxIsolationError(
+                "docker command timeout must be a positive finite value"
+            )
         process = await asyncio.create_subprocess_exec(
             "docker",
             *arguments,
@@ -449,12 +532,39 @@ class DockerCliCommandRunner:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        communication = asyncio.create_task(process.communicate())
         try:
-            stdout, stderr = await process.communicate()
+            stdout, stderr = await asyncio.wait_for(
+                asyncio.shield(communication),
+                timeout=limit,
+            )
+        except TimeoutError as exc:
+            if process.returncode is None:
+                process.terminate()
+            try:
+                await asyncio.wait_for(asyncio.shield(communication), timeout=5.0)
+            except TimeoutError:
+                if process.returncode is None:
+                    process.kill()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(communication),
+                        timeout=5.0,
+                    )
+                except TimeoutError:
+                    communication.cancel()
+            raise CapabilitySandboxIsolationError(
+                "docker command timed out"
+            ) from exc
         except asyncio.CancelledError:
             if process.returncode is None:
                 process.terminate()
-                await process.communicate()
+            try:
+                await asyncio.wait_for(asyncio.shield(communication), timeout=5.0)
+            except TimeoutError:
+                if process.returncode is None:
+                    process.kill()
+                communication.cancel()
             raise
         if len(stdout) > 1_048_576 or len(stderr) > 1_048_576:
             raise CapabilitySandboxIsolationError(
@@ -664,10 +774,14 @@ class DockerCapabilitySandboxRunner:
             raise CapabilitySandboxIsolationError(
                 "sandbox cancellation has no verified process identity"
             )
-        await self._commands.run(
+        killed = await self._commands.run(
             ("kill", execution.container_id),
             timeout_seconds=5.0,
         )
+        if killed.returncode != 0:
+            raise CapabilitySandboxIsolationError(
+                "Docker could not terminate the verified sandbox process tree"
+            )
         inspected = await self._inspect(execution.container_id, 5.0)
         state = _mapping(inspected, "State")
         if state.get("Running") is not False:
@@ -898,6 +1012,28 @@ def parse_capability_factory_args(
             "correlation identity is invalid"
         ) from exc
     source = os.environ if environ is None else environ
+    adapter_manifest_value = source.get(
+        "CAPABILITY_FACTORY_ADAPTER_MANIFEST",
+        "",
+    ).strip()
+    adapter_manifest_sha256 = source.get(
+        "CAPABILITY_FACTORY_ADAPTER_SHA256",
+        "",
+    ).strip()
+    if not adapter_manifest_value or not adapter_manifest_sha256:
+        raise CapabilityFactoryConfigurationError(
+            "required static adapter manifest aliases are missing: "
+            "CAPABILITY_FACTORY_ADAPTER_MANIFEST, CAPABILITY_FACTORY_ADAPTER_SHA256"
+        )
+    adapter_manifest_path = _safe_workspace_path(
+        root,
+        adapter_manifest_value,
+        "adapter manifest",
+    )
+    if not adapter_manifest_path.is_file():
+        raise CapabilityFactoryConfigurationError(
+            "static adapter manifest is not a readable workspace file"
+        )
     aliases = {
         "gateway_token": "CAPTAIN_GATEWAY_TOKEN",
         "runtime_token": "CAPTAIN_RUNTIME_TOKEN",
@@ -925,6 +1061,8 @@ def parse_capability_factory_args(
             runtime_url=runtime_url,
             minibook_url=minibook_url,
             sandbox_image=namespace.sandbox_image,
+            adapter_manifest_path=adapter_manifest_path,
+            adapter_manifest_sha256=adapter_manifest_sha256,
             correlation_id=correlation_id,
             subject_version=namespace.subject_version,
             wall_clock_budget_seconds=namespace.wall_clock_budget_seconds,
@@ -968,23 +1106,9 @@ def write_redacted_evidence_manifest(
 def _load_production_entrypoint(
     config: CapabilityFactoryCliConfig,
     *,
-    environ: Mapping[str, str] | None = None,
+    factory_reference: str,
 ) -> CapabilityFactoryEntrypoint:
-    source = os.environ if environ is None else environ
-    reference = source.get("CAPABILITY_FACTORY_ADAPTER_FACTORY", "").strip()
-    if not reference:
-        raise CapabilityFactoryConfigurationError(
-            "production adapter bundle is missing: "
-            "CAPABILITY_FACTORY_ADAPTER_FACTORY must name module:factory"
-        )
-    if re.fullmatch(
-        r"[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*",
-        reference,
-    ) is None:
-        raise CapabilityFactoryConfigurationError(
-            "production adapter bundle reference must use module:factory"
-        )
-    module_name, factory_name = reference.split(":", 1)
+    module_name, factory_name = factory_reference.split(":", 1)
     try:
         module = importlib.import_module(module_name)
         factory = getattr(module, factory_name)
@@ -1000,6 +1124,47 @@ def _load_production_entrypoint(
     return entrypoint
 
 
+def _validate_static_adapter_manifest(config: CapabilityFactoryCliConfig) -> str:
+    """Verify a side-effect-free, digest-pinned adapter declaration."""
+
+    try:
+        content = config.adapter_manifest_path.read_bytes()
+    except OSError as exc:
+        raise CapabilityFactoryConfigurationError(
+            "static adapter manifest could not be read"
+        ) from exc
+    if len(content) > 65_536:
+        raise CapabilityFactoryConfigurationError(
+            "static adapter manifest exceeds the control-plane size limit"
+        )
+    if hashlib.sha256(content).hexdigest() != config.adapter_manifest_sha256:
+        raise CapabilityFactoryConfigurationError(
+            "static adapter manifest digest does not match"
+        )
+    try:
+        payload = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CapabilityFactoryConfigurationError(
+            "static adapter manifest is not valid JSON"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"schema", "factory"}
+        or payload.get("schema")
+        != "captain.capability-factory-adapter-manifest.v1"
+        or not isinstance(payload.get("factory"), str)
+        or re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*",
+            payload["factory"],
+        )
+        is None
+    ):
+        raise CapabilityFactoryConfigurationError(
+            "static adapter manifest contract is invalid"
+        )
+    return payload["factory"]
+
+
 async def run_capability_factory_cli(
     config: CapabilityFactoryCliConfig,
     *,
@@ -1007,7 +1172,11 @@ async def run_capability_factory_cli(
 ) -> Mapping[str, object]:
     """Run the configured production composition and return redacted evidence only."""
 
-    entrypoint = _load_production_entrypoint(config, environ=environ)
+    document = load_factory_input(config.input_path)
+    FactoryInputCompiler(
+        holdout_store=InMemoryPrivateHoldoutStore(),
+    ).compile(document, config.subject_version)
+    factory_reference = _validate_static_adapter_manifest(config)
     if config.preflight_only:
         return {
             "schema": "captain.capability-factory-cli-result.v1",
@@ -1018,6 +1187,10 @@ async def run_capability_factory_cli(
                 "minibook": config.minibook_url,
             },
         }
+    entrypoint = _load_production_entrypoint(
+        config,
+        factory_reference=factory_reference,
+    )
     started_at = datetime.now(timezone.utc)
     started = time.perf_counter()
     summary = await entrypoint.run(
@@ -1119,6 +1292,13 @@ def _require_same_checkpoint(
     if existing.input_sha256 != proposed.input_sha256:
         raise CapabilityFactoryInputMutation(
             "factory input bytes changed for the existing correlation"
+        )
+    if (
+        existing.occurred_at != proposed.occurred_at
+        or existing.deadline_at != proposed.deadline_at
+    ):
+        raise CapabilityFactoryInputMutation(
+            "factory job timing changed for the existing correlation"
         )
     raise CapabilityFactoryInputMutation(
         "factory job identity changed for the existing correlation"
@@ -1233,21 +1413,22 @@ class CapabilityFactoryEntrypoint:
                 factory_job_id=job.job_id,
                 subject_version=job.subject_version,
                 input_sha256=job.input_ref.sha256,
+                occurred_at=job.occurred_at,
+                deadline_at=job.deadline_at,
             )
         )
+        coordinator = FactoryCoordinator(self._repository, clock=self._clock)
+        coordinator.register(job)
         authority = self._catalog.compatible_record(job)
         if authority is not None:
             _require_catalog_authority(job, authority)
-            execution, projection_events = await self._execute_authority(job, authority)
+            execution = await self._execute_authority(job, authority)
             return _reuse_summary(
                 job,
                 authority,
                 execution=execution,
-                projection_events=projection_events,
             )
 
-        coordinator = FactoryCoordinator(self._repository, clock=self._clock)
-        coordinator.register(job)
         resolution = CapabilityResolver(self._catalog).resolve(job)
         if resolution.kind != "create" or resolution.creation_key is None:
             raise RuntimeError("released capability reuse execution is not configured")
@@ -1386,6 +1567,15 @@ class CapabilityFactoryEntrypoint:
                 evidence=evidence,
             )
 
+        if self._clock.now() >= job.deadline_at:
+            return self._seal_nonready(
+                coordinator,
+                job,
+                creation_job.creation_job_id,
+                validation=package,
+                evaluation=evaluation,
+                evidence=evidence,
+            )
         lifecycle_blocks = await self._evidence_issuer.lifecycle_blocks(
             job,
             tuple(run_receipts),
@@ -1471,22 +1661,21 @@ class CapabilityFactoryEntrypoint:
             or authority.status != "ready_to_use"
         ):
             raise RuntimeError("Gateway catalog readback disagrees with atomic publication")
-        bundle, projection_events = await self._execute_authority(job, authority)
+        execution = await self._execute_authority(job, authority)
         return _summary(
             job,
             terminal,
             creation_job_id=creation_job.creation_job_id,
             package=package,
             evidence=evidence,
-            execution=bundle,
-            projection_events=projection_events,
+            execution=execution,
         )
 
     async def _execute_authority(
         self,
         job: AgentFactoryJobV2,
         authority: CapabilityCatalogRecord,
-    ) -> tuple[CapabilityExecutionBundle, tuple[MinibookProjectionEvent, ...]]:
+    ) -> CapabilityExecutionCompleted | CapabilityExecutionRetryPending:
         self._require_effect_budget(job, "runtime plan preparation")
         plan = await self._runtime.prepare(job, authority)
         if (
@@ -1499,10 +1688,27 @@ class CapabilityFactoryEntrypoint:
         ):
             raise ValueError("runtime execution plan does not match the factory invocation")
 
+        operation = self._gateway.find_runtime_operation(plan.command.event_id)
         existing = self._gateway.capability_execution(plan.command.event_id)
+        if operation is not None:
+            if operation.command != plan.command:
+                raise RuntimeError("Gateway runtime command disagrees with the execution plan")
+            if operation.grant is not None and operation.grant != plan.grant:
+                raise RuntimeError("Gateway runtime grant disagrees with the execution plan")
+            if operation.revocation is not None:
+                raise RuntimeError("Gateway runtime grant was revoked before recovery")
+
         if existing is not None:
-            operation = self._gateway.runtime_operation(plan.command.event_id)
-            if operation.result is None or existing.outcome.result_id != operation.result.event_id:
+            claim = self._gateway.runtime_execution_claim(plan.command.event_id)
+            if (
+                operation is None
+                or operation.result is None
+                or claim is None
+                or claim.status != "completed"
+                or existing.outcome.result_id != operation.result.event_id
+                or existing.claim_owner_id != claim.owner_id
+                or existing.claim_fencing_token != claim.fencing_token
+            ):
                 raise RuntimeError("Gateway execution readback is incomplete")
             bundle = CapabilityExecutionBundle(
                 command=operation.command,
@@ -1512,56 +1718,99 @@ class CapabilityFactoryEntrypoint:
                 claim_owner_id=existing.claim_owner_id,
                 claim_fencing_token=existing.claim_fencing_token,
             )
-        else:
+            return self._project_execution(job, authority, bundle)
+
+        if operation is not None and operation.result is not None:
+            claim = self._gateway.runtime_execution_claim(plan.command.event_id)
+            if claim is None or claim.status != "completed":
+                raise RuntimeError("Gateway runtime result has no completed execution claim")
+            outcome = await self._runtime.derive_outcome(
+                plan,
+                authority,
+                operation.result,
+            )
+            bundle = CapabilityExecutionBundle(
+                command=operation.command,
+                grant=operation.grant or plan.grant,
+                result=operation.result,
+                outcome=outcome,
+                claim_owner_id=claim.owner_id,
+                claim_fencing_token=claim.fencing_token,
+            )
+            self._validate_execution_bundle(job, authority, bundle)
+            self._record_execution(job, bundle)
+            return self._project_execution(job, authority, bundle)
+
+        claim = (
+            self._gateway.runtime_execution_claim(plan.command.event_id)
+            if operation is not None
+            else None
+        )
+        if claim is not None:
+            if claim.status == "completed":
+                raise RuntimeError("completed runtime claim is missing its result")
+            if claim.expires_at > self._clock.now():
+                return CapabilityExecutionRetryPending(
+                    command_id=plan.command.event_id,
+                    expires_at=claim.expires_at,
+                )
+
+        if operation is None:
             self._require_effect_budget(job, "runtime command admission")
             self._gateway.accept_runtime_command(plan.command)
+        if operation is None or operation.grant is None:
             self._require_effect_budget(job, "runtime grant recording")
             self._gateway.record_capability_grant(plan.grant)
-            self._require_effect_budget(job, "runtime execution claim")
-            claim = self._gateway.claim_runtime_execution(
-                RuntimeExecutionClaimRequest(
-                    schema_name="captain.runtime-execution-claim-request.v1",
-                    command_id=plan.command.event_id,
-                    owner_id=plan.claim_owner_id,
-                    lease_seconds=min(plan.command.payload.limits.wall_seconds, 900),
-                    capability_id=authority.capability_id,
-                    capability_version=authority.capability_version,
-                )
-            )
-            if claim.claim_credential is None:
-                raise RuntimeError(
-                    "runtime claim replay cannot recover its one-time credential"
-                )
-            self._require_effect_budget(job, "provider execution")
-            runtime = await self._runtime.execute(plan, authority, claim)
-            bundle = CapabilityExecutionBundle(
-                command=plan.command,
-                grant=plan.grant,
-                result=runtime.result,
-                outcome=runtime.outcome,
-                claim_owner_id=claim.claim.owner_id,
-                claim_fencing_token=claim.claim.fencing_token,
-            )
-            validate_execution_outcome_binding(
-                bundle.outcome,
-                command=bundle.command,
-                result=bundle.result,
-                expected_capability_id=authority.capability_id,
-                expected_capability_version=authority.capability_version,
-                expected_team_version=authority.team_version,
-            )
-            if bundle.command.correlation_id != job.correlation_id:
-                raise ValueError(
-                    "runtime command correlation does not match factory invocation"
-                )
-            self._require_effect_budget(job, "runtime result recording")
-            self._gateway.record_runtime_result(
-                bundle.result,
-                execution_owner_id=claim.claim.owner_id,
-                execution_fencing_token=claim.claim.fencing_token,
-                execution_claim_credential=claim.claim_credential,
-            )
 
+        self._require_effect_budget(job, "runtime execution claim")
+        claim_receipt = self._gateway.claim_runtime_execution(
+            RuntimeExecutionClaimRequest(
+                schema_name="captain.runtime-execution-claim-request.v1",
+                command_id=plan.command.event_id,
+                owner_id=plan.claim_owner_id,
+                lease_seconds=min(plan.command.payload.limits.wall_seconds, 900),
+                capability_id=authority.capability_id,
+                capability_version=authority.capability_version,
+            )
+        )
+        if claim_receipt.claim_credential is None:
+            if (
+                claim_receipt.claim.status == "active"
+                and claim_receipt.claim.expires_at > self._clock.now()
+            ):
+                return CapabilityExecutionRetryPending(
+                    command_id=plan.command.event_id,
+                    expires_at=claim_receipt.claim.expires_at,
+                )
+            raise RuntimeError("Gateway returned an unusable runtime execution claim")
+
+        self._require_effect_budget(job, "provider execution")
+        runtime = await self._runtime.execute(plan, authority, claim_receipt)
+        bundle = CapabilityExecutionBundle(
+            command=plan.command,
+            grant=plan.grant,
+            result=runtime.result,
+            outcome=runtime.outcome,
+            claim_owner_id=claim_receipt.claim.owner_id,
+            claim_fencing_token=claim_receipt.claim.fencing_token,
+        )
+        self._validate_execution_bundle(job, authority, bundle)
+        self._require_effect_budget(job, "runtime result recording")
+        self._gateway.record_runtime_result(
+            bundle.result,
+            execution_owner_id=claim_receipt.claim.owner_id,
+            execution_fencing_token=claim_receipt.claim.fencing_token,
+            execution_claim_credential=claim_receipt.claim_credential,
+        )
+        self._record_execution(job, bundle)
+        return self._project_execution(job, authority, bundle)
+
+    def _validate_execution_bundle(
+        self,
+        job: AgentFactoryJobV2,
+        authority: CapabilityCatalogRecord,
+        bundle: CapabilityExecutionBundle,
+    ) -> None:
         validate_execution_outcome_binding(
             bundle.outcome,
             command=bundle.command,
@@ -1572,30 +1821,52 @@ class CapabilityFactoryEntrypoint:
         )
         if bundle.command.correlation_id != job.correlation_id:
             raise ValueError("runtime command correlation does not match factory invocation")
-        if existing is None:
-            self._require_effect_budget(job, "capability execution recording")
-            execution = CapabilityExecutionRequest(
-                schema_name="captain.capability-execution-request.v1",
-                event_id=uuid5(bundle.command.event_id, "capability-execution-record"),
-                causation_id=bundle.result.event_id,
-                occurred_at=bundle.result.occurred_at,
-                producer="captain",
-                outcome=bundle.outcome,
-                outcome_ref=_canonical_ref(bundle.outcome, "execution-outcome"),
-                claim_owner_id=bundle.claim_owner_id,
-                claim_fencing_token=bundle.claim_fencing_token,
-            )
-            self._gateway.record_capability_execution(execution)
+
+    def _record_execution(
+        self,
+        job: AgentFactoryJobV2,
+        bundle: CapabilityExecutionBundle,
+    ) -> None:
+        self._require_effect_budget(job, "capability execution recording")
+        execution = CapabilityExecutionRequest(
+            schema_name="captain.capability-execution-request.v1",
+            event_id=uuid5(bundle.command.event_id, "capability-execution-record"),
+            causation_id=bundle.result.event_id,
+            occurred_at=bundle.result.occurred_at,
+            producer="captain",
+            outcome=bundle.outcome,
+            outcome_ref=_canonical_ref(bundle.outcome, "execution-outcome"),
+            claim_owner_id=bundle.claim_owner_id,
+            claim_fencing_token=bundle.claim_fencing_token,
+        )
+        self._gateway.record_capability_execution(execution)
+
+    def _project_execution(
+        self,
+        job: AgentFactoryJobV2,
+        authority: CapabilityCatalogRecord,
+        bundle: CapabilityExecutionBundle,
+    ) -> CapabilityExecutionCompleted:
+        self._validate_execution_bundle(job, authority, bundle)
         self._require_effect_budget(job, "Minibook projection")
         projection_events = tuple(
             event
             for event in self._gateway.projection_events(job.correlation_id)
-            if event.correlation_id == job.correlation_id
+            if (
+                event.event_id == bundle.result.event_id
+                and event.correlation_id == job.correlation_id
+                and event.causation_id == bundle.command.event_id
+                and event.event_type == "codex.result"
+                and event.payload.status_id == "built"
+            )
         )
-        if not projection_events:
-            raise RuntimeError("Gateway projection feed has no correlated execution event")
+        if len(projection_events) != 1:
+            raise RuntimeError("Gateway projection feed lacks the exact successful result event")
         self._projector.rebuild(projection_events)
-        return bundle, projection_events
+        return CapabilityExecutionCompleted(
+            bundle=bundle,
+            projection_events=projection_events,
+        )
 
     def _require_effect_budget(self, job: AgentFactoryJobV2, effect: str) -> None:
         if self._clock.now() >= job.deadline_at:
@@ -1660,7 +1931,6 @@ class CapabilityFactoryEntrypoint:
             package=package,
             evidence=evidence,
             execution=None,
-            projection_events=(),
         )
 
 
@@ -1880,8 +2150,7 @@ def _summary(
     creation_job_id: UUID,
     package: CapabilityPackageManifestV1 | None,
     evidence: tuple[CapabilityReleaseEvidenceV1, ...],
-    execution: CapabilityExecutionBundle | None,
-    projection_events: tuple[MinibookProjectionEvent, ...],
+    execution: CapabilityExecutionCompleted | CapabilityExecutionRetryPending | None,
 ) -> CapabilityFactoryRunSummary:
     required_gaps = ()
     optional_gaps = ()
@@ -1898,9 +2167,24 @@ def _summary(
         )
     recovery = next((item for item in evidence if item.kind == "recovery"), None)
     normals = tuple(item for item in evidence if item.kind == "normal")
+    completed = execution if isinstance(execution, CapabilityExecutionCompleted) else None
+    pending = execution if isinstance(execution, CapabilityExecutionRetryPending) else None
     return CapabilityFactoryRunSummary(
         correlation_id=job.correlation_id,
         factory_job_id=job.job_id,
+        invocation_job_id=job.job_id,
+        release_authority_job_id=(
+            job.job_id if terminal.state is FactoryTerminalState.READY_TO_USE else None
+        ),
+        execution_mode="created",
+        execution_state=(
+            "completed"
+            if completed is not None
+            else "retry_pending"
+            if pending is not None
+            else "not_started"
+        ),
+        retry_expires_at=(pending.expires_at if pending is not None else None),
         creation_job_id=creation_job_id,
         terminal_decision_id=terminal.decision_id,
         terminal_state=terminal.state,
@@ -1908,9 +2192,21 @@ def _summary(
         capability_version=(package.capability_version if package is not None else None),
         recovery_id=(recovery.recovery_id if recovery is not None else None),
         e2e_batch_ids=tuple(item.run_id for item in normals),
-        execution_command_id=(execution.command.event_id if execution is not None else None),
-        execution_result_id=(execution.result.event_id if execution is not None else None),
-        projection_event_ids=tuple(item.event_id for item in projection_events),
+        execution_command_id=(
+            completed.bundle.command.event_id
+            if completed is not None
+            else pending.command_id
+            if pending is not None
+            else None
+        ),
+        execution_result_id=(
+            completed.bundle.result.event_id if completed is not None else None
+        ),
+        projection_event_ids=(
+            tuple(item.event_id for item in completed.projection_events)
+            if completed is not None
+            else ()
+        ),
         package_sha256=(canonical_contract_sha256(package) if package is not None else None),
         release_evidence_sha256=tuple(
             hashlib.sha256(item.model_dump_json(by_alias=True).encode("utf-8")).hexdigest()
@@ -1947,20 +2243,38 @@ def _reuse_summary(
     job: AgentFactoryJobV2,
     authority: CapabilityCatalogRecord,
     *,
-    execution: CapabilityExecutionBundle,
-    projection_events: tuple[MinibookProjectionEvent, ...],
+    execution: CapabilityExecutionCompleted | CapabilityExecutionRetryPending,
 ) -> CapabilityFactoryRunSummary:
+    completed = execution if isinstance(execution, CapabilityExecutionCompleted) else None
+    pending = execution if isinstance(execution, CapabilityExecutionRetryPending) else None
     return CapabilityFactoryRunSummary(
         correlation_id=job.correlation_id,
         factory_job_id=job.job_id,
+        invocation_job_id=job.job_id,
+        release_authority_job_id=authority.release_authority_job_id,
+        execution_mode="reused",
+        execution_state=("completed" if completed is not None else "retry_pending"),
+        retry_expires_at=(pending.expires_at if pending is not None else None),
         creation_job_id=None,
         terminal_decision_id=authority.terminal_decision_id,
         terminal_state=FactoryTerminalState.READY_TO_USE,
         capability_id=authority.capability_id,
         capability_version=authority.capability_version,
-        execution_command_id=execution.command.event_id,
-        execution_result_id=execution.result.event_id,
-        projection_event_ids=tuple(item.event_id for item in projection_events),
+        execution_command_id=(
+            completed.bundle.command.event_id
+            if completed is not None
+            else pending.command_id
+            if pending is not None
+            else None
+        ),
+        execution_result_id=(
+            completed.bundle.result.event_id if completed is not None else None
+        ),
+        projection_event_ids=(
+            tuple(item.event_id for item in completed.projection_events)
+            if completed is not None
+            else ()
+        ),
         package_sha256=authority.package_ref.sha256,
         unresolved_required_tool_gaps=authority.unresolved_required_gap_ids,
     )

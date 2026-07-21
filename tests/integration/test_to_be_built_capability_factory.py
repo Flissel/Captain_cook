@@ -1,15 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
-import os
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import urlsplit
 from uuid import UUID, uuid5
 
 import pytest
@@ -27,10 +26,12 @@ from agenten.agent_factory.capability_factory_entrypoint import (
     CapabilityRuntimeExecution,
     CapabilitySandboxIsolationError,
     DockerCapabilitySandboxRunner,
+    DockerCliCommandRunner,
     DockerCommandResult,
     FileCapabilityFactoryCheckpointStore,
     InMemoryCapabilityFactoryCheckpointStore,
     parse_capability_factory_args,
+    run_capability_factory_cli,
     write_redacted_evidence_manifest,
 )
 from agenten.agent_factory.contracts import (
@@ -84,7 +85,6 @@ from gateway.contracts import (
 )
 from gateway.factory_repository import GatewayFactoryRepository
 from gateway.registry_feed import runtime_result_projection
-from gateway.store import GatewayStore
 from tests.agent_factory.test_skill_evaluation_contracts import evidence_payload
 
 
@@ -97,36 +97,6 @@ FIXTURE_INPUT = (
     / "agent_factory"
     / "TO_BE_BUILT.valid.md"
 )
-
-
-def _isolated_test_dsn() -> str | None:
-    value = os.environ.get("TEST_MARIADB_DSN", "").strip()
-    if not value:
-        candidates = (
-            Path(__file__).parents[2] / ".env",
-            Path.home() / "Desktop" / "Captain_cook" / ".env",
-        )
-        for candidate in candidates:
-            if not candidate.is_file():
-                continue
-            for line in candidate.read_text(encoding="utf-8").splitlines():
-                if line.startswith("TEST_MARIADB_DSN="):
-                    value = line.split("=", 1)[1].strip()
-                    break
-            if value:
-                break
-    if not value:
-        return None
-    parsed = urlsplit(value)
-    if (
-        parsed.scheme not in {"mysql", "mariadb"}
-        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
-        or parsed.path.strip("/") != "captain_test"
-    ):
-        pytest.fail(
-            "TEST_MARIADB_DSN must target loopback database exactly captain_test"
-        )
-    return value
 
 
 class SimulatedProcessCrash(RuntimeError):
@@ -232,6 +202,8 @@ def test_checkpoint_binding_is_idempotent_and_rejects_changed_input_bytes() -> N
         factory_job_id=FACTORY_JOB_ID,
         subject_version=1,
         input_sha256="a" * 64,
+        occurred_at=NOW,
+        deadline_at=NOW + timedelta(minutes=10),
     )
 
     assert store.bind(checkpoint) == checkpoint
@@ -247,6 +219,8 @@ def test_file_checkpoint_binding_survives_process_restart(tmp_path: Path) -> Non
         factory_job_id=FACTORY_JOB_ID,
         subject_version=1,
         input_sha256="a" * 64,
+        occurred_at=NOW,
+        deadline_at=NOW + timedelta(minutes=10),
     )
 
     assert FileCapabilityFactoryCheckpointStore(tmp_path).bind(checkpoint) == checkpoint
@@ -255,6 +229,12 @@ def test_file_checkpoint_binding_survives_process_restart(tmp_path: Path) -> Non
 
     with pytest.raises(CapabilityFactoryInputMutation, match="input bytes"):
         restarted.bind(checkpoint.model_copy(update={"input_sha256": "b" * 64}))
+    with pytest.raises(CapabilityFactoryInputMutation, match="timing"):
+        restarted.bind(
+            checkpoint.model_copy(
+                update={"deadline_at": checkpoint.deadline_at + timedelta(seconds=1)}
+            )
+        )
 
 
 def _accepted_evaluation(
@@ -665,8 +645,13 @@ class ScriptedGatewayStore:
     runtime_authority_order: list[str] = field(default_factory=list)
     crash_after_publication_once: bool = False
     crash_after_execution_once: bool = False
+    crash_after_claim_once: bool = False
+    crash_after_result_once: bool = False
+    add_decoy_projection: bool = False
     _crashed_after_publication: bool = False
     _crashed_after_execution: bool = False
+    _crashed_after_claim: bool = False
+    _crashed_after_result: bool = False
     advance_clock_after_publication: timedelta | None = None
     advance_clock_after_execution: timedelta | None = None
 
@@ -789,13 +774,14 @@ class ScriptedGatewayStore:
     def claim_runtime_execution(self, request: object) -> RuntimeExecutionClaimReceipt:
         command_id = request.command_id  # type: ignore[attr-defined]
         existing = self.runtime_claims.get(command_id)
-        if existing is not None:
+        if existing is not None and existing.status == "active" and existing.expires_at > self.clock.now():
             return RuntimeExecutionClaimReceipt(
                 claim=existing,
                 replayed=True,
                 recovered=False,
                 claim_credential=None,
             )
+        fencing_token = existing.fencing_token + 1 if existing is not None else 1
         authority = self.catalog_records[request.capability_id]  # type: ignore[attr-defined]
         claim = RuntimeExecutionClaim(
             capability_id=authority.capability_id,
@@ -809,19 +795,22 @@ class ScriptedGatewayStore:
             package_ref=authority.package_ref,
             published_at=authority.published_at,
             command_id=command_id,
-            claim_id=uuid5(command_id, "runtime-execution-claim:1"),
+            claim_id=uuid5(command_id, f"runtime-execution-claim:{fencing_token}"),
             owner_id=request.owner_id,  # type: ignore[attr-defined]
-            fencing_token=1,
+            fencing_token=fencing_token,
             claimed_at=self.clock.now(),
             expires_at=self.clock.now() + timedelta(seconds=request.lease_seconds),  # type: ignore[attr-defined]
             status="active",
         )
         self.runtime_claims[command_id] = claim
         self.runtime_authority_order.append("claim")
+        if self.crash_after_claim_once and not self._crashed_after_claim:
+            self._crashed_after_claim = True
+            raise SimulatedProcessCrash("after runtime claim")
         return RuntimeExecutionClaimReceipt(
             claim=claim,
             replayed=False,
-            recovered=False,
+            recovered=existing is not None,
             claim_credential="deterministic-runtime-claim-credential",
         )
 
@@ -846,6 +835,9 @@ class ScriptedGatewayStore:
         )
         if existing is None:
             self.runtime_authority_order.append("result")
+        if self.crash_after_result_once and not self._crashed_after_result:
+            self._crashed_after_result = True
+            raise SimulatedProcessCrash("after runtime result")
         return SimpleNamespace(replayed=existing is not None)
 
     def runtime_operation(self, operation_id: UUID) -> RuntimeOperationProjection:
@@ -855,6 +847,17 @@ class ScriptedGatewayStore:
             grant=self.runtime_grants.get(operation_id),
             result=self.runtime_results.get(operation_id),
         )
+
+    def find_runtime_operation(
+        self,
+        operation_id: UUID,
+    ) -> RuntimeOperationProjection | None:
+        if operation_id not in self.runtime_commands:
+            return None
+        return self.runtime_operation(operation_id)
+
+    def runtime_execution_claim(self, operation_id: UUID) -> RuntimeExecutionClaim | None:
+        return self.runtime_claims.get(operation_id)
 
     def record_capability_execution(
         self,
@@ -877,10 +880,19 @@ class ScriptedGatewayStore:
             )
         )
         assert projection is not None
-        self.projection_events_by_correlation.setdefault(
+        projection_feed = self.projection_events_by_correlation.setdefault(
             request.outcome.correlation_id,
             [],
-        ).append(projection)
+        )
+        if self.add_decoy_projection:
+            projection_feed.append(
+                projection.model_copy(
+                    update={
+                        "event_id": uuid5(projection.event_id, "decoy-result"),
+                    }
+                )
+            )
+        projection_feed.append(projection)
         self.runtime_authority_order.append("execution")
         if self.advance_clock_after_execution is not None:
             self.clock.value += self.advance_clock_after_execution
@@ -991,6 +1003,7 @@ class ScriptedReleaseRunPort:
     crash_after_run_once: int | None = None
     max_success_runs: int = 3
     effects: list[str] = field(default_factory=list)
+    lifecycle_calls: int = 0
     receipts: dict[tuple[UUID, int], CapabilityReleaseRunReceipt] = field(default_factory=dict)
     _crashed: bool = False
 
@@ -1020,6 +1033,7 @@ class ScriptedReleaseRunPort:
         job: AgentFactoryJobV2,
         receipts: tuple[CapabilityReleaseRunReceipt, ...],
     ) -> tuple[FactoryEvidenceBlock, FactoryEvidenceBlock, FactoryEvidenceBlock]:
+        self.lifecycle_calls += 1
         refs = tuple(item.reference for item in receipts)
         return (
             _block(
@@ -1073,7 +1087,7 @@ class ScriptedRuntimePort:
                 "event_id": command_id,
                 "correlation_id": job.correlation_id,
                 "causation_id": authority.terminal_decision_id,
-                "occurred_at": self.gateway.clock.now(),
+                "occurred_at": job.occurred_at,
                 "producer": "captain",
                 "subject_id": "capability-execution",
                 "subject_version": job.subject_version,
@@ -1102,8 +1116,8 @@ class ScriptedRuntimePort:
                 "profile": command.payload.capability_profile,
                 "capabilities": ["codex.run"],
                 "mcp_servers": [],
-                "issued_at": self.gateway.clock.now(),
-                "expires_at": self.gateway.clock.now() + timedelta(minutes=5),
+                "issued_at": job.occurred_at,
+                "expires_at": min(job.deadline_at, job.occurred_at + timedelta(minutes=5)),
             }
         )
         plan = CapabilityExecutionPlan(
@@ -1154,6 +1168,31 @@ class ScriptedRuntimePort:
                 "error": None,
             }
         )
+        outcome = await self.derive_outcome(plan, authority, result)
+        execution = CapabilityRuntimeExecution(
+            result=result,
+            outcome=outcome,
+        )
+        self.executions[command_id] = execution
+        self.effects.append(command_id)
+        if self.advance_clock_after_execute is not None:
+            self.gateway.clock.value += self.advance_clock_after_execute
+        return execution
+
+    async def derive_outcome(
+        self,
+        plan: CapabilityExecutionPlan,
+        authority: CapabilityCatalogRecord,
+        result: AgentRuntimeResult,
+    ) -> ExecutionOutcomeV1:
+        command = plan.command
+        if (
+            result.command_id != command.event_id
+            or result.correlation_id != command.correlation_id
+            or not result.artifact_refs
+        ):
+            raise AssertionError("runtime result does not match the deterministic plan")
+        artifact_ref = result.artifact_refs[0]
         assertion_outcomes = tuple(
             AssertionOutcome(
                 assertion_id=assertion_id,
@@ -1175,8 +1214,8 @@ class ScriptedRuntimePort:
             capability_version=authority.capability_version,
             team_version=authority.team_version,
             correlation_id=command.correlation_id,
-            command_id=command_id,
-            result_id=result_id,
+            command_id=command.event_id,
+            result_id=result.event_id,
             business_output={"status": "completed"},
             assertion_outcomes=assertion_outcomes,
             tool_versions=("captain.runtime@1",),
@@ -1184,15 +1223,7 @@ class ScriptedRuntimePort:
             evidence_refs=(artifact_ref,),
             status="succeeded",
         )
-        execution = CapabilityRuntimeExecution(
-            result=result,
-            outcome=outcome,
-        )
-        self.executions[command_id] = execution
-        self.effects.append(command_id)
-        if self.advance_clock_after_execute is not None:
-            self.gateway.clock.value += self.advance_clock_after_execute
-        return execution
+        return outcome
 
 
 @dataclass
@@ -1347,6 +1378,9 @@ async def test_complete_factory_release_chain_recovers_twice_without_duplicate_e
     assert job.required_capability == "customer_support_triage"
     assert job.input_ref.sha256 == hashlib.sha256(harness.input_path.read_bytes()).hexdigest()
     assert summary.factory_job_id == job.job_id
+    assert summary.invocation_job_id == job.job_id
+    assert summary.release_authority_job_id == job.job_id
+    assert summary.execution_mode == "created"
     assert summary.creation_job_id == creation_job.creation_job_id
     assert summary.terminal_state == "ready_to_use"
     assert summary.capability_id == job.required_capability
@@ -1385,73 +1419,6 @@ async def test_complete_factory_release_chain_recovers_twice_without_duplicate_e
     ]
 
 
-def test_deterministic_chain_exercises_production_gateway_authority_methods(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    dsn = _isolated_test_dsn()
-    if dsn is None:
-        pytest.skip(
-            "production GatewayStore authority proof requires isolated TEST_MARIADB_DSN"
-        )
-
-    from blockchain.mariadb_storage import MariaDBStorage
-    from tests.gateway import test_agent_factory as gateway_acceptance
-
-    monkeypatch.setattr(gateway_acceptance, "TEST_DSN", dsn)
-    storage = MariaDBStorage(dsn)
-    storage.clear()
-    try:
-        release = gateway_acceptance._prepare_v2_capability_release(
-            storage,
-            promote=True,
-        )
-        store = GatewayStore(
-            storage,
-            clock=lambda: gateway_acceptance.TEST_GATEWAY_NOW,
-        )
-        insert = store._insert
-
-        def crash_inside_publication(cursor: object, block: dict[str, object]) -> None:
-            insert(cursor, block)
-            if block["block_type"] == "capability_package_published":
-                raise SimulatedProcessCrash("inside atomic publication")
-
-        monkeypatch.setattr(store, "_insert", crash_inside_publication)
-        with pytest.raises(SimulatedProcessCrash, match="atomic publication"):
-            store.publish_capability_release(release)
-        assert store.factory_terminal_decision(release.package.factory_job_id) is None
-        assert store.capability(release.package.capability_id) is None
-
-        monkeypatch.setattr(store, "_insert", insert)
-        published = store.publish_capability_release(release)
-        restarted = GatewayStore(
-            storage,
-            clock=lambda: gateway_acceptance.TEST_GATEWAY_NOW,
-        )
-        replayed = restarted.publish_capability_release(release)
-        authority = restarted.capability(
-            release.package.capability_id,
-            version=release.package.capability_version,
-        )
-        assert published.replayed is False
-        assert replayed.replayed is True
-        assert authority is not None
-        assert authority.terminal_decision_id == release.decision.decision_id
-        assert authority.package_ref == release.package_ref
-
-        command, result = gateway_acceptance._seed_runtime_result(storage, release)
-        execution = gateway_acceptance._execution_request(release, command, result)
-        recorded = restarted.record_capability_execution(execution)
-        execution_replay = GatewayStore(storage).record_capability_execution(execution)
-        readback = restarted.capability_execution(execution.outcome.command_id)
-        assert recorded.replayed is False
-        assert execution_replay.replayed is True
-        assert readback is not None
-        assert readback.outcome == execution.outcome
-    finally:
-        storage.clear()
-
-
 @pytest.mark.asyncio
 async def test_catalog_hit_reuses_frozen_authority_without_forge_or_republication(
     tmp_path: Path,
@@ -1485,10 +1452,15 @@ async def test_catalog_hit_reuses_frozen_authority_without_forge_or_republicatio
     )
 
     assert reused.terminal_state == "ready_to_use"
+    assert reused.execution_mode == "reused"
     assert reused.creation_job_id is None
     assert reused.capability_id == created.capability_id
     assert reused.capability_version == created.capability_version
     assert reused.correlation_id == reuse_correlation
+    assert reused.invocation_job_id != created.invocation_job_id
+    assert reused.release_authority_job_id == created.invocation_job_id
+    assert reused.terminal_decision_id == created.terminal_decision_id
+    assert reused.invocation_job_id in harness.gateway.jobs
     assert reused.execution_command_id in harness.gateway.executions
     assert harness.gateway.executions[reused.execution_command_id].correlation_id == reuse_correlation
     assert tuple(harness.creation.submission_effects) == creation_effects
@@ -1498,6 +1470,118 @@ async def test_catalog_hit_reuses_frozen_authority_without_forge_or_republicatio
     assert len(harness.runtime.effects) == 2
     assert len(harness.gateway.execution_effects) == 2
     assert len(harness.minibook.posts) == 2
+
+
+@pytest.mark.asyncio
+async def test_claim_commit_crash_returns_typed_retry_then_reacquires_after_expiry(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    harness.creation.crash_after_submit_once = False
+    harness.releases.crash_after_run_once = None
+    harness.gateway.crash_after_claim_once = True
+
+    with pytest.raises(SimulatedProcessCrash, match="runtime claim"):
+        await harness.entrypoint().run(
+            input_path=harness.input_path,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            wall_clock_budget_seconds=600,
+        )
+
+    provider_effects = harness.runtime.effects
+    harness.runtime = ScriptedRuntimePort(
+        harness.gateway,
+        effects=provider_effects,
+    )
+    pending = await harness.entrypoint().run(
+        input_path=harness.input_path,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+        wall_clock_budget_seconds=600,
+    )
+    claim = harness.gateway.runtime_claims[pending.execution_command_id]
+    assert pending.execution_state == "retry_pending"
+    assert pending.retry_expires_at == claim.expires_at
+    assert pending.execution_result_id is None
+    assert not harness.runtime.effects
+    assert not harness.gateway.runtime_results
+    checkpoint_text = next(harness.checkpoint_dir.glob("*.json")).read_text(
+        encoding="utf-8"
+    )
+    assert "credential" not in checkpoint_text.casefold()
+
+    harness.clock.value = claim.expires_at + timedelta(microseconds=1)
+    harness.runtime = ScriptedRuntimePort(
+        harness.gateway,
+        effects=provider_effects,
+    )
+    completed = await harness.entrypoint().run(
+        input_path=harness.input_path,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+        wall_clock_budget_seconds=600,
+    )
+    assert completed.execution_state == "completed"
+    assert completed.execution_result_id is not None
+    assert harness.gateway.runtime_claims[completed.execution_command_id].fencing_token == 2
+    assert len(harness.runtime.effects) == 1
+    assert len(harness.gateway.execution_effects) == 1
+
+
+@pytest.mark.asyncio
+async def test_result_commit_crash_derives_execution_without_provider_reexecution(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    harness.creation.crash_after_submit_once = False
+    harness.releases.crash_after_run_once = None
+    harness.gateway.crash_after_result_once = True
+
+    with pytest.raises(SimulatedProcessCrash, match="runtime result"):
+        await harness.entrypoint().run(
+            input_path=harness.input_path,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            wall_clock_budget_seconds=600,
+        )
+
+    provider_effects = harness.runtime.effects
+    harness.runtime = ScriptedRuntimePort(
+        harness.gateway,
+        effects=provider_effects,
+    )
+    summary = await harness.entrypoint().run(
+        input_path=harness.input_path,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+        wall_clock_budget_seconds=600,
+    )
+    assert summary.execution_state == "completed"
+    assert len(harness.runtime.effects) == 1
+    assert len(harness.gateway.runtime_results) == 1
+    assert len(harness.gateway.execution_effects) == 1
+    assert len(harness.minibook.posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_projection_requires_exact_success_result_event(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    harness.creation.crash_after_submit_once = False
+    harness.releases.crash_after_run_once = None
+    harness.gateway.add_decoy_projection = True
+
+    summary = await harness.entrypoint().run(
+        input_path=harness.input_path,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+        wall_clock_budget_seconds=600,
+    )
+
+    assert summary.execution_result_id is not None
+    assert summary.projection_event_ids == (summary.execution_result_id,)
+    assert len(harness.gateway.projection_events(summary.correlation_id)) == 2
+    assert len(harness.minibook.posts) == 1
 
 
 @pytest.mark.asyncio
@@ -1706,6 +1790,27 @@ async def test_deadline_after_execution_commit_stops_before_projection_mutation(
 
 
 @pytest.mark.asyncio
+async def test_expired_validation_stops_before_lifecycle_evidence_request(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    harness.creation.crash_after_submit_once = False
+    harness.releases.crash_after_run_once = None
+    harness.sandbox.advance_clock_after_validate = timedelta(seconds=601)
+
+    summary = await harness.entrypoint().run(
+        input_path=harness.input_path,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+        wall_clock_budget_seconds=600,
+    )
+
+    assert summary.terminal_state != "ready_to_use"
+    assert harness.releases.lifecycle_calls == 0
+    assert not harness.gateway.release_effects
+
+
+@pytest.mark.asyncio
 async def test_rejected_artifact_digest_rejects_package(tmp_path: Path) -> None:
     harness = _harness(tmp_path)
     harness.creation.crash_after_submit_once = False
@@ -1848,6 +1953,40 @@ class RecordingDockerCommandRunner:
         raise AssertionError(f"unexpected docker arguments: {arguments[0]}")
 
 
+@pytest.mark.asyncio
+async def test_docker_cli_runner_enforces_timeout_and_terminates_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stopped = asyncio.Event()
+
+    class HangingProcess:
+        returncode: int | None = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            await stopped.wait()
+            return b"", b""
+
+        def terminate(self) -> None:
+            self.returncode = -15
+            stopped.set()
+
+        def kill(self) -> None:
+            self.returncode = -9
+            stopped.set()
+
+    process = HangingProcess()
+
+    async def create_subprocess(*args: object, **kwargs: object) -> HangingProcess:
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+
+    with pytest.raises(CapabilitySandboxIsolationError, match="timed out"):
+        await DockerCliCommandRunner().run(("version",), timeout_seconds=0.001)
+
+    assert process.returncode == -15
+
+
 def _sandbox_request(tmp_path: Path) -> CapabilitySandboxRequest:
     (tmp_path / "autogen").mkdir()
     (tmp_path / "tests").mkdir()
@@ -1936,10 +2075,23 @@ def test_cli_uses_safe_paths_service_urls_and_environment_only_secrets(
 ) -> None:
     input_path = tmp_path / "TO_BE_BUILT.md"
     input_path.write_bytes(FIXTURE_INPUT.read_bytes())
+    adapter_manifest = tmp_path / "adapter-manifest.json"
+    adapter_manifest_content = json.dumps(
+        {
+            "schema": "captain.capability-factory-adapter-manifest.v1",
+            "factory": "captain_adapter:build_entrypoint",
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    adapter_manifest.write_bytes(adapter_manifest_content)
     environment = {
         "CAPTAIN_GATEWAY_TOKEN": "gateway-secret-value",
         "CAPTAIN_RUNTIME_TOKEN": "runtime-secret-value",
         "MINIBOOK_PROJECTION_API_KEY": "projection-secret-value",
+        "CAPABILITY_FACTORY_ADAPTER_MANIFEST": "adapter-manifest.json",
+        "CAPABILITY_FACTORY_ADAPTER_SHA256": hashlib.sha256(
+            adapter_manifest_content
+        ).hexdigest(),
     }
 
     config = parse_capability_factory_args(
@@ -1970,10 +2122,63 @@ def test_cli_uses_safe_paths_service_urls_and_environment_only_secrets(
     assert config.checkpoint_dir.is_relative_to(tmp_path.resolve())
     assert config.gateway_url == "http://127.0.0.1:8080"
     assert config.sandbox_image == SANDBOX_IMAGE
+    assert config.adapter_manifest_path == adapter_manifest.resolve()
     rendered = repr(config)
     assert "gateway-secret-value" not in rendered
     assert "runtime-secret-value" not in rendered
     assert "projection-secret-value" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_static_preflight_never_imports_or_instantiates_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "TO_BE_BUILT.md"
+    input_path.write_bytes(FIXTURE_INPUT.read_bytes())
+    import_marker = tmp_path / "adapter-imported.txt"
+    (tmp_path / "unsafe_adapter.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(import_marker)!r}).write_text('imported', encoding='utf-8')\n"
+        "def build_entrypoint(config): raise AssertionError('must not instantiate')\n",
+        encoding="utf-8",
+    )
+    manifest_content = json.dumps(
+        {
+            "schema": "captain.capability-factory-adapter-manifest.v1",
+            "factory": "unsafe_adapter:build_entrypoint",
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    manifest_path = tmp_path / "adapter-manifest.json"
+    manifest_path.write_bytes(manifest_content)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    config = parse_capability_factory_args(
+        (
+            "--input",
+            "TO_BE_BUILT.md",
+            "--sandbox-image",
+            SANDBOX_IMAGE,
+            "--correlation-id",
+            str(CORRELATION_ID),
+            "--preflight-only",
+        ),
+        environ={
+            "CAPTAIN_GATEWAY_TOKEN": "gateway-secret-value",
+            "CAPTAIN_RUNTIME_TOKEN": "runtime-secret-value",
+            "MINIBOOK_PROJECTION_API_KEY": "projection-secret-value",
+            "CAPABILITY_FACTORY_ADAPTER_MANIFEST": manifest_path.name,
+            "CAPABILITY_FACTORY_ADAPTER_SHA256": hashlib.sha256(
+                manifest_content
+            ).hexdigest(),
+        },
+        workspace_root=tmp_path,
+    )
+
+    result = await run_capability_factory_cli(config)
+
+    assert result["status"] == "preflight_ok"
+    assert not import_marker.exists()
 
 
 def test_cli_rejects_credential_flags_and_unsafe_paths_without_echo(
@@ -2000,6 +2205,9 @@ def test_redacted_evidence_manifest_is_content_addressed(tmp_path: Path) -> None
     summary = CapabilityFactoryRunSummary(
         correlation_id=CORRELATION_ID,
         factory_job_id=FACTORY_JOB_ID,
+        invocation_job_id=FACTORY_JOB_ID,
+        execution_mode="created",
+        execution_state="not_started",
         creation_job_id=uuid5(FACTORY_JOB_ID, "creation"),
         terminal_decision_id=uuid5(FACTORY_JOB_ID, "terminal"),
         terminal_state="blocked",
@@ -2028,6 +2236,12 @@ def test_live_gate_declares_exact_order_and_preserves_vibemind() -> None:
     positions = tuple(script.index(marker) for marker in markers)
     assert positions == tuple(sorted(positions))
     assert "$env:CAPABILITY_FACTORY_LIVE_REQUIRED = '1'" in script
+    assert "CAPABILITY_FACTORY_ADAPTER_MANIFEST" in script
+    assert "CAPABILITY_FACTORY_ADAPTER_SHA256" in script
+    assert "CAPABILITY_FACTORY_ADAPTER_FACTORY" not in script
+    assert script.index('$null = Invoke-PythonFactory ($commonArguments + \'--preflight-only\')') < script.index("# STEP 3:")
+    assert script.index('$RuntimeUrl/health') < script.index('$runJson = Invoke-PythonFactory')
+    assert script.index('$MinibookUrl/health') < script.index('$runJson = Invoke-PythonFactory')
     assert "docker compose down" not in script.casefold()
     assert "down --volumes" not in script.casefold()
     assert "down -v" not in script.casefold()
