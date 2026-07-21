@@ -650,11 +650,13 @@ class ScriptedGatewayStore:
     crash_after_execution_once: bool = False
     crash_after_claim_once: bool = False
     crash_after_result_once: bool = False
+    result_committed_before_reclaim_once: AgentRuntimeResult | None = None
     add_decoy_projection: bool = False
     _crashed_after_publication: bool = False
     _crashed_after_execution: bool = False
     _crashed_after_claim: bool = False
     _crashed_after_result: bool = False
+    _committed_result_before_reclaim: bool = False
     advance_clock_after_publication: timedelta | None = None
     advance_clock_after_execution: timedelta | None = None
 
@@ -777,6 +779,22 @@ class ScriptedGatewayStore:
     def claim_runtime_execution(self, request: object) -> RuntimeExecutionClaimReceipt:
         command_id = request.command_id  # type: ignore[attr-defined]
         existing = self.runtime_claims.get(command_id)
+        if (
+            existing is not None
+            and existing.expires_at <= self.clock.now()
+            and self.result_committed_before_reclaim_once is not None
+            and not self._committed_result_before_reclaim
+        ):
+            result = self.result_committed_before_reclaim_once
+            assert result.command_id == command_id
+            assert existing.claimed_at <= result.occurred_at < existing.expires_at
+            self.runtime_results[command_id] = result
+            self.runtime_claims[command_id] = existing.model_copy(
+                update={"status": "completed", "completed_at": result.occurred_at}
+            )
+            self.runtime_authority_order.append("result")
+            self._committed_result_before_reclaim = True
+            raise RuntimeError("runtime execution is already completed")
         if existing is not None and existing.status == "active" and existing.expires_at > self.clock.now():
             return RuntimeExecutionClaimReceipt(
                 claim=existing,
@@ -829,6 +847,7 @@ class ScriptedGatewayStore:
         assert execution_owner_id == claim.owner_id
         assert execution_fencing_token == claim.fencing_token
         assert execution_claim_credential == "deterministic-runtime-claim-credential"
+        assert claim.claimed_at <= result.occurred_at < claim.expires_at
         existing = self.runtime_results.get(result.command_id)
         if existing is not None and existing != result:
             raise AssertionError("changed runtime result replay")
@@ -1672,10 +1691,95 @@ async def test_provider_effect_crash_recovers_from_durable_receipt_without_dupli
     assert len(provider_effects) == 1
     assert len(harness.gateway.runtime_results) == 1
     assert len(harness.gateway.execution_effects) == 1
+    recovered_claim = harness.gateway.runtime_claims[command_id]
+    gateway_result = harness.gateway.runtime_results[command_id]
+    provider_execution = next(iter(provider_executions.values()))
+    provider_result = provider_execution.result
+    provider_receipt = provider_execution.provider_receipt
+    receipt_digest = canonical_contract_sha256(provider_receipt)
+    assert recovered_claim.fencing_token == 2
+    assert (
+        recovered_claim.claimed_at
+        <= gateway_result.occurred_at
+        < recovered_claim.expires_at
+    )
+    assert gateway_result.event_id == provider_result.event_id
+    assert gateway_result.command_id == provider_result.command_id
+    assert gateway_result.artifact_refs == provider_result.artifact_refs
+    assert provider_receipt.result_digest == canonical_contract_sha256(
+        provider_result
+    )
+    assert any(
+        reference.uri == f"artifact://provider-effect-receipt/{receipt_digest}"
+        and reference.sha256 == receipt_digest
+        for reference in gateway_result.evidence_refs
+    )
     checkpoint_text = next(harness.checkpoint_dir.glob("*.json")).read_text(
         encoding="utf-8"
     )
     assert "credential" not in checkpoint_text.casefold()
+
+
+@pytest.mark.asyncio
+async def test_provider_result_race_before_reclaim_uses_gateway_readback(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    harness.creation.crash_after_submit_once = False
+    harness.releases.crash_after_run_once = None
+    harness.runtime.crash_after_provider_effect_once = True
+
+    with pytest.raises(SimulatedProcessCrash, match="durable provider effect"):
+        await harness.entrypoint().run(
+            input_path=harness.input_path,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            wall_clock_budget_seconds=600,
+        )
+
+    provider_effects = harness.runtime.effects
+    provider_executions = harness.runtime.executions
+    provider_execution = next(iter(provider_executions.values()))
+    command_id = provider_execution.result.command_id
+    claim = harness.gateway.runtime_claims[command_id]
+    receipt_digest = canonical_contract_sha256(
+        provider_execution.provider_receipt
+    )
+    receipt_ref = ArtifactRef(
+        uri=f"artifact://provider-effect-receipt/{receipt_digest}",
+        sha256=receipt_digest,
+        media_type="application/json",
+    )
+    harness.gateway.result_committed_before_reclaim_once = (
+        provider_execution.result.model_copy(
+            update={
+                "occurred_at": claim.claimed_at,
+                "evidence_refs": (
+                    *provider_execution.result.evidence_refs,
+                    receipt_ref,
+                ),
+            }
+        )
+    )
+    harness.clock.value = claim.expires_at + timedelta(microseconds=1)
+    harness.runtime = ScriptedRuntimePort(
+        harness.gateway,
+        effects=provider_effects,
+        executions=provider_executions,
+    )
+
+    completed = await harness.entrypoint().run(
+        input_path=harness.input_path,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+        wall_clock_budget_seconds=600,
+    )
+
+    assert completed.execution_state == "completed"
+    assert len(provider_effects) == 1
+    assert len(harness.gateway.runtime_results) == 1
+    assert len(harness.gateway.execution_effects) == 1
+    assert harness.gateway.runtime_claims[command_id].fencing_token == 1
 
 
 @pytest.mark.asyncio
