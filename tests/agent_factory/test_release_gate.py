@@ -314,6 +314,7 @@ def workflow_run(
     lease = invocation["lease"]
     assert isinstance(lease, dict)
     lease["attempt"] = attempt
+    lease["lease_id"] = f"lease-real-case-tester-{attempt}-{number}"
     invocation_id = (
         f"00000000-0000-0000-0000-{320 + (attempt - 1) * 10 + number:012d}"
     )
@@ -382,6 +383,8 @@ def workflow_receipts(
             job_id=run.job_id,
             correlation_id=run.correlation_id,
             attempt=run.attempt,
+            lease_id=run.invocation.lease.lease_id,
+            invocation_id=run.invocation_id,
             provider="approved-provider",
             model="approved-model-id",
             input_units=100,
@@ -493,6 +496,8 @@ def test_workflow_release_counts_paid_hermes_receipt_without_binding_it_to_a_run
         update={
             "receipt_id": UUID("00000000-0000-0000-0000-000000000499"),
             "reservation_id": UUID("00000000-0000-0000-0000-000000000498"),
+            "lease_id": "lease-hermes-execute-team-extra",
+            "invocation_id": UUID("00000000-0000-0000-0000-000000000497"),
             "provider": "hermes",
             "cost_usd": Decimal("0.01"),
             "evidence_ref": ArtifactRef.model_validate(
@@ -510,6 +515,71 @@ def test_workflow_release_counts_paid_hermes_receipt_without_binding_it_to_a_run
     )
 
     assert decision.status == "ready"
+
+
+def test_workflow_release_rejects_provider_receipts_swapped_between_runs() -> None:
+    runs = tuple(workflow_run(number) for number in range(1, 4))
+    receipts = workflow_receipts(runs)
+    swapped_runs = (
+        runs[0].model_copy(
+            update={"usage_receipt_refs": (receipts[1].evidence_ref,)}
+        ),
+        runs[1].model_copy(
+            update={"usage_receipt_refs": (receipts[0].evidence_ref,)}
+        ),
+        runs[2],
+    )
+
+    decision = evaluate_factory_workflow_release(
+        workflow_job(mode="release"),
+        swapped_runs,
+        workflow_evaluation(swapped_runs),
+        budget_projection=workflow_budget(),
+        usage_receipts=receipts,
+    )
+
+    assert decision.status == "blocked"
+    assert decision.reasons == (
+        "workflow run usage receipts must match the exact invocation and lease",
+    )
+
+
+def test_workflow_release_rejects_hermes_receipt_substituted_for_run_receipt() -> None:
+    runs = tuple(workflow_run(number) for number in range(1, 4))
+    receipts = workflow_receipts(runs)
+    hermes_extra = receipts[0].model_copy(
+        update={
+            "receipt_id": UUID("00000000-0000-0000-0000-000000000499"),
+            "reservation_id": UUID("00000000-0000-0000-0000-000000000498"),
+            "lease_id": "lease-hermes-execute-team-extra",
+            "invocation_id": UUID("00000000-0000-0000-0000-000000000497"),
+            "provider": "hermes",
+            "cost_usd": Decimal("0.01"),
+            "evidence_ref": ArtifactRef.model_validate(
+                workflow_artifact("extra-usage", "f" * 64)
+            ),
+        }
+    )
+    substituted_runs = (
+        runs[0].model_copy(
+            update={"usage_receipt_refs": (hermes_extra.evidence_ref,)}
+        ),
+        runs[1],
+        runs[2],
+    )
+
+    decision = evaluate_factory_workflow_release(
+        workflow_job(mode="release"),
+        substituted_runs,
+        workflow_evaluation(substituted_runs, budget=workflow_budget("0.76")),
+        budget_projection=workflow_budget("0.76"),
+        usage_receipts=(*receipts, hermes_extra),
+    )
+
+    assert decision.status == "blocked"
+    assert decision.reasons == (
+        "workflow run usage receipts must match the exact invocation and lease",
+    )
 
 
 def test_workflow_release_accepts_disjoint_exact_receipt_union() -> None:

@@ -389,6 +389,7 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
             attempt=self._attempt,
             requested_usd=self._max_cost_per_call,
             now=now,
+            invocation_id=self._invocation.invocation_id,
         )
         return reservation, pricing_quote
 
@@ -414,6 +415,8 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
                     "job_id": str(self._job.job_id),
                     "correlation_id": str(self._job.correlation_id),
                     "attempt": self._attempt,
+                    "lease_id": self._invocation.lease.lease_id,
+                    "invocation_id": str(self._invocation.invocation_id),
                     "execution_policy_sha256": pricing_quote.execution_policy_sha256,
                     "pricing_quote_id": pricing_quote.quote_id,
                     "pricing_version": pricing_quote.version,
@@ -435,6 +438,8 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
             job_id=self._job.job_id,
             correlation_id=self._job.correlation_id,
             attempt=self._attempt,
+            lease_id=self._invocation.lease.lease_id,
+            invocation_id=self._invocation.invocation_id,
             provider=self._provider,
             model=self._model,
             input_units=usage.prompt_tokens,

@@ -728,6 +728,17 @@ async def test_budgeted_model_client_reserves_before_every_provider_call(
     assert skill_authority.calls == 2
     assert pricing_authority.calls == 2
     assert len({item.reservation_id for item in client.usage_receipts}) == 2
+    assert {
+        item.invocation_id for item in client.usage_receipts
+    } == {invocation.invocation_id}
+    assert {
+        item.lease_id for item in client.usage_receipts
+    } == {invocation.lease.lease_id}
+    assert {
+        getattr(event, "reservation").invocation_id
+        for event in budget.events
+        if hasattr(event, "reservation")
+    } == {invocation.invocation_id}
     assert budget.projection(job.job_id).consumed_usd == Decimal("0.20")
     assert budget.projection(job.job_id).reserved_usd == Decimal("0")
 

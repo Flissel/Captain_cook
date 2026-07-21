@@ -218,6 +218,20 @@ def evaluate_factory_workflow_release(
             evaluation,
             "workflow usage receipts must exactly and uniquely cover every run",
         )
+    receipts_by_ref = {
+        receipt.evidence_ref: receipt for receipt in usage_receipts
+    }
+    if any(
+        receipts_by_ref[reference].invocation_id != run.invocation_id
+        or receipts_by_ref[reference].lease_id != run.invocation.lease.lease_id
+        for run in evidence
+        for reference in run.usage_receipt_refs
+    ):
+        return _workflow_blocked(
+            job,
+            evaluation,
+            "workflow run usage receipts must match the exact invocation and lease",
+        )
     run_numbers = tuple(item.run_number for item in evidence)
     if len(run_numbers) != len(set(run_numbers)):
         return _workflow_blocked(job, evaluation, "workflow run numbers must be unique")
