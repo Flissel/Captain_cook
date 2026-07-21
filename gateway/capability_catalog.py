@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import PurePosixPath
 from typing import Literal, Protocol
 from uuid import UUID
 
@@ -122,14 +123,10 @@ class GatewayCapabilityCatalog(CapabilityCatalogPort):
         record = self._repository.find_ready_capability(job.required_capability)
         if record is None:
             return None
-        request = CapabilityCompatibilityRequest(
-            capability_id=job.required_capability,
-            minimum_version=job.subject_version,
-            schema_major=1,
-            accepted_assertion_ids=job.acceptance_assertion_ids,
-            integration_intents=(),
-            tool_contracts=(),
-        )
+        try:
+            request = compatibility_request_for_authority(job, record)
+        except ValueError:
+            return None
         if not record.satisfies(request):
             return None
         promoted = record.promoted_capability
@@ -140,3 +137,50 @@ class GatewayCapabilityCatalog(CapabilityCatalogPort):
         ):
             return None
         return record
+
+
+def compatibility_request_for_authority(
+    job: AgentFactoryJobV2,
+    record: CapabilityCatalogRecord,
+) -> CapabilityCompatibilityRequest:
+    """Derive the exact public request while rejecting incoherent tool authority."""
+
+    intents = record.integration_intents
+    contracts = record.tool_contracts
+    if IntegrationIntent.NONE in intents or len(intents) != len(set(intents)):
+        raise ValueError("catalog integration intents are not canonical")
+    if tuple(sorted(intents, key=lambda item: item.value)) != intents:
+        raise ValueError("catalog integration intents are not canonical")
+    if len(contracts) != len(set(contracts)) or tuple(sorted(contracts)) != contracts:
+        raise ValueError("catalog tool contracts are not canonical")
+
+    n8n_contracts = []
+    for contract in contracts:
+        if "\\" in contract:
+            raise ValueError("catalog tool contract path is not canonical")
+        path = PurePosixPath(contract)
+        if path.is_absolute() or "." in path.parts or ".." in path.parts:
+            raise ValueError("catalog tool contract path is not canonical")
+        if contract.startswith("n8n/") and contract.endswith(".json"):
+            n8n_contracts.append(contract)
+        elif not contract.startswith("adapters/"):
+            raise ValueError("catalog tool contract type is unsupported")
+
+    declares_n8n = IntegrationIntent.N8N in intents
+    if declares_n8n != bool(n8n_contracts):
+        raise ValueError("catalog n8n intent and workflow contracts disagree")
+    if len(record.promoted_capability.tool_refs) != len(contracts):
+        raise ValueError("catalog tool contracts do not match promoted tool references")
+    if len(record.promoted_capability.tool_refs) != len(
+        set(record.promoted_capability.tool_refs)
+    ):
+        raise ValueError("catalog promoted tool references are not unique")
+
+    return CapabilityCompatibilityRequest(
+        capability_id=job.required_capability,
+        minimum_version=job.subject_version,
+        schema_major=1,
+        accepted_assertion_ids=job.acceptance_assertion_ids,
+        integration_intents=intents,
+        tool_contracts=contracts,
+    )

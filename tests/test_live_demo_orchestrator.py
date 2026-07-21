@@ -50,6 +50,7 @@ param(
 )
 $statePath = Join-Path $env:FAKE_STATE_DIR ("$CorrelationId.json")
 Add-Content -LiteralPath (Join-Path $env:FAKE_STATE_DIR 'artifact-directories.log') -Value ([IO.Path]::GetFullPath($ArtifactDirectory))
+Add-Content -LiteralPath (Join-Path $env:FAKE_STATE_DIR 'runtime-costs.log') -Value $env:CAPTAIN_FACTORY_MAX_COST_USD
 if (Test-Path -LiteralPath $statePath) {
     $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
     $mode = 'reused'
@@ -92,6 +93,7 @@ $summary = [ordered]@{
     execution_command_id = $state.command_id
     execution_result_id = $state.result_id
     projection_event_ids = @($(if ($env:FAKE_BAD_PROJECTION -eq '1') { [Guid]::NewGuid().ToString() } else { $state.result_id }))
+    minibook_projection_verified = $true
     package_sha256 = $state.package_sha256
     release_evidence_sha256 = $releaseEvidence
     unresolved_required_tool_gaps = @()
@@ -184,6 +186,36 @@ def test_live_run_rejects_runtime_budget_mismatch_before_service_start(
     assert list(state.iterdir()) == []
 
 
+def test_live_run_rejects_cost_mismatch_before_service_start(tmp_path: Path) -> None:
+    fake_service = tmp_path / "fake-services.ps1"
+    fake_capability = tmp_path / "fake-capability.ps1"
+    _write_fake_service_runner(fake_service)
+    _write_fake_capability_runner(fake_capability)
+    state = tmp_path / "state"
+    state.mkdir()
+    environment = os.environ.copy()
+    environment["FAKE_STATE_DIR"] = str(state)
+    environment["CAPTAIN_FACTORY_MAX_COST_USD"] = "0.50"
+    shared_artifacts = tmp_path / "shared-capability-artifacts"
+    environment["CAPTAIN_RUNTIME_ARTIFACT_ROOT"] = str(shared_artifacts)
+    environment["MINIBOOK_CREATION_ARTIFACTS"] = str(shared_artifacts)
+
+    result = _run(
+        "-LiveProviders",
+        "-ConfirmProviderCost",
+        "-MaxCostUsdPerInput", "1.00",
+        "-CapabilityRunnerPath", str(fake_capability),
+        "-ServiceRunnerPath", str(fake_service),
+        "-CredentialSourceEnv", str(tmp_path / "missing.env"),
+        env=environment,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Factory cost budget disagrees" in output
+    assert list(state.iterdir()) == []
+
+
 def test_fake_live_run_proves_recovery_restart_three_inputs_and_redacts_evidence(
     tmp_path: Path,
 ) -> None:
@@ -221,6 +253,12 @@ def test_fake_live_run_proves_recovery_restart_three_inputs_and_redacts_evidence
     ).read_text(encoding="utf-8").splitlines()
     assert len(artifact_directories) == 4
     assert {Path(value) for value in artifact_directories} == {shared_artifacts}
+    assert (state / "runtime-costs.log").read_text(encoding="utf-8").splitlines() == [
+        "1.00",
+        "1.00",
+        "1.00",
+        "1.00",
+    ]
     evidence_files = list(evidence_dir.glob("capability-live-demo-*.json"))
     assert len(evidence_files) == 1
     evidence_text = evidence_files[0].read_text(encoding="utf-8")

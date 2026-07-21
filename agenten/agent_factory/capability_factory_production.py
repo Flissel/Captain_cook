@@ -6,10 +6,13 @@ never execute a provider during bootstrap; the 8091 runtime owns that effect.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
 import secrets
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
@@ -123,21 +126,32 @@ class AsyncJsonHttpClient(Protocol):
 class MinibookSwarmCreationHttpPort:
     """Typed Minibook Swarm boundary; Hermes evidence stays lease-bound."""
 
-    def __init__(self, base_url: str, token: SecretStr, http: AsyncJsonHttpClient) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        token: SecretStr,
+        http: AsyncJsonHttpClient,
+        *,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self._base_url = _service_url(base_url, "Minibook")
         self._token = token
         self._http = http
+        self._sleep = sleep
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._deadlines: dict[UUID, datetime] = {}
 
     async def preparation_blocks(
         self,
         job: AgentFactoryJobV2,
         creation_job: CreationJobV1,
     ) -> tuple[FactoryEvidenceBlock, FactoryEvidenceBlock]:
-        response = await self._http.get(
+        deadline = self._submitted_deadline(creation_job.creation_job_id)
+        response = await self._get_when_ready(
             f"{self._base_url}/api/v1/creation-jobs/{creation_job.creation_job_id}/preparation-blocks",
-            headers=self._headers(),
+            deadline=deadline,
         )
-        _raise_for_status(response)
         blocks = tuple(FactoryEvidenceBlock.model_validate(item) for item in response.json())
         if len(blocks) != 2 or any(block.job_id != job.job_id for block in blocks):
             raise ValueError("Minibook preparation evidence does not match the factory job")
@@ -150,14 +164,20 @@ class MinibookSwarmCreationHttpPort:
             json=creation_job.model_dump(mode="json", by_alias=True),
         )
         _raise_for_status(response)
-        return CreationSubmissionReceipt.model_validate(response.json())
+        receipt = CreationSubmissionReceipt.model_validate(response.json())
+        if (
+            receipt.creation_job_id != creation_job.creation_job_id
+            or receipt.subject_version != creation_job.subject_version
+        ):
+            raise ValueError("Minibook submission receipt identity changed")
+        self._deadlines[creation_job.creation_job_id] = creation_job.deadline_at
+        return receipt
 
     async def result(self, creation_job_id: UUID) -> CreationResultV1:
-        response = await self._http.get(
+        response = await self._get_when_ready(
             f"{self._base_url}/api/v1/creation-jobs/{creation_job_id}/result",
-            headers=self._headers(),
+            deadline=self._submitted_deadline(creation_job_id),
         )
-        _raise_for_status(response)
         return CreationResultV1.model_validate(response.json())
 
     async def completion_block(
@@ -165,11 +185,10 @@ class MinibookSwarmCreationHttpPort:
         job: AgentFactoryJobV2,
         result: CreationResultV1,
     ) -> FactoryEvidenceBlock:
-        response = await self._http.get(
+        response = await self._get_when_ready(
             f"{self._base_url}/api/v1/creation-jobs/{result.creation_job_id}/completion-block",
-            headers=self._headers(),
+            deadline=self._submitted_deadline(result.creation_job_id),
         )
-        _raise_for_status(response)
         block = FactoryEvidenceBlock.model_validate(response.json())
         if block.job_id != job.job_id:
             raise ValueError("Minibook completion evidence does not match the factory job")
@@ -177,6 +196,33 @@ class MinibookSwarmCreationHttpPort:
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._token.get_secret_value()}"}
+
+    def _submitted_deadline(self, creation_job_id: UUID) -> datetime:
+        try:
+            return self._deadlines[creation_job_id]
+        except KeyError as exc:
+            raise CapabilityProductionConfigurationError(
+                "Minibook creation must be submitted before evidence or result reads"
+            ) from exc
+
+    async def _get_when_ready(self, url: str, *, deadline: datetime) -> Any:
+        while True:
+            now = self._clock()
+            if now.tzinfo is None or now.utcoffset() != timezone.utc.utcoffset(now):
+                raise CapabilityProductionConfigurationError(
+                    "Minibook polling clock must return UTC"
+                )
+            if now >= deadline:
+                raise TimeoutError("Minibook creation did not complete before its deadline")
+            response = await self._http.get(url, headers=self._headers())
+            if response.status_code != status.HTTP_409_CONFLICT:
+                _raise_for_status(response)
+                return response
+            retry_after = _retry_after_seconds(response)
+            remaining = (deadline - now).total_seconds()
+            if retry_after >= remaining:
+                raise TimeoutError("Minibook creation did not complete before its deadline")
+            await self._sleep(retry_after)
 
 
 class EvidenceRunRequest(BaseModel):
@@ -353,3 +399,14 @@ def _raise_for_status(response: Any) -> None:
         response.raise_for_status()
     except Exception as exc:
         raise RuntimeError("production capability service request failed") from exc
+
+
+def _retry_after_seconds(response: Any) -> float:
+    value = str(getattr(response, "headers", {}).get("Retry-After", "1")).strip()
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise RuntimeError("Minibook returned an invalid Retry-After value") from exc
+    if seconds < 0 or seconds > 5:
+        raise RuntimeError("Minibook Retry-After is outside the bounded polling policy")
+    return seconds

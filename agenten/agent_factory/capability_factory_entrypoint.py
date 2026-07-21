@@ -116,7 +116,10 @@ from gateway.contracts import (
     RuntimeResultRecoveryRequest,
     canonical_contract_sha256,
 )
-from gateway.capability_catalog import CapabilityCatalogRecord
+from gateway.capability_catalog import (
+    CapabilityCatalogRecord,
+    compatibility_request_for_authority,
+)
 
 
 class CapabilityFactoryInputMutation(ValueError):
@@ -263,6 +266,7 @@ class CapabilityExecutionCompleted(BaseModel):
 
     bundle: CapabilityExecutionBundle
     projection_events: tuple[MinibookProjectionEvent, ...] = Field(min_length=1)
+    minibook_projection_verified: Literal[True]
 
 
 class CapabilityFactoryRunSummary(BaseModel):
@@ -287,6 +291,7 @@ class CapabilityFactoryRunSummary(BaseModel):
     execution_command_id: UUID | None = None
     execution_result_id: UUID | None = None
     projection_event_ids: tuple[UUID, ...] = ()
+    minibook_projection_verified: bool = False
     package_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     release_evidence_sha256: tuple[str, ...] = ()
     unresolved_required_tool_gaps: tuple[str, ...] = ()
@@ -1593,18 +1598,18 @@ class CapabilityFactoryEntrypoint:
             released_skill=self._released_skill,
         )
         coordinator.record(_captain_forge_requested(job))
-        preparation = await self._creation.preparation_blocks(job, creation_job)
-        if len(preparation) != 2:
-            raise ValueError("creation preparation must return blueprint and tool evidence")
-        for block in preparation:
-            coordinator.record(block)
-
         receipt = await self._creation.submit(creation_job)
         if (
             receipt.creation_job_id != creation_job.creation_job_id
             or receipt.subject_version != job.subject_version
         ):
             raise ValueError("creation submission receipt does not match the factory job")
+        preparation = await self._creation.preparation_blocks(job, creation_job)
+        if len(preparation) != 2:
+            raise ValueError("creation preparation must return blueprint and tool evidence")
+        for block in preparation:
+            coordinator.record(block)
+
         creation_result = await self._creation.result(creation_job.creation_job_id)
         _require_creation_result(job, creation_job, creation_result)
         if self._clock.now() >= job.deadline_at:
@@ -1815,6 +1820,7 @@ class CapabilityFactoryEntrypoint:
             or authority.status != "ready_to_use"
         ):
             raise RuntimeError("Gateway catalog readback disagrees with atomic publication")
+        _require_catalog_authority(job, authority)
         execution = await self._execute_authority(job, authority)
         return _summary(
             job,
@@ -2248,10 +2254,22 @@ class CapabilityFactoryEntrypoint:
         )
         if len(projection_events) != 1:
             raise RuntimeError("Gateway projection feed lacks the exact successful result event")
-        self._projector.rebuild(projection_events)
+        projection_results = tuple(self._projector.rebuild(projection_events))
+        expected_event_ids = tuple(str(event.event_id) for event in projection_events)
+        if (
+            len(projection_results) != len(projection_events)
+            or tuple(result.event_id for result in projection_results)
+            != expected_event_ids
+            or any(
+                result.outcome not in {"projected", "duplicate"}
+                for result in projection_results
+            )
+        ):
+            raise RuntimeError("Minibook projection rebuild did not commit every event")
         return CapabilityExecutionCompleted(
             bundle=bundle,
             projection_events=projection_events,
+            minibook_projection_verified=True,
         )
 
     def _require_effect_budget(self, job: AgentFactoryJobV2, effect: str) -> None:
@@ -2593,6 +2611,9 @@ def _summary(
             if completed is not None
             else ()
         ),
+        minibook_projection_verified=(
+            completed.minibook_projection_verified if completed is not None else False
+        ),
         package_sha256=(canonical_contract_sha256(package) if package is not None else None),
         release_evidence_sha256=tuple(
             hashlib.sha256(item.model_dump_json(by_alias=True).encode("utf-8")).hexdigest()
@@ -2608,15 +2629,14 @@ def _require_catalog_authority(
     authority: CapabilityCatalogRecord,
 ) -> None:
     promoted = authority.promoted_capability
+    try:
+        compatibility = compatibility_request_for_authority(job, authority)
+    except ValueError as exc:
+        raise RuntimeError(
+            "Gateway returned incompatible capability catalog authority"
+        ) from exc
     if (
-        authority.status != "ready_to_use"
-        or authority.unresolved_required_gap_ids
-        or authority.capability_id != job.required_capability
-        or authority.capability_version < job.subject_version
-        or authority.schema_major != 1
-        or authority.accepted_assertion_ids != job.acceptance_assertion_ids
-        or authority.integration_intents
-        or authority.tool_contracts
+        not authority.satisfies(compatibility)
         or promoted.capability_id != authority.capability_id
         or promoted.version != authority.capability_version
         or promoted.status != "ready_to_use"
@@ -2660,6 +2680,9 @@ def _reuse_summary(
             tuple(item.event_id for item in completed.projection_events)
             if completed is not None
             else ()
+        ),
+        minibook_projection_verified=(
+            completed.minibook_projection_verified if completed is not None else False
         ),
         package_sha256=authority.package_ref.sha256,
         unresolved_required_tool_gaps=authority.unresolved_required_gap_ids,

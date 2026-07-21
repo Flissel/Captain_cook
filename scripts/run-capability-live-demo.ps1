@@ -177,6 +177,9 @@ function Assert-RunResult(
     if (@($summary.projection_event_ids | ForEach-Object { [string]$_ }) -notcontains [string]$summary.execution_result_id) {
         throw "Minibook projection does not bind the execution result for $($SelectedInput.input_id)."
     }
+    if ($summary.minibook_projection_verified -ne $true) {
+        throw "Minibook projection result is not committed for $($SelectedInput.input_id)."
+    }
     if (
         [string]$Result.digests.input_sha256 -notmatch '^[0-9a-f]{64}$' -or
         [string]$Result.digests.manifest_sha256 -notmatch '^[0-9a-f]{64}$' -or
@@ -206,6 +209,7 @@ function Assert-RunResult(
         execution_command_id = [string]$summary.execution_command_id
         execution_result_id = [string]$summary.execution_result_id
         projection_event_ids = @($summary.projection_event_ids | ForEach-Object { [string]$_ })
+        minibook_projection_verified = [bool]$summary.minibook_projection_verified
         recovery_id = [string]$summary.recovery_id
         e2e_batch_ids = @($summary.e2e_batch_ids | ForEach-Object { [string]$_ })
         package_sha256 = [string]$summary.package_sha256
@@ -320,7 +324,30 @@ $resolvedSharedArtifactDirectory = Resolve-SharedArtifactDirectory $SharedArtifa
 
 $previousCost = [Environment]::GetEnvironmentVariable('CAPTAIN_FACTORY_MAX_COST_USD', 'Process')
 $costWasSet = $null -ne $previousCost
+$costScale = ([decimal]::GetBits($MaxCostUsdPerInput)[3] -shr 16) -band 0x7F
+if ($costScale -gt 2) {
+    throw 'Factory cost budget accepts at most two decimal places.'
+}
 $costText = $MaxCostUsdPerInput.ToString('0.00', [Globalization.CultureInfo]::InvariantCulture)
+$configuredCost = $previousCost
+if ([string]::IsNullOrWhiteSpace($configuredCost)) {
+    $configuredCost = Get-DotEnvValue $CredentialSourceEnv 'CAPTAIN_FACTORY_MAX_COST_USD'
+}
+if (-not [string]::IsNullOrWhiteSpace($configuredCost)) {
+    $parsedConfiguredCost = [decimal]0
+    $costStyle = [Globalization.NumberStyles]::AllowDecimalPoint
+    if (
+        -not [decimal]::TryParse(
+            $configuredCost,
+            $costStyle,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$parsedConfiguredCost
+        ) -or
+        $parsedConfiguredCost -ne $MaxCostUsdPerInput
+    ) {
+        throw 'Factory cost budget disagrees with the live orchestrator budget.'
+    }
+}
 [Environment]::SetEnvironmentVariable('CAPTAIN_FACTORY_MAX_COST_USD', $costText, 'Process')
 
 try {
@@ -360,6 +387,14 @@ try {
         $runs.Add((Assert-RunResult $result $selectedInput $correlation $true))
     }
 
+    $projectionVerified = (
+        @($runs | Where-Object { $_.minibook_projection_verified -eq $true }).Count -eq $runs.Count -and
+        $resume.minibook_projection_verified -eq $true
+    )
+    if (-not $projectionVerified) {
+        throw 'Minibook projection verification is incomplete.'
+    }
+
     if ($recordingProcess) {
         Stop-NamedWindowRecording $recordingProcess
         $recordingProcess = $null
@@ -387,7 +422,7 @@ try {
         controlled_recovery_verified = $true
         restart_resume_verified = $true
         gateway_execution_verified = $true
-        minibook_projection_verified = $true
+        minibook_projection_verified = $projectionVerified
         runs = @($runs)
         restart_resume = $restartEvidence
         recording = if ($recordingPath) {
