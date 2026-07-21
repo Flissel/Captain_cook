@@ -468,7 +468,21 @@ if ($configurationChanged) {
     Set-ExternalDirectories -Directories @($otherDirectories + $skillRoot) -HermesHome $configuredHermesHome
 }
 
-$skillsOutput = Invoke-Hermes -Arguments @('skills', 'list', '--enabled-only')
+$previousColumns = $env:COLUMNS
+try {
+    # Rich truncates long skill names to the current terminal width. Force a
+    # stable machine-readable width so verification is independent of the host.
+    $env:COLUMNS = '240'
+    $skillsOutput = Invoke-Hermes -Arguments @('skills', 'list', '--enabled-only')
+}
+finally {
+    if ($null -eq $previousColumns) {
+        Remove-Item Env:COLUMNS -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:COLUMNS = $previousColumns
+    }
+}
 foreach ($skillName in $skillNames) {
     $matchingLines = @(
         $skillsOutput -split '\r?\n' | Where-Object { $_ -match [regex]::Escape($skillName) }
