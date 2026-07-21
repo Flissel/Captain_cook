@@ -1,4 +1,4 @@
 interface:
   display_name: "AutoGen Agent Factory"
   short_description: "Build and validate a Captain-approved AutoGen agent team"
-  default_prompt: "Build a Captain-authorized AutoGen agent team, validate it, and emit lifecycle evidence."
+  default_prompt: "Verify the Captain-released skill and job digests, retrieve versioned official documentation, assign bounded dependency-ready work to Codex, and return private candidate evidence without publishing or claiming ready_to_use."

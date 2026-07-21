@@ -57,7 +57,7 @@ def test_readiness_verifier_emits_only_redacted_readiness_fields() -> None:
     )
 
     assert result.stdout.splitlines() == [
-        "hermes_commit=a5199779876455ece6aa7c1220de70bf3f62ece2",
+        "hermes_commit=969ae7ef1dbec015ae0740c96cb0b327e6d41755",
         "entrypoints=hermes_cli/captain_planner.py,hermes_cli/mcp_config.py",
         "tests=passed",
         "n8n_server=n8n-mcp",
