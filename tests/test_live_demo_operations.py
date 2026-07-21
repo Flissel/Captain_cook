@@ -208,6 +208,7 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "OPENAI_MODEL" in source and "gpt-4o-mini" in source
     assert "CAPTAIN_FACTORY_MAX_COST_USD" in source
     assert "CAPTAIN_FACTORY_HERMES_PROVIDER" in source
+    assert "CAPTAIN_FACTORY_HERMES_MODEL" in source
     assert "CAPTAIN_FACTORY_MAX_COST_PER_CALL_USD" in source
     assert "CAPTAIN_FACTORY_PRICING_VERSION" in source
     assert "CAPTAIN_FACTORY_PRICING_INPUT_COST_PER_MILLION_USD" in source

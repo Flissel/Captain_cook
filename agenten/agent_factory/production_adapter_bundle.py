@@ -1162,7 +1162,10 @@ def build_capability_factory_entrypoint(config: Any) -> CapabilityFactoryEntrypo
                 executable=_resolved_executable(
                     os.environ, "HERMES_EXECUTABLE", "hermes"
                 ),
-                model=os.environ.get("CAPTAIN_FACTORY_MODEL", "").strip() or None,
+                model=os.environ.get(
+                    "CAPTAIN_FACTORY_HERMES_MODEL", "gpt-5.6-terra"
+                ).strip()
+                or None,
                 provider=os.environ.get(
                     "CAPTAIN_FACTORY_HERMES_PROVIDER", "openai-api"
                 ).strip()
