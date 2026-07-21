@@ -9,6 +9,7 @@ blockchain.json
 .captain-cook/
 artifacts/evaluations/
 artifacts/agent-factory/
+artifacts/capability-factory/
 config/swarm_agents.json
 output/
 .venv/
