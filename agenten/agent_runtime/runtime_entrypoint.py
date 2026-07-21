@@ -194,13 +194,19 @@ def compose_gateway_backed_runtime_app(
     )
 
 
-def main() -> None:
-    """Fail closed until production Hermes, Codex, and artifact ports are installed."""
+def preflight_runtime() -> None:
+    """Validate settings and fail closed while required production ports are absent."""
 
     RuntimeEntrypointSettings.from_env()
     raise RuntimeConfigurationError(
         "production Hermes, Codex, and artifact runtime ports are unavailable"
     )
+
+
+def main() -> None:
+    """Fail closed until production Hermes, Codex, and artifact ports are installed."""
+
+    preflight_runtime()
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ from .runtime_entrypoint import (
     RuntimeConfigurationError,
     RuntimeEntrypointSettings,
     compose_gateway_backed_runtime_app,
+    preflight_runtime,
 )
 from .tools import RuntimeToolContext, RuntimeToolset, available_tools
 from .swarm import RuntimeTaskProjection, SwarmOrchestrator
@@ -90,6 +91,7 @@ __all__ = [
     "RuntimeConfigurationError",
     "RuntimeEntrypointSettings",
     "compose_gateway_backed_runtime_app",
+    "preflight_runtime",
     "RuntimeToolContext",
     "RuntimeToolset",
     "available_tools",

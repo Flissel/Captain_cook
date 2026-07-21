@@ -239,6 +239,28 @@ function Stop-ManagedRuntime {
     Remove-Item $runtimePid -Force
     Write-Host '[ready] managed Runtime stopped'
 }
+function Assert-RuntimeConfiguration($Values) {
+    $python = Join-Path $root '.venv\Scripts\python.exe'
+    if (-not (Test-Path $python)) { $python = (& python -c 'import sys; print(sys.executable)').Trim() }
+    if (-not (Test-Path $python -PathType Leaf)) { throw 'A concrete Python 3.11 executable is required for Runtime preflight.' }
+    Set-ProcessEnvironment $Values
+    & $python -c 'from agenten.agent_runtime.runtime_entrypoint import preflight_runtime; preflight_runtime()' *> $null
+    if ($LASTEXITCODE -ne 0) { throw 'Production Runtime configuration is unavailable; no services were started.' }
+}
+function Invoke-StartServices([switch]$Recover, [string]$SourceEnv) {
+    $values = Initialize-LocalEnvironment
+    Set-ProcessEnvironment $values
+    Assert-RuntimeConfiguration $values
+    Initialize-CaptainN8n $values -Recover:$Recover -SourceEnv $SourceEnv
+    docker compose --project-name $project --env-file $rootEnv --file $testCompose up -d --wait mariadb-test
+    if ($LASTEXITCODE -ne 0) { throw 'Isolated captain_test MariaDB failed to start.' }
+    Start-Gateway $values
+    Start-Runtime $values
+    docker compose --env-file $rootEnv up -d --wait mailpit
+    if ($LASTEXITCODE -ne 0) { throw 'Captain Mailpit failed to start.' }
+    & (Join-Path $PSScriptRoot 'minibook-demo.ps1') bootstrap -RecoverDemoCredentials:$Recover
+    Invoke-Health
+}
 function Invoke-Health {
     $values = Read-Env $rootEnv @('CAPTAIN_RUNTIME_URL')
     if (-not $values.Contains('CAPTAIN_RUNTIME_URL')) { throw 'Runtime URL is not configured.' }
@@ -255,17 +277,7 @@ Push-Location $root
 try {
     switch ($Action) {
         start {
-            $values = Initialize-LocalEnvironment
-            Set-ProcessEnvironment $values
-            Initialize-CaptainN8n $values -Recover:$RecoverDemoCredentials -SourceEnv $CredentialSourceEnv
-            docker compose --project-name $project --env-file $rootEnv --file $testCompose up -d --wait mariadb-test
-            if ($LASTEXITCODE -ne 0) { throw 'Isolated captain_test MariaDB failed to start.' }
-            Start-Gateway $values
-            Start-Runtime $values
-            docker compose --env-file $rootEnv up -d --wait mailpit
-            if ($LASTEXITCODE -ne 0) { throw 'Captain Mailpit failed to start.' }
-            & (Join-Path $PSScriptRoot 'minibook-demo.ps1') bootstrap -RecoverDemoCredentials:$RecoverDemoCredentials
-            Invoke-Health
+            Invoke-StartServices -Recover:$RecoverDemoCredentials -SourceEnv $CredentialSourceEnv
         }
         health { Invoke-Health }
         stop {

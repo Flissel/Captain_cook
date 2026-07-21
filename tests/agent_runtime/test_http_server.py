@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import logging
 from pathlib import Path
+import shutil
+import subprocess
 from typing import Protocol
 from uuid import uuid5
 
@@ -122,7 +124,10 @@ async def test_execute_returns_adapter_infrastructure_failure_as_a_typed_result(
             "session_id": None,
             "artifact_refs": [],
             "evidence_refs": [],
-            "error": "codex.run adapter failed",
+            "error": (
+                "provider failed with token=provider-secret-canary at "
+                "C:\\Users\\secret-owner\\runtime\\transcript.jsonl"
+            ),
         }
     )
     failed = AgentRuntimeResult.model_validate(failed_value)
@@ -130,7 +135,11 @@ async def test_execute_returns_adapter_infrastructure_failure_as_a_typed_result(
     response = await _request(RecordingExecutor(failed))
 
     assert response.status_code == 200
-    assert AgentRuntimeResult.model_validate(response.json()) == failed
+    observed = AgentRuntimeResult.model_validate(response.json())
+    assert observed == failed.model_copy(update={"error": "codex.run execution failed"})
+    assert "provider-secret-canary" not in response.text
+    assert "secret-owner" not in response.text
+    assert "transcript" not in response.text
 
 
 @pytest.mark.asyncio
@@ -226,6 +235,92 @@ def test_live_demo_service_script_manages_runtime_by_verified_identity() -> None
     assert "CAPTAIN_RUNTIME_URL" in script
     assert "CAPTAIN_RUNTIME_PORT" in script
     assert "services=@('gateway','runtime'" in script
+
+
+def _run_powershell_helpers(tmp_path: Path, body: str) -> subprocess.CompletedProcess[str]:
+    executable = shutil.which("pwsh")
+    assert executable is not None, "PowerShell 7 is required for service lifecycle tests"
+    root = Path(__file__).parents[2]
+    source = (root / "scripts" / "live-demo-services.ps1").read_text(encoding="utf-8")
+    helpers = source[source.index("Set-StrictMode") : source.index("Push-Location $root")]
+    harness = tmp_path / "runtime-service-harness.ps1"
+    harness.write_text(helpers + "\n" + body, encoding="utf-8")
+    return subprocess.run(
+        [executable, "-NoProfile", "-File", str(harness)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_start_preflights_runtime_before_any_service_mutation(tmp_path: Path) -> None:
+    completed = _run_powershell_helpers(
+        tmp_path,
+        r"""
+$script:events = [Collections.Generic.List[string]]::new()
+function Initialize-LocalEnvironment { $script:events.Add('environment'); return [ordered]@{} }
+function Set-ProcessEnvironment($Values) { $script:events.Add('process-env') }
+function Assert-RuntimeConfiguration($Values) { $script:events.Add('runtime-preflight'); throw 'expected preflight failure' }
+function Initialize-CaptainN8n($Values, [switch]$Recover, [string]$SourceEnv) { $script:events.Add('n8n') }
+try { Invoke-StartServices -Recover:$false -SourceEnv '' } catch {
+    if ($_.Exception.Message -ne 'expected preflight failure') { throw }
+}
+if (($script:events -join ',') -ne 'environment,process-env,runtime-preflight') {
+    throw "Unexpected start order: $($script:events -join ',')"
+}
+"preflight-order-ok"
+""",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "preflight-order-ok" in completed.stdout
+    assert "n8n" not in completed.stdout
+
+
+def test_runtime_start_refuses_an_unmanaged_listener_without_stopping_it(
+    tmp_path: Path,
+) -> None:
+    completed = _run_powershell_helpers(
+        tmp_path,
+        r"""
+function Get-ManagedRuntimeProcess { return $null }
+function Get-NetTCPConnection {
+    return [pscustomobject]@{OwningProcess=424242;LocalPort=8091;State='Listen'}
+}
+function taskkill.exe { throw 'taskkill must not run for an unmanaged listener' }
+$values = [ordered]@{CAPTAIN_RUNTIME_URL='http://127.0.0.1:8091'}
+try { Start-Runtime $values; throw 'expected unmanaged listener refusal' } catch {
+    if ($_.Exception.Message -ne 'Runtime port is occupied by an unmanaged process; refusing to reuse or stop it.') { throw }
+}
+"unmanaged-refusal-ok"
+""",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "unmanaged-refusal-ok" in completed.stdout
+
+
+def test_runtime_identity_mismatch_refuses_process_tree_stop(tmp_path: Path) -> None:
+    completed = _run_powershell_helpers(
+        tmp_path,
+        r"""
+$runtimePid = Join-Path $PSScriptRoot 'runtime.pid'
+@{pid=424242;started_at='2026-07-21T10:00:00.0000000Z';executable='C:\expected\python.exe'} | ConvertTo-Json -Compress | Set-Content $runtimePid -Encoding utf8
+function Get-Process {
+    param([int]$Id, $ErrorAction)
+    return [pscustomobject]@{Id=$Id;StartTime=[datetime]'2026-07-21T10:00:00Z';Path='C:\foreign\python.exe'}
+}
+function taskkill.exe { throw 'taskkill must not run after identity mismatch' }
+try { Stop-ManagedRuntime; throw 'expected identity mismatch refusal' } catch {
+    if ($_.Exception.Message -ne 'PID no longer belongs to the managed Runtime process.') { throw }
+}
+"identity-mismatch-ok"
+""",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "identity-mismatch-ok" in completed.stdout
 
 
 def test_example_environment_declares_runtime_boundary_without_secrets() -> None:

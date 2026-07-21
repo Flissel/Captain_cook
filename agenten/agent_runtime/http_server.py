@@ -67,12 +67,17 @@ def create_runtime_app(
         _: None = Depends(require_runtime_token),
     ) -> AgentRuntimeResult:
         try:
-            return await executor.execute(command)
+            result = await executor.execute(command)
         except Exception:
             logger.error("Runtime command execution failed")
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="runtime execution failed",
             ) from None
+        if result.error is None:
+            return result
+        return result.model_copy(
+            update={"error": f"{result.operation.value} execution failed"}
+        )
 
     return app
