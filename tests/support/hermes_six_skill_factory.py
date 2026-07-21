@@ -19,6 +19,9 @@ from types import SimpleNamespace
 from typing import Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from autogen_core import CancellationToken
+from autogen_core.tools import FunctionTool
+
 from agenten.agent_factory.contracts import (
     AgentFactoryJobV3,
     FactoryBlockStatus,
@@ -29,6 +32,8 @@ from agenten.agent_factory.contracts import (
 from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
 from agenten.agent_factory.execution_budget import (
     FactoryBudgetProjection,
+    FactoryBudgetReservationV1,
+    FactoryUsageReceiptV1,
     InMemoryFactoryBudgetLedger,
 )
 from agenten.agent_factory.factory_feedback import FactoryFeedbackBuilder
@@ -37,6 +42,7 @@ from agenten.agent_factory.factory_live_runner import (
     FactoryLiveEffectKind,
     FactoryLiveEffectOutcomeV1,
     FactoryLiveEffectRequestV1,
+    FactoryLiveRunReport,
     FactoryLiveRunner,
     InMemoryFactoryLiveEffectLedger,
 )
@@ -48,11 +54,18 @@ from agenten.agent_factory.hermes_cli import (
 )
 from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.live_composition import (
+    FactoryLiveRuntimeComponents,
     FactoryLiveRuntimePorts,
     compose_live_factory_runtime,
 )
+from agenten.agent_factory.live_n8n import ScopedCaptainN8nMcpAdapter
+from agenten.agent_factory.n8n_tools import TypedN8nTool
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatcher
-from agenten.agent_factory.service import FactoryCoordinator, InMemoryFactoryRepository
+from agenten.agent_factory.service import (
+    FactoryCoordinator,
+    FactoryLifecycleError,
+    InMemoryFactoryRepository,
+)
 from agenten.agent_factory.skill_evaluation import ToolGapMarker
 from agenten.agent_factory.skill_workflow_contracts import (
     CodebaseInventoryV1,
@@ -65,8 +78,28 @@ from agenten.agent_factory.skill_workflow_contracts import (
     TeamExecutionEvidenceV1,
 )
 from agenten.agent_factory.skill_sequence import SkillSequencePolicy
-from agenten.agent_factory.state_machine import FactoryActionKind, FactoryProjection
-from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent
+from agenten.agent_factory.state_machine import (
+    FactoryActionKind,
+    FactoryProjection,
+)
+from agenten.agent_factory.team_execution import (
+    FactoryN8nExecutionEvidenceV1,
+    FactoryN8nToolAuthorizationV1,
+)
+from agenten.agent_runtime.capabilities import PROFILE_CAPABILITIES, validate_grant
+from agenten.agent_runtime.contracts import (
+    AgentRuntimeCommand,
+    AgentRuntimeCommandPayload,
+    AgentRuntimeResult,
+    ArtifactRef,
+    CapabilityGrant,
+    CapabilityProfile,
+    IntegrationIntent,
+    RuntimeLimits,
+    RuntimeOperation,
+    RuntimeStatus,
+)
+from agenten.targets.n8n import N8nExecutionEvidence
 from tests.agent_factory.test_factory_live_runner import effect_outcome
 from tests.agent_factory.test_hermes_cli import (
     _catalog_for,
@@ -76,9 +109,9 @@ from tests.agent_factory.test_hermes_cli import (
 from tests.agent_factory.test_release_gate import (
     workflow_evaluation,
     workflow_job,
-    workflow_receipts,
     workflow_run,
 )
+from tests.agent_factory.test_team_execution import _candidate
 from tests.agent_factory.test_skill_workflow_contracts import (
     brief_payload,
     feedback_payload,
@@ -111,17 +144,15 @@ RETRY_STEPS = (
 class WorkflowGatewayRepository(InMemoryFactoryRepository):
     """In-memory Gateway port with the production repository read surface."""
 
-    def __init__(self, job: AgentFactoryJobV3) -> None:
+    def __init__(
+        self,
+        job: AgentFactoryJobV3,
+        budget: InMemoryFactoryBudgetLedger | None = None,
+    ) -> None:
         super().__init__()
         self.register(job)
         self.artifacts: list[object] = []
-        self.budget = FactoryBudgetProjection(
-            job_id=job.job_id,
-            limit_usd=job.execution_policy.max_cost_usd,
-            consumed_usd=Decimal("0"),
-            reserved_usd=Decimal("0"),
-            remaining_usd=job.execution_policy.max_cost_usd,
-        )
+        self.budget = budget or InMemoryFactoryBudgetLedger()
         self.receipts: list[object] = []
 
     def workflow_artifacts(self, job_id: UUID) -> tuple[object, ...]:
@@ -130,21 +161,12 @@ class WorkflowGatewayRepository(InMemoryFactoryRepository):
 
     def workflow_budget_projection(self, job_id: UUID) -> FactoryBudgetProjection:
         self.job(job_id)
-        return self.budget
+        return self.budget.projection(job_id)
 
     def workflow_usage_receipts(self, job_id: UUID) -> tuple[object, ...]:
         self.job(job_id)
         return tuple(self.receipts)
 
-    def replace_budget(self, consumed: Decimal) -> None:
-        remaining = max(Decimal("0"), self.budget.limit_usd - consumed)
-        self.budget = self.budget.model_copy(
-            update={
-                "consumed_usd": consumed,
-                "reserved_usd": Decimal("0"),
-                "remaining_usd": remaining,
-            }
-        )
 
 
 class DeterministicClock:
@@ -185,9 +207,335 @@ class DeterministicImprovements:
         return _improvement_authorization()
 
 
-class NullForge:
+class GatewayLifecycleView:
+    """Read/write facade over the real, replaceable Gateway coordinator."""
+
+    def __init__(self, coordinator: FactoryCoordinator) -> None:
+        self._coordinator = coordinator
+
+    def replace(self, coordinator: FactoryCoordinator) -> None:
+        self._coordinator = coordinator
+
+    def next_action(self, job_id: UUID):
+        return self._coordinator.next_action(job_id)
+
+    def projection(self, job_id: UUID) -> FactoryProjection:
+        return self._coordinator.projection(job_id)
+
+    def record(self, block: FactoryEvidenceBlock) -> bool:
+        return self._coordinator.record(block)
+
+    def promotion_block(self, job_id: UUID) -> FactoryEvidenceBlock | None:
+        return next(
+            (
+                block
+                for block in reversed(self._coordinator.blocks(job_id))
+                if block.phase is FactoryPhase.CAPABILITY_PROMOTED
+            ),
+            None,
+        )
+
+
+class DeterministicCodexBoundary:
+    """External Codex process boundary used by the composed build adapter."""
+
+    async def start(
+        self,
+        command: AgentRuntimeCommand,
+        grant: CapabilityGrant,
+    ) -> AgentRuntimeResult:
+        return self._result(command, grant)
+
+    async def resume(
+        self,
+        command: AgentRuntimeCommand,
+        grant: CapabilityGrant,
+    ) -> AgentRuntimeResult:
+        return self._result(command, grant)
+
+    async def status(self, command, grant):
+        return self._result(command, grant)
+
+    async def cancel(self, command, grant):
+        return self._result(command, grant)
+
+    async def heartbeat(self, command, grant):
+        return self._result(command, grant)
+
+    @staticmethod
+    def _result(
+        command: AgentRuntimeCommand,
+        grant: CapabilityGrant,
+    ) -> AgentRuntimeResult:
+        reference = ArtifactRef(
+            uri=f"artifact://deterministic/codex/{command.event_id}",
+            sha256=hashlib.sha256(str(command.event_id).encode()).hexdigest(),
+            media_type="application/json",
+        )
+        return AgentRuntimeResult(
+            schema_name="captain.agent-runtime-result.v1",
+            event_id=uuid5(NAMESPACE_URL, f"codex-result:{command.event_id}"),
+            command_id=command.event_id,
+            correlation_id=command.correlation_id,
+            occurred_at=NOW + timedelta(seconds=1),
+            producer="agent-runtime",
+            subject_id=command.subject_id,
+            subject_version=command.subject_version,
+            grant_id=grant.grant_id,
+            operation=command.payload.operation,
+            status=RuntimeStatus.SUCCEEDED,
+            session_id=f"codex-{str(command.event_id)[:12]}",
+            artifact_refs=(reference,),
+            evidence_refs=(reference,),
+        )
+
+
+class DeterministicCandidateProvider:
+    """External Forge archive lookup boundary."""
+
+    def __init__(self, root: Path) -> None:
+        self._candidate = _candidate(root)
+
+    def candidate_for(self, job):
+        del job
+        return self._candidate
+
+
+class DeterministicN8nAuthority:
+    async def authorize_command(self, claim, *, now: datetime):
+        return validate_grant(
+            claim.capability_grant,
+            claim.runtime_command,
+            now,
+        )
+
+    async def authorize(self, evidence, *, now: datetime):
+        return validate_grant(
+            evidence.capability_grant,
+            evidence.runtime_command,
+            now,
+        )
+
+
+class DeterministicN8nBoundary:
+    """One typed MCP boundary with a fresh Captain claim per provider run."""
+
+    def __init__(self, harness: "SixSkillFactoryHarness", workspace_ref: str) -> None:
+        self._harness = harness
+        self._workspace_ref = workspace_ref
+        self._tool_ref = TypedN8nTool(
+            name="support_triage",
+            description="Captain-approved deterministic support triage",
+            input_schema_ref="artifact://factory-support-input",
+            output_schema_ref="artifact://factory-support-output",
+        ).opaque_reference()
+        self._active_claim: FactoryN8nToolAuthorizationV1 | None = None
+        self._evidence: list[FactoryN8nExecutionEvidenceV1] = []
+
+    def tool(self, name: str):
+        assert name == "support_triage"
+
+        async def support_triage(ticket: str) -> str:
+            claim = self._active_claim
+            if claim is None:
+                raise AssertionError("n8n call started without a Captain claim")
+            sequence = len(self._evidence) + 1
+            workflow_ref = ArtifactRef(
+                uri=f"artifact://deterministic/n8n/workflow/{sequence}",
+                sha256=hashlib.sha256(
+                    f"workflow:{claim.runtime_command.event_id}".encode()
+                ).hexdigest(),
+                media_type="application/json",
+            )
+            runtime = AgentRuntimeResult(
+                schema_name="captain.agent-runtime-result.v1",
+                event_id=uuid5(
+                    NAMESPACE_URL,
+                    f"n8n-runtime:{claim.runtime_command.event_id}",
+                ),
+                command_id=claim.runtime_command.event_id,
+                correlation_id=claim.runtime_command.correlation_id,
+                occurred_at=NOW + timedelta(seconds=1),
+                producer="agent-runtime",
+                subject_id=claim.runtime_command.subject_id,
+                subject_version=claim.runtime_command.subject_version,
+                grant_id=claim.capability_grant.grant_id,
+                operation=claim.runtime_command.payload.operation,
+                status=RuntimeStatus.SUCCEEDED,
+            )
+            observed = FactoryN8nExecutionEvidenceV1(
+                tool_name=name,
+                approved_tool_ref=self._tool_ref,
+                runtime_command=claim.runtime_command,
+                capability_grant=claim.capability_grant,
+                runtime_result=runtime,
+                mcp_call_id=f"mcp-call-{sequence}",
+                workflow_ref=workflow_ref,
+                execution=N8nExecutionEvidence(
+                    execution_id=f"n8n-execution-{sequence}",
+                    workflow_id=f"workflow-{sequence}",
+                    artifact_digest=workflow_ref.sha256,
+                    correlation_id=str(claim.runtime_command.correlation_id),
+                    status="success",
+                ),
+                evidence_ref=ArtifactRef(
+                    uri=f"artifact://deterministic/n8n/execution/{sequence}",
+                    sha256=hashlib.sha256(
+                        f"execution:{claim.runtime_command.event_id}".encode()
+                    ).hexdigest(),
+                    media_type="application/json",
+                ),
+            )
+            self._evidence.append(observed)
+            return f"routed:{ticket}"
+
+        return FunctionTool(
+            support_triage,
+            description="Route one Captain-authorized support case",
+            name=name,
+        )
+
+    def authorization(self, name: str) -> FactoryN8nToolAuthorizationV1:
+        assert name == "support_triage"
+        sequence = len(self._evidence) + 1
+        command_id = uuid5(
+            NAMESPACE_URL,
+            f"n8n-command:{self._harness.job.job_id}:{sequence}",
+        )
+        encoded = json.dumps(
+            self._tool_ref.model_dump(mode="json", by_alias=True),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        command = AgentRuntimeCommand(
+            schema_name="captain.agent-runtime-command.v1",
+            event_id=command_id,
+            correlation_id=self._harness.job.correlation_id,
+            occurred_at=NOW,
+            producer="captain",
+            subject_id=name,
+            subject_version=self._harness.job.subject_version,
+            payload=AgentRuntimeCommandPayload(
+                operation=RuntimeOperation.CODEX_RUN,
+                project_id="factory-team",
+                batch_id="factory-n8n-batch",
+                subtask_id=name,
+                workspace_ref=self._workspace_ref,
+                prompt_ref=ArtifactRef(
+                    uri=f"artifact://deterministic/n8n/command/{sequence}",
+                    sha256=hashlib.sha256(encoded).hexdigest(),
+                    media_type="application/json",
+                ),
+                integration_intent=IntegrationIntent.N8N,
+                capability_profile=CapabilityProfile.N8N_BUILDER,
+                limits=RuntimeLimits(wall_seconds=60, max_iterations=2),
+            ),
+        )
+        grant = CapabilityGrant(
+            schema_name="captain.capability-grant.v1",
+            grant_id=f"grant-n8n-{sequence}",
+            command_id=command_id,
+            batch_id="factory-n8n-batch",
+            batch_version=self._harness.job.subject_version,
+            subtask_id=name,
+            workspace_ref=self._workspace_ref,
+            profile=CapabilityProfile.N8N_BUILDER,
+            capabilities=tuple(
+                sorted(PROFILE_CAPABILITIES[CapabilityProfile.N8N_BUILDER])
+            ),
+            mcp_servers=("n8n-mcp",),
+            issued_at=NOW,
+            expires_at=NOW + timedelta(minutes=5),
+        )
+        self._active_claim = FactoryN8nToolAuthorizationV1(
+            tool_name=name,
+            approved_tool_ref=self._tool_ref,
+            runtime_command=command,
+            capability_grant=grant,
+        )
+        return self._active_claim
+
+    def observed_evidence(self) -> tuple[FactoryN8nExecutionEvidenceV1, ...]:
+        return tuple(self._evidence)
+
+
+class DeterministicPricingBoundary:
+    def resolve_quote(self, **kwargs):
+        del kwargs
+        raise AssertionError("team provider pricing is not used by claimed runner effects")
+
+
+class DeterministicHoldoutSource:
+    async def read(self, reference):
+        del reference
+        raise AssertionError("holdout bytes are not read outside team provider execution")
+
+
+class DeterministicHoldoutEvaluator:
+    async def evaluate(self, reference, result, assertion_ids):
+        del reference, result, assertion_ids
+        raise AssertionError("holdout evaluation is not used outside provider execution")
+
+
+class DeterministicForgeBoundary:
+    def __init__(self, harness: "SixSkillFactoryHarness") -> None:
+        self._harness = harness
+
     async def submit(self, request: FactoryDispatch) -> object:
+        self._harness.coordinator.record(
+            self._harness.external_block(
+                FactoryPhase.AGENT_CODE_CREATED,
+                attempt=request.action.attempt,
+                producer="hermes",
+            )
+        )
         return SimpleNamespace(job_id=request.job.job_id)
+
+
+class DeterministicCandidateBoundary:
+    """Fake only the build/provider boundary; FactoryDispatcher owns persistence."""
+
+    def __init__(self, harness: "SixSkillFactoryHarness") -> None:
+        self._harness = harness
+
+    async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
+        if request.action.kind is FactoryActionKind.DISPATCH_BUILD_VALIDATOR:
+            return self._harness.external_block(
+                FactoryPhase.BUILD_PASSED,
+                attempt=request.action.attempt,
+                producer="hermes",
+            )
+        if request.action.kind is FactoryActionKind.DISPATCH_REAL_CASE_TESTER:
+            candidate = self._harness.components.candidate_provider.candidate_for(
+                request.job
+            )
+            invocation = self._harness.components.team_execution.invocation_for(
+                request
+            )
+            assert candidate.source_archive.is_file()
+            assert invocation.step is FactorySkillStep.EXECUTE_TEAM
+            executions = self._harness.materialize_execution_batch(
+                request.action.attempt
+            )
+            self._harness.repository.artifacts.extend(executions)
+            return self._harness.external_block(
+                FactoryPhase.REAL_CASE_EVIDENCE,
+                attempt=request.action.attempt,
+                producer="hermes",
+                role=FactoryRole.REAL_CASE_TESTER,
+                artifact_refs=tuple(item.artifact_ref for item in executions),
+                evidence_refs=tuple(
+                    reference
+                    for item in executions
+                    for reference in item.evidence_refs
+                ),
+                assertion_ids=self._harness.job.acceptance_assertion_ids,
+            )
+        if request.action.kind is FactoryActionKind.DISPATCH_QUALITY_WARDEN:
+            return await self._harness.components.hermes.dispatch(request)
+        raise AssertionError(
+            f"candidate boundary received {request.action.kind.value}"
+        )
 
 
 class DeterministicHermes(HermesCliFactory):
@@ -218,6 +566,8 @@ class DeterministicDispatcher:
     ) -> None:
         self._harness = harness
         self._dispatcher = dispatcher
+        self.dispatch_count = 0
+        self.actions: list[str] = []
 
     def validate_next(
         self,
@@ -259,53 +609,13 @@ class DeterministicDispatcher:
         return action
 
     async def dispatch_next(self, job_id: UUID):
+        self.dispatch_count += 1
         action = self._harness.coordinator.next_action(job_id)
-        if action.kind is FactoryActionKind.SUBMIT_FORGE_JOB:
-            await self._harness.forge.submit(
-                FactoryDispatch(
-                    job=self._harness.job,
-                    action=action,
-                    role=None,
-                    lease=None,
-                )
-            )
-            self._harness.coordinator.record(
-                self._harness.external_block(
-                    FactoryPhase.AGENT_CODE_CREATED,
-                    attempt=action.attempt,
-                    producer="hermes",
-                )
-            )
-            return action
-        if action.kind is FactoryActionKind.DISPATCH_BUILD_VALIDATOR:
-            self._harness.coordinator.record(
-                self._harness.external_block(
-                    FactoryPhase.BUILD_PASSED,
-                    attempt=action.attempt,
-                    producer="hermes",
-                )
-            )
-            return action
-        if action.kind is FactoryActionKind.DISPATCH_REAL_CASE_TESTER:
-            executions = self._harness.materialize_execution_batch(action.attempt)
-            self._harness.repository.artifacts.extend(executions)
-            self._harness.coordinator.record(
-                self._harness.external_block(
-                    FactoryPhase.REAL_CASE_EVIDENCE,
-                    attempt=action.attempt,
-                    producer="hermes",
-                    role=FactoryRole.REAL_CASE_TESTER,
-                    artifact_refs=tuple(item.artifact_ref for item in executions),
-                    evidence_refs=tuple(
-                        reference
-                        for item in executions
-                        for reference in item.evidence_refs
-                    ),
-                    assertion_ids=self._harness.job.acceptance_assertion_ids,
-                )
-            )
-            return action
-        return await self._dispatcher.dispatch_next(job_id)
+        self.actions.append(action.kind.value)
+        dispatched = await self._dispatcher.dispatch_next(job_id)
+        if action.kind is FactoryActionKind.DISPATCH_QUALITY_WARDEN:
+            self._harness.attempt_worker_promotion()
+        return dispatched
 
 
 class RecordingLiveEffectLedger(InMemoryFactoryLiveEffectLedger):
@@ -458,8 +768,13 @@ class LiveEffectPlan:
 
 
 class RecoveringLiveExecutor:
-    def __init__(self, harness: "SixSkillFactoryHarness") -> None:
+    def __init__(
+        self,
+        harness: "SixSkillFactoryHarness",
+        instance_id: str,
+    ) -> None:
         self._harness = harness
+        self.instance_id = instance_id
         self.execute_calls = 0
         self.recover_calls = 0
 
@@ -469,21 +784,15 @@ class RecoveringLiveExecutor:
     ) -> FactoryLiveEffectOutcomeV1:
         self.execute_calls += 1
         self._harness.mark_pre_promotion()
-        if (
-            request.kind is FactoryLiveEffectKind.PROVIDER
-            and self._harness.paid_cost_usd + Decimal("0.25")
-            > self._harness.job.execution_policy.max_cost_usd
-        ):
-            from agenten.agent_factory.execution_budget import BudgetExhausted
-
-            raise BudgetExhausted("factory USD budget is exhausted")
+        if request.kind is FactoryLiveEffectKind.PROVIDER:
+            self._harness.reserve_provider(request, owner=self.instance_id)
         self._harness.effect_order.append(f"start:{request.kind.value}")
         self._harness.effect_counts[request.kind.value] += 1
         self._harness.stage_request(request)
-        if request.kind is FactoryLiveEffectKind.PROVIDER:
-            self._harness.paid_cost_usd += Decimal("0.25")
+        if request.kind is FactoryLiveEffectKind.CODEX:
+            await self._harness.invoke_codex(request)
         if request.kind is FactoryLiveEffectKind.PROVIDER and self._harness.with_n8n:
-            self._harness.effect_counts["n8n"] += 1
+            await self._harness.invoke_n8n(request)
         if (
             request.kind is FactoryLiveEffectKind.PROVIDER
             and self._harness.job.execution_policy.mode.value == "release"
@@ -492,6 +801,8 @@ class RecoveringLiveExecutor:
             self._harness._controlled_recovery_injected = True
             raise FactoryInfrastructureFailure("controlled deterministic recovery")
         outcome = effect_outcome(request)
+        if request.kind is FactoryLiveEffectKind.PROVIDER:
+            self._harness.record_provider_usage(request, outcome)
         self._harness.stage_outcome(request.kind, outcome)
         return outcome
 
@@ -500,11 +811,60 @@ class RecoveringLiveExecutor:
         request: FactoryLiveEffectRequestV1,
     ) -> FactoryLiveEffectOutcomeV1:
         self.recover_calls += 1
+        self._harness._infrastructure_recoveries += 1
         self._harness.effect_order.append(f"recover:{request.kind.value}")
         self._harness.stage_request(request)
         outcome = effect_outcome(request)
+        if request.kind is FactoryLiveEffectKind.PROVIDER:
+            owner = self._harness._reservation_owners[request.effect_id]
+            if owner != self.instance_id:
+                self._harness._reservation_recovered_after_restart = True
+            self._harness.record_provider_usage(request, outcome)
         self._harness.stage_outcome(request.kind, outcome)
         return outcome
+
+
+class RestartableLiveRunner:
+    """Durable history around newly instantiated production live runners."""
+
+    def __init__(self, harness: "SixSkillFactoryHarness") -> None:
+        self._harness = harness
+        self._history: list[FactoryLiveRunReport] = []
+        self.instance_ids: list[str] = []
+        self._runner: FactoryLiveRunner
+        self.restart()
+
+    def restart(self) -> None:
+        instance_id = f"runner-{len(self.instance_ids) + 1}"
+        self.instance_ids.append(instance_id)
+        executor = RecoveringLiveExecutor(self._harness, instance_id)
+        self._harness.live_executor = executor
+        self._harness.lifecycle.replace(FactoryCoordinator(self._harness.repository))
+        self._runner = FactoryLiveRunner(
+            repository=self._harness.repository,
+            effect_ledger=self._harness.effect_ledger,
+            plan=LiveEffectPlan(self._harness),
+            executor=executor,
+            clock=self._harness.clock,
+        )
+
+    def history(self, job_id: UUID) -> tuple[FactoryLiveRunReport, ...]:
+        return tuple(report for report in self._history if report.job_id == job_id)
+
+    async def run(
+        self,
+        job: UUID | AgentFactoryJobV3,
+        *,
+        mode: Literal["demo", "release"],
+    ) -> FactoryLiveRunReport:
+        report = await self._runner.run(job, mode=mode)
+        self._history.append(report)
+        if (
+            report.status == "infrastructure_recovery_required"
+            and self._harness.restart_after_reservation
+        ):
+            self.restart()
+        return report
 
 
 @dataclass(frozen=True)
@@ -528,10 +888,20 @@ class SixSkillHarnessResult:
     live_status: str
     captain_promoted: bool
     pre_promotion_status: str
+    production_dispatch_count: int
+    production_dispatch_actions: tuple[str, ...]
+    budget_projection: FactoryBudgetProjection
+    gateway_budget_projection: FactoryBudgetProjection
+    runner_instance_ids: tuple[str, ...]
+    reservation_recovered_after_restart: bool
+    n8n_execution_ids: tuple[str, ...]
+    worker_promotion_error: str
+    worker_projection_before: FactoryProjection
+    worker_projection_after: FactoryProjection
 
     @property
     def worker_ready_claim_changed_projection(self) -> bool:
-        return False
+        return self.worker_projection_before != self.worker_projection_after
 
 
 class SixSkillFactoryHarness:
@@ -563,17 +933,25 @@ class SixSkillFactoryHarness:
         self.restart_after_evidence = restart_after_evidence
         self.with_n8n = with_n8n
         self.clock = DeterministicClock()
-        self.repository = WorkflowGatewayRepository(self.job)
+        self.budget = InMemoryFactoryBudgetLedger()
+        self.repository = WorkflowGatewayRepository(self.job, self.budget)
         self.coordinator = FactoryCoordinator(self.repository)
-        self.forge = NullForge()
+        self.lifecycle = GatewayLifecycleView(self.coordinator)
         self.process_calls = 0
         self.effect_counts = {"codex": 0, "n8n": 0, "provider": 0}
-        self.paid_cost_usd = Decimal("0")
         self.effect_order: list[str] = []
         self._controlled_recovery_injected = False
         self._codex_outcomes: list[FactoryLiveEffectOutcomeV1] = []
         self._provider_outcomes: list[FactoryLiveEffectOutcomeV1] = []
         self._provider_requests: list[FactoryLiveEffectRequestV1] = []
+        self._reservations: dict[UUID, FactoryBudgetReservationV1] = {}
+        self._reservation_owners: dict[UUID, str] = {}
+        self._reservation_recovered_after_restart = False
+        self._infrastructure_recoveries = 0
+        self._worker_promotion_error = ""
+        self._worker_projection_before = self.coordinator.projection(self.job.job_id)
+        self._worker_projection_after = self._worker_projection_before
+        self._worker_promotion_attempted = False
         self._tmp = TemporaryDirectory(prefix="captain-six-skill-")
         self.root = Path(self._tmp.name)
         self.catalog = _catalog_for(self.root, *tuple(FactorySkillStep))
@@ -592,25 +970,26 @@ class SixSkillFactoryHarness:
         )
         self.leases = DeterministicLeases(self.clock)
         self.improvements = DeterministicImprovements()
+        self.components = self._compose_ports()
+        self.used_composed_ports = (
+            self.components.hermes is self.hermes
+            and self.repository.budget is self.budget
+        )
+        self.forge = DeterministicForgeBoundary(self)
+        self.candidate_boundary = DeterministicCandidateBoundary(self)
         raw_dispatcher = FactoryDispatcher(
             coordinator=self.coordinator,
-            hermes=self.hermes,
+            hermes=self.components.hermes,
             forge=self.forge,
+            candidate_validator=self.candidate_boundary,
             leases=self.leases,
             clock=self.clock,
             improvements=self.improvements,
         )
         self.dispatcher = DeterministicDispatcher(self, raw_dispatcher)
         self.effect_ledger = RecordingLiveEffectLedger(self.effect_order)
-        self.live_executor = RecoveringLiveExecutor(self)
-        self.live_runner = FactoryLiveRunner(
-            repository=self.repository,
-            effect_ledger=self.effect_ledger,
-            plan=LiveEffectPlan(self),
-            executor=self.live_executor,
-            clock=self.clock,
-        )
-        self.used_composed_ports = self._compose_ports()
+        self.live_executor: RecoveringLiveExecutor
+        self.live_runner = RestartableLiveRunner(self)
         self._attempt_runs: dict[int, tuple[TeamExecutionEvidenceV1, ...]] = {}
         self._feedback_by_attempt: dict[int, FactoryFeedbackV1] = {}
         self._last_result: SixSkillHarnessResult | None = None
@@ -632,7 +1011,7 @@ class SixSkillFactoryHarness:
             )
             self._replayed_evidence += sum(item.replayed for item in replay.effects)
         runtime = FactorySixSkillLiveCoordinator(
-            coordinator=self.coordinator,
+            coordinator=self.lifecycle,
             repository=self.repository,
             dispatcher=self.dispatcher,
             live_runner=self.live_runner,
@@ -643,6 +1022,7 @@ class SixSkillFactoryHarness:
             self.job.execution_policy.mode.value,
         )
         if self.restart_after_evidence and result.status == "ready_to_use":
+            self.live_runner.restart()
             replay = await self.live_runner.run(self.job, mode="release")
             self._replayed_evidence += sum(item.replayed for item in replay.effects)
         projection = self.coordinator.projection(self.job.job_id)
@@ -665,8 +1045,8 @@ class SixSkillFactoryHarness:
             tool_gap_severities=tuple(gap.severity for gap in feedback.tool_gaps),
             effect_counts=dict(self.effect_counts),
             effect_order=tuple(self.effect_order),
-            infrastructure_recoveries=self.live_executor.recover_calls,
-            recovered_reservations=self.live_executor.recover_calls,
+            infrastructure_recoveries=self._infrastructure_recoveries,
+            recovered_reservations=self._infrastructure_recoveries,
             replayed_evidence=self._replayed_evidence,
             used_composed_ports=self.used_composed_ports,
             live_status=(
@@ -676,6 +1056,27 @@ class SixSkillFactoryHarness:
             ),
             captain_promoted=result.promotion_block is not None,
             pre_promotion_status=self._pre_promotion_status,
+            production_dispatch_count=self.dispatcher.dispatch_count,
+            production_dispatch_actions=tuple(self.dispatcher.actions),
+            budget_projection=self.budget.projection(self.job.job_id),
+            gateway_budget_projection=self.repository.workflow_budget_projection(
+                self.job.job_id
+            ),
+            runner_instance_ids=tuple(self.live_runner.instance_ids),
+            reservation_recovered_after_restart=(
+                self._reservation_recovered_after_restart
+            ),
+            n8n_execution_ids=tuple(
+                item.execution.execution_id
+                for item in (
+                    self.n8n_delegate.observed_evidence()
+                    if self.n8n_delegate is not None
+                    else ()
+                )
+            ),
+            worker_promotion_error=self._worker_promotion_error,
+            worker_projection_before=self._worker_projection_before,
+            worker_projection_after=self._worker_projection_after,
         )
         self._last_result = wrapped
         return wrapped
@@ -763,7 +1164,7 @@ class SixSkillFactoryHarness:
             self.first_run == "behavioral_failure" and attempt == 1
         ) or (
             attempt == 2
-            and self.repository.budget.remaining_usd <= 0
+            and self.budget.projection(self.job.job_id).remaining_usd <= 0
         ) or self.failure is not None
         run_count = (
             1
@@ -781,7 +1182,16 @@ class SixSkillFactoryHarness:
             for request in self._provider_requests
             if request.attempt == attempt
         )
-        if len(staged) != run_count or len(requests) != run_count:
+        receipts = tuple(
+            receipt
+            for receipt in self.repository.receipts
+            if receipt.attempt == attempt
+        )
+        if (
+            len(staged) != run_count
+            or len(requests) != run_count
+            or len(receipts) != run_count
+        ):
             raise AssertionError(
                 "execute_team evidence was materialized before exact claimed provider effects"
             )
@@ -794,28 +1204,20 @@ class SixSkillFactoryHarness:
                                 dict.fromkeys(
                                     (*run.evidence_refs, outcome.evidence_ref)
                                 )
-                            )
+                            ),
+                            "usage_receipt_refs": (receipt.evidence_ref,),
                         }
                     ).model_dump(mode="json", by_alias=True),
                     request.invocation,
                 )
             )
-            for run, outcome, request in zip(runs, staged, requests, strict=True)
+            for run, outcome, request, receipt in zip(
+                runs, staged, requests, receipts, strict=True
+            )
         )
         if failed:
             runs = tuple(self._failed_run(run) for run in runs)
         self._attempt_runs[attempt] = runs
-        cost = Decimal("0") if attempt == 2 and self.repository.budget.remaining_usd <= 0 else Decimal("0.25")
-        if cost:
-            receipts = tuple(
-                receipt.model_copy(update={"cost_usd": cost})
-                for receipt in workflow_receipts(runs)
-            )
-            self.repository.receipts.extend(receipts)
-            consumed = self.repository.budget.consumed_usd + sum(
-                (receipt.cost_usd for receipt in receipts), Decimal("0")
-            )
-            self.repository.replace_budget(consumed)
         return runs
 
     def _evaluation_for(
@@ -823,7 +1225,10 @@ class SixSkillFactoryHarness:
         invocation: FactorySkillInvocationV1,
     ) -> TeamEvaluationV1:
         runs = self._attempt_runs[invocation.attempt]
-        evaluation = workflow_evaluation(runs, budget=self.repository.budget)
+        evaluation = workflow_evaluation(
+            runs,
+            budget=self.budget.projection(self.job.job_id),
+        )
         if self.failure is not None:
             evaluation = evaluation.model_copy(update={"failure_class": self.failure})
         return TeamEvaluationV1.model_validate(
@@ -854,7 +1259,7 @@ class SixSkillFactoryHarness:
             candidate_ref=self._attempt_runs[invocation.attempt][0].candidate_ref,
             evaluation=evaluation,
             tool_gaps=gaps,
-            budget_projection=self.repository.budget,
+            budget_projection=self.budget.projection(self.job.job_id),
         )
         self._feedback_by_attempt[invocation.attempt] = feedback
         return feedback
@@ -863,6 +1268,50 @@ class SixSkillFactoryHarness:
         self._pre_promotion_status = self.coordinator.projection(
             self.job.job_id
         ).status.value
+
+    def attempt_worker_promotion(self) -> None:
+        if self._worker_promotion_attempted:
+            return
+        self._worker_promotion_attempted = True
+        self._worker_projection_before = self.coordinator.projection(
+            self.job.job_id
+        )
+        self._pre_promotion_status = self._worker_projection_before.status.value
+        reference = self._worker_projection_before.feedback_ref
+        if reference is None:
+            reference = ArtifactRef(
+                uri="artifact://deterministic/worker-promotion",
+                sha256=hashlib.sha256(b"worker-promotion").hexdigest(),
+                media_type="application/json",
+            )
+        try:
+            worker_claim = FactoryEvidenceBlock(
+                schema_name="captain.agent-factory-block.v1",
+                event_id=uuid5(
+                    NAMESPACE_URL,
+                    f"worker-promotion:{self.job.job_id}",
+                ),
+                job_id=self.job.job_id,
+                correlation_id=self.job.correlation_id,
+                causation_id=self.job.event_id,
+                occurred_at=self.clock(),
+                producer="hermes",
+                subject_version=self.job.subject_version,
+                attempt=self._worker_projection_before.attempt,
+                phase=FactoryPhase.CAPABILITY_PROMOTED,
+                role=None,
+                status=FactoryBlockStatus.SUCCEEDED,
+                artifact_refs=(reference,),
+                evidence_refs=(reference,),
+                assertion_ids=self.job.acceptance_assertion_ids,
+                lease_id=None,
+            )
+            self.coordinator.record(worker_claim)
+        except (FactoryLifecycleError, ValueError) as exc:
+            self._worker_promotion_error = f"producer rejected: {exc}"
+        self._worker_projection_after = self.coordinator.projection(
+            self.job.job_id
+        )
 
     def stage_outcome(
         self,
@@ -883,6 +1332,121 @@ class SixSkillFactoryHarness:
             and request not in self._provider_requests
         ):
             self._provider_requests.append(request)
+
+    @property
+    def paid_cost_usd(self) -> Decimal:
+        return self.budget.projection(self.job.job_id).consumed_usd
+
+    def reserve_provider(
+        self,
+        request: FactoryLiveEffectRequestV1,
+        *,
+        owner: str,
+    ) -> FactoryBudgetReservationV1:
+        existing = self._reservations.get(request.effect_id)
+        if existing is not None:
+            return existing
+        reservation = self.budget.reserve(
+            self.job,
+            attempt=request.attempt,
+            requested_usd=Decimal("0.25"),
+            now=self.clock(),
+        )
+        self._reservations[request.effect_id] = reservation
+        self._reservation_owners[request.effect_id] = owner
+        return reservation
+
+    async def invoke_codex(self, request: FactoryLiveEffectRequestV1) -> None:
+        command_id = uuid5(NAMESPACE_URL, f"codex-command:{request.effect_id}")
+        subtask_id = f"factory-{request.invocation.step.value}-{request.attempt}"
+        command = AgentRuntimeCommand(
+            schema_name="captain.agent-runtime-command.v1",
+            event_id=command_id,
+            correlation_id=request.correlation_id,
+            occurred_at=self.clock(),
+            producer="captain",
+            subject_id=subtask_id,
+            subject_version=request.subject_version,
+            payload=AgentRuntimeCommandPayload(
+                operation=RuntimeOperation.CODEX_RUN,
+                project_id="factory-team",
+                batch_id="factory-codex-batch",
+                subtask_id=subtask_id,
+                workspace_ref=request.invocation.lease.workspace_ref,
+                prompt_ref=request.input_ref,
+                integration_intent=IntegrationIntent.NONE,
+                capability_profile=CapabilityProfile.FACTORY_TOOL_INTEGRATOR,
+                limits=RuntimeLimits(wall_seconds=60, max_iterations=2),
+            ),
+        )
+        grant = CapabilityGrant(
+            schema_name="captain.capability-grant.v1",
+            grant_id=f"grant-codex-{str(command_id)[:12]}",
+            command_id=command_id,
+            batch_id="factory-codex-batch",
+            batch_version=request.subject_version,
+            subtask_id=subtask_id,
+            workspace_ref=request.invocation.lease.workspace_ref,
+            profile=CapabilityProfile.FACTORY_TOOL_INTEGRATOR,
+            capabilities=tuple(
+                sorted(
+                    PROFILE_CAPABILITIES[
+                        CapabilityProfile.FACTORY_TOOL_INTEGRATOR
+                    ]
+                )
+            ),
+            issued_at=self.clock(),
+            expires_at=self.clock() + timedelta(minutes=5),
+        )
+        result = await self.components.codex.execute(command, grant)
+        assert result.status is RuntimeStatus.SUCCEEDED
+
+    async def invoke_n8n(self, request: FactoryLiveEffectRequestV1) -> None:
+        if self.n8n_adapter is None:
+            raise AssertionError("n8n effect lacks its composed scoped adapter")
+        self.effect_order.append("n8n:claim")
+        claim = self.n8n_adapter.authorization("support_triage")
+        assert claim.runtime_command.correlation_id == request.correlation_id
+        await self.n8n_authority.authorize_command(claim, now=self.clock())
+        tool = self.n8n_adapter.tool("support_triage")
+        self.effect_order.append("n8n:start")
+        await tool.run_json(
+            {"ticket": f"case-{request.idempotency_key[:12]}"},
+            CancellationToken(),
+        )
+        evidence = self.n8n_adapter.observed_evidence()
+        assert evidence[-1].runtime_command.event_id == claim.runtime_command.event_id
+        self.effect_order.append("n8n:evidence")
+        self.effect_counts["n8n"] += 1
+
+    def record_provider_usage(
+        self,
+        request: FactoryLiveEffectRequestV1,
+        outcome: FactoryLiveEffectOutcomeV1,
+    ) -> None:
+        reservation = self._reservations[request.effect_id]
+        receipt = FactoryUsageReceiptV1(
+            schema_name="captain.factory-usage-receipt.v1",
+            receipt_id=uuid5(
+                NAMESPACE_URL,
+                f"deterministic-provider-receipt:{request.effect_id}",
+            ),
+            reservation_id=reservation.reservation_id,
+            job_id=request.job_id,
+            correlation_id=request.correlation_id,
+            attempt=request.attempt,
+            provider="deterministic-provider",
+            model="approved-model-id",
+            input_units=100,
+            output_units=20,
+            cost_usd=Decimal("0.25"),
+            started_at=self.clock(),
+            ended_at=self.clock() + timedelta(seconds=1),
+            evidence_ref=outcome.evidence_ref,
+        )
+        self.budget.record_usage(self.job, reservation, receipt)
+        if receipt not in self.repository.receipts:
+            self.repository.receipts.append(receipt)
 
     def external_block(
         self,
@@ -964,12 +1528,14 @@ class SixSkillFactoryHarness:
             return self._feedback_by_attempt[max(self._feedback_by_attempt)]
         return FactoryFeedbackV1.model_validate(feedback_payload())
 
-    def _compose_ports(self) -> bool:
+    def _compose_ports(self) -> FactoryLiveRuntimeComponents:
         integration_intent = (
             IntegrationIntent.N8N if self.with_n8n else IntegrationIntent.NONE
         )
         n8n_lease = None
-        n8n_delegate = None
+        self.n8n_delegate: DeterministicN8nBoundary | None = None
+        self.n8n_adapter: ScopedCaptainN8nMcpAdapter | None = None
+        self.n8n_authority = DeterministicN8nAuthority()
         if self.with_n8n:
             n8n_lease = issue_factory_lease(
                 job=self.job,
@@ -979,26 +1545,33 @@ class SixSkillFactoryHarness:
                 now=NOW,
                 integration_intent=IntegrationIntent.N8N,
             )
-            n8n_delegate = object()
+            self.n8n_delegate = DeterministicN8nBoundary(
+                self,
+                n8n_lease.workspace_ref,
+            )
+            self.n8n_adapter = ScopedCaptainN8nMcpAdapter(
+                lease=n8n_lease,
+                delegate=self.n8n_delegate,
+            )
         components = compose_live_factory_runtime(
             job=self.job,
             evidence_store=self.evidence_store,
             ports=FactoryLiveRuntimePorts(
                 hermes=self.hermes,
-                codex=object(),  # type: ignore[arg-type]
+                codex=DeterministicCodexBoundary(),
                 context7=None,
-                candidate_provider=object(),  # type: ignore[arg-type]
+                candidate_provider=DeterministicCandidateProvider(self.root),
                 minibook=None,
                 model_client_for=lambda *_: object(),  # type: ignore[return-value]
-                budget=InMemoryFactoryBudgetLedger(),
-                pricing_source=object(),  # type: ignore[arg-type]
+                budget=self.budget,
+                pricing_source=DeterministicPricingBoundary(),
                 replay_store=self.replay_store,
-                holdout_source=object(),  # type: ignore[arg-type]
-                holdout_evaluator=object(),  # type: ignore[arg-type]
+                holdout_source=DeterministicHoldoutSource(),
+                holdout_evaluator=DeterministicHoldoutEvaluator(),
                 integration_intent=integration_intent,
-                n8n_delegate=n8n_delegate,  # type: ignore[arg-type]
+                n8n_delegate=self.n8n_delegate,
                 n8n_lease=n8n_lease,
-                n8n_authority=object(),  # type: ignore[arg-type]
+                n8n_authority=self.n8n_authority,
                 released_skill_catalog=self.catalog,
                 skill_root=self.root,
                 tools={},
@@ -1009,7 +1582,7 @@ class SixSkillFactoryHarness:
             ),
             holdout_id=self.job.private_holdout_refs[0].holdout_id,
         )
-        return components.hermes is self.hermes
+        return components
 
 
 __all__ = [

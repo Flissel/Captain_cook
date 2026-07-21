@@ -37,6 +37,16 @@ async def test_first_pass_runs_five_skill_steps_and_promotes() -> None:
     assert len(result.usage_receipts) == 3
     assert result.total_cost_usd == Decimal("0.75")
     assert result.used_composed_ports is True
+    assert result.production_dispatch_count == 6
+    assert result.production_dispatch_actions == (
+        "dispatch_agent_architect",
+        "dispatch_tool_integrator",
+        "submit_forge_job",
+        "dispatch_build_validator",
+        "dispatch_real_case_tester",
+        "dispatch_quality_warden",
+    )
+    assert result.budget_projection == result.gateway_budget_projection
 
 
 @pytest.mark.asyncio
@@ -142,6 +152,9 @@ async def test_restart_after_reservation_and_execution_evidence_replays() -> Non
     assert result.recovered_reservations == 1
     assert result.replayed_evidence >= 1
     assert result.effect_counts["provider"] == 3
+    assert len(result.runner_instance_ids) >= 2
+    assert len(set(result.runner_instance_ids)) >= 2
+    assert result.reservation_recovered_after_restart is True
     assert result.effect_order.index("claim:provider") < result.effect_order.index(
         "start:provider"
     )
@@ -164,6 +177,11 @@ async def test_idempotent_replay_does_not_duplicate_external_effects() -> None:
     assert replay.effect_order.index("claim:provider") < replay.effect_order.index(
         "start:provider"
     )
+    assert len(replay.n8n_execution_ids) == 3
+    assert len(set(replay.n8n_execution_ids)) == 3
+    assert replay.effect_order.index("n8n:claim") < replay.effect_order.index(
+        "n8n:start"
+    ) < replay.effect_order.index("n8n:evidence")
 
 
 @pytest.mark.asyncio
@@ -182,6 +200,8 @@ async def test_only_captain_promotion_reaches_terminal_ready_state() -> None:
     assert result.feedback.recommendation is FactoryFeedbackRecommendation.PROMOTE_CANDIDATE
     assert result.pre_promotion_status == "running"
     assert result.worker_ready_claim_changed_projection is False
+    assert "producer" in result.worker_promotion_error
+    assert result.worker_projection_before == result.worker_projection_after
     assert result.gateway_projection.status is FactoryLifecycleStatus.READY_TO_USE
     assert result.coordinator_result.promotion_block is not None
     assert result.coordinator_result.promotion_block.producer == "captain"
