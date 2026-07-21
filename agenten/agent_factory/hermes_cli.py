@@ -82,6 +82,8 @@ class HermesCliSettings:
     timeout_seconds: int = 900
     evidence_root: Path = Path("artifacts/agent-factory/evidence")
     released_skill_root: Path = Path("agenten/agent_factory/released-skills")
+    model: str | None = None
+    provider: str | None = None
 
 
 class HermesPaidUsageReceipt(BaseModel):
@@ -641,7 +643,12 @@ class HermesCliFactory(HermesFactoryPort):
         usage_file: Path | None = None,
     ) -> bytes:
         deadline = _deadline(min(float(self._settings.timeout_seconds), max_seconds))
-        command = [self._settings.executable, "-z"]
+        command = [self._settings.executable]
+        if self._settings.model:
+            command.extend(("--model", self._settings.model))
+        if self._settings.provider:
+            command.extend(("--provider", self._settings.provider))
+        command.append("-z")
         if usage_file is not None:
             command.extend(("--usage-file", str(usage_file)))
         command.append(prompt)

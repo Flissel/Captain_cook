@@ -145,7 +145,11 @@ async def test_paid_hermes_claims_then_reserves_and_records_exact_usage(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
 
     block = await HermesCliFactory(
-        settings=HermesCliSettings(skill_root=tmp_path),
+        settings=HermesCliSettings(
+            skill_root=tmp_path,
+            model="approved-model-id",
+            provider="approved-provider",
+        ),
         evidence_store=evidence_store,
         released_skill_catalog=_catalog_for(tmp_path, FactorySkillStep.DISCOVER),
         replay_store=replay,
@@ -154,7 +158,10 @@ async def test_paid_hermes_claims_then_reserves_and_records_exact_usage(
         clock=lambda: NOW,
     ).dispatch(request)
 
-    assert observed[:2] == ("hermes", "-z")
+    assert observed[:6] == (
+        "hermes", "--model", "approved-model-id",
+        "--provider", "approved-provider", "-z",
+    )
     assert "--usage-file" in observed
     projection = budget.projection(request.job.job_id)
     assert projection.consumed_usd == Decimal("0.02")

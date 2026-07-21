@@ -631,6 +631,8 @@ def build_factory_live_runtime(context: object):
     clock = lambda: datetime.now(timezone.utc)
     settings = HermesCliSettings(
         executable=os.environ.get("HERMES_EXECUTABLE", "hermes"),
+        model=os.environ.get("CAPTAIN_FACTORY_MODEL"),
+        provider=os.environ.get("CAPTAIN_FACTORY_PROVIDER"),
         skill_root=Path(
             os.environ.get(
                 "CAPTAIN_FACTORY_SKILL_ROOT", "agenten/agent_factory/skills"
