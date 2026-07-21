@@ -415,6 +415,103 @@ class GatewayStore:
                     """
                 )
                 self._ensure_factory_live_effect_invocation_schema(cursor)
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS factory_terminal_decisions (
+                        decision_id CHAR(36) NOT NULL PRIMARY KEY,
+                        job_id CHAR(36) NOT NULL UNIQUE,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        CONSTRAINT fk_factory_terminal_decision_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS factory_capability_packages (
+                        capability_id VARCHAR(128) NOT NULL,
+                        capability_version INT NOT NULL,
+                        job_id CHAR(36) NOT NULL UNIQUE,
+                        release_event_id CHAR(36) NOT NULL UNIQUE,
+                        package_sha256 CHAR(64) NOT NULL,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        catalog_payload JSON NOT NULL,
+                        PRIMARY KEY (capability_id, capability_version),
+                        CONSTRAINT fk_factory_capability_package_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS factory_capability_catalog (
+                        capability_id VARCHAR(128) NOT NULL PRIMARY KEY,
+                        capability_version INT NOT NULL,
+                        catalog_fence BIGINT NOT NULL,
+                        status VARCHAR(32) NOT NULL,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        CONSTRAINT fk_factory_capability_catalog_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS factory_capability_executions (
+                        command_id CHAR(36) NOT NULL PRIMARY KEY,
+                        result_id CHAR(36) NOT NULL UNIQUE,
+                        event_id CHAR(36) NOT NULL UNIQUE,
+                        capability_id VARCHAR(128) NOT NULL,
+                        capability_version INT NOT NULL,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        CONSTRAINT fk_factory_capability_execution_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS runtime_batch_admissions (
+                        command_id CHAR(36) NOT NULL PRIMARY KEY,
+                        batch_id VARCHAR(32) NOT NULL,
+                        batch_version INT NOT NULL,
+                        batch_block_index BIGINT NOT NULL,
+                        batch_block_hash CHAR(64) NOT NULL,
+                        release_fence BIGINT NOT NULL,
+                        command_block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        batch_payload JSON NOT NULL,
+                        CONSTRAINT fk_runtime_batch_admission_command
+                            FOREIGN KEY (command_block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS runtime_execution_claims (
+                        command_id CHAR(36) NOT NULL PRIMARY KEY,
+                        claim_id CHAR(36) NOT NULL UNIQUE,
+                        owner_id VARCHAR(128) NOT NULL,
+                        fencing_token BIGINT NOT NULL,
+                        credential_sha256 CHAR(64) NULL,
+                        expires_at DATETIME(6) NOT NULL,
+                        status VARCHAR(32) NOT NULL,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        CONSTRAINT fk_runtime_execution_claim_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """ALTER TABLE runtime_execution_claims
+                       ADD COLUMN IF NOT EXISTS credential_sha256 CHAR(64) NULL
+                       AFTER fencing_token"""
+                )
 
     @staticmethod
     def _ensure_factory_live_effect_invocation_schema(cursor: Any) -> None:
@@ -620,6 +717,19 @@ class GatewayStore:
                 )
                 if existing is not None:
                     if existing["data"] == canonical:
+                        if command.payload.batch_id is not None:
+                            cursor.execute(
+                                "SELECT payload FROM runtime_batch_admissions "
+                                "WHERE command_id = %s FOR UPDATE",
+                                (str(command.event_id),),
+                            )
+                            if cursor.fetchone() is None:
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail=(
+                                        "runtime command lacks an atomic batch admission"
+                                    ),
+                                )
                         raise _RuntimeReplay(command.event_id)
                     raise HTTPException(
                         status_code=409,
@@ -644,21 +754,57 @@ class GatewayStore:
                     raise HTTPException(status_code=409, detail="stale runtime subject version")
 
                 payload = command.payload
+                admission: RuntimeBatchAdmission | None = None
+                admitted_batch: WorkBatch | None = None
                 if payload.batch_id is not None:
-                    parent = self._batch_row(cursor, payload.batch_id, for_update=True)
-                    if parent is None:
-                        raise HTTPException(status_code=409, detail="released batch not found")
-                    batch = WorkBatch.model_validate(parent["data"])
-                    if payload.subtask_id not in batch.subtask_ids:
+                    admitted_at = self._now()
+                    try:
+                        parent, children, projection = self._batch_context(
+                            cursor,
+                            payload.batch_id,
+                            for_update=True,
+                            now=admitted_at,
+                        )
+                    except HTTPException as exc:
+                        if exc.status_code == 404:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="released batch not found",
+                            ) from exc
+                        raise
+                    if projection.status not in {"pending", "claimed"}:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="runtime batch is not currently released",
+                        )
+                    admitted_batch = WorkBatch.model_validate(parent["data"])
+                    if payload.subtask_id not in admitted_batch.subtask_ids:
                         raise HTTPException(
                             status_code=409,
                             detail="runtime subtask was not released in the batch",
                         )
-                    if payload.capability_profile.value not in batch.capability_tags:
+                    if (
+                        payload.capability_profile.value
+                        not in admitted_batch.capability_tags
+                    ):
                         raise HTTPException(
                             status_code=409,
                             detail="runtime capability profile was not released",
                         )
+                    approval_indexes = [
+                        int(child["index"])
+                        for child in children
+                        if child["block_type"] == "batch_approved"
+                    ]
+                    release_fence = max(
+                        [int(parent["index"]), *approval_indexes]
+                    )
+                    admission = self._build_runtime_batch_admission(
+                        command=command,
+                        parent=parent,
+                        release_fence=release_fence,
+                        admitted_at=admitted_at,
+                    )
 
                 block = self._new_block(
                     cursor,
@@ -670,6 +816,31 @@ class GatewayStore:
                     metadata={"schema": "captain.agent-runtime-command.v1"},
                 )
                 self._insert(cursor, block)
+                if admission is not None and admitted_batch is not None:
+                    cursor.execute(
+                        """INSERT INTO runtime_batch_admissions
+                           (command_id, batch_id, batch_version, batch_block_index,
+                            batch_block_hash, release_fence, command_block_index,
+                            payload, batch_payload)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                        (
+                            str(command.event_id),
+                            admission.batch_id,
+                            admission.batch_version,
+                            admission.batch_block_index,
+                            admission.batch_block_hash,
+                            admission.release_fence,
+                            index,
+                            json.dumps(
+                                admission.model_dump(mode="json", by_alias=True),
+                                sort_keys=True,
+                            ),
+                            json.dumps(
+                                admitted_batch.model_dump(mode="json"),
+                                sort_keys=True,
+                            ),
+                        ),
+                    )
 
     def record_capability_grant(
         self,

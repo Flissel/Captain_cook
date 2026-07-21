@@ -18,6 +18,7 @@ from blockchain.mariadb_storage import MariaDBStorage
 from gateway.app import create_app
 from gateway.auth import GatewayRole, require_actor
 from gateway.settings import GatewaySettings
+from gateway.store import GatewayStore
 from tests.support.mariadb import assert_isolated_test_database
 
 
@@ -74,6 +75,43 @@ def load(name: str) -> dict[str, Any]:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
+def test_gateway_initializes_capability_runtime_authority_schema(
+    storage: MariaDBStorage,
+) -> None:
+    GatewayStore(storage)
+    expected_tables = {
+        "factory_terminal_decisions",
+        "factory_capability_packages",
+        "factory_capability_catalog",
+        "factory_capability_executions",
+        "runtime_execution_claims",
+        "runtime_batch_admissions",
+    }
+
+    with storage.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT table_name
+                   FROM information_schema.tables
+                   WHERE table_schema = DATABASE()
+                     AND table_name IN (%s, %s, %s, %s, %s, %s)""",
+                tuple(sorted(expected_tables)),
+            )
+            present_tables = {row["table_name"] for row in cursor.fetchall()}
+            cursor.execute(
+                """SELECT column_name
+                   FROM information_schema.columns
+                   WHERE table_schema = DATABASE()
+                     AND table_name = 'runtime_execution_claims'"""
+            )
+            execution_claim_columns = {
+                row["column_name"] for row in cursor.fetchall()
+            }
+
+    assert present_tables == expected_tables
+    assert "credential_sha256" in execution_claim_columns
+
+
 def release_batch(client: TestClient) -> None:
     response = client.post(
         "/blocks",
@@ -100,7 +138,10 @@ def release_batch(client: TestClient) -> None:
     assert response.status_code == 201, response.text
 
 
-def test_runtime_command_is_idempotent_and_version_fenced(client: TestClient) -> None:
+def test_runtime_command_is_idempotent_and_version_fenced(
+    client: TestClient,
+    storage: MariaDBStorage,
+) -> None:
     release_batch(client)
     command = load("agent_runtime_command.v1.json")
 
@@ -111,11 +152,38 @@ def test_runtime_command_is_idempotent_and_version_fenced(client: TestClient) ->
     assert first.json()["operation_id"] == replay.json()["operation_id"]
     assert first.json()["replayed"] is False
     assert replay.json()["replayed"] is True
+    snapshot = GatewayStore(storage).released_runtime_batch(command["event_id"])
+    assert str(snapshot.admission.command_id) == command["event_id"]
+    assert snapshot.admission.batch_id == command["payload"]["batch_id"]
+    assert snapshot.batch.batch_id == command["payload"]["batch_id"]
 
     stale = copy.deepcopy(command)
     stale["event_id"] = str(uuid4())
     stale["subject_version"] -= 1
     assert client.post("/v1/runtime/commands", json=stale).status_code == 409
+
+
+def test_runtime_command_replay_fails_closed_without_atomic_batch_admission(
+    client: TestClient,
+    storage: MariaDBStorage,
+) -> None:
+    release_batch(client)
+    command = load("agent_runtime_command.v1.json")
+    assert client.post("/v1/runtime/commands", json=command).status_code == 202
+
+    with storage.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM runtime_batch_admissions WHERE command_id = %s",
+                (command["event_id"],),
+            )
+
+    replay = client.post("/v1/runtime/commands", json=command)
+
+    assert replay.status_code == 409
+    assert replay.json()["detail"] == (
+        "runtime command lacks an atomic batch admission"
+    )
 
 
 def test_grant_and_result_require_the_exact_command(client: TestClient) -> None:
