@@ -246,6 +246,20 @@ class CreationJobStore:
             ).fetchall()
         return {row["step"] for row in rows}
 
+    def resumable_job_ids(self) -> tuple[UUID, ...]:
+        """Return persisted non-terminal jobs in stable submission order."""
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT job_id FROM creation_jobs ORDER BY rowid"
+            ).fetchall()
+        job_ids = tuple(UUID(row["job_id"]) for row in rows)
+        return tuple(
+            job_id
+            for job_id in job_ids
+            if self.result(job_id) is None
+            and self.progress(job_id).status in {"queued", "running"}
+        )
+
     def external_effect(self, job_id: UUID, effect_key: str) -> dict[str, Any] | None:
         with self._connect() as db:
             row = db.execute(
