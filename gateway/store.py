@@ -355,6 +355,7 @@ class GatewayStore:
                         event_id CHAR(36) NOT NULL PRIMARY KEY,
                         effect_id CHAR(36) NOT NULL,
                         job_id CHAR(36) NOT NULL,
+                        invocation_id CHAR(36) NULL,
                         claim_key CHAR(64) NULL,
                         event_kind VARCHAR(16) NOT NULL,
                         content_sha256 CHAR(64) NOT NULL,
@@ -362,12 +363,58 @@ class GatewayStore:
                         payload JSON NOT NULL,
                         UNIQUE KEY uq_factory_live_effect_kind (effect_id, event_kind),
                         UNIQUE KEY uq_factory_live_effect_claim (job_id, claim_key),
+                        UNIQUE KEY uq_factory_live_effect_invocation (job_id, invocation_id),
                         INDEX idx_factory_live_effect_job (job_id, block_index),
                         CONSTRAINT fk_factory_live_effect_block
                             FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
                     ) ENGINE=InnoDB
                     """
                 )
+                self._ensure_factory_live_effect_invocation_schema(cursor)
+
+    @staticmethod
+    def _ensure_factory_live_effect_invocation_schema(cursor: Any) -> None:
+        cursor.execute(
+            "SHOW COLUMNS FROM factory_live_effect_events LIKE 'invocation_id'"
+        )
+        if cursor.fetchone() is None:
+            cursor.execute(
+                "ALTER TABLE factory_live_effect_events "
+                "ADD COLUMN invocation_id CHAR(36) NULL AFTER job_id"
+            )
+        cursor.execute(
+            "UPDATE factory_live_effect_events "
+            "SET invocation_id = JSON_UNQUOTE(JSON_EXTRACT(payload, "
+            "'$.invocation.invocation_id')) "
+            "WHERE event_kind = 'claim' AND invocation_id IS NULL"
+        )
+        cursor.execute(
+            "SELECT event_id FROM factory_live_effect_events "
+            "WHERE event_kind = 'claim' AND invocation_id IS NULL LIMIT 1"
+        )
+        if cursor.fetchone() is not None:
+            raise RuntimeError(
+                "factory live effect migration found a claim without invocation_id"
+            )
+        cursor.execute(
+            "SELECT job_id, invocation_id FROM factory_live_effect_events "
+            "WHERE invocation_id IS NOT NULL "
+            "GROUP BY job_id, invocation_id HAVING COUNT(*) > 1 LIMIT 1"
+        )
+        if cursor.fetchone() is not None:
+            raise RuntimeError(
+                "factory live effect migration found duplicate invocation_id claims"
+            )
+        cursor.execute(
+            "SHOW INDEX FROM factory_live_effect_events "
+            "WHERE Key_name = 'uq_factory_live_effect_invocation'"
+        )
+        if cursor.fetchone() is None:
+            cursor.execute(
+                "ALTER TABLE factory_live_effect_events "
+                "ADD UNIQUE KEY uq_factory_live_effect_invocation "
+                "(job_id, invocation_id)"
+            )
 
     def append_delivery_event(
         self,
@@ -1122,6 +1169,7 @@ class GatewayStore:
                     request.effect_id,
                     job_id=request.job_id,
                     idempotency_key=request.idempotency_key,
+                    invocation_id=request.invocation.invocation_id,
                     for_update=True,
                 )
                 if existing is not None:
@@ -2485,15 +2533,27 @@ class GatewayStore:
         *,
         job_id: UUID | None = None,
         idempotency_key: str | None = None,
+        invocation_id: UUID | None = None,
         for_update: bool,
     ) -> FactoryLiveEffectRecord | None:
-        if job_id is not None and idempotency_key is not None:
+        if (
+            job_id is not None
+            and idempotency_key is not None
+            and invocation_id is not None
+        ):
             sql = (
                 "SELECT event_kind, payload FROM factory_live_effect_events "
                 "WHERE effect_id = %s OR (job_id = %s AND claim_key = %s) "
+                "OR (job_id = %s AND invocation_id = %s) "
                 "ORDER BY block_index"
             )
-            parameters = (str(effect_id), str(job_id), idempotency_key)
+            parameters = (
+                str(effect_id),
+                str(job_id),
+                idempotency_key,
+                str(job_id),
+                str(invocation_id),
+            )
         else:
             sql = (
                 "SELECT event_kind, payload FROM factory_live_effect_events "
@@ -2601,13 +2661,16 @@ class GatewayStore:
         self._insert(cursor, block)
         cursor.execute(
             """INSERT INTO factory_live_effect_events
-               (event_id, effect_id, job_id, claim_key, event_kind,
+               (event_id, effect_id, job_id, invocation_id, claim_key, event_kind,
                 content_sha256, block_index, payload)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
                 str(event_id),
                 str(effect_id),
                 str(job_id),
+                canonical["invocation"]["invocation_id"]
+                if event_kind == "claim"
+                else None,
                 canonical["idempotency_key"] if event_kind == "claim" else None,
                 event_kind,
                 digest,

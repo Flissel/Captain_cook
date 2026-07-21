@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
@@ -111,8 +112,16 @@ def prepared_mariadb_effect(store: GatewayStore):
     store.record_factory_job(job)
     lease = record_usage_lease(store, job)
     request = effect_request(job, now=now)
-    invocation = request.invocation.model_copy(update={"lease": lease})
-    request = request.model_copy(update={"invocation": invocation})
+    invocation = request.invocation.model_copy(
+        update={
+            "lease": lease,
+            "input_ref": job.input_ref,
+            "input_sha256": job.input_ref.sha256,
+        }
+    )
+    request = request.model_copy(
+        update={"input_ref": job.input_ref, "invocation": invocation}
+    )
     store.record_released_factory_skill(invocation.released_skill)
     store.record_factory_skill_assignment(
         FactorySkillAssignmentV1(
@@ -162,3 +171,52 @@ def test_mariadb_effect_changed_replay_conflicts(
 
     with pytest.raises(ValueError, match="different content"):
         adapter.claim(changed)
+
+
+def test_mariadb_effect_migration_binds_changed_claim_to_existing_invocation(
+    mariadb_store: GatewayStore,
+) -> None:
+    job, request = prepared_mariadb_effect(mariadb_store)
+    GatewayFactoryLiveEffectLedger(mariadb_store).claim(request)
+
+    with mariadb_store.storage.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SHOW INDEX FROM factory_live_effect_events "
+                "WHERE Key_name = 'uq_factory_live_effect_invocation'"
+            )
+            if cursor.fetchone() is not None:
+                cursor.execute(
+                    "ALTER TABLE factory_live_effect_events "
+                    "DROP INDEX uq_factory_live_effect_invocation"
+                )
+            cursor.execute(
+                "SHOW COLUMNS FROM factory_live_effect_events LIKE 'invocation_id'"
+            )
+            if cursor.fetchone() is not None:
+                cursor.execute(
+                    "ALTER TABLE factory_live_effect_events DROP COLUMN invocation_id"
+                )
+
+    restarted = GatewayStore(mariadb_store.storage)
+    changed_input = job.compiled_spec_ref
+    changed_invocation = request.invocation.model_copy(
+        update={
+            "idempotency_key": "e" * 64,
+            "input_ref": changed_input,
+            "input_sha256": changed_input.sha256,
+        }
+    )
+    changed = request.model_copy(
+        update={
+            "effect_id": uuid5(NAMESPACE_URL, "changed-mariadb-invocation-effect-id"),
+            "idempotency_key": changed_invocation.idempotency_key,
+            "input_ref": changed_input,
+            "invocation": changed_invocation,
+        }
+    )
+
+    replay = GatewayFactoryLiveEffectLedger(restarted).claim(request)
+    assert replay.acquired is False
+    with pytest.raises(ValueError, match="different content"):
+        GatewayFactoryLiveEffectLedger(restarted).claim(changed)

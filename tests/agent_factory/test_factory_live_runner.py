@@ -202,6 +202,35 @@ def test_effect_claim_rejects_a_second_effect_id_for_the_same_idempotency_key() 
         ledger.claim(duplicate_identity)
 
 
+def test_effect_claim_rejects_changed_identity_for_the_same_invocation() -> None:
+    job = workflow_job(mode="demo")
+    request = effect_request(job)
+    ledger = InMemoryFactoryLiveEffectLedger()
+    first = ledger.claim(request)
+    replay = ledger.claim(request)
+    changed_input = job.compiled_spec_ref
+    changed_invocation = request.invocation.model_copy(
+        update={
+            "idempotency_key": "e" * 64,
+            "input_ref": changed_input,
+            "input_sha256": changed_input.sha256,
+        }
+    )
+    changed = request.model_copy(
+        update={
+            "effect_id": uuid5(NAMESPACE_URL, "changed-invocation-effect-id"),
+            "idempotency_key": changed_invocation.idempotency_key,
+            "input_ref": changed_input,
+            "invocation": changed_invocation,
+        }
+    )
+
+    assert first.acquired is True
+    assert replay.acquired is False
+    with pytest.raises(ValueError, match="invocation_id"):
+        ledger.claim(changed)
+
+
 def test_generic_runner_cannot_claim_n8n_without_the_separate_runtime_path() -> None:
     with pytest.raises(ValueError, match="n8n"):
         FactoryLiveEffectKind("n8n")

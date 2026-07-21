@@ -153,6 +153,7 @@ class InMemoryFactoryLiveEffectLedger:
     def __init__(self) -> None:
         self._records: dict[UUID, FactoryLiveEffectRecord] = {}
         self._effect_ids_by_key: dict[tuple[UUID, str], UUID] = {}
+        self._effect_ids_by_invocation: dict[tuple[UUID, UUID], UUID] = {}
         self._lock = Lock()
 
     def claim(
@@ -166,6 +167,17 @@ class InMemoryFactoryLiveEffectLedger:
                 raise ValueError(
                     "factory live idempotency_key already binds another effect_id"
                 )
+            invocation_key = (request.job_id, request.invocation.invocation_id)
+            claimed_invocation_effect_id = self._effect_ids_by_invocation.get(
+                invocation_key
+            )
+            if (
+                claimed_invocation_effect_id is not None
+                and claimed_invocation_effect_id != request.effect_id
+            ):
+                raise ValueError(
+                    "factory live invocation_id already binds another effect_id"
+                )
             existing = self._records.get(request.effect_id)
             if existing is not None:
                 if existing.request != request:
@@ -176,6 +188,7 @@ class InMemoryFactoryLiveEffectLedger:
             record = FactoryLiveEffectRecord(request=request)
             self._records[request.effect_id] = record
             self._effect_ids_by_key[key] = request.effect_id
+            self._effect_ids_by_invocation[invocation_key] = request.effect_id
             return FactoryLiveEffectClaim(record=record, acquired=True)
 
     def complete(
