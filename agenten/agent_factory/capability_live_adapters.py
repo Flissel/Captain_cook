@@ -268,12 +268,22 @@ class ContentAddressedArtifactStore:
 
     def read_bytes(self, reference: ArtifactRef) -> bytes:
         self._require_reference(reference)
-        target = self._content_root / reference.sha256[:2] / reference.sha256
+        return self.read_sha256(reference.sha256)
+
+    def read_sha256(self, digest: str) -> bytes:
+        """Read shared CAS content by an already-authorized contract digest."""
+
+        if (
+            len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError("artifact content digest is invalid")
+        target = self._content_root / digest[:2] / digest
         try:
             content = target.read_bytes()
         except OSError as exc:
             raise ValueError("artifact content is unavailable") from exc
-        if hashlib.sha256(content).hexdigest() != reference.sha256:
+        if hashlib.sha256(content).hexdigest() != digest:
             raise ValueError("artifact content digest changed")
         return content
 

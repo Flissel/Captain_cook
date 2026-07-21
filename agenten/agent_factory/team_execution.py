@@ -1118,10 +1118,10 @@ class HostAutoGenTeamRunner:
             private_case = await self._holdouts.resolve(case_ref)
             if private_case.reference != case_ref:
                 raise ValueError("private holdout resolver returned a different reference")
-            try:
-                task = private_case.body.decode("utf-8")
-            except UnicodeDecodeError as exc:
-                raise ValueError("private holdout body must be UTF-8") from exc
+            task = build_private_holdout_task_envelope(
+                private_case.body,
+                invocation.acceptance_assertion_ids,
+            )
             cancellation_token = CancellationToken()
             try:
                 if manifest.conversation_pattern == "single_agent":
@@ -2155,6 +2155,64 @@ def _unique_refs(references: tuple[ArtifactRef, ...]) -> tuple[ArtifactRef, ...]
         key = (reference.uri, reference.sha256, reference.media_type)
         observed.setdefault(key, reference)
     return tuple(observed.values())
+
+
+def build_private_holdout_task_envelope(
+    body: bytes,
+    assertion_ids: tuple[str, ...],
+) -> str:
+    """Tell the team the deterministic output contract without revealing answers."""
+
+    try:
+        decoded = body.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("private holdout body must be UTF-8") from None
+    try:
+        parsed = json.loads(decoded)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        private_case = parsed
+        stop_condition = private_case.get("observable_expected")
+        if not isinstance(stop_condition, str) or not stop_condition.strip():
+            raise ValueError("private holdout stop condition is missing")
+    else:
+        if not decoded.strip():
+            raise ValueError("private holdout task must not be blank")
+        private_case = {"task": decoded}
+        stop_condition = decoded
+    if not assertion_ids or len(assertion_ids) != len(set(assertion_ids)):
+        raise ValueError("private holdout assertion IDs must be nonempty and unique")
+    payload = {
+        "schema": "captain.factory-private-task-envelope.v1",
+        "private_case": private_case,
+        "required_final_output": {
+            "schema": "captain.factory-observation.v1",
+            "assertion_ids": list(assertion_ids),
+            "assertion_shape": {
+                "passed": "boolean based on executed evidence",
+                "observable": "actual observed outcome, not the requested outcome",
+            },
+            "recovery": {
+                "stop_condition_sha256": hashlib.sha256(
+                    stop_condition.encode("utf-8")
+                ).hexdigest()
+            },
+        },
+        "instructions": (
+            "Execute the private case. In the final agent message emit exactly one JSON "
+            "object using required_final_output.schema, include every assertion_id once "
+            "under assertions, and copy the supplied stop_condition_sha256 only after "
+            "the stop condition was actually respected. Do not mark passed without an "
+            "observed outcome."
+        ),
+    }
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _autogen_termination_reason(

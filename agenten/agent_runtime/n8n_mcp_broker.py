@@ -190,7 +190,11 @@ def create_mcp_broker_app(
         safe_headers = {
             name: value
             for name, value in upstream.headers.items()
-            if name.lower() in {"content-type", "cache-control"}
+            if name.lower() in {
+                "content-type",
+                "cache-control",
+                "mcp-session-id",
+            }
         }
         return Response(
             content=upstream.content,

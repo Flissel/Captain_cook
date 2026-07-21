@@ -110,6 +110,22 @@ class ProductionV3EvidenceSettings:
 
 
 @dataclass(frozen=True)
+class ProductionV3HoldoutPorts:
+    """Private holdout authorities scoped to exactly one V3 job."""
+
+    holdout_source: CaptainPrivateHoldoutSourcePort
+    holdout_evaluator: CaptainPrivateHoldoutEvaluationPort
+
+
+@dataclass(frozen=True)
+class ProductionV3N8nPorts:
+    """n8n effect authorities scoped to exactly one V3 job."""
+
+    n8n_adapter: FactoryN8nToolAdapterPort
+    n8n_authority: FactoryN8nGrantAuthorityPort
+
+
+@dataclass(frozen=True)
 class ProductionV3EvidenceExternalPorts:
     """External authorities that must be concrete before provider-live startup."""
 
@@ -119,11 +135,17 @@ class ProductionV3EvidenceExternalPorts:
         [AgentFactoryJobV3, FactorySkillInvocationV1], ChatCompletionClient
     ]
     pricing_source: FactoryPricingQuoteSourcePort
-    holdout_source: CaptainPrivateHoldoutSourcePort
-    holdout_evaluator: CaptainPrivateHoldoutEvaluationPort
-    n8n_adapter: FactoryN8nToolAdapterPort
-    n8n_authority: FactoryN8nGrantAuthorityPort
+    holdout_source: CaptainPrivateHoldoutSourcePort | None
+    holdout_evaluator: CaptainPrivateHoldoutEvaluationPort | None
+    n8n_adapter: FactoryN8nToolAdapterPort | None
+    n8n_authority: FactoryN8nGrantAuthorityPort | None
     tools: Mapping[str, Callable[..., Any]]
+    holdout_ports_for: (
+        Callable[[AgentFactoryJobV3], ProductionV3HoldoutPorts] | None
+    ) = None
+    n8n_ports_for: (
+        Callable[[AgentFactoryJobV3], ProductionV3N8nPorts] | None
+    ) = None
 
     def __post_init__(self) -> None:
         required = (
@@ -131,15 +153,29 @@ class ProductionV3EvidenceExternalPorts:
             ("candidate_attestation", self.candidate_attestation),
             ("model_client_for", self.model_client_for),
             ("pricing_source", self.pricing_source),
-            ("holdout_source", self.holdout_source),
-            ("holdout_evaluator", self.holdout_evaluator),
-            ("n8n_adapter", self.n8n_adapter),
-            ("n8n_authority", self.n8n_authority),
             ("tools", self.tools),
         )
         for name, value in required:
             if value is None:
                 raise ValueError(f"production V3 external port is missing: {name}")
+        if self.holdout_ports_for is None:
+            for name, value in (
+                ("holdout_source", self.holdout_source),
+                ("holdout_evaluator", self.holdout_evaluator),
+            ):
+                if value is None:
+                    raise ValueError(
+                        f"production V3 external port is missing: {name}"
+                    )
+        if self.n8n_ports_for is None:
+            for name, value in (
+                ("n8n_adapter", self.n8n_adapter),
+                ("n8n_authority", self.n8n_authority),
+            ):
+                if value is None:
+                    raise ValueError(
+                        f"production V3 external port is missing: {name}"
+                    )
 
 
 class GatewayCapabilityV3Authority(CapabilityV3AuthorityPort):
@@ -332,6 +368,22 @@ def build_production_v3_evidence_backend_from_environment(
         existing = adapters.get(job.job_id)
         if existing is not None:
             return existing
+        holdout_ports = (
+            external_ports.holdout_ports_for(job)
+            if external_ports.holdout_ports_for is not None
+            else ProductionV3HoldoutPorts(
+                holdout_source=external_ports.holdout_source,  # type: ignore[arg-type]
+                holdout_evaluator=external_ports.holdout_evaluator,  # type: ignore[arg-type]
+            )
+        )
+        n8n_ports = (
+            external_ports.n8n_ports_for(job)
+            if external_ports.n8n_ports_for is not None
+            else ProductionV3N8nPorts(
+                n8n_adapter=external_ports.n8n_adapter,  # type: ignore[arg-type]
+                n8n_authority=external_ports.n8n_authority,  # type: ignore[arg-type]
+            )
+        )
         adapter = compose_live_team_execution(
             job=job,
             evidence_store=evidence_store,
@@ -342,11 +394,11 @@ def build_production_v3_evidence_backend_from_environment(
                 replay_store=replay_store,
                 holdouts=CaptainPrivateHoldoutAdapter(
                     job=job,
-                    source=external_ports.holdout_source,
-                    evaluator=external_ports.holdout_evaluator,
+                    source=holdout_ports.holdout_source,
+                    evaluator=holdout_ports.holdout_evaluator,
                 ),
-                n8n_adapter=external_ports.n8n_adapter,
-                n8n_authority=external_ports.n8n_authority,
+                n8n_adapter=n8n_ports.n8n_adapter,
+                n8n_authority=n8n_ports.n8n_authority,
                 released_skill_catalog=authority.repository,
                 skill_root=settings.skill_root,
                 tools=external_ports.tools,
