@@ -223,10 +223,11 @@ class GatewayFactoryBudgetLedger(FactoryBudgetPort):
             if exc.status_code == 409 and any(
                 marker in detail.lower()
                 for marker in (
-                    "budget",
-                    "paid effects",
-                    "unapproved model",
-                    "reservation window",
+                    "budget is exhausted",
+                    "budget exhausted",
+                    "exceeds its reservation",
+                    "exceeds the job usd budget",
+                    "exceeds the job budget",
                 )
             ):
                 raise BudgetExhausted(detail) from exc

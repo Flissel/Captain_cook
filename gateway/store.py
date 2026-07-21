@@ -51,7 +51,11 @@ from agenten.agent_factory.skill_evaluation import (
     ReleasedHermesSkill,
 )
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
-from agenten.agent_factory.skill_workflow_contracts import FactorySkillStep
+from agenten.agent_factory.skill_workflow_contracts import (
+    FactoryFeedbackRecommendation,
+    FactorySkillStep,
+    TeamEvaluationV1,
+)
 from agenten.agent_factory.state_machine import (
     FactoryActionKind,
     FactoryLifecycleError,
@@ -860,6 +864,7 @@ class GatewayStore:
     ) -> FactoryBudgetWriteReceipt:
         receipt = submission.receipt
         canonical = submission.model_dump(mode="json", by_alias=True)
+        digest, schema_name = self._factory_budget_payload_identity(submission)
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
                 replay = self._factory_budget_event(cursor, receipt.receipt_id, for_update=True)
@@ -886,10 +891,10 @@ class GatewayStore:
                     reservation_id=receipt.reservation_id,
                     job_id=receipt.job_id,
                     event_kind="usage",
-                    digest=self._canonical_model_sha256(receipt),
+                    digest=digest,
                     payload=canonical,
                     parent_index=job_block["index"],
-                    schema_name=receipt.schema_name,
+                    schema_name=schema_name,
                 )
         return FactoryBudgetWriteReceipt(event_id=receipt.receipt_id, job_id=receipt.job_id, replayed=False)
 
@@ -1711,10 +1716,7 @@ class GatewayStore:
     ) -> None:
         step = artifact.invocation.step
         required_phase = {
-            FactorySkillStep.DISCOVER: {
-                FactoryPhase.FORGE_REQUESTED,
-                FactoryPhase.IMPROVEMENT_REQUESTED,
-            },
+            FactorySkillStep.DISCOVER: {FactoryPhase.FORGE_REQUESTED},
             FactorySkillStep.IMPROVE_TEAM: {FactoryPhase.IMPROVEMENT_REQUESTED},
             FactorySkillStep.BRIEF_CODEX: {FactoryPhase.BLUEPRINT_CREATED},
             FactorySkillStep.EXECUTE_TEAM: {FactoryPhase.BUILD_PASSED},
@@ -1736,9 +1738,20 @@ class GatewayStore:
                 status_code=409,
                 detail="improve_team is allowed only on a later attempt",
             )
+        if step is FactorySkillStep.IMPROVE_TEAM and not any(
+            isinstance(candidate, TeamEvaluationV1)
+            and candidate.attempt == artifact.attempt - 1
+            and candidate.failure_class is not None
+            and candidate.recommendation
+            == FactoryFeedbackRecommendation.RETRY_BUILD
+            for candidate in prior_artifacts
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="improve_team requires the prior attempt failed evaluation",
+            )
         expected = (
             (
-                FactorySkillStep.DISCOVER,
                 FactorySkillStep.IMPROVE_TEAM,
                 FactorySkillStep.BRIEF_CODEX,
                 FactorySkillStep.EXECUTE_TEAM,
@@ -1884,6 +1897,12 @@ class GatewayStore:
         ):
             return FactoryUsageSubmissionV2.model_validate(decoded).receipt
         return FactoryUsageReceiptV1.model_validate(decoded)
+
+    @staticmethod
+    def _factory_budget_payload_identity(
+        payload: FactoryUsageSubmissionV2 | FactoryUsageReceiptV1,
+    ) -> tuple[str, str]:
+        return GatewayStore._canonical_model_sha256(payload), payload.schema_name
 
     def _insert_factory_budget_event(
         self,

@@ -246,19 +246,47 @@ def test_gateway_workflow_sequence_rejects_improvement_on_first_attempt() -> Non
             improvement_requested, revision, ()
         )
 
-    discover = parse_factory_workflow_artifact(inventory_payload())
-    discover_invocation = discover.invocation.model_copy(update={"attempt": 2})
-    discover = discover.model_copy(
-        update={"attempt": 2, "invocation": discover_invocation}
+    failed_evaluation = parse_factory_workflow_artifact(evaluation_payload()).model_copy(
+        update={
+            "failure_class": "behavioral_failure",
+            "recommendation": "RETRY_BUILD",
+        }
     )
     revision_invocation = revision.invocation.model_copy(update={"attempt": 2})
     revision = revision.model_copy(
         update={"attempt": 2, "invocation": revision_invocation}
     )
+    retry_projection = improvement_requested.model_copy(update={"attempt": 2})
+    retry_discovery = parse_factory_workflow_artifact(inventory_payload())
+    retry_discovery = retry_discovery.model_copy(
+        update={
+            "attempt": 2,
+            "invocation": retry_discovery.invocation.model_copy(
+                update={"attempt": 2}
+            ),
+        }
+    )
+    with pytest.raises(HTTPException, match="current factory phase"):
+        GatewayStore._assert_workflow_sequence(
+            retry_projection, retry_discovery, (failed_evaluation,)
+        )
+    with pytest.raises(HTTPException, match="failed evaluation"):
+        GatewayStore._assert_workflow_sequence(retry_projection, revision, ())
     GatewayStore._assert_workflow_sequence(
-        improvement_requested.model_copy(update={"attempt": 2}),
+        retry_projection,
         revision,
-        (discover,),
+        (failed_evaluation,),
+    )
+
+    brief = parse_factory_workflow_artifact(brief_payload())
+    brief_invocation = brief.invocation.model_copy(update={"attempt": 2})
+    brief = brief.model_copy(
+        update={"attempt": 2, "invocation": brief_invocation}
+    )
+    GatewayStore._assert_workflow_sequence(
+        retry_projection.model_copy(update={"phase": FactoryPhase.BLUEPRINT_CREATED}),
+        brief,
+        (failed_evaluation, revision),
     )
 
 

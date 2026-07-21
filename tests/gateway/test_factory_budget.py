@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -213,6 +215,36 @@ def test_usage_submission_adds_subject_and_active_lease_binding(job_v3) -> None:
             {"schema": "captain.factory-usage-submission.v2", "receipt": receipt}
         )
 
+    v2_digest, v2_schema = GatewayStore._factory_budget_payload_identity(
+        submission
+    )
+    v1_digest, v1_schema = GatewayStore._factory_budget_payload_identity(receipt)
+    expected_v2 = hashlib.sha256(
+        json.dumps(
+            submission.model_dump(mode="json", by_alias=True),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    expected_v1 = hashlib.sha256(
+        json.dumps(
+            receipt.model_dump(mode="json", by_alias=True),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+    assert (v2_digest, v2_schema) == (
+        expected_v2,
+        "captain.factory-usage-submission.v2",
+    )
+    assert (v1_digest, v1_schema) == (
+        expected_v1,
+        "captain.factory-usage-receipt.v1",
+    )
+
 
 def test_gateway_usage_submission_requires_exact_active_ledger_lease(job_v3) -> None:
     budget_store = BudgetStore(job_v3)
@@ -290,6 +322,33 @@ def test_gateway_budget_adapter_translates_http_conflicts_to_budget_domain_error
         GatewayFactoryBudgetLedger(ExhaustedStore(job_v3)).reserve(
             job_v3, attempt=1, requested_usd=Decimal("1.00"), now=NOW
         )
+
+
+@pytest.mark.parametrize(
+    ("detail", "error_type"),
+    (
+        ("factory USD budget is exhausted", BudgetExhausted),
+        ("factory usage exceeds its reservation or job budget", BudgetExhausted),
+        (
+            "factory budget reservation already exists with different content",
+            ValueError,
+        ),
+        ("factory budget reservation not found", ValueError),
+        ("factory budget release binding mismatch", ValueError),
+        ("factory paid effects require an AgentFactoryJobV3", ValueError),
+        ("factory budget model is unapproved", ValueError),
+        ("factory reservation window is invalid", ValueError),
+    ),
+)
+def test_gateway_budget_adapter_classifies_only_exhaustion_as_exhausted(
+    detail: str,
+    error_type: type[Exception],
+) -> None:
+    def fail():
+        raise HTTPException(status_code=409, detail=detail)
+
+    with pytest.raises(error_type, match=detail):
+        GatewayFactoryBudgetLedger._translate_budget(fail)
 
 
 def test_factory_projection_preserves_versioned_job_schema_and_execution_policy(job_v3) -> None:
@@ -422,13 +481,30 @@ def test_mariadb_budget_replay_conflict_and_restart_projection(
     usage = FactoryUsageReceiptV1.model_validate(
         usage_payload(reservation, cost_usd="1.25")
     )
-    mariadb_store.record_factory_usage(
-        FactoryUsageSubmissionV2(
-            subject_version=job_v3.subject_version,
-            lease_id=lease.lease_id,
-            receipt=usage,
-        )
+    submission = FactoryUsageSubmissionV2(
+        subject_version=job_v3.subject_version,
+        lease_id=lease.lease_id,
+        receipt=usage,
     )
+    mariadb_store.record_factory_usage(submission)
+    with mariadb_store.storage.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT events.content_sha256, events.payload, blocks.metadata
+                   FROM factory_budget_events AS events
+                   JOIN blocks ON blocks.`index` = events.block_index
+                   WHERE events.event_id = %s""",
+                (str(usage.receipt_id),),
+            )
+            persisted = cursor.fetchone()
+    expected_digest, expected_schema = GatewayStore._factory_budget_payload_identity(
+        submission
+    )
+    assert persisted["content_sha256"] == expected_digest
+    assert GatewayStore._decode_json(persisted["payload"]) == submission.model_dump(
+        mode="json", by_alias=True
+    )
+    assert GatewayStore._decode_json(persisted["metadata"])["schema"] == expected_schema
     restarted = GatewayStore(mariadb_store.storage)
     projection = restarted.factory_budget(job_v3.job_id)
     assert projection.consumed_usd == Decimal("1.25")
