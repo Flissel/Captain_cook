@@ -1,0 +1,26 @@
+{
+  "schema": "captain.capability-release-evidence.v1",
+  "run_id": "controlled-recovery-run-01",
+  "run_number": 1,
+  "factory_job_id": "00000000-0000-0000-0000-000000000011",
+  "correlation_id": "00000000-0000-0000-0000-000000000012",
+  "subject_version": 1,
+  "kind": "recovery",
+  "outcome": "expected_failure_recovered",
+  "producer": "captain",
+  "assertion_results": [
+    {
+      "assertion_id": "output-01",
+      "status": "passed"
+    }
+  ],
+  "recovery_id": "controlled-recovery-01",
+  "holdout_ids": ["private-case-01"],
+  "downstream_evidence_refs": [
+    {
+      "uri": "artifact://release-detail/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "media_type": "application/json"
+    }
+  ]
+}
