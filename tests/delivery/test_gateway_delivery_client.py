@@ -6,12 +6,87 @@ import json
 import httpx
 import pytest
 
+from agenten.delivery.projection_feed_client import GatewayProjectionFeedClient
 from agenten.delivery.gateway_client import (
     GatewayDeliveryClient,
     GatewayDeliveryConflictError,
     GatewayDeliveryError,
     GatewayEvidence,
 )
+
+
+@pytest.mark.asyncio
+async def test_projection_feed_filters_mixed_pages_without_losing_correlated_events() -> None:
+    from uuid import UUID
+
+    correlation_id = UUID("10000000-0000-4000-8000-000000000001")
+    other_correlation_id = UUID("20000000-0000-4000-8000-000000000001")
+
+    def projected_event(
+        *, event_id: str, correlation: UUID, event_type: str
+    ) -> dict[str, object]:
+        promotion = event_type == "capability.promoted"
+        return {
+            "schema": "captain.minibook-projection.v2",
+            "event_id": event_id,
+            "correlation_id": str(correlation),
+            "causation_id": "30000000-0000-4000-8000-000000000001",
+            "occurred_at": "2026-07-20T12:00:00Z",
+            "producer": "captain-gateway",
+            "subject_id": "subject:40000000-0000-4000-8000-000000000001",
+            "subject_version": 1 if promotion else 2,
+            "event_type": event_type,
+            "payload": {
+                "view": "validation" if promotion else "build",
+                "template_id": (
+                    "factory_capability_ready_to_use"
+                    if promotion
+                    else "runtime_build_recorded"
+                ),
+                "status_id": "ready_to_use" if promotion else "built",
+            },
+        }
+
+    promotion = projected_event(
+        event_id="50000000-0000-4000-8000-000000000001",
+        correlation=correlation_id,
+        event_type="capability.promoted",
+    )
+    unrelated = projected_event(
+        event_id="50000000-0000-4000-8000-000000000002",
+        correlation=other_correlation_id,
+        event_type="codex.result",
+    )
+    result = projected_event(
+        event_id="50000000-0000-4000-8000-000000000003",
+        correlation=correlation_id,
+        event_type="codex.result",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        cursor = request.url.params.get("cursor")
+        if cursor is None:
+            body = {"events": [promotion], "cursor": "5", "has_more": True}
+        elif cursor == "5":
+            body = {"events": [unrelated], "cursor": "6", "has_more": True}
+        else:
+            assert cursor == "6"
+            body = {"events": [result], "cursor": "7", "has_more": False}
+        return httpx.Response(200, json=body, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        events = await GatewayProjectionFeedClient(
+            "https://gateway.test", "captain-token", http, page_size=1
+        ).events_for_correlation(correlation_id)
+
+    assert [event.event_id for event in events] == [
+        UUID(str(promotion["event_id"])),
+        UUID(str(result["event_id"])),
+    ]
+    assert [event.event_type for event in events] == [
+        "capability.promoted",
+        "codex.result",
+    ]
 
 
 def projection(*, iteration: int = 1) -> dict[str, object]:

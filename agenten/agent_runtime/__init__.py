@@ -19,6 +19,14 @@ from .capabilities import CapabilityDenied, derive_grant, validate_grant
 from .prompt_policy import PromptPolicyDenied, RenderedPrompt, render_codex_prompt
 from .service import AgentRuntimeService, RuntimeContractViolation
 from .gateway_client import GatewayRuntimeClient
+from .http_server import RuntimeCommandExecutor, create_runtime_app
+from .runtime_entrypoint import (
+    GatewayBackedRuntimeState,
+    RuntimeConfigurationError,
+    RuntimeEntrypointSettings,
+    compose_gateway_backed_runtime_app,
+    preflight_runtime,
+)
 from .tools import RuntimeToolContext, RuntimeToolset, available_tools
 from .swarm import RuntimeTaskProjection, SwarmOrchestrator
 
@@ -77,6 +85,13 @@ __all__ = [
     "AgentRuntimeService",
     "RuntimeContractViolation",
     "GatewayRuntimeClient",
+    "RuntimeCommandExecutor",
+    "create_runtime_app",
+    "GatewayBackedRuntimeState",
+    "RuntimeConfigurationError",
+    "RuntimeEntrypointSettings",
+    "compose_gateway_backed_runtime_app",
+    "preflight_runtime",
     "RuntimeToolContext",
     "RuntimeToolset",
     "available_tools",

@@ -50,7 +50,11 @@ from gateway.contracts import (
 )
 from gateway.mirror import MirrorQueue
 from gateway.registry_feed import mirror_captain_projection
-from gateway.registry_feed import MinibookProjectionFeedPage, factory_promotion_projection
+from gateway.registry_feed import (
+    MinibookProjectionFeedPage,
+    factory_promotion_projection,
+    runtime_result_projection,
+)
 from gateway.settings import GatewaySettings
 from gateway.store import AppendResult, GatewayStore
 
@@ -384,14 +388,20 @@ def create_app(
         _: GatewayRole = Depends(require_captain),
     ) -> MinibookProjectionFeedPage:
         after_index = int(cursor) if cursor is not None else -1
-        records, has_more = get_store().factory_projection_feed(
+        records, has_more = get_store().minibook_projection_feed(
             after_index=after_index,
             limit=limit,
         )
-        events = tuple(
-            factory_promotion_projection(block, job)
-            for _, block, job in records
-        )
+        projected_events = []
+        for _, block_type, data, parent in records:
+            event = (
+                factory_promotion_projection(data, parent)
+                if block_type == "agent_factory_block" and parent is not None
+                else runtime_result_projection(data)
+            )
+            if event is not None:
+                projected_events.append(event)
+        events = tuple(projected_events)
         next_cursor = str(records[-1][0]) if records else str(after_index)
         return MinibookProjectionFeedPage(
             events=events,

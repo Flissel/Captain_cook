@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from typing import Any
+from uuid import UUID
 
 import aiohttp
 from pydantic import BaseModel, ConfigDict
 
+from agenten.agent_runtime.contracts import (
+    AgentRuntimeResult,
+    RuntimeOperation,
+    RuntimeStatus,
+)
 from agenten.delivery.minibook_events import MinibookProjectionEvent
 
 
@@ -44,6 +51,54 @@ def factory_promotion_projection(
                 "status_id": "ready_to_use",
                 "actor_role_id": "captain_gateway",
             },
+        }
+    )
+
+
+def runtime_result_projection(
+    result: dict[str, Any],
+) -> MinibookProjectionEvent | None:
+    """Project only successful Codex builds representable by the v2 catalog."""
+
+    validated = AgentRuntimeResult.model_validate(result)
+    if (
+        validated.producer != "agent-runtime"
+        or validated.status is not RuntimeStatus.SUCCEEDED
+        or validated.operation
+        not in {RuntimeOperation.CODEX_RUN, RuntimeOperation.CODEX_RESUME}
+    ):
+        return None
+    subject_digest = bytearray(
+        hashlib.sha256(
+            (
+                "captain-runtime-subject:"
+                f"{validated.correlation_id}:{validated.subject_id}"
+            ).encode("utf-8")
+        )
+        .digest()[:16]
+    )
+    subject_digest[6] = (subject_digest[6] & 0x0F) | 0x40
+    subject_digest[8] = (subject_digest[8] & 0x3F) | 0x80
+    payload: dict[str, object] = {
+        "view": "build",
+        "template_id": "runtime_build_recorded",
+        "status_id": "built",
+        "actor_role_id": "codex_worker",
+    }
+    if validated.artifact_refs:
+        payload["artifact_digest"] = f"sha256:{validated.artifact_refs[0].sha256}"
+    return MinibookProjectionEvent.model_validate(
+        {
+            "schema": "captain.minibook-projection.v2",
+            "event_id": validated.event_id,
+            "correlation_id": validated.correlation_id,
+            "causation_id": validated.command_id,
+            "occurred_at": validated.occurred_at,
+            "producer": "captain-gateway",
+            "subject_id": f"subject:{UUID(bytes=bytes(subject_digest))}",
+            "subject_version": validated.subject_version,
+            "event_type": "codex.result",
+            "payload": payload,
         }
     )
 

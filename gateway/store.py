@@ -1304,43 +1304,59 @@ class GatewayStore:
             for row in cursor.fetchall()
         )
 
-    def factory_projection_feed(
+    def minibook_projection_feed(
         self,
         *,
         after_index: int,
         limit: int,
-    ) -> tuple[list[tuple[int, dict[str, Any], dict[str, Any]]], bool]:
-        """Read committed successful Factory promotions in ledger order."""
+    ) -> tuple[
+        list[tuple[int, str, dict[str, Any], dict[str, Any] | None]],
+        bool,
+    ]:
+        """Read every admitted Minibook projection from one ledger-ordered page."""
 
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT promotion.`index`, promotion.parent_index,
-                           promotion.block_type, promotion.data,
-                           promotion.status, promotion.children,
-                           promotion.metadata, promotion.hash,
-                           promotion.previous_hash,
-                           job.data AS job_data
-                    FROM blocks AS promotion
-                    JOIN blocks AS job ON job.`index` = promotion.parent_index
-                    WHERE promotion.block_type = 'agent_factory_block'
-                      AND job.block_type = 'agent_factory_job'
-                      AND promotion.`index` > %s
-                      AND JSON_UNQUOTE(JSON_EXTRACT(promotion.data, '$.phase')) = 'capability_promoted'
-                      AND JSON_UNQUOTE(JSON_EXTRACT(promotion.data, '$.status')) = 'succeeded'
-                    ORDER BY promotion.`index`
+                    SELECT event.`index`, event.parent_index,
+                           event.block_type, event.data,
+                           event.status, event.children,
+                           event.metadata, event.hash,
+                           event.previous_hash,
+                           parent.data AS parent_data
+                    FROM blocks AS event
+                    LEFT JOIN blocks AS parent ON parent.`index` = event.parent_index
+                    WHERE event.`index` > %s
+                      AND (
+                        event.block_type = 'agent_runtime_result'
+                        OR (
+                          event.block_type = 'agent_factory_block'
+                          AND parent.block_type = 'agent_factory_job'
+                          AND JSON_UNQUOTE(JSON_EXTRACT(event.data, '$.phase')) = 'capability_promoted'
+                          AND JSON_UNQUOTE(JSON_EXTRACT(event.data, '$.status')) = 'succeeded'
+                        )
+                      )
+                    ORDER BY event.`index`
                     LIMIT %s
                     """,
                     (after_index, limit + 1),
                 )
                 rows = list(cursor.fetchall())
         has_more = len(rows) > limit
-        records: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+        records: list[
+            tuple[int, str, dict[str, Any], dict[str, Any] | None]
+        ] = []
         for row in rows[:limit]:
-            promotion = self.storage._decode_row(row)
-            job = self._decode_json(row["job_data"])
-            records.append((int(row["index"]), promotion["data"], job))
+            event = self.storage._decode_row(row)
+            parent = (
+                self._decode_json(row["parent_data"])
+                if row["parent_data"] is not None
+                else None
+            )
+            records.append(
+                (int(row["index"]), str(event["block_type"]), event["data"], parent)
+            )
         return records, has_more
 
     def _factory_leases(self, cursor: Any, job_id: UUID) -> tuple[FactoryLease, ...]:

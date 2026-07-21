@@ -15,6 +15,7 @@ $n8nEnv = Join-Path $root '.env.captain-n8n'
 $testCompose = Join-Path $root 'docker-compose.test.yml'
 $stateDir = Join-Path $root '.captain-cook'
 $gatewayPid = Join-Path $stateDir 'gateway-demo.pid'
+$runtimePid = Join-Path $stateDir 'runtime-demo.pid'
 $evidence = Join-Path $stateDir 'evidence/live-demo-services.json'
 $project = 'captain-cook-live-demo'
 
@@ -52,7 +53,7 @@ function Set-Missing($Values, [string]$Name, [scriptblock]$Factory) {
     if (-not $Values.Contains($Name) -or [string]::IsNullOrWhiteSpace([string]$Values[$Name])) { $Values[$Name] = & $Factory }
 }
 function Initialize-LocalEnvironment {
-    $allowed = @('MARIADB_PASSWORD','MARIADB_ROOT_PASSWORD','MARIADB_TEST_PASSWORD','MARIADB_TEST_ROOT_PASSWORD','CAPTAIN_GATEWAY_TOKEN','WORKER_GATEWAY_TOKEN','MARIADB_TEST_PORT','GATEWAY_PORT','TEST_MARIADB_DSN','LEDGER_DSN','CAPTAIN_GATEWAY_URL','N8N_API_KEY','N8N_MCP_TOKEN','CAPTAIN_N8N_PORT','CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','CAPTAIN_N8N_MCP_BROKER_URL','CAPTAIN_N8N_URL')
+    $allowed = @('MARIADB_PASSWORD','MARIADB_ROOT_PASSWORD','MARIADB_TEST_PASSWORD','MARIADB_TEST_ROOT_PASSWORD','CAPTAIN_GATEWAY_TOKEN','WORKER_GATEWAY_TOKEN','CAPTAIN_RUNTIME_TOKEN','MARIADB_TEST_PORT','GATEWAY_PORT','CAPTAIN_RUNTIME_PORT','TEST_MARIADB_DSN','LEDGER_DSN','CAPTAIN_GATEWAY_URL','CAPTAIN_RUNTIME_URL','N8N_API_KEY','N8N_MCP_TOKEN','CAPTAIN_N8N_PORT','CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','CAPTAIN_N8N_MCP_BROKER_URL','CAPTAIN_N8N_URL')
     $values = Read-Env $rootEnv $allowed
     Set-Missing $values 'MARIADB_PASSWORD' { New-Secret }
     Set-Missing $values 'MARIADB_ROOT_PASSWORD' { New-Secret }
@@ -60,12 +61,15 @@ function Initialize-LocalEnvironment {
     Set-Missing $values 'MARIADB_TEST_ROOT_PASSWORD' { New-Secret }
     Set-Missing $values 'CAPTAIN_GATEWAY_TOKEN' { New-Secret }
     Set-Missing $values 'WORKER_GATEWAY_TOKEN' { New-Secret }
+    Set-Missing $values 'CAPTAIN_RUNTIME_TOKEN' { New-Secret }
     Set-Missing $values 'MARIADB_TEST_PORT' { '33306' }
     Set-Missing $values 'GATEWAY_PORT' { '8090' }
+    Set-Missing $values 'CAPTAIN_RUNTIME_PORT' { '8091' }
     $escapedPassword = [Uri]::EscapeDataString([string]$values['MARIADB_TEST_PASSWORD'])
     $values['TEST_MARIADB_DSN'] = "mariadb://captain_test:${escapedPassword}@127.0.0.1:$($values['MARIADB_TEST_PORT'])/captain_test"
     $values['LEDGER_DSN'] = $values['TEST_MARIADB_DSN']
     $values['CAPTAIN_GATEWAY_URL'] = "http://127.0.0.1:$($values['GATEWAY_PORT'])"
+    $values['CAPTAIN_RUNTIME_URL'] = "http://127.0.0.1:$($values['CAPTAIN_RUNTIME_PORT'])"
     Save-Env $values $rootEnv
     Write-Host '[ready] local Gateway/captain_test settings initialized (values redacted)'
     $values
@@ -183,10 +187,88 @@ function Stop-ManagedGateway {
     Remove-Item $gatewayPid -Force
     Write-Host '[ready] managed Gateway stopped'
 }
+function Get-ManagedRuntimeProcess {
+    if (-not (Test-Path $runtimePid)) { return $null }
+    try { $identity = Get-Content $runtimePid -Raw | ConvertFrom-Json } catch { throw 'Invalid managed Runtime PID file.' }
+    $process = Get-Process -Id ([int]$identity.pid) -ErrorAction SilentlyContinue
+    if (-not $process) {
+        Remove-Item $runtimePid -Force
+        return $null
+    }
+    $recordedStart = ([DateTimeOffset]$identity.started_at).UtcDateTime
+    if ($process.StartTime.ToUniversalTime().Ticks -ne $recordedStart.Ticks -or [IO.Path]::GetFullPath($process.Path) -ne [IO.Path]::GetFullPath([string]$identity.executable)) {
+        throw 'PID no longer belongs to the managed Runtime process.'
+    }
+    return $process
+}
+function Start-Runtime($Values) {
+    $runtimeUrl = [string]$Values['CAPTAIN_RUNTIME_URL']
+    $managed = Get-ManagedRuntimeProcess
+    if ($managed) {
+        try {
+            if ((Invoke-WebRequest "$runtimeUrl/health" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200) {
+                Write-Host '[ready] Runtime already healthy with verified process identity'
+                return
+            }
+        } catch {}
+        throw 'Managed Runtime process exists but is not healthy.'
+    }
+    $runtimePort = ([Uri]$runtimeUrl).Port
+    $listener = Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $runtimePort -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($listener) { throw 'Runtime port is occupied by an unmanaged process; refusing to reuse or stop it.' }
+    New-Item -ItemType Directory -Force $stateDir | Out-Null
+    $python = Join-Path $root '.venv\Scripts\python.exe'
+    if (-not (Test-Path $python)) { $python = (& python -c 'import sys; print(sys.executable)').Trim() }
+    if (-not (Test-Path $python -PathType Leaf)) { throw 'A concrete Python 3.11 executable is required for the managed Runtime.' }
+    Set-ProcessEnvironment $Values
+    $process = Start-Process $python -ArgumentList '-m','agenten.agent_runtime.runtime_entrypoint' -WorkingDirectory $root -WindowStyle Hidden -PassThru
+    @{pid=$process.Id;started_at=$process.StartTime.ToUniversalTime().ToString('o');executable=$process.Path} | ConvertTo-Json -Compress | Set-Content $runtimePid -Encoding utf8
+    foreach ($attempt in 1..60) {
+        if (-not (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) { break }
+        try { if ((Invoke-WebRequest "$runtimeUrl/health" -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200) { Write-Host '[ready] authenticated Runtime boundary'; return } } catch {}
+        Start-Sleep -Milliseconds 500
+    }
+    Stop-ManagedRuntime
+    throw 'Runtime did not become healthy.'
+}
+function Stop-ManagedRuntime {
+    $process = Get-ManagedRuntimeProcess
+    if (-not $process) { Write-Host '[ready] no managed Runtime process'; return }
+    & taskkill.exe /PID $process.Id /T /F *> $null
+    if ($LASTEXITCODE -ne 0) { throw 'Managed Runtime process tree could not be stopped.' }
+    Remove-Item $runtimePid -Force
+    Write-Host '[ready] managed Runtime stopped'
+}
+function Assert-RuntimeConfiguration($Values) {
+    $python = Join-Path $root '.venv\Scripts\python.exe'
+    if (-not (Test-Path $python)) { $python = (& python -c 'import sys; print(sys.executable)').Trim() }
+    if (-not (Test-Path $python -PathType Leaf)) { throw 'A concrete Python 3.11 executable is required for Runtime preflight.' }
+    Set-ProcessEnvironment $Values
+    & $python -c 'from agenten.agent_runtime.runtime_entrypoint import preflight_runtime; preflight_runtime()' *> $null
+    if ($LASTEXITCODE -ne 0) { throw 'Production Runtime configuration is unavailable; no services were started.' }
+}
+function Invoke-StartServices([switch]$RecoverDemoCredentials, [string]$SourceEnv) {
+    $values = Initialize-LocalEnvironment
+    Set-ProcessEnvironment $values
+    Assert-RuntimeConfiguration $values
+    Initialize-CaptainN8n $values -Recover:$RecoverDemoCredentials -SourceEnv $SourceEnv
+    docker compose --project-name $project --env-file $rootEnv --file $testCompose up -d --wait mariadb-test
+    if ($LASTEXITCODE -ne 0) { throw 'Isolated captain_test MariaDB failed to start.' }
+    Start-Gateway $values
+    Start-Runtime $values
+    docker compose --env-file $rootEnv up -d --wait mailpit
+    if ($LASTEXITCODE -ne 0) { throw 'Captain Mailpit failed to start.' }
+    & (Join-Path $PSScriptRoot 'minibook-demo.ps1') bootstrap -RecoverDemoCredentials:$RecoverDemoCredentials
+    Invoke-Health
+}
 function Invoke-Health {
+    $values = Read-Env $rootEnv @('CAPTAIN_RUNTIME_URL')
+    if (-not $values.Contains('CAPTAIN_RUNTIME_URL')) { throw 'Runtime URL is not configured.' }
+    if (-not (Get-ManagedRuntimeProcess)) { throw 'Managed Runtime process is not running.' }
+    if ((Invoke-WebRequest "$($values['CAPTAIN_RUNTIME_URL'])/health" -UseBasicParsing -TimeoutSec 3).StatusCode -ne 200) { throw 'Runtime health check failed.' }
     & (Join-Path $PSScriptRoot 'minibook-demo.ps1') status
     & (Join-Path $PSScriptRoot 'demo-preflight.ps1') -EnvFile $rootEnv
-    $summary = [ordered]@{schema='captain.live-demo-services.v1';checked_at=(Get-Date).ToUniversalTime().ToString('o');status='ready';secrets='redacted';database='captain_test';services=@('gateway','minibook','captain-n8n-rest','captain-n8n-mcp','mailpit')}
+    $summary = [ordered]@{schema='captain.live-demo-services.v1';checked_at=(Get-Date).ToUniversalTime().ToString('o');status='ready';secrets='redacted';database='captain_test';services=@('gateway','runtime','minibook','captain-n8n-rest','captain-n8n-mcp','mailpit')}
     New-Item -ItemType Directory -Force (Split-Path $evidence -Parent) | Out-Null
     $summary | ConvertTo-Json -Depth 4 | Set-Content $evidence -Encoding utf8
     Write-Host '[ready] redacted .captain-cook/evidence/live-demo-services.json'
@@ -195,20 +277,12 @@ Push-Location $root
 try {
     switch ($Action) {
         start {
-            $values = Initialize-LocalEnvironment
-            Set-ProcessEnvironment $values
-            Initialize-CaptainN8n $values -Recover:$RecoverDemoCredentials -SourceEnv $CredentialSourceEnv
-            docker compose --project-name $project --env-file $rootEnv --file $testCompose up -d --wait mariadb-test
-            if ($LASTEXITCODE -ne 0) { throw 'Isolated captain_test MariaDB failed to start.' }
-            Start-Gateway $values
-            docker compose --env-file $rootEnv up -d --wait mailpit
-            if ($LASTEXITCODE -ne 0) { throw 'Captain Mailpit failed to start.' }
-            & (Join-Path $PSScriptRoot 'minibook-demo.ps1') bootstrap -RecoverDemoCredentials:$RecoverDemoCredentials
-            Invoke-Health
+            Invoke-StartServices -Recover:$RecoverDemoCredentials -SourceEnv $CredentialSourceEnv
         }
         health { Invoke-Health }
         stop {
             & (Join-Path $PSScriptRoot 'minibook-demo.ps1') stop
+            Stop-ManagedRuntime
             Stop-ManagedGateway
             docker compose --env-file $rootEnv stop mailpit
             docker compose --project-name $project --env-file $rootEnv --file $testCompose stop mariadb-test
