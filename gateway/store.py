@@ -1102,20 +1102,6 @@ class GatewayStore:
         canonical = request.model_dump(mode="json", by_alias=True)
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
-                existing = self._factory_live_effect_record(
-                    cursor,
-                    request.effect_id,
-                    job_id=request.job_id,
-                    idempotency_key=request.idempotency_key,
-                    for_update=True,
-                )
-                if existing is not None:
-                    if existing.request != request:
-                        raise HTTPException(
-                            status_code=409,
-                            detail="factory live effect claim already exists with different content",
-                        )
-                    return FactoryLiveEffectClaim(record=existing, acquired=False)
                 job_block = self._runtime_block_by_json_value(
                     cursor,
                     block_type="agent_factory_job",
@@ -1131,25 +1117,25 @@ class GatewayStore:
                         status_code=409,
                         detail="factory live effects require AgentFactoryJobV3",
                     )
-                projection = self._factory_projection(cursor, job)
-                self._assert_factory_effects_open(projection, effect="live effects")
-                replay_after_job_lock = self._factory_live_effect_record(
+                existing = self._factory_live_effect_record(
                     cursor,
                     request.effect_id,
                     job_id=request.job_id,
                     idempotency_key=request.idempotency_key,
                     for_update=True,
                 )
-                if replay_after_job_lock is not None:
-                    if replay_after_job_lock.request != request:
+                if existing is not None:
+                    if existing.request != request:
                         raise HTTPException(
                             status_code=409,
                             detail="factory live effect claim already exists with different content",
                         )
                     return FactoryLiveEffectClaim(
-                        record=replay_after_job_lock,
+                        record=existing,
                         acquired=False,
                     )
+                projection = self._factory_projection(cursor, job)
+                self._assert_factory_effects_open(projection, effect="live effects")
                 workflow_artifacts = self._factory_workflow_artifacts_for_job(
                     cursor,
                     job.job_id,
