@@ -543,11 +543,40 @@ catch {
     throw 'Factory live preflight confirmation is invalid JSON.'
 }
 Assert-ExactPropertyNames -Value $preflight -ExpectedNames @(
-    'schema', 'prerequisites_confirmed', 'database_name', 'services_verified',
-    'codex_authenticated', 'skills_verified', 'skill_digests'
+    'schema', 'mode', 'max_cost_usd', 'model', 'with_n8n',
+    'prerequisites_confirmed', 'database_name', 'services_verified',
+    'codex_authenticated', 'skills_verified', 'runtime_adapters_verified',
+    'skill_digests'
 ) -Label 'preflight'
 Assert-ExactPropertyNames -Value $preflight.skill_digests `
     -ExpectedNames $skillNames -Label 'preflight.skill_digests'
+$preflightCostMatches = $false
+if (
+    $preflight.max_cost_usd -is [string] -and
+    [string]$preflight.max_cost_usd -match '^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$'
+) {
+    try {
+        $preflightCost = [decimal]::Parse(
+            [string]$preflight.max_cost_usd,
+            [System.Globalization.NumberStyles]::Number,
+            [System.Globalization.CultureInfo]::InvariantCulture
+        )
+        $preflightCostMatches = $preflightCost -eq $MaxCostUsd
+    }
+    catch {
+        $preflightCostMatches = $false
+    }
+}
+$expectedWithN8n = $WithN8n.IsPresent
+if (
+    [string]$preflight.mode -cne $Mode -or
+    -not $preflightCostMatches -or
+    [string]$preflight.model -cne $Model -or
+    $preflight.with_n8n -isnot [bool] -or
+    $preflight.with_n8n -ne $expectedWithN8n
+) {
+    throw 'Factory live preflight did not match the requested gate.'
+}
 if (
     [string]$preflight.schema -cne 'captain.hermes-six-skill-factory-preflight.v1' -or
     -not (
@@ -566,6 +595,10 @@ if (
     -not (
         $preflight.skills_verified -is [bool] -and
         $preflight.skills_verified -eq $true
+    ) -or
+    -not (
+        $preflight.runtime_adapters_verified -is [bool] -and
+        $preflight.runtime_adapters_verified -eq $true
     )
 ) {
     throw 'Factory live preflight did not confirm every required prerequisite.'

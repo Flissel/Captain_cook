@@ -84,6 +84,8 @@ def _write_fake_live_gate_commands(
     *,
     live_report: dict[str, object] | None = None,
     preflight_extra: dict[str, object] | None = None,
+    preflight_missing: str | None = None,
+    preflight_with_n8n: bool = False,
 ) -> None:
     directory.mkdir()
     (directory / "docker.cmd").write_text(
@@ -101,15 +103,22 @@ def _write_fake_live_gate_commands(
     )
     preflight = {
         "schema": "captain.hermes-six-skill-factory-preflight.v1",
+        "mode": "demo",
+        "max_cost_usd": "1",
+        "model": "fixture-model",
+        "with_n8n": preflight_with_n8n,
         "prerequisites_confirmed": True,
         "database_name": "captain_test",
         "services_verified": True,
         "codex_authenticated": True,
         "skills_verified": True,
+        "runtime_adapters_verified": True,
         "skill_digests": {skill: "a" * 64 for skill in SKILLS},
     }
     if preflight_extra is not None:
         preflight.update(preflight_extra)
+    if preflight_missing is not None:
+        preflight.pop(preflight_missing)
     preflight_json = json.dumps(preflight, separators=(",", ":"))
     if live_report is None:
         pytest_action = (
@@ -427,7 +436,11 @@ def test_non_n8n_gate_removes_inherited_and_file_n8n_values_from_children(
 
 def test_n8n_gate_loads_dedicated_values_for_children(tmp_path: Path) -> None:
     fake_commands = tmp_path / "fake-bin"
-    _write_fake_live_gate_commands(fake_commands, "sanitized-provider-failure")
+    _write_fake_live_gate_commands(
+        fake_commands,
+        "sanitized-provider-failure",
+        preflight_with_n8n=True,
+    )
     (tmp_path / ".env.captain-n8n").write_text(
         "CAPTAIN_N8N_URL=https://dedicated.invalid\n"
         "CAPTAIN_N8N_API_KEY=dedicated-key\n"
@@ -546,12 +559,75 @@ def test_wrapper_rejects_an_unknown_nested_preflight_field(
 
 
 @pytest.mark.parametrize(
+    "missing_field",
+    ("mode", "max_cost_usd", "model", "with_n8n", "runtime_adapters_verified"),
+)
+def test_wrapper_rejects_a_missing_current_preflight_field(
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    fake_commands = tmp_path / "fake-bin"
+    _write_fake_live_gate_commands(
+        fake_commands,
+        "unused-leak-probe",
+        live_report=_valid_demo_live_report(),
+        preflight_missing=missing_field,
+    )
+    environment = os.environ.copy()
+    environment["TEST_MARIADB_DSN"] = (
+        "mysql+pymysql://captain:db-password-not-in-output@127.0.0.1:3306/captain_test"
+    )
+    environment["PATH"] = str(fake_commands)
+
+    result = _run_copied_wrapper(tmp_path, environment=environment)
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "exact preflight contract" in output
+
+
+@pytest.mark.parametrize(
+    ("field", "changed_value"),
+    (
+        ("mode", "release"),
+        ("max_cost_usd", "2.00"),
+        ("model", "different-model"),
+        ("with_n8n", True),
+    ),
+)
+def test_wrapper_rejects_a_preflight_run_binding_mismatch(
+    tmp_path: Path,
+    field: str,
+    changed_value: object,
+) -> None:
+    fake_commands = tmp_path / "fake-bin"
+    _write_fake_live_gate_commands(
+        fake_commands,
+        "unused-leak-probe",
+        live_report=_valid_demo_live_report(),
+        preflight_extra={field: changed_value},
+    )
+    environment = os.environ.copy()
+    environment["TEST_MARIADB_DSN"] = (
+        "mysql+pymysql://captain:db-password-not-in-output@127.0.0.1:3306/captain_test"
+    )
+    environment["PATH"] = str(fake_commands)
+
+    result = _run_copied_wrapper(tmp_path, environment=environment)
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "did not match the requested gate" in output
+
+
+@pytest.mark.parametrize(
     "boolean_field",
     (
         "prerequisites_confirmed",
         "services_verified",
         "codex_authenticated",
         "skills_verified",
+        "runtime_adapters_verified",
     ),
 )
 def test_wrapper_rejects_stringified_preflight_booleans(
@@ -779,6 +855,7 @@ def test_wrapper_rejects_known_secret_values_in_schema_valid_report_fields(
         fake_commands,
         "unused-leak-probe",
         live_report=report,
+        preflight_with_n8n=with_n8n,
     )
     environment = os.environ.copy()
     environment["TEST_MARIADB_DSN"] = (
@@ -826,6 +903,7 @@ def test_wrapper_rejects_raw_percent_encoded_uri_passwords(
         fake_commands,
         "unused-leak-probe",
         live_report=report,
+        preflight_with_n8n=with_n8n,
     )
     environment = os.environ.copy()
     environment["TEST_MARIADB_DSN"] = (
