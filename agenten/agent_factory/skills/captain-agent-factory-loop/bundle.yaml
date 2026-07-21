@@ -1,0 +1,10 @@
+name: captain-agent-factory-loop
+description: Captain-controlled six-skill AutoGen factory workflow
+skills:
+  - captain-factory-discover
+  - captain-factory-brief-codex
+  - captain-factory-execute-team
+  - captain-factory-evaluate-team
+  - captain-factory-improve-team
+  - captain-factory-report-captain
+instruction: Use only the step released by the current Captain invocation.

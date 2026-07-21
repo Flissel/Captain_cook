@@ -2,11 +2,146 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+import re
 
+import pytest
 import yaml
 
 
 SKILL_DIR = Path("agenten/agent_factory/skills/autogen-agent-factory")
+
+SKILLS = {
+    "captain-factory-discover": ("CodebaseInventoryV1", "do not change code"),
+    "captain-factory-brief-codex": ("CodexBuildBriefV1", "codex.run"),
+    "captain-factory-execute-team": ("TeamExecutionEvidenceV1", "max_cost_usd"),
+    "captain-factory-evaluate-team": ("TeamEvaluationV1", "do not repair"),
+    "captain-factory-improve-team": ("CandidateRevisionV1", "prior green"),
+    "captain-factory-report-captain": ("FactoryFeedbackV1", "Captain decides"),
+}
+
+SKILL_RESOURCES = {
+    "captain-factory-discover": ("references/output-schema.md",),
+    "captain-factory-brief-codex": ("templates/codex-assignment.md",),
+    "captain-factory-execute-team": ("references/evidence-contract.md",),
+    "captain-factory-evaluate-team": ("references/rubric.md",),
+    "captain-factory-improve-team": ("templates/repair-assignment.md",),
+    "captain-factory-report-captain": ("references/recommendations.md",),
+}
+
+
+@pytest.mark.parametrize("skill_name,required", SKILLS.items())
+def test_factory_workflow_skill_is_valid_safe_and_digestible(
+    skill_name: str, required: tuple[str, str]
+) -> None:
+    root = Path("agenten/agent_factory/skills") / skill_name
+    text = (root / "SKILL.md").read_text(encoding="utf-8")
+    frontmatter = yaml.safe_load(text.split("---", 2)[1])
+
+    assert frontmatter["name"] == skill_name
+    assert all(phrase.lower() in text.lower() for phrase in required)
+    assert len(text.split()) <= 400
+    assert "--yolo" not in text
+    assert "api_key=" not in text.lower()
+    assert "bearer " not in text.lower()
+    for resource in SKILL_RESOURCES[skill_name]:
+        assert (root / resource).is_file()
+        assert resource in text
+    for reference in re.findall(r"\[[^]]+\]\(([^)]+)\)", text):
+        assert (root / reference).is_file()
+
+
+def test_factory_workflow_bundle_is_non_authoritative_operator_aid() -> None:
+    bundle = Path("agenten/agent_factory/skills/captain-agent-factory-loop/bundle.yaml")
+    manifest = yaml.safe_load(bundle.read_text(encoding="utf-8"))
+
+    assert manifest == {
+        "name": "captain-agent-factory-loop",
+        "description": "Captain-controlled six-skill AutoGen factory workflow",
+        "skills": list(SKILLS),
+        "instruction": "Use only the step released by the current Captain invocation.",
+    }
+
+
+def test_report_classifies_tool_credential_infrastructure_and_adapter_gaps() -> None:
+    path = Path(
+        "agenten/agent_factory/skills/captain-factory-report-captain/"
+        "references/recommendations.md"
+    )
+    text = path.read_text(encoding="utf-8").lower()
+
+    for phrase in (
+        "required todo_tool.v1",
+        "blocked_tool_required",
+        "optional todo_tool.v1",
+        "every released assertion is green",
+        "blocked_credential_required",
+        "blocked_infrastructure",
+        "self-built adapter",
+    ):
+        assert phrase in text
+
+
+def test_execute_team_fails_closed_on_live_and_budget_uncertainty() -> None:
+    path = Path("agenten/agent_factory/skills/captain-factory-execute-team/SKILL.md")
+    text = path.read_text(encoding="utf-8").lower()
+
+    for phrase in (
+        "live_execution=false",
+        "missing reservation",
+        "unknown or contradictory cost",
+        "budget_exhausted",
+        "stop all new paid effects",
+    ):
+        assert phrase in text
+
+
+def test_real_case_tester_never_receives_n8n_builder_or_mcp_lease() -> None:
+    path = Path("agenten/agent_factory/skills/captain-factory-execute-team/SKILL.md")
+    text = " ".join(path.read_text(encoding="utf-8").lower().split())
+
+    assert (
+        "the real case tester must never receive the `n8n-builder` profile or "
+        "an `n8n-mcp` lease"
+    ) in text
+    assert "consume only typed n8n execution evidence" in text
+    assert "short-lived with the `n8n-builder` profile" not in text
+
+
+@pytest.mark.parametrize(
+    "skill_name", ("captain-factory-brief-codex", "captain-factory-improve-team")
+)
+def test_only_tool_integrator_may_use_scoped_n8n_builder_lease(
+    skill_name: str,
+) -> None:
+    path = Path("agenten/agent_factory/skills") / skill_name / "SKILL.md"
+    text = " ".join(path.read_text(encoding="utf-8").lower().split())
+
+    for phrase in (
+        "only the tool integrator",
+        "integration_intent=n8n",
+        "short-lived",
+        "n8n-builder",
+        "n8n-mcp",
+        "isolated draft",
+        "activation",
+        "production adoption",
+        "service administration",
+        "volume management",
+    ):
+        assert phrase in text
+
+
+def test_brief_codex_selects_builtin_skills_by_assignment_phase() -> None:
+    path = Path("agenten/agent_factory/skills/captain-factory-brief-codex/SKILL.md")
+    text = " ".join(path.read_text(encoding="utf-8").lower().split())
+
+    assert "for build work, load and follow `plan` and `test-driven-development`" in text
+    assert (
+        "load `systematic-debugging` only after a diagnosed failure and only for "
+        "its repair step"
+    ) in text
+    assert "load `requesting-code-review` before completion" in text
+    assert "skills as mandatory instructions" not in text
 
 
 def test_factory_skill_is_digestible_and_contains_release_boundaries() -> None:
