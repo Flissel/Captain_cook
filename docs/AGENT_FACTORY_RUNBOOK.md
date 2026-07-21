@@ -21,6 +21,41 @@ factory job receives an `integration_intent=n8n` lease. See
 [MCP setup](MCP_SETUP.md) for the user-level registration; do not commit its
 token or modify VibeMind n8n volumes.
 
+## Hermes factory skills
+
+Captain's repository remains the source of truth for the six workflow skills.
+From the repository root, register that exact directory and create the operator
+bundle:
+
+```powershell
+$repositoryRoot = (Resolve-Path .).Path
+pwsh -NoProfile -File scripts/configure-hermes-factory-skills.ps1 `
+  -RepositoryRoot $repositoryRoot
+```
+
+The command verifies the pinned directory digests, refuses missing, disabled,
+or shadowed skills, and probes whether the installed Hermes CLI safely
+round-trips an external-directory array before changing user configuration. If
+that probe fails, upgrade Hermes and retry; the command exits before changing
+the configured `HERMES_HOME`.
+
+Verify the six enabled skills and the slash bundle:
+
+```powershell
+hermes skills list --enabled-only
+hermes bundles show captain-agent-factory-loop
+```
+
+Rollback removes only this repository path and this bundle. It preserves unrelated external directories:
+
+```powershell
+pwsh -NoProfile -File scripts/configure-hermes-factory-skills.ps1 `
+  -RepositoryRoot $repositoryRoot -Remove
+```
+
+The rollback does not reset builtin skills or delete other external skill
+directories. It does not open or print `.env`.
+
 ## Offline contract gate
 
 Run this before requesting a live job:
