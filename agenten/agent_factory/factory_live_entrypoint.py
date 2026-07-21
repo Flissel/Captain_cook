@@ -940,9 +940,50 @@ async def run_factory_live_gate_from_environment() -> Mapping[str, object]:
         )
     settings = _settings_from_environment()
     _read_matching_preflight(settings)
-    raise FactoryLiveConfigurationError(
-        "production prepared dispatch adapter is unavailable"
-    )
+    try:
+        from gateway.factory_live_runtime import bootstrap_factory_live_gate
+
+        bootstrap = bootstrap_factory_live_gate(settings)
+        expected_digests = _released_skill_directory_digests(
+            settings.repository_root
+        )
+        prepared = bootstrap.adapter_factory.prepare(settings, expected_digests)
+        if not isinstance(prepared, PreparedFactoryLiveAdapter):
+            raise TypeError("Gateway returned an untyped Factory adapter")
+        prepared.require_matches(settings, expected_digests)
+        job = bootstrap.repository.job(bootstrap.environment.job_id)
+        if not isinstance(job, AgentFactoryJobV3):
+            raise TypeError("Gateway Factory job is not V3")
+        coordinator = FactorySixSkillLiveCoordinator(
+            coordinator=prepared.lifecycle,
+            repository=prepared.repository,
+            dispatcher=prepared.dispatcher,
+            live_runner=prepared.live_runner,
+            clock=bootstrap.clock,
+        )
+        result = await coordinator.run(job, settings.mode)
+        observed = bootstrap.evidence_collector.collect(job.job_id)
+        report = _build_live_report(settings, job, result, observed)
+        payload = report.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        )
+        _write_content_addressed_report(settings.report_directory, payload)
+        return payload
+    except FactoryLiveConfigurationError:
+        raise
+    except Exception as exc:
+        try:
+            from gateway.factory_live_runtime import FactoryLiveBootstrapError
+        except ImportError:
+            FactoryLiveBootstrapError = ()  # type: ignore[assignment,misc]
+        message = (
+            str(exc)
+            if isinstance(exc, FactoryLiveBootstrapError)
+            else "production Factory runtime failed closed"
+        )
+        raise FactoryLiveConfigurationError(message) from None
 
 
 def _build_live_report(
@@ -1270,12 +1311,15 @@ def main(arguments: list[str] | None = None) -> int:
             database_dsn=os.environ.get("TEST_MARIADB_DSN", ""),
             with_n8n=namespace.with_n8n,
         )
+        from gateway.factory_live_runtime import bootstrap_factory_live_gate
+
+        bootstrap = bootstrap_factory_live_gate(settings)
         run_factory_live_preflight(
             settings,
             probe=SystemFactoryLivePreflightProbe(
                 repository_root=settings.repository_root
             ),
-            adapter_factory=None,
+            adapter_factory=bootstrap.adapter_factory,
         )
     except Exception:
         return 1

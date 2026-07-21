@@ -574,6 +574,8 @@ async def test_environment_gate_rejects_spoofed_all_true_adapter(
         preflight.model_dump_json(by_alias=True),
         encoding="utf-8",
     )
+    adapter_manifest = tmp_path / "factory-adapter.json"
+    adapter_manifest.write_text("{}", encoding="utf-8")
     for name, value in {
         "CAPTAIN_FACTORY_PREREQUISITES_CONFIRMED": "1",
         "CAPTAIN_FACTORY_GATE_MODE": "demo",
@@ -582,17 +584,35 @@ async def test_environment_gate_rejects_spoofed_all_true_adapter(
         "CAPTAIN_FACTORY_REPORT_DIRECTORY": str(report_directory),
         "CAPTAIN_FACTORY_PREFLIGHT_PATH": str(preflight_path),
         "CAPTAIN_FACTORY_WITH_N8N": "0",
+        "CAPTAIN_FACTORY_JOB_ID": "00000000-0000-0000-0000-000000000301",
+        "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:8091",
+        "CAPTAIN_RUNTIME_TOKEN": "runtime-token",
+        "CAPABILITY_FACTORY_ADAPTER_MANIFEST": str(adapter_manifest),
+        "CAPABILITY_FACTORY_ADAPTER_SHA256": "0" * 64,
         "TEST_MARIADB_DSN": "mysql://captain:secret@127.0.0.1:3306/captain_test",
     }.items():
         monkeypatch.setenv(name, value)
 
     with pytest.raises(
         entrypoint.FactoryLiveConfigurationError,
-        match="prepared dispatch adapter is unavailable",
+        match="runtime or adapter manifest is invalid",
     ):
         await entrypoint.run_factory_live_gate_from_environment()
 
     assert not tuple(report_directory.glob("sha256-*.json"))
+
+
+def test_factory_live_environment_aliases_are_documented() -> None:
+    example = (Path(__file__).resolve().parents[2] / ".env.example").read_text(
+        encoding="utf-8"
+    )
+
+    for alias in (
+        "CAPTAIN_FACTORY_JOB_ID=",
+        "CAPABILITY_FACTORY_ADAPTER_MANIFEST=",
+        "CAPABILITY_FACTORY_ADAPTER_SHA256=",
+    ):
+        assert alias in example
 
 
 class WorkflowRepository:
