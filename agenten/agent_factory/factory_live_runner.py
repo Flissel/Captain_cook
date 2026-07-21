@@ -565,9 +565,10 @@ class FactoryLiveRunner:
             workflow_artifacts=artifacts,
         )
         requests = self._bind_planned_run(authoritative, planned_requests)
-        effect_reports: list[FactoryLiveEffectReport] = []
         for request in requests:
             self._validate_request(authoritative, projection, request)
+        effect_reports: list[FactoryLiveEffectReport] = []
+        for request in requests:
             claim = self._effect_ledger.claim(request)
             if claim.record.outcome is not None:
                 prior_outcome = claim.record.outcome

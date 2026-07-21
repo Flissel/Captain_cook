@@ -1309,6 +1309,9 @@ class GatewayStore:
                     raise HTTPException(status_code=409, detail="factory job not found")
                 cursor.execute(
                     """SELECT events.effect_id AS projection_effect_id,
+                              events.job_id AS projection_job_id,
+                              events.invocation_id AS projection_invocation_id,
+                              events.claim_key AS projection_claim_key,
                               events.event_kind,
                               events.content_sha256, events.payload,
                               ledger.`index` AS block_index,
@@ -2670,6 +2673,9 @@ class GatewayStore:
         ):
             sql = (
                 "SELECT events.effect_id AS projection_effect_id, "
+                "events.job_id AS projection_job_id, "
+                "events.invocation_id AS projection_invocation_id, "
+                "events.claim_key AS projection_claim_key, "
                 "events.event_kind, events.content_sha256, events.payload, "
                 "ledger.`index` AS block_index, "
                 "events.block_index AS projection_block_index, "
@@ -2678,12 +2684,17 @@ class GatewayStore:
                 "ledger.metadata AS ledger_metadata, ledger.hash AS ledger_hash, "
                 "ledger.previous_hash AS ledger_previous_hash, "
                 "ledger.parent_index AS ledger_parent_index "
-                "FROM factory_live_effect_events AS events "
-                "JOIN blocks AS ledger ON ledger.`index` = events.block_index "
-                "WHERE events.effect_id = %s "
-                "OR (events.job_id = %s AND events.claim_key = %s) "
-                "OR (events.job_id = %s AND events.invocation_id = %s) "
-                "ORDER BY events.block_index"
+                "FROM blocks AS ledger "
+                "LEFT JOIN factory_live_effect_events AS events "
+                "ON events.block_index = ledger.`index` "
+                "WHERE ledger.block_type = 'factory_live_effect' AND ("
+                "JSON_UNQUOTE(JSON_EXTRACT(ledger.data, '$.effect_id')) = %s "
+                "OR (JSON_UNQUOTE(JSON_EXTRACT(ledger.data, '$.job_id')) = %s "
+                "AND JSON_UNQUOTE(JSON_EXTRACT(ledger.data, '$.idempotency_key')) = %s) "
+                "OR (JSON_UNQUOTE(JSON_EXTRACT(ledger.data, '$.job_id')) = %s "
+                "AND JSON_UNQUOTE(JSON_EXTRACT(ledger.data, "
+                "'$.invocation.invocation_id')) = %s)) "
+                "ORDER BY ledger.`index`"
             )
             parameters = (
                 str(effect_id),
@@ -2695,6 +2706,9 @@ class GatewayStore:
         else:
             sql = (
                 "SELECT events.effect_id AS projection_effect_id, "
+                "events.job_id AS projection_job_id, "
+                "events.invocation_id AS projection_invocation_id, "
+                "events.claim_key AS projection_claim_key, "
                 "events.event_kind, events.content_sha256, events.payload, "
                 "ledger.`index` AS block_index, "
                 "events.block_index AS projection_block_index, "
@@ -2703,9 +2717,12 @@ class GatewayStore:
                 "ledger.metadata AS ledger_metadata, ledger.hash AS ledger_hash, "
                 "ledger.previous_hash AS ledger_previous_hash, "
                 "ledger.parent_index AS ledger_parent_index "
-                "FROM factory_live_effect_events AS events "
-                "JOIN blocks AS ledger ON ledger.`index` = events.block_index "
-                "WHERE events.effect_id = %s ORDER BY events.block_index"
+                "FROM blocks AS ledger "
+                "LEFT JOIN factory_live_effect_events AS events "
+                "ON events.block_index = ledger.`index` "
+                "WHERE ledger.block_type = 'factory_live_effect' "
+                "AND JSON_UNQUOTE(JSON_EXTRACT(ledger.data, '$.effect_id')) = %s "
+                "ORDER BY ledger.`index`"
             )
             parameters = (str(effect_id),)
         if for_update:
@@ -2765,6 +2782,7 @@ class GatewayStore:
         if (
             row.get("projection_block_index") is None
             or row.get("projection_effect_id") is None
+            or row.get("projection_job_id") is None
             or row.get("event_kind") is None
             or row.get("payload") is None
             or row.get("content_sha256") is None
@@ -2824,10 +2842,35 @@ class GatewayStore:
             int(row["projection_block_index"]) != int(row["block_index"])
             or not isinstance(ledger_payload.get("effect_id"), str)
             or str(row["projection_effect_id"]) != ledger_payload["effect_id"]
+            or not isinstance(ledger_payload.get("job_id"), str)
+            or str(row["projection_job_id"]) != ledger_payload["job_id"]
         ):
             raise HTTPException(
                 status_code=409,
                 detail="factory live effect side-table projection binding mismatch",
+            )
+        if row["event_kind"] == "claim":
+            invocation = ledger_payload.get("invocation")
+            if (
+                not isinstance(invocation, dict)
+                or not isinstance(invocation.get("invocation_id"), str)
+                or row.get("projection_invocation_id")
+                != invocation["invocation_id"]
+                or not isinstance(ledger_payload.get("idempotency_key"), str)
+                or row.get("projection_claim_key")
+                != ledger_payload["idempotency_key"]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="factory live effect side-table identity projection mismatch",
+                )
+        elif (
+            row.get("projection_invocation_id") is not None
+            or row.get("projection_claim_key") is not None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect outcome carries claim identity projection",
             )
         schema = ledger_payload.get("schema")
         if schema is not None and metadata.get("schema") != schema:

@@ -394,6 +394,52 @@ async def test_release_runner_rejects_inconsistent_bound_plan_before_claim() -> 
 
 
 @pytest.mark.asyncio
+async def test_release_runner_preflights_every_request_before_first_claim() -> None:
+    job = workflow_job(mode="release")
+    first = distinct_effect_request(job, key_char="c", ordinal=1)
+    foreign_job = job.model_copy(
+        update={
+            "job_id": uuid5(NAMESPACE_URL, f"factory-live-foreign-job|{job.job_id}"),
+            "correlation_id": uuid5(
+                NAMESPACE_URL,
+                f"factory-live-foreign-correlation|{job.job_id}",
+            ),
+        }
+    )
+    second = distinct_effect_request(job, key_char="d", ordinal=2)
+    foreign_lease = issue_factory_lease(
+        job=foreign_job,
+        role=FactoryRole.REAL_CASE_TESTER,
+        attempt=1,
+        workspace_ref="workspace://factory/live-runner",
+        now=NOW,
+    )
+    payload = second.model_dump(mode="json", by_alias=True)
+    payload["job_id"] = str(foreign_job.job_id)
+    payload["correlation_id"] = str(foreign_job.correlation_id)
+    payload["invocation"]["job_id"] = str(foreign_job.job_id)
+    payload["invocation"]["correlation_id"] = str(foreign_job.correlation_id)
+    payload["invocation"]["lease"] = foreign_lease.model_dump(
+        mode="json",
+        by_alias=True,
+    )
+    invalid_second = FactoryLiveEffectRequestV1.model_validate(payload)
+    ledger = InMemoryFactoryLiveEffectLedger()
+    executor = MultiExecutor()
+
+    with pytest.raises(ValueError, match="does not match Gateway projection"):
+        await runner(
+            job,
+            ledger,
+            Plan(first, invalid_second),
+            executor,
+        ).run(job, mode="release")
+
+    assert ledger.history(job.job_id) == ()
+    assert executor.execute_calls == []
+
+
+@pytest.mark.asyncio
 async def test_prefix_crash_before_next_claim_is_recoverable() -> None:
     job = workflow_job(mode="release")
     run_id = uuid5(NAMESPACE_URL, f"factory-live-prefix|{job.job_id}")

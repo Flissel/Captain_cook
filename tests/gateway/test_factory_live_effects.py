@@ -20,6 +20,7 @@ from agenten.agent_factory.factory_live_runner import (
     FactoryLiveEffectClaim,
     FactoryLiveEffectKind,
     FactoryLiveEffectOutcomeV1,
+    FactoryLiveEffectRequestV1,
     FactoryLiveEffectRecord,
     FactoryLiveEffectWriteReceipt,
 )
@@ -127,8 +128,10 @@ def test_gateway_history_preserves_exact_non_dispatched_block_reason() -> None:
 
 def test_gateway_effect_payload_digest_rejects_tampering() -> None:
     effect_id = str(uuid5(NAMESPACE_URL, "tampered-effect"))
+    job_id = str(uuid5(NAMESPACE_URL, "tampered-effect-job"))
     ledger_payload = {
         "effect_id": effect_id,
+        "job_id": job_id,
         "status": "budget_exhausted",
         "reason": "original",
     }
@@ -142,6 +145,7 @@ def test_gateway_effect_payload_digest_rejects_tampering() -> None:
     )
     side_payload = {
         "effect_id": effect_id,
+        "job_id": job_id,
         "status": "budget_exhausted",
         "reason": "rewritten",
     }
@@ -157,6 +161,9 @@ def test_gateway_effect_payload_digest_rejects_tampering() -> None:
         "block_index": block.index,
         "projection_block_index": block.index,
         "projection_effect_id": effect_id,
+        "projection_job_id": job_id,
+        "projection_invocation_id": None,
+        "projection_claim_key": None,
         "ledger_data": json.dumps(block.data, sort_keys=True),
         "ledger_block_type": block.block_type,
         "ledger_status": block.status,
@@ -200,6 +207,9 @@ def test_gateway_effect_payload_reads_historical_block_without_reason_field() ->
         "block_index": block.index,
         "projection_block_index": block.index,
         "projection_effect_id": old_payload["effect_id"],
+        "projection_job_id": old_payload["job_id"],
+        "projection_invocation_id": None,
+        "projection_claim_key": None,
         "ledger_data": json.dumps(block.data, sort_keys=True),
         "ledger_block_type": block.block_type,
         "ledger_status": block.status,
@@ -379,6 +389,80 @@ def test_mariadb_effect_history_rejects_side_table_rewrite(
         GatewayFactoryLiveEffectLedger(
             GatewayStore(mariadb_store.storage)
         ).history(request.job_id)
+
+
+@pytest.mark.parametrize("identity_column", ("claim_key", "invocation_id"))
+def test_mariadb_effect_identity_projection_rewrite_fails_closed(
+    mariadb_store: GatewayStore,
+    identity_column: str,
+) -> None:
+    job, request = prepared_mariadb_effect(mariadb_store)
+    adapter = GatewayFactoryLiveEffectLedger(mariadb_store)
+    adapter.claim(request)
+    replacement = (
+        "f" * 64
+        if identity_column == "claim_key"
+        else str(uuid5(NAMESPACE_URL, "rewritten-side-invocation"))
+    )
+    update_sql = {
+        "claim_key": (
+            "UPDATE factory_live_effect_events SET claim_key = %s "
+            "WHERE effect_id = %s AND event_kind = 'claim'"
+        ),
+        "invocation_id": (
+            "UPDATE factory_live_effect_events SET invocation_id = %s "
+            "WHERE effect_id = %s AND event_kind = 'claim'"
+        ),
+    }[identity_column]
+    with mariadb_store.storage.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                update_sql,
+                (replacement, str(request.effect_id)),
+            )
+
+    with pytest.raises(ValueError, match="projection"):
+        adapter.history(job.job_id)
+
+    if identity_column == "claim_key":
+        changed_invocation = request.invocation.model_copy(
+            update={
+                "invocation_id": uuid5(
+                    NAMESPACE_URL,
+                    "changed-invocation-after-claim-key-rewrite",
+                )
+            }
+        )
+    else:
+        changed_invocation = request.invocation.model_copy(
+            update={"idempotency_key": "e" * 64}
+        )
+    changed = FactoryLiveEffectRequestV1.model_validate(
+        request.model_dump(mode="json", by_alias=True)
+        | {
+            "effect_id": str(
+                uuid5(
+                    NAMESPACE_URL,
+                    f"changed-effect-after-{identity_column}-rewrite",
+                )
+            ),
+            "idempotency_key": changed_invocation.idempotency_key,
+            "invocation": changed_invocation.model_dump(mode="json", by_alias=True),
+        }
+    )
+
+    with pytest.raises(ValueError, match="projection"):
+        adapter.claim(changed)
+
+    with mariadb_store.storage.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) AS event_count FROM blocks "
+                "WHERE block_type = 'factory_live_effect' "
+                "AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.job_id')) = %s",
+                (str(job.job_id),),
+            )
+            assert int(cursor.fetchone()["event_count"]) == 1
 
 
 def test_mariadb_effect_history_rejects_deleted_outcome_projection(
