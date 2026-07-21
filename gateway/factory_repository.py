@@ -32,6 +32,7 @@ from agenten.agent_factory.factory_live_runner import (
     FactoryLiveEffectClaim,
     FactoryLiveEffectLedger,
     FactoryLiveEffectOutcomeV1,
+    FactoryLiveEffectRecord,
     FactoryLiveEffectRequestV1,
     FactoryLiveEffectWriteReceipt,
 )
@@ -332,6 +333,11 @@ class GatewayFactoryLiveEffectLedger(FactoryLiveEffectLedger):
     ) -> FactoryLiveEffectWriteReceipt:
         return self._translate(
             lambda: self._store.complete_factory_live_effect(request, outcome)
+        )
+
+    def history(self, job_id: UUID) -> tuple[FactoryLiveEffectRecord, ...]:
+        return self._translate(
+            lambda: self._store.factory_live_effect_history(job_id)
         )
 
     @staticmethod

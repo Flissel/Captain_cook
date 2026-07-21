@@ -1287,6 +1287,78 @@ class GatewayStore:
                 )
         return FactoryLiveEffectWriteReceipt(record=completed, replayed=False)
 
+    def factory_live_effect_history(
+        self,
+        job_id: UUID,
+    ) -> tuple[FactoryLiveEffectRecord, ...]:
+        """Return the authoritative effect stream in original claim order."""
+
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                job_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_job",
+                    field="job_id",
+                    value=str(job_id),
+                    for_update=False,
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job not found")
+                cursor.execute(
+                    "SELECT effect_id, event_kind, content_sha256, payload "
+                    "FROM factory_live_effect_events WHERE job_id = %s "
+                    "ORDER BY block_index",
+                    (str(job_id),),
+                )
+                rows = cursor.fetchall()
+
+        grouped: dict[UUID, list[dict[str, object]]] = {}
+        for row in rows:
+            effect_id = UUID(str(row["effect_id"]))
+            grouped.setdefault(effect_id, []).append(row)
+
+        history: list[FactoryLiveEffectRecord] = []
+        for effect_id, events in grouped.items():
+            if events[0]["event_kind"] != "claim":
+                raise HTTPException(
+                    status_code=409,
+                    detail="factory live effect history has outcome before claim",
+                )
+            claims = tuple(event for event in events if event["event_kind"] == "claim")
+            outcomes = tuple(
+                event for event in events if event["event_kind"] == "outcome"
+            )
+            if len(claims) != 1 or len(outcomes) > 1 or (
+                len(claims) + len(outcomes) != len(events)
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="factory live effect history is ambiguous",
+                )
+            request = FactoryLiveEffectRequestV1.model_validate(
+                self._factory_live_effect_payload(claims[0])
+            )
+            if request.effect_id != effect_id or request.job_id != job_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="factory live effect history binding mismatch",
+                )
+            outcome = (
+                FactoryLiveEffectOutcomeV1.model_validate(
+                    self._factory_live_effect_payload(outcomes[0])
+                )
+                if outcomes
+                else None
+            )
+            try:
+                history.append(FactoryLiveEffectRecord(request=request, outcome=outcome))
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="factory live effect history binding mismatch",
+                ) from exc
+        return tuple(history)
+
     def factory_workflow_artifacts(
         self,
         job_id: UUID,
@@ -2542,7 +2614,8 @@ class GatewayStore:
             and invocation_id is not None
         ):
             sql = (
-                "SELECT event_kind, payload FROM factory_live_effect_events "
+                "SELECT event_kind, content_sha256, payload "
+                "FROM factory_live_effect_events "
                 "WHERE effect_id = %s OR (job_id = %s AND claim_key = %s) "
                 "OR (job_id = %s AND invocation_id = %s) "
                 "ORDER BY block_index"
@@ -2556,7 +2629,8 @@ class GatewayStore:
             )
         else:
             sql = (
-                "SELECT event_kind, payload FROM factory_live_effect_events "
+                "SELECT event_kind, content_sha256, payload "
+                "FROM factory_live_effect_events "
                 "WHERE effect_id = %s ORDER BY block_index"
             )
             parameters = (str(effect_id),)
@@ -2574,16 +2648,31 @@ class GatewayStore:
                 detail="factory live effect ledger is ambiguous",
             )
         request = FactoryLiveEffectRequestV1.model_validate(
-            self._decode_json(claims[0]["payload"])
+            self._factory_live_effect_payload(claims[0])
         )
         outcome = (
             FactoryLiveEffectOutcomeV1.model_validate(
-                self._decode_json(outcomes[0]["payload"])
+                self._factory_live_effect_payload(outcomes[0])
             )
             if outcomes
             else None
         )
         return FactoryLiveEffectRecord(request=request, outcome=outcome)
+
+    @staticmethod
+    def _factory_live_effect_payload(row: dict[str, Any]) -> object:
+        payload = GatewayStore._decode_json(row["payload"])
+        digest = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        if digest != row["content_sha256"]:
+            raise HTTPException(
+                status_code=409,
+                detail="factory live effect payload digest mismatch",
+            )
+        return payload
 
     def _assert_factory_live_invocation(
         self,

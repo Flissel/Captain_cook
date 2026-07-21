@@ -7,6 +7,7 @@ import pytest
 
 from agenten.agent_factory.factory_live_runner import (
     FactoryInfrastructureFailure,
+    FactoryLiveBlockReason,
     FactoryLiveEffectKind,
     FactoryLiveEffectOutcomeV1,
     FactoryLiveEffectRequestV1,
@@ -98,7 +99,13 @@ def effect_outcome(
     request: FactoryLiveEffectRequestV1,
     *,
     status: str = "succeeded",
+    reason: str | None = None,
 ) -> FactoryLiveEffectOutcomeV1:
+    evidence_ref = (
+        None
+        if status in {reason.value for reason in FactoryLiveBlockReason}
+        else artifact(f"effect-{request.effect_id}")
+    )
     return FactoryLiveEffectOutcomeV1(
         schema_name="captain.factory-live-effect-outcome.v1",
         outcome_id=uuid5(NAMESPACE_URL, f"factory-live-outcome|{request.effect_id}"),
@@ -108,7 +115,8 @@ def effect_outcome(
         subject_version=request.subject_version,
         attempt=request.attempt,
         status=status,
-        evidence_ref=artifact(f"effect-{request.effect_id}"),
+        evidence_ref=evidence_ref,
+        reason=reason,
         completed_at=NOW + timedelta(seconds=1),
     )
 
@@ -272,6 +280,66 @@ async def test_restart_after_reservation_recovers_without_starting_provider_twic
     assert report.attempt == 1
 
 
+def test_history_reconstructs_reserved_effect_after_process_crash() -> None:
+    job = workflow_job(mode="demo")
+    request = effect_request(job)
+    ledger = InMemoryFactoryLiveEffectLedger()
+    ledger.claim(request)
+
+    restarted = runner(
+        job,
+        ledger,
+        Plan(request),
+        Executor(request, start=AssertionError("history must not dispatch")),
+    )
+    history = restarted.history(job.job_id)
+
+    assert len(history) == 1
+    assert history[0].effect_id == request.effect_id
+    assert history[0].status == "reserved"
+    assert history[0].provider_started is None
+    assert history[0].evidence_ref is None
+    assert history[0].reason == (
+        "reserved external effect requires authoritative recovery evidence"
+    )
+
+
+@pytest.mark.asyncio
+async def test_history_after_recovery_is_durable_and_exact_replay_is_not_duplicated() -> None:
+    job = workflow_job(mode="demo")
+    first = effect_request(job, kind=FactoryLiveEffectKind.CODEX, key_char="c")
+    second = effect_request(job, kind=FactoryLiveEffectKind.PROVIDER, key_char="d")
+    ledger = InMemoryFactoryLiveEffectLedger()
+    ledger.claim(first)
+    ledger.complete(first, effect_outcome(first))
+    ledger.claim(second)
+
+    recovered = Executor(
+        second,
+        start=AssertionError("must recover"),
+        recover=effect_outcome(second),
+    )
+    await runner(job, ledger, Plan(second), recovered).run(job, mode="demo")
+    await runner(
+        job,
+        ledger,
+        Plan(second),
+        Executor(
+            second,
+            start=AssertionError("must not start"),
+            recover=AssertionError("must not recover"),
+        ),
+    ).run(job, mode="demo")
+
+    history = ledger.history(job.job_id)
+    assert tuple(record.request.effect_id for record in history) == (
+        first.effect_id,
+        second.effect_id,
+    )
+    assert all(record.outcome is not None for record in history)
+    assert recovered.recover_calls == 1
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", tuple(FactoryLiveEffectKind))
 async def test_restart_after_evidence_replays_without_any_external_effect(
@@ -327,6 +395,82 @@ async def test_behavioral_retry_advances_attempt_but_infrastructure_recovery_doe
     assert infrastructure_report.status == "infrastructure_recovery_required"
     assert infrastructure_report.attempt == 1
     assert infrastructure_report.next_attempt == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "block_reason",
+    tuple(FactoryLiveBlockReason),
+)
+async def test_non_dispatched_blocks_are_distinct_and_do_not_consume_attempt(
+    block_reason: FactoryLiveBlockReason,
+) -> None:
+    job = workflow_job(mode="demo")
+    request = effect_request(job)
+    ledger = InMemoryFactoryLiveEffectLedger()
+
+    class PreDispatchExecutor:
+        provider_calls = 0
+
+        async def execute(self, supplied):
+            assert supplied == request
+            return effect_outcome(
+                request,
+                status=block_reason.value,
+                reason=f"blocked by {block_reason.value}",
+            )
+
+        async def recover(self, supplied):
+            raise AssertionError("non-dispatched block must replay from the ledger")
+
+    executor = PreDispatchExecutor()
+    report = await runner(job, ledger, Plan(request), executor).run(job, mode="demo")
+
+    assert report.status == "blocked"
+    assert report.attempt == 1
+    assert report.next_attempt == 1
+    assert report.reasons == (f"blocked by {block_reason.value}",)
+    assert report.effects[0].status == block_reason.value
+    assert report.effects[0].provider_started is False
+    assert executor.provider_calls == 0
+    assert ledger.history(job.job_id)[0].outcome == effect_outcome(
+        request,
+        status=block_reason.value,
+        reason=f"blocked by {block_reason.value}",
+    )
+
+
+def test_non_dispatched_block_requires_an_exact_reason_and_no_effect_evidence() -> None:
+    job = workflow_job(mode="demo")
+    request = effect_request(job)
+    payload = effect_outcome(request).model_dump(mode="json", by_alias=True)
+    payload.update({"status": "credential_required", "reason": None})
+
+    with pytest.raises(ValueError, match="reason"):
+        FactoryLiveEffectOutcomeV1.model_validate(payload)
+
+    payload.update(
+        {
+            "reason": "credential is required",
+            "evidence_ref": artifact("must-not-be-provider-evidence").model_dump(
+                mode="json"
+            ),
+        }
+    )
+    with pytest.raises(ValueError, match="evidence"):
+        FactoryLiveEffectOutcomeV1.model_validate(payload)
+
+
+def test_historical_success_outcome_without_new_optional_fields_stays_readable() -> None:
+    job = workflow_job(mode="demo")
+    request = effect_request(job)
+    old_payload = effect_outcome(request).model_dump(mode="json", by_alias=True)
+    old_payload.pop("reason")
+
+    restored = FactoryLiveEffectOutcomeV1.model_validate(old_payload)
+
+    assert restored.status == "succeeded"
+    assert restored.reason is None
 
 
 @pytest.mark.asyncio

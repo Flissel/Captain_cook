@@ -37,6 +37,17 @@ class FactoryLiveEffectKind(str, Enum):
     PROVIDER = "provider"
 
 
+class FactoryLiveBlockReason(str, Enum):
+    """Typed pre-dispatch reasons which never count as provider execution."""
+
+    CREDENTIAL_REQUIRED = "credential_required"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    REQUIRED_TOOL = "required_tool"
+
+
+_NON_DISPATCHED_STATUSES = frozenset(reason.value for reason in FactoryLiveBlockReason)
+
+
 class _FrozenContract(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -99,8 +110,15 @@ class FactoryLiveEffectOutcomeV1(_FrozenContract):
     correlation_id: UUID
     subject_version: int = Field(ge=1, strict=True)
     attempt: int = Field(ge=1, le=5, strict=True)
-    status: Literal["succeeded", "behavioral_failure"]
-    evidence_ref: ArtifactRef
+    status: Literal[
+        "succeeded",
+        "behavioral_failure",
+        "credential_required",
+        "budget_exhausted",
+        "required_tool",
+    ]
+    evidence_ref: ArtifactRef | None = None
+    reason: str | None = Field(default=None, min_length=1, max_length=512)
     completed_at: datetime
 
     @field_validator("completed_at")
@@ -109,6 +127,19 @@ class FactoryLiveEffectOutcomeV1(_FrozenContract):
         if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
             raise ValueError("completed_at must be UTC")
         return value.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def require_status_evidence(self) -> "FactoryLiveEffectOutcomeV1":
+        if self.status in _NON_DISPATCHED_STATUSES:
+            if self.reason is None or not self.reason.strip():
+                raise ValueError("non-dispatched factory live block requires a reason")
+            if self.evidence_ref is not None:
+                raise ValueError(
+                    "non-dispatched factory live block cannot carry provider evidence"
+                )
+        elif self.evidence_ref is None:
+            raise ValueError("dispatched factory live outcome requires evidence")
+        return self
 
 
 class FactoryLiveEffectRecord(_FrozenContract):
@@ -145,6 +176,8 @@ class FactoryLiveEffectLedger(Protocol):
         request: FactoryLiveEffectRequestV1,
         outcome: FactoryLiveEffectOutcomeV1,
     ) -> FactoryLiveEffectWriteReceipt: ...
+
+    def history(self, job_id: UUID) -> tuple[FactoryLiveEffectRecord, ...]: ...
 
 
 class InMemoryFactoryLiveEffectLedger:
@@ -211,6 +244,14 @@ class InMemoryFactoryLiveEffectLedger:
             self._records[request.effect_id] = completed
             return FactoryLiveEffectWriteReceipt(record=completed, replayed=False)
 
+    def history(self, job_id: UUID) -> tuple[FactoryLiveEffectRecord, ...]:
+        with self._lock:
+            return tuple(
+                record
+                for record in self._records.values()
+                if record.request.job_id == job_id
+            )
+
 
 class FactoryInfrastructureFailure(RuntimeError):
     """A recoverable external failure that must preserve the current attempt."""
@@ -243,9 +284,42 @@ class FactoryLiveEffectReport(_FrozenContract):
     effect_id: UUID
     kind: FactoryLiveEffectKind
     attempt: int
-    status: Literal["succeeded", "behavioral_failure"]
-    evidence_ref: ArtifactRef
+    status: Literal[
+        "reserved",
+        "succeeded",
+        "behavioral_failure",
+        "credential_required",
+        "budget_exhausted",
+        "required_tool",
+    ]
+    evidence_ref: ArtifactRef | None = None
+    reason: str | None = None
+    provider_started: bool | None = None
     replayed: bool
+
+    @model_validator(mode="after")
+    def derive_provider_state(self) -> "FactoryLiveEffectReport":
+        expected = (
+            None
+            if self.status == "reserved"
+            else self.status not in _NON_DISPATCHED_STATUSES
+        )
+        if self.provider_started is not None and self.provider_started is not expected:
+            raise ValueError("factory live effect report provider state mismatch")
+        if self.status == "reserved":
+            if self.evidence_ref is not None or self.reason is None:
+                raise ValueError("reserved factory live effect report is malformed")
+        elif self.status in _NON_DISPATCHED_STATUSES:
+            if (
+                self.evidence_ref is not None
+                or self.reason is None
+                or not self.reason.strip()
+            ):
+                raise ValueError("non-dispatched factory live effect report is malformed")
+        elif self.evidence_ref is None:
+            raise ValueError("dispatched factory live effect report requires evidence")
+        object.__setattr__(self, "provider_started", expected)
+        return self
 
 
 class FactoryLiveRunReport(_FrozenContract):
@@ -285,6 +359,38 @@ class FactoryLiveRunner:
         self._executor = executor
         self._clock = clock
 
+    def history(self, job_id: UUID) -> tuple[FactoryLiveEffectReport, ...]:
+        """Reconstruct ordered, durable effect state from the authority ledger."""
+
+        job = self._resolve_job(job_id)
+        reports: list[FactoryLiveEffectReport] = []
+        for record in self._effect_ledger.history(job_id):
+            request = record.request
+            if (
+                request.job_id != job.job_id
+                or request.correlation_id != job.correlation_id
+                or request.subject_version != job.subject_version
+            ):
+                raise ValueError("factory live effect history binding mismatch")
+            if record.outcome is None:
+                reports.append(
+                    FactoryLiveEffectReport(
+                        effect_id=request.effect_id,
+                        kind=request.kind,
+                        attempt=request.attempt,
+                        status="reserved",
+                        evidence_ref=None,
+                        reason=(
+                            "reserved external effect requires authoritative recovery evidence"
+                        ),
+                        provider_started=None,
+                        replayed=True,
+                    )
+                )
+            else:
+                reports.append(_effect_report(request, record.outcome, replayed=True))
+        return tuple(reports)
+
     async def run(
         self,
         job: UUID | AgentFactoryJobV3,
@@ -306,15 +412,24 @@ class FactoryLiveRunner:
             self._validate_request(authoritative, projection, request)
             claim = self._effect_ledger.claim(request)
             if claim.record.outcome is not None:
+                prior_outcome = claim.record.outcome
                 effect_reports.append(
-                    _effect_report(request, claim.record.outcome, replayed=True)
+                    _effect_report(request, prior_outcome, replayed=True)
                 )
-                if claim.record.outcome.status == "behavioral_failure":
+                if prior_outcome.status == "behavioral_failure":
                     return self._behavioral_report(
                         authoritative,
                         mode,
                         projection,
                         effect_reports,
+                    )
+                if prior_outcome.status in _NON_DISPATCHED_STATUSES:
+                    return self._blocked_report(
+                        authoritative,
+                        mode,
+                        projection,
+                        effect_reports,
+                        prior_outcome.reason,
                     )
                 continue
             try:
@@ -349,6 +464,14 @@ class FactoryLiveRunner:
                     mode,
                     projection,
                     effect_reports,
+                )
+            if outcome.status in _NON_DISPATCHED_STATUSES:
+                return self._blocked_report(
+                    authoritative,
+                    mode,
+                    projection,
+                    effect_reports,
+                    outcome.reason,
                 )
         decision = self._release_decision(authoritative, projection.attempt)
         return FactoryLiveRunReport(
@@ -497,6 +620,27 @@ class FactoryLiveRunner:
             reasons=(reason,),
         )
 
+    @staticmethod
+    def _blocked_report(
+        job: AgentFactoryJobV3,
+        mode: Literal["demo", "release"],
+        projection: FactoryProjection,
+        effects: list[FactoryLiveEffectReport],
+        reason: str | None,
+    ) -> FactoryLiveRunReport:
+        if reason is None:
+            raise ValueError("non-dispatched factory live block lacks its exact reason")
+        return FactoryLiveRunReport(
+            job_id=job.job_id,
+            correlation_id=job.correlation_id,
+            mode=mode,
+            status="blocked",
+            attempt=projection.attempt,
+            next_attempt=projection.attempt,
+            effects=tuple(effects),
+            reasons=(reason,),
+        )
+
 
 def _require_outcome_binding(
     request: FactoryLiveEffectRequestV1,
@@ -524,5 +668,7 @@ def _effect_report(
         attempt=request.attempt,
         status=outcome.status,
         evidence_ref=outcome.evidence_ref,
+        reason=outcome.reason,
+        provider_started=outcome.status not in _NON_DISPATCHED_STATUSES,
         replayed=replayed,
     )
