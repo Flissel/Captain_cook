@@ -27,7 +27,8 @@ _PRIVATE_KEY_PATTERN = re.compile(
 _PRIVATE_VALUE_PATTERN = re.compile(
     r"(?i)(?:\bsk-(?:proj-)?[a-z0-9_-]{8,}|\bbearer\s+\S+|"
     r"\b(?:api[_ -]?key|authorization|credential|password|secret|token)\b\s*[:=]|"
-    r"\bfile\s*:|(?<![A-Za-z0-9:/])[A-Za-z]:[\\/]|\\\\|/(?:home|etc|opt|workspace)/)"
+    r"\bfile\s*:|(?:^|[^A-Za-z0-9])[A-Za-z]:[\\/]|\\\\|"
+    r"/(?:Users|home|tmp|var|etc|opt|workspace)(?:/|$))"
 )
 
 
@@ -85,12 +86,18 @@ class FactorySkillInvocationV1(_FrozenContract):
     input_sha256: str = Field(pattern=SHA256_PATTERN)
     lease: FactoryLease
     idempotency_key: str = Field(pattern=SHA256_PATTERN)
+    acceptance_assertion_ids: tuple[str, ...] = Field(min_length=1)
 
     @model_validator(mode="before")
     @classmethod
     def reject_private_content(cls, value: object) -> object:
         _reject_private_content(value, "skill invocation")
         return value
+
+    @field_validator("acceptance_assertion_ids")
+    @classmethod
+    def require_unique_captain_assertions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _require_unique_ids(value, "Captain assertion IDs")
 
     @model_validator(mode="after")
     def require_exact_bindings(self) -> "FactorySkillInvocationV1":
@@ -169,6 +176,10 @@ class _WorkflowArtifactBase(_FrozenContract):
             raise ValueError("workflow artifact invocation identity does not match invocation")
         if self._required_step is not None and invocation.step is not self._required_step:
             raise ValueError("workflow artifact invocation step does not match result type")
+        if self.acceptance_assertion_ids != invocation.acceptance_assertion_ids:
+            raise ValueError("workflow artifact invocation assertion binding does not match")
+        if not invocation.lease.issued_at <= self.occurred_at < invocation.lease.expires_at:
+            raise ValueError("workflow artifact must occur under an active lease")
         return self
 
 
@@ -208,7 +219,7 @@ class CodebaseInventoryV1(_WorkflowArtifactBase):
 
 
 class CodexBuildBriefV1(_WorkflowArtifactBase):
-    schema_name: Literal["hermes.factory-codex-build-brief.v1"] = Field(
+    schema_name: Literal["hermes.factory-codex-build-assignment.v1"] = Field(
         alias="schema", serialization_alias="schema"
     )
     build_assignment: FactoryBuildAssignmentV1
@@ -252,6 +263,21 @@ class CodexBuildBriefV1(_WorkflowArtifactBase):
             raise ValueError("build assignment does not match brief invocation")
         if set(assignment.public_assertion_ids) != set(self.acceptance_assertion_ids):
             raise ValueError("build assignment must use exactly the Captain assertion IDs")
+        released_skill = self.invocation.released_skill
+        assigned_skill = assignment.released_skill
+        if (
+            assigned_skill.skill_id != released_skill.skill_id
+            or assigned_skill.version != released_skill.version
+            or assigned_skill.content_sha256 != released_skill.content_sha256
+            or assigned_skill.content_ref.uri != released_skill.content_ref.uri
+            or assigned_skill.content_ref.sha256 != released_skill.content_ref.sha256
+            or assigned_skill.content_ref.media_type != released_skill.content_ref.media_type
+        ):
+            raise ValueError("build assignment released skill does not match invocation")
+        if assignment.idempotency_key != self.invocation.idempotency_key:
+            raise ValueError("build assignment idempotency key does not match invocation")
+        if assignment.workspace_ref != self.invocation.lease.workspace_ref:
+            raise ValueError("build assignment workspace does not match invocation lease")
         return self
 
 
@@ -414,10 +440,19 @@ class FactoryFeedbackV1(_WorkflowArtifactBase):
         for gap in self.tool_gaps:
             if set(gap.acceptance_assertion_ids) - accepted:
                 raise ValueError("tool gap contains non-Captain assertion IDs")
+        referenced = {
+            (ref.uri, ref.sha256, ref.media_type) for ref in self.tool_gap_refs
+        }
+        embedded = {
+            (gap.evidence_ref.uri, gap.evidence_ref.sha256, gap.evidence_ref.media_type)
+            for gap in self.tool_gaps
+        }
+        if referenced != embedded:
+            raise ValueError("tool gap refs must bind exactly to embedded TODO_TOOL.v1 markers")
         if self.recommendation is FactoryFeedbackRecommendation.PROMOTE_CANDIDATE and any(
-            gap.severity == "required" and gap.status == "unresolved" for gap in self.tool_gaps
+            gap.status != "resolved" for gap in self.tool_gaps
         ):
-            raise ValueError("PROMOTE_CANDIDATE cannot include a required unresolved TODO_TOOL.v1")
+            raise ValueError("PROMOTE_CANDIDATE requires every referenced TODO_TOOL.v1 to be resolved")
         return self
 
 

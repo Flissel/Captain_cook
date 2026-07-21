@@ -11,6 +11,8 @@ from agenten.agent_factory.skill_workflow_contracts import (
     CodebaseInventoryV1,
     CodexBuildBriefV1,
     FactoryFeedbackV1,
+    FactorySkillInvocationV1,
+    FactorySkillStep,
     TeamEvaluationV1,
     TeamExecutionEvidenceV1,
 )
@@ -85,6 +87,7 @@ def invocation_payload(step: str, **overrides: object) -> dict[str, object]:
         "input_sha256": "a" * 64,
         "lease": lease_payload(role, profile),
         "idempotency_key": "b" * 64,
+        "acceptance_assertion_ids": ["schema_valid", "real_case_green"],
     }
     payload.update(overrides)
     return payload
@@ -117,12 +120,12 @@ def build_assignment_payload() -> dict[str, object]:
         "correlation_id": CORRELATION_ID,
         "subject_version": 1,
         "attempt": 1,
-        "idempotency_key": "d" * 64,
+        "idempotency_key": "b" * 64,
         "released_skill": {
-            "skill_id": "factory_build",
+            "skill_id": "captain_factory_skill",
             "version": 1,
-            "content_ref": artifact("build-skill", "d" * 64),
-            "content_sha256": "d" * 64,
+            "content_ref": artifact("released-skill"),
+            "content_sha256": "a" * 64,
         },
         "compiled_spec_ref": artifact("compiled-spec", "e" * 64),
         "dependency_graph_ref": artifact("dependency-graph", "f" * 64),
@@ -163,7 +166,7 @@ def inventory_payload(**overrides: object) -> dict[str, object]:
 def brief_payload(**overrides: object) -> dict[str, object]:
     payload = common_payload(
         "brief_codex",
-        schema="hermes.factory-codex-build-brief.v1",
+        schema="hermes.factory-codex-build-assignment.v1",
         build_assignment=build_assignment_payload(),
         prompt_ref=artifact("sealed-prompt", "d" * 64),
         context_refs=[artifact("inventory-context", "e" * 64)],
@@ -267,6 +270,23 @@ def feedback_payload(**overrides: object) -> dict[str, object]:
     return payload
 
 
+def tool_gap_payload(
+    *, severity: str = "required", status: str = "unresolved"
+) -> dict[str, object]:
+    return {
+        "schema": "TODO_TOOL.v1",
+        "gap_id": "missing-tool",
+        "severity": severity,
+        "input_contract_ref": artifact("tool-input", "d" * 64),
+        "output_contract_ref": artifact("tool-output", "e" * 64),
+        "least_privilege_capability": "catalog.read",
+        "implementation_options": [],
+        "acceptance_assertion_ids": ["schema_valid"],
+        "evidence_ref": artifact("tool-gap", "f" * 64),
+        "status": status,
+    }
+
+
 @pytest.mark.parametrize(
     ("model", "payload"),
     [
@@ -296,6 +316,165 @@ def test_workflow_artifacts_reject_private_fields(field: str) -> None:
         CodebaseInventoryV1.model_validate(inventory_payload() | {field: "secret"})
 
 
+@pytest.mark.parametrize(
+    ("model", "payload"),
+    [
+        (CodebaseInventoryV1, inventory_payload()),
+        (CodexBuildBriefV1, brief_payload()),
+        (TeamExecutionEvidenceV1, execution_payload()),
+        (TeamEvaluationV1, evaluation_payload()),
+        (CandidateRevisionV1, revision_payload()),
+        (FactoryFeedbackV1, feedback_payload()),
+    ],
+)
+def test_workflow_artifact_schemas_are_exact(
+    model: type[object], payload: dict[str, object]
+) -> None:
+    payload["schema"] = "hermes.factory-wrong.v2"
+
+    with pytest.raises(ValidationError, match="schema"):
+        model.model_validate(payload)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("step", "role", "profile"),
+    [
+        ("discover", "agent_architect", "factory-architect"),
+        ("brief_codex", "tool_integrator", "factory-tool-integrator"),
+        ("execute_team", "real_case_tester", "factory-real-case-tester"),
+        ("evaluate_team", "quality_warden", "factory-quality-warden"),
+        ("improve_team", "tool_integrator", "factory-tool-integrator"),
+        ("report_captain", "quality_warden", "factory-quality-warden"),
+    ],
+)
+def test_every_step_accepts_only_its_captain_role(
+    step: str, role: str, profile: str
+) -> None:
+    invocation = FactorySkillInvocationV1.model_validate(invocation_payload(step))
+
+    assert invocation.step is FactorySkillStep(step)
+    assert invocation.lease.role.value == role
+    assert invocation.lease.capability_profile.value == profile
+
+
+@pytest.mark.parametrize(
+    ("step", "wrong_role", "wrong_profile"),
+    [
+        ("discover", "tool_integrator", "factory-tool-integrator"),
+        ("brief_codex", "agent_architect", "factory-architect"),
+        ("execute_team", "quality_warden", "factory-quality-warden"),
+        ("evaluate_team", "real_case_tester", "factory-real-case-tester"),
+        ("improve_team", "agent_architect", "factory-architect"),
+        ("report_captain", "tool_integrator", "factory-tool-integrator"),
+    ],
+)
+def test_every_step_rejects_a_different_valid_role(
+    step: str, wrong_role: str, wrong_profile: str
+) -> None:
+    payload = invocation_payload(step)
+    payload["lease"] = lease_payload(wrong_role, wrong_profile)
+
+    with pytest.raises(ValidationError, match="role"):
+        FactorySkillInvocationV1.model_validate(payload)
+
+
+def test_invocation_rejects_changed_input_digest_and_duplicate_captain_assertions() -> None:
+    with pytest.raises(ValidationError, match="input digest"):
+        FactorySkillInvocationV1.model_validate(
+            invocation_payload("discover", input_sha256="f" * 64)
+        )
+    with pytest.raises(ValidationError, match="Captain assertion"):
+        FactorySkillInvocationV1.model_validate(
+            invocation_payload(
+                "discover",
+                acceptance_assertion_ids=["schema_valid", "schema_valid"],
+            )
+        )
+
+
+def test_result_assertions_are_bound_to_the_captain_invocation() -> None:
+    with pytest.raises(ValidationError, match="invocation.*assertion"):
+        CodebaseInventoryV1.model_validate(
+            inventory_payload(acceptance_assertion_ids=["schema_valid"])
+        )
+
+
+@pytest.mark.parametrize(
+    "occurred_at",
+    [NOW - timedelta(microseconds=1), NOW + timedelta(minutes=10)],
+)
+def test_step_result_requires_an_active_lease(occurred_at: datetime) -> None:
+    with pytest.raises(ValidationError, match="active lease"):
+        CodebaseInventoryV1.model_validate(inventory_payload(occurred_at=occurred_at))
+
+
+@pytest.mark.parametrize(
+    ("binding", "message"),
+    [
+        ("released_skill_id", "released skill"),
+        ("released_skill_digest", "released skill"),
+        ("idempotency_key", "idempotency"),
+        ("workspace_ref", "workspace"),
+    ],
+)
+def test_codex_assignment_is_bound_to_the_invocation(
+    binding: str, message: str
+) -> None:
+    assignment = build_assignment_payload()
+    if binding == "released_skill_id":
+        assignment["released_skill"] = {
+            "skill_id": "different-skill",
+            "version": 1,
+            "content_ref": artifact("released-skill"),
+            "content_sha256": "a" * 64,
+        }
+    elif binding == "released_skill_digest":
+        assignment["released_skill"] = {
+            "skill_id": "captain_factory_skill",
+            "version": 1,
+            "content_ref": artifact("released-skill", "9" * 64),
+            "content_sha256": "9" * 64,
+        }
+    elif binding == "idempotency_key":
+        assignment["idempotency_key"] = "9" * 64
+    else:
+        assignment["workspace_ref"] = "workspace://factory/different"
+
+    with pytest.raises(ValidationError, match=message):
+        CodexBuildBriefV1.model_validate(brief_payload(build_assignment=assignment))
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        r"C:\Users\User\secret.txt",
+        "C:/Temp/secret.txt",
+        "/Users/tester/secret.txt",
+        "/tmp/secret.txt",
+        "/var/log/secret.txt",
+    ],
+)
+def test_workflow_artifacts_reject_absolute_user_and_system_paths(path: str) -> None:
+    source = artifact("unsafe-source", "d" * 64)
+    source["uri"] = f"artifact://workflow/{path}"
+
+    with pytest.raises(ValidationError, match="private|local.path"):
+        CodebaseInventoryV1.model_validate(inventory_payload(source_refs=[source]))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source_refs", [artifact("same"), artifact("same")]),
+        ("reusable_component_ids", ["same", "same"]),
+        ("evidence_refs", [artifact("same"), artifact("same")]),
+    ],
+)
+def test_inventory_rejects_duplicate_ids_and_refs(field: str, value: object) -> None:
+    with pytest.raises(ValidationError, match="unique|duplicates"):
+        CodebaseInventoryV1.model_validate(inventory_payload(**{field: value}))
+
+
 def test_step_result_must_match_invocation_identity() -> None:
     with pytest.raises(ValidationError, match="invocation"):
         TeamExecutionEvidenceV1.model_validate(
@@ -312,18 +491,38 @@ def test_execution_success_requires_a_passing_runtime_outcome() -> None:
 
 
 def test_feedback_cannot_promote_with_a_required_unresolved_tool_gap() -> None:
-    gap = {
-        "schema": "TODO_TOOL.v1",
-        "gap_id": "missing-tool",
-        "severity": "required",
-        "input_contract_ref": artifact("tool-input", "d" * 64),
-        "output_contract_ref": artifact("tool-output", "e" * 64),
-        "least_privilege_capability": "catalog.read",
-        "implementation_options": [],
-        "acceptance_assertion_ids": ["schema_valid"],
-        "evidence_ref": artifact("tool-gap", "f" * 64),
-        "status": "unresolved",
-    }
+    gap = tool_gap_payload()
 
     with pytest.raises(ValidationError, match="PROMOTE_CANDIDATE"):
-        FactoryFeedbackV1.model_validate(feedback_payload(tool_gaps=[gap]))
+        FactoryFeedbackV1.model_validate(
+            feedback_payload(tool_gaps=[gap], tool_gap_refs=[gap["evidence_ref"]])
+        )
+
+
+def test_feedback_cannot_promote_a_bare_tool_gap_reference() -> None:
+    with pytest.raises(ValidationError, match="tool gap refs"):
+        FactoryFeedbackV1.model_validate(
+            feedback_payload(tool_gap_refs=[artifact("tool-gap", "f" * 64)])
+        )
+
+
+def test_feedback_promotion_requires_referenced_tool_gaps_to_be_resolved() -> None:
+    unresolved_optional = tool_gap_payload(severity="optional")
+    with pytest.raises(ValidationError, match="PROMOTE_CANDIDATE"):
+        FactoryFeedbackV1.model_validate(
+            feedback_payload(
+                tool_gaps=[unresolved_optional],
+                tool_gap_refs=[unresolved_optional["evidence_ref"]],
+            )
+        )
+
+    resolved_optional = tool_gap_payload(severity="optional", status="resolved")
+    assert (
+        FactoryFeedbackV1.model_validate(
+            feedback_payload(
+                tool_gaps=[resolved_optional],
+                tool_gap_refs=[resolved_optional["evidence_ref"]],
+            )
+        ).recommendation.value
+        == "PROMOTE_CANDIDATE"
+    )
