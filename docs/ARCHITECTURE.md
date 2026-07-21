@@ -2,6 +2,123 @@
 
 ## Agent-Factory process boundaries
 
+### Capability package release chain
+
+`agenten.agent_factory.capability_factory_entrypoint` is the Package-C
+composition root for one immutable `TO_BE_BUILT.md` correlation. It uses the
+real input parser/compiler, `FactoryCoordinator`, package validator, Gateway
+repository/catalog, terminal policy, execution contracts, and Minibook
+projector. External creation, provider execution, Gateway HTTP, Runtime HTTP,
+and Minibook HTTP effects remain injected ports. The deterministic integration
+test scripts only those external ports; it does not claim provider execution.
+
+`ready_to_use` has one write path: after the promotion block, the composition
+derives the candidate decision in memory and calls
+`GatewayStore.publish_capability_release` once. That transaction owns the
+terminal decision, published package, and full frozen
+`CapabilityCatalogRecord`; the composition must read all three back before
+execution. It never writes a READY terminal through the non-release terminal
+API. A compatible catalog hit reuses that complete record, skips Forge,
+release E2E, sandbox validation, and republication, and runs the new
+correlation through command admission, capability grant, fenced execution
+claim, provider result, and `CapabilityExecutionRequest` recording.
+
+The entrypoint binds correlation ID, invocation Factory job ID, subject version,
+exact input SHA-256, `occurred_at`, and immutable deadline in an append-only
+checkpoint before the first external effect. It registers that invocation
+idempotently before catalog resolution. Replays use the same
+creation/run/command IDs. Changed input bytes or timing fail closed instead of
+creating a replacement job. Captain's Evidence Issuer is the
+only port permitted to return `captain.capability-release-evidence.v1`; the
+composition rechecks every job, creation, candidate, run-order, producer, and
+digest binding before policy evaluation. Recovery is distinct from the three
+normal successes and never counts toward that streak.
+Restart tests reconstruct the file-checkpoint, repository/catalog, entrypoint,
+and runtime composition adapters while retaining the scripted authoritative
+service state. Crashes after creation submission, release evidence, committed
+atomic publication, runtime claim, durable provider effect, runtime result,
+and committed capability execution expose exactly one provider effect after
+recovery. Provider adapters must declare durable idempotency and persist a
+`ProviderEffectReceipt` keyed by the stable command/effect IDs before returning
+control. Captain looks that receipt up before any re-effect and verifies the
+provider operation ID, request/result digests, result status, explicit
+idempotency guarantee, and the effect-origin claim ID/fence/digest. An
+unexpired claim returns typed `retry_pending`; after
+expiry the Gateway issues a higher fence without calling the provider again.
+The original `AgentRuntimeResult` is then stored byte-stably with its original
+event ID, timestamp, evidence, and business output. A separate Captain-owned
+`RuntimeResultRecoveryObservation` is recorded inside the recovery lease. It
+binds the original result and durable provider receipt by digest/effect ID,
+pins the receipt's historical origin claim independently of any intervening
+expired recovery claims, links the active recovery fence, and has its own event
+ID. The Gateway locks and validates both append-only claim blocks before atomically
+storing the result, observation, and completed recovery claim. No claim
+credential or provider secret enters a checkpoint, receipt, or summary.
+Deadline checks run
+before each later mutation and before requesting lifecycle evidence, so an
+expired post-publication run cannot begin runtime work and an expired
+post-execution run cannot mutate Minibook.
+
+Forge archives are independently validated in a disposable Captain-owned
+Docker sandbox. The production runner accepts only a digest-pinned
+`captain-*` image already present locally (`--pull never`), then inspects the
+created container before execution. It requires a non-root user, no network,
+a read-only root filesystem and exact read-only workspace bind, bounded tmpfs,
+memory/PID limits, all capabilities dropped, `no-new-privileges`, and an init
+process for exact-tree cancellation. Attestations are derived from `docker
+inspect`; an unavailable image or any inspection mismatch is an isolation
+failure, never synthetic evidence. The package tree is hashed again before
+container creation, and Python bytecode/cache output is directed away from the
+host workspace.
+The isolated interpreter explicitly inserts `/workspace` into `sys.path`
+before module discovery, and Docker inspection must report the exact
+`rw,noexec,nosuid,size=67108864` tmpfs. The Docker CLI adapter applies a
+bounded timeout to every command and verifies the exit status of process-tree
+termination; the package validator additionally owns its outer timeout and
+exact-identity cancellation contract. An actual Docker import/pytest smoke
+test is live-only, has its own outer bound, and remains blocked when
+the configured digest is not already local.
+
+CLI configuration resolves input, artifact, and checkpoint paths under the
+workspace; accepts credential-free HTTP service URLs; and reads bearer/API
+credentials only from environment aliases. Its evidence manifest contains
+only typed IDs and digests, is canonical JSON named by its own SHA-256, and is
+written under the gitignored `artifacts/capability-factory/` directory.
+The module is executable with `python -m`. Preflight first parses and compiles
+the selected input and verifies a v2 static adapter manifest without importing
+or instantiating its module. The manifest names one Python module path under
+the workspace root, its SHA-256, and one factory symbol; preflight reads and
+hashes the source bytes and proves the top-level symbol through Python AST.
+Only the full run loads that attested local module and factory, writes the evidence manifest, and
+prints redacted targets, timings, IDs, and digests. Static manifest, path,
+source-digest, syntax, and factory-symbol failures occur before database
+attestation or service startup. Runtime dependency resolution, top-level module
+execution, and factory instantiation occur only in the full invocation after
+database attestation and service health checks; they fail closed before any
+factory effect, but are not part of the side-effect-free preflight claim.
+
+The provider-backed gate is
+`scripts/run-capability-factory-live.ps1`. It validates configuration first,
+requires loopback MariaDB database exactly `captain_test`, and only then may
+start a dedicated Gateway process bound to that DSN. Runtime and Minibook must
+also pass health checks before the full, mutating invocation. It never starts
+or adopts
+an external workflow service. It must observe one recovery, three distinct
+normal successes, Gateway terminal/catalog/execution records, an ordered feed,
+and a Minibook rebuild before a `ready_to_use` claim. The current production
+gate remains blocked: the Runtime has no production Hermes/Codex/artifact port
+bundle, no production capability-factory creation/Evidence-Issuer HTTP adapter
+bundle is installed, and no reviewed digest-pinned capability-sandbox image is
+configured. Deterministic success does not satisfy those live prerequisites.
+Separately, an explicitly selected `live`/`db_mutating` MariaDB acceptance
+proof accepts only the process-exported `TEST_MARIADB_DSN`; ordinary non-live
+tests neither discover `.env` values nor clear a database. The live proof
+executes production
+`GatewayStore` methods against `captain_test`: an injected mid-publication
+crash rolls the transaction back, a reconstructed store replays the single
+publication, and production command/grant/claim/result/execution writes replay
+from their authoritative readbacks.
+
 ## Hermes skill-evaluation release path
 
 Captain/MariaDB is the lifecycle authority for Hermes skill evaluation.  Hermes

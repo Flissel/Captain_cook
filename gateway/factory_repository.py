@@ -39,6 +39,7 @@ from agenten.agent_factory.factory_live_runner import (
 )
 from agenten.agent_factory.leases import FactoryLeaseDenied, FactoryLeasePort, validate_factory_lease
 from agenten.agent_factory.release_gate import FactoryReleaseDecision
+from agenten.agent_factory.outcome_contracts import FactoryTerminalDecision
 from agenten.agent_factory.service import (
     FactoryRepository,
     FactoryRepositoryError,
@@ -88,6 +89,21 @@ class GatewayFactoryRepository(FactoryRepository):
 
     def release_decision_for_job(self, job_id: UUID) -> FactoryReleaseDecision | None:
         return self._translate(lambda: self._store.factory_release_decision(job_id))
+
+    def append_terminal_decision(self, decision: FactoryTerminalDecision) -> bool:
+        receipt = self._translate(
+            lambda: self._store.record_factory_terminal_decision(decision)
+        )
+        return not receipt.replayed
+
+    def terminal_decision_for_job(
+        self,
+        job_id: UUID,
+    ) -> FactoryTerminalDecision | None:
+        lookup = getattr(self._store, "factory_terminal_decision", None)
+        if lookup is None:
+            return None
+        return self._translate(lambda: lookup(job_id))
 
     def workflow_artifacts(self, job_id: UUID) -> tuple[FactoryWorkflowArtifact, ...]:
         return self._translate(lambda: self._store.factory_workflow_artifacts(job_id))

@@ -1,0 +1,31 @@
+{
+  "schema": "forge.capability-package-candidate.v1",
+  "capability_id": "support_triage",
+  "capability_version": 1,
+  "factory_job_id": "00000000-0000-0000-0000-000000000011",
+  "creation_job_id": "00000000-0000-0000-0000-000000000021",
+  "correlation_id": "00000000-0000-0000-0000-000000000012",
+  "subject_version": 1,
+  "attempt": 1,
+  "source_ref": {
+    "uri": "artifact://capability-source/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "media_type": "application/zip"
+  },
+  "team_manifest_ref": {
+    "uri": "artifact://capability-package/1111111111111111111111111111111111111111111111111111111111111111",
+    "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "media_type": "application/json"
+  },
+  "artifacts": [
+    {"path": "team-manifest.json", "kind": "team_manifest", "reference": {"uri": "artifact://capability-package/1111111111111111111111111111111111111111111111111111111111111111", "sha256": "1111111111111111111111111111111111111111111111111111111111111111", "media_type": "application/json"}},
+    {"path": "autogen/team.py", "kind": "autogen_source", "reference": {"uri": "artifact://capability-package/2222222222222222222222222222222222222222222222222222222222222222", "sha256": "2222222222222222222222222222222222222222222222222222222222222222", "media_type": "text/x-python"}},
+    {"path": "skills/support_triage/SKILL.md", "kind": "skill", "reference": {"uri": "artifact://capability-package/3333333333333333333333333333333333333333333333333333333333333333", "sha256": "3333333333333333333333333333333333333333333333333333333333333333", "media_type": "text/markdown"}},
+    {"path": "tests/test_support_triage.py", "kind": "test", "reference": {"uri": "artifact://capability-package/4444444444444444444444444444444444444444444444444444444444444444", "sha256": "4444444444444444444444444444444444444444444444444444444444444444", "media_type": "text/x-python"}},
+    {"path": "evidence/summary.json", "kind": "evidence", "reference": {"uri": "artifact://capability-package/5555555555555555555555555555555555555555555555555555555555555555", "sha256": "5555555555555555555555555555555555555555555555555555555555555555", "media_type": "application/json"}},
+    {"path": "RUNBOOK.md", "kind": "runbook", "reference": {"uri": "artifact://capability-package/6666666666666666666666666666666666666666666666666666666666666666", "sha256": "6666666666666666666666666666666666666666666666666666666666666666", "media_type": "text/markdown"}}
+  ],
+  "skill_usage_receipt_ref": {"uri": "artifact://skill-usage/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "media_type": "application/json"},
+  "tool_gaps": [],
+  "runbook_ref": {"uri": "artifact://capability-package/6666666666666666666666666666666666666666666666666666666666666666", "sha256": "6666666666666666666666666666666666666666666666666666666666666666", "media_type": "text/markdown"}
+}

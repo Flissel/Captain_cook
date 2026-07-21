@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import hashlib
+import json
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, Sequence, TypeAlias
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from pydantic import (
     BaseModel,
@@ -22,13 +24,30 @@ from agenten.agent_runtime.contracts import (
     ArtifactRef,
     CapabilityGrant,
     CapabilityGrantRevocation,
+    IntegrationIntent,
+    ProviderEffectReceipt,
+    SHA256_PATTERN,
 )
-from agenten.agent_factory.contracts import FactoryEvidenceBlock, FactoryJob, FactoryLease
+from agenten.agent_factory.contracts import (
+    FactoryEvidenceBlock,
+    FactoryJob,
+    FactoryLease,
+    PromotedCapability,
+)
 from agenten.agent_factory.execution_budget import (
     FactoryBudgetReservationV1,
     FactoryUsageReceiptV1,
 )
 from agenten.agent_factory.release_gate import E2ERunEvidence, FactoryReleaseDecision
+from agenten.agent_factory.outcome_contracts import (
+    CapabilityPackageManifestV1,
+    CapabilityReleaseEvidenceV1,
+    ExecutionOutcomeV1,
+    FactoryTerminalDecision,
+    FactoryTerminalState,
+    canonical_capability_release_evidence_bytes,
+)
+from agenten.validation.contracts import WorkBatch
 from agenten.agent_factory.skill_evaluation import (
     HermesSkillEvaluationEvidence,
     ReleasedHermesSkill,
@@ -69,12 +88,15 @@ DeliveryEventType: TypeAlias = Literal[
     "hermes_skill_evaluation_submitted",
     "hermes_skill_published",
     "hermes_ready_to_use_validated",
+    "factory_terminal_decided",
+    "capability_package_published",
+    "capability_execution_recorded",
 ]
 ReleaseStatus: TypeAlias = Literal["blocked", "ready"]
 
 
 class _FrozenContract(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
 
 
 class RuntimeWriteReceipt(_FrozenContract):
@@ -99,6 +121,442 @@ class FactorySkillWriteReceipt(_FrozenContract):
     record_id: str = Field(min_length=1)
     replayed: bool
 
+
+class CapabilityWriteReceipt(_FrozenContract):
+    record_id: str = Field(min_length=1)
+    replayed: bool
+
+
+def canonical_contract_sha256(model: BaseModel) -> str:
+    """Hash the one stable Gateway JSON representation of a typed contract."""
+
+    content = json.dumps(
+        model.model_dump(mode="json", by_alias=True),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(content).hexdigest()
+
+
+class RuntimeResultRecoveryObservation(_FrozenContract):
+    """Captain's distinct observation that admits one immutable provider result."""
+
+    schema_name: Literal["captain.runtime-result-recovery-observation.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    event_id: UUID
+    observed_at: datetime
+    command_id: UUID
+    original_result_id: UUID
+    original_result_digest: str = Field(pattern=SHA256_PATTERN)
+    original_claim_id: UUID
+    original_claim_digest: str = Field(pattern=SHA256_PATTERN)
+    provider_effect_id: UUID
+    provider_receipt_digest: str = Field(pattern=SHA256_PATTERN)
+    original_claim_fence: int = Field(ge=1, strict=True)
+    recovery_claim_fence: int = Field(ge=1, strict=True)
+    correlation_id: UUID
+    causation_id: UUID
+
+    @field_validator("observed_at")
+    @classmethod
+    def require_utc_observation(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("recovery observation timestamp must be UTC")
+        return value.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def require_causal_fence_progression(self) -> "RuntimeResultRecoveryObservation":
+        if self.causation_id != self.original_result_id:
+            raise ValueError("recovery observation causation must be the original result")
+        if self.event_id == self.original_result_id:
+            raise ValueError("recovery observation must have a distinct event id")
+        if self.recovery_claim_fence <= self.original_claim_fence:
+            raise ValueError("recovery claim fence must advance the original claim fence")
+        expected_event_id = uuid5(
+            self.original_result_id,
+            (
+                "runtime-result-recovery:"
+                f"{self.original_claim_fence}:{self.recovery_claim_fence}"
+            ),
+        )
+        if self.event_id != expected_event_id:
+            raise ValueError("recovery observation event id is not deterministic")
+        return self
+
+
+class RuntimeResultRecoveryRequest(_FrozenContract):
+    """Original provider evidence plus Captain's separate recovery observation."""
+
+    schema_name: Literal["captain.runtime-result-recovery-request.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    result: AgentRuntimeResult
+    provider_receipt: ProviderEffectReceipt
+    observation: RuntimeResultRecoveryObservation
+
+    @model_validator(mode="after")
+    def require_exact_evidence_bindings(self) -> "RuntimeResultRecoveryRequest":
+        result = self.result
+        receipt = self.provider_receipt
+        observation = self.observation
+        result_digest = canonical_contract_sha256(result)
+        receipt_digest = canonical_contract_sha256(receipt)
+        if (
+            observation.command_id != result.command_id
+            or observation.original_result_id != result.event_id
+            or observation.correlation_id != result.correlation_id
+        ):
+            raise ValueError("recovery observation does not match the original result")
+        if observation.original_result_digest != result_digest:
+            raise ValueError("recovery observation original result digest does not match")
+        if (
+            not receipt.idempotency_guaranteed
+            or receipt.command_id != result.command_id
+            or receipt.result_digest != result_digest
+            or receipt.status != result.status.value
+        ):
+            raise ValueError("provider receipt does not bind the original result")
+        if observation.provider_effect_id != receipt.effect_id:
+            raise ValueError("recovery observation provider effect does not match")
+        if (
+            observation.original_claim_id != receipt.origin_claim_id
+            or observation.original_claim_fence
+            != receipt.origin_claim_fencing_token
+            or observation.original_claim_digest != receipt.origin_claim_digest
+        ):
+            raise ValueError("recovery observation does not match the effect origin claim")
+        if observation.provider_receipt_digest != receipt_digest:
+            raise ValueError("recovery observation provider receipt digest does not match")
+        return self
+
+
+class CapabilityReleaseRequest(_FrozenContract):
+    """Captain's complete, atomic ready-to-use release write."""
+
+    schema_name: Literal["captain.capability-release-request.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    event_id: UUID
+    causation_id: UUID | None = None
+    occurred_at: datetime
+    producer: Literal["captain"]
+    decision: FactoryTerminalDecision
+    decision_ref: ArtifactRef
+    package: CapabilityPackageManifestV1
+    package_ref: ArtifactRef
+    release_evidence: tuple[CapabilityReleaseEvidenceV1, ...] = Field(min_length=4)
+    promoted_capability: PromotedCapability
+    schema_major: Literal[1] = 1
+    team_version: int = Field(ge=1, strict=True)
+    accepted_assertion_ids: tuple[str, ...] = Field(min_length=1)
+    integration_intents: tuple[IntegrationIntent, ...] = ()
+    tool_contracts: tuple[str, ...] = ()
+
+    @field_validator("occurred_at")
+    @classmethod
+    def require_utc_timestamp(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("occurred_at must be UTC")
+        return value.astimezone(timezone.utc)
+
+    @field_validator("accepted_assertion_ids", "tool_contracts")
+    @classmethod
+    def require_unique_values(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)) or any(not item.strip() for item in value):
+            raise ValueError("release compatibility values must be unique and nonblank")
+        return value
+
+    @field_validator("integration_intents")
+    @classmethod
+    def require_unique_integration_intents(
+        cls,
+        value: tuple[IntegrationIntent, ...],
+    ) -> tuple[IntegrationIntent, ...]:
+        if IntegrationIntent.NONE in value:
+            raise ValueError("integration_intents omits the none sentinel")
+        if len(value) != len(set(value)):
+            raise ValueError("integration_intents must not contain duplicates")
+        return value
+
+    @model_validator(mode="after")
+    def require_atomic_release_bindings(self) -> "CapabilityReleaseRequest":
+        decision = self.decision
+        package = self.package
+        promoted = self.promoted_capability
+        if decision.state is not FactoryTerminalState.READY_TO_USE:
+            raise ValueError("capability release requires a ready_to_use terminal decision")
+        if (
+            decision.job_id != package.factory_job_id
+            or decision.correlation_id != package.correlation_id
+            or decision.subject_version != package.subject_version
+        ):
+            raise ValueError("terminal decision does not match the capability package")
+        if (
+            promoted.capability_id != package.capability_id
+            or promoted.version != package.capability_version
+            or promoted.status != "ready_to_use"
+        ):
+            raise ValueError("promoted capability does not match the package identity")
+        package_references = {artifact.reference for artifact in package.artifacts}
+        if promoted.blueprint_ref not in package_references:
+            raise ValueError("promoted blueprint_ref is not in the validated package")
+        if promoted.code_ref not in package_references:
+            raise ValueError("promoted code_ref is not in the validated package")
+        if any(reference not in package_references for reference in promoted.tool_refs):
+            raise ValueError("promoted tool_refs are not in the validated package")
+
+        expected_assertions = tuple(
+            outcome.assertion_id for outcome in package.assertion_outcomes
+        )
+        if self.accepted_assertion_ids != expected_assertions or any(
+            outcome.status != "passed" for outcome in package.assertion_outcomes
+        ):
+            raise ValueError("accepted assertion IDs do not match passed package assertions")
+        expected_intents = tuple(
+            sorted(
+                {
+                    outcome.integration_intent
+                    for outcome in package.assertion_outcomes
+                    if outcome.integration_intent is not IntegrationIntent.NONE
+                },
+                key=lambda item: item.value,
+            )
+        )
+        if self.integration_intents != expected_intents:
+            raise ValueError("integration intents do not exactly match package assertions")
+        if any(
+            gap.severity == "required" and gap.status == "unresolved"
+            for gap in package.tool_gaps
+        ):
+            raise ValueError("ready capability cannot contain unresolved required tool gaps")
+
+        if (
+            self.decision_ref.media_type != "application/json"
+            or self.decision_ref.sha256 != canonical_contract_sha256(decision)
+        ):
+            raise ValueError("decision_ref digest does not match the terminal decision")
+        if (
+            self.package_ref.media_type != "application/json"
+            or self.package_ref.sha256 != canonical_contract_sha256(package)
+        ):
+            raise ValueError("package_ref digest does not match the capability package")
+        if len(self.release_evidence) != len(package.release_evidence_refs):
+            raise ValueError("release evidence does not match package references")
+        for record, reference in zip(
+            self.release_evidence,
+            package.release_evidence_refs,
+            strict=True,
+        ):
+            if (
+                reference.media_type != "application/json"
+                or reference.sha256
+                != hashlib.sha256(
+                    canonical_capability_release_evidence_bytes(record)
+                ).hexdigest()
+            ):
+                raise ValueError("release evidence digest does not match package reference")
+            if (
+                record.factory_job_id != package.factory_job_id
+                or record.creation_job_id != package.creation_job_id
+                or record.correlation_id != package.correlation_id
+                or record.subject_version != package.subject_version
+                or record.capability_id != package.capability_id
+                or record.capability_version != package.capability_version
+            ):
+                raise ValueError("release evidence contains a foreign package binding")
+        return self
+
+
+class RuntimeCapabilityAuthority(_FrozenContract):
+    """Exact catalog and ledger authority frozen for one runtime execution."""
+
+    capability_id: str = Field(min_length=1)
+    capability_version: int = Field(ge=1, strict=True)
+    team_version: int = Field(ge=1, strict=True)
+    catalog_fence: int = Field(ge=1, strict=True)
+    catalog_block_index: int = Field(ge=0, strict=True)
+    catalog_block_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    package_block_index: int = Field(ge=0, strict=True)
+    package_block_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    package_ref: ArtifactRef
+    published_at: datetime
+
+    @field_validator("published_at")
+    @classmethod
+    def require_utc_publication(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("runtime capability publication timestamp must be UTC")
+        return value.astimezone(timezone.utc)
+
+
+class RuntimeExecutionClaimRequest(_FrozenContract):
+    schema_name: Literal["captain.runtime-execution-claim-request.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    command_id: UUID
+    owner_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    lease_seconds: int = Field(ge=1, le=900, strict=True)
+    capability_id: str = Field(min_length=1)
+    capability_version: int = Field(ge=1, strict=True)
+
+
+class RuntimeBatchAdmission(_FrozenContract):
+    schema_name: Literal["captain.runtime-batch-admission.v1"] = Field(
+        default="captain.runtime-batch-admission.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    command_id: UUID
+    batch_id: str = Field(min_length=1)
+    batch_version: int = Field(ge=1, strict=True)
+    batch_block_index: int = Field(ge=0, strict=True)
+    batch_block_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    release_fence: int = Field(ge=0, strict=True)
+    admitted_at: datetime
+
+    @field_validator("admitted_at")
+    @classmethod
+    def require_utc_admission(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("runtime admission timestamp must be UTC")
+        return value.astimezone(timezone.utc)
+
+
+class RuntimeReleasedBatchSnapshot(_FrozenContract):
+    admission: RuntimeBatchAdmission
+    batch: WorkBatch
+
+    @model_validator(mode="after")
+    def require_exact_batch(self) -> "RuntimeReleasedBatchSnapshot":
+        if self.admission.batch_id != self.batch.batch_id:
+            raise ValueError("released batch does not match its runtime admission")
+        return self
+
+
+class RuntimeExecutionClaim(RuntimeCapabilityAuthority):
+    schema_name: Literal["captain.runtime-execution-claim.v1"] = Field(
+        default="captain.runtime-execution-claim.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    command_id: UUID
+    claim_id: UUID
+    owner_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    fencing_token: int = Field(ge=1, strict=True)
+    claimed_at: datetime
+    expires_at: datetime
+    status: Literal["active", "completed"]
+    completed_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def require_consistent_lease(self) -> "RuntimeExecutionClaim":
+        for value in (self.claimed_at, self.expires_at, self.completed_at):
+            if value is not None and (
+                value.tzinfo is None
+                or value.utcoffset() != timezone.utc.utcoffset(value)
+            ):
+                raise ValueError("execution claim timestamps must be UTC")
+        if self.expires_at <= self.claimed_at:
+            raise ValueError("execution claim must expire after it is claimed")
+        if self.status == "completed" and self.completed_at is None:
+            raise ValueError("completed execution claim requires completed_at")
+        if self.status == "active" and self.completed_at is not None:
+            raise ValueError("active execution claim cannot have completed_at")
+        if self.completed_at is not None and not (
+            self.claimed_at <= self.completed_at < self.expires_at
+        ):
+            raise ValueError("execution claim completion must occur inside its lease")
+        return self
+
+
+class RuntimeExecutionClaimReceipt(_FrozenContract):
+    claim: RuntimeExecutionClaim
+    replayed: bool
+    recovered: bool
+    claim_credential: str | None = Field(default=None, min_length=20)
+
+
+class CapabilityExecutionRequest(_FrozenContract):
+    schema_name: Literal["captain.capability-execution-request.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    event_id: UUID
+    causation_id: UUID
+    occurred_at: datetime
+    producer: Literal["captain"]
+    outcome: ExecutionOutcomeV1
+    outcome_ref: ArtifactRef
+    claim_owner_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    claim_fencing_token: int = Field(ge=1, strict=True)
+
+    @model_validator(mode="after")
+    def require_canonical_outcome(self) -> "CapabilityExecutionRequest":
+        if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() != timezone.utc.utcoffset(
+            self.occurred_at
+        ):
+            raise ValueError("capability execution occurred_at must be UTC")
+        if self.causation_id != self.outcome.result_id:
+            raise ValueError("capability execution causation must be the runtime result")
+        if (
+            self.outcome_ref.media_type != "application/json"
+            or self.outcome_ref.sha256 != canonical_contract_sha256(self.outcome)
+        ):
+            raise ValueError("outcome_ref digest does not match the execution outcome")
+        return self
+
+
+class CapabilityExecutionRecord(_FrozenContract):
+    schema_name: Literal["captain.capability-execution-record.v1"] = Field(
+        default="captain.capability-execution-record.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    event_id: UUID
+    command_id: UUID
+    result_id: UUID
+    correlation_id: UUID
+    capability_id: str = Field(min_length=1)
+    capability_version: int = Field(ge=1, strict=True)
+    team_version: int = Field(ge=1, strict=True)
+    outcome: ExecutionOutcomeV1
+    outcome_ref: ArtifactRef
+    claim_owner_id: str = Field(min_length=1)
+    claim_fencing_token: int = Field(ge=1, strict=True)
+    catalog_fence: int = Field(ge=1, strict=True)
+    status: Literal["succeeded", "failed", "escalated"]
+    recorded_at: datetime
+
+    @classmethod
+    def from_request(
+        cls,
+        request: CapabilityExecutionRequest,
+        *,
+        catalog_fence: int,
+    ) -> "CapabilityExecutionRecord":
+        outcome = request.outcome
+        return cls(
+            event_id=request.event_id,
+            command_id=outcome.command_id,
+            result_id=outcome.result_id,
+            correlation_id=outcome.correlation_id,
+            capability_id=outcome.capability_id,
+            capability_version=outcome.capability_version,
+            team_version=outcome.team_version,
+            outcome=outcome,
+            outcome_ref=request.outcome_ref,
+            claim_owner_id=request.claim_owner_id,
+            claim_fencing_token=request.claim_fencing_token,
+            catalog_fence=catalog_fence,
+            status=outcome.status,
+            recorded_at=request.occurred_at,
+        )
 
 class FactorySkillAssignmentV1(_FrozenContract):
     """Immutable Captain assignment of one exact released skill to one job step."""
@@ -639,6 +1097,36 @@ class HermesReadyToUseValidatedPayload(_FrozenContract):
     promotion_event_id: UUID
 
 
+class FactoryTerminalDecidedPayload(_FrozenContract):
+    event_type: Literal["factory_terminal_decided"]
+    causation_id: UUID | None
+    decision_id: UUID
+    job_id: UUID
+    state: Literal["ready_to_use", "blocked", "escalated", "rejected"]
+    decision_ref: ArtifactRef
+
+
+class CapabilityPackagePublishedPayload(_FrozenContract):
+    event_type: Literal["capability_package_published"]
+    causation_id: UUID
+    capability_id: str = Field(min_length=1)
+    capability_version: int = Field(ge=1, strict=True)
+    terminal_decision_id: UUID
+    package_ref: ArtifactRef
+    status: Literal["ready_to_use"]
+
+
+class CapabilityExecutionRecordedPayload(_FrozenContract):
+    event_type: Literal["capability_execution_recorded"]
+    causation_id: UUID
+    capability_id: str = Field(min_length=1)
+    capability_version: int = Field(ge=1, strict=True)
+    command_id: UUID
+    result_id: UUID
+    outcome_ref: ArtifactRef
+    status: Literal["succeeded", "failed", "escalated"]
+
+
 DeliveryEventPayload: TypeAlias = Annotated[
     CodexTaskPayload
     | CodexSessionPayload
@@ -661,7 +1149,10 @@ DeliveryEventPayload: TypeAlias = Annotated[
     | HermesToolGapRecordedPayload
     | HermesSkillEvaluationSubmittedPayload
     | HermesSkillPublishedPayload
-    | HermesReadyToUseValidatedPayload,
+    | HermesReadyToUseValidatedPayload
+    | FactoryTerminalDecidedPayload
+    | CapabilityPackagePublishedPayload
+    | CapabilityExecutionRecordedPayload,
     Field(discriminator="event_type"),
 ]
 
@@ -722,6 +1213,15 @@ class DeliveryEventEnvelope(_FrozenContract):
             "hermes_ready_to_use_validated": (
                 "job_id", "correlation_id", "subject_version", "request_id",
                 "lease_id", "evaluation_id", "skill_id", "skill_version",
+            ),
+            "factory_terminal_decided": (
+                "job_id", "correlation_id", "subject_version",
+            ),
+            "capability_package_published": (
+                "job_id", "correlation_id", "subject_version",
+            ),
+            "capability_execution_recorded": (
+                "job_id", "correlation_id", "subject_version",
             ),
         }
         missing = [

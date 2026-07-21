@@ -4,21 +4,31 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from asyncio import Lock
+from datetime import datetime, timezone
 from typing import Protocol
 from uuid import UUID
 
 from agenten.agent_factory.contracts import (
     AgentFactoryJobV3,
+    AgentFactoryJobV2,
     FactoryEvidenceBlock,
     FactoryJob,
+    FactoryPhase,
 )
 from agenten.agent_factory.execution_budget import (
     FactoryBudgetProjection,
     FactoryUsageReceiptV1,
 )
 from agenten.agent_factory.release_gate import (
+    CapabilityValidationFailure,
     FactoryReleaseDecision,
+    derive_terminal_decision,
     evaluate_factory_workflow_release,
+)
+from agenten.agent_factory.outcome_contracts import (
+    CapabilityPackageManifestV1,
+    CapabilityReleaseEvidenceV1,
+    FactoryTerminalDecision,
 )
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
 from agenten.agent_factory.skill_workflow_contracts import (
@@ -31,15 +41,26 @@ from agenten.agent_factory.skill_workflow_contracts import (
 )
 from agenten.agent_factory.state_machine import (
     FactoryAction,
+    FactoryActionKind,
     FactoryLifecycleError,
     FactoryProjection,
     apply_block,
     next_action,
+    with_terminal_decision,
 )
 
 
 class FactoryRepositoryError(RuntimeError):
     """The append-only factory record cannot be accepted."""
+
+
+class FactoryCoordinatorClock(Protocol):
+    def now(self) -> datetime: ...
+
+
+class _SystemFactoryCoordinatorClock:
+    def now(self) -> datetime:
+        return datetime.now(timezone.utc)
 
 
 FactoryWorkflowArtifact = (
@@ -125,6 +146,12 @@ class FactoryRepository(Protocol):
     ) -> tuple[FactoryUsageReceiptV1, ...]:
         """Return Gateway-accepted provider receipts in append order."""
 
+    def append_terminal_decision(self, decision: FactoryTerminalDecision) -> bool:
+        """Append Captain's immutable terminal decision."""
+
+    def terminal_decision_for_job(self, job_id: UUID) -> FactoryTerminalDecision | None:
+        """Return Captain's terminal decision, if present."""
+
 
 @dataclass
 class InMemoryFactoryRepository:
@@ -135,6 +162,9 @@ class InMemoryFactoryRepository:
     _event_ids: dict[UUID, FactoryEvidenceBlock] = field(default_factory=dict)
     _evaluations_by_job: dict[UUID, StoredSkillEvaluation] = field(default_factory=dict)
     _release_decisions_by_job: dict[UUID, FactoryReleaseDecision] = field(
+        default_factory=dict
+    )
+    _terminal_decisions_by_job: dict[UUID, FactoryTerminalDecision] = field(
         default_factory=dict
     )
 
@@ -197,12 +227,39 @@ class InMemoryFactoryRepository:
         self.job(job_id)
         return ()
 
+    def append_terminal_decision(self, decision: FactoryTerminalDecision) -> bool:
+        job = self.job(decision.job_id)
+        if (
+            decision.correlation_id != job.correlation_id
+            or decision.subject_version != job.subject_version
+        ):
+            raise FactoryRepositoryError("terminal decision does not match factory job")
+        existing = self._terminal_decisions_by_job.get(decision.job_id)
+        if existing is not None:
+            if existing != decision:
+                raise FactoryRepositoryError(
+                    "terminal decision already exists with different content"
+                )
+            return False
+        self._terminal_decisions_by_job[decision.job_id] = decision
+        return True
+
+    def terminal_decision_for_job(self, job_id: UUID) -> FactoryTerminalDecision | None:
+        self.job(job_id)
+        return self._terminal_decisions_by_job.get(job_id)
+
 
 class FactoryCoordinator:
     """Rebuild state before every append; no worker may bypass Captain policy."""
 
-    def __init__(self, repository: FactoryRepository):
+    def __init__(
+        self,
+        repository: FactoryRepository,
+        *,
+        clock: FactoryCoordinatorClock | None = None,
+    ):
         self._repository = repository
+        self._clock = clock or _SystemFactoryCoordinatorClock()
 
     def register(self, job: FactoryJob) -> None:
         self._repository.register(job)
@@ -214,6 +271,7 @@ class FactoryCoordinator:
                 return False
             raise FactoryRepositoryError("event_id already exists with different content")
         projection = self.projection(block.job_id)
+        now = self._clock.now()
         promotion = block.phase.value == "capability_promoted"
         legacy_promotion = promotion and not isinstance(
             projection.job, AgentFactoryJobV3
@@ -241,6 +299,22 @@ class FactoryCoordinator:
             and block.phase.value == "capability_promoted"
             else None
         )
+        action = next_action(
+            projection,
+            evaluation=evaluation,
+            workflow_evaluation=workflow_evaluation,
+            feedback=feedback,
+            workflow_release_decision=workflow_release_decision,
+            now=now,
+        )
+        if isinstance(projection.job, AgentFactoryJobV2) and now >= projection.job.deadline_at:
+            if (
+                action.kind is not FactoryActionKind.RECORD_ESCALATION
+                or block.phase is not FactoryPhase.ESCALATED
+            ):
+                raise FactoryLifecycleError(
+                    "v2 factory deadline permits only the derived Captain escalation"
+                )
         apply_block(
             projection,
             block,
@@ -260,10 +334,18 @@ class FactoryCoordinator:
                 if isinstance(projection.job, AgentFactoryJobV3)
                 else release_decision
             ),
+            now=now,
         )
         return self._repository.append(block)
 
     def projection(self, job_id: UUID) -> FactoryProjection:
+        projection = self._projection_from_blocks(job_id)
+        terminal_decision = self.terminal_decision_for_job(job_id)
+        if terminal_decision is not None:
+            projection = with_terminal_decision(projection, terminal_decision)
+        return projection
+
+    def _projection_from_blocks(self, job_id: UUID) -> FactoryProjection:
         projection = FactoryProjection.from_job(self._repository.job(job_id))
         for stored_block in self._repository.blocks(job_id):
             evaluation = (
@@ -314,10 +396,16 @@ class FactoryCoordinator:
                     in {"quality_reviewed", "capability_promoted"}
                     else None
                 ),
+                now=(
+                    projection.job.deadline_at
+                    if isinstance(projection.job, AgentFactoryJobV2)
+                    and stored_block.phase is FactoryPhase.ESCALATED
+                    else stored_block.occurred_at
+                ),
             )
         return projection
 
-    def next_action(self, job_id: UUID) -> FactoryAction:
+    def next_action(self, job_id: UUID, *, now: datetime | None = None) -> FactoryAction:
         projection = self.projection(job_id)
         evaluation = (
             self.evaluation_for_job(job_id)
@@ -344,7 +432,44 @@ class FactoryCoordinator:
             workflow_evaluation=workflow_evaluation,
             feedback=feedback,
             workflow_release_decision=workflow_release_decision,
+            now=now or self._clock.now(),
         ).model_copy(update={"job_id": job_id})
+
+    def record_terminal_decision(
+        self,
+        job_id: UUID,
+        *,
+        validation: CapabilityPackageManifestV1 | CapabilityValidationFailure | None,
+        evaluation: StoredSkillEvaluation | None,
+        e2e: tuple[CapabilityReleaseEvidenceV1, ...],
+    ) -> bool:
+        job = self._repository.job(job_id)
+        existing = self.terminal_decision_for_job(job_id)
+        decided_at = existing.decided_at if existing is not None else self._clock.now()
+        canonical = derive_terminal_decision(
+            job,
+            self._projection_from_blocks(job_id),
+            validation,
+            evaluation,
+            e2e,
+            decided_at,
+        )
+        if canonical is None:
+            raise FactoryRepositoryError(
+                "current factory facts do not derive a terminal decision"
+            )
+        if existing is not None:
+            if existing != canonical:
+                raise FactoryRepositoryError(
+                    "terminal decision already exists with different content"
+                )
+            return False
+        append = getattr(self._repository, "append_terminal_decision", None)
+        if append is None:
+            raise FactoryRepositoryError(
+                "factory repository does not support terminal decisions"
+            )
+        return bool(append(canonical))
 
     def blocks(self, job_id: UUID) -> tuple[FactoryEvidenceBlock, ...]:
         return self._repository.blocks(job_id)
@@ -357,6 +482,12 @@ class FactoryCoordinator:
 
     def release_decision_for_job(self, job_id: UUID) -> FactoryReleaseDecision | None:
         lookup = getattr(self._repository, "release_decision_for_job", None)
+        if lookup is None:
+            return None
+        return lookup(job_id)
+
+    def terminal_decision_for_job(self, job_id: UUID) -> FactoryTerminalDecision | None:
+        lookup = getattr(self._repository, "terminal_decision_for_job", None)
         if lookup is None:
             return None
         return lookup(job_id)

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -11,6 +13,11 @@ from agenten.agent_factory.contracts import AgentFactoryJobV3
 from agenten.agent_factory.execution_budget import (
     FactoryBudgetProjection,
     FactoryUsageReceiptV1,
+)
+from agenten.agent_factory.outcome_contracts import (
+    CapabilityAssertionResult,
+    CapabilityPackageManifestV1,
+    CapabilityReleaseEvidenceV1,
 )
 from agenten.agent_factory.release_gate import (
     E2EKind,
@@ -28,7 +35,7 @@ from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.skill_evaluation import ToolGapMarker
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
 from tests.agent_factory.test_skill_evaluation_contracts import gap_payload
-from tests.agent_factory.test_state_machine import accepted_evaluation, artifact, job
+from tests.agent_factory.test_state_machine import accepted_evaluation, artifact, job, v2_job
 from tests.agent_factory.test_skill_workflow_contracts import (
     CORRELATION_ID,
     JOB_ID,
@@ -40,6 +47,121 @@ from tests.agent_factory.test_skill_workflow_contracts import (
 
 WORKFLOW_NOW = datetime(2026, 7, 21, 10, tzinfo=timezone.utc)
 
+
+def _base_manifest() -> CapabilityPackageManifestV1:
+    payload = json.loads(
+        (Path(__file__).parents[1] / "fixtures" / "contracts" / "capability_package_manifest.v1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    factory_job = v2_job()
+    assertion_refs = tuple(
+        ArtifactRef.model_validate(artifact(f"assertion-{assertion_id}"))
+        for assertion_id in factory_job.acceptance_assertion_ids
+    )
+    payload.update(
+        {
+            "factory_job_id": str(factory_job.job_id),
+            "correlation_id": str(factory_job.correlation_id),
+            "subject_version": factory_job.subject_version,
+            "capability_id": factory_job.required_capability,
+            "assertion_outcomes": [
+                {
+                    "assertion_id": assertion_id,
+                    "status": "passed",
+                    "integration_intent": "none",
+                    "evidence_refs": [reference.model_dump(mode="json")],
+                }
+                for assertion_id, reference in zip(factory_job.acceptance_assertion_ids, assertion_refs)
+            ],
+            "private_holdout_receipts": [
+                {
+                    "holdout_id": factory_job.private_holdout_refs[0].holdout_id,
+                    "assertion_id": factory_job.acceptance_assertion_ids[0],
+                    "status": "passed",
+                    "evidence_ref": artifact("holdout-passed"),
+                }
+            ],
+            "recovery_receipt": {
+                "recovery_id": "controlled-recovery-01",
+                "assertion_id": factory_job.acceptance_assertion_ids[0],
+                "status": "passed",
+                "evidence_ref": artifact("recovery-passed"),
+            },
+        }
+    )
+    return CapabilityPackageManifestV1.model_validate(payload)
+
+
+def _release_evidence_ref(record: CapabilityReleaseEvidenceV1) -> ArtifactRef:
+    content = record.model_dump_json(by_alias=True).encode("utf-8")
+    digest = hashlib.sha256(content).hexdigest()
+    return ArtifactRef(
+        uri=f"artifact://release-evidence/{digest}",
+        sha256=digest,
+        media_type="application/json",
+    )
+
+
+def accepted_manifest(
+    *,
+    e2e: tuple[CapabilityReleaseEvidenceV1, ...] | None = None,
+) -> CapabilityPackageManifestV1:
+    manifest = _base_manifest()
+    records = e2e if e2e is not None else capability_e2e(manifest=manifest)
+    return manifest.model_copy(
+        update={
+            "release_evidence_refs": tuple(
+                _release_evidence_ref(record) for record in records
+            )
+        }
+    )
+
+
+def capability_e2e(
+    *,
+    successes: int = 3,
+    manifest: CapabilityPackageManifestV1 | None = None,
+) -> tuple[CapabilityReleaseEvidenceV1, ...]:
+    factory_job = v2_job()
+    effective_manifest = manifest or _base_manifest()
+    assertion_results = tuple(
+        CapabilityAssertionResult(
+            assertion_id=assertion_id,
+            status="passed",
+            integration_intent="none",
+            evidence_refs=(ArtifactRef.model_validate(artifact(f"run-assertion-{assertion_id}")),),
+        )
+        for assertion_id in factory_job.acceptance_assertion_ids
+    )
+
+    def run(number: int, *, kind: str, outcome: str) -> CapabilityReleaseEvidenceV1:
+        return CapabilityReleaseEvidenceV1(
+            schema_name="captain.capability-release-evidence.v1",
+            run_id=f"release-run-{number}",
+            run_number=number,
+            factory_job_id=factory_job.job_id,
+            creation_job_id=effective_manifest.creation_job_id,
+            correlation_id=factory_job.correlation_id,
+            subject_version=factory_job.subject_version,
+            attempt=1,
+            capability_id=factory_job.required_capability,
+            capability_version=effective_manifest.capability_version,
+            candidate_manifest_sha256="d" * 64,
+            package_archive_sha256=effective_manifest.source_ref.sha256,
+            extracted_tree_sha256="e" * 64,
+            kind=kind,
+            outcome=outcome,
+            producer="captain",
+            assertion_results=assertion_results,
+            recovery_id="controlled-recovery-01" if kind == "recovery" else None,
+            recovery_assertion_id=factory_job.acceptance_assertion_ids[0] if kind == "recovery" else None,
+        )
+
+    return (
+        run(1, kind="recovery", outcome="expected_failure_recovered"),
+        *(run(number, kind="normal", outcome="succeeded") for number in range(2, 2 + successes)),
+    )
 
 def evidence(number: int, kind: E2EKind, outcome: E2EOutcome) -> E2ERunEvidence:
     factory_job = job()

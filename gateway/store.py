@@ -24,7 +24,13 @@ from agenten.agent_runtime.contracts import (
     CapabilityGrant,
     CapabilityGrantRevocation,
 )
+from agenten.agent_factory.outcome_contracts import (
+    FactoryTerminalDecision,
+    FactoryTerminalState,
+    validate_execution_outcome_binding,
+)
 from agenten.agent_factory.contracts import (
+    AgentFactoryJobV2,
     AgentFactoryJobV3,
     FactoryEvidenceBlock,
     FactoryJob,
@@ -54,6 +60,7 @@ from agenten.agent_factory.release_gate import (
     evaluate_factory_release,
     evaluate_factory_workflow_release,
     factory_evaluation_block_reason,
+    derive_terminal_decision,
 )
 from agenten.agent_factory.skill_evaluation import (
     HermesSkillEvaluationEvidence,
@@ -85,16 +92,31 @@ from gateway.contracts import (
     ArtifactBuiltPayload,
     BatchDoneEvent,
     BatchProjection,
+    CapabilityExecutionRequest,
+    CapabilityExecutionRecord,
+    CapabilityReleaseRequest,
+    CapabilityWriteReceipt,
+    CapabilityPackagePublishedPayload,
+    CapabilityExecutionRecordedPayload,
     ClaimEvent,
     CodexSessionFinishedPayload,
     CodexSessionStartedPayload,
     CodexProcessEvent,
     DeliveryEventEnvelope,
+    FactoryTerminalDecidedPayload,
     HeartbeatEvent,
     ReasoningSliceEvent,
     RecoveryDecisionEvent,
     ReleaseProjection,
     RuntimeOperationProjection,
+    RuntimeBatchAdmission,
+    RuntimeCapabilityAuthority,
+    RuntimeExecutionClaim,
+    RuntimeExecutionClaimReceipt,
+    RuntimeExecutionClaimRequest,
+    RuntimeResultRecoveryObservation,
+    RuntimeResultRecoveryRequest,
+    RuntimeReleasedBatchSnapshot,
     RuntimeWriteReceipt,
     FactoryJobProjection,
     FactoryBudgetReleaseRequest,
@@ -108,10 +130,16 @@ from gateway.contracts import (
     FactorySkillEvaluationSubmission,
     FactorySkillWriteReceipt,
     PublishedHermesSkill,
+    TraceContext,
+    canonical_contract_sha256,
     parse_factory_workflow_artifact,
     ReviewDecisionEvent,
     project_batch,
     project_release,
+)
+from gateway.capability_catalog import (
+    CapabilityCatalogRecord,
+    CapabilityCompatibilityRequest,
 )
 from gateway.release_policy import ReleaseReadiness, evaluate_release_readiness
 
@@ -168,6 +196,14 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _new_claim_credential() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 class GatewayStore:
     """Own all gateway queries and append-only ledger writes."""
 
@@ -176,12 +212,20 @@ class GatewayStore:
         storage: MariaDBStorage,
         *,
         claim_ttl: timedelta = timedelta(minutes=90),
+        clock: Callable[[], datetime] = _utcnow,
     ):
         if claim_ttl <= timedelta(0):
             raise ValueError("claim_ttl must be positive")
         self.storage = storage
         self._claim_ttl = claim_ttl
+        self._clock = clock
         self._ensure_schema()
+
+    def _now(self) -> datetime:
+        now = self._clock()
+        if now.tzinfo is None or now.utcoffset() != timezone.utc.utcoffset(now):
+            raise ValueError("Gateway clock must return a UTC timestamp")
+        return now.astimezone(timezone.utc)
 
     def _ensure_schema(self) -> None:
         with self.storage.transaction() as connection:
@@ -2074,7 +2118,11 @@ class GatewayStore:
                     raise HTTPException(status_code=409, detail="factory job not found")
                 job = parse_factory_job(job_block["data"])
                 projection = self._factory_projection(cursor, job)
-                self._assert_lease_is_next_action(lease, projection)
+                self._assert_lease_is_next_action(
+                    lease,
+                    projection,
+                    now=self._now(),
+                )
                 try:
                     validate_factory_lease(lease, job=job, role=lease.role, attempt=projection.attempt, now=lease.issued_at)
                 except FactoryLeaseDenied as exc:
@@ -3507,8 +3555,13 @@ class GatewayStore:
             )
 
     @staticmethod
-    def _assert_lease_is_next_action(lease: FactoryLease, projection: FactoryProjection) -> None:
-        action = next_action(projection)
+    def _assert_lease_is_next_action(
+        lease: FactoryLease,
+        projection: FactoryProjection,
+        *,
+        now: datetime,
+    ) -> None:
+        action = next_action(projection, now=now)
         role_actions = {
             FactoryRole.AGENT_ARCHITECT: frozenset({FactoryActionKind.DISPATCH_AGENT_ARCHITECT}),
             FactoryRole.TOOL_INTEGRATOR: frozenset(
@@ -4044,6 +4097,1774 @@ class GatewayStore:
                 if block_type == "batch_done" and data["outcome"] == "succeeded":
                     self._upsert_capability(cursor, block)
         return block
+
+    def recover_runtime_result(
+        self,
+        request: RuntimeResultRecoveryRequest,
+        *,
+        execution_owner_id: str,
+        execution_fencing_token: int,
+        execution_claim_credential: str,
+    ) -> RuntimeWriteReceipt:
+        request = RuntimeResultRecoveryRequest.model_validate(
+            request.model_dump(mode="json", by_alias=True)
+        )
+        try:
+            self._retry_write(
+                lambda: self._recover_runtime_result_once(
+                    request,
+                    execution_owner_id=execution_owner_id,
+                    execution_fencing_token=execution_fencing_token,
+                    execution_claim_credential=execution_claim_credential,
+                )
+            )
+        except _RuntimeReplay as replay:
+            return RuntimeWriteReceipt(operation_id=replay.operation_id, replayed=True)
+        return RuntimeWriteReceipt(
+            operation_id=request.observation.command_id,
+            replayed=False,
+        )
+
+    def runtime_result_recovery(
+        self,
+        operation_id: UUID,
+    ) -> RuntimeResultRecoveryObservation | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="runtime_result_recovery_observation",
+                    field="command_id",
+                    value=str(operation_id),
+                )
+        if block is None:
+            return None
+        return RuntimeResultRecoveryObservation.model_validate(block["data"])
+
+    def _recover_runtime_result_once(
+        self,
+        request: RuntimeResultRecoveryRequest,
+        *,
+        execution_owner_id: str,
+        execution_fencing_token: int,
+        execution_claim_credential: str,
+    ) -> None:
+        result = request.result
+        observation = request.observation
+        canonical_result = result.model_dump(mode="json", by_alias=True)
+        canonical_observation = observation.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                self._lock_ledger_state(cursor)
+                command_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_command",
+                    field="event_id",
+                    value=str(result.command_id),
+                    for_update=True,
+                )
+                if command_block is None:
+                    raise HTTPException(status_code=409, detail="runtime command not found")
+                command = AgentRuntimeCommand.model_validate(command_block["data"])
+                self._assert_result_matches_command(result, command)
+
+                cursor.execute(
+                    """SELECT payload, credential_sha256, block_index
+                       FROM runtime_execution_claims
+                       WHERE command_id = %s FOR UPDATE""",
+                    (str(result.command_id),),
+                )
+                claim_row = cursor.fetchone()
+                if claim_row is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime recovery requires a current execution claim",
+                    )
+                current_claim = RuntimeExecutionClaim.model_validate(
+                    self._decode_json(claim_row["payload"])
+                )
+                current_claim_block = self._row_by_index(
+                    cursor,
+                    int(claim_row["block_index"]),
+                    for_update=True,
+                )
+                if current_claim_block is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="current runtime execution claim ledger block is missing",
+                    )
+                ledger_current_claim = RuntimeExecutionClaim.model_validate(
+                    current_claim_block["data"]
+                )
+                expected_ledger_current = current_claim.model_copy(
+                    update={"status": "active", "completed_at": None}
+                )
+                if (
+                    current_claim_block["block_type"] != "runtime_execution_claim"
+                    or current_claim_block["parent_index"] != command_block["index"]
+                    or ledger_current_claim != expected_ledger_current
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="current runtime execution claim disagrees with the ledger",
+                    )
+
+                original_claim_block = self._runtime_execution_claim_block(
+                    cursor,
+                    command_id=result.command_id,
+                    claim_id=request.provider_receipt.origin_claim_id,
+                    fencing_token=observation.original_claim_fence,
+                    for_update=True,
+                )
+                if original_claim_block is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="original runtime execution claim ledger block is missing",
+                    )
+                original_claim = RuntimeExecutionClaim.model_validate(
+                    original_claim_block["data"]
+                )
+                self._assert_runtime_result_recovery_claims(
+                    request,
+                    original_claim=original_claim,
+                    current_claim=current_claim,
+                    command_block_index=int(command_block["index"]),
+                    original_claim_parent_index=original_claim_block["parent_index"],
+                )
+                self._assert_execution_claim_completion_authority(
+                    current_claim,
+                    owner_id=execution_owner_id,
+                    fencing_token=execution_fencing_token,
+                    credential=execution_claim_credential,
+                    credential_sha256=str(claim_row["credential_sha256"] or ""),
+                )
+
+                existing_result = self._runtime_result_block(
+                    cursor,
+                    result,
+                    for_update=True,
+                )
+                existing_observation = self._runtime_recovery_observation_block(
+                    cursor,
+                    observation,
+                    for_update=True,
+                )
+                if existing_result is not None or existing_observation is not None:
+                    if (
+                        existing_result is not None
+                        and existing_observation is not None
+                        and existing_result["data"] == canonical_result
+                        and existing_observation["data"] == canonical_observation
+                        and current_claim.status == "completed"
+                    ):
+                        raise _RuntimeReplay(result.command_id)
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime result recovery already has different or incomplete content",
+                    )
+
+                completion_time = self._now()
+                if observation.observed_at > completion_time:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime recovery observation is after Gateway completion time",
+                    )
+                self._assert_execution_claim_fence(
+                    current_claim,
+                    owner_id=execution_owner_id,
+                    fencing_token=execution_fencing_token,
+                    now=completion_time,
+                )
+
+                grant_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_grant",
+                    field="grant_id",
+                    value=result.grant_id,
+                    for_update=True,
+                )
+                if grant_block is None:
+                    raise HTTPException(status_code=409, detail="runtime grant not found")
+                grant = CapabilityGrant.model_validate(grant_block["data"])
+                if grant.command_id != command.event_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime grant belongs to a different command",
+                    )
+                revocation_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_grant_revocation",
+                    field="grant_id",
+                    value=grant.grant_id,
+                    for_update=True,
+                )
+                if revocation_block is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="revoked runtime grant cannot recover a result",
+                    )
+
+                result_index = self._next_index(cursor)
+                result_block = self._new_block(
+                    cursor,
+                    index=result_index,
+                    block_type="agent_runtime_result",
+                    data=canonical_result,
+                    status=result.status.value,
+                    parent_index=command_block["index"],
+                    metadata={"schema": "captain.agent-runtime-result.v1"},
+                )
+                self._insert(cursor, result_block)
+                observation_index = self._next_index(cursor)
+                observation_block = self._new_block(
+                    cursor,
+                    index=observation_index,
+                    block_type="runtime_result_recovery_observation",
+                    data=canonical_observation,
+                    status="observed",
+                    parent_index=result_index,
+                    metadata={
+                        "schema": "captain.runtime-result-recovery-observation.v1",
+                        "original_claim_block_index": int(original_claim_block["index"]),
+                        "recovery_claim_block_index": int(current_claim_block["index"]),
+                    },
+                )
+                self._insert(cursor, observation_block)
+                completed = current_claim.model_copy(
+                    update={
+                        "status": "completed",
+                        "completed_at": completion_time,
+                    }
+                )
+                cursor.execute(
+                    """UPDATE runtime_execution_claims
+                       SET status = 'completed', payload = %s
+                       WHERE command_id = %s AND fencing_token = %s""",
+                    (
+                        json.dumps(
+                            completed.model_dump(mode="json", by_alias=True),
+                            sort_keys=True,
+                        ),
+                        str(result.command_id),
+                        current_claim.fencing_token,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime recovery claim fence changed during completion",
+                    )
+
+    def find_runtime_operation(
+        self,
+        operation_id: UUID,
+    ) -> RuntimeOperationProjection | None:
+        """Return a runtime operation when present without using 404 for recovery flow."""
+
+        try:
+            return self.runtime_operation(operation_id)
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+
+    def released_runtime_batch(
+        self,
+        operation_id: UUID,
+    ) -> RuntimeReleasedBatchSnapshot:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                command_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_command",
+                    field="event_id",
+                    value=str(operation_id),
+                )
+                if command_block is None:
+                    raise HTTPException(status_code=404, detail="runtime operation not found")
+                cursor.execute(
+                    """SELECT payload, batch_payload FROM runtime_batch_admissions
+                       WHERE command_id = %s""",
+                    (str(operation_id),),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="released runtime batch admission not found",
+                    )
+                admission = RuntimeBatchAdmission.model_validate(
+                    self._decode_json(row["payload"])
+                )
+                batch = WorkBatch.model_validate(
+                    self._decode_json(row["batch_payload"])
+                )
+                parent = self._batch_row(cursor, admission.batch_id)
+                if parent is None:
+                    raise HTTPException(status_code=409, detail="released batch head not found")
+                self._assert_runtime_admission_head(
+                    admission,
+                    command=AgentRuntimeCommand.model_validate(command_block["data"]),
+                    parent=parent,
+                )
+        return RuntimeReleasedBatchSnapshot(admission=admission, batch=batch)
+
+    def claim_runtime_execution(
+        self,
+        request: RuntimeExecutionClaimRequest,
+    ) -> RuntimeExecutionClaimReceipt:
+        return self._retry_write(
+            lambda: self._claim_runtime_execution_once(request)
+        )
+
+    def _claim_runtime_execution_once(
+        self,
+        request: RuntimeExecutionClaimRequest,
+    ) -> RuntimeExecutionClaimReceipt:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                self._lock_ledger_state(cursor)
+                command_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_command",
+                    field="event_id",
+                    value=str(request.command_id),
+                    for_update=True,
+                )
+                if command_block is None:
+                    raise HTTPException(status_code=409, detail="runtime command not found")
+                command = AgentRuntimeCommand.model_validate(command_block["data"])
+                cursor.execute(
+                    """SELECT payload, credential_sha256
+                       FROM runtime_execution_claims WHERE command_id = %s FOR UPDATE""",
+                    (str(request.command_id),),
+                )
+                claim_row = cursor.fetchone()
+                existing = (
+                    RuntimeExecutionClaim.model_validate(
+                        self._decode_json(claim_row["payload"])
+                    )
+                    if claim_row is not None
+                    else None
+                )
+                cursor.execute(
+                    """SELECT payload FROM runtime_batch_admissions
+                       WHERE command_id = %s FOR UPDATE""",
+                    (str(request.command_id),),
+                )
+                admission_row = cursor.fetchone()
+                if admission_row is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="runtime claim requires an atomic batch admission",
+                    )
+                admission = RuntimeBatchAdmission.model_validate(
+                    self._decode_json(admission_row["payload"])
+                )
+                claim_now = self._now()
+                parent, children, projection = self._batch_context(
+                    cursor,
+                    admission.batch_id,
+                    for_update=True,
+                    now=claim_now,
+                )
+                self._assert_runtime_admission_head(
+                    admission,
+                    command=command,
+                    parent=parent,
+                )
+                self._assert_runtime_admission_is_current(
+                    admission,
+                    parent=parent,
+                    children=children,
+                    projection=projection,
+                )
+
+                if existing is not None:
+                    catalog, _ = self._locked_claim_capability_release(
+                        cursor,
+                        existing,
+                    )
+                    authority = self._claim_capability_authority(existing)
+                else:
+                    cursor.execute(
+                        """SELECT block_index, payload FROM factory_capability_catalog
+                           WHERE capability_id = %s FOR UPDATE""",
+                        (request.capability_id,),
+                    )
+                    catalog_row = cursor.fetchone()
+                    if catalog_row is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="capability is not published",
+                        )
+                    catalog = CapabilityCatalogRecord.model_validate(
+                        self._decode_json(catalog_row["payload"])
+                    )
+                    cursor.execute(
+                        """SELECT block_index, catalog_payload
+                           FROM factory_capability_packages
+                           WHERE capability_id = %s AND capability_version = %s
+                           FOR UPDATE""",
+                        (request.capability_id, request.capability_version),
+                    )
+                    package_row = cursor.fetchone()
+                    if package_row is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="published capability package not found",
+                        )
+                    package_catalog = CapabilityCatalogRecord.model_validate(
+                        self._decode_json(package_row["catalog_payload"])
+                    )
+                    if package_catalog != catalog:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="capability package is not the current catalog head",
+                        )
+                    catalog_block = self._row_by_index(
+                        cursor,
+                        int(catalog_row["block_index"]),
+                        for_update=True,
+                    )
+                    package_block = self._row_by_index(
+                        cursor,
+                        int(package_row["block_index"]),
+                        for_update=True,
+                    )
+                    if catalog_block is None or package_block is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="capability release ledger authority is incomplete",
+                        )
+                    authority = RuntimeCapabilityAuthority(
+                        capability_id=catalog.capability_id,
+                        capability_version=catalog.capability_version,
+                        team_version=catalog.team_version,
+                        catalog_fence=catalog.catalog_fence,
+                        catalog_block_index=int(catalog_block["index"]),
+                        catalog_block_hash=str(catalog_block["hash"]),
+                        package_block_index=int(package_block["index"]),
+                        package_block_hash=str(package_block["hash"]),
+                        package_ref=catalog.package_ref,
+                        published_at=catalog.published_at,
+                    )
+                self._assert_runtime_capability_claimable(
+                    request=request,
+                    command=command,
+                    admission=admission,
+                    catalog=catalog,
+                )
+                result_recorded = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_result",
+                    field="command_id",
+                    value=str(request.command_id),
+                    for_update=True,
+                ) is not None
+                receipt = self._resolve_runtime_execution_claim(
+                    existing=existing,
+                    request=request,
+                    now=claim_now,
+                    result_recorded=result_recorded,
+                    authority=authority,
+                )
+                if receipt.replayed:
+                    return receipt
+                index = self._next_index(cursor)
+                canonical = receipt.claim.model_dump(mode="json", by_alias=True)
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="runtime_execution_claim",
+                    data=canonical,
+                    status="active",
+                    parent_index=command_block["index"],
+                    metadata={"schema": "captain.runtime-execution-claim.v1"},
+                )
+                self._insert(cursor, block)
+                cursor.execute(
+                    """INSERT INTO runtime_execution_claims
+                       (command_id, claim_id, owner_id, fencing_token,
+                        credential_sha256, expires_at,
+                        status, block_index, payload)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                       ON DUPLICATE KEY UPDATE
+                         claim_id=VALUES(claim_id), owner_id=VALUES(owner_id),
+                         fencing_token=VALUES(fencing_token),
+                         credential_sha256=VALUES(credential_sha256),
+                         expires_at=VALUES(expires_at),
+                         status=VALUES(status), block_index=VALUES(block_index),
+                         payload=VALUES(payload)""",
+                    (
+                        str(receipt.claim.command_id),
+                        str(receipt.claim.claim_id),
+                        receipt.claim.owner_id,
+                        receipt.claim.fencing_token,
+                        hashlib.sha256(
+                            receipt.claim_credential.encode("utf-8")
+                        ).hexdigest(),
+                        receipt.claim.expires_at.replace(tzinfo=None),
+                        receipt.claim.status,
+                        index,
+                        json.dumps(canonical, sort_keys=True),
+                    ),
+                )
+        return receipt
+
+    def runtime_execution_claim(
+        self,
+        operation_id: UUID,
+    ) -> RuntimeExecutionClaim | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT payload FROM runtime_execution_claims WHERE command_id = %s",
+                    (str(operation_id),),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        return RuntimeExecutionClaim.model_validate(self._decode_json(row["payload"]))
+
+    @staticmethod
+    def _resolve_runtime_execution_claim(
+        *,
+        existing: RuntimeExecutionClaim | None,
+        request: RuntimeExecutionClaimRequest,
+        now: datetime,
+        result_recorded: bool,
+        authority: RuntimeCapabilityAuthority,
+        credential_factory: Callable[[], str] = _new_claim_credential,
+    ) -> RuntimeExecutionClaimReceipt:
+        """Apply the lease/fence policy independently of the SQL transaction."""
+
+        if now.tzinfo is None or now.utcoffset() != timezone.utc.utcoffset(now):
+            raise HTTPException(status_code=409, detail="execution claim clock must be UTC")
+        effective_now = now.astimezone(timezone.utc)
+        if result_recorded or (existing is not None and existing.status == "completed"):
+            raise HTTPException(status_code=409, detail="runtime execution is already completed")
+        effective_authority = authority
+        if existing is not None:
+            if existing.command_id != request.command_id:
+                raise HTTPException(status_code=409, detail="execution claim belongs to another command")
+            effective_authority = GatewayStore._claim_capability_authority(existing)
+        if (
+            request.capability_id != effective_authority.capability_id
+            or request.capability_version != effective_authority.capability_version
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="execution claim request changed frozen capability authority",
+            )
+        if existing is not None:
+            if existing.expires_at > effective_now:
+                if existing.owner_id == request.owner_id:
+                    return RuntimeExecutionClaimReceipt(
+                        claim=existing,
+                        replayed=True,
+                        recovered=False,
+                        claim_credential=None,
+                    )
+                raise HTTPException(
+                    status_code=409,
+                    detail="runtime execution claim is owned by another runtime",
+                )
+            fencing_token = existing.fencing_token + 1
+            recovered = True
+        else:
+            fencing_token = 1
+            recovered = False
+        claim = RuntimeExecutionClaim(
+            **effective_authority.model_dump(),
+            command_id=request.command_id,
+            claim_id=uuid5(
+                NAMESPACE_URL,
+                f"captain:runtime-execution-claim:{request.command_id}:{fencing_token}:{request.owner_id}",
+            ),
+            owner_id=request.owner_id,
+            fencing_token=fencing_token,
+            claimed_at=effective_now,
+            expires_at=effective_now + timedelta(seconds=request.lease_seconds),
+            status="active",
+        )
+        credential = credential_factory()
+        return RuntimeExecutionClaimReceipt(
+            claim=claim,
+            replayed=False,
+            recovered=recovered,
+            claim_credential=credential,
+        )
+
+    @staticmethod
+    def _claim_capability_authority(
+        claim: RuntimeExecutionClaim,
+    ) -> RuntimeCapabilityAuthority:
+        return RuntimeCapabilityAuthority(
+            capability_id=claim.capability_id,
+            capability_version=claim.capability_version,
+            team_version=claim.team_version,
+            catalog_fence=claim.catalog_fence,
+            catalog_block_index=claim.catalog_block_index,
+            catalog_block_hash=claim.catalog_block_hash,
+            package_block_index=claim.package_block_index,
+            package_block_hash=claim.package_block_hash,
+            package_ref=claim.package_ref,
+            published_at=claim.published_at,
+        )
+
+    @staticmethod
+    def _factory_delivery_event(
+        *,
+        base_event_id: UUID,
+        suffix: str,
+        occurred_at: datetime,
+        job_id: UUID,
+        correlation_id: UUID,
+        subject_version: int,
+        payload: BaseModel,
+    ) -> DeliveryEventEnvelope:
+        event_type = str(getattr(payload, "event_type"))
+        return DeliveryEventEnvelope(
+            event_id=uuid5(base_event_id, suffix),
+            event_type=event_type,
+            occurred_at=occurred_at,
+            actor="captain",
+            trace=TraceContext(
+                project_id="agent-factory",
+                run_id=str(job_id),
+                trace_id=str(base_event_id),
+                job_id=job_id,
+                correlation_id=correlation_id,
+                subject_version=subject_version,
+            ),
+            payload=payload,
+        )
+
+    def record_factory_terminal_decision(
+        self,
+        decision: FactoryTerminalDecision,
+    ) -> CapabilityWriteReceipt:
+        """Persist non-release terminal outcomes; ready writes use the atomic release API."""
+
+        if decision.state is FactoryTerminalState.READY_TO_USE:
+            raise HTTPException(
+                status_code=409,
+                detail="ready_to_use terminal decisions require atomic capability publication",
+            )
+        replayed = self._retry_write(
+            lambda: self._record_factory_terminal_decision_once(decision)
+        )
+        return CapabilityWriteReceipt(
+            record_id=str(decision.decision_id),
+            replayed=replayed,
+        )
+
+    def _record_factory_terminal_decision_once(
+        self,
+        decision: FactoryTerminalDecision,
+    ) -> bool:
+        canonical = decision.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                job_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_job",
+                    field="job_id",
+                    value=str(decision.job_id),
+                    for_update=True,
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job not found")
+                cursor.execute(
+                    """SELECT decision_id, job_id, payload FROM factory_terminal_decisions
+                       WHERE decision_id = %s OR job_id = %s FOR UPDATE""",
+                    (str(decision.decision_id), str(decision.job_id)),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    if self._decode_json(existing["payload"]) == canonical:
+                        return True
+                    raise HTTPException(
+                        status_code=409,
+                        detail="factory terminal decision already exists with different content",
+                    )
+                job = parse_factory_job(job_block["data"])
+                if (
+                    decision.correlation_id != job.correlation_id
+                    or decision.subject_version != job.subject_version
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="terminal decision does not match factory job",
+                    )
+                index = self._next_index(cursor)
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="factory_terminal_decision",
+                    data=canonical,
+                    status=decision.state.value,
+                    parent_index=job_block["index"],
+                    metadata={"schema": "captain.factory-terminal-decision.v1"},
+                )
+                self._insert(cursor, block)
+                cursor.execute(
+                    """INSERT INTO factory_terminal_decisions
+                       (decision_id, job_id, block_index, payload)
+                       VALUES (%s, %s, %s, %s)""",
+                    (
+                        str(decision.decision_id),
+                        str(decision.job_id),
+                        index,
+                        json.dumps(canonical, sort_keys=True),
+                    ),
+                )
+        return False
+
+    def factory_terminal_decision(
+        self,
+        job_id: UUID,
+    ) -> FactoryTerminalDecision | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT payload FROM factory_terminal_decisions WHERE job_id = %s",
+                    (str(job_id),),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        return FactoryTerminalDecision.model_validate(self._decode_json(row["payload"]))
+
+    def publish_capability_release(
+        self,
+        request: CapabilityReleaseRequest,
+    ) -> CapabilityWriteReceipt:
+        replayed = self._retry_write(
+            lambda: self._publish_capability_release_once(request)
+        )
+        return CapabilityWriteReceipt(
+            record_id=(
+                f"{request.package.capability_id}:{request.package.capability_version}"
+            ),
+            replayed=replayed,
+        )
+
+    def _publish_capability_release_once(
+        self,
+        request: CapabilityReleaseRequest,
+    ) -> bool:
+        canonical_request = request.model_dump(mode="json", by_alias=True)
+        package = request.package
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                job_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_job",
+                    field="job_id",
+                    value=str(package.factory_job_id),
+                    for_update=True,
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job not found")
+                job = parse_factory_job(job_block["data"])
+                cursor.execute(
+                    """SELECT payload, catalog_payload FROM factory_capability_packages
+                       WHERE (capability_id = %s AND capability_version = %s)
+                          OR job_id = %s OR release_event_id = %s
+                       FOR UPDATE""",
+                    (
+                        package.capability_id,
+                        package.capability_version,
+                        str(package.factory_job_id),
+                        str(request.event_id),
+                    ),
+                )
+                existing_package = cursor.fetchone()
+                if existing_package is not None:
+                    stored_package = self._decode_json(existing_package["payload"])
+                    stored_request = (
+                        stored_package.get("request")
+                        if isinstance(stored_package, dict) and "request" in stored_package
+                        else stored_package
+                    )
+                    if stored_request == canonical_request:
+                        cursor.execute(
+                            "SELECT payload FROM factory_terminal_decisions WHERE job_id = %s FOR UPDATE",
+                            (str(package.factory_job_id),),
+                        )
+                        terminal_row = cursor.fetchone()
+                        cursor.execute(
+                            "SELECT payload FROM factory_capability_catalog WHERE capability_id = %s FOR UPDATE",
+                            (package.capability_id,),
+                        )
+                        catalog_row = cursor.fetchone()
+                        if terminal_row is None or catalog_row is None:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="incomplete capability release state",
+                            )
+                        return True
+                    raise HTTPException(
+                        status_code=409,
+                        detail="capability package already exists with different content",
+                    )
+
+                factory_blocks = self._factory_blocks(
+                    cursor,
+                    package.factory_job_id,
+                    for_update=True,
+                )
+                promotion = next(
+                    (
+                        block
+                        for block in reversed(factory_blocks)
+                        if block.phase is FactoryPhase.CAPABILITY_PROMOTED
+                    ),
+                    None,
+                )
+                evaluation = self._factory_skill_evaluation_for_job(
+                    cursor,
+                    package.factory_job_id,
+                )
+                projection = self._factory_projection(cursor, job)
+                authoritative = self._authoritative_capability_release(
+                    job=job,
+                    projection=projection,
+                    promotion=promotion,
+                    evaluation=evaluation,
+                    request=request,
+                    now=self._now(),
+                )
+                cursor.execute(
+                    """SELECT decision_id, payload FROM factory_terminal_decisions
+                       WHERE decision_id = %s OR job_id = %s FOR UPDATE""",
+                    (
+                        str(authoritative.decision.decision_id),
+                        str(package.factory_job_id),
+                    ),
+                )
+                if cursor.fetchone() is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="factory terminal decision conflicts with capability release",
+                    )
+                cursor.execute(
+                    """SELECT capability_version, catalog_fence, payload
+                       FROM factory_capability_catalog WHERE capability_id = %s FOR UPDATE""",
+                    (package.capability_id,),
+                )
+                head_row = cursor.fetchone()
+                if head_row is not None and package.capability_version <= int(
+                    head_row["capability_version"]
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="capability version is stale or already published",
+                    )
+                catalog_fence = (
+                    int(head_row["catalog_fence"]) + 1 if head_row is not None else 1
+                )
+                catalog = CapabilityCatalogRecord.from_release(
+                    authoritative,
+                    catalog_fence=catalog_fence,
+                )
+
+                terminal_payload = FactoryTerminalDecidedPayload(
+                    event_type="factory_terminal_decided",
+                    causation_id=authoritative.causation_id,
+                    decision_id=authoritative.decision.decision_id,
+                    job_id=package.factory_job_id,
+                    state=authoritative.decision.state.value,
+                    decision_ref=authoritative.decision_ref,
+                )
+                terminal_event = self._factory_delivery_event(
+                    base_event_id=authoritative.event_id,
+                    suffix="factory-terminal-decided",
+                    occurred_at=authoritative.occurred_at,
+                    job_id=package.factory_job_id,
+                    correlation_id=package.correlation_id,
+                    subject_version=package.subject_version,
+                    payload=terminal_payload,
+                )
+                terminal_index = self._next_index(cursor)
+                terminal_block = self._new_block(
+                    cursor,
+                    index=terminal_index,
+                    block_type="factory_terminal_decided",
+                    data=terminal_event.model_dump(mode="json"),
+                    status="ready_to_use",
+                    parent_index=job_block["index"],
+                    metadata={"schema": "captain.factory-terminal-decided.v1"},
+                )
+                self._insert(cursor, terminal_block)
+
+                package_payload = CapabilityPackagePublishedPayload(
+                    event_type="capability_package_published",
+                    causation_id=terminal_event.event_id,
+                    capability_id=package.capability_id,
+                    capability_version=package.capability_version,
+                    terminal_decision_id=authoritative.decision.decision_id,
+                    package_ref=authoritative.package_ref,
+                    status="ready_to_use",
+                )
+                package_event = self._factory_delivery_event(
+                    base_event_id=authoritative.event_id,
+                    suffix="capability-package-published",
+                    occurred_at=authoritative.occurred_at,
+                    job_id=package.factory_job_id,
+                    correlation_id=package.correlation_id,
+                    subject_version=package.subject_version,
+                    payload=package_payload,
+                )
+                package_index = self._next_index(cursor)
+                package_block = self._new_block(
+                    cursor,
+                    index=package_index,
+                    block_type="capability_package_published",
+                    data=package_event.model_dump(mode="json"),
+                    status="ready_to_use",
+                    parent_index=terminal_index,
+                    metadata={"schema": "captain.capability-package-published.v1"},
+                )
+                self._insert(cursor, package_block)
+
+                catalog_index = self._next_index(cursor)
+                catalog_data = catalog.model_dump(mode="json", by_alias=True)
+                catalog_block = self._new_block(
+                    cursor,
+                    index=catalog_index,
+                    block_type="capability_catalog_head",
+                    data=catalog_data,
+                    status=catalog.status,
+                    parent_index=package_index,
+                    metadata={"schema": "captain.capability-catalog-record.v1"},
+                )
+                self._insert(cursor, catalog_block)
+
+                decision_data = authoritative.decision.model_dump(
+                    mode="json", by_alias=True
+                )
+                cursor.execute(
+                    """INSERT INTO factory_terminal_decisions
+                       (decision_id, job_id, block_index, payload)
+                       VALUES (%s, %s, %s, %s)""",
+                    (
+                        str(authoritative.decision.decision_id),
+                        str(package.factory_job_id),
+                        terminal_index,
+                        json.dumps(decision_data, sort_keys=True),
+                    ),
+                )
+                cursor.execute(
+                    """INSERT INTO factory_capability_packages
+                       (capability_id, capability_version, job_id, release_event_id,
+                        package_sha256, block_index, payload, catalog_payload)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        package.capability_id,
+                        package.capability_version,
+                        str(package.factory_job_id),
+                        str(authoritative.event_id),
+                        authoritative.package_ref.sha256,
+                        package_index,
+                        json.dumps(
+                            {
+                                "request": canonical_request,
+                                "release": authoritative.model_dump(
+                                    mode="json", by_alias=True
+                                ),
+                            },
+                            sort_keys=True,
+                        ),
+                        json.dumps(catalog_data, sort_keys=True),
+                    ),
+                )
+                cursor.execute(
+                    """INSERT INTO factory_capability_catalog
+                       (capability_id, capability_version, catalog_fence, status,
+                        block_index, payload)
+                       VALUES (%s, %s, %s, %s, %s, %s)
+                       ON DUPLICATE KEY UPDATE
+                         capability_version=VALUES(capability_version),
+                         catalog_fence=VALUES(catalog_fence), status=VALUES(status),
+                         block_index=VALUES(block_index), payload=VALUES(payload)""",
+                    (
+                        catalog.capability_id,
+                        catalog.capability_version,
+                        catalog.catalog_fence,
+                        catalog.status,
+                        catalog_index,
+                        json.dumps(catalog_data, sort_keys=True),
+                    ),
+                )
+        return False
+
+    def capability(
+        self,
+        capability_id: str,
+        *,
+        version: int | None = None,
+    ) -> CapabilityCatalogRecord | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                if version is None:
+                    cursor.execute(
+                        "SELECT payload FROM factory_capability_catalog WHERE capability_id = %s",
+                        (capability_id,),
+                    )
+                else:
+                    cursor.execute(
+                        """SELECT catalog_payload AS payload FROM factory_capability_packages
+                           WHERE capability_id = %s AND capability_version = %s""",
+                        (capability_id, version),
+                    )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        return CapabilityCatalogRecord.model_validate(self._decode_json(row["payload"]))
+
+    def compatible_capability(
+        self,
+        request: CapabilityCompatibilityRequest,
+    ) -> CapabilityCatalogRecord | None:
+        record = self.capability(request.capability_id)
+        if record is None or not record.satisfies(request):
+            return None
+        return record
+
+    def find_ready_capability(
+        self,
+        capability_id: str,
+    ) -> CapabilityCatalogRecord | None:
+        record = self.capability(capability_id)
+        if record is None or record.status != "ready_to_use":
+            return None
+        return record
+
+    def record_capability_execution(
+        self,
+        request: CapabilityExecutionRequest,
+    ) -> CapabilityWriteReceipt:
+        replayed = self._retry_write(
+            lambda: self._record_capability_execution_once(request)
+        )
+        return CapabilityWriteReceipt(
+            record_id=str(request.outcome.command_id),
+            replayed=replayed,
+        )
+
+    def _record_capability_execution_once(
+        self,
+        request: CapabilityExecutionRequest,
+    ) -> bool:
+        outcome = request.outcome
+        canonical_request = request.model_dump(mode="json", by_alias=True)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                command_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_command",
+                    field="event_id",
+                    value=str(outcome.command_id),
+                    for_update=True,
+                )
+                if command_block is None:
+                    raise HTTPException(status_code=409, detail="runtime command not found")
+                result_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_runtime_result",
+                    field="event_id",
+                    value=str(outcome.result_id),
+                    for_update=True,
+                )
+                if result_block is None:
+                    raise HTTPException(status_code=409, detail="runtime result not found")
+
+                cursor.execute(
+                    """SELECT payload FROM factory_capability_executions
+                       WHERE command_id = %s OR result_id = %s OR event_id = %s
+                       FOR UPDATE""",
+                    (
+                        str(outcome.command_id),
+                        str(outcome.result_id),
+                        str(request.event_id),
+                    ),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    stored = self._decode_json(existing["payload"])
+                    if stored.get("request") == canonical_request:
+                        return True
+                    raise HTTPException(
+                        status_code=409,
+                        detail="capability execution already exists with different content",
+                    )
+
+                cursor.execute(
+                    """SELECT payload FROM runtime_execution_claims
+                       WHERE command_id = %s FOR UPDATE""",
+                    (str(outcome.command_id),),
+                )
+                claim_row = cursor.fetchone()
+                if claim_row is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="capability execution requires a runtime execution claim",
+                    )
+                claim = RuntimeExecutionClaim.model_validate(
+                    self._decode_json(claim_row["payload"])
+                )
+                if claim.status != "completed":
+                    raise HTTPException(
+                        status_code=409,
+                        detail="capability execution requires a completed runtime claim",
+                    )
+                catalog, package_row = self._locked_claim_capability_release(
+                    cursor,
+                    claim,
+                )
+                stored_package = self._decode_json(package_row["payload"])
+                release_payload = (
+                    stored_package.get("release")
+                    if isinstance(stored_package, dict) and "release" in stored_package
+                    else stored_package
+                )
+                release = CapabilityReleaseRequest.model_validate(release_payload)
+                command = AgentRuntimeCommand.model_validate(command_block["data"])
+                result = AgentRuntimeResult.model_validate(result_block["data"])
+                self._assert_capability_execution_binding(
+                    request,
+                    catalog=catalog,
+                    command=command,
+                    result=result,
+                    claim=claim,
+                )
+                if (
+                    release.package.capability_id != catalog.capability_id
+                    or release.package.capability_version
+                    != catalog.capability_version
+                    or release.team_version != claim.team_version
+                    or release.package_ref != claim.package_ref
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="capability execution package is not the catalog head",
+                    )
+
+                record = CapabilityExecutionRecord.from_request(
+                    request,
+                    catalog_fence=claim.catalog_fence,
+                )
+                record_data = record.model_dump(mode="json", by_alias=True)
+                payload = CapabilityExecutionRecordedPayload(
+                    event_type="capability_execution_recorded",
+                    causation_id=request.causation_id,
+                    capability_id=outcome.capability_id,
+                    capability_version=outcome.capability_version,
+                    command_id=outcome.command_id,
+                    result_id=outcome.result_id,
+                    outcome_ref=request.outcome_ref,
+                    status=outcome.status,
+                )
+                event = self._factory_delivery_event(
+                    base_event_id=request.event_id,
+                    suffix="capability-execution-recorded",
+                    occurred_at=request.occurred_at,
+                    job_id=release.package.factory_job_id,
+                    correlation_id=outcome.correlation_id,
+                    subject_version=release.package.subject_version,
+                    payload=payload,
+                )
+                index = self._next_index(cursor)
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="capability_execution_recorded",
+                    data=event.model_dump(mode="json"),
+                    status=outcome.status,
+                    parent_index=claim.package_block_index,
+                    metadata={
+                        "schema": "captain.capability-execution-recorded.v1",
+                        "capability_catalog_block_index": claim.catalog_block_index,
+                        "runtime_command_block_index": command_block["index"],
+                        "runtime_result_block_index": result_block["index"],
+                    },
+                )
+                self._insert(cursor, block)
+                stored = {
+                    "request": canonical_request,
+                    "record": record_data,
+                }
+                cursor.execute(
+                    """INSERT INTO factory_capability_executions
+                       (command_id, result_id, event_id, capability_id,
+                        capability_version, block_index, payload)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        str(outcome.command_id),
+                        str(outcome.result_id),
+                        str(request.event_id),
+                        outcome.capability_id,
+                        outcome.capability_version,
+                        index,
+                        json.dumps(stored, sort_keys=True),
+                    ),
+                )
+        return False
+
+    def capability_execution(
+        self,
+        command_id: UUID,
+    ) -> CapabilityExecutionRecord | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT payload FROM factory_capability_executions WHERE command_id = %s",
+                    (str(command_id),),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        stored = self._decode_json(row["payload"])
+        return CapabilityExecutionRecord.model_validate(stored["record"])
+
+    def _runtime_recovery_observation_block(
+        self,
+        cursor: Any,
+        observation: RuntimeResultRecoveryObservation,
+        *,
+        for_update: bool,
+    ) -> dict[str, Any] | None:
+        return self._runtime_block_by_two_json_values(
+            cursor,
+            block_type="runtime_result_recovery_observation",
+            first_field="event_id",
+            first_value=str(observation.event_id),
+            second_field="command_id",
+            second_value=str(observation.command_id),
+            for_update=for_update,
+        )
+
+    def _runtime_execution_claim_block(
+        self,
+        cursor: Any,
+        *,
+        command_id: UUID,
+        claim_id: UUID,
+        fencing_token: int,
+        for_update: bool,
+    ) -> dict[str, Any] | None:
+        sql = """
+            SELECT `index`, parent_index, block_type, data, status, children,
+                   metadata, hash, previous_hash
+            FROM blocks
+            WHERE block_type = 'runtime_execution_claim'
+              AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.command_id')) = %s
+              AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.claim_id')) = %s
+              AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.fencing_token')) = %s
+            ORDER BY `index` LIMIT 2
+        """
+        if for_update:
+            sql += " FOR UPDATE"
+        cursor.execute(sql, (str(command_id), str(claim_id), str(fencing_token)))
+        rows = cursor.fetchall()
+        if len(rows) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail="runtime execution claim fence is duplicated in the ledger",
+            )
+        return self.storage._decode_row(rows[0]) if rows else None
+
+    @staticmethod
+    def _lock_ledger_state(cursor: Any) -> None:
+        cursor.execute(
+            "SELECT next_block_index FROM ledger_state WHERE id = 1 FOR UPDATE"
+        )
+        if cursor.fetchone() is None:
+            raise RuntimeError("ledger_state row is missing")
+
+
+    @staticmethod
+    def _assert_frozen_capability_authority(
+        claim: RuntimeExecutionClaim,
+        *,
+        authority: RuntimeCapabilityAuthority,
+    ) -> None:
+        if GatewayStore._claim_capability_authority(claim) != authority:
+            raise HTTPException(
+                status_code=409,
+                detail="runtime claim does not match its frozen capability authority",
+            )
+
+    @staticmethod
+    @staticmethod
+    def _assert_runtime_capability_claimable(
+        *,
+        request: RuntimeExecutionClaimRequest,
+        command: AgentRuntimeCommand,
+        admission: RuntimeBatchAdmission,
+        catalog: CapabilityCatalogRecord,
+    ) -> None:
+        if (
+            request.command_id != command.event_id
+            or admission.command_id != command.event_id
+            or request.capability_id != catalog.capability_id
+            or request.capability_version != catalog.capability_version
+            or catalog.status != "ready_to_use"
+            or catalog.promoted_capability.status != "ready_to_use"
+            or catalog.unresolved_required_gap_ids
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="runtime claim does not match a ready capability catalog head",
+            )
+        if (
+            command.occurred_at < catalog.published_at
+            or admission.admitted_at < catalog.published_at
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="runtime command predates capability publication",
+            )
+
+    @staticmethod
+    @staticmethod
+    def _build_runtime_batch_admission(
+        *,
+        command: AgentRuntimeCommand,
+        parent: dict[str, Any],
+        release_fence: int,
+        admitted_at: datetime,
+    ) -> RuntimeBatchAdmission:
+        payload = command.payload
+        if payload.batch_id is None:
+            raise HTTPException(status_code=409, detail="runtime command has no released batch")
+        try:
+            batch = WorkBatch.model_validate(parent["data"])
+            parent_index = int(parent["index"])
+            parent_hash = str(parent["hash"])
+        except (KeyError, TypeError, ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=409, detail="invalid released batch head") from exc
+        if batch.batch_id != payload.batch_id:
+            raise HTTPException(status_code=409, detail="runtime command batch does not match release head")
+        if release_fence < parent_index:
+            raise HTTPException(status_code=409, detail="invalid runtime release fence")
+        return RuntimeBatchAdmission(
+            command_id=command.event_id,
+            batch_id=batch.batch_id,
+            batch_version=command.subject_version,
+            batch_block_index=parent_index,
+            batch_block_hash=parent_hash,
+            release_fence=release_fence,
+            admitted_at=admitted_at,
+        )
+
+    @staticmethod
+    @staticmethod
+    def _assert_runtime_admission_head(
+        admission: RuntimeBatchAdmission,
+        *,
+        command: AgentRuntimeCommand,
+        parent: dict[str, Any],
+    ) -> None:
+        if (
+            admission.command_id != command.event_id
+            or admission.batch_id != command.payload.batch_id
+            or admission.batch_version != command.subject_version
+            or admission.batch_block_index != parent.get("index")
+            or admission.batch_block_hash != parent.get("hash")
+        ):
+            raise HTTPException(status_code=409, detail="stale runtime release head admission")
+
+    @staticmethod
+    @staticmethod
+    def _assert_runtime_admission_is_current(
+        admission: RuntimeBatchAdmission,
+        *,
+        parent: dict[str, Any],
+        children: list[dict[str, Any]],
+        projection: BatchProjection,
+    ) -> None:
+        approval_indexes = [
+            int(child["index"])
+            for child in children
+            if child["block_type"] == "batch_approved"
+        ]
+        current_release_fence = max([int(parent["index"]), *approval_indexes])
+        if (
+            admission.release_fence != current_release_fence
+            or projection.status not in {"pending", "claimed"}
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="runtime batch admission is no longer currently released",
+            )
+
+    @staticmethod
+    @staticmethod
+    def _assert_grant_matches_admission(
+        grant: CapabilityGrant,
+        admission: RuntimeBatchAdmission,
+    ) -> None:
+        if (
+            grant.command_id != admission.command_id
+            or grant.batch_id != admission.batch_id
+            or grant.batch_version != admission.batch_version
+        ):
+            raise HTTPException(status_code=409, detail="runtime grant does not match batch admission")
+
+    @staticmethod
+    @staticmethod
+    def _assert_execution_claim_fence(
+        claim: RuntimeExecutionClaim,
+        *,
+        owner_id: str,
+        fencing_token: int,
+        now: datetime | None = None,
+    ) -> None:
+        if claim.owner_id != owner_id or claim.fencing_token != fencing_token:
+            raise HTTPException(status_code=409, detail="stale runtime execution claim fence")
+        if now is None:
+            return
+        if now.tzinfo is None or now.utcoffset() != timezone.utc.utcoffset(now):
+            raise HTTPException(status_code=409, detail="execution claim clock must be UTC")
+        if claim.status != "active":
+            raise HTTPException(status_code=409, detail="runtime execution claim is not active")
+        if claim.expires_at <= now.astimezone(timezone.utc):
+            raise HTTPException(status_code=409, detail="runtime execution claim is expired")
+
+    @staticmethod
+    @staticmethod
+    def _assert_execution_claim_completion_authority(
+        claim: RuntimeExecutionClaim,
+        *,
+        owner_id: str,
+        fencing_token: int,
+        credential: str,
+        credential_sha256: str,
+    ) -> None:
+        presented_sha256 = hashlib.sha256(credential.encode("utf-8")).hexdigest()
+        expected_proof = f"{credential_sha256}:{claim.fencing_token}".encode("ascii")
+        presented_proof = f"{presented_sha256}:{fencing_token}".encode("ascii")
+        proof_matches = secrets.compare_digest(expected_proof, presented_proof)
+        owner_matches = secrets.compare_digest(claim.owner_id, owner_id)
+        if not (proof_matches and owner_matches):
+            raise HTTPException(status_code=409, detail="stale runtime execution claim authority")
+
+    @staticmethod
+    @staticmethod
+    def _assert_result_occurred_within_claim(
+        claim: RuntimeExecutionClaim,
+        *,
+        occurred_at: datetime,
+    ) -> None:
+        if occurred_at.tzinfo is None or occurred_at.utcoffset() != timezone.utc.utcoffset(
+            occurred_at
+        ):
+            raise HTTPException(status_code=409, detail="runtime result clock must be UTC")
+        occurred_at = occurred_at.astimezone(timezone.utc)
+        if not claim.claimed_at <= occurred_at < claim.expires_at:
+            raise HTTPException(
+                status_code=409,
+                detail="runtime result occurred_at is outside the claim lease window",
+            )
+
+    @staticmethod
+    @staticmethod
+    def _assert_runtime_result_recovery_claims(
+        request: RuntimeResultRecoveryRequest,
+        *,
+        original_claim: RuntimeExecutionClaim,
+        current_claim: RuntimeExecutionClaim,
+        command_block_index: int,
+        original_claim_parent_index: int | None,
+    ) -> None:
+        observation = request.observation
+        receipt = request.provider_receipt
+        expected_effect_id = uuid5(request.result.command_id, "durable-provider-effect")
+        if (
+            original_claim_parent_index != command_block_index
+            or original_claim.command_id != request.result.command_id
+            or current_claim.command_id != request.result.command_id
+            or original_claim.claim_id != receipt.origin_claim_id
+            or original_claim.fencing_token != observation.original_claim_fence
+            or original_claim.fencing_token
+            != receipt.origin_claim_fencing_token
+            or current_claim.fencing_token != observation.recovery_claim_fence
+            or current_claim.fencing_token <= original_claim.fencing_token
+            or original_claim.status != "active"
+            or original_claim.expires_at > current_claim.claimed_at
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="runtime recovery claim lineage is invalid",
+            )
+        if (
+            GatewayStore._claim_capability_authority(original_claim)
+            != GatewayStore._claim_capability_authority(current_claim)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="runtime recovery changed frozen capability authority",
+            )
+        if canonical_contract_sha256(original_claim) != receipt.origin_claim_digest:
+            raise HTTPException(
+                status_code=409,
+                detail="runtime recovery effect origin claim digest does not match the ledger",
+            )
+        if request.provider_receipt.effect_id != expected_effect_id:
+            raise HTTPException(
+                status_code=409,
+                detail="runtime recovery provider effect id is not deterministic",
+            )
+        GatewayStore._assert_result_occurred_within_claim(
+            original_claim,
+            occurred_at=request.result.occurred_at,
+        )
+        GatewayStore._assert_result_occurred_within_claim(
+            current_claim,
+            occurred_at=observation.observed_at,
+        )
+
+    @staticmethod
+    @staticmethod
+    def _assert_capability_execution_binding(
+        request: CapabilityExecutionRequest,
+        *,
+        catalog: CapabilityCatalogRecord,
+        command: AgentRuntimeCommand,
+        result: AgentRuntimeResult,
+        claim: RuntimeExecutionClaim,
+    ) -> None:
+        outcome = request.outcome
+        if (
+            claim.capability_id != catalog.capability_id
+            or claim.capability_version != catalog.capability_version
+            or claim.team_version != catalog.team_version
+            or claim.catalog_fence != catalog.catalog_fence
+            or claim.package_ref != catalog.package_ref
+            or claim.published_at != catalog.published_at
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="capability execution does not match the claim's frozen catalog authority",
+            )
+        if (
+            catalog.status != "ready_to_use"
+            or catalog.capability_id != outcome.capability_id
+            or catalog.capability_version != outcome.capability_version
+            or catalog.team_version != outcome.team_version
+            or catalog.promoted_capability.status != "ready_to_use"
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="capability execution requires the exact published catalog head",
+            )
+        if tuple(item.assertion_id for item in outcome.assertion_outcomes) != (
+            catalog.accepted_assertion_ids
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="capability execution assertions do not match the catalog release",
+            )
+        if claim.command_id != command.event_id:
+            raise HTTPException(status_code=409, detail="execution claim belongs to another command")
+        GatewayStore._assert_execution_claim_fence(
+            claim,
+            owner_id=request.claim_owner_id,
+            fencing_token=request.claim_fencing_token,
+        )
+        try:
+            validate_execution_outcome_binding(
+                outcome,
+                command=command,
+                result=result,
+                expected_capability_id=catalog.capability_id,
+                expected_capability_version=catalog.capability_version,
+                expected_team_version=catalog.team_version,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @staticmethod
+    @staticmethod
+    def _authoritative_capability_release(
+        *,
+        job: FactoryJob,
+        projection: FactoryProjection,
+        promotion: FactoryEvidenceBlock | None,
+        evaluation: StoredSkillEvaluation | None,
+        request: CapabilityReleaseRequest,
+        now: datetime,
+    ) -> CapabilityReleaseRequest:
+        """Rebuild release-owned fields from locked Gateway state and its clock."""
+
+        if now.tzinfo is None or now.utcoffset() != timezone.utc.utcoffset(now):
+            raise HTTPException(status_code=409, detail="capability release clock must be UTC")
+        now = now.astimezone(timezone.utc)
+        package = request.package
+        if not isinstance(job, AgentFactoryJobV2):
+            raise HTTPException(
+                status_code=409,
+                detail="capability package release requires a v2 factory job",
+            )
+        if (
+            package.factory_job_id != job.job_id
+            or package.correlation_id != job.correlation_id
+            or package.subject_version != job.subject_version
+            or package.capability_id != job.required_capability
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="capability release does not match its factory job",
+            )
+        if promotion is None:
+            raise HTTPException(
+                status_code=409,
+                detail="capability catalog publication requires prior Captain promotion",
+            )
+        if (
+            promotion.phase is not FactoryPhase.CAPABILITY_PROMOTED
+            or promotion.producer != "captain"
+            or promotion.job_id != job.job_id
+            or promotion.correlation_id != job.correlation_id
+            or promotion.subject_version != job.subject_version
+            or not set(job.acceptance_assertion_ids).issubset(
+                promotion.assertion_ids
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="capability promotion does not match its factory job",
+            )
+        if evaluation is None:
+            raise HTTPException(
+                status_code=409,
+                detail="capability release requires accepted evaluation evidence",
+            )
+        expected = derive_terminal_decision(
+            job,
+            projection,
+            package,
+            evaluation,
+            request.release_evidence,
+            now,
+        )
+        submitted_at_gateway_time = request.decision.model_copy(
+            update={"decided_at": now}
+        )
+        if (
+            expected is None
+            or expected.state is not FactoryTerminalState.READY_TO_USE
+            or expected != submitted_at_gateway_time
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="terminal decision does not match the Gateway-recomputed ready_to_use decision",
+            )
+
+        assert promotion is not None
+        promotion_ref = ArtifactRef(
+            uri=f"artifact://gateway/factory-promotion/{promotion.event_id}",
+            sha256=canonical_contract_sha256(promotion),
+            media_type="application/json",
+        )
+        promoted_capability = request.promoted_capability.model_copy(
+            update={"promotion_block_ref": promotion_ref}
+        )
+        tool_contracts = tuple(
+            sorted(
+                artifact.path
+                for artifact in package.artifacts
+                if artifact.kind in {"n8n_workflow", "local_adapter"}
+            )
+        )
+        decision_ref = ArtifactRef(
+            uri=f"artifact://gateway/factory-terminal-decision/{expected.decision_id}",
+            sha256=canonical_contract_sha256(expected),
+            media_type="application/json",
+        )
+        return CapabilityReleaseRequest(
+            schema_name=request.schema_name,
+            event_id=request.event_id,
+            causation_id=request.causation_id,
+            occurred_at=now,
+            producer=request.producer,
+            decision=expected,
+            decision_ref=decision_ref,
+            package=package,
+            package_ref=request.package_ref,
+            release_evidence=request.release_evidence,
+            promoted_capability=promoted_capability,
+            schema_major=request.schema_major,
+            team_version=package.capability_version,
+            accepted_assertion_ids=request.accepted_assertion_ids,
+            integration_intents=request.integration_intents,
+            tool_contracts=tool_contracts,
+        )
+
+    def _locked_claim_capability_release(
+        self,
+        cursor: Any,
+        claim: RuntimeExecutionClaim,
+    ) -> tuple[CapabilityCatalogRecord, dict[str, Any]]:
+        cursor.execute(
+            """SELECT block_index, payload, catalog_payload
+               FROM factory_capability_packages
+               WHERE capability_id = %s AND capability_version = %s
+               FOR UPDATE""",
+            (claim.capability_id, claim.capability_version),
+        )
+        package_row = cursor.fetchone()
+        if package_row is None:
+            raise HTTPException(
+                status_code=409,
+                detail="frozen capability package not found",
+            )
+        catalog = CapabilityCatalogRecord.model_validate(
+            self._decode_json(package_row["catalog_payload"])
+        )
+        catalog_block = self._row_by_index(
+            cursor,
+            claim.catalog_block_index,
+            for_update=True,
+        )
+        package_block = self._row_by_index(
+            cursor,
+            claim.package_block_index,
+            for_update=True,
+        )
+        if (
+            int(package_row["block_index"]) != claim.package_block_index
+            or catalog_block is None
+            or package_block is None
+            or catalog_block["block_type"] != "capability_catalog_head"
+            or package_block["block_type"] != "capability_package_published"
+            or int(catalog_block["parent_index"]) != claim.package_block_index
+            or catalog_block["data"] != catalog.model_dump(mode="json", by_alias=True)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="frozen capability release ledger authority is incomplete",
+            )
+        authority = RuntimeCapabilityAuthority(
+            capability_id=catalog.capability_id,
+            capability_version=catalog.capability_version,
+            team_version=catalog.team_version,
+            catalog_fence=catalog.catalog_fence,
+            catalog_block_index=int(catalog_block["index"]),
+            catalog_block_hash=str(catalog_block["hash"]),
+            package_block_index=int(package_block["index"]),
+            package_block_hash=str(package_block["hash"]),
+            package_ref=catalog.package_ref,
+            published_at=catalog.published_at,
+        )
+        self._assert_frozen_capability_authority(claim, authority=authority)
+        return catalog, package_row
+
+    @staticmethod
 
     def recover(self, request: RecoveryDecisionEvent) -> dict[str, Any]:
         try:

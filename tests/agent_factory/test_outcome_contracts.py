@@ -8,10 +8,13 @@ import pytest
 from pydantic import ValidationError
 
 from agenten.agent_factory.outcome_contracts import (
+    CapabilityReleaseEvidenceV1,
     CapabilityPackageManifestV1,
     ExecutionOutcomeV1,
     FactoryTerminalDecision,
     FactoryTerminalState,
+    ForgeCapabilityPackageCandidateV1,
+    PrivateHoldoutEvidence,
     validate_execution_outcome_binding,
 )
 from agenten.agent_factory.skill_evaluation import ToolGapMarker
@@ -41,6 +44,21 @@ def _artifact(path: str, digest: str, *, kind: str = "evidence") -> dict[str, ob
             "media_type": "application/octet-stream",
         },
     }
+
+
+def test_forge_candidate_fixture_is_strict_and_has_no_captain_evidence() -> None:
+    payload = _fixture("forge_capability_package_candidate.v1.json")
+
+    candidate = ForgeCapabilityPackageCandidateV1.model_validate(payload)
+
+    assert candidate.model_dump(mode="json", by_alias=True) == payload
+    assert candidate.schema_name == "forge.capability-package-candidate.v1"
+    assert not hasattr(candidate, "release_evidence_refs")
+    assert not hasattr(candidate, "assertion_outcomes")
+    with pytest.raises(ValidationError, match="extra"):
+        ForgeCapabilityPackageCandidateV1.model_validate(
+            {**payload, "producer": "captain"}
+        )
 
 
 def _runtime_command() -> AgentRuntimeCommand:
@@ -131,7 +149,10 @@ def test_adapter_declaration_requires_an_adapter_root() -> None:
         CapabilityPackageManifestV1.model_validate(payload)
 
 
-@pytest.mark.parametrize("unsafe_path", ("../secret.txt", "/tmp/code.py", "C:\\work\\code.py", "autogen\\..\\secret.py"))
+@pytest.mark.parametrize(
+    "unsafe_path",
+    ("../secret.txt", "/tmp/code.py", "C:\\work\\code.py", "autogen\\..\\secret.py"),
+)
 def test_package_rejects_unsafe_artifact_paths(unsafe_path: str) -> None:
     payload = _fixture("capability_package_manifest.v1.json")
     payload["artifacts"][1]["path"] = unsafe_path
@@ -508,3 +529,78 @@ def test_terminal_decision_uses_only_the_closed_factory_state_vocabulary() -> No
         FactoryTerminalDecision.model_validate(
             {**decision.model_dump(mode="json", by_alias=True), "state": "succeeded"}
         )
+
+
+def test_capability_release_evidence_fixture_is_strict_frozen_and_round_trips() -> None:
+    payload = _fixture("capability_release_evidence.v1.json")
+
+    evidence = CapabilityReleaseEvidenceV1.model_validate(payload)
+
+    assert evidence.model_dump(mode="json", by_alias=True) == payload
+    assert evidence.assertion_ids == ("output-01",)
+    assert evidence.assertion_results[0].integration_intent.value == "none"
+    assert evidence.private_holdout_evidence[0].status == "passed"
+    with pytest.raises(ValidationError, match="frozen"):
+        evidence.run_number = 2
+    with pytest.raises(ValidationError, match="extra"):
+        CapabilityReleaseEvidenceV1.model_validate({**payload, "forge_status": "succeeded"})
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    (
+        ({"recovery_id": None}, "recovery_id"),
+        ({"outcome": "succeeded"}, "expected_failure_recovered"),
+        ({"kind": "normal"}, "normal.*recovery identity"),
+    ),
+)
+def test_capability_release_evidence_enforces_kind_semantics(
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    payload = _fixture("capability_release_evidence.v1.json")
+    payload.update(updates)
+
+    with pytest.raises(ValidationError, match=message):
+        CapabilityReleaseEvidenceV1.model_validate(payload)
+
+
+def test_capability_release_evidence_requires_unique_assertions_holdouts_and_refs() -> None:
+    payload = _fixture("capability_release_evidence.v1.json")
+    payload["assertion_results"].append(payload["assertion_results"][0])
+    with pytest.raises(ValidationError, match="assertion"):
+        CapabilityReleaseEvidenceV1.model_validate(payload)
+
+    payload = _fixture("capability_release_evidence.v1.json")
+    payload["private_holdout_evidence"].append(
+        payload["private_holdout_evidence"][0]
+    )
+    with pytest.raises(ValidationError, match="holdout"):
+        CapabilityReleaseEvidenceV1.model_validate(payload)
+
+
+def test_private_holdout_evidence_is_typed_strict_and_frozen() -> None:
+    payload = _fixture("capability_release_evidence.v1.json")[
+        "private_holdout_evidence"
+    ][0]
+
+    evidence = PrivateHoldoutEvidence.model_validate(payload)
+
+    assert evidence.assertion_id == "output-01"
+    with pytest.raises(ValidationError, match="extra"):
+        PrivateHoldoutEvidence.model_validate({**payload, "producer": "forge"})
+
+    payload = _fixture("capability_release_evidence.v1.json")
+    payload["assertion_results"][0]["evidence_refs"].append(
+        payload["assertion_results"][0]["evidence_refs"][0]
+    )
+    with pytest.raises(ValidationError, match="evidence"):
+        CapabilityReleaseEvidenceV1.model_validate(payload)
+
+
+def test_capability_release_evidence_rejects_private_holdout_bodies() -> None:
+    payload = _fixture("capability_release_evidence.v1.json")
+    payload["holdout_body"] = "private scenario"
+
+    with pytest.raises(ValidationError, match="private"):
+        CapabilityReleaseEvidenceV1.model_validate(payload)

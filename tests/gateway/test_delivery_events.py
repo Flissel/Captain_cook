@@ -7,7 +7,10 @@ import pytest
 from pydantic import ValidationError
 
 from gateway.contracts import (
+    CapabilityExecutionRecordedPayload,
+    CapabilityPackagePublishedPayload,
     DeliveryEventEnvelope,
+    FactoryTerminalDecidedPayload,
     ReleaseProjection,
     TraceContext,
     project_release,
@@ -36,6 +39,79 @@ def artifact(name: str, digest: str = "a" * 64) -> dict[str, str]:
         "sha256": digest,
         "media_type": "application/json",
     }
+
+
+@pytest.mark.parametrize(
+    ("event_type", "payload"),
+    (
+        (
+            "factory_terminal_decided",
+            {
+                "causation_id": "00000000-0000-0000-0000-000000000124",
+                "decision_id": "00000000-0000-0000-0000-000000000901",
+                "job_id": FACTORY_TRACE["job_id"],
+                "state": "ready_to_use",
+                "decision_ref": artifact("terminal-decision"),
+            },
+        ),
+        (
+            "capability_package_published",
+            {
+                "causation_id": "00000000-0000-0000-0000-000000000125",
+                "capability_id": "support_triage",
+                "capability_version": 1,
+                "terminal_decision_id": "00000000-0000-0000-0000-000000000901",
+                "package_ref": artifact("capability-package"),
+                "status": "ready_to_use",
+            },
+        ),
+        (
+            "capability_execution_recorded",
+            {
+                "causation_id": "00000000-0000-0000-0000-000000000126",
+                "capability_id": "support_triage",
+                "capability_version": 1,
+                "command_id": "00000000-0000-0000-0000-000000000001",
+                "result_id": "00000000-0000-0000-0000-000000000003",
+                "outcome_ref": artifact("execution-outcome"),
+                "status": "succeeded",
+            },
+        ),
+    ),
+)
+def test_capability_delivery_payloads_are_strict_and_factory_bound(
+    event_type: str,
+    payload: dict[str, object],
+) -> None:
+    event = DeliveryEventEnvelope.model_validate(
+        {
+            "event_id": uuid4(),
+            "event_type": event_type,
+            "occurred_at": NOW,
+            "actor": "captain",
+            "trace": {**TRACE, **FACTORY_TRACE},
+            "payload": {"event_type": event_type, **payload},
+        }
+    )
+
+    assert isinstance(
+        event.payload,
+        (
+            FactoryTerminalDecidedPayload,
+            CapabilityPackagePublishedPayload,
+            CapabilityExecutionRecordedPayload,
+        ),
+    )
+    with pytest.raises(ValidationError):
+        DeliveryEventEnvelope.model_validate(
+            {
+                **event.model_dump(mode="json"),
+                "payload": {
+                    **event.payload.model_dump(mode="json"),
+                    "private_holdout_body": "forbidden",
+                },
+            }
+        )
 
 
 EVENT_CASES = (

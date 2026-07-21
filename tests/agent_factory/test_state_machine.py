@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -139,6 +141,28 @@ def workflow_block(
             "causation_id": factory_job.event_id,
         }
     )
+
+
+def v2_job(*, deadline_at: datetime | None = None) -> AgentFactoryJobV2:
+    payload = json.loads(
+        (Path(__file__).parents[1] / "fixtures" / "agent_factory" / "agent_factory_job.v2.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    legacy = job()
+    payload.update(
+        {
+            "event_id": str(legacy.event_id),
+            "correlation_id": str(legacy.correlation_id),
+            "occurred_at": legacy.occurred_at.isoformat(),
+            "job_id": str(legacy.job_id),
+            "subject_version": legacy.subject_version,
+            "required_capability": legacy.required_capability,
+            "acceptance_assertion_ids": list(legacy.acceptance_assertion_ids),
+            "deadline_at": (deadline_at or NOW + timedelta(minutes=15)).isoformat(),
+        }
+    )
+    return AgentFactoryJobV2.model_validate(payload)
 
 
 def block(
