@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import hashlib
-import importlib
 import json
 import os
+import re
 import subprocess
 from collections.abc import Callable
-from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -46,6 +44,8 @@ from agenten.agent_factory.factory_live_runner import (
     FactoryLiveEffectKind,
     FactoryLiveRunReport,
 )
+from agenten.agent_factory.hermes_cli import skill_directory_digest
+from agenten.agent_factory.orchestration import FactoryDispatchError
 from agenten.agent_factory.release_gate import FactoryReleaseDecision
 from agenten.agent_factory.skill_sequence import SkillSequencePolicy
 from agenten.agent_factory.state_machine import (
@@ -60,37 +60,11 @@ FACTORY_SKILL_NAMES = tuple(
     FACTORY_SKILL_ID_BY_STEP[step]
     for step in FactorySkillStep
 )
-_TEXT_ASSET_EXTENSIONS = frozenset(
-    {
-        ".bash",
-        ".cjs",
-        ".conf",
-        ".css",
-        ".csv",
-        ".html",
-        ".ini",
-        ".js",
-        ".json",
-        ".jsonl",
-        ".jsx",
-        ".md",
-        ".mjs",
-        ".ps1",
-        ".psd1",
-        ".psm1",
-        ".py",
-        ".pyi",
-        ".scss",
-        ".sh",
-        ".toml",
-        ".ts",
-        ".tsx",
-        ".txt",
-        ".xml",
-        ".yaml",
-        ".yml",
-        ".zsh",
-    }
+_SENSITIVE_PUBLIC_VALUE = re.compile(
+    r"(?i)(?:^[A-Za-z]:[\\/]|^/|^\\\\|\bbearer\s+\S+|"
+    r"\bsk-(?:proj-)?[A-Za-z0-9_-]+|"
+    r"\b(?:api[_-]?key|authorization|credential|password|secret|token|"
+    r"raw[_-]?prompt)\b)"
 )
 
 
@@ -131,29 +105,6 @@ class FactoryLivePreflightSettings(BaseModel):
         if not repository.is_dir() or not report_directory.is_dir():
             raise ValueError("repository and external report directories must exist")
         return self
-
-
-class FactoryLiveAdapterPreflight(BaseModel):
-    """Typed confirmation that every requested production adapter exists."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-
-    model: str
-    hermes: Literal[True]
-    codex: Literal[True]
-    autogen: Literal[True]
-    context7: Literal[True]
-    forge: Literal[True]
-    pricing: Literal[True]
-    holdouts: Literal[True]
-    hermes_usage_file_receipts: Literal[True]
-    hermes_costs_persisted_by_captain: Literal[True]
-    sealed_codex_brief_before_claim: Literal[True]
-    dispatch_replays_claimed_effects: Literal[True]
-    hermes_gateway_claims: Literal[True]
-    quality_warden_runs_hermes_skills: Literal[True]
-    workflow_artifacts_persisted_before_blocks: Literal[True]
-    n8n: bool
 
 
 class FactoryLivePreflight(BaseModel):
@@ -203,6 +154,19 @@ class FactoryLiveProviderTrace(BaseModel):
     cost_usd: Decimal
     usage_receipt_ref: ArtifactRef
     budget_receipt_ref: ArtifactRef
+
+    @field_validator(
+        "trace_id",
+        "codex_session_id",
+        "hermes_session_id",
+        "provider",
+        "model",
+    )
+    @classmethod
+    def require_redacted_public_values(cls, value: str) -> str:
+        if _SENSITIVE_PUBLIC_VALUE.search(value):
+            raise ValueError("provider trace values must be redacted")
+        return value
 
     @field_validator("cost_usd", mode="before")
     @classmethod
@@ -318,25 +282,14 @@ class FactoryLivePreflightProbe(Protocol):
     def verify_n8n(self) -> None: ...
 
 
-class FactoryLiveAdapterFactory(Protocol):
-    def preflight(
-        self,
-        settings: FactoryLivePreflightSettings,
-    ) -> FactoryLiveAdapterPreflight: ...
-
-    def build(
-        self,
-        settings: FactoryLivePreflightSettings,
-        preflight: FactoryLivePreflight,
-    ) -> "FactoryLiveGateBindings": ...
-
-
 class FactoryLiveLifecyclePort(Protocol):
     def next_action(self, job_id: UUID) -> FactoryAction: ...
 
     def projection(self, job_id: UUID) -> Any: ...
 
     def record(self, block: FactoryEvidenceBlock) -> bool: ...
+
+    def promotion_block(self, job_id: UUID) -> FactoryEvidenceBlock | None: ...
 
 
 class FactoryLiveWorkflowRepositoryPort(Protocol):
@@ -359,29 +312,14 @@ class FactoryLiveDispatcherPort(Protocol):
 
 
 class FactoryLiveRunnerPort(Protocol):
+    def history(self, job_id: UUID) -> tuple[FactoryLiveRunReport, ...]: ...
+
     async def run(
         self,
         job: UUID | AgentFactoryJobV3,
         *,
         mode: Literal["demo", "release"],
     ) -> FactoryLiveRunReport: ...
-
-
-class FactoryLiveEvidenceObserverPort(Protocol):
-    async def observe(
-        self,
-        job: AgentFactoryJobV3,
-        result: "FactorySixSkillLiveResult",
-    ) -> FactoryLiveObservedEvidence: ...
-
-
-@dataclass(frozen=True)
-class FactoryLiveGateBindings:
-    """All explicit production dependencies needed after preflight."""
-
-    job: AgentFactoryJobV3
-    coordinator: "FactorySixSkillLiveCoordinator"
-    observer: FactoryLiveEvidenceObserverPort
 
 
 class FactorySixSkillLiveResult(BaseModel):
@@ -459,7 +397,7 @@ class FactorySixSkillLiveCoordinator:
         if projection.job != job:
             raise ValueError("Factory live job does not match Gateway authority")
         observed_steps: list[FactorySkillStep] = []
-        runner_reports: list[FactoryLiveRunReport] = []
+        runner_reports = list(self._live_runner.history(job.job_id))
         for _ in range(self._max_actions):
             action = self._coordinator.next_action(job.job_id)
             if action.kind in _EXTERNAL_ACTIONS:
@@ -539,12 +477,22 @@ class FactorySixSkillLiveCoordinator:
                 status = self._coordinator.projection(job.job_id).status.value
                 if status not in {"ready_to_use", "escalated"}:
                     raise ValueError("Factory completed without a terminal Gateway state")
+                promotion = (
+                    self._coordinator.promotion_block(job.job_id)
+                    if status == "ready_to_use"
+                    else None
+                )
+                if status == "ready_to_use" and promotion is None:
+                    raise ValueError(
+                        "Gateway ready_to_use state lacks its promotion block"
+                    )
                 return self._result(
                     job,
                     mode,
                     status,
                     tuple(observed_steps),
                     tuple(runner_reports),
+                    promotion=promotion,
                 )
             raise ValueError(f"unsupported Factory live action: {action.kind.value}")
         raise ValueError("Factory live coordinator exceeded its bounded action count")
@@ -834,14 +782,11 @@ def run_factory_live_preflight(
     settings: FactoryLivePreflightSettings,
     *,
     probe: FactoryLivePreflightProbe,
-    adapter_factory: FactoryLiveAdapterFactory | None,
+    adapter_factory: object | None,
 ) -> FactoryLivePreflight:
     """Verify real prerequisites and persist one redacted external confirmation."""
 
-    if adapter_factory is None:
-        raise FactoryLiveConfigurationError(
-            "production factory live adapter factory is unavailable"
-        )
+    del adapter_factory
     observed_skill_digests = _released_skill_directory_digests(
         settings.repository_root
     )
@@ -857,32 +802,9 @@ def run_factory_live_preflight(
     probe.verify_hermes(observed_skill_digests)
     if settings.with_n8n:
         probe.verify_n8n()
-    try:
-        adapter_evidence = FactoryLiveAdapterPreflight.model_validate(
-            adapter_factory.preflight(settings)
-        )
-    except Exception:
-        raise FactoryLiveConfigurationError("provider_cost_unresolved") from None
-    if adapter_evidence.model != settings.model:
-        raise FactoryLiveConfigurationError("Factory model is not approved")
-    if adapter_evidence.n8n is not settings.with_n8n:
-        raise FactoryLiveConfigurationError("Factory n8n adapter scope does not match")
-    result = FactoryLivePreflight(
-        schema_name="captain.hermes-six-skill-factory-preflight.v1",
-        mode=settings.mode,
-        max_cost_usd=settings.max_cost_usd,
-        model=settings.model,
-        with_n8n=settings.with_n8n,
-        prerequisites_confirmed=True,
-        database_name="captain_test",
-        services_verified=True,
-        codex_authenticated=True,
-        skills_verified=True,
-        runtime_adapters_verified=True,
-        skill_digests=dict(observed_skill_digests),
+    raise FactoryLiveConfigurationError(
+        "production prepared dispatch adapter is unavailable"
     )
-    _write_json(settings.output, result.model_dump(mode="json", by_alias=True))
-    return result
 
 
 async def run_factory_live_gate_from_environment() -> Mapping[str, object]:
@@ -893,37 +815,10 @@ async def run_factory_live_gate_from_environment() -> Mapping[str, object]:
             "Factory live prerequisites were not explicitly confirmed"
         )
     settings = _settings_from_environment()
-    preflight = _read_matching_preflight(settings)
-    adapter_factory = _load_adapter_factory()
-    try:
-        bindings = adapter_factory.build(settings, preflight)
-    except Exception:
-        raise FactoryLiveConfigurationError(
-            "production Factory live bindings are unavailable"
-        ) from None
-    if not isinstance(bindings, FactoryLiveGateBindings):
-        raise FactoryLiveConfigurationError(
-            "production Factory live bindings are unavailable"
-        )
-    if bindings.job.execution_policy.max_cost_usd != settings.max_cost_usd:
-        raise FactoryLiveConfigurationError("Factory live budget does not match Captain")
-    if settings.model not in bindings.job.execution_policy.allowed_models:
-        raise FactoryLiveConfigurationError("Factory live model does not match Captain")
-    result = await bindings.coordinator.run(bindings.job, settings.mode)
-    try:
-        observed = FactoryLiveObservedEvidence.model_validate(
-            await bindings.observer.observe(bindings.job, result)
-        )
-    except Exception:
-        raise FactoryLiveConfigurationError("provider_cost_unresolved") from None
-    report = _build_live_report(settings, bindings.job, result, observed)
-    payload = report.model_dump(
-        mode="json",
-        by_alias=True,
-        exclude_none=True,
+    _read_matching_preflight(settings)
+    raise FactoryLiveConfigurationError(
+        "production prepared dispatch adapter is unavailable"
     )
-    _write_content_addressed_report(settings.report_directory, payload)
-    return payload
 
 
 def _build_live_report(
@@ -1039,16 +934,21 @@ def _settings_from_environment() -> FactoryLivePreflightSettings:
     report_directory = Path(required["CAPTAIN_FACTORY_REPORT_DIRECTORY"] or "")
     output = Path(required["CAPTAIN_FACTORY_PREFLIGHT_PATH"] or "")
     repository_root = Path(__file__).resolve().parents[2]
-    return FactoryLivePreflightSettings(
-        mode=required["CAPTAIN_FACTORY_GATE_MODE"],
-        max_cost_usd=required["CAPTAIN_FACTORY_MAX_COST_USD"],
-        model=required["CAPTAIN_FACTORY_MODEL"],
-        repository_root=repository_root,
-        report_directory=report_directory,
-        output=output,
-        database_dsn=required["TEST_MARIADB_DSN"],
-        with_n8n=os.environ.get("CAPTAIN_FACTORY_WITH_N8N") == "1",
-    )
+    try:
+        return FactoryLivePreflightSettings(
+            mode=required["CAPTAIN_FACTORY_GATE_MODE"],
+            max_cost_usd=required["CAPTAIN_FACTORY_MAX_COST_USD"],
+            model=required["CAPTAIN_FACTORY_MODEL"],
+            repository_root=repository_root,
+            report_directory=report_directory,
+            output=output,
+            database_dsn=required["TEST_MARIADB_DSN"],
+            with_n8n=os.environ.get("CAPTAIN_FACTORY_WITH_N8N") == "1",
+        )
+    except Exception:
+        raise FactoryLiveConfigurationError(
+            "Factory live environment is invalid"
+        ) from None
 
 
 def _read_matching_preflight(
@@ -1073,35 +973,6 @@ def _read_matching_preflight(
             "Factory live preflight no longer matches the runtime"
         )
     return preflight
-
-
-def _load_adapter_factory() -> FactoryLiveAdapterFactory:
-    target = os.environ.get("CAPTAIN_FACTORY_LIVE_ADAPTER_FACTORY", "").strip()
-    if not target or ":" not in target:
-        raise FactoryLiveConfigurationError(
-            "production factory live adapter factory is unavailable"
-        )
-    module_name, attribute_name = target.split(":", 1)
-    try:
-        candidate = getattr(importlib.import_module(module_name), attribute_name)
-        factory = (
-            candidate()
-            if isinstance(candidate, type)
-            or (
-                callable(candidate)
-                and not callable(getattr(candidate, "preflight", None))
-            )
-            else candidate
-        )
-    except Exception:
-        raise FactoryLiveConfigurationError(
-            "production factory live adapter factory is unavailable"
-        ) from None
-    if not callable(getattr(factory, "preflight", None)):
-        raise FactoryLiveConfigurationError(
-            "production factory live adapter factory is unavailable"
-        )
-    return factory
 
 
 def _write_content_addressed_report(
@@ -1280,7 +1151,7 @@ def main(arguments: list[str] | None = None) -> int:
             probe=SystemFactoryLivePreflightProbe(
                 repository_root=settings.repository_root
             ),
-            adapter_factory=_load_adapter_factory(),
+            adapter_factory=None,
         )
     except Exception:
         return 1
@@ -1289,10 +1160,21 @@ def main(arguments: list[str] | None = None) -> int:
 
 def _released_skill_directory_digests(repository_root: Path) -> dict[str, str]:
     root = repository_root.resolve() / "agenten" / "agent_factory" / "skills"
-    return {
-        name: _directory_manifest_digest(root / name)
-        for name in FACTORY_SKILL_NAMES
-    }
+    try:
+        return {
+            name: _released_skill_digest(root / name)
+            for name in FACTORY_SKILL_NAMES
+        }
+    except (FactoryDispatchError, OSError):
+        raise FactoryLiveConfigurationError(
+            "a released Factory skill is unavailable"
+        ) from None
+
+
+def _released_skill_digest(directory: Path) -> str:
+    if not directory.is_dir() or not (directory / "SKILL.md").is_file():
+        raise FactoryLiveConfigurationError("a released Factory skill is unavailable")
+    return skill_directory_digest(directory)
 
 
 def _known_projection_refs(projection: Any) -> tuple[ArtifactRef, ...]:
@@ -1328,26 +1210,6 @@ def _require_exact_skill_digests(value: Mapping[str, str]) -> None:
         for digest in value.values()
     ):
         raise ValueError("Factory skill digests must be lowercase SHA-256 values")
-
-
-def _directory_manifest_digest(directory: Path) -> str:
-    if not directory.is_dir() or not (directory / "SKILL.md").is_file():
-        raise FactoryLiveConfigurationError("a released Factory skill is unavailable")
-    files = sorted(
-        (item for item in directory.rglob("*") if item.is_file()),
-        key=lambda item: item.relative_to(directory).as_posix(),
-    )
-    if any(item.is_symlink() for item in directory.rglob("*")):
-        raise FactoryLiveConfigurationError("released Factory skills cannot be symlinks")
-    entries: list[str] = []
-    for path in files:
-        content = path.read_bytes()
-        if path.suffix.lower() in _TEXT_ASSET_EXTENSIONS:
-            content = content.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-        digest = hashlib.sha256(content).hexdigest()
-        entries.append(f"{path.relative_to(directory).as_posix()}={digest}")
-    payload = "\n".join(entries).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
 
 
 def _write_json(path: Path, payload: Mapping[str, object]) -> None:

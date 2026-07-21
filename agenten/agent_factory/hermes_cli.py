@@ -895,12 +895,13 @@ def _require_released_skill_directory(
         raise FactoryDispatchError("factory skill directory is outside the configured root") from exc
     if not directory.is_dir() or not (directory / "SKILL.md").is_file():
         raise FactoryDispatchError("released factory skill directory is missing")
-    digest = _skill_directory_digest(directory)
+    digest = skill_directory_digest(directory)
     if digest != released_skill.content_sha256:
         raise FactoryDispatchError("released factory skill digest does not match Captain's release")
 
 
-def _skill_directory_digest(directory: Path) -> str:
+def skill_directory_digest(directory: Path) -> str:
+    """Return the canonical raw-byte manifest digest for one skill directory."""
     manifest: list[dict[str, object]] = []
     entries = sorted(
         directory.rglob("*"),

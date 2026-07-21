@@ -35,6 +35,21 @@ SKILLS = (
 )
 
 
+def test_preflight_uses_the_canonical_hermes_skill_directory_digest() -> None:
+    from agenten.agent_factory.factory_live_entrypoint import (
+        _released_skill_directory_digests,
+    )
+    from agenten.agent_factory.hermes_cli import skill_directory_digest
+
+    repository_root = Path(__file__).resolve().parents[2]
+    skill_root = repository_root / "agenten" / "agent_factory" / "skills"
+
+    assert _released_skill_directory_digests(repository_root) == {
+        skill_name: skill_directory_digest(skill_root / skill_name)
+        for skill_name in SKILLS
+    }
+
+
 class PreflightProbe:
     def verify_database(self, _dsn: str) -> str:
         return "captain_test"
@@ -54,32 +69,16 @@ class PreflightProbe:
 
 class AdapterFactory:
     def preflight(self, settings):
-        from agenten.agent_factory.factory_live_entrypoint import (
-            FactoryLiveAdapterPreflight,
-        )
-
-        return FactoryLiveAdapterPreflight(
-            model=settings.model,
-            hermes=True,
-            codex=True,
-            autogen=True,
-            context7=True,
-            forge=True,
-            pricing=True,
-            holdouts=True,
-            hermes_usage_file_receipts=True,
-            hermes_costs_persisted_by_captain=True,
-            sealed_codex_brief_before_claim=True,
-            dispatch_replays_claimed_effects=True,
-            hermes_gateway_claims=True,
-            quality_warden_runs_hermes_skills=True,
-            workflow_artifacts_persisted_before_blocks=True,
-            n8n=settings.with_n8n,
-        )
+        return {
+            "model": settings.model,
+            "all_runtime_claims": True,
+            "n8n": settings.with_n8n,
+        }
 
 
-def test_preflight_writes_exact_six_skill_redacted_contract(tmp_path: Path) -> None:
+def test_preflight_rejects_self_attested_runtime_adapter(tmp_path: Path) -> None:
     from agenten.agent_factory.factory_live_entrypoint import (
+        FactoryLiveConfigurationError,
         FactoryLivePreflightSettings,
         run_factory_live_preflight,
     )
@@ -100,29 +99,17 @@ def test_preflight_writes_exact_six_skill_redacted_contract(tmp_path: Path) -> N
         with_n8n=False,
     )
 
-    result = run_factory_live_preflight(
-        settings,
-        probe=PreflightProbe(),
-        adapter_factory=AdapterFactory(),
-    )
+    with pytest.raises(
+        FactoryLiveConfigurationError,
+        match="prepared dispatch adapter is unavailable",
+    ):
+        run_factory_live_preflight(
+            settings,
+            probe=PreflightProbe(),
+            adapter_factory=AdapterFactory(),
+        )
 
-    payload = json.loads(output.read_text(encoding="utf-8"))
-    assert payload == result.model_dump(mode="json", by_alias=True)
-    assert payload["schema"] == "captain.hermes-six-skill-factory-preflight.v1"
-    assert payload["database_name"] == "captain_test"
-    assert payload["prerequisites_confirmed"] is True
-    assert payload["services_verified"] is True
-    assert payload["codex_authenticated"] is True
-    assert payload["skills_verified"] is True
-    assert set(payload["skill_digests"]) == set(SKILLS)
-    assert all(
-        len(digest) == 64 and digest == digest.lower()
-        for digest in payload["skill_digests"].values()
-    )
-    serialized = output.read_text(encoding="utf-8")
-    assert secret not in serialized
-    assert str(repository_root) not in serialized
-    assert str(report_directory) not in serialized
+    assert not output.exists()
 
 
 @pytest.mark.parametrize(
@@ -155,7 +142,7 @@ def test_preflight_rejects_invalid_cost_or_model_without_writing(
         )
 
 
-def test_preflight_requires_external_output_and_real_adapter_factory(
+def test_preflight_requires_external_output_and_hard_blocks_without_adapter(
     tmp_path: Path,
 ) -> None:
     from agenten.agent_factory.factory_live_entrypoint import (
@@ -190,7 +177,10 @@ def test_preflight_requires_external_output_and_real_adapter_factory(
         database_dsn="mysql://captain:secret@127.0.0.1:3306/captain_test",
         with_n8n=False,
     )
-    with pytest.raises(FactoryLiveConfigurationError, match="adapter factory"):
+    with pytest.raises(
+        FactoryLiveConfigurationError,
+        match="prepared dispatch adapter is unavailable",
+    ):
         run_factory_live_preflight(
             settings,
             probe=PreflightProbe(),
@@ -198,7 +188,7 @@ def test_preflight_requires_external_output_and_real_adapter_factory(
         )
 
 
-def test_preflight_fails_closed_when_hermes_usage_cost_is_unresolved(
+def test_preflight_hard_blocks_unaccounted_hermes_adapter(
     tmp_path: Path,
 ) -> None:
     from agenten.agent_factory.factory_live_entrypoint import (
@@ -239,7 +229,7 @@ def test_preflight_fails_closed_when_hermes_usage_cost_is_unresolved(
 
     with pytest.raises(
         FactoryLiveConfigurationError,
-        match="provider_cost_unresolved",
+        match="prepared dispatch adapter is unavailable",
     ):
         run_factory_live_preflight(
             settings,
@@ -339,89 +329,90 @@ def test_provider_trace_rejects_unknown_float_cost() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "unsafe_value",
+    (
+        r"C:\Users\User\private\receipt.json",
+        "/home/captain/private/receipt.json",
+        "Bearer highly-sensitive-token",
+        "api_key=highly-sensitive-token",
+        "raw_prompt=do not expose this",
+        "sk-proj-highly-sensitive-token",
+    ),
+)
+def test_provider_trace_rejects_secret_path_and_raw_prompt_values(
+    unsafe_value: str,
+) -> None:
+    from agenten.agent_factory.factory_live_entrypoint import FactoryLiveProviderTrace
+
+    with pytest.raises(ValueError, match="redacted"):
+        FactoryLiveProviderTrace(
+            trace_id=unsafe_value,
+            codex_session_id="codex-session-1",
+            hermes_session_id="hermes-session-1",
+            provider="openai",
+            model="approved-model-id",
+            status="succeeded",
+            cost_usd="0.25",
+            usage_receipt_ref=workflow_artifact("usage-live", "d" * 64),
+            budget_receipt_ref=workflow_artifact("budget-live", "e" * 64),
+        )
+
+
+def test_environment_settings_redact_validation_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agenten.agent_factory.factory_live_entrypoint as entrypoint
+
+    leaked_password = "database-password-must-not-leak"
+    for name, value in {
+        "CAPTAIN_FACTORY_GATE_MODE": "not-a-mode",
+        "CAPTAIN_FACTORY_MAX_COST_USD": "5.00",
+        "CAPTAIN_FACTORY_MODEL": "approved-model-id",
+        "CAPTAIN_FACTORY_REPORT_DIRECTORY": ".",
+        "CAPTAIN_FACTORY_PREFLIGHT_PATH": "preflight.json",
+        "TEST_MARIADB_DSN": (
+            f"mysql://captain:{leaked_password}@127.0.0.1:3306/captain_test"
+        ),
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    with pytest.raises(entrypoint.FactoryLiveConfigurationError) as raised:
+        entrypoint._settings_from_environment()
+
+    assert leaked_password not in str(raised.value)
+    assert raised.value.__cause__ is None
+
+
 @pytest.mark.asyncio
-async def test_environment_gate_uses_explicit_bindings_and_persists_one_report(
+async def test_environment_gate_rejects_spoofed_all_true_adapter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import agenten.agent_factory.factory_live_entrypoint as entrypoint
 
-    job = workflow_job(mode="demo")
-    repository = WorkflowRepository()
-    lifecycle = ScriptedCoordinator(job, _coordinator_actions())
-    timeline: list[str] = []
-    dispatcher = ScriptedDispatcher(
-        lifecycle,
-        repository,
-        required_live_runs=1,
-        timeline=timeline,
-    )
-    live_runner = ScriptedLiveRunner(
-        job,
-        (
-            ("blocked", (FactoryLiveEffectKind.CODEX,)),
-            ("blocked", (FactoryLiveEffectKind.PROVIDER,)),
-            ("demo_ready", ()),
-        ),
-        timeline=timeline,
-    )
-    coordinator = entrypoint.FactorySixSkillLiveCoordinator(
-        coordinator=lifecycle,
-        repository=repository,
-        dispatcher=dispatcher,
-        live_runner=live_runner,
-        clock=lambda: job.occurred_at,
-    )
-
-    class Observer:
-        async def observe(self, supplied_job, result):
-            assert supplied_job == job
-            assert result.status == "demo_ready"
-            return entrypoint.FactoryLiveObservedEvidence(
-                context7_provenance_digest="a" * 64,
-                provider_traces=(
-                    entrypoint.FactoryLiveProviderTrace(
-                        trace_id="provider-trace-1",
-                        codex_session_id="codex-session-1",
-                        hermes_session_id="hermes-session-1",
-                        provider="openai",
-                        model="approved-model-id",
-                        status="succeeded",
-                        cost_usd="0.25",
-                        usage_receipt_ref=workflow_artifact("usage-live", "d" * 64),
-                        budget_receipt_ref=workflow_artifact("budget-live", "e" * 64),
-                    ),
-                ),
-                gateway_total_cost_usd="0.25",
-            )
-
-    class RuntimeFactory(AdapterFactory):
-        def build(self, settings, preflight):
-            assert preflight.prerequisites_confirmed is True
-            return entrypoint.FactoryLiveGateBindings(
-                job=job,
-                coordinator=coordinator,
-                observer=Observer(),
-            )
-
     report_directory = tmp_path / "external"
     report_directory.mkdir()
     preflight_path = report_directory / "preflight.json"
-    settings = entrypoint.FactoryLivePreflightSettings(
+    repository_root = Path(__file__).resolve().parents[2]
+    preflight = entrypoint.FactoryLivePreflight(
+        schema_name="captain.hermes-six-skill-factory-preflight.v1",
         mode="demo",
         max_cost_usd="5.00",
         model="approved-model-id",
-        repository_root=Path(__file__).resolve().parents[2],
-        report_directory=report_directory,
-        output=preflight_path,
-        database_dsn="mysql://captain:secret@127.0.0.1:3306/captain_test",
+        with_n8n=False,
+        prerequisites_confirmed=True,
+        database_name="captain_test",
+        services_verified=True,
+        codex_authenticated=True,
+        skills_verified=True,
+        runtime_adapters_verified=True,
+        skill_digests=entrypoint._released_skill_directory_digests(repository_root),
     )
-    entrypoint.run_factory_live_preflight(
-        settings,
-        probe=PreflightProbe(),
-        adapter_factory=RuntimeFactory(),
+    preflight_path.write_text(
+        preflight.model_dump_json(by_alias=True),
+        encoding="utf-8",
     )
-    monkeypatch.setattr(entrypoint, "_load_adapter_factory", RuntimeFactory)
     for name, value in {
         "CAPTAIN_FACTORY_PREREQUISITES_CONFIRMED": "1",
         "CAPTAIN_FACTORY_GATE_MODE": "demo",
@@ -434,12 +425,13 @@ async def test_environment_gate_uses_explicit_bindings_and_persists_one_report(
     }.items():
         monkeypatch.setenv(name, value)
 
-    payload = await entrypoint.run_factory_live_gate_from_environment()
+    with pytest.raises(
+        entrypoint.FactoryLiveConfigurationError,
+        match="prepared dispatch adapter is unavailable",
+    ):
+        await entrypoint.run_factory_live_gate_from_environment()
 
-    reports = tuple(report_directory.glob("sha256-*.json"))
-    assert len(reports) == 1
-    assert json.loads(reports[0].read_text(encoding="utf-8")) == payload
-    assert payload["terminal_status"] == "demo_ready"
+    assert not tuple(report_directory.glob("sha256-*.json"))
 
 
 class WorkflowRepository:
@@ -477,6 +469,16 @@ class ScriptedCoordinator:
             self.status = FactoryLifecycleStatus.READY_TO_USE
         self.index += 1
         return True
+
+    def promotion_block(self, _job_id):
+        return next(
+            (
+                block
+                for block in reversed(self.blocks)
+                if block.phase is FactoryPhase.CAPABILITY_PROMOTED
+            ),
+            None,
+        )
 
 
 class ScriptedDispatcher:
@@ -540,6 +542,10 @@ class ScriptedLiveRunner:
         self.scripts = list(scripts)
         self.calls = 0
         self.timeline = timeline
+        self.persisted_history = []
+
+    def history(self, _job_id):
+        return tuple(self.persisted_history)
 
     async def run(self, supplied_job, *, mode):
         assert supplied_job == self.job
@@ -549,7 +555,7 @@ class ScriptedLiveRunner:
         decision_status = "ready" if status == "ready" else status
         if decision_status not in {"ready", "demo_ready"}:
             decision_status = "blocked"
-        return FactoryLiveRunReport(
+        report = FactoryLiveRunReport(
             job_id=self.job.job_id,
             correlation_id=self.job.correlation_id,
             mode=mode,
@@ -584,6 +590,8 @@ class ScriptedLiveRunner:
             ),
             reasons=(),
         )
+        self.persisted_history.append(report)
+        return report
 
 
 def _coordinator_actions() -> tuple[FactoryActionKind, ...]:
@@ -596,6 +604,7 @@ def _coordinator_actions() -> tuple[FactoryActionKind, ...]:
         FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
         FactoryActionKind.DISPATCH_QUALITY_WARDEN,
         FactoryActionKind.VALIDATE_FOR_PROMOTION,
+        FactoryActionKind.COMPLETE,
     )
 
 
@@ -739,3 +748,56 @@ async def test_release_coordinator_requires_recovery_then_promotes_and_rereads()
     assert timeline.index("claim:provider,provider,provider") < timeline.index(
         "dispatch:dispatch_real_case_tester"
     )
+
+
+@pytest.mark.asyncio
+async def test_restart_after_promotion_rebuilds_history_and_promotion_from_gateway() -> None:
+    from agenten.agent_factory.factory_live_entrypoint import (
+        FactorySixSkillLiveCoordinator,
+    )
+
+    job = workflow_job(mode="release")
+    repository = WorkflowRepository()
+    lifecycle = ScriptedCoordinator(job, _coordinator_actions())
+    timeline: list[str] = []
+    dispatcher = ScriptedDispatcher(
+        lifecycle,
+        repository,
+        required_live_runs=3,
+        timeline=timeline,
+    )
+    live_runner = ScriptedLiveRunner(
+        job,
+        (
+            ("blocked", (FactoryLiveEffectKind.CODEX,)),
+            ("infrastructure_recovery_required", ()),
+            ("blocked", (FactoryLiveEffectKind.PROVIDER,) * 3),
+            ("ready", ()),
+        ),
+        timeline=timeline,
+    )
+    first = FactorySixSkillLiveCoordinator(
+        coordinator=lifecycle,
+        repository=repository,
+        dispatcher=dispatcher,
+        live_runner=live_runner,
+        clock=lambda: job.occurred_at,
+    )
+    original = await first.run(job, "release")
+    calls_before_restart = live_runner.calls
+
+    restarted = FactorySixSkillLiveCoordinator(
+        coordinator=lifecycle,
+        repository=repository,
+        dispatcher=dispatcher,
+        live_runner=live_runner,
+        clock=lambda: job.occurred_at,
+    )
+    rebuilt = await restarted.run(job, "release")
+
+    assert original.status == "ready_to_use"
+    assert rebuilt.status == "ready_to_use"
+    assert rebuilt.runner_reports == tuple(live_runner.persisted_history)
+    assert rebuilt.promotion_block == lifecycle.blocks[-1]
+    assert rebuilt.promotion_block is not None
+    assert live_runner.calls == calls_before_restart
