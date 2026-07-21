@@ -31,6 +31,8 @@ from agenten.agent_factory.capability_factory_entrypoint import (
     DockerCommandResult,
     FileCapabilityFactoryCheckpointStore,
     InMemoryCapabilityFactoryCheckpointStore,
+    _StaticAdapterAttestation,
+    _load_production_entrypoint,
     parse_capability_factory_args,
     run_capability_factory_cli,
     write_redacted_evidence_manifest,
@@ -2683,6 +2685,36 @@ async def test_static_preflight_never_imports_or_instantiates_adapter(
 
     assert result["status"] == "preflight_ok"
     assert not import_marker.exists()
+
+
+def test_attested_adapter_loader_registers_module_before_dataclass_execution(
+    tmp_path: Path,
+) -> None:
+    module_path = tmp_path / "dataclass-adapter.py"
+    module_content = (
+        "from __future__ import annotations\n"
+        "from dataclasses import dataclass\n"
+        "from agenten.agent_factory.capability_factory_entrypoint import "
+        "CapabilityFactoryEntrypoint\n"
+        "@dataclass(frozen=True)\n"
+        "class AdapterMarker:\n"
+        "    value: str\n"
+        "def build_entrypoint(config):\n"
+        "    return CapabilityFactoryEntrypoint.__new__(CapabilityFactoryEntrypoint)\n"
+    ).encode("utf-8")
+    module_path.write_bytes(module_content)
+    attestation = _StaticAdapterAttestation(
+        module_path=module_path,
+        module_sha256=hashlib.sha256(module_content).hexdigest(),
+        factory_symbol="build_entrypoint",
+    )
+
+    entrypoint = _load_production_entrypoint(
+        SimpleNamespace(),
+        attestation=attestation,
+    )
+
+    assert isinstance(entrypoint, CapabilityFactoryEntrypoint)
 
 
 @pytest.mark.asyncio
