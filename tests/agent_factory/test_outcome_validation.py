@@ -18,14 +18,17 @@ from agenten.agent_factory.outcome_contracts import (
     CapabilityAssertionResult,
     CapabilityPackageManifestV1,
     CapabilityReleaseEvidenceV1,
+    ForgeCapabilityPackageCandidateV1,
 )
 from agenten.agent_factory.outcome_validation import (
     CapabilitySandboxRequest,
     CapabilitySandboxResult,
+    CapabilitySandboxTermination,
     CapabilityPackageValidationError,
     CapabilityPackageValidator,
 )
 from agenten.agent_factory.skill_evaluation import HermesSkillUsageReceipt
+from agenten.agent_runtime.contracts import ArtifactRef
 
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
@@ -67,30 +70,58 @@ class RecordingContentStore:
 class RecordingTrustedSandboxRunner:
     requests: list[CapabilitySandboxRequest] = field(default_factory=list)
     result_updates: dict[str, object] = field(default_factory=dict)
+    cancelled_execution_ids: list[UUID] = field(default_factory=list)
+    termination_waits: list[UUID] = field(default_factory=list)
 
     async def validate(self, request: CapabilitySandboxRequest) -> CapabilitySandboxResult:
         self.requests.append(request)
         result = CapabilitySandboxResult(
+            execution_id=request.execution_id,
             request_digest=request.request_digest,
             status="passed",
             imported_modules=request.module_names,
             executed_test_paths=request.test_paths,
+            sandbox_identity="sandbox://validator-test/isolated-python",
             workspace_was_read_only=True,
             network_was_disabled=True,
             resource_limits_were_enforced=True,
+            process_tree_termination_capable=True,
         )
         return result.model_copy(update=self.result_updates)
 
+    async def cancel(self, execution_id: UUID) -> None:
+        self.cancelled_execution_ids.append(execution_id)
+
+    async def await_termination(
+        self,
+        execution_id: UUID,
+    ) -> CapabilitySandboxTermination:
+        self.termination_waits.append(execution_id)
+        return CapabilitySandboxTermination(
+            execution_id=execution_id,
+            sandbox_identity="sandbox://validator-test/isolated-python",
+            terminated=True,
+            process_tree_terminated=True,
+        )
+
 
 @dataclass
-class HangingTrustedSandboxRunner:
-    cancelled: bool = False
+class CancellationResistantTrustedSandboxRunner(RecordingTrustedSandboxRunner):
+    stopped: asyncio.Event = field(default_factory=asyncio.Event)
+    local_cancellations: int = 0
 
     async def validate(self, request: CapabilitySandboxRequest) -> CapabilitySandboxResult:
-        try:
-            await asyncio.Event().wait()
-        finally:
-            self.cancelled = True
+        self.requests.append(request)
+        while not self.stopped.is_set():
+            try:
+                await self.stopped.wait()
+            except asyncio.CancelledError:
+                self.local_cancellations += 1
+        return await super().validate(request)
+
+    async def cancel(self, execution_id: UUID) -> None:
+        await super().cancel(execution_id)
+        self.stopped.set()
 
 
 @dataclass
@@ -104,7 +135,8 @@ class MutatingTrustedSandboxRunner(RecordingTrustedSandboxRunner):
 class ValidationCase:
     job: AgentFactoryJobV2
     creation_result: CreationResultV1
-    package: CapabilityPackageManifestV1
+    candidate: ForgeCapabilityPackageCandidateV1
+    release_evidence_refs: tuple[ArtifactRef, ...]
     store: RecordingContentStore
     runner: RecordingTrustedSandboxRunner
     release_evidence: tuple[CapabilityReleaseEvidenceV1, ...]
@@ -187,62 +219,6 @@ def _validation_case(
         str(item["path"]): item["reference"] for item in artifacts
     }
 
-    downstream_contents = (
-        b'{"check":"recovery-and-private-holdout","status":"passed"}',
-        b'{"check":"normal-e2e-1","status":"passed"}',
-        b'{"check":"normal-e2e-2","status":"passed"}',
-        b'{"check":"normal-e2e-3","status":"passed"}',
-    )
-    downstream_refs = tuple(
-        _ref(content, "application/json") for content in downstream_contents
-    )
-    release_evidence = tuple(
-        CapabilityReleaseEvidenceV1.model_validate(
-            {
-                "schema": "captain.capability-release-evidence.v1",
-                "run_id": (
-                    "controlled-recovery-run-01"
-                    if run_number == 1
-                    else f"normal-e2e-run-{run_number - 1}"
-                ),
-                "run_number": run_number,
-                "factory_job_id": str(job.job_id),
-                "correlation_id": str(job.correlation_id),
-                "subject_version": job.subject_version,
-                "kind": "recovery" if run_number == 1 else "normal",
-                "outcome": (
-                    "expected_failure_recovered"
-                    if run_number == 1
-                    else "succeeded"
-                ),
-                "producer": "captain",
-                "assertion_results": [
-                    {
-                        "assertion_id": job.acceptance_assertion_ids[0],
-                        "status": "passed",
-                    }
-                ],
-                "recovery_id": (
-                    "controlled-recovery-01" if run_number == 1 else None
-                ),
-                "holdout_ids": (
-                    [job.private_holdout_refs[0].holdout_id]
-                    if run_number == 1
-                    else []
-                ),
-                "downstream_evidence_refs": [downstream_refs[run_number - 1]],
-            }
-        )
-        for run_number in range(1, 5)
-    )
-    release_evidence_bytes = tuple(
-        item.model_dump_json(by_alias=True).encode("utf-8")
-        for item in release_evidence
-    )
-    release_evidence_refs = tuple(
-        _ref(content, "application/json") for content in release_evidence_bytes
-    )
-
     skill_detail = b'{"check":"released-skill-use","status":"passed"}'
     skill_detail_ref = _ref(skill_detail, "application/json")
     released_skill_ref = artifact_ref_by_path["skills/support_triage/SKILL.md"]
@@ -281,58 +257,121 @@ def _validation_case(
     )
     skill_receipt_bytes = skill_receipt.model_dump_json(by_alias=True).encode("utf-8")
     skill_receipt_ref = _ref(skill_receipt_bytes, "application/json")
-    package_payload = {
-        "schema": "captain.capability-package.v1",
+    candidate_payload = {
+        "schema": "forge.capability-package-candidate.v1",
         "capability_id": job.required_capability,
         "capability_version": 1,
         "factory_job_id": str(job.job_id),
         "creation_job_id": "11111111-1111-4111-8111-111111111111",
         "correlation_id": str(job.correlation_id),
         "subject_version": job.subject_version,
+        "attempt": 1,
         "source_ref": source_ref,
         "team_manifest_ref": artifact_ref_by_path["team-manifest.json"],
         "artifacts": artifacts,
-        "assertion_outcomes": [
-            {
-                "assertion_id": job.acceptance_assertion_ids[0],
-                "status": "passed",
-                "integration_intent": "none",
-                "evidence_refs": [downstream_refs[1]],
-            }
-        ],
-        "private_holdout_receipts": [
-            {
-                "holdout_id": job.private_holdout_refs[0].holdout_id,
-                "assertion_id": job.acceptance_assertion_ids[0],
-                "status": "passed",
-                "evidence_ref": downstream_refs[0],
-            }
-        ],
-        "recovery_receipt": {
-            "recovery_id": "controlled-recovery-01",
-            "assertion_id": job.acceptance_assertion_ids[0],
-            "status": "passed",
-            "evidence_ref": release_evidence_refs[0],
-        },
-        "release_evidence_refs": list(release_evidence_refs),
         "skill_usage_receipt_ref": skill_receipt_ref,
         "tool_gaps": [],
         "runbook_ref": artifact_ref_by_path["RUNBOOK.md"],
     }
-    package = CapabilityPackageManifestV1.model_validate(package_payload)
-    package_bytes = package.model_dump_json(by_alias=True).encode("utf-8")
-    package_manifest_ref = _ref(package_bytes, "application/json")
+    candidate = ForgeCapabilityPackageCandidateV1.model_validate(candidate_payload)
+    candidate_bytes = candidate.model_dump_json(by_alias=True).encode("utf-8")
+    candidate_ref = _ref(candidate_bytes, "application/json")
+    tree_entries = sorted(
+        (path, hashlib.sha256(content).hexdigest(), len(content))
+        for path, content in files.items()
+    )
+    tree_sha256 = hashlib.sha256(
+        json.dumps(tree_entries, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    assertion_evidence_contents = tuple(
+        json.dumps(
+            {
+                "schema": "captain.capability-assertion-evidence.v1",
+                "run_id": (
+                    "controlled-recovery-run-01"
+                    if run_number == 1
+                    else f"normal-e2e-run-{run_number - 1}"
+                ),
+                "assertion_id": job.acceptance_assertion_ids[0],
+                "status": "passed",
+                "producer": "captain",
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        for run_number in range(1, 5)
+    )
+    assertion_evidence_refs = tuple(
+        _ref(content, "application/json") for content in assertion_evidence_contents
+    )
+    release_evidence = tuple(
+        CapabilityReleaseEvidenceV1.model_validate(
+            {
+                "schema": "captain.capability-release-evidence.v1",
+                "run_id": (
+                    "controlled-recovery-run-01"
+                    if run_number == 1
+                    else f"normal-e2e-run-{run_number - 1}"
+                ),
+                "run_number": run_number,
+                "factory_job_id": str(job.job_id),
+                "creation_job_id": str(candidate.creation_job_id),
+                "correlation_id": str(job.correlation_id),
+                "subject_version": job.subject_version,
+                "attempt": candidate.attempt,
+                "capability_id": candidate.capability_id,
+                "capability_version": candidate.capability_version,
+                "candidate_manifest_sha256": candidate_ref["sha256"],
+                "package_archive_sha256": source_ref["sha256"],
+                "extracted_tree_sha256": tree_sha256,
+                "kind": "recovery" if run_number == 1 else "normal",
+                "outcome": (
+                    "expected_failure_recovered"
+                    if run_number == 1
+                    else "succeeded"
+                ),
+                "producer": "captain",
+                "assertion_results": [
+                    {
+                        "assertion_id": job.acceptance_assertion_ids[0],
+                        "status": "passed",
+                        "evidence_refs": [assertion_evidence_refs[run_number - 1]],
+                    }
+                ],
+                "recovery_id": (
+                    "controlled-recovery-01" if run_number == 1 else None
+                ),
+                "recovery_assertion_id": (
+                    job.acceptance_assertion_ids[0] if run_number == 1 else None
+                ),
+                "holdout_ids": (
+                    [job.private_holdout_refs[0].holdout_id]
+                    if run_number == 1
+                    else []
+                ),
+            }
+        )
+        for run_number in range(1, 5)
+    )
+    release_evidence_bytes = tuple(
+        item.model_dump_json(by_alias=True).encode("utf-8")
+        for item in release_evidence
+    )
+    release_evidence_refs = tuple(
+        ArtifactRef.model_validate(_ref(content, "application/json"))
+        for content in release_evidence_bytes
+    )
 
     creation_payload = _fixture("contracts/minibook_creation_result.v1.json")
     creation_payload.update(
         {
-            "creation_job_id": str(package.creation_job_id),
+            "creation_job_id": str(candidate.creation_job_id),
             "correlation_id": str(job.correlation_id),
             "subject_version": job.subject_version,
+            "attempt": candidate.attempt,
             "status": "succeeded",
-            "package_manifest_ref": package_manifest_ref,
+            "package_manifest_ref": candidate_ref,
             "artifact_refs": [source_ref],
-            "evidence_refs": list(release_evidence_refs),
+            "evidence_refs": [],
             "tool_gaps": [],
             "skill_usage_receipt_ref": skill_receipt_ref,
             "failure": None,
@@ -342,7 +381,7 @@ def _validation_case(
 
     all_content: dict[str, bytes] = {
         str(source_ref["uri"]): archive,
-        str(package_manifest_ref["uri"]): package_bytes,
+        str(candidate_ref["uri"]): candidate_bytes,
         str(skill_receipt_ref["uri"]): skill_receipt_bytes,
         str(skill_detail_ref["uri"]): skill_detail,
     }
@@ -354,7 +393,7 @@ def _validation_case(
     )
     all_content.update(
         {
-            str(reference["uri"]): content
+            reference.uri: content
             for reference, content in zip(
                 release_evidence_refs,
                 release_evidence_bytes,
@@ -366,8 +405,8 @@ def _validation_case(
         {
             str(reference["uri"]): content
             for reference, content in zip(
-                downstream_refs,
-                downstream_contents,
+                assertion_evidence_refs,
+                assertion_evidence_contents,
                 strict=True,
             )
         }
@@ -375,7 +414,8 @@ def _validation_case(
     return ValidationCase(
         job=job,
         creation_result=creation_result,
-        package=package,
+        candidate=candidate,
+        release_evidence_refs=release_evidence_refs,
         store=RecordingContentStore(all_content),
         runner=RecordingTrustedSandboxRunner(),
         release_evidence=release_evidence,
@@ -398,10 +438,15 @@ async def test_validator_independently_accepts_a_bound_digest_verified_package()
     validated = await _validator(case).validate(
         job=case.job,
         creation_result=case.creation_result,
-        package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
     )
 
-    assert validated is case.package
+    assert isinstance(validated, CapabilityPackageManifestV1)
+    assert validated is not case.candidate
+    assert validated.schema_name == "captain.capability-package.v1"
+    assert validated.creation_job_id == case.candidate.creation_job_id
+    assert validated.release_evidence_refs == case.release_evidence_refs
     expected_uris = {
         reference.uri
         for reference in (
@@ -409,21 +454,19 @@ async def test_validator_independently_accepts_a_bound_digest_verified_package()
             *case.creation_result.artifact_refs,
             *case.creation_result.evidence_refs,
             case.creation_result.skill_usage_receipt_ref,
-            case.package.source_ref,
-            case.package.team_manifest_ref,
-            *(item.reference for item in case.package.artifacts),
-            *(ref for item in case.package.assertion_outcomes for ref in item.evidence_refs),
-            *(item.evidence_ref for item in case.package.private_holdout_receipts),
-            case.package.recovery_receipt.evidence_ref,
-            *case.package.release_evidence_refs,
-            case.package.skill_usage_receipt_ref,
+            case.candidate.source_ref,
+            case.candidate.team_manifest_ref,
+            *(item.reference for item in case.candidate.artifacts),
+            *case.release_evidence_refs,
+            case.candidate.skill_usage_receipt_ref,
             *case.skill_receipt.evidence_refs,
             *(
                 reference
                 for evidence in case.release_evidence
-                for reference in evidence.downstream_evidence_refs
+                for result in evidence.assertion_results
+                for reference in result.evidence_refs
             ),
-            case.package.runbook_ref,
+            case.candidate.runbook_ref,
         )
         if reference is not None
     }
@@ -438,6 +481,8 @@ async def test_validator_independently_accepts_a_bound_digest_verified_package()
     assert request.test_paths == ("tests/test_support_triage.py",)
     assert request.workspace_access == "read_only"
     assert request.network_access == "disabled"
+    assert request.package_archive_sha256 == case.candidate.source_ref.sha256
+    assert request.extracted_tree_sha256 == case.release_evidence[0].extracted_tree_sha256
     assert request.max_processes >= 1
     assert request.max_memory_bytes >= 1
     assert request.kill_process_tree_on_cancel is True
@@ -452,7 +497,8 @@ async def test_validator_fails_closed_without_an_explicit_trusted_sandbox() -> N
         await CapabilityPackageValidator(content_store=case.store).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
     assert case.store.reads == []
@@ -467,7 +513,8 @@ async def test_validator_requires_trusted_runner_to_attest_the_exact_request() -
         await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
 
@@ -480,28 +527,33 @@ async def test_validator_rejects_missing_sandbox_isolation_attestations() -> Non
         await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
 
 @pytest.mark.asyncio
 async def test_validator_bounds_and_cancels_a_hung_trusted_runner() -> None:
     case = _validation_case()
-    runner = HangingTrustedSandboxRunner()
+    runner = CancellationResistantTrustedSandboxRunner()
     validator = CapabilityPackageValidator(
         content_store=case.store,
         sandbox_runner=runner,
         command_timeout_seconds=1,
+        termination_timeout_seconds=0.25,
     )
 
     with pytest.raises(CapabilityPackageValidationError, match="timed out"):
         await validator.validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
-    assert runner.cancelled is True
+    execution_id = runner.requests[0].execution_id
+    assert runner.cancelled_execution_ids == [execution_id]
+    assert runner.termination_waits == [execution_id]
 
 
 @pytest.mark.asyncio
@@ -516,41 +568,49 @@ async def test_validator_rehashes_the_effective_tree_after_sandbox_validation() 
         ).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
 
 @pytest.mark.asyncio
 async def test_validator_does_not_trust_forge_succeeded_when_content_digest_is_wrong() -> None:
     case = _validation_case()
-    case.store.content_by_uri[case.package.source_ref.uri] += b"tampered"
+    case.store.content_by_uri[case.candidate.source_ref.uri] += b"tampered"
 
     with pytest.raises(CapabilityPackageValidationError, match="digest"):
         await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
 
 @pytest.mark.asyncio
 async def test_validator_rejects_nested_evidence_uri_with_conflicting_digest() -> None:
     case = _validation_case()
-    nested_ref = case.release_evidence[2].downstream_evidence_refs[0]
+    result = case.release_evidence[2].assertion_results[0]
+    nested_ref = result.evidence_refs[0]
     conflicting_ref = nested_ref.model_copy(
-        update={"uri": case.package.source_ref.uri}
+        update={"uri": case.candidate.source_ref.uri}
     )
     _replace_release_record(
         case,
         2,
-        {"downstream_evidence_refs": (conflicting_ref,)},
+        {
+            "assertion_results": (
+                result.model_copy(update={"evidence_refs": (conflicting_ref,)}),
+            )
+        },
     )
 
     with pytest.raises(CapabilityPackageValidationError, match="conflicting"):
         await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
 
@@ -563,7 +623,8 @@ async def test_validator_rejects_semanticless_release_evidence_blobs() -> None:
         await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
 
@@ -586,6 +647,13 @@ async def test_validator_rejects_semanticless_release_evidence_blobs() -> None:
                     CapabilityAssertionResult(
                         assertion_id="foreign-assertion",
                         status="passed",
+                        evidence_refs=(
+                            ArtifactRef(
+                                uri="artifact://validator-test/foreign-assertion",
+                                sha256="f" * 64,
+                                media_type="application/json",
+                            ),
+                        ),
                     ),
                 )
             },
@@ -604,7 +672,8 @@ async def test_validator_binds_typed_release_evidence_to_captain_authority(
         await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
 
@@ -617,7 +686,8 @@ async def test_validator_requires_exactly_three_distinct_successes_after_recover
         await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
     case = _validation_case()
@@ -630,7 +700,8 @@ async def test_validator_requires_exactly_three_distinct_successes_after_recover
         await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
 
@@ -638,7 +709,6 @@ async def test_validator_requires_exactly_three_distinct_successes_after_recover
 @pytest.mark.parametrize(
     ("updates", "message"),
     (
-        ({"recovery_id": "foreign-recovery"}, "recovery ID"),
         ({"holdout_ids": ()}, "private holdout"),
         ({"outcome": "failed"}, "succeeded"),
     ),
@@ -655,7 +725,45 @@ async def test_validator_binds_recovery_holdout_and_success_semantics(
         await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
+        )
+
+
+@pytest.mark.asyncio
+async def test_validator_rejects_assertion_evidence_swapped_between_runs() -> None:
+    case = _validation_case()
+    first_result = case.release_evidence[0].assertion_results[0]
+    second_result = case.release_evidence[1].assertion_results[0]
+    _replace_release_record(
+        case,
+        0,
+        {
+            "assertion_results": (
+                first_result.model_copy(
+                    update={"evidence_refs": second_result.evidence_refs}
+                ),
+            )
+        },
+    )
+    _replace_release_record(
+        case,
+        1,
+        {
+            "assertion_results": (
+                second_result.model_copy(
+                    update={"evidence_refs": first_result.evidence_refs}
+                ),
+            )
+        },
+    )
+
+    with pytest.raises(CapabilityPackageValidationError, match="assertion evidence"):
+        await _validator(case).validate(
+            job=case.job,
+            creation_result=case.creation_result,
+            candidate=case.candidate,
+            release_evidence_refs=case.release_evidence_refs,
         )
 
 
@@ -673,7 +781,8 @@ async def test_validator_parses_and_binds_the_skill_usage_receipt() -> None:
         await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
 
@@ -681,10 +790,11 @@ async def test_validator_parses_and_binds_the_skill_usage_receipt() -> None:
 @pytest.mark.parametrize(
     ("target", "updates", "message"),
     (
-        ("package", {"factory_job_id": "99999999-9999-4999-8999-999999999999"}, "factory job"),
-        ("package", {"correlation_id": "99999999-9999-4999-8999-999999999999"}, "correlation"),
-        ("package", {"subject_version": 2}, "subject version"),
-        ("package", {"capability_id": "foreign_capability"}, "capability"),
+        ("candidate", {"factory_job_id": "99999999-9999-4999-8999-999999999999"}, "factory job"),
+        ("candidate", {"correlation_id": "99999999-9999-4999-8999-999999999999"}, "correlation"),
+        ("candidate", {"subject_version": 2}, "subject version"),
+        ("candidate", {"capability_id": "foreign_capability"}, "capability"),
+        ("candidate", {"attempt": 2}, "attempt"),
         ("creation", {"creation_job_id": "99999999-9999-4999-8999-999999999999"}, "creation job"),
         ("creation", {"correlation_id": "99999999-9999-4999-8999-999999999999"}, "correlation"),
         ("creation", {"subject_version": 2}, "subject version"),
@@ -696,10 +806,10 @@ async def test_validator_rejects_foreign_job_relationships(
     message: str,
 ) -> None:
     case = _validation_case()
-    package = case.package
+    candidate = case.candidate
     creation_result = case.creation_result
-    if target == "package":
-        package = package.model_copy(update=updates)
+    if target == "candidate":
+        candidate = candidate.model_copy(update=updates)
     else:
         creation_result = creation_result.model_copy(update=updates)
 
@@ -707,25 +817,32 @@ async def test_validator_rejects_foreign_job_relationships(
         await _validator(case).validate(
             job=case.job,
             creation_result=creation_result,
-            package=package,
+            candidate=candidate,
+            release_evidence_refs=case.release_evidence_refs,
         )
 
 
 @pytest.mark.asyncio
-async def test_validator_requires_exact_captain_assertion_and_holdout_receipts() -> None:
+async def test_validator_binds_release_evidence_to_attempt_and_candidate_digest() -> None:
     case = _validation_case()
-    package = case.package.model_copy(
-        update={
-            "assertion_outcomes": (),
-            "private_holdout_receipts": (),
-        }
-    )
+    _replace_release_record(case, 1, {"attempt": 2})
 
-    with pytest.raises(CapabilityPackageValidationError, match="acceptance assertions"):
+    with pytest.raises(CapabilityPackageValidationError, match="attempt"):
         await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=package,
+            candidate=case.candidate,
+            release_evidence_refs=case.release_evidence_refs,
+        )
+
+    case = _validation_case()
+    _replace_release_record(case, 1, {"candidate_manifest_sha256": "f" * 64})
+    with pytest.raises(CapabilityPackageValidationError, match="candidate digest"):
+        await _validator(case).validate(
+            job=case.job,
+            creation_result=case.creation_result,
+            candidate=case.candidate,
+            release_evidence_refs=case.release_evidence_refs,
         )
 
 
@@ -740,7 +857,8 @@ async def test_validator_requires_creation_skill_receipt_and_source_archive_bind
         await _validator(case).validate(
             job=case.job,
             creation_result=creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
 
@@ -749,7 +867,7 @@ async def test_validator_rejects_manifest_bytes_that_do_not_describe_the_package
     case = _validation_case()
     manifest_ref = case.creation_result.package_manifest_ref
     assert manifest_ref is not None
-    mismatched = case.package.model_copy(update={"capability_version": 2})
+    mismatched = case.candidate.model_copy(update={"capability_version": 2})
     mismatched_bytes = mismatched.model_dump_json(by_alias=True).encode("utf-8")
     mismatched_ref = manifest_ref.model_copy(
         update={"sha256": hashlib.sha256(mismatched_bytes).hexdigest()}
@@ -759,11 +877,12 @@ async def test_validator_rejects_manifest_bytes_that_do_not_describe_the_package
         update={"package_manifest_ref": mismatched_ref}
     )
 
-    with pytest.raises(CapabilityPackageValidationError, match="manifest.*package"):
+    with pytest.raises(CapabilityPackageValidationError, match="manifest.*candidate"):
         await _validator(case).validate(
             job=case.job,
             creation_result=creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
 
@@ -790,7 +909,8 @@ async def test_validator_rejects_archive_path_traversal(unsafe_entry: str) -> No
         await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
 
@@ -811,7 +931,8 @@ async def test_validator_rejects_archive_symlinks() -> None:
         await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
 
@@ -825,7 +946,8 @@ async def test_validator_rejects_undeclared_archive_members() -> None:
         await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
 
@@ -841,7 +963,8 @@ async def test_validator_rejects_case_insensitive_archive_collisions() -> None:
         await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
 
@@ -853,7 +976,8 @@ async def test_validator_rejects_team_manifest_schema_or_capability_mismatch() -
         await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
 
@@ -866,7 +990,8 @@ async def test_validator_imports_autogen_code_in_the_fresh_workspace() -> None:
         await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
 
@@ -879,7 +1004,8 @@ async def test_validator_runs_only_manifest_allowlisted_package_tests() -> None:
         await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
 
@@ -893,7 +1019,8 @@ async def test_validator_rejects_test_paths_not_exactly_declared_as_test_artifac
         await _validator(case).validate(
             job=case.job,
             creation_result=case.creation_result,
-            package=case.package,
+        candidate=case.candidate,
+        release_evidence_refs=case.release_evidence_refs,
         )
 
 
@@ -904,44 +1031,24 @@ def _replace_release_record(
 ) -> None:
     evidence = case.release_evidence[index].model_copy(update=updates)
     content = evidence.model_dump_json(by_alias=True).encode("utf-8")
-    old_ref = case.package.release_evidence_refs[index]
+    old_ref = case.release_evidence_refs[index]
     reference = old_ref.__class__.model_validate(_ref(content, "application/json"))
     case.store.content_by_uri[reference.uri] = content
-    release_refs = list(case.package.release_evidence_refs)
+    release_refs = list(case.release_evidence_refs)
     release_refs[index] = reference
-    package_updates: dict[str, object] = {"release_evidence_refs": tuple(release_refs)}
-    if index == 0:
-        package_updates["recovery_receipt"] = case.package.recovery_receipt.model_copy(
-            update={"evidence_ref": reference}
-        )
-    object.__setattr__(
-        case,
-        "package",
-        case.package.model_copy(update=package_updates),
-    )
+    object.__setattr__(case, "release_evidence_refs", tuple(release_refs))
     records = list(case.release_evidence)
     records[index] = evidence
     object.__setattr__(case, "release_evidence", tuple(records))
-    _refresh_sealed_package(case)
 
 
 def _replace_release_blob(case: ValidationCase, index: int, content: bytes) -> None:
-    old_ref = case.package.release_evidence_refs[index]
+    old_ref = case.release_evidence_refs[index]
     reference = old_ref.__class__.model_validate(_ref(content, "application/json"))
     case.store.content_by_uri[reference.uri] = content
-    release_refs = list(case.package.release_evidence_refs)
+    release_refs = list(case.release_evidence_refs)
     release_refs[index] = reference
-    package_updates: dict[str, object] = {"release_evidence_refs": tuple(release_refs)}
-    if index == 0:
-        package_updates["recovery_receipt"] = case.package.recovery_receipt.model_copy(
-            update={"evidence_ref": reference}
-        )
-    object.__setattr__(
-        case,
-        "package",
-        case.package.model_copy(update=package_updates),
-    )
-    _refresh_sealed_package(case)
+    object.__setattr__(case, "release_evidence_refs", tuple(release_refs))
 
 
 def _append_release_record(case: ValidationCase) -> None:
@@ -949,25 +1056,20 @@ def _append_release_record(case: ValidationCase) -> None:
         update={"run_id": "normal-e2e-run-04", "run_number": 5}
     )
     content = evidence.model_dump_json(by_alias=True).encode("utf-8")
-    reference = case.package.release_evidence_refs[-1].__class__.model_validate(
+    reference = case.release_evidence_refs[-1].__class__.model_validate(
         _ref(content, "application/json")
     )
     case.store.content_by_uri[reference.uri] = content
     object.__setattr__(
         case,
-        "package",
-        case.package.model_copy(
-            update={
-                "release_evidence_refs": (*case.package.release_evidence_refs, reference)
-            }
-        ),
+        "release_evidence_refs",
+        (*case.release_evidence_refs, reference),
     )
     object.__setattr__(
         case,
         "release_evidence",
         (*case.release_evidence, evidence),
     )
-    _refresh_sealed_package(case)
 
 
 def _replace_skill_receipt(
@@ -975,14 +1077,14 @@ def _replace_skill_receipt(
     receipt: HermesSkillUsageReceipt,
 ) -> None:
     content = receipt.model_dump_json(by_alias=True).encode("utf-8")
-    reference = case.package.skill_usage_receipt_ref.__class__.model_validate(
+    reference = case.candidate.skill_usage_receipt_ref.__class__.model_validate(
         _ref(content, "application/json")
     )
     case.store.content_by_uri[reference.uri] = content
     object.__setattr__(
         case,
-        "package",
-        case.package.model_copy(update={"skill_usage_receipt_ref": reference}),
+        "candidate",
+        case.candidate.model_copy(update={"skill_usage_receipt_ref": reference}),
     )
     creation_reference = case.creation_result.skill_usage_receipt_ref
     assert creation_reference is not None
@@ -998,11 +1100,12 @@ def _replace_skill_receipt(
         ),
     )
     object.__setattr__(case, "skill_receipt", receipt)
-    _refresh_sealed_package(case)
+    _refresh_sealed_candidate(case)
+    _rebind_release_digests(case)
 
 
-def _refresh_sealed_package(case: ValidationCase) -> None:
-    package_bytes = case.package.model_dump_json(by_alias=True).encode("utf-8")
+def _refresh_sealed_candidate(case: ValidationCase) -> None:
+    package_bytes = case.candidate.model_dump_json(by_alias=True).encode("utf-8")
     manifest_ref = case.creation_result.package_manifest_ref
     assert manifest_ref is not None
     updated_manifest_ref = manifest_ref.__class__.model_validate(
@@ -1021,10 +1124,14 @@ def _refresh_sealed_package(case: ValidationCase) -> None:
 async def _replace_source_archive(case: ValidationCase, archive: bytes) -> None:
     """Mutate only test models/store to preserve a valid digest binding."""
 
-    source_ref = case.package.source_ref.model_copy(
+    source_ref = case.candidate.source_ref.model_copy(
         update={"sha256": hashlib.sha256(archive).hexdigest()}
     )
-    object.__setattr__(case, "package", case.package.model_copy(update={"source_ref": source_ref}))
+    object.__setattr__(
+        case,
+        "candidate",
+        case.candidate.model_copy(update={"source_ref": source_ref}),
+    )
     creation_source_ref = case.creation_result.artifact_refs[0].model_copy(
         update={"sha256": source_ref.sha256}
     )
@@ -1034,4 +1141,19 @@ async def _replace_source_archive(case: ValidationCase, archive: bytes) -> None:
         case.creation_result.model_copy(update={"artifact_refs": (creation_source_ref,)}),
     )
     case.store.content_by_uri[source_ref.uri] = archive
-    _refresh_sealed_package(case)
+    _refresh_sealed_candidate(case)
+    _rebind_release_digests(case)
+
+
+def _rebind_release_digests(case: ValidationCase) -> None:
+    manifest_ref = case.creation_result.package_manifest_ref
+    assert manifest_ref is not None
+    for index in range(len(case.release_evidence)):
+        _replace_release_record(
+            case,
+            index,
+            {
+                "candidate_manifest_sha256": manifest_ref.sha256,
+                "package_archive_sha256": case.candidate.source_ref.sha256,
+            },
+        )

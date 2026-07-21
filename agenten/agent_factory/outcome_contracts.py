@@ -104,6 +104,15 @@ class AssertionOutcome(_FrozenContract):
 class CapabilityAssertionResult(_FrozenContract):
     assertion_id: str = Field(pattern=IDENTIFIER_PATTERN)
     status: Literal["passed", "failed"]
+    evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def require_unique_evidence(
+        cls,
+        value: tuple[ArtifactRef, ...],
+    ) -> tuple[ArtifactRef, ...]:
+        return _unique_artifact_refs(value, "assertion result evidence refs")
 
 
 class CapabilityReleaseEvidenceV1(_FrozenContract):
@@ -116,15 +125,25 @@ class CapabilityReleaseEvidenceV1(_FrozenContract):
     run_id: str = Field(pattern=IDENTIFIER_PATTERN)
     run_number: int = Field(ge=1, strict=True)
     factory_job_id: UUID
+    creation_job_id: UUID
     correlation_id: UUID
     subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    capability_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    capability_version: int = Field(ge=1, strict=True)
+    candidate_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    package_archive_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    extracted_tree_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     kind: Literal["recovery", "normal"]
     outcome: Literal["expected_failure_recovered", "succeeded", "failed"]
     producer: Literal["captain"]
     assertion_results: tuple[CapabilityAssertionResult, ...] = Field(min_length=1)
     recovery_id: str | None = Field(default=None, pattern=IDENTIFIER_PATTERN)
+    recovery_assertion_id: str | None = Field(
+        default=None,
+        pattern=IDENTIFIER_PATTERN,
+    )
     holdout_ids: tuple[str, ...] = ()
-    downstream_evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
 
     @model_validator(mode="before")
     @classmethod
@@ -147,26 +166,24 @@ class CapabilityReleaseEvidenceV1(_FrozenContract):
     def require_unique_holdouts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return _require_unique_nonblank(value, "release evidence holdout IDs")
 
-    @field_validator("downstream_evidence_refs")
-    @classmethod
-    def require_unique_downstream_evidence(
-        cls,
-        value: tuple[ArtifactRef, ...],
-    ) -> tuple[ArtifactRef, ...]:
-        return _unique_artifact_refs(value, "downstream evidence refs")
-
     @model_validator(mode="after")
     def require_kind_semantics(self) -> "CapabilityReleaseEvidenceV1":
         if self.kind == "recovery":
             if self.recovery_id is None:
                 raise ValueError("recovery evidence requires recovery_id")
+            if self.recovery_assertion_id not in self.assertion_ids:
+                raise ValueError(
+                    "recovery evidence requires a known recovery_assertion_id"
+                )
             if self.outcome != "expected_failure_recovered":
                 raise ValueError(
                     "recovery evidence requires expected_failure_recovered outcome"
                 )
         else:
-            if self.recovery_id is not None:
-                raise ValueError("normal evidence cannot include recovery_id")
+            if self.recovery_id is not None or self.recovery_assertion_id is not None:
+                raise ValueError(
+                    "normal evidence cannot include recovery identity"
+                )
             if self.outcome == "expected_failure_recovered":
                 raise ValueError(
                     "normal evidence cannot use expected_failure_recovered outcome"
@@ -194,6 +211,43 @@ class ControlledRecoveryReceipt(_FrozenContract):
     assertion_id: str = Field(pattern=IDENTIFIER_PATTERN)
     status: Literal["passed"]
     evidence_ref: ArtifactRef
+
+
+class ForgeCapabilityPackageCandidateV1(_FrozenContract):
+    """Untrusted structural package proposal emitted by Forge."""
+
+    schema_name: Literal["forge.capability-package-candidate.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    capability_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    capability_version: int = Field(ge=1, strict=True)
+    factory_job_id: UUID
+    creation_job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    source_ref: ArtifactRef
+    team_manifest_ref: ArtifactRef
+    artifacts: tuple[PackageArtifact, ...] = Field(min_length=1)
+    skill_usage_receipt_ref: ArtifactRef
+    tool_gaps: tuple[ToolGapMarker, ...] = ()
+    runbook_ref: ArtifactRef
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_private_content(cls, value: object) -> object:
+        _reject_private_content(value, "capability package candidate")
+        return value
+
+    @model_validator(mode="after")
+    def require_closed_logical_package(self) -> "ForgeCapabilityPackageCandidateV1":
+        _require_closed_package_artifacts(
+            self.artifacts,
+            team_manifest_ref=self.team_manifest_ref,
+            runbook_ref=self.runbook_ref,
+        )
+        return self
 
 
 class CapabilityPackageManifestV1(_FrozenContract):
@@ -416,6 +470,40 @@ def _contains_root(paths: tuple[str, ...], root: str) -> bool:
     if root.endswith("/"):
         return any(path.startswith(root) for path in paths)
     return root in paths
+
+
+def _require_closed_package_artifacts(
+    artifacts: tuple[PackageArtifact, ...],
+    *,
+    team_manifest_ref: ArtifactRef,
+    runbook_ref: ArtifactRef,
+) -> None:
+    paths = tuple(item.path for item in artifacts)
+    if len(paths) != len(set(paths)):
+        raise ValueError("package artifact paths must be unique")
+    digests = tuple(item.reference.sha256 for item in artifacts)
+    if len(digests) != len(set(digests)):
+        raise ValueError("package artifact digests must be unique")
+    required_roots = (
+        "team-manifest.json",
+        "autogen/",
+        "skills/",
+        "tests/",
+        "evidence/",
+        "RUNBOOK.md",
+    )
+    missing = tuple(root for root in required_roots if not _contains_root(paths, root))
+    if missing:
+        raise ValueError("missing logical package root: " + ", ".join(missing))
+    if any(item.kind == "local_adapter" for item in artifacts) and not any(
+        item.path.startswith("adapters/") for item in artifacts
+    ):
+        raise ValueError("declared local adapters require the adapters/ package root")
+    artifacts_by_path = {item.path: item.reference for item in artifacts}
+    if artifacts_by_path["team-manifest.json"] != team_manifest_ref:
+        raise ValueError("team_manifest_ref must match team-manifest.json")
+    if artifacts_by_path["RUNBOOK.md"] != runbook_ref:
+        raise ValueError("runbook_ref must match RUNBOOK.md")
 
 
 def _require_unique_nonblank(value: tuple[str, ...], field_name: str) -> tuple[str, ...]:
