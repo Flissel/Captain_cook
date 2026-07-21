@@ -140,6 +140,8 @@ class RuntimeResultRecoveryObservation(_FrozenContract):
     command_id: UUID
     original_result_id: UUID
     original_result_digest: str = Field(pattern=SHA256_PATTERN)
+    original_claim_id: UUID
+    original_claim_digest: str = Field(pattern=SHA256_PATTERN)
     provider_effect_id: UUID
     provider_receipt_digest: str = Field(pattern=SHA256_PATTERN)
     original_claim_fence: int = Field(ge=1, strict=True)
@@ -209,6 +211,13 @@ class RuntimeResultRecoveryRequest(_FrozenContract):
             raise ValueError("provider receipt does not bind the original result")
         if observation.provider_effect_id != receipt.effect_id:
             raise ValueError("recovery observation provider effect does not match")
+        if (
+            observation.original_claim_id != receipt.origin_claim_id
+            or observation.original_claim_fence
+            != receipt.origin_claim_fencing_token
+            or observation.original_claim_digest != receipt.origin_claim_digest
+        ):
+            raise ValueError("recovery observation does not match the effect origin claim")
         if observation.provider_receipt_digest != receipt_digest:
             raise ValueError("recovery observation provider receipt digest does not match")
         return self

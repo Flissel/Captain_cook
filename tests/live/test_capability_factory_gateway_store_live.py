@@ -149,13 +149,19 @@ def test_recovered_claim_preserves_result_and_records_distinct_observation(
             clock=lambda: gateway_acceptance.TEST_GATEWAY_NOW
             + timedelta(seconds=20),
         ).claim_runtime_execution(claim_request)
-        recovered = GatewayStore(
+        intermediate = GatewayStore(
             storage,
             clock=lambda: gateway_acceptance.TEST_GATEWAY_NOW
             + timedelta(seconds=81),
         ).claim_runtime_execution(claim_request)
+        recovered = GatewayStore(
+            storage,
+            clock=lambda: gateway_acceptance.TEST_GATEWAY_NOW
+            + timedelta(seconds=142),
+        ).claim_runtime_execution(claim_request)
         assert first.claim.fencing_token == 1
-        assert recovered.claim.fencing_token == 2
+        assert intermediate.claim.fencing_token == 2
+        assert recovered.claim.fencing_token == 3
         assert recovered.claim_credential is not None
 
         provider_result = AgentRuntimeResult.model_validate(result_payload)
@@ -164,6 +170,9 @@ def test_recovered_claim_preserves_result_and_records_distinct_observation(
             provider_operation_id=f"provider-operation:{effect_id}",
             effect_id=effect_id,
             command_id=command_id,
+            origin_claim_id=first.claim.claim_id,
+            origin_claim_fencing_token=first.claim.fencing_token,
+            origin_claim_digest=canonical_contract_sha256(first.claim),
             request_digest="a" * 64,
             result_digest=canonical_contract_sha256(provider_result),
             status=provider_result.status.value,
@@ -174,12 +183,14 @@ def test_recovered_claim_preserves_result_and_records_distinct_observation(
             schema_name="captain.runtime-result-recovery-observation.v1",
             event_id=uuid5(
                 provider_result.event_id,
-                "runtime-result-recovery:1:2",
+                "runtime-result-recovery:1:3",
             ),
             observed_at=recovered.claim.claimed_at,
             command_id=command_id,
             original_result_id=provider_result.event_id,
             original_result_digest=canonical_contract_sha256(provider_result),
+            original_claim_id=first.claim.claim_id,
+            original_claim_digest=canonical_contract_sha256(first.claim),
             provider_effect_id=effect_id,
             provider_receipt_digest=canonical_contract_sha256(provider_receipt),
             original_claim_fence=first.claim.fencing_token,
@@ -196,7 +207,7 @@ def test_recovered_claim_preserves_result_and_records_distinct_observation(
         completion_store = GatewayStore(
             storage,
             clock=lambda: gateway_acceptance.TEST_GATEWAY_NOW
-            + timedelta(seconds=90),
+            + timedelta(seconds=150),
         )
         with pytest.raises(HTTPException, match="lease window"):
             completion_store.record_runtime_result(
@@ -255,7 +266,7 @@ def test_recovered_claim_preserves_result_and_records_distinct_observation(
         assert persisted_observation.event_id != provider_result.event_id
         assert persisted_claim is not None
         assert persisted_claim.status == "completed"
-        assert persisted_claim.fencing_token == 2
+        assert persisted_claim.fencing_token == 3
         assert (
             persisted_claim.claimed_at
             <= persisted_observation.observed_at

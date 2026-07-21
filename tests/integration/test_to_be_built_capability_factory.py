@@ -888,6 +888,18 @@ class ScriptedGatewayStore:
         assert execution_fencing_token == claim.fencing_token
         assert execution_claim_credential == "deterministic-runtime-claim-credential"
         assert observation.recovery_claim_fence == claim.fencing_token
+        assert observation.original_claim_id == original_claim.claim_id
+        assert observation.original_claim_digest == canonical_contract_sha256(
+            original_claim
+        )
+        assert request.provider_receipt.origin_claim_id == original_claim.claim_id
+        assert (
+            request.provider_receipt.origin_claim_fencing_token
+            == original_claim.fencing_token
+        )
+        assert request.provider_receipt.origin_claim_digest == canonical_contract_sha256(
+            original_claim
+        )
         assert claim.claimed_at <= observation.observed_at < claim.expires_at
         assert (
             original_claim.claimed_at
@@ -1280,6 +1292,9 @@ class ScriptedRuntimePort:
                 ),
                 effect_id=effect_id,
                 command_id=command_id,
+                origin_claim_id=claim.claim.claim_id,
+                origin_claim_fencing_token=claim.claim.fencing_token,
+                origin_claim_digest=canonical_contract_sha256(claim.claim),
                 request_digest=canonical_contract_sha256(plan),
                 result_digest=canonical_contract_sha256(result),
                 status=result.status.value,
@@ -1761,6 +1776,8 @@ async def test_provider_effect_crash_recovers_from_durable_receipt_without_dupli
     assert recovery.command_id == provider_result.command_id
     assert recovery.original_result_id == provider_result.event_id
     assert recovery.original_result_digest == canonical_contract_sha256(provider_result)
+    assert recovery.original_claim_id == provider_receipt.origin_claim_id
+    assert recovery.original_claim_digest == provider_receipt.origin_claim_digest
     assert recovery.provider_effect_id == provider_receipt.effect_id
     assert recovery.provider_receipt_digest == receipt_digest
     assert recovery.original_claim_fence == 1
@@ -1774,6 +1791,85 @@ async def test_provider_effect_crash_recovers_from_durable_receipt_without_dupli
         encoding="utf-8"
     )
     assert "credential" not in checkpoint_text.casefold()
+
+
+@pytest.mark.asyncio
+async def test_provider_effect_origin_survives_intermediate_recovery_claim_crash(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    harness.creation.crash_after_submit_once = False
+    harness.releases.crash_after_run_once = None
+    harness.runtime.crash_after_provider_effect_once = True
+
+    with pytest.raises(SimulatedProcessCrash, match="durable provider effect"):
+        await harness.entrypoint().run(
+            input_path=harness.input_path,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            wall_clock_budget_seconds=600,
+        )
+
+    provider_effects = harness.runtime.effects
+    provider_executions = harness.runtime.executions
+    command_id = provider_effects[0]
+    origin_claim = harness.gateway.runtime_claims[command_id]
+    provider_execution = next(iter(provider_executions.values()))
+    original_result_json = provider_execution.result.model_dump_json(by_alias=True)
+    original_receipt_json = provider_execution.provider_receipt.model_dump_json(
+        by_alias=True
+    )
+
+    harness.clock.value = origin_claim.expires_at + timedelta(microseconds=1)
+    harness.gateway.crash_after_claim_once = True
+    harness.runtime = ScriptedRuntimePort(
+        harness.gateway,
+        effects=provider_effects,
+        executions=provider_executions,
+    )
+    with pytest.raises(SimulatedProcessCrash, match="after runtime claim"):
+        await harness.entrypoint().run(
+            input_path=harness.input_path,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            wall_clock_budget_seconds=600,
+        )
+
+    intermediate_claim = harness.gateway.runtime_claims[command_id]
+    assert intermediate_claim.fencing_token == 2
+    assert not harness.gateway.runtime_results
+    harness.clock.value = intermediate_claim.expires_at + timedelta(microseconds=1)
+    harness.runtime = ScriptedRuntimePort(
+        harness.gateway,
+        effects=provider_effects,
+        executions=provider_executions,
+    )
+    completed = await harness.entrypoint().run(
+        input_path=harness.input_path,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+        wall_clock_budget_seconds=600,
+    )
+
+    recovery_claim = harness.gateway.runtime_claims[command_id]
+    recovery = harness.gateway.runtime_recoveries[command_id]
+    gateway_result = harness.gateway.runtime_results[command_id]
+    assert completed.execution_state == "completed"
+    assert recovery_claim.fencing_token == 3
+    assert provider_execution.provider_receipt.origin_claim_id == origin_claim.claim_id
+    assert provider_execution.provider_receipt.origin_claim_fencing_token == 1
+    assert provider_execution.provider_receipt.origin_claim_digest == canonical_contract_sha256(
+        origin_claim
+    )
+    assert recovery.original_claim_id == origin_claim.claim_id
+    assert recovery.original_claim_digest == canonical_contract_sha256(origin_claim)
+    assert recovery.original_claim_fence == 1
+    assert recovery.recovery_claim_fence == 3
+    assert gateway_result.model_dump_json(by_alias=True) == original_result_json
+    assert provider_execution.provider_receipt.model_dump_json(
+        by_alias=True
+    ) == original_receipt_json
+    assert len(provider_effects) == 1
 
 
 @pytest.mark.asyncio

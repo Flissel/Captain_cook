@@ -1126,6 +1126,7 @@ class GatewayStore:
                 original_claim_block = self._runtime_execution_claim_block(
                     cursor,
                     command_id=result.command_id,
+                    claim_id=request.provider_receipt.origin_claim_id,
                     fencing_token=observation.original_claim_fence,
                     for_update=True,
                 )
@@ -1845,12 +1846,16 @@ class GatewayStore:
         original_claim_parent_index: int | None,
     ) -> None:
         observation = request.observation
+        receipt = request.provider_receipt
         expected_effect_id = uuid5(request.result.command_id, "durable-provider-effect")
         if (
             original_claim_parent_index != command_block_index
             or original_claim.command_id != request.result.command_id
             or current_claim.command_id != request.result.command_id
+            or original_claim.claim_id != receipt.origin_claim_id
             or original_claim.fencing_token != observation.original_claim_fence
+            or original_claim.fencing_token
+            != receipt.origin_claim_fencing_token
             or current_claim.fencing_token != observation.recovery_claim_fence
             or current_claim.fencing_token <= original_claim.fencing_token
             or original_claim.status != "active"
@@ -1867,6 +1872,11 @@ class GatewayStore:
             raise HTTPException(
                 status_code=409,
                 detail="runtime recovery changed frozen capability authority",
+            )
+        if canonical_contract_sha256(original_claim) != receipt.origin_claim_digest:
+            raise HTTPException(
+                status_code=409,
+                detail="runtime recovery effect origin claim digest does not match the ledger",
             )
         if request.provider_receipt.effect_id != expected_effect_id:
             raise HTTPException(
@@ -3742,6 +3752,7 @@ class GatewayStore:
         cursor: Any,
         *,
         command_id: UUID,
+        claim_id: UUID,
         fencing_token: int,
         for_update: bool,
     ) -> dict[str, Any] | None:
@@ -3751,12 +3762,13 @@ class GatewayStore:
             FROM blocks
             WHERE block_type = 'runtime_execution_claim'
               AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.command_id')) = %s
+              AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.claim_id')) = %s
               AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.fencing_token')) = %s
             ORDER BY `index` LIMIT 2
         """
         if for_update:
             sql += " FOR UPDATE"
-        cursor.execute(sql, (str(command_id), str(fencing_token)))
+        cursor.execute(sql, (str(command_id), str(claim_id), str(fencing_token)))
         rows = cursor.fetchall()
         if len(rows) > 1:
             raise HTTPException(

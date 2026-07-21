@@ -243,11 +243,25 @@ def test_execution_claim_request_has_bounded_utc_lease_and_owner_identity() -> N
 
 def _runtime_result_recovery_request() -> RuntimeResultRecoveryRequest:
     result = _runtime_result()
+    authority = _runtime_capability_authority()
+    origin_claim = RuntimeExecutionClaim(
+        **authority.model_dump(),
+        command_id=result.command_id,
+        claim_id=UUID("00000000-0000-0000-0000-000000000811"),
+        owner_id="runtime-a",
+        fencing_token=1,
+        claimed_at=result.occurred_at - timedelta(seconds=30),
+        expires_at=result.occurred_at + timedelta(seconds=30),
+        status="active",
+    )
     effect_id = uuid5(result.command_id, "durable-provider-effect")
     receipt = ProviderEffectReceipt(
         provider_operation_id=f"provider-operation:{effect_id}",
         effect_id=effect_id,
         command_id=result.command_id,
+        origin_claim_id=origin_claim.claim_id,
+        origin_claim_fencing_token=origin_claim.fencing_token,
+        origin_claim_digest=canonical_contract_sha256(origin_claim),
         request_digest="a" * 64,
         result_digest=canonical_contract_sha256(result),
         status=result.status.value,
@@ -256,10 +270,12 @@ def _runtime_result_recovery_request() -> RuntimeResultRecoveryRequest:
     observation = RuntimeResultRecoveryObservation(
         schema_name="captain.runtime-result-recovery-observation.v1",
         event_id=uuid5(result.event_id, "runtime-result-recovery:1:2"),
-        observed_at=NOW,
+        observed_at=origin_claim.expires_at,
         command_id=result.command_id,
         original_result_id=result.event_id,
         original_result_digest=canonical_contract_sha256(result),
+        original_claim_id=origin_claim.claim_id,
+        original_claim_digest=canonical_contract_sha256(origin_claim),
         provider_effect_id=effect_id,
         provider_receipt_digest=canonical_contract_sha256(receipt),
         original_claim_fence=1,
@@ -292,6 +308,11 @@ def test_runtime_result_recovery_request_binds_immutable_result_and_provider_rec
     payload = request.model_dump(mode="json", by_alias=True)
     payload["observation"]["provider_effect_id"] = str(uuid5(effect_id, "changed"))
     with pytest.raises(ValidationError, match="provider effect"):
+        RuntimeResultRecoveryRequest.model_validate(payload)
+
+    payload = request.model_dump(mode="json", by_alias=True)
+    payload["observation"]["original_claim_digest"] = "0" * 64
+    with pytest.raises(ValidationError, match="effect origin claim"):
         RuntimeResultRecoveryRequest.model_validate(payload)
 
     payload = observation.model_dump(mode="json", by_alias=True)

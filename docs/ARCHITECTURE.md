@@ -41,17 +41,20 @@ and committed capability execution expose exactly one provider effect after
 recovery. Provider adapters must declare durable idempotency and persist a
 `ProviderEffectReceipt` keyed by the stable command/effect IDs before returning
 control. Captain looks that receipt up before any re-effect and verifies the
-provider operation ID, request/result digests, result status, and explicit
-idempotency guarantee. An unexpired claim returns typed `retry_pending`; after
+provider operation ID, request/result digests, result status, explicit
+idempotency guarantee, and the effect-origin claim ID/fence/digest. An
+unexpired claim returns typed `retry_pending`; after
 expiry the Gateway issues a higher fence without calling the provider again.
 The original `AgentRuntimeResult` is then stored byte-stably with its original
 event ID, timestamp, evidence, and business output. A separate Captain-owned
 `RuntimeResultRecoveryObservation` is recorded inside the recovery lease. It
 binds the original result and durable provider receipt by digest/effect ID,
-links both historical and recovery fences, and has its own event ID. The
-Gateway locks and validates both append-only claim blocks before atomically
+pins the receipt's historical origin claim independently of any intervening
+expired recovery claims, links the active recovery fence, and has its own event
+ID. The Gateway locks and validates both append-only claim blocks before atomically
 storing the result, observation, and completed recovery claim. No claim
-credential or provider secret enters a checkpoint, receipt, or summary. Deadline checks run
+credential or provider secret enters a checkpoint, receipt, or summary.
+Deadline checks run
 before each later mutation and before requesting lifecycle evidence, so an
 expired post-publication run cannot begin runtime work and an expired
 post-execution run cannot mutate Minibook.
