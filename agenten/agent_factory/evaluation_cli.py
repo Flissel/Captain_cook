@@ -15,20 +15,11 @@ from agenten.agent_factory.candidate_evaluation import (
     ResolvedFactoryCandidate,
     StaticFactoryCandidateProvider,
 )
-from agenten.agent_factory.contracts import (
-    AgentFactoryJobV3,
-    FactoryLease,
-    FactoryRole,
-    parse_factory_job,
-)
+from agenten.agent_factory.contracts import FactoryLease, FactoryRole, parse_factory_job
 from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
 from agenten.agent_factory.leases import validate_factory_lease
 from agenten.agent_factory.orchestration import FactoryDispatch
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
-from agenten.agent_factory.team_execution import (
-    FactoryLiveTeamExecutionPorts,
-    compose_live_team_execution,
-)
 
 
 _ACTION_ROLES: dict[FactoryActionKind, FactoryRole] = {
@@ -39,11 +30,7 @@ _ACTION_ROLES: dict[FactoryActionKind, FactoryRole] = {
 }
 
 
-def main(
-    argv: Sequence[str] | None = None,
-    *,
-    live_ports: FactoryLiveTeamExecutionPorts | None = None,
-) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         job = parse_factory_job(
@@ -60,28 +47,11 @@ def main(
             attempt=lease.attempt,
             now=datetime.now(timezone.utc),
         )
-        evidence_store = FilesystemFactoryEvidenceStore(Path(args.evidence_root))
-        team_execution = None
-        if args.live_team_execution:
-            if (
-                action_kind is not FactoryActionKind.DISPATCH_REAL_CASE_TESTER
-                or not isinstance(job, AgentFactoryJobV3)
-                or live_ports is None
-            ):
-                raise ValueError(
-                    "live team execution requires JobV3, real-case action, and all trusted ports"
-                )
-            team_execution = compose_live_team_execution(
-                job=job,
-                evidence_store=evidence_store,
-                ports=live_ports,
-            )
         validator = CandidateEvaluationFactory(
             provider=StaticFactoryCandidateProvider(
                 {job.job_id: ResolvedFactoryCandidate(candidate=candidate, source_archive=Path(args.source_archive))}
             ),
-            evidence_store=evidence_store,
-            team_execution=team_execution,
+            evidence_store=FilesystemFactoryEvidenceStore(Path(args.evidence_root)),
         )
         block = asyncio.run(
             validator.dispatch(
@@ -108,11 +78,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-archive", required=True, help="Path to the digest-verified generated source ZIP.")
     parser.add_argument("--evidence-root", required=True, help="Captain-owned local root for immutable evidence JSON.")
     parser.add_argument("--action", required=True, choices=tuple(kind.value for kind in _ACTION_ROLES))
-    parser.add_argument(
-        "--live-team-execution",
-        action="store_true",
-        help="Opt in to the fully injected host-owned AutoGen live composition.",
-    )
     return parser
 
 

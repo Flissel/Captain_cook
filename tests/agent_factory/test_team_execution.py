@@ -5,6 +5,7 @@ import asyncio
 import json
 import zipfile
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
@@ -30,6 +31,8 @@ from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.hermes_cli import InMemoryFactorySkillReplayStore
 from agenten.agent_factory.n8n_tools import TypedN8nTool
 from agenten.agent_factory.outcome_contracts import AssertionOutcome, ExecutionOutcomeV1
+from agenten.agent_factory.orchestration import FactoryDispatch
+from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillInvocationV1,
@@ -38,15 +41,19 @@ from agenten.agent_factory.skill_workflow_contracts import (
 from agenten.agent_factory.team_execution import (
     BudgetedChatCompletionClient,
     CaptainN8nGrantAuthority,
+    CaptainAuthorizedN8nTool,
     CaptainReleasedSkillAuthority,
     FactoryN8nExecutionEvidenceV1,
+    FactoryN8nToolAuthorizationV1,
     FactoryHoldoutAssertionDecisionV1,
     FactoryHoldoutEvaluationReceiptV1,
+    FactoryLiveTeamExecutionPorts,
     FactoryPricingQuoteV1,
     FactoryTeamRunResult,
     HostAutoGenTeamRunner,
     ResolvedFactoryHoldoutCase,
     TeamExecutionService,
+    compose_live_team_execution,
 )
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
@@ -65,6 +72,8 @@ from agenten.targets.n8n import N8nExecutionEvidence
 from agenten.agent_runtime.capabilities import PROFILE_CAPABILITIES
 from agenten.llm.model_client import build_replay_model_client
 from autogen_core.models import ModelFamily, ModelInfo, UserMessage
+from autogen_core import CancellationToken
+from autogen_core.tools import FunctionTool
 from autogen_ext.models.replay import ReplayChatCompletionClient
 from autogen_agentchat.teams import Swarm
 
@@ -96,6 +105,42 @@ def _pricing_quote(job: AgentFactoryJobV3) -> FactoryPricingQuoteV1:
         output_cost_per_million="0",
         minimum_cost_usd="0.10",
         evidence_ref=_artifact("factory-pricing", "4" * 64),
+    )
+
+
+def _released_skill_fixture(tmp_path: Path) -> tuple[ReleasedHermesSkill, Path]:
+    skill_root = tmp_path / "skills"
+    directory = skill_root / "captain-factory-execute-team"
+    directory.mkdir(parents=True)
+    skill_file = directory / "SKILL.md"
+    skill_file.write_text("approved host workflow\n", encoding="utf-8")
+    entries = [
+        {
+            "path": "SKILL.md",
+            "sha256": hashlib.sha256(skill_file.read_bytes()).hexdigest(),
+            "size": skill_file.stat().st_size,
+        }
+    ]
+    digest = hashlib.sha256(
+        json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return (
+        ReleasedHermesSkill(
+            schema_name="captain.released-hermes-skill.v1",
+            skill_id="captain-factory-execute-team",
+            version=1,
+            capability="factory_workflow",
+            content_ref=ArtifactRef(
+                uri="artifact://released-skills/captain-factory-execute-team/v1",
+                sha256=digest,
+                media_type="application/json",
+            ),
+            content_sha256=digest,
+            status="released",
+            released_at=NOW,
+            producer="captain",
+        ),
+        skill_root,
     )
 
 
@@ -758,36 +803,7 @@ def test_captain_skill_authority_rejects_wrong_capability_and_digest(
     tmp_path: Path,
 ) -> None:
     job = _job_v3()
-    directory = tmp_path / "skills" / "captain-factory-execute-team"
-    directory.mkdir(parents=True)
-    (directory / "SKILL.md").write_text("approved host workflow\n", encoding="utf-8")
-    entries = [
-        {
-            "path": "SKILL.md",
-            "sha256": hashlib.sha256(
-                (directory / "SKILL.md").read_bytes()
-            ).hexdigest(),
-            "size": (directory / "SKILL.md").stat().st_size,
-        }
-    ]
-    digest = hashlib.sha256(
-        json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    released = ReleasedHermesSkill(
-        schema_name="captain.released-hermes-skill.v1",
-        skill_id="captain-factory-execute-team",
-        version=1,
-        capability="factory_workflow",
-        content_ref=ArtifactRef(
-            uri="artifact://released-skills/captain-factory-execute-team/v1",
-            sha256=digest,
-            media_type="application/json",
-        ),
-        content_sha256=digest,
-        status="released",
-        released_at=NOW,
-        producer="captain",
-    )
+    released, skill_root = _released_skill_fixture(tmp_path)
 
     class Catalog:
         current = released
@@ -798,7 +814,7 @@ def test_captain_skill_authority_rejects_wrong_capability_and_digest(
     catalog = Catalog()
     authority = CaptainReleasedSkillAuthority(
         catalog=catalog,  # type: ignore[arg-type]
-        skill_root=tmp_path / "skills",
+        skill_root=skill_root,
     )
     invocation = _invocation(job).model_copy(update={"released_skill": released})
     assert authority.authorize(job=job, invocation=invocation, now=NOW) == released
@@ -830,6 +846,62 @@ def test_captain_skill_authority_rejects_wrong_capability_and_digest(
             job=job,
             invocation=invocation.model_copy(update={"released_skill": wrong_digest}),
             now=NOW,
+        )
+
+
+def test_embedded_live_composition_is_available_and_fails_closed_without_a_port(
+    tmp_path: Path,
+) -> None:
+    job = _job_v3()
+    released, skill_root = _released_skill_fixture(tmp_path)
+
+    class Catalog:
+        def released_for(self, *_: object) -> ReleasedHermesSkill:
+            return released
+
+    ports = FactoryLiveTeamExecutionPorts(
+        model_client_for=lambda *_: build_replay_model_client(["unused"]),
+        budget=InMemoryFactoryBudgetLedger(),
+        pricing_authority=_PricingAuthority(_pricing_quote(job)),
+        replay_store=InMemoryFactorySkillReplayStore(),
+        holdouts=object(),  # type: ignore[arg-type]
+        n8n_adapter=object(),  # type: ignore[arg-type]
+        n8n_authority=object(),  # type: ignore[arg-type]
+        released_skill_catalog=Catalog(),  # type: ignore[arg-type]
+        skill_root=skill_root,
+        tools={},
+        provider="deterministic-replay",
+        model="approved-model-id",
+        max_cost_per_call=Decimal("0.50"),
+        clock=lambda: NOW,
+    )
+    adapter = compose_live_team_execution(
+        job=job,
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "embedded"),
+        ports=ports,
+    )
+    lease = _invocation(job).lease
+    invocation = adapter.invocation_for(
+        FactoryDispatch(
+            job=job,
+            action=FactoryAction(
+                kind=FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
+                attempt=1,
+                job_id=job.job_id,
+            ),
+            role=FactoryRole.REAL_CASE_TESTER,
+            lease=lease,
+        )
+    )
+    assert invocation.step is FactorySkillStep.EXECUTE_TEAM
+    assert invocation.released_skill == released
+    assert invocation.execution_scope_ref == job.private_holdout_refs[0]
+
+    with pytest.raises(ValueError, match="every authoritative port"):
+        compose_live_team_execution(
+            job=job,
+            evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "closed"),
+            ports=replace(ports, n8n_authority=None),  # type: ignore[arg-type]
         )
 
 
@@ -946,12 +1018,22 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
     class TrustedN8nAdapter:
         def tool(self, name: str) -> object:
             assert name == "support_triage"
-            return support_triage
+            return FunctionTool(
+                support_triage,
+                description="Route support case",
+                name=name,
+            )
+
+        def authorization(self, name: str) -> object:
+            raise AssertionError("unused n8n tool must not request authority")
 
         def observed_evidence(self) -> tuple[FactoryN8nExecutionEvidenceV1, ...]:
             return ()
 
     class TrustedN8nAuthority:
+        async def authorize_command(self, claim: object, *, now: datetime) -> object:
+            raise AssertionError("unused n8n tool must not request authority")
+
         async def authorize(self, evidence: object, *, now: datetime) -> object:
             raise AssertionError("no n8n call should be observed in this run")
 
@@ -1236,15 +1318,58 @@ async def test_n8n_authority_rejects_unknown_revoked_and_noncanonical_grants() -
         revoked_at=NOW + timedelta(milliseconds=500),
         reason="policy_violation",
     )
+    underlying_calls = 0
+
+    async def n8n_effect(ticket: str) -> str:
+        nonlocal underlying_calls
+        underlying_calls += 1
+        return ticket
+
+    class Adapter:
+        current_grant = grant
+
+        def tool(self, name: str) -> object:
+            return FunctionTool(n8n_effect, description="n8n effect", name=name)
+
+        def authorization(self, name: str) -> FactoryN8nToolAuthorizationV1:
+            return FactoryN8nToolAuthorizationV1(
+                tool_name=name,
+                runtime_command=command,
+                capability_grant=self.current_grant,
+            )
+
+        def observed_evidence(self) -> tuple[FactoryN8nExecutionEvidenceV1, ...]:
+            return ()
+
+    adapter = Adapter()
+    authorized_tool = CaptainAuthorizedN8nTool(
+        name="support_triage",
+        adapter=adapter,  # type: ignore[arg-type]
+        authority=authority,
+        clock=lambda: NOW + timedelta(seconds=1),
+    )
     with pytest.raises(Exception, match="revoked"):
         await authority.authorize(evidence, now=NOW + timedelta(seconds=1))
+    with pytest.raises(Exception, match="revoked"):
+        await authorized_tool.run_json(
+            {"ticket": "case-1"},
+            CancellationToken(),
+        )
+    assert underlying_calls == 0
 
     state.revocation = None
     noncanonical = grant.model_copy(update={"capabilities": ("mcp.n8n",)})
     state.stored = noncanonical
+    adapter.current_grant = noncanonical
     forged = evidence.model_copy(update={"capability_grant": noncanonical})
     with pytest.raises(Exception, match="exactly match"):
         await authority.authorize(forged, now=NOW + timedelta(seconds=1))
+    with pytest.raises(Exception, match="exactly match"):
+        await authorized_tool.run_json(
+            {"ticket": "case-2"},
+            CancellationToken(),
+        )
+    assert underlying_calls == 0
 
 
 @pytest.mark.asyncio

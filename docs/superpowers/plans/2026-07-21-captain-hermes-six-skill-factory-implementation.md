@@ -983,6 +983,10 @@ class CandidatePreflightPort(Protocol):
 
 Adapt the existing Candidate Evaluator for compile/import/build preflight. The live runner host-materializes only the digest-verified sealed manifest, prompts, and declared artifacts, then instantiates the approved AutoGen team under Captain-owned instrumentation. Candidate `entrypoint_command` metadata is non-authoritative and is never executed in the paid path; candidate stdout cannot define runtime outcome, assertions, usage, or billing.
 
+Task 7 exposes live execution only as the embedded `compose_live_team_execution(..., ports=live_ports)` API. The standalone `evaluation_cli` has no live flag because it cannot receive the authoritative runtime ports. Task 11 owns the real deployment bootstrap/wrapper that injects those ports.
+
+- [ ] **2026-07-21 maintainability follow-up (Task 11):** Split the roughly 1.8k-line `team_execution.py` into pricing/budget, holdout/n8n authority, Host AutoGen runner, and composition modules without changing the frozen contracts or ownership boundaries.
+
 - [ ] **Step 3: Implement reserve-run-record-release sequencing**
 
 1. Revalidate candidate and skill digests.

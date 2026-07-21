@@ -6,6 +6,8 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from agenten.agent_factory.candidate_evaluation import FactoryCandidateManifest
 from agenten.agent_factory.evaluation_cli import main
 from agenten.agent_factory.leases import issue_factory_lease
@@ -72,11 +74,9 @@ def test_cli_emits_leased_build_block_and_persists_its_evidence(tmp_path: Path, 
     assert output["status"] == "succeeded"
     assert (tmp_path / "evidence" / str(factory_job.job_id)).is_dir()
 
-    refused = main([
-        "--job", str(job_path), "--lease", str(lease_path), "--candidate", str(candidate_path),
-        "--source-archive", str(source), "--action", FactoryActionKind.DISPATCH_BUILD_VALIDATOR.value,
-        "--evidence-root", str(tmp_path / "evidence"), "--live-team-execution",
-    ])
-    refusal = json.loads(capsys.readouterr().out)
-    assert refused == 1
-    assert refusal == {"error": "ValueError", "status": "failed"}
+    with pytest.raises(SystemExit):
+        main([
+            "--job", str(job_path), "--lease", str(lease_path), "--candidate", str(candidate_path),
+            "--source-archive", str(source), "--action", FactoryActionKind.DISPATCH_BUILD_VALIDATOR.value,
+            "--evidence-root", str(tmp_path / "evidence"), "--live-team-execution",
+        ])

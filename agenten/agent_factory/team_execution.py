@@ -599,10 +599,22 @@ class FactoryN8nExecutionEvidenceV1(BaseModel):
         return self
 
 
-class FactoryN8nToolAdapterPort(Protocol):
-    """Host-owned n8n call surface with Captain-bound execution evidence."""
+class FactoryN8nToolAuthorizationV1(BaseModel):
+    """The exact Captain command/grant claim checked before one n8n call."""
 
-    def tool(self, name: str) -> Callable[..., Any]: ...
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tool_name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    runtime_command: AgentRuntimeCommand
+    capability_grant: CapabilityGrant
+
+
+class FactoryN8nToolAdapterPort(Protocol):
+    """Host-owned n8n tool plus a fresh authorization claim for every call."""
+
+    def tool(self, name: str) -> BaseTool[BaseModel, Any]: ...
+
+    def authorization(self, name: str) -> FactoryN8nToolAuthorizationV1: ...
 
     def observed_evidence(self) -> tuple[FactoryN8nExecutionEvidenceV1, ...]: ...
 
@@ -628,27 +640,86 @@ class CaptainN8nGrantAuthority:
         *,
         now: datetime,
     ) -> CapabilityGrant:
-        stored = await self._state.get_grant(evidence.runtime_command.event_id)
-        if stored is None or stored != evidence.capability_grant:
+        claim = FactoryN8nToolAuthorizationV1(
+            tool_name=evidence.tool_name,
+            runtime_command=evidence.runtime_command,
+            capability_grant=evidence.capability_grant,
+        )
+        return await self.authorize_command(claim, now=now)
+
+    async def authorize_command(
+        self,
+        claim: FactoryN8nToolAuthorizationV1,
+        *,
+        now: datetime,
+    ) -> CapabilityGrant:
+        stored = await self._state.get_grant(claim.runtime_command.event_id)
+        if stored is None or stored != claim.capability_grant:
             raise ValueError("n8n grant is unknown or not canonical")
         revocation = await self._state.get_grant_revocation(
-            evidence.runtime_command.event_id
+            claim.runtime_command.event_id
         )
         return validate_grant(
             stored,
-            evidence.runtime_command,
+            claim.runtime_command,
             now,
             revocation,
         )
 
 
 class FactoryN8nGrantAuthorityPort(Protocol):
+    async def authorize_command(
+        self,
+        claim: FactoryN8nToolAuthorizationV1,
+        *,
+        now: datetime,
+    ) -> CapabilityGrant: ...
+
     async def authorize(
         self,
         evidence: FactoryN8nExecutionEvidenceV1,
         *,
         now: datetime,
     ) -> CapabilityGrant: ...
+
+
+class CaptainAuthorizedN8nTool(BaseTool[BaseModel, Any]):
+    """Revalidate Captain authority immediately before the external tool effect."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        adapter: FactoryN8nToolAdapterPort,
+        authority: FactoryN8nGrantAuthorityPort,
+        clock: Callable[[], datetime],
+    ) -> None:
+        delegate = adapter.tool(name)
+        super().__init__(
+            delegate.args_type(),
+            delegate.return_type(),
+            delegate.name,
+            delegate.description,
+        )
+        self._name_from_manifest = name
+        self._adapter = adapter
+        self._delegate = delegate
+        self._authority = authority
+        self._clock = clock
+
+    async def run(
+        self,
+        args: BaseModel,
+        cancellation_token: CancellationToken,
+    ) -> Any:
+        raw_claim = self._adapter.authorization(self._name_from_manifest)
+        claim = FactoryN8nToolAuthorizationV1.model_validate(
+            raw_claim.model_dump(mode="python")
+        )
+        if claim.tool_name != self._name_from_manifest:
+            raise ValueError("n8n authorization claim belongs to a different tool")
+        await self._authority.authorize_command(claim, now=self._clock())
+        return await self._delegate.run(args, cancellation_token)
 
 
 class FactoryTeamRunResult(BaseModel):
@@ -851,7 +922,12 @@ class HostAutoGenTeamRunner:
             if self._n8n_adapter is not None:
                 resolved_tools.update(
                     {
-                        name: self._n8n_adapter.tool(name)
+                        name: CaptainAuthorizedN8nTool(
+                            name=name,
+                            adapter=self._n8n_adapter,
+                            authority=self._n8n_authority,
+                            clock=self._clock,
+                        )
                         for name in required_n8n_tools
                     }
                 )
