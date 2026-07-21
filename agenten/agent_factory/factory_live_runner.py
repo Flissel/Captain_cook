@@ -8,14 +8,16 @@ claim and reconstructs release readiness from Gateway-owned evidence.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 from enum import Enum
 from threading import Lock
 from typing import Callable, Literal, Protocol
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agenten.agent_factory.contracts import AgentFactoryJobV3
+from agenten.agent_factory.execution_budget import FactoryBudgetProjection
 from agenten.agent_factory.release_gate import (
     FactoryReleaseDecision,
     evaluate_factory_workflow_release,
@@ -397,9 +399,20 @@ class FactoryLiveRunner:
             grouped[group_id].append(record)
 
         reports: list[FactoryLiveRunReport] = []
+        visible_invocation_ids: set[UUID] = set()
         for group_id in group_order:
             group = self._ordered_run_records(grouped[group_id])
-            reports.extend(self._rebuild_run_history(job, mode, group))
+            visible_invocation_ids.update(
+                record.request.invocation.invocation_id for record in group
+            )
+            reports.extend(
+                self._rebuild_run_history(
+                    job,
+                    mode,
+                    group,
+                    visible_invocation_ids=frozenset(visible_invocation_ids),
+                )
+            )
         return tuple(reports)
 
     @staticmethod
@@ -420,9 +433,12 @@ class FactoryLiveRunner:
             sorted(records, key=lambda record: record.request.run_effect_index or 0)
         )
         expected_count = first.run_effect_count
-        if expected_count is None or tuple(
-            record.request.run_effect_index for record in ordered
-        ) != tuple(range(1, expected_count + 1)):
+        indexes = tuple(record.request.run_effect_index for record in ordered)
+        if (
+            expected_count is None
+            or len(ordered) > expected_count
+            or indexes != tuple(range(1, len(ordered) + 1))
+        ):
             raise ValueError("factory live effect run history is incomplete")
         return ordered
 
@@ -431,6 +447,8 @@ class FactoryLiveRunner:
         job: AgentFactoryJobV3,
         mode: Literal["demo", "release"],
         records: tuple[FactoryLiveEffectRecord, ...],
+        *,
+        visible_invocation_ids: frozenset[UUID],
     ) -> tuple[FactoryLiveRunReport, ...]:
         attempt = records[0].request.attempt
         projection = FactoryProjection.from_job(job).model_copy(
@@ -450,7 +468,15 @@ class FactoryLiveRunner:
             )
             for record in records
         )
-        if any(record.outcome is None for record in records):
+        expected_count = records[0].request.run_effect_count
+        prefix_is_incomplete = (
+            expected_count is not None and len(records) < expected_count
+        )
+        if any(record.outcome is None for record in records) or prefix_is_incomplete:
+            if prefix_is_incomplete and all(
+                record.outcome is not None for record in records
+            ):
+                reason = "planned run suffix was not claimed before process restart"
             return (
                 self._infrastructure_report(
                     job, mode, projection, list(effects), reason
@@ -502,7 +528,11 @@ class FactoryLiveRunner:
                     )
                 )
             else:
-                decision = self._release_decision(job, attempt)
+                decision = self._release_decision(
+                    job,
+                    attempt,
+                    visible_invocation_ids=visible_invocation_ids,
+                )
                 rebuilt.append(
                     FactoryLiveRunReport(
                         job_id=job.job_id,
@@ -528,12 +558,13 @@ class FactoryLiveRunner:
         self._validate_run(authoritative, mode)
         projection = self._coordinator.projection(authoritative.job_id)
         artifacts = self._repository.workflow_artifacts(authoritative.job_id)
-        requests = self._plan.effects_for(
+        planned_requests = self._plan.effects_for(
             job=authoritative,
             mode=mode,
             projection=projection,
             workflow_artifacts=artifacts,
         )
+        requests = self._bind_planned_run(authoritative, planned_requests)
         effect_reports: list[FactoryLiveEffectReport] = []
         for request in requests:
             self._validate_request(authoritative, projection, request)
@@ -618,6 +649,82 @@ class FactoryLiveRunner:
             reasons=decision.reasons,
         )
 
+    def _bind_planned_run(
+        self,
+        job: AgentFactoryJobV3,
+        requests: tuple[FactoryLiveEffectRequestV1, ...],
+    ) -> tuple[FactoryLiveEffectRequestV1, ...]:
+        """Bind a planner batch as one deterministic, replay-safe run."""
+
+        if not requests:
+            return requests
+        if job.execution_policy.mode.value != "release":
+            return requests
+        if (
+            len({request.effect_id for request in requests}) != len(requests)
+            or any(request.attempt != requests[0].attempt for request in requests)
+        ):
+            raise ValueError("factory live effect run binding mismatch")
+
+        existing_by_effect = {
+            record.request.effect_id: record.request
+            for record in self._effect_ledger.history(job.job_id)
+        }
+        replayed = tuple(
+            existing_by_effect[request.effect_id]
+            for request in requests
+            if request.effect_id in existing_by_effect
+        )
+        if replayed and any(request.run_id is None for request in replayed):
+            if any(request.run_id is not None for request in replayed):
+                raise ValueError("factory live effect run binding mismatch")
+            if any(request.run_id is not None for request in requests):
+                raise ValueError("factory live effect run binding mismatch")
+            return requests
+
+        bound = tuple(request for request in requests if request.run_id is not None)
+        if bound:
+            first = bound[0]
+            expected_count = len(requests)
+            if (
+                len(bound) != expected_count
+                or first.run_effect_count != expected_count
+                or tuple(request.run_effect_index for request in requests)
+                != tuple(range(1, expected_count + 1))
+                or any(
+                    request.run_id != first.run_id
+                    or request.run_effect_count != expected_count
+                    or request.attempt != first.attempt
+                    for request in requests
+                )
+            ):
+                raise ValueError("factory live effect run binding mismatch")
+            return requests
+
+        run_id = uuid5(
+            NAMESPACE_URL,
+            "|".join(
+                (
+                    "captain.factory-live-run.v1",
+                    str(job.job_id),
+                    str(job.subject_version),
+                    str(requests[0].attempt),
+                    *(str(request.effect_id) for request in requests),
+                )
+            ),
+        )
+        effect_count = len(requests)
+        return tuple(
+            request.model_copy(
+                update={
+                    "run_id": run_id,
+                    "run_effect_index": index,
+                    "run_effect_count": effect_count,
+                }
+            )
+            for index, request in enumerate(requests, start=1)
+        )
+
     def _resolve_job(self, supplied: UUID | AgentFactoryJobV3) -> AgentFactoryJobV3:
         job_id = supplied if isinstance(supplied, UUID) else supplied.job_id
         stored = self._repository.job(job_id)
@@ -679,6 +786,8 @@ class FactoryLiveRunner:
         self,
         job: AgentFactoryJobV3,
         attempt: int,
+        *,
+        visible_invocation_ids: frozenset[UUID] | None = None,
     ) -> FactoryReleaseDecision:
         artifacts = self._repository.workflow_artifacts(job.job_id)
         evaluations = tuple(
@@ -691,6 +800,10 @@ class FactoryLiveRunner:
             for artifact in artifacts
             if isinstance(artifact, TeamExecutionEvidenceV1)
             and artifact.attempt == attempt
+            and (
+                visible_invocation_ids is None
+                or artifact.invocation.invocation_id in visible_invocation_ids
+            )
         )
         if len(evaluations) != 1:
             return FactoryReleaseDecision(
@@ -699,12 +812,37 @@ class FactoryLiveRunner:
                 status="blocked",
                 reasons=("missing one exact Gateway workflow evaluation",),
             )
+        budget = self._repository.workflow_budget_projection(job.job_id)
+        receipts = self._repository.workflow_usage_receipts(job.job_id)
+        if visible_invocation_ids is not None and budget is not None:
+            visible_receipt_refs = {
+                reference
+                for execution in executions
+                for reference in execution.usage_receipt_refs
+            }
+            receipts = tuple(
+                receipt
+                for receipt in receipts
+                if receipt.evidence_ref in visible_receipt_refs
+            )
+            consumed = sum(
+                (receipt.cost_usd for receipt in receipts),
+                start=Decimal("0.00"),
+            )
+            budget = FactoryBudgetProjection(
+                job_id=budget.job_id,
+                limit_usd=budget.limit_usd,
+                consumed_usd=consumed,
+                reserved_usd=Decimal("0.00"),
+                remaining_usd=budget.limit_usd - consumed,
+                active_reservation_ids=(),
+            )
         return evaluate_factory_workflow_release(
             job,
             executions,
             evaluations[0],
-            budget_projection=self._repository.workflow_budget_projection(job.job_id),
-            usage_receipts=self._repository.workflow_usage_receipts(job.job_id),
+            budget_projection=budget,
+            usage_receipts=receipts,
         )
 
     @staticmethod

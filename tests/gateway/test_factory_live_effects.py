@@ -407,6 +407,58 @@ def test_mariadb_effect_history_rejects_deleted_outcome_projection(
         ).claim(request)
 
 
+def test_mariadb_effect_history_rejects_additional_side_projection(
+    mariadb_store: GatewayStore,
+) -> None:
+    job, request = prepared_mariadb_effect(mariadb_store)
+    adapter = GatewayFactoryLiveEffectLedger(mariadb_store)
+    adapter.claim(request)
+    with mariadb_store.storage.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT `index` FROM blocks WHERE block_type = 'agent_factory_job' "
+                "AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.job_id')) = %s",
+                (str(job.job_id),),
+            )
+            unrelated_block_index = int(cursor.fetchone()["index"])
+            extra_effect_id = uuid5(
+                NAMESPACE_URL,
+                f"extra-side-projection|{job.job_id}",
+            )
+            payload = request.model_copy(
+                update={"effect_id": extra_effect_id}
+            ).model_dump(mode="json", by_alias=True)
+            cursor.execute(
+                """INSERT INTO factory_live_effect_events
+                   (event_id, effect_id, job_id, invocation_id, claim_key,
+                    event_kind, content_sha256, block_index, payload)
+                   VALUES (%s, %s, %s, NULL, NULL, 'outcome', %s, %s, %s)""",
+                (
+                    str(extra_effect_id),
+                    str(extra_effect_id),
+                    str(job.job_id),
+                    hashlib.sha256(
+                        json.dumps(
+                            payload,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                    unrelated_block_index,
+                    json.dumps(payload, sort_keys=True),
+                ),
+            )
+
+    with pytest.raises(ValueError, match="projection"):
+        GatewayFactoryLiveEffectLedger(
+            GatewayStore(mariadb_store.storage)
+        ).history(job.job_id)
+    with pytest.raises(ValueError, match="projection"):
+        GatewayFactoryLiveEffectLedger(
+            GatewayStore(mariadb_store.storage)
+        ).claim(request)
+
+
 def test_mariadb_effect_changed_replay_conflicts(
     mariadb_store: GatewayStore,
 ) -> None:

@@ -140,6 +140,26 @@ def run_bound_request(
     return FactoryLiveEffectRequestV1.model_validate(payload)
 
 
+def distinct_effect_request(
+    job,
+    *,
+    key_char: str,
+    ordinal: int,
+) -> FactoryLiveEffectRequestV1:
+    request = effect_request(job, key_char=key_char)
+    return FactoryLiveEffectRequestV1.model_validate(
+        request.model_dump(mode="json", by_alias=True)
+        | {
+            "effect_id": str(
+                uuid5(
+                    NAMESPACE_URL,
+                    f"factory-live|{job.job_id}|distinct|{ordinal}",
+                )
+            )
+        }
+    )
+
+
 class Repository(InMemoryFactoryRepository):
     def __init__(self, job, *, artifacts=(), budget=None, receipts=()) -> None:
         super().__init__()
@@ -325,6 +345,156 @@ def test_history_reconstructs_reserved_effect_after_process_crash() -> None:
     assert history[0].effects[0].reason == (
         "reserved external effect requires authoritative recovery evidence"
     )
+
+
+@pytest.mark.asyncio
+async def test_runner_binds_unbound_planned_effects_as_one_deterministic_run() -> None:
+    job = workflow_job(mode="release")
+    first = distinct_effect_request(job, key_char="c", ordinal=1)
+    second = distinct_effect_request(job, key_char="d", ordinal=2)
+    ledger = InMemoryFactoryLiveEffectLedger()
+
+    await runner(job, ledger, Plan(first, second), MultiExecutor()).run(
+        job,
+        mode="release",
+    )
+
+    requests = tuple(record.request for record in ledger.history(job.job_id))
+    assert len(requests) == 2
+    assert requests[0].run_id is not None
+    assert requests[1].run_id == requests[0].run_id
+    assert tuple(request.run_effect_index for request in requests) == (1, 2)
+    assert tuple(request.run_effect_count for request in requests) == (2, 2)
+
+
+@pytest.mark.asyncio
+async def test_release_runner_rejects_inconsistent_bound_plan_before_claim() -> None:
+    job = workflow_job(mode="release")
+    first = run_bound_request(
+        distinct_effect_request(job, key_char="c", ordinal=1),
+        run_id=uuid5(NAMESPACE_URL, f"factory-live-invalid-a|{job.job_id}"),
+        run_effect_index=1,
+        run_effect_count=2,
+    )
+    second = run_bound_request(
+        distinct_effect_request(job, key_char="d", ordinal=2),
+        run_id=uuid5(NAMESPACE_URL, f"factory-live-invalid-b|{job.job_id}"),
+        run_effect_index=2,
+        run_effect_count=2,
+    )
+    ledger = InMemoryFactoryLiveEffectLedger()
+
+    with pytest.raises(ValueError, match="run binding mismatch"):
+        await runner(job, ledger, Plan(first, second), MultiExecutor()).run(
+            job,
+            mode="release",
+        )
+
+    assert ledger.history(job.job_id) == ()
+
+
+@pytest.mark.asyncio
+async def test_prefix_crash_before_next_claim_is_recoverable() -> None:
+    job = workflow_job(mode="release")
+    run_id = uuid5(NAMESPACE_URL, f"factory-live-prefix|{job.job_id}")
+    first = run_bound_request(
+        distinct_effect_request(job, key_char="c", ordinal=1),
+        run_id=run_id,
+        run_effect_index=1,
+        run_effect_count=2,
+    )
+    second = run_bound_request(
+        distinct_effect_request(job, key_char="d", ordinal=2),
+        run_id=run_id,
+        run_effect_index=2,
+        run_effect_count=2,
+    )
+    ledger = InMemoryFactoryLiveEffectLedger()
+    ledger.claim(first)
+    ledger.complete(first, effect_outcome(first))
+    restarted = runner(job, ledger, Plan(first, second), MultiExecutor())
+
+    prefix_history = restarted.history(job.job_id)
+    resumed = await restarted.run(job, mode="release")
+    final_history = runner(
+        job,
+        ledger,
+        Plan(),
+        MultiExecutor(),
+    ).history(job.job_id)
+
+    assert prefix_history[0].status == "infrastructure_recovery_required"
+    assert tuple(effect.effect_id for effect in resumed.effects) == (
+        first.effect_id,
+        second.effect_id,
+    )
+    assert tuple(effect.effect_id for effect in final_history[-1].effects) == (
+        first.effect_id,
+        second.effect_id,
+    )
+
+
+def test_history_release_decisions_do_not_see_future_run_evidence() -> None:
+    job = workflow_job(mode="release")
+    runs = tuple(workflow_run(number) for number in range(1, 4))
+    requests = tuple(
+        run_bound_request(
+            FactoryLiveEffectRequestV1.model_validate(
+                effect_request(job, key_char=key_char).model_dump(
+                    mode="json", by_alias=True
+                )
+                | {
+                    "effect_id": str(
+                        uuid5(
+                            NAMESPACE_URL,
+                            f"factory-live-history-run|{job.job_id}|{number}",
+                        )
+                    ),
+                    "idempotency_key": run.invocation.idempotency_key,
+                    "input_ref": run.invocation.input_ref.model_dump(mode="json"),
+                    "invocation": run.invocation.model_dump(
+                        mode="json", by_alias=True
+                    ),
+                }
+            ),
+            run_id=uuid5(
+                NAMESPACE_URL,
+                f"factory-live-history-group|{job.job_id}|{number}",
+            ),
+            run_effect_index=1,
+            run_effect_count=1,
+        )
+        for number, (run, key_char) in enumerate(
+            zip(runs, ("c", "d", "e"), strict=True),
+            start=1,
+        )
+    )
+    ledger = InMemoryFactoryLiveEffectLedger()
+    for request in requests:
+        ledger.claim(request)
+        ledger.complete(request, effect_outcome(request))
+    repository = Repository(
+        job,
+        artifacts=(*runs, workflow_evaluation(runs)),
+        budget=workflow_budget(),
+        receipts=workflow_receipts(runs),
+    )
+
+    history = runner(
+        job,
+        ledger,
+        Plan(),
+        MultiExecutor(),
+        repository=repository,
+    ).history(job.job_id)
+
+    assert tuple(report.status for report in history) == (
+        "blocked",
+        "blocked",
+        "ready",
+    )
+    assert "missing exactly three" in history[0].reasons[0]
+    assert "missing exactly three" in history[1].reasons[0]
 
 
 @pytest.mark.asyncio
