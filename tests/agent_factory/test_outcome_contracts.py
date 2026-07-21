@@ -13,6 +13,7 @@ from agenten.agent_factory.outcome_contracts import (
     ExecutionOutcomeV1,
     FactoryTerminalDecision,
     FactoryTerminalState,
+    ForgeCapabilityPackageCandidateV1,
     validate_execution_outcome_binding,
 )
 from agenten.agent_factory.skill_evaluation import ToolGapMarker
@@ -42,6 +43,21 @@ def _artifact(path: str, digest: str, *, kind: str = "evidence") -> dict[str, ob
             "media_type": "application/octet-stream",
         },
     }
+
+
+def test_forge_candidate_fixture_is_strict_and_has_no_captain_evidence() -> None:
+    payload = _fixture("forge_capability_package_candidate.v1.json")
+
+    candidate = ForgeCapabilityPackageCandidateV1.model_validate(payload)
+
+    assert candidate.model_dump(mode="json", by_alias=True) == payload
+    assert candidate.schema_name == "forge.capability-package-candidate.v1"
+    assert not hasattr(candidate, "release_evidence_refs")
+    assert not hasattr(candidate, "assertion_outcomes")
+    with pytest.raises(ValidationError, match="extra"):
+        ForgeCapabilityPackageCandidateV1.model_validate(
+            {**payload, "producer": "captain"}
+        )
 
 
 def _runtime_command() -> AgentRuntimeCommand:
@@ -532,7 +548,7 @@ def test_capability_release_evidence_fixture_is_strict_frozen_and_round_trips() 
     (
         ({"recovery_id": None}, "recovery_id"),
         ({"outcome": "succeeded"}, "expected_failure_recovered"),
-        ({"kind": "normal"}, "normal.*recovery_id"),
+        ({"kind": "normal"}, "normal.*recovery identity"),
     ),
 )
 def test_capability_release_evidence_enforces_kind_semantics(
@@ -558,8 +574,10 @@ def test_capability_release_evidence_requires_unique_assertions_holdouts_and_ref
         CapabilityReleaseEvidenceV1.model_validate(payload)
 
     payload = _fixture("capability_release_evidence.v1.json")
-    payload["downstream_evidence_refs"].append(payload["downstream_evidence_refs"][0])
-    with pytest.raises(ValidationError, match="downstream"):
+    payload["assertion_results"][0]["evidence_refs"].append(
+        payload["assertion_results"][0]["evidence_refs"][0]
+    )
+    with pytest.raises(ValidationError, match="evidence"):
         CapabilityReleaseEvidenceV1.model_validate(payload)
 
 

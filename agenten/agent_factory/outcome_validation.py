@@ -12,7 +12,7 @@ import stat
 from tempfile import TemporaryDirectory
 from typing import Literal, Protocol
 import unicodedata
-from uuid import UUID
+from uuid import UUID, uuid4
 import zipfile
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -20,9 +20,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from agenten.agent_factory.contracts import AgentFactoryJobV2
 from agenten.agent_factory.forge_contracts import CreationResultV1
 from agenten.agent_factory.outcome_contracts import (
+    AssertionOutcome,
     CapabilityPackageManifestV1,
     CapabilityReleaseEvidenceV1,
+    ControlledRecoveryReceipt,
+    ForgeCapabilityPackageCandidateV1,
     PackageArtifact,
+    PrivateHoldoutReceipt,
 )
 from agenten.agent_factory.skill_evaluation import HermesSkillUsageReceipt
 from agenten.agent_runtime.contracts import ArtifactRef, SHA256_PATTERN
@@ -42,12 +46,14 @@ class CapabilitySandboxRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     request_digest: str = Field(pattern=SHA256_PATTERN)
+    execution_id: UUID
     correlation_id: UUID
     workspace: Path
     python_path_root: Path
     module_names: tuple[str, ...] = Field(min_length=1)
     test_paths: tuple[str, ...] = Field(min_length=1)
     extracted_tree_sha256: str = Field(pattern=SHA256_PATTERN)
+    package_archive_sha256: str = Field(pattern=SHA256_PATTERN)
     timeout_seconds: int = Field(ge=1, le=300, strict=True)
     workspace_access: Literal["read_only"] = "read_only"
     network_access: Literal["disabled"] = "disabled"
@@ -62,14 +68,26 @@ class CapabilitySandboxResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    execution_id: UUID
     request_digest: str = Field(pattern=SHA256_PATTERN)
     status: Literal["passed", "failed", "isolation_failed"]
     failure_stage: Literal["compile", "import", "test", "isolation"] | None = None
     imported_modules: tuple[str, ...]
     executed_test_paths: tuple[str, ...]
+    sandbox_identity: str = Field(pattern=r"^sandbox://[A-Za-z0-9._:/-]+$")
     workspace_was_read_only: Literal[True]
     network_was_disabled: Literal[True]
     resource_limits_were_enforced: Literal[True]
+    process_tree_termination_capable: Literal[True]
+
+
+class CapabilitySandboxTermination(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    execution_id: UUID
+    sandbox_identity: str = Field(pattern=r"^sandbox://[A-Za-z0-9._:/-]+$")
+    terminated: Literal[True]
+    process_tree_terminated: Literal[True]
 
 
 class TrustedCapabilitySandboxRunner(Protocol):
@@ -77,6 +95,13 @@ class TrustedCapabilitySandboxRunner(Protocol):
         self,
         request: CapabilitySandboxRequest,
     ) -> CapabilitySandboxResult: ...
+
+    async def cancel(self, execution_id: UUID) -> None: ...
+
+    async def await_termination(
+        self,
+        execution_id: UUID,
+    ) -> CapabilitySandboxTermination: ...
 
 
 class _TeamManifestV1(BaseModel):
@@ -100,6 +125,18 @@ class _TeamManifestV1(BaseModel):
         return value
 
 
+class _CapabilityAssertionEvidenceV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_name: Literal["captain.capability-assertion-evidence.v1"] = Field(
+        alias="schema"
+    )
+    run_id: str
+    assertion_id: str
+    status: Literal["passed", "failed"]
+    producer: Literal["captain"]
+
+
 class CapabilityPackageValidator:
     """Validate untrusted Forge output using only Captain-owned references."""
 
@@ -109,76 +146,106 @@ class CapabilityPackageValidator:
         content_store: ReadOnlyCapabilityContentStore,
         sandbox_runner: TrustedCapabilitySandboxRunner | None = None,
         command_timeout_seconds: int = 60,
+        termination_timeout_seconds: float = 5.0,
     ) -> None:
         if not 1 <= command_timeout_seconds <= 300:
             raise ValueError("command timeout must be between 1 and 300 seconds")
+        if not 0 < termination_timeout_seconds <= 30:
+            raise ValueError("termination timeout must be between 0 and 30 seconds")
         self._content_store = content_store
         self._sandbox_runner = sandbox_runner
         self._command_timeout_seconds = command_timeout_seconds
+        self._termination_timeout_seconds = termination_timeout_seconds
 
     async def validate(
         self,
         *,
         job: AgentFactoryJobV2,
         creation_result: CreationResultV1,
-        package: CapabilityPackageManifestV1,
+        candidate: ForgeCapabilityPackageCandidateV1,
+        release_evidence_refs: tuple[ArtifactRef, ...],
     ) -> CapabilityPackageManifestV1:
         if self._sandbox_runner is None:
             raise CapabilityPackageValidationError(
                 "capability validation requires an explicit trusted sandbox runner"
             )
-        self._validate_authority(job, creation_result, package)
-        references = _collect_references(creation_result, package)
+        self._validate_authority(job, creation_result, candidate)
+        references = _collect_references(
+            creation_result,
+            candidate,
+            release_evidence_refs,
+        )
         content = await self._read_verified(references)
-        self._validate_sealed_manifest(creation_result, package, content)
-        release_evidence = self._validate_release_evidence(job, package, content)
-        skill_receipt = self._validate_skill_receipt(job, package, content)
+        self._validate_sealed_candidate(creation_result, candidate, content)
+        release_evidence = self._validate_release_evidence(
+            job,
+            creation_result,
+            candidate,
+            release_evidence_refs,
+            content,
+        )
+        skill_receipt = self._validate_skill_receipt(job, candidate, content)
         nested_references = (
-            *(reference for item in release_evidence for reference in item.downstream_evidence_refs),
+            *(
+                reference
+                for item in release_evidence
+                for result in item.assertion_results
+                for reference in result.evidence_refs
+            ),
             *skill_receipt.evidence_refs,
         )
         content = await self._read_verified(
             _unique_references((*references, *nested_references)),
             existing=content,
         )
-        archive_content = content[package.source_ref.uri]
-        await self._validate_archive(
+        self._validate_assertion_evidence(release_evidence, content)
+        archive_content = content[candidate.source_ref.uri]
+        tree_digest = await self._validate_archive(
             job,
-            package,
+            candidate,
             archive_content,
             content,
         )
-        return package
+        if any(item.extracted_tree_sha256 != tree_digest for item in release_evidence):
+            raise CapabilityPackageValidationError(
+                "release evidence tree digest does not match extracted package"
+            )
+        return _build_captain_manifest(
+            candidate,
+            release_evidence_refs,
+            release_evidence,
+            job,
+        )
 
     @staticmethod
     def _validate_authority(
         job: AgentFactoryJobV2,
         creation_result: CreationResultV1,
-        package: CapabilityPackageManifestV1,
+        candidate: ForgeCapabilityPackageCandidateV1,
     ) -> None:
         if creation_result.status != "succeeded":
             raise CapabilityPackageValidationError(
                 "Forge result is not a successful candidate"
             )
-        if package.factory_job_id != job.job_id:
+        if candidate.factory_job_id != job.job_id:
             raise CapabilityPackageValidationError(
-                "package factory job does not match Captain job"
+                "candidate factory job does not match Captain job"
             )
-        if package.correlation_id != job.correlation_id:
+        if candidate.correlation_id != job.correlation_id:
             raise CapabilityPackageValidationError(
-                "package correlation does not match Captain job"
+                "candidate correlation does not match Captain job"
             )
-        if package.subject_version != job.subject_version:
+        if candidate.subject_version != job.subject_version:
             raise CapabilityPackageValidationError(
-                "package subject version does not match Captain job"
+                "candidate subject version does not match Captain job"
             )
-        if package.capability_id != job.required_capability:
+        if candidate.capability_id != job.required_capability:
             raise CapabilityPackageValidationError(
-                "package capability does not match Captain job"
+                "candidate capability does not match Captain job"
             )
-        if creation_result.creation_job_id != package.creation_job_id:
+        if creation_result.creation_job_id != candidate.creation_job_id:
             raise CapabilityPackageValidationError(
-                "creation job does not match package"
+                "creation job does not match candidate"
             )
         if creation_result.correlation_id != job.correlation_id:
             raise CapabilityPackageValidationError(
@@ -188,50 +255,30 @@ class CapabilityPackageValidator:
             raise CapabilityPackageValidationError(
                 "creation subject version does not match Captain job"
             )
+        if creation_result.attempt != candidate.attempt:
+            raise CapabilityPackageValidationError(
+                "creation attempt does not match candidate attempt"
+            )
         if creation_result.package_manifest_ref is None:
             raise CapabilityPackageValidationError(
                 "creation result is missing its package manifest"
             )
-        if not _contains_reference(creation_result.artifact_refs, package.source_ref):
+        if not _contains_reference(creation_result.artifact_refs, candidate.source_ref):
             raise CapabilityPackageValidationError(
                 "creation result does not bind the package source archive"
             )
         if creation_result.skill_usage_receipt_ref is None or not _same_reference(
             creation_result.skill_usage_receipt_ref,
-            package.skill_usage_receipt_ref,
+            candidate.skill_usage_receipt_ref,
         ):
             raise CapabilityPackageValidationError(
                 "creation result does not bind the skill usage receipt"
             )
 
-        expected_assertions = set(job.acceptance_assertion_ids)
-        actual_assertions = {item.assertion_id for item in package.assertion_outcomes}
-        if actual_assertions != expected_assertions or any(
-            item.status != "passed" for item in package.assertion_outcomes
+        if any(
+            marker.severity == "required" and marker.status == "unresolved"
+            for marker in candidate.tool_gaps
         ):
-            raise CapabilityPackageValidationError(
-                "package does not prove exactly the Captain acceptance assertions"
-            )
-        expected_holdouts = {item.holdout_id for item in job.private_holdout_refs}
-        actual_holdouts = {item.holdout_id for item in package.private_holdout_receipts}
-        if actual_holdouts != expected_holdouts or any(
-            item.status != "passed" for item in package.private_holdout_receipts
-        ):
-            raise CapabilityPackageValidationError(
-                "package holdout receipts do not match Captain private holdout refs"
-            )
-        if package.recovery_receipt.assertion_id not in expected_assertions:
-            raise CapabilityPackageValidationError(
-                "recovery receipt does not match a Captain acceptance assertion"
-            )
-        if not _contains_reference(
-            package.release_evidence_refs,
-            package.recovery_receipt.evidence_ref,
-        ):
-            raise CapabilityPackageValidationError(
-                "release evidence does not bind the controlled recovery receipt"
-            )
-        if any(marker.severity == "required" and marker.status == "unresolved" for marker in package.tool_gaps):
             raise CapabilityPackageValidationError(
                 "package contains an unresolved required tool gap"
             )
@@ -241,7 +288,7 @@ class CapabilityPackageValidator:
         }
         package_gaps = {
             (gap.gap_id, gap.severity, gap.status, _reference_identity(gap.evidence_ref))
-            for gap in package.tool_gaps
+            for gap in candidate.tool_gaps
         }
         if creation_gaps != package_gaps:
             raise CapabilityPackageValidationError(
@@ -278,11 +325,13 @@ class CapabilityPackageValidator:
     @staticmethod
     def _validate_release_evidence(
         job: AgentFactoryJobV2,
-        package: CapabilityPackageManifestV1,
+        creation_result: CreationResultV1,
+        candidate: ForgeCapabilityPackageCandidateV1,
+        release_evidence_refs: tuple[ArtifactRef, ...],
         content: dict[str, bytes],
     ) -> tuple[CapabilityReleaseEvidenceV1, ...]:
         records: list[CapabilityReleaseEvidenceV1] = []
-        for reference in package.release_evidence_refs:
+        for reference in release_evidence_refs:
             try:
                 records.append(
                     CapabilityReleaseEvidenceV1.model_validate_json(
@@ -325,6 +374,34 @@ class CapabilityPackageValidator:
                 raise CapabilityPackageValidationError(
                     "release evidence subject version does not match Captain job"
                 )
+            if item.creation_job_id != creation_result.creation_job_id:
+                raise CapabilityPackageValidationError(
+                    "release evidence creation job does not match candidate"
+                )
+            if item.attempt != creation_result.attempt:
+                raise CapabilityPackageValidationError(
+                    "release evidence attempt does not match creation attempt"
+                )
+            if item.capability_id != candidate.capability_id:
+                raise CapabilityPackageValidationError(
+                    "release evidence capability does not match candidate"
+                )
+            if item.capability_version != candidate.capability_version:
+                raise CapabilityPackageValidationError(
+                    "release evidence capability version does not match candidate"
+                )
+            manifest_ref = creation_result.package_manifest_ref
+            if (
+                manifest_ref is None
+                or item.candidate_manifest_sha256 != manifest_ref.sha256
+            ):
+                raise CapabilityPackageValidationError(
+                    "release evidence candidate digest does not match creation result"
+                )
+            if item.package_archive_sha256 != candidate.source_ref.sha256:
+                raise CapabilityPackageValidationError(
+                    "release evidence package digest does not match candidate archive"
+                )
             if set(item.assertion_ids) != set(job.acceptance_assertion_ids) or any(
                 result.status != "passed" for result in item.assertion_results
             ):
@@ -332,15 +409,6 @@ class CapabilityPackageValidator:
                     "release evidence assertions do not match Captain assertions"
                 )
         recovery_record = recovery[0]
-        if recovery_record.recovery_id != package.recovery_receipt.recovery_id:
-            raise CapabilityPackageValidationError(
-                "release evidence recovery ID does not match recovery receipt"
-            )
-        recovery_reference = package.release_evidence_refs[evidence.index(recovery_record)]
-        if recovery_reference != package.recovery_receipt.evidence_ref:
-            raise CapabilityPackageValidationError(
-                "recovery receipt does not point to its typed release evidence"
-            )
         if any(item.outcome != "succeeded" for item in normal):
             raise CapabilityPackageValidationError(
                 "all three normal release evidence runs must be succeeded"
@@ -362,52 +430,54 @@ class CapabilityPackageValidator:
             raise CapabilityPackageValidationError(
                 "typed release evidence does not bind every Captain private holdout"
             )
-        downstream_by_holdout = {
-            holdout_id: {
-                _reference_identity(reference)
-                for item in evidence
-                if holdout_id in item.holdout_ids
-                for reference in item.downstream_evidence_refs
-            }
-            for holdout_id in expected_holdouts
-        }
-        for receipt in package.private_holdout_receipts:
-            if _reference_identity(receipt.evidence_ref) not in downstream_by_holdout.get(
-                receipt.holdout_id,
-                set(),
-            ):
-                raise CapabilityPackageValidationError(
-                    "private holdout receipt is not bound to typed release evidence"
-                )
-        downstream_identities = [
+        assertion_evidence_identities = [
             _reference_identity(reference)
             for item in evidence
-            for reference in item.downstream_evidence_refs
+            for result in item.assertion_results
+            for reference in result.evidence_refs
         ]
-        if len(downstream_identities) != len(set(downstream_identities)):
-            raise CapabilityPackageValidationError(
-                "release runs must use distinct downstream evidence"
-            )
-        downstream_set = set(downstream_identities)
-        if any(
-            _reference_identity(reference) not in downstream_set
-            for outcome in package.assertion_outcomes
-            for reference in outcome.evidence_refs
+        if len(assertion_evidence_identities) != len(
+            set(assertion_evidence_identities)
         ):
             raise CapabilityPackageValidationError(
-                "assertion outcome is not bound to typed release evidence"
+                "release assertion results must use distinct evidence"
             )
         return evidence
 
     @staticmethod
+    def _validate_assertion_evidence(
+        release_evidence: tuple[CapabilityReleaseEvidenceV1, ...],
+        content: dict[str, bytes],
+    ) -> None:
+        for run in release_evidence:
+            for result in run.assertion_results:
+                for reference in result.evidence_refs:
+                    try:
+                        evidence = _CapabilityAssertionEvidenceV1.model_validate_json(
+                            content[reference.uri]
+                        )
+                    except (ValidationError, ValueError) as exc:
+                        raise CapabilityPackageValidationError(
+                            "assertion evidence is not a typed Captain record"
+                        ) from exc
+                    if (
+                        evidence.run_id != run.run_id
+                        or evidence.assertion_id != result.assertion_id
+                        or evidence.status != result.status
+                    ):
+                        raise CapabilityPackageValidationError(
+                            "assertion evidence does not match its release result"
+                        )
+
+    @staticmethod
     def _validate_skill_receipt(
         job: AgentFactoryJobV2,
-        package: CapabilityPackageManifestV1,
+        candidate: ForgeCapabilityPackageCandidateV1,
         content: dict[str, bytes],
     ) -> HermesSkillUsageReceipt:
         try:
             receipt = HermesSkillUsageReceipt.model_validate_json(
-                content[package.skill_usage_receipt_ref.uri]
+                content[candidate.skill_usage_receipt_ref.uri]
             )
         except (ValidationError, ValueError) as exc:
             raise CapabilityPackageValidationError(
@@ -434,7 +504,7 @@ class CapabilityPackageValidator:
                 "skill receipt did not pass"
             )
         if not _contains_reference(
-            (item.reference for item in package.artifacts),
+            (item.reference for item in candidate.artifacts),
             receipt.released_skill.content_ref,
         ):
             raise CapabilityPackageValidationError(
@@ -443,34 +513,34 @@ class CapabilityPackageValidator:
         return receipt
 
     @staticmethod
-    def _validate_sealed_manifest(
+    def _validate_sealed_candidate(
         creation_result: CreationResultV1,
-        package: CapabilityPackageManifestV1,
+        candidate: ForgeCapabilityPackageCandidateV1,
         content: dict[str, bytes],
     ) -> None:
         reference = creation_result.package_manifest_ref
         if reference is None:  # guarded above; keeps type narrowing local
             raise CapabilityPackageValidationError("creation result has no manifest")
         try:
-            sealed = CapabilityPackageManifestV1.model_validate_json(
+            sealed = ForgeCapabilityPackageCandidateV1.model_validate_json(
                 content[reference.uri]
             )
         except (ValidationError, ValueError) as exc:
             raise CapabilityPackageValidationError(
-                "sealed package manifest is invalid"
+                "sealed candidate manifest is invalid"
             ) from exc
-        if sealed != package:
+        if sealed != candidate:
             raise CapabilityPackageValidationError(
-                "sealed manifest does not describe the supplied package"
+                "sealed manifest does not describe the supplied candidate"
             )
 
     async def _validate_archive(
         self,
         job: AgentFactoryJobV2,
-        package: CapabilityPackageManifestV1,
+        package: ForgeCapabilityPackageCandidateV1,
         archive_content: bytes,
         resolved_content: dict[str, bytes],
-    ) -> None:
+    ) -> str:
         if package.source_ref.media_type != "application/zip":
             raise CapabilityPackageValidationError(
                 "package source archive must use application/zip"
@@ -501,6 +571,7 @@ class CapabilityPackageValidator:
                     raise CapabilityPackageValidationError(
                         "trusted sandbox changed the effective extracted tree"
                     )
+                return tree_digest
         except zipfile.BadZipFile as exc:
             raise CapabilityPackageValidationError(
                 "package source is not a valid ZIP archive"
@@ -508,7 +579,7 @@ class CapabilityPackageValidator:
 
     @staticmethod
     def _extract_verified(
-        package: CapabilityPackageManifestV1,
+        package: ForgeCapabilityPackageCandidateV1,
         archive_content: bytes,
         workspace: Path,
         resolved_content: dict[str, bytes],
@@ -586,7 +657,7 @@ class CapabilityPackageValidator:
 
     @staticmethod
     def _validate_manifest_relationships(
-        package: CapabilityPackageManifestV1,
+        package: ForgeCapabilityPackageCandidateV1,
         workspace: Path,
     ) -> _TeamManifestV1:
         for artifact in package.artifacts:
@@ -626,7 +697,7 @@ class CapabilityPackageValidator:
     async def _run_package_checks(
         self,
         job: AgentFactoryJobV2,
-        package: CapabilityPackageManifestV1,
+        package: ForgeCapabilityPackageCandidateV1,
         manifest: _TeamManifestV1,
         workspace: Path,
         tree_digest: str,
@@ -641,6 +712,7 @@ class CapabilityPackageValidator:
             )
         )
         request_payload = {
+            "execution_id": None,
             "correlation_id": str(job.correlation_id),
             "package_sha256": package.source_ref.sha256,
             "tree_sha256": tree_digest,
@@ -654,6 +726,8 @@ class CapabilityPackageValidator:
             "kill_process_tree_on_cancel": True,
             "require_process_identity": True,
         }
+        execution_id = uuid4()
+        request_payload["execution_id"] = str(execution_id)
         request_digest = hashlib.sha256(
             json.dumps(
                 request_payload,
@@ -663,12 +737,14 @@ class CapabilityPackageValidator:
         ).hexdigest()
         request = CapabilitySandboxRequest(
             request_digest=request_digest,
+            execution_id=execution_id,
             correlation_id=job.correlation_id,
             workspace=workspace,
             python_path_root=workspace,
             module_names=module_names,
             test_paths=manifest.test_paths,
             extracted_tree_sha256=tree_digest,
+            package_archive_sha256=package.source_ref.sha256,
             timeout_seconds=self._command_timeout_seconds,
         )
         task = asyncio.create_task(runner.validate(request))
@@ -677,16 +753,41 @@ class CapabilityPackageValidator:
             timeout=self._command_timeout_seconds,
         )
         if not done:
-            task.cancel()
-            cleanup_done, _ = await asyncio.wait({task}, timeout=5)
-            if not cleanup_done:
-                task.add_done_callback(_consume_task_result)
+            try:
+                await asyncio.wait_for(
+                    runner.cancel(execution_id),
+                    timeout=self._termination_timeout_seconds,
+                )
+                termination = await asyncio.wait_for(
+                    runner.await_termination(execution_id),
+                    timeout=self._termination_timeout_seconds,
+                )
+                if (
+                    termination.execution_id != execution_id
+                    or termination.terminated is not True
+                    or termination.process_tree_terminated is not True
+                ):
+                    raise CapabilityPackageValidationError(
+                        "trusted sandbox termination was not attested"
+                    )
+            except (asyncio.TimeoutError, Exception) as exc:
+                raise CapabilityPackageValidationError(
+                    "trusted sandbox cancellation failed closed"
+                ) from exc
+            finally:
+                task.cancel()
+                cleanup_done, _ = await asyncio.wait(
+                    {task},
+                    timeout=self._termination_timeout_seconds,
+                )
+                if not cleanup_done:
+                    task.add_done_callback(_consume_task_result)
             raise CapabilityPackageValidationError(
                 "trusted sandbox validation timed out"
             )
         try:
             result = task.result()
-        except Exception as exc:
+        except (asyncio.CancelledError, Exception) as exc:
             raise CapabilityPackageValidationError(
                 "trusted sandbox validation failed closed"
             ) from exc
@@ -694,7 +795,10 @@ class CapabilityPackageValidator:
             raise CapabilityPackageValidationError(
                 "trusted sandbox returned an invalid result"
             )
-        if result.request_digest != request.request_digest:
+        if (
+            result.execution_id != request.execution_id
+            or result.request_digest != request.request_digest
+        ):
             raise CapabilityPackageValidationError(
                 "trusted sandbox result request digest does not match"
             )
@@ -702,6 +806,7 @@ class CapabilityPackageValidator:
             result.workspace_was_read_only is not True
             or result.network_was_disabled is not True
             or result.resource_limits_were_enforced is not True
+            or result.process_tree_termination_capable is not True
         ):
             raise CapabilityPackageValidationError(
                 "trusted sandbox did not attest required isolation"
@@ -720,9 +825,77 @@ class CapabilityPackageValidator:
             )
 
 
+def _build_captain_manifest(
+    candidate: ForgeCapabilityPackageCandidateV1,
+    release_evidence_refs: tuple[ArtifactRef, ...],
+    release_evidence: tuple[CapabilityReleaseEvidenceV1, ...],
+    job: AgentFactoryJobV2,
+) -> CapabilityPackageManifestV1:
+    recovery = next(item for item in release_evidence if item.kind == "recovery")
+    recovery_assertion_id = recovery.recovery_assertion_id
+    if recovery_assertion_id is None:  # contract validation already prevents this
+        raise CapabilityPackageValidationError(
+            "recovery evidence is missing its assertion identity"
+        )
+    recovery_result = next(
+        item
+        for item in recovery.assertion_results
+        if item.assertion_id == recovery_assertion_id
+    )
+    assertion_outcomes = tuple(
+        AssertionOutcome(
+            assertion_id=assertion_id,
+            status="passed",
+            evidence_refs=_unique_references(
+                reference
+                for item in release_evidence
+                for result in item.assertion_results
+                if result.assertion_id == assertion_id
+                for reference in result.evidence_refs
+            ),
+        )
+        for assertion_id in job.acceptance_assertion_ids
+    )
+    private_holdout_receipts = tuple(
+        PrivateHoldoutReceipt(
+            holdout_id=holdout.holdout_id,
+            assertion_id=recovery_assertion_id,
+            status="passed",
+            evidence_ref=recovery_result.evidence_refs[0],
+        )
+        for holdout in job.private_holdout_refs
+    )
+    recovery_index = release_evidence.index(recovery)
+    return CapabilityPackageManifestV1(
+        schema_name="captain.capability-package.v1",
+        capability_id=candidate.capability_id,
+        capability_version=candidate.capability_version,
+        factory_job_id=candidate.factory_job_id,
+        creation_job_id=candidate.creation_job_id,
+        correlation_id=candidate.correlation_id,
+        subject_version=candidate.subject_version,
+        source_ref=candidate.source_ref,
+        team_manifest_ref=candidate.team_manifest_ref,
+        artifacts=candidate.artifacts,
+        assertion_outcomes=assertion_outcomes,
+        private_holdout_receipts=private_holdout_receipts,
+        recovery_receipt=ControlledRecoveryReceipt(
+            recovery_id=recovery.recovery_id,
+            assertion_id=recovery_assertion_id,
+            status="passed",
+            evidence_ref=release_evidence_refs[recovery_index],
+        ),
+        release_evidence_refs=release_evidence_refs,
+        skill_usage_receipt_ref=candidate.skill_usage_receipt_ref,
+        tool_gaps=candidate.tool_gaps,
+        runbook_ref=candidate.runbook_ref,
+    )
+
+
 def _collect_references(
     creation_result: CreationResultV1,
-    package: CapabilityPackageManifestV1,
+    package: ForgeCapabilityPackageCandidateV1,
+    release_evidence_refs: tuple[ArtifactRef, ...],
 ) -> tuple[ArtifactRef, ...]:
     raw_references: list[object | None] = [
         creation_result.package_manifest_ref,
@@ -734,10 +907,7 @@ def _collect_references(
         package.source_ref,
         package.team_manifest_ref,
         *(item.reference for item in package.artifacts),
-        *(ref for item in package.assertion_outcomes for ref in item.evidence_refs),
-        *(item.evidence_ref for item in package.private_holdout_receipts),
-        package.recovery_receipt.evidence_ref,
-        *package.release_evidence_refs,
+        *release_evidence_refs,
         package.skill_usage_receipt_ref,
         *(gap.input_contract_ref for gap in package.tool_gaps),
         *(gap.output_contract_ref for gap in package.tool_gaps),
@@ -856,7 +1026,7 @@ def _windows_canonical_path(value: str) -> str:
 
 def _effective_tree_digest(
     workspace: Path,
-    package: CapabilityPackageManifestV1,
+    package: ForgeCapabilityPackageCandidateV1,
 ) -> str:
     declared = {item.path: item for item in package.artifacts}
     actual_paths: set[str] = set()
