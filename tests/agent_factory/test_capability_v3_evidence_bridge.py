@@ -216,7 +216,7 @@ class _CandidateProvider:
 
 
 class _Attestation:
-    def attest(
+    async def attest(
         self,
         job: AgentFactoryJobV3,
         resolved: ResolvedFactoryCandidate,

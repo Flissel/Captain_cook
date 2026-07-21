@@ -238,7 +238,7 @@ class CapabilityCandidateProviderPort(Protocol):
 
 
 class CapabilityCandidateAttestationPort(Protocol):
-    def attest(
+    async def attest(
         self,
         job: AgentFactoryJobV3,
         resolved: ResolvedFactoryCandidate,
@@ -318,7 +318,9 @@ class PackageCV3CapabilityReleaseExecutor:
         resolved = self._context.candidate_provider.candidate_for(v3, candidate)
         if resolved.candidate.source_archive_ref != candidate.source_ref:
             raise ValueError("resolved V3 candidate does not match Package-C source authority")
-        attestation = self._context.candidate_attestation.attest(v3, resolved, candidate)
+        attestation = await self._context.candidate_attestation.attest(
+            v3, resolved, candidate
+        )
         if attestation.job_id != v3.job_id or attestation.candidate_ref != candidate.source_ref:
             raise ValueError("candidate sandbox attestation does not match V3 authority")
         leases = self._leases(v3, attempt=creation_result.attempt)

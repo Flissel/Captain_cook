@@ -277,6 +277,12 @@ class ContentAddressedArtifactStore:
             raise ValueError("artifact content digest changed")
         return content
 
+    def local_path(self, reference: ArtifactRef) -> Path:
+        """Return the immutable local CAS path after verifying its exact digest."""
+
+        self.read_bytes(reference)
+        return self._content_root / reference.sha256[:2] / reference.sha256
+
     async def read(self, reference: ArtifactRef) -> bytes:
         """Implement ``ReadOnlyCapabilityContentStore`` without blocking effects."""
 

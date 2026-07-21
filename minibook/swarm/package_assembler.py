@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -12,9 +13,21 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+import yaml
+
 
 class PackageAssemblyError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class AssembledArtifact:
+    path: str
+    kind: str
+    uri: str
+    sha256: str
+    media_type: str
+    size: int
 
 
 @dataclass(frozen=True)
@@ -22,6 +35,8 @@ class AssembledPackage:
     archive_path: Path
     archive_sha256: str
     manifest_sha256: str
+    artifacts: tuple[AssembledArtifact, ...] = ()
+    candidate_descriptor_sha256: str | None = None
 
 
 _EXCLUDED_NAMES = {".env", ".git", ".hg", "__pycache__", ".pytest_cache"}
@@ -30,11 +45,19 @@ _INTEGRATION_FIELDS = {
     "workflow", "input_schema", "output_schema", "idempotency", "timeout",
     "retry", "duplicate", "failure", "compensation",
 }
+_PATTERNS = {
+    "swarm": "swarm",
+    "selector": "selector_group_chat",
+    "selector_group_chat": "selector_group_chat",
+    "round_robin": "round_robin_group_chat",
+    "round_robin_group_chat": "round_robin_group_chat",
+    "single_agent": "single_agent",
+}
 
 
 def _safe_relative(value: str) -> PurePosixPath:
     path = PurePosixPath(value.replace("\\", "/"))
-    if path.is_absolute() or ".." in path.parts or not path.parts:
+    if path.is_absolute() or ".." in path.parts or "." in path.parts or not path.parts:
         raise PackageAssemblyError("package path must be safe and relative")
     return path
 
@@ -47,56 +70,99 @@ class PackageAssembler:
         *,
         startup_command: tuple[str, ...],
         integration_contracts: tuple[dict[str, object], ...] = (),
+        capability_id: str | None = None,
+        capability_version: int = 1,
     ) -> AssembledPackage:
         source = source.resolve()
         if not source.is_dir():
             raise PackageAssemblyError("candidate source is not a directory")
         self._validate_startup(source, startup_command)
-        for contract in integration_contracts:
-            if set(contract) != _INTEGRATION_FIELDS:
-                raise PackageAssemblyError("integration contract is incomplete")
-            _safe_relative(str(contract["workflow"]))
-        files: dict[str, bytes] = {}
-        directories: set[str] = set()
-        for path in sorted(source.rglob("*")):
-            relative = path.relative_to(source).as_posix()
-            if any(part in _EXCLUDED_NAMES for part in path.relative_to(source).parts):
-                continue
-            if path.is_symlink():
-                raise PackageAssemblyError("candidate packages must not contain symlinks")
-            if path.is_dir():
-                directories.add(relative.rstrip("/") + "/")
-                continue
-            if path.suffix.lower() in _EXCLUDED_SUFFIXES or "transcript" in path.name.lower():
-                continue
-            _safe_relative(relative)
-            files[relative] = path.read_bytes()
+        contracts = self._validate_integrations(source, integration_contracts)
+        files, directories = self._source_files(source)
+        if any(
+            path in {
+                "adapters/factory-candidate.json",
+                "adapters/execution-team.json",
+                "evidence/package-index.json",
+            }
+            or path.startswith("adapters/prompts/")
+            for path in files
+        ):
+            raise PackageAssemblyError(
+                "candidate source collides with Captain-generated package metadata"
+            )
+        descriptor_digest: str | None = None
+        if contracts:
+            generated = self._candidate_execution_files(
+                source,
+                files,
+                startup_command=startup_command,
+                integration_contracts=contracts,
+            )
+            files.update(generated)
+            descriptor_digest = hashlib.sha256(
+                generated["adapters/factory-candidate.json"]
+            ).hexdigest()
+            directories.update({"adapters/", "adapters/prompts/"})
         required = {"autogen/", "skills/", "tests/", "evidence/", "RUNBOOK.md"}
-        if integration_contracts:
-            required.add("n8n/")
+        if contracts:
+            required.update({"n8n/", "adapters/"})
         present = directories | set(files)
         if not required.issubset(present):
             raise PackageAssemblyError("candidate package is missing required layout")
+        if isinstance(capability_version, bool) or capability_version < 1:
+            raise PackageAssemblyError("capability version must be a positive integer")
+        base_exported = tuple(
+            _artifact(path, content)
+            for path, content in sorted(files.items())
+        )
         entries = [
-            {"path": name, "sha256": hashlib.sha256(content).hexdigest(), "size": len(content)}
-            for name, content in sorted(files.items())
+            {
+                "path": item.path,
+                "kind": item.kind,
+                "uri": item.uri,
+                "sha256": item.sha256,
+                "media_type": item.media_type,
+                "size": item.size,
+            }
+            for item in base_exported
         ]
-        manifest = {
-            "schema": "minibook.team-manifest.v1",
+        package_index = {
+            "schema": "minibook.package-index.v1",
             "startup_command": list(startup_command),
             "required_layout": sorted(required),
             "files": entries,
-            "integrations": list(integration_contracts),
+            "integrations": list(contracts),
         }
-        manifest_bytes = json.dumps(
-            manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        ).encode("utf-8")
+        files["evidence/package-index.json"] = _canonical_json(package_index)
+        exported = tuple(
+            _artifact(path, content)
+            for path, content in sorted(files.items())
+        )
+        manifest = {
+            "schema": "autogen-team.v1",
+            "capability_id": _identifier(capability_id or source.name),
+            "capability_version": capability_version,
+            "autogen_modules": [
+                item.path for item in exported if item.kind == "autogen_source"
+            ],
+            "test_paths": [item.path for item in exported if item.kind == "test"],
+        }
+        manifest_bytes = _canonical_json(manifest)
+        manifest_artifact = _artifact(
+            "team-manifest.json", manifest_bytes, kind="team_manifest"
+        )
         archive_entries = dict(files)
-        archive_entries["team-manifest.json"] = manifest_bytes
+        archive_entries[manifest_artifact.path] = manifest_bytes
         for directory in directories:
             archive_entries.setdefault(directory, b"")
         archive_path.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        with zipfile.ZipFile(
+            archive_path,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=9,
+        ) as archive:
             for name, content in sorted(archive_entries.items()):
                 info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
                 info.create_system = 3
@@ -107,8 +173,214 @@ class PackageAssembler:
         return AssembledPackage(
             archive_path=archive_path,
             archive_sha256=hashlib.sha256(archive_bytes).hexdigest(),
-            manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+            manifest_sha256=manifest_artifact.sha256,
+            artifacts=tuple(sorted((*exported, manifest_artifact), key=lambda item: item.path)),
+            candidate_descriptor_sha256=descriptor_digest,
         )
+
+    def _source_files(self, source: Path) -> tuple[dict[str, bytes], set[str]]:
+        files: dict[str, bytes] = {}
+        directories: set[str] = set()
+        for path in sorted(source.rglob("*")):
+            parts = path.relative_to(source).parts
+            if path.is_symlink():
+                raise PackageAssemblyError("candidate packages must not contain symlinks")
+            if any(part in _EXCLUDED_NAMES for part in parts):
+                continue
+            if (parts and parts[0] == "agents") or path.name == "project.yml":
+                continue
+            relative = path.relative_to(source).as_posix()
+            if path.is_dir():
+                directories.add(relative.rstrip("/") + "/")
+                continue
+            if path.suffix.lower() in _EXCLUDED_SUFFIXES or "transcript" in path.name.lower():
+                continue
+            _safe_relative(relative)
+            files[relative] = path.read_bytes()
+        return files, directories
+
+    def _validate_integrations(
+        self,
+        source: Path,
+        integration_contracts: tuple[dict[str, object], ...],
+    ) -> tuple[dict[str, object], ...]:
+        normalized: list[dict[str, object]] = []
+        for contract in integration_contracts:
+            if set(contract) != _INTEGRATION_FIELDS:
+                raise PackageAssemblyError("integration contract is incomplete")
+            checked = dict(contract)
+            for field in ("workflow", "input_schema", "output_schema"):
+                path = _safe_relative(str(checked[field])).as_posix()
+                if not (source / Path(*PurePosixPath(path).parts)).is_file():
+                    raise PackageAssemblyError(
+                        f"integration contract {field} is not an exported file"
+                    )
+                checked[field] = path
+            normalized.append(checked)
+        return tuple(normalized)
+
+    def _candidate_execution_files(
+        self,
+        source: Path,
+        files: dict[str, bytes],
+        *,
+        startup_command: tuple[str, ...],
+        integration_contracts: tuple[dict[str, object], ...],
+    ) -> dict[str, bytes]:
+        agents = self._exported_agents(source)
+        tool_records = tuple(
+            self._tool_record(contract, files) for contract in integration_contracts
+        )
+        allowed_tools = {str(item["name"]) for item in tool_records}
+        prompts: dict[str, bytes] = {}
+        manifest_agents: list[dict[str, object]] = []
+        for agent in agents:
+            prompt_path = f"adapters/prompts/{agent['name']}.md"
+            prompt = (str(agent["system_message"]).rstrip() + "\n").encode("utf-8")
+            prompts[prompt_path] = prompt
+            tools = tuple(str(item) for item in agent["tools"])
+            if set(tools) - allowed_tools:
+                raise PackageAssemblyError(
+                    "exported agent references a tool outside integration contracts"
+                )
+            manifest_agents.append(
+                {
+                    "name": agent["name"],
+                    "tools": list(tools),
+                    "system_prompt_ref": _reference(prompt, prompt_path),
+                    "handoffs": list(agent["handoffs"]),
+                }
+            )
+        names = {str(item["name"]) for item in manifest_agents}
+        if any(set(item["handoffs"]) - names for item in manifest_agents):
+            raise PackageAssemblyError("exported agent handoff names are not closed")
+        pattern = self._conversation_pattern(source, manifest_agents)
+        execution_manifest = {
+            "schema": "autogen-team.v1",
+            "name": _identifier(source.name),
+            "conversation_pattern": pattern,
+            "agents": manifest_agents,
+            "memory_policy": "bounded",
+            "max_messages": 40,
+            "max_handoffs": 20 if any(item["handoffs"] for item in manifest_agents) else 0,
+            "max_tool_calls": max(1, len(tool_records) * 4),
+            "termination_conditions": ["task_completed", "max_messages", "max_tool_calls"],
+            "entrypoint_command": list(startup_command),
+        }
+        execution_bytes = _canonical_json(execution_manifest)
+        execution_path = "adapters/execution-team.json"
+        generated = {**prompts, execution_path: execution_bytes}
+        combined = {**files, **generated}
+        descriptor = {
+            "schema": "captain.factory-candidate-descriptor.v1",
+            "candidate_id": _identifier(source.name),
+            "team_manifest": _candidate_artifact(execution_path, execution_bytes),
+            "workflow_artifacts": [
+                _candidate_artifact(str(item["workflow"]), combined[str(item["workflow"])])
+                for item in tool_records
+            ],
+            "tool_schema_artifacts": [
+                _candidate_artifact(path, combined[path])
+                for item in tool_records
+                for path in (str(item["input_schema"]), str(item["output_schema"]))
+            ],
+            "n8n_tools": [
+                {
+                    "name": item["name"],
+                    "description": item["description"],
+                    "input_schema_ref": _reference(
+                        combined[str(item["input_schema"])], str(item["input_schema"])
+                    )["uri"],
+                    "output_schema_ref": _reference(
+                        combined[str(item["output_schema"])], str(item["output_schema"])
+                    )["uri"],
+                }
+                for item in tool_records
+            ],
+            "build_command": ["python", "-m", "compileall", "-q", "autogen"],
+            "real_case_command": list(startup_command),
+            "timeout_seconds": min(
+                300,
+                max(1, max(int(item["timeout"]) for item in tool_records)),
+            ),
+        }
+        generated["adapters/factory-candidate.json"] = _canonical_json(descriptor)
+        return generated
+
+    def _exported_agents(self, source: Path) -> tuple[dict[str, object], ...]:
+        root = source / "agents"
+        records: list[dict[str, object]] = []
+        for path in sorted(root.glob("*/agent.yml")) if root.is_dir() else ():
+            try:
+                payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, yaml.YAMLError) as exc:
+                raise PackageAssemblyError("exported agent YAML is invalid") from exc
+            if not isinstance(payload, dict):
+                raise PackageAssemblyError("exported agent YAML must be an object")
+            name = _identifier(str(payload.get("name", "")))
+            prompt = payload.get("system_message")
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise PackageAssemblyError("exported agent lacks a system prompt")
+            raw_tools = payload.get("domain_tools", payload.get("tools", ()))
+            if not isinstance(raw_tools, list) or any(not isinstance(item, str) for item in raw_tools):
+                raise PackageAssemblyError("exported agent tools must be named strings")
+            raw_handoffs = payload.get("handoffs", ())
+            if not isinstance(raw_handoffs, list) or any(
+                not isinstance(item, str) for item in raw_handoffs
+            ):
+                raise PackageAssemblyError("exported agent handoffs must be named strings")
+            records.append(
+                {
+                    "name": name,
+                    "system_message": prompt,
+                    "tools": tuple(raw_tools),
+                    "handoffs": tuple(_identifier(item) for item in raw_handoffs),
+                }
+            )
+        if not records or len({item["name"] for item in records}) != len(records):
+            raise PackageAssemblyError("candidate export requires unique agent.yml files")
+        return tuple(records)
+
+    def _conversation_pattern(
+        self,
+        source: Path,
+        agents: list[dict[str, object]],
+    ) -> str:
+        project = source / "project.yml"
+        raw_pattern = ""
+        if project.is_file():
+            try:
+                payload = yaml.safe_load(project.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    raw_pattern = str(payload.get("pattern", ""))
+            except (OSError, UnicodeError, yaml.YAMLError) as exc:
+                raise PackageAssemblyError("exported project YAML is invalid") from exc
+        if raw_pattern in _PATTERNS:
+            selected = _PATTERNS[raw_pattern]
+        elif len(agents) == 1:
+            selected = "single_agent"
+        elif any(item["handoffs"] for item in agents):
+            selected = "swarm"
+        else:
+            selected = "round_robin_group_chat"
+        if selected == "single_agent" and len(agents) != 1:
+            raise PackageAssemblyError("single_agent pattern requires exactly one export")
+        return selected
+
+    @staticmethod
+    def _tool_record(
+        contract: dict[str, object],
+        files: dict[str, bytes],
+    ) -> dict[str, object]:
+        paths = tuple(str(contract[field]) for field in ("workflow", "input_schema", "output_schema"))
+        if any(path not in files for path in paths):
+            raise PackageAssemblyError("integration files were excluded from the package")
+        name = _identifier(PurePosixPath(paths[0]).stem)
+        return {
+            **contract,
+            "name": name,
+            "description": f"Execute the sealed {name} integration workflow.",
+        }
 
     def _validate_startup(self, source: Path, command: tuple[str, ...]) -> None:
         if len(command) < 2 or command[0] != "python":
@@ -140,3 +412,75 @@ class PackageAssembler:
                 raise PackageAssemblyError("candidate startup validation failed") from exc
             if completed.returncode != 0:
                 raise PackageAssemblyError("candidate startup validation failed")
+
+
+def _identifier(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9_]+", "_", value.lower()).strip("_")
+    if not normalized or not normalized[0].isalpha() or len(normalized) > 64:
+        raise PackageAssemblyError("exported identifier is invalid")
+    return normalized
+
+
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _reference(content: bytes, path: str) -> dict[str, str]:
+    digest = hashlib.sha256(content).hexdigest()
+    return {
+        "uri": f"artifact://capability-factory/package-file/{digest}",
+        "sha256": digest,
+        "media_type": _media_type(path),
+    }
+
+
+def _candidate_artifact(path: str, content: bytes) -> dict[str, object]:
+    return {"reference": _reference(content, path), "relative_path": path}
+
+
+def _artifact(path: str, content: bytes, *, kind: str | None = None) -> AssembledArtifact:
+    resolved_kind = kind or _kind(path)
+    reference = _reference(content, path)
+    media_type = _media_type(path)
+    return AssembledArtifact(
+        path=path,
+        kind=resolved_kind,
+        uri=reference["uri"],
+        sha256=reference["sha256"],
+        media_type=media_type,
+        size=len(content),
+    )
+
+
+def _kind(path: str) -> str:
+    if path.startswith("autogen/"):
+        return "autogen_source"
+    if path.startswith("n8n/"):
+        return "n8n_workflow"
+    if path.startswith("adapters/"):
+        return "local_adapter"
+    if path.startswith("skills/"):
+        return "skill"
+    if path.startswith("tests/"):
+        return "test"
+    if path.startswith("evidence/"):
+        return "evidence"
+    if path == "RUNBOOK.md":
+        return "runbook"
+    raise PackageAssemblyError(f"unsupported package artifact path: {path}")
+
+
+def _media_type(path: str) -> str:
+    suffix = PurePosixPath(path).suffix.lower()
+    return {
+        ".json": "application/json",
+        ".py": "text/x-python",
+        ".md": "text/markdown",
+        ".yaml": "application/yaml",
+        ".yml": "application/yaml",
+    }.get(suffix, "application/octet-stream")
