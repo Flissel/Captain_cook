@@ -415,6 +415,36 @@ def test_gateway_workflow_input_binding_uses_the_exact_step_predecessor() -> Non
         )
 
 
+def test_gateway_rejects_foreign_skill_with_the_same_factory_capability() -> None:
+    inventory = parse_factory_workflow_artifact(inventory_payload())
+    factory_job = job().model_copy(
+        update={
+            "job_id": inventory.job_id,
+            "correlation_id": inventory.correlation_id,
+            "subject_version": inventory.subject_version,
+            "input_ref": inventory.invocation.input_ref,
+            "acceptance_assertion_ids": inventory.acceptance_assertion_ids,
+            "required_capability": inventory.invocation.released_skill.capability,
+        }
+    )
+    foreign_skill = inventory.invocation.released_skill.model_copy(
+        update={"skill_id": "captain-factory-foreign"}
+    )
+    foreign_invocation = inventory.invocation.model_copy(
+        update={"released_skill": foreign_skill}
+    )
+    foreign_inventory = inventory.model_copy(
+        update={"invocation": foreign_invocation}
+    )
+
+    with pytest.raises(HTTPException, match="skill ID"):
+        GatewayStore._assert_workflow_artifact(
+            factory_job,
+            foreign_inventory,
+            (),
+        )
+
+
 def test_gateway_workflow_sequence_rejects_improvement_on_first_attempt() -> None:
     factory_job = job()
     revision = parse_factory_workflow_artifact(revision_payload())

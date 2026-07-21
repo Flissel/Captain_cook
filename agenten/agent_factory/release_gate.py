@@ -165,11 +165,11 @@ def evaluate_factory_workflow_release(
             evaluation,
             "workflow budget projection is not release-complete",
         )
-    run_receipt_refs = {
+    run_receipt_refs = tuple(
         reference
         for run in evidence
         for reference in run.usage_receipt_refs
-    }
+    )
     receipt_identity_is_unique = all(
         len(values) == len(set(values))
         for values in (
@@ -185,16 +185,14 @@ def evaluate_factory_workflow_release(
         and receipt.model in job.execution_policy.allowed_models
         for receipt in usage_receipts
     )
-    current_receipts = {
+    accepted_receipt_refs = {
         receipt.evidence_ref
         for receipt in usage_receipts
-        if receipt.attempt == evaluation.attempt
     }
     if (
         not usage_receipts
         or not receipt_identity_is_unique
         or not receipts_are_bound
-        or not run_receipt_refs.issubset(current_receipts)
         or sum(
             (receipt.cost_usd for receipt in usage_receipts),
             start=Decimal("0"),
@@ -205,6 +203,15 @@ def evaluate_factory_workflow_release(
             job,
             evaluation,
             "workflow usage receipts do not cover the Gateway budget projection",
+        )
+    if (
+        len(run_receipt_refs) != len(set(run_receipt_refs))
+        or set(run_receipt_refs) != accepted_receipt_refs
+    ):
+        return _workflow_blocked(
+            job,
+            evaluation,
+            "workflow usage receipts must exactly and uniquely cover every run",
         )
     run_numbers = tuple(item.run_number for item in evidence)
     if len(run_numbers) != len(set(run_numbers)):

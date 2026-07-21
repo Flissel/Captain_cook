@@ -54,6 +54,7 @@ from agenten.agent_factory.skill_evaluation import (
 )
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
 from agenten.agent_factory.skill_workflow_contracts import (
+    FACTORY_SKILL_ID_BY_STEP,
     CandidateRevisionV1,
     CodebaseInventoryV1,
     FactoryFeedbackV1,
@@ -1775,6 +1776,14 @@ class GatewayStore:
             != job.required_capability
         ):
             raise HTTPException(status_code=409, detail="factory workflow artifact job binding mismatch")
+        if (
+            artifact.invocation.released_skill.skill_id
+            != FACTORY_SKILL_ID_BY_STEP[artifact.invocation.step]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="factory workflow artifact released skill ID does not match step",
+            )
         expected_input = GatewayStore._workflow_input_ref(
             job,
             artifact,

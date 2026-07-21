@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from uuid import UUID
 
 import pytest
@@ -422,6 +423,70 @@ def test_workflow_release_requires_receipts_to_cover_the_budget_projection() -> 
     assert decision.reasons == (
         "workflow usage receipts do not cover the Gateway budget projection",
     )
+
+
+def test_workflow_release_rejects_receipt_reference_reused_between_runs() -> None:
+    runs = tuple(workflow_run(number) for number in range(1, 4))
+    shared_ref = runs[0].usage_receipt_refs[0]
+    reused = tuple(
+        run.model_copy(update={"usage_receipt_refs": (shared_ref,)})
+        for run in runs
+    )
+
+    decision = evaluate_factory_workflow_release(
+        workflow_job(mode="release"),
+        reused,
+        workflow_evaluation(reused),
+        budget_projection=workflow_budget(),
+        usage_receipts=workflow_receipts((runs[0],)),
+    )
+
+    assert decision.status == "blocked"
+    assert decision.reasons == (
+        "workflow usage receipts must exactly and uniquely cover every run",
+    )
+
+
+def test_workflow_release_rejects_extra_gateway_receipt_not_bound_to_a_run() -> None:
+    runs = tuple(workflow_run(number) for number in range(1, 4))
+    receipts = workflow_receipts(runs)
+    extra = receipts[0].model_copy(
+        update={
+            "receipt_id": UUID("00000000-0000-0000-0000-000000000499"),
+            "reservation_id": UUID("00000000-0000-0000-0000-000000000498"),
+            "cost_usd": Decimal("0.00"),
+            "evidence_ref": ArtifactRef.model_validate(
+                workflow_artifact("extra-usage", "f" * 64)
+            ),
+        }
+    )
+
+    decision = evaluate_factory_workflow_release(
+        workflow_job(mode="release"),
+        runs,
+        workflow_evaluation(runs),
+        budget_projection=workflow_budget(),
+        usage_receipts=(*receipts, extra),
+    )
+
+    assert decision.status == "blocked"
+    assert decision.reasons == (
+        "workflow usage receipts must exactly and uniquely cover every run",
+    )
+
+
+def test_workflow_release_accepts_disjoint_exact_receipt_union() -> None:
+    runs = tuple(workflow_run(number) for number in range(1, 4))
+
+    decision = evaluate_factory_workflow_release(
+        workflow_job(mode="release"),
+        runs,
+        workflow_evaluation(runs),
+        budget_projection=workflow_budget(),
+        usage_receipts=workflow_receipts(runs),
+    )
+
+    assert decision.status == "ready"
 
 
 def test_workflow_release_rejects_changed_candidate_binding() -> None:

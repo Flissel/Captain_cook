@@ -21,6 +21,14 @@ from agenten.agent_factory.skill_workflow_contracts import (
 NOW = datetime(2026, 7, 21, 10, tzinfo=timezone.utc)
 JOB_ID = "00000000-0000-0000-0000-000000000301"
 CORRELATION_ID = "00000000-0000-0000-0000-000000000302"
+EXPECTED_SKILL_IDS = {
+    "discover": "captain-factory-discover",
+    "brief_codex": "captain-factory-brief-codex",
+    "execute_team": "captain-factory-execute-team",
+    "evaluate_team": "captain-factory-evaluate-team",
+    "improve_team": "captain-factory-improve-team",
+    "report_captain": "captain-factory-report-captain",
+}
 
 
 def artifact(name: str, digest: str = "a" * 64) -> dict[str, str]:
@@ -50,10 +58,12 @@ def lease_payload(role: str, profile: str, **overrides: object) -> dict[str, obj
     return payload
 
 
-def released_skill_payload() -> dict[str, object]:
+def released_skill_payload(
+    skill_id: str = "captain-factory-discover",
+) -> dict[str, object]:
     return {
         "schema": "captain.released-hermes-skill.v1",
-        "skill_id": "captain_factory_skill",
+        "skill_id": skill_id,
         "version": 1,
         "capability": "factory_workflow",
         "content_ref": artifact("released-skill"),
@@ -82,7 +92,7 @@ def invocation_payload(step: str, **overrides: object) -> dict[str, object]:
         "subject_version": 1,
         "attempt": 1,
         "step": step,
-        "released_skill": released_skill_payload(),
+        "released_skill": released_skill_payload(EXPECTED_SKILL_IDS[step]),
         "input_ref": artifact("input"),
         "input_sha256": "a" * 64,
         "lease": lease_payload(role, profile),
@@ -122,7 +132,7 @@ def build_assignment_payload() -> dict[str, object]:
         "attempt": 1,
         "idempotency_key": "b" * 64,
         "released_skill": {
-            "skill_id": "captain_factory_skill",
+            "skill_id": EXPECTED_SKILL_IDS["brief_codex"],
             "version": 1,
             "content_ref": artifact("released-skill"),
             "content_sha256": "a" * 64,
@@ -368,6 +378,26 @@ def test_every_step_accepts_only_its_captain_role(
 
 
 @pytest.mark.parametrize(
+    ("step", "skill_id"),
+    tuple(EXPECTED_SKILL_IDS.items()),
+)
+def test_every_step_requires_its_exact_released_skill_id(
+    step: str,
+    skill_id: str,
+) -> None:
+    invocation = FactorySkillInvocationV1.model_validate(invocation_payload(step))
+
+    assert invocation.released_skill.skill_id == skill_id
+
+    payload = invocation_payload(step)
+    foreign = dict(payload["released_skill"])  # type: ignore[arg-type]
+    foreign["skill_id"] = "captain-factory-foreign"
+    payload["released_skill"] = foreign
+    with pytest.raises(ValidationError, match="skill ID"):
+        FactorySkillInvocationV1.model_validate(payload)
+
+
+@pytest.mark.parametrize(
     ("step", "wrong_role", "wrong_profile"),
     [
         ("discover", "tool_integrator", "factory-tool-integrator"),
@@ -440,7 +470,7 @@ def test_codex_assignment_is_bound_to_the_invocation(
         }
     elif binding == "released_skill_digest":
         assignment["released_skill"] = {
-            "skill_id": "captain_factory_skill",
+            "skill_id": EXPECTED_SKILL_IDS["brief_codex"],
             "version": 1,
             "content_ref": artifact("released-skill", "9" * 64),
             "content_sha256": "9" * 64,

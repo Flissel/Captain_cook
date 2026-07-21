@@ -49,6 +49,16 @@ class FactorySkillStep(str, Enum):
     REPORT_CAPTAIN = "report_captain"
 
 
+FACTORY_SKILL_ID_BY_STEP: dict[FactorySkillStep, str] = {
+    FactorySkillStep.DISCOVER: "captain-factory-discover",
+    FactorySkillStep.BRIEF_CODEX: "captain-factory-brief-codex",
+    FactorySkillStep.EXECUTE_TEAM: "captain-factory-execute-team",
+    FactorySkillStep.EVALUATE_TEAM: "captain-factory-evaluate-team",
+    FactorySkillStep.IMPROVE_TEAM: "captain-factory-improve-team",
+    FactorySkillStep.REPORT_CAPTAIN: "captain-factory-report-captain",
+}
+
+
 class FactoryFeedbackRecommendation(str, Enum):
     PROMOTE_CANDIDATE = "PROMOTE_CANDIDATE"
     RETRY_BUILD = "RETRY_BUILD"
@@ -115,6 +125,8 @@ class FactorySkillInvocationV1(_FrozenContract):
         expected_role = _STEP_ROLES[self.step]
         if self.lease.role is not expected_role:
             raise ValueError("skill invocation lease role does not match step")
+        if self.released_skill.skill_id != FACTORY_SKILL_ID_BY_STEP[self.step]:
+            raise ValueError("skill invocation released skill ID does not match step")
         return self
 
 

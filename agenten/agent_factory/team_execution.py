@@ -1843,6 +1843,9 @@ def compose_live_team_execution(
     job: AgentFactoryJobV3,
     evidence_store: FactoryEvidenceStore,
     ports: FactoryLiveTeamExecutionPorts,
+    holdout_selector: (
+        Callable[[AgentFactoryJobV3], PrivateHoldoutRef] | None
+    ) = None,
 ) -> TeamExecutionCandidateAdapter:
     """Compose only the host AutoGen runner; generated runners are never accepted."""
 
@@ -1873,9 +1876,19 @@ def compose_live_team_execution(
     )
 
     def holdout_for(current_job: AgentFactoryJobV3) -> PrivateHoldoutRef:
-        if len(current_job.private_holdout_refs) != 1:
-            raise ValueError("live execution requires an explicit single holdout scope")
-        return current_job.private_holdout_refs[0]
+        if holdout_selector is None:
+            if len(current_job.private_holdout_refs) != 1:
+                raise ValueError(
+                    "live execution requires an explicit Captain holdout selector"
+                )
+            selected = current_job.private_holdout_refs[0]
+        else:
+            selected = holdout_selector(current_job)
+        if selected not in current_job.private_holdout_refs:
+            raise ValueError(
+                "live execution holdout selector returned an unauthorized scope"
+            )
+        return selected
 
     def invocation_for(request: FactoryDispatch) -> FactorySkillInvocationV1:
         if request.job != job or request.lease is None:
