@@ -23,6 +23,18 @@ from .job_builder import build_factory_job_v3
 from .input_contracts import FactoryInputDocumentV2
 from .input_document import FactoryInputError, load_factory_input, parse_factory_input_bytes
 from .service import FactoryCoordinator, FactoryRepository, InMemoryFactoryRepository
+from .skill_workflow_contracts import (
+    CandidateChangedComponent,
+    CandidateRevisionV1,
+    CodebaseInventoryV1,
+    CodexBuildBriefV1,
+    FactoryFeedbackRecommendation,
+    FactoryFeedbackV1,
+    FactorySkillInvocationV1,
+    FactorySkillStep,
+    TeamEvaluationV1,
+    TeamExecutionEvidenceV1,
+)
 
 __all__ = [
     "AgentFactoryJob",
@@ -44,6 +56,16 @@ __all__ = [
     "InMemoryFactoryRepository",
     "FactoryInputDocumentV2",
     "FactoryInputError",
+    "FactorySkillStep",
+    "FactorySkillInvocationV1",
+    "CodebaseInventoryV1",
+    "CodexBuildBriefV1",
+    "TeamExecutionEvidenceV1",
+    "TeamEvaluationV1",
+    "CandidateChangedComponent",
+    "CandidateRevisionV1",
+    "FactoryFeedbackRecommendation",
+    "FactoryFeedbackV1",
     "load_factory_input",
     "parse_factory_input_bytes",
     "parse_factory_job",
