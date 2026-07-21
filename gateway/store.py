@@ -921,7 +921,10 @@ class GatewayStore:
             with connection.cursor() as cursor:
                 replay = self._factory_budget_event(cursor, reservation.reservation_id, for_update=True)
                 if replay is not None:
-                    if self._decode_json(replay["payload"]) != canonical:
+                    if not self._factory_budget_replay_matches(
+                        self._decode_json(replay["payload"]),
+                        reservation,
+                    ):
                         raise HTTPException(status_code=409, detail="budget reservation already exists with different content")
                     return FactoryBudgetReservationWriteReceipt(
                         event_id=reservation.reservation_id,
@@ -966,7 +969,10 @@ class GatewayStore:
             with connection.cursor() as cursor:
                 replay = self._factory_budget_event(cursor, receipt.receipt_id, for_update=True)
                 if replay is not None:
-                    if self._decode_json(replay["payload"]) != canonical:
+                    if not self._factory_budget_replay_matches(
+                        self._decode_json(replay["payload"]),
+                        submission,
+                    ):
                         raise HTTPException(status_code=409, detail="factory usage receipt already exists with different content")
                     return FactoryBudgetWriteReceipt(event_id=receipt.receipt_id, job_id=receipt.job_id, replayed=True)
                 job, job_block = self._factory_budget_job(cursor, receipt.job_id)
@@ -2037,6 +2043,10 @@ class GatewayStore:
             or receipt.job_id != job.job_id
             or receipt.correlation_id != job.correlation_id
             or receipt.attempt != reservation.attempt
+            or (
+                reservation.invocation_id is not None
+                and receipt.invocation_id != reservation.invocation_id
+            )
         ):
             raise HTTPException(status_code=409, detail="factory usage receipt binding mismatch")
         if receipt.model not in job.execution_policy.allowed_models:
@@ -2064,10 +2074,7 @@ class GatewayStore:
                 detail="factory usage requires a matching active lease",
             )
         lease = FactoryLease.model_validate(lease_block["data"])
-        if (
-            lease.role is not FactoryRole.REAL_CASE_TESTER
-            or "model.invoke" not in lease.capabilities
-        ):
+        if "model.invoke" not in lease.capabilities:
             raise HTTPException(
                 status_code=409,
                 detail="factory usage lease does not authorize the paid model effect",
@@ -2079,6 +2086,10 @@ class GatewayStore:
             or lease.correlation_id != job.correlation_id
             or lease.subject_version != submission.subject_version
             or lease.attempt != receipt.attempt
+            or (
+                receipt.lease_id is not None
+                and receipt.lease_id != submission.lease_id
+            )
             or receipt.ended_at >= lease.expires_at
         ):
             raise HTTPException(
@@ -2775,6 +2786,16 @@ class GatewayStore:
         payload: FactoryUsageSubmissionV2 | FactoryUsageReceiptV1,
     ) -> tuple[str, str]:
         return GatewayStore._canonical_model_sha256(payload), payload.schema_name
+
+    @staticmethod
+    def _factory_budget_replay_matches(
+        stored_payload: object,
+        expected: BaseModel,
+    ) -> bool:
+        try:
+            return type(expected).model_validate(stored_payload) == expected
+        except (TypeError, ValueError, ValidationError):
+            return False
 
     def _insert_factory_budget_event(
         self,

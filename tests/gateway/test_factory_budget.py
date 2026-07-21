@@ -94,6 +94,7 @@ class BudgetStore:
             subject_version=request.subject_version,
             execution_policy_sha256=request.execution_policy_sha256,
             attempt=request.attempt,
+            invocation_id=request.invocation_id,
             requested_usd=request.requested_usd,
             reserved_at=request.reserved_at,
             expires_at=request.expires_at,
@@ -283,18 +284,53 @@ def test_gateway_usage_submission_requires_exact_active_ledger_lease(job_v3) -> 
     store._assert_budget_usage_lease(
         Cursor(budget_store.lease), job_v3, submission
     )
-    wrong_effect_lease = issue_factory_lease(
+    architect_lease = issue_factory_lease(
         job=job_v3,
         role=FactoryRole.AGENT_ARCHITECT,
         attempt=2,
         workspace_ref="workspace://factory/budget-test",
         now=job_v3.occurred_at,
     )
+    architect_submission = submission.model_copy(
+        update={
+            "lease_id": architect_lease.lease_id,
+            "receipt": submission.receipt.model_copy(
+                update={"lease_id": architect_lease.lease_id}
+            ),
+        }
+    )
+    store._assert_budget_usage_lease(
+        Cursor(architect_lease),
+        job_v3,
+        architect_submission,
+    )
+    wrong_effect_lease = architect_lease.model_copy(
+        update={
+            "capabilities": tuple(
+                capability
+                for capability in architect_lease.capabilities
+                if capability != "model.invoke"
+            )
+        }
+    )
     with pytest.raises(HTTPException, match="paid model effect"):
         store._assert_budget_usage_lease(
             Cursor(wrong_effect_lease),
             job_v3,
             submission.model_copy(update={"lease_id": wrong_effect_lease.lease_id}),
+        )
+    mismatched_receipt_lease = architect_submission.model_copy(
+        update={
+            "receipt": architect_submission.receipt.model_copy(
+                update={"lease_id": budget_store.lease.lease_id}
+            )
+        }
+    )
+    with pytest.raises(HTTPException, match="subject binding"):
+        store._assert_budget_usage_lease(
+            Cursor(architect_lease),
+            job_v3,
+            mismatched_receipt_lease,
         )
     with pytest.raises(HTTPException, match="subject binding"):
         store._assert_budget_usage_lease(
@@ -311,6 +347,56 @@ def test_gateway_usage_submission_requires_exact_active_ledger_lease(job_v3) -> 
     assert GatewayStore._factory_usage_receipt(
         submission.model_dump(mode="json", by_alias=True)
     ) == submission.receipt
+
+
+def test_gateway_usage_rejects_receipt_for_another_reserved_invocation(job_v3) -> None:
+    reservation = GatewayFactoryBudgetLedger(BudgetStore(job_v3)).reserve(
+        job_v3,
+        attempt=1,
+        requested_usd=Decimal("1.00"),
+        now=NOW,
+        invocation_id=UUID("10000000-0000-0000-0000-000000000001"),
+    )
+    receipt = FactoryUsageReceiptV1.model_validate(
+        usage_payload(reservation)
+    ).model_copy(
+        update={"invocation_id": UUID("10000000-0000-0000-0000-000000000002")}
+    )
+
+    with pytest.raises(HTTPException, match="binding mismatch"):
+        GatewayStore._assert_budget_usage(job_v3, reservation, receipt)
+
+
+def test_gateway_budget_replays_accept_historical_payloads_without_new_null_fields(
+    job_v3,
+) -> None:
+    budget_store = BudgetStore(job_v3)
+    reservation = GatewayFactoryBudgetLedger(budget_store).reserve(
+        job_v3,
+        attempt=2,
+        requested_usd=Decimal("1.00"),
+        now=NOW,
+    )
+    historical_reservation = reservation.model_dump(mode="json", by_alias=True)
+    historical_reservation.pop("invocation_id")
+    receipt = FactoryUsageReceiptV1.model_validate(usage_payload(reservation))
+    submission = FactoryUsageSubmissionV2(
+        subject_version=job_v3.subject_version,
+        lease_id=budget_store.lease.lease_id,
+        receipt=receipt,
+    )
+    historical_submission = submission.model_dump(mode="json", by_alias=True)
+    historical_submission["receipt"].pop("lease_id")
+    historical_submission["receipt"].pop("invocation_id")
+
+    assert GatewayStore._factory_budget_replay_matches(
+        historical_reservation,
+        reservation,
+    )
+    assert GatewayStore._factory_budget_replay_matches(
+        historical_submission,
+        submission,
+    )
 
 
 def test_gateway_budget_adapter_translates_http_conflicts_to_budget_domain_error(

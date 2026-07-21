@@ -17,8 +17,10 @@ from agenten.agent_factory.execution_budget import (
     InMemoryFactoryBudgetLedger,
 )
 from agenten.agent_factory.hermes_cli import (
+    FilesystemFactorySkillReplayStore,
     HermesCliFactory,
     HermesCliSettings,
+    HermesPaidUsageReceipt,
     InMemoryFactorySkillReplayStore,
 )
 from agenten.agent_factory.leases import issue_factory_lease
@@ -78,6 +80,17 @@ def _usage_report(**updates: object) -> dict[str, object]:
     }
     report.update(updates)
     return report
+
+
+def test_paid_usage_accepts_hermes_total_that_includes_reasoning_tokens() -> None:
+    usage = HermesPaidUsageReceipt.model_validate(
+        _usage_report(total_tokens=125)
+    )
+
+    assert usage.input_tokens == 100
+    assert usage.output_tokens == 20
+    assert usage.reasoning_tokens == 5
+    assert usage.total_tokens == 125
 
 
 class _EvidenceStore:
@@ -319,6 +332,85 @@ async def test_completed_replay_rechecks_sink_without_second_paid_call(
     assert calls == 1
     assert len(sink.artifacts(request.job.job_id)) == 1
     assert budget.projection(request.job.job_id).consumed_usd == Decimal("0.02")
+
+
+@pytest.mark.asyncio
+async def test_lost_usage_ack_recovers_from_completed_replay_without_second_paid_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request()
+    durable_budget = InMemoryFactoryBudgetLedger()
+    replay_root = tmp_path / "paid-replays"
+    sink = InMemoryFactoryWorkflowArtifactSink()
+    process_calls = 0
+
+    class LostAckBudget:
+        def __init__(self) -> None:
+            self.record_calls = 0
+
+        def reserve(self, *args: object, **kwargs: object):
+            return durable_budget.reserve(*args, **kwargs)
+
+        def record_usage(self, *args: object, **kwargs: object):
+            self.record_calls += 1
+            receipt = durable_budget.record_usage(*args, **kwargs)
+            if self.record_calls == 1:
+                raise OSError("usage commit acknowledgement lost")
+            return receipt
+
+        def projection(self, *args: object, **kwargs: object):
+            return durable_budget.projection(*args, **kwargs)
+
+        def release(self, *args: object, **kwargs: object):
+            return durable_budget.release(*args, **kwargs)
+
+    class Process:
+        returncode = 0
+
+        def __init__(self, command: tuple[str, ...]) -> None:
+            self.command = command
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            usage_path = Path(self.command[self.command.index("--usage-file") + 1])
+            usage_path.write_text(json.dumps(_usage_report()), encoding="utf-8")
+            return json.dumps(_typed_payload(self.command[-1])).encode(), b""
+
+    async def create_process(*command: str, **_: object) -> Process:
+        nonlocal process_calls
+        process_calls += 1
+        return Process(command)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    budget = LostAckBudget()
+    first_factory = HermesCliFactory(
+        settings=HermesCliSettings(skill_root=tmp_path),
+        evidence_store=_EvidenceStore(),
+        released_skill_catalog=_catalog_for(tmp_path, FactorySkillStep.DISCOVER),
+        replay_store=FilesystemFactorySkillReplayStore(replay_root),
+        budget=budget,
+        workflow_artifact_sink=sink,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(OSError, match="acknowledgement lost"):
+        await first_factory.dispatch(request)
+
+    recovered = await HermesCliFactory(
+        settings=HermesCliSettings(skill_root=tmp_path),
+        evidence_store=_EvidenceStore(),
+        released_skill_catalog=_catalog_for(tmp_path, FactorySkillStep.DISCOVER),
+        replay_store=FilesystemFactorySkillReplayStore(replay_root),
+        budget=budget,
+        workflow_artifact_sink=sink,
+        clock=lambda: NOW,
+    ).dispatch(request)
+
+    assert recovered.artifact_refs
+    assert process_calls == 1
+    assert budget.record_calls == 2
+    assert durable_budget.projection(request.job.job_id).consumed_usd == Decimal("0.02")
+    assert len(sink.artifacts(request.job.job_id)) == 1
 
 
 def test_gateway_budget_accepts_usage_bound_to_exact_paid_hermes_lease() -> None:
