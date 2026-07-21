@@ -472,6 +472,11 @@ class CapabilityFactoryClock(Protocol):
 
 
 class CapabilityFactoryCheckpointStore(Protocol):
+    def load(
+        self,
+        correlation_id: UUID,
+    ) -> CapabilityFactoryCheckpoint | None: ...
+
     def bind(
         self,
         checkpoint: CapabilityFactoryCheckpoint,
@@ -483,6 +488,9 @@ class InMemoryCapabilityFactoryCheckpointStore:
 
     def __init__(self) -> None:
         self._by_correlation: dict[UUID, CapabilityFactoryCheckpoint] = {}
+
+    def load(self, correlation_id: UUID) -> CapabilityFactoryCheckpoint | None:
+        return self._by_correlation.get(correlation_id)
 
     def bind(self, checkpoint: CapabilityFactoryCheckpoint) -> CapabilityFactoryCheckpoint:
         existing = self._by_correlation.get(checkpoint.correlation_id)
@@ -498,6 +506,9 @@ class FileCapabilityFactoryCheckpointStore:
     def __init__(self, directory: Path) -> None:
         self._directory = directory.resolve()
         self._directory.mkdir(parents=True, exist_ok=True)
+
+    def load(self, correlation_id: UUID) -> CapabilityFactoryCheckpoint | None:
+        return self._read(self._directory / f"{correlation_id}.json")
 
     def bind(self, checkpoint: CapabilityFactoryCheckpoint) -> CapabilityFactoryCheckpoint:
         target = self._directory / f"{checkpoint.correlation_id}.json"
@@ -1519,10 +1530,25 @@ class CapabilityFactoryEntrypoint:
             document,
             subject_version,
         )
+        checkpoint = self._checkpoint_store.load(correlation_id)
+        registration_time = self._clock.now()
+        if checkpoint is not None:
+            stored_budget_seconds = (
+                checkpoint.deadline_at - checkpoint.occurred_at
+            ).total_seconds()
+            if (
+                checkpoint.subject_version != subject_version
+                or not stored_budget_seconds.is_integer()
+                or int(stored_budget_seconds) != wall_clock_budget_seconds
+            ):
+                raise CapabilityFactoryInputMutation(
+                    "factory job identity changed for the existing correlation"
+                )
+            registration_time = checkpoint.occurred_at
         proposed_job = build_factory_job(
             compiled,
             correlation_id=correlation_id,
-            now=self._clock.now(),
+            now=registration_time,
             wall_clock_budget_seconds=wall_clock_budget_seconds,
         )
         job = self._resume_job(proposed_job)
@@ -2084,7 +2110,21 @@ class CapabilityFactoryEntrypoint:
             )
         recovery = self._gateway.runtime_result_recovery(observed.command_id)
         if recovery is None:
-            if not claim.claimed_at <= observed.occurred_at < claim.expires_at:
+            origin_claim = claim.model_copy(
+                update={"status": "active", "completed_at": None}
+            )
+            receipt = runtime.provider_receipt
+            if (
+                receipt.origin_claim_id != origin_claim.claim_id
+                or receipt.origin_claim_fencing_token
+                != origin_claim.fencing_token
+                or receipt.origin_claim_digest
+                != canonical_contract_sha256(origin_claim)
+            ):
+                raise CapabilityProviderIdempotencyError(
+                    "Gateway runtime result receipt does not bind its execution claim"
+                )
+            if not origin_claim.claimed_at <= observed.occurred_at < origin_claim.expires_at:
                 raise CapabilityProviderIdempotencyError(
                     "Gateway runtime result is outside its execution claim"
                 )
