@@ -659,6 +659,33 @@ def _opaque_n8n_tool_reference_digest(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _redacted_transcript(
+    messages: Sequence[BaseAgentEvent | BaseChatMessage],
+) -> tuple[dict[str, str], ...]:
+    """Bind a run to its exact transcript without persisting private prose."""
+
+    return tuple(
+        {
+            "source": message.source,
+            "message_type": type(message).__name__,
+            "content_sha256": _canonical_json_digest(
+                message.model_dump(mode="json", by_alias=True).get("content")
+            ),
+        }
+        for message in messages
+    )
+
+
+def _canonical_json_digest(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 class FactoryN8nToolAdapterPort(Protocol):
     """Host-owned n8n tool plus a fresh authorization claim for every call."""
 
@@ -1162,16 +1189,22 @@ class HostAutoGenTeamRunner:
             resolved_status: Literal["succeeded", "failed"] = (
                 "succeeded" if all(normalized_results.values()) else "failed"
             )
+            session_id = f"autogen-team-{invocation.attempt}-{invocation.invocation_id}"
+            transcript = _redacted_transcript(result.messages)
             observation_ref = await self._evidence_store.persist(
                 job,
                 json.dumps(
                     {
                         "schema": "captain.factory-autogen-observation.v1",
                         "conversation_pattern": manifest.conversation_pattern,
+                        "invocation_id": str(invocation.invocation_id),
+                        "session_id": session_id,
                         "message_count": len(result.messages),
                         "handoff_count": len(handoff_messages),
                         "tool_call_count": tool_call_count,
                         "stop_reason": result.stop_reason,
+                        "transcript": transcript,
+                        "transcript_sha256": _canonical_json_digest(transcript),
                     },
                     sort_keys=True,
                     separators=(",", ":"),
@@ -1249,7 +1282,7 @@ class HostAutoGenTeamRunner:
                 grant_id=lease.lease_id,
                 operation=RuntimeOperation.CODEX_RUN,
                 status=(RuntimeStatus.SUCCEEDED if succeeded else RuntimeStatus.FAILED),
-                session_id=f"autogen-team-{invocation.attempt}",
+                session_id=session_id,
                 artifact_refs=(observation_ref,),
                 evidence_refs=(observation_ref, decision_ref, *n8n_refs),
                 error=None if succeeded else "Captain holdout assertions unresolved",
