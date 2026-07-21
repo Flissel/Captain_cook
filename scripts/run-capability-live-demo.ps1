@@ -45,6 +45,19 @@ function Get-DotEnvValue([string]$Path, [string]$Name) {
     return $null
 }
 
+function Resolve-ConfiguredUrl([string]$Name, [string]$EnvPath) {
+    $value = Get-DotEnvValue $EnvPath $Name
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        $value = [Environment]::GetEnvironmentVariable($Name, 'Process')
+    }
+    if ([string]::IsNullOrWhiteSpace($value)) { return $null }
+    try { $uri = [Uri]$value } catch { throw "$Name must be an absolute HTTP(S) URL." }
+    if (-not $uri.IsAbsoluteUri -or $uri.Scheme -notin @('http', 'https')) {
+        throw "$Name must be an absolute HTTP(S) URL."
+    }
+    return $value.TrimEnd('/')
+}
+
 function Resolve-SharedArtifactDirectory([string]$ExplicitPath, [string]$EnvPath) {
     if (-not [string]::IsNullOrWhiteSpace($ExplicitPath)) {
         $configured = @($ExplicitPath)
@@ -227,6 +240,10 @@ function Invoke-CapabilityRun([object]$SelectedInput, [Guid]$CorrelationId) {
         ArtifactDirectory = $resolvedSharedArtifactDirectory
         CheckpointDirectory = (Join-Path $runState 'checkpoints')
         WallClockBudgetSeconds = $WallClockBudgetSeconds
+    }
+    $gatewayUrl = Resolve-ConfiguredUrl 'CAPTAIN_GATEWAY_URL' $CredentialSourceEnv
+    if (-not [string]::IsNullOrWhiteSpace($gatewayUrl)) {
+        $arguments['GatewayUrl'] = $gatewayUrl
     }
     $global:LASTEXITCODE = 0
     $raw = @(& $CapabilityRunnerPath @arguments 6>&1)

@@ -46,11 +46,13 @@ param(
     [Parameter(Mandatory)][Guid]$CorrelationId,
     [string]$ArtifactDirectory,
     [string]$CheckpointDirectory,
-    [int]$WallClockBudgetSeconds
+    [int]$WallClockBudgetSeconds,
+    [string]$GatewayUrl
 )
 $statePath = Join-Path $env:FAKE_STATE_DIR ("$CorrelationId.json")
 Add-Content -LiteralPath (Join-Path $env:FAKE_STATE_DIR 'artifact-directories.log') -Value ([IO.Path]::GetFullPath($ArtifactDirectory))
 Add-Content -LiteralPath (Join-Path $env:FAKE_STATE_DIR 'runtime-costs.log') -Value $env:CAPTAIN_FACTORY_MAX_COST_USD
+Add-Content -LiteralPath (Join-Path $env:FAKE_STATE_DIR 'gateway-urls.log') -Value $GatewayUrl
 if (Test-Path -LiteralPath $statePath) {
     $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
     $mode = 'reused'
@@ -232,6 +234,7 @@ def test_fake_live_run_proves_recovery_restart_three_inputs_and_redacts_evidence
     shared_artifacts = tmp_path / "shared-capability-artifacts"
     environment["CAPTAIN_RUNTIME_ARTIFACT_ROOT"] = str(shared_artifacts)
     environment["MINIBOOK_CREATION_ARTIFACTS"] = str(shared_artifacts)
+    environment["CAPTAIN_GATEWAY_URL"] = "http://127.0.0.1:19090"
 
     result = _run(
         "-LiveProviders",
@@ -240,6 +243,7 @@ def test_fake_live_run_proves_recovery_restart_three_inputs_and_redacts_evidence
         "-CapabilityRunnerPath", str(fake_capability),
         "-ServiceRunnerPath", str(fake_service),
         "-EvidenceDirectory", str(evidence_dir),
+        "-CredentialSourceEnv", str(tmp_path / "missing.env"),
         env=environment,
     )
 
@@ -258,6 +262,12 @@ def test_fake_live_run_proves_recovery_restart_three_inputs_and_redacts_evidence
         "1.00",
         "1.00",
         "1.00",
+    ]
+    assert (state / "gateway-urls.log").read_text(encoding="utf-8").splitlines() == [
+        "http://127.0.0.1:19090",
+        "http://127.0.0.1:19090",
+        "http://127.0.0.1:19090",
+        "http://127.0.0.1:19090",
     ]
     evidence_files = list(evidence_dir.glob("capability-live-demo-*.json"))
     assert len(evidence_files) == 1
