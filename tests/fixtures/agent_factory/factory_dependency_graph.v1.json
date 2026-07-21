@@ -1,0 +1,6 @@
+{
+  "schema": "captain.factory-work-graph.v1",
+  "source_sha256": "e04a69a25eb4eb2cb96bbdef3f3edbad50f6fed97ec3f2915ee1e98013ef6a6a",
+  "nodes": [{"node_id": "architecture", "kind": "architecture", "dependencies": [], "agent_keys": [], "integration_keys": []}],
+  "dependency_order": ["architecture"]
+}

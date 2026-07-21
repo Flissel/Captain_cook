@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from graphlib import TopologicalSorter
+import json
 from pathlib import Path
 
 from agenten.agent_factory.holdout_store import InMemoryPrivateHoldoutStore
 from agenten.agent_factory.input_compiler import FactoryInputCompiler
+from agenten.agent_factory.input_compiler import CompiledFactorySpecification
 from agenten.agent_factory.input_document import load_factory_input
 
 
@@ -58,3 +60,11 @@ def test_subject_version_changes_compilation_identity_not_source(tmp_path: Path)
     second = service.compile(document(tmp_path), subject_version=2)
     assert first.source_ref == second.source_ref
     assert first.compilation_digest != second.compilation_digest
+
+
+def test_public_handoff_fixture_contains_refs_but_no_holdout_body() -> None:
+    fixture = Path(__file__).parents[1] / "fixtures" / "agent_factory" / "compiled_factory_spec.v1.json"
+    source = fixture.read_text(encoding="utf-8")
+    parsed = CompiledFactorySpecification.model_validate(json.loads(source))
+    assert parsed.private_holdout_refs[0].uri.startswith("holdout://")
+    assert "controlled recovery" not in source.casefold()

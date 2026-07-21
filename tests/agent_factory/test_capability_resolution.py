@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from agenten.agent_factory.capability_resolution import CapabilityResolver
+from agenten.agent_factory.capability_resolution import CapabilityResolution, CapabilityResolver
 from agenten.agent_factory.contracts import AgentFactoryJobV2, PromotedCapability
 
 
@@ -64,3 +64,8 @@ def test_incompatible_or_stale_catalog_result_is_a_miss() -> None:
     for candidate in (incompatible, stale):
         result = CapabilityResolver(Catalog(candidate)).resolve(job())
         assert result.kind == "create"
+
+
+def test_capability_resolution_handoff_fixture_is_strict() -> None:
+    payload = json.loads((FIXTURES / "capability_resolution.create.v1.json").read_text(encoding="utf-8"))
+    assert CapabilityResolution.model_validate(payload).kind == "create"

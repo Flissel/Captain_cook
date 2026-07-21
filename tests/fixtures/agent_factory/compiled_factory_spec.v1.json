@@ -1,0 +1,11 @@
+{
+  "schema_name": "captain.compiled-factory-spec.v1",
+  "source_ref": {"uri": "artifact://factory-input/e04a69a25eb4eb2cb96bbdef3f3edbad50f6fed97ec3f2915ee1e98013ef6a6a", "sha256": "e04a69a25eb4eb2cb96bbdef3f3edbad50f6fed97ec3f2915ee1e98013ef6a6a", "media_type": "text/markdown"},
+  "subject_version": 1,
+  "capability_key": "customer_support_triage",
+  "assertions": [{"assertion_id": "assert-5a3826050e71", "source_path": ["Acceptance outcomes", "billing_outcome"], "observable_setup": "Given an overdue invoice", "observable_action": "Run the triage workflow", "observable_expected": "The request is classified as billing and high urgency", "kind": "business"}],
+  "private_holdout_refs": [{"schema_name": "captain.private-holdout-ref.v1", "holdout_id": "holdout-a4f238ca4cd7", "uri": "holdout://holdout-a4f238ca4cd7", "sha256": "71d1c1f80bac1753a260deae6a9a217825a339b1cf8004442c98267b50d1746e"}],
+  "work_nodes": [{"node_id": "architecture", "kind": "architecture", "dependencies": [], "agent_keys": [], "integration_keys": []}],
+  "dependency_order": ["architecture"],
+  "compilation_digest": "e3ff8659ad5e7b21da6043a9d0aa1c188829475f09293f480c3e5c16a65aae16"
+}
