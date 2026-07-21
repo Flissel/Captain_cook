@@ -492,7 +492,10 @@ class FactorySixSkillLiveCoordinator:
                 continue
             if action.kind is FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED:
                 projection = self._coordinator.projection(job.job_id)
-                references = _known_projection_refs(projection)
+                references = _known_improvement_refs(
+                    projection,
+                    self._repository.workflow_artifacts(job.job_id),
+                )
                 self._coordinator.record(
                     self._captain_block(
                         job,
@@ -1371,6 +1374,27 @@ def _known_projection_refs(projection: Any) -> tuple[ArtifactRef, ...]:
             if isinstance(reference, ArtifactRef)
         )
     )
+
+
+def _known_improvement_refs(
+    projection: Any,
+    workflow_artifacts: tuple[object, ...],
+) -> tuple[ArtifactRef, ...]:
+    """Bind the evaluated candidate itself into Captain's retry authority."""
+
+    attempt = getattr(projection, "attempt", None)
+    executions = tuple(
+        artifact
+        for artifact in workflow_artifacts
+        if isinstance(artifact, TeamExecutionEvidenceV1)
+        and artifact.attempt == attempt
+    )
+    if not executions:
+        raise ValueError("improvement request lacks prior candidate evidence")
+    candidate_refs = {artifact.candidate_ref for artifact in executions}
+    if len(candidate_refs) != 1:
+        raise ValueError("improvement request has conflicting prior candidates")
+    return _unique_refs((*_known_projection_refs(projection), *candidate_refs))
 
 
 def _unique_refs(references: tuple[ArtifactRef, ...]) -> tuple[ArtifactRef, ...]:
