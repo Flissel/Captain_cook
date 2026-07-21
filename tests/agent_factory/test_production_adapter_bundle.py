@@ -146,8 +146,79 @@ def test_production_entrypoint_seeds_exact_canonical_input_into_shared_cas(
     reference = entrypoint.seed_input(source)
 
     target = tmp_path / "content" / "sha256" / reference.sha256[:2] / reference.sha256
-    assert reference.uri == f"artifact://factory-input/{reference.sha256}"
+    assert reference.uri == (
+        f"artifact://capability-factory/factory-input/{reference.sha256}"
+    )
     assert target.read_bytes() == source.read_bytes()
+
+
+def test_production_entrypoint_materializes_creation_contract_in_shared_cas(
+    tmp_path: Path,
+) -> None:
+    from datetime import datetime, timezone
+    import json
+    from uuid import UUID
+
+    from agenten.agent_factory.capability_live_adapters import (
+        ContentAddressedArtifactStore,
+    )
+    from agenten.agent_factory.forge_contracts import (
+        ArtifactRef as ForgeArtifactRef,
+        ReleasedSkillRefV1,
+    )
+    from agenten.agent_factory.holdout_store import InMemoryPrivateHoldoutStore
+    from agenten.agent_factory.input_compiler import FactoryInputCompiler
+    from agenten.agent_factory.input_document import load_factory_input
+    from agenten.agent_factory.job_builder import build_factory_job
+
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "demo_inputs"
+        / "agent_factory"
+        / "sales_pipeline_brief"
+        / "TO_BE_BUILT.md"
+    )
+    artifacts = ContentAddressedArtifactStore(tmp_path)
+    entrypoint = object.__new__(ProductionCapabilityFactoryEntrypoint)
+    entrypoint._production_artifacts = artifacts
+    entrypoint.seed_input(source)
+    document = load_factory_input(source)
+    compiled = FactoryInputCompiler(
+        holdout_store=InMemoryPrivateHoldoutStore()
+    ).compile(document, 1)
+    job = build_factory_job(
+        compiled,
+        correlation_id=UUID("11111111-1111-4111-8111-111111111111"),
+        now=datetime(2026, 7, 21, tzinfo=timezone.utc),
+        wall_clock_budget_seconds=600,
+    )
+    skill_ref = artifacts.put(
+        b"released skill bytes", "application/octet-stream", namespace="released-skill"
+    )
+    released_skill = ReleasedSkillRefV1(
+        skill_id="captain-agent-factory-loop",
+        version=1,
+        content_ref=ForgeArtifactRef.model_validate(skill_ref.model_dump(mode="json")),
+        content_sha256=skill_ref.sha256,
+    )
+
+    creation = entrypoint._build_creation_job(
+        job,
+        compiled=compiled,
+        creation_key="create-sales-pipeline",
+        released_skill=released_skill,
+    )
+
+    for reference in (
+        creation.input_ref,
+        creation.compiled_spec_ref,
+        creation.dependency_graph_ref,
+        creation.released_skill.content_ref,
+    ):
+        assert reference.uri.startswith("artifact://capability-factory/")
+        assert artifacts.read_sha256(reference.sha256)
+    compiled_payload = json.loads(artifacts.read_sha256(creation.compiled_spec_ref.sha256))
+    assert compiled_payload["capability_key"] == compiled.capability_key
 
 
 def test_live_scripts_forward_provider_and_both_manifest_contracts() -> None:

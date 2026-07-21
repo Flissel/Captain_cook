@@ -56,7 +56,10 @@ from agenten.agent_factory.holdout_store import (
     InMemoryPrivateHoldoutStore,
     PrivateHoldoutStore,
 )
-from agenten.agent_factory.input_compiler import FactoryInputCompiler
+from agenten.agent_factory.input_compiler import (
+    CompiledFactorySpecification,
+    FactoryInputCompiler,
+)
 from agenten.agent_factory.input_document import load_factory_input
 from agenten.agent_factory.job_builder import build_factory_job
 from agenten.agent_factory.outcome_contracts import (
@@ -1592,8 +1595,9 @@ class CapabilityFactoryEntrypoint:
         if resolution.kind != "create" or resolution.creation_key is None:
             raise RuntimeError("released capability reuse execution is not configured")
 
-        creation_job = _creation_job(
+        creation_job = self._build_creation_job(
             job,
+            compiled=compiled,
             creation_key=resolution.creation_key,
             released_skill=self._released_skill,
         )
@@ -2335,6 +2339,21 @@ class CapabilityFactoryEntrypoint:
             package=package,
             evidence=evidence,
             execution=None,
+        )
+
+    def _build_creation_job(
+        self,
+        job: AgentFactoryJobV2,
+        *,
+        compiled: CompiledFactorySpecification,
+        creation_key: str,
+        released_skill: ReleasedSkillRefV1,
+    ) -> CreationJobV1:
+        del compiled
+        return _creation_job(
+            job,
+            creation_key=creation_key,
+            released_skill=released_skill,
         )
 
 

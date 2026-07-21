@@ -609,7 +609,64 @@ class ProductionCapabilityFactoryEntrypoint(CapabilityFactoryEntrypoint):
         ):
             raise ValueError("canonical Factory input CAS binding changed")
         self._production_artifacts.read_bytes(stored)
-        return document.input_ref
+        return stored
+
+    def _build_creation_job(
+        self,
+        job: Any,
+        *,
+        compiled: Any,
+        creation_key: str,
+        released_skill: ReleasedSkillRefV1,
+    ) -> Any:
+        input_ref = self._production_artifacts.put(
+            self._production_artifacts.read_sha256(job.input_ref.sha256),
+            job.input_ref.media_type,
+            namespace="factory-input",
+        )
+        compiled_content = json.dumps(
+            compiled.model_dump(mode="json", by_alias=True),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        compiled_ref = self._production_artifacts.put(
+            compiled_content,
+            "application/json",
+            namespace="compiled-factory-spec",
+        )
+        graph_payload = {
+            "schema": "captain.factory-work-graph.v1",
+            "source_sha256": compiled.source_ref.sha256,
+            "nodes": [node.model_dump(mode="json") for node in compiled.work_nodes],
+            "dependency_order": compiled.dependency_order,
+        }
+        graph_content = json.dumps(
+            graph_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        dependency_graph_ref = self._production_artifacts.put(
+            graph_content,
+            "application/json",
+            namespace="factory-work-graph",
+        )
+        if dependency_graph_ref.sha256 != job.dependency_graph_ref.sha256:
+            raise ValueError("factory work graph CAS binding changed")
+        canonical_job = job.model_copy(
+            update={
+                "input_ref": input_ref,
+                "compiled_spec_ref": compiled_ref,
+                "dependency_graph_ref": dependency_graph_ref,
+            }
+        )
+        return super()._build_creation_job(
+            canonical_job,
+            compiled=compiled,
+            creation_key=creation_key,
+            released_skill=released_skill,
+        )
 
     async def run(
         self,
@@ -667,7 +724,10 @@ def _required_environment(name: str) -> str:
     return value
 
 
-def _released_skill(root: Path) -> ReleasedSkillRefV1:
+def _released_skill(
+    root: Path,
+    artifacts: ContentAddressedArtifactStore,
+) -> ReleasedSkillRefV1:
     skill_root = root / "agenten" / "agent_factory" / "skills" / "captain-agent-factory-loop"
     if not skill_root.is_dir():
         raise _todo("released_capability_factory_skill")
@@ -679,15 +739,19 @@ def _released_skill(root: Path) -> ReleasedSkillRefV1:
                 hashlib.sha256(path.read_bytes()).hexdigest(),
             )
         )
-    digest = hashlib.sha256(repr(entries).encode("utf-8")).hexdigest()
+    content = repr(entries).encode("utf-8")
+    digest = hashlib.sha256(content).hexdigest()
+    stored = artifacts.put(
+        content,
+        "application/octet-stream",
+        namespace="released-skill",
+    )
+    if stored.sha256 != digest:
+        raise ValueError("released skill CAS binding changed")
     return ReleasedSkillRefV1(
         skill_id="captain-agent-factory-loop",
         version=1,
-        content_ref=ForgeArtifactRef(
-            uri=f"artifact://released-skill/{digest}",
-            sha256=digest,
-            media_type="application/octet-stream",
-        ),
+        content_ref=ForgeArtifactRef.model_validate(stored.model_dump(mode="json")),
         content_sha256=digest,
     )
 
@@ -730,7 +794,7 @@ def build_capability_factory_entrypoint(config: Any) -> CapabilityFactoryEntrypo
         holdout_store=InMemoryPrivateHoldoutStore(),
         repository=GatewayFactoryRepository(store),
         catalog=GatewayCapabilityCatalog(store),
-        released_skill=_released_skill(root),
+        released_skill=_released_skill(root, content),
         creation=MinibookSwarmCreationHttpPort(
             config.minibook_url,
             SecretStr(minibook_api_key),
