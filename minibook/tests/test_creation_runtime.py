@@ -166,6 +166,70 @@ def test_creation_runtime_is_not_constructed_without_opt_in() -> None:
     assert configured_creation_runtime({}) is None
 
 
+def test_bound_hermes_creation_evidence_resolver_reads_exact_shared_cas_bytes(
+    tmp_path: Path,
+) -> None:
+    import hashlib
+
+    from minibook.swarm.creation_runtime import BoundHermesCreationEvidenceResolver
+    from minibook.swarm.pipeline_adapter import ContentAddressedCreationArtifacts
+
+    artifacts = ContentAddressedCreationArtifacts(tmp_path)
+    job = creation_job()
+    receipt = b'{"schema":"hermes.skill-usage-receipt.v1"}'
+    gaps = b'{"schema":"minibook.creation-tool-gaps.v1","tool_gaps":[]}'
+    receipt_ref = artifacts.put(receipt, "application/json", namespace="hermes-receipt")
+    gaps_ref = artifacts.put(gaps, "application/json", namespace="hermes-tool-gaps")
+    envelope = json.dumps(
+        {
+            "schema": "captain.hermes-creation-evidence-binding.v1",
+            "creation_job_id": str(job.creation_job_id),
+            "skill_usage_receipt_ref": receipt_ref.model_dump(mode="json"),
+            "tool_gaps_ref": gaps_ref.model_dump(mode="json"),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    envelope_ref = artifacts.put(
+        envelope, "application/json", namespace="hermes-creation-evidence"
+    )
+    identity = str(job.creation_job_id)
+    binding_path = (
+        tmp_path
+        / "bindings"
+        / "hermes-creation-evidence"
+        / f"{hashlib.sha256(identity.encode('utf-8')).hexdigest()}.json"
+    )
+    binding_path.parent.mkdir(parents=True)
+    binding_path.write_text(
+        json.dumps(
+            {"identity": identity, "reference": envelope_ref.model_dump(mode="json")},
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    resolver = BoundHermesCreationEvidenceResolver(artifacts)
+
+    assert resolver(job) == {"skill_usage_receipt": receipt, "tool_gaps": gaps}
+
+
+def test_configured_creation_runtime_installs_hermes_evidence_resolver(
+    tmp_path: Path,
+) -> None:
+    from minibook.swarm.creation_runtime import configured_creation_runtime
+
+    configured = configured_creation_runtime(
+        {
+            "MINIBOOK_CREATION_DB": str(tmp_path / "creation.sqlite3"),
+            "MINIBOOK_CREATION_ARTIFACTS": str(tmp_path / "artifacts"),
+        }
+    )
+
+    assert configured is not None
+    assert configured.runtime.pipeline_factory._hermes_evidence_resolver is not None
+
+
 @pytest.mark.asyncio
 async def test_production_factory_injects_real_session_agents_project_and_input(
     tmp_path: Path,

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import UUID
 
-from .contracts import CreationJobV1, CreationResultV1
+from .contracts import ArtifactRef, CreationJobV1, CreationResultV1
 from .job_store import CreationJobStore
 from .pipeline_adapter import (
     ContentAddressedCreationArtifacts,
@@ -32,6 +33,56 @@ class CreationPipelineFactory(Protocol):
     def open(
         self, job: CreationJobV1
     ) -> AbstractAsyncContextManager[PipelineStepPort]: ...
+
+
+class BoundHermesCreationEvidenceResolver:
+    """Resolve Captain-bound Hermes bytes without granting Minibook authority."""
+
+    def __init__(self, artifacts: ContentAddressedCreationArtifacts) -> None:
+        self.artifacts = artifacts
+
+    def __call__(self, job: CreationJobV1) -> Mapping[str, bytes] | None:
+        identity = str(job.creation_job_id)
+        binding_path = (
+            self.artifacts.root
+            / "bindings"
+            / "hermes-creation-evidence"
+            / f"{hashlib.sha256(identity.encode('utf-8')).hexdigest()}.json"
+        )
+        try:
+            binding = json.loads(binding_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Hermes creation evidence binding is invalid") from exc
+        if not isinstance(binding, dict) or set(binding) != {"identity", "reference"}:
+            raise ValueError("Hermes creation evidence binding is invalid")
+        if binding["identity"] != identity:
+            raise ValueError("Hermes creation evidence binding identity changed")
+        envelope_ref = ArtifactRef.model_validate(binding["reference"])
+        try:
+            envelope = json.loads(self.artifacts.read(envelope_ref))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Hermes creation evidence envelope is invalid") from exc
+        required = {
+            "schema",
+            "creation_job_id",
+            "skill_usage_receipt_ref",
+            "tool_gaps_ref",
+        }
+        if (
+            not isinstance(envelope, dict)
+            or set(envelope) != required
+            or envelope["schema"] != "captain.hermes-creation-evidence-binding.v1"
+            or envelope["creation_job_id"] != identity
+        ):
+            raise ValueError("Hermes creation evidence envelope is invalid")
+        receipt_ref = ArtifactRef.model_validate(envelope["skill_usage_receipt_ref"])
+        tool_gaps_ref = ArtifactRef.model_validate(envelope["tool_gaps_ref"])
+        return {
+            "skill_usage_receipt": self.artifacts.read(receipt_ref),
+            "tool_gaps": self.artifacts.read(tool_gaps_ref),
+        }
 
 
 class BackgroundCreationRuntime:
@@ -343,8 +394,10 @@ def configured_creation_runtime(
         )
     )
     store = CreationJobStore(database_path)
+    artifacts = ContentAddressedCreationArtifacts(artifact_root)
     factory = pipeline_factory or ProductionSwarmPipelineFactory(
-        ContentAddressedCreationArtifacts(artifact_root)
+        artifacts,
+        hermes_evidence_resolver=BoundHermesCreationEvidenceResolver(artifacts),
     )
     return ConfiguredCreationRuntime(
         store=store,
