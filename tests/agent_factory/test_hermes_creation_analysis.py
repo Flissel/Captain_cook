@@ -147,6 +147,22 @@ async def test_creation_analysis_materializes_exact_hermes_evidence_and_replays(
         assert usage_file is not None
         assert max_seconds == 60
         assert json.loads(prompt)["released_skill_path"] == str(skill_path.resolve())
+        request = json.loads(prompt)
+        assert set(request["artifact_paths"]) == {
+            "canonical_input",
+            "compiled_spec",
+            "dependency_graph",
+            "released_skill_content",
+        }
+        assert all(Path(path).is_file() for path in request["artifact_paths"].values())
+        assert {
+            capability["capability"]: capability["status"]
+            for capability in request["provided_capabilities"]
+        } == {
+            "artifact.read": "ready",
+            "codex.run": "ready",
+            "n8n.workflow.execute": "unavailable",
+        }
         calls.append(prompt)
         usage_file.write_text(json.dumps(_usage()), encoding="utf-8")
         return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()

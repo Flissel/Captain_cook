@@ -739,13 +739,53 @@ class ProductionHermesCreationAnalysis:
         return self._materialize(job, creation_job, payload, usage_bytes)
 
     def _prompt(self, job: AgentFactoryJobV2, creation_job: CreationJobV1) -> str:
+        artifact_paths = {
+            "canonical_input": str(self._artifacts.local_path(creation_job.input_ref)),
+            "compiled_spec": str(
+                self._artifacts.local_path(creation_job.compiled_spec_ref)
+            ),
+            "dependency_graph": str(
+                self._artifacts.local_path(creation_job.dependency_graph_ref)
+            ),
+            "released_skill_content": str(
+                self._artifacts.local_path(creation_job.released_skill.content_ref)
+            ),
+        }
         request = {
             "instruction": (
                 "Use the released skill at released_skill_path. Analyze the exact creation "
-                "job before Minibook starts. Return exactly one JSON object matching "
+                "job before Minibook starts. Read only the authoritative artifact_paths, "
+                "never same-named workspace files. Capabilities listed in "
+                "provided_capabilities are already implemented and must not be reported as "
+                "missing. Return exactly one JSON object matching "
                 "response_schema. Declare every missing tool as TODO_TOOL.v1; use [] only "
                 "when your actual analysis finds no gaps. Do not include credentials."
             ),
+            "artifact_paths": artifact_paths,
+            "provided_capabilities": [
+                {
+                    "capability": "artifact.read",
+                    "implementation": "captain.content-addressed-artifact-store.v1",
+                    "status": "ready",
+                    "constraint": "read-only and SHA-256 verified",
+                },
+                {
+                    "capability": "codex.run",
+                    "implementation": "captain.strict-codex-cli.v1",
+                    "status": "ready",
+                    "constraint": "Captain-scoped workspace and evidence",
+                },
+                {
+                    "capability": "n8n.workflow.execute",
+                    "implementation": "captain.n8n-mcp-broker.v1",
+                    "status": (
+                        "ready"
+                        if os.environ.get("CAPTAIN_FACTORY_N8N_WORKFLOW_ID", "").strip()
+                        else "unavailable"
+                    ),
+                    "constraint": "Captain-approved integration intent only",
+                },
+            ],
             "released_skill_path": str(self._released_skill_path),
             "released_skill": creation_job.released_skill.model_dump(mode="json", by_alias=True),
             "creation_job": creation_job.model_dump(mode="json", by_alias=True),
