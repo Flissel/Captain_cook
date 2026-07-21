@@ -53,7 +53,7 @@ function Set-Missing($Values, [string]$Name, [scriptblock]$Factory) {
     if (-not $Values.Contains($Name) -or [string]::IsNullOrWhiteSpace([string]$Values[$Name])) { $Values[$Name] = & $Factory }
 }
 function Initialize-LocalEnvironment {
-    $allowed = @('MARIADB_PASSWORD','MARIADB_ROOT_PASSWORD','MARIADB_TEST_PASSWORD','MARIADB_TEST_ROOT_PASSWORD','CAPTAIN_GATEWAY_TOKEN','WORKER_GATEWAY_TOKEN','CAPTAIN_RUNTIME_TOKEN','MARIADB_TEST_PORT','GATEWAY_PORT','CAPTAIN_RUNTIME_PORT','TEST_MARIADB_DSN','LEDGER_DSN','CAPTAIN_GATEWAY_URL','CAPTAIN_RUNTIME_URL','MINIBOOK_API_KEY','MINIBOOK_PROJECTION_API_KEY','CAPTAIN_DEMO_MINIBOOK_API_KEY','MINIBOOK_CREATION_DB','MINIBOOK_CREATION_ARTIFACTS','CAPTAIN_CAPABILITY_SANDBOX_IMAGE','N8N_API_KEY','N8N_MCP_TOKEN','CAPTAIN_N8N_PORT','CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','CAPTAIN_N8N_MCP_BROKER_URL','CAPTAIN_N8N_URL','OPENAI_API_KEY','OPENAI_MODEL','LLM_PROVIDER','CONTEXT7_API_KEY','HERMES_EXECUTABLE','CODEX_EXECUTABLE','CAPTAIN_RUNTIME_ARTIFACT_ROOT','CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_MANIFEST','CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_SHA256','FACTORY_LIVE_RUNTIME_ADAPTER_MANIFEST','FACTORY_LIVE_RUNTIME_ADAPTER_SHA256','CAPTAIN_FACTORY_JOB_ID','CAPTAIN_FACTORY_SKILL_ROOT','CAPTAIN_FACTORY_WORKSPACE_REF','CAPTAIN_FACTORY_PROVIDER','CAPTAIN_FACTORY_MODEL','CAPTAIN_FACTORY_MAX_COST_USD','CAPTAIN_FACTORY_MAX_COST_PER_CALL_USD','CAPTAIN_FACTORY_RUNTIME_SECONDS')
+    $allowed = @('MARIADB_PASSWORD','MARIADB_ROOT_PASSWORD','MARIADB_TEST_PASSWORD','MARIADB_TEST_ROOT_PASSWORD','CAPTAIN_GATEWAY_TOKEN','WORKER_GATEWAY_TOKEN','CAPTAIN_RUNTIME_TOKEN','MARIADB_TEST_PORT','GATEWAY_PORT','CAPTAIN_RUNTIME_PORT','TEST_MARIADB_DSN','LEDGER_DSN','CAPTAIN_GATEWAY_URL','CAPTAIN_RUNTIME_URL','MINIBOOK_API_KEY','MINIBOOK_PROJECTION_API_KEY','CAPTAIN_DEMO_MINIBOOK_API_KEY','MINIBOOK_CREATION_DB','MINIBOOK_CREATION_ARTIFACTS','CAPTAIN_CAPABILITY_SANDBOX_IMAGE','N8N_API_KEY','N8N_MCP_TOKEN','CAPTAIN_N8N_PORT','CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','CAPTAIN_N8N_MCP_BROKER_URL','CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET','CAPTAIN_N8N_URL','CAPTAIN_N8N_BATCH_ID','CAPTAIN_N8N_PROJECT_ID','CAPTAIN_N8N_WORKSPACE_REF','OPENAI_API_KEY','OPENAI_MODEL','LLM_PROVIDER','CONTEXT7_API_KEY','HERMES_EXECUTABLE','CODEX_EXECUTABLE','CAPTAIN_RUNTIME_ARTIFACT_ROOT','CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_MANIFEST','CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_SHA256','FACTORY_LIVE_RUNTIME_ADAPTER_MANIFEST','FACTORY_LIVE_RUNTIME_ADAPTER_SHA256','CAPTAIN_FACTORY_JOB_ID','CAPTAIN_FACTORY_SKILL_ROOT','CAPTAIN_FACTORY_WORKSPACE_REF','CAPTAIN_FACTORY_PROVIDER','CAPTAIN_FACTORY_MODEL','CAPTAIN_FACTORY_MAX_COST_USD','CAPTAIN_FACTORY_MAX_COST_PER_CALL_USD','CAPTAIN_FACTORY_RUNTIME_SECONDS','CAPTAIN_FACTORY_PRICING_VERSION','CAPTAIN_FACTORY_PRICING_EFFECTIVE_AT','CAPTAIN_FACTORY_INPUT_COST_PER_MILLION_USD','CAPTAIN_FACTORY_OUTPUT_COST_PER_MILLION_USD','CAPTAIN_FACTORY_MINIMUM_COST_USD')
     $values = Read-Env $rootEnv $allowed
     Set-Missing $values 'MARIADB_PASSWORD' { New-Secret }
     Set-Missing $values 'MARIADB_ROOT_PASSWORD' { New-Secret }
@@ -83,6 +83,14 @@ function Initialize-LocalEnvironment {
     Set-Missing $values 'CAPTAIN_FACTORY_MAX_COST_USD' { '1.00' }
     Set-Missing $values 'CAPTAIN_FACTORY_MAX_COST_PER_CALL_USD' { '0.25' }
     Set-Missing $values 'CAPTAIN_FACTORY_RUNTIME_SECONDS' { '600' }
+    Set-Missing $values 'CAPTAIN_FACTORY_PRICING_VERSION' { 'openai-gpt-4o-mini-2026-07-21' }
+    Set-Missing $values 'CAPTAIN_FACTORY_PRICING_EFFECTIVE_AT' { '2026-07-21T00:00:00Z' }
+    Set-Missing $values 'CAPTAIN_FACTORY_INPUT_COST_PER_MILLION_USD' { '0.15' }
+    Set-Missing $values 'CAPTAIN_FACTORY_OUTPUT_COST_PER_MILLION_USD' { '0.60' }
+    Set-Missing $values 'CAPTAIN_FACTORY_MINIMUM_COST_USD' { '0.000001' }
+    Set-Missing $values 'CAPTAIN_N8N_BATCH_ID' { 'factory-live-demo-n8n' }
+    Set-Missing $values 'CAPTAIN_N8N_PROJECT_ID' { 'captain-cook-live-demo' }
+    Set-Missing $values 'CAPTAIN_N8N_WORKSPACE_REF' { 'workspace://captain-cook/live-demo/n8n' }
     Set-Missing $values 'CAPTAIN_RUNTIME_ARTIFACT_ROOT' { [IO.Path]::GetFullPath((Join-Path $root 'artifacts/capability-factory')) }
     Set-Missing $values 'MINIBOOK_CREATION_ARTIFACTS' { [string]$values['CAPTAIN_RUNTIME_ARTIFACT_ROOT'] }
     Set-Missing $values 'MINIBOOK_CREATION_DB' { [IO.Path]::GetFullPath((Join-Path $root '.captain-cook/minibook-creation.sqlite3')) }
@@ -108,14 +116,27 @@ function Initialize-LocalEnvironment {
 }
 function Sync-CaptainN8nEnvironment($Values) {
     if (-not (Test-Path $n8nEnv)) { throw 'Captain n8n credential file is missing after bootstrap.' }
-    $source = Read-Env $n8nEnv @('CAPTAIN_N8N_PORT','CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','CAPTAIN_N8N_MCP_BROKER_URL')
-    foreach ($name in @('CAPTAIN_N8N_PORT','CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','CAPTAIN_N8N_MCP_BROKER_URL')) {
+    $source = Read-Env $n8nEnv @('CAPTAIN_N8N_PORT','CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','CAPTAIN_N8N_MCP_BROKER_URL','CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET')
+    foreach ($name in @('CAPTAIN_N8N_PORT','CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','CAPTAIN_N8N_MCP_BROKER_URL','CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET')) {
         if (-not $source.Contains($name) -or [string]::IsNullOrWhiteSpace([string]$source[$name])) { throw "Captain n8n bootstrap did not provide $name." }
         $Values[$name] = $source[$name]
     }
     $Values['CAPTAIN_N8N_URL'] = "http://127.0.0.1:$($Values['CAPTAIN_N8N_PORT'])"
     Save-Env $Values $rootEnv
     Write-Host '[ready] Captain n8n credentials inherited (values redacted)'
+}
+function Start-CaptainN8nBroker($Values) {
+    $n8n = Join-Path $PSScriptRoot 'captain-n8n.ps1'
+    $previousGatewayUrl = [Environment]::GetEnvironmentVariable('CAPTAIN_GATEWAY_URL','Process')
+    try {
+        [Environment]::SetEnvironmentVariable('CAPTAIN_GATEWAY_URL',"http://host.docker.internal:$($Values['GATEWAY_PORT'])",'Process')
+        [Environment]::SetEnvironmentVariable('CAPTAIN_GATEWAY_TOKEN',[string]$Values['CAPTAIN_GATEWAY_TOKEN'],'Process')
+        & $n8n broker-start
+        if ($LASTEXITCODE -ne 0) { throw 'Captain n8n MCP broker failed to start.' }
+    } finally {
+        [Environment]::SetEnvironmentVariable('CAPTAIN_GATEWAY_URL',$previousGatewayUrl,'Process')
+    }
+    Write-Host '[ready] Captain n8n MCP broker bound to Gateway authority'
 }
 function Set-ProcessEnvironment($Values) {
     foreach ($item in $Values.GetEnumerator()) { [Environment]::SetEnvironmentVariable([string]$item.Key,[string]$item.Value,'Process') }
@@ -142,8 +163,12 @@ function Recover-CaptainN8nEnvironment($Values, [string]$SourceEnv) {
         Start-Sleep -Seconds 1
     }
     if (-not $authenticated) { throw 'Captain n8n recovery credentials failed REST or MCP authentication.' }
+    $builderValues = Read-Env $n8nEnv @('CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET')
+    $signingSecret = if ($builderValues.Contains('CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET') -and -not [string]::IsNullOrWhiteSpace([string]$builderValues['CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET'])) {
+        [string]$builderValues['CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET']
+    } else { New-Secret }
     $recovered = [ordered]@{
-        CAPTAIN_N8N_PORT='5679'; CAPTAIN_N8N_API_KEY=[string]$Values['N8N_API_KEY']; CAPTAIN_N8N_MCP_TOKEN=[string]$Values['N8N_MCP_TOKEN']; CAPTAIN_N8N_MCP_BROKER_URL='http://127.0.0.1:5680'
+        CAPTAIN_N8N_PORT='5679'; CAPTAIN_N8N_API_KEY=[string]$Values['N8N_API_KEY']; CAPTAIN_N8N_MCP_TOKEN=[string]$Values['N8N_MCP_TOKEN']; CAPTAIN_N8N_MCP_BROKER_URL='http://127.0.0.1:5680'; CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET=$signingSecret
     }
     Save-Env $recovered $n8nEnv
     foreach ($item in $recovered.GetEnumerator()) { $Values[$item.Key] = $item.Value }
@@ -287,6 +312,7 @@ function Invoke-StartServices([switch]$RecoverDemoCredentials, [string]$SourceEn
     docker compose --project-name $project --env-file $rootEnv --file $testCompose up -d --wait mariadb-test
     if ($LASTEXITCODE -ne 0) { throw 'Isolated captain_test MariaDB failed to start.' }
     Start-Gateway $values
+    Start-CaptainN8nBroker $values
     Start-Runtime $values
     docker compose --env-file $rootEnv up -d --wait mailpit
     if ($LASTEXITCODE -ne 0) { throw 'Captain Mailpit failed to start.' }

@@ -16,6 +16,7 @@ def test_demo_preflight_contract_is_fail_closed_and_redacted() -> None:
     assert "captain_test" in source
     assert "CAPTAIN_N8N_API_KEY" in source
     assert "CAPTAIN_N8N_MCP_TOKEN" in source
+    assert "CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET" in source
     assert "/api/v1/workflows" in source
     assert "/mcp-server/http" in source
     assert "MINIBOOK_BACKEND_URL" in source
@@ -82,6 +83,7 @@ def test_preflight_rejects_mutable_sandbox_reference_before_network(tmp_path: Pa
     secrets = {
         "CAPTAIN_N8N_API_KEY": "n8n-rest-secret",
         "CAPTAIN_N8N_MCP_TOKEN": "n8n-mcp-secret",
+        "CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET": "broker-signing-secret",
         "MINIBOOK_API_KEY": "minibook-secret",
         "MINIBOOK_PROJECTION_API_KEY": "projection-secret",
     }
@@ -201,6 +203,14 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "OPENAI_MODEL" in source and "gpt-4o-mini" in source
     assert "CAPTAIN_FACTORY_MAX_COST_USD" in source
     assert "CAPTAIN_FACTORY_MAX_COST_PER_CALL_USD" in source
+    assert "CAPTAIN_FACTORY_PRICING_VERSION" in source
+    assert "CAPTAIN_FACTORY_INPUT_COST_PER_MILLION_USD" in source
+    assert "CAPTAIN_FACTORY_OUTPUT_COST_PER_MILLION_USD" in source
+    assert "function Start-CaptainN8nBroker" in source
+    assert "http://host.docker.internal:" in source
+    assert "& $n8n broker-start" in source
+    assert source.index("Start-Gateway $values") < source.index("Start-CaptainN8nBroker $values")
+    assert source.index("Start-CaptainN8nBroker $values") < source.index("Start-Runtime $values")
     assert "Captain Runtime and Minibook capability artifact roots differ" in source
     assert "Write-Output $values" not in source
     assert source.index("Initialize-CaptainN8n $values") < source.index("mariadb-test")

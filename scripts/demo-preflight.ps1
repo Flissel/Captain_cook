@@ -72,13 +72,14 @@ function Assert-CaptainSandboxImage([string]$Reference) {
     Write-Host '[ready] Captain capability sandbox image digest verified'
 }
 
-$allowedNames = @('MAILPIT_WEB_PORT','MAILPIT_URL','MAILPIT_SMTP_PORT','CAPTAIN_N8N_URL','CAPTAIN_GATEWAY_URL','MINIBOOK_BACKEND_URL','MINIBOOK_API_KEY','MINIBOOK_PROJECTION_API_KEY','CAPTAIN_CAPABILITY_SANDBOX_IMAGE','CAPTAIN_N8N_API_KEY','N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','N8N_MCP_TOKEN','TEST_MARIADB_DSN')
+$allowedNames = @('MAILPIT_WEB_PORT','MAILPIT_URL','MAILPIT_SMTP_PORT','CAPTAIN_N8N_URL','CAPTAIN_N8N_MCP_BROKER_URL','CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET','CAPTAIN_GATEWAY_URL','MINIBOOK_BACKEND_URL','MINIBOOK_API_KEY','MINIBOOK_PROJECTION_API_KEY','CAPTAIN_CAPABILITY_SANDBOX_IMAGE','CAPTAIN_N8N_API_KEY','N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','N8N_MCP_TOKEN','TEST_MARIADB_DSN')
 $config = Read-SafeEnv $EnvFile $allowedNames
 # The running Captain Mailpit instance is intentionally published on 18025.
 $config['MAILPIT_WEB_PORT'] = '18025'
 $config['MAILPIT_URL'] = 'http://localhost:18025'
 Set-SafeDefault $config 'MAILPIT_SMTP_PORT' '1025'
 Set-SafeDefault $config 'CAPTAIN_N8N_URL' 'http://127.0.0.1:5679'
+Set-SafeDefault $config 'CAPTAIN_N8N_MCP_BROKER_URL' 'http://127.0.0.1:5680'
 Set-SafeDefault $config 'CAPTAIN_GATEWAY_URL' 'http://127.0.0.1:8090'
 Set-SafeDefault $config 'MINIBOOK_BACKEND_URL' 'http://127.0.0.1:3456'
 if (-not $config.Contains('CAPTAIN_N8N_API_KEY') -and $config.Contains('N8N_API_KEY')) { $config['CAPTAIN_N8N_API_KEY'] = $config['N8N_API_KEY'] }
@@ -87,7 +88,7 @@ Save-SafeEnv $config $EnvFile
 Write-Host '[ready] local .env normalized (values redacted)'
 if ($NormalizeOnly) { exit 0 }
 
-foreach ($required in @('CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','MINIBOOK_API_KEY','MINIBOOK_PROJECTION_API_KEY','CAPTAIN_CAPABILITY_SANDBOX_IMAGE','TEST_MARIADB_DSN')) {
+foreach ($required in @('CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET','MINIBOOK_API_KEY','MINIBOOK_PROJECTION_API_KEY','CAPTAIN_CAPABILITY_SANDBOX_IMAGE','TEST_MARIADB_DSN')) {
     if (-not $config.Contains($required) -or [string]::IsNullOrWhiteSpace([string]$config[$required])) { throw "Missing required local setting: $required" }
 }
 if ([string]$config['TEST_MARIADB_DSN'] -notmatch '/captain_test(?:\?|$)') { throw 'TEST_MARIADB_DSN must target the isolated captain_test database.' }
@@ -104,6 +105,11 @@ Test-Http 'Mailpit' "$mailpitUrl/api/v1/info"
 Test-Http 'Minibook' "$minibookUrl/health"
 Test-Http 'Minibook API identity' "$minibookUrl/api/v1/agents/me" @{ Authorization="Bearer $([string]$config['MINIBOOK_API_KEY'])" }
 Test-Http 'Gateway' "$gatewayUrl/healthz"
+
+$broker = [Uri]([string]$config['CAPTAIN_N8N_MCP_BROKER_URL'])
+$brokerTcp = [Net.Sockets.TcpClient]::new()
+try { $brokerTcp.Connect($broker.Host, $(if ($broker.Port -gt 0) {$broker.Port} else {80})) } finally { $brokerTcp.Dispose() }
+Write-Host '[ready] Captain n8n MCP broker'
 
 $dsn = [Uri]([string]$config['TEST_MARIADB_DSN'])
 $tcp = [Net.Sockets.TcpClient]::new()
