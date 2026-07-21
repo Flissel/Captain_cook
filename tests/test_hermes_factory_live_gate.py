@@ -545,6 +545,39 @@ def test_wrapper_rejects_an_unknown_nested_preflight_field(
     assert leak_probe not in output
 
 
+@pytest.mark.parametrize(
+    "boolean_field",
+    (
+        "prerequisites_confirmed",
+        "services_verified",
+        "codex_authenticated",
+        "skills_verified",
+    ),
+)
+def test_wrapper_rejects_stringified_preflight_booleans(
+    tmp_path: Path,
+    boolean_field: str,
+) -> None:
+    fake_commands = tmp_path / "fake-bin"
+    _write_fake_live_gate_commands(
+        fake_commands,
+        "unused-leak-probe",
+        live_report=_valid_demo_live_report(),
+        preflight_extra={boolean_field: "true"},
+    )
+    environment = os.environ.copy()
+    environment["TEST_MARIADB_DSN"] = (
+        "mysql+pymysql://captain:db-password-not-in-output@127.0.0.1:3306/captain_test"
+    )
+    environment["PATH"] = str(fake_commands)
+
+    result = _run_copied_wrapper(tmp_path, environment=environment)
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "did not confirm every required prerequisite" in output
+
+
 def test_live_gate_rejects_a_non_isolated_database_without_printing_the_dsn() -> None:
     secret = "fixture-password-must-not-be-printed"
     environment = os.environ.copy()

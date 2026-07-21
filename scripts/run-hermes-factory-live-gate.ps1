@@ -550,11 +550,23 @@ Assert-ExactPropertyNames -Value $preflight.skill_digests `
     -ExpectedNames $skillNames -Label 'preflight.skill_digests'
 if (
     [string]$preflight.schema -cne 'captain.hermes-six-skill-factory-preflight.v1' -or
-    $preflight.prerequisites_confirmed -ne $true -or
+    -not (
+        $preflight.prerequisites_confirmed -is [bool] -and
+        $preflight.prerequisites_confirmed -eq $true
+    ) -or
     [string]$preflight.database_name -cne 'captain_test' -or
-    $preflight.services_verified -ne $true -or
-    $preflight.codex_authenticated -ne $true -or
-    $preflight.skills_verified -ne $true
+    -not (
+        $preflight.services_verified -is [bool] -and
+        $preflight.services_verified -eq $true
+    ) -or
+    -not (
+        $preflight.codex_authenticated -is [bool] -and
+        $preflight.codex_authenticated -eq $true
+    ) -or
+    -not (
+        $preflight.skills_verified -is [bool] -and
+        $preflight.skills_verified -eq $true
+    )
 ) {
     throw 'Factory live preflight did not confirm every required prerequisite.'
 }
