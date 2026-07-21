@@ -8,7 +8,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .contracts import FactoryEvidenceBlock, FactoryJob, FactoryPhase
+from .contracts import AgentFactoryJobV3, FactoryEvidenceBlock, FactoryJob, FactoryPhase
 from .release_gate import (
     FactoryReleaseDecision,
     evaluation_requires_improvement,
@@ -18,6 +18,11 @@ from .release_gate import (
 )
 from .skill_evaluation import ToolGapMarker
 from .skill_store import StoredSkillEvaluation
+from .skill_workflow_contracts import (
+    FactoryFeedbackRecommendation,
+    FactoryFeedbackV1,
+    TeamEvaluationV1,
+)
 from agenten.agent_runtime.contracts import ArtifactRef
 
 
@@ -70,6 +75,9 @@ class FactoryProjection(BaseModel):
     block_ids: tuple[UUID, ...] = ()
     evaluation_id: UUID | None = None
     evaluation_ref: ArtifactRef | None = None
+    workflow_evaluation_ref: ArtifactRef | None = None
+    feedback_ref: ArtifactRef | None = None
+    feedback_recommendation: FactoryFeedbackRecommendation | None = None
     tool_gaps: tuple[ToolGapMarker, ...] = ()
 
     @classmethod
@@ -83,6 +91,8 @@ def apply_block(
     *,
     evaluation: StoredSkillEvaluation | None = None,
     release_decision: FactoryReleaseDecision | None = None,
+    workflow_evaluation: TeamEvaluationV1 | None = None,
+    feedback: FactoryFeedbackV1 | None = None,
 ) -> FactoryProjection:
     """Apply one new immutable block after enforcing lifecycle ordering."""
 
@@ -145,6 +155,28 @@ def apply_block(
         }
     elif block.phase is FactoryPhase.ESCALATED:
         status = FactoryLifecycleStatus.ESCALATED
+    elif block.phase is FactoryPhase.QUALITY_REVIEWED and (
+        workflow_evaluation is not None or feedback is not None
+    ):
+        _validate_workflow_feedback(
+            projection,
+            workflow_evaluation=workflow_evaluation,
+            feedback=feedback,
+        )
+        assert workflow_evaluation is not None
+        assert feedback is not None
+        if (
+            workflow_evaluation.artifact_ref not in block.artifact_refs
+            or feedback.artifact_ref not in block.artifact_refs
+        ):
+            raise FactoryLifecycleError(
+                "quality review block is missing workflow feedback artifacts"
+            )
+        evaluation_update = {
+            "workflow_evaluation_ref": workflow_evaluation.artifact_ref,
+            "feedback_ref": feedback.artifact_ref,
+            "feedback_recommendation": feedback.recommendation,
+        }
 
     return projection.model_copy(
         update={
@@ -162,6 +194,8 @@ def next_action(
     projection: FactoryProjection,
     *,
     evaluation: StoredSkillEvaluation | None = None,
+    workflow_evaluation: TeamEvaluationV1 | None = None,
+    feedback: FactoryFeedbackV1 | None = None,
 ) -> FactoryAction:
     """Return the one allowed next side effect for a derived projection."""
 
@@ -186,6 +220,39 @@ def next_action(
     if phase is FactoryPhase.REAL_CASE_EVIDENCE:
         return FactoryAction(kind=FactoryActionKind.DISPATCH_QUALITY_WARDEN, attempt=projection.attempt)
     if phase in {FactoryPhase.BUILD_FAILED, FactoryPhase.QUALITY_REVIEWED}:
+        if (
+            phase is FactoryPhase.QUALITY_REVIEWED
+            and isinstance(projection.job, AgentFactoryJobV3)
+        ):
+            _validate_workflow_feedback(
+                projection,
+                workflow_evaluation=workflow_evaluation,
+                feedback=feedback,
+            )
+            assert feedback is not None
+            if (
+                feedback.recommendation
+                is FactoryFeedbackRecommendation.PROMOTE_CANDIDATE
+            ):
+                required = set(projection.job.acceptance_assertion_ids)
+                if not required.issubset(projection.observed_assertion_ids):
+                    raise FactoryLifecycleError(
+                        "workflow promotion recommendation is missing Captain assertions"
+                    )
+                return FactoryAction(
+                    kind=FactoryActionKind.VALIDATE_FOR_PROMOTION,
+                    attempt=projection.attempt,
+                )
+            if feedback.recommendation is FactoryFeedbackRecommendation.RETRY_BUILD:
+                if projection.attempt < projection.job.max_behavioral_iterations:
+                    return FactoryAction(
+                        kind=FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED,
+                        attempt=projection.attempt,
+                    )
+            return FactoryAction(
+                kind=FactoryActionKind.APPEND_ESCALATED,
+                attempt=projection.attempt,
+            )
         required = set(projection.job.acceptance_assertion_ids)
         if phase is FactoryPhase.QUALITY_REVIEWED and required.issubset(projection.observed_assertion_ids):
             if evaluation_requires_improvement(projection.job, evaluation):
@@ -226,3 +293,53 @@ def _allowed_next_phases(projection: FactoryProjection) -> frozenset[FactoryPhas
         return transitions[phase]  # type: ignore[index]
     except KeyError as exc:
         raise FactoryLifecycleError(f"no legal transition from {phase!r}") from exc
+
+
+def _validate_workflow_feedback(
+    projection: FactoryProjection,
+    *,
+    workflow_evaluation: TeamEvaluationV1 | None,
+    feedback: FactoryFeedbackV1 | None,
+) -> None:
+    if workflow_evaluation is None or feedback is None:
+        raise FactoryLifecycleError("missing validated workflow feedback")
+    job = projection.job
+    if (
+        workflow_evaluation.job_id != job.job_id
+        or workflow_evaluation.correlation_id != job.correlation_id
+        or workflow_evaluation.subject_version != job.subject_version
+        or workflow_evaluation.attempt != projection.attempt
+        or workflow_evaluation.acceptance_assertion_ids
+        != job.acceptance_assertion_ids
+        or feedback.job_id != job.job_id
+        or feedback.correlation_id != job.correlation_id
+        or feedback.subject_version != job.subject_version
+        or feedback.attempt != projection.attempt
+        or feedback.acceptance_assertion_ids != job.acceptance_assertion_ids
+        or feedback.assertion_ids != job.acceptance_assertion_ids
+        or feedback.invocation.input_ref != workflow_evaluation.artifact_ref
+        or workflow_evaluation.artifact_ref not in feedback.evidence_refs
+    ):
+        raise FactoryLifecycleError("workflow feedback binding does not match projection")
+    required_gap = any(
+        gap.severity == "required" and gap.status == "unresolved"
+        for gap in feedback.tool_gaps
+    )
+    if (
+        feedback.recommendation is FactoryFeedbackRecommendation.PROMOTE_CANDIDATE
+        and (
+            workflow_evaluation.failure_class is not None
+            or any(
+                outcome.status != "passed"
+                for outcome in workflow_evaluation.assertion_outcomes
+            )
+            or required_gap
+        )
+    ):
+        raise FactoryLifecycleError("workflow feedback cannot weaken Captain assertions")
+    if (
+        feedback.recommendation is FactoryFeedbackRecommendation.RETRY_BUILD
+        and workflow_evaluation.failure_class
+        not in {"behavioral_failure", "test_regression"}
+    ):
+        raise FactoryLifecycleError("workflow retry lacks a behavioral failure")

@@ -8,9 +8,16 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from agenten.agent_factory.contracts import AgentFactoryJob
+from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryJob
+from agenten.agent_factory.execution_budget import FactoryBudgetProjection
+from agenten.agent_factory.execution_policy import FactoryExecutionMode
 from agenten.agent_factory.skill_evaluation import ToolGapMarker
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
+from agenten.agent_factory.skill_workflow_contracts import (
+    FactoryFeedbackRecommendation,
+    TeamEvaluationV1,
+    TeamExecutionEvidenceV1,
+)
 from agenten.agent_runtime.contracts import ArtifactRef
 
 
@@ -40,7 +47,7 @@ class FactoryReleaseDecision(BaseModel):
 
     job_id: UUID
     correlation_id: UUID
-    status: Literal["blocked", "ready"]
+    status: Literal["blocked", "demo_ready", "ready"]
     reasons: tuple[str, ...]
     evaluation_id: UUID | None = None
     evaluation_ref: ArtifactRef | None = None
@@ -48,7 +55,7 @@ class FactoryReleaseDecision(BaseModel):
 
 
 def factory_release_decision_block_reason(
-    job: AgentFactoryJob,
+    job: FactoryJob,
     evaluation: StoredSkillEvaluation | None,
     decision: FactoryReleaseDecision | None,
 ) -> str | None:
@@ -73,7 +80,7 @@ def factory_release_decision_block_reason(
 
 
 def evaluate_factory_release(
-    job: AgentFactoryJob,
+    job: FactoryJob,
     evidence: tuple[E2ERunEvidence, ...],
     evaluation: StoredSkillEvaluation | None = None,
 ) -> FactoryReleaseDecision:
@@ -115,8 +122,146 @@ def evaluate_factory_release(
     )
 
 
+def evaluate_factory_workflow_release(
+    job: AgentFactoryJobV3,
+    evidence: tuple[TeamExecutionEvidenceV1, ...],
+    evaluation: TeamEvaluationV1,
+    *,
+    budget_projection: FactoryBudgetProjection | None = None,
+) -> FactoryReleaseDecision:
+    """Validate V3 live workflow evidence without granting promotion authority."""
+
+    blocked = _workflow_evaluation_block_reason(job, evidence, evaluation)
+    if blocked is not None:
+        return _workflow_blocked(job, evaluation, blocked)
+    required_runs = job.execution_policy.required_live_runs
+    if len(evidence) != required_runs:
+        label = "one" if required_runs == 1 else "three"
+        return _workflow_blocked(
+            job,
+            evaluation,
+            f"missing exactly {label} successful live workflow run(s)",
+        )
+    if budget_projection is not None:
+        if (
+            budget_projection.job_id != job.job_id
+            or budget_projection.limit_usd != job.execution_policy.max_cost_usd
+            or budget_projection.consumed_usd > job.execution_policy.max_cost_usd
+            or budget_projection.reserved_usd != 0
+            or budget_projection.active_reservation_ids
+        ):
+            return _workflow_blocked(
+                job,
+                evaluation,
+                "workflow budget projection is not release-complete",
+            )
+    run_numbers = tuple(item.run_number for item in evidence)
+    if len(run_numbers) != len(set(run_numbers)):
+        return _workflow_blocked(job, evaluation, "workflow run numbers must be unique")
+    invocation_ids = tuple(item.invocation_id for item in evidence)
+    idempotency_keys = tuple(item.invocation.idempotency_key for item in evidence)
+    artifact_digests = tuple(item.artifact_ref.sha256 for item in evidence)
+    if (
+        len(invocation_ids) != len(set(invocation_ids))
+        or len(idempotency_keys) != len(set(idempotency_keys))
+        or len(artifact_digests) != len(set(artifact_digests))
+    ):
+        return _workflow_blocked(
+            job,
+            evaluation,
+            "workflow runs must have distinct invocation and evidence identities",
+        )
+    candidates = {item.candidate_ref for item in evidence}
+    if len(candidates) != 1:
+        return _workflow_blocked(
+            job,
+            evaluation,
+            "workflow candidate binding changed across live runs",
+        )
+    candidate_ref = next(iter(candidates))
+    if candidate_ref not in evaluation.evidence_refs:
+        return _workflow_blocked(
+            job,
+            evaluation,
+            "workflow evaluation is missing its candidate binding",
+        )
+    accepted = job.acceptance_assertion_ids
+    for run in evidence:
+        outcome_ids = tuple(
+            item.assertion_id for item in run.execution_outcome.assertion_outcomes
+        )
+        if (
+            run.job_id != job.job_id
+            or run.correlation_id != job.correlation_id
+            or run.subject_version != job.subject_version
+            or run.attempt != evaluation.attempt
+            or run.invocation.job_id != job.job_id
+            or run.invocation.correlation_id != job.correlation_id
+            or run.invocation.subject_version != job.subject_version
+            or run.invocation.attempt != evaluation.attempt
+        ):
+            return _workflow_blocked(
+                job,
+                evaluation,
+                "workflow run identity does not match the Factory job",
+            )
+        if (
+            run.acceptance_assertion_ids != accepted
+            or outcome_ids != accepted
+            or run.execution_outcome.correlation_id != job.correlation_id
+        ):
+            return _workflow_blocked(
+                job,
+                evaluation,
+                "workflow run assertions do not match the Captain release",
+            )
+        if (
+            run.status != "succeeded"
+            or run.execution_outcome.status != "succeeded"
+            or any(
+                outcome.status != "passed"
+                for outcome in run.execution_outcome.assertion_outcomes
+            )
+        ):
+            return _workflow_blocked(
+                job,
+                evaluation,
+                "workflow run did not succeed",
+            )
+        if not run.usage_receipt_refs:
+            return _workflow_blocked(
+                job,
+                evaluation,
+                "workflow run is missing provider budget receipts",
+            )
+        if run.artifact_ref not in evaluation.evidence_refs:
+            return _workflow_blocked(
+                job,
+                evaluation,
+                "workflow evaluation is missing exact run evidence",
+            )
+    status: Literal["demo_ready", "ready"] = (
+        "demo_ready"
+        if job.execution_policy.mode is FactoryExecutionMode.DEMO
+        else "ready"
+    )
+    return FactoryReleaseDecision(
+        job_id=job.job_id,
+        correlation_id=job.correlation_id,
+        status=status,
+        reasons=(
+            "one successful live demo run verified"
+            if status == "demo_ready"
+            else "three distinct successful live workflow runs verified"
+        ,),
+        evaluation_id=evaluation.invocation_id,
+        evaluation_ref=evaluation.artifact_ref,
+        tool_gaps=(),
+    )
+
+
 def factory_evaluation_block_reason(
-    job: AgentFactoryJob,
+    job: FactoryJob,
     evaluation: StoredSkillEvaluation | None,
 ) -> str | None:
     """Return the first auditable reason that blocks Captain promotion."""
@@ -201,7 +346,7 @@ def evaluation_tool_gaps(evaluation: StoredSkillEvaluation) -> tuple[ToolGapMark
 
 
 def evaluation_requires_improvement(
-    job: AgentFactoryJob,
+    job: FactoryJob,
     evaluation: StoredSkillEvaluation | None,
 ) -> bool:
     """Honor only a matching code/skill failure as a behavioral retry."""
@@ -255,7 +400,7 @@ def _missing_assertion_reason(subject: str, missing: set[str]) -> str:
 
 
 def _blocked(
-    job: AgentFactoryJob,
+    job: FactoryJob,
     reason: str,
     evaluation: StoredSkillEvaluation | None = None,
 ) -> FactoryReleaseDecision:
@@ -267,4 +412,56 @@ def _blocked(
         evaluation_id=None if evaluation is None else evaluation.evidence.evidence_id,
         evaluation_ref=None if evaluation is None else evaluation.evidence_ref,
         tool_gaps=() if evaluation is None else evaluation_tool_gaps(evaluation),
+    )
+
+
+def _workflow_evaluation_block_reason(
+    job: AgentFactoryJobV3,
+    evidence: tuple[TeamExecutionEvidenceV1, ...],
+    evaluation: TeamEvaluationV1,
+) -> str | None:
+    if not job.execution_policy.live_execution:
+        return "workflow release requires Captain-authorized live execution"
+    if (
+        evaluation.job_id != job.job_id
+        or evaluation.correlation_id != job.correlation_id
+        or evaluation.subject_version != job.subject_version
+        or evaluation.attempt < 1
+        or evaluation.acceptance_assertion_ids != job.acceptance_assertion_ids
+        or evaluation.invocation.job_id != job.job_id
+        or evaluation.invocation.correlation_id != job.correlation_id
+        or evaluation.invocation.subject_version != job.subject_version
+        or evaluation.invocation.attempt != evaluation.attempt
+    ):
+        return "workflow evaluation identity does not match the Factory job"
+    if not evidence:
+        return "missing live workflow execution evidence"
+    evaluation_ids = tuple(
+        item.assertion_id for item in evaluation.assertion_outcomes
+    )
+    if evaluation_ids != job.acceptance_assertion_ids:
+        return "workflow evaluation assertions do not match the Captain release"
+    if (
+        evaluation.failure_class is not None
+        or evaluation.recommendation
+        is not FactoryFeedbackRecommendation.PROMOTE_CANDIDATE
+        or any(item.status != "passed" for item in evaluation.assertion_outcomes)
+    ):
+        return "workflow evaluation did not recommend the candidate"
+    return None
+
+
+def _workflow_blocked(
+    job: AgentFactoryJobV3,
+    evaluation: TeamEvaluationV1,
+    reason: str,
+) -> FactoryReleaseDecision:
+    return FactoryReleaseDecision(
+        job_id=job.job_id,
+        correlation_id=job.correlation_id,
+        status="blocked",
+        reasons=(reason,),
+        evaluation_id=evaluation.invocation_id,
+        evaluation_ref=evaluation.artifact_ref,
+        tool_gaps=(),
     )

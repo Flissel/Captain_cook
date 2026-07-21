@@ -1018,11 +1018,10 @@ def _may_continue_after(artifact: _FactoryWorkflowArtifact) -> bool:
     if isinstance(artifact, TeamExecutionEvidenceV1):
         return artifact.status == "succeeded"
     if isinstance(artifact, TeamEvaluationV1):
-        return (
-            artifact.failure_class is None
-            and artifact.recommendation
-            is FactoryFeedbackRecommendation.PROMOTE_CANDIDATE
-        )
+        # Evaluation is evidence, not a terminal Hermes decision.  The Quality
+        # Warden must always run REPORT_CAPTAIN so Captain receives one typed,
+        # redacted recommendation even when deterministic evaluation failed.
+        return True
     return True
 
 
