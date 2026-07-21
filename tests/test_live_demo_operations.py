@@ -195,6 +195,10 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "application/json, text/event-stream" in PREFLIGHT.read_text(encoding="utf-8")
     assert "bootstrap -RecoverDemoCredentials:$RecoverDemoCredentials" in source
     assert "OPENAI_API_KEY" in source
+    assert "MINIBOOK_CREATION_DB" in source
+    assert "MINIBOOK_CREATION_ARTIFACTS" in source
+    assert "CAPTAIN_RUNTIME_ARTIFACT_ROOT" in source
+    assert "Captain Runtime and Minibook capability artifact roots differ" in source
     assert "Write-Output $values" not in source
     assert source.index("Initialize-CaptainN8n $values") < source.index("mariadb-test")
     lowered = source.lower()

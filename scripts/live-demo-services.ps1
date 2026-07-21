@@ -53,7 +53,7 @@ function Set-Missing($Values, [string]$Name, [scriptblock]$Factory) {
     if (-not $Values.Contains($Name) -or [string]::IsNullOrWhiteSpace([string]$Values[$Name])) { $Values[$Name] = & $Factory }
 }
 function Initialize-LocalEnvironment {
-    $allowed = @('MARIADB_PASSWORD','MARIADB_ROOT_PASSWORD','MARIADB_TEST_PASSWORD','MARIADB_TEST_ROOT_PASSWORD','CAPTAIN_GATEWAY_TOKEN','WORKER_GATEWAY_TOKEN','CAPTAIN_RUNTIME_TOKEN','MARIADB_TEST_PORT','GATEWAY_PORT','CAPTAIN_RUNTIME_PORT','TEST_MARIADB_DSN','LEDGER_DSN','CAPTAIN_GATEWAY_URL','CAPTAIN_RUNTIME_URL','MINIBOOK_API_KEY','MINIBOOK_PROJECTION_API_KEY','CAPTAIN_DEMO_MINIBOOK_API_KEY','CAPTAIN_CAPABILITY_SANDBOX_IMAGE','N8N_API_KEY','N8N_MCP_TOKEN','CAPTAIN_N8N_PORT','CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','CAPTAIN_N8N_MCP_BROKER_URL','CAPTAIN_N8N_URL','OPENAI_API_KEY','CONTEXT7_API_KEY','HERMES_EXECUTABLE','CODEX_EXECUTABLE','CAPTAIN_RUNTIME_ARTIFACT_ROOT','CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_MANIFEST','CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_SHA256','FACTORY_LIVE_RUNTIME_ADAPTER_MANIFEST','FACTORY_LIVE_RUNTIME_ADAPTER_SHA256','CAPTAIN_FACTORY_JOB_ID')
+    $allowed = @('MARIADB_PASSWORD','MARIADB_ROOT_PASSWORD','MARIADB_TEST_PASSWORD','MARIADB_TEST_ROOT_PASSWORD','CAPTAIN_GATEWAY_TOKEN','WORKER_GATEWAY_TOKEN','CAPTAIN_RUNTIME_TOKEN','MARIADB_TEST_PORT','GATEWAY_PORT','CAPTAIN_RUNTIME_PORT','TEST_MARIADB_DSN','LEDGER_DSN','CAPTAIN_GATEWAY_URL','CAPTAIN_RUNTIME_URL','MINIBOOK_API_KEY','MINIBOOK_PROJECTION_API_KEY','CAPTAIN_DEMO_MINIBOOK_API_KEY','MINIBOOK_CREATION_DB','MINIBOOK_CREATION_ARTIFACTS','CAPTAIN_CAPABILITY_SANDBOX_IMAGE','N8N_API_KEY','N8N_MCP_TOKEN','CAPTAIN_N8N_PORT','CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','CAPTAIN_N8N_MCP_BROKER_URL','CAPTAIN_N8N_URL','OPENAI_API_KEY','CONTEXT7_API_KEY','HERMES_EXECUTABLE','CODEX_EXECUTABLE','CAPTAIN_RUNTIME_ARTIFACT_ROOT','CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_MANIFEST','CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_SHA256','FACTORY_LIVE_RUNTIME_ADAPTER_MANIFEST','FACTORY_LIVE_RUNTIME_ADAPTER_SHA256','CAPTAIN_FACTORY_JOB_ID')
     $values = Read-Env $rootEnv $allowed
     Set-Missing $values 'MARIADB_PASSWORD' { New-Secret }
     Set-Missing $values 'MARIADB_ROOT_PASSWORD' { New-Secret }
@@ -74,7 +74,20 @@ function Initialize-LocalEnvironment {
     Set-Missing $values 'CAPTAIN_RUNTIME_PORT' { '8091' }
     Set-Missing $values 'HERMES_EXECUTABLE' { 'hermes' }
     Set-Missing $values 'CODEX_EXECUTABLE' { 'codex' }
-    Set-Missing $values 'CAPTAIN_RUNTIME_ARTIFACT_ROOT' { '.captain-cook/runtime-artifacts' }
+    Set-Missing $values 'CAPTAIN_RUNTIME_ARTIFACT_ROOT' { 'artifacts/capability-factory' }
+    Set-Missing $values 'MINIBOOK_CREATION_ARTIFACTS' { [string]$values['CAPTAIN_RUNTIME_ARTIFACT_ROOT'] }
+    Set-Missing $values 'MINIBOOK_CREATION_DB' { '.captain-cook/minibook-creation.sqlite3' }
+    $runtimeArtifactValue = [string]$values['CAPTAIN_RUNTIME_ARTIFACT_ROOT']
+    $runtimeArtifactRoot = if ([IO.Path]::IsPathFullyQualified($runtimeArtifactValue)) {
+        [IO.Path]::GetFullPath($runtimeArtifactValue)
+    } else { [IO.Path]::GetFullPath((Join-Path $root $runtimeArtifactValue)) }
+    $minibookArtifactValue = [string]$values['MINIBOOK_CREATION_ARTIFACTS']
+    $minibookArtifactRoot = if ([IO.Path]::IsPathFullyQualified($minibookArtifactValue)) {
+        [IO.Path]::GetFullPath($minibookArtifactValue)
+    } else { [IO.Path]::GetFullPath((Join-Path $root $minibookArtifactValue)) }
+    if ($runtimeArtifactRoot -ne $minibookArtifactRoot) {
+        throw 'Captain Runtime and Minibook capability artifact roots differ.'
+    }
     $escapedPassword = [Uri]::EscapeDataString([string]$values['MARIADB_TEST_PASSWORD'])
     $values['TEST_MARIADB_DSN'] = "mariadb://captain_test:${escapedPassword}@127.0.0.1:$($values['MARIADB_TEST_PORT'])/captain_test"
     $values['LEDGER_DSN'] = $values['TEST_MARIADB_DSN']
