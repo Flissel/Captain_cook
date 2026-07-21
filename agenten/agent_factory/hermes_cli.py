@@ -13,13 +13,23 @@ import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal, Protocol
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
-from pydantic import BaseModel, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from agenten.agent_factory.contracts import (
+    AgentFactoryJobV3,
     FactoryBlockStatus,
     FactoryEvidenceBlock,
     FactoryJob,
@@ -27,7 +37,13 @@ from agenten.agent_factory.contracts import (
     FactoryRole,
 )
 from agenten.agent_factory.evidence_store import FactoryEvidenceStore, FilesystemFactoryEvidenceStore
+from agenten.agent_factory.execution_budget import (
+    FactoryBudgetPort,
+    FactoryBudgetReservationV1,
+    FactoryUsageReceiptV1,
+)
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError, HermesFactoryPort
+from agenten.agent_factory.service import FactoryWorkflowArtifactSink
 from agenten.agent_factory.skill_evaluation import (
     HermesSkillEvaluationEvidence,
     HermesSkillEvaluationRequest,
@@ -65,6 +81,66 @@ class HermesCliSettings:
     timeout_seconds: int = 900
     evidence_root: Path = Path("artifacts/agent-factory/evidence")
     released_skill_root: Path = Path("agenten/agent_factory/released-skills")
+
+
+class HermesPaidUsageReceipt(BaseModel):
+    """Exact machine-readable receipt emitted by ``hermes -z --usage-file``."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    estimated_cost_usd: Decimal
+    cost_status: str = Field(min_length=1)
+    cost_source: str = Field(min_length=1)
+    input_tokens: int = Field(ge=0, strict=True)
+    output_tokens: int = Field(ge=0, strict=True)
+    cache_read_tokens: int = Field(ge=0, strict=True)
+    cache_write_tokens: int = Field(ge=0, strict=True)
+    reasoning_tokens: int = Field(ge=0, strict=True)
+    total_tokens: int = Field(ge=0, strict=True)
+    api_calls: int = Field(ge=1, strict=True)
+    model: str = Field(min_length=1)
+    provider: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    completed: StrictBool
+    failed: StrictBool
+    service_tier: str | None = None
+
+    @field_validator("estimated_cost_usd", mode="before")
+    @classmethod
+    def require_known_positive_cost(cls, value: object) -> Decimal:
+        if isinstance(value, bool) or value is None:
+            raise ValueError("provider cost is unknown")
+        try:
+            amount = Decimal(str(value))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError("provider cost is unknown") from exc
+        if not amount.is_finite() or amount <= 0:
+            raise ValueError("provider cost must be known and positive")
+        return amount
+
+    @field_validator("cost_status")
+    @classmethod
+    def require_known_cost_status(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized or normalized.lower() == "unknown":
+            raise ValueError("provider cost status is unknown")
+        return normalized
+
+    @field_validator("cost_source", "model", "provider", "session_id")
+    @classmethod
+    def require_named_field(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("paid usage identity fields must not be blank")
+        return normalized
+
+    @model_validator(mode="after")
+    def require_successful_complete_run(self) -> "HermesPaidUsageReceipt":
+        if self.completed is not True or self.failed is not False:
+            raise ValueError("paid usage report is not a successful completed run")
+        if self.total_tokens != self.input_tokens + self.output_tokens:
+            raise ValueError("paid usage token totals are contradictory")
+        return self
 
 
 class ReleasedFactorySkillCatalog(Protocol):
@@ -115,6 +191,8 @@ class HermesCliFactory(HermesFactoryPort):
         released_skill_catalog: ReleasedFactorySkillCatalog | None = None,
         sequence_policy: SkillSequencePolicy | None = None,
         replay_store: FactorySkillReplayStore | None = None,
+        budget: FactoryBudgetPort | None = None,
+        workflow_artifact_sink: FactoryWorkflowArtifactSink | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._settings = settings
@@ -128,6 +206,8 @@ class HermesCliFactory(HermesFactoryPort):
                 settings.evidence_root / "skill-replays"
             )
         )
+        self._budget = budget
+        self._workflow_artifact_sink = workflow_artifact_sink
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
@@ -142,6 +222,7 @@ class HermesCliFactory(HermesFactoryPort):
             attempt=request.action.attempt,
         )
         improvement = _validated_improvement_authorization(request)
+        self._require_v3_paid_ports(request)
 
         deadline = _deadline(
             min(
@@ -156,6 +237,7 @@ class HermesCliFactory(HermesFactoryPort):
         )
         artifacts: list[_FactoryWorkflowArtifact] = []
         transcript_refs: list[ArtifactRef] = []
+        accounting_refs: list[ArtifactRef] = []
         for step in steps:
             released_skill = self._released_skill_catalog.released_for(request.job, step)
             skill_name = FACTORY_SKILL_ID_BY_STEP[step]
@@ -181,15 +263,26 @@ class HermesCliFactory(HermesFactoryPort):
                 assert accepted.transcript_ref is not None
                 artifacts.append(accepted.artifact)
                 transcript_refs.append(accepted.transcript_ref)
+                accounting_refs.extend(accepted.accounting_refs)
+                await self._persist_workflow_artifact(accepted.artifact)
                 input_ref = accepted.artifact.artifact_ref
                 if not _may_continue_after(accepted.artifact):
                     break
                 continue
             try:
-                stdout = await self._run_skill_prompt(
-                    _factory_skill_prompt(invocation, skill_name=skill_name),
-                    max_seconds=_remaining_deadline_seconds(deadline),
-                )
+                if isinstance(request.job, AgentFactoryJobV3):
+                    stdout, step_accounting_refs = await self._run_paid_skill_prompt(
+                        request,
+                        invocation=invocation,
+                        prompt=_factory_skill_prompt(invocation, skill_name=skill_name),
+                        max_seconds=_remaining_deadline_seconds(deadline),
+                    )
+                else:
+                    stdout = await self._run_skill_prompt(
+                        _factory_skill_prompt(invocation, skill_name=skill_name),
+                        max_seconds=_remaining_deadline_seconds(deadline),
+                    )
+                    step_accounting_refs = ()
                 artifact = _parse_workflow_artifact(stdout, step=step)
                 if artifact.invocation != invocation:
                     raise FactoryDispatchError(
@@ -227,10 +320,13 @@ class HermesCliFactory(HermesFactoryPort):
                 claim.record,
                 artifact=artifact,
                 transcript_ref=transcript_ref,
+                accounting_refs=step_accounting_refs,
             )
             assert accepted.artifact is not None
             assert accepted.transcript_ref is not None
+            await self._persist_workflow_artifact(accepted.artifact)
             transcript_refs.append(accepted.transcript_ref)
+            accounting_refs.extend(accepted.accounting_refs)
             artifact = accepted.artifact
             artifacts.append(artifact)
             input_ref = artifact.artifact_ref
@@ -240,7 +336,89 @@ class HermesCliFactory(HermesFactoryPort):
             request,
             artifacts=tuple(artifacts),
             transcript_refs=tuple(transcript_refs),
+            accounting_refs=tuple(accounting_refs),
         )
+
+    def _require_v3_paid_ports(self, request: FactoryDispatch) -> None:
+        if not isinstance(request.job, AgentFactoryJobV3):
+            return
+        if self._budget is None:
+            raise FactoryDispatchError("V3 Hermes dispatch requires a Captain budget port")
+        if self._workflow_artifact_sink is None:
+            raise FactoryDispatchError("V3 Hermes dispatch requires a workflow artifact sink")
+
+    async def _persist_workflow_artifact(
+        self,
+        artifact: "_FactoryWorkflowArtifact",
+    ) -> None:
+        if self._workflow_artifact_sink is not None:
+            await self._workflow_artifact_sink.persist(artifact)
+
+    async def _run_paid_skill_prompt(
+        self,
+        request: FactoryDispatch,
+        *,
+        invocation: FactorySkillInvocationV1,
+        prompt: str,
+        max_seconds: float,
+    ) -> tuple[bytes, tuple[ArtifactRef, ArtifactRef]]:
+        assert isinstance(request.job, AgentFactoryJobV3)
+        assert request.lease is not None
+        assert self._budget is not None
+        started_at = self._clock()
+        requested_usd = _remaining_reservable_usd(self._budget, request.job)
+        reservation = self._budget.reserve(
+            request.job,
+            attempt=request.action.attempt,
+            requested_usd=requested_usd,
+            now=started_at,
+            invocation_id=invocation.invocation_id,
+        )
+        try:
+            with tempfile.TemporaryDirectory(prefix="captain-hermes-usage-") as temporary:
+                usage_path = Path(temporary) / f"{invocation.invocation_id}.json"
+                stdout = await self._run_skill_prompt(
+                    prompt,
+                    max_seconds=max_seconds,
+                    usage_file=usage_path,
+                )
+                usage_bytes = usage_path.read_bytes()
+            usage = _parse_paid_usage(usage_bytes)
+            if usage.model not in request.job.execution_policy.allowed_models:
+                raise ValueError("Hermes used a model outside Captain policy")
+            ended_at = self._clock()
+            if (
+                ended_at < started_at
+                or ended_at >= request.lease.expires_at
+                or ended_at > reservation.expires_at
+            ):
+                raise ValueError("paid usage is outside the active lease")
+            canonical_usage = _canonical_json(
+                usage.model_dump(mode="json")
+            ).encode("utf-8")
+            usage_ref = await self._evidence_store.persist(
+                request.job,
+                canonical_usage,
+            )
+            receipt = _factory_usage_receipt(
+                request,
+                invocation=invocation,
+                reservation=reservation,
+                usage=usage,
+                started_at=started_at,
+                ended_at=ended_at,
+                evidence_ref=usage_ref,
+            )
+            receipt_ref = await self._evidence_store.persist(
+                request.job,
+                receipt.model_dump_json(by_alias=True).encode("utf-8"),
+            )
+            self._budget.record_usage(request.job, reservation, receipt)
+            return stdout, (usage_ref, receipt_ref)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise FactoryDispatchError("provider_cost_unresolved") from exc
 
     def validate_dispatch_configuration(self, request: FactoryDispatch) -> None:
         """Fail before external setup when a released sequence cannot be resolved."""
@@ -254,6 +432,7 @@ class HermesCliFactory(HermesFactoryPort):
         now = self._clock()
         _validate_factory_dispatch(request, now=now)
         _validated_improvement_authorization(request)
+        self._require_v3_paid_ports(request)
         for step in self._sequence_policy.steps_for(
             role=request.role,
             attempt=request.action.attempt,
@@ -345,13 +524,21 @@ class HermesCliFactory(HermesFactoryPort):
             ) from exc
         return receipt
 
-    async def _run_skill_prompt(self, prompt: str, *, max_seconds: float) -> bytes:
+    async def _run_skill_prompt(
+        self,
+        prompt: str,
+        *,
+        max_seconds: float,
+        usage_file: Path | None = None,
+    ) -> bytes:
         deadline = _deadline(min(float(self._settings.timeout_seconds), max_seconds))
+        command = [self._settings.executable, "-z"]
+        if usage_file is not None:
+            command.extend(("--usage-file", str(usage_file)))
+        command.append(prompt)
         try:
             process = await asyncio.create_subprocess_exec(
-                self._settings.executable,
-                "-z",
-                prompt,
+                *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 **_async_process_group_options(),
@@ -410,6 +597,7 @@ class FactorySkillReplayRecord:
     state: Literal["pending", "completed", "failed"]
     artifact: _FactoryWorkflowArtifact | None = None
     transcript_ref: ArtifactRef | None = None
+    accounting_refs: tuple[ArtifactRef, ...] = ()
     failure_kind: str | None = None
 
     def __post_init__(self) -> None:
@@ -420,7 +608,7 @@ class FactorySkillReplayRecord:
         if self.state == "pending" and any(
             item is not None
             for item in (self.artifact, self.transcript_ref, self.failure_kind)
-        ):
+        ) or self.state == "pending" and self.accounting_refs:
             raise FactoryDispatchError("pending factory skill replay contains an outcome")
         if self.state == "completed" and (
             self.artifact is None
@@ -431,6 +619,7 @@ class FactorySkillReplayRecord:
         if self.state == "failed" and (
             self.artifact is not None
             or self.transcript_ref is not None
+            or self.accounting_refs
             or self.failure_kind is None
         ):
             raise FactoryDispatchError("failed factory skill replay is incomplete")
@@ -458,6 +647,7 @@ class FactorySkillReplayStore(Protocol):
         *,
         artifact: _FactoryWorkflowArtifact,
         transcript_ref: ArtifactRef,
+        accounting_refs: tuple[ArtifactRef, ...] = (),
     ) -> FactorySkillReplayRecord: ...
 
     async def fail(
@@ -495,11 +685,13 @@ class InMemoryFactorySkillReplayStore:
         *,
         artifact: _FactoryWorkflowArtifact,
         transcript_ref: ArtifactRef,
+        accounting_refs: tuple[ArtifactRef, ...] = (),
     ) -> FactorySkillReplayRecord:
         completed = _completed_replay_record(
             pending,
             artifact=artifact,
             transcript_ref=transcript_ref,
+            accounting_refs=accounting_refs,
         )
         return await self._transition(pending, completed)
 
@@ -562,11 +754,13 @@ class FilesystemFactorySkillReplayStore:
         *,
         artifact: _FactoryWorkflowArtifact,
         transcript_ref: ArtifactRef,
+        accounting_refs: tuple[ArtifactRef, ...] = (),
     ) -> FactorySkillReplayRecord:
         completed = _completed_replay_record(
             pending,
             artifact=artifact,
             transcript_ref=transcript_ref,
+            accounting_refs=accounting_refs,
         )
         return await self._transition(pending, completed)
 
@@ -663,10 +857,15 @@ class FilesystemFactorySkillReplayStore:
             state = value["state"]
             artifact = None
             transcript_ref = None
+            accounting_refs: tuple[ArtifactRef, ...] = ()
             if state == "completed":
                 model = _STEP_RESULT_MODELS[invocation.step]
                 artifact = model.model_validate(value["artifact"])
                 transcript_ref = ArtifactRef.model_validate(value["transcript_ref"])
+                accounting_refs = tuple(
+                    ArtifactRef.model_validate(item)
+                    for item in value.get("accounting_refs", ())
+                )
             return FactorySkillReplayRecord(
                 invocation=invocation,
                 invocation_sha256=value["invocation_sha256"],
@@ -674,6 +873,7 @@ class FilesystemFactorySkillReplayStore:
                 state=state,
                 artifact=artifact,
                 transcript_ref=transcript_ref,
+                accounting_refs=accounting_refs,
                 failure_kind=value.get("failure_kind"),
             )
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
@@ -698,6 +898,10 @@ def _factory_skill_replay_content(record: FactorySkillReplayRecord) -> bytes:
                 if record.transcript_ref is None
                 else record.transcript_ref.model_dump(mode="json")
             ),
+            "accounting_refs": [
+                reference.model_dump(mode="json")
+                for reference in record.accounting_refs
+            ],
             "failure_kind": record.failure_kind,
         }
     ).encode("utf-8")
@@ -724,6 +928,7 @@ def _completed_replay_record(
     *,
     artifact: _FactoryWorkflowArtifact,
     transcript_ref: ArtifactRef,
+    accounting_refs: tuple[ArtifactRef, ...] = (),
 ) -> FactorySkillReplayRecord:
     if pending.state != "pending":
         raise FactoryDispatchError("factory skill replay claim is no longer pending")
@@ -734,6 +939,7 @@ def _completed_replay_record(
         state="completed",
         artifact=artifact,
         transcript_ref=transcript_ref,
+        accounting_refs=accounting_refs,
     )
 
 
@@ -1007,6 +1213,70 @@ def _parse_workflow_artifact(
     return parsed
 
 
+def _parse_paid_usage(content: bytes) -> HermesPaidUsageReceipt:
+    try:
+        value = json.loads(content.decode("utf-8"), parse_float=Decimal)
+        return HermesPaidUsageReceipt.model_validate(value)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ValueError("provider cost receipt is missing or invalid") from exc
+
+
+def _remaining_reservable_usd(
+    budget: FactoryBudgetPort,
+    job: AgentFactoryJobV3,
+) -> Decimal:
+    try:
+        remaining = budget.projection(job.job_id).remaining_usd
+    except KeyError:
+        remaining = job.execution_policy.max_cost_usd
+    amount = Decimal(remaining).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+    if amount <= 0:
+        raise FactoryDispatchError("factory USD budget is exhausted")
+    return amount
+
+
+def _factory_usage_receipt(
+    request: FactoryDispatch,
+    *,
+    invocation: FactorySkillInvocationV1,
+    reservation: FactoryBudgetReservationV1,
+    usage: HermesPaidUsageReceipt,
+    started_at: datetime,
+    ended_at: datetime,
+    evidence_ref: ArtifactRef,
+) -> FactoryUsageReceiptV1:
+    cost_usd = usage.estimated_cost_usd.quantize(
+        Decimal("0.01"),
+        rounding=ROUND_CEILING,
+    )
+    binding = "|".join(
+        (
+            str(invocation.invocation_id),
+            str(reservation.reservation_id),
+            usage.session_id,
+            evidence_ref.sha256,
+        )
+    )
+    return FactoryUsageReceiptV1(
+        schema_name="captain.factory-usage-receipt.v1",
+        receipt_id=uuid5(NAMESPACE_URL, f"captain.hermes-usage:{binding}"),
+        reservation_id=reservation.reservation_id,
+        job_id=request.job.job_id,
+        correlation_id=request.job.correlation_id,
+        attempt=request.action.attempt,
+        lease_id=request.lease.lease_id if request.lease is not None else None,
+        invocation_id=invocation.invocation_id,
+        provider=usage.provider,
+        model=usage.model,
+        input_units=usage.input_tokens,
+        output_units=usage.output_tokens,
+        cost_usd=cost_usd,
+        started_at=started_at,
+        ended_at=ended_at,
+        evidence_ref=evidence_ref,
+    )
+
+
 def _may_continue_after(artifact: _FactoryWorkflowArtifact) -> bool:
     if isinstance(artifact, TeamExecutionEvidenceV1):
         return artifact.status == "succeeded"
@@ -1023,6 +1293,7 @@ def _factory_block_for(
     *,
     artifacts: tuple[_FactoryWorkflowArtifact, ...],
     transcript_refs: tuple[ArtifactRef, ...],
+    accounting_refs: tuple[ArtifactRef, ...] = (),
 ) -> FactoryEvidenceBlock:
     if not artifacts or request.role is None or request.lease is None:
         raise FactoryDispatchError("Hermes factory sequence produced no typed artifacts")
@@ -1049,6 +1320,7 @@ def _factory_block_for(
         (
             *(ref for artifact in artifacts for ref in artifact.evidence_refs),
             *transcript_refs,
+            *accounting_refs,
         )
     )
     return FactoryEvidenceBlock(

@@ -553,11 +553,7 @@ class FactoryDispatcher:
                     raise FactoryDispatchError("candidate build validator is not configured")
                 evidence = await self._candidate_validator.dispatch(request)
             elif (
-                action.kind
-                in {
-                    FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
-                    FactoryActionKind.DISPATCH_QUALITY_WARDEN,
-                }
+                action.kind is FactoryActionKind.DISPATCH_REAL_CASE_TESTER
                 and self._candidate_validator is not None
             ):
                 evidence = await self._candidate_validator.dispatch(request)

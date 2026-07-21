@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from decimal import Decimal
@@ -37,7 +38,11 @@ from agenten.agent_factory.factory_live_runner import (
 )
 from agenten.agent_factory.leases import FactoryLeaseDenied, FactoryLeasePort, validate_factory_lease
 from agenten.agent_factory.release_gate import FactoryReleaseDecision
-from agenten.agent_factory.service import FactoryRepository, FactoryRepositoryError
+from agenten.agent_factory.service import (
+    FactoryRepository,
+    FactoryRepositoryError,
+    FactoryWorkflowArtifactSink,
+)
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import FactorySkillStep
@@ -149,6 +154,23 @@ class GatewayFactoryRepository(FactoryRepository):
             raise FactoryRepositoryError(str(exc.detail)) from exc
 
 
+class GatewayFactoryWorkflowArtifactSink(FactoryWorkflowArtifactSink):
+    """Persist typed workflow artifacts through the Gateway sole writer."""
+
+    def __init__(self, store: GatewayStore) -> None:
+        self._store = store
+
+    async def persist(self, artifact: FactoryWorkflowArtifact) -> bool:
+        try:
+            receipt = await asyncio.to_thread(
+                self._store.record_factory_workflow_artifact,
+                artifact,
+            )
+        except HTTPException as exc:
+            raise FactoryRepositoryError(str(exc.detail)) from exc
+        return not receipt.replayed
+
+
 class GatewayFactoryLeases(FactoryLeasePort):
     """Resolve the current valid role lease only from Captain's ledger."""
 
@@ -191,6 +213,7 @@ class GatewayFactoryBudgetLedger(FactoryBudgetPort):
         attempt: int,
         requested_usd: Decimal,
         now: datetime,
+        invocation_id: UUID | None = None,
     ) -> FactoryBudgetReservationV1:
         policy_digest = _execution_policy_digest(job.execution_policy)
         reservation_id = uuid5(
@@ -201,6 +224,7 @@ class GatewayFactoryBudgetLedger(FactoryBudgetPort):
                     str(job.job_id),
                     str(job.subject_version),
                     str(attempt),
+                    str(invocation_id or "legacy"),
                     _canonical_decimal(requested_usd),
                     now.isoformat(),
                 )
@@ -214,6 +238,7 @@ class GatewayFactoryBudgetLedger(FactoryBudgetPort):
             subject_version=job.subject_version,
             execution_policy_sha256=policy_digest,
             attempt=attempt,
+            invocation_id=invocation_id,
             requested_usd=requested_usd,
             reserved_at=now,
             expires_at=job.deadline_at,
@@ -233,6 +258,10 @@ class GatewayFactoryBudgetLedger(FactoryBudgetPort):
             or receipt.job_id != job.job_id
             or receipt.correlation_id != job.correlation_id
             or receipt.attempt != reservation.attempt
+            or (
+                reservation.invocation_id is not None
+                and receipt.invocation_id != reservation.invocation_id
+            )
         ):
             raise ValueError("factory usage receipt binding mismatch")
         leases = self._translate_budget(
@@ -245,7 +274,11 @@ class GatewayFactoryBudgetLedger(FactoryBudgetPort):
             and lease.correlation_id == job.correlation_id
             and lease.subject_version == job.subject_version
             and lease.attempt == receipt.attempt
-            and lease.role is FactoryRole.REAL_CASE_TESTER
+            and (
+                lease.lease_id == receipt.lease_id
+                if receipt.lease_id is not None
+                else lease.role is FactoryRole.REAL_CASE_TESTER
+            )
             and "model.invoke" in lease.capabilities
             and lease.issued_at <= receipt.started_at
             and receipt.ended_at < lease.expires_at

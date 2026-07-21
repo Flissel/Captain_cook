@@ -46,6 +46,8 @@ class FactoryUsageReceiptV1(_FrozenContract):
     job_id: UUID
     correlation_id: UUID
     attempt: int = Field(ge=1, le=5, strict=True)
+    lease_id: str | None = Field(default=None, min_length=1)
+    invocation_id: UUID | None = None
     provider: str = Field(min_length=1)
     model: str = Field(min_length=1)
     input_units: int = Field(ge=0, strict=True)
@@ -92,6 +94,7 @@ class FactoryBudgetReservationV1(_FrozenContract):
     subject_version: int = Field(ge=1, strict=True)
     execution_policy_sha256: str = Field(pattern=SHA256_PATTERN)
     attempt: int = Field(ge=1, le=5, strict=True)
+    invocation_id: UUID | None = None
     requested_usd: Decimal
     reserved_at: datetime
     expires_at: datetime
@@ -156,6 +159,7 @@ class FactoryBudgetPort(Protocol):
         attempt: int,
         requested_usd: Decimal,
         now: datetime,
+        invocation_id: UUID | None = None,
     ) -> FactoryBudgetReservationV1: ...
 
     def record_usage(
@@ -218,6 +222,7 @@ class InMemoryFactoryBudgetLedger:
         attempt: int,
         requested_usd: Decimal,
         now: datetime,
+        invocation_id: UUID | None = None,
     ) -> FactoryBudgetReservationV1:
         checked_at = _require_utc(now)
         requested = _require_positive_usd(requested_usd, "requested_usd")
@@ -242,6 +247,7 @@ class InMemoryFactoryBudgetLedger:
                         str(job.subject_version),
                         policy_digest,
                         str(attempt),
+                        str(invocation_id or "legacy"),
                         _canonical_usd_text(requested),
                         checked_at.isoformat(),
                         str(sequence),
@@ -256,6 +262,7 @@ class InMemoryFactoryBudgetLedger:
                 subject_version=job.subject_version,
                 execution_policy_sha256=policy_digest,
                 attempt=attempt,
+                invocation_id=invocation_id,
                 requested_usd=requested,
                 reserved_at=checked_at,
                 expires_at=job.deadline_at,
@@ -457,6 +464,10 @@ class InMemoryFactoryBudgetLedger:
             or receipt.job_id != job.job_id
             or receipt.correlation_id != job.correlation_id
             or receipt.attempt != reservation.attempt
+            or (
+                reservation.invocation_id is not None
+                and receipt.invocation_id != reservation.invocation_id
+            )
         ):
             raise ValueError("usage receipt does not match its reservation")
 
