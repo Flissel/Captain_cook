@@ -240,6 +240,7 @@ function Invoke-CapabilityRun([object]$SelectedInput, [Guid]$CorrelationId) {
         ArtifactDirectory = $resolvedSharedArtifactDirectory
         CheckpointDirectory = (Join-Path $runState 'checkpoints')
         WallClockBudgetSeconds = $WallClockBudgetSeconds
+        UseManagedGateway = $true
     }
     $gatewayUrl = Resolve-ConfiguredUrl 'CAPTAIN_GATEWAY_URL' $CredentialSourceEnv
     if (-not [string]::IsNullOrWhiteSpace($gatewayUrl)) {

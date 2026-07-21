@@ -3,6 +3,7 @@
 param(
     [Parameter(Mandatory)]
     [string]$InputPath,
+    [switch]$UseManagedGateway,
     [string]$GatewayUrl = 'http://127.0.0.1:18090',
     [string]$RuntimeUrl,
     [string]$MinibookUrl,
@@ -150,24 +151,39 @@ if row is None or row["database_name"] != "captain_test":
 '@ *> $null
     if ($LASTEXITCODE -ne 0) { throw 'MariaDB did not attest database exactly captain_test.' }
 
-    # STEP 4: start a dedicated Gateway process whose inherited DSN is captain_test.
+    # STEP 4: start a dedicated Gateway or attest the managed demo Gateway.
     $gatewayUri = [Uri]$GatewayUrl
     if ($gatewayUri.Scheme -ne 'http' -or $gatewayUri.Host -notin @('127.0.0.1', 'localhost')) {
         throw 'The dedicated Gateway URL must be loopback HTTP.'
     }
-    if (Test-NetConnection -ComputerName $gatewayUri.Host -Port $gatewayUri.Port -InformationLevel Quiet) {
-        throw 'The dedicated Gateway port is already occupied; adoption is forbidden.'
-    }
-    $env:GATEWAY_PORT = $gatewayUri.Port.ToString()
-    $gatewayProcess = Start-Process -FilePath $python -ArgumentList @('-m', 'gateway.app') -PassThru -WindowStyle Hidden
     $health = $null
-    foreach ($attempt in 1..60) {
+    $portOccupied = Test-NetConnection -ComputerName $gatewayUri.Host -Port $gatewayUri.Port -InformationLevel Quiet
+    if ($portOccupied) {
+        if (-not $UseManagedGateway) {
+            throw 'The dedicated Gateway port is already occupied; adoption is forbidden.'
+        }
         try {
-            $health = Invoke-RestMethod -Uri "$GatewayUrl/healthz" -TimeoutSec 2
-            if ($health.status -eq 'ok') { break }
-        } catch {}
-        if ($gatewayProcess.HasExited) { throw 'Dedicated captain_test Gateway exited during startup.' }
-        Start-Sleep -Milliseconds 500
+            $headers = @{ Authorization = "Bearer $($values['CAPTAIN_GATEWAY_TOKEN'])" }
+            $authority = Invoke-WebRequest -Uri "$GatewayUrl/batches?status=READY" -Headers $headers -TimeoutSec 3
+            $health = Invoke-RestMethod -Uri "$GatewayUrl/healthz" -TimeoutSec 3
+        } catch {
+            throw 'Managed Gateway failed authenticated authority attestation.'
+        }
+        if ($authority.StatusCode -ne 200 -or $health.status -ne 'ok') {
+            throw 'Managed Gateway failed authenticated authority attestation.'
+        }
+    } else {
+        if ($UseManagedGateway) { throw 'The managed Gateway is not listening on its configured endpoint.' }
+        $env:GATEWAY_PORT = $gatewayUri.Port.ToString()
+        $gatewayProcess = Start-Process -FilePath $python -ArgumentList @('-m', 'gateway.app') -PassThru -WindowStyle Hidden
+        foreach ($attempt in 1..60) {
+            try {
+                $health = Invoke-RestMethod -Uri "$GatewayUrl/healthz" -TimeoutSec 2
+                if ($health.status -eq 'ok') { break }
+            } catch {}
+            if ($gatewayProcess.HasExited) { throw 'Dedicated captain_test Gateway exited during startup.' }
+            Start-Sleep -Milliseconds 500
+        }
     }
     if ($null -eq $health -or $health.status -ne 'ok') { throw 'Dedicated captain_test Gateway did not become healthy.' }
 

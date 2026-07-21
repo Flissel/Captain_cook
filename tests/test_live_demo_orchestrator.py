@@ -47,12 +47,14 @@ param(
     [string]$ArtifactDirectory,
     [string]$CheckpointDirectory,
     [int]$WallClockBudgetSeconds,
-    [string]$GatewayUrl
+    [string]$GatewayUrl,
+    [switch]$UseManagedGateway
 )
 $statePath = Join-Path $env:FAKE_STATE_DIR ("$CorrelationId.json")
 Add-Content -LiteralPath (Join-Path $env:FAKE_STATE_DIR 'artifact-directories.log') -Value ([IO.Path]::GetFullPath($ArtifactDirectory))
 Add-Content -LiteralPath (Join-Path $env:FAKE_STATE_DIR 'runtime-costs.log') -Value $env:CAPTAIN_FACTORY_MAX_COST_USD
 Add-Content -LiteralPath (Join-Path $env:FAKE_STATE_DIR 'gateway-urls.log') -Value $GatewayUrl
+Add-Content -LiteralPath (Join-Path $env:FAKE_STATE_DIR 'managed-gateway.log') -Value $UseManagedGateway.IsPresent
 if (Test-Path -LiteralPath $statePath) {
     $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
     $mode = 'reused'
@@ -268,6 +270,12 @@ def test_fake_live_run_proves_recovery_restart_three_inputs_and_redacts_evidence
         "http://127.0.0.1:19090",
         "http://127.0.0.1:19090",
         "http://127.0.0.1:19090",
+    ]
+    assert (state / "managed-gateway.log").read_text(encoding="utf-8").splitlines() == [
+        "True",
+        "True",
+        "True",
+        "True",
     ]
     evidence_files = list(evidence_dir.glob("capability-live-demo-*.json"))
     assert len(evidence_files) == 1

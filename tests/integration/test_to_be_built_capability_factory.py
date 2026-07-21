@@ -2788,6 +2788,8 @@ def test_live_gate_declares_exact_order_and_preserves_vibemind() -> None:
     positions = tuple(script.index(marker) for marker in markers)
     assert positions == tuple(sorted(positions))
     assert "$env:CAPABILITY_FACTORY_LIVE_REQUIRED = '1'" in script
+    assert "[switch]$UseManagedGateway" in script
+    assert '"$GatewayUrl/batches?status=READY"' in script
     assert "CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_MANIFEST" in script
     assert "CAPABILITY_FACTORY_ENTRYPOINT_ADAPTER_SHA256" in script
     assert "CAPABILITY_FACTORY_ADAPTER_FACTORY" not in script
