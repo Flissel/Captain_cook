@@ -169,7 +169,7 @@ def _write_fake_hermes(tmp_path: Path) -> Path:
                 name = args[2]
                 bundle_path = home / "skill-bundles" / f"{name}.yaml"
                 if not bundle_path.exists():
-                    print(f"Bundle not found: /{name}", file=sys.stderr)
+                    print(f"No bundle at {bundle_path}", file=sys.stderr)
                     raise SystemExit(1)
                 bundle_path.unlink()
                 print(f"Deleted bundle: /{name}")
@@ -199,7 +199,12 @@ def _environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
     return env, hermes_home
 
 
-def _command(repository_root: Path, *, remove: bool = False) -> list[str]:
+def _command(
+    repository_root: Path,
+    *,
+    remove: bool = False,
+    hermes_executable: Path | None = None,
+) -> list[str]:
     command = [
         "pwsh",
         "-NoProfile",
@@ -208,6 +213,8 @@ def _command(repository_root: Path, *, remove: bool = False) -> list[str]:
         "-RepositoryRoot",
         str(repository_root),
     ]
+    if hermes_executable is not None:
+        command.extend(("-HermesExecutable", str(hermes_executable)))
     if remove:
         command.append("-Remove")
     return command
@@ -305,6 +312,43 @@ def test_configure_script_rejects_nested_frontmatter_shadow(
     assert not (hermes_home / "skill-bundles").exists()
 
 
+def test_configure_script_rejects_folded_yaml_frontmatter_shadow(
+    tmp_path: Path,
+) -> None:
+    env, hermes_home = _environment(tmp_path)
+    shadow = hermes_home / "skills" / "nested" / "alias-directory"
+    shadow.mkdir(parents=True)
+    (shadow / "SKILL.md").write_text(
+        f"---\nname: >-\n  {SKILL_NAMES[0]}\ndescription: shadow\n---\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(_command(ROOT), env=env, text=True, capture_output=True)
+
+    assert result.returncode != 0
+    assert "shadow" in (result.stdout + result.stderr).lower()
+    assert not (hermes_home / "skill-bundles").exists()
+
+
+def test_configure_script_fails_closed_on_invalid_shadow_frontmatter(
+    tmp_path: Path,
+) -> None:
+    env, hermes_home = _environment(tmp_path)
+    shadow = hermes_home / "skills" / "nested" / "invalid-frontmatter"
+    shadow.mkdir(parents=True)
+    (shadow / "SKILL.md").write_text(
+        "---\nname: [unterminated\n---\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(_command(ROOT), env=env, text=True, capture_output=True)
+
+    assert result.returncode != 0
+    assert "safely parse" in (result.stdout + result.stderr).lower()
+    assert not (hermes_home / "config.yaml").exists()
+    assert not (hermes_home / "skill-bundles").exists()
+
+
 def test_configure_script_preserves_hermes_home_relative_external_dir(
     tmp_path: Path,
 ) -> None:
@@ -392,6 +436,28 @@ def test_remove_succeeds_when_key_path_and_bundle_are_absent(tmp_path: Path) -> 
     calls = (hermes_home / "calls.log").read_text(encoding="utf-8")
     assert '["bundles", "delete", "captain-agent-factory-loop"]' in calls
     assert not (hermes_home / "config.yaml").exists()
+
+
+def test_remove_twice_is_idempotent_with_real_hermes_cli(tmp_path: Path) -> None:
+    if shutil.which("pwsh") is None:
+        pytest.skip("PowerShell 7 is required")
+    hermes = shutil.which("hermes")
+    if hermes is None:
+        pytest.skip("Hermes CLI is required")
+    hermes_home = tmp_path / "real-hermes"
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(hermes_home)
+    command = _command(ROOT, remove=True, hermes_executable=Path(hermes))
+
+    first = subprocess.run(command, env=env, text=True, capture_output=True)
+    second = subprocess.run(command, env=env, text=True, capture_output=True)
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "already removed" in first.stdout.lower()
+    assert "already removed" in second.stdout.lower()
+    assert not (hermes_home / "config.yaml").exists()
+    assert not (hermes_home / "skill-bundles").exists()
 
 
 def test_runbook_documents_setup_verification_and_scoped_rollback() -> None:

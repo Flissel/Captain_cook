@@ -2,6 +2,7 @@
 param(
     [string]$RepositoryRoot = (Split-Path -Parent $PSScriptRoot),
     [string]$HermesExecutable = 'hermes',
+    [string]$PythonExecutable = 'py',
     [switch]$Remove
 )
 
@@ -183,10 +184,68 @@ function Remove-HermesBundle {
     if ($exitCode -eq 0) {
         return $true
     }
-    if ($outputText -match '(?i)(bundle\s+not\s+found|does\s+not\s+exist|unknown\s+bundle)') {
+    if ($outputText -match '(?i)(bundle\s+not\s+found|no\s+bundle\s+at|does\s+not\s+exist|unknown\s+bundle)') {
         return $false
     }
     throw "Hermes command failed: hermes bundles delete $Name`n$outputText"
+}
+
+function Read-HermesSkillName {
+    param([Parameter(Mandatory)][string]$SkillFile)
+
+    if (-not (Get-Command $PythonExecutable -ErrorAction SilentlyContinue)) {
+        throw "Python 3.11 executable was not found; cannot safely parse skill frontmatter."
+    }
+
+    $pythonArguments = @()
+    $pythonCommandName = [System.IO.Path]::GetFileNameWithoutExtension($PythonExecutable)
+    if ([string]::Equals($pythonCommandName, 'py', [StringComparison]::OrdinalIgnoreCase)) {
+        $pythonArguments += '-3.11'
+    }
+    $parserSource = @'
+from pathlib import Path
+import json
+import sys
+
+import yaml
+
+result = {"ok": False}
+try:
+    skill_file = Path(sys.argv[1])
+    lines = skill_file.read_text(encoding="utf-8-sig").splitlines()
+    metadata = {}
+    if lines and lines[0].strip() == "---":
+        closing_index = next(
+            index for index, line in enumerate(lines[1:], start=1)
+            if line.strip() == "---"
+        )
+        metadata = yaml.safe_load("\n".join(lines[1:closing_index])) or {}
+        if not isinstance(metadata, dict):
+            raise ValueError("frontmatter must be a mapping")
+    name = metadata.get("name", skill_file.parent.name)
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("skill name must be a non-empty string")
+    result = {"ok": True, "name": name.strip()}
+except Exception:
+    pass
+print(json.dumps(result, separators=(",", ":")))
+'@
+
+    $output = & $PythonExecutable @pythonArguments '-c' $parserSource $SkillFile 2>$null
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "Python 3.11 with PyYAML is required to safely parse skill frontmatter: $SkillFile"
+    }
+    try {
+        $parsed = ([string]::Join([Environment]::NewLine, @($output))) | ConvertFrom-Json
+    }
+    catch {
+        throw "Could not safely parse skill frontmatter: $SkillFile"
+    }
+    if (-not $parsed.ok -or -not ($parsed.name -is [string]) -or -not $parsed.name.Trim()) {
+        throw "Could not safely parse skill frontmatter: $SkillFile"
+    }
+    return $parsed.name.Trim()
 }
 
 function Get-HermesSkillCandidates {
@@ -227,24 +286,7 @@ function Get-HermesSkillCandidates {
             continue
         }
 
-        $skillName = $skillFile.Directory.Name
-        $content = Get-Content -Raw -LiteralPath $skillFile.FullName
-        $frontmatterMatch = [regex]::Match(
-            $content,
-            '(?s)\A(?:\uFEFF)?---\s*\r?\n(?<frontmatter>.*?)\r?\n---(?:\s*\r?\n|\z)'
-        )
-        if ($frontmatterMatch.Success) {
-            $nameMatch = [regex]::Match(
-                $frontmatterMatch.Groups['frontmatter'].Value,
-                '(?m)^\s*name\s*:\s*(?<name>[^#\r\n]+?)\s*$'
-            )
-            if ($nameMatch.Success) {
-                $parsedName = $nameMatch.Groups['name'].Value.Trim().Trim([char[]]@([char]39, [char]34))
-                if ($parsedName) {
-                    $skillName = $parsedName
-                }
-            }
-        }
+        $skillName = Read-HermesSkillName -SkillFile $skillFile.FullName
         $candidates += [pscustomobject]@{
             Name = $skillName
             Path = $skillFile.Directory.FullName
