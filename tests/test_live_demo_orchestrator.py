@@ -49,6 +49,7 @@ param(
     [int]$WallClockBudgetSeconds
 )
 $statePath = Join-Path $env:FAKE_STATE_DIR ("$CorrelationId.json")
+Add-Content -LiteralPath (Join-Path $env:FAKE_STATE_DIR 'artifact-directories.log') -Value ([IO.Path]::GetFullPath($ArtifactDirectory))
 if (Test-Path -LiteralPath $statePath) {
     $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
     $mode = 'reused'
@@ -166,6 +167,9 @@ def test_fake_live_run_proves_recovery_restart_three_inputs_and_redacts_evidence
     environment = os.environ.copy()
     environment["FAKE_STATE_DIR"] = str(state)
     environment["OPENAI_API_KEY"] = "provider-secret-must-not-appear"
+    shared_artifacts = tmp_path / "shared-capability-artifacts"
+    environment["CAPTAIN_RUNTIME_ARTIFACT_ROOT"] = str(shared_artifacts)
+    environment["MINIBOOK_CREATION_ARTIFACTS"] = str(shared_artifacts)
 
     result = _run(
         "-LiveProviders",
@@ -182,6 +186,11 @@ def test_fake_live_run_proves_recovery_restart_three_inputs_and_redacts_evidence
     assert "provider-secret-must-not-appear" not in output
     service_actions = (state / "services.log").read_text(encoding="utf-8").splitlines()
     assert service_actions == ["start", "stop", "start"]
+    artifact_directories = (
+        state / "artifact-directories.log"
+    ).read_text(encoding="utf-8").splitlines()
+    assert len(artifact_directories) == 4
+    assert {Path(value) for value in artifact_directories} == {shared_artifacts}
     evidence_files = list(evidence_dir.glob("capability-live-demo-*.json"))
     assert len(evidence_files) == 1
     evidence_text = evidence_files[0].read_text(encoding="utf-8")

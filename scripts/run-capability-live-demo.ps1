@@ -15,6 +15,7 @@ param(
     [string]$CapabilityRunnerPath = (Join-Path $PSScriptRoot 'run-capability-factory-live.ps1'),
     [string]$ServiceRunnerPath = (Join-Path $PSScriptRoot 'live-demo-services.ps1'),
     [string]$CredentialSourceEnv = (Join-Path (Split-Path -Parent $PSScriptRoot) '.env'),
+    [string]$SharedArtifactDirectory,
     [ValidateRange(60, 86400)]
     [int]$WallClockBudgetSeconds = 1800,
     [switch]$RecordVideo,
@@ -28,6 +29,48 @@ $root = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $stateRoot = Join-Path $root '.captain-cook'
 $recordingProcess = $null
 $recordingPath = $null
+$resolvedSharedArtifactDirectory = $null
+
+function Get-DotEnvValue([string]$Path, [string]$Name) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        if ($line -notmatch '^\s*(?:export\s+)?(?<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?<value>.*)\s*$') { continue }
+        if ($Matches.name -ne $Name) { continue }
+        $value = $Matches.value.Trim()
+        if ($value.Length -ge 2 -and (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'")))) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        return $value
+    }
+    return $null
+}
+
+function Resolve-SharedArtifactDirectory([string]$ExplicitPath, [string]$EnvPath) {
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitPath)) {
+        $configured = @($ExplicitPath)
+    } else {
+        $configured = @('CAPTAIN_RUNTIME_ARTIFACT_ROOT', 'MINIBOOK_CREATION_ARTIFACTS' | ForEach-Object {
+            [Environment]::GetEnvironmentVariable($_, 'Process')
+        } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($configured.Count -eq 0) {
+            $configured = @('CAPTAIN_RUNTIME_ARTIFACT_ROOT', 'MINIBOOK_CREATION_ARTIFACTS' | ForEach-Object {
+                Get-DotEnvValue $EnvPath $_
+            } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        }
+    }
+    if ($configured.Count -eq 0) {
+        throw 'Shared capability artifact root is missing (CAPTAIN_RUNTIME_ARTIFACT_ROOT / MINIBOOK_CREATION_ARTIFACTS).'
+    }
+    $resolved = @($configured | ForEach-Object {
+        $candidate = [string]$_
+        if (-not [IO.Path]::IsPathFullyQualified($candidate)) { $candidate = Join-Path $root $candidate }
+        [IO.Path]::GetFullPath($candidate)
+    } | Sort-Object -Unique)
+    if ($resolved.Count -ne 1) {
+        throw 'Captain Runtime and Minibook must use the same capability artifact root.'
+    }
+    return $resolved[0]
+}
 
 function Resolve-Leaf([string]$Path, [string]$Label) {
     $candidate = [IO.Path]::GetFullPath($Path)
@@ -177,7 +220,7 @@ function Invoke-CapabilityRun([object]$SelectedInput, [Guid]$CorrelationId) {
     $arguments = @{
         InputPath = [string]$SelectedInput.path
         CorrelationId = $CorrelationId
-        ArtifactDirectory = (Join-Path $runState 'artifacts')
+        ArtifactDirectory = $resolvedSharedArtifactDirectory
         CheckpointDirectory = (Join-Path $runState 'checkpoints')
         WallClockBudgetSeconds = $WallClockBudgetSeconds
     }
@@ -262,6 +305,7 @@ if (-not $ConfirmProviderCost) {
 if ($RecordVideo -and [string]::IsNullOrWhiteSpace($RecordingWindowTitle)) {
     throw 'Recording requires -RecordingWindowTitle so capture stays limited to one named window.'
 }
+$resolvedSharedArtifactDirectory = Resolve-SharedArtifactDirectory $SharedArtifactDirectory $CredentialSourceEnv
 
 $previousCost = [Environment]::GetEnvironmentVariable('CAPTAIN_FACTORY_MAX_COST_USD', 'Process')
 $costWasSet = $null -ne $previousCost
