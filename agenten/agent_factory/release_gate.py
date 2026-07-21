@@ -185,10 +185,14 @@ def evaluate_factory_workflow_release(
         and receipt.model in job.execution_policy.allowed_models
         for receipt in usage_receipts
     )
+    run_receipt_ref_set = set(run_receipt_refs)
     accepted_receipt_refs = {
         receipt.evidence_ref
         for receipt in usage_receipts
-        if receipt.attempt == evaluation.attempt
+        if (
+            receipt.attempt == evaluation.attempt
+            and receipt.evidence_ref in run_receipt_ref_set
+        )
     }
     if (
         not usage_receipts

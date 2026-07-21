@@ -486,14 +486,15 @@ def test_workflow_release_rejects_receipt_reference_reused_between_runs() -> Non
     )
 
 
-def test_workflow_release_rejects_extra_gateway_receipt_not_bound_to_a_run() -> None:
+def test_workflow_release_counts_paid_hermes_receipt_without_binding_it_to_a_run() -> None:
     runs = tuple(workflow_run(number) for number in range(1, 4))
     receipts = workflow_receipts(runs)
     extra = receipts[0].model_copy(
         update={
             "receipt_id": UUID("00000000-0000-0000-0000-000000000499"),
             "reservation_id": UUID("00000000-0000-0000-0000-000000000498"),
-            "cost_usd": Decimal("0.00"),
+            "provider": "hermes",
+            "cost_usd": Decimal("0.01"),
             "evidence_ref": ArtifactRef.model_validate(
                 workflow_artifact("extra-usage", "f" * 64)
             ),
@@ -504,14 +505,11 @@ def test_workflow_release_rejects_extra_gateway_receipt_not_bound_to_a_run() -> 
         workflow_job(mode="release"),
         runs,
         workflow_evaluation(runs),
-        budget_projection=workflow_budget(),
+        budget_projection=workflow_budget("0.76"),
         usage_receipts=(*receipts, extra),
     )
 
-    assert decision.status == "blocked"
-    assert decision.reasons == (
-        "workflow usage receipts must exactly and uniquely cover every run",
-    )
+    assert decision.status == "ready"
 
 
 def test_workflow_release_accepts_disjoint_exact_receipt_union() -> None:

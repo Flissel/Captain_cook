@@ -292,6 +292,28 @@ class WorkflowGatewayRepository(InMemoryFactoryRepository):
         )
 
 
+class RepositoryWorkflowArtifactSink:
+    """Idempotently persist Hermes artifacts in the file-backed repository."""
+
+    def __init__(self, repository: WorkflowGatewayRepository) -> None:
+        self._repository = repository
+
+    async def persist(self, artifact: object) -> bool:
+        existing = tuple(
+            item
+            for item in self._repository.workflow_artifacts(artifact.job_id)
+            if getattr(item, "invocation_id", None) == artifact.invocation_id
+        )
+        if existing:
+            if existing != (artifact,):
+                raise ValueError(
+                    "workflow invocation already exists with different content"
+                )
+            return False
+        self._repository.append_artifact(artifact)
+        return True
+
+
 
 class DeterministicClock:
     def __init__(self, value: datetime = NOW) -> None:
@@ -841,14 +863,44 @@ class DeterministicHermes(HermesCliFactory):
         super().__init__(**kwargs)
         self._harness = harness
 
-    async def _run_skill_prompt(self, prompt: str, *, max_seconds: float) -> bytes:
+    async def _run_skill_prompt(
+        self,
+        prompt: str,
+        *,
+        max_seconds: float,
+        usage_file: Path | None = None,
+    ) -> bytes:
         assert max_seconds > 0
         self._harness.process_calls += 1
         invocation = FactorySkillInvocationV1.model_validate(
             _invocation_from_prompt(prompt)
         )
         artifact = self._harness.artifact_for(invocation)
-        self._harness.repository.append_artifact(artifact)
+        if usage_file is not None:
+            usage_file.write_text(
+                json.dumps(
+                    {
+                        "estimated_cost_usd": "0.01",
+                        "cost_status": "estimated",
+                        "cost_source": "deterministic-test",
+                        "input_tokens": 2,
+                        "output_tokens": 1,
+                        "cache_read_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "reasoning_tokens": 0,
+                        "total_tokens": 3,
+                        "api_calls": 1,
+                        "model": "approved-model-id",
+                        "provider": "deterministic-hermes",
+                        "session_id": f"hermes-{invocation.invocation_id}",
+                        "completed": True,
+                        "failed": False,
+                        "service_tier": None,
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
         return artifact.model_dump_json(by_alias=True).encode("utf-8")
 
 
@@ -1331,6 +1383,10 @@ class SixSkillFactoryHarness:
             evidence_store=self.evidence_store,
             released_skill_catalog=self.catalog,
             replay_store=self.replay_store,
+            budget=self.budget,
+            workflow_artifact_sink=RepositoryWorkflowArtifactSink(
+                self.repository
+            ),
             clock=self.clock,
         )
         self.leases = DeterministicLeases(self.clock)
@@ -1564,7 +1620,7 @@ class SixSkillFactoryHarness:
         runs = self._attempt_runs[invocation.attempt]
         evaluation = workflow_evaluation(
             runs,
-            budget=self.budget.projection(self.job.job_id),
+            budget=self._budget_without_current_invocation(invocation),
         )
         if self.failure is not None:
             evaluation = evaluation.model_copy(update={"failure_class": self.failure})
@@ -1598,10 +1654,45 @@ class SixSkillFactoryHarness:
             candidate_ref=self._attempt_runs[invocation.attempt][0].candidate_ref,
             evaluation=evaluation,
             tool_gaps=gaps,
-            budget_projection=self.budget.projection(self.job.job_id),
+            budget_projection=self._budget_without_current_invocation(invocation),
         )
         self._feedback_by_attempt[invocation.attempt] = feedback
         return feedback
+
+    def _budget_without_current_invocation(
+        self,
+        invocation: FactorySkillInvocationV1,
+    ) -> FactoryBudgetProjection:
+        """Hide only the active reservation of the Hermes call producing evidence."""
+
+        projection = self.budget.projection(self.job.job_id)
+        active = set(projection.active_reservation_ids)
+        current_reserved = sum(
+            (
+                event.reservation.requested_usd
+                for event in self.budget.events
+                if hasattr(event, "reservation")
+                and event.reservation.reservation_id in active
+                and event.reservation.invocation_id == invocation.invocation_id
+            ),
+            start=Decimal("0"),
+        )
+        return projection.model_copy(
+            update={
+                "reserved_usd": projection.reserved_usd - current_reserved,
+                "remaining_usd": projection.remaining_usd + current_reserved,
+                "active_reservation_ids": tuple(
+                    reservation_id
+                    for reservation_id in projection.active_reservation_ids
+                    if not any(
+                        hasattr(event, "reservation")
+                        and event.reservation.reservation_id == reservation_id
+                        and event.reservation.invocation_id == invocation.invocation_id
+                        for event in self.budget.events
+                    )
+                ),
+            }
+        )
 
     def mark_pre_promotion(self) -> None:
         self._pre_promotion_status = self.coordinator.projection(
@@ -1861,6 +1952,10 @@ class SixSkillFactoryHarness:
             evidence_store=self.evidence_store,
             released_skill_catalog=self.catalog,
             replay_store=self.replay_store,
+            budget=self.budget,
+            workflow_artifact_sink=RepositoryWorkflowArtifactSink(
+                self.repository
+            ),
             clock=self.clock,
         )
         self.components = self._compose_ports()

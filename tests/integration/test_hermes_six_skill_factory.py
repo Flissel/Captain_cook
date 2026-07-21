@@ -34,8 +34,20 @@ async def test_first_pass_runs_five_skill_steps_and_promotes() -> None:
     assert sum(
         isinstance(item, TeamEvaluationV1) for item in result.workflow_artifacts
     ) == 1
-    assert len(result.usage_receipts) == 3
-    assert result.total_cost_usd == Decimal("0.75")
+    provider_receipts = tuple(
+        receipt
+        for receipt in result.usage_receipts
+        if receipt.provider == "deterministic-provider"
+    )
+    hermes_receipts = tuple(
+        receipt
+        for receipt in result.usage_receipts
+        if receipt.provider == "deterministic-hermes"
+    )
+    assert len(provider_receipts) == 3
+    assert len(hermes_receipts) == 4
+    assert len(result.usage_receipts) == 7
+    assert result.total_cost_usd == Decimal("0.79")
     assert result.used_composed_ports is True
     assert result.production_dispatch_count == 6
     assert result.production_dispatch_actions == (
@@ -71,7 +83,17 @@ async def test_behavioral_retry_uses_improve_then_rebuild_and_promotes() -> None
     assert result.attempts == 2
     assert result.gateway_projection.status is FactoryLifecycleStatus.READY_TO_USE
     assert "improvement_requested" in result.gateway_phases
-    assert tuple(receipt.attempt for receipt in result.usage_receipts) == (
+    provider_receipts = tuple(
+        receipt
+        for receipt in result.usage_receipts
+        if receipt.provider == "deterministic-provider"
+    )
+    hermes_receipts = tuple(
+        receipt
+        for receipt in result.usage_receipts
+        if receipt.provider == "deterministic-hermes"
+    )
+    assert tuple(receipt.attempt for receipt in provider_receipts) == (
         1,
         1,
         1,
@@ -79,6 +101,18 @@ async def test_behavioral_retry_uses_improve_then_rebuild_and_promotes() -> None
         2,
         2,
     )
+    assert tuple(receipt.attempt for receipt in hermes_receipts) == (
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+    )
+    assert result.total_cost_usd == Decimal("1.59")
 
 
 @pytest.mark.asyncio
@@ -125,13 +159,13 @@ async def test_credential_and_infrastructure_blocks_remain_distinct() -> None:
 
 @pytest.mark.asyncio
 async def test_budget_exhaustion_stops_before_second_paid_run() -> None:
-    harness = SixSkillFactoryHarness(budget_usd=Decimal("0.25"))
+    harness = SixSkillFactoryHarness(budget_usd=Decimal("0.27"))
 
     with pytest.raises(BudgetExhausted, match="budget"):
         await harness.run()
 
     assert harness.effect_counts["provider"] == 1
-    assert harness.paid_cost_usd == Decimal("0.25")
+    assert harness.paid_cost_usd == Decimal("0.27")
     assert harness.coordinator.projection(harness.job.job_id).attempt == 1
 
 
