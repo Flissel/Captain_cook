@@ -47,6 +47,14 @@ async def test_first_pass_runs_five_skill_steps_and_promotes() -> None:
         "dispatch_quality_warden",
     )
     assert result.budget_projection == result.gateway_budget_projection
+    assert result.team_execution_execute_calls == 3
+    assert result.team_execution_provider_calls == 3
+    assert tuple(item.run_number for item in result.team_execution_runs) == (1, 2, 3)
+    assert all(
+        item.holdout_ref in result.authorized_holdout_refs
+        for item in result.team_execution_runs
+    )
+    assert len({item.invocation_id for item in result.team_execution_runs}) == 3
 
 
 @pytest.mark.asyncio

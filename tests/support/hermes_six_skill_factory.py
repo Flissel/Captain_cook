@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+import zipfile
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -19,8 +20,10 @@ from types import SimpleNamespace
 from typing import Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from autogen_core import CancellationToken
+from autogen_core import FunctionCall
+from autogen_core.models import CreateResult, ModelFamily, ModelInfo, RequestUsage
 from autogen_core.tools import FunctionTool
+from autogen_ext.models.replay import ReplayChatCompletionClient
 
 from agenten.agent_factory.contracts import (
     AgentFactoryJobV3,
@@ -31,9 +34,8 @@ from agenten.agent_factory.contracts import (
 )
 from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
 from agenten.agent_factory.execution_budget import (
+    BudgetExhausted,
     FactoryBudgetProjection,
-    FactoryBudgetReservationV1,
-    FactoryUsageReceiptV1,
     InMemoryFactoryBudgetLedger,
 )
 from agenten.agent_factory.factory_feedback import FactoryFeedbackBuilder
@@ -52,6 +54,7 @@ from agenten.agent_factory.hermes_cli import (
     InMemoryFactorySkillReplayStore,
     _factory_invocation,
 )
+from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.live_composition import (
     FactoryLiveRuntimeComponents,
@@ -59,7 +62,7 @@ from agenten.agent_factory.live_composition import (
     compose_live_factory_runtime,
 )
 from agenten.agent_factory.live_n8n import ScopedCaptainN8nMcpAdapter
-from agenten.agent_factory.n8n_tools import TypedN8nTool
+from agenten.agent_factory.live_pricing import _execution_policy_digest
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatcher
 from agenten.agent_factory.service import (
     FactoryCoordinator,
@@ -83,8 +86,13 @@ from agenten.agent_factory.state_machine import (
     FactoryProjection,
 )
 from agenten.agent_factory.team_execution import (
+    FactoryHoldoutAssertionDecisionV1,
+    FactoryHoldoutEvaluationReceiptV1,
     FactoryN8nExecutionEvidenceV1,
     FactoryN8nToolAuthorizationV1,
+    FactoryPricingQuoteV1,
+    ResolvedFactoryHoldoutCase,
+    _run_scoped_invocation,
 )
 from agenten.agent_runtime.capabilities import PROFILE_CAPABILITIES, validate_grant
 from agenten.agent_runtime.contracts import (
@@ -109,9 +117,8 @@ from tests.agent_factory.test_hermes_cli import (
 from tests.agent_factory.test_release_gate import (
     workflow_evaluation,
     workflow_job,
-    workflow_run,
 )
-from tests.agent_factory.test_team_execution import _candidate
+from tests.agent_factory.test_team_execution import _sealed_team_candidate
 from tests.agent_factory.test_skill_workflow_contracts import (
     brief_payload,
     feedback_payload,
@@ -153,7 +160,6 @@ class WorkflowGatewayRepository(InMemoryFactoryRepository):
         self.register(job)
         self.artifacts: list[object] = []
         self.budget = budget or InMemoryFactoryBudgetLedger()
-        self.receipts: list[object] = []
 
     def workflow_artifacts(self, job_id: UUID) -> tuple[object, ...]:
         self.job(job_id)
@@ -165,7 +171,11 @@ class WorkflowGatewayRepository(InMemoryFactoryRepository):
 
     def workflow_usage_receipts(self, job_id: UUID) -> tuple[object, ...]:
         self.job(job_id)
-        return tuple(self.receipts)
+        return tuple(
+            event.receipt
+            for event in self.budget.events
+            if hasattr(event, "receipt") and event.receipt.job_id == job_id
+        )
 
 
 
@@ -293,12 +303,45 @@ class DeterministicCodexBoundary:
 class DeterministicCandidateProvider:
     """External Forge archive lookup boundary."""
 
-    def __init__(self, root: Path) -> None:
-        self._candidate = _candidate(root)
+    def __init__(self, candidate) -> None:
+        self._candidate = candidate
 
     def candidate_for(self, job):
         del job
         return self._candidate
+
+
+def _without_candidate_tools(candidate):
+    with zipfile.ZipFile(candidate.source_archive, "r") as archive:
+        entries = {name: archive.read(name) for name in archive.namelist()}
+    manifest = json.loads(entries["team_manifest.json"])
+    for agent in manifest["agents"]:
+        agent["tools"] = []
+    manifest_body = json.dumps(manifest, sort_keys=True).encode()
+    entries["team_manifest.json"] = manifest_body
+    with zipfile.ZipFile(candidate.source_archive, "w") as archive:
+        for name, body in entries.items():
+            archive.writestr(name, body)
+    updated_manifest = candidate.candidate.team_manifest.model_copy(
+        update={
+            "reference": candidate.candidate.team_manifest.reference.model_copy(
+                update={"sha256": hashlib.sha256(manifest_body).hexdigest()}
+            )
+        }
+    )
+    updated_candidate = candidate.candidate.model_copy(
+        update={
+            "source_archive_ref": candidate.candidate.source_archive_ref.model_copy(
+                update={
+                    "sha256": hashlib.sha256(
+                        candidate.source_archive.read_bytes()
+                    ).hexdigest()
+                }
+            ),
+            "team_manifest": updated_manifest,
+        }
+    )
+    return candidate.model_copy(update={"candidate": updated_candidate})
 
 
 class DeterministicN8nAuthority:
@@ -323,12 +366,9 @@ class DeterministicN8nBoundary:
     def __init__(self, harness: "SixSkillFactoryHarness", workspace_ref: str) -> None:
         self._harness = harness
         self._workspace_ref = workspace_ref
-        self._tool_ref = TypedN8nTool(
-            name="support_triage",
-            description="Captain-approved deterministic support triage",
-            input_schema_ref="artifact://factory-support-input",
-            output_schema_ref="artifact://factory-support-output",
-        ).opaque_reference()
+        self._tool_ref = (
+            harness.sealed_candidate.candidate.n8n_tools[0].opaque_reference()
+        )
         self._active_claim: FactoryN8nToolAuthorizationV1 | None = None
         self._evidence: list[FactoryN8nExecutionEvidenceV1] = []
 
@@ -339,6 +379,7 @@ class DeterministicN8nBoundary:
             claim = self._active_claim
             if claim is None:
                 raise AssertionError("n8n call started without a Captain claim")
+            self._harness.effect_order.append("n8n:start")
             sequence = len(self._evidence) + 1
             workflow_ref = ArtifactRef(
                 uri=f"artifact://deterministic/n8n/workflow/{sequence}",
@@ -387,6 +428,8 @@ class DeterministicN8nBoundary:
                 ),
             )
             self._evidence.append(observed)
+            self._harness.effect_order.append("n8n:evidence")
+            self._harness.effect_counts["n8n"] += 1
             return f"routed:{ticket}"
 
         return FunctionTool(
@@ -397,6 +440,7 @@ class DeterministicN8nBoundary:
 
     def authorization(self, name: str) -> FactoryN8nToolAuthorizationV1:
         assert name == "support_triage"
+        self._harness.effect_order.append("n8n:claim")
         sequence = len(self._evidence) + 1
         command_id = uuid5(
             NAMESPACE_URL,
@@ -456,25 +500,158 @@ class DeterministicN8nBoundary:
         return self._active_claim
 
     def observed_evidence(self) -> tuple[FactoryN8nExecutionEvidenceV1, ...]:
+        return tuple(self._evidence[-1:])
+
+    @property
+    def all_evidence(self) -> tuple[FactoryN8nExecutionEvidenceV1, ...]:
         return tuple(self._evidence)
 
 
 class DeterministicPricingBoundary:
+    def __init__(self, job: AgentFactoryJobV3) -> None:
+        self._quote = FactoryPricingQuoteV1(
+            quote_id="deterministic-price-v1",
+            job_id=job.job_id,
+            subject_version=job.subject_version,
+            execution_policy_sha256=_execution_policy_digest(job),
+            provider="deterministic-provider",
+            model="approved-model-id",
+            version="2026-07-21",
+            effective_at=NOW,
+            max_cost_per_call="0.25",
+            input_cost_per_million="0",
+            output_cost_per_million="0",
+            minimum_cost_usd="0.25",
+            evidence_ref=ArtifactRef(
+                uri="artifact://deterministic/pricing/v1",
+                sha256=hashlib.sha256(b"deterministic-price-v1").hexdigest(),
+                media_type="application/json",
+            ),
+        )
+
     def resolve_quote(self, **kwargs):
-        del kwargs
-        raise AssertionError("team provider pricing is not used by claimed runner effects")
+        assert kwargs["job"].job_id == self._quote.job_id
+        return self._quote
 
 
 class DeterministicHoldoutSource:
+    def __init__(self, bodies: dict[PrivateHoldoutRef, bytes]) -> None:
+        self._bodies = bodies
+
     async def read(self, reference):
-        del reference
-        raise AssertionError("holdout bytes are not read outside team provider execution")
+        return self._bodies[reference]
 
 
 class DeterministicHoldoutEvaluator:
+    def __init__(self, harness: "SixSkillFactoryHarness") -> None:
+        self._harness = harness
+
     async def evaluate(self, reference, result, assertion_ids):
-        del reference, result, assertion_ids
-        raise AssertionError("holdout evaluation is not used outside provider execution")
+        assert result is not None
+        attempt = self._harness._team_attempt_by_holdout[reference]
+        passed = not self._harness.team_run_should_fail(attempt)
+        return FactoryHoldoutEvaluationReceiptV1(
+            schema_name="captain.factory-holdout-evaluation-receipt.v1",
+            holdout_ref=reference,
+            candidate_ref=self._harness.sealed_candidate.candidate.source_archive_ref,
+            assertion_ids=assertion_ids,
+            decisions=tuple(
+                FactoryHoldoutAssertionDecisionV1(
+                    assertion_id=assertion_id,
+                    passed=passed,
+                    provenance_code="deterministic_rule",
+                )
+                for assertion_id in assertion_ids
+            ),
+            evaluator_id="captain_test_evaluator",
+            evaluator_version="1",
+            evaluated_at=NOW,
+        )
+
+
+class CountingReplayModelClient(ReplayChatCompletionClient):
+    def __init__(self, harness: "SixSkillFactoryHarness", responses) -> None:
+        super().__init__(
+            responses,
+            model_info=ModelInfo(
+                vision=False,
+                function_calling=True,
+                json_output=True,
+                family=ModelFamily.UNKNOWN,
+                structured_output=True,
+            ),
+        )
+        self._harness = harness
+
+    async def create(self, *args, **kwargs):
+        self._harness.team_execution_provider_calls += 1
+        return await super().create(*args, **kwargs)
+
+
+class ProductionTeamExecutionRouter:
+    """Route run scopes to real composed TeamExecutionCandidateAdapters."""
+
+    def __init__(self, adapter: object, required_runs: int) -> None:
+        self._adapter = adapter
+        self._required_runs = required_runs
+        self._claimed: dict[UUID, TeamExecutionEvidenceV1] = {}
+        self._run_by_invocation: dict[UUID, int] = {}
+        self.execute_calls = 0
+
+    def invocation_for_run(
+        self,
+        request: FactoryDispatch,
+        run_number: int,
+    ) -> FactorySkillInvocationV1:
+        base = self._adapter.invocation_for(request)
+        holdout = request.job.private_holdout_refs[0]
+        invocation = _run_scoped_invocation(
+            base,
+            holdout,
+            run_number,
+            required_live_runs=self._required_runs,
+        )
+        self._run_by_invocation[invocation.invocation_id] = run_number
+        return invocation
+
+    async def execute_claimed(
+        self,
+        request: FactoryDispatch,
+        candidate,
+        invocation: FactorySkillInvocationV1,
+    ) -> TeamExecutionEvidenceV1:
+        run_number = self._run_by_invocation[invocation.invocation_id]
+        try:
+            evidence = await self._adapter.execute_run(
+                request,
+                candidate,
+                run_number=run_number,
+            )
+        except RuntimeError as exc:
+            if "BudgetExhausted: factory USD budget is exhausted" not in str(exc):
+                raise
+            raise BudgetExhausted("factory USD budget is exhausted") from exc
+        if evidence.invocation != invocation:
+            raise AssertionError("claimed team invocation changed before execution")
+        self._claimed[invocation.invocation_id] = evidence
+        return evidence
+
+    async def execute(
+        self,
+        request: FactoryDispatch,
+        candidate,
+    ) -> TeamExecutionEvidenceV1:
+        run_number = self.execute_calls % self._required_runs + 1
+        evidence = await self._adapter.execute_run(
+            request,
+            candidate,
+            run_number=run_number,
+        )
+        claimed = self._claimed[evidence.invocation_id]
+        if evidence != claimed:
+            raise AssertionError("team execution replay changed durable evidence")
+        self.execute_calls += 1
+        return evidence
 
 
 class DeterministicForgeBoundary:
@@ -509,14 +686,19 @@ class DeterministicCandidateBoundary:
             candidate = self._harness.components.candidate_provider.candidate_for(
                 request.job
             )
-            invocation = self._harness.components.team_execution.invocation_for(
-                request
-            )
             assert candidate.source_archive.is_file()
-            assert invocation.step is FactorySkillStep.EXECUTE_TEAM
-            executions = self._harness.materialize_execution_batch(
-                request.action.attempt
+            executions = tuple(
+                [
+                    await self._harness.components.team_execution.execute(
+                        request,
+                        candidate,
+                    )
+                    for _ in range(
+                        request.job.execution_policy.required_live_runs
+                    )
+                ]
             )
+            self._harness._attempt_runs[request.action.attempt] = executions
             self._harness.repository.artifacts.extend(executions)
             return self._harness.external_block(
                 FactoryPhase.REAL_CASE_EVIDENCE,
@@ -721,30 +903,32 @@ class LiveEffectPlan:
                 else None
             ),
         )
-        released = self._harness.catalog.released_for(job, step)
-        invocation = _factory_invocation(
-            dispatch,
-            step=step,
-            released_skill=released,
-            input_ref=job.input_ref,
-        )
-        identity = hashlib.sha256(
-            f"{job.job_id}:{action.attempt}:{step.value}:{sequence}".encode()
-        ).hexdigest()
-        invocation = invocation.model_copy(
-            update={
-                "invocation_id": uuid5(
-                    NAMESPACE_URL,
-                    f"deterministic-live-invocation:{identity}",
-                ),
-                "idempotency_key": identity,
-                "execution_scope_ref": (
-                    job.private_holdout_refs[0]
-                    if step is FactorySkillStep.EXECUTE_TEAM
-                    else None
-                ),
-            }
-        )
+        if step is FactorySkillStep.EXECUTE_TEAM:
+            invocation = self._harness.components.team_execution.invocation_for_run(
+                dispatch,
+                sequence,
+            )
+            identity = invocation.idempotency_key
+        else:
+            released = self._harness.catalog.released_for(job, step)
+            invocation = _factory_invocation(
+                dispatch,
+                step=step,
+                released_skill=released,
+                input_ref=job.input_ref,
+            )
+            identity = hashlib.sha256(
+                f"{job.job_id}:{action.attempt}:{step.value}:{sequence}".encode()
+            ).hexdigest()
+            invocation = invocation.model_copy(
+                update={
+                    "invocation_id": uuid5(
+                        NAMESPACE_URL,
+                        f"deterministic-live-invocation:{identity}",
+                    ),
+                    "idempotency_key": identity,
+                }
+            )
         kind = (
             FactoryLiveEffectKind.PROVIDER
             if step is FactorySkillStep.EXECUTE_TEAM
@@ -784,15 +968,14 @@ class RecoveringLiveExecutor:
     ) -> FactoryLiveEffectOutcomeV1:
         self.execute_calls += 1
         self._harness.mark_pre_promotion()
-        if request.kind is FactoryLiveEffectKind.PROVIDER:
-            self._harness.reserve_provider(request, owner=self.instance_id)
         self._harness.effect_order.append(f"start:{request.kind.value}")
-        self._harness.effect_counts[request.kind.value] += 1
-        self._harness.stage_request(request)
         if request.kind is FactoryLiveEffectKind.CODEX:
             await self._harness.invoke_codex(request)
-        if request.kind is FactoryLiveEffectKind.PROVIDER and self._harness.with_n8n:
-            await self._harness.invoke_n8n(request)
+            self._harness.effect_counts[request.kind.value] += 1
+        else:
+            self._harness._reservation_owners[request.effect_id] = self.instance_id
+            await self._harness.execute_claimed_team(request)
+            self._harness.effect_counts[request.kind.value] += 1
         if (
             request.kind is FactoryLiveEffectKind.PROVIDER
             and self._harness.job.execution_policy.mode.value == "release"
@@ -801,9 +984,8 @@ class RecoveringLiveExecutor:
             self._harness._controlled_recovery_injected = True
             raise FactoryInfrastructureFailure("controlled deterministic recovery")
         outcome = effect_outcome(request)
-        if request.kind is FactoryLiveEffectKind.PROVIDER:
-            self._harness.record_provider_usage(request, outcome)
-        self._harness.stage_outcome(request.kind, outcome)
+        if request.kind is FactoryLiveEffectKind.CODEX:
+            self._harness.stage_codex_outcome(outcome)
         return outcome
 
     async def recover(
@@ -813,14 +995,14 @@ class RecoveringLiveExecutor:
         self.recover_calls += 1
         self._harness._infrastructure_recoveries += 1
         self._harness.effect_order.append(f"recover:{request.kind.value}")
-        self._harness.stage_request(request)
         outcome = effect_outcome(request)
         if request.kind is FactoryLiveEffectKind.PROVIDER:
             owner = self._harness._reservation_owners[request.effect_id]
             if owner != self.instance_id:
                 self._harness._reservation_recovered_after_restart = True
-            self._harness.record_provider_usage(request, outcome)
-        self._harness.stage_outcome(request.kind, outcome)
+            await self._harness.execute_claimed_team(request)
+        if request.kind is FactoryLiveEffectKind.CODEX:
+            self._harness.stage_codex_outcome(outcome)
         return outcome
 
 
@@ -898,6 +1080,10 @@ class SixSkillHarnessResult:
     worker_promotion_error: str
     worker_projection_before: FactoryProjection
     worker_projection_after: FactoryProjection
+    team_execution_execute_calls: int
+    team_execution_provider_calls: int
+    team_execution_runs: tuple[TeamExecutionEvidenceV1, ...]
+    authorized_holdout_refs: tuple[PrivateHoldoutRef, ...]
 
     @property
     def worker_ready_claim_changed_projection(self) -> bool:
@@ -921,10 +1107,25 @@ class SixSkillFactoryHarness:
         with_n8n: bool = False,
     ) -> None:
         base_job = workflow_job(mode=mode)
+        holdout_bodies = (b"Resolve the deterministic private release case.",)
+        holdouts = (
+            PrivateHoldoutRef(
+                schema_name="captain.private-holdout-ref.v1",
+                holdout_id="holdout-111111111111",
+                uri="holdout://holdout-111111111111",
+                sha256=hashlib.sha256(holdout_bodies[0]).hexdigest(),
+            ),
+        )
         policy = base_job.execution_policy.model_copy(
             update={"max_cost_usd": budget_usd}
         )
-        self.job = base_job.model_copy(update={"execution_policy": policy})
+        self.job = base_job.model_copy(
+            update={
+                "execution_policy": policy,
+                "private_holdout_refs": holdouts,
+            }
+        )
+        self._holdout_bodies = dict(zip(holdouts, holdout_bodies, strict=True))
         self.first_run = first_run
         self.tool_gap = tool_gap
         self.failure = failure
@@ -942,9 +1143,6 @@ class SixSkillFactoryHarness:
         self.effect_order: list[str] = []
         self._controlled_recovery_injected = False
         self._codex_outcomes: list[FactoryLiveEffectOutcomeV1] = []
-        self._provider_outcomes: list[FactoryLiveEffectOutcomeV1] = []
-        self._provider_requests: list[FactoryLiveEffectRequestV1] = []
-        self._reservations: dict[UUID, FactoryBudgetReservationV1] = {}
         self._reservation_owners: dict[UUID, str] = {}
         self._reservation_recovered_after_restart = False
         self._infrastructure_recoveries = 0
@@ -954,6 +1152,11 @@ class SixSkillFactoryHarness:
         self._worker_promotion_attempted = False
         self._tmp = TemporaryDirectory(prefix="captain-six-skill-")
         self.root = Path(self._tmp.name)
+        self.sealed_candidate = _sealed_team_candidate(self.root)
+        if not with_n8n:
+            self.sealed_candidate = _without_candidate_tools(self.sealed_candidate)
+        self.team_execution_provider_calls = 0
+        self._team_attempt_by_holdout: dict[PrivateHoldoutRef, int] = {}
         self.catalog = _catalog_for(self.root, *tuple(FactorySkillStep))
         self.replay_store = InMemoryFactorySkillReplayStore()
         self.evidence_store = FilesystemFactoryEvidenceStore(self.root / "evidence")
@@ -1027,7 +1230,7 @@ class SixSkillFactoryHarness:
             self._replayed_evidence += sum(item.replayed for item in replay.effects)
         projection = self.coordinator.projection(self.job.job_id)
         feedback = self._latest_feedback()
-        receipts = tuple(self.repository.receipts)
+        receipts = self.repository.workflow_usage_receipts(self.job.job_id)
         wrapped = SixSkillHarnessResult(
             coordinator_result=result,
             skill_steps=tuple(step.value for step in result.skill_steps),
@@ -1069,7 +1272,7 @@ class SixSkillFactoryHarness:
             n8n_execution_ids=tuple(
                 item.execution.execution_id
                 for item in (
-                    self.n8n_delegate.observed_evidence()
+                    self.n8n_delegate.all_evidence
                     if self.n8n_delegate is not None
                     else ()
                 )
@@ -1077,6 +1280,16 @@ class SixSkillFactoryHarness:
             worker_promotion_error=self._worker_promotion_error,
             worker_projection_before=self._worker_projection_before,
             worker_projection_after=self._worker_projection_after,
+            team_execution_execute_calls=(
+                self.components.team_execution.execute_calls
+            ),
+            team_execution_provider_calls=self.team_execution_provider_calls,
+            team_execution_runs=tuple(
+                artifact
+                for artifact in self.repository.artifacts
+                if isinstance(artifact, TeamExecutionEvidenceV1)
+            ),
+            authorized_holdout_refs=self.job.private_holdout_refs,
         )
         self._last_result = wrapped
         return wrapped
@@ -1155,70 +1368,6 @@ class SixSkillFactoryHarness:
         raise AssertionError(
             "execute_team must consume claimed provider results through the dispatcher"
         )
-
-    def materialize_execution_batch(
-        self,
-        attempt: int,
-    ) -> tuple[TeamExecutionEvidenceV1, ...]:
-        failed = (
-            self.first_run == "behavioral_failure" and attempt == 1
-        ) or (
-            attempt == 2
-            and self.budget.projection(self.job.job_id).remaining_usd <= 0
-        ) or self.failure is not None
-        run_count = (
-            1
-            if self.job.execution_policy.mode.value == "demo"
-            else self.job.execution_policy.required_live_runs
-        )
-        runs = tuple(workflow_run(number, attempt=attempt) for number in range(1, run_count + 1))
-        staged = tuple(
-            outcome
-            for outcome in self._provider_outcomes
-            if outcome.attempt == attempt
-        )
-        requests = tuple(
-            request
-            for request in self._provider_requests
-            if request.attempt == attempt
-        )
-        receipts = tuple(
-            receipt
-            for receipt in self.repository.receipts
-            if receipt.attempt == attempt
-        )
-        if (
-            len(staged) != run_count
-            or len(requests) != run_count
-            or len(receipts) != run_count
-        ):
-            raise AssertionError(
-                "execute_team evidence was materialized before exact claimed provider effects"
-            )
-        runs = tuple(
-            TeamExecutionEvidenceV1.model_validate(
-                self._bound_payload(
-                    run.model_copy(
-                        update={
-                            "evidence_refs": tuple(
-                                dict.fromkeys(
-                                    (*run.evidence_refs, outcome.evidence_ref)
-                                )
-                            ),
-                            "usage_receipt_refs": (receipt.evidence_ref,),
-                        }
-                    ).model_dump(mode="json", by_alias=True),
-                    request.invocation,
-                )
-            )
-            for run, outcome, request, receipt in zip(
-                runs, staged, requests, receipts, strict=True
-            )
-        )
-        if failed:
-            runs = tuple(self._failed_run(run) for run in runs)
-        self._attempt_runs[attempt] = runs
-        return runs
 
     def _evaluation_for(
         self,
@@ -1313,48 +1462,69 @@ class SixSkillFactoryHarness:
             self.job.job_id
         )
 
-    def stage_outcome(
-        self,
-        kind: FactoryLiveEffectKind,
-        outcome: FactoryLiveEffectOutcomeV1,
-    ) -> None:
-        target = (
-            self._provider_outcomes
-            if kind is FactoryLiveEffectKind.PROVIDER
-            else self._codex_outcomes
-        )
-        if outcome not in target:
-            target.append(outcome)
-
-    def stage_request(self, request: FactoryLiveEffectRequestV1) -> None:
-        if (
-            request.kind is FactoryLiveEffectKind.PROVIDER
-            and request not in self._provider_requests
-        ):
-            self._provider_requests.append(request)
+    def stage_codex_outcome(self, outcome: FactoryLiveEffectOutcomeV1) -> None:
+        if outcome not in self._codex_outcomes:
+            self._codex_outcomes.append(outcome)
 
     @property
     def paid_cost_usd(self) -> Decimal:
         return self.budget.projection(self.job.job_id).consumed_usd
 
-    def reserve_provider(
+    async def execute_claimed_team(
         self,
         request: FactoryLiveEffectRequestV1,
-        *,
-        owner: str,
-    ) -> FactoryBudgetReservationV1:
-        existing = self._reservations.get(request.effect_id)
-        if existing is not None:
-            return existing
-        reservation = self.budget.reserve(
-            self.job,
-            attempt=request.attempt,
-            requested_usd=Decimal("0.25"),
-            now=self.clock(),
+    ) -> TeamExecutionEvidenceV1:
+        dispatch = FactoryDispatch(
+            job=self.job,
+            action=SimpleNamespace(
+                kind=FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
+                attempt=request.attempt,
+            ),
+            role=FactoryRole.REAL_CASE_TESTER,
+            lease=request.invocation.lease,
         )
-        self._reservations[request.effect_id] = reservation
-        self._reservation_owners[request.effect_id] = owner
-        return reservation
+        candidate = self.components.candidate_provider.candidate_for(self.job)
+        return await self.components.team_execution.execute_claimed(
+            dispatch,
+            candidate,
+            request.invocation,
+        )
+
+    def model_client_for(
+        self,
+        job: AgentFactoryJobV3,
+        invocation: FactorySkillInvocationV1,
+    ) -> CountingReplayModelClient:
+        assert job == self.job
+        scope = invocation.execution_scope_ref
+        if not isinstance(scope, PrivateHoldoutRef):
+            raise AssertionError("team model invocation lacks a private holdout scope")
+        self._team_attempt_by_holdout[scope] = invocation.attempt
+        responses: list[str | CreateResult] = []
+        if self.with_n8n:
+            responses.append(
+                CreateResult(
+                    finish_reason="function_calls",
+                    content=[
+                        FunctionCall(
+                            id=f"n8n-{invocation.invocation_id}",
+                            name="support_triage",
+                            arguments=json.dumps(
+                                {"ticket": f"case-{scope.holdout_id}"}
+                            ),
+                        )
+                    ],
+                    usage=RequestUsage(prompt_tokens=1, completion_tokens=1),
+                    cached=False,
+                )
+            )
+        responses.append("TERMINATE")
+        return CountingReplayModelClient(self, responses)
+
+    def team_run_should_fail(self, attempt: int) -> bool:
+        return (
+            self.first_run == "behavioral_failure" and attempt == 1
+        ) or self.failure is not None
 
     async def invoke_codex(self, request: FactoryLiveEffectRequestV1) -> None:
         command_id = uuid5(NAMESPACE_URL, f"codex-command:{request.effect_id}")
@@ -1400,53 +1570,6 @@ class SixSkillFactoryHarness:
         )
         result = await self.components.codex.execute(command, grant)
         assert result.status is RuntimeStatus.SUCCEEDED
-
-    async def invoke_n8n(self, request: FactoryLiveEffectRequestV1) -> None:
-        if self.n8n_adapter is None:
-            raise AssertionError("n8n effect lacks its composed scoped adapter")
-        self.effect_order.append("n8n:claim")
-        claim = self.n8n_adapter.authorization("support_triage")
-        assert claim.runtime_command.correlation_id == request.correlation_id
-        await self.n8n_authority.authorize_command(claim, now=self.clock())
-        tool = self.n8n_adapter.tool("support_triage")
-        self.effect_order.append("n8n:start")
-        await tool.run_json(
-            {"ticket": f"case-{request.idempotency_key[:12]}"},
-            CancellationToken(),
-        )
-        evidence = self.n8n_adapter.observed_evidence()
-        assert evidence[-1].runtime_command.event_id == claim.runtime_command.event_id
-        self.effect_order.append("n8n:evidence")
-        self.effect_counts["n8n"] += 1
-
-    def record_provider_usage(
-        self,
-        request: FactoryLiveEffectRequestV1,
-        outcome: FactoryLiveEffectOutcomeV1,
-    ) -> None:
-        reservation = self._reservations[request.effect_id]
-        receipt = FactoryUsageReceiptV1(
-            schema_name="captain.factory-usage-receipt.v1",
-            receipt_id=uuid5(
-                NAMESPACE_URL,
-                f"deterministic-provider-receipt:{request.effect_id}",
-            ),
-            reservation_id=reservation.reservation_id,
-            job_id=request.job_id,
-            correlation_id=request.correlation_id,
-            attempt=request.attempt,
-            provider="deterministic-provider",
-            model="approved-model-id",
-            input_units=100,
-            output_units=20,
-            cost_usd=Decimal("0.25"),
-            started_at=self.clock(),
-            ended_at=self.clock() + timedelta(seconds=1),
-            evidence_ref=outcome.evidence_ref,
-        )
-        self.budget.record_usage(self.job, reservation, receipt)
-        if receipt not in self.repository.receipts:
-            self.repository.receipts.append(receipt)
 
     def external_block(
         self,
@@ -1510,19 +1633,6 @@ class SixSkillFactoryHarness:
         )
         return bound
 
-    @staticmethod
-    def _failed_run(run: TeamExecutionEvidenceV1) -> TeamExecutionEvidenceV1:
-        outcomes = tuple(
-            outcome.model_copy(update={"status": "failed"})
-            for outcome in run.execution_outcome.assertion_outcomes
-        )
-        execution_outcome = run.execution_outcome.model_copy(
-            update={"status": "failed", "assertion_outcomes": outcomes}
-        )
-        return run.model_copy(
-            update={"status": "failed", "execution_outcome": execution_outcome}
-        )
-
     def _latest_feedback(self) -> FactoryFeedbackV1:
         if self._feedback_by_attempt:
             return self._feedback_by_attempt[max(self._feedback_by_attempt)]
@@ -1553,36 +1663,48 @@ class SixSkillFactoryHarness:
                 lease=n8n_lease,
                 delegate=self.n8n_delegate,
             )
-        components = compose_live_factory_runtime(
-            job=self.job,
-            evidence_store=self.evidence_store,
-            ports=FactoryLiveRuntimePorts(
-                hermes=self.hermes,
-                codex=DeterministicCodexBoundary(),
-                context7=None,
-                candidate_provider=DeterministicCandidateProvider(self.root),
-                minibook=None,
-                model_client_for=lambda *_: object(),  # type: ignore[return-value]
-                budget=self.budget,
-                pricing_source=DeterministicPricingBoundary(),
-                replay_store=self.replay_store,
-                holdout_source=DeterministicHoldoutSource(),
-                holdout_evaluator=DeterministicHoldoutEvaluator(),
-                integration_intent=integration_intent,
-                n8n_delegate=self.n8n_delegate,
-                n8n_lease=n8n_lease,
-                n8n_authority=self.n8n_authority,
-                released_skill_catalog=self.catalog,
-                skill_root=self.root,
-                tools={},
-                provider="deterministic-provider",
-                model="approved-model-id",
-                max_cost_per_call=Decimal("0.25"),
-                clock=self.clock,
+        ports = FactoryLiveRuntimePorts(
+            hermes=self.hermes,
+            codex=DeterministicCodexBoundary(),
+            context7=None,
+            candidate_provider=DeterministicCandidateProvider(
+                self.sealed_candidate
             ),
-            holdout_id=self.job.private_holdout_refs[0].holdout_id,
+            minibook=None,
+            model_client_for=self.model_client_for,
+            budget=self.budget,
+            pricing_source=DeterministicPricingBoundary(self.job),
+            replay_store=self.replay_store,
+            holdout_source=DeterministicHoldoutSource(self._holdout_bodies),
+            holdout_evaluator=DeterministicHoldoutEvaluator(self),
+            integration_intent=integration_intent,
+            n8n_delegate=self.n8n_delegate,
+            n8n_lease=n8n_lease,
+            n8n_authority=self.n8n_authority,
+            released_skill_catalog=self.catalog,
+            skill_root=self.root,
+            tools={},
+            provider="deterministic-provider",
+            model="approved-model-id",
+            max_cost_per_call=Decimal("0.25"),
+            clock=self.clock,
         )
-        return components
+        components = tuple(
+            compose_live_factory_runtime(
+                job=self.job,
+                evidence_store=self.evidence_store,
+                ports=ports,
+                holdout_id=holdout.holdout_id,
+            )
+            for holdout in self.job.private_holdout_refs
+        )
+        return replace(
+            components[0],
+            team_execution=ProductionTeamExecutionRouter(
+                components[0].team_execution,
+                self.job.execution_policy.required_live_runs,
+            ),
+        )
 
 
 __all__ = [
