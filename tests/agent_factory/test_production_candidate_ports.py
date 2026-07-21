@@ -7,6 +7,7 @@ import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
@@ -24,6 +25,7 @@ from agenten.agent_factory.production_candidate_ports import (
     FactoryCandidateExecutionDescriptorV1,
     ProductionCandidatePortError,
     build_production_candidate_ports,
+    candidate_ref_for_job,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
 from minibook.swarm.package_assembler import PackageAssembler
@@ -77,6 +79,7 @@ def _case(
     *,
     unsafe_name: str | None = None,
     include_descriptor: bool = True,
+    marker: str = "ready",
 ) -> tuple[
     ContentAddressedArtifactStore,
     ForgeCapabilityPackageCandidateV1,
@@ -85,7 +88,10 @@ def _case(
     store = ContentAddressedArtifactStore(tmp_path / "cas")
     raw: dict[str, tuple[str, bytes]] = {
         "team-manifest.json": ("team_manifest", b'{"schema":"package-team.v1"}'),
-        "autogen/team.py": ("autogen_source", b"TEAM = 'ready'\n"),
+        "autogen/team.py": (
+            "autogen_source",
+            f"TEAM = {marker!r}\n".encode("utf-8"),
+        ),
         "skills/demo/SKILL.md": ("skill", b"# Demo skill\n"),
         "tests/test_team.py": ("test", b"def test_team(): assert True\n"),
         "evidence/summary.json": ("evidence", b'{"status":"candidate"}'),
@@ -209,6 +215,31 @@ def _case(
     return store, candidate, manifest
 
 
+def _other_v3_job():
+    from agenten.agent_factory.contracts import AgentFactoryJobV3
+
+    job = _v3_job()
+    input_digest = hashlib.sha256(b"second canonical input").hexdigest()
+    payload = job.model_dump(mode="python", by_alias=True)
+    payload.update(
+        {
+            "event_id": uuid5(NAMESPACE_URL, "captain-demo-event-two"),
+            "correlation_id": uuid5(NAMESPACE_URL, "captain-demo-correlation-two"),
+            "causation_id": uuid5(NAMESPACE_URL, "captain-demo-causation-two"),
+            "job_id": uuid5(NAMESPACE_URL, "captain-demo-job-two"),
+            "input_ref": ArtifactRef(
+                uri=(
+                    "artifact://capability-factory/canonical-input/"
+                    f"{input_digest}"
+                ),
+                sha256=input_digest,
+                media_type="text/markdown",
+            ),
+        }
+    )
+    return AgentFactoryJobV3.model_validate(payload)
+
+
 def _media_type(path: str) -> str:
     if path.endswith(".json"):
         return "application/json"
@@ -286,6 +317,53 @@ async def test_ports_resolve_shared_cas_candidate_and_cache_real_sandbox_attesta
     assert evidence["sandbox_image"] == IMAGE
     assert evidence["network_was_disabled"] is True
     assert evidence["workspace_was_read_only"] is True
+
+
+def test_provider_write_once_binds_two_jobs_to_their_distinct_inputs(
+    tmp_path: Path,
+) -> None:
+    store, first_candidate, _ = _case(tmp_path, marker="first-input")
+    _, second_candidate, _ = _case(tmp_path, marker="second-input")
+    first_job = _v3_job()
+    second_job = _other_v3_job()
+    second_candidate = second_candidate.model_copy(
+        update={"correlation_id": second_job.correlation_id}
+    )
+    ports = build_production_candidate_ports(
+        artifacts=store,
+        sandbox_image=IMAGE,
+        sandbox_runner=RecordingSandbox(),
+        clock=lambda: NOW,
+    )
+
+    first = ports.candidate_provider.candidate_for(first_job, first_candidate)
+    second = ports.candidate_provider.candidate_for(second_job, second_candidate)
+    replay = ports.candidate_provider.candidate_for(first_job, first_candidate)
+
+    assert first.candidate.source_archive_ref != second.candidate.source_archive_ref
+    assert replay == first
+    assert candidate_ref_for_job(store, first_job) == first_candidate.source_ref
+    assert candidate_ref_for_job(store, second_job) == second_candidate.source_ref
+
+
+def test_provider_rejects_a_different_input_for_an_already_bound_job(
+    tmp_path: Path,
+) -> None:
+    store, first_candidate, _ = _case(tmp_path, marker="first-input")
+    _, replacement_candidate, _ = _case(tmp_path, marker="replacement-input")
+    job = _v3_job()
+    ports = build_production_candidate_ports(
+        artifacts=store,
+        sandbox_image=IMAGE,
+        sandbox_runner=RecordingSandbox(),
+        clock=lambda: NOW,
+    )
+    ports.candidate_provider.candidate_for(job, first_candidate)
+
+    with pytest.raises(ProductionCandidatePortError, match="different input"):
+        ports.candidate_provider.candidate_for(job, replacement_candidate)
+
+    assert candidate_ref_for_job(store, job) == first_candidate.source_ref
 
 
 def test_provider_rejects_archive_member_outside_sealed_package(tmp_path: Path) -> None:

@@ -53,6 +53,7 @@ _CAPTAIN_IMAGE = re.compile(
     r"^(?:(?:[a-z0-9.-]+(?::[0-9]+)?)/)?"
     r"captain-[a-z0-9._/-]+@sha256:[0-9a-f]{64}$"
 )
+_CANDIDATE_FOR_JOB_BINDING = "factory-candidate-for-job"
 _WINDOWS_RESERVED_NAMES = {
     "con",
     "prn",
@@ -220,6 +221,7 @@ class SharedCasCapabilityCandidateProvider:
                 "bound Factory candidate manifest is invalid"
             ) from exc
         _require_manifest_binding(self._artifacts, candidate, manifest)
+        _bind_candidate_ref_for_job(self._artifacts, job, candidate.source_ref)
         return ResolvedFactoryCandidate(
             candidate=manifest,
             source_archive=self._artifacts.local_path(candidate.source_ref),
@@ -419,6 +421,70 @@ def bind_factory_candidate_manifest(
     return artifacts.bind(
         "factory-candidate-manifest", candidate.source_ref.sha256, reference
     )
+
+
+def candidate_ref_for_job(
+    artifacts: ContentAddressedArtifactStore,
+    job: AgentFactoryJobV3,
+) -> ArtifactRef:
+    """Resolve the immutable Package-C input selected for one exact V3 job."""
+
+    try:
+        reference = artifacts.binding(_CANDIDATE_FOR_JOB_BINDING, str(job.job_id))
+    except ValueError as exc:
+        raise ProductionCandidatePortError(
+            "Factory candidate job binding is invalid"
+        ) from exc
+    if reference is None:
+        raise ProductionCandidatePortError(
+            "TODO_TOOL.v1 required capability=factory_candidate_for_job; "
+            "reason=V3 job has no sealed Package-C candidate input"
+        )
+    if reference.media_type != "application/zip":
+        raise ProductionCandidatePortError(
+            "Factory candidate job binding is not a Package-C archive"
+        )
+    try:
+        artifacts.read_bytes(reference)
+    except ValueError as exc:
+        raise ProductionCandidatePortError(
+            "Factory candidate job binding content is unavailable"
+        ) from exc
+    return reference
+
+
+def _bind_candidate_ref_for_job(
+    artifacts: ContentAddressedArtifactStore,
+    job: AgentFactoryJobV3,
+    reference: ArtifactRef,
+) -> ArtifactRef:
+    identity = str(job.job_id)
+    try:
+        existing = artifacts.binding(_CANDIDATE_FOR_JOB_BINDING, identity)
+    except ValueError as exc:
+        raise ProductionCandidatePortError(
+            "Factory candidate job binding is invalid"
+        ) from exc
+    if existing is not None:
+        if existing != reference:
+            raise ProductionCandidatePortError(
+                "V3 job is already bound to a different input"
+            )
+        return candidate_ref_for_job(artifacts, job)
+    try:
+        artifacts.bind(_CANDIDATE_FOR_JOB_BINDING, identity, reference)
+    except ValueError as exc:
+        try:
+            raced = artifacts.binding(_CANDIDATE_FOR_JOB_BINDING, identity)
+        except ValueError as binding_exc:
+            raise ProductionCandidatePortError(
+                "Factory candidate job binding is invalid"
+            ) from binding_exc
+        if raced != reference:
+            raise ProductionCandidatePortError(
+                "V3 job is already bound to a different input"
+            ) from exc
+    return candidate_ref_for_job(artifacts, job)
 
 
 def build_production_candidate_ports(
