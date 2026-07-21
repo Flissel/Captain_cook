@@ -380,18 +380,22 @@ def test_gateway_recomputes_ready_release_and_requires_prior_promotion() -> None
         assertions=factory_job.acceptance_assertion_ids,
     )
 
-    GatewayStore._assert_capability_release_ready(
+    GatewayStore._authoritative_capability_release(
         job=factory_job,
+        projection=FactoryProjection.from_job(factory_job),
         promotion=promotion,
         evaluation=accepted_evaluation(),
         request=request,
+        now=request.decision.decided_at,
     )
     with pytest.raises(HTTPException, match="promotion"):
-        GatewayStore._assert_capability_release_ready(
+        GatewayStore._authoritative_capability_release(
             job=factory_job,
+            projection=FactoryProjection.from_job(factory_job),
             promotion=None,
             evaluation=accepted_evaluation(),
             request=request,
+            now=request.decision.decided_at,
         )
 
 
@@ -479,11 +483,13 @@ def test_gateway_release_uses_gateway_clock_for_deadline() -> None:
             now=factory_job.deadline_at,
         )
     with pytest.raises(HTTPException, match="factory job"):
-        GatewayStore._assert_capability_release_ready(
+        GatewayStore._authoritative_capability_release(
             job=factory_job.model_copy(update={"job_id": UUID(int=999)}),
+            projection=FactoryProjection.from_job(factory_job),
             promotion=promotion,
             evaluation=accepted_evaluation(),
             request=request,
+            now=request.decision.decided_at,
         )
 
 
@@ -538,6 +544,73 @@ def test_release_write_retry_is_bounded_and_recovers_transient_conflicts() -> No
 
     with pytest.raises(OperationalError):
         GatewayStore._retry_write(never_succeeds)
+    assert attempts == 3
+
+
+def test_terminal_decision_public_write_retries_its_once_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = GatewayStore.__new__(GatewayStore)
+    decision = release_request().decision.model_copy(
+        update={
+            "state": FactoryTerminalState.BLOCKED,
+            "reasons": ("package_validation_blocked",),
+            "evidence_refs": (),
+        }
+    )
+    attempts = 0
+
+    def transient_then_replay(_decision: object) -> bool:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise OperationalError(1213, "deterministic terminal race")
+        return True
+
+    monkeypatch.setattr(
+        store,
+        "_record_factory_terminal_decision_once",
+        transient_then_replay,
+        raising=False,
+    )
+
+    receipt = store.record_factory_terminal_decision(decision)
+
+    assert attempts == 3
+    assert receipt.replayed is True
+
+
+def test_runtime_claim_public_write_retries_its_once_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = GatewayStore.__new__(GatewayStore)
+    authority = _runtime_capability_authority()
+    request = RuntimeExecutionClaimRequest(
+        schema_name="captain.runtime-execution-claim-request.v1",
+        command_id=_runtime_command().event_id,
+        owner_id="runtime-a",
+        lease_seconds=60,
+        capability_id=authority.capability_id,
+        capability_version=authority.capability_version,
+    )
+    expected = object()
+    attempts = 0
+
+    def transient_then_claim(_request: object) -> object:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise OperationalError(1213, "deterministic claim/result race")
+        return expected
+
+    monkeypatch.setattr(
+        store,
+        "_claim_runtime_execution_once",
+        transient_then_claim,
+        raising=False,
+    )
+
+    assert store.claim_runtime_execution(request) is expected
     assert attempts == 3
 
 

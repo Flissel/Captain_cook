@@ -6,6 +6,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 from uuid import UUID
 
 import pytest
@@ -19,7 +20,11 @@ from agenten.agent_factory.contracts import (
     FactoryRole,
     PromotedCapability,
 )
-from agenten.agent_factory.outcome_contracts import ExecutionOutcomeV1
+from agenten.agent_factory.outcome_contracts import (
+    ExecutionOutcomeV1,
+    FactoryTerminalDecision,
+    FactoryTerminalState,
+)
 from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.release_gate import (
     E2EKind,
@@ -30,7 +35,7 @@ from agenten.agent_factory.release_gate import (
 )
 from agenten.agent_factory.state_machine import FactoryProjection
 from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationEvidence
-from agenten.agent_runtime.contracts import ArtifactRef
+from agenten.agent_runtime.contracts import AgentRuntimeResult, ArtifactRef
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.app import create_app
 from gateway.auth import GatewayRole, require_actor
@@ -53,6 +58,7 @@ from tests.support.mariadb import assert_isolated_test_database
 TEST_DSN = os.getenv("TEST_MARIADB_DSN")
 pytestmark = pytest.mark.skipif(not TEST_DSN, reason="TEST_MARIADB_DSN is not configured")
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "contracts"
+TEST_GATEWAY_NOW = NOW + timedelta(minutes=10)
 
 
 class Mirror:
@@ -64,14 +70,23 @@ async def captain_actor(_: Request) -> GatewayRole:
     return GatewayRole.CAPTAIN
 
 
+def _gateway_store(
+    storage: MariaDBStorage,
+    *,
+    clock: Callable[[], datetime] | None = None,
+) -> GatewayStore:
+    return GatewayStore(storage, clock=clock or (lambda: TEST_GATEWAY_NOW))
+
+
 def application(
     storage: MariaDBStorage,
     *,
     actor: GatewayRole = GatewayRole.CAPTAIN,
+    clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
     assert TEST_DSN is not None
     app = create_app(
-        storage=storage,
+        gateway_store=_gateway_store(storage, clock=clock),
         mirror=Mirror(),
         settings=GatewaySettings(
             ledger_dsn=SecretStr(TEST_DSN),
@@ -113,6 +128,39 @@ def test_factory_job_and_block_are_idempotent_and_restart_safe(storage: MariaDBS
     assert recovered.status_code == 200
     assert recovered.json()["projection"]["phase"] == "forge_requested"
     assert [item["phase"] for item in recovered.json()["blocks"]] == ["forge_requested"]
+
+
+def test_concurrent_identical_terminal_decision_replays_and_changed_conflicts(
+    storage: MariaDBStorage,
+) -> None:
+    factory_job = job()
+    _gateway_store(storage).record_factory_job(factory_job)
+    decision = FactoryTerminalDecision(
+        schema_name="captain.factory-terminal-decision.v1",
+        decision_id=UUID("00000000-0000-0000-0000-0000000007a1"),
+        job_id=factory_job.job_id,
+        correlation_id=factory_job.correlation_id,
+        subject_version=factory_job.subject_version,
+        state=FactoryTerminalState.BLOCKED,
+        reasons=("package_validation_blocked",),
+        decided_at=TEST_GATEWAY_NOW,
+    )
+
+    def write_terminal(_: int):
+        return _gateway_store(storage).record_factory_terminal_decision(decision)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        receipts = tuple(pool.map(write_terminal, range(2)))
+
+    assert sorted(receipt.replayed for receipt in receipts) == [False, True]
+    changed = decision.model_copy(
+        update={
+            "decision_id": UUID("00000000-0000-0000-0000-0000000007a2"),
+            "reasons": ("e2e_blocked",),
+        }
+    )
+    with pytest.raises(HTTPException, match="different content"):
+        _gateway_store(storage).record_factory_terminal_decision(changed)
 
 
 def test_factory_gateway_rejects_invalid_phase_before_ledger_write(storage: MariaDBStorage) -> None:
@@ -828,7 +876,7 @@ def test_capability_release_crash_rolls_back_then_retry_exposes_exactly_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = _prepare_v2_capability_release(storage, promote=True)
-    store = GatewayStore(storage)
+    store = _gateway_store(storage)
     insert = store._insert
 
     def crash_after_package(cursor, ledger_block) -> None:
@@ -846,7 +894,7 @@ def test_capability_release_crash_rolls_back_then_retry_exposes_exactly_one(
 
     monkeypatch.setattr(store, "_insert", insert)
     first = store.publish_capability_release(request)
-    replay = GatewayStore(storage).publish_capability_release(request)
+    replay = _gateway_store(storage).publish_capability_release(request)
 
     assert first.replayed is False
     assert replay.replayed is True
@@ -874,12 +922,14 @@ def _load_contract(name: str) -> dict[str, object]:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
-def _seed_runtime_result(storage: MariaDBStorage) -> tuple[dict[str, object], dict[str, object]]:
+def _seed_runtime_command_and_grant(
+    storage: MariaDBStorage,
+) -> tuple[dict[str, object], dict[str, object]]:
     command = _load_contract("agent_runtime_command.v1.json")
     result = _load_contract("agent_runtime_result.v1.json")
-    issued_at = datetime(2026, 7, 21, 10, 1, tzinfo=timezone.utc)
-    command["occurred_at"] = datetime(2026, 7, 21, 10, tzinfo=timezone.utc).isoformat()
-    result["occurred_at"] = datetime(2026, 7, 21, 10, 2, tzinfo=timezone.utc).isoformat()
+    issued_at = TEST_GATEWAY_NOW + timedelta(seconds=5)
+    command["occurred_at"] = (TEST_GATEWAY_NOW + timedelta(seconds=1)).isoformat()
+    result["occurred_at"] = (TEST_GATEWAY_NOW + timedelta(seconds=35)).isoformat()
     grant = {
         "schema": "captain.capability-grant.v1",
         "grant_id": result["grant_id"],
@@ -922,10 +972,31 @@ def _seed_runtime_result(storage: MariaDBStorage) -> tuple[dict[str, object], di
             ],
         },
     }
-    with TestClient(application(storage)) as captain:
+    clock_values = iter(
+        (
+            TEST_GATEWAY_NOW + timedelta(seconds=2),
+            TEST_GATEWAY_NOW + timedelta(seconds=10),
+        )
+    )
+    with TestClient(application(storage, clock=lambda: next(clock_values))) as captain:
         assert captain.post("/blocks", json=batch).status_code == 201
         assert captain.post("/v1/runtime/commands", json=command).status_code == 202
         assert captain.post("/v1/runtime/grants", json=grant).status_code == 201
+    return command, result
+
+
+def _seed_runtime_result(
+    storage: MariaDBStorage,
+    release: CapabilityReleaseRequest,
+) -> tuple[dict[str, object], dict[str, object]]:
+    command, result = _seed_runtime_command_and_grant(storage)
+    clock_values = iter(
+        (
+            TEST_GATEWAY_NOW + timedelta(seconds=20),
+            TEST_GATEWAY_NOW + timedelta(seconds=40),
+        )
+    )
+    with TestClient(application(storage, clock=lambda: next(clock_values))) as captain:
         claim = captain.post(
             "/v1/runtime/execution-claims",
             json={
@@ -933,16 +1004,20 @@ def _seed_runtime_result(storage: MariaDBStorage) -> tuple[dict[str, object], di
                 "command_id": command["event_id"],
                 "owner_id": "runtime-a",
                 "lease_seconds": 60,
+                "capability_id": release.package.capability_id,
+                "capability_version": release.package.capability_version,
             },
         )
         assert claim.status_code == 201, claim.text
         fence = claim.json()["claim"]["fencing_token"]
+        credential = claim.json()["claim_credential"]
         recorded = captain.post(
             "/v1/runtime/results",
             json=result,
             headers={
                 "X-Runtime-Owner-ID": "runtime-a",
                 "X-Runtime-Fencing-Token": str(fence),
+                "X-Runtime-Claim-Credential": credential,
             },
         )
         assert recorded.status_code == 201, recorded.text
@@ -983,19 +1058,19 @@ def _execution_request(
     )
 
 
-def test_capability_execution_rejects_unpublished_and_stale_then_replays(
+def test_capability_execution_rejects_stale_then_replays(
     storage: MariaDBStorage,
 ) -> None:
     release = _prepare_v2_capability_release(storage, promote=True)
-    command, result = _seed_runtime_result(storage)
-    execution = _execution_request(release, command, result)
-    body = execution.model_dump(mode="json", by_alias=True)
     with TestClient(application(storage)) as captain:
-        assert captain.post("/v1/capability-executions", json=body).status_code == 409
         assert captain.post(
             "/v1/capabilities",
             json=release.model_dump(mode="json", by_alias=True),
         ).status_code == 201
+    command, result = _seed_runtime_result(storage, release)
+    execution = _execution_request(release, command, result)
+    body = execution.model_dump(mode="json", by_alias=True)
+    with TestClient(application(storage)) as captain:
         stale_outcome = execution.outcome.model_copy(
             update={"capability_version": release.package.capability_version + 1}
         )
@@ -1021,74 +1096,61 @@ def test_capability_execution_rejects_unpublished_and_stale_then_replays(
     assert read.json()["result_id"] == str(execution.outcome.result_id)
 
 
-def test_concurrent_runtime_claim_has_one_owner_and_restart_safe_recovery(
+def test_concurrent_runtime_claim_replay_and_result_completion_do_not_deadlock(
     storage: MariaDBStorage,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    command = _load_contract("agent_runtime_command.v1.json")
-    batch = {
-        "block_type": "work_batch",
-        "status": "pending",
-        "data": {
-            "batch_id": "batch-1",
-            "title": "Runtime integration",
-            "goal": "Execute the released runtime command",
-            "subtask_ids": ["subtask-1"],
-            "target": "python",
-            "capability_tags": ["n8n-builder"],
-            "acceptance_criteria": [
-                {
-                    "assertion_id": "runtime-result",
-                    "kind": "status_equals",
-                    "expected": "succeeded",
-                }
-            ],
-        },
-    }
+    release = _prepare_v2_capability_release(storage, promote=True)
     with TestClient(application(storage)) as captain:
-        assert captain.post("/blocks", json=batch).status_code == 201
-        assert captain.post("/v1/runtime/commands", json=command).status_code == 202
+        assert captain.post(
+            "/v1/capabilities",
+            json=release.model_dump(mode="json", by_alias=True),
+        ).status_code == 201
+    command, result_payload = _seed_runtime_command_and_grant(storage)
+    request = RuntimeExecutionClaimRequest(
+        schema_name="captain.runtime-execution-claim-request.v1",
+        command_id=UUID(str(command["event_id"])),
+        owner_id="runtime-a",
+        lease_seconds=60,
+        capability_id=release.package.capability_id,
+        capability_version=release.package.capability_version,
+    )
+    acquired = _gateway_store(
+        storage,
+        clock=lambda: TEST_GATEWAY_NOW + timedelta(seconds=20),
+    ).claim_runtime_execution(request)
+    assert acquired.claim_credential is not None
+    result = AgentRuntimeResult.model_validate(result_payload)
 
-    monkeypatch.setattr("gateway.store._utcnow", lambda: NOW)
-    store = GatewayStore(storage)
-
-    def attempt(owner: str) -> tuple[str, object]:
-        request = RuntimeExecutionClaimRequest(
-            schema_name="captain.runtime-execution-claim-request.v1",
-            command_id=UUID(str(command["event_id"])),
-            owner_id=owner,
-            lease_seconds=60,
-        )
+    def replay_claim() -> tuple[str, object]:
         try:
-            return "claimed", store.claim_runtime_execution(request)
+            receipt = _gateway_store(
+                storage,
+                clock=lambda: TEST_GATEWAY_NOW + timedelta(seconds=25),
+            ).claim_runtime_execution(request)
+            return "replayed", receipt
         except HTTPException as exc:
-            return "conflict", exc.detail
+            return "completed", exc.detail
+
+    def complete_result() -> tuple[str, object]:
+        receipt = _gateway_store(
+            storage,
+            clock=lambda: TEST_GATEWAY_NOW + timedelta(seconds=40),
+        ).record_runtime_result(
+            result,
+            execution_owner_id="runtime-a",
+            execution_fencing_token=acquired.claim.fencing_token,
+            execution_claim_credential=acquired.claim_credential,
+        )
+        return "result", receipt
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        outcomes = tuple(pool.map(attempt, ("runtime-a", "runtime-b")))
+        claim_future = pool.submit(replay_claim)
+        result_future = pool.submit(complete_result)
+        claim_outcome = claim_future.result()
+        result_outcome = result_future.result()
 
-    assert [kind for kind, _ in outcomes].count("claimed") == 1
-    assert [kind for kind, _ in outcomes].count("conflict") == 1
-    winner = next(value.claim.owner_id for kind, value in outcomes if kind == "claimed")
-    restarted = GatewayStore(storage)
-    replay = restarted.claim_runtime_execution(
-        RuntimeExecutionClaimRequest(
-            schema_name="captain.runtime-execution-claim-request.v1",
-            command_id=UUID(str(command["event_id"])),
-            owner_id=winner,
-            lease_seconds=60,
-        )
-    )
-    assert replay.replayed is True
-
-    monkeypatch.setattr("gateway.store._utcnow", lambda: NOW + timedelta(seconds=61))
-    recovered = restarted.claim_runtime_execution(
-        RuntimeExecutionClaimRequest(
-            schema_name="captain.runtime-execution-claim-request.v1",
-            command_id=UUID(str(command["event_id"])),
-            owner_id="runtime-recovery",
-            lease_seconds=60,
-        )
-    )
-    assert recovered.recovered is True
-    assert recovered.claim.fencing_token == 2
+    assert claim_outcome[0] in {"replayed", "completed"}
+    assert result_outcome[0] == "result"
+    persisted = _gateway_store(storage).runtime_execution_claim(request.command_id)
+    assert persisted is not None
+    assert persisted.status == "completed"

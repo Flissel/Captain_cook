@@ -1104,8 +1104,17 @@ class GatewayStore:
         self,
         request: RuntimeExecutionClaimRequest,
     ) -> RuntimeExecutionClaimReceipt:
+        return self._retry_write(
+            lambda: self._claim_runtime_execution_once(request)
+        )
+
+    def _claim_runtime_execution_once(
+        self,
+        request: RuntimeExecutionClaimRequest,
+    ) -> RuntimeExecutionClaimReceipt:
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
+                self._lock_ledger_state(cursor)
                 command_block = self._runtime_block_by_json_value(
                     cursor,
                     block_type="agent_runtime_command",
@@ -1116,6 +1125,19 @@ class GatewayStore:
                 if command_block is None:
                     raise HTTPException(status_code=409, detail="runtime command not found")
                 command = AgentRuntimeCommand.model_validate(command_block["data"])
+                cursor.execute(
+                    """SELECT payload, credential_sha256
+                       FROM runtime_execution_claims WHERE command_id = %s FOR UPDATE""",
+                    (str(request.command_id),),
+                )
+                claim_row = cursor.fetchone()
+                existing = (
+                    RuntimeExecutionClaim.model_validate(
+                        self._decode_json(claim_row["payload"])
+                    )
+                    if claim_row is not None
+                    else None
+                )
                 cursor.execute(
                     """SELECT payload FROM runtime_batch_admissions
                        WHERE command_id = %s FOR UPDATE""",
@@ -1221,17 +1243,6 @@ class GatewayStore:
                     value=str(request.command_id),
                     for_update=True,
                 ) is not None
-                cursor.execute(
-                    """SELECT payload, credential_sha256
-                       FROM runtime_execution_claims WHERE command_id = %s FOR UPDATE""",
-                    (str(request.command_id),),
-                )
-                row = cursor.fetchone()
-                existing = (
-                    RuntimeExecutionClaim.model_validate(self._decode_json(row["payload"]))
-                    if row is not None
-                    else None
-                )
                 receipt = self._resolve_runtime_execution_claim(
                     existing=existing,
                     request=request,
@@ -1613,23 +1624,6 @@ class GatewayStore:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @staticmethod
-    def _assert_capability_release_ready(
-        *,
-        job: FactoryJob,
-        promotion: FactoryEvidenceBlock | None,
-        evaluation: StoredSkillEvaluation | None,
-        request: CapabilityReleaseRequest,
-    ) -> None:
-        GatewayStore._authoritative_capability_release(
-            job=job,
-            projection=FactoryProjection.from_job(job),
-            promotion=promotion,
-            evaluation=evaluation,
-            request=request,
-            now=request.decision.decided_at,
-        )
-
-    @staticmethod
     def _authoritative_capability_release(
         *,
         job: FactoryJob,
@@ -1784,25 +1778,21 @@ class GatewayStore:
                 status_code=409,
                 detail="ready_to_use terminal decisions require atomic capability publication",
             )
+        replayed = self._retry_write(
+            lambda: self._record_factory_terminal_decision_once(decision)
+        )
+        return CapabilityWriteReceipt(
+            record_id=str(decision.decision_id),
+            replayed=replayed,
+        )
+
+    def _record_factory_terminal_decision_once(
+        self,
+        decision: FactoryTerminalDecision,
+    ) -> bool:
         canonical = decision.model_dump(mode="json", by_alias=True)
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(
-                    """SELECT decision_id, job_id, payload FROM factory_terminal_decisions
-                       WHERE decision_id = %s OR job_id = %s FOR UPDATE""",
-                    (str(decision.decision_id), str(decision.job_id)),
-                )
-                existing = cursor.fetchone()
-                if existing is not None:
-                    if self._decode_json(existing["payload"]) == canonical:
-                        return CapabilityWriteReceipt(
-                            record_id=str(decision.decision_id),
-                            replayed=True,
-                        )
-                    raise HTTPException(
-                        status_code=409,
-                        detail="factory terminal decision already exists with different content",
-                    )
                 job_block = self._runtime_block_by_json_value(
                     cursor,
                     block_type="agent_factory_job",
@@ -1812,6 +1802,19 @@ class GatewayStore:
                 )
                 if job_block is None:
                     raise HTTPException(status_code=409, detail="factory job not found")
+                cursor.execute(
+                    """SELECT decision_id, job_id, payload FROM factory_terminal_decisions
+                       WHERE decision_id = %s OR job_id = %s FOR UPDATE""",
+                    (str(decision.decision_id), str(decision.job_id)),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    if self._decode_json(existing["payload"]) == canonical:
+                        return True
+                    raise HTTPException(
+                        status_code=409,
+                        detail="factory terminal decision already exists with different content",
+                    )
                 job = parse_factory_job(job_block["data"])
                 if (
                     decision.correlation_id != job.correlation_id
@@ -1843,10 +1846,7 @@ class GatewayStore:
                         json.dumps(canonical, sort_keys=True),
                     ),
                 )
-        return CapabilityWriteReceipt(
-            record_id=str(decision.decision_id),
-            replayed=False,
-        )
+        return False
 
     def factory_terminal_decision(
         self,
@@ -3647,6 +3647,14 @@ class GatewayStore:
         children = self._child_rows(cursor, parent["index"], for_update=for_update)
         projection = project_batch([parent, *children], batch_id, now=now)
         return parent, children, projection
+
+    @staticmethod
+    def _lock_ledger_state(cursor: Any) -> None:
+        cursor.execute(
+            "SELECT next_block_index FROM ledger_state WHERE id = 1 FOR UPDATE"
+        )
+        if cursor.fetchone() is None:
+            raise RuntimeError("ledger_state row is missing")
 
     @staticmethod
     def _next_index(cursor: Any) -> int:
