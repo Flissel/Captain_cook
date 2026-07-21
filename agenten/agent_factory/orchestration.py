@@ -10,7 +10,7 @@ import time
 from typing import TYPE_CHECKING, Awaitable, Protocol, TypeVar
 from uuid import UUID
 
-from agenten.agent_factory.contracts import AgentFactoryJob, FactoryEvidenceBlock, FactoryLease, FactoryRole
+from agenten.agent_factory.contracts import FactoryEvidenceBlock, FactoryJob, FactoryLease, FactoryRole
 from agenten.agent_factory.leases import FactoryLeasePort
 from agenten.agent_factory.service import FactoryCoordinator
 from agenten.agent_factory.skill_evaluation import (
@@ -48,10 +48,11 @@ class FactoryDispatchError(RuntimeError):
 
 @dataclass(frozen=True)
 class FactoryDispatch:
-    job: AgentFactoryJob
+    job: FactoryJob
     action: FactoryAction
     role: FactoryRole | None
     lease: FactoryLease | None
+    improvement_authorized: bool = False
 
 
 class FactoryClock(Protocol):
@@ -501,7 +502,8 @@ class FactoryDispatcher:
 
     async def dispatch_next(self, job_id: UUID) -> FactoryAction:
         action = self._coordinator.next_action(job_id)
-        job = self._coordinator.projection(job_id).job
+        projection = self._coordinator.projection(job_id)
+        job = projection.job
         if action.kind in _ROLE_ACTIONS:
             role = _ROLE_ACTIONS[action.kind]
             request = FactoryDispatch(
@@ -509,6 +511,11 @@ class FactoryDispatcher:
                 action=action,
                 role=role,
                 lease=self._leases.active(job, role, action.attempt, self._clock.now()),
+                improvement_authorized=(
+                    role is FactoryRole.TOOL_INTEGRATOR
+                    and action.attempt > 1
+                    and projection.attempt == action.attempt
+                ),
             )
             if action.kind is FactoryActionKind.DISPATCH_BUILD_VALIDATOR:
                 if self._candidate_validator is None:

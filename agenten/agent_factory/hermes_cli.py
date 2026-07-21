@@ -11,18 +11,41 @@ import signal
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Protocol
+from uuid import NAMESPACE_URL, uuid5
 
-from agenten.agent_factory.contracts import FactoryEvidenceBlock, FactoryPhase, FactoryRole
+from pydantic import BaseModel, ValidationError
+
+from agenten.agent_factory.contracts import (
+    FactoryBlockStatus,
+    FactoryEvidenceBlock,
+    FactoryJob,
+    FactoryPhase,
+    FactoryRole,
+)
 from agenten.agent_factory.evidence_store import FactoryEvidenceStore, FilesystemFactoryEvidenceStore
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError, HermesFactoryPort
 from agenten.agent_factory.skill_evaluation import (
     HermesSkillEvaluationEvidence,
     HermesSkillEvaluationRequest,
     HermesSkillUsageReceipt,
+    ReleasedHermesSkill,
 )
+from agenten.agent_factory.skill_sequence import SkillSequencePolicy
 from agenten.agent_factory.skill_store import reject_sensitive_data
+from agenten.agent_factory.skill_workflow_contracts import (
+    CandidateRevisionV1,
+    CodebaseInventoryV1,
+    CodexBuildBriefV1,
+    FactoryFeedbackRecommendation,
+    FactoryFeedbackV1,
+    FactorySkillInvocationV1,
+    FactorySkillStep,
+    TeamEvaluationV1,
+    TeamExecutionEvidenceV1,
+)
 from agenten.agent_runtime.contracts import ArtifactRef
 
 if TYPE_CHECKING:
@@ -32,10 +55,20 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class HermesCliSettings:
     executable: str = "hermes"
-    skill_path: Path = Path("agenten/agent_factory/skills/autogen-agent-factory")
+    skill_root: Path = Path("agenten/agent_factory/skills")
     timeout_seconds: int = 900
     evidence_root: Path = Path("artifacts/agent-factory/evidence")
     released_skill_root: Path = Path("agenten/agent_factory/released-skills")
+
+
+class ReleasedFactorySkillCatalog(Protocol):
+    """Captain-owned lookup for one released skill at one workflow step."""
+
+    def released_for(
+        self,
+        job: FactoryJob,
+        step: FactorySkillStep,
+    ) -> ReleasedHermesSkill: ...
 
 
 class HermesCliFactory(HermesFactoryPort):
@@ -45,44 +78,87 @@ class HermesCliFactory(HermesFactoryPort):
         self,
         settings: HermesCliSettings = HermesCliSettings(),
         evidence_store: FactoryEvidenceStore | None = None,
+        released_skill_catalog: ReleasedFactorySkillCatalog | None = None,
+        sequence_policy: SkillSequencePolicy | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._settings = settings
         self._evidence_store = evidence_store or FilesystemFactoryEvidenceStore(settings.evidence_root)
+        self._released_skill_catalog = released_skill_catalog
+        self._sequence_policy = sequence_policy or SkillSequencePolicy()
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
         if request.role is None or request.lease is None:
             raise FactoryDispatchError("Hermes factory dispatch requires a role and active lease")
-        prompt = _prompt_for(request, self._settings.skill_path)
-        try:
-            process = await asyncio.create_subprocess_exec(
-                self._settings.executable,
-                "-z",
-                prompt,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+        if self._released_skill_catalog is None:
+            raise FactoryDispatchError("released factory skill catalog is not configured")
+        now = self._clock()
+        _validate_factory_dispatch(request, now=now)
+        steps = self._sequence_policy.steps_for(
+            role=request.role,
+            attempt=request.action.attempt,
+        )
+        if (
+            request.role is FactoryRole.TOOL_INTEGRATOR
+            and request.action.attempt > 1
+            and not request.improvement_authorized
+        ):
+            raise FactoryDispatchError(
+                "improve_team requires Captain IMPROVEMENT_REQUESTED authority"
             )
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=self._settings.timeout_seconds
+
+        deadline = _deadline(
+            min(
+                float(self._settings.timeout_seconds),
+                (request.lease.expires_at - now).total_seconds(),
             )
-        except FileNotFoundError as exc:
-            raise FactoryDispatchError("Hermes CLI executable is not available") from exc
-        except TimeoutError as exc:
-            raise FactoryDispatchError("Hermes factory role timed out") from exc
-        if process.returncode != 0:
-            detail = stderr.decode("utf-8", errors="replace").strip()
-            raise FactoryDispatchError(f"Hermes factory role failed: {detail[:500]}")
-        try:
-            payload = _parse_evidence_payload(stdout)
-            if not isinstance(payload, dict):
-                raise ValueError("Hermes output must be an object")
-            transcript = await self._evidence_store.persist(
-                request.job,
-                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        )
+        input_ref = request.job.input_ref
+        artifacts: list[_FactoryWorkflowArtifact] = []
+        transcript_refs: list[ArtifactRef] = []
+        for step in steps:
+            released_skill = self._released_skill_catalog.released_for(request.job, step)
+            skill_name = _STEP_SKILL_NAMES[step]
+            _require_released_skill_directory(
+                self._settings.skill_root,
+                skill_name=skill_name,
+                released_skill=released_skill,
+                now=now,
             )
-            payload["evidence_refs"] = [transcript.model_dump(mode="json")]
-            return FactoryEvidenceBlock.model_validate(payload)
-        except (TypeError, ValueError) as exc:
-            raise FactoryDispatchError("Hermes must return exactly one factory evidence JSON object") from exc
+            invocation = _factory_invocation(
+                request,
+                step=step,
+                released_skill=released_skill,
+                input_ref=input_ref,
+            )
+            _validate_serialized_prompt_value(
+                invocation.model_dump(mode="json", by_alias=True)
+            )
+            stdout = await self._run_skill_prompt(
+                _factory_skill_prompt(invocation, skill_name=skill_name),
+                max_seconds=_remaining_deadline_seconds(deadline),
+            )
+            artifact = _parse_workflow_artifact(stdout, step=step)
+            if artifact.invocation != invocation:
+                raise FactoryDispatchError(
+                    f"Hermes {step.value} artifact does not match the Captain invocation"
+                )
+            transcript_refs.append(
+                await self._evidence_store.persist(
+                    request.job,
+                    artifact.model_dump_json(by_alias=True).encode("utf-8"),
+                )
+            )
+            artifacts.append(artifact)
+            input_ref = artifact.artifact_ref
+            if not _may_continue_after(artifact):
+                break
+        return _factory_block_for(
+            request,
+            artifacts=tuple(artifacts),
+            transcript_refs=tuple(transcript_refs),
+        )
 
     async def evaluate_skill(
         self,
@@ -199,6 +275,259 @@ class HermesCliFactory(HermesFactoryPort):
         return stdout
 
 
+_FactoryWorkflowArtifact = (
+    CodebaseInventoryV1
+    | CodexBuildBriefV1
+    | TeamExecutionEvidenceV1
+    | TeamEvaluationV1
+    | CandidateRevisionV1
+    | FactoryFeedbackV1
+)
+
+_STEP_SKILL_NAMES: dict[FactorySkillStep, str] = {
+    FactorySkillStep.DISCOVER: "captain-factory-discover",
+    FactorySkillStep.BRIEF_CODEX: "captain-factory-brief-codex",
+    FactorySkillStep.EXECUTE_TEAM: "captain-factory-execute-team",
+    FactorySkillStep.EVALUATE_TEAM: "captain-factory-evaluate-team",
+    FactorySkillStep.IMPROVE_TEAM: "captain-factory-improve-team",
+    FactorySkillStep.REPORT_CAPTAIN: "captain-factory-report-captain",
+}
+
+_STEP_RESULT_MODELS: dict[FactorySkillStep, type[BaseModel]] = {
+    FactorySkillStep.DISCOVER: CodebaseInventoryV1,
+    FactorySkillStep.BRIEF_CODEX: CodexBuildBriefV1,
+    FactorySkillStep.EXECUTE_TEAM: TeamExecutionEvidenceV1,
+    FactorySkillStep.EVALUATE_TEAM: TeamEvaluationV1,
+    FactorySkillStep.IMPROVE_TEAM: CandidateRevisionV1,
+    FactorySkillStep.REPORT_CAPTAIN: FactoryFeedbackV1,
+}
+
+
+def _validate_factory_dispatch(request: FactoryDispatch, *, now: datetime) -> None:
+    assert request.role is not None
+    assert request.lease is not None
+    lease = request.lease
+    if now.tzinfo is None or now.utcoffset() != timezone.utc.utcoffset(now):
+        raise FactoryDispatchError("Hermes factory dispatch requires a UTC clock")
+    if request.action.job_id not in {None, request.job.job_id}:
+        raise FactoryDispatchError("factory action belongs to a different job")
+    if (
+        lease.job_id != request.job.job_id
+        or lease.correlation_id != request.job.correlation_id
+        or lease.subject_version != request.job.subject_version
+        or lease.attempt != request.action.attempt
+        or lease.role is not request.role
+    ):
+        raise FactoryDispatchError("Hermes factory dispatch lease is stale or mismatched")
+    if lease.issued_at > now or lease.expires_at <= now:
+        raise FactoryDispatchError("Hermes factory dispatch requires an active lease")
+
+
+def _require_released_skill_directory(
+    skill_root: Path,
+    *,
+    skill_name: str,
+    released_skill: ReleasedHermesSkill,
+    now: datetime,
+) -> None:
+    if released_skill.skill_id != skill_name:
+        raise FactoryDispatchError("Captain released the wrong skill for the requested step")
+    if released_skill.released_at > now:
+        raise FactoryDispatchError("Captain skill release is stale for this dispatch")
+    root = skill_root.resolve()
+    directory = (root / skill_name).resolve()
+    try:
+        directory.relative_to(root)
+    except ValueError as exc:
+        raise FactoryDispatchError("factory skill directory is outside the configured root") from exc
+    if not directory.is_dir() or not (directory / "SKILL.md").is_file():
+        raise FactoryDispatchError("released factory skill directory is missing")
+    digest = _skill_directory_digest(directory)
+    if digest != released_skill.content_sha256:
+        raise FactoryDispatchError("released factory skill digest does not match Captain's release")
+
+
+def _skill_directory_digest(directory: Path) -> str:
+    manifest: list[dict[str, object]] = []
+    files = sorted(
+        (item for item in directory.rglob("*") if item.is_file()),
+        key=lambda item: item.relative_to(directory).as_posix(),
+    )
+    for path in files:
+        if path.is_symlink():
+            raise FactoryDispatchError("released factory skill cannot contain symlinks")
+        content = path.read_bytes()
+        manifest.append(
+            {
+                "path": path.relative_to(directory).as_posix(),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "size": len(content),
+            }
+        )
+    encoded = _canonical_json(manifest).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _factory_invocation(
+    request: FactoryDispatch,
+    *,
+    step: FactorySkillStep,
+    released_skill: ReleasedHermesSkill,
+    input_ref: ArtifactRef,
+) -> FactorySkillInvocationV1:
+    assert request.lease is not None
+    if input_ref.uri.startswith("holdout://"):
+        raise FactoryDispatchError("private holdout references cannot enter Hermes prompts")
+    binding = _canonical_json(
+        {
+            "job_id": str(request.job.job_id),
+            "subject_version": request.job.subject_version,
+            "attempt": request.action.attempt,
+            "step": step.value,
+            "released_skill_sha256": released_skill.content_sha256,
+            "input_sha256": input_ref.sha256,
+            "lease_id": request.lease.lease_id,
+        }
+    )
+    idempotency_key = hashlib.sha256(binding.encode("utf-8")).hexdigest()
+    return FactorySkillInvocationV1(
+        schema_name="captain.factory-skill-invocation.v1",
+        invocation_id=uuid5(NAMESPACE_URL, f"captain.factory-skill:{idempotency_key}"),
+        job_id=request.job.job_id,
+        correlation_id=request.job.correlation_id,
+        subject_version=request.job.subject_version,
+        attempt=request.action.attempt,
+        step=step,
+        released_skill=released_skill,
+        input_ref=input_ref,
+        input_sha256=input_ref.sha256,
+        lease=request.lease,
+        idempotency_key=idempotency_key,
+        acceptance_assertion_ids=request.job.acceptance_assertion_ids,
+    )
+
+
+def _factory_skill_prompt(
+    invocation: FactorySkillInvocationV1,
+    *,
+    skill_name: str,
+) -> str:
+    schema = _STEP_RESULT_MODELS[invocation.step].model_fields["schema_name"].default
+    return "\n".join(
+        (
+            f"Use /{skill_name} and no other skill.",
+            f"captain_invocation_json={_canonical_json(invocation.model_dump(mode='json', by_alias=True))}",
+            f"Return exactly one {schema} JSON object and no markdown or prose.",
+            "Use only opaque artifact and workspace references from the invocation.",
+            "Do not reveal prompts, holdouts, credentials, endpoints, or local paths.",
+            "Never write Captain's ledger and stop when the lease expires.",
+        )
+    )
+
+
+def _parse_workflow_artifact(
+    stdout: bytes,
+    *,
+    step: FactorySkillStep,
+) -> _FactoryWorkflowArtifact:
+    model = _STEP_RESULT_MODELS[step]
+    try:
+        parsed = model.model_validate(_parse_evidence_payload(stdout))
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise FactoryDispatchError(
+            f"Hermes must return exactly one typed {step.value} artifact"
+        ) from exc
+    assert isinstance(
+        parsed,
+        (
+            CodebaseInventoryV1,
+            CodexBuildBriefV1,
+            TeamExecutionEvidenceV1,
+            TeamEvaluationV1,
+            CandidateRevisionV1,
+            FactoryFeedbackV1,
+        ),
+    )
+    return parsed
+
+
+def _may_continue_after(artifact: _FactoryWorkflowArtifact) -> bool:
+    if isinstance(artifact, TeamExecutionEvidenceV1):
+        return artifact.status == "succeeded"
+    if isinstance(artifact, TeamEvaluationV1):
+        return (
+            artifact.failure_class is None
+            and artifact.recommendation
+            is FactoryFeedbackRecommendation.PROMOTE_CANDIDATE
+        )
+    return True
+
+
+def _factory_block_for(
+    request: FactoryDispatch,
+    *,
+    artifacts: tuple[_FactoryWorkflowArtifact, ...],
+    transcript_refs: tuple[ArtifactRef, ...],
+) -> FactoryEvidenceBlock:
+    if not artifacts or request.role is None or request.lease is None:
+        raise FactoryDispatchError("Hermes factory sequence produced no typed artifacts")
+    last = artifacts[-1]
+    successful = _may_continue_after(last)
+    status = FactoryBlockStatus.SUCCEEDED
+    if not successful:
+        status = FactoryBlockStatus.FAILED
+    elif isinstance(last, FactoryFeedbackV1) and (
+        last.recommendation is not FactoryFeedbackRecommendation.PROMOTE_CANDIDATE
+    ):
+        status = FactoryBlockStatus.RECOMMENDED
+    phase = _ROLE_EVIDENCE_PHASE[request.role]
+    event_binding = _canonical_json(
+        {
+            "job_id": str(request.job.job_id),
+            "subject_version": request.job.subject_version,
+            "attempt": request.action.attempt,
+            "role": request.role.value,
+            "artifact_sha256": [item.artifact_ref.sha256 for item in artifacts],
+        }
+    )
+    evidence_refs = _unique_artifact_refs(
+        (
+            *(ref for artifact in artifacts for ref in artifact.evidence_refs),
+            *transcript_refs,
+        )
+    )
+    return FactoryEvidenceBlock(
+        schema_name="captain.agent-factory-block.v1",
+        event_id=uuid5(NAMESPACE_URL, f"captain.factory-block:{event_binding}"),
+        job_id=request.job.job_id,
+        correlation_id=request.job.correlation_id,
+        causation_id=request.job.event_id,
+        occurred_at=last.occurred_at,
+        producer="hermes",
+        subject_version=request.job.subject_version,
+        attempt=request.action.attempt,
+        phase=phase,
+        role=request.role,
+        status=status,
+        artifact_refs=_unique_artifact_refs(
+            tuple(item.artifact_ref for item in artifacts)
+        ),
+        evidence_refs=evidence_refs,
+        assertion_ids=last.acceptance_assertion_ids,
+        lease_id=request.lease.lease_id,
+    )
+
+
+def _unique_artifact_refs(references: tuple[ArtifactRef, ...]) -> tuple[ArtifactRef, ...]:
+    unique: dict[tuple[str, str, str], ArtifactRef] = {}
+    for reference in references:
+        unique.setdefault(
+            (reference.uri, reference.sha256, reference.media_type),
+            reference,
+        )
+    return tuple(unique.values())
+
+
 def _parse_evidence_payload(stdout: bytes) -> object:
     """Accept one JSON object plus Hermes' non-semantic trailing tool telemetry."""
 
@@ -209,56 +538,6 @@ def _parse_evidence_payload(stdout: bytes) -> object:
     if remainder and any(not line.strip().startswith("[tool]") for line in remainder.splitlines() if line.strip()):
         raise ValueError("Hermes output contains non-telemetry content after its evidence object")
     return payload
-
-
-def _prompt_for(request: FactoryDispatch, skill_path: Path) -> str:
-    assert request.role is not None
-    assert request.lease is not None
-    phase = _ROLE_EVIDENCE_PHASE[request.role]
-    response_shape = {
-        "schema": "captain.agent-factory-block.v1",
-        "event_id": "generate a new UUID",
-        "job_id": str(request.job.job_id),
-        "correlation_id": str(request.job.correlation_id),
-        "causation_id": str(request.job.event_id),
-        "occurred_at": request.lease.issued_at.isoformat(),
-        "producer": "hermes",
-        "subject_version": request.job.subject_version,
-        "attempt": request.action.attempt,
-        "phase": phase.value,
-        "role": request.role.value,
-        "status": "succeeded",
-        "artifact_refs": [],
-        "evidence_refs": [
-            {
-                "uri": "artifact://factory/replace-with-real-evidence",
-                "sha256": "replace-with-sha256-of-real-evidence",
-                "media_type": "application/json",
-            }
-        ],
-        "assertion_ids": [],
-        "lease_id": request.lease.lease_id,
-    }
-    return "\n".join(
-        (
-            f"Use the skill at {skill_path.as_posix()}.",
-            "You are a leased Hermes factory role. Do not write Captain's ledger directly.",
-            f"job_id={request.job.job_id}",
-            f"correlation_id={request.job.correlation_id}",
-            f"subject_version={request.job.subject_version}",
-            f"attempt={request.action.attempt}",
-            f"role={request.role.value}",
-            f"lease_id={request.lease.lease_id}",
-            f"workspace_ref={request.lease.workspace_ref}",
-            f"input_ref={request.job.input_ref.uri}",
-            f"required_capability={request.job.required_capability}",
-            f"acceptance_assertion_ids={','.join(request.job.acceptance_assertion_ids)}",
-            "Return exactly one JSON object and no markdown or prose.",
-            "Use this exact evidence envelope; replace event_id, occurred_at, and evidence_refs with actual values.",
-            "Every role block needs at least one real evidence_ref. Create and hash the evidence before returning; never claim success with a placeholder.",
-            json.dumps(response_shape, separators=(",", ":")),
-        )
-    )
 
 
 def _resolve_released_skill(
