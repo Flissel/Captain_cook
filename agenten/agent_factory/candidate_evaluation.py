@@ -12,11 +12,20 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import time
-from typing import Literal
+from typing import Any, Literal
 from uuid import NAMESPACE_URL, uuid5
 import zipfile
+from contextlib import contextmanager
+from collections.abc import Iterator
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from agenten.agent_factory.contracts import (
     AgentFactoryJob,
@@ -50,6 +59,104 @@ class FactoryCandidateArtifact(_FrozenModel):
         if path.is_absolute() or ".." in path.parts or "." in path.parts:
             raise ValueError("candidate artifact path must be a safe relative path")
         return path.as_posix()
+
+
+class FactoryAutoGenAgentV1(_FrozenModel):
+    """One named specialist in the sealed AutoGen topology."""
+
+    name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    tools: tuple[str, ...] = ()
+    system_prompt_ref: ArtifactRef
+    handoffs: tuple[str, ...] = ()
+
+    @field_validator("tools", "handoffs")
+    @classmethod
+    def require_unique_names(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)) or any(not item.strip() for item in value):
+            raise ValueError("agent tools and handoffs must be unique named entries")
+        return value
+
+
+class FactoryAutoGenTeamManifestV1(_FrozenModel):
+    """Strict executable topology read from the candidate's sealed team manifest."""
+
+    schema_name: Literal["autogen-team.v1"] = Field(
+        alias="schema", serialization_alias="schema"
+    )
+    name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    conversation_pattern: Literal[
+        "swarm",
+        "selector_group_chat",
+        "round_robin_group_chat",
+        "single_agent",
+    ]
+    agents: tuple[FactoryAutoGenAgentV1, ...] = Field(min_length=1)
+    memory_policy: str = Field(min_length=1, max_length=64)
+    max_messages: int = Field(ge=1, le=100, strict=True)
+    max_handoffs: int = Field(ge=0, le=50, strict=True)
+    termination_conditions: tuple[str, ...] = Field(min_length=1)
+    entrypoint_command: tuple[str, ...] = Field(min_length=2)
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_conversation_pattern(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "conversation_pattern" in value:
+            return value
+        agents = value.get("agents")
+        has_handoffs = isinstance(agents, (list, tuple)) and any(
+            isinstance(agent, dict) and bool(agent.get("handoffs")) for agent in agents
+        )
+        copied = dict(value)
+        copied["conversation_pattern"] = (
+            "swarm" if isinstance(agents, (list, tuple)) and len(agents) > 1 and has_handoffs else "single_agent"
+        )
+        return copied
+
+    @field_validator("memory_policy")
+    @classmethod
+    def require_named_memory_policy(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("memory policy must be named")
+        return normalized
+
+    @field_validator("termination_conditions")
+    @classmethod
+    def require_unique_termination_conditions(
+        cls, value: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        if len(value) != len(set(value)) or any(not item.strip() for item in value):
+            raise ValueError("termination conditions must be unique named entries")
+        return value
+
+    @field_validator("entrypoint_command")
+    @classmethod
+    def require_isolated_entrypoint(
+        cls, value: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        if value[0] != "python" or any(not item or "\x00" in item for item in value):
+            raise ValueError("team entrypoint must use the isolated python executable")
+        return value
+
+    @model_validator(mode="after")
+    def require_closed_topology(self, info: ValidationInfo) -> "FactoryAutoGenTeamManifestV1":
+        names = tuple(agent.name for agent in self.agents)
+        if len(names) != len(set(names)):
+            raise ValueError("AutoGen agent names must be unique")
+        known_agents = set(names)
+        allowed_tools = set((info.context or {}).get("allowed_tools", ()))
+        for agent in self.agents:
+            unknown_handoffs = set(agent.handoffs) - known_agents
+            if unknown_handoffs:
+                raise ValueError(f"unknown handoff: {sorted(unknown_handoffs)[0]}")
+            unknown_tools = set(agent.tools) - allowed_tools
+            if unknown_tools:
+                raise ValueError(f"unknown tool: {sorted(unknown_tools)[0]}")
+        if self.conversation_pattern == "single_agent" and len(self.agents) != 1:
+            raise ValueError("single_agent conversation requires exactly one agent")
+        if any(agent.handoffs for agent in self.agents) and self.max_handoffs == 0:
+            raise ValueError("handoff topology requires a positive max_handoffs ceiling")
+        return self
 
 
 class FactoryCandidateManifest(_FrozenModel):
@@ -113,10 +220,124 @@ class FactoryCandidateEvaluationResult(_FrozenModel):
     workspace_was_temporary: Literal[True] = True
     checks: tuple[FactoryEvaluationCheck, ...]
     candidate_manifest: FactoryCandidateManifest | None = None
+    team_execution_manifest: FactoryAutoGenTeamManifestV1 | None = None
 
 
 class FactoryCandidateEvaluator:
     """Evaluate only a digest-verified archive in a newly created temp directory."""
+
+    def validate(
+        self,
+        candidate: "ResolvedFactoryCandidate",
+        max_seconds: float,
+    ) -> FactoryCandidateEvaluationResult:
+        """Preflight the sealed executable topology without running a paid case."""
+
+        if max_seconds <= 0:
+            raise ValueError("candidate evaluation requires positive remaining lease time")
+        deadline = time.monotonic() + max_seconds
+        manifest = candidate.candidate
+        tool_names = tuple(tool.name for tool in manifest.n8n_tools)
+        checks: list[FactoryEvaluationCheck] = []
+        topology: FactoryAutoGenTeamManifestV1 | None = None
+        try:
+            self._verify_source_archive(manifest.source_archive_ref, candidate.source_archive)
+            checks.append(
+                FactoryEvaluationCheck(
+                    name="source_archive", status="passed", detail="sha256 verified"
+                )
+            )
+            with TemporaryDirectory(prefix="captain-factory-preflight-") as temporary:
+                workspace = Path(temporary) / "candidate"
+                self._extract_archive(candidate.source_archive, workspace)
+                self._verify_artifact(manifest.team_manifest, workspace, "team_manifest")
+                topology = self._read_team_execution_manifest(manifest, workspace)
+                self._verify_system_prompts(topology, workspace)
+                checks.append(
+                    FactoryEvaluationCheck(
+                        name="team_manifest",
+                        status="passed",
+                        detail="digest and AutoGen topology verified",
+                    )
+                )
+                for index, workflow in enumerate(manifest.workflow_artifacts, start=1):
+                    self._verify_artifact(workflow, workspace, f"workflow_{index}")
+                    self._require_json(workspace / workflow.relative_path)
+                for index, schema in enumerate(manifest.tool_schema_artifacts, start=1):
+                    self._verify_artifact(schema, workspace, f"tool_schema_{index}")
+                    self._require_json(workspace / schema.relative_path)
+                static_compile = self._run(
+                    ("python", "-m", "compileall", "-q", "."),
+                    workspace,
+                    manifest.candidate_id,
+                    self._command_timeout(manifest.timeout_seconds, deadline),
+                )
+                if static_compile.returncode != 0:
+                    raise ValueError(self._command_failure(static_compile))
+                build = self._run(
+                    manifest.build_command,
+                    workspace,
+                    manifest.candidate_id,
+                    self._command_timeout(manifest.timeout_seconds, deadline),
+                )
+                if build.returncode != 0:
+                    raise ValueError(self._command_failure(build))
+                checks.append(
+                    FactoryEvaluationCheck(
+                        name="build", status="passed", detail="compile and build succeeded"
+                    )
+                )
+            return FactoryCandidateEvaluationResult(
+                status="succeeded",
+                trace_id=manifest.candidate_id,
+                tool_names=tool_names,
+                checks=tuple(checks),
+                candidate_manifest=manifest,
+                team_execution_manifest=topology,
+            )
+        except (FileNotFoundError, OSError, zipfile.BadZipFile) as exc:
+            checks.append(
+                FactoryEvaluationCheck(
+                    name="infrastructure", status="infrastructure_failed", detail=str(exc)
+                )
+            )
+            status: Literal["failed", "infrastructure_failed"] = "infrastructure_failed"
+        except ValueError as exc:
+            checks.append(
+                FactoryEvaluationCheck(name="validation", status="failed", detail=str(exc))
+            )
+            status = "failed"
+        return FactoryCandidateEvaluationResult(
+            status=status,
+            trace_id=manifest.candidate_id,
+            tool_names=tool_names,
+            checks=tuple(checks),
+            candidate_manifest=manifest,
+            team_execution_manifest=topology,
+        )
+
+    @contextmanager
+    def verified_team_workspace(
+        self,
+        candidate: "ResolvedFactoryCandidate",
+    ) -> Iterator[tuple[Path, FactoryAutoGenTeamManifestV1]]:
+        """Yield a fresh digest-verified workspace; generated code stays out of Captain."""
+
+        manifest = candidate.candidate
+        self._verify_source_archive(manifest.source_archive_ref, candidate.source_archive)
+        with TemporaryDirectory(prefix="captain-factory-team-") as temporary:
+            workspace = Path(temporary) / "candidate"
+            self._extract_archive(candidate.source_archive, workspace)
+            self._verify_artifact(manifest.team_manifest, workspace, "team_manifest")
+            topology = self._read_team_execution_manifest(manifest, workspace)
+            self._verify_system_prompts(topology, workspace)
+            for index, workflow in enumerate(manifest.workflow_artifacts, start=1):
+                self._verify_artifact(workflow, workspace, f"workflow_{index}")
+                self._require_json(workspace / workflow.relative_path)
+            for index, schema in enumerate(manifest.tool_schema_artifacts, start=1):
+                self._verify_artifact(schema, workspace, f"tool_schema_{index}")
+                self._require_json(workspace / schema.relative_path)
+            yield workspace, topology
 
     def evaluate(
         self,
@@ -303,6 +524,37 @@ class FactoryCandidateEvaluator:
             raise ValueError(f"{name} is missing from the candidate archive")
         if hashlib.sha256(path.read_bytes()).hexdigest() != artifact.reference.sha256:
             raise ValueError(f"{name} digest does not match its artifact reference")
+
+    @staticmethod
+    def _read_team_execution_manifest(
+        candidate: FactoryCandidateManifest,
+        workspace: Path,
+    ) -> FactoryAutoGenTeamManifestV1:
+        path = workspace / candidate.team_manifest.relative_path
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("team manifest must be valid UTF-8 JSON") from exc
+        return FactoryAutoGenTeamManifestV1.model_validate(
+            payload,
+            context={"allowed_tools": {tool.name for tool in candidate.n8n_tools}},
+        )
+
+    @staticmethod
+    def _verify_system_prompts(
+        manifest: FactoryAutoGenTeamManifestV1,
+        workspace: Path,
+    ) -> None:
+        digests = {
+            hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in workspace.rglob("*")
+            if path.is_file()
+        }
+        if any(
+            agent.system_prompt_ref.sha256 not in digests
+            for agent in manifest.agents
+        ):
+            raise ValueError("system prompt ref is not sealed in the candidate archive")
 
     @staticmethod
     def _require_json(path: Path) -> None:

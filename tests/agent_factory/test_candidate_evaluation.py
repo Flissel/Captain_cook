@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from agenten.agent_factory.candidate_evaluation import (
+    FactoryAutoGenTeamManifestV1,
     CandidateEvaluationFactory,
     FactoryCandidateEvaluator,
     FactoryCandidateManifest,
@@ -70,6 +71,85 @@ def _write_candidate_archive(path: Path) -> tuple[ArtifactRef, ArtifactRef, Arti
         _ref("artifact://factory/schema/support-triage-output", output_schema),
         _ref("artifact://factory/source/support-triage", path.read_bytes(), "application/zip"),
     )
+
+
+def test_autogen_manifest_defaults_to_swarm_for_specialist_handoffs() -> None:
+    manifest = FactoryAutoGenTeamManifestV1.model_validate(
+        {
+            "schema": "autogen-team.v1",
+            "name": "support_triage",
+            "agents": [
+                {
+                    "name": "triage",
+                    "tools": ["support_triage"],
+                    "system_prompt_ref": _ref("artifact://factory/prompts/triage", b"triage"),
+                    "handoffs": ["resolver"],
+                },
+                {
+                    "name": "resolver",
+                    "tools": [],
+                    "system_prompt_ref": _ref("artifact://factory/prompts/resolver", b"resolver"),
+                    "handoffs": [],
+                },
+            ],
+            "memory_policy": "buffered",
+            "max_messages": 20,
+            "max_handoffs": 4,
+            "termination_conditions": ["task_completed", "max_messages"],
+            "entrypoint_command": ["python", "run_team.py"],
+        },
+        context={"allowed_tools": {"support_triage"}},
+    )
+
+    assert manifest.conversation_pattern == "swarm"
+
+
+@pytest.mark.parametrize(
+    ("agents", "message"),
+    [
+        (
+            [
+                {
+                    "name": "triage",
+                    "tools": ["unreleased_tool"],
+                    "system_prompt_ref": _ref("artifact://factory/prompts/triage", b"triage"),
+                    "handoffs": [],
+                }
+            ],
+            "unknown tool",
+        ),
+        (
+            [
+                {
+                    "name": "triage",
+                    "tools": [],
+                    "system_prompt_ref": _ref("artifact://factory/prompts/triage", b"triage"),
+                    "handoffs": ["missing_agent"],
+                }
+            ],
+            "unknown handoff",
+        ),
+    ],
+)
+def test_autogen_manifest_rejects_unknown_tools_and_handoffs(
+    agents: list[dict[str, object]],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        FactoryAutoGenTeamManifestV1.model_validate(
+            {
+                "schema": "autogen-team.v1",
+                "name": "support_triage",
+                "conversation_pattern": "single_agent",
+                "agents": agents,
+                "memory_policy": "none",
+                "max_messages": 10,
+                "max_handoffs": 2,
+                "termination_conditions": ["task_completed"],
+                "entrypoint_command": ["python", "run_team.py"],
+            },
+            context={"allowed_tools": {"support_triage"}},
+        )
 
 
 def test_evaluator_runs_a_sealed_candidate_in_a_temporary_workspace(tmp_path: Path) -> None:
