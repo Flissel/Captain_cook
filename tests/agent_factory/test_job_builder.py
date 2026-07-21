@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
@@ -110,3 +111,36 @@ def test_factory_job_v3_identity_changes_with_execution_policy(tmp_path: Path) -
 
     assert first.job_id != changed.job_id
     assert first.event_id != changed.event_id
+
+
+def test_factory_job_v3_canonicalizes_equivalent_decimal_costs(tmp_path: Path) -> None:
+    specification = compiled(tmp_path)
+    correlation_id = UUID("00000000-0000-0000-0000-000000000099")
+    now = datetime(2026, 7, 21, 12, tzinfo=timezone.utc)
+
+    one_decimal = build_factory_job_v3(
+        specification,
+        correlation_id=correlation_id,
+        now=now,
+        execution_policy=release_policy(max_cost_usd="5.0"),
+    )
+    two_decimals = build_factory_job_v3(
+        specification,
+        correlation_id=correlation_id,
+        now=now,
+        execution_policy=release_policy(max_cost_usd="5.00"),
+    )
+
+    assert one_decimal.job_id == two_decimals.job_id
+    assert one_decimal.event_id == two_decimals.event_id
+    assert one_decimal.model_dump(mode="json", by_alias=True) == two_decimals.model_dump(
+        mode="json", by_alias=True
+    )
+
+    trailing_integer_zero = build_factory_job_v3(
+        specification,
+        correlation_id=correlation_id,
+        now=now,
+        execution_policy=release_policy(max_cost_usd="50"),
+    )
+    assert trailing_integer_zero.execution_policy.max_cost_usd == Decimal("50")

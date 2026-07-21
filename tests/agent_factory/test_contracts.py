@@ -156,6 +156,10 @@ def test_factory_job_v3_is_additive_strict_and_preserves_older_parsing() -> None
                 | {"max_cost_usd": 5.0}
             }
         )
+    with pytest.raises(ValidationError, match="max_runtime_seconds"):
+        AgentFactoryJobV3.model_validate(
+            v3_payload | {"deadline_at": "2026-07-21T12:14:59Z"}
+        )
 
 
 def test_evidence_block_binds_phase_role_and_lease() -> None:

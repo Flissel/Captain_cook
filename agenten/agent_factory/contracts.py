@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Literal
 from uuid import UUID
@@ -141,6 +141,17 @@ class AgentFactoryJobV3(AgentFactoryJobV2):
         alias="schema", serialization_alias="schema"
     )
     execution_policy: FactoryExecutionPolicyV1
+
+    @model_validator(mode="after")
+    def require_policy_deadline(self) -> "AgentFactoryJobV3":
+        expected_deadline = self.occurred_at + timedelta(
+            seconds=self.execution_policy.max_runtime_seconds
+        )
+        if self.deadline_at != expected_deadline:
+            raise ValueError(
+                "deadline_at must equal occurred_at plus max_runtime_seconds"
+            )
+        return self
 
 
 FactoryJob = AgentFactoryJob | AgentFactoryJobV2 | AgentFactoryJobV3

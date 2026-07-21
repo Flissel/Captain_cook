@@ -5,12 +5,16 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryRole
-from agenten.agent_factory.execution_policy import FactoryExecutionPolicyV1
+from agenten.agent_factory.execution_policy import (
+    FactoryExecutionPolicyV1,
+    FactoryLiveCapability,
+)
 from agenten.agent_factory.leases import (
     FactoryLeaseDenied,
     issue_factory_lease,
     validate_factory_lease,
 )
+from agenten.agent_runtime.contracts import IntegrationIntent
 from tests.agent_factory.test_state_machine import job
 
 
@@ -188,3 +192,93 @@ def test_v3_lease_validation_rejects_one_injected_capability() -> None:
             attempt=1,
             now=NOW,
         )
+
+
+def test_v3_offline_job_cannot_issue_n8n_lease() -> None:
+    with pytest.raises(FactoryLeaseDenied, match="offline"):
+        issue_factory_lease(
+            job=v3_job(live=False),
+            role=FactoryRole.TOOL_INTEGRATOR,
+            attempt=1,
+            workspace_ref="workspace://factory/support-triage",
+            now=NOW,
+            integration_intent=IntegrationIntent.N8N,
+        )
+
+
+def test_factory_lease_id_binds_integration_intent_and_profile() -> None:
+    factory_job = v3_job(live=True)
+    normal = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage",
+        now=NOW,
+    )
+    n8n = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage",
+        now=NOW,
+        integration_intent=IntegrationIntent.N8N,
+    )
+
+    assert normal.lease_id != n8n.lease_id
+
+
+def test_validation_rejects_authority_changed_under_existing_lease_id() -> None:
+    factory_job = v3_job(live=True)
+    normal = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage",
+        now=NOW,
+    )
+    n8n = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage",
+        now=NOW,
+        integration_intent=IntegrationIntent.N8N,
+    )
+    tampered = n8n.model_copy(update={"lease_id": normal.lease_id})
+
+    with pytest.raises(FactoryLeaseDenied, match="authority"):
+        validate_factory_lease(
+            tampered,
+            job=factory_job,
+            role=FactoryRole.TOOL_INTEGRATOR,
+            attempt=1,
+            now=NOW,
+        )
+
+
+def test_factory_lease_id_binds_exact_capability_set() -> None:
+    factory_job = v3_job(live=True)
+    narrower_policy = factory_job.execution_policy.model_copy(
+        update={
+            "live_capabilities": (FactoryLiveCapability.MODEL_INVOKE,),
+        }
+    )
+    narrower_job = factory_job.model_copy(
+        update={"execution_policy": narrower_policy}
+    )
+    full = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.REAL_CASE_TESTER,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage",
+        now=NOW,
+    )
+    narrow = issue_factory_lease(
+        job=narrower_job,
+        role=FactoryRole.REAL_CASE_TESTER,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage",
+        now=NOW,
+    )
+
+    assert full.lease_id != narrow.lease_id

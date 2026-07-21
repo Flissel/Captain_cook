@@ -48,11 +48,20 @@ def issue_factory_lease(
     integration_intent: IntegrationIntent = IntegrationIntent.NONE,
 ) -> FactoryLease:
     issued_at = _require_utc(now)
+    _require_execution_intent(job, integration_intent)
     profile = _ROLE_PROFILES[role]
     if role is FactoryRole.TOOL_INTEGRATOR and integration_intent is IntegrationIntent.N8N:
         profile = CapabilityProfile.N8N_BUILDER
-    binding = "|".join((str(job.job_id), role.value, str(attempt), workspace_ref))
-    lease_id = f"factory-{hashlib.sha256(binding.encode('utf-8')).hexdigest()[:32]}"
+    capabilities = expected_factory_capabilities(job, role, profile)
+    lease_id = _factory_lease_id(
+        job=job,
+        role=role,
+        attempt=attempt,
+        workspace_ref=workspace_ref,
+        integration_intent=integration_intent,
+        profile=profile,
+        capabilities=capabilities,
+    )
     return FactoryLease(
         schema_name="captain.factory-lease.v1",
         lease_id=lease_id,
@@ -63,7 +72,7 @@ def issue_factory_lease(
         role=role,
         capability_profile=profile,
         integration_intent=integration_intent,
-        capabilities=tuple(sorted(expected_factory_capabilities(job, role, profile))),
+        capabilities=tuple(sorted(capabilities)),
         workspace_ref=workspace_ref,
         issued_at=issued_at,
         expires_at=issued_at + FACTORY_LEASE_DURATION,
@@ -79,6 +88,7 @@ def validate_factory_lease(
     now: datetime,
 ) -> FactoryLease:
     checked_at = _require_utc(now)
+    _require_execution_intent(job, lease.integration_intent)
     if lease.job_id != job.job_id or lease.correlation_id != job.correlation_id:
         raise FactoryLeaseDenied("factory lease belongs to a different job")
     if lease.subject_version != job.subject_version or lease.attempt != attempt:
@@ -90,6 +100,17 @@ def validate_factory_lease(
     expected = expected_factory_capabilities(job, role, lease.capability_profile)
     if frozenset(lease.capabilities) != expected:
         raise FactoryLeaseDenied("factory lease capabilities do not match role profile")
+    expected_lease_id = _factory_lease_id(
+        job=job,
+        role=role,
+        attempt=attempt,
+        workspace_ref=lease.workspace_ref,
+        integration_intent=lease.integration_intent,
+        profile=lease.capability_profile,
+        capabilities=expected,
+    )
+    if lease.lease_id != expected_lease_id:
+        raise FactoryLeaseDenied("factory lease ID does not match its authority")
     return lease
 
 
@@ -104,6 +125,42 @@ def expected_factory_capabilities(
             capability.value for capability in job.execution_policy.live_capabilities
         )
     return frozenset(expected)
+
+
+def _require_execution_intent(
+    job: FactoryJob, integration_intent: IntegrationIntent
+) -> None:
+    if (
+        isinstance(job, AgentFactoryJobV3)
+        and not job.execution_policy.live_execution
+        and integration_intent is IntegrationIntent.N8N
+    ):
+        raise FactoryLeaseDenied("offline factory execution forbids n8n authority")
+
+
+def _factory_lease_id(
+    *,
+    job: FactoryJob,
+    role: FactoryRole,
+    attempt: int,
+    workspace_ref: str,
+    integration_intent: IntegrationIntent,
+    profile: CapabilityProfile,
+    capabilities: frozenset[str],
+) -> str:
+    binding = "|".join(
+        (
+            str(job.job_id),
+            role.value,
+            str(attempt),
+            workspace_ref,
+            integration_intent.value,
+            profile.value,
+            ",".join(sorted(capabilities)),
+        )
+    )
+    digest = hashlib.sha256(binding.encode("utf-8")).hexdigest()
+    return f"factory-{digest[:32]}"
 
 
 def _require_utc(value: datetime) -> datetime:

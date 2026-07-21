@@ -6,7 +6,14 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    field_validator,
+    model_validator,
+)
 
 
 class FactoryExecutionMode(str, Enum):
@@ -34,7 +41,7 @@ class FactoryExecutionPolicyV1(BaseModel):
         alias="schema", serialization_alias="schema"
     )
     mode: FactoryExecutionMode
-    live_execution: bool
+    live_execution: StrictBool
     max_cost_usd: Decimal
     max_runtime_seconds: int = Field(ge=1, le=86400, strict=True)
     required_live_runs: int = Field(ge=0, le=3, strict=True)
