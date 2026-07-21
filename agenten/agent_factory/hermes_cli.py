@@ -648,10 +648,9 @@ class HermesCliFactory(HermesFactoryPort):
             command.extend(("--model", self._settings.model))
         if self._settings.provider:
             command.extend(("--provider", self._settings.provider))
-        command.append("-z")
         if usage_file is not None:
             command.extend(("--usage-file", str(usage_file)))
-        command.append(prompt)
+        command.extend(("-z", prompt))
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,

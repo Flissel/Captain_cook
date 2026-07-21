@@ -158,11 +158,12 @@ async def test_paid_hermes_claims_then_reserves_and_records_exact_usage(
         clock=lambda: NOW,
     ).dispatch(request)
 
-    assert observed[:6] == (
+    assert observed[:5] == (
         "hermes", "--model", "approved-model-id",
-        "--provider", "approved-provider", "-z",
+        "--provider", "approved-provider",
     )
     assert "--usage-file" in observed
+    assert observed[-2] == "-z"
     projection = budget.projection(request.job.job_id)
     assert projection.consumed_usd == Decimal("0.02")
     assert projection.reserved_usd == Decimal("0")
