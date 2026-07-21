@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import pickle
 import zipfile
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -49,9 +50,9 @@ from agenten.agent_factory.factory_live_runner import (
     InMemoryFactoryLiveEffectLedger,
 )
 from agenten.agent_factory.hermes_cli import (
+    FilesystemFactorySkillReplayStore,
     HermesCliFactory,
     HermesCliSettings,
-    InMemoryFactorySkillReplayStore,
     _factory_invocation,
 )
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
@@ -148,20 +149,133 @@ RETRY_STEPS = (
 )
 
 
+def _persist_state(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    temporary.write_bytes(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL))
+    temporary.replace(path)
+
+
+def _read_state(path: Path) -> object:
+    return pickle.loads(path.read_bytes())
+
+
+class PersistentFactoryBudgetLedger(InMemoryFactoryBudgetLedger):
+    """Reload exact budget events for every newly constructed component."""
+
+    def __init__(self, state_path: Path) -> None:
+        super().__init__()
+        self._state_path = state_path
+        self._reload()
+
+    def _reload(self) -> None:
+        if self._state_path.is_file():
+            self._events = _read_state(self._state_path)  # type: ignore[assignment]
+
+    def _persist(self) -> None:
+        _persist_state(self._state_path, self._events)
+
+    @property
+    def events(self):
+        self._reload()
+        return super().events
+
+    def reserve(self, *args, **kwargs):
+        self._reload()
+        reservation = super().reserve(*args, **kwargs)
+        self._persist()
+        return reservation
+
+    def record_usage(self, *args, **kwargs):
+        self._reload()
+        receipt = super().record_usage(*args, **kwargs)
+        self._persist()
+        return receipt
+
+    def release(self, *args, **kwargs):
+        self._reload()
+        receipt = super().release(*args, **kwargs)
+        self._persist()
+        return receipt
+
+    def projection(self, job_id: UUID) -> FactoryBudgetProjection:
+        self._reload()
+        return super().projection(job_id)
+
+
 class WorkflowGatewayRepository(InMemoryFactoryRepository):
-    """In-memory Gateway port with the production repository read surface."""
+    """File-rehydrated Gateway port with the production repository read surface."""
 
     def __init__(
         self,
         job: AgentFactoryJobV3,
-        budget: InMemoryFactoryBudgetLedger | None = None,
+        budget: PersistentFactoryBudgetLedger,
+        state_path: Path,
     ) -> None:
         super().__init__()
-        self.register(job)
+        self._state_path = state_path
         self.artifacts: list[object] = []
-        self.budget = budget or InMemoryFactoryBudgetLedger()
+        self.budget = budget
+        if self._state_path.is_file():
+            self._reload()
+            if self.job(job.job_id) != job:
+                raise ValueError("persisted Factory job does not match restart input")
+        else:
+            super().register(job)
+            self._persist()
+
+    def _reload(self) -> None:
+        if not self._state_path.is_file():
+            return
+        state = _read_state(self._state_path)
+        (
+            self._jobs,
+            self._blocks,
+            self._event_ids,
+            self._evaluations_by_job,
+            self._release_decisions_by_job,
+            self.artifacts,
+        ) = state  # type: ignore[misc]
+
+    def _persist(self) -> None:
+        _persist_state(
+            self._state_path,
+            (
+                self._jobs,
+                self._blocks,
+                self._event_ids,
+                self._evaluations_by_job,
+                self._release_decisions_by_job,
+                self.artifacts,
+            ),
+        )
+
+    def job(self, job_id: UUID):
+        self._reload()
+        return super().job(job_id)
+
+    def append(self, block: FactoryEvidenceBlock) -> bool:
+        self._reload()
+        appended = super().append(block)
+        self._persist()
+        return appended
+
+    def blocks(self, job_id: UUID) -> tuple[FactoryEvidenceBlock, ...]:
+        self._reload()
+        return super().blocks(job_id)
+
+    def append_artifact(self, artifact: object) -> None:
+        self._reload()
+        self.artifacts.append(artifact)
+        self._persist()
+
+    def extend_artifacts(self, artifacts: tuple[object, ...]) -> None:
+        self._reload()
+        self.artifacts.extend(artifacts)
+        self._persist()
 
     def workflow_artifacts(self, job_id: UUID) -> tuple[object, ...]:
+        self._reload()
         self.job(job_id)
         return tuple(self.artifacts)
 
@@ -699,7 +813,7 @@ class DeterministicCandidateBoundary:
                 ]
             )
             self._harness._attempt_runs[request.action.attempt] = executions
-            self._harness.repository.artifacts.extend(executions)
+            self._harness.repository.extend_artifacts(executions)
             return self._harness.external_block(
                 FactoryPhase.REAL_CASE_EVIDENCE,
                 attempt=request.action.attempt,
@@ -734,7 +848,7 @@ class DeterministicHermes(HermesCliFactory):
             _invocation_from_prompt(prompt)
         )
         artifact = self._harness.artifact_for(invocation)
-        self._harness.repository.artifacts.append(artifact)
+        self._harness.repository.append_artifact(artifact)
         return artifact.model_dump_json(by_alias=True).encode("utf-8")
 
 
@@ -750,6 +864,9 @@ class DeterministicDispatcher:
         self._dispatcher = dispatcher
         self.dispatch_count = 0
         self.actions: list[str] = []
+
+    def replace(self, dispatcher: FactoryDispatcher) -> None:
+        self._dispatcher = dispatcher
 
     def validate_next(
         self,
@@ -801,13 +918,48 @@ class DeterministicDispatcher:
 
 
 class RecordingLiveEffectLedger(InMemoryFactoryLiveEffectLedger):
-    def __init__(self, events: list[str]) -> None:
+    def __init__(self, events: list[str], state_path: Path) -> None:
         super().__init__()
         self._events = events
+        self._state_path = state_path
+        self._reload()
+
+    def _reload(self) -> None:
+        if not self._state_path.is_file():
+            return
+        state = _read_state(self._state_path)
+        (
+            self._records,
+            self._effect_ids_by_key,
+            self._effect_ids_by_invocation,
+        ) = state  # type: ignore[misc]
+
+    def _persist(self) -> None:
+        _persist_state(
+            self._state_path,
+            (
+                self._records,
+                self._effect_ids_by_key,
+                self._effect_ids_by_invocation,
+            ),
+        )
 
     def claim(self, request: FactoryLiveEffectRequestV1):
         self._events.append(f"claim:{request.kind.value}")
-        return super().claim(request)
+        self._reload()
+        claim = super().claim(request)
+        self._persist()
+        return claim
+
+    def complete(
+        self,
+        request: FactoryLiveEffectRequestV1,
+        outcome: FactoryLiveEffectOutcomeV1,
+    ):
+        self._reload()
+        receipt = super().complete(request, outcome)
+        self._persist()
+        return receipt
 
 
 class LiveEffectPlan:
@@ -1017,6 +1169,8 @@ class RestartableLiveRunner:
         self.restart()
 
     def restart(self) -> None:
+        if self.instance_ids:
+            self._harness.rehydrate_state_components()
         instance_id = f"runner-{len(self.instance_ids) + 1}"
         self.instance_ids.append(instance_id)
         executor = RecoveringLiveExecutor(self._harness, instance_id)
@@ -1075,6 +1229,7 @@ class SixSkillHarnessResult:
     budget_projection: FactoryBudgetProjection
     gateway_budget_projection: FactoryBudgetProjection
     runner_instance_ids: tuple[str, ...]
+    state_component_instance_ids: dict[str, tuple[int, ...]]
     reservation_recovered_after_restart: bool
     n8n_execution_ids: tuple[str, ...]
     worker_promotion_error: str
@@ -1083,6 +1238,7 @@ class SixSkillHarnessResult:
     team_execution_execute_calls: int
     team_execution_provider_calls: int
     team_execution_runs: tuple[TeamExecutionEvidenceV1, ...]
+    team_execution_transcript_digests: tuple[str, ...]
     authorized_holdout_refs: tuple[PrivateHoldoutRef, ...]
 
     @property
@@ -1106,6 +1262,8 @@ class SixSkillFactoryHarness:
         restart_after_evidence: bool = False,
         with_n8n: bool = False,
     ) -> None:
+        self._tmp = TemporaryDirectory(prefix="captain-six-skill-")
+        self.root = Path(self._tmp.name)
         base_job = workflow_job(mode=mode)
         holdout_bodies = (b"Resolve the deterministic private release case.",)
         holdouts = (
@@ -1134,8 +1292,12 @@ class SixSkillFactoryHarness:
         self.restart_after_evidence = restart_after_evidence
         self.with_n8n = with_n8n
         self.clock = DeterministicClock()
-        self.budget = InMemoryFactoryBudgetLedger()
-        self.repository = WorkflowGatewayRepository(self.job, self.budget)
+        self.budget = PersistentFactoryBudgetLedger(self.root / "state" / "budget.pkl")
+        self.repository = WorkflowGatewayRepository(
+            self.job,
+            self.budget,
+            self.root / "state" / "repository.pkl",
+        )
         self.coordinator = FactoryCoordinator(self.repository)
         self.lifecycle = GatewayLifecycleView(self.coordinator)
         self.process_calls = 0
@@ -1150,15 +1312,15 @@ class SixSkillFactoryHarness:
         self._worker_projection_before = self.coordinator.projection(self.job.job_id)
         self._worker_projection_after = self._worker_projection_before
         self._worker_promotion_attempted = False
-        self._tmp = TemporaryDirectory(prefix="captain-six-skill-")
-        self.root = Path(self._tmp.name)
         self.sealed_candidate = _sealed_team_candidate(self.root)
         if not with_n8n:
             self.sealed_candidate = _without_candidate_tools(self.sealed_candidate)
         self.team_execution_provider_calls = 0
         self._team_attempt_by_holdout: dict[PrivateHoldoutRef, int] = {}
         self.catalog = _catalog_for(self.root, *tuple(FactorySkillStep))
-        self.replay_store = InMemoryFactorySkillReplayStore()
+        self.replay_store = FilesystemFactorySkillReplayStore(
+            self.root / "state" / "skill-replays"
+        )
         self.evidence_store = FilesystemFactoryEvidenceStore(self.root / "evidence")
         self.hermes = DeterministicHermes(
             self,
@@ -1190,8 +1352,19 @@ class SixSkillFactoryHarness:
             improvements=self.improvements,
         )
         self.dispatcher = DeterministicDispatcher(self, raw_dispatcher)
-        self.effect_ledger = RecordingLiveEffectLedger(self.effect_order)
+        self.effect_ledger = RecordingLiveEffectLedger(
+            self.effect_order,
+            self.root / "state" / "live-effects.pkl",
+        )
         self.live_executor: RecoveringLiveExecutor
+        self._state_component_instance_ids = {
+            "repository": [id(self.repository)],
+            "effect_ledger": [id(self.effect_ledger)],
+            "replay_store": [id(self.replay_store)],
+            "budget": [id(self.budget)],
+            "components": [id(self.components)],
+        }
+        self._retired_state_components: list[object] = []
         self.live_runner = RestartableLiveRunner(self)
         self._attempt_runs: dict[int, tuple[TeamExecutionEvidenceV1, ...]] = {}
         self._feedback_by_attempt: dict[int, FactoryFeedbackV1] = {}
@@ -1231,6 +1404,20 @@ class SixSkillFactoryHarness:
         projection = self.coordinator.projection(self.job.job_id)
         feedback = self._latest_feedback()
         receipts = self.repository.workflow_usage_receipts(self.job.job_id)
+        team_execution_runs = tuple(
+            artifact
+            for artifact in self.repository.workflow_artifacts(self.job.job_id)
+            if isinstance(artifact, TeamExecutionEvidenceV1)
+        )
+        transcript_digests: list[str] = []
+        for execution in team_execution_runs:
+            output_ref = execution.execution_outcome.output_ref
+            if output_ref is None:
+                continue
+            observation = json.loads(
+                (await self.evidence_store.read(output_ref)).decode("utf-8")
+            )
+            transcript_digests.append(observation["transcript_sha256"])
         wrapped = SixSkillHarnessResult(
             coordinator_result=result,
             skill_steps=tuple(step.value for step in result.skill_steps),
@@ -1239,7 +1426,7 @@ class SixSkillFactoryHarness:
             gateway_phases=tuple(
                 block.phase.value for block in self.coordinator.blocks(self.job.job_id)
             ),
-            workflow_artifacts=tuple(self.repository.artifacts),
+            workflow_artifacts=self.repository.workflow_artifacts(self.job.job_id),
             usage_receipts=receipts,
             total_cost_usd=sum(
                 (receipt.cost_usd for receipt in receipts), Decimal("0")
@@ -1266,6 +1453,10 @@ class SixSkillFactoryHarness:
                 self.job.job_id
             ),
             runner_instance_ids=tuple(self.live_runner.instance_ids),
+            state_component_instance_ids={
+                name: tuple(instance_ids)
+                for name, instance_ids in self._state_component_instance_ids.items()
+            },
             reservation_recovered_after_restart=(
                 self._reservation_recovered_after_restart
             ),
@@ -1284,11 +1475,8 @@ class SixSkillFactoryHarness:
                 self.components.team_execution.execute_calls
             ),
             team_execution_provider_calls=self.team_execution_provider_calls,
-            team_execution_runs=tuple(
-                artifact
-                for artifact in self.repository.artifacts
-                if isinstance(artifact, TeamExecutionEvidenceV1)
-            ),
+            team_execution_runs=team_execution_runs,
+            team_execution_transcript_digests=tuple(transcript_digests),
             authorized_holdout_refs=self.job.private_holdout_refs,
         )
         self._last_result = wrapped
@@ -1393,7 +1581,9 @@ class SixSkillFactoryHarness:
     ) -> FactoryFeedbackV1:
         evaluation = next(
             artifact
-            for artifact in reversed(self.repository.artifacts)
+            for artifact in reversed(
+                self.repository.workflow_artifacts(self.job.job_id)
+            )
             if isinstance(artifact, TeamEvaluationV1)
             and artifact.attempt == invocation.attempt
         )
@@ -1518,7 +1708,7 @@ class SixSkillFactoryHarness:
                     cached=False,
                 )
             )
-        responses.append("TERMINATE")
+        responses.append(f"completed:{invocation.invocation_id} TERMINATE")
         return CountingReplayModelClient(self, responses)
 
     def team_run_should_fail(self, attempt: int) -> bool:
@@ -1637,6 +1827,73 @@ class SixSkillFactoryHarness:
         if self._feedback_by_attempt:
             return self._feedback_by_attempt[max(self._feedback_by_attempt)]
         return FactoryFeedbackV1.model_validate(feedback_payload())
+
+    def rehydrate_state_components(self) -> None:
+        """Construct a new runtime exclusively from persisted authority state."""
+
+        self._retired_state_components.extend(
+            (
+                self.repository,
+                self.effect_ledger,
+                self.replay_store,
+                self.budget,
+                self.components,
+            )
+        )
+        self.budget = PersistentFactoryBudgetLedger(self.root / "state" / "budget.pkl")
+        self.repository = WorkflowGatewayRepository(
+            self.job,
+            self.budget,
+            self.root / "state" / "repository.pkl",
+        )
+        self.coordinator = FactoryCoordinator(self.repository)
+        self.lifecycle.replace(self.coordinator)
+        self.replay_store = FilesystemFactorySkillReplayStore(
+            self.root / "state" / "skill-replays"
+        )
+        self.evidence_store = FilesystemFactoryEvidenceStore(self.root / "evidence")
+        self.hermes = DeterministicHermes(
+            self,
+            settings=HermesCliSettings(
+                skill_root=self.root,
+                evidence_root=self.root / "evidence",
+            ),
+            evidence_store=self.evidence_store,
+            released_skill_catalog=self.catalog,
+            replay_store=self.replay_store,
+            clock=self.clock,
+        )
+        self.components = self._compose_ports()
+        self.forge = DeterministicForgeBoundary(self)
+        self.candidate_boundary = DeterministicCandidateBoundary(self)
+        self.dispatcher.replace(
+            FactoryDispatcher(
+                coordinator=self.coordinator,
+                hermes=self.components.hermes,
+                forge=self.forge,
+                candidate_validator=self.candidate_boundary,
+                leases=self.leases,
+                clock=self.clock,
+                improvements=self.improvements,
+            )
+        )
+        self.effect_ledger = RecordingLiveEffectLedger(
+            self.effect_order,
+            self.root / "state" / "live-effects.pkl",
+        )
+        self.used_composed_ports = (
+            self.components.hermes is self.hermes
+            and self.repository.budget is self.budget
+        )
+        current = {
+            "repository": self.repository,
+            "effect_ledger": self.effect_ledger,
+            "replay_store": self.replay_store,
+            "budget": self.budget,
+            "components": self.components,
+        }
+        for name, component in current.items():
+            self._state_component_instance_ids[name].append(id(component))
 
     def _compose_ports(self) -> FactoryLiveRuntimeComponents:
         integration_intent = (

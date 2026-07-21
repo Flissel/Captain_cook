@@ -55,6 +55,12 @@ async def test_first_pass_runs_five_skill_steps_and_promotes() -> None:
         for item in result.team_execution_runs
     )
     assert len({item.invocation_id for item in result.team_execution_runs}) == 3
+    output_refs = tuple(
+        item.execution_outcome.output_ref for item in result.team_execution_runs
+    )
+    assert all(reference is not None for reference in output_refs)
+    assert len(set(output_refs)) == 3
+    assert len(set(result.team_execution_transcript_digests)) == 3
 
 
 @pytest.mark.asyncio
@@ -162,6 +168,10 @@ async def test_restart_after_reservation_and_execution_evidence_replays() -> Non
     assert result.effect_counts["provider"] == 3
     assert len(result.runner_instance_ids) >= 2
     assert len(set(result.runner_instance_ids)) >= 2
+    assert all(
+        len(set(instance_ids)) >= 2
+        for instance_ids in result.state_component_instance_ids.values()
+    )
     assert result.reservation_recovered_after_restart is True
     assert result.effect_order.index("claim:provider") < result.effect_order.index(
         "start:provider"

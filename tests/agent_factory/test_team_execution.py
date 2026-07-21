@@ -1226,7 +1226,7 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
         invocation=invocation,
         attempt=1,
         delegate=ReplayChatCompletionClient(
-            ["TERMINATE"],
+            ["SENSITIVE-AGENT-OUTPUT TERMINATE"],
             model_info=ModelInfo(
                 vision=False,
                 function_calling=True,
@@ -1361,8 +1361,32 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
         path.read_text(encoding="utf-8")
         for path in (tmp_path / "host-evidence").rglob("*.json")
     ]
+    observations = [
+        json.loads(item)
+        for item in persisted
+        if json.loads(item).get("schema") == "captain.factory-autogen-observation.v1"
+    ]
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation["invocation_id"] == str(invocation.invocation_id)
+    assert observation["session_id"] == f"autogen-team-1-{invocation.invocation_id}"
+    assert observation["message_count"] == len(observation["transcript"])
+    assert tuple(message["source"] for message in observation["transcript"]) == (
+        "user",
+        "triage",
+    )
+    assert all(
+        set(message) == {"content_sha256", "message_type", "source"}
+        for message in observation["transcript"]
+    )
+    assert all(
+        len(message["content_sha256"]) == 64
+        for message in observation["transcript"]
+    )
+    assert len(observation["transcript_sha256"]) == 64
     assert any("factory-holdout-evaluation-receipt.v1" in item for item in persisted)
     assert all(holdout_body.decode("utf-8") not in item for item in persisted)
+    assert all("SENSITIVE-AGENT-OUTPUT" not in item for item in persisted)
 
     timeout_tokens: list[object] = []
 
