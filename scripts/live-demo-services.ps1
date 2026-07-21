@@ -269,7 +269,13 @@ function Stop-CaptainN8nContainers {
     Write-Host '[ready] labelled Captain n8n containers stopped; volumes preserved'
 }
 function Start-Gateway($Values) {
-    try { if ((Invoke-WebRequest "$($Values['CAPTAIN_GATEWAY_URL'])/healthz" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200) { Write-Host '[ready] Gateway already healthy'; return } } catch {}
+    $gatewayHealthy = $false
+    try { $gatewayHealthy = (Invoke-WebRequest "$($Values['CAPTAIN_GATEWAY_URL'])/healthz" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200 } catch {}
+    if ($gatewayHealthy) {
+        if (-not (Test-Path $gatewayPid -PathType Leaf)) { throw 'Healthy Gateway endpoint is not the managed demo process.' }
+        Stop-ManagedGateway
+        Write-Host '[ready] managed Gateway restarted for current configuration'
+    }
     $gatewayPort = [Uri]$Values['CAPTAIN_GATEWAY_URL'] | Select-Object -ExpandProperty Port
     $listener = Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $gatewayPort -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($listener) {
@@ -323,13 +329,8 @@ function Start-Runtime($Values) {
     $runtimeUrl = [string]$Values['CAPTAIN_RUNTIME_URL']
     $managed = Get-ManagedRuntimeProcess
     if ($managed) {
-        try {
-            if ((Invoke-WebRequest "$runtimeUrl/health" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200) {
-                Write-Host '[ready] Runtime already healthy with verified process identity'
-                return
-            }
-        } catch {}
-        throw 'Managed Runtime process exists but is not healthy.'
+        Stop-ManagedRuntime
+        Write-Host '[ready] managed Runtime restarted for current configuration'
     }
     $runtimePort = ([Uri]$runtimeUrl).Port
     $listener = Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $runtimePort -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1

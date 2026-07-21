@@ -105,6 +105,11 @@ Test-Http 'Captain n8n MCP' "$captainN8nUrl/mcp-server/http" @{ Authorization="B
 Test-Http 'Mailpit' "$mailpitUrl/api/v1/info"
 Test-Http 'Minibook' "$minibookUrl/health"
 Test-Http 'Minibook API identity' "$minibookUrl/api/v1/agents/me" @{ Authorization="Bearer $([string]$config['MINIBOOK_API_KEY'])" }
+$creationCapabilities = Invoke-RestMethod "$minibookUrl/api/v1/creation-capabilities" -Headers @{ Authorization="Bearer $([string]$config['MINIBOOK_API_KEY'])" } -TimeoutSec 10
+if ($creationCapabilities.schema -ne 'minibook.creation-capabilities.v1' -or $creationCapabilities.creation_jobs -ne $true) {
+    throw 'Minibook creation jobs are not enabled.'
+}
+Write-Host '[ready] Minibook creation jobs'
 Test-Http 'Gateway' "$gatewayUrl/healthz"
 
 $broker = [Uri]([string]$config['CAPTAIN_N8N_MCP_BROKER_URL'])

@@ -40,11 +40,24 @@ function Save-Env($values) {
 function Test-Health {
     try { (Invoke-WebRequest "$baseUrl/health" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200 } catch { $false }
 }
+function Get-ManagedServiceProcess {
+    if (-not (Test-Path $pidFile -PathType Leaf)) { return $null }
+    try { $identity = Get-Content $pidFile -Raw | ConvertFrom-Json } catch { throw 'Invalid managed Minibook PID file.' }
+    $process = Get-Process -Id ([int]$identity.pid) -ErrorAction SilentlyContinue
+    if (-not $process) { Remove-Item $pidFile -Force; return $null }
+    $sameStart = $process.StartTime.ToUniversalTime().Ticks -eq ([DateTimeOffset]$identity.started_at).UtcDateTime.Ticks
+    $sameExecutable = [IO.Path]::GetFullPath($process.Path) -eq [IO.Path]::GetFullPath([string]$identity.executable)
+    if (-not $sameStart -or -not $sameExecutable) { throw 'PID no longer belongs to the managed Minibook process.' }
+    return $process
+}
 function Start-Service {
     $values = Read-Env
     $projectionKey = [string]$values['MINIBOOK_PROJECTION_API_KEY']
     if ([string]::IsNullOrWhiteSpace($projectionKey)) { throw 'Projection credential is required before starting Minibook.' }
-    if (Test-Health) { Write-Host '[ready] Minibook local instance'; return }
+    if (Test-Health) {
+        if (-not (Get-ManagedServiceProcess)) { throw 'Healthy Minibook endpoint is not the managed demo process.' }
+        Write-Host '[ready] Minibook local instance'; return
+    }
     New-Item -ItemType Directory -Force $stateDir | Out-Null
     $python = Join-Path $root '.venv\Scripts\python.exe'; if (-not (Test-Path $python)) { $python = (Get-Command python).Source }
     $previousProjectionKey = [Environment]::GetEnvironmentVariable('MINIBOOK_PROJECTION_API_KEY','Process')
@@ -105,15 +118,9 @@ function Bootstrap-Service {
     Write-Host '[ready] Minibook demo service account created locally (credential redacted)'
 }
 function Stop-Service {
-    if (-not (Test-Path $pidFile)) { Write-Host '[ready] no managed Minibook process'; return }
-    try { $identity = Get-Content $pidFile -Raw | ConvertFrom-Json } catch { throw 'Invalid managed Minibook PID file.' }
-    $process = Get-Process -Id ([int]$identity.pid) -ErrorAction SilentlyContinue
-    if ($process) {
-        $sameStart = $process.StartTime.ToUniversalTime().Ticks -eq ([DateTimeOffset]$identity.started_at).UtcDateTime.Ticks
-        $sameExecutable = [IO.Path]::GetFullPath($process.Path) -eq [IO.Path]::GetFullPath([string]$identity.executable)
-        if (-not $sameStart -or -not $sameExecutable) { throw 'PID no longer belongs to the managed Minibook process.' }
-        Stop-Process -Id $process.Id -ErrorAction Stop
-    }
+    $process = Get-ManagedServiceProcess
+    if (-not $process) { Write-Host '[ready] no managed Minibook process'; return }
+    Stop-Process -Id $process.Id -ErrorAction Stop
     Remove-Item $pidFile -Force
     Write-Host '[ready] managed Minibook process stopped'
 }

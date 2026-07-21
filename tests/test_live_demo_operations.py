@@ -223,6 +223,8 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert source.index("Start-Gateway $values") < source.index("Start-CaptainN8nBroker $values")
     assert source.index("Start-CaptainN8nBroker $values") < source.index("Start-Runtime $values")
     assert "Captain Runtime and Minibook capability artifact roots differ" in source
+    assert "managed Runtime restarted for current configuration" in source
+    assert "managed Gateway restarted for current configuration" in source
     assert "Write-Output $values" not in source
     start_body = source.split("function Invoke-StartServices", 1)[1].split(
         "function Invoke-Health", 1
@@ -238,6 +240,12 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "down -v" not in lowered
     assert "volume rm" not in lowered
     assert "vibemind" not in lowered
+    preflight = PREFLIGHT.read_text(encoding="utf-8")
+    assert "/api/v1/creation-capabilities" in preflight
+    assert "creation_jobs -ne $true" in preflight
+    minibook = (ROOT / "scripts" / "minibook-demo.ps1").read_text(encoding="utf-8")
+    assert "function Get-ManagedServiceProcess" in minibook
+    assert "Healthy Minibook endpoint is not the managed demo process" in minibook
 
 
 def test_readme_documents_safe_recording_commands() -> None:
