@@ -53,7 +53,7 @@ _SEARCH_GLOBS = (
 _SEMANTIC_PATTERN = (
     r"(?i)(autogen|Swarm|AssistantAgent|model[_ -]?client|system[_ -]?prompt|"
     r"user[_ -]?prompt|memory|termination|handoff|BaseModel|tool|n8n|test_|"
-    r"\$schema|architecture|TODO_TOOL\.v1|def\s+(?:build|main|run))"
+    r"\$schema|architecture|TODO_TOOL\.v1|__main__|def\s+(?:build|main|run))"
 )
 _SECRET_PATH_PATTERN = re.compile(
     r"(?i)(?:^|[._-])(?:api[_-]?key|credentials?|password|secrets?|tokens?)"
@@ -69,6 +69,7 @@ class WorktreeObservation(BaseModel):
     revision: str = Field(pattern=_REVISION_PATTERN)
     relative_name: str = Field(min_length=1)
     branch: str | None = None
+    detached: bool = False
     dirty: bool
 
     @field_validator("relative_name")
@@ -134,17 +135,36 @@ class SubprocessGitWorktreeInspection:
         top_level = Path(self._run(root, "rev-parse", "--show-toplevel")).resolve()
         if top_level != root.resolve():
             raise ValueError("Git top-level does not match assigned repository root")
-        revision = self._run(root, "rev-parse", "HEAD")
-        branch = self._run(root, "branch", "--show-current") or None
-        dirty = bool(self._run(root, "status", "--porcelain=v1"))
-        return (
-            WorktreeObservation(
-                revision=revision,
-                relative_name=".",
-                branch=branch,
-                dirty=dirty,
-            ),
+        records = _parse_git_worktree_porcelain(
+            self._run(root, "worktree", "list", "--porcelain")
         )
+        observations = []
+        for record in records:
+            worktree_root = Path(record["worktree"]).resolve()
+            branch_ref = record.get("branch")
+            branch = (
+                branch_ref.removeprefix("refs/heads/")
+                if branch_ref is not None
+                else None
+            )
+            observations.append(
+                WorktreeObservation(
+                    revision=record["HEAD"],
+                    relative_name=(
+                        "."
+                        if worktree_root == root.resolve()
+                        else _registered_worktree_name(worktree_root)
+                    ),
+                    branch=branch,
+                    detached="detached" in record,
+                    dirty=bool(
+                        self._run(worktree_root, "status", "--porcelain=v1")
+                    ),
+                )
+            )
+        if not any(item.relative_name == "." for item in observations):
+            raise ValueError("Git worktree list omitted the assigned repository root")
+        return tuple(observations)
 
     @staticmethod
     def _run(root: Path, *arguments: str) -> str:
@@ -197,8 +217,6 @@ class FilesystemRepositoryInspection:
             raise ValueError("Git worktree observation must include the assigned worktree")
         if current.revision != expected_revision:
             raise ValueError("caller revision mismatch with observed Git HEAD")
-        if any(item.revision != expected_revision for item in observations):
-            raise ValueError("observed worktree revision mismatch")
         self._revision = current.revision
         self._worktrees = observations
 
@@ -311,7 +329,11 @@ class CodebaseDiscoveryService:
             raise ValueError("repository returned an invalid revision")
 
         worktrees = _sorted_worktrees(self._repository.worktrees())
-        if not worktrees or any(item.revision != revision for item in worktrees):
+        assigned_worktree = next(
+            (item for item in worktrees if item.relative_name == "."),
+            None,
+        )
+        if assigned_worktree is None or assigned_worktree.revision != revision:
             raise ValueError("repository worktree evidence does not match observed revision")
         matches = _sorted_matches(
             self._repository.search(_SEMANTIC_PATTERN, _SEARCH_GLOBS)
@@ -320,6 +342,14 @@ class CodebaseDiscoveryService:
             path: self._repository.read_text(PurePosixPath(path))
             for path in sorted({match.relative_path for match in matches})
         }
+        for match in matches:
+            observed_digest = hashlib.sha256(
+                contents[match.relative_path].encode("utf-8")
+            ).hexdigest()
+            if observed_digest != match.content_sha256:
+                raise ValueError(
+                    f"repository source changed during snapshot: {match.relative_path}"
+                )
         categories = self._categorize(contents, matches)
         reusable_ids = self._reusable_component_ids(categories)
         source_refs = self._source_refs(categories, contents)
@@ -549,7 +579,7 @@ class CodebaseDiscoveryService:
             markers.append(marker)
 
         if not tool_matches:
-            markers.append(self._required_gap(specification))
+            markers.extend(self._required_gaps(specification))
 
         marker_ids = [marker.gap_id for marker in markers]
         if len(marker_ids) != len(set(marker_ids)):
@@ -562,9 +592,31 @@ class CodebaseDiscoveryService:
             for marker in sorted(markers, key=lambda item: item.gap_id)
         )
 
+    def _required_gaps(
+        self,
+        specification: CompiledFactorySpecification,
+    ) -> tuple[ToolGapMarker, ...]:
+        assertion_chunks = tuple(
+            specification.assertion_ids[index : index + 3]
+            for index in range(0, len(specification.assertion_ids), 3)
+        )
+        return tuple(
+            self._required_gap(
+                specification,
+                assertion_ids=assertion_ids,
+                part=index,
+                part_count=len(assertion_chunks),
+            )
+            for index, assertion_ids in enumerate(assertion_chunks, start=1)
+        )
+
     def _required_gap(
         self,
         specification: CompiledFactorySpecification,
+        *,
+        assertion_ids: tuple[str, ...],
+        part: int,
+        part_count: int,
     ) -> ToolGapMarker:
         blueprints = [
             (
@@ -584,11 +636,7 @@ class CodebaseDiscoveryService:
                     "Provide a typed n8n integration under an approved capability lease.",
                 )
             )
-        if len(specification.assertion_ids) > 3:
-            raise ValueError(
-                "TODO_TOOL.v1 cannot bind more than three blocked assertions"
-            )
-        while len(blueprints) < len(specification.assertion_ids):
+        while len(blueprints) < len(assertion_ids):
             index = len(blueprints) + 1
             blueprints.append(
                 (
@@ -601,9 +649,7 @@ class CodebaseDiscoveryService:
             ToolImplementationOption(
                 option_id=option_id,
                 description=description,
-                acceptance_assertion_id=specification.assertion_ids[
-                    index % len(specification.assertion_ids)
-                ],
+                acceptance_assertion_id=assertion_ids[index % len(assertion_ids)],
             )
             for index, (option_id, description) in enumerate(blueprints)
         ]
@@ -611,14 +657,19 @@ class CodebaseDiscoveryService:
             "required-tool-gap-rationale",
             {
                 "capability_key": specification.capability_key,
-                "acceptance_assertion_ids": list(specification.assertion_ids),
+                "acceptance_assertion_ids": list(assertion_ids),
                 "reason": "no released tool catalog match",
+                "part": part,
+                "part_count": part_count,
             },
         )
+        gap_id = f"missing-{specification.capability_key}"
+        if part_count > 1:
+            gap_id = f"{gap_id}-part-{part}"
         return ToolGapMarker.model_validate(
             {
                 "schema": "TODO_TOOL.v1",
-                "gap_id": f"missing-{specification.capability_key}",
+                "gap_id": gap_id,
                 "severity": "required",
                 "input_contract_ref": _contract_ref(
                     specification.capability_key,
@@ -630,7 +681,7 @@ class CodebaseDiscoveryService:
                 ),
                 "least_privilege_capability": f"{specification.capability_key}.execute",
                 "implementation_options": options,
-                "acceptance_assertion_ids": specification.assertion_ids,
+                "acceptance_assertion_ids": assertion_ids,
                 "evidence_ref": rationale_ref,
                 "status": "unresolved",
             }
@@ -649,6 +700,37 @@ def _safe_relative_path(value: str, *, allow_dot: bool = False) -> str:
     if normalized in {".", ""}:
         raise ValueError("repository path must identify a relative file")
     return path.as_posix()
+
+
+def _parse_git_worktree_porcelain(output: str) -> tuple[dict[str, str], ...]:
+    records: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line in output.splitlines():
+        if not line:
+            if current:
+                records.append(current)
+                current = {}
+            continue
+        key, separator, value = line.partition(" ")
+        if key == "worktree" and current:
+            records.append(current)
+            current = {}
+        if key in {"worktree", "HEAD", "branch"} and separator:
+            current[key] = value
+        elif key == "detached":
+            current["detached"] = "true"
+    if current:
+        records.append(current)
+    if not records or any(
+        "worktree" not in record or "HEAD" not in record for record in records
+    ):
+        raise ValueError("Git returned incomplete worktree porcelain evidence")
+    return tuple(records)
+
+
+def _registered_worktree_name(root: Path) -> str:
+    digest = hashlib.sha256(str(root).casefold().encode("utf-8")).hexdigest()[:12]
+    return f"registered-{digest}"
 
 
 def _is_excluded(path: PurePosixPath) -> bool:
@@ -679,8 +761,13 @@ def _python_symbols_by_line(relative_path: str, content: str) -> dict[int, str]:
     )
     symbols: dict[int, str] = {}
     for node in definitions:
+        decorator_lines = [
+            decorator.lineno
+            for decorator in getattr(node, "decorator_list", ())
+        ]
+        start_line = min([node.lineno, *decorator_lines])
         end_line = getattr(node, "end_lineno", node.lineno) or node.lineno
-        for line_number in range(node.lineno, end_line + 1):
+        for line_number in range(start_line, end_line + 1):
             symbols[line_number] = node.name
     return symbols
 
@@ -726,9 +813,18 @@ def _python_categories(content: str, observed_symbols: set[str | None]) -> set[s
             if node.module is not None and node.module.startswith("autogen"):
                 categories.add("autogen")
         elif isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
-            if node.name in {"build_team", "main", "run"} and node.name in observed_symbols:
+            is_team_builder = node.name.startswith("build_") and node.name.endswith(
+                "_team"
+            )
+            if (
+                node.name in {"main", "run"} or is_team_builder
+            ) and node.name in observed_symbols:
                 categories.add("entrypoint")
-            if any(_qualified_name(item).endswith("tool") for item in node.decorator_list):
+            if any(
+                _qualified_name(item).split(".")[-1]
+                in {"function_tool", "tool", "typed_tool"}
+                for item in node.decorator_list
+            ):
                 tool_symbols.add(node.name)
         elif isinstance(node, ast.ClassDef):
             base_names = {_qualified_name(base) for base in node.bases}
@@ -758,6 +854,8 @@ def _python_categories(content: str, observed_symbols: set[str | None]) -> set[s
                 categories.add("handoff")
             if call_name.endswith("Memory"):
                 categories.add("memory")
+        elif isinstance(node, ast.If) and _is_main_guard(node.test):
+            categories.add("entrypoint")
     if contract_classes & observed_symbols and tool_symbols & observed_symbols:
         categories.add("typed_tool")
     return categories
@@ -772,6 +870,26 @@ def _qualified_name(node: ast.AST) -> str:
     if isinstance(node, ast.Call):
         return _qualified_name(node.func)
     return ""
+
+
+def _is_main_guard(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Compare) or len(node.ops) != 1:
+        return False
+    if not isinstance(node.ops[0], ast.Eq) or len(node.comparators) != 1:
+        return False
+    left = node.left
+    right = node.comparators[0]
+    return (
+        isinstance(left, ast.Name)
+        and left.id == "__name__"
+        and isinstance(right, ast.Constant)
+        and right.value == "__main__"
+    ) or (
+        isinstance(right, ast.Name)
+        and right.id == "__name__"
+        and isinstance(left, ast.Constant)
+        and left.value == "__main__"
+    )
 
 
 def _assignment_names(node: ast.Assign | ast.AnnAssign) -> set[str]:
@@ -815,7 +933,13 @@ def _sorted_worktrees(
     observations: tuple[WorktreeObservation, ...],
 ) -> tuple[WorktreeObservation, ...]:
     unique = {
-        (item.relative_name, item.revision, item.branch or "", item.dirty): item
+        (
+            item.relative_name,
+            item.revision,
+            item.branch or "",
+            item.detached,
+            item.dirty,
+        ): item
         for item in observations
     }
     return tuple(unique[key] for key in sorted(unique))

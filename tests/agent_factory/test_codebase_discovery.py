@@ -32,6 +32,14 @@ CORRELATION_ID = "00000000-0000-0000-0000-000000000502"
 INVOCATION_ID = "00000000-0000-0000-0000-000000000503"
 ASSERTION_ID = "assert-aaaaaaaaaaaa"
 SECOND_ASSERTION_ID = "assert-cccccccccccc"
+THIRD_ASSERTION_ID = "assert-dddddddddddd"
+FOURTH_ASSERTION_ID = "assert-eeeeeeeeeeee"
+ASSERTION_IDS = (
+    ASSERTION_ID,
+    SECOND_ASSERTION_ID,
+    THIRD_ASSERTION_ID,
+    FOURTH_ASSERTION_ID,
+)
 
 
 def artifact(name: str, *, media_type: str = "application/json") -> ArtifactRef:
@@ -117,6 +125,33 @@ class DisorderedRepository:
         return self._delegate.read_text(relative_path)
 
 
+class MutatingRepository:
+    def __init__(
+        self,
+        delegate: FilesystemRepositoryInspection,
+        changed_path: Path,
+    ) -> None:
+        self._delegate = delegate
+        self._changed_path = changed_path
+
+    def revision(self) -> str:
+        return self._delegate.revision()
+
+    def worktrees(self) -> tuple[WorktreeObservation, ...]:
+        return self._delegate.worktrees()
+
+    def search(self, pattern: str, globs: tuple[str, ...]) -> tuple[SourceMatch, ...]:
+        matches = self._delegate.search(pattern, globs)
+        self._changed_path.write_text(
+            self._changed_path.read_text(encoding="utf-8") + "\n# changed after search\n",
+            encoding="utf-8",
+        )
+        return matches
+
+    def read_text(self, relative_path: PurePosixPath) -> str:
+        return self._delegate.read_text(relative_path)
+
+
 class RecordingToolCatalog:
     def __init__(self, matches: tuple[str, ...]) -> None:
         self.matches = matches
@@ -169,6 +204,18 @@ def factory_repo_fixture(
             "    termination = TextMentionTermination('DONE')\n"
             "    return Swarm([], termination_condition=termination)\n"
         ),
+        "agenten/workflows/existing_specialist_team.py": (
+            "from autogen_agentchat.teams import Swarm\n\n"
+            "def build_existing_team():\n"
+            "    return Swarm([])\n"
+        ),
+        "agenten/workflows/cli.py": (
+            "from autogen_agentchat.teams import Swarm\n\n"
+            "def launch():\n"
+            "    return Swarm([])\n\n"
+            "if __name__ == '__main__':\n"
+            "    launch()\n"
+        ),
         "agenten/tools/customer_lookup.py": (
             "from pydantic import BaseModel\n\n"
             "class CustomerLookupInput(BaseModel):\n"
@@ -177,12 +224,24 @@ def factory_repo_fixture(
             "    name = 'customer_lookup'\n"
         ),
         "agenten/not_a_tool.py": (
-            "class BaseModel:\n"
-            "    pass\n\n"
+            "from pydantic import BaseModel\n\n"
+            "class OrdinaryInput(BaseModel):\n"
+            "    value: str\n\n"
             "def tool():\n"
             "    return 'ordinary helper'\n\n"
+            "@not_a_tool\n"
+            "def ordinary_helper(value: OrdinaryInput):\n"
+            "    return value.value\n\n"
             "def build_report():\n"
             "    return 'ordinary report'\n"
+        ),
+        "agenten/tools/decorated_lookup.py": (
+            "from pydantic import BaseModel\n\n"
+            "class DecoratedLookupInput(BaseModel):\n"
+            "    customer_id: str\n\n"
+            "@tool\n"
+            "def lookup_customer(value: DecoratedLookupInput):\n"
+            "    return value.customer_id\n"
         ),
         "prompts/support.md": "# System prompt\nUse customer context and typed handoffs.\n",
         "tests/test_existing_team.py": (
@@ -242,27 +301,22 @@ def compiled_spec(
                 dependencies=("architecture",),
             )
         )
+    if assertion_count < 1 or assertion_count > len(ASSERTION_IDS):
+        raise ValueError("fixture assertion count is out of range")
     assertions = [
         AcceptanceAssertion(
-            assertion_id=ASSERTION_ID,
-            source_path=("Acceptance outcomes", "support"),
-            observable_setup="Given a support request",
+            assertion_id=assertion_id,
+            source_path=("Acceptance outcomes", f"case-{index}"),
+            observable_setup=f"Given acceptance case {index}",
             observable_action="Run the generated team",
-            observable_expected="Return the typed supported response",
+            observable_expected="Return typed evidence",
             kind="business",
-        ),
-    ]
-    if assertion_count == 2:
-        assertions.append(
-            AcceptanceAssertion(
-                assertion_id=SECOND_ASSERTION_ID,
-                source_path=("Acceptance outcomes", "audit"),
-                observable_setup="Given a completed support request",
-                observable_action="Inspect the generated evidence",
-                observable_expected="Return a typed audit record",
-                kind="business",
-            )
         )
+        for index, assertion_id in enumerate(
+            ASSERTION_IDS[:assertion_count],
+            start=1,
+        )
+    ]
     return CompiledFactorySpecification(
         source_ref=artifact("compiled-input"),
         subject_version=1,
@@ -374,7 +428,10 @@ def test_discovery_finds_semantic_reuse_without_reading_secrets(tmp_path: Path) 
     inventory = discovery.discover(invocation(specification), specification)
 
     assert "agenten.workflows.existing_team" in inventory.reusable_component_ids
+    assert "agenten.workflows.existing_specialist_team" in inventory.reusable_component_ids
+    assert "agenten.workflows.cli" in inventory.reusable_component_ids
     assert "agenten.tools.customer_lookup" in inventory.reusable_component_ids
+    assert "agenten.tools.decorated_lookup" in inventory.reusable_component_ids
     assert any("agenten/workflows/existing_team.py" in ref.uri for ref in inventory.entrypoint_refs)
     assert any("tests/test_existing_team.py" in ref.uri for ref in inventory.test_refs)
     assert any("schemas/team.schema.json" in ref.uri for ref in inventory.schema_refs)
@@ -396,6 +453,7 @@ def test_discovery_finds_semantic_reuse_without_reading_secrets(tmp_path: Path) 
     assert evidence.read(worktrees_ref) == [
         {
             "branch": "fixture-branch",
+            "detached": False,
             "dirty": True,
             "relative_name": ".",
             "revision": REVISION,
@@ -406,6 +464,8 @@ def test_discovery_finds_semantic_reuse_without_reading_secrets(tmp_path: Path) 
     )
     search_evidence = evidence.read(search_ref)
     assert any(item["symbol"] == "build_team" for item in search_evidence)
+    assert any(item["symbol"] == "build_existing_team" for item in search_evidence)
+    assert any(item["symbol"] == "lookup_customer" for item in search_evidence)
 
     documentation = evidence.read(inventory.documentation_refs[0])
     assert documentation["query"]["ecosystem"] == "autogen"
@@ -553,23 +613,66 @@ def test_filesystem_adapter_uses_real_git_state_and_rejects_revision_mismatch(
             capture_output=True,
             text=True,
         )
+    first_revision = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (root / "tracked.txt").write_text("second commit\n", encoding="utf-8")
+    for args in (
+        ("add", "tracked.txt"),
+        ("commit", "-q", "-m", "test: advance fixture"),
+    ):
+        subprocess.run(
+            ["git", "-C", str(root), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
     revision = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "HEAD"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
+    secondary_root = tmp_path / "secondary-worktree"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "worktree",
+            "add",
+            "--detach",
+            "-q",
+            str(secondary_root),
+            first_revision,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (secondary_root / "tracked.txt").write_text("detached dirty\n", encoding="utf-8")
 
     repository = FilesystemRepositoryInspection(root, expected_revision=revision)
     clean = repository.worktrees()
 
-    assert clean[0].revision == revision
-    assert clean[0].branch
-    assert clean[0].dirty is False
+    assert len(clean) == 2
+    assigned = next(item for item in clean if item.relative_name == ".")
+    detached = next(item for item in clean if item.relative_name != ".")
+    assert assigned.revision == revision
+    assert assigned.branch
+    assert assigned.detached is False
+    assert assigned.dirty is False
+    assert detached.revision == first_revision
+    assert detached.branch is None
+    assert detached.detached is True
+    assert detached.dirty is True
 
     (root / "tracked.txt").write_text("changed\n", encoding="utf-8")
     dirty = FilesystemRepositoryInspection(root, expected_revision=revision).worktrees()
-    assert dirty[0].dirty is True
+    assert next(item for item in dirty if item.relative_name == ".").dirty is True
 
     with pytest.raises(ValueError, match="revision mismatch"):
         FilesystemRepositoryInspection(root, expected_revision="f" * 40)
@@ -624,6 +727,38 @@ def test_service_sorts_and_deduplicates_port_observations(tmp_path: Path) -> Non
     assert identities == sorted(set(identities))
 
 
+def test_discovery_rejects_source_changed_between_search_and_read(tmp_path: Path) -> None:
+    root = factory_repo_fixture(tmp_path)
+    base = FilesystemRepositoryInspection(
+        root,
+        expected_revision=REVISION,
+        git_worktrees=RecordingGitWorktrees(),
+    )
+    repository = MutatingRepository(
+        base,
+        root / "agenten" / "workflows" / "existing_team.py",
+    )
+    docs = RecordingDocumentationPort()
+    catalog = RecordingToolCatalog(("released.customer_lookup",))
+    evidence = RecordingEvidenceStore()
+    discovery = CodebaseDiscoveryService(
+        repository=repository,
+        documentation=docs,
+        tool_catalog=catalog,
+        evidence_store=evidence,
+        package_metadata=RecordingPackageMetadata(),
+        clock=lambda: NOW + timedelta(minutes=1),
+    )
+    specification = compiled_spec()
+
+    with pytest.raises(ValueError, match="changed|snapshot"):
+        discovery.discover(invocation(specification), specification)
+
+    assert docs.queries == []
+    assert catalog.requests == []
+    assert evidence.payloads == {}
+
+
 def test_required_gap_options_cover_every_blocked_assertion(tmp_path: Path) -> None:
     root = factory_repo_fixture(tmp_path, integration_intent="n8n")
     specification = compiled_spec(
@@ -639,6 +774,36 @@ def test_required_gap_options_cover_every_blocked_assertion(tmp_path: Path) -> N
     assert {
         option.acceptance_assertion_id for option in marker.implementation_options
     } == set(specification.assertion_ids)
+
+
+def test_required_gaps_preserve_more_than_three_blocked_assertions(
+    tmp_path: Path,
+) -> None:
+    root = factory_repo_fixture(tmp_path)
+    specification = compiled_spec(
+        capability_key="missing_crm_api",
+        assertion_count=4,
+    )
+    discovery, _, _, _, evidence = service(root, matches=())
+
+    inventory = discovery.discover(invocation(specification), specification)
+
+    markers = [
+        ToolGapMarker.model_validate(evidence.read(reference))
+        for reference in inventory.gap_refs
+    ]
+    assert len(markers) == 2
+    assert {
+        assertion_id
+        for marker in markers
+        for assertion_id in marker.acceptance_assertion_ids
+    } == set(specification.assertion_ids)
+    for marker in markers:
+        assert len(marker.implementation_options) <= 3
+        assert {
+            option.acceptance_assertion_id
+            for option in marker.implementation_options
+        } == set(marker.acceptance_assertion_ids)
 
 
 def test_repository_reader_rejects_secrets_and_scope_escape(tmp_path: Path) -> None:
