@@ -26,6 +26,7 @@ from agenten.agent_factory.execution_budget import (
     FactoryUsageReceiptV1,
     InMemoryFactoryBudgetLedger,
 )
+from agenten.agent_factory.execution_policy import FactoryExecutionMode
 from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.hermes_cli import InMemoryFactorySkillReplayStore
@@ -513,11 +514,18 @@ async def test_live_run_reserves_records_usage_handoffs_and_termination(
         uri="holdout://holdout-333333333333",
         sha256="3" * 64,
     )
+    third_holdout = PrivateHoldoutRef(
+        schema_name="captain.private-holdout-ref.v1",
+        holdout_id="holdout-444444444444",
+        uri="holdout://holdout-444444444444",
+        sha256="4" * 64,
+    )
     job = base_job.model_copy(
         update={
             "private_holdout_refs": (
                 *base_job.private_holdout_refs,
                 second_holdout,
+                third_holdout,
             )
         }
     )
@@ -657,17 +665,34 @@ async def test_live_run_reserves_records_usage_handoffs_and_termination(
         invocation, candidate, job.private_holdout_refs[0]
     )
     second_case = await service.execute(invocation, candidate, second_holdout)
+    third_case = await service.execute(invocation, candidate, third_holdout)
 
     assert evidence.status == "succeeded"
     assert evidence.termination_reason == "task_completed"
     assert evidence.usage_receipt_refs == (_artifact("factory-usage", "8" * 64),)
     assert evidence.handoff_evidence_refs == (handoff_ref,)
     assert evidence.tool_evidence_refs == (tool_ref,)
-    assert len(runner.calls) == 2
+    assert len(runner.calls) == 3
     assert replayed == evidence
     assert second_case.holdout_ref == second_holdout
+    assert third_case.holdout_ref == third_holdout
+    assert tuple(
+        item.run_number for item in (evidence, second_case, third_case)
+    ) == (1, 2, 3)
+    assert len(
+        {
+            item.invocation_id
+            for item in (evidence, second_case, third_case)
+        }
+    ) == 3
+    assert len(
+        {
+            item.invocation.idempotency_key
+            for item in (evidence, second_case, third_case)
+        }
+    ) == 3
     projection = budget.projection(job.job_id)
-    assert projection.consumed_usd == Decimal("0.84")
+    assert projection.consumed_usd == Decimal("1.26")
     assert projection.reserved_usd == Decimal("0")
 
 
@@ -915,6 +940,197 @@ def test_embedded_live_composition_is_available_and_fails_closed_without_a_port(
             evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "closed"),
             ports=replace(ports, n8n_authority=None),  # type: ignore[arg-type]
         )
+
+
+@pytest.mark.asyncio
+async def test_live_composition_executes_each_explicit_authorized_holdout_scope(
+    tmp_path: Path,
+) -> None:
+    bodies = (
+        b"Resolve private release case one.",
+        b"Resolve private release case two.",
+        b"Resolve private release case three.",
+    )
+    holdouts = tuple(
+        PrivateHoldoutRef(
+            schema_name="captain.private-holdout-ref.v1",
+            holdout_id=f"holdout-{str(number) * 12}",
+            uri=f"holdout://holdout-{str(number) * 12}",
+            sha256=hashlib.sha256(body).hexdigest(),
+        )
+        for number, body in enumerate(bodies, start=1)
+    )
+    base_job = _job_v3()
+    job = base_job.model_copy(
+        update={
+            "private_holdout_refs": holdouts,
+            "execution_policy": base_job.execution_policy.model_copy(
+                update={
+                    "mode": FactoryExecutionMode.RELEASE,
+                    "required_live_runs": 3,
+                }
+            ),
+        }
+    )
+    candidate = _sealed_team_candidate(tmp_path)
+    with zipfile.ZipFile(candidate.source_archive, "r") as archive:
+        entries = {name: archive.read(name) for name in archive.namelist()}
+    team_payload = json.loads(entries["team_manifest.json"])
+    for agent in team_payload["agents"]:
+        agent["tools"] = []
+    team_bytes = json.dumps(team_payload, sort_keys=True).encode("utf-8")
+    entries["team_manifest.json"] = team_bytes
+    with zipfile.ZipFile(candidate.source_archive, "w") as archive:
+        for name, content in entries.items():
+            archive.writestr(name, content)
+    candidate = candidate.model_copy(
+        update={
+            "candidate": candidate.candidate.model_copy(
+                update={
+                    "source_archive_ref": candidate.candidate.source_archive_ref.model_copy(
+                        update={
+                            "sha256": hashlib.sha256(
+                                candidate.source_archive.read_bytes()
+                            ).hexdigest()
+                        }
+                    ),
+                    "team_manifest": candidate.candidate.team_manifest.model_copy(
+                        update={
+                            "reference": candidate.candidate.team_manifest.reference.model_copy(
+                                update={
+                                    "sha256": hashlib.sha256(team_bytes).hexdigest()
+                                }
+                            )
+                        }
+                    ),
+                }
+            )
+        }
+    )
+    released, skill_root = _released_skill_fixture(tmp_path)
+
+    class Catalog:
+        def released_for(self, *_: object) -> ReleasedHermesSkill:
+            return released
+
+    class Holdouts:
+        async def resolve(
+            self, reference: PrivateHoldoutRef
+        ) -> ResolvedFactoryHoldoutCase:
+            return ResolvedFactoryHoldoutCase(
+                reference=reference,
+                body=bodies[holdouts.index(reference)],
+            )
+
+        async def evaluate(
+            self,
+            reference: PrivateHoldoutRef,
+            result: object,
+            assertion_ids: tuple[str, ...],
+        ) -> FactoryHoldoutEvaluationReceiptV1:
+            assert result is not None
+            return FactoryHoldoutEvaluationReceiptV1(
+                schema_name="captain.factory-holdout-evaluation-receipt.v1",
+                holdout_ref=reference,
+                candidate_ref=candidate.candidate.source_archive_ref,
+                assertion_ids=assertion_ids,
+                decisions=tuple(
+                    FactoryHoldoutAssertionDecisionV1(
+                        assertion_id=assertion_id,
+                        passed=True,
+                        provenance_code="deterministic_rule",
+                    )
+                    for assertion_id in assertion_ids
+                ),
+                evaluator_id="captain_test_evaluator",
+                evaluator_version="1",
+                evaluated_at=NOW,
+            )
+
+    async def support_triage(ticket: str) -> str:
+        return f"routed:{ticket}"
+
+    class TrustedN8nAdapter:
+        def tool(self, name: str) -> object:
+            return FunctionTool(
+                support_triage,
+                description="Route support case",
+                name=name,
+            )
+
+        def authorization(self, name: str) -> object:
+            raise AssertionError(f"unused n8n tool {name} requested authority")
+
+        def observed_evidence(self) -> tuple[FactoryN8nExecutionEvidenceV1, ...]:
+            return ()
+
+    class TrustedN8nAuthority:
+        async def authorize_command(self, claim: object, *, now: datetime) -> object:
+            raise AssertionError("unused n8n tool requested authority")
+
+        async def authorize(self, evidence: object, *, now: datetime) -> object:
+            raise AssertionError("no n8n call should be observed")
+
+    ports = FactoryLiveTeamExecutionPorts(
+        model_client_for=lambda *_: ReplayChatCompletionClient(
+            ["TERMINATE"],
+            model_info=ModelInfo(
+                vision=False,
+                function_calling=True,
+                json_output=True,
+                family=ModelFamily.UNKNOWN,
+                structured_output=True,
+            ),
+        ),
+        budget=InMemoryFactoryBudgetLedger(),
+        pricing_authority=_PricingAuthority(_pricing_quote(job)),
+        replay_store=InMemoryFactorySkillReplayStore(),
+        holdouts=Holdouts(),  # type: ignore[arg-type]
+        n8n_adapter=TrustedN8nAdapter(),  # type: ignore[arg-type]
+        n8n_authority=TrustedN8nAuthority(),  # type: ignore[arg-type]
+        released_skill_catalog=Catalog(),  # type: ignore[arg-type]
+        skill_root=skill_root,
+        tools={},
+        provider="deterministic-replay",
+        model="approved-model-id",
+        max_cost_per_call=Decimal("0.50"),
+        clock=lambda: NOW,
+    )
+    adapters = tuple(
+        compose_live_team_execution(
+            job=job,
+            evidence_store=FilesystemFactoryEvidenceStore(
+                tmp_path / "composition"
+            ),
+            ports=ports,
+            holdout_selector=lambda _current_job, selected=holdout: selected,
+        )
+        for holdout in holdouts
+    )
+    dispatch = FactoryDispatch(
+        job=job,
+        action=FactoryAction(
+            kind=FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
+            attempt=1,
+            job_id=job.job_id,
+        ),
+        role=FactoryRole.REAL_CASE_TESTER,
+        lease=_invocation(job).lease,
+    )
+
+    evidence = tuple(
+        [
+            await adapter.execute(
+                dispatch,
+                candidate,
+            )
+            for adapter in adapters
+        ]
+    )
+
+    assert tuple(item.run_number for item in evidence) == (1, 2, 3)
+    assert len({item.invocation_id for item in evidence}) == 3
+    assert len({item.invocation.idempotency_key for item in evidence}) == 3
 
 
 @pytest.mark.asyncio

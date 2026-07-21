@@ -1549,7 +1549,7 @@ class TeamExecutionService:
             artifact_ref=preflight_ref,
             evidence_refs=(preflight_ref,),
             acceptance_assertion_ids=invocation.acceptance_assertion_ids,
-            run_number=invocation.attempt,
+            run_number=self._run_number(case_ref),
             candidate_ref=candidate.candidate.source_archive_ref,
             holdout_ref=case_ref,
             execution_outcome=outcome,
@@ -1690,7 +1690,7 @@ class TeamExecutionService:
             artifact_ref=failure_ref,
             evidence_refs=evidence_refs,
             acceptance_assertion_ids=invocation.acceptance_assertion_ids,
-            run_number=invocation.attempt,
+            run_number=self._run_number(case_ref),
             candidate_ref=candidate.candidate.source_archive_ref,
             holdout_ref=case_ref,
             execution_outcome=outcome,
@@ -1740,7 +1740,7 @@ class TeamExecutionService:
             artifact_ref=artifact_ref,
             evidence_refs=evidence_refs,
             acceptance_assertion_ids=invocation.acceptance_assertion_ids,
-            run_number=invocation.attempt,
+            run_number=self._run_number(case_ref),
             candidate_ref=candidate.candidate.source_archive_ref,
             holdout_ref=case_ref,
             execution_outcome=outcome,
@@ -1751,6 +1751,16 @@ class TeamExecutionService:
             termination_reason=run.termination_reason,
             status=run.status,
         )
+
+    def _run_number(self, case_ref: PrivateHoldoutRef) -> int:
+        """Use the Captain-authorized holdout order as stable run identity."""
+
+        try:
+            return self._job.private_holdout_refs.index(case_ref) + 1
+        except ValueError as exc:
+            raise ValueError(
+                "team execution case is not authorized by the factory job"
+            ) from exc
 
 
 class TeamExecutionCandidateAdapter:
@@ -1833,6 +1843,9 @@ def compose_live_team_execution(
     job: AgentFactoryJobV3,
     evidence_store: FactoryEvidenceStore,
     ports: FactoryLiveTeamExecutionPorts,
+    holdout_selector: (
+        Callable[[AgentFactoryJobV3], PrivateHoldoutRef] | None
+    ) = None,
 ) -> TeamExecutionCandidateAdapter:
     """Compose only the host AutoGen runner; generated runners are never accepted."""
 
@@ -1863,9 +1876,19 @@ def compose_live_team_execution(
     )
 
     def holdout_for(current_job: AgentFactoryJobV3) -> PrivateHoldoutRef:
-        if len(current_job.private_holdout_refs) != 1:
-            raise ValueError("live execution requires an explicit single holdout scope")
-        return current_job.private_holdout_refs[0]
+        if holdout_selector is None:
+            if len(current_job.private_holdout_refs) != 1:
+                raise ValueError(
+                    "live execution requires an explicit Captain holdout selector"
+                )
+            selected = current_job.private_holdout_refs[0]
+        else:
+            selected = holdout_selector(current_job)
+        if selected not in current_job.private_holdout_refs:
+            raise ValueError(
+                "live execution holdout selector returned an unauthorized scope"
+            )
+        return selected
 
     def invocation_for(request: FactoryDispatch) -> FactorySkillInvocationV1:
         if request.job != job or request.lease is None:

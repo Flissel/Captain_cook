@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from uuid import UUID
 
 import pytest
 from fastapi import HTTPException
@@ -12,10 +13,16 @@ import gateway.contracts as gateway_contracts
 from agenten.agent_factory.contracts import FactoryPhase
 from agenten.agent_factory.contracts import FactoryRole
 from agenten.agent_factory.leases import issue_factory_lease
+from agenten.agent_factory.execution_budget import FactoryBudgetProjection
 from agenten.agent_factory.release_gate import E2EKind, E2EOutcome, E2ERunEvidence
-from agenten.agent_factory.service import FactoryCoordinator, InMemoryFactoryRepository
+from agenten.agent_factory.service import (
+    FactoryCoordinator,
+    FactoryRepositoryError,
+    InMemoryFactoryRepository,
+)
 from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationEvidence
 from agenten.agent_factory.skill_workflow_contracts import (
+    FACTORY_SKILL_ID_BY_STEP,
     CodebaseInventoryV1,
     FactorySkillStep,
 )
@@ -36,6 +43,13 @@ from tests.agent_factory.test_state_machine import (
     job,
 )
 from tests.agent_factory.test_execution_budget import job_v3
+from tests.agent_factory.test_release_gate import (
+    workflow_budget,
+    workflow_evaluation,
+    workflow_job,
+    workflow_receipts,
+    workflow_run,
+)
 from tests.agent_factory.test_skill_workflow_contracts import (
     brief_payload,
     evaluation_payload,
@@ -53,6 +67,10 @@ class Store:
         self.evaluations = {}
         self.decisions = {}
         self.workflow_artifacts = {}
+        self.budgets = {}
+        self.usage_receipts = {}
+        self.released_skills = []
+        self.skill_assignments = []
 
     def record_factory_job(self, factory_job):
         self.jobs.setdefault(factory_job.job_id, factory_job)
@@ -73,6 +91,27 @@ class Store:
 
     def factory_workflow_artifacts(self, job_id):
         return tuple(self.workflow_artifacts.get(job_id, ()))
+
+    def factory_budget(self, job_id):
+        return self.budgets[job_id]
+
+    def factory_usage_receipts(self, job_id):
+        return tuple(self.usage_receipts.get(job_id, ()))
+
+    def record_released_factory_skill(self, skill):
+        self.released_skills.append(skill)
+        return type("Receipt", (), {"replayed": False})()
+
+    def record_factory_skill_assignment(self, assignment):
+        self.skill_assignments.append(assignment)
+        return type("Receipt", (), {"replayed": False})()
+
+    def factory_skill_assignment(self, job_id, step):
+        return next(
+            assignment
+            for assignment in self.skill_assignments
+            if assignment.job_id == job_id and assignment.step is step
+        )
 
 
 def test_gateway_adapter_runs_coordinator_against_gateway_store_shape() -> None:
@@ -159,6 +198,101 @@ def test_gateway_repository_exposes_workflow_artifacts_read_only() -> None:
     assert recovered == (artifact,)
 
 
+def test_gateway_repository_exposes_budget_and_usage_as_read_only_evidence(job_v3) -> None:
+    store = Store()
+    budget = FactoryBudgetProjection(
+        job_id=job_v3.job_id,
+        limit_usd=job_v3.execution_policy.max_cost_usd,
+        consumed_usd="0",
+        reserved_usd="0",
+        remaining_usd=job_v3.execution_policy.max_cost_usd,
+    )
+    store.budgets[job_v3.job_id] = budget
+    store.usage_receipts[job_v3.job_id] = []
+    repository = GatewayFactoryRepository(store)
+
+    assert repository.workflow_budget_projection(job_v3.job_id) == budget
+    assert repository.workflow_usage_receipts(job_v3.job_id) == ()
+
+
+def test_gateway_repository_seeds_all_six_exact_job_skill_assignments() -> None:
+    factory_job = workflow_job(mode="release")
+    base_skill = parse_factory_workflow_artifact(
+        inventory_payload()
+    ).invocation.released_skill
+
+    class Catalog:
+        def released_for(self, _job, step: FactorySkillStep):
+            digest = hashlib.sha256(step.value.encode()).hexdigest()
+            return base_skill.model_copy(
+                update={
+                    "skill_id": FACTORY_SKILL_ID_BY_STEP[step],
+                    "content_ref": base_skill.content_ref.model_copy(
+                        update={
+                            "uri": (
+                                "artifact://released-skills/"
+                                f"{FACTORY_SKILL_ID_BY_STEP[step]}/v1"
+                            ),
+                            "sha256": digest,
+                        }
+                    ),
+                    "content_sha256": digest,
+                }
+            )
+
+    store = Store()
+    repository = GatewayFactoryRepository(store)
+    repository.register(factory_job)
+    repository.seed_released_skill_assignments(factory_job, Catalog())
+
+    assert tuple(item.step for item in store.skill_assignments) == tuple(
+        FactorySkillStep
+    )
+    assert tuple(
+        item.released_skill.skill_id for item in store.skill_assignments
+    ) == tuple(FACTORY_SKILL_ID_BY_STEP.values())
+    assert tuple(item.released_skill for item in store.skill_assignments) == tuple(
+        store.released_skills
+    )
+    assert repository.released_for(
+        factory_job,
+        FactorySkillStep.DISCOVER,
+    ) == store.skill_assignments[0].released_skill
+
+    changed_envelope = factory_job.model_copy(
+        update={"max_behavioral_iterations": 4}
+    )
+    with pytest.raises(FactoryRepositoryError, match="job envelope"):
+        repository.released_for(changed_envelope, FactorySkillStep.DISCOVER)
+
+
+def test_gateway_recomputes_v3_release_from_persisted_workflow_evidence() -> None:
+    runs = tuple(workflow_run(number) for number in range(1, 4))
+    evaluation = workflow_evaluation(runs)
+    store = GatewayStore.__new__(GatewayStore)
+    store._factory_workflow_artifacts_for_job = (  # type: ignore[method-assign]
+        lambda _cursor, _job_id, *, for_update: (*runs, evaluation)
+    )
+    store._factory_budget_projection = (  # type: ignore[method-assign]
+        lambda _cursor, _job, *, for_update: workflow_budget()
+    )
+    store._factory_usage_receipts_for_job = (  # type: ignore[method-assign]
+        lambda _cursor, _job_id, *, for_update: workflow_receipts(runs)
+    )
+
+    decision = store._factory_workflow_release_decision(
+        object(),
+        workflow_job(mode="release"),
+        attempt=1,
+        evaluation=evaluation,
+        for_update=True,
+    )
+
+    assert decision is not None
+    assert decision.status == "ready"
+    assert decision.evaluation_ref == evaluation.artifact_ref
+
+
 @pytest.mark.parametrize(
     "payload_builder",
     (
@@ -187,6 +321,62 @@ def test_gateway_workflow_sequence_requires_current_phase_and_prior_artifact() -
     inventory = parse_factory_workflow_artifact(inventory_payload())
     brief = parse_factory_workflow_artifact(brief_payload())
     execution = parse_factory_workflow_artifact(execution_payload())
+    second_execution = execution.model_copy(
+        update={
+            "run_number": 2,
+            "invocation_id": UUID("00000000-0000-0000-0000-000000000381"),
+            "invocation": execution.invocation.model_copy(
+                update={
+                    "invocation_id": UUID(
+                        "00000000-0000-0000-0000-000000000381"
+                    ),
+                    "idempotency_key": "8" * 64,
+                    "execution_scope_ref": execution.holdout_ref.model_copy(
+                        update={
+                            "holdout_id": "holdout-333333333333",
+                            "uri": "holdout://holdout-333333333333",
+                            "sha256": "3" * 64,
+                        }
+                    ),
+                }
+            ),
+            "holdout_ref": execution.holdout_ref.model_copy(
+                update={
+                    "holdout_id": "holdout-333333333333",
+                    "uri": "holdout://holdout-333333333333",
+                    "sha256": "3" * 64,
+                }
+            ),
+        }
+    )
+    third_execution = second_execution.model_copy(
+        update={
+            "run_number": 3,
+            "invocation_id": UUID("00000000-0000-0000-0000-000000000382"),
+            "invocation": second_execution.invocation.model_copy(
+                update={
+                    "invocation_id": UUID(
+                        "00000000-0000-0000-0000-000000000382"
+                    ),
+                    "idempotency_key": "9" * 64,
+                    "execution_scope_ref": second_execution.holdout_ref.model_copy(
+                        update={
+                            "holdout_id": "holdout-444444444444",
+                            "uri": "holdout://holdout-444444444444",
+                            "sha256": "4" * 64,
+                        }
+                    ),
+                }
+            ),
+            "holdout_ref": second_execution.holdout_ref.model_copy(
+                update={
+                    "holdout_id": "holdout-444444444444",
+                    "uri": "holdout://holdout-444444444444",
+                    "sha256": "4" * 64,
+                }
+            ),
+        }
+    )
     evaluation = parse_factory_workflow_artifact(evaluation_payload())
     feedback = parse_factory_workflow_artifact(feedback_payload())
     forge_requested = FactoryProjection.from_job(factory_job).model_copy(
@@ -211,23 +401,172 @@ def test_gateway_workflow_sequence_requires_current_phase_and_prior_artifact() -
         (inventory, brief),
     )
     GatewayStore._assert_workflow_sequence(
+        blueprint_created.model_copy(update={"phase": FactoryPhase.BUILD_PASSED}),
+        second_execution,
+        (inventory, brief, execution),
+    )
+    GatewayStore._assert_workflow_sequence(
+        blueprint_created.model_copy(update={"phase": FactoryPhase.BUILD_PASSED}),
+        third_execution,
+        (inventory, brief, execution, second_execution),
+    )
+    GatewayStore._assert_workflow_sequence(
         blueprint_created.model_copy(
             update={"phase": FactoryPhase.REAL_CASE_EVIDENCE}
         ),
         evaluation,
-        (inventory, brief, execution),
+        (inventory, brief, execution, second_execution, third_execution),
     )
+    feedback_invocation = feedback.invocation.model_copy(
+        update={
+            "input_ref": evaluation.artifact_ref,
+            "input_sha256": evaluation.artifact_ref.sha256,
+        }
+    )
+    feedback = feedback.model_copy(update={"invocation": feedback_invocation})
     GatewayStore._assert_workflow_sequence(
         blueprint_created.model_copy(
-            update={"phase": FactoryPhase.QUALITY_REVIEWED}
+            update={"phase": FactoryPhase.REAL_CASE_EVIDENCE}
         ),
         feedback,
-        (inventory, brief, execution, evaluation),
+        (inventory, brief, execution, second_execution, third_execution, evaluation),
     )
     with pytest.raises(HTTPException, match="current factory phase"):
         GatewayStore._assert_workflow_sequence(
             blueprint_created, inventory, ()
         )
+
+
+def test_gateway_workflow_input_binding_uses_the_exact_step_predecessor() -> None:
+    inventory = parse_factory_workflow_artifact(inventory_payload())
+    evaluation = parse_factory_workflow_artifact(evaluation_payload())
+    feedback = parse_factory_workflow_artifact(feedback_payload())
+    factory_job = job().model_copy(
+        update={
+            "job_id": inventory.job_id,
+            "correlation_id": inventory.correlation_id,
+            "subject_version": inventory.subject_version,
+            "input_ref": inventory.invocation.input_ref,
+            "acceptance_assertion_ids": inventory.acceptance_assertion_ids,
+            "required_capability": inventory.invocation.released_skill.capability,
+        }
+    )
+    report_invocation = feedback.invocation.model_copy(
+        update={
+            "input_ref": evaluation.artifact_ref,
+            "input_sha256": evaluation.artifact_ref.sha256,
+        }
+    )
+    feedback = feedback.model_copy(update={"invocation": report_invocation})
+
+    GatewayStore._assert_workflow_artifact(
+        factory_job,
+        inventory,
+        (),
+    )
+    GatewayStore._assert_workflow_artifact(
+        factory_job,
+        feedback,
+        (evaluation,),
+    )
+
+    stale = feedback.model_copy(
+        update={
+            "invocation": report_invocation.model_copy(
+                update={
+                    "input_ref": factory_job.input_ref,
+                    "input_sha256": factory_job.input_ref.sha256,
+                }
+            )
+        }
+    )
+    with pytest.raises(HTTPException, match="input binding"):
+        GatewayStore._assert_workflow_artifact(
+            factory_job,
+            stale,
+            (evaluation,),
+        )
+
+
+def test_gateway_rejects_foreign_skill_with_the_same_factory_capability() -> None:
+    inventory = parse_factory_workflow_artifact(inventory_payload())
+    factory_job = job().model_copy(
+        update={
+            "job_id": inventory.job_id,
+            "correlation_id": inventory.correlation_id,
+            "subject_version": inventory.subject_version,
+            "input_ref": inventory.invocation.input_ref,
+            "acceptance_assertion_ids": inventory.acceptance_assertion_ids,
+            "required_capability": inventory.invocation.released_skill.capability,
+        }
+    )
+    foreign_skill = inventory.invocation.released_skill.model_copy(
+        update={"skill_id": "captain-factory-foreign"}
+    )
+    foreign_invocation = inventory.invocation.model_copy(
+        update={"released_skill": foreign_skill}
+    )
+    foreign_inventory = inventory.model_copy(
+        update={"invocation": foreign_invocation}
+    )
+
+    with pytest.raises(HTTPException, match="skill ID"):
+        GatewayStore._assert_workflow_artifact(
+            factory_job,
+            foreign_inventory,
+            (),
+        )
+
+
+def test_gateway_requires_exact_persisted_job_step_skill_assignment() -> None:
+    assignment_type = getattr(
+        gateway_contracts,
+        "FactorySkillAssignmentV1",
+        None,
+    )
+    assert assignment_type is not None, "Gateway skill assignment contract is missing"
+    validator = getattr(GatewayStore, "_assert_workflow_skill_assignment", None)
+    assert validator is not None, "Gateway skill assignment validator is missing"
+    inventory = parse_factory_workflow_artifact(inventory_payload())
+    assignment = assignment_type(
+        job_id=inventory.job_id,
+        step=FactorySkillStep.DISCOVER,
+        released_skill=inventory.invocation.released_skill,
+    )
+
+    class Cursor:
+        def __init__(self, payload) -> None:
+            self.payload = payload
+
+        def execute(self, *_args) -> None:
+            return None
+
+        def fetchone(self):
+            return None if self.payload is None else {"payload": self.payload}
+
+    cursor = Cursor(assignment.model_dump(mode="json", by_alias=True))
+    validator(GatewayStore.__new__(GatewayStore), cursor, inventory)
+
+    alternate_skill = inventory.invocation.released_skill.model_copy(
+        update={
+            "version": 2,
+            "content_ref": inventory.invocation.released_skill.content_ref.model_copy(
+                update={"sha256": "f" * 64}
+            ),
+            "content_sha256": "f" * 64,
+        }
+    )
+    alternate = inventory.model_copy(
+        update={
+            "invocation": inventory.invocation.model_copy(
+                update={"released_skill": alternate_skill}
+            )
+        }
+    )
+    with pytest.raises(HTTPException, match="skill assignment"):
+        validator(GatewayStore.__new__(GatewayStore), cursor, alternate)
+    with pytest.raises(HTTPException, match="skill assignment"):
+        validator(GatewayStore.__new__(GatewayStore), Cursor(None), inventory)
 
 
 def test_gateway_workflow_sequence_rejects_improvement_on_first_attempt() -> None:

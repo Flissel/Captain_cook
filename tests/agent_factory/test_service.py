@@ -9,11 +9,28 @@ from agenten.agent_factory.service import (
 )
 from agenten.agent_factory.state_machine import FactoryActionKind, FactoryLifecycleError
 from agenten.agent_factory.contracts import FactoryPhase
+from agenten.agent_factory.factory_feedback import FactoryFeedbackBuilder
+from tests.agent_factory.test_factory_feedback import (
+    _budget as workflow_budget,
+    _candidate as workflow_candidate,
+    _evaluation as workflow_evaluation,
+    _report_invocation,
+)
 from tests.agent_factory.test_state_machine import (
     accepted_evaluation,
     accepted_release_decision,
     block,
     job,
+    job_v2,
+    job_v3,
+    workflow_block,
+)
+from tests.agent_factory.test_release_gate import (
+    workflow_budget as release_workflow_budget,
+    workflow_evaluation as release_workflow_evaluation,
+    workflow_job as release_workflow_job,
+    workflow_receipts,
+    workflow_run,
 )
 
 
@@ -32,6 +49,26 @@ class EvaluationLookupRepository(InMemoryFactoryRepository):
     def release_decision_for_job(self, job_id):
         self.decision_lookup_job_ids.append(job_id)
         return self.decision
+
+
+class WorkflowLookupRepository(InMemoryFactoryRepository):
+    def __init__(self, *, artifacts=(), budget=None, receipts=()):
+        super().__init__()
+        self.artifacts = tuple(artifacts)
+        self.budget = budget
+        self.receipts = tuple(receipts)
+
+    def workflow_artifacts(self, job_id):
+        self.job(job_id)
+        return self.artifacts
+
+    def workflow_budget_projection(self, job_id):
+        self.job(job_id)
+        return self.budget
+
+    def workflow_usage_receipts(self, job_id):
+        self.job(job_id)
+        return self.receipts
 
 
 def test_repository_rebuilds_state_and_returns_next_captain_action() -> None:
@@ -129,3 +166,113 @@ def test_coordinator_routes_failed_skill_evaluation_through_improvement() -> Non
 
     assert coordinator.next_action(factory_job.job_id).kind is FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED
     assert repository.lookup_job_ids == [factory_job.job_id]
+
+
+@pytest.mark.parametrize("factory_job", [job(), job_v2(), job_v3()])
+def test_repository_replays_v1_v2_and_v3_without_changing_phase_order(factory_job) -> None:
+    coordinator = FactoryCoordinator(InMemoryFactoryRepository())
+    coordinator.register(factory_job)
+    for phase in (
+        FactoryPhase.FORGE_REQUESTED,
+        FactoryPhase.BLUEPRINT_CREATED,
+        FactoryPhase.TOOL_CANDIDATE_TESTED,
+    ):
+        current = block(phase)
+        if current.job_id != factory_job.job_id:
+            current = current.model_copy(
+                update={
+                    "job_id": factory_job.job_id,
+                    "correlation_id": factory_job.correlation_id,
+                    "causation_id": factory_job.event_id,
+                }
+            )
+        coordinator.record(current)
+
+    projection = coordinator.projection(factory_job.job_id)
+
+    assert projection.job == factory_job
+    assert projection.phase is FactoryPhase.TOOL_CANDIDATE_TESTED
+    assert coordinator.next_action(factory_job.job_id).kind is FactoryActionKind.SUBMIT_FORGE_JOB
+
+
+def test_coordinator_reads_gateway_workflow_artifacts_for_v3_feedback() -> None:
+    factory_job = job_v3()
+    evaluation = workflow_evaluation(failed=True)
+    feedback = FactoryFeedbackBuilder(clock=lambda: evaluation.occurred_at).build(
+        invocation=_report_invocation(evaluation),
+        candidate_ref=workflow_candidate(),
+        evaluation=evaluation,
+        budget_projection=workflow_budget(),
+    )
+    repository = WorkflowLookupRepository(artifacts=(evaluation, feedback))
+    coordinator = FactoryCoordinator(repository)
+    coordinator.register(factory_job)
+    for phase in (
+        FactoryPhase.FORGE_REQUESTED,
+        FactoryPhase.BLUEPRINT_CREATED,
+        FactoryPhase.TOOL_CANDIDATE_TESTED,
+        FactoryPhase.AGENT_CODE_CREATED,
+        FactoryPhase.BUILD_PASSED,
+        FactoryPhase.REAL_CASE_EVIDENCE,
+    ):
+        coordinator.record(workflow_block(phase))
+    reviewed = workflow_block(
+        FactoryPhase.QUALITY_REVIEWED,
+        assertions=factory_job.acceptance_assertion_ids,
+    ).model_copy(
+        update={"artifact_refs": (evaluation.artifact_ref, feedback.artifact_ref)}
+    )
+    coordinator.record(reviewed)
+
+    projection = coordinator.projection(factory_job.job_id)
+
+    assert projection.workflow_evaluation_ref == evaluation.artifact_ref
+    assert projection.feedback_ref == feedback.artifact_ref
+    assert coordinator.next_action(factory_job.job_id).kind is FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED
+
+
+def test_coordinator_recomputes_v3_release_from_read_only_gateway_evidence() -> None:
+    factory_job = release_workflow_job(mode="release")
+    runs = tuple(workflow_run(number) for number in range(1, 4))
+    evaluation = release_workflow_evaluation(runs)
+    feedback = FactoryFeedbackBuilder(clock=lambda: evaluation.occurred_at).build(
+        invocation=_report_invocation(evaluation),
+        candidate_ref=runs[0].candidate_ref,
+        evaluation=evaluation,
+        budget_projection=release_workflow_budget(),
+    )
+    repository = WorkflowLookupRepository(
+        artifacts=(*runs, evaluation, feedback),
+        budget=release_workflow_budget(),
+        receipts=workflow_receipts(runs),
+    )
+    coordinator = FactoryCoordinator(repository)
+    coordinator.register(factory_job)
+    for phase in (
+        FactoryPhase.FORGE_REQUESTED,
+        FactoryPhase.BLUEPRINT_CREATED,
+        FactoryPhase.TOOL_CANDIDATE_TESTED,
+        FactoryPhase.AGENT_CODE_CREATED,
+        FactoryPhase.BUILD_PASSED,
+        FactoryPhase.REAL_CASE_EVIDENCE,
+    ):
+        coordinator.record(workflow_block(phase))
+    reviewed = workflow_block(
+        FactoryPhase.QUALITY_REVIEWED,
+        assertions=factory_job.acceptance_assertion_ids,
+    ).model_copy(
+        update={"artifact_refs": (evaluation.artifact_ref, feedback.artifact_ref)}
+    )
+    coordinator.record(reviewed)
+
+    assert coordinator.next_action(factory_job.job_id).kind is (
+        FactoryActionKind.VALIDATE_FOR_PROMOTION
+    )
+
+    coordinator.record(
+        workflow_block(
+            FactoryPhase.CAPABILITY_PROMOTED,
+            assertions=factory_job.acceptance_assertion_ids,
+        )
+    )
+    assert coordinator.projection(factory_job.job_id).status.value == "ready_to_use"

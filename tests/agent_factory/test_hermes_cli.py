@@ -560,7 +560,7 @@ async def test_dispatch_timeout_terminates_hermes_process_tree(
 
 
 @pytest.mark.asyncio
-async def test_quality_sequence_stops_after_unresolved_evaluation(
+async def test_quality_sequence_reports_unresolved_evaluation_to_captain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -596,14 +596,23 @@ async def test_quality_sequence_stops_after_unresolved_evaluation(
             self.prompt = prompt
 
         async def communicate(self) -> tuple[bytes, bytes]:
-            invocations.append(_invocation_from_prompt(self.prompt))
+            invocation = _invocation_from_prompt(self.prompt)
+            invocations.append(invocation)
             payload = _typed_payload(self.prompt)
-            payload.update(
-                {
-                    "failure_class": "unresolved",
-                    "recommendation": "MANUAL_DECISION_REQUIRED",
-                }
-            )
+            if invocation["step"] == "evaluate_team":
+                payload.update(
+                    {
+                        "failure_class": "unresolved",
+                        "recommendation": "MANUAL_DECISION_REQUIRED",
+                    }
+                )
+            else:
+                payload.update(
+                    {
+                        "recommendation": "MANUAL_DECISION_REQUIRED",
+                        "reason_codes": ["evaluation_unresolved"],
+                    }
+                )
             return json.dumps(payload).encode(), b""
 
     async def create_process(*command: str, **__: object) -> Process:
@@ -620,10 +629,16 @@ async def test_quality_sequence_stops_after_unresolved_evaluation(
         clock=lambda: lease.issued_at,
     ).dispatch(request)
 
-    assert [item["step"] for item in invocations] == ["evaluate_team"]
-    assert catalog.calls == [FactorySkillStep.EVALUATE_TEAM]
+    assert [item["step"] for item in invocations] == [
+        "evaluate_team",
+        "report_captain",
+    ]
+    assert catalog.calls == [
+        FactorySkillStep.EVALUATE_TEAM,
+        FactorySkillStep.REPORT_CAPTAIN,
+    ]
     assert evidence.phase is FactoryPhase.QUALITY_REVIEWED
-    assert evidence.status.value == "failed"
+    assert evidence.status.value == "recommended"
 
 
 @pytest.mark.asyncio

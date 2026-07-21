@@ -41,6 +41,7 @@ from agenten.agent_factory.skill_sequence import (
 from agenten.agent_factory.skill_store import reject_sensitive_data
 from agenten.agent_factory.state_machine import FactoryActionKind
 from agenten.agent_factory.skill_workflow_contracts import (
+    FACTORY_SKILL_ID_BY_STEP,
     CandidateRevisionV1,
     CodebaseInventoryV1,
     CodexBuildBriefV1,
@@ -157,7 +158,7 @@ class HermesCliFactory(HermesFactoryPort):
         transcript_refs: list[ArtifactRef] = []
         for step in steps:
             released_skill = self._released_skill_catalog.released_for(request.job, step)
-            skill_name = _STEP_SKILL_NAMES[step]
+            skill_name = FACTORY_SKILL_ID_BY_STEP[step]
             _require_released_skill_directory(
                 self._settings.skill_root,
                 skill_name=skill_name,
@@ -263,7 +264,7 @@ class HermesCliFactory(HermesFactoryPort):
             )
             _require_released_skill_directory(
                 self._settings.skill_root,
-                skill_name=_STEP_SKILL_NAMES[step],
+                skill_name=FACTORY_SKILL_ID_BY_STEP[step],
                 released_skill=released_skill,
                 now=now,
             )
@@ -770,15 +771,6 @@ def _existing_replay_claim(
     return FactorySkillReplayClaim(record=existing, acquired=False)
 
 
-_STEP_SKILL_NAMES: dict[FactorySkillStep, str] = {
-    FactorySkillStep.DISCOVER: "captain-factory-discover",
-    FactorySkillStep.BRIEF_CODEX: "captain-factory-brief-codex",
-    FactorySkillStep.EXECUTE_TEAM: "captain-factory-execute-team",
-    FactorySkillStep.EVALUATE_TEAM: "captain-factory-evaluate-team",
-    FactorySkillStep.IMPROVE_TEAM: "captain-factory-improve-team",
-    FactorySkillStep.REPORT_CAPTAIN: "captain-factory-report-captain",
-}
-
 _STEP_RESULT_MODELS: dict[FactorySkillStep, type[BaseModel]] = {
     FactorySkillStep.DISCOVER: CodebaseInventoryV1,
     FactorySkillStep.BRIEF_CODEX: CodexBuildBriefV1,
@@ -1018,11 +1010,10 @@ def _may_continue_after(artifact: _FactoryWorkflowArtifact) -> bool:
     if isinstance(artifact, TeamExecutionEvidenceV1):
         return artifact.status == "succeeded"
     if isinstance(artifact, TeamEvaluationV1):
-        return (
-            artifact.failure_class is None
-            and artifact.recommendation
-            is FactoryFeedbackRecommendation.PROMOTE_CANDIDATE
-        )
+        # Evaluation is evidence, not a terminal Hermes decision.  The Quality
+        # Warden must always run REPORT_CAPTAIN so Captain receives one typed,
+        # redacted recommendation even when deterministic evaluation failed.
+        return True
     return True
 
 
