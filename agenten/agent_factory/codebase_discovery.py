@@ -59,6 +59,16 @@ _SECRET_PATH_PATTERN = re.compile(
     r"(?i)(?:^|[._-])(?:api[_-]?key|credentials?|password|secrets?|tokens?)"
     r"(?:$|[._-])"
 )
+_RUNNABLE_AUTOGEN_TEAM_TYPES_BY_SERIES = {
+    "0.7": frozenset(
+        {
+            "MagenticOneGroupChat",
+            "RoundRobinGroupChat",
+            "SelectorGroupChat",
+            "Swarm",
+        }
+    ),
+}
 
 
 class WorktreeObservation(BaseModel):
@@ -350,12 +360,12 @@ class CodebaseDiscoveryService:
                 raise ValueError(
                     f"repository source changed during snapshot: {match.relative_path}"
                 )
-        categories = self._categorize(contents, matches)
-        reusable_ids = self._reusable_component_ids(categories)
-        source_refs = self._source_refs(categories, contents)
         autogen_version = self._package_metadata.installed_version("autogen-agentchat")
         if not autogen_version.strip():
             raise ValueError("installed AutoGen package metadata returned a blank version")
+        categories = self._categorize(contents, matches, autogen_version)
+        reusable_ids = self._reusable_component_ids(categories)
+        source_refs = self._source_refs(categories, contents)
         documentation_refs = self._documentation_refs(
             specification=specification,
             autogen_version=autogen_version,
@@ -452,6 +462,7 @@ class CodebaseDiscoveryService:
     def _categorize(
         contents: dict[str, str],
         matches: tuple[SourceMatch, ...],
+        autogen_version: str,
     ) -> dict[str, tuple[str, ...]]:
         categories: dict[str, set[str]] = {}
         observed_symbols = {
@@ -466,6 +477,9 @@ class CodebaseDiscoveryService:
                     _python_categories(
                         content,
                         observed_symbols.get(path, set()),
+                        runnable_team_types=_runnable_autogen_team_types(
+                            autogen_version
+                        ),
                     )
                 )
             for category in present_categories:
@@ -479,8 +493,10 @@ class CodebaseDiscoveryService:
     def _reusable_component_ids(
         categories: dict[str, tuple[str, ...]],
     ) -> tuple[str, ...]:
-        reusable_paths = set(categories.get("entrypoint", ())) | set(
-            categories.get("typed_tool", ())
+        reusable_paths = (
+            set(categories.get("autogen_component", ()))
+            | set(categories.get("entrypoint", ()))
+            | set(categories.get("typed_tool", ()))
         )
         identifiers = {
             path[:-3].replace("/", ".")
@@ -797,7 +813,12 @@ def _path_categories(path_lower: str, content: str) -> set[str]:
     return categories
 
 
-def _python_categories(content: str, observed_symbols: set[str | None]) -> set[str]:
+def _python_categories(
+    content: str,
+    observed_symbols: set[str | None],
+    *,
+    runnable_team_types: frozenset[str],
+) -> set[str]:
     try:
         tree = ast.parse(content)
     except SyntaxError:
@@ -808,6 +829,7 @@ def _python_categories(content: str, observed_symbols: set[str | None]) -> set[s
     decorated_typed_tool_symbols: set[str] = set()
     team_constructors: set[str] = set()
     team_module_aliases: set[str] = set()
+    autogen_team_components: set[str] = set()
     imported_schema_symbols: set[str] = set()
     imported_schema_modules: set[str] = set()
     for node in ast.walk(tree):
@@ -816,7 +838,9 @@ def _python_categories(content: str, observed_symbols: set[str | None]) -> set[s
             for alias in node.names:
                 local_name = alias.asname or alias.name
                 if node.module.startswith("autogen") and "teams" in module_parts:
-                    team_constructors.add(local_name)
+                    autogen_team_components.add(local_name)
+                    if alias.name in runnable_team_types:
+                        team_constructors.add(local_name)
                 if alias.name == "teams" and node.module.startswith("autogen"):
                     team_module_aliases.add(local_name)
                 if _is_schema_import(node.module):
@@ -843,6 +867,7 @@ def _python_categories(content: str, observed_symbols: set[str | None]) -> set[s
                 node,
                 team_constructors=team_constructors,
                 team_module_aliases=team_module_aliases,
+                runnable_team_types=runnable_team_types,
             ):
                 categories.add("entrypoint")
             is_tool_decorated = any(
@@ -876,6 +901,12 @@ def _python_categories(content: str, observed_symbols: set[str | None]) -> set[s
                 categories.add("model_client")
         elif isinstance(node, ast.Call):
             call_name = _qualified_name(node.func)
+            if _is_autogen_team_component_call(
+                node,
+                autogen_team_components=autogen_team_components,
+                team_module_aliases=team_module_aliases,
+            ):
+                categories.add("autogen_component")
             if call_name.endswith("ChatCompletionClient"):
                 categories.add("model_client")
             if call_name.endswith("Termination") or call_name.endswith(
@@ -908,11 +939,25 @@ def _is_schema_import(module: str) -> bool:
     return bool(set(module.lower().split(".")) & semantic_parts)
 
 
+def _runnable_autogen_team_types(version: str) -> frozenset[str]:
+    match = re.match(r"^(\d+)\.(\d+)", version)
+    if match is None:
+        raise ValueError("installed AutoGen version is not a semantic version")
+    series = f"{match.group(1)}.{match.group(2)}"
+    try:
+        return _RUNNABLE_AUTOGEN_TEAM_TYPES_BY_SERIES[series]
+    except KeyError as exc:
+        raise ValueError(
+            f"no runnable AutoGen team allowlist is registered for {series}"
+        ) from exc
+
+
 def _function_returns_autogen_team(
     function: ast.AsyncFunctionDef | ast.FunctionDef,
     *,
     team_constructors: set[str],
     team_module_aliases: set[str],
+    runnable_team_types: frozenset[str],
 ) -> bool:
     team_variables: set[str] = set()
     nodes = tuple(_function_body_nodes(function))
@@ -923,6 +968,7 @@ def _function_returns_autogen_team(
                 value,
                 team_constructors=team_constructors,
                 team_module_aliases=team_module_aliases,
+                runnable_team_types=runnable_team_types,
             ):
                 team_variables.update(_assignment_names(node))
     return any(
@@ -933,6 +979,7 @@ def _function_returns_autogen_team(
                 node.value,
                 team_constructors=team_constructors,
                 team_module_aliases=team_module_aliases,
+                runnable_team_types=runnable_team_types,
             )
             or (isinstance(node.value, ast.Name) and node.value.id in team_variables)
         )
@@ -959,11 +1006,32 @@ def _is_autogen_team_call(
     *,
     team_constructors: set[str],
     team_module_aliases: set[str],
+    runnable_team_types: frozenset[str],
 ) -> bool:
     if not isinstance(node, ast.Call):
         return False
     call_name = _qualified_name(node.func)
     if call_name in team_constructors:
+        return True
+    root_name = call_name.split(".", maxsplit=1)[0]
+    exported_name = call_name.rsplit(".", maxsplit=1)[-1]
+    return (
+        "." in call_name
+        and root_name in team_module_aliases
+        and exported_name in runnable_team_types
+    )
+
+
+def _is_autogen_team_component_call(
+    node: ast.AST,
+    *,
+    autogen_team_components: set[str],
+    team_module_aliases: set[str],
+) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    call_name = _qualified_name(node.func)
+    if call_name in autogen_team_components:
         return True
     root_name = call_name.split(".", maxsplit=1)[0]
     return "." in call_name and root_name in team_module_aliases
