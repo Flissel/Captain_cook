@@ -577,7 +577,8 @@ def test_mariadb_effect_migration_binds_changed_claim_to_existing_invocation(
             )
             if cursor.fetchone() is not None:
                 cursor.execute(
-                    "ALTER TABLE factory_live_effect_events DROP COLUMN invocation_id"
+                    "ALTER TABLE factory_live_effect_events "
+                    "DROP COLUMN invocation_id, ALGORITHM=COPY"
                 )
 
     restarted = GatewayStore(mariadb_store.storage)
