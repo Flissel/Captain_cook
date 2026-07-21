@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from uuid import UUID
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -220,11 +221,83 @@ def test_runtime_releases_exact_candidate_n8n_tools_before_leasing() -> None:
             gateway_url="http://127.0.0.1:8090",
             gateway_token="captain-secret",
             client=client,
+            job_id=UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
             tool_names=("crm_read", "calendar_read"),
         )
 
     payload = json.loads(requests[0].content)
     assert requests[0].url.path == "/blocks"
     assert payload["data"]["subtask_ids"] == ["crm_read", "calendar_read"]
+    assert payload["data"]["batch_id"].startswith("factory-n8n-")
     assert payload["data"]["capability_tags"] == ["n8n-builder"]
     assert requests[0].headers["authorization"] == "Bearer captain-secret"
+
+
+def test_runtime_n8n_batch_is_job_scoped_and_replays_only_exact_gateway_state() -> None:
+    batches: dict[str, dict[str, object]] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            payload = json.loads(request.content)
+            batch = payload["data"]
+            batch_id = batch["batch_id"]
+            if batch_id in batches:
+                return httpx.Response(409, json={"detail": "batch already exists"})
+            batches[batch_id] = batch
+            return httpx.Response(201, json={"index": len(batches)})
+        batch_id = request.url.path.split("/")[2]
+        return httpx.Response(200, json=batches[batch_id])
+
+    first_job = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    second_job = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        first = _ensure_factory_n8n_batch(
+            environ={"CAPTAIN_N8N_BATCH_ID": "factory-live-demo-n8n"},
+            gateway_url="http://127.0.0.1:8090",
+            gateway_token="captain-secret",
+            client=client,
+            job_id=first_job,
+            tool_names=("crm_read",),
+        )
+        replay = _ensure_factory_n8n_batch(
+            environ={"CAPTAIN_N8N_BATCH_ID": "factory-live-demo-n8n"},
+            gateway_url="http://127.0.0.1:8090",
+            gateway_token="captain-secret",
+            client=client,
+            job_id=first_job,
+            tool_names=("crm_read",),
+        )
+        second = _ensure_factory_n8n_batch(
+            environ={"CAPTAIN_N8N_BATCH_ID": "factory-live-demo-n8n"},
+            gateway_url="http://127.0.0.1:8090",
+            gateway_token="captain-secret",
+            client=client,
+            job_id=second_job,
+            tool_names=("crm_read",),
+        )
+
+    assert first == replay
+    assert first != second
+    assert set(batches) == {first, second}
+
+
+def test_runtime_n8n_batch_rejects_unverified_conflict() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(409, json={"detail": "batch already exists"})
+        return httpx.Response(200, json={"batch_id": "different"})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        try:
+            _ensure_factory_n8n_batch(
+                environ={"CAPTAIN_N8N_BATCH_ID": "factory-live-demo-n8n"},
+                gateway_url="http://127.0.0.1:8090",
+                gateway_token="captain-secret",
+                client=client,
+                job_id=UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                tool_names=("crm_read",),
+            )
+        except ProductionToolRequired as exc:
+            assert "factory_n8n_work_batch_release" in str(exc)
+        else:
+            raise AssertionError("unverified Gateway conflict must fail closed")

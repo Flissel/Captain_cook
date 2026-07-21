@@ -410,15 +410,20 @@ def build_production_runtime_app_from_environment(
 
     def n8n_bindings_for(job: Any, resolved: Any) -> tuple[Any, ...]:
         tools = tuple(resolved.candidate.n8n_tools)
-        _ensure_factory_n8n_batch(
+        batch_id = _ensure_factory_n8n_batch(
             environ=environ,
             gateway_url=gateway_url,
             gateway_token=gateway_token,
             client=gateway_sync_http,
+            job_id=job.job_id,
             tool_names=tuple(tool.name for tool in tools),
         )
         return tuple(
-            build_captain_factory_n8n_binding(environ, tool=tool)
+            build_captain_factory_n8n_binding(
+                environ,
+                tool=tool,
+                batch_id=batch_id,
+            )
             for tool in tools
         )
 
@@ -465,45 +470,70 @@ def _ensure_factory_n8n_batch(
     gateway_url: str,
     gateway_token: str,
     client: httpx.Client,
+    job_id: UUID,
     tool_names: tuple[str, ...],
-) -> None:
+) -> str:
     """Release the exact candidate tool set before its first scoped MCP lease."""
 
-    batch_id = _required_from_mapping(environ, "CAPTAIN_N8N_BATCH_ID")
+    batch_namespace = _required_from_mapping(environ, "CAPTAIN_N8N_BATCH_ID")
     if not tool_names or len(tool_names) != len(set(tool_names)):
         raise ProductionToolRequired("TODO_TOOL:factory_n8n_candidate_tools")
+    batch_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "namespace": batch_namespace,
+                "job_id": str(job_id),
+                "tool_names": list(tool_names),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    batch_id = f"factory-n8n-{batch_digest[:20]}"
+    batch = {
+        "batch_id": batch_id,
+        "title": "Captain Factory n8n evidence tools",
+        "goal": "Execute only the sealed candidate n8n tools under a short-lived lease",
+        "subtask_ids": list(tool_names),
+        "target": "n8n",
+        "runtime": "n8n-mcp",
+        "runtime_version": "v1",
+        "interface_schema": "captain.n8n-mcp-tool-reference.v1",
+        "capability_tags": ["n8n-builder"],
+        "constraints": [
+            "integration_intent=n8n",
+            "workflow identity is host pinned",
+        ],
+        "acceptance_criteria": [
+            {
+                "assertion_id": "n8n-evidence",
+                "kind": "side_effect_observed",
+                "description": "Provider execution and workflow digests match Captain authority",
+            }
+        ],
+    }
+    headers = {"Authorization": f"Bearer {gateway_token}"}
     response = client.post(
         f"{gateway_url}/blocks",
-        headers={"Authorization": f"Bearer {gateway_token}"},
+        headers=headers,
         json={
             "block_type": "work_batch",
             "status": "pending",
-            "data": {
-                "batch_id": batch_id,
-                "title": "Captain Factory n8n evidence tools",
-                "goal": "Execute only the sealed candidate n8n tools under a short-lived lease",
-                "subtask_ids": list(tool_names),
-                "target": "n8n",
-                "runtime": "n8n-mcp",
-                "runtime_version": "v1",
-                "interface_schema": "captain.n8n-mcp-tool-reference.v1",
-                "capability_tags": ["n8n-builder"],
-                "constraints": [
-                    "integration_intent=n8n",
-                    "workflow identity is host pinned",
-                ],
-                "acceptance_criteria": [
-                    {
-                        "assertion_id": "n8n-evidence",
-                        "kind": "side_effect_observed",
-                        "description": "Provider execution and workflow digests match Captain authority",
-                    }
-                ],
-            },
+            "data": batch,
         },
     )
+    if response.status_code == status.HTTP_201_CREATED:
+        return batch_id
+    if response.status_code == status.HTTP_409_CONFLICT:
+        replay = client.get(
+            f"{gateway_url}/batches/{batch_id}/bundle",
+            headers=headers,
+        )
+        if replay.status_code == status.HTTP_200_OK and replay.json() == batch:
+            return batch_id
     if response.status_code != status.HTTP_201_CREATED:
         raise ProductionToolRequired("TODO_TOOL:factory_n8n_work_batch_release")
+    return batch_id
 
 
 def _required_from_mapping(environ: Mapping[str, str], name: str) -> str:

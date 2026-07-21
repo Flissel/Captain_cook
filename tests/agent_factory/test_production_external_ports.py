@@ -129,6 +129,7 @@ def _binding() -> CaptainN8nToolBinding:
         mcp_tool_name="execute_workflow",
         workflow_id="uROkVuVjYGnw8Dfm",
         workflow_name="Captain Factory Integration Evidence",
+        batch_id="factory-n8n-test",
     )
 
 

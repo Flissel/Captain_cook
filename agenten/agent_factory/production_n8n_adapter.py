@@ -62,6 +62,7 @@ class CaptainN8nToolBinding:
     mcp_tool_name: str
     workflow_id: str
     workflow_name: str
+    batch_id: str
     required_node_types: tuple[str, ...] = (
         "n8n-nodes-base.webhook",
         "n8n-nodes-base.set",
@@ -76,6 +77,8 @@ class CaptainN8nToolBinding:
             raise ValueError("n8n tool binding requires a pinned workflowId")
         if not self.workflow_name.strip():
             raise ValueError("n8n tool binding requires a pinned workflow name")
+        if not self.batch_id.strip():
+            raise ValueError("n8n tool binding requires Captain batch authority")
         if (
             not self.required_node_types
             or len(self.required_node_types) != len(set(self.required_node_types))
@@ -94,6 +97,7 @@ def build_captain_factory_n8n_binding(
     environ: Mapping[str, str],
     *,
     tool: TypedN8nTool,
+    batch_id: str,
 ) -> CaptainN8nToolBinding:
     """Pin the one validated demo workflow; never expose workflow choice to a model."""
 
@@ -108,6 +112,7 @@ def build_captain_factory_n8n_binding(
         mcp_tool_name="execute_workflow",
         workflow_id=workflow_id,
         workflow_name=CAPTAIN_FACTORY_N8N_WORKFLOW_NAME,
+        batch_id=batch_id,
     )
 
 

@@ -30,11 +30,13 @@ def test_demo_binding_pins_the_operator_validated_workflow() -> None:
     binding = build_captain_factory_n8n_binding(
         {"CAPTAIN_FACTORY_N8N_WORKFLOW_ID": "uROkVuVjYGnw8Dfm"},
         tool=_binding().tool,
+        batch_id="factory-n8n-test",
     )
 
     assert binding.workflow_id == "uROkVuVjYGnw8Dfm"
     assert binding.workflow_name == "Captain Factory Integration Evidence"
     assert binding.mcp_tool_name == "execute_workflow"
+    assert binding.batch_id == "factory-n8n-test"
 
 
 class Registrar:
@@ -93,6 +95,7 @@ def _binding() -> CaptainN8nToolBinding:
         mcp_tool_name="execute_workflow",
         workflow_id="workflow-7",
         workflow_name="Captain Factory Integration Evidence",
+        batch_id="factory-n8n-test",
     )
 
 

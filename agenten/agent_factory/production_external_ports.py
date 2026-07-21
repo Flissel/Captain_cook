@@ -192,6 +192,10 @@ class ProductionV3JobPortFactory:
             raise _todo("candidate_n8n_tool_bindings")
         bindings = tuple(self._n8n_bindings_for(job, resolved))
         self._validate_n8n_bindings(resolved, bindings)
+        batch_ids = {binding.batch_id for binding in bindings}
+        if len(batch_ids) != 1:
+            raise ValueError("n8n MCP bindings must share one Captain batch authority")
+        batch_id = next(iter(batch_ids))
         if (
             self._gateway_sync_http is None
             or self._gateway_async_http is None
@@ -210,7 +214,7 @@ class ProductionV3JobPortFactory:
                 correlation_id=job.correlation_id,
                 subject_version=job.subject_version,
                 project_id=_required(self._environ, "CAPTAIN_N8N_PROJECT_ID"),
-                batch_id=_required(self._environ, "CAPTAIN_N8N_BATCH_ID"),
+                batch_id=batch_id,
                 workspace_ref=_required(self._environ, "CAPTAIN_N8N_WORKSPACE_REF"),
                 broker_url=broker_url,
                 signing_secret=_required(
