@@ -7,17 +7,22 @@ import json
 import os
 import re
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from enum import Enum
 from typing import Any, Callable, Protocol
+from uuid import UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from .contracts import (
     ArtifactRef,
+    CreationCompletionEvidenceV1,
     CreationFailure,
     CreationJobV1,
+    CreationPreparationEvidenceV1,
     CreationResultV1,
+    FactoryEvidenceBlockV1,
     ToolGapMarkerV1,
 )
 from .runner import StepOutcome
@@ -46,7 +51,7 @@ PIPELINE_STEP_ORDER = tuple(SwarmStep)
 
 class SwarmSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
-    creation_job_id: object
+    creation_job_id: UUID
     completed_steps: tuple[str, ...] = ()
     output_digests: dict[str, str] = Field(default_factory=dict)
     artifact_bindings: dict[str, ArtifactRef] = Field(default_factory=dict)
@@ -56,6 +61,8 @@ class SwarmSnapshot(BaseModel):
     skill_usage_receipt_ref: ArtifactRef | None = None
     pipeline_state_ref: ArtifactRef | None = None
     tool_gaps: tuple[ToolGapMarkerV1, ...] = ()
+    evidence_step_refs: dict[str, ArtifactRef] = Field(default_factory=dict)
+    evidence_step_times: dict[str, datetime] = Field(default_factory=dict)
 
 
 class ContentAddressedCreationArtifacts:
@@ -361,6 +368,21 @@ class ExportArtifactSnapshotter:
     def _capture_export(
         self, job: CreationJobV1, pipeline: Any
     ) -> dict[str, Any]:
+        package_gap = getattr(pipeline, "package_contract_gap", None)
+        if isinstance(package_gap, dict):
+            gap_id = package_gap.get("gap_id")
+            required_outputs = package_gap.get("required_outputs")
+            if (
+                isinstance(gap_id, str)
+                and gap_id
+                and isinstance(required_outputs, (list, tuple))
+                and required_outputs
+                and all(isinstance(item, str) and item for item in required_outputs)
+            ):
+                return self._required_gap(
+                    gap_id,
+                    "; ".join(required_outputs),
+                )
         export = getattr(pipeline, "export_result", None)
         if not isinstance(export, dict) or export.get("status") != "SUCCESS":
             raise ValueError("legacy pipeline did not produce a successful export")
@@ -607,7 +629,11 @@ class SwarmPipelineAdapter:
         accepted_effect: dict[str, Any] | None,
     ) -> StepOutcome:
         named_step = SwarmStep(step)
-        prior = SwarmSnapshot.model_validate(prior_snapshot)
+        prior = SwarmSnapshot.model_validate(
+            prior_snapshot or {"creation_job_id": job.creation_job_id}
+        )
+        if prior.creation_job_id != job.creation_job_id:
+            raise ValueError("creation snapshot identity changed")
         pipeline = self._pipeline_factory(prior)
         output: Any = accepted_effect
         snapshot_updates: dict[str, Any] = {}
@@ -633,6 +659,13 @@ class SwarmPipelineAdapter:
         ).hexdigest()
         completed = tuple(dict.fromkeys((*prior.completed_steps, named_step.value)))
         receipts = dict(prior.external_receipt_ids)
+        evidence_refs = dict(prior.evidence_step_refs)
+        evidence_times = dict(prior.evidence_step_times)
+        if named_step in {SwarmStep.ARCHITECT, SwarmStep.TOOLFORGE}:
+            reference = snapshot_updates.get("pipeline_state_ref")
+            if reference is not None:
+                evidence_refs[named_step.value] = ArtifactRef.model_validate(reference)
+                evidence_times[named_step.value] = datetime.now(timezone.utc)
         receipt = None
         if named_step.value in self.effectful_steps:
             receipt = accepted_effect or {
@@ -647,10 +680,109 @@ class SwarmPipelineAdapter:
                 "completed_steps": completed,
                 "output_digests": prior.output_digests | {named_step.value: digest},
                 "external_receipt_ids": receipts,
+                "evidence_step_refs": evidence_refs,
+                "evidence_step_times": evidence_times,
                 **snapshot_updates,
             }
         )
         return StepOutcome(snapshot=snapshot.model_dump(mode="json"), effect_receipt=receipt)
+
+    def preparation_evidence(
+        self,
+        job: CreationJobV1,
+        snapshot: dict[str, Any],
+    ) -> CreationPreparationEvidenceV1:
+        state = SwarmSnapshot.model_validate(snapshot)
+        architect_ref = state.evidence_step_refs.get(SwarmStep.ARCHITECT.value)
+        tool_ref = state.evidence_step_refs.get(SwarmStep.TOOLFORGE.value)
+        architect_at = state.evidence_step_times.get(SwarmStep.ARCHITECT.value)
+        tool_at = state.evidence_step_times.get(SwarmStep.TOOLFORGE.value)
+        if (
+            architect_ref is None
+            or tool_ref is None
+            or architect_at is None
+            or tool_at is None
+            or architect_at >= tool_at
+        ):
+            raise ValueError(
+                "creation preparation requires completed architect and toolforge evidence"
+            )
+        return CreationPreparationEvidenceV1(
+            creation_job=job,
+            blocks=(
+                self._evidence_block(
+                    job,
+                    phase="blueprint_created",
+                    role="agent_architect",
+                    occurred_at=architect_at,
+                    evidence_ref=architect_ref,
+                ),
+                self._evidence_block(
+                    job,
+                    phase="tool_candidate_tested",
+                    role="tool_integrator",
+                    occurred_at=tool_at,
+                    evidence_ref=tool_ref,
+                ),
+            ),
+        )
+
+    def completion_evidence(
+        self,
+        job: CreationJobV1,
+        result: CreationResultV1,
+        snapshot: dict[str, Any],
+    ) -> CreationCompletionEvidenceV1:
+        state = SwarmSnapshot.model_validate(snapshot)
+        tool_at = state.evidence_step_times.get(SwarmStep.TOOLFORGE.value)
+        occurred_at = datetime.now(timezone.utc)
+        if tool_at is None or occurred_at <= tool_at:
+            raise ValueError("creation completion does not follow tool evidence")
+        if result.package_manifest_ref is None or result.skill_usage_receipt_ref is None:
+            raise ValueError("creation completion requires package and skill evidence")
+        return CreationCompletionEvidenceV1(
+            result=result,
+            block=self._evidence_block(
+                job,
+                phase="agent_code_created",
+                role="tool_integrator",
+                occurred_at=occurred_at,
+                evidence_ref=result.package_manifest_ref,
+                additional_evidence_ref=result.skill_usage_receipt_ref,
+            ),
+        )
+
+    @staticmethod
+    def _evidence_block(
+        job: CreationJobV1,
+        *,
+        phase: str,
+        role: str,
+        occurred_at: datetime,
+        evidence_ref: ArtifactRef,
+        additional_evidence_ref: ArtifactRef | None = None,
+    ) -> FactoryEvidenceBlockV1:
+        evidence_refs = (
+            (evidence_ref,)
+            if additional_evidence_ref is None
+            else (evidence_ref, additional_evidence_ref)
+        )
+        return FactoryEvidenceBlockV1(
+            event_id=uuid5(job.creation_job_id, f"hermes:{phase}"),
+            job_id=job.factory_job_id,
+            correlation_id=job.correlation_id,
+            causation_id=job.causation_id,
+            occurred_at=occurred_at,
+            producer="hermes",
+            subject_version=job.subject_version,
+            attempt=job.attempt,
+            phase=phase,
+            role=role,
+            status="succeeded",
+            evidence_refs=evidence_refs,
+            assertion_ids=(),
+            lease_id=f"minibook-swarm-{job.creation_job_id}",
+        )
 
     async def _dispatch(self, pipeline: Any, step: SwarmStep, job: CreationJobV1) -> Any:
         if step is SwarmStep.MANAGER:

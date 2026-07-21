@@ -98,7 +98,12 @@ def create_creation_router(
         try:
             return store.preparation(job_id).blocks
         except CreationNotFoundError as exc:
-            raise HTTPException(404, "Creation preparation evidence not found") from exc
+            _raise_pending_or_missing(
+                store,
+                job_id,
+                "Creation preparation evidence is not available",
+                exc,
+            )
 
     @router.get("/api/v1/creation-jobs/{job_id}")
     def status(job_id: UUID):
@@ -131,7 +136,11 @@ def create_creation_router(
         except CreationNotFoundError as exc:
             raise HTTPException(404, "Creation job not found") from exc
         if value is None:
-            raise HTTPException(409, "Creation result is not available")
+            raise HTTPException(
+                409,
+                "Creation result is not available",
+                headers={"Retry-After": "1"},
+            )
         return value.model_dump(mode="json", by_alias=True)
 
     @router.put("/api/v1/creation-jobs/{job_id}/completion-evidence")
@@ -168,6 +177,24 @@ def create_creation_router(
         try:
             return store.completion(job_id).block
         except CreationNotFoundError as exc:
-            raise HTTPException(404, "Creation completion evidence not found") from exc
+            _raise_pending_or_missing(
+                store,
+                job_id,
+                "Creation completion evidence is not available",
+                exc,
+            )
 
     return router
+
+
+def _raise_pending_or_missing(
+    store: CreationJobStore,
+    job_id: UUID,
+    detail: str,
+    cause: CreationNotFoundError,
+) -> None:
+    try:
+        store.job(job_id)
+    except CreationNotFoundError:
+        raise HTTPException(404, "Creation job not found") from cause
+    raise HTTPException(409, detail, headers={"Retry-After": "1"}) from cause

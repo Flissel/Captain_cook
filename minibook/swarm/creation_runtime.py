@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
@@ -20,6 +21,11 @@ from .pipeline_adapter import (
 )
 from .runner import CreationRunner, PipelineStepPort
 from .cost_budget import llm_cost_budget
+from .package_assembler import (
+    LegacyPackageContractGap,
+    PackageAssembler,
+    PackageAssemblyError,
+)
 
 
 class CreationPipelineFactory(Protocol):
@@ -77,7 +83,24 @@ class BackgroundCreationRuntime:
         job = self.store.job(job_id)
         try:
             async with self.pipeline_factory.open(job) as pipeline:
-                await CreationRunner(self.store, pipeline).run_slice(job_id)
+                result = await CreationRunner(self.store, pipeline).run_slice(
+                    job_id,
+                    persist_result=False,
+                )
+                preparation_builder = getattr(pipeline, "preparation_evidence", None)
+                completion_builder = getattr(pipeline, "completion_evidence", None)
+                if (
+                    result.status == "succeeded"
+                    and callable(preparation_builder)
+                    and callable(completion_builder)
+                ):
+                    snapshot = self.store.snapshot(job_id)
+                    preparation = preparation_builder(job, snapshot)
+                    self.store.record_preparation(preparation)
+                    completion = completion_builder(job, result, snapshot)
+                    self.store.finish_with_completion(result, completion)
+                else:
+                    self.store.finish(result)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -123,6 +146,8 @@ class ProductionSwarmPipelineFactory:
         setup_project: Callable[[Any, dict[str, Any], str], Any] | None = None,
         pipeline_type: Callable[..., Any] | None = None,
         input_resolver: Callable[[Any], str] | None = None,
+        hermes_evidence_resolver: Callable[[CreationJobV1], Mapping[str, bytes] | None]
+        | None = None,
     ) -> None:
         self.artifacts = artifacts
         self._session_factory = session_factory
@@ -130,6 +155,7 @@ class ProductionSwarmPipelineFactory:
         self._setup_project = setup_project
         self._pipeline_type = pipeline_type
         self._input_resolver = input_resolver
+        self._hermes_evidence_resolver = hermes_evidence_resolver
 
     def _dependencies(self):
         if all(
@@ -188,6 +214,7 @@ class ProductionSwarmPipelineFactory:
                     task,
                     interactive=False,
                 )
+                self._install_package_c_export(pipeline, job)
                 snapshotter = ExportArtifactSnapshotter(self.artifacts)
 
                 def restore(snapshot):
@@ -198,6 +225,99 @@ class ProductionSwarmPipelineFactory:
                     session=session,
                     snapshotter=snapshotter,
                 )
+
+    def _install_package_c_export(self, pipeline: Any, job: CreationJobV1) -> None:
+        legacy_export = getattr(pipeline, "step_export", None)
+        if not callable(legacy_export):
+            return
+
+        async def export_package_c(session: object) -> Any:
+            output = await legacy_export(session)
+            export = getattr(pipeline, "export_result", None)
+            if not isinstance(export, dict) or export.get("status") != "SUCCESS":
+                return output
+            source = Path(str(export.get("path", "")))
+            evidence = (
+                self._hermes_evidence_resolver(job)
+                if self._hermes_evidence_resolver is not None
+                else None
+            ) or {}
+            invalid_evidence = tuple(
+                sorted(
+                    key
+                    for key, value in evidence.items()
+                    if key not in {"skill_usage_receipt", "tool_gaps"}
+                    or not isinstance(value, bytes)
+                )
+            )
+            if invalid_evidence:
+                pipeline.package_contract_gap = {
+                    "gap_id": "legacy-swarm-package-c-export",
+                    "required_outputs": (
+                        "Hermes evidence resolver must return only byte-exact "
+                        "skill_usage_receipt and tool_gaps",
+                    ),
+                }
+                return output
+            capability_id = self._compiled_capability_id(job)
+            if capability_id is None:
+                pipeline.package_contract_gap = {
+                    "gap_id": "legacy-swarm-package-c-export",
+                    "required_outputs": (
+                        "compiled capability identity from compiled_spec_ref",
+                    ),
+                }
+                return output
+            try:
+                skill = self.artifacts.read(job.released_skill.content_ref)
+            except ValueError:
+                released_skill = None
+            else:
+                released_skill = (job.released_skill.skill_id, skill)
+            try:
+                package_path = PackageAssembler().materialize_legacy_export(
+                    source,
+                    self.artifacts.root / "exports" / str(job.creation_job_id),
+                    capability_id=capability_id,
+                    capability_version=job.subject_version,
+                    pipeline_results={
+                        "build": getattr(pipeline, "build_result", None),
+                        "run": getattr(pipeline, "run_result", None),
+                        "output_evaluation": getattr(pipeline, "output_eval", None),
+                    },
+                    hermes_skill_usage_receipt=evidence.get("skill_usage_receipt"),
+                    hermes_tool_gaps=evidence.get("tool_gaps"),
+                    released_skill=released_skill,
+                )
+            except LegacyPackageContractGap as exc:
+                pipeline.package_contract_gap = {
+                    "gap_id": exc.gap_id,
+                    "required_outputs": exc.required_outputs,
+                }
+            except PackageAssemblyError:
+                pipeline.package_contract_gap = {
+                    "gap_id": "legacy-swarm-package-c-assembly",
+                    "required_outputs": (
+                        "runnable deterministic Package-C candidate from observed legacy bytes",
+                    ),
+                }
+            else:
+                pipeline.export_result = {
+                    **export,
+                    "legacy_path": str(source.resolve()),
+                    "path": str(package_path),
+                }
+            return output
+
+        pipeline.step_export = export_package_c
+
+    def _compiled_capability_id(self, job: CreationJobV1) -> str | None:
+        try:
+            payload = json.loads(self.artifacts.read(job.compiled_spec_ref))
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        value = payload.get("capability_key") if isinstance(payload, dict) else None
+        return value if isinstance(value, str) and value else None
 
 
 @dataclass(frozen=True)

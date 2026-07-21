@@ -243,3 +243,102 @@ async def test_production_factory_injects_real_session_agents_project_and_input(
         and call[4] is False
         for call in calls
     )
+
+
+@pytest.mark.asyncio
+async def test_production_factory_exports_legacy_swarm_through_package_c_or_exact_todo(
+    tmp_path: Path,
+) -> None:
+    from minibook.swarm.creation_runtime import ProductionSwarmPipelineFactory
+    from minibook.swarm.pipeline_adapter import (
+        ContentAddressedCreationArtifacts,
+        SwarmSnapshot,
+        SwarmStep,
+    )
+
+    calls: list[str] = []
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+
+    async def setup_agents(session: Session) -> dict[str, object]:
+        del session
+        return {"SwarmManager": object()}
+
+    async def setup_project(
+        session: Session, agents: dict[str, object], name: str
+    ) -> str:
+        del session, agents, name
+        return "project-1"
+
+    export = tmp_path / "legacy-export"
+    (export / "src").mkdir(parents=True)
+    (export / "src/main.py").write_text("print('legacy')\n", encoding="utf-8")
+    (export / "SETUP.md").write_text("# Legacy setup\n", encoding="utf-8")
+
+    class Pipeline:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+            self.export_result = None
+            self.build_result = {"status": "PASS", "duration": 1.0}
+            self.run_result = {"status": "PASS", "duration": 1.0}
+            self.output_eval = {"status": "PASS", "score": 0.9}
+
+        async def step_export(self, session: Session) -> dict[str, object]:
+            del session
+            calls.append("legacy-export")
+            self.export_result = {"status": "SUCCESS", "path": str(export)}
+            return dict(self.export_result)
+
+    artifacts = ContentAddressedCreationArtifacts(tmp_path / "artifacts")
+    skill_ref = artifacts.put(
+        b"# Released factory skill\n",
+        "text/markdown",
+        namespace="released-skill",
+    )
+    compiled_ref = artifacts.put(
+        b'{"capability_key":"legacy-team"}',
+        "application/json",
+        namespace="compiled-spec",
+    )
+    payload = creation_job().model_dump(mode="json", by_alias=True)
+    payload["compiled_spec_ref"] = compiled_ref.model_dump(mode="json")
+    payload["released_skill"] = {
+        **payload["released_skill"],
+        "content_ref": skill_ref.model_dump(mode="json"),
+        "content_sha256": skill_ref.sha256,
+    }
+    job = CreationJobV1.model_validate(payload)
+    factory = ProductionSwarmPipelineFactory(
+        artifacts,
+        session_factory=Session,
+        setup_agents=setup_agents,
+        setup_project=setup_project,
+        pipeline_type=Pipeline,
+        input_resolver=lambda reference: "Build the requested team",
+    )
+
+    async with factory.open(job) as adapter:
+        prior = SwarmSnapshot(creation_job_id=job.creation_job_id)
+        outcome = await adapter.run_step(
+            job, SwarmStep.EXPORT.value, prior.model_dump(), "export-effect", None
+        )
+        result = adapter.assemble_result(job, outcome.snapshot)
+
+    assert calls == ["legacy-export"]
+    assert result.status == "blocked"
+    assert len(result.tool_gaps) == 1
+    assert result.tool_gaps[0].gap_id == "legacy-swarm-package-c-export"
+    marker = json.loads(artifacts.read(result.tool_gaps[0].evidence_ref))
+    assert marker["schema"] == "TODO_TOOL.v1"
+    assert "evidence/hermes-skill-usage-receipt.json (from Hermes)" in marker[
+        "required_output"
+    ]
+    assert "evidence/tool-gaps.json (from Hermes ToolIntegrator)" in marker[
+        "required_output"
+    ]
+    assert "tests/ (real executable tests)" in marker["required_output"]

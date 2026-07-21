@@ -126,25 +126,7 @@ class CreationJobStore:
             raise CreationConflictError(
                 "completion evidence requires the exact persisted creation result"
             )
-        block = evidence.block
-        if (
-            block.job_id != job.factory_job_id
-            or block.correlation_id != job.correlation_id
-            or block.causation_id != job.causation_id
-            or block.subject_version != job.subject_version
-            or block.attempt != job.attempt
-        ):
-            raise CreationConflictError(
-                "completion evidence is not bound to the creation job"
-            )
-        if (
-            block.occurred_at <= preparation.blocks[-1].occurred_at
-            or block.occurred_at >= job.deadline_at
-            or block.event_id in {item.event_id for item in preparation.blocks}
-        ):
-            raise CreationConflictError(
-                "completion evidence does not extend the immutable preparation chain"
-            )
+        self._require_completion_binding(job, preparation, evidence)
         encoded = _json(evidence)
         with self._connect() as db:
             existing = db.execute(
@@ -162,6 +144,74 @@ class CreationJobStore:
                 (str(result.creation_job_id), encoded),
             )
         return False
+
+    def finish_with_completion(
+        self,
+        result: CreationResultV1,
+        evidence: CreationCompletionEvidenceV1,
+    ) -> CreationResultV1:
+        """Commit one successful result and its Hermes completion evidence atomically."""
+
+        if result.status != "succeeded" or evidence.result != result:
+            raise CreationConflictError(
+                "atomic completion requires the exact succeeded creation result"
+            )
+        job = self.job(result.creation_job_id)
+        self._require_result_identity(job, result)
+        job_id = str(result.creation_job_id)
+        encoded_result = _json(result)
+        encoded_evidence = _json(evidence)
+        with self._connect() as db:
+            preparation_row = db.execute(
+                "SELECT payload FROM creation_preparation_evidence WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if preparation_row is None:
+                raise CreationConflictError(
+                    "completion evidence requires durable preparation evidence"
+                )
+            preparation = CreationPreparationEvidenceV1.model_validate_json(
+                preparation_row["payload"]
+            )
+            self._require_completion_binding(job, preparation, evidence)
+            existing_result = db.execute(
+                "SELECT payload FROM creation_results WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            existing_evidence = db.execute(
+                "SELECT payload FROM creation_completion_evidence WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if existing_result is not None or existing_evidence is not None:
+                if (
+                    existing_result is None
+                    or existing_evidence is None
+                    or existing_result["payload"] != encoded_result
+                    or existing_evidence["payload"] != encoded_evidence
+                ):
+                    raise CreationConflictError(
+                        "creation result and completion evidence already differ"
+                    )
+                return CreationResultV1.model_validate_json(existing_result["payload"])
+            head = self._head(result.creation_job_id, db)
+            db.execute(
+                "INSERT INTO creation_results VALUES (?, ?)",
+                (job_id, encoded_result),
+            )
+            db.execute(
+                "INSERT INTO creation_completion_evidence VALUES (?, ?)",
+                (job_id, encoded_evidence),
+            )
+            db.execute(
+                "INSERT INTO creation_heads VALUES (?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    head["version"] + 1,
+                    result.status,
+                    head["checkpoint"],
+                    head["snapshot"],
+                ),
+            )
+        return result
 
     def completion(self, job_id: UUID) -> CreationCompletionEvidenceV1:
         with self._connect() as db:
@@ -353,6 +403,32 @@ class CreationJobStore:
             or result.attempt != job.attempt
         ):
             raise CreationConflictError("creation result identity changed")
+
+    @staticmethod
+    def _require_completion_binding(
+        job: CreationJobV1,
+        preparation: CreationPreparationEvidenceV1,
+        evidence: CreationCompletionEvidenceV1,
+    ) -> None:
+        block = evidence.block
+        if (
+            block.job_id != job.factory_job_id
+            or block.correlation_id != job.correlation_id
+            or block.causation_id != job.causation_id
+            or block.subject_version != job.subject_version
+            or block.attempt != job.attempt
+        ):
+            raise CreationConflictError(
+                "completion evidence is not bound to the creation job"
+            )
+        if (
+            block.occurred_at <= preparation.blocks[-1].occurred_at
+            or block.occurred_at >= job.deadline_at
+            or block.event_id in {item.event_id for item in preparation.blocks}
+        ):
+            raise CreationConflictError(
+                "completion evidence does not extend the immutable preparation chain"
+            )
 
     def result(self, job_id: UUID) -> CreationResultV1 | None:
         self.job(job_id)

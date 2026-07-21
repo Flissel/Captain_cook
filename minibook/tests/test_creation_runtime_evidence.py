@@ -1,0 +1,156 @@
+from __future__ import annotations
+
+import json
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from minibook.swarm.contracts import (
+    ArtifactRef,
+    CreationCompletionEvidenceV1,
+    CreationJobV1,
+    CreationPreparationEvidenceV1,
+)
+from minibook.swarm.creation_runtime import BackgroundCreationRuntime
+from minibook.swarm.job_store import CreationConflictError, CreationJobStore
+from minibook.swarm.pipeline_adapter import SwarmPipelineAdapter, SwarmStep
+from minibook.tests.test_creation_evidence_api import (
+    _completion_payload,
+    _preparation_payload,
+    _result,
+)
+
+
+FIXTURE = Path(__file__).parents[2] / "tests/fixtures/contracts/minibook_creation_job.v1.json"
+
+
+def _job() -> CreationJobV1:
+    return CreationJobV1.model_validate_json(FIXTURE.read_text(encoding="utf-8"))
+
+
+class LegacyPipeline:
+    async def step_swarm_manager(self, session: object, input_uri: str) -> str:
+        del session, input_uri
+        return "manager-complete"
+
+    def __getattr__(self, name: str):
+        if not name.startswith("step_"):
+            raise AttributeError(name)
+
+        async def step(session: object) -> str:
+            del session
+            return f"{name}-complete"
+
+        return step
+
+
+class EvidenceSnapshotter:
+    def capture(
+        self,
+        job: CreationJobV1,
+        step: SwarmStep,
+        pipeline: Any,
+        output: Any,
+        prior: Any,
+    ) -> dict[str, Any]:
+        del job, pipeline, output, prior
+        digit = f"{list(SwarmStep).index(step) + 1:x}"
+        state_ref = ArtifactRef(
+            uri=f"artifact://capability-factory/pipeline/{digit * 64}",
+            sha256=digit * 64,
+            media_type="application/json",
+        )
+        updates: dict[str, Any] = {"pipeline_state_ref": state_ref}
+        if step is SwarmStep.EXPORT:
+            updates.update(
+                {
+                    "package_manifest_ref": ArtifactRef(
+                        uri=f"artifact://capability-factory/package/{'e' * 64}",
+                        sha256="e" * 64,
+                        media_type="application/json",
+                    ),
+                    "skill_usage_receipt_ref": ArtifactRef(
+                        uri=f"artifact://capability-factory/skill/{'f' * 64}",
+                        sha256="f" * 64,
+                        media_type="application/json",
+                    ),
+                }
+            )
+        return updates
+
+
+class PipelineFactory:
+    @asynccontextmanager
+    async def open(self, job: CreationJobV1):
+        del job
+        yield SwarmPipelineAdapter(
+            lambda _snapshot: LegacyPipeline(),
+            session=object(),
+            snapshotter=EvidenceSnapshotter(),
+        )
+
+
+async def _wait_for_completion(store: CreationJobStore, job: CreationJobV1) -> None:
+    import asyncio
+
+    for _ in range(200):
+        if store.result(job.creation_job_id) is not None:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("creation result was not persisted")
+
+
+@pytest.mark.asyncio
+async def test_background_runtime_persists_real_step_evidence_with_success_result(
+    tmp_path: Path,
+) -> None:
+    store = CreationJobStore(tmp_path / "creation.sqlite3")
+    job = _job()
+    store.submit(job)
+    runtime = BackgroundCreationRuntime(store, PipelineFactory())
+
+    await runtime.start()
+    await _wait_for_completion(store, job)
+    await runtime.stop()
+
+    result = store.result(job.creation_job_id)
+    assert result is not None and result.status == "succeeded", result
+    preparation = store.preparation(job.creation_job_id)
+    completion = store.completion(job.creation_job_id)
+
+    assert tuple(block.phase for block in preparation.blocks) == (
+        "blueprint_created",
+        "tool_candidate_tested",
+    )
+    assert preparation.blocks[0].evidence_refs[0].sha256 == "3" * 64
+    assert preparation.blocks[1].evidence_refs[0].sha256 == "c" * 64
+    assert completion.result == result
+    assert completion.block.evidence_refs == (
+        result.package_manifest_ref,
+        result.skill_usage_receipt_ref,
+    )
+    assert not preparation.blocks[0].assertion_ids
+    assert not preparation.blocks[1].assertion_ids
+    assert not completion.block.assertion_ids
+
+
+def test_finish_with_completion_rolls_back_result_when_evidence_binding_is_invalid(
+    tmp_path: Path,
+) -> None:
+    store = CreationJobStore(tmp_path / "creation.sqlite3")
+    job = _job()
+    result = _result()
+    store.submit(job)
+    store.record_preparation(
+        CreationPreparationEvidenceV1.model_validate(_preparation_payload())
+    )
+    payload = _completion_payload(result)
+    payload["block"]["job_id"] = "99999999-9999-4999-8999-999999999999"  # type: ignore[index]
+    completion = CreationCompletionEvidenceV1.model_validate(payload)
+
+    with pytest.raises(CreationConflictError, match="bound"):
+        store.finish_with_completion(result, completion)
+
+    assert store.result(job.creation_job_id) is None

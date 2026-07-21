@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -18,6 +19,18 @@ import yaml
 
 class PackageAssemblyError(RuntimeError):
     pass
+
+
+class LegacyPackageContractGap(PackageAssemblyError):
+    """Exact Package-C outputs a legacy run did not actually produce."""
+
+    def __init__(self, required_outputs: tuple[str, ...]) -> None:
+        self.gap_id = "legacy-swarm-package-c-export"
+        self.required_outputs = required_outputs
+        super().__init__(
+            "TODO_TOOL.v1 required capability=legacy_swarm_package_c_export; "
+            "required_outputs=" + "; ".join(required_outputs)
+        )
 
 
 @dataclass(frozen=True)
@@ -63,6 +76,202 @@ def _safe_relative(value: str) -> PurePosixPath:
 
 
 class PackageAssembler:
+    def materialize_legacy_export(
+        self,
+        source: Path,
+        destination: Path,
+        *,
+        capability_id: str,
+        capability_version: int,
+        pipeline_results: Mapping[str, object],
+        hermes_skill_usage_receipt: bytes | None,
+        hermes_tool_gaps: bytes | None = None,
+        released_skill: tuple[str, bytes] | None = None,
+    ) -> Path:
+        """Repackage only observed legacy/Hermes bytes into Package C.
+
+        This method deliberately does not manufacture tests, empty tool-gap
+        declarations, or a passing Hermes receipt.  Missing evidence becomes a
+        typed gap that the caller can persist as ``TODO_TOOL.v1``.
+        """
+
+        source = source.resolve()
+        missing: list[str] = []
+        runbook = next(
+            (
+                source / name
+                for name in ("RUNBOOK.md", "SETUP.md", "README.md")
+                if (source / name).is_file()
+            ),
+            None,
+        )
+        if runbook is None:
+            missing.append("RUNBOOK.md (from real RUNBOOK.md, SETUP.md, or README.md)")
+        receipt_path = source / "evidence/hermes-skill-usage-receipt.json"
+        if hermes_skill_usage_receipt is None and not receipt_path.is_file():
+            missing.append("evidence/hermes-skill-usage-receipt.json (from Hermes)")
+        gaps_path = source / "evidence/tool-gaps.json"
+        if hermes_tool_gaps is None and not gaps_path.is_file():
+            missing.append("evidence/tool-gaps.json (from Hermes ToolIntegrator)")
+        required_results = (
+            ("build", "pipeline build_result"),
+            ("output_evaluation", "pipeline output_eval"),
+            ("run", "pipeline run_result"),
+        )
+        for field, label in required_results:
+            if not isinstance(pipeline_results.get(field), Mapping):
+                missing.append(label)
+        has_skill_files = (source / "skills").is_dir() and any(
+            path.is_file() for path in (source / "skills").rglob("*")
+        )
+        if not has_skill_files and released_skill is None:
+            missing.append("skills/ (released or Hermes-created skill bytes)")
+        has_tests = (source / "tests").is_dir() and any(
+            path.is_file() and path.name.startswith("test_") and path.suffix == ".py"
+            for path in (source / "tests").rglob("*")
+        )
+        if not has_tests:
+            missing.append("tests/ (real executable tests)")
+        source_modules = (
+            tuple(path for path in sorted((source / "src").rglob("*.py")) if path.is_file())
+            if (source / "src").is_dir()
+            else ()
+        )
+        if not source_modules or not (source / "src/main.py").is_file():
+            missing.append("autogen/ (from real legacy src/*.py including src/main.py)")
+        if missing:
+            raise LegacyPackageContractGap(tuple(sorted(missing)))
+
+        with tempfile.TemporaryDirectory(prefix="minibook-legacy-package-") as temporary:
+            temporary_root = Path(temporary)
+            staged = temporary_root / "candidate"
+            staged.mkdir()
+            for path in source_modules:
+                relative = path.relative_to(source / "src")
+                target = staged / "autogen" / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, target)
+            self._copy_observed_tree(source / "tests", staged / "tests")
+            if has_skill_files:
+                self._copy_observed_tree(source / "skills", staged / "skills")
+            else:
+                assert released_skill is not None
+                skill_id, skill_bytes = released_skill
+                skill_target = staged / "skills" / _identifier(skill_id) / "SKILL.md"
+                skill_target.parent.mkdir(parents=True, exist_ok=True)
+                skill_target.write_bytes(skill_bytes)
+            assert runbook is not None
+            shutil.copy2(runbook, staged / "RUNBOOK.md")
+            evidence = staged / "evidence"
+            evidence.mkdir()
+            receipt = (
+                hermes_skill_usage_receipt
+                if hermes_skill_usage_receipt is not None
+                else receipt_path.read_bytes()
+            )
+            gaps = hermes_tool_gaps if hermes_tool_gaps is not None else gaps_path.read_bytes()
+            (evidence / "hermes-skill-usage-receipt.json").write_bytes(receipt)
+            (evidence / "tool-gaps.json").write_bytes(gaps)
+            observed_results = {
+                "schema": "minibook.legacy-swarm-pipeline-results.v1",
+                **{
+                    name: self._pipeline_result_summary(pipeline_results[name])
+                    for name, _label in required_results
+                },
+            }
+            (evidence / "legacy-pipeline-results.json").write_bytes(
+                _canonical_json(observed_results)
+            )
+            for optional_root in ("n8n", "adapters"):
+                candidate = source / optional_root
+                if candidate.is_dir():
+                    self._copy_observed_tree(candidate, staged / optional_root)
+            for metadata in ("agents",):
+                candidate = source / metadata
+                if candidate.is_dir():
+                    self._copy_observed_tree(candidate, staged / metadata)
+            if (source / "project.yml").is_file():
+                shutil.copy2(source / "project.yml", staged / "project.yml")
+
+            archive_path = temporary_root / "candidate.zip"
+            assembled = self.assemble(
+                staged,
+                archive_path,
+                startup_command=("python", "autogen/main.py"),
+                capability_id=capability_id,
+                capability_version=capability_version,
+            )
+            with zipfile.ZipFile(assembled.archive_path) as archive:
+                expected = {
+                    info.filename: archive.read(info)
+                    for info in archive.infolist()
+                    if not info.is_dir()
+                }
+            self._materialize_immutable(destination.resolve(), expected)
+        return destination.resolve()
+
+    @staticmethod
+    def _copy_observed_tree(source: Path, destination: Path) -> None:
+        for path in sorted(source.rglob("*")):
+            if path.is_symlink():
+                raise PackageAssemblyError("legacy export contains a symbolic link")
+            if not path.is_file():
+                continue
+            relative = path.relative_to(source)
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+
+    @staticmethod
+    def _pipeline_result_summary(value: object) -> dict[str, object]:
+        if not isinstance(value, Mapping):
+            raise PackageAssemblyError("legacy pipeline result is not structured")
+        allowed = {
+            "status",
+            "duration",
+            "score",
+            "docker_down",
+            "total_chars",
+            "eval_mode",
+        }
+        summary = {str(key): item for key, item in value.items() if key in allowed}
+        if summary.get("status") != "PASS":
+            raise PackageAssemblyError("legacy pipeline result is not an observed pass")
+        try:
+            _canonical_json(summary)
+        except (TypeError, ValueError) as exc:
+            raise PackageAssemblyError("legacy pipeline result is not JSON-safe") from exc
+        return summary
+
+    @staticmethod
+    def _materialize_immutable(destination: Path, files: Mapping[str, bytes]) -> None:
+        if destination.exists():
+            existing = {
+                path.relative_to(destination).as_posix(): path.read_bytes()
+                for path in destination.rglob("*")
+                if path.is_file()
+            }
+            if existing != dict(files):
+                raise PackageAssemblyError("legacy Package-C export already differs")
+            return
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = Path(
+            tempfile.mkdtemp(
+                prefix=destination.name + ".",
+                dir=destination.parent,
+            )
+        )
+        try:
+            for name, content in sorted(files.items()):
+                relative = _safe_relative(name)
+                target = temporary / Path(*relative.parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(content)
+            temporary.replace(destination)
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+
     def assemble(
         self,
         source: Path,

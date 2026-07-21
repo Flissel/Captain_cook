@@ -7,7 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from minibook.swarm.package_assembler import PackageAssemblyError, PackageAssembler
+from minibook.swarm.package_assembler import (
+    LegacyPackageContractGap,
+    PackageAssemblyError,
+    PackageAssembler,
+)
 
 
 def candidate(tmp_path: Path) -> Path:
@@ -157,3 +161,121 @@ def test_symlink_and_secret_files_are_rejected_or_excluded(tmp_path: Path) -> No
     result = PackageAssembler().assemble(root, tmp_path / "safe.zip", startup_command=("python", "autogen/main.py"))
     with zipfile.ZipFile(result.archive_path) as archive:
         assert ".env" not in archive.namelist()
+
+
+def _legacy_export(tmp_path: Path) -> Path:
+    root = tmp_path / "legacy-export"
+    (root / "src").mkdir(parents=True)
+    (root / "src/main.py").write_text("print('legacy-ready')\n", encoding="utf-8")
+    (root / "skills/factory").mkdir(parents=True)
+    (root / "skills/factory/SKILL.md").write_text(
+        "# Released factory skill\n", encoding="utf-8"
+    )
+    (root / "tests").mkdir()
+    (root / "tests/test_team.py").write_text(
+        "def test_team():\n    assert 2 + 2 == 4\n", encoding="utf-8"
+    )
+    (root / "evidence").mkdir()
+    (root / "evidence/tool-gaps.json").write_text(
+        '{"schema":"minibook.creation-tool-gaps.v1","tool_gaps":[]}',
+        encoding="utf-8",
+    )
+    (root / "SETUP.md").write_text(
+        "Run `python autogen/main.py`.\n", encoding="utf-8"
+    )
+    return root
+
+
+def test_legacy_export_materializes_deterministic_package_c_from_real_results(
+    tmp_path: Path,
+) -> None:
+    source = _legacy_export(tmp_path)
+    receipt = b'{"schema":"hermes.skill-usage-receipt.v1","outcome":"passed"}'
+    pipeline_results = {
+        "build": {"status": "PASS", "duration": 1.25},
+        "run": {"status": "PASS", "duration": 2.5},
+        "output_evaluation": {"status": "PASS", "score": 0.92},
+    }
+    assembler = PackageAssembler()
+
+    first = assembler.materialize_legacy_export(
+        source,
+        tmp_path / "package-c-one",
+        capability_id="legacy-team",
+        capability_version=2,
+        pipeline_results=pipeline_results,
+        hermes_skill_usage_receipt=receipt,
+    )
+    second = assembler.materialize_legacy_export(
+        source,
+        tmp_path / "package-c-two",
+        capability_id="legacy-team",
+        capability_version=2,
+        pipeline_results=pipeline_results,
+        hermes_skill_usage_receipt=receipt,
+    )
+
+    required = {
+        "team-manifest.json",
+        "RUNBOOK.md",
+        "evidence/tool-gaps.json",
+        "evidence/hermes-skill-usage-receipt.json",
+        "autogen/main.py",
+        "skills/factory/SKILL.md",
+        "tests/test_team.py",
+    }
+    assert required.issubset(
+        path.relative_to(first).as_posix()
+        for path in first.rglob("*")
+        if path.is_file()
+    )
+    assert (first / "autogen/main.py").read_bytes() == (source / "src/main.py").read_bytes()
+    assert (first / "RUNBOOK.md").read_bytes() == (source / "SETUP.md").read_bytes()
+    assert (first / "evidence/hermes-skill-usage-receipt.json").read_bytes() == receipt
+    assert json.loads((first / "evidence/legacy-pipeline-results.json").read_bytes()) == {
+        "build": {"duration": 1.25, "status": "PASS"},
+        "output_evaluation": {"score": 0.92, "status": "PASS"},
+        "run": {"duration": 2.5, "status": "PASS"},
+        "schema": "minibook.legacy-swarm-pipeline-results.v1",
+    }
+    first_bytes = {
+        path.relative_to(first).as_posix(): path.read_bytes()
+        for path in first.rglob("*")
+        if path.is_file()
+    }
+    second_bytes = {
+        path.relative_to(second).as_posix(): path.read_bytes()
+        for path in second.rglob("*")
+        if path.is_file()
+    }
+    assert first_bytes == second_bytes
+
+
+def test_legacy_export_reports_exact_missing_real_outputs_as_todo_tool(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "legacy-export"
+    (source / "src").mkdir(parents=True)
+    (source / "src/main.py").write_text("print('legacy')\n", encoding="utf-8")
+
+    with pytest.raises(LegacyPackageContractGap) as raised:
+        PackageAssembler().materialize_legacy_export(
+            source,
+            tmp_path / "package-c",
+            capability_id="legacy-team",
+            capability_version=1,
+            pipeline_results={},
+            hermes_skill_usage_receipt=None,
+        )
+
+    assert raised.value.gap_id == "legacy-swarm-package-c-export"
+    assert raised.value.required_outputs == (
+        "RUNBOOK.md (from real RUNBOOK.md, SETUP.md, or README.md)",
+        "evidence/hermes-skill-usage-receipt.json (from Hermes)",
+        "evidence/tool-gaps.json (from Hermes ToolIntegrator)",
+        "pipeline build_result",
+        "pipeline output_eval",
+        "pipeline run_result",
+        "skills/ (released or Hermes-created skill bytes)",
+        "tests/ (real executable tests)",
+    )
