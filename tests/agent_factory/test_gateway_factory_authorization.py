@@ -73,7 +73,11 @@ def test_tool_integrator_lease_is_authorized_for_build_validation() -> None:
         now=datetime(2026, 7, 19, 10, tzinfo=timezone.utc),
     )
 
-    GatewayStore._assert_lease_is_next_action(lease, projection)
+    GatewayStore._assert_lease_is_next_action(
+        lease,
+        projection,
+        now=lease.issued_at,
+    )
 
 
 def test_tool_integrator_lease_is_authorized_before_forge_submission() -> None:
@@ -95,7 +99,11 @@ def test_tool_integrator_lease_is_authorized_before_forge_submission() -> None:
         now=datetime(2026, 7, 19, 10, tzinfo=timezone.utc),
     )
 
-    GatewayStore._assert_lease_is_next_action(lease, projection)
+    GatewayStore._assert_lease_is_next_action(
+        lease,
+        projection,
+        now=lease.issued_at,
+    )
 
 
 def test_factory_projection_loads_complete_ledger_rows() -> None:

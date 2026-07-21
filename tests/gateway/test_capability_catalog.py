@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import timedelta
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -10,14 +11,17 @@ from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from pydantic import ValidationError
+from pymysql.err import OperationalError
 
-from agenten.agent_factory.contracts import FactoryPhase, PromotedCapability
+from agenten.agent_factory.contracts import FactoryPhase, FactoryRole, PromotedCapability
+from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.outcome_contracts import (
     ExecutionOutcomeV1,
     FactoryTerminalState,
 )
 from agenten.agent_factory.release_gate import derive_terminal_decision
-from agenten.agent_factory.state_machine import FactoryProjection
+from agenten.agent_factory.state_machine import FactoryProjection, apply_block
+from agenten.agent_runtime.contracts import CapabilityProfile
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
@@ -38,10 +42,12 @@ from gateway.contracts import (
     CapabilityReleaseRequest,
     CapabilityWriteReceipt,
     RuntimeBatchAdmission,
+    RuntimeCapabilityAuthority,
     RuntimeExecutionClaim,
     RuntimeExecutionClaimRequest,
     RuntimeExecutionClaimReceipt,
     RuntimeReleasedBatchSnapshot,
+    canonical_contract_sha256,
 )
 from gateway.settings import GatewaySettings
 from gateway.store import GatewayStore
@@ -211,11 +217,14 @@ def test_gateway_catalog_adapter_fails_closed_for_stale_or_unexpressed_requireme
 
 
 def test_execution_claim_request_has_bounded_utc_lease_and_owner_identity() -> None:
+    release = release_request()
     claim = RuntimeExecutionClaimRequest(
         schema_name="captain.runtime-execution-claim-request.v1",
         command_id=UUID("00000000-0000-0000-0000-000000000001"),
         owner_id="runtime-host-01",
         lease_seconds=120,
+        capability_id=release.package.capability_id,
+        capability_version=release.package.capability_version,
     )
 
     assert claim.owner_id == "runtime-host-01"
@@ -264,6 +273,23 @@ def _released_batch() -> WorkBatch:
                 "expected": "succeeded",
             }
         ],
+    )
+
+
+def _runtime_capability_authority() -> RuntimeCapabilityAuthority:
+    release = release_request()
+    catalog = CapabilityCatalogRecord.from_release(release, catalog_fence=7)
+    return RuntimeCapabilityAuthority(
+        capability_id=catalog.capability_id,
+        capability_version=catalog.capability_version,
+        team_version=catalog.team_version,
+        catalog_fence=catalog.catalog_fence,
+        catalog_block_index=31,
+        catalog_block_hash="c" * 64,
+        package_block_index=30,
+        package_block_hash="b" * 64,
+        package_ref=catalog.package_ref,
+        published_at=catalog.published_at,
     )
 
 
@@ -323,6 +349,27 @@ def test_gateway_admission_and_grant_use_one_immutable_batch_head() -> None:
             command=command,
             parent={**parent, "hash": "b" * 64},
         )
+    children = [{"index": 12, "block_type": "batch_approved"}]
+    GatewayStore._assert_runtime_admission_is_current(
+        admission,
+        parent=parent,
+        children=children,
+        projection=SimpleNamespace(status="pending"),
+    )
+    with pytest.raises(HTTPException, match="currently released"):
+        GatewayStore._assert_runtime_admission_is_current(
+            admission,
+            parent=parent,
+            children=[*children, {"index": 13, "block_type": "batch_approved"}],
+            projection=SimpleNamespace(status="pending"),
+        )
+    with pytest.raises(HTTPException, match="currently released"):
+        GatewayStore._assert_runtime_admission_is_current(
+            admission,
+            parent=parent,
+            children=children,
+            projection=SimpleNamespace(status="done"),
+        )
 
 
 def test_gateway_recomputes_ready_release_and_requires_prior_promotion() -> None:
@@ -346,6 +393,91 @@ def test_gateway_recomputes_ready_release_and_requires_prior_promotion() -> None
             evaluation=accepted_evaluation(),
             request=request,
         )
+
+
+def test_gateway_derives_release_clock_team_tools_and_promotion_authority() -> None:
+    request = release_request()
+    factory_job = v2_job()
+    promotion = block(
+        FactoryPhase.CAPABILITY_PROMOTED,
+        assertions=factory_job.acceptance_assertion_ids,
+    )
+    submitted = request.model_copy(
+        update={
+            "team_version": 99,
+            "tool_contracts": ("caller-invented",),
+            "promoted_capability": request.promoted_capability.model_copy(
+                update={
+                    "promotion_block_ref": ArtifactRef(
+                        uri="artifact://caller/invented-promotion",
+                        sha256="0" * 64,
+                        media_type="application/json",
+                    )
+                }
+            ),
+        }
+    )
+    gateway_now = NOW + timedelta(seconds=30)
+
+    authoritative = GatewayStore._authoritative_capability_release(
+        job=factory_job,
+        projection=FactoryProjection.from_job(factory_job),
+        promotion=promotion,
+        evaluation=accepted_evaluation(),
+        request=submitted,
+        now=gateway_now,
+    )
+
+    assert authoritative.occurred_at == gateway_now
+    assert authoritative.decision.decided_at == gateway_now
+    assert authoritative.team_version == authoritative.package.capability_version
+    assert authoritative.tool_contracts == ()
+    assert authoritative.promoted_capability.promotion_block_ref == ArtifactRef(
+        uri=f"artifact://gateway/factory-promotion/{promotion.event_id}",
+        sha256=canonical_contract_sha256(promotion),
+        media_type="application/json",
+    )
+
+
+def test_gateway_release_uses_stored_retry_projection() -> None:
+    request = release_request()
+    factory_job = v2_job()
+    promotion = block(
+        FactoryPhase.CAPABILITY_PROMOTED,
+        assertions=factory_job.acceptance_assertion_ids,
+    )
+    retried_projection = FactoryProjection.from_job(factory_job).model_copy(
+        update={"attempt": 2}
+    )
+
+    with pytest.raises(HTTPException, match="ready_to_use"):
+        GatewayStore._authoritative_capability_release(
+            job=factory_job,
+            projection=retried_projection,
+            promotion=promotion,
+            evaluation=accepted_evaluation(),
+            request=request,
+            now=NOW,
+        )
+
+
+def test_gateway_release_uses_gateway_clock_for_deadline() -> None:
+    request = release_request()
+    factory_job = v2_job()
+    promotion = block(
+        FactoryPhase.CAPABILITY_PROMOTED,
+        assertions=factory_job.acceptance_assertion_ids,
+    )
+
+    with pytest.raises(HTTPException, match="ready_to_use"):
+        GatewayStore._authoritative_capability_release(
+            job=factory_job,
+            projection=FactoryProjection.from_job(factory_job),
+            promotion=promotion,
+            evaluation=accepted_evaluation(),
+            request=request,
+            now=factory_job.deadline_at,
+        )
     with pytest.raises(HTTPException, match="factory job"):
         GatewayStore._assert_capability_release_ready(
             job=factory_job.model_copy(update={"job_id": UUID(int=999)}),
@@ -355,34 +487,100 @@ def test_gateway_recomputes_ready_release_and_requires_prior_promotion() -> None
         )
 
 
+def test_gateway_v2_lease_decision_uses_authoritative_clock() -> None:
+    factory_job = v2_job()
+    projection = apply_block(
+        FactoryProjection.from_job(factory_job),
+        block(FactoryPhase.FORGE_REQUESTED),
+        now=NOW,
+    )
+    lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.AGENT_ARCHITECT,
+        attempt=1,
+        workspace_ref="workspace://factory/architect",
+        now=NOW,
+    )
+    assert lease.capability_profile is CapabilityProfile.FACTORY_ARCHITECT
+
+    GatewayStore._assert_lease_is_next_action(
+        lease,
+        projection,
+        now=factory_job.deadline_at - timedelta(microseconds=1),
+    )
+    with pytest.raises(HTTPException, match="next authorized"):
+        GatewayStore._assert_lease_is_next_action(
+            lease,
+            projection,
+            now=factory_job.deadline_at,
+        )
+
+
+def test_release_write_retry_is_bounded_and_recovers_transient_conflicts() -> None:
+    attempts = 0
+
+    def succeeds_on_third_attempt() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise OperationalError(1213, "deterministic deadlock")
+        return "published"
+
+    assert GatewayStore._retry_write(succeeds_on_third_attempt) == "published"
+    assert attempts == 3
+
+    attempts = 0
+
+    def never_succeeds() -> str:
+        nonlocal attempts
+        attempts += 1
+        raise OperationalError(1213, "deterministic deadlock")
+
+    with pytest.raises(OperationalError):
+        GatewayStore._retry_write(never_succeeds)
+    assert attempts == 3
+
+
 def test_execution_claim_policy_is_restart_safe_owner_bound_and_fenced() -> None:
+    authority = _runtime_capability_authority()
     first_request = RuntimeExecutionClaimRequest(
         schema_name="captain.runtime-execution-claim-request.v1",
         command_id=_runtime_command().event_id,
         owner_id="runtime-a",
         lease_seconds=60,
+        capability_id=authority.capability_id,
+        capability_version=authority.capability_version,
     )
     first = GatewayStore._resolve_runtime_execution_claim(
         existing=None,
         request=first_request,
         now=NOW,
         result_recorded=False,
+        credential_factory=lambda: "first-one-time-credential",
+        authority=authority,
     )
     replay = GatewayStore._resolve_runtime_execution_claim(
         existing=first.claim,
         request=first_request,
         now=NOW + timedelta(seconds=1),
         result_recorded=False,
+        credential_factory=lambda: "must-not-be-issued-on-replay",
+        authority=authority,
     )
 
     assert first.claim.fencing_token == 1
+    assert first.claim_credential == "first-one-time-credential"
     assert replay.replayed is True
+    assert replay.claim_credential is None
+    assert "credential" not in first.claim.model_dump(mode="json")
     with pytest.raises(HTTPException, match="owned"):
         GatewayStore._resolve_runtime_execution_claim(
             existing=first.claim,
             request=first_request.model_copy(update={"owner_id": "runtime-b"}),
             now=NOW + timedelta(seconds=1),
             result_recorded=False,
+            credential_factory=lambda: "unused",
+            authority=authority,
         )
 
     recovered = GatewayStore._resolve_runtime_execution_claim(
@@ -390,9 +588,12 @@ def test_execution_claim_policy_is_restart_safe_owner_bound_and_fenced() -> None
         request=first_request.model_copy(update={"owner_id": "runtime-b"}),
         now=NOW + timedelta(seconds=61),
         result_recorded=False,
+        credential_factory=lambda: "recovery-one-time-credential",
+        authority=authority,
     )
     assert recovered.claim.fencing_token == 2
     assert recovered.recovered is True
+    assert recovered.claim_credential == "recovery-one-time-credential"
     with pytest.raises(HTTPException, match="stale"):
         GatewayStore._assert_execution_claim_fence(
             recovered.claim,
@@ -405,6 +606,159 @@ def test_execution_claim_policy_is_restart_safe_owner_bound_and_fenced() -> None
             owner_id="runtime-a",
             fencing_token=1,
             now=NOW + timedelta(seconds=61),
+        )
+
+
+def test_execution_completion_requires_one_time_credential_and_fence() -> None:
+    authority = _runtime_capability_authority()
+    request = RuntimeExecutionClaimRequest(
+        schema_name="captain.runtime-execution-claim-request.v1",
+        command_id=_runtime_command().event_id,
+        owner_id="runtime-a",
+        lease_seconds=60,
+        capability_id=authority.capability_id,
+        capability_version=authority.capability_version,
+    )
+    receipt = GatewayStore._resolve_runtime_execution_claim(
+        existing=None,
+        request=request,
+        now=NOW,
+        result_recorded=False,
+        credential_factory=lambda: "only-the-acquirer-knows-this",
+        authority=authority,
+    )
+    assert receipt.claim_credential is not None
+    credential_sha256 = hashlib.sha256(
+        receipt.claim_credential.encode("utf-8")
+    ).hexdigest()
+
+    GatewayStore._assert_execution_claim_completion_authority(
+        receipt.claim,
+        owner_id=request.owner_id,
+        fencing_token=receipt.claim.fencing_token,
+        credential=receipt.claim_credential,
+        credential_sha256=credential_sha256,
+    )
+    with pytest.raises(HTTPException, match="stale"):
+        GatewayStore._assert_execution_claim_completion_authority(
+            receipt.claim,
+            owner_id=request.owner_id,
+            fencing_token=receipt.claim.fencing_token,
+            credential="shared-worker-token-is-not-the-claim-secret",
+            credential_sha256=credential_sha256,
+        )
+    with pytest.raises(HTTPException, match="stale"):
+        GatewayStore._assert_execution_claim_completion_authority(
+            receipt.claim,
+            owner_id=request.owner_id,
+            fencing_token=receipt.claim.fencing_token + 1,
+            credential=receipt.claim_credential,
+            credential_sha256=credential_sha256,
+        )
+
+
+def test_result_time_must_fall_inside_the_execution_claim_lease() -> None:
+    authority = _runtime_capability_authority()
+    claim = RuntimeExecutionClaim(
+        **authority.model_dump(),
+        command_id=_runtime_command().event_id,
+        claim_id=UUID("00000000-0000-0000-0000-000000000801"),
+        owner_id="runtime-a",
+        fencing_token=1,
+        claimed_at=NOW,
+        expires_at=NOW + timedelta(minutes=1),
+        status="active",
+    )
+
+    GatewayStore._assert_result_occurred_within_claim(
+        claim,
+        occurred_at=NOW,
+    )
+    with pytest.raises(HTTPException, match="lease window"):
+        GatewayStore._assert_result_occurred_within_claim(
+            claim,
+            occurred_at=NOW - timedelta(microseconds=1),
+        )
+
+
+def test_runtime_claim_rejects_prepublish_commands_and_freezes_exact_catalog() -> None:
+    authority = _runtime_capability_authority()
+    release = release_request()
+    catalog = CapabilityCatalogRecord.from_release(
+        release,
+        catalog_fence=authority.catalog_fence,
+    )
+    request = RuntimeExecutionClaimRequest(
+        schema_name="captain.runtime-execution-claim-request.v1",
+        command_id=_runtime_command().event_id,
+        owner_id="runtime-a",
+        lease_seconds=60,
+        capability_id=authority.capability_id,
+        capability_version=authority.capability_version,
+    )
+    command = _runtime_command().model_copy(
+        update={"occurred_at": catalog.published_at + timedelta(seconds=1)}
+    )
+    admission = RuntimeBatchAdmission(
+        command_id=command.event_id,
+        batch_id="batch-1",
+        batch_version=command.subject_version,
+        batch_block_index=11,
+        batch_block_hash="a" * 64,
+        release_fence=12,
+        admitted_at=catalog.published_at + timedelta(seconds=1),
+    )
+
+    GatewayStore._assert_runtime_capability_claimable(
+        request=request,
+        command=command,
+        admission=admission,
+        catalog=catalog,
+    )
+    with pytest.raises(HTTPException, match="predates"):
+        GatewayStore._assert_runtime_capability_claimable(
+            request=request,
+            command=command.model_copy(
+                update={"occurred_at": catalog.published_at - timedelta(microseconds=1)}
+            ),
+            admission=admission,
+            catalog=catalog,
+        )
+    with pytest.raises(HTTPException, match="predates"):
+        GatewayStore._assert_runtime_capability_claimable(
+            request=request,
+            command=command,
+            admission=admission.model_copy(
+                update={
+                    "admitted_at": catalog.published_at - timedelta(microseconds=1)
+                }
+            ),
+            catalog=catalog,
+        )
+
+    claim = GatewayStore._resolve_runtime_execution_claim(
+        existing=None,
+        request=request,
+        now=catalog.published_at + timedelta(seconds=2),
+        result_recorded=False,
+        authority=authority,
+        credential_factory=lambda: "catalog-bound-one-time-credential",
+    ).claim
+    assert claim.capability_id == catalog.capability_id
+    assert claim.capability_version == catalog.capability_version
+    assert claim.catalog_fence == catalog.catalog_fence
+    assert claim.package_block_hash == authority.package_block_hash
+    with pytest.raises(HTTPException, match="frozen"):
+        GatewayStore._assert_frozen_capability_authority(
+            claim,
+            authority=authority.model_copy(
+                update={"catalog_fence": authority.catalog_fence + 1}
+            ),
+        )
+    with pytest.raises(HTTPException, match="lease window"):
+        GatewayStore._assert_result_occurred_within_claim(
+            claim,
+            occurred_at=claim.expires_at,
         )
 
 
@@ -451,7 +805,18 @@ def capability_execution_request() -> CapabilityExecutionRequest:
 def test_execution_outcome_is_bound_to_catalog_command_result_and_claim() -> None:
     request = capability_execution_request()
     catalog = CapabilityCatalogRecord.from_release(release_request(), catalog_fence=1)
+    authority = _runtime_capability_authority().model_copy(
+        update={
+            "capability_id": catalog.capability_id,
+            "capability_version": catalog.capability_version,
+            "team_version": catalog.team_version,
+            "catalog_fence": catalog.catalog_fence,
+            "package_ref": catalog.package_ref,
+            "published_at": catalog.published_at,
+        }
+    )
     claim = RuntimeExecutionClaim(
+        **authority.model_dump(),
         command_id=request.outcome.command_id,
         claim_id=UUID("00000000-0000-0000-0000-000000000801"),
         owner_id=request.claim_owner_id,
@@ -475,6 +840,16 @@ def test_execution_outcome_is_bound_to_catalog_command_result_and_claim() -> Non
             command=_runtime_command(),
             result=_runtime_result(),
             claim=claim,
+        )
+    with pytest.raises(HTTPException, match="frozen"):
+        GatewayStore._assert_capability_execution_binding(
+            request,
+            catalog=catalog,
+            command=_runtime_command(),
+            result=_runtime_result(),
+            claim=claim.model_copy(
+                update={"catalog_fence": claim.catalog_fence + 1}
+            ),
         )
 
 

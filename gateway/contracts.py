@@ -264,6 +264,28 @@ class CapabilityReleaseRequest(_FrozenContract):
         return self
 
 
+class RuntimeCapabilityAuthority(_FrozenContract):
+    """Exact catalog and ledger authority frozen for one runtime execution."""
+
+    capability_id: str = Field(min_length=1)
+    capability_version: int = Field(ge=1, strict=True)
+    team_version: int = Field(ge=1, strict=True)
+    catalog_fence: int = Field(ge=1, strict=True)
+    catalog_block_index: int = Field(ge=0, strict=True)
+    catalog_block_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    package_block_index: int = Field(ge=0, strict=True)
+    package_block_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    package_ref: ArtifactRef
+    published_at: datetime
+
+    @field_validator("published_at")
+    @classmethod
+    def require_utc_publication(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("runtime capability publication timestamp must be UTC")
+        return value.astimezone(timezone.utc)
+
+
 class RuntimeExecutionClaimRequest(_FrozenContract):
     schema_name: Literal["captain.runtime-execution-claim-request.v1"] = Field(
         alias="schema",
@@ -272,6 +294,8 @@ class RuntimeExecutionClaimRequest(_FrozenContract):
     command_id: UUID
     owner_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
     lease_seconds: int = Field(ge=1, le=900, strict=True)
+    capability_id: str = Field(min_length=1)
+    capability_version: int = Field(ge=1, strict=True)
 
 
 class RuntimeBatchAdmission(_FrozenContract):
@@ -307,7 +331,7 @@ class RuntimeReleasedBatchSnapshot(_FrozenContract):
         return self
 
 
-class RuntimeExecutionClaim(_FrozenContract):
+class RuntimeExecutionClaim(RuntimeCapabilityAuthority):
     schema_name: Literal["captain.runtime-execution-claim.v1"] = Field(
         default="captain.runtime-execution-claim.v1",
         alias="schema",
@@ -336,6 +360,10 @@ class RuntimeExecutionClaim(_FrozenContract):
             raise ValueError("completed execution claim requires completed_at")
         if self.status == "active" and self.completed_at is not None:
             raise ValueError("active execution claim cannot have completed_at")
+        if self.completed_at is not None and not (
+            self.claimed_at <= self.completed_at < self.expires_at
+        ):
+            raise ValueError("execution claim completion must occur inside its lease")
         return self
 
 
@@ -343,6 +371,7 @@ class RuntimeExecutionClaimReceipt(_FrozenContract):
     claim: RuntimeExecutionClaim
     replayed: bool
     recovered: bool
+    claim_credential: str | None = Field(default=None, min_length=20)
 
 
 class CapabilityExecutionRequest(_FrozenContract):

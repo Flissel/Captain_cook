@@ -608,12 +608,18 @@ def create_app(
             alias="X-Runtime-Fencing-Token",
             ge=1,
         ),
+        execution_claim_credential: str | None = Header(
+            default=None,
+            alias="X-Runtime-Claim-Credential",
+            min_length=20,
+        ),
         _: GatewayRole = Depends(require_actor),
     ) -> RuntimeWriteReceipt:
         receipt = get_store().record_runtime_result(
             result,
             execution_owner_id=execution_owner_id,
             execution_fencing_token=execution_fencing_token,
+            execution_claim_credential=execution_claim_credential,
         )
         if receipt.replayed:
             response.status_code = status.HTTP_200_OK
