@@ -246,6 +246,8 @@ def test_live_demo_service_script_manages_runtime_by_verified_identity() -> None
     assert "CAPTAIN_RUNTIME_TOKEN" in script
     assert "CAPTAIN_RUNTIME_URL" in script
     assert "CAPTAIN_RUNTIME_PORT" in script
+    assert "CAPTAIN_RUNTIME_EVIDENCE_MODE" in script
+    assert "production-v3" in script
     assert "services=@('gateway','runtime'" in script
 
 

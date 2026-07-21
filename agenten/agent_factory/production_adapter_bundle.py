@@ -374,6 +374,145 @@ def build_runtime_app_with_v3_evidence(
     )
 
 
+def build_production_runtime_app_from_environment(
+    settings: RuntimeEntrypointSettings,
+    environ: Mapping[str, str],
+) -> Any:
+    """Compose Runtime 8091 with every real V3 evidence port, still effect-lazy."""
+
+    from agenten.agent_factory.production_candidate_ports import (
+        build_production_candidate_ports,
+    )
+    from agenten.agent_factory.production_evidence_composition import (
+        build_production_v3_evidence_backend_from_environment,
+    )
+    from agenten.agent_factory.production_external_ports import (
+        build_production_v3_external_ports,
+    )
+    from agenten.agent_factory.production_n8n_adapter import (
+        build_captain_factory_n8n_binding,
+    )
+
+    artifact_root = _required_from_mapping(environ, "CAPTAIN_RUNTIME_ARTIFACT_ROOT")
+    sandbox_image = _required_from_mapping(
+        environ, "CAPTAIN_CAPABILITY_SANDBOX_IMAGE"
+    )
+    gateway_url = _required_from_mapping(environ, "CAPTAIN_GATEWAY_URL").rstrip("/")
+    gateway_token = _required_from_mapping(environ, "CAPTAIN_GATEWAY_TOKEN")
+    artifacts = ContentAddressedArtifactStore(Path(artifact_root))
+    candidate_ports = build_production_candidate_ports(
+        artifacts=artifacts,
+        sandbox_image=sandbox_image,
+    )
+    gateway_sync_http = httpx.Client(timeout=30.0)
+    gateway_async_http = httpx.AsyncClient(timeout=30.0)
+    n8n_async_http = httpx.AsyncClient(timeout=30.0)
+
+    def n8n_bindings_for(job: Any, resolved: Any) -> tuple[Any, ...]:
+        tools = tuple(resolved.candidate.n8n_tools)
+        _ensure_factory_n8n_batch(
+            environ=environ,
+            gateway_url=gateway_url,
+            gateway_token=gateway_token,
+            client=gateway_sync_http,
+            tool_names=tuple(tool.name for tool in tools),
+        )
+        return tuple(
+            build_captain_factory_n8n_binding(environ, tool=tool)
+            for tool in tools
+        )
+
+    external_ports = build_production_v3_external_ports(
+        environ,
+        candidate_provider=candidate_ports.candidate_provider,
+        candidate_attestation=candidate_ports.candidate_attestation,
+        artifacts=artifacts,
+        n8n_bindings_for=n8n_bindings_for,
+        gateway_sync_http=gateway_sync_http,
+        gateway_async_http=gateway_async_http,
+        n8n_async_http=n8n_async_http,
+    )
+    evidence_runtime = build_production_v3_evidence_backend_from_environment(
+        environ,
+        external_ports=external_ports,
+    )
+    app = build_runtime_app_from_environment(
+        settings,
+        environ,
+        evidence_backend=evidence_runtime.backend,
+    )
+    app.state.production_v3_evidence_runtime = evidence_runtime
+    app.state.production_v3_external_ports = external_ports
+    original_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def close_production_clients(application: Any):
+        try:
+            async with original_lifespan(application):
+                yield
+        finally:
+            gateway_sync_http.close()
+            await gateway_async_http.aclose()
+            await n8n_async_http.aclose()
+
+    app.router.lifespan_context = close_production_clients
+    return app
+
+
+def _ensure_factory_n8n_batch(
+    *,
+    environ: Mapping[str, str],
+    gateway_url: str,
+    gateway_token: str,
+    client: httpx.Client,
+    tool_names: tuple[str, ...],
+) -> None:
+    """Release the exact candidate tool set before its first scoped MCP lease."""
+
+    batch_id = _required_from_mapping(environ, "CAPTAIN_N8N_BATCH_ID")
+    if not tool_names or len(tool_names) != len(set(tool_names)):
+        raise ProductionToolRequired("TODO_TOOL:factory_n8n_candidate_tools")
+    response = client.post(
+        f"{gateway_url}/blocks",
+        headers={"Authorization": f"Bearer {gateway_token}"},
+        json={
+            "block_type": "work_batch",
+            "status": "pending",
+            "data": {
+                "batch_id": batch_id,
+                "title": "Captain Factory n8n evidence tools",
+                "goal": "Execute only the sealed candidate n8n tools under a short-lived lease",
+                "subtask_ids": list(tool_names),
+                "target": "n8n",
+                "runtime": "n8n-mcp",
+                "runtime_version": "v1",
+                "interface_schema": "captain.n8n-mcp-tool-reference.v1",
+                "capability_tags": ["n8n-builder"],
+                "constraints": [
+                    "integration_intent=n8n",
+                    "workflow identity is host pinned",
+                ],
+                "acceptance_criteria": [
+                    {
+                        "assertion_id": "n8n-evidence",
+                        "kind": "side_effect_observed",
+                        "description": "Provider execution and workflow digests match Captain authority",
+                    }
+                ],
+            },
+        },
+    )
+    if response.status_code != status.HTTP_201_CREATED:
+        raise ProductionToolRequired("TODO_TOOL:factory_n8n_work_batch_release")
+
+
+def _required_from_mapping(environ: Mapping[str, str], name: str) -> str:
+    value = environ.get(name, "").strip()
+    if not value:
+        raise ProductionToolRequired(f"TODO_TOOL:configuration:{name}")
+    return value
+
+
 class GatewayCapabilityFactoryPort:
     """Package-C adapter preserving GatewayStore claim/fence authority."""
 

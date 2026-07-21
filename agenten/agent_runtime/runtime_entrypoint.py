@@ -224,15 +224,26 @@ def preflight_runtime() -> FastAPI:
     settings = RuntimeEntrypointSettings.from_env()
     try:
         from agenten.agent_factory.production_adapter_bundle import (
+            build_production_runtime_app_from_environment,
             build_runtime_app_from_environment,
         )
 
+        evidence_mode = os.environ.get("CAPTAIN_RUNTIME_EVIDENCE_MODE", "").strip()
+        if evidence_mode == "production-v3":
+            return build_production_runtime_app_from_environment(
+                settings,
+                os.environ,
+            )
+        if evidence_mode:
+            raise RuntimeConfigurationError(
+                "CAPTAIN_RUNTIME_EVIDENCE_MODE must be production-v3 or empty"
+            )
         return build_runtime_app_from_environment(settings, os.environ)
     except RuntimeConfigurationError:
         raise
     except Exception as exc:
         marker = str(exc)
-        if marker.startswith("TODO_TOOL:"):
+        if marker.startswith(("TODO_TOOL:", "TODO_TOOL.v1")):
             raise RuntimeConfigurationError(marker) from None
         raise RuntimeConfigurationError("production runtime composition failed") from None
 
