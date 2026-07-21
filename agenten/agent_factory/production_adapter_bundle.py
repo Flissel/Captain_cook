@@ -1163,7 +1163,10 @@ def build_capability_factory_entrypoint(config: Any) -> CapabilityFactoryEntrypo
                     os.environ, "HERMES_EXECUTABLE", "hermes"
                 ),
                 model=os.environ.get("CAPTAIN_FACTORY_MODEL", "").strip() or None,
-                provider=os.environ.get("CAPTAIN_FACTORY_PROVIDER", "").strip() or None,
+                provider=os.environ.get(
+                    "CAPTAIN_FACTORY_HERMES_PROVIDER", "openai-api"
+                ).strip()
+                or None,
                 timeout_seconds=hermes_timeout,
             )
         ),

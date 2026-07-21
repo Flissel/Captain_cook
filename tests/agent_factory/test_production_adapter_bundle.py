@@ -88,6 +88,7 @@ def test_capability_entrypoint_factory_is_real_but_blocks_unimplemented_effects(
     monkeypatch.setenv("CAPTAIN_RUNTIME_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
     monkeypatch.setenv("CODEX_EXECUTABLE", sys.executable)
     monkeypatch.setenv("HERMES_EXECUTABLE", sys.executable)
+    monkeypatch.setenv("CAPTAIN_FACTORY_HERMES_PROVIDER", "openai-api")
     monkeypatch.setenv("CAPTAIN_FACTORY_MAX_COST_PER_CALL_USD", "0.25")
 
     entrypoint = build_capability_factory_entrypoint(config)
@@ -97,6 +98,7 @@ def test_capability_entrypoint_factory_is_real_but_blocks_unimplemented_effects(
     assert isinstance(entrypoint._creation, MinibookSwarmCreationHttpPort)
     assert isinstance(entrypoint._evidence_issuer, RuntimeCaptainEvidenceHttpPort)
     assert isinstance(entrypoint._runtime, ClaimAwareCapabilityRuntime)
+    assert entrypoint._creation_analysis._hermes._settings.provider == "openai-api"
 
 
 def test_capability_entrypoint_rejects_split_runtime_and_creation_cas(
