@@ -1252,6 +1252,36 @@ def _replace_release_record(
     object.__setattr__(case, "release_evidence", tuple(records))
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variant", ("whitespace", "key_order", "escaped_z"))
+async def test_validator_rejects_noncanonical_release_evidence_json(variant: str) -> None:
+    case = _validation_case()
+    payload = case.release_evidence[0].model_dump(mode="json", by_alias=True)
+    if variant == "whitespace":
+        content = json.dumps(payload, indent=2).encode("utf-8")
+    elif variant == "key_order":
+        content = json.dumps(
+            dict(reversed(tuple(payload.items()))),
+            separators=(",", ":"),
+        ).encode("utf-8")
+    else:
+        payload["run_id"] = f'{payload["run_id"]}-Z'
+        content = json.dumps(payload, separators=(",", ":")).replace(
+            "-Z",
+            r"-\u005a",
+            1,
+        ).encode("utf-8")
+    _replace_release_blob(case, 0, content)
+
+    with pytest.raises(CapabilityPackageValidationError, match="canonical"):
+        await _validator(case).validate(
+            job=case.job,
+            creation_result=case.creation_result,
+            candidate=case.candidate,
+            release_evidence_refs=case.release_evidence_refs,
+        )
+
+
 def _replace_release_blob(case: ValidationCase, index: int, content: bytes) -> None:
     old_ref = case.release_evidence_refs[index]
     reference = old_ref.__class__.model_validate(_ref(content, "application/json"))

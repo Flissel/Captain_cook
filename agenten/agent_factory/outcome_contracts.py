@@ -208,6 +208,14 @@ class CapabilityReleaseEvidenceV1(_FrozenContract):
         return tuple(item.assertion_id for item in self.assertion_results)
 
 
+def canonical_capability_release_evidence_bytes(
+    evidence: CapabilityReleaseEvidenceV1,
+) -> bytes:
+    """Return the sole accepted UTF-8 JSON representation for release evidence."""
+
+    return evidence.model_dump_json(by_alias=True).encode("utf-8")
+
+
 class PrivateHoldoutReceipt(_FrozenContract):
     """Opaque result identity for a Captain-owned private holdout."""
 

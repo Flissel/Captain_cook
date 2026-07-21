@@ -23,6 +23,7 @@ from agenten.agent_factory.outcome_contracts import (
     AssertionOutcome,
     CapabilityPackageManifestV1,
     CapabilityReleaseEvidenceV1,
+    canonical_capability_release_evidence_bytes,
     ControlledRecoveryReceipt,
     ForgeCapabilityPackageCandidateV1,
     PackageArtifact,
@@ -349,16 +350,18 @@ class CapabilityPackageValidator:
     ) -> tuple[CapabilityReleaseEvidenceV1, ...]:
         records: list[CapabilityReleaseEvidenceV1] = []
         for reference in release_evidence_refs:
+            raw_content = content[reference.uri]
             try:
-                records.append(
-                    CapabilityReleaseEvidenceV1.model_validate_json(
-                        content[reference.uri]
-                    )
-                )
+                record = CapabilityReleaseEvidenceV1.model_validate_json(raw_content)
             except (ValidationError, ValueError) as exc:
                 raise CapabilityPackageValidationError(
                     "release reference does not contain typed release evidence"
                 ) from exc
+            if raw_content != canonical_capability_release_evidence_bytes(record):
+                raise CapabilityPackageValidationError(
+                    "release evidence JSON is not in canonical Captain serialization"
+                )
+            records.append(record)
         evidence = tuple(records)
         recovery = tuple(item for item in evidence if item.kind == "recovery")
         normal = tuple(item for item in evidence if item.kind == "normal")

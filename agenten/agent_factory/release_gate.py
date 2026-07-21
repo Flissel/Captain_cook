@@ -16,6 +16,7 @@ from agenten.agent_factory.outcome_contracts import (
     CapabilityReleaseEvidenceV1,
     FactoryTerminalDecision,
     FactoryTerminalState,
+    canonical_capability_release_evidence_bytes,
 )
 from agenten.agent_factory.skill_evaluation import ToolGapMarker
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
@@ -652,7 +653,7 @@ def _release_evidence_matches_manifest(
     for reference, record in zip(references, evidence, strict=True):
         if reference.media_type != "application/json":
             return False
-        content = record.model_dump_json(by_alias=True).encode("utf-8")
+        content = canonical_capability_release_evidence_bytes(record)
         digest = hashlib.sha256(content).hexdigest()
         if reference.sha256 != digest or reference.uri.rsplit("/", 1)[-1] != digest:
             return False
