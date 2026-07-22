@@ -94,6 +94,7 @@ async def test_creation_analysis_materializes_exact_hermes_evidence_and_replays(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     assert hasattr(production, "ProductionHermesCreationAnalysis")
+    monkeypatch.delenv("CAPTAIN_FACTORY_N8N_WORKFLOW_ID", raising=False)
     artifacts = ContentAddressedArtifactStore(tmp_path / "cas")
     job, creation = _job_and_creation(artifacts)
     skill_path = tmp_path / "released-skills" / "captain-agent-factory-loop"
