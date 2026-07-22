@@ -789,7 +789,10 @@ class SwarmPipelineAdapter:
 
     async def _dispatch(self, pipeline: Any, step: SwarmStep, job: CreationJobV1) -> Any:
         if step is SwarmStep.MANAGER:
-            return await pipeline.step_swarm_manager(self._session, str(job.input_ref.uri))
+            task = getattr(pipeline, "task_name", None)
+            if not isinstance(task, str) or not task.strip():
+                task = str(job.input_ref.uri)
+            return await pipeline.step_swarm_manager(self._session, task)
         method_names = {
             SwarmStep.CATALOG: "step_catalog",
             SwarmStep.ARCHITECT: "step_architect",

@@ -46,6 +46,34 @@ class LegacyPipeline:
         return step
 
 
+@pytest.mark.asyncio
+async def test_manager_receives_resolved_canonical_task_when_pipeline_exposes_one() -> None:
+    received: list[str] = []
+
+    class TaskPipeline(LegacyPipeline):
+        task_name = "# Canonical sales-agent brief\n\nBuild the requested team."
+
+        async def step_swarm_manager(self, session: object, task: str) -> str:
+            del session
+            received.append(task)
+            return "manager-complete"
+
+    job = _job()
+    adapter = SwarmPipelineAdapter(
+        lambda _snapshot: TaskPipeline(),
+        session=object(),
+    )
+    await adapter.run_step(
+        job,
+        SwarmStep.MANAGER.value,
+        {},
+        "manager-effect",
+        None,
+    )
+
+    assert received == [TaskPipeline.task_name]
+
+
 class EvidenceSnapshotter:
     def capture(
         self,
