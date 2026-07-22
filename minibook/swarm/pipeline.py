@@ -42,7 +42,13 @@ _CLAUDE_CODE_TEMPLATE = SALES_TOOL_IMPLEMENTATIONS["claude_code"].strip()
 def _safe_output_evaluation_task(candidate: str, task_name: str) -> str:
     """Reject evaluator prompts that invent an unavailable remote dependency."""
     normalized = " ".join(candidate.split())
-    if normalized and not re.search(r"https?://|\\b(?:remote|external)\s+(?:api|url|endpoint)\\b", normalized, re.I):
+    unavailable_dependency = re.search(
+        r"https?://|\b(?:remote|external|provided)\s+(?:api(?:\s+endpoint)?|url|endpoint)\b|"
+        r"\b(?:fetch|collect)\s+data\b",
+        normalized,
+        re.I,
+    )
+    if normalized and unavailable_dependency is None:
         return normalized
     return (
         "Using only the information in this request, produce a substantive, "

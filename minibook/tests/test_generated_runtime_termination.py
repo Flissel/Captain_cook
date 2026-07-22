@@ -62,3 +62,14 @@ def test_output_evaluation_task_replaces_remote_fixture_with_self_contained_work
     assert "https://" not in task
     assert "Enterprise sales pipeline briefing team" in task
     assert "self-contained" in task.lower()
+
+
+def test_output_evaluation_task_replaces_unbound_api_endpoint_work() -> None:
+    """An API mentioned without supplied data is as unavailable as a remote URL."""
+    task = _safe_output_evaluation_task(
+        "Collect data from the provided API endpoint and analyze it.",
+        "Renewal orchestration team",
+    )
+
+    assert "api endpoint" not in task.lower()
+    assert "Renewal orchestration team" in task
