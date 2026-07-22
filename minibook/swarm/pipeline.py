@@ -1786,11 +1786,13 @@ class SwarmPipeline:
 
         if not self.build_dir:
             print("[TodoImplementer] No build directory — skipping")
+            self.completed_steps.add("TodoImplementer")
             return
 
         tools_py_path = self.build_dir / "src" / "tools.py"
         if not tools_py_path.exists():
             print("[TodoImplementer] No tools.py found — skipping")
+            self.completed_steps.add("TodoImplementer")
             return
 
         # Quick check: any TODOs at all?
@@ -1798,6 +1800,7 @@ class SwarmPipeline:
         todos = await scan_todo_tools(tools_content)
         if not todos:
             print("[TodoImplementer] No TODO-marked tools found — skipping")
+            self.completed_steps.add("TodoImplementer")
             return
 
         print(f"[TodoImplementer] Found {len(todos)} TODO tools, implementing via Claude CLI...")
@@ -1854,6 +1857,8 @@ class SwarmPipeline:
                     tags=["todo", "tools", "swarm"])
         except Exception as e:
             print(f"[TodoImplementer] Could not post to Minibook: {e}")
+
+        self.completed_steps.add("TodoImplementer")
 
     async def step_toolforge(self, session):
         """ToolForgeAgent: Generate custom MCP servers for unimplemented tools."""
