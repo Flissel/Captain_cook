@@ -39,6 +39,19 @@ from .input_parser import SALES_TOOL_IMPLEMENTATIONS
 _CLAUDE_CODE_TEMPLATE = SALES_TOOL_IMPLEMENTATIONS["claude_code"].strip()
 
 
+def _safe_output_evaluation_task(candidate: str, task_name: str) -> str:
+    """Reject evaluator prompts that invent an unavailable remote dependency."""
+    normalized = " ".join(candidate.split())
+    if normalized and not re.search(r"https?://|\\b(?:remote|external)\s+(?:api|url|endpoint)\\b", normalized, re.I):
+        return normalized
+    return (
+        "Using only the information in this request, produce a substantive, "
+        f"self-contained deliverable for the {task_name}. Do not call remote URLs, "
+        "external APIs, or require credentials. Write the resulting analysis and "
+        "implementation plan to /app/output/ with concrete task-specific details."
+    )
+
+
 def _fix_kwargs_tools(code: str) -> str:
     """Fix **kwargs tool signatures that crash autogen's _function_utils.py.
 
@@ -1610,6 +1623,8 @@ class SwarmPipeline:
             f"- Requires real work (create files, write code, use git)\n"
             f"- Produces output files in /app/output/\n"
             f"- Can complete in under 30 agent messages\n\n"
+            f"- Is entirely self-contained: do not require remote URLs, external APIs, "
+            f"credentials, or data that is not included in the task\n\n"
             f"Respond with ONLY the task text, no explanation. "
             f"The task must be a single paragraph, actionable instruction."
         )
@@ -1626,6 +1641,7 @@ class SwarmPipeline:
                 if line.strip().startswith("TEST_TASK:"):
                     test_task = line.split(":", 1)[1].strip()
                     break
+        test_task = _safe_output_evaluation_task(test_task, self.task_name)
 
         print(f"[OutputEvalAgent] Test task: {test_task[:100]}... ({elapsed()})")
 

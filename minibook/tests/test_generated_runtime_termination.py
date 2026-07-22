@@ -5,7 +5,7 @@ import time
 import pytest
 
 from minibook.swarm.knowledge import GENERIC_MAIN_PY
-from minibook.swarm.pipeline import SwarmPipeline
+from minibook.swarm.pipeline import SwarmPipeline, _safe_output_evaluation_task
 
 
 def test_generated_runtime_honors_project_message_limit() -> None:
@@ -50,3 +50,15 @@ async def test_feedback_loop_reuses_passing_output_evaluation() -> None:
     await pipeline.step_feedback_loop(session=object())
 
     assert "FeedbackAgent" in pipeline.completed_steps
+
+
+def test_output_evaluation_task_replaces_remote_fixture_with_self_contained_work() -> None:
+    """A provider-created evaluation must not depend on an invented remote API."""
+    task = _safe_output_evaluation_task(
+        'Fetch https://example.com/data.csv, analyze it, and write a report.',
+        "Enterprise sales pipeline briefing team",
+    )
+
+    assert "https://" not in task
+    assert "Enterprise sales pipeline briefing team" in task
+    assert "self-contained" in task.lower()
