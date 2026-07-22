@@ -1297,7 +1297,10 @@ async def main():
     print(f"  [Output] Written summary.json ({len(summary['messages'])} messages)")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if os.environ.get("CAPTAIN_PACKAGE_VALIDATE") == "1":
+        print("package validation ready")
+    else:
+        asyncio.run(main())
 '''
 
 # --- Agent Role Definitions ---

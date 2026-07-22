@@ -14,6 +14,11 @@ def test_generated_runtime_honors_project_message_limit() -> None:
     assert "max(term_val, 50)" not in GENERIC_MAIN_PY
 
 
+def test_generated_runtime_supports_offline_package_validation() -> None:
+    """Package assembly must validate generated entrypoints without an LLM call."""
+    assert 'os.environ.get("CAPTAIN_PACKAGE_VALIDATE") == "1"' in GENERIC_MAIN_PY
+
+
 @pytest.mark.asyncio
 async def test_todo_implementation_completes_when_no_todo_tools_exist(
     tmp_path, monkeypatch: pytest.MonkeyPatch

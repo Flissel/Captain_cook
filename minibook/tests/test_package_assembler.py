@@ -93,6 +93,17 @@ def test_same_inputs_produce_same_archive_digest_and_complete_manifest(tmp_path:
     assert all("sha256" in entry for entry in manifest["files"])
 
 
+def test_startup_validation_uses_package_validation_mode(tmp_path: Path) -> None:
+    root = candidate(tmp_path)
+    (root / "autogen/main.py").write_text(
+        "import os\nimport sys\nif os.environ.get('CAPTAIN_PACKAGE_VALIDATE') != '1': sys.exit(1)\n",
+        encoding="utf-8",
+    )
+    PackageAssembler().assemble(
+        root, tmp_path / "validated.zip", startup_command=("python", "autogen/main.py")
+    )
+
+
 def test_integration_requires_typed_n8n_behavior_contract(tmp_path: Path) -> None:
     root = candidate(tmp_path)
     (root / "n8n").mkdir()

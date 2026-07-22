@@ -612,6 +612,7 @@ class PackageAssembler:
                 key: value for key, value in os.environ.items()
                 if key in {"PATH", "SystemRoot", "WINDIR", "TEMP", "TMP"}
             }
+            environment["CAPTAIN_PACKAGE_VALIDATE"] = "1"
             try:
                 completed = subprocess.run(
                     [sys.executable, *command[1:]], cwd=workspace, env=environment,
