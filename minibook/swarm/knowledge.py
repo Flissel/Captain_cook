@@ -1149,7 +1149,7 @@ async def main():
     cli_task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else ""
     task = cli_task or project.get("task", project.get("description", "Run the agent team."))
     term_val = project.get("termination", {}).get("value", 20)
-    termination = TextMentionTermination("TERMINATE") | MaxMessageTermination(max(term_val, 50))
+    termination = TextMentionTermination("TERMINATE") | MaxMessageTermination(term_val)
 
     agent_cfgs = _discover_agents("agents")
     if not agent_cfgs:
