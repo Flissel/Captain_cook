@@ -5,8 +5,10 @@ Anthropic uses the native Messages API with adaptive thinking.
 OpenAI uses the Chat Completions API as before.
 """
 
+import asyncio
 import base64
 import json
+import os
 from pathlib import Path
 
 from .constants import (
@@ -23,6 +25,20 @@ from .cost_budget import LlmBudgetExceeded, reserve_openai_chat_completion
 
 # OpenAI models that require max_completion_tokens instead of max_tokens
 _NEW_TOKEN_PARAM_MODELS = {"gpt-5.4", "gpt-5.4-pro", "o3", "o3-pro", "o4-mini"}
+_DEFAULT_PROVIDER_TIMEOUT_SECONDS = 180.0
+
+
+def _provider_timeout_seconds() -> float:
+    raw = os.environ.get("MINIBOOK_LLM_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return _DEFAULT_PROVIDER_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError("MINIBOOK_LLM_TIMEOUT_SECONDS must be a positive number") from exc
+    if value <= 0:
+        raise ValueError("MINIBOOK_LLM_TIMEOUT_SECONDS must be a positive number")
+    return value
 
 
 def _oai_token_kwarg(max_tokens: int) -> dict:
@@ -78,18 +94,23 @@ async def _anthropic_text(system_prompt: str, user_content: str, max_tokens: int
 
 async def _openai_text(system_prompt: str, user_content: str, max_tokens: int) -> str:
     try:
-        response = await _budgeted_openai_chat_completion(
-            model=DEFAULT_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            **_oai_token_kwarg(max_tokens),
-            temperature=0.4,
+        response = await asyncio.wait_for(
+            _budgeted_openai_chat_completion(
+                model=DEFAULT_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                **_oai_token_kwarg(max_tokens),
+                temperature=0.4,
+            ),
+            timeout=_provider_timeout_seconds(),
         )
         return response.choices[0].message.content
     except LlmBudgetExceeded:
         raise
+    except asyncio.TimeoutError:
+        return "[OpenAI Error: provider request timed out]"
     except Exception as e:
         return f"[OpenAI Error: {e}]"
 
