@@ -828,16 +828,10 @@ class SwarmPipelineAdapter:
                 task = str(job.input_ref.uri)
             return await pipeline.step_swarm_manager(self._session, task)
         if step is SwarmStep.ARCHITECT:
-            # The legacy pipeline intentionally has Coder and Reviewer poll in
-            # parallel while Architect publishes the handoff.  Calling its
-            # methods strictly serially makes those polls time out and then
-            # turns skipped build work into misleading downstream success.
-            # Keep the named Captain checkpoints while preserving that real
-            # conversation pattern.
-            coder = asyncio.create_task(pipeline.step_coder(self._session))
-            reviewer = asyncio.create_task(pipeline.step_reviewer(self._session))
-            setattr(pipeline, "_captain_coder_task", coder)
-            setattr(pipeline, "_captain_reviewer_task", reviewer)
+            # Persist Architect's durable Minibook handoff first.  Coder and
+            # Reviewer are started together at the next checkpoint so a
+            # snapshot restore cannot overwrite state while either task is
+            # still waiting for Architect's mention.
             return await pipeline.step_architect(self._session)
         if step is SwarmStep.CODER:
             coder = getattr(pipeline, "_captain_coder_task", None)
