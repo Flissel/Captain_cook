@@ -385,7 +385,10 @@ class ExportArtifactSnapshotter:
                 )
         export = getattr(pipeline, "export_result", None)
         if not isinstance(export, dict) or export.get("status") != "SUCCESS":
-            raise ValueError("legacy pipeline did not produce a successful export")
+            return self._required_gap(
+                "legacy-swarm-package-c-export",
+                "successful legacy export with an observed output path",
+            )
         export_path = Path(str(export.get("path", ""))).resolve()
         if not export_path.is_dir():
             raise ValueError("legacy pipeline export path is unavailable")

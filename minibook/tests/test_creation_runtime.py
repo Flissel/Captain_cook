@@ -406,3 +406,68 @@ async def test_production_factory_exports_legacy_swarm_through_package_c_or_exac
         "required_output"
     ]
     assert "tests/ (real executable tests)" in marker["required_output"]
+
+
+@pytest.mark.asyncio
+async def test_production_factory_marks_unsuccessful_legacy_export_as_required_gap(
+    tmp_path: Path,
+) -> None:
+    from minibook.swarm.creation_runtime import ProductionSwarmPipelineFactory
+    from minibook.swarm.pipeline_adapter import (
+        ContentAddressedCreationArtifacts,
+        SwarmSnapshot,
+        SwarmStep,
+    )
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+
+    async def setup_agents(session: Session) -> dict[str, object]:
+        del session
+        return {"SwarmManager": object()}
+
+    async def setup_project(
+        session: Session, agents: dict[str, object], name: str
+    ) -> str:
+        del session, agents, name
+        return "project-1"
+
+    class Pipeline:
+        export_result = {"status": "FAIL", "reason": "no output path"}
+
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        async def step_export(self, session: Session) -> dict[str, str]:
+            del session
+            return dict(self.export_result)
+
+    artifacts = ContentAddressedCreationArtifacts(tmp_path / "artifacts")
+    factory = ProductionSwarmPipelineFactory(
+        artifacts,
+        session_factory=Session,
+        setup_agents=setup_agents,
+        setup_project=setup_project,
+        pipeline_type=Pipeline,
+        input_resolver=lambda reference: "Build the requested team",
+    )
+    job = creation_job()
+    async with factory.open(job) as adapter:
+        outcome = await adapter.run_step(
+            job,
+            SwarmStep.EXPORT.value,
+            SwarmSnapshot(creation_job_id=job.creation_job_id).model_dump(),
+            "export-effect",
+            None,
+        )
+        result = adapter.assemble_result(job, outcome.snapshot)
+
+    assert result.status == "blocked"
+    assert result.tool_gaps[0].gap_id == "legacy-swarm-package-c-export"
+    marker = json.loads(artifacts.read(result.tool_gaps[0].evidence_ref))
+    assert marker["schema"] == "TODO_TOOL.v1"
+    assert marker["required_output"] == "successful legacy export with an observed output path"
