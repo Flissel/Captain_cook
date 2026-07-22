@@ -1948,8 +1948,14 @@ class SwarmPipeline:
         """FeedbackAgent: Run team, score output, improve if needed."""
         elapsed = lambda: f"{time.time() - self.start_time:.1f}s"
 
+        if isinstance(self.output_eval, dict) and self.output_eval.get("status") == "PASS":
+            print("[FeedbackAgent] SKIP - output evaluation already passed")
+            self.completed_steps.add("FeedbackAgent")
+            return
+
         if not self.output_path or not self.build_dir:
             print("[FeedbackAgent] SKIP - no output/build")
+            self.completed_steps.add("FeedbackAgent")
             return
 
         for round_num in range(max_rounds):

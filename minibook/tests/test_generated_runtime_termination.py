@@ -38,3 +38,15 @@ async def test_todo_implementation_completes_when_no_todo_tools_exist(
     await pipeline.step_todo_implement(session=object())
 
     assert "TodoImplementer" in pipeline.completed_steps
+
+
+@pytest.mark.asyncio
+async def test_feedback_loop_reuses_passing_output_evaluation() -> None:
+    """A passed evaluation is valid evidence; it must not trigger duplicate live runs."""
+    pipeline = SwarmPipeline({}, "project", "task", interactive=False)
+    pipeline.start_time = time.time()
+    pipeline.output_eval = {"status": "PASS", "score": "8"}
+
+    await pipeline.step_feedback_loop(session=object())
+
+    assert "FeedbackAgent" in pipeline.completed_steps
