@@ -100,6 +100,32 @@ def _fix_truncated_tools_py(code: str) -> str:
     return code
 
 
+def _render_export_smoke_test() -> str:
+    """Return an executable test for the observed generated AutoGen sources.
+
+    The test is intentionally structural: the legacy TesterAgent has already
+    executed its richer validation, while this file makes that generated source
+    set independently checkable after Package-C relocates ``src/`` to
+    ``autogen/``.  It does not claim a runtime result or manufacture a passing
+    implementation.
+    """
+
+    return '''from __future__ import annotations
+
+from pathlib import Path
+
+
+def test_generated_autogen_sources_compile() -> None:
+    root = Path(__file__).resolve().parents[1]
+    source_root = root / "autogen"
+    assert (source_root / "main.py").is_file()
+    modules = sorted(source_root.rglob("*.py"))
+    assert modules
+    for module in modules:
+        compile(module.read_text(encoding="utf-8"), str(module), "exec")
+'''
+
+
 LEGACY_PIPELINE_AGENT_ORDER = (
     "manager", "catalog", "architect", "coder", "reviewer", "tester",
     "validator", "builder", "executor", "output_evaluation",
@@ -1246,6 +1272,10 @@ class SwarmPipeline:
 
         # Run automated tests (code + YAML)
         test_results = test_generated_code(self.generated_files, self.yaml_files)
+        if test_results.get("overall") == "PASS":
+            self.generated_files["tests/test_generated_team.py"] = (
+                _render_export_smoke_test()
+            )
 
         # Format results for GPT-4o analysis
         test_summary = json.dumps(test_results, indent=2)
