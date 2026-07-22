@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -72,6 +73,43 @@ async def test_manager_receives_resolved_canonical_task_when_pipeline_exposes_on
     )
 
     assert received == [TaskPipeline.task_name]
+
+
+@pytest.mark.asyncio
+async def test_architect_coder_and_reviewer_keep_legacy_conversation_parallel() -> None:
+    events: list[str] = []
+    architect_started = asyncio.Event()
+
+    class ConversationPipeline:
+        async def step_architect(self, session: object) -> str:
+            del session
+            events.append("architect")
+            architect_started.set()
+            await asyncio.sleep(0)
+            return "architect"
+
+        async def step_coder(self, session: object) -> str:
+            del session
+            await architect_started.wait()
+            events.append("coder")
+            return "coder"
+
+        async def step_reviewer(self, session: object) -> str:
+            del session
+            await architect_started.wait()
+            events.append("reviewer")
+            return "reviewer"
+
+    job = _job()
+    pipeline = ConversationPipeline()
+    adapter = SwarmPipelineAdapter(lambda _snapshot: pipeline, session=object())
+    architect = await adapter._dispatch(pipeline, SwarmStep.ARCHITECT, job)
+    coder = await adapter._dispatch(pipeline, SwarmStep.CODER, job)
+    reviewer = await adapter._dispatch(pipeline, SwarmStep.REVIEWER, job)
+
+    assert (architect, coder, reviewer) == ("architect", "coder", "reviewer")
+    assert events[0] == "architect"
+    assert set(events[1:]) == {"coder", "reviewer"}
 
 
 class EvidenceSnapshotter:

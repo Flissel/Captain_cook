@@ -1,6 +1,7 @@
 """Named, resumable step adapter around the legacy SwarmPipeline."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -793,6 +794,37 @@ class SwarmPipelineAdapter:
             if not isinstance(task, str) or not task.strip():
                 task = str(job.input_ref.uri)
             return await pipeline.step_swarm_manager(self._session, task)
+        if step is SwarmStep.ARCHITECT:
+            # The legacy pipeline intentionally has Coder and Reviewer poll in
+            # parallel while Architect publishes the handoff.  Calling its
+            # methods strictly serially makes those polls time out and then
+            # turns skipped build work into misleading downstream success.
+            # Keep the named Captain checkpoints while preserving that real
+            # conversation pattern.
+            coder = asyncio.create_task(pipeline.step_coder(self._session))
+            reviewer = asyncio.create_task(pipeline.step_reviewer(self._session))
+            setattr(pipeline, "_captain_coder_task", coder)
+            setattr(pipeline, "_captain_reviewer_task", reviewer)
+            return await pipeline.step_architect(self._session)
+        if step is SwarmStep.CODER:
+            coder = getattr(pipeline, "_captain_coder_task", None)
+            if not isinstance(coder, asyncio.Task):
+                # A process restart retains the Architect post but not its
+                # in-memory waiters.  Re-create both waits from that durable
+                # handoff and keep Reviewer alive for the next checkpoint.
+                coder = asyncio.create_task(pipeline.step_coder(self._session))
+                setattr(pipeline, "_captain_coder_task", coder)
+                setattr(
+                    pipeline,
+                    "_captain_reviewer_task",
+                    asyncio.create_task(pipeline.step_reviewer(self._session)),
+                )
+            return await coder
+        if step is SwarmStep.REVIEWER:
+            reviewer = getattr(pipeline, "_captain_reviewer_task", None)
+            if isinstance(reviewer, asyncio.Task):
+                return await reviewer
+            return await pipeline.step_reviewer(self._session)
         method_names = {
             SwarmStep.CATALOG: "step_catalog",
             SwarmStep.ARCHITECT: "step_architect",
