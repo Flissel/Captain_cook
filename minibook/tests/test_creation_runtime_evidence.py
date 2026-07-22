@@ -112,6 +112,26 @@ async def test_architect_coder_and_reviewer_keep_legacy_conversation_parallel() 
     assert set(events[1:]) == {"coder", "reviewer"}
 
 
+@pytest.mark.asyncio
+async def test_adapter_rejects_a_legacy_timeout_as_a_completed_checkpoint() -> None:
+    from minibook.swarm.pipeline_adapter import LegacySwarmStepIncomplete
+
+    class TimedOutPipeline:
+        completed_steps: set[str] = set()
+
+        async def step_coder(self, session: object) -> None:
+            del session
+
+        async def step_reviewer(self, session: object) -> None:
+            del session
+
+    job = _job()
+    adapter = SwarmPipelineAdapter(lambda _snapshot: TimedOutPipeline(), session=object())
+
+    with pytest.raises(LegacySwarmStepIncomplete, match="CoderAgent"):
+        await adapter.run_step(job, SwarmStep.CODER.value, {}, "coder-effect", None)
+
+
 class EvidenceSnapshotter:
     def capture(
         self,

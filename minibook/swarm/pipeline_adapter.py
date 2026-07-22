@@ -50,6 +50,10 @@ class SwarmStep(str, Enum):
 PIPELINE_STEP_ORDER = tuple(SwarmStep)
 
 
+class LegacySwarmStepIncomplete(RuntimeError):
+    """A legacy method returned without completing its claimed agent stage."""
+
+
 class SwarmSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     creation_job_id: UUID
@@ -587,6 +591,7 @@ _KNOWN_FAILURES = {
     "N8nExecutionError": "n8n_failed",
     "BuildError": "build_failed",
     "ValidationError": "validation_failed",
+    "LegacySwarmStepIncomplete": "validation_failed",
 }
 
 
@@ -643,6 +648,7 @@ class SwarmPipelineAdapter:
         snapshot_updates: dict[str, Any] = {}
         if accepted_effect is None:
             output = await self._dispatch(pipeline, named_step, job)
+            self._require_legacy_step_completion(pipeline, named_step)
             if self._snapshotter is not None:
                 snapshot_updates = self._snapshotter.capture(
                     job, named_step, pipeline, output, prior
@@ -690,6 +696,33 @@ class SwarmPipelineAdapter:
             }
         )
         return StepOutcome(snapshot=snapshot.model_dump(mode="json"), effect_receipt=receipt)
+
+    @staticmethod
+    def _require_legacy_step_completion(pipeline: Any, step: SwarmStep) -> None:
+        completed = getattr(pipeline, "completed_steps", None)
+        if not isinstance(completed, set):
+            return
+        expected = {
+            SwarmStep.MANAGER: "SwarmManager",
+            SwarmStep.CATALOG: "CatalogAgent",
+            SwarmStep.ARCHITECT: "ArchitectAgent",
+            SwarmStep.CODER: "CoderAgent",
+            SwarmStep.REVIEWER: "ReviewerAgent",
+            SwarmStep.TESTER: "TesterAgent",
+            SwarmStep.VALIDATOR: "ValidatorAgent",
+            SwarmStep.BUILDER: "BuilderAgent",
+            SwarmStep.EXECUTOR: "ExecutorAgent",
+            SwarmStep.OUTPUT_EVALUATION: "OutputEvalAgent",
+            SwarmStep.TODO_IMPLEMENTATION: "TodoImplementer",
+            SwarmStep.TOOLFORGE: "ToolForgeAgent",
+            SwarmStep.FEEDBACK_LOOP: "FeedbackAgent",
+            SwarmStep.EVALUATION_REPORT: "EvalReporterAgent",
+            SwarmStep.EXPORT: "ExportAgent",
+        }[step]
+        if expected not in completed:
+            raise LegacySwarmStepIncomplete(
+                f"legacy swarm did not complete {expected} for checkpoint {step.value}"
+            )
 
     def preparation_evidence(
         self,
