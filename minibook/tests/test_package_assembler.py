@@ -104,6 +104,25 @@ def test_startup_validation_uses_package_validation_mode(tmp_path: Path) -> None
     )
 
 
+def test_startup_validation_keeps_windows_runtime_environment_without_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Validation needs the OS runtime, but must not expose provider credentials."""
+    root = candidate(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "not-for-generated-code")
+    (root / "autogen/main.py").write_text(
+        "import asyncio\nimport os\nimport sys\n"
+        "if os.environ.get('CAPTAIN_PACKAGE_VALIDATE') != '1': sys.exit(1)\n"
+        "if os.environ.get('OPENAI_API_KEY'): sys.exit(2)\n",
+        encoding="utf-8",
+    )
+
+    PackageAssembler().assemble(
+        root, tmp_path / "windows-runtime.zip", startup_command=("python", "autogen/main.py")
+    )
+
+
 def test_integration_requires_typed_n8n_behavior_contract(tmp_path: Path) -> None:
     root = candidate(tmp_path)
     (root / "n8n").mkdir()

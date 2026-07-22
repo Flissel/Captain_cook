@@ -66,6 +66,9 @@ _PATTERNS = {
     "round_robin_group_chat": "round_robin_group_chat",
     "single_agent": "single_agent",
 }
+_VALIDATION_SECRET_ENV = re.compile(
+    r"(?:key|token|secret|password|credential|auth|dsn|connection)", re.I
+)
 
 
 def _safe_relative(value: str) -> PurePosixPath:
@@ -609,8 +612,9 @@ class PackageAssembler:
             workspace = Path(temporary) / "candidate"
             shutil.copytree(source, workspace)
             environment = {
-                key: value for key, value in os.environ.items()
-                if key in {"PATH", "SystemRoot", "WINDIR", "TEMP", "TMP"}
+                key: value
+                for key, value in os.environ.items()
+                if _VALIDATION_SECRET_ENV.search(key) is None
             }
             environment["CAPTAIN_PACKAGE_VALIDATE"] = "1"
             try:
