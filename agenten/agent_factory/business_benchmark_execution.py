@@ -4,14 +4,25 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Literal, Protocol
-from uuid import NAMESPACE_URL, UUID, uuid5
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Literal, Protocol
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agenten.agent_factory.business_benchmark_contracts import (
     BusinessBenchmarkCaseV1,
     BusinessBenchmarkRunReceiptV1,
+)
+from agenten.agent_factory.business_benchmark_replay import (
+    BenchmarkRecoveryUncertainError,
+    BusinessBenchmarkEffectClaimV1,
+    BusinessBenchmarkEffectIdentityV1,
+    BusinessBenchmarkFenceReceiptV1,
+    BusinessBenchmarkPreparedEffectV1,
+    BusinessBenchmarkRecoveryObservationV1,
+    BusinessBenchmarkReplayStore,
+    BusinessBenchmarkRuntimePreparationV1,
 )
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_runtime.contracts import ArtifactRef, IDENTIFIER_PATTERN, IntegrationIntent
@@ -107,11 +118,36 @@ class BusinessBenchmarkExecutionEnvelopeV1(_FrozenExecutionContract):
 
 
 class BusinessBenchmarkExecutorPort(Protocol):
-    """Injected boundary for a bounded candidate or baseline execution."""
+    """Provider boundary that registers and enforces the greatest seen fence.
+
+    Implementations must durably register each fence before recovery/execution
+    and reject either operation when its claim or fence is older than the
+    provider-side maximum for the prepared runtime identity.
+    """
+
+    async def prepare(
+        self, envelope: BusinessBenchmarkExecutionEnvelopeV1
+    ) -> BusinessBenchmarkRuntimePreparationV1: ...
 
     async def execute(
-        self, envelope: BusinessBenchmarkExecutionEnvelopeV1
+        self,
+        envelope: BusinessBenchmarkExecutionEnvelopeV1,
+        claim: BusinessBenchmarkEffectClaimV1,
+        fence_receipt: BusinessBenchmarkFenceReceiptV1,
     ) -> BusinessBenchmarkRunReceiptV1: ...
+
+    async def register_fence(
+        self,
+        prepared: BusinessBenchmarkPreparedEffectV1,
+        claim: BusinessBenchmarkEffectClaimV1,
+    ) -> BusinessBenchmarkFenceReceiptV1: ...
+
+    async def recover(
+        self,
+        prepared: BusinessBenchmarkPreparedEffectV1,
+        claim: BusinessBenchmarkEffectClaimV1,
+        fence_receipt: BusinessBenchmarkFenceReceiptV1,
+    ) -> BusinessBenchmarkRecoveryObservationV1: ...
 
 
 class BusinessBenchmarkExecutionError(ValueError):
@@ -130,6 +166,10 @@ class PairedBusinessBenchmarkCoordinator:
         attempt: int,
         suite_id: str,
         executor: BusinessBenchmarkExecutorPort,
+        replay_store: BusinessBenchmarkReplayStore,
+        clock: Callable[[], datetime] | None = None,
+        claim_ttl: timedelta = timedelta(minutes=5),
+        claim_id_factory: Callable[[], UUID] = uuid4,
     ) -> None:
         if subject_version < 1:
             raise ValueError("subject_version must be positive")
@@ -137,12 +177,18 @@ class PairedBusinessBenchmarkCoordinator:
             raise ValueError("attempt must be between 1 and 5")
         if not suite_id:
             raise ValueError("suite_id must not be blank")
+        if claim_ttl <= timedelta(0):
+            raise ValueError("claim_ttl must be positive")
         self._job_id = job_id
         self._correlation_id = correlation_id
         self._subject_version = subject_version
         self._attempt = attempt
         self._suite_id = suite_id
         self._executor = executor
+        self._replay_store = replay_store
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._claim_ttl = claim_ttl
+        self._claim_id_factory = claim_id_factory
 
     async def run_case_pair(
         self,
@@ -170,12 +216,128 @@ class PairedBusinessBenchmarkCoordinator:
             candidate_ref=None,
             execution_policy=execution_policy,
         )
-        candidate_receipt = await self._executor.execute(candidate)
-        baseline_receipt = await self._executor.execute(baseline)
-        self._validate_receipt(candidate_receipt, candidate)
-        self._validate_receipt(baseline_receipt, baseline)
+        candidate_receipt = await self._run_variant(candidate)
+        baseline_receipt = await self._run_variant(baseline)
         self._validate_pair(candidate_receipt, baseline_receipt)
         return candidate_receipt, baseline_receipt
+
+    async def _run_variant(
+        self, envelope: BusinessBenchmarkExecutionEnvelopeV1
+    ) -> BusinessBenchmarkRunReceiptV1:
+        identity = BusinessBenchmarkEffectIdentityV1.create(
+            request_id=envelope.request_id,
+            job_id=envelope.job_id,
+            correlation_id=envelope.correlation_id,
+            subject_version=envelope.subject_version,
+            attempt=envelope.attempt,
+            suite_ref=envelope.suite_ref,
+            suite_id=envelope.suite_id,
+            case_id=envelope.case.case_id,
+            variant=envelope.variant,
+            execution_policy_sha256=envelope.execution_policy_sha256,
+            variant_policy_sha256=envelope.variant_policy_sha256,
+        )
+        snapshot = self._replay_store.snapshot(identity)
+        if snapshot.receipt is not None:
+            self._validate_receipt(snapshot.receipt, envelope)
+            return snapshot.receipt
+        prepared = snapshot.prepared_effect
+        if prepared is None:
+            preparation = await self._executor.prepare(envelope)
+            if preparation.runtime_session_id != envelope.runtime_session_id:
+                raise BusinessBenchmarkExecutionError(
+                    "prepared runtime session does not match envelope"
+                )
+            prepared = BusinessBenchmarkPreparedEffectV1(
+                schema="captain.business-benchmark-prepared-effect.v1",
+                identity=identity,
+                runtime_session_id=preparation.runtime_session_id,
+            )
+        now = self._clock()
+        result = self._replay_store.claim(
+            prepared,
+            claim_id=self._claim_id_factory(),
+            acquired_at=now,
+            expires_at=now + self._claim_ttl,
+        )
+        if result.receipt is not None:
+            self._validate_receipt(result.receipt, envelope)
+            return result.receipt
+        claim = result.claim
+        if not result.acquired or claim is None:
+            raise BusinessBenchmarkExecutionError(
+                "benchmark replay store returned no effect claim"
+            )
+        fence_receipt = await self._executor.register_fence(
+            claim.prepared_effect, claim
+        )
+        self._validate_fence_receipt(fence_receipt, claim)
+        fence_receipt = self._replay_store.record_fence(claim, fence_receipt)
+        if result.recovery_required:
+            recovery = await self._executor.recover(
+                claim.prepared_effect, claim, fence_receipt
+            )
+            self._validate_recovery(recovery, claim, fence_receipt)
+            recovery = self._replay_store.record_recovery(
+                claim, fence_receipt, recovery
+            )
+            if recovery.outcome == "terminal":
+                recovered_receipt = recovery.receipt
+                if recovered_receipt is None:
+                    raise BusinessBenchmarkExecutionError(
+                        "terminal recovery did not include a receipt"
+                    )
+                self._validate_receipt(recovered_receipt, envelope)
+                return self._replay_store.complete(
+                    claim, fence_receipt, recovered_receipt
+                )
+            if recovery.outcome == "uncertain":
+                raise BenchmarkRecoveryUncertainError(
+                    "benchmark effect recovery is uncertain; execution remains fenced"
+                )
+        receipt = await self._executor.execute(envelope, claim, fence_receipt)
+        self._validate_receipt(receipt, envelope)
+        return self._replay_store.complete(claim, fence_receipt, receipt)
+
+    @staticmethod
+    def _validate_fence_receipt(
+        fence_receipt: BusinessBenchmarkFenceReceiptV1,
+        claim: BusinessBenchmarkEffectClaimV1,
+    ) -> None:
+        expected: dict[str, object] = {
+            "effect_id": claim.identity.effect_id,
+            "runtime_session_id": claim.prepared_effect.runtime_session_id,
+            "claim_id": claim.claim_id,
+            "fence": claim.fence,
+        }
+        for field_name, value in expected.items():
+            if getattr(fence_receipt, field_name) != value:
+                raise BusinessBenchmarkExecutionError(
+                    f"provider fence receipt {field_name} does not match claim"
+                )
+
+    @staticmethod
+    def _validate_recovery(
+        recovery: BusinessBenchmarkRecoveryObservationV1,
+        claim: BusinessBenchmarkEffectClaimV1,
+        fence_receipt: BusinessBenchmarkFenceReceiptV1,
+    ) -> None:
+        if recovery.effect_id != claim.identity.effect_id:
+            raise BusinessBenchmarkExecutionError(
+                "recovery effect identity does not match prepared effect"
+            )
+        if recovery.runtime_session_id != claim.prepared_effect.runtime_session_id:
+            raise BusinessBenchmarkExecutionError(
+                "recovery runtime session does not match prepared effect"
+            )
+        if recovery.claim_id != claim.claim_id or recovery.fence != claim.fence:
+            raise BusinessBenchmarkExecutionError(
+                "recovery claim or fence does not match current claim"
+            )
+        if recovery.fence_receipt != fence_receipt:
+            raise BusinessBenchmarkExecutionError(
+                "recovery proof does not match provider fence receipt"
+            )
 
     def _envelope(
         self,
@@ -204,8 +366,10 @@ class PairedBusinessBenchmarkCoordinator:
         binding = {
             "job_id": str(self._job_id),
             "correlation_id": str(self._correlation_id),
+            "subject_version": self._subject_version,
             "attempt": self._attempt,
             "suite_ref": suite_ref.model_dump(mode="json", by_alias=True),
+            "suite_id": self._suite_id,
             "case_id": case.case_id,
             "variant": variant,
             "execution_policy_sha256": execution_policy_sha256,
@@ -236,7 +400,7 @@ class PairedBusinessBenchmarkCoordinator:
             redaction_policy_sha256=redaction_policy_sha256,
             execution_policy_sha256=execution_policy_sha256,
             variant_policy_sha256=variant_policy_sha256,
-            runtime_session_id=f"benchmark-session-{variant}-{idempotency_key[:16]}",
+            runtime_session_id=f"benchmark-session-{variant}-{idempotency_key}",
             evaluation_only=variant == "single_agent_baseline",
         )
 

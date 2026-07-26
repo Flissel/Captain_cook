@@ -18,6 +18,14 @@ from agenten.agent_factory.business_benchmark_execution import (
     BusinessBenchmarkExecutionError,
     PairedBusinessBenchmarkCoordinator,
 )
+from agenten.agent_factory.business_benchmark_replay import (
+    BusinessBenchmarkEffectClaimV1,
+    BusinessBenchmarkFenceReceiptV1,
+    BusinessBenchmarkPreparedEffectV1,
+    BusinessBenchmarkRecoveryObservationV1,
+    BusinessBenchmarkRuntimePreparationV1,
+    InMemoryBusinessBenchmarkReplayStore,
+)
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent
 
@@ -87,9 +95,22 @@ class RecordingExecutor:
         self.envelopes: list[BusinessBenchmarkExecutionEnvelopeV1] = []
         self._receipt_transform = receipt_transform
 
-    async def execute(
+    async def prepare(
         self, envelope: BusinessBenchmarkExecutionEnvelopeV1
+    ) -> BusinessBenchmarkRuntimePreparationV1:
+        return BusinessBenchmarkRuntimePreparationV1(
+            schema="captain.business-benchmark-runtime-preparation.v1",
+            runtime_session_id=envelope.runtime_session_id,
+        )
+
+    async def execute(
+        self,
+        envelope: BusinessBenchmarkExecutionEnvelopeV1,
+        claim: BusinessBenchmarkEffectClaimV1,
+        fence_receipt: BusinessBenchmarkFenceReceiptV1,
     ) -> BusinessBenchmarkRunReceiptV1:
+        assert claim.prepared_effect.runtime_session_id == envelope.runtime_session_id
+        assert fence_receipt.claim_id == claim.claim_id
         self.envelopes.append(envelope)
         receipt = BusinessBenchmarkRunReceiptV1(
             schema="captain.business-benchmark-run-receipt.v1",
@@ -125,6 +146,43 @@ class RecordingExecutor:
             return self._receipt_transform(receipt, envelope)
         return receipt
 
+    async def register_fence(
+        self,
+        prepared: BusinessBenchmarkPreparedEffectV1,
+        claim: BusinessBenchmarkEffectClaimV1,
+    ) -> BusinessBenchmarkFenceReceiptV1:
+        return BusinessBenchmarkFenceReceiptV1(
+            schema="captain.business-benchmark-fence-receipt.v1",
+            effect_id=prepared.identity.effect_id,
+            runtime_session_id=prepared.runtime_session_id,
+            claim_id=claim.claim_id,
+            fence=claim.fence,
+            registered_at=NOW,
+            evidence_ref=artifact(
+                f"fence-{prepared.identity.effect_id}-{claim.fence}"
+            ),
+        )
+
+    async def recover(
+        self,
+        prepared: BusinessBenchmarkPreparedEffectV1,
+        claim: BusinessBenchmarkEffectClaimV1,
+        fence_receipt: BusinessBenchmarkFenceReceiptV1,
+    ) -> BusinessBenchmarkRecoveryObservationV1:
+        return BusinessBenchmarkRecoveryObservationV1(
+            schema="captain.business-benchmark-recovery-observation.v1",
+            effect_id=prepared.identity.effect_id,
+            runtime_session_id=prepared.runtime_session_id,
+            claim_id=claim.claim_id,
+            fence=claim.fence,
+            fence_receipt=fence_receipt,
+            checked_at=NOW,
+            evidence_ref=artifact(
+                f"recovery-{prepared.identity.effect_id}-{claim.fence}"
+            ),
+            outcome="no_effect",
+        )
+
 
 def coordinator(executor: RecordingExecutor) -> PairedBusinessBenchmarkCoordinator:
     return PairedBusinessBenchmarkCoordinator(
@@ -134,6 +192,7 @@ def coordinator(executor: RecordingExecutor) -> PairedBusinessBenchmarkCoordinat
         attempt=1,
         suite_id="claims-suite-v1",
         executor=executor,
+        replay_store=InMemoryBusinessBenchmarkReplayStore(),
     )
 
 
