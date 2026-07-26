@@ -155,6 +155,9 @@ class BusinessBenchmarkRunReceiptV1(_FrozenContract):
         alias="schema", serialization_alias="schema"
     )
     run_id: UUID
+    request_id: UUID
+    execution_policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    runtime_session_id: str = Field(min_length=1)
     job_id: UUID
     correlation_id: UUID
     subject_version: int = Field(ge=1, strict=True)
@@ -183,6 +186,13 @@ class BusinessBenchmarkRunReceiptV1(_FrozenContract):
     @classmethod
     def require_utc_timestamp(cls, value: datetime) -> datetime:
         return _require_utc(value)
+
+    @field_validator("runtime_session_id")
+    @classmethod
+    def require_nonblank_runtime_session_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("runtime_session_id must not be blank")
+        return value
 
     @field_validator("allowed_tool_intents", "observed_tool_intents")
     @classmethod

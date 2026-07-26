@@ -129,8 +129,15 @@ def run_receipt(
         or UUID(
             "00000000-0000-0000-0000-000000000103"
             if variant == "candidate"
-            else "00000000-0000-0000-0000-000000000104"
+                else "00000000-0000-0000-0000-000000000104"
+            ),
+        request_id=UUID(
+            "00000000-0000-0000-0000-000000000105"
+            if variant == "candidate"
+            else "00000000-0000-0000-0000-000000000106"
         ),
+        execution_policy_sha256="c" * 64,
+        runtime_session_id=f"benchmark-session-{variant}",
         job_id=JOB_ID,
         correlation_id=CORRELATION_ID,
         subject_version=1,

@@ -93,6 +93,9 @@ def run_payload(variant: str, **overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "schema": "captain.business-benchmark-run-receipt.v1",
         "run_id": UUID("00000000-0000-0000-0000-000000000003" if variant == "candidate" else "00000000-0000-0000-0000-000000000004"),
+        "request_id": UUID("00000000-0000-0000-0000-000000000005" if variant == "candidate" else "00000000-0000-0000-0000-000000000006"),
+        "execution_policy_sha256": "c" * 64,
+        "runtime_session_id": f"benchmark-session-{variant}",
         "job_id": JOB_ID,
         "correlation_id": CORRELATION_ID,
         "subject_version": 1,
