@@ -13,6 +13,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from agenten.agent_runtime.contracts import ArtifactRef, IDENTIFIER_PATTERN, IntegrationIntent
+from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 
 
 _SECRET_KEY_PATTERN = re.compile(
@@ -158,7 +159,7 @@ class BusinessBenchmarkRunReceiptV1(_FrozenContract):
     correlation_id: UUID
     subject_version: int = Field(ge=1, strict=True)
     attempt: int = Field(ge=1, le=5, strict=True)
-    suite_ref: ArtifactRef
+    suite_ref: PrivateHoldoutRef
     suite_id: str = Field(pattern=IDENTIFIER_PATTERN)
     case_id: str = Field(pattern=IDENTIFIER_PATTERN)
     variant: Literal["candidate", "single_agent_baseline"]
@@ -329,7 +330,7 @@ class BusinessBenchmarkSummaryV1(_FrozenContract):
     subject_version: int = Field(ge=1, strict=True)
     attempt: int = Field(ge=1, le=5, strict=True)
     candidate_ref: ArtifactRef
-    suite_ref: ArtifactRef
+    suite_ref: PrivateHoldoutRef
     suite_id: str = Field(pattern=IDENTIFIER_PATTERN)
     artifact_ref: ArtifactRef
     policy: BusinessBenchmarkPolicyV1

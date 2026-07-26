@@ -20,6 +20,7 @@ from agenten.agent_factory.business_benchmark_contracts import (
     BusinessBenchmarkSummaryV1,
     BusinessCaseCategory,
 )
+from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 
 
 NOW = datetime(2026, 7, 26, 10, tzinfo=timezone.utc)
@@ -33,6 +34,16 @@ def artifact(name: str) -> dict[str, str]:
         "sha256": "a" * 64,
         "media_type": "application/json",
     }
+
+
+def suite_ref() -> dict[str, str]:
+    digest = "b" * 64
+    holdout_id = f"holdout-{digest[:12]}"
+    return PrivateHoldoutRef(
+        holdout_id=holdout_id,
+        uri=f"holdout://{holdout_id}",
+        sha256=digest,
+    ).model_dump(mode="json")
 
 
 def canonical_digest(payload: dict[str, object]) -> str:
@@ -86,7 +97,7 @@ def run_payload(variant: str, **overrides: object) -> dict[str, object]:
         "correlation_id": CORRELATION_ID,
         "subject_version": 1,
         "attempt": 1,
-        "suite_ref": artifact("suite"),
+        "suite_ref": suite_ref(),
         "suite_id": "claims-suite-v1",
         "case_id": "claims-ordinary-01",
         "variant": variant,
@@ -119,7 +130,7 @@ def summary(**overrides: object) -> BusinessBenchmarkSummaryV1:
         "subject_version": 1,
         "attempt": 1,
         "candidate_ref": artifact("candidate"),
-        "suite_ref": artifact("suite"),
+        "suite_ref": suite_ref(),
         "suite_id": "claims-suite-v1",
         "policy": BusinessBenchmarkPolicyV1(
             schema="captain.business-benchmark-policy.v1"
