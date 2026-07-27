@@ -68,7 +68,7 @@ class FactoryUsageReceiptV1(_FrozenContract):
     def require_known_cost(cls, value: object) -> Decimal:
         if value is None:
             raise ValueError("a known USD cost is required")
-        return _parse_usd(value, "cost_usd")
+        return _parse_usage_usd(value, "cost_usd")
 
     @field_validator("started_at", "ended_at")
     @classmethod
@@ -513,6 +513,22 @@ def _parse_usd(value: object, field_name: str) -> Decimal:
     if not amount.is_finite() or amount < 0 or amount.as_tuple().exponent < -2:
         raise ValueError(
             f"{field_name} must be finite, non-negative, and use cents"
+        )
+    return _canonical_usd(amount)
+
+
+def _parse_usage_usd(value: object, field_name: str) -> Decimal:
+    """Parse finalized provider usage at exact micro-USD precision."""
+
+    if isinstance(value, (bool, float)) or not isinstance(value, (str, Decimal)):
+        raise ValueError(f"{field_name} must be a decimal string")
+    try:
+        amount = Decimal(value)
+    except InvalidOperation as exc:
+        raise ValueError(f"{field_name} must be finite") from exc
+    if not amount.is_finite() or amount < 0 or amount.as_tuple().exponent < -6:
+        raise ValueError(
+            f"{field_name} must be finite, non-negative, and use micro-USD"
         )
     return _canonical_usd(amount)
 
