@@ -19,6 +19,7 @@ from agenten.agent_factory.business_benchmark_contracts import (
     BusinessBenchmarkSuiteV1,
     BusinessBenchmarkSummaryV1,
     BusinessCaseCategory,
+    business_benchmark_metric_partition,
 )
 from agenten.agent_factory.business_benchmark_store import (
     BusinessBenchmarkConflictError,
@@ -236,6 +237,12 @@ def summary(
         "reason_codes": reason_codes,
         "evaluated_at": "2026-07-26T10:00:00Z",
     }
+    if reason_codes == ("missing_receipt",):
+        payload["case_metrics"] = payload["case_metrics"][:-1]
+        payload["missing_receipt_count"] = 1
+    passed_metric_ids, failed_metric_ids = business_benchmark_metric_partition(reason_codes)
+    payload["passed_metric_ids"] = passed_metric_ids
+    payload["failed_metric_ids"] = failed_metric_ids
     digest = hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -301,6 +308,8 @@ def test_case_receipts_and_summaries_are_idempotent_and_queryable(tmp_path: Path
     assert store.record_case_receipt(case_receipt()) == case_ref
     assert store.record_summary(summary()) == summary_ref
     assert store.summary(UUID("00000000-0000-0000-0000-000000000106")) == summary()
+    assert summary_ref != summary().artifact_ref
+    assert store.summary(UUID("00000000-0000-0000-0000-000000000106")).artifact_ref == summary().artifact_ref
 
 
 @pytest.mark.parametrize(
@@ -478,9 +487,16 @@ def test_store_rejects_embedded_local_paths_in_valid_failed_summaries(
     tmp_path: Path, unsafe_text: str
 ) -> None:
     store = FilesystemBusinessBenchmarkEvidenceStore(tmp_path)
-    failed = summary(
+    valid_failed = summary(
         disposition=BenchmarkDisposition.FAILED,
-        reason_codes=(unsafe_text,),
+        reason_codes=("missing_receipt",),
+    )
+    failed = valid_failed.model_copy(
+        update={
+            "candidate_ref": artifact("unsafe-candidate").model_copy(
+                update={"uri": unsafe_text}
+            )
+        }
     )
 
     with pytest.raises(ValueError, match="(local path|file URI|traversal)"):

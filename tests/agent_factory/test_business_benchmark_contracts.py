@@ -19,7 +19,9 @@ from agenten.agent_factory.business_benchmark_contracts import (
     BusinessBenchmarkSuiteV1,
     BusinessBenchmarkSummaryV1,
     BusinessCaseCategory,
+    business_benchmark_metric_partition,
 )
+from agenten.agent_factory.business_benchmark import ZERO_BASELINE_RATIO_BPS
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 
 
@@ -157,6 +159,11 @@ def summary(**overrides: object) -> BusinessBenchmarkSummaryV1:
         "evaluated_at": "2026-07-26T10:00:00Z",
     }
     payload.update(overrides)
+    passed_metric_ids, failed_metric_ids = business_benchmark_metric_partition(
+        payload["reason_codes"]
+    )
+    payload.setdefault("passed_metric_ids", list(passed_metric_ids))
+    payload.setdefault("failed_metric_ids", list(failed_metric_ids))
     if "artifact_ref" not in overrides:
         payload["artifact_ref"] = summary_artifact(canonical_digest(payload))
     return BusinessBenchmarkSummaryV1.model_validate(payload)
@@ -421,7 +428,12 @@ def test_summary_requires_exact_fifteen_opaque_case_metric_refs() -> None:
     assert result.missing_receipt_count == 1
 
     with pytest.raises(ValidationError, match="missing receipt"):
-        summary(case_metrics=[case_metric_payload(1)], missing_receipt_count=0, disposition="failed")
+        summary(
+            case_metrics=[case_metric_payload(1)],
+            missing_receipt_count=0,
+            disposition="failed",
+            reason_codes=["missing_receipt"],
+        )
     with pytest.raises(ValidationError, match="hard-rule"):
         summary(
             case_metrics=incomplete,
@@ -429,6 +441,47 @@ def test_summary_requires_exact_fifteen_opaque_case_metric_refs() -> None:
             disposition="passed",
         )
     assert len(summary().case_metrics) == 15
+
+
+def test_failed_summary_can_represent_zero_of_fifteen_receipts() -> None:
+    result = summary(
+        case_metrics=[],
+        missing_receipt_count=15,
+        candidate_correctness_bps=0,
+        baseline_correctness_bps=0,
+        candidate_completion_bps=0,
+        baseline_completion_bps=0,
+        candidate_cost_micro_usd=0,
+        baseline_cost_micro_usd=0,
+        candidate_latency_ms=0,
+        baseline_latency_ms=0,
+        cost_ratio_bps=0,
+        latency_ratio_bps=0,
+        disposition="failed",
+        reason_codes=["missing_receipt", "below_minimum_correctness"],
+    )
+
+    assert result.case_metrics == ()
+    assert result.missing_receipt_count == 15
+
+
+def test_positive_candidate_totals_with_zero_baseline_use_fail_closed_sentinel() -> None:
+    result = summary(
+        candidate_cost_micro_usd=1,
+        baseline_cost_micro_usd=0,
+        candidate_latency_ms=1,
+        baseline_latency_ms=0,
+        cost_ratio_bps=ZERO_BASELINE_RATIO_BPS,
+        latency_ratio_bps=ZERO_BASELINE_RATIO_BPS,
+        disposition="failed",
+        reason_codes=[
+            "zero_baseline_cost_with_candidate_spend",
+            "zero_baseline_latency_with_candidate_time",
+        ],
+    )
+
+    assert result.cost_ratio_bps == ZERO_BASELINE_RATIO_BPS
+    assert result.latency_ratio_bps == ZERO_BASELINE_RATIO_BPS
 
 
 def test_case_metric_ref_is_opaque_and_digest_bound() -> None:
@@ -446,7 +499,7 @@ def test_ceiling_ratios_fail_hard_caps_without_rounding_down() -> None:
         baseline_cost_micro_usd=100000,
         cost_ratio_bps=12501,
         disposition="failed",
-        reason_codes=["cost_ratio"],
+        reason_codes=["cost_ratio_exceeded"],
     )
     assert cost_failed.cost_ratio_bps == 12501
     with pytest.raises(ValidationError, match="hard-rule"):
@@ -461,7 +514,7 @@ def test_ceiling_ratios_fail_hard_caps_without_rounding_down() -> None:
         baseline_latency_ms=100000,
         latency_ratio_bps=15001,
         disposition="failed",
-        reason_codes=["latency_ratio"],
+        reason_codes=["latency_ratio_exceeded"],
     )
     assert latency_failed.latency_ratio_bps == 15001
     with pytest.raises(ValidationError, match="hard-rule"):
@@ -489,3 +542,68 @@ def test_summary_rejects_passed_disposition_when_any_hard_rule_fails() -> None:
 def test_disposition_is_a_closed_enum() -> None:
     assert BenchmarkDisposition.PASSED.value == "passed"
     assert BenchmarkDisposition.FAILED.value == "failed"
+
+
+def test_summary_metric_ids_are_complete_disjoint_and_reason_bound() -> None:
+    result = summary()
+    assert set(result.passed_metric_ids) == {
+        "coverage",
+        "decision_correctness",
+        "rationale_completeness",
+        "terminal_completion",
+        "tool_safety",
+        "mandatory_handoff",
+        "baseline_correctness",
+        "baseline_completion",
+        "cost_efficiency",
+        "latency_efficiency",
+    }
+    assert result.failed_metric_ids == ()
+
+    failed = summary(
+        disposition="failed",
+        reason_codes=["unsafe_tool_intent", "cost_ratio_exceeded"],
+        case_metrics=[
+            case_metric_payload(
+                number,
+                candidate_unsafe_tool_use=(number == 1),
+            )
+            for number in range(1, 16)
+        ],
+        unsafe_tool_uses=1,
+        candidate_cost_micro_usd=125001,
+        baseline_cost_micro_usd=100000,
+        cost_ratio_bps=12501,
+    )
+    assert failed.failed_metric_ids == ("tool_safety", "cost_efficiency")
+    assert not set(failed.passed_metric_ids) & set(failed.failed_metric_ids)
+
+    with pytest.raises(ValidationError, match="metric IDs"):
+        summary(
+            disposition="failed",
+            reason_codes=["unsafe_tool_intent"],
+            passed_metric_ids=["tool_safety"],
+            failed_metric_ids=[],
+            case_metrics=[
+                case_metric_payload(
+                    number,
+                    candidate_unsafe_tool_use=(number == 1),
+                )
+                for number in range(1, 16)
+            ],
+            unsafe_tool_uses=1,
+        )
+
+    with pytest.raises(ValidationError, match="reason codes"):
+        summary(
+            disposition="failed",
+            reason_codes=["unsafe_tool_intent"],
+        )
+
+
+def test_summary_rejects_reason_codes_outside_stable_taxonomy() -> None:
+    with pytest.raises(ValidationError, match="reason_codes"):
+        summary(
+            disposition="failed",
+            reason_codes=["provider_said_no"],
+        )

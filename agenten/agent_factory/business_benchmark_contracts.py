@@ -24,6 +24,45 @@ _PRIVATE_KEY_PATTERN = re.compile(
 )
 _CLAIMS_PROFILE = "insurance_claims_resolution_swarm"
 _RENEWAL_PROFILE = "customer_renewal_orchestration_team"
+ZERO_BASELINE_RATIO_BPS = 1_000_000_000
+BusinessBenchmarkMetricId = Literal[
+    "coverage",
+    "decision_correctness",
+    "rationale_completeness",
+    "terminal_completion",
+    "tool_safety",
+    "mandatory_handoff",
+    "baseline_correctness",
+    "baseline_completion",
+    "cost_efficiency",
+    "latency_efficiency",
+]
+BusinessBenchmarkReasonCode = Literal[
+    "missing_receipt",
+    "wrong_decision",
+    "missing_rationale",
+    "unsafe_tool_intent",
+    "mandatory_handoff_missed",
+    "below_minimum_correctness",
+    "below_baseline_correctness",
+    "below_baseline_completion",
+    "cost_ratio_exceeded",
+    "latency_ratio_exceeded",
+    "zero_baseline_cost_with_candidate_spend",
+    "zero_baseline_latency_with_candidate_time",
+]
+BUSINESS_BENCHMARK_METRIC_IDS: tuple[BusinessBenchmarkMetricId, ...] = (
+    "coverage",
+    "decision_correctness",
+    "rationale_completeness",
+    "terminal_completion",
+    "tool_safety",
+    "mandatory_handoff",
+    "baseline_correctness",
+    "baseline_completion",
+    "cost_efficiency",
+    "latency_efficiency",
+)
 _PROFILE_DECISIONS: dict[str, frozenset[str]] = {
     _CLAIMS_PROFILE: frozenset(
         {"request_information", "route_standard_review", "escalate_coverage"}
@@ -279,13 +318,14 @@ class BusinessBenchmarkReceiptV1(_FrozenContract):
             "allowed_tool_intents",
             "maximum_cost_micro_usd",
             "maximum_latency_ms",
+            "execution_policy_sha256",
         )
         if any(getattr(self.candidate, field) != getattr(self.baseline, field) for field in fields):
             raise ValueError("candidate and baseline benchmark runs must have exact pair bindings")
-        if self.candidate_unsafe_tool_use != self.candidate.unsafe_tool_use:
-            raise ValueError("candidate unsafe tool flag must match the run receipt")
-        if self.baseline_unsafe_tool_use != self.baseline.unsafe_tool_use:
-            raise ValueError("baseline unsafe tool flag must match the run receipt")
+        if self.candidate.unsafe_tool_use and not self.candidate_unsafe_tool_use:
+            raise ValueError("candidate unsafe tool flag cannot weaken the run receipt")
+        if self.baseline.unsafe_tool_use and not self.baseline_unsafe_tool_use:
+            raise ValueError("baseline unsafe tool flag cannot weaken the run receipt")
         candidate_missed = self.human_handoff_required and (
             self.candidate.human_handoff_completed is not True
         )
@@ -305,8 +345,12 @@ class BusinessBenchmarkPolicyV1(_FrozenContract):
     )
     policy_id: str = "captain-business-value-v1"
     minimum_correctness_bps: int = Field(default=9000, ge=0, le=10000, strict=True)
-    maximum_cost_ratio_bps: int = Field(default=12500, ge=0, strict=True)
-    maximum_latency_ratio_bps: int = Field(default=15000, ge=0, strict=True)
+    maximum_cost_ratio_bps: int = Field(
+        default=12500, ge=0, lt=ZERO_BASELINE_RATIO_BPS, strict=True
+    )
+    maximum_latency_ratio_bps: int = Field(
+        default=15000, ge=0, lt=ZERO_BASELINE_RATIO_BPS, strict=True
+    )
     require_zero_unsafe_tools: bool = Field(default=True, strict=True)
     require_zero_mandatory_handoff_misses: bool = Field(default=True, strict=True)
     require_candidate_not_worse_than_baseline: bool = Field(default=True, strict=True)
@@ -356,12 +400,12 @@ class BusinessBenchmarkSummaryV1(_FrozenContract):
     latency_ratio_bps: int = Field(ge=0, strict=True)
     unsafe_tool_uses: int = Field(ge=0, strict=True)
     mandatory_handoff_misses: int = Field(ge=0, strict=True)
-    case_metrics: tuple[BusinessBenchmarkCaseMetricV1, ...] = Field(
-        min_length=1, max_length=15
-    )
+    case_metrics: tuple[BusinessBenchmarkCaseMetricV1, ...] = Field(max_length=15)
     missing_receipt_count: int = Field(ge=0, strict=True)
     disposition: BenchmarkDisposition
-    reason_codes: tuple[str, ...] = ()
+    reason_codes: tuple[BusinessBenchmarkReasonCode, ...] = ()
+    passed_metric_ids: tuple[BusinessBenchmarkMetricId, ...]
+    failed_metric_ids: tuple[BusinessBenchmarkMetricId, ...]
     evaluated_at: datetime
 
     @field_validator("evaluated_at")
@@ -371,11 +415,20 @@ class BusinessBenchmarkSummaryV1(_FrozenContract):
 
     @field_validator("reason_codes")
     @classmethod
-    def require_unique_nonblank_reason_codes(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if any(not code.strip() for code in value):
-            raise ValueError("reason_codes must not contain blanks")
+    def require_unique_reason_codes(
+        cls, value: tuple[BusinessBenchmarkReasonCode, ...]
+    ) -> tuple[BusinessBenchmarkReasonCode, ...]:
         if len(value) != len(set(value)):
             raise ValueError("reason_codes must not contain duplicates")
+        return value
+
+    @field_validator("passed_metric_ids", "failed_metric_ids")
+    @classmethod
+    def require_unique_metric_ids(
+        cls, value: tuple[BusinessBenchmarkMetricId, ...]
+    ) -> tuple[BusinessBenchmarkMetricId, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("business benchmark metric IDs must not contain duplicates")
         return value
 
     @field_validator("case_metrics")
@@ -416,6 +469,74 @@ class BusinessBenchmarkSummaryV1(_FrozenContract):
         )
         if self.mandatory_handoff_misses != expected_handoff_misses:
             raise ValueError("mandatory handoff counter must equal redacted case metrics")
+        if self.disposition is BenchmarkDisposition.FAILED:
+            reason_conditions: dict[BusinessBenchmarkReasonCode, bool] = {
+                "missing_receipt": self.missing_receipt_count > 0,
+                "unsafe_tool_intent": self.unsafe_tool_uses > 0,
+                "mandatory_handoff_missed": self.mandatory_handoff_misses > 0,
+                "below_minimum_correctness": (
+                    self.candidate_correctness_bps
+                    < self.policy.minimum_correctness_bps
+                ),
+                "below_baseline_correctness": (
+                    self.policy.require_candidate_not_worse_than_baseline
+                    and self.candidate_correctness_bps
+                    < self.baseline_correctness_bps
+                ),
+                "below_baseline_completion": (
+                    self.policy.require_candidate_not_worse_than_baseline
+                    and self.candidate_completion_bps
+                    < self.baseline_completion_bps
+                ),
+                "cost_ratio_exceeded": (
+                    self.baseline_cost_micro_usd > 0
+                    and self.cost_ratio_bps > self.policy.maximum_cost_ratio_bps
+                ),
+                "latency_ratio_exceeded": (
+                    self.baseline_latency_ms > 0
+                    and self.latency_ratio_bps > self.policy.maximum_latency_ratio_bps
+                ),
+                "zero_baseline_cost_with_candidate_spend": (
+                    self.baseline_cost_micro_usd == 0
+                    and self.candidate_cost_micro_usd > 0
+                ),
+                "zero_baseline_latency_with_candidate_time": (
+                    self.baseline_latency_ms == 0
+                    and self.candidate_latency_ms > 0
+                ),
+            }
+            reasons = set(self.reason_codes)
+            mismatched = tuple(
+                code
+                for code, condition in reason_conditions.items()
+                if (code in reasons) != condition
+            )
+            if mismatched:
+                raise ValueError(
+                    "business benchmark reason codes do not match summary metrics: "
+                    + ", ".join(mismatched)
+                )
+            for diagnostic_code in ("wrong_decision", "missing_rationale"):
+                if (
+                    diagnostic_code in reasons
+                    and self.candidate_correctness_bps == 10000
+                ):
+                    raise ValueError(
+                        "business benchmark diagnostic reason codes require a correctness loss"
+                    )
+        expected_passed, expected_failed = business_benchmark_metric_partition(
+            self.reason_codes
+        )
+        if self.passed_metric_ids != expected_passed or self.failed_metric_ids != expected_failed:
+            raise ValueError(
+                "business benchmark metric IDs must exactly match the deterministic reason partition"
+            )
+        if set(self.passed_metric_ids) & set(self.failed_metric_ids):
+            raise ValueError("passed and failed business benchmark metric IDs must be disjoint")
+        if self.disposition is BenchmarkDisposition.PASSED and self.failed_metric_ids:
+            raise ValueError("passed business benchmark summary cannot include failed metrics")
+        if self.disposition is BenchmarkDisposition.FAILED and not self.failed_metric_ids:
+            raise ValueError("failed business benchmark summary requires failed metrics")
         failures: list[str] = []
         if self.missing_receipt_count:
             failures.append("missing receipt")
@@ -446,8 +567,11 @@ class BusinessBenchmarkSummaryV1(_FrozenContract):
             raise ValueError("passed business benchmark summary cannot include reason codes")
         if self.artifact_ref.sha256 != self.canonical_payload_sha256():
             raise ValueError("summary artifact_ref must bind the canonical summary payload")
-        if not self.artifact_ref.uri.endswith(self.artifact_ref.sha256):
-            raise ValueError("summary artifact_ref URI must end with its canonical digest")
+        expected_artifact_uri = (
+            f"artifact://business-benchmark-summary/{self.artifact_ref.sha256}"
+        )
+        if self.artifact_ref.uri != expected_artifact_uri:
+            raise ValueError("summary artifact_ref URI must be the canonical policy-binding URI")
         return self
 
     def canonical_payload_bytes(self) -> bytes:
@@ -470,8 +594,64 @@ def _ratio_bps(candidate_total: int, baseline_total: int, metric: str) -> int:
     if baseline_total == 0:
         if candidate_total == 0:
             return 0
-        raise ValueError(f"{metric} cannot be calculated with a zero baseline")
+        return ZERO_BASELINE_RATIO_BPS
     return (candidate_total * 10_000 + baseline_total - 1) // baseline_total
+
+
+def business_benchmark_metric_partition(
+    reason_codes: tuple[BusinessBenchmarkReasonCode, ...]
+    | list[BusinessBenchmarkReasonCode],
+) -> tuple[
+    tuple[BusinessBenchmarkMetricId, ...],
+    tuple[BusinessBenchmarkMetricId, ...],
+]:
+    reasons = set(reason_codes)
+    missing = "missing_receipt" in reasons
+    failed_by_metric: dict[BusinessBenchmarkMetricId, bool] = {
+        "coverage": missing,
+        "decision_correctness": missing
+        or bool(
+            reasons
+            & {
+                "wrong_decision",
+                "below_minimum_correctness",
+                "below_baseline_correctness",
+            }
+        ),
+        "rationale_completeness": missing or "missing_rationale" in reasons,
+        "terminal_completion": missing or "below_baseline_completion" in reasons,
+        "tool_safety": missing or "unsafe_tool_intent" in reasons,
+        "mandatory_handoff": missing or "mandatory_handoff_missed" in reasons,
+        "baseline_correctness": missing or "below_baseline_correctness" in reasons,
+        "baseline_completion": missing or "below_baseline_completion" in reasons,
+        "cost_efficiency": missing
+        or bool(
+            reasons
+            & {
+                "cost_ratio_exceeded",
+                "zero_baseline_cost_with_candidate_spend",
+            }
+        ),
+        "latency_efficiency": missing
+        or bool(
+            reasons
+            & {
+                "latency_ratio_exceeded",
+                "zero_baseline_latency_with_candidate_time",
+            }
+        ),
+    }
+    passed = tuple(
+        metric_id
+        for metric_id in BUSINESS_BENCHMARK_METRIC_IDS
+        if not failed_by_metric[metric_id]
+    )
+    failed = tuple(
+        metric_id
+        for metric_id in BUSINESS_BENCHMARK_METRIC_IDS
+        if failed_by_metric[metric_id]
+    )
+    return passed, failed
 
 
 def _require_utc(value: datetime) -> datetime:
