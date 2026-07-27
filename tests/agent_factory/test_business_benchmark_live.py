@@ -15,6 +15,10 @@ from agenten.agent_factory.business_benchmark_execution import (
 )
 from agenten.agent_factory.business_benchmark_live import (
     BaselineAssistantPolicyV1,
+    BenchmarkEvidenceBindingV1,
+    BoundBenchmarkHandoffEvidenceV1,
+    BoundBenchmarkToolEvidenceV1,
+    BoundBenchmarkUsageEvidenceV1,
     BusinessBenchmarkLiveAdapter,
     LiveBusinessBenchmarkPreflight,
     LiveBusinessBenchmarkSettings,
@@ -219,6 +223,7 @@ class RuntimeBundle:
 
 
 def result(env: BusinessBenchmarkExecutionEnvelopeV1, **overrides: object) -> ProviderBenchmarkExecutionV1:
+    binding = BenchmarkEvidenceBindingV1.from_execution(env, claim(env))
     payload: dict[str, object] = {
         "request_id": env.request_id,
         "runtime_session_id": env.runtime_session_id,
@@ -237,7 +242,14 @@ def result(env: BusinessBenchmarkExecutionEnvelopeV1, **overrides: object) -> Pr
                 "observed_rationale_fact_ids": ["fact-policy-state"],
             }
         ),
-        "usage_receipts": (usage(env, "0.000001", "one"), usage(env, "0.000002", "two")),
+        "usage_receipts": (
+            BoundBenchmarkUsageEvidenceV1(
+                binding=binding, receipt=usage(env, "0.000001", "one")
+            ),
+            BoundBenchmarkUsageEvidenceV1(
+                binding=binding, receipt=usage(env, "0.000002", "two")
+            ),
+        ),
         "runtime_evidence_ref": artifact("runtime"),
         "terminal_evidence_ref": artifact("terminal"),
         "tool_executions": (),
@@ -245,6 +257,29 @@ def result(env: BusinessBenchmarkExecutionEnvelopeV1, **overrides: object) -> Pr
         "completed_at": NOW,
     }
     payload.update(overrides)
+    payload["usage_receipts"] = tuple(
+        item
+        if isinstance(item, BoundBenchmarkUsageEvidenceV1)
+        else BoundBenchmarkUsageEvidenceV1(binding=binding, receipt=item)
+        for item in payload["usage_receipts"]  # type: ignore[union-attr]
+    )
+    payload["tool_executions"] = tuple(
+        item
+        if isinstance(item, BoundBenchmarkToolEvidenceV1)
+        else BoundBenchmarkToolEvidenceV1(binding=binding, execution=item)
+        for item in payload["tool_executions"]  # type: ignore[union-attr]
+    )
+    payload["handoffs"] = tuple(
+        item
+        if isinstance(item, BoundBenchmarkHandoffEvidenceV1)
+        else BoundBenchmarkHandoffEvidenceV1(
+            binding=binding,
+            handoff=item,
+            authority=None,
+            status="observed",
+        )
+        for item in payload["handoffs"]  # type: ignore[union-attr]
+    )
     return ProviderBenchmarkExecutionV1.model_validate(payload)
 
 

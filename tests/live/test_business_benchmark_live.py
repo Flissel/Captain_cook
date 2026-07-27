@@ -10,7 +10,7 @@ from urllib.request import Request, urlopen
 import pytest
 
 from agenten.agent_factory.business_benchmark_live import (
-    LiveBusinessBenchmarkPreflight,
+    run_provider_business_benchmarks,
 )
 
 
@@ -30,10 +30,11 @@ async def _runtime_health(url: str) -> bool:
 async def test_provider_backed_business_benchmark_preflight() -> None:
     """Missing live prerequisites are failures, never skips or mock success."""
 
-    await LiveBusinessBenchmarkPreflight(
-        health_check=_runtime_health,
-        # TODO_TOOL.v1: production_adapter_bundle/capability bridges are not
-        # integrated on this branch. Supplying None is the honest production
-        # state and the preflight must fail before a provider effect.
-        runtime_bundle=None,
-    ).validate_environment(os.environ, repository_root=Path.cwd())
+    # The default production composition loader is deliberately fail-closed with
+    # TODO_TOOL.v1 until the adapter/capability bridge exists. Once integrated,
+    # this same call performs health preflight and requires the complete
+    # 30/30/60 finalized receipt scope plus Captain summaries/evidence.
+    await run_provider_business_benchmarks(
+        os.environ,
+        repository_root=Path.cwd(),
+    )

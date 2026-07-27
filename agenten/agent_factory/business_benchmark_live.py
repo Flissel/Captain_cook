@@ -35,6 +35,7 @@ from agenten.agent_factory.business_benchmark_replay import (
 from agenten.agent_factory.execution_budget import FactoryUsageReceiptV1
 from agenten.agent_factory.team_execution import (
     FactoryHandoffEvidenceV1,
+    FactoryN8nExecutionEvidenceV1,
     FactoryToolExecutionEvidenceV1,
 )
 from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent
@@ -61,6 +62,72 @@ class ProductionAdapterUnavailableError(RuntimeError):
 
 class UnsafeBenchmarkToolError(ValueError):
     """A provider run observed a tool without a trusted intent binding."""
+
+
+class BenchmarkEvidenceBindingV1(_FrozenModel):
+    """Exact effect/fence identity carried by every nested provider receipt."""
+
+    request_id: UUID
+    runtime_session_id: str = Field(min_length=1)
+    case_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    variant: Literal["candidate", "single_agent_baseline"]
+    effect_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    fence: int = Field(ge=1, strict=True)
+
+    @classmethod
+    def from_execution(
+        cls,
+        envelope: BusinessBenchmarkExecutionEnvelopeV1,
+        claim: BusinessBenchmarkEffectClaimV1,
+    ) -> "BenchmarkEvidenceBindingV1":
+        return cls(
+            request_id=envelope.request_id,
+            runtime_session_id=envelope.runtime_session_id,
+            case_sha256=envelope.case_sha256,
+            variant=envelope.variant,
+            effect_id=claim.prepared_effect.identity.effect_id,
+            fence=claim.fence,
+        )
+
+
+class BoundBenchmarkUsageEvidenceV1(_FrozenModel):
+    binding: BenchmarkEvidenceBindingV1
+    receipt: FactoryUsageReceiptV1
+
+
+class BoundBenchmarkToolEvidenceV1(_FrozenModel):
+    binding: BenchmarkEvidenceBindingV1
+    execution: FactoryToolExecutionEvidenceV1
+    n8n_execution: FactoryN8nExecutionEvidenceV1 | None = None
+
+    @model_validator(mode="after")
+    def bind_n8n_tool_name(self) -> "BoundBenchmarkToolEvidenceV1":
+        if (
+            self.n8n_execution is not None
+            and self.n8n_execution.tool_name != self.execution.tool_name
+        ):
+            raise ValueError("typed n8n evidence belongs to a different tool")
+        return self
+
+
+class BoundBenchmarkHandoffEvidenceV1(_FrozenModel):
+    binding: BenchmarkEvidenceBindingV1
+    handoff: FactoryHandoffEvidenceV1
+    authority: Literal["captain_human_review"] | None = None
+    status: Literal["observed", "completed"]
+
+    @model_validator(mode="after")
+    def bind_completed_human_review(self) -> "BoundBenchmarkHandoffEvidenceV1":
+        if self.status == "completed" and (
+            self.authority != "captain_human_review"
+            or self.handoff.to_agent != "human_review"
+        ):
+            raise ValueError(
+                "completed handoff requires the Captain human-review authority"
+            )
+        if self.status == "observed" and self.authority is not None:
+            raise ValueError("observed internal handoff cannot claim review authority")
+        return self
 
 
 class BaselineAssistantPolicyV1(_FrozenModel):
@@ -137,11 +204,11 @@ class ProviderBenchmarkExecutionV1(_FrozenModel):
         "succeeded", "failed", "infrastructure_failed", "policy_failed", "cancelled"
     ]
     terminal_output: str | None = None
-    usage_receipts: tuple[FactoryUsageReceiptV1, ...] = ()
+    usage_receipts: tuple[BoundBenchmarkUsageEvidenceV1, ...] = ()
     runtime_evidence_ref: ArtifactRef
     terminal_evidence_ref: ArtifactRef | None = None
-    tool_executions: tuple[FactoryToolExecutionEvidenceV1, ...] = ()
-    handoffs: tuple[FactoryHandoffEvidenceV1, ...] = ()
+    tool_executions: tuple[BoundBenchmarkToolEvidenceV1, ...] = ()
+    handoffs: tuple[BoundBenchmarkHandoffEvidenceV1, ...] = ()
     completed_at: datetime
 
     @model_validator(mode="after")
@@ -208,14 +275,12 @@ class BusinessBenchmarkLiveAdapter:
         trusted_tool_intents: Mapping[str, IntegrationIntent],
         monotonic_clock: Callable[[], float],
         clock: Callable[[], datetime],
-        approved_n8n_tool_names: tuple[str, ...] = (),
     ) -> None:
         self._runtime_bundle = runtime_bundle
         self._fence_store = fence_store
         self._trusted_tool_intents = dict(trusted_tool_intents)
         self._monotonic_clock = monotonic_clock
         self._clock = clock
-        self._approved_n8n_tool_names = frozenset(approved_n8n_tool_names)
 
     async def prepare(
         self, envelope: BusinessBenchmarkExecutionEnvelopeV1
@@ -279,27 +344,44 @@ class BusinessBenchmarkLiveAdapter:
         if any(observed != expected for observed, expected in provider_bindings):
             raise ValueError("provider execution bindings do not match benchmark envelope")
         if any(
-            receipt.job_id != envelope.job_id
-            or receipt.correlation_id != envelope.correlation_id
-            or receipt.attempt != envelope.attempt
-            or receipt.model != envelope.model_version
-            for receipt in provider.usage_receipts
+            item.receipt.job_id != envelope.job_id
+            or item.receipt.correlation_id != envelope.correlation_id
+            or item.receipt.attempt != envelope.attempt
+            or item.receipt.model != envelope.model_version
+            for item in provider.usage_receipts
         ):
             raise ValueError("usage receipt does not match benchmark envelope")
+
+        expected_binding = BenchmarkEvidenceBindingV1.from_execution(envelope, claim)
+        nested_bindings = (
+            *(item.binding for item in provider.usage_receipts),
+            *(item.binding for item in provider.tool_executions),
+            *(item.binding for item in provider.handoffs),
+        )
+        if any(binding != expected_binding for binding in nested_bindings):
+            raise ValueError("nested provider evidence binding does not match effect and fence")
 
         if envelope.variant == "single_agent_baseline" and provider.handoffs:
             raise ValueError("baseline has no handoff authority")
         observed_intents = self._observed_tool_intents(provider.tool_executions)
+        human_handoff_completed = self._human_handoff_completed(provider.handoffs)
         terminal = self._parse_terminal(provider)
-        cost_micro_usd = _usage_micro_usd(provider.usage_receipts)
+        cost_micro_usd = _usage_micro_usd(
+            tuple(item.receipt for item in provider.usage_receipts)
+        )
         evidence_refs = _unique_refs(
             (
                 fence_receipt.evidence_ref,
-                *(item.evidence_ref for item in provider.usage_receipts),
+                *(item.receipt.evidence_ref for item in provider.usage_receipts),
                 provider.runtime_evidence_ref,
                 *((provider.terminal_evidence_ref,) if provider.terminal_evidence_ref else ()),
-                *(item.evidence_ref for item in provider.tool_executions),
-                *(item.evidence_ref for item in provider.handoffs),
+                *(item.execution.evidence_ref for item in provider.tool_executions),
+                *(item.handoff.evidence_ref for item in provider.handoffs),
+                *(
+                    item.n8n_execution.evidence_ref
+                    for item in provider.tool_executions
+                    if item.n8n_execution is not None
+                ),
             )
         )
         succeeded = provider.status == "succeeded"
@@ -331,7 +413,7 @@ class BusinessBenchmarkLiveAdapter:
             observed_tool_intents=observed_intents,
             unsafe_tool_use=bool(set(observed_intents) - set(envelope.allowed_tool_intents)),
             human_handoff_completed=(
-                bool(provider.handoffs)
+                human_handoff_completed
                 if succeeded and envelope.variant == "candidate"
                 else False if succeeded else None
             ),
@@ -362,26 +444,42 @@ class BusinessBenchmarkLiveAdapter:
         return observation
 
     def _observed_tool_intents(
-        self, executions: tuple[FactoryToolExecutionEvidenceV1, ...]
+        self, executions: tuple[BoundBenchmarkToolEvidenceV1, ...]
     ) -> tuple[IntegrationIntent, ...]:
         observed: list[IntegrationIntent] = []
-        for execution in executions:
+        for item in executions:
+            execution = item.execution
             try:
                 intent = self._trusted_tool_intents[execution.tool_name]
             except KeyError as exc:
                 raise UnsafeBenchmarkToolError(
                     f"unknown tool is unsafe: {execution.tool_name}"
                 ) from exc
-            if (
-                intent is IntegrationIntent.N8N
-                and execution.tool_name not in self._approved_n8n_tool_names
-            ):
+            if intent is IntegrationIntent.N8N and item.n8n_execution is None:
                 raise UnsafeBenchmarkToolError(
-                    "n8n intent requires an injected Captain-approved tool port"
+                    "n8n intent requires a typed n8n grant command result chain"
+                )
+            if intent is not IntegrationIntent.N8N and item.n8n_execution is not None:
+                raise UnsafeBenchmarkToolError(
+                    "typed n8n evidence cannot authorize a non-n8n tool intent"
                 )
             if intent not in observed:
                 observed.append(intent)
         return tuple(observed)
+
+    @staticmethod
+    def _human_handoff_completed(
+        handoffs: tuple[BoundBenchmarkHandoffEvidenceV1, ...]
+    ) -> bool:
+        for item in handoffs:
+            if item.status == "completed" and (
+                item.authority != "captain_human_review"
+                or item.handoff.to_agent != "human_review"
+            ):
+                raise ValueError(
+                    "completed handoff is not bound to the human-review authority"
+                )
+        return any(item.status == "completed" for item in handoffs)
 
     @staticmethod
     def _parse_terminal(
@@ -525,6 +623,169 @@ class BusinessBenchmarkPreflightReceiptV1(_FrozenModel):
     runtime_healthy: Literal[True] = True
     provider_secret_present: Literal[True] = True
     production_bundle_present: Literal[True] = True
+
+
+class BusinessBenchmarkFinalizedReceiptV1(_FrozenModel):
+    """One finalized receipt with explicit selected business-profile binding."""
+
+    profile: Literal["claims", "renewal"]
+    receipt: BusinessBenchmarkRunReceiptV1
+    receipt_ref: ArtifactRef
+
+    @model_validator(mode="after")
+    def require_successful_final_receipt(self) -> "BusinessBenchmarkFinalizedReceiptV1":
+        if self.receipt.status != "succeeded":
+            raise ValueError("provider-live receipt must be finalized successfully")
+        return self
+
+
+class BusinessBenchmarkLiveRunResultV1(_FrozenModel):
+    """Final provider-live receipts plus Captain summary/evidence references."""
+
+    profile: Literal["claims", "renewal", "all"]
+    receipts: tuple[BusinessBenchmarkFinalizedReceiptV1, ...]
+    summary_refs: tuple[ArtifactRef, ...]
+    evidence_refs: tuple[ArtifactRef, ...]
+    completed_at: datetime
+
+    @model_validator(mode="after")
+    def require_complete_finalized_scope(self) -> "BusinessBenchmarkLiveRunResultV1":
+        per_variant = 30 if self.profile == "all" else 15
+        expected_total = per_variant * 2
+        candidate = tuple(
+            item for item in self.receipts if item.receipt.variant == "candidate"
+        )
+        baseline = tuple(
+            item
+            for item in self.receipts
+            if item.receipt.variant == "single_agent_baseline"
+        )
+        if (
+            len(self.receipts) != expected_total
+            or len(candidate) != per_variant
+            or len(baseline) != per_variant
+            or any(item.receipt.status != "succeeded" for item in self.receipts)
+        ):
+            raise ValueError(
+                "live run requires exact finalized candidate and baseline receipts"
+            )
+        if len({item.receipt.run_id for item in self.receipts}) != expected_total:
+            raise ValueError("finalized live receipt IDs must be unique")
+        if len(
+            {
+                (item.profile, item.receipt.case_id, item.receipt.variant)
+                for item in self.receipts
+            }
+        ) != expected_total:
+            raise ValueError("live receipts must cover each case and variant exactly once")
+        expected_profiles = ("claims", "renewal") if self.profile == "all" else (self.profile,)
+        for profile in expected_profiles:
+            for variant in ("candidate", "single_agent_baseline"):
+                if (
+                    sum(
+                        item.profile == profile and item.receipt.variant == variant
+                        for item in self.receipts
+                    )
+                    != 15
+                ):
+                    raise ValueError(
+                        "live receipts must cover 15 cases per selected profile and variant"
+                    )
+        if any(item.profile not in expected_profiles for item in self.receipts):
+            raise ValueError("live receipt names an unselected business profile")
+        expected_summaries = 2 if self.profile == "all" else 1
+        if len(self.summary_refs) != expected_summaries:
+            raise ValueError("live run requires one Captain summary per selected profile")
+        required_evidence = {
+            *(item.receipt_ref for item in self.receipts),
+            *(
+                reference
+                for item in self.receipts
+                for reference in item.receipt.evidence_refs
+            ),
+            *self.summary_refs,
+        }
+        if not required_evidence.issubset(set(self.evidence_refs)):
+            raise ValueError("live run evidence must include every receipt and summary reference")
+        if len(self.evidence_refs) != len(set(self.evidence_refs)):
+            raise ValueError("live run evidence references must be deduplicated")
+        return self
+
+
+class ProductionBusinessBenchmarkCompositionPort(Protocol):
+    """Production wiring for runtime bundle, durable fence store, and full run."""
+
+    runtime_bundle: ProductionBusinessBenchmarkRuntimeBundlePort
+    fence_store: DurableProviderFencePort
+
+    async def health_check(self, url: str) -> bool: ...
+
+    async def run(
+        self, settings: LiveBusinessBenchmarkSettings
+    ) -> BusinessBenchmarkLiveRunResultV1: ...
+
+
+BusinessBenchmarkCompositionLoader = Callable[
+    [LiveBusinessBenchmarkSettings], ProductionBusinessBenchmarkCompositionPort
+]
+
+
+def load_production_business_benchmark_composition(
+    settings: LiveBusinessBenchmarkSettings,
+) -> ProductionBusinessBenchmarkCompositionPort:
+    """Fail closed until the real adapter/capability bundle is integrated."""
+
+    del settings
+    raise ProductionAdapterUnavailableError(
+        "production_adapter_bundle and capability live bridges are not integrated"
+    )
+
+
+async def run_provider_business_benchmarks(
+    environment: Mapping[str, str],
+    *,
+    repository_root: Path | None = None,
+    composition_loader: BusinessBenchmarkCompositionLoader = (
+        load_production_business_benchmark_composition
+    ),
+) -> BusinessBenchmarkLiveRunResultV1:
+    """Load production wiring, preflight it, execute, and validate full scope."""
+
+    settings = LiveBusinessBenchmarkSettings.from_environment(
+        environment, repository_root=repository_root
+    )
+    if not environment.get(settings.provider_secret_name, "").strip():
+        raise ValueError("provider secret is not present")
+    composition = composition_loader(settings)
+    runtime_bundle = getattr(composition, "runtime_bundle", None)
+    if runtime_bundle is None or any(
+        not callable(getattr(runtime_bundle, method, None))
+        for method in ("prepare", "execute", "recover")
+    ):
+        raise ProductionAdapterUnavailableError("runtime bundle is unavailable")
+    fence_store = getattr(composition, "fence_store", None)
+    if fence_store is None or any(
+        not callable(getattr(fence_store, method, None))
+        for method in ("register_fence", "assert_current")
+    ):
+        raise ProductionAdapterUnavailableError("durable provider fence store is unavailable")
+    await LiveBusinessBenchmarkPreflight(
+        health_check=composition.health_check,
+        runtime_bundle=composition.runtime_bundle,
+    ).validate_environment(environment, repository_root=repository_root)
+    raw = await composition.run(settings)
+    result = BusinessBenchmarkLiveRunResultV1.model_validate(
+        raw.model_dump(mode="python") if isinstance(raw, BaseModel) else raw
+    )
+    if result.profile != settings.profile:
+        raise ValueError("live result profile does not match selected settings")
+    if any(
+        item.receipt.job_id != settings.job_id
+        or item.receipt.model_version != settings.model
+        for item in result.receipts
+    ):
+        raise ValueError("live receipts do not match configured job and model")
+    return result
 
 
 class LiveBusinessBenchmarkPreflight:
