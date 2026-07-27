@@ -107,6 +107,74 @@ occurred.
    successful normal E2E runs. Captain evaluates the release gate and only then
    appends `capability_promoted`.
 
+## Business benchmark gate
+
+Select exactly one approved profile and suite version per candidate attempt:
+
+- Claims: `insurance_claims_resolution_swarm`, suite version 1.
+- Renewal: `customer_renewal_orchestration_team`, suite version 1.
+
+Captain also fixes the candidate/baseline model version, redaction and baseline
+policy versions, per-case cost and latency ceilings, and the job-wide maximum
+cost. Each private suite contains 15 runtime-loaded anonymized cases with
+exactly three ordinary, boundary, incomplete, contradictory, and mandatory
+escalation cases. Do not copy case bodies into logs, evidence exports, prompts,
+Minibook, or source control.
+
+Run the deterministic complete-chain gate first:
+
+```powershell
+python -m pytest -q --no-cov tests/integration/test_business_benchmark_factory.py
+```
+
+The lifecycle order is private suite, paired receipts, independent scoring,
+private summary persistence, Gateway summary persistence, team evaluation,
+feedback, quality review, release validation, Captain promotion, then Minibook
+projection. A summary must be resolvable by its exact artifact digest before an
+evaluation is accepted. Captain/Gateway is the sole `ready_to_use` authority.
+
+Provider-backed runs are explicitly opt in and enforce the configured maximum
+cost:
+
+```powershell
+pwsh -NoProfile -File scripts/run-business-benchmark-live.ps1 -Profile claims
+pwsh -NoProfile -File scripts/run-business-benchmark-live.ps1 -Profile renewal
+```
+
+Live evidence is written only below
+`.captain-cook/evidence/business-benchmarks/`. Private suites and case/run
+receipts remain in the configured Captain-private benchmark store. Redacted
+summaries and workflow evaluations are append-only Gateway records. Minibook
+receives only aggregate disposition/reason codes, correctness/completion basis
+points, cost/latency ratios, unsafe-tool/missed-handoff counters, the summary
+digest, and the same correlation ID.
+
+Failure reason codes include `missing_receipt`, `wrong_decision`,
+`missing_rationale`, `unsafe_tool_intent`, `mandatory_handoff_missed`,
+`below_minimum_correctness`, `below_baseline_correctness`,
+`below_baseline_completion`, `cost_ratio_exceeded`,
+`latency_ratio_exceeded`, and the two zero-baseline ratio failures. Missing
+infrastructure/evidence remains blocked. Behavioral failure creates bounded
+improvement feedback and a new candidate attempt; it never creates promotion.
+
+For restart/recovery, rerun the same profile command with the same Captain job,
+attempt, suite, candidate, and policy bindings. The replay store resumes the
+durably prepared/fenced effect and rejects stale writers. If recovery is
+uncertain, preserve the evidence and stop; do not start a duplicate provider
+effect. After behavioral improvement, use the next Captain-authorized attempt
+(maximum five). Useful checks are:
+
+```powershell
+python -m pytest -q --no-cov tests/agent_factory/test_business_benchmark_replay.py
+python -m pytest -q --no-cov tests/gateway/test_factory_repository.py
+python -m pytest -q --no-cov tests/gateway/test_registry_feed.py
+```
+
+These synthetic/anonymized suites validate release behavior and regression
+resistance. They do not prove regulated-domain accuracy, legal compliance, or
+production performance; those require separately governed real-domain
+validation and live evidence.
+
 ## Recording evidence handoff
 
 The live integration owner exports a redacted

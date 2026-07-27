@@ -21,6 +21,50 @@ acceptance assertions.  Captain alone publishes a evaluated candidate and
 records the final promotion.  The `hermes-agent/` submodule is a leased worker
 runtime and never a shared-registry writer.
 
+### Business benchmark release validation
+
+Every V3 Factory candidate must pass a Captain-owned paired business benchmark
+before promotion. The product composition is
+`BusinessBenchmarkFactoryComposition`; it connects existing ports and does not
+create a second lifecycle authority:
+
+```text
+private suite reference
+  -> 15 paired candidate / single-agent baseline executions
+  -> private immutable run and case receipts
+  -> deterministic redacted aggregate summary
+  -> Gateway summary commit
+  -> TeamEvaluationV1
+  -> FactoryFeedbackV1
+  -> Quality reviewed
+  -> Gateway release validation
+  -> Captain capability promotion
+  -> redacted Minibook aggregate projection
+```
+
+The summary is committed before the evaluation so the evaluation can reference
+an exact, resolvable artifact. Captain/Gateway alone accepts that summary,
+recomputes the release decision, and writes `ready_to_use`. A failed but exactly
+bound summary may reach quality review so Captain can issue a bounded
+improvement; it can never reach promotion. Direct release or promotion bypasses
+fail closed.
+
+Claims uses profile `insurance_claims_resolution_swarm`; Renewal uses
+`customer_renewal_orchestration_team`. The selected profile, suite version,
+model version, redaction policy, baseline policy, per-case cost/latency limits,
+and job-wide budget are immutable inputs. Each suite has exactly 15 private
+cases: three each for ordinary, boundary, incomplete, contradictory, and
+mandatory-escalation behavior. Retry/resume reuses the durable effect identity
+and provider fence for the same attempt; behavioral improvement creates the
+next candidate attempt and remains bounded by the job's five-attempt ceiling.
+
+Only aggregate disposition/reason codes, correctness and completion basis
+points, cost/latency ratios, unsafe-tool and missed-handoff counters, summary
+digest, and correlation cross into Minibook. Case identifiers, inputs,
+expectations, rationales, run receipts, prompts, provider output, and credentials
+remain private. Synthetic/anonymized benchmarks are release validation, not
+evidence of regulated-domain accuracy or production fitness by themselves.
+
 The deterministic integration path uses sealed candidate archives and the
 Gateway repository. Provider-backed Gate E is separate. Gate E verifies the
 generic provider-backed delivery release policy: three distinct clean delivery

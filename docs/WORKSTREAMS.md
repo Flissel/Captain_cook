@@ -29,6 +29,25 @@ submodule never writes the shared registry. n8n capabilities are limited to a
 Captain-issued `integration_intent=n8n` tool-integrator lease and opaque MCP
 references.
 
+### Business benchmark gate ownership
+
+The Factory evaluation workstream owns the paired Claims/Renewal benchmark
+contract and the product composition that records its aggregate summary before
+team evaluation. Captain/Gateway owns profile/version/budget selection,
+summary acceptance, retry authorization, release validation, and promotion.
+Hermes and AutoGen execute only the candidate side; the baseline is a fresh
+versioned single agent with no publish capability. Minibook consumes only the
+redacted aggregate projection after promotion.
+
+Deterministic acceptance generates both 15-case private suites at runtime; no
+case bodies are fixtures or repository artifacts. A green technical execution
+cannot override `below_minimum_correctness`, `below_baseline_correctness`,
+`below_baseline_completion`, unsafe-tool, missed-handoff, cost, latency, or
+missing-receipt failures. Failed business value routes through the existing
+bounded `improvement_requested` action. Provider, MariaDB, and Minibook live
+proof remains a separate opt-in workstream and must never be inferred from the
+deterministic gate.
+
 ```text
 feat/devpost-demo-readiness
         │
