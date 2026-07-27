@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Awaitable, Protocol, TypeVar
 from uuid import UUID
 
 from agenten.agent_factory.contracts import (
+    AgentFactoryJobV3,
     FactoryEvidenceBlock,
     FactoryJob,
     FactoryLease,
@@ -102,6 +103,13 @@ class FactoryCandidateValidationPort(Protocol):
 
     async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
         """Return build, real-case, or quality evidence for the leased role."""
+
+
+class FactoryBusinessBenchmarkPort(Protocol):
+    """Run the Captain-owned V3 business gate and return quality evidence."""
+
+    async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
+        """Persist benchmark/evaluation/feedback before returning quality evidence."""
 
 
 class HermesSkillEvaluationPort(Protocol):
@@ -510,6 +518,7 @@ class FactoryDispatcher:
         hermes: HermesFactoryPort,
         forge: MinibookForgePort,
         candidate_validator: FactoryCandidateValidationPort | None = None,
+        business_benchmark: FactoryBusinessBenchmarkPort | None = None,
         leases: FactoryLeasePort,
         clock: FactoryClock,
         improvements: FactoryImprovementAuthorizationPort | None = None,
@@ -518,6 +527,7 @@ class FactoryDispatcher:
         self._hermes = hermes
         self._forge = forge
         self._candidate_validator = candidate_validator
+        self._business_benchmark = business_benchmark
         self._leases = leases
         self._clock = clock
         self._improvements = improvements
@@ -552,6 +562,15 @@ class FactoryDispatcher:
                 if self._candidate_validator is None:
                     raise FactoryDispatchError("candidate build validator is not configured")
                 evidence = await self._candidate_validator.dispatch(request)
+            elif (
+                action.kind is FactoryActionKind.DISPATCH_QUALITY_WARDEN
+                and isinstance(job, AgentFactoryJobV3)
+            ):
+                if self._business_benchmark is None:
+                    raise FactoryDispatchError(
+                        "V3 quality dispatch requires the business benchmark service"
+                    )
+                evidence = await self._business_benchmark.dispatch(request)
             elif (
                 action.kind
                 in {

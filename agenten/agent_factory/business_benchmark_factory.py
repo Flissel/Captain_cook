@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable, Protocol
+from uuid import UUID
 
 from agenten.agent_factory.business_benchmark import (
     BusinessBenchmarkEvaluationBinding,
@@ -14,6 +15,7 @@ from agenten.agent_factory.business_benchmark_contracts import (
     BusinessBenchmarkPolicyV1,
     BusinessBenchmarkReceiptV1,
     BusinessBenchmarkRunReceiptV1,
+    BusinessBenchmarkSuiteV1,
     BusinessBenchmarkSummaryV1,
 )
 from agenten.agent_factory.business_benchmark_execution import (
@@ -26,6 +28,8 @@ from agenten.agent_factory.business_benchmark_replay import (
 )
 from agenten.agent_factory.business_benchmark_store import (
     BusinessBenchmarkRepository,
+    FilesystemBusinessBenchmarkEvidenceStore,
+    PrivateBusinessBenchmarkStore,
 )
 from agenten.agent_factory.contracts import AgentFactoryJobV3
 from agenten.agent_factory.execution_budget import FactoryBudgetProjection
@@ -52,6 +56,34 @@ class BusinessBenchmarkGatewayPort(Protocol):
     def record_workflow_artifact(
         self, artifact: TeamEvaluationV1 | FactoryFeedbackV1
     ) -> bool: ...
+
+
+@dataclass(frozen=True)
+class PrivateFilesystemBusinessBenchmarkRepository:
+    """Production adapter joining a private suite with append-only evidence."""
+
+    suites: PrivateBusinessBenchmarkStore
+    evidence: FilesystemBusinessBenchmarkEvidenceStore
+
+    def suite_ref(self, profile_id: str, suite_version: int) -> PrivateHoldoutRef:
+        return self.suites.suite_ref(profile_id, suite_version)
+
+    def private_suite(
+        self, reference: PrivateHoldoutRef
+    ) -> BusinessBenchmarkSuiteV1:
+        return self.suites.private_suite(reference)
+
+    def record_run_receipt(self, receipt: BusinessBenchmarkRunReceiptV1) -> ArtifactRef:
+        return self.evidence.record_run_receipt(receipt)
+
+    def record_case_receipt(self, receipt: BusinessBenchmarkReceiptV1) -> ArtifactRef:
+        return self.evidence.record_case_receipt(receipt)
+
+    def record_summary(self, summary: BusinessBenchmarkSummaryV1) -> ArtifactRef:
+        return self.evidence.record_summary(summary)
+
+    def summary(self, summary_id: UUID) -> BusinessBenchmarkSummaryV1 | None:
+        return self.evidence.summary(summary_id)
 
 
 @dataclass(frozen=True)
@@ -235,4 +267,5 @@ __all__ = [
     "BusinessBenchmarkFactoryComposition",
     "BusinessBenchmarkFactoryResult",
     "BusinessBenchmarkGatewayPort",
+    "PrivateFilesystemBusinessBenchmarkRepository",
 ]

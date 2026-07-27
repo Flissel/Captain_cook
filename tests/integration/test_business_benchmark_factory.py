@@ -24,6 +24,11 @@ from agenten.agent_factory.business_benchmark_execution import (
 )
 from agenten.agent_factory.business_benchmark_factory import (
     BusinessBenchmarkFactoryComposition,
+    PrivateFilesystemBusinessBenchmarkRepository,
+)
+from agenten.agent_factory.business_benchmark_dispatch import (
+    BusinessBenchmarkDispatchInputs,
+    BusinessBenchmarkDispatchService,
 )
 from agenten.agent_factory.business_benchmark_replay import (
     BusinessBenchmarkEffectClaimV1,
@@ -34,10 +39,13 @@ from agenten.agent_factory.business_benchmark_replay import (
     InMemoryBusinessBenchmarkReplayStore,
 )
 from agenten.agent_factory.business_benchmark_store import (
+    FilesystemBusinessBenchmarkEvidenceStore,
     InMemoryBusinessBenchmarkRepository,
+    PrivateBusinessBenchmarkStore,
 )
 from agenten.agent_factory.contracts import FactoryPhase
 from agenten.agent_factory.factory_feedback import FactoryFeedbackBuilder
+from agenten.agent_factory.orchestration import FactoryDispatchError, FactoryDispatcher
 from agenten.agent_factory.service import FactoryCoordinator, InMemoryFactoryRepository
 from agenten.agent_factory.skill_workflow_contracts import (
     FactoryFeedbackRecommendation,
@@ -244,6 +252,8 @@ class _DeterministicGatewayStore:
         self._artifacts: list[object] = []
         self._budget = budget
         self._usage_receipts = usage_receipts
+        self.write_order: list[str] = []
+        self.block_writes: list[object] = []
 
     def record_factory_job(self, job):
         self._factory.register(job)
@@ -256,7 +266,10 @@ class _DeterministicGatewayStore:
         )
 
     def record_factory_block(self, block):
-        return SimpleNamespace(replayed=not self._factory.append(block))
+        replayed = not self._factory.append(block)
+        if not replayed:
+            self.block_writes.append(block)
+        return SimpleNamespace(replayed=replayed)
 
     def factory_skill_evaluation(self, job_id):
         return None
@@ -268,6 +281,7 @@ class _DeterministicGatewayStore:
         if artifact in self._artifacts:
             return SimpleNamespace(replayed=True)
         self._artifacts.append(artifact)
+        self.write_order.append(type(artifact).__name__)
         return SimpleNamespace(replayed=False)
 
     def factory_workflow_artifacts(self, job_id):
@@ -286,6 +300,8 @@ class _DeterministicGatewayStore:
 
     def record_business_benchmark_summary(self, summary):
         replayed = not self._factory.record_business_benchmark_summary(summary)
+        if not replayed:
+            self.write_order.append("BusinessBenchmarkSummaryV1")
         return SimpleNamespace(replayed=replayed)
 
     def business_benchmark_summary(self, summary_id):
@@ -492,3 +508,175 @@ async def test_business_red_requests_bounded_improvement_and_rejects_bypass() ->
     assert coordinator.next_action(job.job_id).kind is FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED
     with pytest.raises(FactoryLifecycleError, match="business benchmark|workflow"):
         coordinator.record(_lifecycle_block(job, FactoryPhase.CAPABILITY_PROMOTED))
+
+
+@pytest.mark.asyncio
+async def test_factory_dispatcher_invokes_product_business_benchmark_gate(
+    tmp_path,
+) -> None:
+    profile_id = "insurance_claims_resolution_swarm"
+    suite_store = PrivateBusinessBenchmarkStore.from_fixture(
+        _suite(profile_id), tmp_path / "private"
+    )
+    private_repository = PrivateFilesystemBusinessBenchmarkRepository(
+        suites=suite_store,
+        evidence=FilesystemBusinessBenchmarkEvidenceStore(tmp_path / "evidence"),
+    )
+    suite_ref = suite_store.public_suite_ref()
+    job = workflow_job(mode="release").model_copy(
+        update={"private_holdout_refs": (suite_ref,)}
+    )
+    runs = tuple(workflow_run(number) for number in range(1, 4))
+    store = _DeterministicGatewayStore(
+        budget=workflow_budget(), usage_receipts=workflow_receipts(runs)
+    )
+    gateway_repository = GatewayFactoryRepository(store)
+    coordinator = FactoryCoordinator(gateway_repository)
+    coordinator.register(job)
+    for run in runs:
+        gateway_repository.record_workflow_artifact(run)
+    for phase in (
+        FactoryPhase.FORGE_REQUESTED,
+        FactoryPhase.BLUEPRINT_CREATED,
+        FactoryPhase.TOOL_CANDIDATE_TESTED,
+        FactoryPhase.AGENT_CODE_CREATED,
+        FactoryPhase.BUILD_PASSED,
+        FactoryPhase.REAL_CASE_EVIDENCE,
+    ):
+        coordinator.record(_lifecycle_block(job, phase))
+
+    evaluation_invocation = _evaluation_invocation()
+    active_time = evaluation_invocation.lease.issued_at + timedelta(minutes=1)
+    uuid_numbers = iter(range(1, 100))
+    inputs = BusinessBenchmarkDispatchInputs(
+        profile_id=profile_id,
+        suite_version=1,
+        candidate_ref=runs[0].candidate_ref,
+        executor=_DeterministicExecutor(),
+        replay_store=InMemoryBusinessBenchmarkReplayStore(),
+        execution_policy_factory=lambda benchmark_case: _execution_policy().model_copy(
+            update={"allowed_tool_intents": benchmark_case.allowed_tool_intents}
+        ),
+        benchmark_policy=BusinessBenchmarkPolicyV1(
+            schema="captain.business-benchmark-policy.v1"
+        ),
+        evaluation_invocation=evaluation_invocation,
+        report_invocation_factory=_report_invocation,
+        technical_executions=runs,
+        budget_projection=workflow_budget(),
+    )
+
+    class Inputs:
+        def resolve(self, request):
+            assert request.job == job
+            assert request.action.kind is FactoryActionKind.DISPATCH_QUALITY_WARDEN
+            return inputs
+
+    class Leases:
+        def active(self, factory_job, role, attempt, now):
+            assert factory_job == job
+            assert role.value == "quality_warden"
+            assert attempt == 1
+            assert now == active_time
+            return evaluation_invocation.lease
+
+    class Clock:
+        def now(self):
+            return active_time
+
+    class MustNotRun:
+        async def dispatch(self, request):
+            raise AssertionError("generic Hermes/validator path must not run")
+
+        async def submit(self, request):
+            raise AssertionError("Forge path must not run")
+
+    composition = BusinessBenchmarkFactoryComposition(
+        private_repository=private_repository,
+        gateway_repository=gateway_repository,
+        evaluator=BusinessBenchmarkEvaluator(
+            clock=lambda: NOW,
+            uuid_factory=lambda: uuid5(
+                NAMESPACE_URL, f"dispatcher-{next(uuid_numbers)}"
+            ),
+        ),
+        team_evaluator=TeamEvaluationService(clock=lambda: active_time),
+        feedback_builder=FactoryFeedbackBuilder(
+            clock=lambda: active_time + timedelta(minutes=1)
+        ),
+    )
+    service = BusinessBenchmarkDispatchService(
+        composition=composition,
+        inputs=Inputs(),
+        clock=lambda: active_time + timedelta(minutes=2),
+    )
+    dispatcher = FactoryDispatcher(
+        coordinator=coordinator,
+        hermes=MustNotRun(),
+        forge=MustNotRun(),
+        candidate_validator=MustNotRun(),
+        business_benchmark=service,
+        leases=Leases(),
+        clock=Clock(),
+    )
+
+    action = await dispatcher.dispatch_next(job.job_id)
+
+    assert action.kind is FactoryActionKind.DISPATCH_QUALITY_WARDEN
+    projection = coordinator.projection(job.job_id)
+    assert projection.phase is FactoryPhase.QUALITY_REVIEWED
+    assert coordinator.next_action(job.job_id).kind is FactoryActionKind.VALIDATE_FOR_PROMOTION
+    assert store.write_order[-3:] == [
+        "BusinessBenchmarkSummaryV1",
+        "TeamEvaluationV1",
+        "FactoryFeedbackV1",
+    ]
+    quality_writes = [
+        block
+        for block in store.block_writes
+        if block.phase is FactoryPhase.QUALITY_REVIEWED
+    ]
+    assert len(quality_writes) == 1
+    assert quality_writes[0].event_id == projection.block_ids[-1]
+
+
+@pytest.mark.asyncio
+async def test_v3_quality_dispatch_fails_closed_without_benchmark_service() -> None:
+    job = workflow_job(mode="release")
+    repository = InMemoryFactoryRepository()
+    coordinator = FactoryCoordinator(repository)
+    coordinator.register(job)
+    for phase in (
+        FactoryPhase.FORGE_REQUESTED,
+        FactoryPhase.BLUEPRINT_CREATED,
+        FactoryPhase.TOOL_CANDIDATE_TESTED,
+        FactoryPhase.AGENT_CODE_CREATED,
+        FactoryPhase.BUILD_PASSED,
+        FactoryPhase.REAL_CASE_EVIDENCE,
+    ):
+        coordinator.record(_lifecycle_block(job, phase))
+
+    class Clock:
+        def now(self):
+            return NOW
+
+    class Leases:
+        def active(self, factory_job, role, attempt, now):
+            return _evaluation_invocation().lease
+
+    class MustNotRun:
+        async def dispatch(self, request):
+            raise AssertionError("fallback worker must not bypass benchmark gate")
+
+        async def submit(self, request):
+            raise AssertionError("Forge must not run")
+
+    with pytest.raises(FactoryDispatchError, match="business benchmark"):
+        await FactoryDispatcher(
+            coordinator=coordinator,
+            hermes=MustNotRun(),
+            forge=MustNotRun(),
+            candidate_validator=MustNotRun(),
+            leases=Leases(),
+            clock=Clock(),
+        ).dispatch_next(job.job_id)
