@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from threading import Barrier
 from uuid import UUID
 
 import pytest
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
@@ -209,6 +211,111 @@ def test_business_benchmark_summary_is_restart_safe_and_rejects_changed_replay(
     assert [event["event_type"] for event in events.json()] == [
         "captain_business_benchmark_validated"
     ]
+
+
+def _second_workflow_job_and_execution():
+    first_job = workflow_job(mode="demo")
+    first_execution = workflow_run(1)
+    second_job_id = UUID("00000000-0000-0000-0000-000000000901")
+    second_correlation_id = UUID("00000000-0000-0000-0000-000000000902")
+    second_invocation_id = UUID("00000000-0000-0000-0000-000000000921")
+    second_job = first_job.model_copy(
+        update={
+            "event_id": UUID("00000000-0000-0000-0000-000000000911"),
+            "job_id": second_job_id,
+            "correlation_id": second_correlation_id,
+        }
+    )
+    second_lease = first_execution.invocation.lease.model_copy(
+        update={
+            "job_id": second_job_id,
+            "correlation_id": second_correlation_id,
+            "lease_id": "lease-real_case_tester-job-two",
+        }
+    )
+    second_invocation = first_execution.invocation.model_copy(
+        update={
+            "job_id": second_job_id,
+            "correlation_id": second_correlation_id,
+            "invocation_id": second_invocation_id,
+            "idempotency_key": "factory-job-two-real-case-tester-attempt-1",
+            "lease": second_lease,
+        }
+    )
+    second_execution = first_execution.model_copy(
+        update={
+            "job_id": second_job_id,
+            "correlation_id": second_correlation_id,
+            "invocation_id": second_invocation_id,
+            "invocation": second_invocation,
+        }
+    )
+    return second_job, second_execution
+
+
+def test_business_benchmark_cross_job_concurrent_conflict_is_normalized(
+    storage: MariaDBStorage,
+) -> None:
+    first_job = workflow_job(mode="demo")
+    first_execution = workflow_run(1)
+    second_job, second_execution = _second_workflow_job_and_execution()
+    setup_store = GatewayStore(storage)
+    setup_store.record_factory_job(first_job)
+    setup_store.record_factory_job(second_job)
+    _seed_workflow_execution(setup_store, first_execution)
+    _seed_workflow_execution(setup_store, second_execution)
+    summaries = (
+        workflow_benchmark((first_execution,)),
+        workflow_benchmark((second_execution,)),
+    )
+    contenders = (
+        GatewayStore(MariaDBStorage(TEST_DSN)),
+        GatewayStore(MariaDBStorage(TEST_DSN)),
+    )
+    ready = Barrier(2)
+
+    def persist(contender):
+        contender_store, summary = contender
+        ready.wait()
+        try:
+            contender_store.record_business_benchmark_summary(summary)
+            return "created"
+        except HTTPException as exc:
+            return f"conflict:{exc.status_code}"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = tuple(pool.map(persist, zip(contenders, summaries, strict=True)))
+
+    assert sorted(outcomes) == ["conflict:409", "created"]
+
+
+def test_business_benchmark_event_failure_rolls_back_in_mariadb(
+    storage: MariaDBStorage,
+) -> None:
+    factory_job = workflow_job(mode="demo")
+    execution = workflow_run(1)
+    summary = workflow_benchmark((execution,))
+    store = GatewayStore(storage)
+    store.record_factory_job(factory_job)
+    _seed_workflow_execution(store, execution)
+    original_insert = store._insert
+
+    def fail_delivery_event(cursor, block):
+        if block["block_type"] == "delivery_event":
+            raise RuntimeError("injected delivery event failure")
+        return original_insert(cursor, block)
+
+    store._insert = fail_delivery_event  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="injected delivery event failure"):
+        store.record_business_benchmark_summary(summary)
+
+    restarted = GatewayStore(storage)
+    assert restarted.business_benchmark_summary(summary.summary_id) is None
+    assert restarted.delivery_events(
+        project_id="agent-factory",
+        run_id=str(factory_job.job_id),
+    ) == ()
 
 
 def test_factory_budget_routes_keep_reservations_captain_owned_and_usage_worker_owned(

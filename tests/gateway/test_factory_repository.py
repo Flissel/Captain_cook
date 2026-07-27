@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
 from uuid import UUID
 
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from pydantic import SecretStr
+from pymysql.err import IntegrityError, OperationalError
 
 import gateway.contracts as gateway_contracts
 
@@ -36,8 +40,9 @@ from gateway.contracts import (
 )
 from gateway.factory_repository import GatewayFactoryLeases, GatewayFactoryRepository
 from gateway.store import GatewayStore
-from gateway.app import CAPTAIN_SKILL_EVENT_TYPES, require_skill_event_writer
+from gateway.app import CAPTAIN_SKILL_EVENT_TYPES, create_app, require_skill_event_writer
 from gateway.auth import GatewayRole
+from gateway.settings import GatewaySettings
 from agenten.agent_factory.business_benchmark_contracts import canonical_business_benchmark_model_bytes
 from tests.agent_factory.test_state_machine import (
     accepted_evaluation,
@@ -272,6 +277,215 @@ def test_business_benchmark_delivery_event_is_deterministic_and_captain_only() -
         require_skill_event_writer(first, GatewayRole.WORKER)
     assert denied.value.status_code == 403
     assert "case_metrics" not in first.model_dump_json()
+
+
+class _BenchmarkConflictCursor:
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self.rows = rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def execute(self, _query, _parameters) -> None:
+        return None
+
+    def fetchall(self):
+        return self.rows
+
+
+class _BenchmarkConflictConnection:
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self.rows = rows
+
+    def cursor(self):
+        return _BenchmarkConflictCursor(self.rows)
+
+
+class _BenchmarkConflictStorage:
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self.rows = rows
+
+    @contextmanager
+    def transaction(self):
+        yield _BenchmarkConflictConnection(self.rows)
+
+
+@pytest.mark.parametrize(
+    "write_error, expected_attempts",
+    (
+        (IntegrityError(1062, "duplicate benchmark identity"), 1),
+        (OperationalError(1213, "deadlock found"), 3),
+    ),
+)
+def test_business_benchmark_write_contention_is_normalized_to_conflict(
+    write_error: Exception,
+    expected_attempts: int,
+) -> None:
+    summary = workflow_benchmark((workflow_run(1),))
+    other_job_id = UUID("00000000-0000-0000-0000-000000000991")
+    conflicting_payload = summary.model_dump(mode="json", by_alias=True)
+    conflicting_payload["job_id"] = str(other_job_id)
+    rows = [
+        {
+            "summary_id": str(summary.summary_id),
+            "job_id": str(other_job_id),
+            "correlation_id": str(summary.correlation_id),
+            "subject_version": summary.subject_version,
+            "attempt": summary.attempt,
+            "candidate_sha256": summary.candidate_ref.sha256,
+            "artifact_sha256": summary.artifact_ref.sha256,
+            "payload": json.dumps(conflicting_payload, sort_keys=True),
+        }
+    ]
+    store = GatewayStore.__new__(GatewayStore)
+    store.storage = _BenchmarkConflictStorage(rows)
+    attempts = 0
+
+    def fail_write(_summary):
+        nonlocal attempts
+        attempts += 1
+        raise write_error
+
+    store._record_business_benchmark_summary_once = fail_write  # type: ignore[method-assign]
+
+    with pytest.raises(HTTPException) as conflict:
+        store.record_business_benchmark_summary(summary)
+
+    assert attempts == expected_attempts
+    assert conflict.value.status_code == 409
+    assert conflict.value.detail == (
+        "business benchmark summary identity already exists with different content"
+    )
+
+
+def test_business_benchmark_duplicate_race_accepts_only_exact_replay() -> None:
+    summary = workflow_benchmark((workflow_run(1),))
+    canonical = summary.model_dump(mode="json", by_alias=True)
+    rows = [
+        {
+            "summary_id": str(summary.summary_id),
+            "job_id": str(summary.job_id),
+            "correlation_id": str(summary.correlation_id),
+            "subject_version": summary.subject_version,
+            "attempt": summary.attempt,
+            "candidate_sha256": summary.candidate_ref.sha256,
+            "artifact_sha256": summary.artifact_ref.sha256,
+            "payload": json.dumps(canonical, sort_keys=True),
+        }
+    ]
+    store = GatewayStore.__new__(GatewayStore)
+    store.storage = _BenchmarkConflictStorage(rows)
+
+    def lose_duplicate_race(_summary):
+        raise IntegrityError(1062, "duplicate benchmark identity")
+
+    store._record_business_benchmark_summary_once = lose_duplicate_race  # type: ignore[method-assign]
+
+    receipt = store.record_business_benchmark_summary(summary)
+
+    assert receipt.replayed is True
+    assert receipt.summary_id == summary.summary_id
+
+
+class _AtomicBenchmarkCursor:
+    def __init__(self, state: dict[str, object]) -> None:
+        self.state = state
+        self._rows: list[dict[str, object]] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def execute(self, query: str, parameters) -> None:
+        if "SELECT summary_id" in query:
+            self._rows = []
+        elif "INSERT INTO factory_business_benchmark_summaries" in query:
+            self.state["summary"] = parameters
+
+    def fetchall(self):
+        return self._rows
+
+
+class _AtomicBenchmarkConnection:
+    def __init__(self, state: dict[str, object]) -> None:
+        self.state = state
+
+    def cursor(self):
+        return _AtomicBenchmarkCursor(self.state)
+
+
+class _AtomicBenchmarkStorage:
+    def __init__(self) -> None:
+        self.committed: dict[str, object] = {}
+
+    @contextmanager
+    def transaction(self):
+        staged = dict(self.committed)
+        try:
+            yield _AtomicBenchmarkConnection(staged)
+        except Exception:
+            raise
+        else:
+            self.committed = staged
+
+
+def test_business_benchmark_event_failure_rolls_back_summary_transaction() -> None:
+    factory_job = workflow_job(mode="demo")
+    execution = workflow_run(1)
+    summary = workflow_benchmark((execution,))
+    storage = _AtomicBenchmarkStorage()
+    store = GatewayStore.__new__(GatewayStore)
+    store.storage = storage
+    store._runtime_block_by_json_value = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: {"index": 7, "data": factory_job.model_dump(mode="json", by_alias=True)}
+    )
+    store._factory_projection = (  # type: ignore[method-assign]
+        lambda _cursor, job: FactoryProjection.from_job(job)
+    )
+    store._factory_workflow_artifacts_for_job = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: (execution,)
+    )
+    indexes = iter((8, 9))
+    store._next_index = lambda _cursor: next(indexes)  # type: ignore[method-assign]
+    store._new_block = (  # type: ignore[method-assign]
+        lambda _cursor, **values: values
+    )
+
+    def fail_delivery_event(_cursor, block):
+        if block["block_type"] == "delivery_event":
+            raise RuntimeError("injected delivery event failure")
+        _cursor.state.setdefault("blocks", []).append(block)
+
+    store._insert = fail_delivery_event  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="injected delivery event failure"):
+        store._record_business_benchmark_summary_once(summary)
+
+    assert "summary" not in storage.committed
+    assert storage.committed.get("blocks", []) == []
+
+
+def test_business_benchmark_artifact_route_rejects_malformed_sha256() -> None:
+    app = create_app(
+        settings=GatewaySettings(
+            ledger_dsn=SecretStr("mysql://unused"),
+            captain_gateway_token=SecretStr("captain-test-token"),
+            worker_gateway_token=SecretStr("worker-test-token"),
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/factory/business-benchmarks/artifacts/NOT-A-DIGEST",
+            headers={"Authorization": "Bearer captain-test-token"},
+        )
+
+    assert response.status_code == 422
 
 
 def test_gateway_repository_seeds_all_six_exact_job_skill_assignments() -> None:

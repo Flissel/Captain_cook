@@ -69,3 +69,31 @@ Exact command:
   live isolated `captain_test` database in this worktree.
 - No VibeMind n8n service or volume was touched. No Task 7 provider/live
   adapter work was added, and nothing was pushed.
+
+## Review fix: persistence contention and atomicity
+
+- Routed benchmark writes through the existing bounded transaction retry path.
+  MariaDB duplicate-key (`1062`) and exhausted deadlock (`1213`) outcomes now
+  re-read every immutable identity column. Only exact canonical same-identity
+  replay succeeds; all other global summary/artifact/composite collisions return
+  deterministic HTTP 409 from the store. The repository only translates that
+  store `HTTPException` into its domain error.
+- Added deterministic fake-contention coverage for duplicate and deadlock
+  normalization plus exact raced replay, and fault-injection coverage proving a
+  delivery-event insert failure commits neither the summary nor its event.
+- Added isolated-MariaDB concurrent cross-job conflict and transaction rollback
+  nodes. They remain DB-unverified here because `TEST_MARIADB_DSN` is absent.
+- Constrained the artifact lookup path to exactly lowercase `[0-9a-f]{64}`;
+  malformed authenticated requests now fail request validation with HTTP 422.
+
+Review verification:
+
+- Focused Task 6 gate: `91 passed, 12 skipped in 0.80s`.
+- Gateway deterministic scope: `206 passed, 95 skipped in 1.05s`.
+- Full Agent Factory gate: `642 passed in 12.93s`.
+- `python -m compileall -q agenten gateway`: exit 0.
+- `git diff --check`: exit 0; only LF-to-CRLF checkout warnings.
+- Exact MariaDB nodes with `-rs`: `3 skipped in 2.27s`, each because
+  `TEST_MARIADB_DSN is not configured`. The command exited 1 separately because
+  the isolated skipped nodes reached only `17.34%` repository coverage, below
+  the configured 70% threshold. This is not MariaDB success evidence.

@@ -13,7 +13,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ValidationError
-from pymysql.err import OperationalError
+from pymysql.err import IntegrityError, OperationalError
 
 from agenten.validation.contracts import HoldoutSuite, WorkBatch
 from agenten.agent_runtime.capabilities import CapabilityDenied, validate_grant
@@ -1114,6 +1114,24 @@ class GatewayStore:
         self,
         summary: BusinessBenchmarkSummaryV1,
     ) -> BusinessBenchmarkSummaryWriteReceipt:
+        try:
+            return self._retry_write(
+                lambda: self._record_business_benchmark_summary_once(summary)
+            )
+        except IntegrityError as exc:
+            error_code = exc.args[0] if exc.args else None
+            if error_code != 1062:
+                raise
+        except OperationalError as exc:
+            error_code = exc.args[0] if exc.args else None
+            if error_code not in TRANSIENT_TRANSACTION_ERRORS:
+                raise
+        return self._resolve_business_benchmark_summary_conflict(summary)
+
+    def _record_business_benchmark_summary_once(
+        self,
+        summary: BusinessBenchmarkSummaryV1,
+    ) -> BusinessBenchmarkSummaryWriteReceipt:
         canonical = summary.model_dump(mode="json", by_alias=True)
         artifact_sha256 = summary.artifact_ref.sha256
         content_sha256 = hashlib.sha256(
@@ -1238,6 +1256,71 @@ class GatewayStore:
             artifact_sha256=artifact_sha256,
             content_sha256=content_sha256,
             replayed=False,
+        )
+
+    def _resolve_business_benchmark_summary_conflict(
+        self,
+        summary: BusinessBenchmarkSummaryV1,
+    ) -> BusinessBenchmarkSummaryWriteReceipt:
+        canonical = summary.model_dump(mode="json", by_alias=True)
+        artifact_sha256 = summary.artifact_ref.sha256
+        content_sha256 = hashlib.sha256(
+            canonical_business_benchmark_model_bytes(summary)
+        ).hexdigest()
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT summary_id, job_id, correlation_id, subject_version,
+                              attempt, candidate_sha256, artifact_sha256, payload
+                       FROM factory_business_benchmark_summaries
+                       WHERE summary_id = %s OR artifact_sha256 = %s OR
+                         (job_id = %s AND correlation_id = %s AND subject_version = %s
+                          AND attempt = %s AND candidate_sha256 = %s)
+                       FOR UPDATE""",
+                    (
+                        str(summary.summary_id),
+                        artifact_sha256,
+                        str(summary.job_id),
+                        str(summary.correlation_id),
+                        summary.subject_version,
+                        summary.attempt,
+                        summary.candidate_ref.sha256,
+                    ),
+                )
+                rows = cursor.fetchall()
+        immutable_identity = (
+            str(summary.summary_id),
+            str(summary.job_id),
+            str(summary.correlation_id),
+            summary.subject_version,
+            summary.attempt,
+            summary.candidate_ref.sha256,
+            artifact_sha256,
+        )
+        if len(rows) == 1:
+            row = rows[0]
+            stored_identity = (
+                str(row["summary_id"]),
+                str(row["job_id"]),
+                str(row["correlation_id"]),
+                row["subject_version"],
+                row["attempt"],
+                row["candidate_sha256"],
+                row["artifact_sha256"],
+            )
+            if (
+                stored_identity == immutable_identity
+                and self._decode_json(row["payload"]) == canonical
+            ):
+                return BusinessBenchmarkSummaryWriteReceipt(
+                    summary_id=summary.summary_id,
+                    artifact_sha256=artifact_sha256,
+                    content_sha256=content_sha256,
+                    replayed=True,
+                )
+        raise HTTPException(
+            status_code=409,
+            detail="business benchmark summary identity already exists with different content",
         )
 
     def business_benchmark_summary(

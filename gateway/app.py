@@ -9,7 +9,7 @@ from threading import Lock
 from typing import Any, Literal, Protocol
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request, Response, status
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -374,7 +374,7 @@ def create_app(
 
     @app.get("/v1/factory/business-benchmarks/artifacts/{artifact_sha256}")
     async def get_business_benchmark_summary_by_artifact(
-        artifact_sha256: str,
+        artifact_sha256: str = Path(pattern=r"^[0-9a-f]{64}$"),
         _: GatewayRole = Depends(require_reader),
     ) -> BusinessBenchmarkSummaryV1:
         artifact_ref = ArtifactRef(
