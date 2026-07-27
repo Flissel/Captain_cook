@@ -231,7 +231,7 @@ def test_coordinator_reads_gateway_workflow_artifacts_for_v3_feedback() -> None:
     assert coordinator.next_action(factory_job.job_id).kind is FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED
 
 
-def test_coordinator_recomputes_v3_release_from_read_only_gateway_evidence() -> None:
+def test_coordinator_fails_closed_until_gateway_resolves_benchmark_summary() -> None:
     factory_job = release_workflow_job(mode="release")
     runs = tuple(workflow_run(number) for number in range(1, 4))
     evaluation = release_workflow_evaluation(runs)
@@ -266,13 +266,6 @@ def test_coordinator_recomputes_v3_release_from_read_only_gateway_evidence() -> 
     coordinator.record(reviewed)
 
     assert coordinator.next_action(factory_job.job_id).kind is (
-        FactoryActionKind.VALIDATE_FOR_PROMOTION
+        FactoryActionKind.APPEND_ESCALATED
     )
-
-    coordinator.record(
-        workflow_block(
-            FactoryPhase.CAPABILITY_PROMOTED,
-            assertions=factory_job.acceptance_assertion_ids,
-        )
-    )
-    assert coordinator.projection(factory_job.job_id).status.value == "ready_to_use"
+    assert coordinator.projection(factory_job.job_id).status.value == "running"

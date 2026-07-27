@@ -58,6 +58,7 @@ class TeamEvaluationService:
         benchmark_summary: BusinessBenchmarkSummaryV1,
         budget_projection: FactoryBudgetProjection | None = None,
         prior_evaluation: TeamEvaluationV1 | None = None,
+        prior_benchmark_summary: BusinessBenchmarkSummaryV1 | None = None,
     ) -> TeamEvaluationV1:
         """Evaluate released assertions before considering an optional judge."""
 
@@ -76,6 +77,7 @@ class TeamEvaluationService:
             benchmark_summary=benchmark_summary,
             budget_projection=budget_projection,
             prior_evaluation=prior_evaluation,
+            prior_benchmark_summary=prior_benchmark_summary,
         )
 
         deterministic_passed, failure_class = self._deterministic_result(executions)
@@ -264,6 +266,7 @@ class TeamEvaluationService:
         benchmark_summary: BusinessBenchmarkSummaryV1,
         budget_projection: FactoryBudgetProjection | None,
         prior_evaluation: TeamEvaluationV1 | None,
+        prior_benchmark_summary: BusinessBenchmarkSummaryV1 | None,
     ) -> None:
         if not executions:
             raise ValueError("team evaluation requires immutable execution evidence")
@@ -317,10 +320,20 @@ class TeamEvaluationService:
                 prior_evaluation.job_id != invocation.job_id
                 or prior_evaluation.correlation_id != invocation.correlation_id
                 or prior_evaluation.subject_version != invocation.subject_version
-                or prior_evaluation.attempt >= invocation.attempt
+                or prior_evaluation.attempt != invocation.attempt - 1
                 or prior_evaluation.acceptance_assertion_ids != expected_assertions
             ):
-                raise ValueError("prior evaluation binding does not match evaluation")
+                raise ValueError(
+                    "prior evaluation must bind the immediately preceding attempt"
+                )
+            _validate_prior_business_summary(
+                prior_evaluation,
+                prior_benchmark_summary,
+            )
+        elif prior_benchmark_summary is not None:
+            raise ValueError(
+                "prior business benchmark summary requires a prior evaluation"
+            )
 
     @staticmethod
     def _deterministic_result(
@@ -400,11 +413,38 @@ def _combined_failure_class(
 ) -> str | None:
     if benchmark_summary.disposition is BenchmarkDisposition.PASSED:
         return execution_failure
+    if execution_failure is not None:
+        return execution_failure
     if "missing_receipt" in benchmark_summary.reason_codes:
         return "infrastructure_failure"
-    if execution_failure is None:
-        return "behavioral_failure"
-    return execution_failure
+    return "behavioral_failure"
+
+
+def _validate_prior_business_summary(
+    prior_evaluation: TeamEvaluationV1,
+    prior_summary: BusinessBenchmarkSummaryV1 | None,
+) -> None:
+    if prior_summary is None:
+        raise ValueError(
+            "prior business benchmark summary is required for regression guards"
+        )
+    summary = _validated_business_summary(prior_summary)
+    if (
+        summary.job_id != prior_evaluation.job_id
+        or summary.correlation_id != prior_evaluation.correlation_id
+        or summary.subject_version != prior_evaluation.subject_version
+        or summary.attempt != prior_evaluation.attempt
+        or summary.candidate_ref not in prior_evaluation.evidence_refs
+        or prior_evaluation.benchmark_summary_ref != summary.artifact_ref
+        or summary.artifact_ref not in prior_evaluation.evidence_refs
+        or prior_evaluation.benchmark_policy_id != summary.policy.policy_id
+        or prior_evaluation.benchmark_disposition != summary.disposition.value
+        or prior_evaluation.benchmark_reason_codes != summary.reason_codes
+        or prior_evaluation.failed_benchmark_metric_ids != summary.failed_metric_ids
+    ):
+        raise ValueError(
+            "prior business benchmark binding does not match prior evaluation"
+        )
 
 
 def _content_ref(kind: str, payload: object) -> ArtifactRef:

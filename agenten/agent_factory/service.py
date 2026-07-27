@@ -372,6 +372,7 @@ class FactoryCoordinator:
             job,
             executions,
             evaluation,
+            benchmark_summary=None,
             budget_projection=self.workflow_budget_projection(job.job_id),
             usage_receipts=self.workflow_usage_receipts(job.job_id),
         )

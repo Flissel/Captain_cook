@@ -2196,6 +2196,7 @@ class GatewayStore:
             job,
             executions,
             evaluation,
+            benchmark_summary=None,
             budget_projection=self._factory_budget_projection(
                 cursor,
                 job,

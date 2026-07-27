@@ -135,6 +135,16 @@ class CodexBriefBuilder:
             authorized_path_roots=(assignment.workspace_ref,),
             required_test_command_ids=test_ids,
             forbidden_effect_ids=self._FORBIDDEN_EFFECT_IDS,
+            failed_benchmark_metric_ids=(
+                ()
+                if improvement_authorization is None
+                else improvement_authorization.failed_evaluation.failed_benchmark_metric_ids
+            ),
+            regression_benchmark_metric_ids=(
+                ()
+                if improvement_authorization is None
+                else improvement_authorization.prior_green_benchmark_metric_ids
+            ),
         )
 
     @staticmethod

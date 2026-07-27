@@ -253,4 +253,6 @@ def test_retry_brief_binds_failed_evaluation_candidate_and_prior_green() -> None
     assert '"prior green benchmark metrics": [\n      "coverage"' in rendered
     assert '"failed benchmark metric IDs": [\n      "tool_safety"' in rendered
     assert '"benchmark reason codes": [\n      "unsafe_tool_intent"' in rendered
+    assert brief.failed_benchmark_metric_ids == ("tool_safety",)
+    assert brief.regression_benchmark_metric_ids == ("coverage",)
     assert authorization.prior_candidate_ref.uri in rendered

@@ -148,6 +148,7 @@ def apply_block(
                 projection.job,
                 workflow_evaluation,
                 release_decision,
+                benchmark_summary=None,
             )
             if decision_reason is not None:
                 raise FactoryLifecycleError(decision_reason)
@@ -268,6 +269,7 @@ def next_action(
                     projection.job,
                     workflow_evaluation,
                     workflow_release_decision,
+                    benchmark_summary=None,
                 )
                 if decision_reason is None:
                     return FactoryAction(

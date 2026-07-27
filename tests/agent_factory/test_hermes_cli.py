@@ -42,6 +42,7 @@ from agenten.agent_factory.skill_evaluation import (
 )
 from agenten.agent_factory.skill_workflow_contracts import (
     CandidateRevisionV1,
+    CodexBuildBriefV1,
     FactorySkillInvocationV1,
     FactorySkillStep,
     TeamEvaluationV1,
@@ -366,6 +367,29 @@ def test_improvement_artifact_binds_benchmark_regression_guards() -> None:
     with pytest.raises(FactoryDispatchError, match="authorized failed candidate"):
         _require_improvement_artifact_binding(
             revision,
+            authorization=authorization,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("failed_benchmark_metric_ids", ()),
+        ("regression_benchmark_metric_ids", ()),
+    ),
+)
+def test_codex_brief_typed_benchmark_guards_match_authorization(
+    field: str,
+    value: tuple[str, ...],
+) -> None:
+    authorization = _improvement_authorization()
+    brief = CodexBuildBriefV1.model_validate(brief_payload()).model_copy(
+        update={field: value}
+    )
+
+    with pytest.raises(FactoryDispatchError, match="benchmark guards"):
+        _require_improvement_artifact_binding(
+            brief,
             authorization=authorization,
         )
 
@@ -820,6 +844,12 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
                     authorization.failed_evaluation.artifact_ref.model_dump(mode="json"),
                     authorization.prior_candidate_ref.model_dump(mode="json"),
                 ]
+                payload["failed_benchmark_metric_ids"] = list(
+                    authorization.failed_evaluation.failed_benchmark_metric_ids
+                )
+                payload["regression_benchmark_metric_ids"] = list(
+                    authorization.prior_green_benchmark_metric_ids
+                )
             return json.dumps(payload).encode(), b""
 
     async def create_process(*command: str, **__: object) -> Process:

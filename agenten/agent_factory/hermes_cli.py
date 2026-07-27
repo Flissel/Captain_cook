@@ -861,6 +861,15 @@ def _require_improvement_artifact_binding(
                 "improve_team artifact does not bind the authorized failed candidate"
             )
     if isinstance(artifact, CodexBuildBriefV1):
+        if (
+            artifact.failed_benchmark_metric_ids
+            != authorization.failed_evaluation.failed_benchmark_metric_ids
+            or artifact.regression_benchmark_metric_ids
+            != authorization.prior_green_benchmark_metric_ids
+        ):
+            raise FactoryDispatchError(
+                "Codex brief benchmark guards do not match improvement authorization"
+            )
         required_refs = {
             authorization.authorization_ref,
             authorization.failed_evaluation.artifact_ref,

@@ -73,13 +73,16 @@ def _budget() -> FactoryBudgetProjection:
 def _benchmark(
     *,
     failure: str | None = None,
+    invocation: FactorySkillInvocationV1 | None = None,
+    candidate: ArtifactRef | None = None,
 ) -> BusinessBenchmarkSummaryV1:
+    bound_invocation = invocation or _invocation()
     overrides: dict[str, object] = {
-        "job_id": str(_invocation().job_id),
-        "correlation_id": str(_invocation().correlation_id),
-        "subject_version": _invocation().subject_version,
-        "attempt": _invocation().attempt,
-        "candidate_ref": _candidate().model_dump(mode="json"),
+        "job_id": str(bound_invocation.job_id),
+        "correlation_id": str(bound_invocation.correlation_id),
+        "subject_version": bound_invocation.subject_version,
+        "attempt": bound_invocation.attempt,
+        "candidate_ref": (candidate or _candidate()).model_dump(mode="json"),
     }
     if failure == "unsafe_tool_intent":
         overrides.update(
@@ -102,6 +105,35 @@ def _benchmark(
             missing_receipt_count=1,
         )
     return business_summary(**overrides)
+
+
+def _invocation_for_attempt(attempt: int) -> FactorySkillInvocationV1:
+    payload = invocation_payload("evaluate_team")
+    payload["attempt"] = attempt
+    payload["invocation_id"] = f"00000000-0000-0000-0000-{700 + attempt:012d}"
+    payload["idempotency_key"] = str(attempt) * 64
+    lease = payload["lease"]
+    assert isinstance(lease, dict)
+    lease["attempt"] = attempt
+    return FactorySkillInvocationV1.model_validate(payload)
+
+
+def _execution_for_attempt(
+    attempt: int,
+    candidate: ArtifactRef,
+) -> TeamExecutionEvidenceV1:
+    payload = execution_payload(candidate_ref=candidate.model_dump(mode="json"))
+    payload["attempt"] = attempt
+    payload["invocation_id"] = f"00000000-0000-0000-0000-{710 + attempt:012d}"
+    invocation = payload["invocation"]
+    assert isinstance(invocation, dict)
+    invocation["attempt"] = attempt
+    invocation["invocation_id"] = payload["invocation_id"]
+    invocation["idempotency_key"] = str(attempt + 1) * 64
+    lease = invocation["lease"]
+    assert isinstance(lease, dict)
+    lease["attempt"] = attempt
+    return TeamExecutionEvidenceV1.model_validate(payload)
 
 
 class RecordingJudge:
@@ -381,6 +413,133 @@ def test_missing_benchmark_receipt_is_infrastructure_failure() -> None:
 
     assert evaluation.failure_class == "infrastructure_failure"
     assert evaluation.recommendation.value == "BLOCKED_INFRASTRUCTURE"
+
+
+@pytest.mark.parametrize(
+    ("termination_reason", "failure_class", "recommendation"),
+    (
+        ("credential_required", "credential_required", "BLOCKED_CREDENTIAL_REQUIRED"),
+        ("preflight_failed", "test_regression", "RETRY_BUILD"),
+    ),
+)
+def test_execution_failure_precedence_survives_missing_benchmark_receipt(
+    termination_reason: str,
+    failure_class: str,
+    recommendation: str,
+) -> None:
+    evaluation = TeamEvaluationService(clock=lambda: NOW).evaluate(
+        _invocation(),
+        _candidate(),
+        _execution(failed=True, termination_reason=termination_reason),
+        benchmark_summary=_benchmark(failure="missing_receipt"),
+        budget_projection=_budget(),
+    )
+
+    assert evaluation.failure_class == failure_class
+    assert evaluation.recommendation.value == recommendation
+
+
+def test_prior_green_guards_require_the_immediately_preceding_attempt() -> None:
+    first_invocation = _invocation_for_attempt(1)
+    first_candidate = ArtifactRef.model_validate(artifact("candidate-one", "1" * 64))
+    first_summary = _benchmark(
+        invocation=first_invocation,
+        candidate=first_candidate,
+    )
+    first = TeamEvaluationService(clock=lambda: NOW).evaluate(
+        first_invocation,
+        first_candidate,
+        _execution_for_attempt(1, first_candidate),
+        benchmark_summary=first_summary,
+        budget_projection=_budget(),
+    )
+    third_invocation = _invocation_for_attempt(3)
+    third_candidate = ArtifactRef.model_validate(artifact("candidate-three", "3" * 64))
+
+    with pytest.raises(ValueError, match="immediately preceding"):
+        TeamEvaluationService(clock=lambda: NOW).evaluate(
+            third_invocation,
+            third_candidate,
+            _execution_for_attempt(3, third_candidate),
+            benchmark_summary=_benchmark(
+                invocation=third_invocation,
+                candidate=third_candidate,
+            ),
+            budget_projection=_budget(),
+            prior_evaluation=first,
+            prior_benchmark_summary=first_summary,
+        )
+
+
+def test_prior_green_guards_require_authoritative_prior_summary_binding() -> None:
+    first_invocation = _invocation_for_attempt(1)
+    first_candidate = ArtifactRef.model_validate(artifact("candidate-one", "1" * 64))
+    first_summary = _benchmark(
+        invocation=first_invocation,
+        candidate=first_candidate,
+    )
+    first = TeamEvaluationService(clock=lambda: NOW).evaluate(
+        first_invocation,
+        first_candidate,
+        _execution_for_attempt(1, first_candidate),
+        benchmark_summary=first_summary,
+        budget_projection=_budget(),
+    )
+    second_invocation = _invocation_for_attempt(2)
+    second_candidate = ArtifactRef.model_validate(artifact("candidate-two", "2" * 64))
+    forged_prior = first.model_copy(update={"benchmark_policy_id": "forged-policy"})
+
+    with pytest.raises(ValueError, match="prior business benchmark"):
+        TeamEvaluationService(clock=lambda: NOW).evaluate(
+            second_invocation,
+            second_candidate,
+            _execution_for_attempt(2, second_candidate),
+            benchmark_summary=_benchmark(
+                invocation=second_invocation,
+                candidate=second_candidate,
+            ),
+            budget_projection=_budget(),
+            prior_evaluation=forged_prior,
+            prior_benchmark_summary=first_summary,
+        )
+
+
+def test_prior_green_guards_accept_authoritative_previous_different_candidate() -> None:
+    first_invocation = _invocation_for_attempt(1)
+    first_candidate = ArtifactRef.model_validate(artifact("candidate-one", "1" * 64))
+    first_summary = _benchmark(
+        invocation=first_invocation,
+        candidate=first_candidate,
+    )
+    first = TeamEvaluationService(clock=lambda: NOW).evaluate(
+        first_invocation,
+        first_candidate,
+        _execution_for_attempt(1, first_candidate),
+        benchmark_summary=first_summary,
+        budget_projection=_budget(),
+    )
+    second_invocation = _invocation_for_attempt(2)
+    second_candidate = ArtifactRef.model_validate(artifact("candidate-two", "2" * 64))
+    second_summary = _benchmark(
+        invocation=second_invocation,
+        candidate=second_candidate,
+    )
+
+    second = TeamEvaluationService(clock=lambda: NOW).evaluate(
+        second_invocation,
+        second_candidate,
+        _execution_for_attempt(2, second_candidate),
+        benchmark_summary=second_summary,
+        budget_projection=_budget(),
+        prior_evaluation=first,
+        prior_benchmark_summary=first_summary,
+    )
+
+    assert second.prior_green_regression_ids == first.prior_green_regression_ids
+    assert (
+        second.prior_green_benchmark_metric_ids
+        == first.prior_green_benchmark_metric_ids
+    )
 
 
 @pytest.mark.parametrize("missing_evidence", ["usage_receipt", "tool_evidence"])

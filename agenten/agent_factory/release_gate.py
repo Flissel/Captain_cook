@@ -9,6 +9,10 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from agenten.agent_factory.business_benchmark_contracts import (
+    BenchmarkDisposition,
+    BusinessBenchmarkSummaryV1,
+)
 from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryJob
 from agenten.agent_factory.execution_budget import (
     FactoryBudgetProjection,
@@ -131,12 +135,18 @@ def evaluate_factory_workflow_release(
     evidence: tuple[TeamExecutionEvidenceV1, ...],
     evaluation: TeamEvaluationV1,
     *,
+    benchmark_summary: BusinessBenchmarkSummaryV1 | None,
     budget_projection: FactoryBudgetProjection | None = None,
     usage_receipts: tuple[FactoryUsageReceiptV1, ...] = (),
 ) -> FactoryReleaseDecision:
     """Validate V3 live workflow evidence without granting promotion authority."""
 
-    blocked = _workflow_evaluation_block_reason(job, evidence, evaluation)
+    blocked = _workflow_evaluation_block_reason(
+        job,
+        evidence,
+        evaluation,
+        benchmark_summary=benchmark_summary,
+    )
     if blocked is not None:
         return _workflow_blocked(job, evaluation, blocked)
     if budget_projection is None:
@@ -478,6 +488,8 @@ def _workflow_evaluation_block_reason(
     job: AgentFactoryJobV3,
     evidence: tuple[TeamExecutionEvidenceV1, ...],
     evaluation: TeamEvaluationV1,
+    *,
+    benchmark_summary: BusinessBenchmarkSummaryV1 | None,
 ) -> str | None:
     if not job.execution_policy.live_execution:
         return "workflow release requires Captain-authorized live execution"
@@ -495,7 +507,12 @@ def _workflow_evaluation_block_reason(
         return "workflow evaluation identity does not match the Factory job"
     if not evidence:
         return "missing live workflow execution evidence"
-    benchmark_reason = _workflow_business_benchmark_block_reason(evaluation)
+    benchmark_reason = _workflow_business_benchmark_block_reason(
+        job,
+        evidence,
+        evaluation,
+        benchmark_summary=benchmark_summary,
+    )
     if benchmark_reason is not None:
         return benchmark_reason
     evaluation_ids = tuple(
@@ -517,6 +534,8 @@ def factory_workflow_release_decision_block_reason(
     job: AgentFactoryJobV3,
     evaluation: TeamEvaluationV1 | None,
     decision: FactoryReleaseDecision | None,
+    *,
+    benchmark_summary: BusinessBenchmarkSummaryV1 | None,
 ) -> str | None:
     """Require a Captain V3 decision bound only to workflow evaluation evidence."""
 
@@ -530,7 +549,12 @@ def factory_workflow_release_decision_block_reason(
         return "Factory workflow release decision does not match the factory job"
     if evaluation is None:
         return "missing accepted workflow evaluation evidence"
-    benchmark_reason = _workflow_business_benchmark_block_reason(evaluation)
+    benchmark_reason = _workflow_business_benchmark_block_reason(
+        job,
+        None,
+        evaluation,
+        benchmark_summary=benchmark_summary,
+    )
     if benchmark_reason is not None:
         return benchmark_reason
     if (
@@ -544,14 +568,52 @@ def factory_workflow_release_decision_block_reason(
 
 
 def _workflow_business_benchmark_block_reason(
+    job: AgentFactoryJobV3,
+    evidence: tuple[TeamExecutionEvidenceV1, ...] | None,
     evaluation: TeamEvaluationV1,
+    *,
+    benchmark_summary: BusinessBenchmarkSummaryV1 | None,
 ) -> str | None:
+    if benchmark_summary is None:
+        return "missing authoritative business benchmark summary"
+    if not isinstance(benchmark_summary, BusinessBenchmarkSummaryV1):
+        return "workflow business benchmark summary is not authoritative"
+    try:
+        summary = BusinessBenchmarkSummaryV1.model_validate(
+            benchmark_summary.model_dump(mode="json", by_alias=True)
+        )
+    except ValueError:
+        return "workflow business benchmark summary is not canonical"
+    if summary.artifact_ref.sha256 != summary.canonical_payload_sha256():
+        return "workflow business benchmark summary is not canonical"
+    candidate_refs = (
+        None if evidence is None else {item.candidate_ref for item in evidence}
+    )
     if (
-        evaluation.benchmark_summary_ref is None
-        or evaluation.benchmark_summary_ref not in evaluation.evidence_refs
-        or evaluation.benchmark_policy_id is None
-        or evaluation.benchmark_disposition != "passed"
-        or evaluation.failed_benchmark_metric_ids
+        summary.job_id != job.job_id
+        or summary.job_id != evaluation.job_id
+        or summary.correlation_id != job.correlation_id
+        or summary.correlation_id != evaluation.correlation_id
+        or summary.subject_version != job.subject_version
+        or summary.subject_version != evaluation.subject_version
+        or summary.attempt != evaluation.attempt
+        or (candidate_refs is not None and summary.candidate_ref not in candidate_refs)
+        or summary.candidate_ref not in evaluation.evidence_refs
+    ):
+        return "workflow business benchmark binding does not match release evidence"
+    if (
+        evaluation.benchmark_summary_ref != summary.artifact_ref
+        or summary.artifact_ref not in evaluation.evidence_refs
+        or evaluation.benchmark_policy_id != summary.policy.policy_id
+        or evaluation.benchmark_disposition != summary.disposition.value
+        or evaluation.benchmark_reason_codes != summary.reason_codes
+        or evaluation.failed_benchmark_metric_ids != summary.failed_metric_ids
+    ):
+        return "workflow evaluation does not match authoritative business benchmark"
+    if (
+        summary.disposition is not BenchmarkDisposition.PASSED
+        or summary.reason_codes
+        or summary.failed_metric_ids
     ):
         return "workflow business benchmark did not pass"
     return None

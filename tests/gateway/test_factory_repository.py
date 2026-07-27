@@ -266,7 +266,7 @@ def test_gateway_repository_seeds_all_six_exact_job_skill_assignments() -> None:
         repository.released_for(changed_envelope, FactorySkillStep.DISCOVER)
 
 
-def test_gateway_recomputes_v3_release_from_persisted_workflow_evidence() -> None:
+def test_gateway_release_fails_closed_until_task6_resolves_benchmark_summary() -> None:
     runs = tuple(workflow_run(number) for number in range(1, 4))
     evaluation = workflow_evaluation(runs)
     store = GatewayStore.__new__(GatewayStore)
@@ -289,7 +289,10 @@ def test_gateway_recomputes_v3_release_from_persisted_workflow_evidence() -> Non
     )
 
     assert decision is not None
-    assert decision.status == "ready"
+    assert decision.status == "blocked"
+    assert decision.reasons == (
+        "missing authoritative business benchmark summary",
+    )
     assert decision.evaluation_ref == evaluation.artifact_ref
 
 

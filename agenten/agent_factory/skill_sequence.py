@@ -38,13 +38,23 @@ class FactoryImprovementAuthorizationV1(BaseModel):
     prior_green_assertion_ids: tuple[str, ...]
     prior_green_benchmark_metric_ids: tuple[BusinessBenchmarkMetricId, ...] = ()
 
-    @field_validator(
-        "prior_green_assertion_ids", "prior_green_benchmark_metric_ids"
-    )
+    @field_validator("prior_green_assertion_ids")
     @classmethod
     def require_unique_prior_green_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if len(value) != len(set(value)):
             raise ValueError("prior-green assertion IDs must not contain duplicates")
+        return value
+
+    @field_validator("prior_green_benchmark_metric_ids")
+    @classmethod
+    def require_unique_prior_green_benchmark_metric_ids(
+        cls,
+        value: tuple[BusinessBenchmarkMetricId, ...],
+    ) -> tuple[BusinessBenchmarkMetricId, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError(
+                "prior-green benchmark metric IDs must not contain duplicates"
+            )
         return value
 
     @model_validator(mode="after")

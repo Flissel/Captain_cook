@@ -482,7 +482,7 @@ def test_v3_quality_feedback_routes_only_through_existing_captain_actions() -> N
         workflow_evaluation=evaluation,
         feedback=feedback,
         workflow_release_decision=ready,
-    ).kind is FactoryActionKind.VALIDATE_FOR_PROMOTION
+    ).kind is FactoryActionKind.APPEND_ESCALATED
 
     demo_ready = ready.model_copy(
         update={
@@ -538,16 +538,17 @@ def test_v3_promotion_uses_only_the_workflow_release_decision() -> None:
         evaluation_id=evaluation.invocation_id,
         evaluation_ref=evaluation.artifact_ref,
     )
-    promoted = apply_block(
-        state,
-        promotion,
-        workflow_evaluation=evaluation,
-        feedback=feedback,
-        release_decision=ready,
-    )
-
-    assert promoted.status is FactoryLifecycleStatus.READY_TO_USE
-    assert promoted.workflow_evaluation_ref == evaluation.artifact_ref
+    with pytest.raises(
+        FactoryLifecycleError,
+        match="authoritative business benchmark summary",
+    ):
+        apply_block(
+            state,
+            promotion,
+            workflow_evaluation=evaluation,
+            feedback=feedback,
+            release_decision=ready,
+        )
 
 
 def test_v3_failed_feedback_requests_improvement_and_missing_feedback_fails_closed() -> None:

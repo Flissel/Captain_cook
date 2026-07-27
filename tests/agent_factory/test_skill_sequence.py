@@ -212,3 +212,10 @@ def test_improvement_authorization_accepts_benchmark_only_failure() -> None:
         "tool_safety",
     )
     assert authorization.prior_green_benchmark_metric_ids == ("coverage",)
+
+
+def test_prior_green_benchmark_duplicate_has_metric_specific_diagnostic() -> None:
+    with pytest.raises(ValueError, match="benchmark metric IDs"):
+        FactoryImprovementAuthorizationV1.require_unique_prior_green_benchmark_metric_ids(
+            ("coverage", "coverage")
+        )

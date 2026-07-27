@@ -249,6 +249,8 @@ class CodexBuildBriefV1(_WorkflowArtifactBase):
     authorized_path_roots: tuple[str, ...] = Field(min_length=1)
     required_test_command_ids: tuple[str, ...] = Field(min_length=1)
     forbidden_effect_ids: tuple[str, ...] = ()
+    failed_benchmark_metric_ids: tuple[BusinessBenchmarkMetricId, ...] = ()
+    regression_benchmark_metric_ids: tuple[BusinessBenchmarkMetricId, ...] = ()
 
     _required_step: ClassVar[FactorySkillStep] = FactorySkillStep.BRIEF_CODEX
 
@@ -272,6 +274,19 @@ class CodexBuildBriefV1(_WorkflowArtifactBase):
         if any(re.fullmatch(IDENTIFIER_PATTERN, item) is None for item in value):
             raise ValueError("brief identifiers must be valid IDs")
         return _require_unique_ids(value, "brief IDs")
+
+    @field_validator(
+        "failed_benchmark_metric_ids",
+        "regression_benchmark_metric_ids",
+    )
+    @classmethod
+    def require_unique_benchmark_metric_ids(
+        cls,
+        value: tuple[BusinessBenchmarkMetricId, ...],
+    ) -> tuple[BusinessBenchmarkMetricId, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("brief benchmark metric IDs must not contain duplicates")
+        return value
 
     @model_validator(mode="after")
     def require_assignment_bindings(self) -> "CodexBuildBriefV1":
@@ -299,6 +314,12 @@ class CodexBuildBriefV1(_WorkflowArtifactBase):
             raise ValueError("build assignment idempotency key does not match invocation")
         if assignment.workspace_ref != self.invocation.lease.workspace_ref:
             raise ValueError("build assignment workspace does not match invocation lease")
+        if set(self.failed_benchmark_metric_ids) & set(
+            self.regression_benchmark_metric_ids
+        ):
+            raise ValueError(
+                "failed and regression benchmark metric IDs must be disjoint"
+            )
         return self
 
 
