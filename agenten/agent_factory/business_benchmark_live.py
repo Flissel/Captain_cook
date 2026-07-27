@@ -33,6 +33,7 @@ from agenten.agent_factory.business_benchmark_replay import (
     BusinessBenchmarkRuntimePreparationV1,
 )
 from agenten.agent_factory.execution_budget import FactoryUsageReceiptV1
+from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.team_execution import (
     FactoryHandoffEvidenceV1,
     FactoryN8nExecutionEvidenceV1,
@@ -639,6 +640,54 @@ class BusinessBenchmarkFinalizedReceiptV1(_FrozenModel):
         return self
 
 
+class BusinessBenchmarkExpectedCaseV1(_FrozenModel):
+    """Canonical private-case identity without the private case body."""
+
+    case_id: str = Field(min_length=1)
+    case_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class BusinessBenchmarkExpectedSuiteV1(_FrozenModel):
+    """Authoritative suite identity supplied by production composition."""
+
+    profile: Literal["claims", "renewal"]
+    suite_id: str = Field(min_length=1)
+    suite_version: int = Field(ge=1, strict=True)
+    suite_ref: PrivateHoldoutRef
+    cases: tuple[BusinessBenchmarkExpectedCaseV1, ...] = Field(
+        min_length=15, max_length=15
+    )
+
+    @model_validator(mode="after")
+    def require_unique_case_identities(self) -> "BusinessBenchmarkExpectedSuiteV1":
+        identities = tuple((item.case_id, item.case_sha256) for item in self.cases)
+        if len(set(identities)) != 15 or len({item.case_id for item in self.cases}) != 15:
+            raise ValueError("authoritative suite requires 15 unique case identities")
+        return self
+
+
+class BusinessBenchmarkExpectedScopeV1(_FrozenModel):
+    """Captain-authoritative job, candidate, and digest-only suite scope."""
+
+    job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    model_version: str = Field(min_length=1)
+    candidate_id: str = Field(min_length=1)
+    candidate_ref: ArtifactRef
+    suites: tuple[BusinessBenchmarkExpectedSuiteV1, ...] = Field(
+        min_length=1, max_length=2
+    )
+
+    @model_validator(mode="after")
+    def require_unique_profiles(self) -> "BusinessBenchmarkExpectedScopeV1":
+        profiles = tuple(item.profile for item in self.suites)
+        if len(profiles) != len(set(profiles)):
+            raise ValueError("authoritative scope contains duplicate suite profiles")
+        return self
+
+
 class BusinessBenchmarkLiveRunResultV1(_FrozenModel):
     """Final provider-live receipts plus Captain summary/evidence references."""
 
@@ -717,6 +766,7 @@ class ProductionBusinessBenchmarkCompositionPort(Protocol):
 
     runtime_bundle: ProductionBusinessBenchmarkRuntimeBundlePort
     fence_store: DurableProviderFencePort
+    expected_scope: BusinessBenchmarkExpectedScopeV1
 
     async def health_check(self, url: str) -> bool: ...
 
@@ -769,6 +819,17 @@ async def run_provider_business_benchmarks(
         for method in ("register_fence", "assert_current")
     ):
         raise ProductionAdapterUnavailableError("durable provider fence store is unavailable")
+    raw_expected_scope = getattr(composition, "expected_scope", None)
+    if raw_expected_scope is None:
+        raise ProductionAdapterUnavailableError(
+            "authoritative expected suite and candidate scope is unavailable"
+        )
+    expected_scope = BusinessBenchmarkExpectedScopeV1.model_validate(
+        raw_expected_scope.model_dump(mode="python")
+        if isinstance(raw_expected_scope, BaseModel)
+        else raw_expected_scope
+    )
+    _validate_expected_scope_settings(expected_scope, settings)
     await LiveBusinessBenchmarkPreflight(
         health_check=composition.health_check,
         runtime_bundle=composition.runtime_bundle,
@@ -779,13 +840,73 @@ async def run_provider_business_benchmarks(
     )
     if result.profile != settings.profile:
         raise ValueError("live result profile does not match selected settings")
-    if any(
-        item.receipt.job_id != settings.job_id
-        or item.receipt.model_version != settings.model
-        for item in result.receipts
-    ):
-        raise ValueError("live receipts do not match configured job and model")
+    _validate_result_against_expected_scope(result, expected_scope, settings)
     return result
+
+
+def _validate_expected_scope_settings(
+    scope: BusinessBenchmarkExpectedScopeV1,
+    settings: LiveBusinessBenchmarkSettings,
+) -> None:
+    selected_profiles = (
+        {"claims", "renewal"} if settings.profile == "all" else {settings.profile}
+    )
+    if (
+        scope.job_id != settings.job_id
+        or scope.model_version != settings.model
+        or scope.candidate_id != settings.candidate_id
+        or {suite.profile for suite in scope.suites} != selected_profiles
+        or any(suite.suite_version != settings.suite_version for suite in scope.suites)
+    ):
+        raise ValueError(
+            "authoritative benchmark scope does not match configured suite or candidate"
+        )
+
+
+def _validate_result_against_expected_scope(
+    result: BusinessBenchmarkLiveRunResultV1,
+    scope: BusinessBenchmarkExpectedScopeV1,
+    settings: LiveBusinessBenchmarkSettings,
+) -> None:
+    suites = {suite.profile: suite for suite in scope.suites}
+    observed: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    for item in result.receipts:
+        receipt = item.receipt
+        suite = suites[item.profile]
+        expected_candidate_ref = (
+            scope.candidate_ref if receipt.variant == "candidate" else None
+        )
+        if (
+            receipt.job_id != scope.job_id
+            or receipt.correlation_id != scope.correlation_id
+            or receipt.subject_version != scope.subject_version
+            or receipt.attempt != scope.attempt
+            or receipt.model_version != scope.model_version
+            or receipt.suite_id != suite.suite_id
+            or receipt.suite_ref != suite.suite_ref
+            or receipt.candidate_ref != expected_candidate_ref
+        ):
+            raise ValueError("live receipt does not match authoritative benchmark scope")
+        case_identity = (receipt.case_id, receipt.case_sha256)
+        if case_identity not in {
+            (expected.case_id, expected.case_sha256) for expected in suite.cases
+        }:
+            raise ValueError("live receipt does not match authoritative benchmark scope")
+        observed.setdefault((item.profile, receipt.variant), set()).add(case_identity)
+
+    for suite in scope.suites:
+        expected_cases = {
+            (expected.case_id, expected.case_sha256) for expected in suite.cases
+        }
+        for variant in ("candidate", "single_agent_baseline"):
+            if observed.get((suite.profile, variant), set()) != expected_cases:
+                raise ValueError("live receipt does not match authoritative benchmark scope")
+
+    maximum_micro_usd = settings.maximum_usd * Decimal(1_000_000)
+    if maximum_micro_usd != maximum_micro_usd.to_integral_value() or sum(
+        item.receipt.cost_micro_usd for item in result.receipts
+    ) > int(maximum_micro_usd):
+        raise ValueError("live receipt cost exceeds configured benchmark maximum")
 
 
 class LiveBusinessBenchmarkPreflight:

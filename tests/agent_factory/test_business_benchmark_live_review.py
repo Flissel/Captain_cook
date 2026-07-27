@@ -15,6 +15,9 @@ from agenten.agent_factory.business_benchmark_live import (
     BoundBenchmarkToolEvidenceV1,
     BoundBenchmarkUsageEvidenceV1,
     BusinessBenchmarkFinalizedReceiptV1,
+    BusinessBenchmarkExpectedCaseV1,
+    BusinessBenchmarkExpectedScopeV1,
+    BusinessBenchmarkExpectedSuiteV1,
     BusinessBenchmarkLiveAdapter,
     BusinessBenchmarkLiveRunResultV1,
     LiveBusinessBenchmarkSettings,
@@ -65,6 +68,36 @@ class RuntimePort:
 class FencePort:
     async def register_fence(self, prepared, claim): ...
     async def assert_current(self, prepared, claim, receipt): ...
+
+
+def expected_scope(profile: str = "claims") -> BusinessBenchmarkExpectedScopeV1:
+    selected_profiles = ("claims", "renewal") if profile == "all" else (profile,)
+    env = envelope()
+    return BusinessBenchmarkExpectedScopeV1(
+        job_id=env.job_id,
+        correlation_id=env.correlation_id,
+        subject_version=env.subject_version,
+        attempt=env.attempt,
+        model_version=env.model_version,
+        candidate_id="candidate-v3",
+        candidate_ref=env.candidate_ref,
+        suites=tuple(
+            BusinessBenchmarkExpectedSuiteV1(
+                profile=selected_profile,
+                suite_id=f"{selected_profile}-suite-v2",
+                suite_version=2,
+                suite_ref=env.suite_ref,
+                cases=tuple(
+                    BusinessBenchmarkExpectedCaseV1(
+                        case_id=f"{selected_profile}-case-{index:02d}",
+                        case_sha256=f"{index + 1:064x}",
+                    )
+                    for index in range(15)
+                ),
+            )
+            for selected_profile in selected_profiles
+        ),
+    )
 
 
 def evidence_binding(variant: str = "candidate") -> BenchmarkEvidenceBindingV1:
@@ -164,9 +197,12 @@ async def test_live_entrypoint_loads_composition_and_requires_finalized_receipts
 ) -> None:
     calls: list[str] = []
 
+    authoritative_scope = expected_scope(profile)
+
     class Composition:
         runtime_bundle = RuntimePort()
         fence_store = FencePort()
+        expected_scope = authoritative_scope
 
         async def health_check(self, url: str) -> bool:
             calls.append("health")
@@ -187,9 +223,12 @@ async def test_live_entrypoint_loads_composition_and_requires_finalized_receipts
 
 @pytest.mark.asyncio
 async def test_live_entrypoint_rejects_incomplete_receipt_scope() -> None:
+    authoritative_scope = expected_scope()
+
     class Composition:
         runtime_bundle = RuntimePort()
         fence_store = FencePort()
+        expected_scope = authoritative_scope
 
         async def health_check(self, url: str) -> bool:
             return True
@@ -209,9 +248,12 @@ async def test_live_entrypoint_rejects_incomplete_receipt_scope() -> None:
 
 @pytest.mark.asyncio
 async def test_all_profile_requires_claims_and_renewal_receipt_coverage() -> None:
+    authoritative_scope = expected_scope("all")
+
     class Composition:
         runtime_bundle = RuntimePort()
         fence_store = FencePort()
+        expected_scope = authoritative_scope
 
         async def health_check(self, url: str) -> bool:
             return True
@@ -234,9 +276,12 @@ async def test_all_profile_requires_claims_and_renewal_receipt_coverage() -> Non
 
 @pytest.mark.asyncio
 async def test_live_entrypoint_requires_durable_fence_wiring() -> None:
+    authoritative_scope = expected_scope()
+
     class Composition:
         runtime_bundle = RuntimePort()
         fence_store = object()
+        expected_scope = authoritative_scope
 
         async def health_check(self, url: str) -> bool:
             return True
@@ -250,6 +295,84 @@ async def test_live_entrypoint_requires_durable_fence_wiring() -> None:
             repository_root=Path.cwd(),
             composition_loader=lambda settings: Composition(),
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("suite_id", "self-labelled-suite"),
+        (
+            "suite_ref",
+            envelope().suite_ref.model_copy(update={"sha256": "e" * 64}),
+        ),
+        ("case_id", "self-labelled-case"),
+        ("case_sha256", "f" * 64),
+        ("candidate_ref", artifact("different-candidate")),
+        ("job_id", uuid5(NAMESPACE_URL, "different-job")),
+        ("correlation_id", uuid5(NAMESPACE_URL, "different-correlation")),
+        ("subject_version", 99),
+        ("attempt", 5),
+        ("model_version", "different-model"),
+    ],
+)
+async def test_live_receipts_must_match_authoritative_scope(
+    field: str, value: object
+) -> None:
+    authoritative_scope = expected_scope()
+
+    class Composition:
+        runtime_bundle = RuntimePort()
+        fence_store = FencePort()
+        expected_scope = authoritative_scope
+
+        async def health_check(self, url: str) -> bool:
+            return True
+
+        async def run(self, settings: LiveBusinessBenchmarkSettings):
+            complete = live_result(settings.profile)
+            first = complete.receipts[0]
+            changed_receipt = first.receipt.model_copy(update={field: value})
+            changed = first.model_copy(update={"receipt": changed_receipt})
+            return complete.model_copy(
+                update={"receipts": (changed, *complete.receipts[1:])}
+            )
+
+    with pytest.raises(ValueError, match="authoritative benchmark scope"):
+        await run_provider_business_benchmarks(
+            live_environment(),
+            repository_root=Path.cwd(),
+            composition_loader=lambda settings: Composition(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_authoritative_scope_must_match_configured_suite_and_candidate() -> None:
+    wrong_scope = expected_scope().model_copy(
+        update={"candidate_id": "different-candidate"}
+    )
+    calls: list[str] = []
+
+    class Composition:
+        runtime_bundle = RuntimePort()
+        fence_store = FencePort()
+        expected_scope = wrong_scope
+
+        async def health_check(self, url: str) -> bool:
+            calls.append("health")
+            return True
+
+        async def run(self, settings: LiveBusinessBenchmarkSettings):
+            calls.append("run")
+            return live_result(settings.profile)
+
+    with pytest.raises(ValueError, match="configured suite or candidate"):
+        await run_provider_business_benchmarks(
+            live_environment(),
+            repository_root=Path.cwd(),
+            composition_loader=lambda settings: Composition(),
+        )
+    assert calls == []
 
 
 @pytest.mark.asyncio
