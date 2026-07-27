@@ -10,6 +10,8 @@ from uuid import UUID
 import aiohttp
 from pydantic import BaseModel, ConfigDict
 
+from agenten.agent_factory.business_benchmark_contracts import BusinessBenchmarkSummaryV1
+
 from agenten.agent_runtime.contracts import (
     AgentRuntimeResult,
     RuntimeOperation,
@@ -31,8 +33,42 @@ class MinibookProjectionFeedPage(BaseModel):
 def factory_promotion_projection(
     block: dict[str, Any],
     job: dict[str, Any],
+    *,
+    benchmark_summary: BusinessBenchmarkSummaryV1 | None = None,
 ) -> MinibookProjectionEvent:
     """Build the strict public view of one committed Factory promotion."""
+
+    payload: dict[str, object] = {
+        "view": "validation",
+        "template_id": "factory_capability_ready_to_use",
+        "status_id": "ready_to_use",
+        "actor_role_id": "captain_gateway",
+    }
+    if benchmark_summary is not None:
+        if (
+            str(benchmark_summary.job_id) != str(block["job_id"])
+            or str(benchmark_summary.correlation_id) != str(job["correlation_id"])
+            or benchmark_summary.subject_version != block["subject_version"]
+            or benchmark_summary.attempt != block["attempt"]
+        ):
+            raise ValueError("benchmark summary does not match promoted capability")
+        if benchmark_summary.disposition.value != "passed":
+            raise ValueError("promoted capability requires a passed business benchmark")
+        payload.update(
+            {
+                "benchmark_disposition": benchmark_summary.disposition.value,
+                "benchmark_reason_codes": list(benchmark_summary.reason_codes),
+                "candidate_correctness_bps": benchmark_summary.candidate_correctness_bps,
+                "baseline_correctness_bps": benchmark_summary.baseline_correctness_bps,
+                "candidate_completion_bps": benchmark_summary.candidate_completion_bps,
+                "baseline_completion_bps": benchmark_summary.baseline_completion_bps,
+                "cost_ratio_bps": benchmark_summary.cost_ratio_bps,
+                "latency_ratio_bps": benchmark_summary.latency_ratio_bps,
+                "unsafe_tool_uses": benchmark_summary.unsafe_tool_uses,
+                "mandatory_handoff_misses": benchmark_summary.mandatory_handoff_misses,
+                "benchmark_summary_digest": f"sha256:{benchmark_summary.artifact_ref.sha256}",
+            }
+        )
 
     return MinibookProjectionEvent.model_validate(
         {
@@ -42,17 +78,26 @@ def factory_promotion_projection(
             "causation_id": job.get("event_id"),
             "occurred_at": block["occurred_at"],
             "producer": "captain-gateway",
-            "subject_id": f"subject:{block['job_id']}",
+            "subject_id": _factory_subject_reference(str(block["job_id"])),
             "subject_version": block["subject_version"],
             "event_type": "capability.promoted",
-            "payload": {
-                "view": "validation",
-                "template_id": "factory_capability_ready_to_use",
-                "status_id": "ready_to_use",
-                "actor_role_id": "captain_gateway",
-            },
+            "payload": payload,
         }
     )
+
+
+def _factory_subject_reference(job_id: str) -> str:
+    """Keep valid v4 job IDs stable and canonicalize all other UUIDs."""
+
+    parsed = UUID(job_id)
+    if parsed.version == 4:
+        return f"subject:{parsed}"
+    subject_digest = bytearray(
+        hashlib.sha256(f"captain-factory-subject:{parsed}".encode("utf-8")).digest()[:16]
+    )
+    subject_digest[6] = (subject_digest[6] & 0x0F) | 0x40
+    subject_digest[8] = (subject_digest[8] & 0x3F) | 0x80
+    return f"subject:{UUID(bytes=bytes(subject_digest))}"
 
 
 def runtime_result_projection(

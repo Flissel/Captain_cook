@@ -81,6 +81,14 @@ class GatewayFactoryRepository(FactoryRepository):
     def workflow_artifacts(self, job_id: UUID) -> tuple[FactoryWorkflowArtifact, ...]:
         return self._translate(lambda: self._store.factory_workflow_artifacts(job_id))
 
+    def record_workflow_artifact(self, artifact: FactoryWorkflowArtifact) -> bool:
+        """Persist one Captain-validated workflow artifact through the Gateway."""
+
+        receipt = self._translate(
+            lambda: self._store.record_factory_workflow_artifact(artifact)
+        )
+        return not receipt.replayed
+
     def workflow_budget_projection(
         self,
         job_id: UUID,

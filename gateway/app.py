@@ -30,6 +30,7 @@ from agenten.agent_factory.execution_budget import (
     FactoryBudgetWriteReceipt,
 )
 from agenten.agent_factory.business_benchmark_contracts import BusinessBenchmarkSummaryV1
+from agenten.agent_factory.skill_workflow_contracts import TeamEvaluationV1
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from gateway.auth import (
     GatewayRole,
@@ -182,6 +183,35 @@ def require_skill_event_writer(event: DeliveryEventEnvelope, actor: GatewayRole)
             status_code=status.HTTP_403_FORBIDDEN,
             detail="insufficient gateway role",
         )
+
+
+def _factory_promotion_benchmark_summary(
+    store: GatewayStore,
+    block: dict[str, Any],
+) -> BusinessBenchmarkSummaryV1:
+    """Resolve the exact persisted V3 summary; never derive public metrics."""
+
+    job_id = UUID(str(block["job_id"]))
+    attempt = int(block["attempt"])
+    evaluations = tuple(
+        artifact
+        for artifact in store.factory_workflow_artifacts(job_id)
+        if isinstance(artifact, TeamEvaluationV1) and artifact.attempt == attempt
+    )
+    if len(evaluations) != 1 or evaluations[0].benchmark_summary_ref is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="factory promotion has no unambiguous business benchmark evaluation",
+        )
+    summary = store.business_benchmark_summary_by_artifact(
+        evaluations[0].benchmark_summary_ref
+    )
+    if summary is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="factory promotion business benchmark summary is unavailable",
+        )
+    return summary
 
 
 def create_app(
@@ -507,11 +537,19 @@ def create_app(
         )
         projected_events = []
         for _, block_type, data, parent in records:
-            event = (
-                factory_promotion_projection(data, parent)
-                if block_type == "agent_factory_block" and parent is not None
-                else runtime_result_projection(data)
-            )
+            if block_type == "agent_factory_block" and parent is not None:
+                benchmark_summary = (
+                    _factory_promotion_benchmark_summary(get_store(), data)
+                    if parent.get("schema") == "captain.agent-factory-job.v3"
+                    else None
+                )
+                event = factory_promotion_projection(
+                    data,
+                    parent,
+                    benchmark_summary=benchmark_summary,
+                )
+            else:
+                event = runtime_result_projection(data)
             if event is not None:
                 projected_events.append(event)
         events = tuple(projected_events)

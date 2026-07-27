@@ -147,6 +147,7 @@ def apply_block(
                 workflow_evaluation=workflow_evaluation,
                 feedback=feedback,
                 benchmark_summary=benchmark_summary,
+                require_passed_benchmark=True,
             )
             decision_reason = factory_workflow_release_decision_block_reason(
                 projection.job,
@@ -192,6 +193,7 @@ def apply_block(
             workflow_evaluation=workflow_evaluation,
             feedback=feedback,
             benchmark_summary=benchmark_summary,
+            require_passed_benchmark=False,
         )
         assert workflow_evaluation is not None
         assert feedback is not None
@@ -261,6 +263,7 @@ def next_action(
                 workflow_evaluation=workflow_evaluation,
                 feedback=feedback,
                 benchmark_summary=benchmark_summary,
+                require_passed_benchmark=False,
             )
             assert feedback is not None
             if (
@@ -345,6 +348,7 @@ def _validate_workflow_feedback(
     workflow_evaluation: TeamEvaluationV1 | None,
     feedback: FactoryFeedbackV1 | None,
     benchmark_summary: BusinessBenchmarkSummaryV1 | None,
+    require_passed_benchmark: bool,
 ) -> None:
     if workflow_evaluation is None or feedback is None:
         raise FactoryLifecycleError("missing validated workflow feedback")
@@ -371,6 +375,7 @@ def _validate_workflow_feedback(
         workflow_evaluation,
         benchmark_summary,
         current_attempt=projection.attempt,
+        require_passed=require_passed_benchmark,
     )
     if benchmark_reason is not None:
         raise FactoryLifecycleError(benchmark_reason)

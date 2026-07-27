@@ -573,17 +573,21 @@ def factory_workflow_business_benchmark_block_reason(
     benchmark_summary: BusinessBenchmarkSummaryV1 | None,
     *,
     current_attempt: int,
+    require_passed: bool = True,
 ) -> str | None:
     """Validate the exact persisted summary used by a lifecycle transition."""
 
     if evaluation.attempt != current_attempt:
         return "workflow business benchmark attempt does not match current projection"
-    return _workflow_business_benchmark_block_reason(
+    reason = _workflow_business_benchmark_block_reason(
         job,
         None,
         evaluation,
         benchmark_summary=benchmark_summary,
     )
+    if not require_passed and reason == "workflow business benchmark did not pass":
+        return None
+    return reason
 
 
 def _workflow_business_benchmark_block_reason(

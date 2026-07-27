@@ -72,6 +72,9 @@ BatchReference = Annotated[
     ),
 ]
 ArtifactDigest = Annotated[str, StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$")]
+BenchmarkReasonCode = Annotated[
+    str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+]
 
 _EVENT_CATALOG: dict[
     ProjectionEventType,
@@ -111,6 +114,39 @@ class ProjectionPayloadV2(BaseModel):
     batch_version: int | None = Field(default=None, ge=1)
     actor_role_id: ActorRoleId | None = None
     artifact_digest: ArtifactDigest | None = None
+    benchmark_disposition: Literal["passed", "failed"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    benchmark_reason_codes: tuple[BenchmarkReasonCode, ...] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    candidate_correctness_bps: int | None = Field(
+        default=None, ge=0, le=10000, exclude_if=lambda value: value is None
+    )
+    baseline_correctness_bps: int | None = Field(
+        default=None, ge=0, le=10000, exclude_if=lambda value: value is None
+    )
+    candidate_completion_bps: int | None = Field(
+        default=None, ge=0, le=10000, exclude_if=lambda value: value is None
+    )
+    baseline_completion_bps: int | None = Field(
+        default=None, ge=0, le=10000, exclude_if=lambda value: value is None
+    )
+    cost_ratio_bps: int | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
+    latency_ratio_bps: int | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
+    unsafe_tool_uses: int | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
+    mandatory_handoff_misses: int | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
+    benchmark_summary_digest: ArtifactDigest | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class ProjectionEventV2(BaseModel):
@@ -140,7 +176,33 @@ class ProjectionEventV2(BaseModel):
         )
         if actual != expected:
             raise ValueError("projection template/status does not match event type")
+        _validate_benchmark_projection(self.event_type, self.payload)
         return self
+
+
+def _validate_benchmark_projection(
+    event_type: ProjectionEventType,
+    payload: ProjectionPayloadV2,
+) -> None:
+    aggregate_values = (
+        payload.benchmark_disposition,
+        payload.candidate_correctness_bps,
+        payload.baseline_correctness_bps,
+        payload.candidate_completion_bps,
+        payload.baseline_completion_bps,
+        payload.cost_ratio_bps,
+        payload.latency_ratio_bps,
+        payload.unsafe_tool_uses,
+        payload.mandatory_handoff_misses,
+        payload.benchmark_summary_digest,
+    )
+    present = tuple(value is not None for value in aggregate_values)
+    if any(present) and not all(present):
+        raise ValueError("benchmark projection aggregates must be complete")
+    if (any(present) or payload.benchmark_reason_codes) and event_type != "capability.promoted":
+        raise ValueError("benchmark aggregates are allowed only on capability promotion")
+    if payload.benchmark_disposition == "passed" and payload.benchmark_reason_codes:
+        raise ValueError("passed benchmark projection cannot include failure reasons")
 
 
 class ProjectionRetireRequest(BaseModel):
@@ -185,6 +247,23 @@ def render_projection_event(event: ProjectionEventV2) -> CanonicalProjectionPost
         fields.append(("Actor", _actor_label(payload.actor_role_id)))
     if payload.artifact_digest is not None:
         fields.append(("Artifact", payload.artifact_digest))
+    if payload.benchmark_disposition is not None:
+        fields.extend(
+            (
+                ("Benchmark", payload.benchmark_disposition),
+                ("Candidate correctness", str(payload.candidate_correctness_bps)),
+                ("Baseline correctness", str(payload.baseline_correctness_bps)),
+                ("Candidate completion", str(payload.candidate_completion_bps)),
+                ("Baseline completion", str(payload.baseline_completion_bps)),
+                ("Cost ratio", str(payload.cost_ratio_bps)),
+                ("Latency ratio", str(payload.latency_ratio_bps)),
+                ("Unsafe tool uses", str(payload.unsafe_tool_uses)),
+                ("Mandatory handoff misses", str(payload.mandatory_handoff_misses)),
+                ("Benchmark summary", str(payload.benchmark_summary_digest)),
+            )
+        )
+        if payload.benchmark_reason_codes:
+            fields.append(("Benchmark reasons", ", ".join(payload.benchmark_reason_codes)))
     content = "\n".join(f"- **{label}:** {value}" for label, value in fields)
     title = f"[{event.event_type}] {_template_title(payload.template_id)}"
     identity_tags = (
