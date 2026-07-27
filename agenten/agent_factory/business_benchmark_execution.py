@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from agenten.agent_factory.business_benchmark_contracts import (
     BusinessBenchmarkCaseV1,
     BusinessBenchmarkRunReceiptV1,
+    canonical_business_benchmark_model_bytes,
 )
 from agenten.agent_factory.business_benchmark_replay import (
     BenchmarkRecoveryUncertainError,
@@ -469,7 +470,7 @@ class PairedBusinessBenchmarkCoordinator:
 
 
 def _digest_model(model: BaseModel) -> str:
-    return _digest_value(model.model_dump(mode="json", by_alias=True))
+    return hashlib.sha256(canonical_business_benchmark_model_bytes(model)).hexdigest()
 
 
 def _digest_value(value: object) -> str:

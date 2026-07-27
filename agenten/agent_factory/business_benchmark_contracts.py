@@ -63,6 +63,19 @@ BUSINESS_BENCHMARK_METRIC_IDS: tuple[BusinessBenchmarkMetricId, ...] = (
     "cost_efficiency",
     "latency_efficiency",
 )
+
+
+def canonical_business_benchmark_model_bytes(model: BaseModel) -> bytes:
+    """Return one canonical UTF-8 representation for benchmark models."""
+
+    return json.dumps(
+        model.model_dump(mode="json", by_alias=True),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 _PROFILE_DECISIONS: dict[str, frozenset[str]] = {
     _CLAIMS_PROFILE: frozenset(
         {"request_information", "route_standard_review", "escalate_coverage"}

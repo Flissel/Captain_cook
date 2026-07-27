@@ -8,9 +8,13 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 import pytest
 from pydantic import ValidationError
 
+from agenten.agent_factory.business_benchmark import BusinessBenchmarkEvaluator
 from agenten.agent_factory.business_benchmark_contracts import (
     BusinessBenchmarkCaseV1,
+    BusinessBenchmarkPolicyV1,
     BusinessBenchmarkRunReceiptV1,
+    BusinessBenchmarkSuiteV1,
+    BusinessCaseCategory,
 )
 from agenten.agent_factory.business_benchmark_execution import (
     BenchmarkExecutionPolicyV1,
@@ -25,6 +29,9 @@ from agenten.agent_factory.business_benchmark_replay import (
     BusinessBenchmarkRecoveryObservationV1,
     BusinessBenchmarkRuntimePreparationV1,
     InMemoryBusinessBenchmarkReplayStore,
+)
+from agenten.agent_factory.business_benchmark_store import (
+    InMemoryBusinessBenchmarkRepository,
 )
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent
@@ -93,6 +100,7 @@ class RecordingExecutor:
         ) = None,
     ) -> None:
         self.envelopes: list[BusinessBenchmarkExecutionEnvelopeV1] = []
+        self.prepared_effects: list[BusinessBenchmarkPreparedEffectV1] = []
         self._receipt_transform = receipt_transform
 
     async def prepare(
@@ -152,6 +160,7 @@ class RecordingExecutor:
         prepared: BusinessBenchmarkPreparedEffectV1,
         claim: BusinessBenchmarkEffectClaimV1,
     ) -> BusinessBenchmarkFenceReceiptV1:
+        self.prepared_effects.append(prepared)
         return BusinessBenchmarkFenceReceiptV1(
             schema="captain.business-benchmark-fence-receipt.v1",
             effect_id=prepared.identity.effect_id,
@@ -440,3 +449,79 @@ async def test_changed_case_body_changes_request_identity() -> None:
         assert changed.case_sha256 != initial.case_sha256
         assert changed.request_id != initial.request_id
         assert changed.idempotency_key != initial.idempotency_key
+
+
+@pytest.mark.asyncio
+async def test_unicode_case_digest_is_identical_from_execution_through_summary() -> None:
+    unicode_case = benchmark_case().model_copy(
+        update={"redacted_input": {"test_organization_id": "München"}}
+    )
+    cases = tuple(
+        unicode_case.model_copy(
+            update={
+                "case_id": f"claims-{category.value}-{index + 1:02d}",
+                "category": category,
+                "human_handoff_required": (
+                    category is BusinessCaseCategory.MANDATORY_ESCALATION
+                ),
+                "severity": (
+                    "critical"
+                    if category is BusinessCaseCategory.MANDATORY_ESCALATION
+                    else "normal"
+                ),
+            }
+        )
+        for category in BusinessCaseCategory
+        for index in range(3)
+    )
+    benchmark_suite = BusinessBenchmarkSuiteV1(
+        schema="captain.business-benchmark-suite.v1",
+        suite_id="claims-suite-v1",
+        profile_id="insurance_claims_resolution_swarm",
+        suite_version=1,
+        cases=cases,
+        created_at=NOW,
+    )
+    unicode_case = benchmark_suite.cases[0]
+    repository = InMemoryBusinessBenchmarkRepository()
+    private_suite_ref = repository.add_suite(benchmark_suite)
+    executor = RecordingExecutor()
+    candidate, baseline = await coordinator(executor).run_case_pair(
+        case=unicode_case,
+        suite_ref=private_suite_ref,
+        candidate_ref=artifact("candidate-package"),
+        execution_policy=execution_policy(),
+    )
+    evaluator = BusinessBenchmarkEvaluator(
+        clock=lambda: NOW,
+        uuid_factory=lambda: UUID("00000000-0000-0000-0000-000000000303"),
+    )
+
+    case_receipt = evaluator.evaluate_case(unicode_case, candidate, baseline)
+    summary = evaluator.summarize(
+        benchmark_suite,
+        (case_receipt,),
+        BusinessBenchmarkPolicyV1(schema="captain.business-benchmark-policy.v1"),
+    )
+
+    assert candidate.case_sha256 == baseline.case_sha256 == case_receipt.case_ref.sha256
+    assert summary.suite_ref == private_suite_ref
+
+    changed_case = unicode_case.model_copy(
+        update={"redacted_input": {"test_organization_id": "Münster"}}
+    )
+    changed_executor = RecordingExecutor()
+    await coordinator(changed_executor).run_case_pair(
+        case=changed_case,
+        suite_ref=private_suite_ref,
+        candidate_ref=artifact("candidate-package"),
+        execution_policy=execution_policy(),
+    )
+    for initial, changed in zip(executor.envelopes, changed_executor.envelopes):
+        assert changed.case_sha256 != initial.case_sha256
+        assert changed.request_id != initial.request_id
+        assert changed.idempotency_key != initial.idempotency_key
+    for initial, changed in zip(
+        executor.prepared_effects, changed_executor.prepared_effects
+    ):
+        assert changed.identity.effect_id != initial.identity.effect_id

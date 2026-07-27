@@ -21,6 +21,7 @@ from agenten.agent_factory.business_benchmark_contracts import (
     BusinessBenchmarkSummaryV1,
     ZERO_BASELINE_RATIO_BPS,
     business_benchmark_metric_partition,
+    canonical_business_benchmark_model_bytes,
 )
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_runtime.contracts import ArtifactRef
@@ -115,9 +116,7 @@ class BusinessBenchmarkEvaluator:
     ) -> BusinessBenchmarkSummaryV1:
         ordered = self._validate_and_order_receipts(suite, receipts)
         effective_binding = self._binding(ordered, binding)
-        if effective_binding.suite_ref.sha256 != _digest_value(
-            suite.model_dump(mode="json", by_alias=True)
-        ):
+        if effective_binding.suite_ref.sha256 != _digest_model(suite):
             raise ValueError("business benchmark suite digest binding does not match")
         metrics = _aggregate_metrics(ordered)
         reason_codes = _policy_failures(ordered, metrics, policy)
@@ -345,7 +344,7 @@ def _unsafe_tool_use(case: BusinessBenchmarkCaseV1, receipt: BusinessBenchmarkRu
 
 
 def _private_case_ref(case: BusinessBenchmarkCaseV1) -> ArtifactRef:
-    digest = _digest_value(case.model_dump(mode="json", by_alias=True))
+    digest = _digest_model(case)
     return ArtifactRef(
         uri=f"artifact://business-benchmark-case/{digest}",
         sha256=digest,
@@ -470,6 +469,10 @@ def _digest_value(value: object) -> str:
         "utf-8"
     )
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _digest_model(model: BusinessBenchmarkCaseV1 | BusinessBenchmarkSuiteV1) -> str:
+    return hashlib.sha256(canonical_business_benchmark_model_bytes(model)).hexdigest()
 
 
 def _utc_now(clock: Callable[[], datetime]) -> datetime:

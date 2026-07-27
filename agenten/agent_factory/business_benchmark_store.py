@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import tempfile
@@ -19,6 +18,7 @@ from agenten.agent_factory.business_benchmark_contracts import (
     BusinessBenchmarkRunReceiptV1,
     BusinessBenchmarkSuiteV1,
     BusinessBenchmarkSummaryV1,
+    canonical_business_benchmark_model_bytes,
 )
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_runtime.contracts import ArtifactRef
@@ -294,12 +294,7 @@ _BenchmarkModel = BusinessBenchmarkRunReceiptV1 | BusinessBenchmarkReceiptV1 | B
 def _canonical_json(model: BaseModel) -> bytes:
     payload = model.model_dump(mode="json", by_alias=True)
     _reject_unsafe_evidence(payload, "record")
-    return json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    return canonical_business_benchmark_model_bytes(model)
 
 
 def _canonical_suite(
