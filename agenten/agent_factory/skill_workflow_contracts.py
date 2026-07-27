@@ -13,6 +13,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from agenten.agent_runtime.contracts import ArtifactRef, IDENTIFIER_PATTERN, SHA256_PATTERN
 
+from .business_benchmark_contracts import (
+    BusinessBenchmarkMetricId,
+    BusinessBenchmarkReasonCode,
+)
 from .contracts import FactoryLease, FactoryRole
 from .forge_contracts import FactoryBuildAssignmentV1
 from .holdout_contracts import PrivateHoldoutRef
@@ -352,6 +356,12 @@ class TeamEvaluationV1(_WorkflowArtifactBase):
     deterministic_check_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
     judge_ref: ArtifactRef | None = None
     prior_green_regression_ids: tuple[str, ...] = ()
+    benchmark_summary_ref: ArtifactRef | None = None
+    benchmark_policy_id: str | None = Field(default=None, pattern=IDENTIFIER_PATTERN)
+    benchmark_disposition: Literal["passed", "failed"] | None = None
+    benchmark_reason_codes: tuple[BusinessBenchmarkReasonCode, ...] = ()
+    failed_benchmark_metric_ids: tuple[BusinessBenchmarkMetricId, ...] = ()
+    prior_green_benchmark_metric_ids: tuple[BusinessBenchmarkMetricId, ...] = ()
     cost_summary_ref: ArtifactRef
     latency_summary_ref: ArtifactRef
     failure_class: Literal[
@@ -377,6 +387,26 @@ class TeamEvaluationV1(_WorkflowArtifactBase):
     def require_unique_regression_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return _require_unique_ids(value, "prior-green regression IDs")
 
+    @field_validator(
+        "benchmark_reason_codes",
+        "failed_benchmark_metric_ids",
+        "prior_green_benchmark_metric_ids",
+    )
+    @classmethod
+    def require_unique_benchmark_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _require_unique_ids(value, "business benchmark IDs")
+
+    @field_validator("benchmark_summary_ref")
+    @classmethod
+    def require_canonical_benchmark_summary_ref(
+        cls, value: ArtifactRef | None
+    ) -> ArtifactRef | None:
+        if value is not None and value.uri != (
+            f"artifact://business-benchmark-summary/{value.sha256}"
+        ):
+            raise ValueError("business benchmark summary ref must be canonical")
+        return value
+
     @model_validator(mode="after")
     def require_captain_assertion_outcomes(self) -> "TeamEvaluationV1":
         outcome_ids = tuple(item.assertion_id for item in self.assertion_outcomes)
@@ -386,6 +416,41 @@ class TeamEvaluationV1(_WorkflowArtifactBase):
             raise ValueError("evaluation must contain exactly the Captain assertion IDs")
         if set(self.prior_green_regression_ids) - accepted:
             raise ValueError("prior-green regression IDs must be Captain assertion IDs")
+        binding = (
+            self.benchmark_summary_ref,
+            self.benchmark_policy_id,
+            self.benchmark_disposition,
+        )
+        if any(item is not None for item in binding) and any(
+            item is None for item in binding
+        ):
+            raise ValueError("business benchmark binding must be complete")
+        if self.benchmark_summary_ref is None and (
+            self.benchmark_reason_codes
+            or self.failed_benchmark_metric_ids
+            or self.prior_green_benchmark_metric_ids
+        ):
+            raise ValueError("legacy evaluation cannot contain unbound benchmark results")
+        if (
+            self.benchmark_summary_ref is not None
+            and self.benchmark_summary_ref not in self.evidence_refs
+        ):
+            raise ValueError("business benchmark summary ref must be evaluation evidence")
+        if self.benchmark_disposition == "passed" and (
+            self.benchmark_reason_codes or self.failed_benchmark_metric_ids
+        ):
+            raise ValueError("passed business benchmark cannot contain failures")
+        if (
+            self.benchmark_disposition == "failed"
+            and not self.failed_benchmark_metric_ids
+        ):
+            raise ValueError("failed business benchmark requires failed metric IDs")
+        if set(self.failed_benchmark_metric_ids) & set(
+            self.prior_green_benchmark_metric_ids
+        ):
+            raise ValueError(
+                "failed and prior-green benchmark metric IDs must not overlap"
+            )
         return self
 
 
@@ -395,9 +460,11 @@ class CandidateRevisionV1(_WorkflowArtifactBase):
     )
     parent_candidate_ref: ArtifactRef
     candidate_ref: ArtifactRef
-    failed_assertion_ids: tuple[str, ...] = Field(min_length=1)
+    failed_assertion_ids: tuple[str, ...] = ()
+    failed_benchmark_metric_ids: tuple[BusinessBenchmarkMetricId, ...] = ()
     changed_components: tuple[CandidateChangedComponent, ...] = Field(min_length=1)
     regression_assertion_ids: tuple[str, ...] = ()
+    regression_benchmark_metric_ids: tuple[BusinessBenchmarkMetricId, ...] = ()
     codex_session_ref: ArtifactRef
 
     _required_step: ClassVar[FactorySkillStep] = FactorySkillStep.IMPROVE_TEAM
@@ -406,6 +473,15 @@ class CandidateRevisionV1(_WorkflowArtifactBase):
     @classmethod
     def require_unique_assertions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return _require_unique_ids(value, "revision assertion IDs")
+
+    @field_validator(
+        "failed_benchmark_metric_ids", "regression_benchmark_metric_ids"
+    )
+    @classmethod
+    def require_unique_benchmark_metrics(
+        cls, value: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        return _require_unique_ids(value, "revision benchmark metric IDs")
 
     @field_validator("changed_components")
     @classmethod
@@ -425,6 +501,14 @@ class CandidateRevisionV1(_WorkflowArtifactBase):
             raise ValueError("revision assertion IDs must be Captain assertion IDs")
         if set(self.failed_assertion_ids) & set(self.regression_assertion_ids):
             raise ValueError("failed and regression assertion IDs must not overlap")
+        if not self.failed_assertion_ids and not self.failed_benchmark_metric_ids:
+            raise ValueError(
+                "candidate revision requires a failed assertion or benchmark metric"
+            )
+        if set(self.failed_benchmark_metric_ids) & set(
+            self.regression_benchmark_metric_ids
+        ):
+            raise ValueError("failed and regression benchmark metric IDs must not overlap")
         return self
 
 

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from uuid import UUID
 
 import pytest
 
+from agenten.agent_factory.business_benchmark_contracts import BusinessBenchmarkSummaryV1
 from agenten.agent_factory.execution_budget import FactoryBudgetProjection
 from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillInvocationV1,
@@ -16,6 +18,10 @@ from tests.agent_factory.test_skill_workflow_contracts import (
     execution_outcome_payload,
     execution_payload,
     invocation_payload,
+)
+from tests.agent_factory.test_business_benchmark_contracts import (
+    case_metric_payload,
+    summary as business_summary,
 )
 
 
@@ -64,6 +70,40 @@ def _budget() -> FactoryBudgetProjection:
     )
 
 
+def _benchmark(
+    *,
+    failure: str | None = None,
+) -> BusinessBenchmarkSummaryV1:
+    overrides: dict[str, object] = {
+        "job_id": str(_invocation().job_id),
+        "correlation_id": str(_invocation().correlation_id),
+        "subject_version": _invocation().subject_version,
+        "attempt": _invocation().attempt,
+        "candidate_ref": _candidate().model_dump(mode="json"),
+    }
+    if failure == "unsafe_tool_intent":
+        overrides.update(
+            disposition="failed",
+            reason_codes=["unsafe_tool_intent"],
+            unsafe_tool_uses=1,
+            case_metrics=[
+                case_metric_payload(
+                    number,
+                    **({"candidate_unsafe_tool_use": True} if number == 1 else {}),
+                )
+                for number in range(1, 16)
+            ],
+        )
+    elif failure == "missing_receipt":
+        overrides.update(
+            disposition="failed",
+            reason_codes=["missing_receipt"],
+            case_metrics=[case_metric_payload(number) for number in range(1, 15)],
+            missing_receipt_count=1,
+        )
+    return business_summary(**overrides)
+
+
 class RecordingJudge:
     def __init__(self) -> None:
         self.calls: list[tuple[ArtifactRef, tuple[int, ...]]] = []
@@ -87,6 +127,7 @@ def test_deterministic_assertions_run_before_optional_model_judge() -> None:
         _invocation(),
         _candidate(),
         _execution(failed=True),
+        benchmark_summary=_benchmark(),
         budget_projection=_budget(),
     )
 
@@ -114,6 +155,7 @@ def test_evaluator_cannot_accept_unknown_or_missing_captain_assertions() -> None
             _invocation(),
             _candidate(),
             fabricated,
+            benchmark_summary=_benchmark(),
             budget_projection=_budget(),
         )
 
@@ -141,6 +183,7 @@ def test_evaluator_requires_exact_execution_and_candidate_bindings(binding: str)
             _invocation(),
             _candidate(),
             fabricated,
+            benchmark_summary=_benchmark(),
             budget_projection=_budget(),
         )
 
@@ -152,6 +195,7 @@ def test_optional_judge_runs_only_after_deterministic_evidence_passes() -> None:
         _invocation(),
         _candidate(),
         _execution(),
+        benchmark_summary=_benchmark(),
         budget_projection=_budget(),
     )
 
@@ -173,6 +217,7 @@ def test_exhausted_budget_wins_before_behavioral_retry() -> None:
         _invocation(),
         _candidate(),
         _execution(failed=True),
+        benchmark_summary=_benchmark(),
         budget_projection=exhausted,
     )
 
@@ -188,6 +233,7 @@ def test_multi_run_evaluation_keeps_an_early_failure_failed_and_repairable() -> 
             _execution(failed=True, run_number=1),
             _execution(run_number=2),
         ),
+        benchmark_summary=_benchmark(),
         budget_projection=_budget(),
     )
 
@@ -226,6 +272,7 @@ def test_typed_execution_reason_codes_reach_exact_block_classification(
         _invocation(),
         _candidate(),
         _execution(failed=True, termination_reason=termination_reason),
+        benchmark_summary=_benchmark(),
         budget_projection=_budget(),
     )
 
@@ -242,13 +289,139 @@ def test_multi_run_evaluation_is_canonical_regardless_of_input_order() -> None:
         _invocation(),
         _candidate(),
         (first, second),
+        benchmark_summary=_benchmark(),
         budget_projection=_budget(),
     )
     reverse = evaluator.evaluate(
         _invocation(),
         _candidate(),
         (second, first),
+        benchmark_summary=_benchmark(),
         budget_projection=_budget(),
     )
 
     assert reverse == forward
+
+
+def test_team_evaluation_requires_authoritative_business_summary() -> None:
+    with pytest.raises(ValueError, match="business benchmark"):
+        TeamEvaluationService(clock=lambda: NOW).evaluate(
+            _invocation(),
+            _candidate(),
+            _execution(),
+            benchmark_summary=None,  # type: ignore[arg-type]
+            budget_projection=_budget(),
+        )
+
+
+@pytest.mark.parametrize(
+    "binding",
+    ["job_id", "correlation_id", "subject_version", "attempt", "candidate_ref", "artifact_ref"],
+)
+def test_team_evaluation_requires_exact_business_summary_binding(binding: str) -> None:
+    summary = _benchmark()
+    updates: dict[str, object] = {
+        "job_id": UUID("00000000-0000-0000-0000-000000000999"),
+        "correlation_id": UUID("00000000-0000-0000-0000-000000000999"),
+        "subject_version": 2,
+        "attempt": 2,
+        "candidate_ref": ArtifactRef.model_validate(artifact("other", "8" * 64)),
+        "artifact_ref": ArtifactRef(
+            uri="artifact://business-benchmark-summary/" + "9" * 64,
+            sha256="9" * 64,
+            media_type="application/json",
+        ),
+    }
+    fabricated = summary.model_construct(**{**summary.__dict__, binding: updates[binding]})
+
+    with pytest.raises(ValueError, match="business benchmark"):
+        TeamEvaluationService(clock=lambda: NOW).evaluate(
+            _invocation(),
+            _candidate(),
+            _execution(),
+            benchmark_summary=fabricated,
+            budget_projection=_budget(),
+        )
+
+
+def test_business_summary_fields_are_copied_without_fabricating_assertions() -> None:
+    summary = _benchmark(failure="unsafe_tool_intent")
+
+    evaluation = TeamEvaluationService(clock=lambda: NOW).evaluate(
+        _invocation(),
+        _candidate(),
+        _execution(),
+        benchmark_summary=summary,
+        budget_projection=_budget(),
+    )
+
+    assert evaluation.benchmark_summary_ref == summary.artifact_ref
+    assert summary.artifact_ref in evaluation.evidence_refs
+    assert evaluation.benchmark_policy_id == summary.policy.policy_id
+    assert evaluation.benchmark_disposition == "failed"
+    assert evaluation.benchmark_reason_codes == ("unsafe_tool_intent",)
+    assert evaluation.failed_benchmark_metric_ids == ("tool_safety",)
+    assert evaluation.prior_green_benchmark_metric_ids == summary.passed_metric_ids
+    assert tuple(item.assertion_id for item in evaluation.assertion_outcomes) == (
+        "schema_valid",
+        "real_case_green",
+    )
+    assert evaluation.failure_class == "behavioral_failure"
+    assert evaluation.recommendation.value == "RETRY_BUILD"
+
+
+def test_missing_benchmark_receipt_is_infrastructure_failure() -> None:
+    evaluation = TeamEvaluationService(clock=lambda: NOW).evaluate(
+        _invocation(),
+        _candidate(),
+        _execution(),
+        benchmark_summary=_benchmark(failure="missing_receipt"),
+        budget_projection=_budget(),
+    )
+
+    assert evaluation.failure_class == "infrastructure_failure"
+    assert evaluation.recommendation.value == "BLOCKED_INFRASTRUCTURE"
+
+
+@pytest.mark.parametrize("missing_evidence", ["usage_receipt", "tool_evidence"])
+def test_missing_execution_evidence_is_infrastructure_failure(
+    missing_evidence: str,
+) -> None:
+    execution = _execution()
+    if missing_evidence == "usage_receipt":
+        execution = execution.model_copy(update={"usage_receipt_refs": ()})
+    else:
+        outcome = execution.execution_outcome.model_copy(
+            update={"tool_versions": ("tool-v1",)}
+        )
+        execution = execution.model_copy(
+            update={"execution_outcome": outcome, "tool_evidence_refs": ()}
+        )
+
+    evaluation = TeamEvaluationService(clock=lambda: NOW).evaluate(
+        _invocation(),
+        _candidate(),
+        execution,
+        benchmark_summary=_benchmark(),
+        budget_projection=_budget(),
+    )
+
+    assert evaluation.failure_class == "infrastructure_failure"
+    assert evaluation.recommendation.value == "BLOCKED_INFRASTRUCTURE"
+
+
+def test_exhausted_budget_wins_before_business_benchmark_retry() -> None:
+    exhausted = _budget().model_copy(
+        update={"consumed_usd": _budget().limit_usd, "remaining_usd": 0}
+    )
+
+    evaluation = TeamEvaluationService(clock=lambda: NOW).evaluate(
+        _invocation(),
+        _candidate(),
+        _execution(),
+        benchmark_summary=_benchmark(failure="unsafe_tool_intent"),
+        budget_projection=exhausted,
+    )
+
+    assert evaluation.failure_class == "budget_exhausted"
+    assert evaluation.recommendation.value == "BUDGET_EXHAUSTED"

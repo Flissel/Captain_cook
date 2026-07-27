@@ -8,6 +8,11 @@ from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from typing import Protocol
 
+from agenten.agent_factory.business_benchmark_contracts import (
+    BUSINESS_BENCHMARK_METRIC_IDS,
+    BenchmarkDisposition,
+    BusinessBenchmarkSummaryV1,
+)
 from agenten.agent_factory.execution_budget import FactoryBudgetProjection
 from agenten.agent_factory.outcome_contracts import AssertionOutcome
 from agenten.agent_factory.skill_workflow_contracts import (
@@ -50,6 +55,7 @@ class TeamEvaluationService:
         candidate_ref: ArtifactRef,
         execution: TeamExecutionEvidenceV1 | tuple[TeamExecutionEvidenceV1, ...],
         *,
+        benchmark_summary: BusinessBenchmarkSummaryV1,
         budget_projection: FactoryBudgetProjection | None = None,
         prior_evaluation: TeamEvaluationV1 | None = None,
     ) -> TeamEvaluationV1:
@@ -61,18 +67,24 @@ class TeamEvaluationService:
                 key=lambda item: item.run_number,
             )
         )
+        benchmark_summary = _validated_business_summary(benchmark_summary)
         now = self._validate_invocation(invocation)
         self._validate_bindings(
             invocation,
             candidate_ref,
             executions,
+            benchmark_summary=benchmark_summary,
             budget_projection=budget_projection,
             prior_evaluation=prior_evaluation,
         )
 
         deterministic_passed, failure_class = self._deterministic_result(executions)
+        failure_class = _combined_failure_class(
+            failure_class,
+            benchmark_summary,
+        )
         if (
-            not deterministic_passed
+            failure_class in {"behavioral_failure", "test_regression"}
             and budget_projection is not None
             and budget_projection.remaining_usd == 0
         ):
@@ -80,7 +92,11 @@ class TeamEvaluationService:
 
         recommendation = self._recommendation_for(failure_class)
         judge_ref: ArtifactRef | None = None
-        if deterministic_passed and self._judge is not None:
+        if (
+            deterministic_passed
+            and benchmark_summary.disposition is BenchmarkDisposition.PASSED
+            and self._judge is not None
+        ):
             judge_ref = self._judge.evaluate(
                 invocation=invocation,
                 candidate_ref=candidate_ref,
@@ -107,6 +123,18 @@ class TeamEvaluationService:
             assertion_id
             for assertion_id in invocation.acceptance_assertion_ids
             if assertion_id in prior_green
+        )
+        prior_green_benchmark = set(
+            ()
+            if prior_evaluation is None
+            else prior_evaluation.prior_green_benchmark_metric_ids
+        )
+        prior_green_benchmark.update(benchmark_summary.passed_metric_ids)
+        prior_green_benchmark.difference_update(benchmark_summary.failed_metric_ids)
+        regression_benchmark_metric_ids = tuple(
+            metric_id
+            for metric_id in BUSINESS_BENCHMARK_METRIC_IDS
+            if metric_id in prior_green_benchmark
         )
 
         holdout_refs = _unique_refs(
@@ -156,6 +184,7 @@ class TeamEvaluationService:
                 *deterministic_refs,
                 cost_summary_ref,
                 latency_summary_ref,
+                benchmark_summary.artifact_ref,
                 *((judge_ref,) if judge_ref is not None else ()),
             )
         )
@@ -171,6 +200,16 @@ class TeamEvaluationService:
                 "candidate_sha256": candidate_ref.sha256,
                 "assertion_ids": list(invocation.acceptance_assertion_ids),
                 "execution_sha256": [run.artifact_ref.sha256 for run in executions],
+                "benchmark_summary_sha256": benchmark_summary.artifact_ref.sha256,
+                "benchmark_policy_id": benchmark_summary.policy.policy_id,
+                "benchmark_disposition": benchmark_summary.disposition.value,
+                "benchmark_reason_codes": list(benchmark_summary.reason_codes),
+                "failed_benchmark_metric_ids": list(
+                    benchmark_summary.failed_metric_ids
+                ),
+                "prior_green_benchmark_metric_ids": list(
+                    regression_benchmark_metric_ids
+                ),
                 "recommendation": recommendation.value,
                 "failure_class": failure_class,
                 "evidence_sha256": [reference.sha256 for reference in evidence_refs],
@@ -194,6 +233,12 @@ class TeamEvaluationService:
             deterministic_check_refs=deterministic_refs,
             judge_ref=judge_ref,
             prior_green_regression_ids=regression_ids,
+            benchmark_summary_ref=benchmark_summary.artifact_ref,
+            benchmark_policy_id=benchmark_summary.policy.policy_id,
+            benchmark_disposition=benchmark_summary.disposition.value,
+            benchmark_reason_codes=benchmark_summary.reason_codes,
+            failed_benchmark_metric_ids=benchmark_summary.failed_metric_ids,
+            prior_green_benchmark_metric_ids=regression_benchmark_metric_ids,
             cost_summary_ref=cost_summary_ref,
             latency_summary_ref=latency_summary_ref,
             failure_class=failure_class,
@@ -216,11 +261,20 @@ class TeamEvaluationService:
         candidate_ref: ArtifactRef,
         executions: tuple[TeamExecutionEvidenceV1, ...],
         *,
+        benchmark_summary: BusinessBenchmarkSummaryV1,
         budget_projection: FactoryBudgetProjection | None,
         prior_evaluation: TeamEvaluationV1 | None,
     ) -> None:
         if not executions:
             raise ValueError("team evaluation requires immutable execution evidence")
+        if (
+            benchmark_summary.job_id != invocation.job_id
+            or benchmark_summary.correlation_id != invocation.correlation_id
+            or benchmark_summary.subject_version != invocation.subject_version
+            or benchmark_summary.attempt != invocation.attempt
+            or benchmark_summary.candidate_ref != candidate_ref
+        ):
+            raise ValueError("business benchmark binding does not match evaluation")
         if len({run.run_number for run in executions}) != len(executions):
             raise ValueError("team execution run-number binding is not unique")
         expected_assertions = invocation.acceptance_assertion_ids
@@ -283,7 +337,7 @@ class TeamEvaluationService:
             run.status == "succeeded" and not run.usage_receipt_refs
             for run in executions
         ):
-            return False, "unresolved"
+            return False, "infrastructure_failure"
         if any(
             outcome.integration_intent is IntegrationIntent.N8N
             and not run.workflow_evidence_refs
@@ -295,7 +349,7 @@ class TeamEvaluationService:
             run.execution_outcome.tool_versions and not run.tool_evidence_refs
             for run in executions
         ):
-            return False, "unresolved"
+            return False, "infrastructure_failure"
         failed = tuple(
             outcome
             for run in executions
@@ -325,6 +379,32 @@ class TeamEvaluationService:
             "budget_exhausted": FactoryFeedbackRecommendation.BUDGET_EXHAUSTED,
             "unresolved": FactoryFeedbackRecommendation.MANUAL_DECISION_REQUIRED,
         }[failure_class]
+
+
+def _validated_business_summary(
+    summary: BusinessBenchmarkSummaryV1,
+) -> BusinessBenchmarkSummaryV1:
+    if not isinstance(summary, BusinessBenchmarkSummaryV1):
+        raise ValueError("authoritative business benchmark summary is required")
+    try:
+        return BusinessBenchmarkSummaryV1.model_validate(
+            summary.model_dump(mode="json", by_alias=True)
+        )
+    except ValueError as exc:
+        raise ValueError("business benchmark summary is not canonical") from exc
+
+
+def _combined_failure_class(
+    execution_failure: str | None,
+    benchmark_summary: BusinessBenchmarkSummaryV1,
+) -> str | None:
+    if benchmark_summary.disposition is BenchmarkDisposition.PASSED:
+        return execution_failure
+    if "missing_receipt" in benchmark_summary.reason_codes:
+        return "infrastructure_failure"
+    if execution_failure is None:
+        return "behavioral_failure"
+    return execution_failure
 
 
 def _content_ref(kind: str, payload: object) -> ArtifactRef:

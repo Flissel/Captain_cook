@@ -18,6 +18,7 @@ from agenten.agent_factory.release_gate import (
     E2ERunEvidence,
     evaluate_factory_release,
     evaluate_factory_workflow_release,
+    factory_workflow_release_decision_block_reason,
 )
 from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillInvocationV1,
@@ -28,6 +29,9 @@ from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.skill_evaluation import ToolGapMarker
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
 from tests.agent_factory.test_skill_evaluation_contracts import gap_payload
+from tests.agent_factory.test_business_benchmark_contracts import (
+    summary as business_summary,
+)
 from tests.agent_factory.test_state_machine import accepted_evaluation, artifact, job
 from tests.agent_factory.test_skill_workflow_contracts import (
     CORRELATION_ID,
@@ -341,12 +345,20 @@ def workflow_evaluation(
     lease["attempt"] = runs[0].attempt
     invocation = FactorySkillInvocationV1.model_validate(payload)
     projection = budget or workflow_budget()
+    benchmark_summary = business_summary(
+        job_id=str(invocation.job_id),
+        correlation_id=str(invocation.correlation_id),
+        subject_version=invocation.subject_version,
+        attempt=invocation.attempt,
+        candidate_ref=runs[0].candidate_ref.model_dump(mode="json"),
+    )
     return TeamEvaluationService(
         clock=lambda: WORKFLOW_NOW + timedelta(minutes=2)
     ).evaluate(
         invocation,
         runs[0].candidate_ref,
         runs,
+        benchmark_summary=benchmark_summary,
         budget_projection=projection,
     )
 
@@ -526,6 +538,57 @@ def test_workflow_release_accepts_disjoint_exact_receipt_union() -> None:
     )
 
     assert decision.status == "ready"
+
+
+def test_workflow_release_rejects_legacy_evaluation_without_business_benchmark() -> None:
+    runs = tuple(workflow_run(number) for number in range(1, 4))
+    evaluation = workflow_evaluation(runs).model_copy(
+        update={
+            "benchmark_summary_ref": None,
+            "benchmark_policy_id": None,
+            "benchmark_disposition": None,
+            "benchmark_reason_codes": (),
+            "failed_benchmark_metric_ids": (),
+        }
+    )
+
+    decision = evaluate_factory_workflow_release(
+        workflow_job(mode="release"),
+        runs,
+        evaluation,
+        budget_projection=workflow_budget(),
+        usage_receipts=workflow_receipts(runs),
+    )
+
+    assert decision.status == "blocked"
+    assert decision.reasons == ("workflow business benchmark did not pass",)
+
+
+def test_ready_decision_cannot_bypass_missing_business_benchmark() -> None:
+    runs = tuple(workflow_run(number) for number in range(1, 4))
+    evaluation = workflow_evaluation(runs)
+    decision = evaluate_factory_workflow_release(
+        workflow_job(mode="release"),
+        runs,
+        evaluation,
+        budget_projection=workflow_budget(),
+        usage_receipts=workflow_receipts(runs),
+    )
+    legacy = evaluation.model_copy(
+        update={
+            "benchmark_summary_ref": None,
+            "benchmark_policy_id": None,
+            "benchmark_disposition": None,
+            "benchmark_reason_codes": (),
+            "failed_benchmark_metric_ids": (),
+        }
+    )
+
+    reason = factory_workflow_release_decision_block_reason(
+        workflow_job(mode="release"), legacy, decision
+    )
+
+    assert reason == "workflow business benchmark did not pass"
 
 
 def test_workflow_release_scopes_exact_receipt_coverage_to_current_attempt() -> None:

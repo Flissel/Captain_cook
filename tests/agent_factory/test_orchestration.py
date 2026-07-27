@@ -207,6 +207,7 @@ def _retry_authorization(factory_job) -> FactoryImprovementAuthorizationV1:
         failed_evaluation=evaluation,
         prior_candidate_ref=prior_candidate,
         prior_green_assertion_ids=("schema_valid",),
+        prior_green_benchmark_metric_ids=("coverage",),
     )
 
 

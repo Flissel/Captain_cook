@@ -70,6 +70,9 @@ def retry_authorization() -> FactoryImprovementAuthorizationV1:
         failure_class="behavioral_failure",
         recommendation="RETRY_BUILD",
         prior_green_regression_ids=["schema_valid"],
+        benchmark_disposition="failed",
+        benchmark_reason_codes=["unsafe_tool_intent"],
+        failed_benchmark_metric_ids=["tool_safety"],
     )
     outcomes = evaluation_data["assertion_outcomes"]
     assert isinstance(outcomes, list)
@@ -109,6 +112,7 @@ def retry_authorization() -> FactoryImprovementAuthorizationV1:
         failed_evaluation=evaluation,
         prior_candidate_ref=prior_candidate,
         prior_green_assertion_ids=("schema_valid",),
+        prior_green_benchmark_metric_ids=("coverage",),
     )
 
 
@@ -246,4 +250,7 @@ def test_retry_brief_binds_failed_evaluation_candidate_and_prior_green() -> None
     assert authorization.prior_candidate_ref in brief.context_refs
     rendered = store.read(brief.prompt_ref)
     assert '"prior green assertions": [\n      "schema_valid"' in rendered
+    assert '"prior green benchmark metrics": [\n      "coverage"' in rendered
+    assert '"failed benchmark metric IDs": [\n      "tool_safety"' in rendered
+    assert '"benchmark reason codes": [\n      "unsafe_tool_intent"' in rendered
     assert authorization.prior_candidate_ref.uri in rendered

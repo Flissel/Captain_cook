@@ -6,6 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from agenten.agent_factory.business_benchmark_contracts import BusinessBenchmarkMetricId
 from agenten.agent_factory.contracts import (
     FactoryBlockStatus,
     FactoryEvidenceBlock,
@@ -35,8 +36,11 @@ class FactoryImprovementAuthorizationV1(BaseModel):
     failed_evaluation: TeamEvaluationV1
     prior_candidate_ref: ArtifactRef
     prior_green_assertion_ids: tuple[str, ...]
+    prior_green_benchmark_metric_ids: tuple[BusinessBenchmarkMetricId, ...] = ()
 
-    @field_validator("prior_green_assertion_ids")
+    @field_validator(
+        "prior_green_assertion_ids", "prior_green_benchmark_metric_ids"
+    )
     @classmethod
     def require_unique_prior_green_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if len(value) != len(set(value)):
@@ -68,11 +72,12 @@ class FactoryImprovementAuthorizationV1(BaseModel):
             for outcome in evaluation.assertion_outcomes
             if outcome.status == "failed"
         )
+        failed_benchmark_metric_ids = evaluation.failed_benchmark_metric_ids
         if (
-            not failed_ids
-            or evaluation.failure_class is None
-            or evaluation.recommendation
-            is FactoryFeedbackRecommendation.PROMOTE_CANDIDATE
+            (not failed_ids and not failed_benchmark_metric_ids)
+            or evaluation.failure_class
+            not in {"behavioral_failure", "test_regression"}
+            or evaluation.recommendation is not FactoryFeedbackRecommendation.RETRY_BUILD
         ):
             raise ValueError("improvement authorization requires a failed evaluation")
         if evaluation.artifact_ref not in request.evidence_refs:
@@ -81,6 +86,17 @@ class FactoryImprovementAuthorizationV1(BaseModel):
             raise ValueError("Captain request does not bind the prior candidate")
         if self.prior_green_assertion_ids != evaluation.prior_green_regression_ids:
             raise ValueError("prior-green assertions do not match the failed evaluation")
+        if (
+            self.prior_green_benchmark_metric_ids
+            != evaluation.prior_green_benchmark_metric_ids
+        ):
+            raise ValueError(
+                "prior-green benchmark metrics do not match the failed evaluation"
+            )
+        if set(failed_benchmark_metric_ids) & set(
+            self.prior_green_benchmark_metric_ids
+        ):
+            raise ValueError("failed benchmark metrics cannot be prior-green guards")
         return self
 
 

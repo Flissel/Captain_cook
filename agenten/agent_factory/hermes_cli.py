@@ -850,8 +850,12 @@ def _require_improvement_artifact_binding(
         if (
             artifact.parent_candidate_ref != authorization.prior_candidate_ref
             or artifact.failed_assertion_ids != failed_ids
+            or artifact.failed_benchmark_metric_ids
+            != authorization.failed_evaluation.failed_benchmark_metric_ids
             or artifact.regression_assertion_ids
             != authorization.prior_green_assertion_ids
+            or artifact.regression_benchmark_metric_ids
+            != authorization.prior_green_benchmark_metric_ids
         ):
             raise FactoryDispatchError(
                 "improve_team artifact does not bind the authorized failed candidate"

@@ -210,6 +210,27 @@ class CodexBriefBuilder:
                 if outcome.status == "failed"
             ]
         )
+        prior_green_benchmark_metric_ids = (
+            []
+            if improvement_authorization is None
+            else list(
+                improvement_authorization.prior_green_benchmark_metric_ids
+            )
+        )
+        failed_benchmark_metric_ids = (
+            []
+            if improvement_authorization is None
+            else list(
+                improvement_authorization.failed_evaluation.failed_benchmark_metric_ids
+            )
+        )
+        benchmark_reason_codes = (
+            []
+            if improvement_authorization is None
+            else list(
+                improvement_authorization.failed_evaluation.benchmark_reason_codes
+            )
+        )
         document = {
             "Goal": (
                 "Implement the dependency-ready node described by "
@@ -219,6 +240,9 @@ class CodexBriefBuilder:
                 "acceptance_assertion_ids": list(invocation.acceptance_assertion_ids),
                 "prior green assertions": prior_green_ids,
                 "failed assertion IDs": failed_assertion_ids,
+                "prior green benchmark metrics": prior_green_benchmark_metric_ids,
+                "failed benchmark metric IDs": failed_benchmark_metric_ids,
+                "benchmark reason codes": benchmark_reason_codes,
             },
             "selected reusable components": list(inventory.reusable_component_ids),
             "authorized workspace roots": [assignment.workspace_ref],

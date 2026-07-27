@@ -5,8 +5,10 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from agenten.agent_factory.improvement import ImprovementBuilder
+from agenten.agent_factory.skill_sequence import FactoryImprovementAuthorizationV1
 from agenten.agent_factory.skill_workflow_contracts import (
     CandidateChangedComponent,
+    FactoryFeedbackRecommendation,
     FactorySkillInvocationV1,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
@@ -57,6 +59,56 @@ def _builder() -> ImprovementBuilder:
         },
         clock=lambda: NOW,
     )
+
+
+def _benchmark_authorization(
+    *,
+    reason_code: str,
+    metric_id: str,
+) -> FactoryImprovementAuthorizationV1:
+    base = _improvement_authorization()
+    passed_outcomes = tuple(
+        outcome.model_copy(update={"status": "passed"})
+        for outcome in base.failed_evaluation.assertion_outcomes
+    )
+    evaluation = base.failed_evaluation.model_copy(
+        update={
+            "assertion_outcomes": passed_outcomes,
+            "benchmark_disposition": "failed",
+            "benchmark_reason_codes": (reason_code,),
+            "failed_benchmark_metric_ids": (metric_id,),
+            "prior_green_benchmark_metric_ids": ("coverage",),
+            "failure_class": "behavioral_failure",
+        }
+    )
+    return FactoryImprovementAuthorizationV1(
+        schema_name="captain.factory-improvement-authorization.v1",
+        authorization_ref=base.authorization_ref,
+        authorized_attempt=base.authorized_attempt,
+        request_block=base.request_block,
+        failed_evaluation=evaluation,
+        prior_candidate_ref=base.prior_candidate_ref,
+        prior_green_assertion_ids=evaluation.prior_green_regression_ids,
+        prior_green_benchmark_metric_ids=("coverage",),
+    )
+
+
+def _invocation_for(
+    authorization: FactoryImprovementAuthorizationV1,
+) -> FactorySkillInvocationV1:
+    payload = invocation_payload(
+        "improve_team",
+        attempt=2,
+        input_ref=authorization.authorization_ref.model_dump(mode="json"),
+        input_sha256=authorization.authorization_ref.sha256,
+        lease=lease_payload(
+            "tool_integrator",
+            "factory-tool-integrator",
+            attempt=2,
+            expires_at=NOW + timedelta(minutes=8),
+        ),
+    )
+    return FactorySkillInvocationV1.model_validate(payload)
 
 
 def test_improvement_targets_failed_components_and_preserves_green_assertions() -> None:
@@ -142,3 +194,120 @@ def test_improvement_never_uses_a_green_assertion_as_a_change_target() -> None:
     )
     assert authorization.authorization_ref in revision.evidence_refs
     assert authorization.failed_evaluation.artifact_ref in revision.evidence_refs
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "metric_id", "expected"),
+    [
+        (
+            "wrong_decision",
+            "decision_correctness",
+            (
+                CandidateChangedComponent.SYSTEM_PROMPT,
+                CandidateChangedComponent.CONTEXT,
+                CandidateChangedComponent.AUTOGEN_CONVERSATION_PATTERN,
+            ),
+        ),
+        (
+            "missing_rationale",
+            "rationale_completeness",
+            (
+                CandidateChangedComponent.SYSTEM_PROMPT,
+                CandidateChangedComponent.CONTEXT,
+                CandidateChangedComponent.AUTOGEN_CONVERSATION_PATTERN,
+            ),
+        ),
+        (
+            "unsafe_tool_intent",
+            "tool_safety",
+            (CandidateChangedComponent.TOOL_CONTRACT,),
+        ),
+        (
+            "mandatory_handoff_missed",
+            "mandatory_handoff",
+            (CandidateChangedComponent.HANDOFFS,),
+        ),
+        (
+            "below_baseline_completion",
+            "baseline_completion",
+            (
+                CandidateChangedComponent.TERMINATION,
+                CandidateChangedComponent.AUTOGEN_CONVERSATION_PATTERN,
+            ),
+        ),
+        (
+            "cost_ratio_exceeded",
+            "cost_efficiency",
+            (
+                CandidateChangedComponent.MODEL_CLIENT,
+                CandidateChangedComponent.AUTOGEN_CONVERSATION_PATTERN,
+            ),
+        ),
+        (
+            "latency_ratio_exceeded",
+            "latency_efficiency",
+            (
+                CandidateChangedComponent.MODEL_CLIENT,
+                CandidateChangedComponent.AUTOGEN_CONVERSATION_PATTERN,
+            ),
+        ),
+    ],
+)
+def test_benchmark_only_failure_targets_exact_candidate_components(
+    reason_code: str,
+    metric_id: str,
+    expected: tuple[CandidateChangedComponent, ...],
+) -> None:
+    authorization = _benchmark_authorization(
+        reason_code=reason_code,
+        metric_id=metric_id,
+    )
+    revision = ImprovementBuilder(
+        authorization=authorization,
+        candidate_ref=_new_candidate(),
+        codex_session_ref=_codex_session(),
+        clock=lambda: NOW,
+    ).build(
+        invocation=_invocation_for(authorization),
+        prior_candidate=authorization.prior_candidate_ref,
+        evaluation=authorization.failed_evaluation,
+    )
+
+    assert revision.failed_assertion_ids == ()
+    assert revision.failed_benchmark_metric_ids == (metric_id,)
+    assert revision.changed_components == expected
+    assert revision.regression_benchmark_metric_ids == ("coverage",)
+
+
+def test_infrastructure_only_benchmark_failure_creates_no_revision() -> None:
+    authorization = _benchmark_authorization(
+        reason_code="unsafe_tool_intent",
+        metric_id="tool_safety",
+    )
+    infrastructure_evaluation = authorization.failed_evaluation.model_copy(
+        update={
+            "benchmark_reason_codes": ("missing_receipt",),
+            "failed_benchmark_metric_ids": ("coverage",),
+            "prior_green_benchmark_metric_ids": (),
+            "failure_class": "infrastructure_failure",
+            "recommendation": FactoryFeedbackRecommendation.BLOCKED_INFRASTRUCTURE,
+        }
+    )
+    infrastructure_authorization = authorization.model_copy(
+        update={
+            "failed_evaluation": infrastructure_evaluation,
+            "prior_green_benchmark_metric_ids": (),
+        }
+    )
+
+    with pytest.raises(ValueError, match="not a retry decision"):
+        ImprovementBuilder(
+            authorization=infrastructure_authorization,
+            candidate_ref=_new_candidate(),
+            codex_session_ref=_codex_session(),
+            clock=lambda: NOW,
+        ).build(
+            invocation=_invocation_for(infrastructure_authorization),
+            prior_candidate=infrastructure_authorization.prior_candidate_ref,
+            evaluation=infrastructure_evaluation,
+        )

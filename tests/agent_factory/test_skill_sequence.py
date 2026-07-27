@@ -104,6 +104,7 @@ def test_improvement_authorization_binds_captain_failure_and_prior_candidate() -
         failed_evaluation=evaluation,
         prior_candidate_ref=prior_candidate,
         prior_green_assertion_ids=("real_case_green",),
+        prior_green_benchmark_metric_ids=("coverage",),
     )
 
     assert authorization.request_block.phase is FactoryPhase.IMPROVEMENT_REQUESTED
@@ -156,4 +157,58 @@ def test_improvement_authorization_rejects_unbound_prior_candidate() -> None:
                 media_type="application/zip",
             ),
             prior_green_assertion_ids=("real_case_green",),
+            prior_green_benchmark_metric_ids=("coverage",),
         )
+
+
+def test_improvement_authorization_accepts_benchmark_only_failure() -> None:
+    evaluation_data = evaluation_payload(
+        failure_class="behavioral_failure",
+        recommendation="RETRY_BUILD",
+        benchmark_disposition="failed",
+        benchmark_reason_codes=["unsafe_tool_intent"],
+        failed_benchmark_metric_ids=["tool_safety"],
+        prior_green_benchmark_metric_ids=["coverage"],
+    )
+    outcomes = evaluation_data["assertion_outcomes"]
+    assert isinstance(outcomes, list)
+    evaluation = TeamEvaluationV1.model_validate(evaluation_data)
+    prior_candidate = ArtifactRef(
+        uri="artifact://workflow/prior-candidate",
+        sha256="9" * 64,
+        media_type="application/zip",
+    )
+    request_data = block(FactoryPhase.IMPROVEMENT_REQUESTED).model_dump(
+        mode="json", by_alias=True
+    )
+    request_data.update(
+        {
+            "job_id": str(evaluation.job_id),
+            "correlation_id": str(evaluation.correlation_id),
+            "subject_version": evaluation.subject_version,
+            "attempt": evaluation.attempt,
+            "occurred_at": evaluation.occurred_at.isoformat(),
+            "artifact_refs": [prior_candidate.model_dump(mode="json")],
+            "evidence_refs": [evaluation.artifact_ref.model_dump(mode="json")],
+        }
+    )
+
+    authorization = FactoryImprovementAuthorizationV1(
+        schema_name="captain.factory-improvement-authorization.v1",
+        authorization_ref=ArtifactRef(
+            uri="artifact://factory/improvement-request",
+            sha256="8" * 64,
+            media_type="application/json",
+        ),
+        authorized_attempt=2,
+        request_block=FactoryEvidenceBlock.model_validate(request_data),
+        failed_evaluation=evaluation,
+        prior_candidate_ref=prior_candidate,
+        prior_green_assertion_ids=evaluation.prior_green_regression_ids,
+        prior_green_benchmark_metric_ids=("coverage",),
+    )
+
+    assert authorization.failed_evaluation.failed_benchmark_metric_ids == (
+        "tool_safety",
+    )
+    assert authorization.prior_green_benchmark_metric_ids == ("coverage",)

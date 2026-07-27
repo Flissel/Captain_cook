@@ -28,6 +28,7 @@ from agenten.agent_factory.hermes_cli import (
     FilesystemReleasedFactorySkillCatalog,
     HermesCliFactory,
     HermesCliSettings,
+    _require_improvement_artifact_binding,
     InMemoryFactorySkillReplayStore,
 )
 from agenten.agent_factory.leases import issue_factory_lease
@@ -40,6 +41,7 @@ from agenten.agent_factory.skill_evaluation import (
     ReleasedHermesSkill,
 )
 from agenten.agent_factory.skill_workflow_contracts import (
+    CandidateRevisionV1,
     FactorySkillInvocationV1,
     FactorySkillStep,
     TeamEvaluationV1,
@@ -351,7 +353,21 @@ def _improvement_authorization() -> FactoryImprovementAuthorizationV1:
         failed_evaluation=evaluation,
         prior_candidate_ref=prior_candidate,
         prior_green_assertion_ids=("schema_valid",),
+        prior_green_benchmark_metric_ids=("coverage",),
     )
+
+
+def test_improvement_artifact_binds_benchmark_regression_guards() -> None:
+    authorization = _improvement_authorization()
+    revision = CandidateRevisionV1.model_validate(revision_payload()).model_copy(
+        update={"regression_benchmark_metric_ids": ()}
+    )
+
+    with pytest.raises(FactoryDispatchError, match="authorized failed candidate"):
+        _require_improvement_artifact_binding(
+            revision,
+            authorization=authorization,
+        )
 
 
 @pytest.mark.asyncio

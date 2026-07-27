@@ -495,6 +495,9 @@ def _workflow_evaluation_block_reason(
         return "workflow evaluation identity does not match the Factory job"
     if not evidence:
         return "missing live workflow execution evidence"
+    benchmark_reason = _workflow_business_benchmark_block_reason(evaluation)
+    if benchmark_reason is not None:
+        return benchmark_reason
     evaluation_ids = tuple(
         item.assertion_id for item in evaluation.assertion_outcomes
     )
@@ -527,6 +530,9 @@ def factory_workflow_release_decision_block_reason(
         return "Factory workflow release decision does not match the factory job"
     if evaluation is None:
         return "missing accepted workflow evaluation evidence"
+    benchmark_reason = _workflow_business_benchmark_block_reason(evaluation)
+    if benchmark_reason is not None:
+        return benchmark_reason
     if (
         decision.evaluation_id != evaluation.invocation_id
         or decision.evaluation_ref != evaluation.artifact_ref
@@ -534,6 +540,20 @@ def factory_workflow_release_decision_block_reason(
         return "Factory workflow release decision does not match the workflow evaluation"
     if decision.tool_gaps:
         return "Factory workflow release decision contains unvalidated tool gaps"
+    return None
+
+
+def _workflow_business_benchmark_block_reason(
+    evaluation: TeamEvaluationV1,
+) -> str | None:
+    if (
+        evaluation.benchmark_summary_ref is None
+        or evaluation.benchmark_summary_ref not in evaluation.evidence_refs
+        or evaluation.benchmark_policy_id is None
+        or evaluation.benchmark_disposition != "passed"
+        or evaluation.failed_benchmark_metric_ids
+    ):
+        return "workflow business benchmark did not pass"
     return None
 
 

@@ -65,12 +65,30 @@ class ImprovementBuilder:
             for outcome in evaluation.assertion_outcomes
             if outcome.status == "failed"
         )
+        failed_benchmark_metric_ids = evaluation.failed_benchmark_metric_ids
         changed_components = _unique_components(
-            self._component_by_assertion.get(
-                assertion_id,
-                _component_for_assertion(assertion_id),
+            (
+                self._component_by_assertion.get(
+                    assertion_id,
+                    _component_for_assertion(assertion_id),
+                )
+                for assertion_id in failed_ids
             )
-            for assertion_id in failed_ids
+        )
+        changed_components = _unique_components(
+            (
+                *changed_components,
+                *(
+                    component
+                    for reason_code in evaluation.benchmark_reason_codes
+                    for component in _components_for_benchmark_reason(reason_code)
+                ),
+                *(
+                    component
+                    for metric_id in failed_benchmark_metric_ids
+                    for component in _components_for_benchmark_metric(metric_id)
+                ),
+            )
         )
         if not changed_components:
             raise ValueError("improvement requires an evidence-implicated component")
@@ -97,8 +115,12 @@ class ImprovementBuilder:
                 "parent_candidate_sha256": prior_candidate.sha256,
                 "candidate_sha256": self._candidate_ref.sha256,
                 "failed_assertion_ids": list(failed_ids),
+                "failed_benchmark_metric_ids": list(failed_benchmark_metric_ids),
                 "regression_assertion_ids": list(
                     authority.prior_green_assertion_ids
+                ),
+                "regression_benchmark_metric_ids": list(
+                    authority.prior_green_benchmark_metric_ids
                 ),
                 "changed_components": [item.value for item in changed_components],
                 "evidence_sha256": [reference.sha256 for reference in evidence_refs],
@@ -120,8 +142,12 @@ class ImprovementBuilder:
             parent_candidate_ref=prior_candidate,
             candidate_ref=self._candidate_ref,
             failed_assertion_ids=failed_ids,
+            failed_benchmark_metric_ids=failed_benchmark_metric_ids,
             changed_components=changed_components,
             regression_assertion_ids=authority.prior_green_assertion_ids,
+            regression_benchmark_metric_ids=(
+                authority.prior_green_benchmark_metric_ids
+            ),
             codex_session_ref=self._codex_session_ref,
         )
 
@@ -166,10 +192,17 @@ class ImprovementBuilder:
             for outcome in evaluation.assertion_outcomes
             if outcome.status == "failed"
         )
-        if not failed_ids:
-            raise ValueError("improvement authorization contains no failed assertion")
+        failed_benchmark_metric_ids = evaluation.failed_benchmark_metric_ids
+        if not failed_ids and not failed_benchmark_metric_ids:
+            raise ValueError(
+                "improvement authorization contains no failed assertion or benchmark metric"
+            )
         if set(failed_ids) & set(authority.prior_green_assertion_ids):
             raise ValueError("improvement cannot weaken a prior-green assertion")
+        if set(failed_benchmark_metric_ids) & set(
+            authority.prior_green_benchmark_metric_ids
+        ):
+            raise ValueError("improvement cannot weaken a prior-green benchmark metric")
         if self._candidate_ref == prior_candidate:
             raise ValueError("improvement must produce a child candidate")
         return now
@@ -195,6 +228,67 @@ def _component_for_assertion(assertion_id: str) -> CandidateChangedComponent:
         if any(marker in normalized for marker in markers):
             return component
     return CandidateChangedComponent.AGENT_CODE
+
+
+def _components_for_benchmark_reason(
+    reason_code: str,
+) -> tuple[CandidateChangedComponent, ...]:
+    decision_components = (
+        CandidateChangedComponent.SYSTEM_PROMPT,
+        CandidateChangedComponent.CONTEXT,
+        CandidateChangedComponent.AUTOGEN_CONVERSATION_PATTERN,
+    )
+    conversation_components = (
+        CandidateChangedComponent.MODEL_CLIENT,
+        CandidateChangedComponent.AUTOGEN_CONVERSATION_PATTERN,
+    )
+    return {
+        "wrong_decision": decision_components,
+        "missing_rationale": decision_components,
+        "below_minimum_correctness": decision_components,
+        "below_baseline_correctness": decision_components,
+        "unsafe_tool_intent": (CandidateChangedComponent.TOOL_CONTRACT,),
+        "mandatory_handoff_missed": (CandidateChangedComponent.HANDOFFS,),
+        "below_baseline_completion": (
+            CandidateChangedComponent.TERMINATION,
+            CandidateChangedComponent.AUTOGEN_CONVERSATION_PATTERN,
+        ),
+        "cost_ratio_exceeded": conversation_components,
+        "zero_baseline_cost_with_candidate_spend": conversation_components,
+        "latency_ratio_exceeded": conversation_components,
+        "zero_baseline_latency_with_candidate_time": conversation_components,
+    }.get(reason_code, ())
+
+
+def _components_for_benchmark_metric(
+    metric_id: str,
+) -> tuple[CandidateChangedComponent, ...]:
+    decision_components = (
+        CandidateChangedComponent.SYSTEM_PROMPT,
+        CandidateChangedComponent.CONTEXT,
+        CandidateChangedComponent.AUTOGEN_CONVERSATION_PATTERN,
+    )
+    model_components = (
+        CandidateChangedComponent.MODEL_CLIENT,
+        CandidateChangedComponent.AUTOGEN_CONVERSATION_PATTERN,
+    )
+    return {
+        "decision_correctness": decision_components,
+        "rationale_completeness": decision_components,
+        "baseline_correctness": decision_components,
+        "tool_safety": (CandidateChangedComponent.TOOL_CONTRACT,),
+        "mandatory_handoff": (CandidateChangedComponent.HANDOFFS,),
+        "terminal_completion": (
+            CandidateChangedComponent.TERMINATION,
+            CandidateChangedComponent.AUTOGEN_CONVERSATION_PATTERN,
+        ),
+        "baseline_completion": (
+            CandidateChangedComponent.TERMINATION,
+            CandidateChangedComponent.AUTOGEN_CONVERSATION_PATTERN,
+        ),
+        "cost_efficiency": model_components,
+        "latency_efficiency": model_components,
+    }.get(metric_id, ())
 
 
 def _content_ref(kind: str, payload: object) -> ArtifactRef:
