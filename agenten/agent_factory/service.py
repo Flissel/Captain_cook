@@ -6,6 +6,12 @@ from dataclasses import dataclass, field
 from typing import Protocol
 from uuid import UUID
 
+from agenten.agent_factory.business_benchmark_contracts import (
+    BusinessBenchmarkSummaryV1,
+    canonical_business_benchmark_model_bytes,
+)
+from agenten.agent_runtime.contracts import ArtifactRef
+
 from agenten.agent_factory.contracts import (
     AgentFactoryJobV3,
     FactoryEvidenceBlock,
@@ -90,6 +96,21 @@ class FactoryRepository(Protocol):
     ) -> tuple[FactoryUsageReceiptV1, ...]:
         """Return Gateway-accepted provider receipts in append order."""
 
+    def record_business_benchmark_summary(
+        self, summary: BusinessBenchmarkSummaryV1
+    ) -> bool:
+        """Persist one Captain-authored redacted summary."""
+
+    def business_benchmark_summary(
+        self, summary_id: UUID
+    ) -> BusinessBenchmarkSummaryV1 | None:
+        """Resolve a persisted summary by immutable summary identity."""
+
+    def business_benchmark_summary_by_artifact(
+        self, artifact_ref: ArtifactRef
+    ) -> BusinessBenchmarkSummaryV1 | None:
+        """Resolve the exact summary artifact referenced by an evaluation."""
+
 
 @dataclass
 class InMemoryFactoryRepository:
@@ -102,6 +123,9 @@ class InMemoryFactoryRepository:
     _release_decisions_by_job: dict[UUID, FactoryReleaseDecision] = field(
         default_factory=dict
     )
+    _benchmark_summaries_by_id: dict[UUID, tuple[bytes, BusinessBenchmarkSummaryV1]] = field(default_factory=dict)
+    _benchmark_summaries_by_artifact: dict[str, tuple[bytes, BusinessBenchmarkSummaryV1]] = field(default_factory=dict)
+    _benchmark_summaries_by_identity: dict[tuple[UUID, UUID, int, int, str], tuple[bytes, BusinessBenchmarkSummaryV1]] = field(default_factory=dict)
 
     def register(self, job: FactoryJob) -> None:
         existing = self._jobs.get(job.job_id)
@@ -162,6 +186,53 @@ class InMemoryFactoryRepository:
         self.job(job_id)
         return ()
 
+    def record_business_benchmark_summary(
+        self, summary: BusinessBenchmarkSummaryV1
+    ) -> bool:
+        self.job(summary.job_id)
+        content = canonical_business_benchmark_model_bytes(summary)
+        identity = (
+            summary.job_id,
+            summary.correlation_id,
+            summary.subject_version,
+            summary.attempt,
+            summary.candidate_ref.sha256,
+        )
+        matches = tuple(
+            item
+            for item in (
+                self._benchmark_summaries_by_id.get(summary.summary_id),
+                self._benchmark_summaries_by_artifact.get(summary.artifact_ref.sha256),
+                self._benchmark_summaries_by_identity.get(identity),
+            )
+            if item is not None
+        )
+        if matches:
+            if any(stored_bytes != content for stored_bytes, _ in matches):
+                raise FactoryRepositoryError(
+                    "business benchmark summary identity already exists with different content"
+                )
+            return False
+        stored = (content, summary)
+        self._benchmark_summaries_by_id[summary.summary_id] = stored
+        self._benchmark_summaries_by_artifact[summary.artifact_ref.sha256] = stored
+        self._benchmark_summaries_by_identity[identity] = stored
+        return True
+
+    def business_benchmark_summary(
+        self, summary_id: UUID
+    ) -> BusinessBenchmarkSummaryV1 | None:
+        stored = self._benchmark_summaries_by_id.get(summary_id)
+        return None if stored is None else stored[1]
+
+    def business_benchmark_summary_by_artifact(
+        self, artifact_ref: ArtifactRef
+    ) -> BusinessBenchmarkSummaryV1 | None:
+        stored = self._benchmark_summaries_by_artifact.get(artifact_ref.sha256)
+        if stored is None or stored[1].artifact_ref != artifact_ref:
+            return None
+        return stored[1]
+
 
 class FactoryCoordinator:
     """Rebuild state before every append; no worker may bypass Captain policy."""
@@ -196,6 +267,7 @@ class FactoryCoordinator:
             if isinstance(projection.job, AgentFactoryJobV3)
             else (None, None)
         )
+        benchmark_summary = self._workflow_benchmark_summary(workflow_evaluation)
         workflow_release_decision = (
             self._workflow_release_decision(
                 projection.job,
@@ -217,6 +289,11 @@ class FactoryCoordinator:
             ),
             feedback=(
                 feedback
+                if block.phase.value in {"quality_reviewed", "capability_promoted"}
+                else None
+            ),
+            benchmark_summary=(
+                benchmark_summary
                 if block.phase.value in {"quality_reviewed", "capability_promoted"}
                 else None
             ),
@@ -248,6 +325,7 @@ class FactoryCoordinator:
                 if isinstance(projection.job, AgentFactoryJobV3)
                 else (None, None)
             )
+            benchmark_summary = self._workflow_benchmark_summary(workflow_evaluation)
             workflow_release_decision = (
                 self._workflow_release_decision(
                     projection.job,
@@ -279,6 +357,11 @@ class FactoryCoordinator:
                     in {"quality_reviewed", "capability_promoted"}
                     else None
                 ),
+                benchmark_summary=(
+                    benchmark_summary
+                    if stored_block.phase.value in {"quality_reviewed", "capability_promoted"}
+                    else None
+                ),
             )
         return projection
 
@@ -303,12 +386,14 @@ class FactoryCoordinator:
             if isinstance(projection.job, AgentFactoryJobV3)
             else None
         )
+        benchmark_summary = self._workflow_benchmark_summary(workflow_evaluation)
         return next_action(
             projection,
             evaluation=evaluation,
             workflow_evaluation=workflow_evaluation,
             feedback=feedback,
             workflow_release_decision=workflow_release_decision,
+            benchmark_summary=benchmark_summary,
         ).model_copy(update={"job_id": job_id})
 
     def blocks(self, job_id: UUID) -> tuple[FactoryEvidenceBlock, ...]:
@@ -353,6 +438,14 @@ class FactoryCoordinator:
             return ()
         return lookup(job_id)
 
+    def business_benchmark_summary_by_artifact(
+        self, artifact_ref: ArtifactRef
+    ) -> BusinessBenchmarkSummaryV1 | None:
+        lookup = getattr(self._repository, "business_benchmark_summary_by_artifact", None)
+        if lookup is None:
+            return None
+        return lookup(artifact_ref)
+
     def _workflow_release_decision(
         self,
         job: AgentFactoryJobV3,
@@ -372,9 +465,19 @@ class FactoryCoordinator:
             job,
             executions,
             evaluation,
-            benchmark_summary=None,
+            benchmark_summary=self._workflow_benchmark_summary(evaluation),
             budget_projection=self.workflow_budget_projection(job.job_id),
             usage_receipts=self.workflow_usage_receipts(job.job_id),
+        )
+
+    def _workflow_benchmark_summary(
+        self,
+        evaluation: TeamEvaluationV1 | None,
+    ) -> BusinessBenchmarkSummaryV1 | None:
+        if evaluation is None or evaluation.benchmark_summary_ref is None:
+            return None
+        return self.business_benchmark_summary_by_artifact(
+            evaluation.benchmark_summary_ref
         )
 
     def _workflow_review(

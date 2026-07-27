@@ -19,6 +19,7 @@ from blockchain.mariadb_storage import MariaDBStorage
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
+    ArtifactRef,
     CapabilityGrant,
     CapabilityGrantRevocation,
 )
@@ -28,6 +29,7 @@ from agenten.agent_factory.execution_budget import (
     FactoryBudgetReservationV1,
     FactoryBudgetWriteReceipt,
 )
+from agenten.agent_factory.business_benchmark_contracts import BusinessBenchmarkSummaryV1
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from gateway.auth import (
     GatewayRole,
@@ -51,6 +53,7 @@ from gateway.contracts import (
     FactoryBudgetReservationWriteReceipt,
     FactoryWorkflowArtifact,
     FactoryWorkflowArtifactWriteReceipt,
+    BusinessBenchmarkSummaryWriteReceipt,
     FactoryUsageSubmissionV2,
     FactoryReleaseDecisionSubmission,
     FactoryWriteReceipt,
@@ -124,6 +127,7 @@ CAPTAIN_SKILL_EVENT_TYPES = frozenset(
         "hermes_skill_evaluation_requested",
         "hermes_skill_published",
         "hermes_ready_to_use_validated",
+        "captain_business_benchmark_validated",
     }
 )
 HERMES_SKILL_EVENT_TYPES = frozenset(
@@ -356,6 +360,42 @@ def create_app(
         _: GatewayRole = Depends(require_reader),
     ) -> tuple[FactoryWorkflowArtifact, ...]:
         return get_store().factory_workflow_artifacts(job_id)
+
+    @app.post("/v1/factory/business-benchmarks", status_code=status.HTTP_201_CREATED)
+    async def record_business_benchmark_summary(
+        summary: BusinessBenchmarkSummaryV1,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> BusinessBenchmarkSummaryWriteReceipt:
+        receipt = get_store().record_business_benchmark_summary(summary)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
+
+    @app.get("/v1/factory/business-benchmarks/artifacts/{artifact_sha256}")
+    async def get_business_benchmark_summary_by_artifact(
+        artifact_sha256: str,
+        _: GatewayRole = Depends(require_reader),
+    ) -> BusinessBenchmarkSummaryV1:
+        artifact_ref = ArtifactRef(
+            uri=f"artifact://business-benchmark-summary/{artifact_sha256}",
+            sha256=artifact_sha256,
+            media_type="application/json",
+        )
+        summary = get_store().business_benchmark_summary_by_artifact(artifact_ref)
+        if summary is None:
+            raise HTTPException(status_code=404, detail="business benchmark summary not found")
+        return summary
+
+    @app.get("/v1/factory/business-benchmarks/{summary_id}")
+    async def get_business_benchmark_summary(
+        summary_id: UUID,
+        _: GatewayRole = Depends(require_reader),
+    ) -> BusinessBenchmarkSummaryV1:
+        summary = get_store().business_benchmark_summary(summary_id)
+        if summary is None:
+            raise HTTPException(status_code=404, detail="business benchmark summary not found")
+        return summary
 
     @app.post("/v1/factory/blocks", status_code=status.HTTP_201_CREATED)
     async def record_factory_block(

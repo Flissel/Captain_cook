@@ -567,6 +567,25 @@ def factory_workflow_release_decision_block_reason(
     return None
 
 
+def factory_workflow_business_benchmark_block_reason(
+    job: AgentFactoryJobV3,
+    evaluation: TeamEvaluationV1,
+    benchmark_summary: BusinessBenchmarkSummaryV1 | None,
+    *,
+    current_attempt: int,
+) -> str | None:
+    """Validate the exact persisted summary used by a lifecycle transition."""
+
+    if evaluation.attempt != current_attempt:
+        return "workflow business benchmark attempt does not match current projection"
+    return _workflow_business_benchmark_block_reason(
+        job,
+        None,
+        evaluation,
+        benchmark_summary=benchmark_summary,
+    )
+
+
 def _workflow_business_benchmark_block_reason(
     job: AgentFactoryJobV3,
     evidence: tuple[TeamExecutionEvidenceV1, ...] | None,
@@ -601,6 +620,8 @@ def _workflow_business_benchmark_block_reason(
         or summary.candidate_ref not in evaluation.evidence_refs
     ):
         return "workflow business benchmark binding does not match release evidence"
+    if summary.suite_ref not in job.private_holdout_refs:
+        return "workflow business benchmark suite is not owned by the Factory job"
     if (
         evaluation.benchmark_summary_ref != summary.artifact_ref
         or summary.artifact_ref not in evaluation.evidence_refs

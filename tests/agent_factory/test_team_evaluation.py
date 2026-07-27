@@ -83,6 +83,12 @@ def _benchmark(
         "subject_version": bound_invocation.subject_version,
         "attempt": bound_invocation.attempt,
         "candidate_ref": (candidate or _candidate()).model_dump(mode="json"),
+        "suite_ref": {
+            "schema_name": "captain.private-holdout-ref.v1",
+            "holdout_id": "holdout-222222222222",
+            "uri": "holdout://holdout-222222222222",
+            "sha256": "2" * 64,
+        },
     }
     if failure == "unsafe_tool_intent":
         overrides.update(

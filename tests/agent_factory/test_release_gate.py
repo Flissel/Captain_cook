@@ -360,12 +360,14 @@ def workflow_evaluation(
 
 def workflow_benchmark(runs: tuple[TeamExecutionEvidenceV1, ...]):
     invocation = runs[0].invocation
+    suite_ref = workflow_job(mode="release").private_holdout_refs[0]
     return business_summary(
         job_id=str(invocation.job_id),
         correlation_id=str(invocation.correlation_id),
         subject_version=invocation.subject_version,
         attempt=invocation.attempt,
         candidate_ref=runs[0].candidate_ref.model_dump(mode="json"),
+        suite_ref=suite_ref.model_dump(mode="json", by_alias=True),
     )
 
 
@@ -535,6 +537,44 @@ def test_workflow_release_matches_authoritative_summary_identity(
     assert decision.status == "blocked"
     assert decision.reasons == (
         "workflow business benchmark binding does not match release evidence",
+    )
+
+
+def test_workflow_release_requires_a_job_owned_private_suite() -> None:
+    runs = (workflow_run(1),)
+    summary = workflow_benchmark(runs)
+    payload = summary.model_dump(mode="json", by_alias=True)
+    payload.pop("artifact_ref")
+    payload["suite_ref"] = {
+        **payload["suite_ref"],
+        "holdout_id": "holdout-999999999999",
+        "uri": "holdout://holdout-999999999999",
+        "sha256": "9" * 64,
+    }
+    foreign = business_summary(**payload)
+    evaluation = workflow_evaluation(runs)
+    evaluation = evaluation.model_copy(
+        update={
+            "benchmark_summary_ref": foreign.artifact_ref,
+            "evidence_refs": tuple(
+                foreign.artifact_ref if ref == summary.artifact_ref else ref
+                for ref in evaluation.evidence_refs
+            ),
+        }
+    )
+
+    decision = evaluate_factory_workflow_release(
+        workflow_job(mode="demo"),
+        runs,
+        evaluation,
+        benchmark_summary=foreign,
+        budget_projection=workflow_budget(),
+        usage_receipts=workflow_receipts(runs),
+    )
+
+    assert decision.status == "blocked"
+    assert decision.reasons == (
+        "workflow business benchmark suite is not owned by the Factory job",
     )
 
 

@@ -19,6 +19,8 @@ from agenten.agent_factory.contracts import (
     FactoryLease,
     FactoryRole,
 )
+from agenten.agent_factory.business_benchmark_contracts import BusinessBenchmarkSummaryV1
+from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.execution_budget import (
     BudgetExhausted,
     FactoryBudgetPort,
@@ -90,6 +92,30 @@ class GatewayFactoryRepository(FactoryRepository):
         job_id: UUID,
     ) -> tuple[FactoryUsageReceiptV1, ...]:
         return self._translate(lambda: self._store.factory_usage_receipts(job_id))
+
+    def record_business_benchmark_summary(
+        self, summary: BusinessBenchmarkSummaryV1
+    ) -> bool:
+        receipt = self._translate(
+            lambda: self._store.record_business_benchmark_summary(summary)
+        )
+        return not receipt.replayed
+
+    def business_benchmark_summary(
+        self, summary_id: UUID
+    ) -> BusinessBenchmarkSummaryV1 | None:
+        return self._translate(
+            lambda: self._store.business_benchmark_summary(summary_id)
+        )
+
+    def business_benchmark_summary_by_artifact(
+        self, artifact_ref: ArtifactRef
+    ) -> BusinessBenchmarkSummaryV1 | None:
+        return self._translate(
+            lambda: self._store.business_benchmark_summary_by_artifact(
+                artifact_ref
+            )
+        )
 
     def seed_released_skill_assignments(
         self,

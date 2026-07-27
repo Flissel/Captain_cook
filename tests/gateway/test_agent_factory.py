@@ -25,6 +25,9 @@ from agenten.agent_factory.execution_budget import (
     FactoryUsageReceiptV1,
     InMemoryFactoryBudgetLedger,
 )
+from agenten.agent_factory.business_benchmark_contracts import (
+    canonical_business_benchmark_model_bytes,
+)
 from agenten.agent_runtime.contracts import ArtifactRef
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.app import create_app
@@ -41,6 +44,12 @@ from tests.agent_factory.test_state_machine import block, job
 from tests.agent_factory.test_skill_evaluation_contracts import evidence_payload
 from tests.agent_factory.test_execution_budget import job_v3, usage_payload
 from tests.gateway.test_factory_budget import record_usage_lease
+from tests.agent_factory.test_business_benchmark_contracts import summary as business_summary
+from tests.agent_factory.test_release_gate import (
+    workflow_benchmark,
+    workflow_job,
+    workflow_run,
+)
 from tests.support.mariadb import assert_isolated_test_database
 
 
@@ -106,6 +115,100 @@ def test_factory_job_and_block_are_idempotent_and_restart_safe(storage: MariaDBS
     assert recovered.status_code == 200
     assert recovered.json()["projection"]["phase"] == "forge_requested"
     assert [item["phase"] for item in recovered.json()["blocks"]] == ["forge_requested"]
+
+
+def _seed_workflow_execution(store: GatewayStore, execution) -> None:
+    canonical = execution.model_dump(mode="json", by_alias=True)
+    digest = store._canonical_model_sha256(execution)
+    with store.storage.transaction() as connection:
+        with connection.cursor() as cursor:
+            job_block = store._runtime_block_by_json_value(
+                cursor,
+                block_type="agent_factory_job",
+                field="job_id",
+                value=str(execution.job_id),
+                for_update=True,
+            )
+            assert job_block is not None
+            index = store._next_index(cursor)
+            block = store._new_block(
+                cursor,
+                index=index,
+                block_type="factory_workflow_artifact",
+                data=canonical,
+                status="accepted",
+                parent_index=job_block["index"],
+                metadata={"schema": execution.schema_name},
+            )
+            store._insert(cursor, block)
+            cursor.execute(
+                """INSERT INTO factory_workflow_artifacts
+                   (invocation_id, job_id, correlation_id, subject_version, attempt,
+                    schema_name, content_sha256, block_index, payload)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    str(execution.invocation_id), str(execution.job_id),
+                    str(execution.correlation_id), execution.subject_version,
+                    execution.attempt, execution.schema_name, digest, index,
+                    json.dumps(canonical, sort_keys=True),
+                ),
+            )
+
+
+def test_business_benchmark_summary_is_restart_safe_and_rejects_changed_replay(
+    storage: MariaDBStorage,
+) -> None:
+    factory_job = workflow_job(mode="demo")
+    execution = workflow_run(1)
+    summary = workflow_benchmark((execution,))
+    store = GatewayStore(storage)
+    store.record_factory_job(factory_job)
+    _seed_workflow_execution(store, execution)
+    payload = summary.model_dump(mode="json", by_alias=True)
+
+    with TestClient(application(storage)) as captain:
+        first = captain.post("/v1/factory/business-benchmarks", json=payload)
+        replay = captain.post("/v1/factory/business-benchmarks", json=payload)
+    with TestClient(application(storage, actor=GatewayRole.WORKER)) as hermes:
+        forbidden = hermes.post("/v1/factory/business-benchmarks", json=payload)
+
+    changed_payload = summary.model_dump(mode="json", by_alias=True)
+    changed_payload.pop("artifact_ref")
+    changed_payload["summary_id"] = "00000000-0000-0000-0000-000000000999"
+    changed_payload["evaluated_at"] = (
+        summary.evaluated_at + timedelta(seconds=1)
+    )
+    changed = business_summary(**changed_payload)
+    with TestClient(application(storage)) as restarted:
+        conflict = restarted.post(
+            "/v1/factory/business-benchmarks",
+            json=changed.model_dump(mode="json", by_alias=True),
+        )
+        by_id = restarted.get(
+            f"/v1/factory/business-benchmarks/{summary.summary_id}"
+        )
+        by_artifact = restarted.get(
+            "/v1/factory/business-benchmarks/artifacts/"
+            f"{summary.artifact_ref.sha256}"
+        )
+        events = restarted.get(
+            f"/v1/projects/agent-factory/runs/{factory_job.job_id}/events"
+        )
+
+    assert first.status_code == 201
+    assert first.json()["artifact_sha256"] == summary.artifact_ref.sha256
+    assert first.json()["content_sha256"] == hashlib.sha256(
+        canonical_business_benchmark_model_bytes(summary)
+    ).hexdigest()
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+    assert forbidden.status_code == 403
+    assert conflict.status_code == 409
+    assert by_id.status_code == by_artifact.status_code == 200
+    assert by_id.json() == by_artifact.json() == payload
+    assert [event["event_type"] for event in events.json()] == [
+        "captain_business_benchmark_validated"
+    ]
 
 
 def test_factory_budget_routes_keep_reservations_captain_owned_and_usage_worker_owned(

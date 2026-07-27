@@ -69,6 +69,7 @@ DeliveryEventType: TypeAlias = Literal[
     "hermes_skill_evaluation_submitted",
     "hermes_skill_published",
     "hermes_ready_to_use_validated",
+    "captain_business_benchmark_validated",
 ]
 ReleaseStatus: TypeAlias = Literal["blocked", "ready"]
 
@@ -196,6 +197,13 @@ def parse_factory_workflow_artifact(value: object) -> FactoryWorkflowArtifact:
 
 class FactoryWorkflowArtifactWriteReceipt(_FrozenContract):
     invocation_id: UUID
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    replayed: bool
+
+
+class BusinessBenchmarkSummaryWriteReceipt(_FrozenContract):
+    summary_id: UUID
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     replayed: bool
 
@@ -639,6 +647,15 @@ class HermesReadyToUseValidatedPayload(_FrozenContract):
     promotion_event_id: UUID
 
 
+class CaptainBusinessBenchmarkValidatedPayload(_FrozenContract):
+    event_type: Literal["captain_business_benchmark_validated"]
+    summary_id: UUID
+    attempt: int = Field(ge=1, le=5, strict=True)
+    candidate_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    artifact_ref: ArtifactRef
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 DeliveryEventPayload: TypeAlias = Annotated[
     CodexTaskPayload
     | CodexSessionPayload
@@ -661,7 +678,8 @@ DeliveryEventPayload: TypeAlias = Annotated[
     | HermesToolGapRecordedPayload
     | HermesSkillEvaluationSubmittedPayload
     | HermesSkillPublishedPayload
-    | HermesReadyToUseValidatedPayload,
+    | HermesReadyToUseValidatedPayload
+    | CaptainBusinessBenchmarkValidatedPayload,
     Field(discriminator="event_type"),
 ]
 
@@ -723,6 +741,9 @@ class DeliveryEventEnvelope(_FrozenContract):
                 "job_id", "correlation_id", "subject_version", "request_id",
                 "lease_id", "evaluation_id", "skill_id", "skill_version",
             ),
+            "captain_business_benchmark_validated": (
+                "job_id", "correlation_id", "subject_version", "candidate_id", "artifact_id",
+            ),
         }
         missing = [
             field_name
@@ -770,6 +791,12 @@ class DeliveryEventEnvelope(_FrozenContract):
         if isinstance(self.payload, HermesSkillPublishedPayload):
             if self.trace.skill_id != self.payload.skill_id or self.trace.skill_version != self.payload.version:
                 raise ValueError("trace skill identity must match published skill")
+        if isinstance(self.payload, CaptainBusinessBenchmarkValidatedPayload):
+            if (
+                self.trace.candidate_id != self.payload.candidate_sha256
+                or self.trace.artifact_id != self.payload.artifact_ref.sha256
+            ):
+                raise ValueError("trace identity must match business benchmark summary")
         return self
 
 

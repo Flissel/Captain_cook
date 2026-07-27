@@ -39,6 +39,7 @@ from tests.agent_factory.test_factory_feedback import (
     _report_invocation,
 )
 from agenten.agent_factory.factory_feedback import FactoryFeedbackBuilder
+from tests.agent_factory.test_team_evaluation import _benchmark as workflow_benchmark
 from tests.agent_factory.test_skill_evaluation_contracts import evidence_payload
 
 
@@ -465,6 +466,7 @@ def test_v3_quality_feedback_routes_only_through_existing_captain_actions() -> N
         reviewed,
         workflow_evaluation=evaluation,
         feedback=feedback,
+        benchmark_summary=workflow_benchmark(),
     )
 
     assert state.workflow_evaluation_ref == evaluation.artifact_ref
@@ -482,7 +484,8 @@ def test_v3_quality_feedback_routes_only_through_existing_captain_actions() -> N
         workflow_evaluation=evaluation,
         feedback=feedback,
         workflow_release_decision=ready,
-    ).kind is FactoryActionKind.APPEND_ESCALATED
+        benchmark_summary=workflow_benchmark(),
+    ).kind is FactoryActionKind.VALIDATE_FOR_PROMOTION
 
     demo_ready = ready.model_copy(
         update={
@@ -495,6 +498,7 @@ def test_v3_quality_feedback_routes_only_through_existing_captain_actions() -> N
         workflow_evaluation=evaluation,
         feedback=feedback,
         workflow_release_decision=demo_ready,
+        benchmark_summary=workflow_benchmark(),
     ).kind is FactoryActionKind.APPEND_ESCALATED
 
 
@@ -550,6 +554,46 @@ def test_v3_promotion_uses_only_the_workflow_release_decision() -> None:
             release_decision=ready,
         )
 
+    promoted = apply_block(
+        state,
+        promotion,
+        workflow_evaluation=evaluation,
+        feedback=feedback,
+        release_decision=ready,
+        benchmark_summary=workflow_benchmark(),
+    )
+
+    assert promoted.status is FactoryLifecycleStatus.READY_TO_USE
+
+
+def test_v3_quality_feedback_rejects_a_summary_for_another_suite() -> None:
+    evaluation = workflow_evaluation()
+    feedback = FactoryFeedbackBuilder(clock=lambda: evaluation.occurred_at).build(
+        invocation=_report_invocation(evaluation),
+        candidate_ref=workflow_candidate(),
+        evaluation=evaluation,
+        budget_projection=workflow_budget(),
+    )
+    state = FactoryProjection.from_job(job_v3()).model_copy(
+        update={"status": FactoryLifecycleStatus.RUNNING, "phase": FactoryPhase.REAL_CASE_EVIDENCE}
+    )
+    reviewed = workflow_block(
+        FactoryPhase.QUALITY_REVIEWED,
+        assertions=job_v3().acceptance_assertion_ids,
+    ).model_copy(update={"artifact_refs": (evaluation.artifact_ref, feedback.artifact_ref)})
+    other_suite = workflow_benchmark().model_copy(
+        update={"suite_ref": workflow_benchmark().suite_ref.model_copy(update={"sha256": "9" * 64})}
+    )
+
+    with pytest.raises(FactoryLifecycleError, match="business benchmark"):
+        apply_block(
+            state,
+            reviewed,
+            workflow_evaluation=evaluation,
+            feedback=feedback,
+            benchmark_summary=other_suite,
+        )
+
 
 def test_v3_failed_feedback_requests_improvement_and_missing_feedback_fails_closed() -> None:
     evaluation = workflow_evaluation(failed=True)
@@ -573,6 +617,7 @@ def test_v3_failed_feedback_requests_improvement_and_missing_feedback_fails_clos
         state,
         workflow_evaluation=evaluation,
         feedback=feedback,
+        benchmark_summary=workflow_benchmark(),
     ).kind is FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED
     with pytest.raises(FactoryLifecycleError, match="workflow feedback"):
         next_action(state)

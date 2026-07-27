@@ -12,6 +12,7 @@ import gateway.contracts as gateway_contracts
 
 from agenten.agent_factory.contracts import FactoryPhase
 from agenten.agent_factory.contracts import FactoryRole
+from agenten.agent_factory.business_benchmark_contracts import BusinessBenchmarkSummaryV1
 from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.execution_budget import FactoryBudgetProjection
 from agenten.agent_factory.release_gate import E2EKind, E2EOutcome, E2ERunEvidence
@@ -35,6 +36,9 @@ from gateway.contracts import (
 )
 from gateway.factory_repository import GatewayFactoryLeases, GatewayFactoryRepository
 from gateway.store import GatewayStore
+from gateway.app import CAPTAIN_SKILL_EVENT_TYPES, require_skill_event_writer
+from gateway.auth import GatewayRole
+from agenten.agent_factory.business_benchmark_contracts import canonical_business_benchmark_model_bytes
 from tests.agent_factory.test_state_machine import (
     accepted_evaluation,
     accepted_release_decision,
@@ -45,6 +49,7 @@ from tests.agent_factory.test_state_machine import (
 from tests.agent_factory.test_execution_budget import job_v3
 from tests.agent_factory.test_release_gate import (
     workflow_budget,
+    workflow_benchmark,
     workflow_evaluation,
     workflow_job,
     workflow_receipts,
@@ -71,6 +76,7 @@ class Store:
         self.usage_receipts = {}
         self.released_skills = []
         self.skill_assignments = []
+        self.benchmark_summaries = {}
 
     def record_factory_job(self, factory_job):
         self.jobs.setdefault(factory_job.job_id, factory_job)
@@ -111,6 +117,19 @@ class Store:
             assignment
             for assignment in self.skill_assignments
             if assignment.job_id == job_id and assignment.step is step
+        )
+
+    def record_business_benchmark_summary(self, summary):
+        self.benchmark_summaries[summary.summary_id] = summary
+        return type("Receipt", (), {"replayed": False})()
+
+    def business_benchmark_summary(self, summary_id):
+        return self.benchmark_summaries.get(summary_id)
+
+    def business_benchmark_summary_by_artifact(self, artifact_ref):
+        return next(
+            (item for item in self.benchmark_summaries.values() if item.artifact_ref == artifact_ref),
+            None,
         )
 
 
@@ -215,6 +234,46 @@ def test_gateway_repository_exposes_budget_and_usage_as_read_only_evidence(job_v
     assert repository.workflow_usage_receipts(job_v3.job_id) == ()
 
 
+def test_gateway_repository_records_and_resolves_business_benchmark_summary() -> None:
+    runs = (workflow_run(1),)
+    summary = workflow_benchmark(runs)
+    store = Store()
+    repository = GatewayFactoryRepository(store)
+
+    assert repository.record_business_benchmark_summary(summary) is True
+    assert repository.business_benchmark_summary(summary.summary_id) == summary
+    assert repository.business_benchmark_summary_by_artifact(summary.artifact_ref) == summary
+
+
+def test_gateway_repository_translates_benchmark_conflict() -> None:
+    class ConflictStore(Store):
+        def record_business_benchmark_summary(self, summary):
+            raise HTTPException(status_code=409, detail="benchmark conflict")
+
+    with pytest.raises(FactoryRepositoryError, match="benchmark conflict"):
+        GatewayFactoryRepository(ConflictStore()).record_business_benchmark_summary(
+            workflow_benchmark((workflow_run(1),))
+        )
+
+
+def test_business_benchmark_delivery_event_is_deterministic_and_captain_only() -> None:
+    summary = workflow_benchmark((workflow_run(1),))
+    content_sha256 = hashlib.sha256(
+        canonical_business_benchmark_model_bytes(summary)
+    ).hexdigest()
+
+    first = GatewayStore._business_benchmark_validated_event(summary, content_sha256)
+    replay = GatewayStore._business_benchmark_validated_event(summary, content_sha256)
+
+    assert first == replay
+    assert first.event_type in CAPTAIN_SKILL_EVENT_TYPES
+    require_skill_event_writer(first, GatewayRole.CAPTAIN)
+    with pytest.raises(HTTPException) as denied:
+        require_skill_event_writer(first, GatewayRole.WORKER)
+    assert denied.value.status_code == 403
+    assert "case_metrics" not in first.model_dump_json()
+
+
 def test_gateway_repository_seeds_all_six_exact_job_skill_assignments() -> None:
     factory_job = workflow_job(mode="release")
     base_skill = parse_factory_workflow_artifact(
@@ -278,6 +337,9 @@ def test_gateway_release_fails_closed_until_task6_resolves_benchmark_summary() -
     )
     store._factory_usage_receipts_for_job = (  # type: ignore[method-assign]
         lambda _cursor, _job_id, *, for_update: workflow_receipts(runs)
+    )
+    store._factory_business_benchmark_summary_by_artifact = (  # type: ignore[method-assign]
+        lambda _cursor, _artifact_ref, *, for_update: None
     )
 
     decision = store._factory_workflow_release_decision(

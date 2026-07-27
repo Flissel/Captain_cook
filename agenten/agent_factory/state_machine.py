@@ -16,7 +16,9 @@ from .release_gate import (
     factory_evaluation_block_reason,
     factory_release_decision_block_reason,
     factory_workflow_release_decision_block_reason,
+    factory_workflow_business_benchmark_block_reason,
 )
+from .business_benchmark_contracts import BusinessBenchmarkSummaryV1
 from .skill_evaluation import ToolGapMarker
 from .skill_store import StoredSkillEvaluation
 from .skill_workflow_contracts import (
@@ -94,6 +96,7 @@ def apply_block(
     release_decision: FactoryReleaseDecision | None = None,
     workflow_evaluation: TeamEvaluationV1 | None = None,
     feedback: FactoryFeedbackV1 | None = None,
+    benchmark_summary: BusinessBenchmarkSummaryV1 | None = None,
 ) -> FactoryProjection:
     """Apply one new immutable block after enforcing lifecycle ordering."""
 
@@ -143,12 +146,13 @@ def apply_block(
                 projection,
                 workflow_evaluation=workflow_evaluation,
                 feedback=feedback,
+                benchmark_summary=benchmark_summary,
             )
             decision_reason = factory_workflow_release_decision_block_reason(
                 projection.job,
                 workflow_evaluation,
                 release_decision,
-                benchmark_summary=None,
+                benchmark_summary=benchmark_summary,
             )
             if decision_reason is not None:
                 raise FactoryLifecycleError(decision_reason)
@@ -187,6 +191,7 @@ def apply_block(
             projection,
             workflow_evaluation=workflow_evaluation,
             feedback=feedback,
+            benchmark_summary=benchmark_summary,
         )
         assert workflow_evaluation is not None
         assert feedback is not None
@@ -222,6 +227,7 @@ def next_action(
     workflow_evaluation: TeamEvaluationV1 | None = None,
     feedback: FactoryFeedbackV1 | None = None,
     workflow_release_decision: FactoryReleaseDecision | None = None,
+    benchmark_summary: BusinessBenchmarkSummaryV1 | None = None,
 ) -> FactoryAction:
     """Return the one allowed next side effect for a derived projection."""
 
@@ -254,6 +260,7 @@ def next_action(
                 projection,
                 workflow_evaluation=workflow_evaluation,
                 feedback=feedback,
+                benchmark_summary=benchmark_summary,
             )
             assert feedback is not None
             if (
@@ -269,7 +276,7 @@ def next_action(
                     projection.job,
                     workflow_evaluation,
                     workflow_release_decision,
-                    benchmark_summary=None,
+                    benchmark_summary=benchmark_summary,
                 )
                 if decision_reason is None:
                     return FactoryAction(
@@ -337,6 +344,7 @@ def _validate_workflow_feedback(
     *,
     workflow_evaluation: TeamEvaluationV1 | None,
     feedback: FactoryFeedbackV1 | None,
+    benchmark_summary: BusinessBenchmarkSummaryV1 | None,
 ) -> None:
     if workflow_evaluation is None or feedback is None:
         raise FactoryLifecycleError("missing validated workflow feedback")
@@ -358,6 +366,14 @@ def _validate_workflow_feedback(
         or workflow_evaluation.artifact_ref not in feedback.evidence_refs
     ):
         raise FactoryLifecycleError("workflow feedback binding does not match projection")
+    benchmark_reason = factory_workflow_business_benchmark_block_reason(
+        job,
+        workflow_evaluation,
+        benchmark_summary,
+        current_attempt=projection.attempt,
+    )
+    if benchmark_reason is not None:
+        raise FactoryLifecycleError(benchmark_reason)
     required_gap = any(
         gap.severity == "required" and gap.status == "unresolved"
         for gap in feedback.tool_gaps

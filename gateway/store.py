@@ -40,6 +40,10 @@ from agenten.agent_factory.execution_budget import (
     FactoryBudgetWriteReceipt,
     FactoryUsageReceiptV1,
 )
+from agenten.agent_factory.business_benchmark_contracts import (
+    BusinessBenchmarkSummaryV1,
+    canonical_business_benchmark_model_bytes,
+)
 from agenten.agent_factory.leases import FactoryLeaseDenied, validate_factory_lease
 from agenten.agent_factory.release_gate import (
     E2ERunEvidence,
@@ -94,6 +98,8 @@ from gateway.contracts import (
     FactoryBudgetReservationWriteReceipt,
     FactoryWorkflowArtifact,
     FactoryWorkflowArtifactWriteReceipt,
+    BusinessBenchmarkSummaryWriteReceipt,
+    CaptainBusinessBenchmarkValidatedPayload,
     FactoryUsageSubmissionV2,
     FactoryReleaseDecisionSubmission,
     FactorySkillAssignmentV1,
@@ -103,6 +109,7 @@ from gateway.contracts import (
     PublishedHermesSkill,
     parse_factory_workflow_artifact,
     ReviewDecisionEvent,
+    TraceContext,
     project_batch,
     project_release,
 )
@@ -338,6 +345,27 @@ class GatewayStore:
                         payload JSON NOT NULL,
                         INDEX idx_factory_workflow_job (job_id, block_index),
                         CONSTRAINT fk_factory_workflow_artifact_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS factory_business_benchmark_summaries (
+                        summary_id CHAR(36) NOT NULL PRIMARY KEY,
+                        job_id CHAR(36) NOT NULL,
+                        correlation_id CHAR(36) NOT NULL,
+                        subject_version INT NOT NULL,
+                        attempt INT NOT NULL,
+                        candidate_sha256 CHAR(64) NOT NULL,
+                        artifact_sha256 CHAR(64) NOT NULL UNIQUE,
+                        content_sha256 CHAR(64) NOT NULL,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        UNIQUE KEY uq_factory_benchmark_identity
+                            (job_id, correlation_id, subject_version, attempt, candidate_sha256),
+                        INDEX idx_factory_benchmark_job (job_id, block_index),
+                        CONSTRAINT fk_factory_benchmark_block
                             FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
                     ) ENGINE=InnoDB
                     """
@@ -1082,6 +1110,159 @@ class GatewayStore:
                 )
                 return self._factory_workflow_artifacts_for_job(cursor, job_id)
 
+    def record_business_benchmark_summary(
+        self,
+        summary: BusinessBenchmarkSummaryV1,
+    ) -> BusinessBenchmarkSummaryWriteReceipt:
+        canonical = summary.model_dump(mode="json", by_alias=True)
+        artifact_sha256 = summary.artifact_ref.sha256
+        content_sha256 = hashlib.sha256(
+            canonical_business_benchmark_model_bytes(summary)
+        ).hexdigest()
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                job_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_job",
+                    field="job_id",
+                    value=str(summary.job_id),
+                    for_update=True,
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job not found")
+                job = parse_factory_job(job_block["data"])
+                if not isinstance(job, AgentFactoryJobV3):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="business benchmark summary requires a V3 Factory job",
+                    )
+                projection = self._factory_projection(cursor, job)
+                if (
+                    summary.correlation_id != job.correlation_id
+                    or summary.subject_version != job.subject_version
+                    or summary.attempt != projection.attempt
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="business benchmark summary does not match current Factory identity",
+                    )
+                if summary.suite_ref not in job.private_holdout_refs:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="business benchmark suite is not owned by the Factory job",
+                    )
+                executions = tuple(
+                    artifact
+                    for artifact in self._factory_workflow_artifacts_for_job(
+                        cursor, job.job_id, for_update=True
+                    )
+                    if isinstance(artifact, TeamExecutionEvidenceV1)
+                    and artifact.attempt == projection.attempt
+                )
+                if not executions or {
+                    artifact.candidate_ref for artifact in executions
+                } != {summary.candidate_ref}:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="business benchmark candidate is not the current workflow execution candidate",
+                    )
+                cursor.execute(
+                    """SELECT summary_id, artifact_sha256, payload
+                       FROM factory_business_benchmark_summaries
+                       WHERE summary_id = %s OR artifact_sha256 = %s OR
+                         (job_id = %s AND correlation_id = %s AND subject_version = %s
+                          AND attempt = %s AND candidate_sha256 = %s)
+                       FOR UPDATE""",
+                    (
+                        str(summary.summary_id),
+                        artifact_sha256,
+                        str(summary.job_id),
+                        str(summary.correlation_id),
+                        summary.subject_version,
+                        summary.attempt,
+                        summary.candidate_ref.sha256,
+                    ),
+                )
+                existing = cursor.fetchall()
+                if existing:
+                    if len(existing) == 1 and self._decode_json(existing[0]["payload"]) == canonical:
+                        return BusinessBenchmarkSummaryWriteReceipt(
+                            summary_id=summary.summary_id,
+                            artifact_sha256=artifact_sha256,
+                            content_sha256=content_sha256,
+                            replayed=True,
+                        )
+                    raise HTTPException(
+                        status_code=409,
+                        detail="business benchmark summary identity already exists with different content",
+                    )
+                summary_index = self._next_index(cursor)
+                summary_block = self._new_block(
+                    cursor,
+                    index=summary_index,
+                    block_type="factory_business_benchmark_summary",
+                    data=canonical,
+                    status="validated",
+                    parent_index=job_block["index"],
+                    metadata={"schema": summary.schema_name},
+                )
+                self._insert(cursor, summary_block)
+                cursor.execute(
+                    """INSERT INTO factory_business_benchmark_summaries
+                       (summary_id, job_id, correlation_id, subject_version, attempt,
+                        candidate_sha256, artifact_sha256, content_sha256, block_index, payload)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        str(summary.summary_id), str(summary.job_id), str(summary.correlation_id),
+                        summary.subject_version, summary.attempt, summary.candidate_ref.sha256,
+                        artifact_sha256, content_sha256, summary_index,
+                        json.dumps(canonical, sort_keys=True),
+                    ),
+                )
+                event = self._business_benchmark_validated_event(
+                    summary, content_sha256
+                )
+                event_index = self._next_index(cursor)
+                event_block = self._new_block(
+                    cursor,
+                    index=event_index,
+                    block_type="delivery_event",
+                    data=event.model_dump(mode="json"),
+                    status="recorded",
+                    parent_index=summary_index,
+                    metadata={"schema": "captain-delivery-event/v1"},
+                )
+                self._insert(cursor, event_block)
+        return BusinessBenchmarkSummaryWriteReceipt(
+            summary_id=summary.summary_id,
+            artifact_sha256=artifact_sha256,
+            content_sha256=content_sha256,
+            replayed=False,
+        )
+
+    def business_benchmark_summary(
+        self, summary_id: UUID
+    ) -> BusinessBenchmarkSummaryV1 | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT payload FROM factory_business_benchmark_summaries WHERE summary_id = %s",
+                    (str(summary_id),),
+                )
+                row = cursor.fetchone()
+        return None if row is None else BusinessBenchmarkSummaryV1.model_validate(
+            self._decode_json(row["payload"])
+        )
+
+    def business_benchmark_summary_by_artifact(
+        self, artifact_ref: ArtifactRef
+    ) -> BusinessBenchmarkSummaryV1 | None:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                return self._factory_business_benchmark_summary_by_artifact(
+                    cursor, artifact_ref, for_update=False
+                )
+
     def record_released_factory_skill(
         self,
         skill: ReleasedHermesSkill,
@@ -1594,6 +1775,7 @@ class GatewayStore:
                 release_decision = None
                 workflow_evaluation = None
                 feedback = None
+                benchmark_summary = None
                 if isinstance(job, AgentFactoryJobV3) and evidence.phase in {
                     FactoryPhase.QUALITY_REVIEWED,
                     FactoryPhase.CAPABILITY_PROMOTED,
@@ -1604,6 +1786,12 @@ class GatewayStore:
                         attempt=evidence.attempt,
                         for_update=True,
                     )
+                    if workflow_evaluation is not None and workflow_evaluation.benchmark_summary_ref is not None:
+                        benchmark_summary = self._factory_business_benchmark_summary_by_artifact(
+                            cursor,
+                            workflow_evaluation.benchmark_summary_ref,
+                            for_update=True,
+                        )
                     if evidence.phase is FactoryPhase.CAPABILITY_PROMOTED:
                         release_decision = self._factory_workflow_release_decision(
                             cursor,
@@ -1650,6 +1838,7 @@ class GatewayStore:
                         release_decision=release_decision,
                         workflow_evaluation=workflow_evaluation,
                         feedback=feedback,
+                        benchmark_summary=benchmark_summary,
                     )
                 except FactoryLifecycleError as exc:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -1685,6 +1874,7 @@ class GatewayStore:
                         release_decision,
                         workflow_evaluation,
                         feedback,
+                        benchmark_summary,
                     ) = self._factory_block_context(
                         cursor,
                         job,
@@ -1698,6 +1888,7 @@ class GatewayStore:
                         release_decision=release_decision,
                         workflow_evaluation=workflow_evaluation,
                         feedback=feedback,
+                        benchmark_summary=benchmark_summary,
                     )
         return FactoryJobProjection(job=job, blocks=blocks, leases=leases, projection=projection)
 
@@ -1741,6 +1932,7 @@ class GatewayStore:
                 release_decision,
                 workflow_evaluation,
                 feedback,
+                benchmark_summary,
             ) = self._factory_block_context(
                 cursor,
                 job,
@@ -1754,6 +1946,7 @@ class GatewayStore:
                 release_decision=release_decision,
                 workflow_evaluation=workflow_evaluation,
                 feedback=feedback,
+                benchmark_summary=benchmark_summary,
             )
         return projection
 
@@ -2090,6 +2283,71 @@ class GatewayStore:
             for row in cursor.fetchall()
         )
 
+    def _factory_business_benchmark_summary_by_artifact(
+        self,
+        cursor: Any,
+        artifact_ref: ArtifactRef,
+        *,
+        for_update: bool,
+    ) -> BusinessBenchmarkSummaryV1 | None:
+        sql = (
+            "SELECT payload FROM factory_business_benchmark_summaries "
+            "WHERE artifact_sha256 = %s"
+        )
+        if for_update:
+            sql += " FOR UPDATE"
+        cursor.execute(sql, (artifact_ref.sha256,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        summary = BusinessBenchmarkSummaryV1.model_validate(
+            self._decode_json(row["payload"])
+        )
+        return summary if summary.artifact_ref == artifact_ref else None
+
+    @staticmethod
+    def _business_benchmark_validated_event(
+        summary: BusinessBenchmarkSummaryV1,
+        content_sha256: str,
+    ) -> DeliveryEventEnvelope:
+        identity = "|".join(
+            (
+                "captain-business-benchmark-validated",
+                str(summary.job_id),
+                str(summary.correlation_id),
+                str(summary.subject_version),
+                str(summary.attempt),
+                summary.candidate_ref.sha256,
+                summary.artifact_ref.sha256,
+                content_sha256,
+            )
+        )
+        event_id = uuid5(NAMESPACE_URL, identity)
+        return DeliveryEventEnvelope(
+            event_id=event_id,
+            event_type="captain_business_benchmark_validated",
+            occurred_at=summary.evaluated_at,
+            actor="captain",
+            trace=TraceContext(
+                project_id="agent-factory",
+                run_id=str(summary.job_id),
+                trace_id=str(uuid5(NAMESPACE_URL, "trace|" + identity)),
+                job_id=summary.job_id,
+                correlation_id=summary.correlation_id,
+                subject_version=summary.subject_version,
+                candidate_id=summary.candidate_ref.sha256,
+                artifact_id=summary.artifact_ref.sha256,
+            ),
+            payload=CaptainBusinessBenchmarkValidatedPayload(
+                event_type="captain_business_benchmark_validated",
+                summary_id=summary.summary_id,
+                attempt=summary.attempt,
+                candidate_sha256=summary.candidate_ref.sha256,
+                artifact_ref=summary.artifact_ref,
+                content_sha256=content_sha256,
+            ),
+        )
+
     def _factory_skill_assignment_for_step(
         self,
         cursor: Any,
@@ -2196,7 +2454,15 @@ class GatewayStore:
             job,
             executions,
             evaluation,
-            benchmark_summary=None,
+            benchmark_summary=(
+                None
+                if evaluation.benchmark_summary_ref is None
+                else self._factory_business_benchmark_summary_by_artifact(
+                    cursor,
+                    evaluation.benchmark_summary_ref,
+                    for_update=for_update,
+                )
+            ),
             budget_projection=self._factory_budget_projection(
                 cursor,
                 job,
@@ -2221,11 +2487,13 @@ class GatewayStore:
         FactoryReleaseDecision | None,
         TeamEvaluationV1 | None,
         FactoryFeedbackV1 | None,
+        BusinessBenchmarkSummaryV1 | None,
     ]:
         evaluation = None
         release_decision = None
         workflow_evaluation = None
         feedback = None
+        benchmark_summary = None
         if isinstance(job, AgentFactoryJobV3) and evidence.phase in {
             FactoryPhase.QUALITY_REVIEWED,
             FactoryPhase.CAPABILITY_PROMOTED,
@@ -2236,6 +2504,12 @@ class GatewayStore:
                 attempt=evidence.attempt,
                 for_update=for_update,
             )
+            if workflow_evaluation is not None and workflow_evaluation.benchmark_summary_ref is not None:
+                benchmark_summary = self._factory_business_benchmark_summary_by_artifact(
+                    cursor,
+                    workflow_evaluation.benchmark_summary_ref,
+                    for_update=for_update,
+                )
             if evidence.phase is FactoryPhase.CAPABILITY_PROMOTED:
                 release_decision = self._factory_workflow_release_decision(
                     cursor,
@@ -2250,7 +2524,7 @@ class GatewayStore:
                 cursor,
                 job.job_id,
             )
-        return evaluation, release_decision, workflow_evaluation, feedback
+        return evaluation, release_decision, workflow_evaluation, feedback, benchmark_summary
 
     @staticmethod
     def _assert_factory_effects_open(
