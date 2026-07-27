@@ -204,6 +204,7 @@ class BusinessBenchmarkRunReceiptV1(_FrozenContract):
     suite_ref: PrivateHoldoutRef
     suite_id: str = Field(pattern=IDENTIFIER_PATTERN)
     case_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    case_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     variant: Literal["candidate", "single_agent_baseline"]
     candidate_ref: ArtifactRef | None = None
     model_version: str = Field(pattern=IDENTIFIER_PATTERN)
@@ -314,6 +315,7 @@ class BusinessBenchmarkReceiptV1(_FrozenContract):
             "suite_ref",
             "suite_id",
             "case_id",
+            "case_sha256",
             "model_version",
             "allowed_tool_intents",
             "maximum_cost_micro_usd",
@@ -390,6 +392,12 @@ class BusinessBenchmarkSummaryV1(_FrozenContract):
     policy: BusinessBenchmarkPolicyV1
     candidate_correctness_bps: int = Field(ge=0, le=10000, strict=True)
     baseline_correctness_bps: int = Field(ge=0, le=10000, strict=True)
+    candidate_rationale_completeness_bps: int = Field(
+        ge=0, le=10000, strict=True
+    )
+    baseline_rationale_completeness_bps: int = Field(
+        ge=0, le=10000, strict=True
+    )
     candidate_completion_bps: int = Field(ge=0, le=10000, strict=True)
     baseline_completion_bps: int = Field(ge=0, le=10000, strict=True)
     candidate_cost_micro_usd: int = Field(ge=0, strict=True)
@@ -478,6 +486,10 @@ class BusinessBenchmarkSummaryV1(_FrozenContract):
                     self.candidate_correctness_bps
                     < self.policy.minimum_correctness_bps
                 ),
+                "missing_rationale": (
+                    bool(self.case_metrics)
+                    and self.candidate_rationale_completeness_bps < 10000
+                ),
                 "below_baseline_correctness": (
                     self.policy.require_candidate_not_worse_than_baseline
                     and self.candidate_correctness_bps
@@ -516,14 +528,13 @@ class BusinessBenchmarkSummaryV1(_FrozenContract):
                     "business benchmark reason codes do not match summary metrics: "
                     + ", ".join(mismatched)
                 )
-            for diagnostic_code in ("wrong_decision", "missing_rationale"):
-                if (
-                    diagnostic_code in reasons
-                    and self.candidate_correctness_bps == 10000
-                ):
-                    raise ValueError(
-                        "business benchmark diagnostic reason codes require a correctness loss"
-                    )
+            if (
+                "wrong_decision" in reasons
+                and self.candidate_correctness_bps == 10000
+            ):
+                raise ValueError(
+                    "business benchmark wrong_decision requires a decision correctness loss"
+                )
         expected_passed, expected_failed = business_benchmark_metric_partition(
             self.reason_codes
         )
@@ -549,6 +560,8 @@ class BusinessBenchmarkSummaryV1(_FrozenContract):
             failures.append("mandatory handoff")
         if self.candidate_correctness_bps < self.policy.minimum_correctness_bps:
             failures.append("candidate correctness")
+        if self.case_metrics and self.candidate_rationale_completeness_bps < 10000:
+            failures.append("candidate rationale")
         if self.policy.require_candidate_not_worse_than_baseline and (
             self.candidate_correctness_bps < self.baseline_correctness_bps
             or self.candidate_completion_bps < self.baseline_completion_bps

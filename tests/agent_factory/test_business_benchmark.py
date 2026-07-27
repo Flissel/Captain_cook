@@ -41,9 +41,17 @@ def artifact(label: str) -> ArtifactRef:
 CANDIDATE_REF = artifact("candidate")
 
 
+def model_digest(value: BusinessBenchmarkCaseV1 | BusinessBenchmarkSuiteV1) -> str:
+    payload = value.model_dump(mode="json", by_alias=True)
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def private_suite_ref() -> PrivateHoldoutRef:
-    digest = hashlib.sha256(b"private-suite").hexdigest()
-    holdout_id = f"holdout-{digest[:12]}"
+    digest = model_digest(suite())
+    holdout_id = "holdout-aaaaaaaaaaaa"
     return PrivateHoldoutRef(
         holdout_id=holdout_id,
         uri=f"holdout://{holdout_id}",
@@ -125,6 +133,7 @@ def run_receipt(
         suite_ref=private_suite_ref(),
         suite_id="claims-suite-v1",
         case_id=case.case_id,
+        case_sha256=model_digest(case),
         variant=variant,
         candidate_ref=CANDIDATE_REF if variant == "candidate" else None,
         model_version="approved-model-v1",
@@ -244,6 +253,71 @@ def test_private_case_allowlist_cannot_be_bypassed_by_broader_run_allowlist() ->
     assert receipt.baseline_unsafe_tool_use is True
 
 
+def test_summary_rejects_forged_persisted_case_score_booleans() -> None:
+    target, benchmark_suite, receipts = evaluate_receipts(
+        candidate_changes={
+            0: {
+                "decision": "request_information",
+                "rationale": ("fact-policy",),
+            }
+        }
+    )
+    payload = receipts[0].model_dump(mode="json", by_alias=True)
+    payload.update(
+        {
+            "candidate_decision_correct": True,
+            "candidate_rationale_complete": True,
+            "candidate_completion_complete": True,
+        }
+    )
+    forged = BusinessBenchmarkReceiptV1.model_validate(payload)
+
+    with pytest.raises(ValueError, match="score fields"):
+        target.summarize(
+            benchmark_suite,
+            (forged,) + receipts[1:],
+            policy(),
+        )
+
+
+def test_case_digest_rejects_same_case_id_with_changed_private_body() -> None:
+    target = evaluator()
+    original = suite().cases[0]
+    changed = original.model_copy(
+        update={"redacted_input": {"opaque_test_subject": "changed-subject"}}
+    )
+
+    with pytest.raises(ValueError, match="case digest"):
+        target.evaluate_case(
+            changed,
+            run_receipt(original, "candidate"),
+            run_receipt(original, "single_agent_baseline"),
+        )
+
+
+def test_summary_rejects_receipts_bound_to_unrelated_private_suite_digest() -> None:
+    target, benchmark_suite, receipts = evaluate_receipts()
+    unrelated_digest = hashlib.sha256(b"unrelated-private-suite").hexdigest()
+    unrelated_ref = PrivateHoldoutRef(
+        holdout_id=f"holdout-{unrelated_digest[:12]}",
+        uri=f"holdout://holdout-{unrelated_digest[:12]}",
+        sha256=unrelated_digest,
+    )
+    foreign = receipts[0].model_copy(
+        update={
+            "candidate": receipts[0].candidate.model_copy(
+                update={"suite_ref": unrelated_ref}
+            ),
+            "baseline": receipts[0].baseline.model_copy(
+                update={"suite_ref": unrelated_ref}
+            ),
+        }
+    )
+
+    with pytest.raises(ValueError, match="suite digest"):
+        target.summarize(benchmark_suite, (foreign,), policy())
+
+
 def test_missed_critical_handoff_and_unsafe_tool_are_hard_stops_even_when_baseline_fails() -> None:
     target, benchmark_suite, receipts = evaluate_receipts(
         candidate_changes={
@@ -272,7 +346,8 @@ def test_correctness_rationale_completion_and_baseline_reasons_are_stable() -> N
 
     summary = target.summarize(benchmark_suite, receipts, policy())
 
-    assert summary.candidate_correctness_bps == 7334
+    assert summary.candidate_correctness_bps == 8000
+    assert summary.candidate_rationale_completeness_bps == 8667
     assert summary.candidate_completion_bps == 9334
     assert summary.reason_codes == tuple(sorted(set(summary.reason_codes)))
     assert {
@@ -282,6 +357,20 @@ def test_correctness_rationale_completion_and_baseline_reasons_are_stable() -> N
         "below_baseline_correctness",
         "below_baseline_completion",
     }.issubset(summary.reason_codes)
+
+
+def test_rationale_only_failure_keeps_decision_metric_passed() -> None:
+    target, benchmark_suite, receipts = evaluate_receipts(
+        candidate_changes={0: {"rationale": ("fact-policy",)}}
+    )
+
+    summary = target.summarize(benchmark_suite, receipts, policy())
+
+    assert summary.candidate_correctness_bps == 10000
+    assert summary.candidate_rationale_completeness_bps == 9334
+    assert "decision_correctness" in summary.passed_metric_ids
+    assert "rationale_completeness" in summary.failed_metric_ids
+    assert summary.reason_codes == ("missing_rationale",)
 
 
 def test_cost_latency_ratios_use_integer_basis_points_and_ceilings_are_inclusive() -> None:

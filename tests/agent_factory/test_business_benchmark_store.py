@@ -75,6 +75,16 @@ def artifact(name: str) -> ArtifactRef:
     )
 
 
+def model_digest(value: BusinessBenchmarkCaseV1) -> str:
+    encoded = json.dumps(
+        value.model_dump(mode="json", by_alias=True),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def toy_suite() -> BusinessBenchmarkSuiteV1:
     cases = tuple(
         BusinessBenchmarkCaseV1(
@@ -146,6 +156,7 @@ def run_receipt(
         suite_ref=suite_reference(),
         suite_id="toy-claims-suite-v1",
         case_id="toy-ordinary-1",
+        case_sha256=model_digest(toy_suite().cases[0]),
         variant=variant,
         candidate_ref=artifact("candidate") if variant == "candidate" else None,
         model_version="test-model-v1",
@@ -221,6 +232,8 @@ def summary(
         ).model_dump(mode="json", by_alias=True),
         "candidate_correctness_bps": 10000,
         "baseline_correctness_bps": 9000,
+        "candidate_rationale_completeness_bps": 10000,
+        "baseline_rationale_completeness_bps": 10000,
         "candidate_completion_bps": 10000,
         "baseline_completion_bps": 10000,
         "candidate_cost_micro_usd": 100,

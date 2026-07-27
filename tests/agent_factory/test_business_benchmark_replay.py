@@ -20,6 +20,7 @@ from agenten.agent_factory.business_benchmark_contracts import (
 from agenten.agent_factory.business_benchmark_execution import (
     BenchmarkExecutionPolicyV1,
     BusinessBenchmarkExecutionEnvelopeV1,
+    BusinessBenchmarkExecutionError,
     PairedBusinessBenchmarkCoordinator,
 )
 from agenten.agent_factory.business_benchmark_replay import (
@@ -106,6 +107,7 @@ def receipt(envelope: BusinessBenchmarkExecutionEnvelopeV1) -> BusinessBenchmark
         suite_ref=envelope.suite_ref,
         suite_id=envelope.suite_id,
         case_id=envelope.case.case_id,
+        case_sha256=envelope.case_sha256,
         variant=envelope.variant,
         candidate_ref=envelope.candidate_ref,
         model_version=envelope.model_version,
@@ -415,6 +417,37 @@ async def test_expired_claim_uses_higher_fence_and_recovers_terminal_without_ree
     assert store.recovery_observation(
         new_claim.identity.effect_id, new_claim.fence
     ) == executor.recovery_observations[0]
+
+
+@pytest.mark.asyncio
+async def test_terminal_recovery_rejects_receipt_with_wrong_case_digest() -> None:
+    clock = MutableClock()
+    store = InMemoryBusinessBenchmarkReplayStore()
+    captured: dict[str, BusinessBenchmarkExecutionEnvelopeV1] = {}
+
+    def crash(
+        envelope: BusinessBenchmarkExecutionEnvelopeV1,
+        claim: BusinessBenchmarkEffectClaimV1,
+        fence_receipt: BusinessBenchmarkFenceReceiptV1,
+    ) -> BusinessBenchmarkRunReceiptV1:
+        captured[envelope.variant] = envelope
+        raise RuntimeError("simulated interruption")
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        await run_pair(
+            coordinator(PreparedExecutor(on_execute=crash), store, clock, FixedUUIDs())
+        )
+
+    clock.now += timedelta(minutes=6)
+    forged = receipt(captured["candidate"]).model_copy(
+        update={"case_sha256": "d" * 64}
+    )
+    executor = PreparedExecutor(
+        recovery_outcomes={"candidate": ("terminal", forged)}
+    )
+
+    with pytest.raises(BusinessBenchmarkExecutionError, match="case_sha256"):
+        await run_pair(coordinator(executor, store, clock, FixedUUIDs()))
 
 
 @pytest.mark.asyncio

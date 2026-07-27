@@ -57,6 +57,17 @@ def canonical_digest(payload: dict[str, object]) -> str:
     ).hexdigest()
 
 
+def case_digest() -> str:
+    case = BusinessBenchmarkCaseV1.model_validate(case_payload())
+    encoded = json.dumps(
+        case.model_dump(mode="json", by_alias=True),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def summary_artifact(digest: str) -> dict[str, str]:
     return {
         "uri": f"artifact://business-benchmark-summary/{digest}",
@@ -105,6 +116,7 @@ def run_payload(variant: str, **overrides: object) -> dict[str, object]:
         "suite_ref": suite_ref(),
         "suite_id": "claims-suite-v1",
         "case_id": "claims-ordinary-01",
+        "case_sha256": case_digest(),
         "variant": variant,
         "candidate_ref": artifact("candidate") if variant == "candidate" else None,
         "model_version": "approved-model-v1",
@@ -142,6 +154,8 @@ def summary(**overrides: object) -> BusinessBenchmarkSummaryV1:
         ).model_dump(mode="json", by_alias=True),
         "candidate_correctness_bps": 10000,
         "baseline_correctness_bps": 9000,
+        "candidate_rationale_completeness_bps": 10000,
+        "baseline_rationale_completeness_bps": 10000,
         "candidate_completion_bps": 10000,
         "baseline_completion_bps": 10000,
         "candidate_cost_micro_usd": 125,
@@ -344,12 +358,27 @@ def test_run_receipts_require_exact_candidate_baseline_pair_binding_and_utc_metr
             receipt.model_dump(mode="json", by_alias=True)
             | {"baseline": run_payload("single_agent_baseline", case_id="claims-ordinary-02")}
         )
+    with pytest.raises(ValidationError, match="pair"):
+        BusinessBenchmarkReceiptV1.model_validate(
+            receipt.model_dump(mode="json", by_alias=True)
+            | {
+                "baseline": run_payload(
+                    "single_agent_baseline", case_sha256="d" * 64
+                )
+            }
+        )
     with pytest.raises(ValidationError):
         BusinessBenchmarkRunReceiptV1.model_validate(run_payload("candidate", cost_micro_usd=-1))
     with pytest.raises(ValidationError, match="UTC"):
         BusinessBenchmarkRunReceiptV1.model_validate(
             run_payload("candidate", completed_at=datetime(2026, 7, 26, 10))
         )
+
+
+def test_run_receipt_exposes_an_exact_case_digest_binding() -> None:
+    receipt = BusinessBenchmarkRunReceiptV1.model_validate(run_payload("candidate"))
+
+    assert receipt.case_sha256 == case_digest()
 
 
 def test_receipts_reject_forged_safe_tool_and_handoff_flags() -> None:
@@ -451,6 +480,8 @@ def test_failed_summary_can_represent_zero_of_fifteen_receipts() -> None:
         baseline_correctness_bps=0,
         candidate_completion_bps=0,
         baseline_completion_bps=0,
+        candidate_rationale_completeness_bps=0,
+        baseline_rationale_completeness_bps=0,
         candidate_cost_micro_usd=0,
         baseline_cost_micro_usd=0,
         candidate_latency_ms=0,

@@ -125,6 +125,7 @@ class RecordingExecutor:
             suite_ref=envelope.suite_ref,
             suite_id=envelope.suite_id,
             case_id=envelope.case.case_id,
+            case_sha256=envelope.case_sha256,
             variant=envelope.variant,
             candidate_ref=envelope.candidate_ref,
             model_version=envelope.model_version,
@@ -312,6 +313,15 @@ async def test_pair_rejects_receipts_with_mismatched_pair_or_request_session_bin
     with pytest.raises(BusinessBenchmarkExecutionError, match="runtime session"):
         await run_pair(coordinator(RecordingExecutor(mismatch_runtime_session)))
 
+    def mismatch_case_digest(
+        receipt: BusinessBenchmarkRunReceiptV1,
+        envelope: BusinessBenchmarkExecutionEnvelopeV1,
+    ) -> BusinessBenchmarkRunReceiptV1:
+        return receipt.model_copy(update={"case_sha256": "d" * 64})
+
+    with pytest.raises(BusinessBenchmarkExecutionError, match="case_sha256"):
+        await run_pair(coordinator(RecordingExecutor(mismatch_case_digest)))
+
 
 def test_run_receipt_requires_nonblank_runtime_session_id() -> None:
     payload = {
@@ -327,6 +337,7 @@ def test_run_receipt_requires_nonblank_runtime_session_id() -> None:
         "suite_ref": suite_ref().model_dump(mode="json", by_alias=True),
         "suite_id": "claims-suite-v1",
         "case_id": benchmark_case().case_id,
+        "case_sha256": "d" * 64,
         "variant": "single_agent_baseline",
         "model_version": "approved-model-v1",
         "allowed_tool_intents": ["none"],
@@ -410,5 +421,22 @@ async def test_execution_policy_change_changes_both_request_id_and_idempotency_k
     )
 
     for initial, changed in zip(initial_executor.envelopes, changed_executor.envelopes):
+        assert changed.request_id != initial.request_id
+        assert changed.idempotency_key != initial.idempotency_key
+
+
+@pytest.mark.asyncio
+async def test_changed_case_body_changes_request_identity() -> None:
+    initial_executor = RecordingExecutor()
+    await run_pair(coordinator(initial_executor))
+    changed_case = benchmark_case().model_copy(
+        update={"redacted_input": {"test_organization_id": "changed-test-org"}}
+    )
+    changed_executor = RecordingExecutor()
+
+    await run_pair(coordinator(changed_executor), case=changed_case)
+
+    for initial, changed in zip(initial_executor.envelopes, changed_executor.envelopes):
+        assert changed.case_sha256 != initial.case_sha256
         assert changed.request_id != initial.request_id
         assert changed.idempotency_key != initial.idempotency_key

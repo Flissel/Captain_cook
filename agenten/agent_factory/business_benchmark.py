@@ -48,6 +48,8 @@ class BusinessBenchmarkEvaluationBinding:
 class _Metrics:
     candidate_correctness_bps: int
     baseline_correctness_bps: int
+    candidate_rationale_completeness_bps: int
+    baseline_rationale_completeness_bps: int
     candidate_completion_bps: int
     baseline_completion_bps: int
     candidate_cost_micro_usd: int
@@ -81,29 +83,25 @@ class BusinessBenchmarkEvaluator:
         baseline: BusinessBenchmarkRunReceiptV1,
     ) -> BusinessBenchmarkReceiptV1:
         self._require_case_pair(case, candidate, baseline)
+        candidate_scores = _score(case, candidate)
+        baseline_scores = _score(case, baseline)
         return BusinessBenchmarkReceiptV1(
             schema="captain.business-benchmark-receipt.v1",
             receipt_id=self._uuid_factory(),
             case_ref=_private_case_ref(case),
             candidate=candidate,
             baseline=baseline,
-            candidate_decision_correct=_decision_correct(case, candidate),
-            baseline_decision_correct=_decision_correct(case, baseline),
-            candidate_rationale_complete=_rationale_complete(case, candidate),
-            baseline_rationale_complete=_rationale_complete(case, baseline),
-            candidate_completion_complete=_completion_complete(case, candidate),
-            baseline_completion_complete=_completion_complete(case, baseline),
-            candidate_unsafe_tool_use=_unsafe_tool_use(case, candidate),
-            baseline_unsafe_tool_use=_unsafe_tool_use(case, baseline),
+            candidate_decision_correct=candidate_scores.decision_correct,
+            baseline_decision_correct=baseline_scores.decision_correct,
+            candidate_rationale_complete=candidate_scores.rationale_complete,
+            baseline_rationale_complete=baseline_scores.rationale_complete,
+            candidate_completion_complete=candidate_scores.completion_complete,
+            baseline_completion_complete=baseline_scores.completion_complete,
+            candidate_unsafe_tool_use=candidate_scores.unsafe_tool_use,
+            baseline_unsafe_tool_use=baseline_scores.unsafe_tool_use,
             human_handoff_required=case.human_handoff_required,
-            candidate_mandatory_handoff_missed=(
-                case.human_handoff_required
-                and candidate.human_handoff_completed is not True
-            ),
-            baseline_mandatory_handoff_missed=(
-                case.human_handoff_required
-                and baseline.human_handoff_completed is not True
-            ),
+            candidate_mandatory_handoff_missed=candidate_scores.mandatory_handoff_missed,
+            baseline_mandatory_handoff_missed=baseline_scores.mandatory_handoff_missed,
             evaluated_at=_utc_now(self._clock),
         )
 
@@ -117,6 +115,10 @@ class BusinessBenchmarkEvaluator:
     ) -> BusinessBenchmarkSummaryV1:
         ordered = self._validate_and_order_receipts(suite, receipts)
         effective_binding = self._binding(ordered, binding)
+        if effective_binding.suite_ref.sha256 != _digest_value(
+            suite.model_dump(mode="json", by_alias=True)
+        ):
+            raise ValueError("business benchmark suite digest binding does not match")
         metrics = _aggregate_metrics(ordered)
         reason_codes = _policy_failures(ordered, metrics, policy)
         passed_metric_ids, failed_metric_ids = business_benchmark_metric_partition(
@@ -135,6 +137,8 @@ class BusinessBenchmarkEvaluator:
             "policy": policy.model_dump(mode="json", by_alias=True),
             "candidate_correctness_bps": metrics.candidate_correctness_bps,
             "baseline_correctness_bps": metrics.baseline_correctness_bps,
+            "candidate_rationale_completeness_bps": metrics.candidate_rationale_completeness_bps,
+            "baseline_rationale_completeness_bps": metrics.baseline_rationale_completeness_bps,
             "candidate_completion_bps": metrics.candidate_completion_bps,
             "baseline_completion_bps": metrics.baseline_completion_bps,
             "candidate_cost_micro_usd": metrics.candidate_cost_micro_usd,
@@ -175,6 +179,12 @@ class BusinessBenchmarkEvaluator:
             raise ValueError("benchmark inputs are not a candidate/baseline pair")
         if candidate.case_id != case.case_id or baseline.case_id != case.case_id:
             raise ValueError("benchmark pair is foreign to the private case")
+        expected_case_sha256 = _private_case_ref(case).sha256
+        if (
+            candidate.case_sha256 != expected_case_sha256
+            or baseline.case_sha256 != expected_case_sha256
+        ):
+            raise ValueError("benchmark pair case digest does not match the private case")
         shared_fields = (
             "job_id",
             "correlation_id",
@@ -183,6 +193,7 @@ class BusinessBenchmarkEvaluator:
             "suite_ref",
             "suite_id",
             "case_id",
+            "case_sha256",
             "model_version",
             "allowed_tool_intents",
             "maximum_cost_micro_usd",
@@ -210,6 +221,11 @@ class BusinessBenchmarkEvaluator:
             seen.add(digest)
             if digest not in expected or receipt.case_ref != expected_refs[expected[digest]]:
                 raise ValueError("foreign business benchmark case receipt")
+            case = suite.cases[expected[digest]]
+            BusinessBenchmarkEvaluator._require_case_pair(
+                case, receipt.candidate, receipt.baseline
+            )
+            _require_exact_scores(case, receipt)
             indexed.append((expected[digest], receipt))
         ordered = tuple(receipt for _, receipt in sorted(indexed, key=lambda item: item[0]))
         if ordered:
@@ -254,6 +270,58 @@ def _successful_with_evidence(receipt: BusinessBenchmarkRunReceiptV1) -> bool:
     return receipt.status == "succeeded" and bool(receipt.evidence_refs)
 
 
+@dataclass(frozen=True)
+class _CaseScore:
+    decision_correct: bool
+    rationale_complete: bool
+    completion_complete: bool
+    unsafe_tool_use: bool
+    mandatory_handoff_missed: bool
+
+
+def _score(
+    case: BusinessBenchmarkCaseV1, receipt: BusinessBenchmarkRunReceiptV1
+) -> _CaseScore:
+    return _CaseScore(
+        decision_correct=_decision_correct(case, receipt),
+        rationale_complete=_rationale_complete(case, receipt),
+        completion_complete=_completion_complete(case, receipt),
+        unsafe_tool_use=_unsafe_tool_use(case, receipt),
+        mandatory_handoff_missed=(
+            case.human_handoff_required
+            and receipt.human_handoff_completed is not True
+        ),
+    )
+
+
+def _require_exact_scores(
+    case: BusinessBenchmarkCaseV1, receipt: BusinessBenchmarkReceiptV1
+) -> None:
+    candidate = _score(case, receipt.candidate)
+    baseline = _score(case, receipt.baseline)
+    expected = {
+        "candidate_decision_correct": candidate.decision_correct,
+        "baseline_decision_correct": baseline.decision_correct,
+        "candidate_rationale_complete": candidate.rationale_complete,
+        "baseline_rationale_complete": baseline.rationale_complete,
+        "candidate_completion_complete": candidate.completion_complete,
+        "baseline_completion_complete": baseline.completion_complete,
+        "candidate_unsafe_tool_use": candidate.unsafe_tool_use,
+        "baseline_unsafe_tool_use": baseline.unsafe_tool_use,
+        "human_handoff_required": case.human_handoff_required,
+        "candidate_mandatory_handoff_missed": candidate.mandatory_handoff_missed,
+        "baseline_mandatory_handoff_missed": baseline.mandatory_handoff_missed,
+    }
+    mismatched = tuple(
+        field for field, value in expected.items() if getattr(receipt, field) != value
+    )
+    if mismatched:
+        raise ValueError(
+            "business benchmark persisted score fields do not match private case and runs: "
+            + ", ".join(mismatched)
+        )
+
+
 def _decision_correct(case: BusinessBenchmarkCaseV1, receipt: BusinessBenchmarkRunReceiptV1) -> bool:
     return _successful_with_evidence(receipt) and receipt.observed_decision == case.expected_decision
 
@@ -287,14 +355,8 @@ def _private_case_ref(case: BusinessBenchmarkCaseV1) -> ArtifactRef:
 
 def _aggregate_metrics(receipts: tuple[BusinessBenchmarkReceiptV1, ...]) -> _Metrics:
     count = len(receipts)
-    candidate_correct = sum(
-        receipt.candidate_decision_correct and receipt.candidate_rationale_complete
-        for receipt in receipts
-    )
-    baseline_correct = sum(
-        receipt.baseline_decision_correct and receipt.baseline_rationale_complete
-        for receipt in receipts
-    )
+    candidate_correct = sum(receipt.candidate_decision_correct for receipt in receipts)
+    baseline_correct = sum(receipt.baseline_decision_correct for receipt in receipts)
     candidate_cost = sum(receipt.candidate.cost_micro_usd for receipt in receipts)
     baseline_cost = sum(receipt.baseline.cost_micro_usd for receipt in receipts)
     candidate_latency = sum(receipt.candidate.latency_ms for receipt in receipts)
@@ -312,6 +374,12 @@ def _aggregate_metrics(receipts: tuple[BusinessBenchmarkReceiptV1, ...]) -> _Met
     return _Metrics(
         candidate_correctness_bps=_percentage_bps(candidate_correct, count),
         baseline_correctness_bps=_percentage_bps(baseline_correct, count),
+        candidate_rationale_completeness_bps=_percentage_bps(
+            sum(receipt.candidate_rationale_complete for receipt in receipts), count
+        ),
+        baseline_rationale_completeness_bps=_percentage_bps(
+            sum(receipt.baseline_rationale_complete for receipt in receipts), count
+        ),
         candidate_completion_bps=_percentage_bps(
             sum(receipt.candidate_completion_complete for receipt in receipts), count
         ),
@@ -353,8 +421,8 @@ def _policy_failures(
     if correctness_failed or baseline_correctness_failed:
         if any(not receipt.candidate_decision_correct for receipt in receipts):
             reasons.append("wrong_decision")
-        if any(not receipt.candidate_rationale_complete for receipt in receipts):
-            reasons.append("missing_rationale")
+    if any(not receipt.candidate_rationale_complete for receipt in receipts):
+        reasons.append("missing_rationale")
     if policy.require_zero_unsafe_tools and any(
         receipt.candidate_unsafe_tool_use or receipt.baseline_unsafe_tool_use
         for receipt in receipts
