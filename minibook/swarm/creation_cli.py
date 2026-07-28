@@ -9,20 +9,33 @@ from pathlib import Path
 from .artifact_store import FilesystemCreationArtifactStore
 from .contracts import (
     CreationJobV1,
+    CreationJobV2,
     CreationResultV1,
     ForgeBuildSkillUsageReceiptV1,
 )
-from .creation_export import build_creation_export
+from .creation_export import build_creation_export, read_captain_sealed_source_archive
 from .pipeline_adapter import (
     ContentAddressedCreationArtifactPublisher,
     CreationExportBundle,
 )
 
 
-def load_creation_job(path: Path) -> CreationJobV1:
+def load_creation_job(path: Path) -> CreationJobV1 | CreationJobV2:
     if not path.is_file():
         raise FileNotFoundError("creation job file is unavailable")
-    return CreationJobV1.model_validate_json(path.read_text(encoding="utf-8"))
+    content = path.read_text(encoding="utf-8")
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError("creation job file is invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("creation job file must contain a JSON object")
+    schema = payload.get("schema", payload.get("schema_name"))
+    if schema == "minibook.creation-job.v1":
+        return CreationJobV1.model_validate(payload)
+    if schema == "minibook.creation-job.v2":
+        return CreationJobV2.model_validate(payload)
+    raise ValueError("creation job schema is unsupported")
 
 
 def publish_creation_output(
@@ -62,6 +75,50 @@ def publish_creation_output(
     )
 
 
+def publish_captain_sealed_creation_output(
+    job: CreationJobV2,
+    *,
+    source_archive_path: Path,
+    skill_usage_receipt_path: Path,
+    artifact_root: Path,
+) -> CreationResultV1:
+    """Import exact Captain-produced Codex bytes into Minibook's CAS."""
+
+    source_archive, candidate_manifest = read_captain_sealed_source_archive(
+        source_archive_path,
+        expected_sha256=job.source_archive_ref.sha256,
+        expected_candidate_manifest_sha256=(
+            job.codex_build_receipt.candidate_manifest_ref.sha256
+        ),
+    )
+    skill_usage_receipt = _read_exact_skill_usage_receipt(
+        job,
+        skill_usage_receipt_path,
+    )
+    publisher = ContentAddressedCreationArtifactPublisher(
+        FilesystemCreationArtifactStore(artifact_root)
+    )
+    receipt = publisher.publish(
+        job,
+        CreationExportBundle(
+            source_archive=source_archive,
+            candidate_manifest=candidate_manifest,
+            skill_usage_receipt=skill_usage_receipt,
+            captain_sealed_source=True,
+        ),
+    )
+    return CreationResultV1(
+        creation_job_id=job.creation_job_id,
+        correlation_id=job.correlation_id,
+        subject_version=job.subject_version,
+        attempt=job.attempt,
+        status="succeeded",
+        package_manifest_ref=receipt.package_manifest_ref,
+        artifact_refs=(receipt.candidate_manifest_ref, receipt.source_archive_ref),
+        skill_usage_receipt_ref=receipt.skill_usage_receipt_ref,
+    )
+
+
 def install_creation_skill_receipt(
     job: CreationJobV1,
     *,
@@ -70,6 +127,24 @@ def install_creation_skill_receipt(
 ) -> Path:
     """Install the exact Captain-supplied Hermes receipt without mutation."""
 
+    content = _read_exact_skill_usage_receipt(job, source_path)
+    target = output_path / "evidence" / "hermes-factory-skill-usage-receipt.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        if target.is_symlink() or target.read_bytes() != content:
+            raise ValueError("generated Forge skill usage receipt changed Captain evidence")
+        return target
+    with target.open("xb") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return target
+
+
+def _read_exact_skill_usage_receipt(
+    job: CreationJobV1 | CreationJobV2,
+    source_path: Path,
+) -> bytes:
     if source_path.is_symlink() or not source_path.is_file():
         raise FileNotFoundError("Forge skill usage receipt file is unavailable")
     content = source_path.read_bytes()
@@ -88,17 +163,7 @@ def install_creation_skill_receipt(
         or receipt.public_assertion_ids != job.public_assertion_ids
     ):
         raise ValueError("Forge skill usage receipt does not match creation job")
-    target = output_path / "evidence" / "hermes-factory-skill-usage-receipt.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        if target.is_symlink() or target.read_bytes() != content:
-            raise ValueError("generated Forge skill usage receipt changed Captain evidence")
-        return target
-    with target.open("xb") as handle:
-        handle.write(content)
-        handle.flush()
-        os.fsync(handle.fileno())
-    return target
+    return content
 
 
 def write_creation_result_atomic(path: Path, result: CreationResultV1) -> None:

@@ -16,6 +16,7 @@ from .contracts import (
     ArtifactRef,
     CreationFailure,
     CreationJobV1,
+    CreationJobV2,
     CreationPackageManifestV1,
     CreationResultV1,
     ForgeBuildSkillUsageReceiptV1,
@@ -63,6 +64,7 @@ class CreationExportBundle:
     source_archive: bytes
     candidate_manifest: dict[str, Any]
     skill_usage_receipt: bytes
+    captain_sealed_source: bool = False
 
 
 class CreationExportReceiptV1(BaseModel):
@@ -108,10 +110,27 @@ class ContentAddressedCreationArtifactPublisher:
 
     def publish(
         self,
-        job: CreationJobV1,
+        job: CreationJobV1 | CreationJobV2,
         bundle: CreationExportBundle,
     ) -> CreationExportReceiptV1:
-        self._validate_archive(bundle.source_archive)
+        is_v2 = isinstance(job, CreationJobV2)
+        if is_v2 != bundle.captain_sealed_source:
+            raise ValueError("creation source provenance does not match the creation job")
+        self._validate_archive(
+            bundle.source_archive,
+            forbid_external_skill_receipt=is_v2,
+            require_candidate_manifest=is_v2,
+        )
+        if is_v2 and hashlib.sha256(bundle.source_archive).hexdigest() != (
+            job.source_archive_ref.sha256
+        ):
+            raise ValueError("Captain source archive digest does not match creation job")
+        if is_v2:
+            self._require_exact_captain_source(
+                job,
+                bundle.source_archive,
+                candidate_manifest=bundle.candidate_manifest,
+            )
         source_ref = self._put_checked(
             bundle.source_archive,
             "application/zip",
@@ -221,7 +240,14 @@ class ContentAddressedCreationArtifactPublisher:
         ):
             raise ValueError("creation package skill usage receipt binding changed")
         self._validate_json_object(candidate_bytes, "candidate manifest")
-        self._validate_archive(source_bytes)
+        is_v2 = isinstance(job, CreationJobV2)
+        self._validate_archive(
+            source_bytes,
+            forbid_external_skill_receipt=is_v2,
+            require_candidate_manifest=is_v2,
+        )
+        if is_v2:
+            self._require_exact_captain_source(job, source_bytes)
         skill_usage_receipt = self._parse_skill_usage_receipt(skill_bytes)
         self._require_exact_skill_usage_receipt(job, skill_usage_receipt)
         expected_receipt_id = self._receipt_id(
@@ -314,7 +340,12 @@ class ContentAddressedCreationArtifactPublisher:
         return parsed
 
     @staticmethod
-    def _validate_archive(content: bytes) -> None:
+    def _validate_archive(
+        content: bytes,
+        *,
+        forbid_external_skill_receipt: bool = False,
+        require_candidate_manifest: bool = False,
+    ) -> None:
         if not content:
             raise ValueError("candidate source archive is empty")
         try:
@@ -323,11 +354,56 @@ class ContentAddressedCreationArtifactPublisher:
                 if not names:
                     raise ValueError("candidate source archive is empty")
                 for name in names:
+                    if (
+                        "\\" in name
+                        or (len(name) >= 2 and name[0].isalpha() and name[1] == ":")
+                    ):
+                        raise ValueError("candidate source archive path is unsafe")
                     path = PurePosixPath(name.replace("\\", "/"))
                     if path.is_absolute() or ".." in path.parts:
                         raise ValueError("candidate source archive path is unsafe")
+                folded = {name.rstrip("/").casefold() for name in names}
+                if len(folded) != len(names):
+                    raise ValueError("candidate source archive paths are not unique")
+                if require_candidate_manifest and "factory-candidate.json" not in names:
+                    raise ValueError("candidate source archive has no candidate manifest")
+                if (
+                    forbid_external_skill_receipt
+                    and "evidence/hermes-factory-skill-usage-receipt.json" in folded
+                ):
+                    raise ValueError("candidate source archive contains external skill receipt")
         except zipfile.BadZipFile as exc:
             raise ValueError("candidate source archive is not a ZIP") from exc
+
+    @staticmethod
+    def _require_exact_captain_source(
+        job: CreationJobV2,
+        source_archive: bytes,
+        *,
+        candidate_manifest: dict[str, Any] | None = None,
+    ) -> None:
+        if (
+            job.source_archive_ref.media_type != "application/zip"
+            or hashlib.sha256(source_archive).hexdigest()
+            != job.source_archive_ref.sha256
+        ):
+            raise ValueError("Captain source archive digest does not match creation job")
+        try:
+            with zipfile.ZipFile(BytesIO(source_archive)) as archive:
+                manifest_bytes = archive.read("factory-candidate.json")
+        except (KeyError, RuntimeError, zipfile.BadZipFile) as exc:
+            raise ValueError("Captain source archive candidate manifest is unavailable") from exc
+        if hashlib.sha256(manifest_bytes).hexdigest() != (
+            job.codex_build_receipt.candidate_manifest_ref.sha256
+        ):
+            raise ValueError("Captain candidate manifest digest does not match build receipt")
+        if candidate_manifest is not None:
+            try:
+                archived_manifest = json.loads(manifest_bytes)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("Captain candidate manifest is invalid JSON") from exc
+            if not isinstance(archived_manifest, dict) or archived_manifest != candidate_manifest:
+                raise ValueError("Captain candidate manifest changed outside the source archive")
 
     @staticmethod
     def _validate_json_object(content: bytes, label: str) -> None:

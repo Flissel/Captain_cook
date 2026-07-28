@@ -209,6 +209,118 @@ class ForgeBuildSkillUsageReceiptV1(_FrozenContract):
         return value
 
 
+class CodexBuildReceiptV1(_FrozenContract):
+    """Minibook mirror of Captain's sealed Codex build receipt."""
+
+    schema_name: Literal["captain.codex-build-receipt.v1"] = Field(
+        default="captain.codex-build-receipt.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    receipt_id: UUID
+    producer: Literal["captain"]
+    outcome: Literal["sealed"]
+    assignment_id: UUID
+    creation_job_id: UUID
+    factory_job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    idempotency_key: str = Field(pattern=SHA256_PATTERN)
+    build_brief_ref: ArtifactRef
+    codex_session_ref: ArtifactRef
+    workspace_ref: str = Field(pattern=r"^workspace://[A-Za-z0-9._:/-]+$")
+    workspace_snapshot_ref: ArtifactRef
+    source_archive_ref: ArtifactRef
+    candidate_manifest_ref: ArtifactRef
+    test_evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
+    acceptance_assertion_ids: tuple[str, ...] = Field(min_length=1)
+    completed_at: datetime
+
+    @field_validator("completed_at")
+    @classmethod
+    def require_completed_at_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("Codex build completion timestamp must be UTC")
+        return value
+
+    @field_validator("acceptance_assertion_ids")
+    @classmethod
+    def require_unique_public_assertions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)) or any(not item for item in value):
+            raise ValueError("Codex build assertion ids must be unique and nonblank")
+        return value
+
+    @field_validator("test_evidence_refs")
+    @classmethod
+    def require_unique_test_evidence(
+        cls, value: tuple[ArtifactRef, ...]
+    ) -> tuple[ArtifactRef, ...]:
+        identities = tuple((ref.uri, ref.sha256, ref.media_type) for ref in value)
+        if len(identities) != len(set(identities)):
+            raise ValueError("Codex build test evidence refs must be unique")
+        return value
+
+    @model_validator(mode="after")
+    def require_build_media_types(self) -> "CodexBuildReceiptV1":
+        if self.source_archive_ref.media_type != "application/zip":
+            raise ValueError("Codex source archive must be application/zip")
+        if self.candidate_manifest_ref.media_type != "application/json":
+            raise ValueError("Codex candidate manifest must be application/json")
+        if self.workspace_snapshot_ref.media_type != "application/zip":
+            raise ValueError("Codex workspace snapshot must be application/zip")
+        sealed_refs = (
+            self.build_brief_ref,
+            self.codex_session_ref,
+            self.workspace_snapshot_ref,
+            self.candidate_manifest_ref,
+            self.source_archive_ref,
+            *self.test_evidence_refs,
+        )
+        identities = tuple(
+            (ref.uri, ref.sha256, ref.media_type) for ref in sealed_refs
+        )
+        if len(identities) != len(set(identities)):
+            raise ValueError("sealed Codex build refs must be distinct")
+        return self
+
+
+class CreationJobV2(CreationJobV1):
+    """Minibook mirror for a Captain-sealed Codex source archive."""
+
+    schema_name: Literal["minibook.creation-job.v2"] = Field(
+        default="minibook.creation-job.v2",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    source_archive_ref: ArtifactRef
+    codex_build_receipt: CodexBuildReceiptV1
+
+    @field_validator("source_archive_ref")
+    @classmethod
+    def require_captain_source_zip(cls, value: ArtifactRef) -> ArtifactRef:
+        if value.media_type != "application/zip":
+            raise ValueError("Captain source archive must be application/zip")
+        return value
+
+    @model_validator(mode="after")
+    def require_exact_codex_build_binding(self) -> "CreationJobV2":
+        receipt = self.codex_build_receipt
+        if (
+            receipt.creation_job_id != self.creation_job_id
+            or receipt.factory_job_id != self.factory_job_id
+            or receipt.correlation_id != self.correlation_id
+            or receipt.subject_version != self.subject_version
+            or receipt.attempt != self.attempt
+            or receipt.idempotency_key != self.idempotency_key
+            or receipt.acceptance_assertion_ids != self.public_assertion_ids
+            or receipt.source_archive_ref.sha256 != self.source_archive_ref.sha256
+            or receipt.source_archive_ref.media_type != self.source_archive_ref.media_type
+        ):
+            raise ValueError("Codex build receipt does not match creation job")
+        return self
+
+
 class CreationPackageManifestV1(_FrozenContract):
     schema_name: Literal["minibook.creation-package-manifest.v1"] = Field(
         default="minibook.creation-package-manifest.v1",

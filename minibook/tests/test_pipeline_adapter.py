@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import zipfile
+from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -11,6 +14,7 @@ import pytest
 from minibook.swarm.contracts import (
     ArtifactRef,
     CreationJobV1,
+    CreationJobV2,
     ForgeBuildSkillUsageReceiptV1,
 )
 from minibook.swarm.pipeline_adapter import (
@@ -162,6 +166,87 @@ def _export_bundle(
     )
 
 
+def _captain_bundle(tmp_path: Path) -> CreationExportBundle:
+    legacy = _export_bundle(tmp_path)
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "factory-candidate.json",
+            json.dumps(legacy.candidate_manifest, separators=(",", ":")),
+        )
+        archive.writestr("run_team.py", "print('ok')\n")
+    return CreationExportBundle(
+        source_archive=buffer.getvalue(),
+        candidate_manifest=legacy.candidate_manifest,
+        skill_usage_receipt=legacy.skill_usage_receipt,
+        captain_sealed_source=True,
+    )
+
+
+def _captain_v2_job(bundle: CreationExportBundle) -> CreationJobV2:
+    with zipfile.ZipFile(BytesIO(bundle.source_archive)) as archive:
+        candidate_bytes = archive.read("factory-candidate.json")
+    base = job().model_dump(mode="json", by_alias=True)
+    source_digest = hashlib.sha256(bundle.source_archive).hexdigest()
+    candidate_digest = hashlib.sha256(candidate_bytes).hexdigest()
+    source_ref = {
+        "uri": f"artifact://captain/source/{source_digest}",
+        "sha256": source_digest,
+        "media_type": "application/zip",
+    }
+    base.update(
+        {
+            "schema": "minibook.creation-job.v2",
+            "source_archive_ref": source_ref,
+            "codex_build_receipt": {
+                "schema": "captain.codex-build-receipt.v1",
+                "receipt_id": str(uuid4()),
+                "producer": "captain",
+                "outcome": "sealed",
+                "assignment_id": str(uuid4()),
+                "creation_job_id": base["creation_job_id"],
+                "factory_job_id": base["factory_job_id"],
+                "correlation_id": base["correlation_id"],
+                "subject_version": base["subject_version"],
+                "attempt": base["attempt"],
+                "idempotency_key": base["idempotency_key"],
+                "build_brief_ref": {
+                    "uri": "artifact://captain/brief/" + "1" * 64,
+                    "sha256": "1" * 64,
+                    "media_type": "application/json",
+                },
+                "codex_session_ref": {
+                    "uri": "artifact://captain/session/" + "2" * 64,
+                    "sha256": "2" * 64,
+                    "media_type": "application/json",
+                },
+                "workspace_ref": "workspace://captain/codex",
+                "workspace_snapshot_ref": {
+                    "uri": "artifact://captain/workspace/" + "4" * 64,
+                    "sha256": "4" * 64,
+                    "media_type": "application/zip",
+                },
+                "source_archive_ref": source_ref,
+                "candidate_manifest_ref": {
+                    "uri": f"artifact://captain/candidate/{candidate_digest}",
+                    "sha256": candidate_digest,
+                    "media_type": "application/json",
+                },
+                "test_evidence_refs": [
+                    {
+                        "uri": "artifact://captain/tests/" + "3" * 64,
+                        "sha256": "3" * 64,
+                        "media_type": "application/json",
+                    }
+                ],
+                "acceptance_assertion_ids": base["public_assertion_ids"],
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            },
+        }
+    )
+    return CreationJobV2.model_validate(base)
+
+
 @pytest.mark.asyncio
 async def test_adapter_dispatches_exactly_one_named_step_and_captures_safe_snapshot() -> None:
     pipeline = FakePipeline()
@@ -300,6 +385,30 @@ def test_export_rejects_unbound_forge_build_skill_usage_receipt(
                 skill_usage_receipt=skill_usage_receipt,
             ),
         )
+
+
+def test_v2_export_replay_rechecks_captain_source_digest(
+    tmp_path: Path,
+) -> None:
+    bundle = _captain_bundle(tmp_path)
+    creation_job = _captain_v2_job(bundle)
+    store = BusinessBenchmarkContentAddressedArtifactStore(
+        tmp_path / ".captain-cook" / "captain-sealed-export"
+    )
+    publisher = ContentAddressedCreationArtifactPublisher(store)
+    receipt = publisher.publish(creation_job, bundle)
+    changed = creation_job.model_dump(mode="json", by_alias=True)
+    changed_ref = {
+        **changed["source_archive_ref"],
+        "sha256": "f" * 64,
+        "uri": "artifact://captain/source/" + "f" * 64,
+    }
+    changed["source_archive_ref"] = changed_ref
+    changed["codex_build_receipt"]["source_archive_ref"] = changed_ref
+    changed_job = CreationJobV2.model_validate(changed)
+
+    with pytest.raises(ValueError, match="Captain source archive digest"):
+        publisher.accept_receipt(changed_job, receipt)
 
 
 @pytest.mark.asyncio

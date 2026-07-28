@@ -14,6 +14,7 @@ class RuntimeOptions:
     result_file: str | None = None
     skill_usage_receipt_file: str | None = None
     artifact_root: str | None = None
+    source_archive_file: str | None = None
 
 
 def parse_runtime_options(argv: Sequence[str]) -> RuntimeOptions:
@@ -24,6 +25,7 @@ def parse_runtime_options(argv: Sequence[str]) -> RuntimeOptions:
     result_file = _option_value(argv, "--result-file")
     skill_usage_receipt_file = _option_value(argv, "--skill-usage-receipt-file")
     artifact_root = _option_value(argv, "--artifact-root")
+    source_archive_file = _option_value(argv, "--source-archive-file")
     creation_values = (
         creation_job_file,
         result_file,
@@ -36,6 +38,13 @@ def parse_runtime_options(argv: Sequence[str]) -> RuntimeOptions:
         raise ValueError(
             "--creation-job-file, --result-file, --skill-usage-receipt-file, "
             "and --artifact-root must be provided together"
+        )
+    if source_archive_file is not None and not all(
+        value is not None for value in creation_values
+    ):
+        raise ValueError(
+            "--source-archive-file requires --creation-job-file, --result-file, "
+            "--skill-usage-receipt-file, and --artifact-root"
         )
     if "--max-runtime-seconds" in argv:
         index = argv.index("--max-runtime-seconds")
@@ -54,6 +63,7 @@ def parse_runtime_options(argv: Sequence[str]) -> RuntimeOptions:
         result_file=result_file,
         skill_usage_receipt_file=skill_usage_receipt_file,
         artifact_root=artifact_root,
+        source_archive_file=source_archive_file,
     )
 
 

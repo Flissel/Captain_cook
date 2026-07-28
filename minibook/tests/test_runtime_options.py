@@ -23,6 +23,8 @@ def test_runtime_options_bind_creation_job_and_result_files() -> None:
             "work/forge-skill-usage-receipt.json",
             "--artifact-root",
             "work/.captain-cook/creation-cas",
+            "--source-archive-file",
+            "work/captain-source.zip",
         )
     )
 
@@ -30,6 +32,7 @@ def test_runtime_options_bind_creation_job_and_result_files() -> None:
     assert options.result_file == "work/creation-result.json"
     assert options.skill_usage_receipt_file == "work/forge-skill-usage-receipt.json"
     assert options.artifact_root == "work/.captain-cook/creation-cas"
+    assert options.source_archive_file == "work/captain-source.zip"
 
 
 @pytest.mark.parametrize(
@@ -60,3 +63,8 @@ def test_runtime_options_require_complete_creation_paths(argv: tuple[str, ...]) 
 def test_runtime_options_reject_invalid_deadlines(argv: tuple[str, str]) -> None:
     with pytest.raises(ValueError, match="max-runtime-seconds"):
         parse_runtime_options(argv)
+
+
+def test_runtime_options_reject_source_archive_without_creation_boundary() -> None:
+    with pytest.raises(ValueError, match="source-archive-file.*creation-job-file"):
+        parse_runtime_options(("--source-archive-file", "work/source.zip"))

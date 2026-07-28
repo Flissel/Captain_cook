@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import stat
 import zipfile
@@ -22,10 +23,104 @@ _EXCLUDED_DIRECTORY_NAMES = {
     "transcripts",
 }
 _EXCLUDED_SUFFIXES = {".log", ".pyc", ".pyo"}
+_MAX_CAPTAIN_ARCHIVE_FILES = 4096
+_MAX_CAPTAIN_ARCHIVE_UNCOMPRESSED_BYTES = 128 * 1024 * 1024
+_MAX_CANDIDATE_MANIFEST_BYTES = 1024 * 1024
 
 
 class CreationExportError(RuntimeError):
     """The local candidate output cannot be exported safely."""
+
+
+class CaptainSealedSourceError(ValueError):
+    """A Captain-provided Codex archive failed its immutable import contract."""
+
+
+def read_captain_sealed_source_archive(
+    source_path: Path,
+    *,
+    expected_sha256: str,
+    expected_candidate_manifest_sha256: str,
+) -> tuple[bytes, dict[str, Any]]:
+    """Verify and read a Captain-sealed ZIP without rewriting its bytes."""
+
+    path = Path(source_path)
+    if path.is_symlink() or not path.is_file():
+        raise CaptainSealedSourceError("Captain source archive file is unavailable")
+    try:
+        source_archive = path.read_bytes()
+    except OSError as exc:
+        raise CaptainSealedSourceError("Captain source archive could not be read") from exc
+    if hashlib.sha256(source_archive).hexdigest() != expected_sha256:
+        raise CaptainSealedSourceError("Captain source archive digest does not match")
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(source_archive)) as archive:
+            infos = archive.infolist()
+            if not infos or len(infos) > _MAX_CAPTAIN_ARCHIVE_FILES:
+                raise CaptainSealedSourceError("Captain source archive structure is unsafe")
+            normalized_names: set[str] = set()
+            casefolded_names: set[str] = set()
+            total_size = 0
+            manifest_info: zipfile.ZipInfo | None = None
+            for info in infos:
+                name = info.filename
+                if (
+                    "\\" in name
+                    or "\x00" in name
+                    or (len(name) >= 2 and name[0].isalpha() and name[1] == ":")
+                ):
+                    raise CaptainSealedSourceError("Captain source archive path is unsafe")
+                member = PurePosixPath(name)
+                if member.is_absolute() or not member.parts or ".." in member.parts:
+                    raise CaptainSealedSourceError("Captain source archive path is unsafe")
+                normalized = member.as_posix().rstrip("/")
+                if not normalized or normalized in normalized_names:
+                    raise CaptainSealedSourceError("Captain source archive structure is unsafe")
+                casefolded = normalized.casefold()
+                if casefolded in casefolded_names:
+                    raise CaptainSealedSourceError("Captain source archive path collision is unsafe")
+                normalized_names.add(normalized)
+                casefolded_names.add(casefolded)
+                mode = (info.external_attr >> 16) & 0o170000
+                if mode == stat.S_IFLNK or info.flag_bits & 0x1:
+                    raise CaptainSealedSourceError("Captain source archive member is unsafe")
+                total_size += info.file_size
+                if total_size > _MAX_CAPTAIN_ARCHIVE_UNCOMPRESSED_BYTES:
+                    raise CaptainSealedSourceError("Captain source archive is too large")
+                if casefolded == _SKILL_USAGE_RECEIPT.as_posix().casefold():
+                    raise CaptainSealedSourceError(
+                        "Captain source archive contains the external skill usage receipt"
+                    )
+                if normalized == _CANDIDATE_MANIFEST.as_posix():
+                    if info.is_dir() or info.file_size > _MAX_CANDIDATE_MANIFEST_BYTES:
+                        raise CaptainSealedSourceError("Captain candidate manifest is unsafe")
+                    manifest_info = info
+            if manifest_info is None:
+                raise CaptainSealedSourceError("Captain candidate manifest is missing")
+            try:
+                candidate_manifest_bytes = archive.read(manifest_info)
+                candidate_manifest = json.loads(candidate_manifest_bytes)
+            except (UnicodeDecodeError, json.JSONDecodeError, RuntimeError) as exc:
+                raise CaptainSealedSourceError("Captain candidate manifest is invalid JSON") from exc
+    except zipfile.BadZipFile as exc:
+        raise CaptainSealedSourceError("Captain source archive is not a ZIP") from exc
+
+    if not isinstance(candidate_manifest, dict):
+        raise CaptainSealedSourceError("Captain candidate manifest must be a JSON object")
+    if hashlib.sha256(candidate_manifest_bytes).hexdigest() != (
+        expected_candidate_manifest_sha256
+    ):
+        raise CaptainSealedSourceError("Captain candidate manifest digest does not match")
+    if candidate_manifest.get("schema", candidate_manifest.get("schema_name")) != (
+        "captain.factory-candidate.v1"
+    ):
+        raise CaptainSealedSourceError("Captain candidate manifest schema is invalid")
+    if "source_archive_ref" in candidate_manifest:
+        raise CaptainSealedSourceError(
+            "Captain candidate manifest must not contain publisher-owned source_archive_ref"
+        )
+    return source_archive, candidate_manifest
 
 
 def build_creation_export(

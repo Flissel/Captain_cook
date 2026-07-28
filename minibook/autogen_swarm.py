@@ -51,14 +51,38 @@ from swarm.forge_agents import ForgeState, load_forge_state, save_forge_state
 from swarm.forge_orchestrator import ForgeOrchestrator, ForgeAPI
 from swarm.input_designer import InputDesignPipeline
 from swarm.local_services import default_npm_command, ensure_frontend_dependencies
-from swarm.runtime_options import parse_runtime_options
-from swarm.contracts import CreationFailure, CreationResultV1
+from swarm.runtime_options import RuntimeOptions, parse_runtime_options
+from swarm.contracts import CreationFailure, CreationJobV2, CreationResultV1
 from swarm.creation_cli import (
     install_creation_skill_receipt,
     load_creation_job,
+    publish_captain_sealed_creation_output,
     publish_creation_output,
     write_creation_result_atomic,
 )
+
+
+def _publish_captain_sealed_import(
+    creation_job: CreationJobV2,
+    runtime_options: RuntimeOptions,
+) -> None:
+    """Complete a V2 import before any Minibook, Swarm, or provider effect."""
+
+    if runtime_options.source_archive_file is None:
+        raise ValueError("Captain V2 creation import requires --source-archive-file")
+    if runtime_options.skill_usage_receipt_file is None:
+        raise ValueError("Captain V2 creation import requires --skill-usage-receipt-file")
+    if runtime_options.artifact_root is None:
+        raise ValueError("Captain V2 creation import requires --artifact-root")
+    if runtime_options.result_file is None:
+        raise ValueError("Captain V2 creation import requires --result-file")
+    result = publish_captain_sealed_creation_output(
+        creation_job,
+        source_archive_path=Path(runtime_options.source_archive_file),
+        skill_usage_receipt_path=Path(runtime_options.skill_usage_receipt_file),
+        artifact_root=Path(runtime_options.artifact_root),
+    )
+    write_creation_result_atomic(Path(runtime_options.result_file), result)
 
 
 # --- Setup ---
@@ -1193,6 +1217,8 @@ async def main():
             i += 2
         elif argv[i] == "--artifact-root" and i + 1 < len(argv):
             i += 2
+        elif argv[i] == "--source-archive-file" and i + 1 < len(argv):
+            i += 2
         elif argv[i].startswith("--"):
             i += 1  # skip unknown flags
         else:
@@ -1200,6 +1226,33 @@ async def main():
             i += 1
 
     task = " ".join(positional_args) if positional_args else None
+    if isinstance(creation_job, CreationJobV2):
+        if input_file is not None or cascade_from is not None or cascade_file is not None:
+            print("ERROR: Captain V2 creation imports cannot run a generation pipeline")
+            raise SystemExit(2)
+        try:
+            _publish_captain_sealed_import(creation_job, runtime_options)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            assert runtime_options.result_file is not None
+            blocked_result = CreationResultV1(
+                creation_job_id=creation_job.creation_job_id,
+                correlation_id=creation_job.correlation_id,
+                subject_version=creation_job.subject_version,
+                attempt=creation_job.attempt,
+                status="blocked",
+                failure=CreationFailure(
+                    code="validation_failed",
+                    summary="Captain-sealed Codex build import failed validation",
+                ),
+            )
+            write_creation_result_atomic(
+                Path(runtime_options.result_file),
+                blocked_result,
+            )
+        return
+    if creation_job is not None and runtime_options.source_archive_file is not None:
+        print("ERROR: --source-archive-file requires a V2 creation job")
+        raise SystemExit(2)
     if creation_job is not None and input_file is None:
         print("ERROR: Captain creation jobs require --input-file")
         raise SystemExit(2)
