@@ -55,7 +55,7 @@ from tests.agent_factory.test_skill_evaluation_contracts import (
     receipt_payload,
     request_payload,
 )
-from tests.agent_factory.test_state_machine import block, job
+from tests.agent_factory.test_state_machine import block, job, job_v3
 from tests.agent_factory.test_skill_workflow_contracts import (
     brief_payload,
     evaluation_payload,
@@ -1009,7 +1009,7 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     authorization = _improvement_authorization()
-    factory_job = job().model_copy(
+    factory_job = job_v3(mode="demo").model_copy(
         update={
             "job_id": authorization.request_block.job_id,
             "correlation_id": authorization.request_block.correlation_id,

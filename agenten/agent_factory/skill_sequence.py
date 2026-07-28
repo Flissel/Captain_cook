@@ -118,6 +118,7 @@ class SkillSequencePolicy:
         *,
         role: FactoryRole,
         attempt: int,
+        require_codex_seal: bool = True,
     ) -> tuple[FactorySkillStep, ...]:
         if isinstance(attempt, bool) or not 1 <= attempt <= 5:
             raise ValueError("factory skill attempt must be between 1 and 5")
@@ -125,14 +126,19 @@ class SkillSequencePolicy:
             return (FactorySkillStep.DISCOVER,)
         if role is FactoryRole.TOOL_INTEGRATOR:
             if attempt > 1:
-                return (
+                retry_steps = (
                     FactorySkillStep.IMPROVE_TEAM,
                     FactorySkillStep.BRIEF_CODEX,
-                    FactorySkillStep.SEAL_CODEX_BUILD,
                 )
-            return (
-                FactorySkillStep.BRIEF_CODEX,
-                FactorySkillStep.SEAL_CODEX_BUILD,
+                return retry_steps + (
+                    (FactorySkillStep.SEAL_CODEX_BUILD,)
+                    if require_codex_seal
+                    else ()
+                )
+            return (FactorySkillStep.BRIEF_CODEX,) + (
+                (FactorySkillStep.SEAL_CODEX_BUILD,)
+                if require_codex_seal
+                else ()
             )
         if role is FactoryRole.REAL_CASE_TESTER:
             return (FactorySkillStep.EXECUTE_TEAM,)

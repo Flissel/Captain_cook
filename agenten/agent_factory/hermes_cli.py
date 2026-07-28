@@ -21,6 +21,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 from pydantic import BaseModel, ValidationError
 
 from agenten.agent_factory.contracts import (
+    AgentFactoryJobV3,
     FactoryBlockStatus,
     FactoryEvidenceBlock,
     FactoryJob,
@@ -185,6 +186,7 @@ class HermesCliFactory(HermesFactoryPort):
         steps = self._sequence_policy.steps_for(
             role=request.role,
             attempt=request.action.attempt,
+            require_codex_seal=isinstance(request.job, AgentFactoryJobV3),
         )
         improvement = _validated_improvement_authorization(request)
 
@@ -317,6 +319,8 @@ class HermesCliFactory(HermesFactoryPort):
         _validate_factory_dispatch(request, now=now)
         _validated_improvement_authorization(request)
         if (
+            isinstance(request.job, AgentFactoryJobV3)
+            and
             request.role is FactoryRole.TOOL_INTEGRATOR
             and self._codex_build_sealer is None
         ):
@@ -324,6 +328,7 @@ class HermesCliFactory(HermesFactoryPort):
         for step in self._sequence_policy.steps_for(
             role=request.role,
             attempt=request.action.attempt,
+            require_codex_seal=isinstance(request.job, AgentFactoryJobV3),
         ):
             released_skill = self._released_skill_catalog.released_for(
                 request.job,

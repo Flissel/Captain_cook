@@ -169,6 +169,14 @@ def test_improvement_authorization_rejects_unbound_prior_candidate() -> None:
         )
 
 
+def test_legacy_v1_sequence_can_omit_additive_codex_seal() -> None:
+    assert SkillSequencePolicy().steps_for(
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        require_codex_seal=False,
+    ) == (FactorySkillStep.BRIEF_CODEX,)
+
+
 def test_improvement_authorization_accepts_benchmark_only_failure() -> None:
     evaluation_data = evaluation_payload(
         failure_class="behavioral_failure",
