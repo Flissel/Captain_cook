@@ -1,6 +1,8 @@
 """Strict JSON contracts for the Minibook creation boundary."""
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from datetime import datetime, timezone
 from typing import Literal
@@ -227,6 +229,7 @@ class CodexBuildReceiptV1(_FrozenContract):
     subject_version: int = Field(ge=1, strict=True)
     attempt: int = Field(ge=1, le=5, strict=True)
     idempotency_key: str = Field(pattern=SHA256_PATTERN)
+    seal_idempotency_key: str = Field(pattern=SHA256_PATTERN)
     build_brief_ref: ArtifactRef
     codex_session_ref: ArtifactRef
     workspace_ref: str = Field(pattern=r"^workspace://[A-Za-z0-9._:/-]+$")
@@ -295,12 +298,20 @@ class CreationJobV2(CreationJobV1):
     )
     source_archive_ref: ArtifactRef
     codex_build_receipt: CodexBuildReceiptV1
+    codex_build_receipt_ref: ArtifactRef
 
     @field_validator("source_archive_ref")
     @classmethod
     def require_captain_source_zip(cls, value: ArtifactRef) -> ArtifactRef:
         if value.media_type != "application/zip":
             raise ValueError("Captain source archive must be application/zip")
+        return value
+
+    @field_validator("codex_build_receipt_ref")
+    @classmethod
+    def require_codex_receipt_json(cls, value: ArtifactRef) -> ArtifactRef:
+        if value.media_type != "application/json":
+            raise ValueError("Codex build receipt must be application/json")
         return value
 
     @model_validator(mode="after")
@@ -318,6 +329,17 @@ class CreationJobV2(CreationJobV1):
             or receipt.source_archive_ref.media_type != self.source_archive_ref.media_type
         ):
             raise ValueError("Codex build receipt does not match creation job")
+        canonical_receipt = json.dumps(
+            receipt.model_dump(mode="json", by_alias=True),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if (
+            self.codex_build_receipt_ref.media_type != "application/json"
+            or self.codex_build_receipt_ref.sha256
+            != hashlib.sha256(canonical_receipt).hexdigest()
+        ):
+            raise ValueError("Codex build receipt ref canonical digest does not match")
         return self
 
 
@@ -345,6 +367,22 @@ class CreationPackageManifestV1(_FrozenContract):
         if self.skill_usage_receipt_ref.media_type != "application/json":
             raise ValueError("skill usage receipt must be application/json")
         return self
+
+
+class CreationPackageManifestV2(CreationPackageManifestV1):
+    schema_name: Literal["minibook.creation-package-manifest.v2"] = Field(
+        default="minibook.creation-package-manifest.v2",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    codex_build_receipt_ref: ArtifactRef
+
+    @field_validator("codex_build_receipt_ref")
+    @classmethod
+    def require_codex_receipt_json(cls, value: ArtifactRef) -> ArtifactRef:
+        if value.media_type != "application/json":
+            raise ValueError("Codex build receipt must be application/json")
+        return value
 
 
 class CreationResultV1(_FrozenContract):

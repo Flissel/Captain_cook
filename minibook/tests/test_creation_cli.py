@@ -16,6 +16,7 @@ from minibook.swarm.contracts import (
     CodexBuildReceiptV1,
     CreationJobV1,
     CreationJobV2,
+    CreationPackageManifestV2,
     CreationResultV1,
 )
 from minibook.swarm.creation_cli import (
@@ -244,6 +245,7 @@ def _v2_job(source_bytes: bytes) -> CreationJobV2:
         "subject_version": payload["subject_version"],
         "attempt": payload["attempt"],
         "idempotency_key": payload["idempotency_key"],
+        "seal_idempotency_key": "5" * 64,
         "build_brief_ref": {
             "uri": "artifact://captain/codex-brief/" + "1" * 64,
             "sha256": "1" * 64,
@@ -272,6 +274,19 @@ def _v2_job(source_bytes: bytes) -> CreationJobV2:
         "acceptance_assertion_ids": payload["public_assertion_ids"],
         "completed_at": "2026-07-28T12:00:00Z",
     }
+    canonical_receipt = json.dumps(
+        CodexBuildReceiptV1.model_validate(
+            payload["codex_build_receipt"]
+        ).model_dump(mode="json", by_alias=True),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    receipt_digest = hashlib.sha256(canonical_receipt).hexdigest()
+    payload["codex_build_receipt_ref"] = {
+        "uri": "artifact://captain/codex-build-receipt/" + receipt_digest,
+        "sha256": receipt_digest,
+        "media_type": "application/json",
+    }
     return CreationJobV2.model_validate(payload)
 
 
@@ -280,6 +295,13 @@ def test_v2_job_binds_complete_captain_codex_build_receipt() -> None:
 
     assert isinstance(job.codex_build_receipt, CodexBuildReceiptV1)
     assert job.codex_build_receipt.source_archive_ref == job.source_archive_ref
+    assert job.codex_build_receipt_ref.sha256 == hashlib.sha256(
+        json.dumps(
+            job.codex_build_receipt.model_dump(mode="json", by_alias=True),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     changed = job.model_dump(mode="json", by_alias=True)
     changed["codex_build_receipt"]["attempt"] = job.attempt + 1
     with pytest.raises(ValueError, match="Codex build receipt.*creation job"):
@@ -289,6 +311,11 @@ def test_v2_job_binds_complete_captain_codex_build_receipt() -> None:
     duplicate["workspace_snapshot_ref"] = duplicate["source_archive_ref"]
     with pytest.raises(ValueError, match="sealed Codex build refs"):
         CodexBuildReceiptV1.model_validate(duplicate)
+
+    changed_ref = job.model_dump(mode="json", by_alias=True)
+    changed_ref["codex_build_receipt_ref"]["sha256"] = "e" * 64
+    with pytest.raises(ValueError, match="canonical.*digest"):
+        CreationJobV2.model_validate(changed_ref)
 
 
 def test_codex_build_receipt_is_schema_compatible_with_captain() -> None:
@@ -329,6 +356,21 @@ def test_v2_import_publishes_exact_captain_zip_and_keeps_receipt_external(
     assert store.read_bytes(source_ref) == source_bytes
     assert result.skill_usage_receipt_ref is not None
     assert store.read_bytes(result.skill_usage_receipt_ref) == receipt_bytes
+    codex_receipt_refs = [
+        ref
+        for ref in result.artifact_refs
+        if ref.media_type == "application/json"
+        and ref.sha256 == job.codex_build_receipt_ref.sha256
+    ]
+    assert len(codex_receipt_refs) == 1
+    assert CodexBuildReceiptV1.model_validate_json(
+        store.read_bytes(codex_receipt_refs[0])
+    ) == job.codex_build_receipt
+    assert result.package_manifest_ref is not None
+    package = CreationPackageManifestV2.model_validate_json(
+        store.read_bytes(result.package_manifest_ref)
+    )
+    assert package.codex_build_receipt_ref == codex_receipt_refs[0]
     with zipfile.ZipFile(BytesIO(store.read_bytes(source_ref))) as archive:
         assert "factory-candidate.json" in archive.namelist()
         assert "evidence/hermes-factory-skill-usage-receipt.json" not in archive.namelist()
@@ -360,6 +402,20 @@ def test_v2_import_fails_closed_for_changed_candidate_manifest_binding(
     changed["codex_build_receipt"]["candidate_manifest_ref"]["sha256"] = "f" * 64
     changed["codex_build_receipt"]["candidate_manifest_ref"]["uri"] = (
         "artifact://captain/candidate-manifest/" + "f" * 64
+    )
+    changed_receipt = CodexBuildReceiptV1.model_validate(
+        changed["codex_build_receipt"]
+    )
+    changed_receipt_digest = hashlib.sha256(
+        json.dumps(
+            changed_receipt.model_dump(mode="json", by_alias=True),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    changed["codex_build_receipt_ref"]["sha256"] = changed_receipt_digest
+    changed["codex_build_receipt_ref"]["uri"] = (
+        "artifact://captain/codex-build-receipt/" + changed_receipt_digest
     )
     job = CreationJobV2.model_validate(changed)
     source = tmp_path / "captain-source.zip"

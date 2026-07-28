@@ -17,6 +17,7 @@ from .creation_export import build_creation_export, read_captain_sealed_source_a
 from .pipeline_adapter import (
     ContentAddressedCreationArtifactPublisher,
     CreationExportBundle,
+    CreationExportReceiptV2,
 )
 
 
@@ -107,6 +108,8 @@ def publish_captain_sealed_creation_output(
             captain_sealed_source=True,
         ),
     )
+    if not isinstance(receipt, CreationExportReceiptV2):
+        raise ValueError("Captain V2 creation export did not produce V2 evidence")
     return CreationResultV1(
         creation_job_id=job.creation_job_id,
         correlation_id=job.correlation_id,
@@ -114,7 +117,11 @@ def publish_captain_sealed_creation_output(
         attempt=job.attempt,
         status="succeeded",
         package_manifest_ref=receipt.package_manifest_ref,
-        artifact_refs=(receipt.candidate_manifest_ref, receipt.source_archive_ref),
+        artifact_refs=(
+            receipt.candidate_manifest_ref,
+            receipt.source_archive_ref,
+            receipt.codex_build_receipt_ref,
+        ),
         skill_usage_receipt_ref=receipt.skill_usage_receipt_ref,
     )
 

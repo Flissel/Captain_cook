@@ -14,10 +14,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .contracts import (
     ArtifactRef,
+    CodexBuildReceiptV1,
     CreationFailure,
     CreationJobV1,
     CreationJobV2,
     CreationPackageManifestV1,
+    CreationPackageManifestV2,
     CreationResultV1,
     ForgeBuildSkillUsageReceiptV1,
 )
@@ -82,6 +84,16 @@ class CreationExportReceiptV1(BaseModel):
     skill_usage_receipt_ref: ArtifactRef
 
 
+class CreationExportReceiptV2(CreationExportReceiptV1):
+    schema_name: str = Field(
+        default="minibook.creation-export-receipt.v2",
+        alias="schema",
+        serialization_alias="schema",
+        pattern=r"^minibook\.creation-export-receipt\.v2$",
+    )
+    codex_build_receipt_ref: ArtifactRef
+
+
 class CreationArtifactSink(Protocol):
     def put(self, content: bytes, media_type: str, *, namespace: str) -> object: ...
 
@@ -91,15 +103,15 @@ class CreationArtifactSink(Protocol):
 class CreationArtifactPublisher(Protocol):
     def publish(
         self,
-        job: CreationJobV1,
+        job: CreationJobV1 | CreationJobV2,
         bundle: CreationExportBundle,
-    ) -> CreationExportReceiptV1: ...
+    ) -> CreationExportReceiptV1 | CreationExportReceiptV2: ...
 
     def accept_receipt(
         self,
-        job: CreationJobV1,
-        receipt: CreationExportReceiptV1,
-    ) -> CreationExportReceiptV1: ...
+        job: CreationJobV1 | CreationJobV2,
+        receipt: CreationExportReceiptV1 | CreationExportReceiptV2,
+    ) -> CreationExportReceiptV1 | CreationExportReceiptV2: ...
 
 
 class ContentAddressedCreationArtifactPublisher:
@@ -112,7 +124,7 @@ class ContentAddressedCreationArtifactPublisher:
         self,
         job: CreationJobV1 | CreationJobV2,
         bundle: CreationExportBundle,
-    ) -> CreationExportReceiptV1:
+    ) -> CreationExportReceiptV1 | CreationExportReceiptV2:
         is_v2 = isinstance(job, CreationJobV2)
         if is_v2 != bundle.captain_sealed_source:
             raise ValueError("creation source provenance does not match the creation job")
@@ -159,42 +171,89 @@ class ContentAddressedCreationArtifactPublisher:
             "application/json",
             namespace="forge-skill-receipt",
         )
-        package = CreationPackageManifestV1(
-            creation_job_id=job.creation_job_id,
-            factory_job_id=job.factory_job_id,
-            correlation_id=job.correlation_id,
-            subject_version=job.subject_version,
-            attempt=job.attempt,
-            candidate_manifest_ref=candidate_ref,
-            source_archive_ref=source_ref,
-            skill_usage_receipt_ref=skill_ref,
-        )
+        codex_receipt_ref: ArtifactRef | None = None
+        package: CreationPackageManifestV1 | CreationPackageManifestV2
+        if is_v2:
+            codex_receipt_bytes = _canonical_json(
+                job.codex_build_receipt.model_dump(mode="json", by_alias=True)
+            )
+            if hashlib.sha256(codex_receipt_bytes).hexdigest() != (
+                job.codex_build_receipt_ref.sha256
+            ):
+                raise ValueError("Codex build receipt canonical digest changed")
+            codex_receipt_ref = self._put_checked(
+                codex_receipt_bytes,
+                "application/json",
+                namespace="captain-codex-build-receipt",
+            )
+            if (
+                codex_receipt_ref.sha256 != job.codex_build_receipt_ref.sha256
+                or codex_receipt_ref.media_type
+                != job.codex_build_receipt_ref.media_type
+            ):
+                raise ValueError("Codex build receipt CAS binding changed")
+            package = CreationPackageManifestV2(
+                creation_job_id=job.creation_job_id,
+                factory_job_id=job.factory_job_id,
+                correlation_id=job.correlation_id,
+                subject_version=job.subject_version,
+                attempt=job.attempt,
+                candidate_manifest_ref=candidate_ref,
+                source_archive_ref=source_ref,
+                skill_usage_receipt_ref=skill_ref,
+                codex_build_receipt_ref=codex_receipt_ref,
+            )
+        else:
+            package = CreationPackageManifestV1(
+                creation_job_id=job.creation_job_id,
+                factory_job_id=job.factory_job_id,
+                correlation_id=job.correlation_id,
+                subject_version=job.subject_version,
+                attempt=job.attempt,
+                candidate_manifest_ref=candidate_ref,
+                source_archive_ref=source_ref,
+                skill_usage_receipt_ref=skill_ref,
+            )
         package_ref = self._put_checked(
             _canonical_json(package.model_dump(mode="json", by_alias=True)),
             "application/json",
             namespace="forge-package-manifest",
         )
-        receipt = CreationExportReceiptV1(
-            receipt_id=self._receipt_id(
+        receipt_values = {
+            "receipt_id": self._receipt_id(
                 job,
                 package_ref=package_ref,
                 candidate_ref=candidate_ref,
                 source_ref=source_ref,
                 skill_ref=skill_ref,
+                codex_receipt_ref=codex_receipt_ref,
             ),
-            package_manifest_ref=package_ref,
-            candidate_manifest_ref=candidate_ref,
-            source_archive_ref=source_ref,
-            skill_usage_receipt_ref=skill_ref,
-        )
+            "package_manifest_ref": package_ref,
+            "candidate_manifest_ref": candidate_ref,
+            "source_archive_ref": source_ref,
+            "skill_usage_receipt_ref": skill_ref,
+        }
+        receipt: CreationExportReceiptV1 | CreationExportReceiptV2
+        if codex_receipt_ref is None:
+            receipt = CreationExportReceiptV1(**receipt_values)
+        else:
+            receipt = CreationExportReceiptV2(
+                **receipt_values,
+                codex_build_receipt_ref=codex_receipt_ref,
+            )
         return self.accept_receipt(job, receipt)
 
     def accept_receipt(
         self,
-        job: CreationJobV1,
-        receipt: CreationExportReceiptV1,
-    ) -> CreationExportReceiptV1:
-        canonical = CreationExportReceiptV1.model_validate(
+        job: CreationJobV1 | CreationJobV2,
+        receipt: CreationExportReceiptV1 | CreationExportReceiptV2,
+    ) -> CreationExportReceiptV1 | CreationExportReceiptV2:
+        receipt_type = (
+            CreationExportReceiptV2
+            if isinstance(job, CreationJobV2)
+            else CreationExportReceiptV1
+        )
+        canonical = receipt_type.model_validate(
             receipt.model_dump(mode="json", by_alias=True)
         )
         package_bytes = self._read_checked(
@@ -217,8 +276,20 @@ class ContentAddressedCreationArtifactPublisher:
             "application/json",
             label="skill usage receipt",
         )
+        codex_receipt_bytes: bytes | None = None
+        if isinstance(canonical, CreationExportReceiptV2):
+            codex_receipt_bytes = self._read_checked(
+                canonical.codex_build_receipt_ref,
+                "application/json",
+                label="Codex build receipt",
+            )
         try:
-            package = CreationPackageManifestV1.model_validate_json(package_bytes)
+            package_type = (
+                CreationPackageManifestV2
+                if isinstance(job, CreationJobV2)
+                else CreationPackageManifestV1
+            )
+            package = package_type.model_validate_json(package_bytes)
         except ValueError as exc:
             raise ValueError("creation package manifest is invalid") from exc
         if (
@@ -239,6 +310,29 @@ class ContentAddressedCreationArtifactPublisher:
             != canonical.skill_usage_receipt_ref
         ):
             raise ValueError("creation package skill usage receipt binding changed")
+        if isinstance(job, CreationJobV2):
+            if (
+                not isinstance(package, CreationPackageManifestV2)
+                or not isinstance(canonical, CreationExportReceiptV2)
+                or package.codex_build_receipt_ref
+                != canonical.codex_build_receipt_ref
+                or codex_receipt_bytes is None
+            ):
+                raise ValueError("Codex build receipt package binding changed")
+            try:
+                persisted_codex_receipt = CodexBuildReceiptV1.model_validate_json(
+                    codex_receipt_bytes
+                )
+            except ValueError as exc:
+                raise ValueError("Codex build receipt is invalid") from exc
+            if (
+                persisted_codex_receipt != job.codex_build_receipt
+                or canonical.codex_build_receipt_ref.sha256
+                != job.codex_build_receipt_ref.sha256
+                or canonical.codex_build_receipt_ref.media_type
+                != job.codex_build_receipt_ref.media_type
+            ):
+                raise ValueError("Codex build receipt does not match creation job")
         self._validate_json_object(candidate_bytes, "candidate manifest")
         is_v2 = isinstance(job, CreationJobV2)
         self._validate_archive(
@@ -256,6 +350,11 @@ class ContentAddressedCreationArtifactPublisher:
             candidate_ref=canonical.candidate_manifest_ref,
             source_ref=canonical.source_archive_ref,
             skill_ref=canonical.skill_usage_receipt_ref,
+            codex_receipt_ref=(
+                canonical.codex_build_receipt_ref
+                if isinstance(canonical, CreationExportReceiptV2)
+                else None
+            ),
         )
         if canonical.receipt_id != expected_receipt_id:
             raise ValueError("creation export receipt ID does not match CAS bindings")
@@ -307,17 +406,19 @@ class ContentAddressedCreationArtifactPublisher:
         candidate_ref: ArtifactRef,
         source_ref: ArtifactRef,
         skill_ref: ArtifactRef,
+        codex_receipt_ref: ArtifactRef | None = None,
     ) -> str:
+        digest_parts = [
+            str(job.creation_job_id),
+            package_ref.sha256,
+            candidate_ref.sha256,
+            source_ref.sha256,
+            skill_ref.sha256,
+        ]
+        if codex_receipt_ref is not None:
+            digest_parts.append(codex_receipt_ref.sha256)
         return hashlib.sha256(
-            "|".join(
-                (
-                    str(job.creation_job_id),
-                    package_ref.sha256,
-                    candidate_ref.sha256,
-                    source_ref.sha256,
-                    skill_ref.sha256,
-                )
-            ).encode("utf-8")
+            "|".join(digest_parts).encode("utf-8")
         ).hexdigest()
 
     def _put_checked(
@@ -496,7 +597,7 @@ class SwarmPipelineAdapter:
 
     async def run_step(
         self,
-        job: CreationJobV1,
+        job: CreationJobV1 | CreationJobV2,
         step: str,
         prior_snapshot: dict[str, Any],
         effect_key: str,
@@ -540,6 +641,10 @@ class SwarmPipelineAdapter:
                     "source_archive": export_receipt.source_archive_ref,
                 }
             )
+            if isinstance(export_receipt, CreationExportReceiptV2):
+                artifact_bindings["codex_build_receipt"] = (
+                    export_receipt.codex_build_receipt_ref
+                )
             package_manifest_ref = export_receipt.package_manifest_ref
             skill_usage_receipt_ref = export_receipt.skill_usage_receipt_ref
         snapshot = prior.model_copy(
@@ -556,17 +661,22 @@ class SwarmPipelineAdapter:
 
     def _export_receipt(
         self,
-        job: CreationJobV1,
+        job: CreationJobV1 | CreationJobV2,
         step: SwarmStep,
         output: Any,
         accepted_effect: dict[str, Any] | None,
-    ) -> CreationExportReceiptV1 | None:
+    ) -> CreationExportReceiptV1 | CreationExportReceiptV2 | None:
         if step is not SwarmStep.EXPORT:
             return None
         if accepted_effect is not None:
             if self._artifact_publisher is None:
                 raise ValueError("creation artifact CAS read authority is unavailable")
-            receipt = CreationExportReceiptV1.model_validate(accepted_effect)
+            receipt_type = (
+                CreationExportReceiptV2
+                if isinstance(job, CreationJobV2)
+                else CreationExportReceiptV1
+            )
+            receipt = receipt_type.model_validate(accepted_effect)
             return self._artifact_publisher.accept_receipt(job, receipt)
         if not isinstance(output, CreationExportBundle):
             # A creation export must expose verified local bytes. Any legacy
@@ -576,7 +686,12 @@ class SwarmPipelineAdapter:
             return None
         return self._artifact_publisher.publish(job, output)
 
-    async def _dispatch(self, pipeline: Any, step: SwarmStep, job: CreationJobV1) -> Any:
+    async def _dispatch(
+        self,
+        pipeline: Any,
+        step: SwarmStep,
+        job: CreationJobV1 | CreationJobV2,
+    ) -> Any:
         if step is SwarmStep.MANAGER:
             return await pipeline.step_swarm_manager(self._session, str(job.input_ref.uri))
         method_names = {
@@ -599,10 +714,14 @@ class SwarmPipelineAdapter:
         return await method(self._session)
 
     def assemble_result(
-        self, job: CreationJobV1, snapshot: dict[str, Any]
+        self, job: CreationJobV1 | CreationJobV2, snapshot: dict[str, Any]
     ) -> CreationResultV1:
         state = SwarmSnapshot.model_validate(snapshot)
-        required_bindings = ("candidate_manifest", "source_archive")
+        required_bindings = (
+            ("candidate_manifest", "source_archive", "codex_build_receipt")
+            if isinstance(job, CreationJobV2)
+            else ("candidate_manifest", "source_archive")
+        )
         if (
             state.package_manifest_ref is None
             or state.skill_usage_receipt_ref is None

@@ -13,13 +13,16 @@ import pytest
 
 from minibook.swarm.contracts import (
     ArtifactRef,
+    CodexBuildReceiptV1,
     CreationJobV1,
     CreationJobV2,
+    CreationPackageManifestV2,
     ForgeBuildSkillUsageReceiptV1,
 )
 from minibook.swarm.pipeline_adapter import (
     ContentAddressedCreationArtifactPublisher,
     CreationExportBundle,
+    CreationExportReceiptV2,
     PIPELINE_STEP_ORDER,
     SwarmPipelineAdapter,
     SwarmSnapshot,
@@ -210,6 +213,7 @@ def _captain_v2_job(bundle: CreationExportBundle) -> CreationJobV2:
                 "subject_version": base["subject_version"],
                 "attempt": base["attempt"],
                 "idempotency_key": base["idempotency_key"],
+                "seal_idempotency_key": "5" * 64,
                 "build_brief_ref": {
                     "uri": "artifact://captain/brief/" + "1" * 64,
                     "sha256": "1" * 64,
@@ -244,6 +248,19 @@ def _captain_v2_job(bundle: CreationExportBundle) -> CreationJobV2:
             },
         }
     )
+    canonical_receipt = json.dumps(
+        CodexBuildReceiptV1.model_validate(base["codex_build_receipt"]).model_dump(
+            mode="json", by_alias=True
+        ),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    receipt_digest = hashlib.sha256(canonical_receipt).hexdigest()
+    base["codex_build_receipt_ref"] = {
+        "uri": f"artifact://captain/codex-build-receipt/{receipt_digest}",
+        "sha256": receipt_digest,
+        "media_type": "application/json",
+    }
     return CreationJobV2.model_validate(base)
 
 
@@ -278,6 +295,19 @@ async def test_export_publishes_real_bytes_and_rehydrates_accepted_receipt(
         job(), SwarmStep.EXPORT.value, prior.model_dump(), "effect", None
     )
     result = adapter.assemble_result(job(), outcome.snapshot)
+
+    assert outcome.effect_receipt is not None
+    assert outcome.effect_receipt["receipt_id"] == hashlib.sha256(
+        "|".join(
+            (
+                str(job().creation_job_id),
+                outcome.effect_receipt["package_manifest_ref"]["sha256"],
+                outcome.effect_receipt["candidate_manifest_ref"]["sha256"],
+                outcome.effect_receipt["source_archive_ref"]["sha256"],
+                outcome.effect_receipt["skill_usage_receipt_ref"]["sha256"],
+            )
+        ).encode("utf-8")
+    ).hexdigest()
 
     assert result.status == "succeeded"
     assert result.package_manifest_ref is not None
@@ -397,6 +427,15 @@ def test_v2_export_replay_rechecks_captain_source_digest(
     )
     publisher = ContentAddressedCreationArtifactPublisher(store)
     receipt = publisher.publish(creation_job, bundle)
+    assert isinstance(receipt, CreationExportReceiptV2)
+    package = CreationPackageManifestV2.model_validate_json(
+        store.read_bytes(
+            RuntimeArtifactRef.model_validate(
+                receipt.package_manifest_ref.model_dump(mode="json")
+            )
+        )
+    )
+    assert package.codex_build_receipt_ref == receipt.codex_build_receipt_ref
     changed = creation_job.model_dump(mode="json", by_alias=True)
     changed_ref = {
         **changed["source_archive_ref"],
@@ -405,10 +444,85 @@ def test_v2_export_replay_rechecks_captain_source_digest(
     }
     changed["source_archive_ref"] = changed_ref
     changed["codex_build_receipt"]["source_archive_ref"] = changed_ref
+    changed_codex_receipt = CodexBuildReceiptV1.model_validate(
+        changed["codex_build_receipt"]
+    )
+    changed_codex_digest = hashlib.sha256(
+        json.dumps(
+            changed_codex_receipt.model_dump(mode="json", by_alias=True),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    changed["codex_build_receipt_ref"] = {
+        **changed["codex_build_receipt_ref"],
+        "sha256": changed_codex_digest,
+        "uri": f"artifact://captain/codex-build-receipt/{changed_codex_digest}",
+    }
     changed_job = CreationJobV2.model_validate(changed)
 
-    with pytest.raises(ValueError, match="Captain source archive digest"):
+    with pytest.raises(
+        ValueError,
+        match="Codex build receipt|Captain source archive digest",
+    ):
         publisher.accept_receipt(changed_job, receipt)
+
+    tampered = receipt.model_dump(mode="json", by_alias=True)
+    tampered["codex_build_receipt_ref"] = tampered["candidate_manifest_ref"]
+    with pytest.raises(ValueError, match="Codex build receipt"):
+        publisher.accept_receipt(
+            creation_job,
+            CreationExportReceiptV2.model_validate(tampered),
+        )
+
+
+@pytest.mark.asyncio
+async def test_v2_adapter_retains_codex_receipt_in_snapshot_result_and_replay(
+    tmp_path: Path,
+) -> None:
+    bundle = _captain_bundle(tmp_path)
+    creation_job = _captain_v2_job(bundle)
+    store = BusinessBenchmarkContentAddressedArtifactStore(
+        tmp_path / ".captain-cook" / "captain-sealed-adapter"
+    )
+    prior = SwarmSnapshot(creation_job_id=creation_job.creation_job_id)
+    adapter = SwarmPipelineAdapter(
+        lambda _prior: ExportPipeline(bundle),
+        session=object(),
+        artifact_publisher=ContentAddressedCreationArtifactPublisher(store),
+    )
+
+    exported = await adapter.run_step(
+        creation_job,
+        SwarmStep.EXPORT.value,
+        prior.model_dump(),
+        "effect",
+        None,
+    )
+    result = adapter.assemble_result(creation_job, exported.snapshot)
+
+    assert result.status == "succeeded"
+    assert any(
+        ref.sha256 == creation_job.codex_build_receipt_ref.sha256
+        and ref.media_type == "application/json"
+        for ref in result.artifact_refs
+    )
+
+    replay_pipeline = ExportPipeline(None)
+    replay = SwarmPipelineAdapter(
+        lambda _prior: replay_pipeline,
+        session=object(),
+        artifact_publisher=ContentAddressedCreationArtifactPublisher(store),
+    )
+    replayed = await replay.run_step(
+        creation_job,
+        SwarmStep.EXPORT.value,
+        prior.model_dump(),
+        "effect",
+        exported.effect_receipt,
+    )
+    assert replayed.snapshot == exported.snapshot
+    assert replay_pipeline.calls == 0
 
 
 @pytest.mark.asyncio
