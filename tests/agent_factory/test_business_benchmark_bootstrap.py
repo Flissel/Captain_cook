@@ -142,7 +142,7 @@ def _invocation(
     )
 
 
-def test_default_loader_reports_exact_missing_authority_instead_of_bundle_todo(
+def test_default_loader_defers_gateway_authority_until_async_preflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     job = live_job()
@@ -151,13 +151,15 @@ def test_default_loader_reports_exact_missing_authority_instead_of_bundle_todo(
         "production-benchmark-seed-v1",
     )
 
-    with pytest.raises(
-        ValueError,
-        match="CAPTAIN_BENCHMARK_CASE_MAX_COST_USD",
-    ) as caught:
-        load_production_business_benchmark_composition(_settings(job))
+    composition = load_production_business_benchmark_composition(
+        _settings(job),
+        environment={},
+    )
 
-    assert "production_adapter_bundle" not in str(caught.value)
+    assert composition.expected_scopes == ()
+    assert callable(composition.preflight)
+    assert callable(composition.run)
+    assert callable(composition.aclose)
 
 
 def test_bootstrap_config_builds_only_gitignored_captain_roots(

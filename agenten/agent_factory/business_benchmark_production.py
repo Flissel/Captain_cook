@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import Lock
 from typing import Protocol
 from uuid import UUID
@@ -505,6 +507,15 @@ class BusinessBenchmarkClockPort(Protocol):
     def __call__(self) -> datetime: ...
 
 
+@dataclass(frozen=True)
+class _PreparedProductionBusinessBenchmarkScope:
+    scope: ProductionBusinessBenchmarkScope
+    executor: BusinessBenchmarkExecutorPort
+    replay_store: BusinessBenchmarkReplayStore
+    case_policies: dict[str, BenchmarkExecutionPolicyV1]
+    policy_binding: CaptainBusinessBenchmarkPolicyBindingV1
+
+
 class ProductionBusinessBenchmarkComposition:
     """Execute exactly one already-resolved production benchmark team."""
 
@@ -534,6 +545,9 @@ class ProductionBusinessBenchmarkComposition:
         self._scopes: dict[
             tuple[str, UUID, int], BusinessBenchmarkExpectedScopeV1
         ] = {}
+        self._prepared_scopes: dict[
+            tuple[str, UUID, int], _PreparedProductionBusinessBenchmarkScope
+        ] = {}
 
     @property
     def expected_scopes(self) -> tuple[BusinessBenchmarkExpectedScopeV1, ...]:
@@ -556,6 +570,32 @@ class ProductionBusinessBenchmarkComposition:
             self._remember_scope(scope)
         return tuple(scope.expected_scope for scope in resolved)
 
+    async def preflight(
+        self,
+        settings: LiveBusinessBenchmarkSettings,
+        environment: Mapping[str, str],
+        *,
+        repository_root: Path | None = None,
+    ) -> tuple[BusinessBenchmarkExpectedScopeV1, ...]:
+        """Materialize every real team adapter without provider or n8n effects."""
+
+        del repository_root
+        canonical = LiveBusinessBenchmarkSettings.model_validate(
+            settings.model_dump(mode="python")
+        )
+        secret_getter = getattr(environment, "get", None)
+        if not callable(secret_getter) or not str(
+            secret_getter(canonical.provider_secret_name, "")
+        ).strip():
+            raise BusinessBenchmarkProductionScopeError(
+                "benchmark provider secret is not present"
+            )
+        prepared = tuple(
+            self._prepare_scope(canonical.for_selection(selection))
+            for selection in canonical.selections
+        )
+        return tuple(item.scope.expected_scope for item in prepared)
+
     async def run(
         self, settings: LiveBusinessBenchmarkSettings
     ) -> BusinessBenchmarkLiveRunResultV1:
@@ -563,20 +603,12 @@ class ProductionBusinessBenchmarkComposition:
             raise BusinessBenchmarkProductionScopeError(
                 "production composition requires single team settings"
             )
-        scope = self._resolver.resolve(settings)
-        self._remember_scope(scope)
-
-        case_policy_factory = self._execution_policy_factory(scope)
-        case_policies = self._materialize_case_policies(
-            scope,
-            case_policy_factory,
-        )
-        policy_binding = self._captain_policy(scope)
-
-        # Runtime dependencies are created only after every immutable policy,
-        # suite, candidate, invocation, technical run, and budget check passed.
-        executor = self._executor_factory(scope)
-        replay_store = self._replay_store_factory(scope)
+        prepared = self._prepare_scope(settings)
+        scope = prepared.scope
+        case_policies = prepared.case_policies
+        policy_binding = prepared.policy_binding
+        executor = prepared.executor
+        replay_store = prepared.replay_store
 
         def exact_case_policy(
             benchmark_case: BusinessBenchmarkCaseV1,
@@ -671,6 +703,53 @@ class ProductionBusinessBenchmarkComposition:
             completed_at=completed_at,
         )
 
+    def _prepare_scope(
+        self, settings: LiveBusinessBenchmarkSettings
+    ) -> _PreparedProductionBusinessBenchmarkScope:
+        scope = self._resolver.resolve(settings)
+        self._remember_scope(scope)
+        key = self._scope_key(scope)
+        with self._scope_lock:
+            existing = self._prepared_scopes.get(key)
+        if existing is not None:
+            if existing.scope != scope:
+                raise BusinessBenchmarkProductionScopeError(
+                    "production benchmark scope changed after preflight"
+                )
+            return existing
+
+        case_policy_factory = self._execution_policy_factory(scope)
+        case_policies = self._materialize_case_policies(
+            scope,
+            case_policy_factory,
+        )
+        policy_binding = self._captain_policy(scope)
+        executor = self._executor_factory(scope)
+        replay_store = self._replay_store_factory(scope)
+        prepared = _PreparedProductionBusinessBenchmarkScope(
+            scope=scope,
+            executor=executor,
+            replay_store=replay_store,
+            case_policies=case_policies,
+            policy_binding=policy_binding,
+        )
+        with self._scope_lock:
+            existing = self._prepared_scopes.get(key)
+            if existing is not None and existing != prepared:
+                raise BusinessBenchmarkProductionScopeError(
+                    "production benchmark adapter changed after preflight"
+                )
+            self._prepared_scopes[key] = prepared
+        return prepared
+
+    @staticmethod
+    def _scope_key(scope: ProductionBusinessBenchmarkScope) -> tuple[str, UUID, int]:
+        return (
+            scope.selection.profile,
+            scope.job.job_id,
+            scope.selection.attempt,
+        )
+
     @staticmethod
     def _materialize_case_policies(
         scope: ProductionBusinessBenchmarkScope,
@@ -748,11 +827,7 @@ class ProductionBusinessBenchmarkComposition:
         return binding
 
     def _remember_scope(self, scope: ProductionBusinessBenchmarkScope) -> None:
-        key = (
-            scope.selection.profile,
-            scope.job.job_id,
-            scope.selection.attempt,
-        )
+        key = self._scope_key(scope)
         with self._scope_lock:
             existing = self._scopes.get(key)
             if existing is not None and existing != scope.expected_scope:

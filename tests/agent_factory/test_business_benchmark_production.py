@@ -739,6 +739,57 @@ async def test_production_composition_runs_one_isolated_team_and_returns_exact_e
 
 
 @pytest.mark.asyncio
+async def test_production_preflight_materializes_and_reuses_real_scope_adapters(
+    tmp_path: Path,
+) -> None:
+    job, manifest, _, invocations, resolver = authorities(tmp_path)
+    factory = FactoryComposition(job, manifest.source_archive_ref)
+    executors: list[object] = []
+    replays: list[object] = []
+    execution_policy = BenchmarkExecutionPolicyV1(
+        schema="captain.business-benchmark-execution-policy.v1",
+        model_version="approved-model-id",
+        baseline_system_policy_version="baseline-v1",
+        maximum_cost_micro_usd=100,
+        maximum_latency_ms=1000,
+        redaction_policy_version="redaction-v1",
+    )
+    composition = ProductionBusinessBenchmarkComposition(
+        resolver=resolver,
+        factory_composition=factory,
+        invocation_authority=invocations,
+        executor_factory=lambda scope: executors.append(object()) or executors[-1],
+        replay_store_factory=lambda scope: replays.append(object()) or replays[-1],
+        execution_policy_factory=lambda scope: (lambda case: execution_policy),
+        benchmark_policy_authority=PolicyAuthority(job),
+        receipt_finalizer=Finalizer(),
+        clock=lambda: NOW,
+    )
+    selected = settings(job, manifest.candidate_id)
+
+    prepared = await composition.preflight(
+        selected,
+        {"OPENAI_API_KEY": "present-for-deterministic-test-only"},
+        repository_root=tmp_path,
+    )
+    repeated = await composition.preflight(
+        selected,
+        {"OPENAI_API_KEY": "present-for-deterministic-test-only"},
+        repository_root=tmp_path,
+    )
+
+    assert prepared == repeated == composition.expected_scopes
+    assert len(executors) == len(replays) == 1
+    assert factory.calls == []
+
+    await composition.run(selected)
+
+    assert len(executors) == len(replays) == 1
+    assert factory.calls[0]["executor"] is executors[0]
+    assert factory.calls[0]["replay_store"] is replays[0]
+
+
+@pytest.mark.asyncio
 async def test_production_composition_rejects_aggregate_settings_before_effects(
     tmp_path: Path,
 ) -> None:

@@ -54,6 +54,12 @@ class GatewayBusinessBenchmarkCompositionAuthority:
         self.leases = GatewayFactoryLeases(store)
         self.budget = GatewayFactoryBudgetLedger(store)
 
+    @property
+    def runtime_store(self) -> GatewayStore:
+        """Expose the store only to sibling Gateway-owned runtime adapters."""
+
+        return self._store
+
     def compose(
         self,
         settings: LiveBusinessBenchmarkSettings,

@@ -12,7 +12,7 @@ import json
 import math
 import re
 from collections.abc import Awaitable, Callable, Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal, Protocol
@@ -597,7 +597,7 @@ class LiveBusinessBenchmarkSettings(_FrozenModel):
     maximum_usd: Decimal
     allowed_models: tuple[str, ...]
     evidence_root: Path
-    runtime_url: str
+    runtime_url: str | None
     provider_secret_name: str
 
     @model_validator(mode="after")
@@ -738,7 +738,7 @@ class LiveBusinessBenchmarkSettings(_FrozenModel):
             maximum_usd=maximum,
             allowed_models=allowed_models,
             evidence_root=evidence_root,
-            runtime_url=_required(environment, "CAPTAIN_RUNTIME_URL"),
+            runtime_url=environment.get("CAPTAIN_RUNTIME_URL", "").strip() or None,
             provider_secret_name=secret_name,
         )
 
@@ -899,13 +899,17 @@ class BusinessBenchmarkLiveRunResultV1(_FrozenModel):
 
 
 class ProductionBusinessBenchmarkCompositionPort(Protocol):
-    """Production wiring for runtime bundle, durable fence store, and full run."""
+    """Production wiring that prepares real per-team adapters before effects."""
 
-    runtime_bundle: ProductionBusinessBenchmarkRuntimeBundlePort
-    fence_store: DurableProviderFencePort
     expected_scopes: tuple[BusinessBenchmarkExpectedScopeV1, ...]
 
-    async def health_check(self, url: str) -> bool: ...
+    async def preflight(
+        self,
+        settings: LiveBusinessBenchmarkSettings,
+        environment: Mapping[str, str],
+        *,
+        repository_root: Path | None = None,
+    ) -> tuple[BusinessBenchmarkExpectedScopeV1, ...]: ...
 
     async def run(
         self, settings: LiveBusinessBenchmarkSettings
@@ -917,25 +921,93 @@ BusinessBenchmarkCompositionLoader = Callable[
 ]
 
 
+class _AsyncClosePort(Protocol):
+    async def aclose(self) -> None: ...
+
+
+class _ScopedGatewayBusinessBenchmarkComposition:
+    """Own the Gateway composition and its request-scoped HTTP client."""
+
+    def __init__(
+        self,
+        settings: LiveBusinessBenchmarkSettings,
+        environment: Mapping[str, str],
+    ) -> None:
+        self._settings = settings
+        self._environment = dict(environment)
+        self._composition: ProductionBusinessBenchmarkCompositionPort | None = None
+        self._client: _AsyncClosePort | None = None
+
+    @property
+    def expected_scopes(self) -> tuple[BusinessBenchmarkExpectedScopeV1, ...]:
+        if self._composition is None:
+            return ()
+        return self._composition.expected_scopes
+
+    async def preflight(
+        self,
+        settings: LiveBusinessBenchmarkSettings,
+        environment: Mapping[str, str],
+        *,
+        repository_root: Path | None = None,
+    ) -> tuple[BusinessBenchmarkExpectedScopeV1, ...]:
+        composition = await self._load()
+        return await composition.preflight(
+            settings,
+            environment,
+            repository_root=repository_root,
+        )
+
+    async def run(
+        self, settings: LiveBusinessBenchmarkSettings
+    ) -> BusinessBenchmarkLiveRunResultV1:
+        return await (await self._load()).run(settings)
+
+    async def aclose(self) -> None:
+        client = self._client
+        self._client = None
+        if client is not None:
+            await client.aclose()
+
+    async def _load(self) -> ProductionBusinessBenchmarkCompositionPort:
+        if self._composition is not None:
+            return self._composition
+        import httpx
+
+        from gateway.business_benchmark_live_composition import (
+            GatewayBusinessBenchmarkLiveCompositionLoader,
+        )
+
+        client = httpx.AsyncClient()
+        try:
+            composition = GatewayBusinessBenchmarkLiveCompositionLoader(
+                environment=self._environment,
+                n8n_client=client,
+                clock=lambda: datetime.now(timezone.utc),
+            )(self._settings)
+        except Exception:
+            await client.aclose()
+            raise
+        self._client = client
+        self._composition = composition
+        return composition
+
+
 def load_production_business_benchmark_composition(
     settings: LiveBusinessBenchmarkSettings,
+    *,
+    environment: Mapping[str, str],
 ) -> ProductionBusinessBenchmarkCompositionPort:
-    """Build the concrete production graph and fail on its exact missing port."""
+    """Return the Gateway-owned production graph with scoped client ownership."""
 
-    from agenten.agent_factory.business_benchmark_bootstrap import (
-        build_production_business_benchmark_composition,
-    )
-
-    return build_production_business_benchmark_composition(settings)
+    return _ScopedGatewayBusinessBenchmarkComposition(settings, environment)
 
 
 async def run_provider_business_benchmarks(
     environment: Mapping[str, str],
     *,
     repository_root: Path | None = None,
-    composition_loader: BusinessBenchmarkCompositionLoader = (
-        load_production_business_benchmark_composition
-    ),
+    composition_loader: BusinessBenchmarkCompositionLoader | None = None,
 ) -> BusinessBenchmarkLiveRunResultV1:
     """Load production wiring, preflight it, execute, and validate full scope."""
 
@@ -944,34 +1016,73 @@ async def run_provider_business_benchmarks(
     )
     if not environment.get(settings.provider_secret_name, "").strip():
         raise ValueError("provider secret is not present")
-    composition = composition_loader(settings)
-    scope_preparer = getattr(composition, "prepare_scopes", None)
-    if callable(scope_preparer):
-        scope_preparer(settings)
-    runtime_bundle = getattr(composition, "runtime_bundle", None)
-    if runtime_bundle is None or any(
-        not callable(getattr(runtime_bundle, method, None))
-        for method in ("prepare", "execute", "recover")
-    ):
-        raise ProductionAdapterUnavailableError("runtime bundle is unavailable")
-    fence_store = getattr(composition, "fence_store", None)
-    if fence_store is None or any(
-        not callable(getattr(fence_store, method, None))
-        for method in (
-            "register_fence",
-            "assert_current",
-            "begin_dispatch",
-            "record_provider_terminal",
-            "finalize",
+    composition = (
+        load_production_business_benchmark_composition(
+            settings,
+            environment=environment,
         )
-    ):
-        raise ProductionAdapterUnavailableError("durable provider fence store is unavailable")
-    expected_scopes = _load_expected_scopes(composition, settings)
-    _validate_expected_scope_settings(expected_scopes, settings)
-    await LiveBusinessBenchmarkPreflight(
-        health_check=composition.health_check,
-        runtime_bundle=composition.runtime_bundle,
-    ).validate_environment(environment, repository_root=repository_root)
+        if composition_loader is None
+        else composition_loader(settings)
+    )
+    try:
+        return await _run_loaded_provider_business_benchmarks(
+            settings,
+            environment,
+            repository_root=repository_root,
+            composition=composition,
+        )
+    finally:
+        closer = getattr(composition, "aclose", None)
+        if callable(closer):
+            await closer()
+
+
+async def _run_loaded_provider_business_benchmarks(
+    settings: LiveBusinessBenchmarkSettings,
+    environment: Mapping[str, str],
+    *,
+    repository_root: Path | None,
+    composition: ProductionBusinessBenchmarkCompositionPort,
+) -> BusinessBenchmarkLiveRunResultV1:
+    production_preflight = getattr(composition, "preflight", None)
+    if callable(production_preflight):
+        await production_preflight(
+            settings,
+            environment,
+            repository_root=repository_root,
+        )
+        expected_scopes = _load_expected_scopes(composition, settings)
+        _validate_expected_scope_settings(expected_scopes, settings)
+    else:
+        scope_preparer = getattr(composition, "prepare_scopes", None)
+        if callable(scope_preparer):
+            scope_preparer(settings)
+        runtime_bundle = getattr(composition, "runtime_bundle", None)
+        if runtime_bundle is None or any(
+            not callable(getattr(runtime_bundle, method, None))
+            for method in ("prepare", "execute", "recover")
+        ):
+            raise ProductionAdapterUnavailableError("runtime bundle is unavailable")
+        fence_store = getattr(composition, "fence_store", None)
+        if fence_store is None or any(
+            not callable(getattr(fence_store, method, None))
+            for method in (
+                "register_fence",
+                "assert_current",
+                "begin_dispatch",
+                "record_provider_terminal",
+                "finalize",
+            )
+        ):
+            raise ProductionAdapterUnavailableError(
+                "durable provider fence store is unavailable"
+            )
+        expected_scopes = _load_expected_scopes(composition, settings)
+        _validate_expected_scope_settings(expected_scopes, settings)
+        await LiveBusinessBenchmarkPreflight(
+            health_check=composition.health_check,
+            runtime_bundle=composition.runtime_bundle,
+        ).validate_environment(environment, repository_root=repository_root)
     scopes_by_profile = {scope.suites[0].profile: scope for scope in expected_scopes}
     team_results: list[BusinessBenchmarkLiveRunResultV1] = []
     for selection in settings.selections:
@@ -1157,6 +1268,8 @@ class LiveBusinessBenchmarkPreflight:
         )
         if not environment.get(settings.provider_secret_name, "").strip():
             raise ValueError("provider secret is not present")
+        if settings.runtime_url is None:
+            raise ValueError("legacy benchmark runtime URL is not configured")
         if not await self._health_check(settings.runtime_url):
             raise ValueError("Captain runtime health check failed")
         if self._runtime_bundle is None:

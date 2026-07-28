@@ -251,6 +251,92 @@ async def test_live_entrypoint_loads_composition_and_requires_finalized_receipts
 
 
 @pytest.mark.asyncio
+async def test_live_entrypoint_uses_effect_free_production_preflight_contract() -> None:
+    calls: list[str] = []
+    authoritative_scope = expected_scope()
+
+    class Composition:
+        expected_scopes = (authoritative_scope,)
+
+        async def preflight(
+            self,
+            settings: LiveBusinessBenchmarkSettings,
+            environment,
+            *,
+            repository_root: Path | None = None,
+        ):
+            calls.append("preflight")
+            assert settings.profile == "claims"
+            assert environment["OPENAI_API_KEY"]
+            assert repository_root == Path.cwd()
+            return self.expected_scopes
+
+        async def run(self, settings: LiveBusinessBenchmarkSettings):
+            calls.append(settings.profile)
+            return live_result(settings.profile)
+
+    outcome = await run_provider_business_benchmarks(
+        live_environment(),
+        repository_root=Path.cwd(),
+        composition_loader=lambda settings: Composition(),
+    )
+
+    assert len(outcome.receipts) == 30
+    assert calls == ["preflight", "claims"]
+
+
+@pytest.mark.asyncio
+async def test_default_live_loader_owns_gateway_client_and_needs_no_unused_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = live_environment()
+    environment.pop("CAPTAIN_RUNTIME_URL")
+    authoritative_scope = expected_scope()
+    captured: dict[str, object] = {}
+
+    class GatewayComposition:
+        expected_scopes = (authoritative_scope,)
+
+        async def preflight(self, settings, supplied_environment, **kwargs):
+            captured["preflight"] = True
+            assert "CAPTAIN_RUNTIME_URL" not in supplied_environment
+            return self.expected_scopes
+
+        async def run(self, settings):
+            return live_result(settings.profile)
+
+    class GatewayLoader:
+        def __init__(self, *, environment, n8n_client, clock):
+            captured["client"] = n8n_client
+            captured["loader_environment"] = environment
+
+        def __call__(self, settings):
+            return GatewayComposition()
+
+    monkeypatch.setattr(
+        "gateway.business_benchmark_live_composition."
+        "GatewayBusinessBenchmarkLiveCompositionLoader",
+        GatewayLoader,
+    )
+    for name, value in environment.items():
+        monkeypatch.setenv(name, f"ambient-conflict-{name.lower()}")
+    monkeypatch.delenv("CAPTAIN_RUNTIME_URL", raising=False)
+
+    outcome = await run_provider_business_benchmarks(
+        environment,
+        repository_root=Path.cwd(),
+    )
+
+    assert len(outcome.receipts) == 30
+    assert captured["preflight"] is True
+    assert captured["loader_environment"] == environment
+    assert captured["loader_environment"]["OPENAI_API_KEY"] == (
+        "present-for-deterministic-test-only"
+    )
+    assert captured["client"].is_closed is True
+
+
+@pytest.mark.asyncio
 async def test_live_entrypoint_rejects_incomplete_receipt_scope() -> None:
     authoritative_scope = expected_scope()
 

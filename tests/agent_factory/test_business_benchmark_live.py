@@ -616,3 +616,5 @@ def test_powershell_runner_contract_is_fail_closed_and_redacted() -> None:
         assert required in script
     assert "Get-ChildItem Env:" not in script
     assert "Write-Host $env:" not in script
+    global_requirements = script.split("$singleTeamRequiredEnvironment", 1)[0]
+    assert "'CAPTAIN_RUNTIME_URL'" not in global_requirements
