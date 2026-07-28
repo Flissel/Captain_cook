@@ -1216,6 +1216,14 @@ class AuthorityFreeBaselineTool:
             raise ValueError("authority-free baseline tool name is invalid")
         if not callable(self.function):
             raise ValueError("authority-free baseline tool must be callable")
+        if (
+            self.integration_intent is not IntegrationIntent.NONE
+            or self.mutates_external_state
+            or self.routing_authority
+            or self.publication_authority
+            or self.grant_authority
+        ):
+            raise ValueError("baseline tool must be authority-free")
 
 
 class HostAutoGenSessionExecutor:
@@ -1233,6 +1241,7 @@ class HostAutoGenSessionExecutor:
         holdouts: FactoryHoldoutEvaluatorPort,
         tools: Mapping[str, Callable[..., Any]],
         baseline_tools: Mapping[str, AuthorityFreeBaselineTool] | None = None,
+        baseline_n8n_tools: Mapping[str, OpaqueN8nToolReference] | None = None,
         evaluator: FactoryCandidateEvaluator | None = None,
         n8n_adapter: FactoryN8nToolAdapterPort | None = None,
         n8n_authority: FactoryN8nGrantAuthorityPort | None = None,
@@ -1250,6 +1259,14 @@ class HostAutoGenSessionExecutor:
         }
         if any(name != tool.name for name, tool in (baseline_tools or {}).items()):
             raise ValueError("baseline tool registry key does not match sealed tool")
+        self._baseline_n8n_tools = dict(baseline_n8n_tools or {})
+        if any(
+            name != reference.tool_name
+            for name, reference in self._baseline_n8n_tools.items()
+        ):
+            raise ValueError("baseline n8n tool registry key does not match opaque ref")
+        if set(self._baseline_tools).intersection(self._baseline_n8n_tools):
+            raise ValueError("baseline tool cannot have ambiguous authority")
         self._evaluator = evaluator or FactoryCandidateEvaluator()
         self._n8n_adapter = n8n_adapter
         self._n8n_authority = n8n_authority
@@ -1299,7 +1316,7 @@ class HostAutoGenSessionExecutor:
         resolved_tools = self._resolve_tools(
             policy.allowed_tools,
             maximum=policy.max_tool_calls,
-            n8n_tools={},
+            n8n_tools=self._baseline_n8n_tools,
             registry=self._baseline_tools,
         )
         agent = AssistantAgent(
@@ -1359,7 +1376,11 @@ class HostAutoGenSessionExecutor:
             max_handoffs=0,
             max_tool_calls=policy.max_tool_calls,
             termination_conditions=("task_completed", "max_messages", "max_tool_calls"),
-            n8n_tool_names=set(),
+            n8n_tools={
+                name: self._baseline_n8n_tools[name]
+                for name in policy.allowed_tools
+                if name in self._baseline_n8n_tools
+            },
             n8n_evidence_offset=n8n_evidence_offset,
         )
 
@@ -1547,7 +1568,7 @@ class HostAutoGenSessionExecutor:
             max_handoffs=manifest.max_handoffs,
             max_tool_calls=manifest.max_tool_calls,
             termination_conditions=manifest.termination_conditions,
-            n8n_tool_names=n8n_tool_names,
+            n8n_tools={name: n8n_tools[name] for name in n8n_tool_names},
             n8n_evidence_offset=n8n_evidence_offset,
         )
 
@@ -1573,13 +1594,25 @@ class HostAutoGenSessionExecutor:
             self._n8n_adapter is None or self._n8n_authority is None
         ):
             raise ValueError(
-                "candidate n8n tools require trusted n8n adapter and grant authority"
+                "n8n tools require trusted n8n adapter and grant authority"
             )
         resolved: dict[str, Callable[..., Any] | BaseTool[BaseModel, Any]] = dict(
             registry
         )
         if self._n8n_adapter is not None:
             assert self._n8n_authority is not None or not required_n8n_tools
+            for name in required_n8n_tools:
+                raw_claim = self._n8n_adapter.authorization(name)
+                claim = FactoryN8nToolAuthorizationV1.model_validate(
+                    raw_claim.model_dump(mode="python")
+                )
+                if (
+                    claim.tool_name != name
+                    or claim.approved_tool_ref != n8n_tools[name]
+                ):
+                    raise ValueError(
+                        "n8n authorization claim belongs to a different tool"
+                    )
             resolved.update(
                 {
                     name: CaptainAuthorizedN8nTool(
@@ -1628,7 +1661,7 @@ class HostAutoGenSessionExecutor:
         max_handoffs: int,
         max_tool_calls: int,
         termination_conditions: tuple[str, ...],
-        n8n_tool_names: set[str],
+        n8n_tools: Mapping[str, OpaqueN8nToolReference],
         n8n_evidence_offset: int,
     ) -> HostAutoGenSessionResult:
         handoff_messages = tuple(
@@ -1705,7 +1738,10 @@ class HostAutoGenSessionExecutor:
         for n8n_execution in n8n_executions:
             assert self._n8n_authority is not None
             if (
-                n8n_execution.runtime_command.correlation_id
+                n8n_execution.tool_name not in n8n_tools
+                or n8n_execution.approved_tool_ref
+                != n8n_tools.get(n8n_execution.tool_name)
+                or n8n_execution.runtime_command.correlation_id
                 != identity.correlation_id
                 or n8n_execution.runtime_command.subject_version
                 != identity.subject_version
@@ -1719,7 +1755,7 @@ class HostAutoGenSessionExecutor:
                 raise ValueError("n8n evidence does not match session identity")
             await self._n8n_authority.authorize(n8n_execution, now=self._clock())
         observed_n8n_calls = tuple(
-            item for item in tool_executions if item.tool_name in n8n_tool_names
+            item for item in tool_executions if item.tool_name in n8n_tools
         )
         if len(n8n_executions) != len(observed_n8n_calls) or any(
             observed.tool_name != evidence.tool_name

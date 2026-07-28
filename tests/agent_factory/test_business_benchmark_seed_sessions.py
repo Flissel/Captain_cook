@@ -19,6 +19,7 @@ from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
 from agenten.agent_factory.execution_budget import InMemoryFactoryBudgetLedger
 from agenten.agent_factory.team_execution import (
     BudgetedChatCompletionClient,
+    FactoryN8nToolAuthorizationV1,
     HostAutoGenSessionExecutor,
     HostAutoGenSessionIdentityV1,
     ResolvedFactoryHoldoutCase,
@@ -27,6 +28,7 @@ from tests.agent_factory.test_team_execution import (
     NOW,
     _PaidEffectAuthority,
     _PricingAuthority,
+    _baseline_n8n_contract,
     _invocation,
     _job_v3,
     _pricing_quote,
@@ -58,6 +60,15 @@ async def test_seed_candidate_runs_through_real_host_autogen_session(
     invocation = _invocation(job)
     candidate = package_business_benchmark_seed(profile_id, tmp_path / "candidate")
     evidence = FilesystemFactoryEvidenceStore(tmp_path / "evidence")
+    expected_authorization = (
+        _baseline_n8n_contract(
+            job,
+            candidate.candidate.n8n_tools[0].opaque_reference(),
+            suffix="2",
+        )[0]
+        if candidate.candidate.n8n_tools
+        else None
+    )
 
     class Holdouts:
         async def resolve(self, reference):
@@ -86,8 +97,11 @@ async def test_seed_candidate_runs_through_real_host_autogen_session(
                 description="Read a synthetic renewal context.",
             )
 
-        def authorization(self, name: str) -> object:
-            raise AssertionError(f"unexpected n8n call: {name}")
+        def authorization(self, name: str) -> FactoryN8nToolAuthorizationV1:
+            if expected_authorization is None:
+                raise AssertionError(f"unexpected n8n preflight: {name}")
+            assert name == expected_authorization.tool_name
+            return expected_authorization
 
         def observed_evidence(self) -> tuple[()]:
             return ()
