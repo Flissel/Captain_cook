@@ -183,6 +183,7 @@ $global:gets = 0
 $global:postFields = @()
 $global:activations = 0
 $global:detailReads = 0
+$global:activationJson = $false
 function Invoke-WebRequest {{
     param($Uri, $Method = 'GET', $Headers, $Body, $ContentType, [switch]$UseBasicParsing, $TimeoutSec, $ErrorAction)
     $target = [string]$Uri
@@ -214,6 +215,9 @@ function Invoke-WebRequest {{
         throw 'unexpected update'
     }}
     if ($target -eq 'http://127.0.0.1:5679/api/v1/workflows/renewal-owned-1/activate' -and $verb -eq 'POST') {{
+        $activationBody = $Body | ConvertFrom-Json -Depth 4
+        if ($ContentType -ne 'application/json' -or @($activationBody.PSObject.Properties).Count -ne 0) {{ throw 'activation requires canonical empty JSON' }}
+        $global:activationJson = $true
         $global:activations++
         $global:remote.active = $true
         return [pscustomobject]@{{ StatusCode = 200; Content = (@{{ id = 'renewal-owned-1'; active = $true }} | ConvertTo-Json -Compress) }}
@@ -271,6 +275,7 @@ try {{
     gets = $global:gets
     post_fields = @($global:postFields)
     activations = $global:activations
+    activation_json = $global:activationJson
     ownership_after_failure = $ownershipAfterFailure
     deployment_after_failure = $deploymentAfterFailure
     ownership_receipts = @(Get-ChildItem -LiteralPath {_pwsh_literal(evidence)} -Filter 'renewal-context-n8n-ownership.v1.json' -File -ErrorAction SilentlyContinue).Count
@@ -296,6 +301,7 @@ try {{
         "gets": 1,
         "post_fields": ["connections", "name", "nodes", "settings"],
         "activations": 1,
+        "activation_json": True,
         "ownership_after_failure": 1,
         "deployment_after_failure": 0,
         "ownership_receipts": 1,

@@ -609,7 +609,7 @@ function Ensure-WorkflowActivation {
         return Write-ActivationReceipt -WorkflowId $WorkflowId -PublishedSha256 $Validated.PublishedSha256
     }
 
-    $activated = Invoke-CaptainRest -Verb POST -Path "/api/v1/workflows/$([uri]::EscapeDataString($WorkflowId))/activate" -ApiKey $ApiKey -Body $null
+    $activated = Invoke-CaptainRest -Verb POST -Path "/api/v1/workflows/$([uri]::EscapeDataString($WorkflowId))/activate" -ApiKey $ApiKey -Body ([ordered]@{})
     if (
         (Get-WorkflowId -Value $activated) -cne $WorkflowId -or
         $null -eq $activated.PSObject.Properties["active"] -or
