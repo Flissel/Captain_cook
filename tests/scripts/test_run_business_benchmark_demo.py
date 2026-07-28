@@ -20,10 +20,13 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
 
     assert source.startswith("#requires -Version 7")
     assert "[ValidateSet('Plan', 'Run')]" in source
-    assert "--maximum-usd-per-team', '0.50'" in source
-    assert "$seedVersion = 'business-benchmark-demo-2026-07-v3'" in source
-    assert "'--suite-version', '3'" in source
-    assert "business-benchmark-demo-2026-07-v3" in source
+    assert "--maximum-usd-per-team', $maximumUsdPerTeam" in source
+    assert "$maximumUsdPerTeam = '0.45'" in source
+    assert "$maximumHermesUsd = '0.10'" in source
+    assert "$environment['CAPTAIN_BENCHMARK_MAX_USD'] = '0.90'" in source
+    assert "$seedVersion = 'business-benchmark-demo-2026-07-v4'" in source
+    assert "'--suite-version', '4'" in source
+    assert "run-agent-factory-business-demo.py" in source
     assert "--apply" in source
     assert "preflight-business-benchmark-demo.py" in source
     assert "& $serviceRunner benchmark-start" in source
@@ -104,12 +107,12 @@ def team(profile, job_id, candidate_id, batch=None):
             'job_id': job_id,
             'execution_policy': {
                 'allowed_models': ['gpt-4.1-mini'],
-                'max_cost_usd': '0.50',
+                'max_cost_usd': '0.45',
             },
         },
         'suite': {'suite_version': 1},
         'candidate_id': candidate_id,
-        'gateway_budget_remaining_usd': '0.50',
+        'gateway_budget_remaining_usd': '0.45',
         'work_batch': None if batch is None else {'batch_id': batch},
         'production_scope_resolvable': True,
         'missing_gateway_evidence': ['team_execution_evidence'],
@@ -178,7 +181,7 @@ print(json.dumps({
         "status": "factory_dispatch_required",
         "database": "captain_test",
         "issued_at": checkpoint["issued_at"],
-        "maximum_usd_per_team": "0.50",
+        "maximum_usd_per_team": "0.45",
         "jobs": [
             {
                 "profile": "claims",
@@ -204,8 +207,8 @@ print(json.dumps({
     assert not (repository / "provider-called").exists()
     arguments = json.loads((repository / "provision-args.json").read_text("utf-8"))
     assert "--apply" in arguments
-    assert arguments[arguments.index("--maximum-usd-per-team") + 1] == "0.50"
-    assert arguments[arguments.index("--suite-version") + 1] == "3"
+    assert arguments[arguments.index("--maximum-usd-per-team") + 1] == "0.45"
+    assert arguments[arguments.index("--suite-version") + 1] == "4"
     issued_at = arguments[arguments.index("--issued-at") + 1]
     assert issued_at.endswith("Z")
     combined = completed.stdout + completed.stderr
@@ -252,6 +255,97 @@ print(json.dumps({
     assert provider_boundary.returncode != 0
     assert "OPENAI_API_KEY must already exist in the process" in provider_boundary.stderr
     assert not (repository / "provider-called").exists()
+
+    (scripts / "preflight-business-benchmark-demo.py").write_text(
+        r"""
+import json
+from pathlib import Path
+
+root = Path(__file__).resolve().parents[1]
+resolvable = root.joinpath('factory-called').is_file()
+print(json.dumps({
+    'schema': 'captain.business-benchmark-default-preflight.v1',
+    'status': 'resolvable' if resolvable else 'factory_dispatch_required',
+    'database': 'captain_test',
+    'production_scope_resolvable': resolvable,
+    **({'jobs': []} if resolvable else {}),
+}))
+""".strip(),
+        encoding="utf-8",
+    )
+    (scripts / "run-agent-factory-business-demo.py").write_text(
+        r"""
+import json
+from pathlib import Path
+import sys
+
+root = Path(__file__).resolve().parents[1]
+root.joinpath('factory-called').write_text('yes', encoding='utf-8')
+root.joinpath('factory-args.json').write_text(
+    json.dumps(sys.argv[1:]), encoding='utf-8'
+)
+job_ids = [
+    value for index, value in enumerate(sys.argv[1:])
+    if index > 0 and sys.argv[index] == '--job-id'
+]
+print(json.dumps({
+    'schema': 'captain.business-demo-factory-operator.v1',
+    'database': 'captain_test',
+    'results': [
+        {
+            'schema': 'captain.factory-dispatch-run-result.v1',
+            'job_id': job_id,
+            'status': 'captain_action_required',
+        }
+        for job_id in job_ids
+    ],
+}))
+""".strip(),
+        encoding="utf-8",
+    )
+    (scripts / "run-business-benchmark-live.ps1").write_text(
+        r"""
+param([string]$Profile, [string]$PythonPath)
+$root = Split-Path -Parent $PSScriptRoot
+if (-not (Test-Path -LiteralPath (Join-Path $root 'factory-called'))) {
+    throw 'Factory must run before provider benchmark.'
+}
+Set-Content (Join-Path $root 'provider-called') 'yes'
+""".strip(),
+        encoding="utf-8",
+    )
+    environment["OPENAI_API_KEY"] = "process-only-demo-key"
+
+    successful = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(scripts / SCRIPT.name),
+            "-Action",
+            "Run",
+            "-PythonPath",
+            sys.executable,
+        ],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert successful.returncode == 0, successful.stderr
+    assert json.loads(successful.stdout)["status"] == "completed"
+    assert (repository / "factory-called").is_file()
+    assert (repository / "provider-called").is_file()
+    factory_arguments = json.loads(
+        (repository / "factory-args.json").read_text("utf-8")
+    )
+    assert factory_arguments[factory_arguments.index("--hermes-max-usd") + 1] == "0.10"
+    assert factory_arguments[factory_arguments.index("--hermes-model") + 1] == "gpt-4.1-mini"
+    assert factory_arguments.count("--job-id") == 2
+    assert "process-only-demo-key" not in successful.stdout + successful.stderr
 
 
 def test_missing_provider_key_does_not_block_infrastructure_checkpoint(

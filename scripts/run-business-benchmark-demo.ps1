@@ -16,11 +16,13 @@ $rootEnvPath = Join-Path $repositoryRoot '.env'
 $captainN8nEnvPath = Join-Path $repositoryRoot '.env.captain-n8n'
 $provisionScript = Join-Path $PSScriptRoot 'provision-business-benchmark-demo.py'
 $preflightScript = Join-Path $PSScriptRoot 'preflight-business-benchmark-demo.py'
+$factoryRunner = Join-Path $PSScriptRoot 'run-agent-factory-business-demo.py'
 $liveRunner = Join-Path $PSScriptRoot 'run-business-benchmark-live.ps1'
 $serviceRunner = Join-Path $PSScriptRoot 'live-demo-services.ps1'
 $canonicalRenewalWorkflow = Join-Path $repositoryRoot 'examples/business_benchmark_candidates/customer_renewal_orchestration_team/workflows/renewal_context_read.json'
-$maximumUsdPerTeam = '0.50'
-$seedVersion = 'business-benchmark-demo-2026-07-v3'
+$maximumUsdPerTeam = '0.45'
+$maximumHermesUsd = '0.10'
+$seedVersion = 'business-benchmark-demo-2026-07-v4'
 
 $rootEnvAllowlist = @(
     'TEST_MARIADB_DSN',
@@ -309,8 +311,8 @@ try {
         '--workspace-root', $repositoryRoot,
         '--issued-at', $issuedAt,
         '--model', $model,
-        '--maximum-usd-per-team', '0.50',
-        '--suite-version', '3',
+        '--maximum-usd-per-team', $maximumUsdPerTeam,
+        '--suite-version', '4',
         '--seed-version-id', $seedVersion
     )
     if ($Action -ceq 'Run') {
@@ -362,7 +364,7 @@ try {
     $renewalBatchId = Require-NonEmpty $renewal.work_batch.batch_id 'renewal.work_batch.batch_id'
 
     $environment['CAPTAIN_BENCHMARK_PROFILE'] = 'all'
-    $environment['CAPTAIN_BENCHMARK_MAX_USD'] = '1.00'
+    $environment['CAPTAIN_BENCHMARK_MAX_USD'] = '0.90'
     $environment['CAPTAIN_JOB_ALLOWED_MODELS'] = $model
     foreach ($binding in @(
         @('CLAIMS', $claims),
@@ -411,7 +413,12 @@ try {
     ) {
         throw 'Captain business benchmark default composition preflight is not canonical.'
     }
-    if ($preflight.production_scope_resolvable -ne $true) {
+
+    $processOpenAiKey = [Environment]::GetEnvironmentVariable('OPENAI_API_KEY', 'Process')
+    if (
+        $preflight.production_scope_resolvable -ne $true -and
+        [string]::IsNullOrWhiteSpace($processOpenAiKey)
+    ) {
         New-FactoryDispatchCheckpoint `
             -Teams $teams `
             -IssuedAt $issuedAt `
@@ -420,9 +427,84 @@ try {
         exit 2
     }
 
-    $processOpenAiKey = [Environment]::GetEnvironmentVariable('OPENAI_API_KEY', 'Process')
     if ([string]::IsNullOrWhiteSpace($processOpenAiKey)) {
         throw 'OPENAI_API_KEY must already exist in the process; demo env files are never read for it.'
+    }
+
+    if ($preflight.production_scope_resolvable -ne $true) {
+        $factoryArguments = @(
+            $factoryRunner,
+            '--workspace-root', $repositoryRoot,
+            '--python-executable', $python,
+            '--job-id', [string]$claims.job.job_id,
+            '--job-id', [string]$renewal.job.job_id,
+            '--hermes-provider', 'openai-api',
+            '--hermes-model', $model,
+            '--hermes-max-usd', $maximumHermesUsd,
+            '--maximum-dispatches', '12'
+        )
+        $rawFactory = @(& $python @factoryArguments 2>$null)
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Captain Factory live operator failed closed; inspect private evidence.'
+        }
+        try {
+            $factoryResult = ($rawFactory -join [Environment]::NewLine) |
+                ConvertFrom-Json -Depth 100
+        }
+        catch {
+            throw 'Captain Factory live operator returned invalid JSON.'
+        }
+        $expectedJobIds = @(
+            [string]$claims.job.job_id,
+            [string]$renewal.job.job_id
+        ) | Sort-Object
+        $actualJobIds = @($factoryResult.results | ForEach-Object { [string]$_.job_id }) |
+            Sort-Object
+        if (
+            $factoryResult.schema -cne 'captain.business-demo-factory-operator.v1' -or
+            $factoryResult.database -cne 'captain_test' -or
+            @($factoryResult.results).Count -ne 2 -or
+            ($expectedJobIds -join ',') -cne ($actualJobIds -join ',') -or
+            @($factoryResult.results | Where-Object {
+                $_.schema -cne 'captain.factory-dispatch-run-result.v1' -or
+                $_.status -notin @(
+                    'complete',
+                    'captain_action_required',
+                    'infrastructure_blocked',
+                    'dispatch_limit_reached'
+                )
+            }).Count -ne 0
+        ) {
+            throw 'Captain Factory live operator result is not canonical.'
+        }
+
+        $rawPreflight = @(& $python $preflightScript)
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Captain business benchmark post-Factory preflight failed closed.'
+        }
+        try {
+            $preflight = ($rawPreflight -join [Environment]::NewLine) |
+                ConvertFrom-Json -Depth 20
+        }
+        catch {
+            throw 'Captain business benchmark post-Factory preflight returned invalid JSON.'
+        }
+        if (
+            $preflight.schema -cne 'captain.business-benchmark-default-preflight.v1' -or
+            $preflight.database -cne 'captain_test' -or
+            $preflight.status -notin @('resolvable', 'factory_dispatch_required') -or
+            ($preflight.production_scope_resolvable -isnot [bool])
+        ) {
+            throw 'Captain business benchmark post-Factory preflight is not canonical.'
+        }
+        if ($preflight.production_scope_resolvable -ne $true) {
+            New-FactoryDispatchCheckpoint `
+                -Teams $teams `
+                -IssuedAt $issuedAt `
+                -RenewalBatchId $renewalBatchId |
+                ConvertTo-Json -Compress -Depth 20
+            exit 2
+        }
     }
 
     $liveFailure = $null
