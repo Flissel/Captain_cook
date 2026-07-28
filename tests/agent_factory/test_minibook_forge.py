@@ -7,7 +7,10 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 
-from agenten.agent_factory.forge_contracts import CreationJobV1
+from agenten.agent_factory.forge_contracts import (
+    CreationJobV1,
+    ForgeBuildSkillUsageReceiptV1,
+)
 from agenten.agent_factory.contracts import AgentFactoryJob
 from agenten.agent_factory.minibook_forge import (
     CaptainCreationJobMapper,
@@ -58,6 +61,33 @@ class Mapper:
     def map(self, _request: FactoryDispatch) -> CreationJobV1:
         fixture = Path("tests/fixtures/contracts/minibook_creation_job.v1.json")
         return CreationJobV1.model_validate_json(fixture.read_text(encoding="utf-8"))
+
+    def build_skill_receipt(
+        self,
+        _request: FactoryDispatch,
+        creation_job: CreationJobV1,
+    ) -> ForgeBuildSkillUsageReceiptV1:
+        return ForgeBuildSkillUsageReceiptV1.model_validate(
+            {
+                "producer": "hermes",
+                "outcome": "fulfilled",
+                "creation_job_id": creation_job.creation_job_id,
+                "factory_job_id": creation_job.factory_job_id,
+                "correlation_id": creation_job.correlation_id,
+                "subject_version": creation_job.subject_version,
+                "attempt": creation_job.attempt,
+                "idempotency_key": creation_job.idempotency_key,
+                "released_skill": creation_job.released_skill,
+                "public_assertion_ids": creation_job.public_assertion_ids,
+                "evidence_refs": (
+                    {
+                        "uri": "artifact://forge/hermes-brief/" + "9" * 64,
+                        "sha256": "9" * 64,
+                        "media_type": "application/json",
+                    },
+                ),
+            }
+        )
 
 
 def _workflow_evidence():
@@ -154,6 +184,7 @@ def test_creation_job_mapper_uses_exact_captain_brief_and_is_deterministic() -> 
 
     first = mapper.map(request)
     second = mapper.map(request)
+    receipt = mapper.build_skill_receipt(request, first)
 
     assignment = brief.build_assignment
     assert first == second
@@ -170,6 +201,14 @@ def test_creation_job_mapper_uses_exact_captain_brief_and_is_deterministic() -> 
     assert first.released_skill.content_sha256 == brief.invocation.released_skill.content_sha256
     assert first.public_assertion_ids == factory_job.acceptance_assertion_ids
     assert first.deadline_at == factory_job.deadline_at
+    assert receipt.producer == "hermes"
+    assert receipt.outcome == "fulfilled"
+    assert receipt.creation_job_id == first.creation_job_id
+    assert receipt.factory_job_id == first.factory_job_id
+    assert receipt.released_skill == first.released_skill
+    assert receipt.public_assertion_ids == first.public_assertion_ids
+    assert any(ref.sha256 == inventory.artifact_ref.sha256 for ref in receipt.evidence_refs)
+    assert any(ref.sha256 == brief.artifact_ref.sha256 for ref in receipt.evidence_refs)
 
 
 def test_creation_job_mapper_rejects_missing_blueprint_inventory_binding() -> None:
@@ -221,6 +260,7 @@ async def test_forge_rejects_a_non_file_input_before_spawning(tmp_path: Path) ->
     forge = MinibookSwarmForge(
         materializer=Materializer(tmp_path / "missing.md"),
         mapper=Mapper(),
+        skill_receipts=Mapper(),
     )
 
     with pytest.raises(RuntimeError, match="materialize"):
@@ -236,6 +276,7 @@ async def test_forge_rejects_non_private_artifact_root_before_spawning(
     forge = MinibookSwarmForge(
         materializer=Materializer(input_path),
         mapper=Mapper(),
+        skill_receipts=Mapper(),
         settings=MinibookForgeSettings(
             working_directory=tmp_path,
             artifact_root=tmp_path / "public-cas",
@@ -264,6 +305,7 @@ async def test_forge_starts_a_noninteractive_deadline_bounded_input_run(
     input_path.write_text("# Team", encoding="utf-8")
     received: list[object] = []
     observed_job_payloads: list[dict[str, object]] = []
+    observed_skill_receipts: list[ForgeBuildSkillUsageReceiptV1] = []
 
     class Process:
         returncode = 0
@@ -273,8 +315,16 @@ async def test_forge_starts_a_noninteractive_deadline_bounded_input_run(
                 received[received.index("--creation-job-file") + 1]
             )
             result_path = Path(received[received.index("--result-file") + 1])
+            receipt_path = Path(
+                received[received.index("--skill-usage-receipt-file") + 1]
+            )
             observed_job_payloads.append(
                 json.loads(creation_job_path.read_text(encoding="utf-8"))
+            )
+            observed_skill_receipts.append(
+                ForgeBuildSkillUsageReceiptV1.model_validate_json(
+                    receipt_path.read_text(encoding="utf-8")
+                )
             )
             assert result_path.parent == creation_job_path.parent
             assert not result_path.exists()
@@ -299,6 +349,7 @@ async def test_forge_starts_a_noninteractive_deadline_bounded_input_run(
     forge = MinibookSwarmForge(
         materializer=Materializer(input_path),
         mapper=Mapper(),
+        skill_receipts=Mapper(),
         settings=MinibookForgeSettings(working_directory=tmp_path, max_runtime_seconds=120),
     )
 
@@ -312,20 +363,26 @@ async def test_forge_starts_a_noninteractive_deadline_bounded_input_run(
         "--creation-job-file",
         received[5],
     ]
-    assert received[6:10] == [
+    assert received[6:12] == [
+        "--skill-usage-receipt-file",
+        received[7],
         "--non-interactive",
         "--max-runtime-seconds",
         "120",
         "--result-file",
     ]
     assert Path(received[5]).name == "creation-job.json"
-    assert Path(received[10]).name == "creation-result.json"
-    assert received[11:13] == [
+    assert Path(received[7]).name == "forge-skill-usage-receipt.json"
+    assert Path(received[12]).name == "creation-result.json"
+    assert received[13:15] == [
         "--artifact-root",
         str((tmp_path / ".captain-cook" / "minibook-creation-cas").resolve()),
     ]
     assert observed_job_payloads == [
         Mapper().map(request).model_dump(mode="json", by_alias=True)
+    ]
+    assert observed_skill_receipts == [
+        Mapper().build_skill_receipt(request, Mapper().map(request))
     ]
     assert result.status == "succeeded"
 
@@ -362,6 +419,7 @@ async def test_forge_rejects_result_bound_to_a_different_creation_job(
     forge = MinibookSwarmForge(
         materializer=Materializer(input_path),
         mapper=Mapper(),
+        skill_receipts=Mapper(),
         settings=MinibookForgeSettings(
             working_directory=tmp_path,
             max_runtime_seconds=120,

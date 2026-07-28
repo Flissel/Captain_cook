@@ -19,6 +19,7 @@ from agenten.agent_factory.forge_contracts import (
     CreationProgressV1,
     CreationResultV1,
     CreationSubmissionReceipt,
+    ForgeBuildSkillUsageReceiptV1,
 )
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import (
@@ -36,6 +37,14 @@ class FactoryInputMaterializer(Protocol):
 
 class CreationJobMapper(Protocol):
     def map(self, request: FactoryDispatch) -> CreationJobV1: ...
+
+
+class ForgeBuildSkillReceiptProvider(Protocol):
+    def build_skill_receipt(
+        self,
+        request: FactoryDispatch,
+        creation_job: CreationJobV1,
+    ) -> ForgeBuildSkillUsageReceiptV1: ...
 
 
 class CaptainForgeEvidencePort(Protocol):
@@ -125,6 +134,63 @@ class CaptainCreationJobMapper:
                 "public_assertion_ids": assignment.public_assertion_ids,
                 "deadline_at": assignment.deadline_at,
             }
+        )
+
+    def build_skill_receipt(
+        self,
+        request: FactoryDispatch,
+        creation_job: CreationJobV1,
+    ) -> ForgeBuildSkillUsageReceiptV1:
+        """Derive one Forge receipt only from Captain-validated Hermes artifacts."""
+
+        if self.map(request) != creation_job:
+            raise FactoryDispatchError(
+                "Forge skill receipt does not match the mapped creation job"
+            )
+        artifacts = self._evidence.workflow_artifacts(request.job.job_id)
+        inventories = tuple(
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, CodebaseInventoryV1)
+            and _matches_dispatch(artifact, request.job, request.action.attempt)
+        )
+        briefs = tuple(
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, CodexBuildBriefV1)
+            and _matches_dispatch(artifact, request.job, request.action.attempt)
+        )
+        if len(inventories) != 1 or len(briefs) != 1:
+            raise FactoryDispatchError(
+                "Forge skill receipt requires exact Hermes inventory and brief evidence"
+            )
+        inventory = inventories[0]
+        brief = briefs[0]
+        evidence_refs_by_identity = {
+            (reference.uri, reference.sha256, reference.media_type): reference
+            for reference in (
+                inventory.artifact_ref,
+                brief.artifact_ref,
+                *inventory.evidence_refs,
+                *brief.evidence_refs,
+            )
+        }
+        evidence_refs = tuple(
+            reference.model_dump(mode="json")
+            for reference in evidence_refs_by_identity.values()
+        )
+        return ForgeBuildSkillUsageReceiptV1(
+            producer="hermes",
+            outcome="fulfilled",
+            creation_job_id=creation_job.creation_job_id,
+            factory_job_id=creation_job.factory_job_id,
+            correlation_id=creation_job.correlation_id,
+            subject_version=creation_job.subject_version,
+            attempt=creation_job.attempt,
+            idempotency_key=creation_job.idempotency_key,
+            released_skill=creation_job.released_skill,
+            public_assertion_ids=creation_job.public_assertion_ids,
+            evidence_refs=evidence_refs,
         )
 
 
@@ -230,16 +296,22 @@ class MinibookSwarmForge(MinibookForgePort):
         *,
         materializer: FactoryInputMaterializer,
         mapper: CreationJobMapper,
+        skill_receipts: ForgeBuildSkillReceiptProvider,
         settings: MinibookForgeSettings = MinibookForgeSettings(),
     ) -> None:
         self._materializer = materializer
         self._mapper = mapper
+        self._skill_receipts = skill_receipts
         self._settings = settings
 
     async def submit(self, request: FactoryDispatch) -> CreationResultV1:
         if request.role is not None or request.lease is not None:
             raise FactoryDispatchError("Minibook Forge must not receive a Hermes role lease")
         creation_job = self._mapper.map(request)
+        skill_receipt = self._skill_receipts.build_skill_receipt(
+            request,
+            creation_job,
+        )
         input_path = self._materializer.materialize(request.job.input_ref)
         if not input_path.is_file():
             raise FactoryDispatchError("factory input artifact did not materialize to a file")
@@ -262,10 +334,20 @@ class MinibookSwarmForge(MinibookForgePort):
         ) as temporary:
             run_directory = Path(temporary)
             creation_job_path = run_directory / "creation-job.json"
+            skill_receipt_path = run_directory / "forge-skill-usage-receipt.json"
             result_path = run_directory / "creation-result.json"
             creation_job_path.write_text(
                 json.dumps(
                     creation_job.model_dump(mode="json", by_alias=True),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            skill_receipt_path.write_text(
+                json.dumps(
+                    skill_receipt.model_dump(mode="json", by_alias=True),
                     sort_keys=True,
                     separators=(",", ":"),
                     ensure_ascii=False,
@@ -280,6 +362,8 @@ class MinibookSwarmForge(MinibookForgePort):
                     str(input_path),
                     "--creation-job-file",
                     str(creation_job_path),
+                    "--skill-usage-receipt-file",
+                    str(skill_receipt_path),
                     "--non-interactive",
                     "--max-runtime-seconds",
                     str(self._settings.max_runtime_seconds),

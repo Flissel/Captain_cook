@@ -7,6 +7,7 @@ import pytest
 
 from minibook.swarm.contracts import CreationJobV1, CreationResultV1
 from minibook.swarm.creation_cli import (
+    install_creation_skill_receipt,
     load_creation_job,
     publish_creation_output,
     write_creation_result_atomic,
@@ -107,3 +108,50 @@ def test_creation_cli_publishes_sealed_output_to_persistent_cas(tmp_path: Path) 
     assert result.skill_usage_receipt_ref is not None
     assert len(result.artifact_refs) == 2
     assert all(ref.uri.startswith("artifact://minibook-creation/") for ref in result.artifact_refs)
+
+
+def test_creation_cli_installs_exact_captain_supplied_skill_receipt(
+    tmp_path: Path,
+) -> None:
+    job = CreationJobV1.model_validate_json(
+        (FIXTURE_ROOT / "minibook_creation_job.v1.json").read_text(encoding="utf-8")
+    )
+    payload = {
+        "schema": "hermes.forge-build-skill-usage-receipt.v1",
+        "producer": "hermes",
+        "outcome": "fulfilled",
+        "creation_job_id": str(job.creation_job_id),
+        "factory_job_id": str(job.factory_job_id),
+        "correlation_id": str(job.correlation_id),
+        "subject_version": job.subject_version,
+        "attempt": job.attempt,
+        "idempotency_key": job.idempotency_key,
+        "released_skill": job.released_skill.model_dump(mode="json"),
+        "public_assertion_ids": list(job.public_assertion_ids),
+        "evidence_refs": [
+            {
+                "uri": "artifact://forge/hermes-brief/" + "8" * 64,
+                "sha256": "8" * 64,
+                "media_type": "application/json",
+            }
+        ],
+    }
+    source = tmp_path / "receipt.json"
+    source_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    source.write_bytes(source_bytes)
+    output = tmp_path / "candidate"
+    output.mkdir()
+
+    installed = install_creation_skill_receipt(
+        job,
+        source_path=source,
+        output_path=output,
+    )
+
+    assert installed.read_bytes() == source_bytes
+    assert installed == output / "evidence/hermes-factory-skill-usage-receipt.json"
+
+    changed = source_bytes.replace(str(job.factory_job_id).encode(), str(job.creation_job_id).encode())
+    source.write_bytes(changed)
+    with pytest.raises(ValueError, match="does not match"):
+        install_creation_skill_receipt(job, source_path=source, output_path=output)

@@ -54,6 +54,7 @@ from swarm.local_services import default_npm_command, ensure_frontend_dependenci
 from swarm.runtime_options import parse_runtime_options
 from swarm.contracts import CreationFailure, CreationResultV1
 from swarm.creation_cli import (
+    install_creation_skill_receipt,
     load_creation_job,
     publish_creation_output,
     write_creation_result_atomic,
@@ -1188,6 +1189,8 @@ async def main():
             i += 2
         elif argv[i] == "--result-file" and i + 1 < len(argv):
             i += 2
+        elif argv[i] == "--skill-usage-receipt-file" and i + 1 < len(argv):
+            i += 2
         elif argv[i] == "--artifact-root" and i + 1 < len(argv):
             i += 2
         elif argv[i].startswith("--"):
@@ -1308,6 +1311,12 @@ async def main():
                 if not isinstance(run_result, Path):
                     raise ValueError("creation pipeline has no merged output")
                 assert runtime_options.artifact_root is not None
+                assert runtime_options.skill_usage_receipt_file is not None
+                install_creation_skill_receipt(
+                    creation_job,
+                    source_path=Path(runtime_options.skill_usage_receipt_file),
+                    output_path=run_result,
+                )
                 creation_result = publish_creation_output(
                     creation_job,
                     output_path=run_result,

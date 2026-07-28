@@ -19,6 +19,8 @@ def test_runtime_options_bind_creation_job_and_result_files() -> None:
             "work/creation-job.json",
             "--result-file",
             "work/creation-result.json",
+            "--skill-usage-receipt-file",
+            "work/forge-skill-usage-receipt.json",
             "--artifact-root",
             "work/.captain-cook/creation-cas",
         )
@@ -26,6 +28,7 @@ def test_runtime_options_bind_creation_job_and_result_files() -> None:
 
     assert options.creation_job_file == "work/creation-job.json"
     assert options.result_file == "work/creation-result.json"
+    assert options.skill_usage_receipt_file == "work/forge-skill-usage-receipt.json"
     assert options.artifact_root == "work/.captain-cook/creation-cas"
 
 
@@ -39,12 +42,17 @@ def test_runtime_options_bind_creation_job_and_result_files() -> None:
             "work/creation-job.json",
             "--result-file",
             "work/creation-result.json",
+            "--artifact-root",
+            "work/.captain-cook/creation-cas",
         ),
         ("--artifact-root", "work/.captain-cook/creation-cas"),
     ),
 )
 def test_runtime_options_require_complete_creation_paths(argv: tuple[str, ...]) -> None:
-    with pytest.raises(ValueError, match="creation-job-file.*result-file.*artifact-root"):
+    with pytest.raises(
+        ValueError,
+        match="creation-job-file.*result-file.*skill-usage-receipt-file.*artifact-root",
+    ):
         parse_runtime_options(argv)
 
 
