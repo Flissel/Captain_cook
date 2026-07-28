@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -9,7 +10,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 from autogen_agentchat.base import TaskResult
-from autogen_agentchat.messages import TextMessage
+from autogen_agentchat.messages import StopMessage, TextMessage
 
 from agenten.agent_factory.business_benchmark_contracts import (
     BusinessBenchmarkCaseV1,
@@ -57,6 +58,7 @@ from agenten.agent_factory.team_execution import (
     FactoryN8nExecutionEvidenceV1,
     FactoryToolExecutionEvidenceV1,
     HostAutoGenSessionResult,
+    ResolvedFactoryHoldoutCase,
     SealedSingleAgentPolicyV1,
 )
 from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent
@@ -148,11 +150,13 @@ def invocation(current_job: AgentFactoryJobV3) -> FactorySkillInvocationV1:
     )
 
 
-def benchmark_policy() -> BenchmarkExecutionPolicyV1:
+def benchmark_policy(
+    allowed_tool_intents: tuple[IntegrationIntent, ...] = (IntegrationIntent.N8N,),
+) -> BenchmarkExecutionPolicyV1:
     return BenchmarkExecutionPolicyV1(
         schema="captain.business-benchmark-execution-policy.v1",
         model_version="approved-model-id",
-        allowed_tool_intents=(IntegrationIntent.N8N,),
+        allowed_tool_intents=allowed_tool_intents,
         maximum_cost_micro_usd=500_000,
         maximum_latency_ms=20_000,
         redaction_policy_version="redaction-v1",
@@ -187,17 +191,18 @@ def envelope(
     *,
     variant: str = "candidate",
     case: BusinessBenchmarkCaseV1 | None = None,
+    policy: BenchmarkExecutionPolicyV1 | None = None,
 ) -> BusinessBenchmarkExecutionEnvelopeV1:
     selected_case = case or benchmark_case()
-    policy = benchmark_policy()
+    selected_policy = policy or benchmark_policy()
     execution_policy_sha256 = hashlib.sha256(
-        canonical_business_benchmark_model_bytes(policy)
+        canonical_business_benchmark_model_bytes(selected_policy)
     ).hexdigest()
     variant_policy_sha256 = digest(
         {
             "candidate_ref_sha256": candidate_ref.sha256 if variant == "candidate" else None,
             "baseline_system_policy_version": (
-                policy.baseline_system_policy_version
+                selected_policy.baseline_system_policy_version
                 if variant == "single_agent_baseline"
                 else None
             ),
@@ -240,12 +245,12 @@ def envelope(
         case_sha256=case_sha256,
         variant=variant,
         candidate_ref=candidate_ref if variant == "candidate" else None,
-        model_version=policy.model_version,
-        allowed_tool_intents=policy.allowed_tool_intents,
-        maximum_cost_micro_usd=policy.maximum_cost_micro_usd,
-        maximum_latency_ms=policy.maximum_latency_ms,
+        model_version=selected_policy.model_version,
+        allowed_tool_intents=selected_policy.allowed_tool_intents,
+        maximum_cost_micro_usd=selected_policy.maximum_cost_micro_usd,
+        maximum_latency_ms=selected_policy.maximum_latency_ms,
         redaction_policy_sha256=digest(
-            {"redaction_policy_version": policy.redaction_policy_version}
+            {"redaction_policy_version": selected_policy.redaction_policy_version}
         ),
         execution_policy_sha256=execution_policy_sha256,
         variant_policy_sha256=variant_policy_sha256,
@@ -392,7 +397,15 @@ def create_scope(tmp_path: Path):
         model="approved-model-id",
         suite_ref=current_job.private_holdout_refs[0],
         suite_id="claims_suite_v1",
-        benchmark_policy=benchmark_policy(),
+        benchmark_policies={
+            (
+                item.case_id,
+                hashlib.sha256(
+                    canonical_business_benchmark_model_bytes(item)
+                ).hexdigest(),
+            ): benchmark_policy()
+            for item in (benchmark_case(), benchmark_case(handoff=True))
+        },
         baseline_policy=sealed_baseline,
         baseline_system_policy_version="single-agent-baseline-v1",
         allowed_host_tools=("claims_lookup",),
@@ -434,6 +447,7 @@ class RecordingSessionFactory:
             sort_keys=True,
             separators=(",", ":"),
         )
+        self.trailing_message: StopMessage | None = None
 
     def create(self, request):
         self.requests.append(request)
@@ -503,9 +517,12 @@ class RecordingSessionExecutor:
             ended_at=NOW + timedelta(minutes=1, seconds=1),
             evidence_ref=usage_ref,
         )
+        messages = [TextMessage(content=self.owner.terminal, source="assistant")]
+        if self.owner.trailing_message is not None:
+            messages.append(self.owner.trailing_message)
         return HostAutoGenSessionResult(
             task_result=TaskResult(
-                messages=[TextMessage(content=self.owner.terminal, source="assistant")],
+                messages=messages,
                 stop_reason="task_completed",
             ),
             runtime_evidence_ref=runtime_ref,
@@ -825,3 +842,301 @@ def test_runtime_module_documents_deferred_provider_state_transitions() -> None:
     assert "record_provider_terminal" in source
     assert "finalize" in source
     assert "BusinessBenchmarkLiveAdapter" in source
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    ["cost", "latency", "idempotency", "request", "variant_policy", "suite_case"],
+)
+async def test_prepare_rejects_every_changed_envelope_policy_and_suite_binding(
+    tmp_path: Path,
+    change: str,
+) -> None:
+    _, scope, _, _, _, runtime, _ = runtime_parts(tmp_path)
+    env = envelope(scope.job, scope.candidate_ref)
+    if change == "cost":
+        changed = env.model_copy(update={"maximum_cost_micro_usd": 999_999_999})
+    elif change == "latency":
+        changed = env.model_copy(update={"maximum_latency_ms": 999_999_999})
+    elif change == "idempotency":
+        foreign_key = "9" * 64
+        changed = env.model_copy(
+            update={
+                "idempotency_key": foreign_key,
+                "runtime_session_id": f"benchmark-session-candidate-{foreign_key}",
+            }
+        )
+    elif change == "request":
+        changed = env.model_copy(update={"request_id": UUID(int=99)})
+    elif change == "variant_policy":
+        changed = env.model_copy(update={"variant_policy_sha256": "9" * 64})
+    else:
+        foreign_case = benchmark_case().model_copy(update={"case_id": "claim_case_99"})
+        changed = envelope(scope.job, scope.candidate_ref, case=foreign_case)
+
+    with pytest.raises(ValueError, match="scope|binding|policy|suite|stable"):
+        await runtime.prepare(changed)
+
+
+@pytest.mark.asyncio
+async def test_prepare_rejects_expired_real_case_lease(tmp_path: Path) -> None:
+    from agenten.agent_factory.business_benchmark_runtime import (
+        BusinessBenchmarkDurableFenceAdapter,
+        BusinessBenchmarkProviderRuntimeBridge,
+    )
+
+    store, scope, state, factory, review, _, _ = runtime_parts(tmp_path)
+    runtime = BusinessBenchmarkProviderRuntimeBridge(
+        scopes={scope.job.job_id: scope},
+        session_factory=factory,
+        artifacts=store,
+        provider_state=state,
+        human_review=review,
+        clock=lambda: scope.invocation.lease.expires_at + timedelta(seconds=1),
+    )
+
+    with pytest.raises(ValueError, match="lease|active"):
+        await runtime.prepare(envelope(scope.job, scope.candidate_ref))
+
+
+@pytest.mark.asyncio
+async def test_prepare_requires_candidate_source_from_the_injected_cas(tmp_path: Path) -> None:
+    from agenten.agent_factory.business_benchmark_runtime import (
+        BusinessBenchmarkProviderRuntimeBridge,
+    )
+
+    store, scope, state, factory, review, _, _ = runtime_parts(tmp_path)
+    external = tmp_path / "outside-cas.zip"
+    external.write_bytes(store.read_bytes(scope.candidate_ref))
+    forged_candidate = ResolvedFactoryCandidate(
+        candidate=scope.resolved_candidate.candidate,
+        source_archive=external,
+    )
+    forged_scope = replace(scope, resolved_candidate=forged_candidate)
+    runtime = BusinessBenchmarkProviderRuntimeBridge(
+        scopes={scope.job.job_id: forged_scope},
+        session_factory=factory,
+        artifacts=store,
+        provider_state=state,
+        human_review=review,
+        clock=lambda: NOW + timedelta(minutes=2),
+    )
+
+    with pytest.raises(ValueError, match="CAS|artifact"):
+        await runtime.prepare(envelope(scope.job, scope.candidate_ref))
+
+
+def test_runtime_scope_rejects_tools_outside_the_verified_candidate_manifest(
+    tmp_path: Path,
+) -> None:
+    _, scope = create_scope(tmp_path)
+
+    with pytest.raises(ValueError, match="tools|manifest"):
+        replace(scope, allowed_host_tools=(), tool_intents={})
+
+
+@pytest.mark.asyncio
+async def test_session_task_digest_matches_host_holdout_and_excludes_benchmark_labels(
+    tmp_path: Path,
+) -> None:
+    _, scope, _, factory, _, runtime, fence = runtime_parts(tmp_path)
+    env = envelope(scope.job, scope.candidate_ref, case=benchmark_case(handoff=True))
+    await runtime.prepare(env)
+    effect_claim = claimed(env)
+    receipt = await fence.register_fence(effect_claim.prepared_effect, effect_claim)
+    factory.terminal = json.dumps(
+        {
+            "schema": "captain.business-benchmark-terminal.v1",
+            "observed_decision": "escalate_coverage",
+            "observed_rationale_fact_ids": ["fact-policy-state"],
+        }
+    )
+
+    await runtime.execute(env, effect_claim, receipt, baseline_policy=None)
+
+    request = factory.requests[0]
+    call = factory.executors[0].calls[0][1]
+    resolved = ResolvedFactoryHoldoutCase(
+        reference=call["case_ref"],
+        body=request.redacted_case_task.encode("utf-8"),
+    )
+    assert resolved.reference.sha256 == hashlib.sha256(resolved.body).hexdigest()
+    assert "mandatory_escalation" not in request.redacted_case_task
+    assert '"severity"' not in request.redacted_case_task
+
+
+@pytest.mark.asyncio
+async def test_mandatory_review_is_requested_even_for_wrong_decision_and_acceptance_is_bound(
+    tmp_path: Path,
+) -> None:
+    store, scope, _, factory, review, runtime, fence = runtime_parts(
+        tmp_path, review_status="accepted"
+    )
+    env = envelope(scope.job, scope.candidate_ref, case=benchmark_case(handoff=True))
+    await runtime.prepare(env)
+    effect_claim = claimed(env)
+    receipt = await fence.register_fence(effect_claim.prepared_effect, effect_claim)
+    factory.terminal = json.dumps(
+        {
+            "schema": "captain.business-benchmark-terminal.v1",
+            "observed_decision": "route_standard_review",
+            "observed_rationale_fact_ids": ["fact-policy-state"],
+        }
+    )
+
+    result = await runtime.execute(env, effect_claim, receipt, baseline_policy=None)
+
+    assert len(review.requests) == 1
+    review_ref = store.binding(
+        "human-review-receipt",
+        f"{effect_claim.identity.effect_id}:{effect_claim.fence}",
+    )
+    assert review_ref is not None
+    persisted_receipt = CaptainHumanReviewReceiptV1.model_validate_json(
+        store.read_bytes(review_ref)
+    )
+    assert persisted_receipt.status == "accepted"
+    assert any(
+        item.handoff.evidence_ref == review_ref and item.status == "observed"
+        for item in result.handoffs
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_json_must_be_the_last_task_event(tmp_path: Path) -> None:
+    _, scope, _, factory, _, runtime, fence = runtime_parts(tmp_path)
+    env = envelope(scope.job, scope.candidate_ref)
+    await runtime.prepare(env)
+    effect_claim = claimed(env)
+    receipt = await fence.register_fence(effect_claim.prepared_effect, effect_claim)
+    factory.trailing_message = StopMessage(content="stopped after JSON", source="runtime")
+
+    with pytest.raises(ValueError, match="terminal|last"):
+        await runtime.execute(env, effect_claim, receipt, baseline_policy=None)
+
+
+@pytest.mark.asyncio
+async def test_assert_current_rejects_forged_fence_evidence_reference(tmp_path: Path) -> None:
+    store, scope, _, _, _, runtime, fence = runtime_parts(tmp_path)
+    env = envelope(scope.job, scope.candidate_ref)
+    await runtime.prepare(env)
+    effect_claim = claimed(env)
+    receipt = await fence.register_fence(effect_claim.prepared_effect, effect_claim)
+    forged_ref = store.put(
+        b'{"schema":"not-a-fence-state"}',
+        "application/json",
+        namespace="forged-fence",
+    )
+
+    with pytest.raises(ValueError, match="fence.*evidence|evidence.*fence"):
+        await fence.assert_current(
+            effect_claim.prepared_effect,
+            effect_claim,
+            receipt.model_copy(update={"evidence_ref": forged_ref}),
+        )
+
+
+def test_runtime_scope_allows_unused_candidate_tool_descriptor(tmp_path: Path) -> None:
+    _, scope = create_scope(tmp_path)
+    existing_tool = scope.resolved_candidate.candidate.n8n_tools[0]
+    unused = TypedN8nTool(
+        name="claims_manifest_placeholder",
+        description="Compatibility descriptor not assigned to an agent.",
+        input_schema_ref=existing_tool.input_schema_ref,
+        output_schema_ref=existing_tool.output_schema_ref,
+    )
+    candidate = scope.resolved_candidate.candidate.model_copy(
+        update={"n8n_tools": (*scope.resolved_candidate.candidate.n8n_tools, unused)}
+    )
+    resolved = ResolvedFactoryCandidate(
+        candidate=candidate,
+        source_archive=scope.resolved_candidate.source_archive,
+    )
+
+    updated = replace(scope, resolved_candidate=resolved)
+
+    assert updated.allowed_host_tools == ("claims_lookup",)
+
+
+@pytest.mark.asyncio
+async def test_runtime_selects_exact_case_policy_for_n8n_and_none_cases(
+    tmp_path: Path,
+) -> None:
+    from agenten.agent_factory.business_benchmark_runtime import (
+        BusinessBenchmarkDurableFenceAdapter,
+        BusinessBenchmarkProviderRuntimeBridge,
+    )
+
+    store, scope, state, factory, review, _, _ = runtime_parts(tmp_path)
+    none_case = benchmark_case().model_copy(
+        update={
+            "case_id": "claim_case_02",
+            "allowed_tool_intents": (IntegrationIntent.NONE,),
+        }
+    )
+    none_binding = (
+        none_case.case_id,
+        hashlib.sha256(
+            canonical_business_benchmark_model_bytes(none_case)
+        ).hexdigest(),
+    )
+    none_policy = benchmark_policy((IntegrationIntent.NONE,))
+    scoped = replace(
+        scope,
+        benchmark_policies={
+            **scope.benchmark_policies,
+            none_binding: none_policy,
+        },
+    )
+    runtime = BusinessBenchmarkProviderRuntimeBridge(
+        scopes={scope.job.job_id: scoped},
+        session_factory=factory,
+        artifacts=store,
+        provider_state=state,
+        human_review=review,
+        clock=lambda: NOW + timedelta(minutes=2),
+    )
+
+    n8n_env = envelope(scope.job, scope.candidate_ref)
+    none_env = envelope(
+        scope.job,
+        scope.candidate_ref,
+        case=none_case,
+        policy=none_policy,
+    )
+    await runtime.prepare(n8n_env)
+    await runtime.prepare(none_env)
+    none_claim = claimed(none_env)
+    none_fence = BusinessBenchmarkDurableFenceAdapter(
+        provider_state=state,
+        artifacts=store,
+        preparation_for_effect=runtime.preparation_binding_for,
+        clock=lambda: NOW + timedelta(minutes=2),
+    )
+    none_receipt = await none_fence.register_fence(
+        none_claim.prepared_effect,
+        none_claim,
+    )
+    await runtime.execute(none_env, none_claim, none_receipt, baseline_policy=None)
+
+    assert n8n_env.allowed_tool_intents == (IntegrationIntent.N8N,)
+    assert none_env.allowed_tool_intents == (IntegrationIntent.NONE,)
+    assert factory.requests[-1].allowed_host_tools == ()
+
+
+def test_runtime_scope_defensively_freezes_policy_and_tool_mappings(
+    tmp_path: Path,
+) -> None:
+    _, scope = create_scope(tmp_path)
+    policies = dict(scope.benchmark_policies)
+    intents = dict(scope.tool_intents)
+    frozen = replace(scope, benchmark_policies=policies, tool_intents=intents)
+
+    policies.clear()
+    intents.clear()
+
+    assert frozen.benchmark_policies
+    assert frozen.tool_intents == {"claims_lookup": IntegrationIntent.N8N}
+    with pytest.raises(TypeError):
+        frozen.tool_intents["forged"] = IntegrationIntent.N8N  # type: ignore[index]

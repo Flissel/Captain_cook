@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Callable, Literal, Mapping, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -47,6 +48,7 @@ from agenten.agent_factory.business_benchmark_production_ports import (
 )
 from agenten.agent_factory.business_benchmark_provider_state import (
     BusinessBenchmarkProviderBindingV1,
+    BusinessBenchmarkProviderStateV1,
     BusinessBenchmarkProviderStateStore,
 )
 from agenten.agent_factory.business_benchmark_replay import (
@@ -63,6 +65,7 @@ from agenten.agent_factory.candidate_evaluation import (
 )
 from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryRole
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
+from agenten.agent_factory.leases import FactoryLeaseDenied, validate_factory_lease
 from agenten.agent_factory.skill_workflow_contracts import FactorySkillInvocationV1
 from agenten.agent_factory.team_execution import (
     FactoryHandoffEvidenceV1,
@@ -115,13 +118,25 @@ class BusinessBenchmarkTeamRuntimeScopeV1:
     model: str
     suite_ref: PrivateHoldoutRef
     suite_id: str
-    benchmark_policy: BenchmarkExecutionPolicyV1
+    benchmark_policies: Mapping[
+        tuple[str, str], BenchmarkExecutionPolicyV1
+    ]
     baseline_policy: SealedSingleAgentPolicyV1
     baseline_system_policy_version: str
     allowed_host_tools: tuple[str, ...]
     tool_intents: Mapping[str, IntegrationIntent]
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "benchmark_policies",
+            MappingProxyType(dict(self.benchmark_policies)),
+        )
+        object.__setattr__(
+            self,
+            "tool_intents",
+            MappingProxyType(dict(self.tool_intents)),
+        )
         if (
             self.invocation.job_id != self.job.job_id
             or self.invocation.correlation_id != self.job.correlation_id
@@ -135,7 +150,12 @@ class BusinessBenchmarkTeamRuntimeScopeV1:
             or self.candidate_ref
             != self.resolved_candidate.candidate.source_archive_ref
             or self.model not in self.job.execution_policy.allowed_models
-            or self.benchmark_policy.model_version != self.model
+            or any(
+                policy.model_version != self.model
+                or policy.baseline_system_policy_version
+                != self.baseline_system_policy_version
+                for policy in self.benchmark_policies.values()
+            )
             or self.baseline_policy.model != self.model
             or self.baseline_system_policy_version
             != "single-agent-baseline-v1"
@@ -148,20 +168,48 @@ class BusinessBenchmarkTeamRuntimeScopeV1:
         if (
             len(self.allowed_host_tools) != len(set(self.allowed_host_tools))
             or set(self.allowed_host_tools) != set(self.tool_intents)
+            or set(self.allowed_host_tools)
+            != {
+                tool_name
+                for agent in self.team_manifest.agents
+                for tool_name in agent.tools
+            }
+            or set(self.allowed_host_tools)
+            - {tool.name for tool in self.resolved_candidate.candidate.n8n_tools}
+            or set(self.allowed_host_tools) != set(self.baseline_policy.allowed_tools)
             or any(
                 not isinstance(intent, IntegrationIntent)
                 for intent in self.tool_intents.values()
             )
+            or (
+                {
+                    intent
+                    for policy in self.benchmark_policies.values()
+                    for intent in policy.allowed_tool_intents
+                    if intent is not IntegrationIntent.NONE
+                }
+                - set(self.tool_intents.values())
+            )
         ):
-            raise ValueError("runtime host tools require exact intent bindings")
+            raise ValueError(
+                "runtime host tools require exact manifest and intent bindings"
+            )
         if self.invocation.execution_scope_ref != self.suite_ref:
             raise ValueError("runtime invocation is not scoped to the benchmark suite")
+        if not self.benchmark_policies or any(
+            not case_id
+            or len(case_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in case_sha256)
+            for case_id, case_sha256 in self.benchmark_policies
+        ):
+            raise ValueError("runtime per-case benchmark policies are invalid")
 
 
 @dataclass(frozen=True)
 class BusinessBenchmarkSessionRequestV1:
     identity: HostAutoGenSessionIdentityV1
-    redacted_case_task: str
+    benchmark_case_sha256: str
+    redacted_case_task: str = field(repr=False)
     allowed_host_tools: tuple[str, ...]
     maximum_cost_micro_usd: int
     maximum_latency_ms: int
@@ -304,7 +352,8 @@ class BusinessBenchmarkProviderRuntimeBridge:
             for name in scope.allowed_host_tools
             if scope.tool_intents[name] in envelope.allowed_tool_intents
         )
-        case_ref = self._case_reference(envelope)
+        redacted_case_task = self._redacted_case_task(envelope, allowed_tools)
+        case_ref = self._case_reference(redacted_case_task)
         identity = HostAutoGenSessionIdentityV1.for_factory_execution(
             job=scope.job,
             invocation=scope.invocation,
@@ -324,7 +373,8 @@ class BusinessBenchmarkProviderRuntimeBridge:
         )
         request = BusinessBenchmarkSessionRequestV1(
             identity=identity,
-            redacted_case_task=self._redacted_case_task(envelope, allowed_tools),
+            benchmark_case_sha256=envelope.case_sha256,
+            redacted_case_task=redacted_case_task,
             allowed_host_tools=allowed_tools,
             maximum_cost_micro_usd=envelope.maximum_cost_micro_usd,
             maximum_latency_ms=envelope.maximum_latency_ms,
@@ -416,14 +466,39 @@ class BusinessBenchmarkProviderRuntimeBridge:
             scope = self._scopes[envelope.job_id]
         except KeyError as exc:
             raise ValueError("Captain benchmark runtime scope is unavailable") from exc
+        case_binding = (envelope.case.case_id, envelope.case_sha256)
+        try:
+            case_policy = scope.benchmark_policies[case_binding]
+        except KeyError as exc:
+            raise ValueError("benchmark case is not bound to the selected suite") from exc
         expected_policy_sha = hashlib.sha256(
-            canonical_business_benchmark_model_bytes(scope.benchmark_policy)
+            canonical_business_benchmark_model_bytes(case_policy)
         ).hexdigest()
         expected_redaction_sha = _digest_json(
-            {"redaction_policy_version": scope.benchmark_policy.redaction_policy_version}
+            {"redaction_policy_version": case_policy.redaction_policy_version}
         )
         expected_candidate = (
             scope.candidate_ref if envelope.variant == "candidate" else None
+        )
+        expected_variant_policy_sha256 = _digest_json(
+            {
+                "candidate_ref_sha256": (
+                    scope.candidate_ref.sha256
+                    if envelope.variant == "candidate"
+                    else None
+                ),
+                "baseline_system_policy_version": (
+                    case_policy.baseline_system_policy_version
+                    if envelope.variant == "single_agent_baseline"
+                    else None
+                ),
+                "variant": envelope.variant,
+            }
+        )
+        idempotency_key = _envelope_idempotency_key(envelope)
+        expected_request_id = uuid5(
+            NAMESPACE_URL,
+            f"captain.business-benchmark-execution:{idempotency_key}",
         )
         if (
             envelope.correlation_id != scope.job.correlation_id
@@ -435,11 +510,35 @@ class BusinessBenchmarkProviderRuntimeBridge:
             or envelope.candidate_ref != expected_candidate
             or envelope.execution_policy_sha256 != expected_policy_sha
             or envelope.redaction_policy_sha256 != expected_redaction_sha
-            or not set(envelope.allowed_tool_intents).issubset(
-                set(scope.benchmark_policy.allowed_tool_intents)
-            )
+            or envelope.allowed_tool_intents
+            != case_policy.allowed_tool_intents
+            or envelope.maximum_cost_micro_usd
+            != case_policy.maximum_cost_micro_usd
+            or envelope.maximum_latency_ms
+            != case_policy.maximum_latency_ms
+            or envelope.variant_policy_sha256
+            != expected_variant_policy_sha256
+            or envelope.idempotency_key != idempotency_key
+            or envelope.request_id != expected_request_id
         ):
             raise ValueError("benchmark envelope model or authority scope is stale")
+        try:
+            validate_factory_lease(
+                scope.invocation.lease,
+                job=scope.job,
+                role=FactoryRole.REAL_CASE_TESTER,
+                attempt=scope.invocation.attempt,
+                now=self._utc_now(),
+            )
+        except FactoryLeaseDenied as exc:
+            raise ValueError("runtime REAL_CASE_TESTER lease is not active") from exc
+        try:
+            self._artifacts.read_bytes(scope.candidate_ref)
+            canonical_candidate_path = self._artifacts.local_path(scope.candidate_ref)
+        except ValueError as exc:
+            raise ValueError("runtime candidate is not available from the CAS") from exc
+        if scope.resolved_candidate.source_archive.resolve() != canonical_candidate_path.resolve():
+            raise ValueError("runtime candidate source path is outside the CAS authority")
         return scope
 
     @staticmethod
@@ -461,12 +560,13 @@ class BusinessBenchmarkProviderRuntimeBridge:
         )
 
     @staticmethod
-    def _case_reference(envelope: BusinessBenchmarkExecutionEnvelopeV1):
-        holdout_id = f"holdout-{envelope.case_sha256[:12]}"
+    def _case_reference(redacted_case_task: str):
+        task_sha256 = hashlib.sha256(redacted_case_task.encode("utf-8")).hexdigest()
+        holdout_id = f"holdout-{task_sha256[:12]}"
         return PrivateHoldoutRef(
             holdout_id=holdout_id,
             uri=f"holdout://{holdout_id}",
-            sha256=envelope.case_sha256,
+            sha256=task_sha256,
         )
 
     @staticmethod
@@ -479,8 +579,6 @@ class BusinessBenchmarkProviderRuntimeBridge:
                 "schema": "captain.business-benchmark-redacted-task.v1",
                 "case_id": envelope.case.case_id,
                 "profile_id": envelope.case.profile_id,
-                "category": envelope.case.category.value,
-                "severity": envelope.case.severity,
                 "redacted_input": envelope.case.redacted_input,
                 "allowed_tool_intents": [
                     item.value for item in envelope.allowed_tool_intents
@@ -538,8 +636,6 @@ class BusinessBenchmarkProviderRuntimeBridge:
         if (
             envelope.variant == "candidate"
             and envelope.case.human_handoff_required
-            and terminal.observed_decision
-            in {"escalate_coverage", "human_commercial_review"}
         ):
             request = CaptainHumanReviewRequestV1(
                 schema="captain.business-benchmark-human-review-request.v1",
@@ -555,19 +651,34 @@ class BusinessBenchmarkProviderRuntimeBridge:
                 request,
                 await self._human_review.request_review(request),
             )
-            if receipt.status == "completed":
-                handoffs.append(
-                    BoundBenchmarkHandoffEvidenceV1(
-                        binding=binding,
-                        handoff=FactoryHandoffEvidenceV1(
-                            from_agent="captain",
-                            to_agent="human_review",
-                            evidence_ref=receipt.evidence_ref,
-                        ),
-                        authority="captain_human_review",
-                        status="completed",
-                    )
+            receipt_record_ref = self._artifacts.put(
+                canonical_business_benchmark_model_bytes(receipt),
+                "application/json",
+                namespace="human-review-receipt",
+            )
+            self._artifacts.bind(
+                "human-review-receipt",
+                f"{provider_binding.effect_id}:{provider_binding.fence}",
+                receipt_record_ref,
+            )
+            handoffs.append(
+                BoundBenchmarkHandoffEvidenceV1(
+                    binding=binding,
+                    handoff=FactoryHandoffEvidenceV1(
+                        from_agent="captain",
+                        to_agent="human_review",
+                        evidence_ref=receipt_record_ref,
+                    ),
+                    authority=(
+                        "captain_human_review"
+                        if receipt.status == "completed"
+                        else None
+                    ),
+                    status=(
+                        "completed" if receipt.status == "completed" else "observed"
+                    ),
                 )
+            )
         return ProviderBenchmarkExecutionV1(
             request_id=envelope.request_id,
             runtime_session_id=envelope.runtime_session_id,
@@ -593,12 +704,14 @@ class BusinessBenchmarkProviderRuntimeBridge:
 
     @staticmethod
     def _terminal_output(observed: HostAutoGenSessionResult) -> str:
-        messages = tuple(
-            item for item in observed.task_result.messages if isinstance(item, TextMessage)
-        )
-        if not messages or not isinstance(messages[-1].content, str):
+        if not observed.task_result.messages or not isinstance(
+            observed.task_result.messages[-1], TextMessage
+        ):
+            raise ValueError("provider terminal JSON must be the last task event")
+        terminal_message = observed.task_result.messages[-1]
+        if not isinstance(terminal_message.content, str):
             raise ValueError("provider terminal output is missing")
-        raw = messages[-1].content
+        raw = terminal_message.content
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -734,6 +847,18 @@ class BusinessBenchmarkDurableFenceAdapter:
     ) -> None:
         binding = self.binding_for(prepared, claim)
         BusinessBenchmarkProviderRuntimeBridge._require_fence(binding, receipt)
+        try:
+            encoded = self._artifacts.read_bytes(receipt.evidence_ref)
+            fenced = BusinessBenchmarkProviderStateV1.model_validate_json(encoded)
+            if (
+                canonical_business_benchmark_model_bytes(fenced) != encoded
+                or fenced.stage != "fenced"
+                or fenced.binding != binding
+                or fenced.recorded_at != receipt.registered_at
+            ):
+                raise ValueError("provider fence evidence does not match its receipt")
+        except ValueError as exc:
+            raise ValueError("provider fence evidence is invalid") from exc
         self._provider_state.assert_current(binding)
 
     async def begin_dispatch(
@@ -786,6 +911,26 @@ def _digest_json(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def _envelope_idempotency_key(
+    envelope: BusinessBenchmarkExecutionEnvelopeV1,
+) -> str:
+    return _digest_json(
+        {
+            "job_id": str(envelope.job_id),
+            "correlation_id": str(envelope.correlation_id),
+            "subject_version": envelope.subject_version,
+            "attempt": envelope.attempt,
+            "suite_ref": envelope.suite_ref.model_dump(mode="json", by_alias=True),
+            "suite_id": envelope.suite_id,
+            "case_id": envelope.case.case_id,
+            "case_sha256": envelope.case_sha256,
+            "variant": envelope.variant,
+            "execution_policy_sha256": envelope.execution_policy_sha256,
+            "variant_policy_sha256": envelope.variant_policy_sha256,
+        }
+    )
 
 
 __all__ = [
