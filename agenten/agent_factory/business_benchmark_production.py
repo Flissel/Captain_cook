@@ -464,6 +464,22 @@ class ProductionBusinessBenchmarkComposition:
         with self._scope_lock:
             return tuple(self._scopes.values())
 
+    def prepare_scopes(
+        self, settings: LiveBusinessBenchmarkSettings
+    ) -> tuple[BusinessBenchmarkExpectedScopeV1, ...]:
+        """Resolve every selected authority scope before health or provider effects."""
+
+        canonical = LiveBusinessBenchmarkSettings.model_validate(
+            settings.model_dump(mode="python")
+        )
+        resolved = tuple(
+            self._resolver.resolve(canonical.for_selection(selection))
+            for selection in canonical.selections
+        )
+        for scope in resolved:
+            self._remember_scope(scope)
+        return tuple(scope.expected_scope for scope in resolved)
+
     async def run(
         self, settings: LiveBusinessBenchmarkSettings
     ) -> BusinessBenchmarkLiveRunResultV1:
@@ -472,18 +488,7 @@ class ProductionBusinessBenchmarkComposition:
                 "production composition requires single team settings"
             )
         scope = self._resolver.resolve(settings)
-        key = (
-            scope.selection.profile,
-            scope.job.job_id,
-            scope.selection.attempt,
-        )
-        with self._scope_lock:
-            existing = self._scopes.get(key)
-            if existing is not None and existing != scope.expected_scope:
-                raise BusinessBenchmarkProductionScopeError(
-                    "production benchmark scope changed for the same team attempt"
-                )
-            self._scopes[key] = scope.expected_scope
+        self._remember_scope(scope)
 
         executor = self._executor_factory(scope)
         replay_store = self._replay_store_factory(scope)
@@ -552,6 +557,20 @@ class ProductionBusinessBenchmarkComposition:
             evidence_refs=evidence_refs,
             completed_at=completed_at,
         )
+
+    def _remember_scope(self, scope: ProductionBusinessBenchmarkScope) -> None:
+        key = (
+            scope.selection.profile,
+            scope.job.job_id,
+            scope.selection.attempt,
+        )
+        with self._scope_lock:
+            existing = self._scopes.get(key)
+            if existing is not None and existing != scope.expected_scope:
+                raise BusinessBenchmarkProductionScopeError(
+                    "production benchmark scope changed for the same team attempt"
+                )
+            self._scopes[key] = scope.expected_scope
 
     def _report_invocation(
         self,

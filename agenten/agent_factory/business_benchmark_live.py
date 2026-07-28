@@ -944,6 +944,9 @@ async def run_provider_business_benchmarks(
     if not environment.get(settings.provider_secret_name, "").strip():
         raise ValueError("provider secret is not present")
     composition = composition_loader(settings)
+    scope_preparer = getattr(composition, "prepare_scopes", None)
+    if callable(scope_preparer):
+        scope_preparer(settings)
     runtime_bundle = getattr(composition, "runtime_bundle", None)
     if runtime_bundle is None or any(
         not callable(getattr(runtime_bundle, method, None))

@@ -228,6 +228,11 @@ async def test_live_entrypoint_loads_composition_and_requires_finalized_receipts
         fence_store = FencePort()
         expected_scope = authoritative_scope
 
+        def prepare_scopes(self, settings: LiveBusinessBenchmarkSettings):
+            calls.append("scope")
+            assert settings.profile == profile
+            return (authoritative_scope,)
+
         async def health_check(self, url: str) -> bool:
             calls.append("health")
             return True
@@ -242,7 +247,7 @@ async def test_live_entrypoint_loads_composition_and_requires_finalized_receipts
         composition_loader=lambda settings: Composition(),
     )
     assert len(outcome.receipts) == expected
-    assert calls == ["health", profile]
+    assert calls == ["scope", "health", profile]
 
 
 @pytest.mark.asyncio

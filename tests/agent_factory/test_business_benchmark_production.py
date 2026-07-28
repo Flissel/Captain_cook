@@ -517,6 +517,13 @@ async def test_production_composition_runs_one_isolated_team_and_returns_exact_e
         clock=lambda: NOW,
     )
 
+    prepared_scopes = composition.prepare_scopes(
+        settings(job, manifest.candidate_id)
+    )
+    assert prepared_scopes == composition.expected_scopes
+    assert len(prepared_scopes) == 1
+    assert factory.calls == []
+
     result = await composition.run(settings(job, manifest.candidate_id))
 
     assert result.profile == "claims"
