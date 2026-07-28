@@ -283,7 +283,7 @@ def result(env: BusinessBenchmarkExecutionEnvelopeV1, **overrides: object) -> Pr
     return ProviderBenchmarkExecutionV1.model_validate(payload)
 
 
-@pytest.mark.parametrize("profile,count", [("claims", 30), ("renewal", 30), ("all", 60)])
+@pytest.mark.parametrize("profile,count", [("claims", 30), ("renewal", 30)])
 def test_live_settings_validate_scope_budget_model_and_safe_root(profile: str, count: int) -> None:
     settings = LiveBusinessBenchmarkSettings.from_environment(
         {
@@ -506,11 +506,21 @@ async def test_preflight_checks_deterministic_budget_before_health_and_bundle() 
                 "CAPTAIN_BENCHMARK_PROFILE": "all",
                 "CAPTAIN_BENCHMARK_PROVIDER": "openai",
                 "CAPTAIN_BENCHMARK_MODEL": "gpt-5-business-v1",
-                "CAPTAIN_BENCHMARK_SUITE_VERSION": "2",
-                "CAPTAIN_BENCHMARK_CANDIDATE_ID": "candidate-v3",
-                "CAPTAIN_BENCHMARK_JOB_ID": str(JOB_ID),
                 "CAPTAIN_BENCHMARK_MAX_USD": "5.00",
-                "CAPTAIN_JOB_REMAINING_USD": "4.00",
+                "CAPTAIN_BENCHMARK_CLAIMS_SUITE_VERSION": "2",
+                "CAPTAIN_BENCHMARK_CLAIMS_CANDIDATE_ID": "claims-candidate-v3",
+                "CAPTAIN_BENCHMARK_CLAIMS_JOB_ID": str(JOB_ID),
+                "CAPTAIN_BENCHMARK_CLAIMS_ATTEMPT": "2",
+                "CAPTAIN_BENCHMARK_CLAIMS_MAX_USD": "3.00",
+                "CAPTAIN_BENCHMARK_CLAIMS_REMAINING_USD": "4.00",
+                "CAPTAIN_BENCHMARK_RENEWAL_SUITE_VERSION": "2",
+                "CAPTAIN_BENCHMARK_RENEWAL_CANDIDATE_ID": "renewal-candidate-v3",
+                "CAPTAIN_BENCHMARK_RENEWAL_JOB_ID": (
+                    "00000000-0000-0000-0000-000000000799"
+                ),
+                "CAPTAIN_BENCHMARK_RENEWAL_ATTEMPT": "2",
+                "CAPTAIN_BENCHMARK_RENEWAL_MAX_USD": "2.00",
+                "CAPTAIN_BENCHMARK_RENEWAL_REMAINING_USD": "1.50",
                 "CAPTAIN_JOB_ALLOWED_MODELS": "gpt-5-business-v1",
                 "CAPTAIN_BENCHMARK_EVIDENCE_ROOT": ".captain-cook/evidence/business-benchmarks/run-1",
                 "CAPTAIN_RUNTIME_URL": "http://127.0.0.1:8000",

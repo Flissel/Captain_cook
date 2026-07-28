@@ -20,6 +20,7 @@ from agenten.agent_factory.business_benchmark_live import (
     BusinessBenchmarkExpectedSuiteV1,
     BusinessBenchmarkLiveAdapter,
     BusinessBenchmarkLiveRunResultV1,
+    BusinessBenchmarkTeamSelectionV1,
     LiveBusinessBenchmarkSettings,
     ProductionAdapterUnavailableError,
     UnsafeBenchmarkToolError,
@@ -42,13 +43,14 @@ from tests.agent_factory.test_business_benchmark_live import (
 
 
 def live_environment(profile: str = "claims") -> dict[str, str]:
-    return {
+    environment = {
         "CAPTAIN_BENCHMARK_PROFILE": profile,
         "CAPTAIN_BENCHMARK_PROVIDER": "openai",
         "CAPTAIN_BENCHMARK_MODEL": "gpt-5-business-v1",
         "CAPTAIN_BENCHMARK_SUITE_VERSION": "2",
         "CAPTAIN_BENCHMARK_CANDIDATE_ID": "candidate-v3",
         "CAPTAIN_BENCHMARK_JOB_ID": "00000000-0000-0000-0000-000000000701",
+        "CAPTAIN_BENCHMARK_ATTEMPT": "2",
         "CAPTAIN_BENCHMARK_MAX_USD": "3.00",
         "CAPTAIN_JOB_REMAINING_USD": "4.00",
         "CAPTAIN_JOB_ALLOWED_MODELS": "gpt-5-business-v1",
@@ -57,6 +59,19 @@ def live_environment(profile: str = "claims") -> dict[str, str]:
         "CAPTAIN_BENCHMARK_PROVIDER_SECRET": "OPENAI_API_KEY",
         "OPENAI_API_KEY": "present-for-deterministic-test-only",
     }
+    return environment
+
+
+def team_selection(profile: str = "claims") -> BusinessBenchmarkTeamSelectionV1:
+    return BusinessBenchmarkTeamSelectionV1(
+        profile=profile,
+        job_id="00000000-0000-0000-0000-000000000701",
+        candidate_id="candidate-v3",
+        suite_version=2,
+        attempt=2,
+        maximum_usd="3.00",
+        captain_remaining_usd="4.00",
+    )
 
 
 class RuntimePort:
@@ -171,6 +186,10 @@ def live_result(profile: str = "claims") -> BusinessBenchmarkLiveRunResultV1:
     )
     return BusinessBenchmarkLiveRunResultV1(
         profile=profile,
+        selections=tuple(
+            team_selection(selected_profile)
+            for selected_profile in selected_profiles
+        ),
         receipts=receipts,
         summary_refs=summaries,
         evidence_refs=tuple(
@@ -191,7 +210,7 @@ def live_result(profile: str = "claims") -> BusinessBenchmarkLiveRunResultV1:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("profile,expected", [("claims", 30), ("renewal", 30), ("all", 60)])
+@pytest.mark.parametrize("profile,expected", [("claims", 30), ("renewal", 30)])
 async def test_live_entrypoint_loads_composition_and_requires_finalized_receipts(
     profile: str, expected: int
 ) -> None:
@@ -248,18 +267,38 @@ async def test_live_entrypoint_rejects_incomplete_receipt_scope() -> None:
 
 @pytest.mark.asyncio
 async def test_all_profile_requires_claims_and_renewal_receipt_coverage() -> None:
-    authoritative_scope = expected_scope("all")
+    from tests.agent_factory.test_business_benchmark_live_team_scopes import (
+        all_environment,
+        expected_scope as isolated_expected_scope,
+        live_result as isolated_live_result,
+    )
+
+    environment = all_environment()
+    environment["OPENAI_API_KEY"] = "present-for-deterministic-test-only"
+    settings = LiveBusinessBenchmarkSettings.from_environment(
+        environment, repository_root=Path.cwd()
+    )
+    authoritative_scopes = tuple(
+        isolated_expected_scope(selection) for selection in settings.selections
+    )
 
     class Composition:
         runtime_bundle = RuntimePort()
         fence_store = FencePort()
-        expected_scope = authoritative_scope
+        expected_scopes = authoritative_scopes
 
         async def health_check(self, url: str) -> bool:
             return True
 
         async def run(self, settings: LiveBusinessBenchmarkSettings):
-            complete = live_result("all")
+            scope = next(
+                item
+                for item in authoritative_scopes
+                if item.suites[0].profile == settings.profile
+            )
+            complete = isolated_live_result(settings, (scope,))
+            if settings.profile == "claims":
+                return complete
             claims_only = tuple(
                 item.model_copy(update={"profile": "claims"})
                 for item in complete.receipts
@@ -268,7 +307,7 @@ async def test_all_profile_requires_claims_and_renewal_receipt_coverage() -> Non
 
     with pytest.raises(ValueError, match="selected profile and variant"):
         await run_provider_business_benchmarks(
-            live_environment("all"),
+            environment,
             repository_root=Path.cwd(),
             composition_loader=lambda settings: Composition(),
         )
@@ -366,7 +405,7 @@ async def test_authoritative_scope_must_match_configured_suite_and_candidate() -
             calls.append("run")
             return live_result(settings.profile)
 
-    with pytest.raises(ValueError, match="configured suite or candidate"):
+    with pytest.raises(ValueError, match="configured team selection"):
         await run_provider_business_benchmarks(
             live_environment(),
             repository_root=Path.cwd(),

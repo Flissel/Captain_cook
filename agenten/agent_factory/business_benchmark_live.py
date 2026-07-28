@@ -7,6 +7,7 @@ production runtime bundle and an injected durable provider fence store.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -46,6 +47,9 @@ _SAFE_FACT_ID = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
 _SAFE_AGENT_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _EVIDENCE_RELATIVE_ROOT = Path(".captain-cook/evidence/business-benchmarks")
 _PROVIDER_SECRET_NAMES = {"openai": "OPENAI_API_KEY"}
+_DEFAULT_REDACTION_POLICY_SHA256 = hashlib.sha256(
+    b"captain-business-benchmark-redaction-policy-v1"
+).hexdigest()
 
 
 class _FrozenModel(BaseModel):
@@ -528,23 +532,106 @@ class BusinessBenchmarkLiveAdapter:
             raise ValueError("provider fence receipt does not match claim")
 
 
+class BusinessBenchmarkTeamSelectionV1(_FrozenModel):
+    """One Captain-authorized business team and its isolated job budget."""
+
+    profile: Literal["claims", "renewal"]
+    job_id: UUID
+    candidate_id: str = Field(min_length=1)
+    suite_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    maximum_usd: Decimal = Field(gt=0)
+    captain_remaining_usd: Decimal = Field(gt=0)
+
+    @model_validator(mode="after")
+    def require_available_job_budget(self) -> "BusinessBenchmarkTeamSelectionV1":
+        if self.maximum_usd > self.captain_remaining_usd:
+            raise ValueError("maximum benchmark cost exceeds remaining Captain budget")
+        return self
+
+
 class LiveBusinessBenchmarkSettings(_FrozenModel):
     profile: Literal["claims", "renewal", "all"]
     provider: str
     model: str
-    suite_version: int = Field(ge=1, strict=True)
-    candidate_id: str
-    job_id: UUID
+    redaction_policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    selections: tuple[BusinessBenchmarkTeamSelectionV1, ...] = Field(
+        min_length=1, max_length=2
+    )
     maximum_usd: Decimal
-    captain_remaining_usd: Decimal
     allowed_models: tuple[str, ...]
     evidence_root: Path
     runtime_url: str
     provider_secret_name: str
 
+    @model_validator(mode="after")
+    def require_exact_profile_and_budget_scope(self) -> "LiveBusinessBenchmarkSettings":
+        expected_profiles = (
+            ("claims", "renewal") if self.profile == "all" else (self.profile,)
+        )
+        if tuple(selection.profile for selection in self.selections) != expected_profiles:
+            raise ValueError("benchmark selections do not match selected profiles")
+        if len({selection.job_id for selection in self.selections}) != len(
+            self.selections
+        ):
+            raise ValueError("business benchmark teams require distinct job identities")
+        if len({selection.candidate_id for selection in self.selections}) != len(
+            self.selections
+        ):
+            raise ValueError("business benchmark teams require distinct candidate identities")
+        if sum(
+            (selection.maximum_usd for selection in self.selections), Decimal(0)
+        ) != self.maximum_usd:
+            raise ValueError(
+                "aggregate benchmark budget must equal the selected team budgets"
+            )
+        return self
+
     @property
     def execution_count(self) -> int:
-        return 60 if self.profile == "all" else 30
+        return len(self.selections) * 30
+
+    def selection_for(
+        self, profile: Literal["claims", "renewal"]
+    ) -> BusinessBenchmarkTeamSelectionV1:
+        for selection in self.selections:
+            if selection.profile == profile:
+                return selection
+        raise ValueError(f"business benchmark profile is not selected: {profile}")
+
+    def for_selection(
+        self, selection: BusinessBenchmarkTeamSelectionV1
+    ) -> "LiveBusinessBenchmarkSettings":
+        if selection not in self.selections:
+            raise ValueError("team selection is not authorized by aggregate settings")
+        return self.model_copy(
+            update={
+                "profile": selection.profile,
+                "selections": (selection,),
+                "maximum_usd": selection.maximum_usd,
+            }
+        )
+
+    @property
+    def suite_version(self) -> int:
+        return self._single_selection().suite_version
+
+    @property
+    def candidate_id(self) -> str:
+        return self._single_selection().candidate_id
+
+    @property
+    def job_id(self) -> UUID:
+        return self._single_selection().job_id
+
+    @property
+    def captain_remaining_usd(self) -> Decimal:
+        return self._single_selection().captain_remaining_usd
+
+    def _single_selection(self) -> BusinessBenchmarkTeamSelectionV1:
+        if len(self.selections) != 1:
+            raise ValueError("aggregate benchmark settings have no single team identity")
+        return self.selections[0]
 
     @classmethod
     def from_environment(
@@ -562,18 +649,21 @@ class LiveBusinessBenchmarkSettings(_FrozenModel):
             raise ValueError("benchmark profile must be claims, renewal, or all")
         provider = _required(environment, "CAPTAIN_BENCHMARK_PROVIDER")
         model = _required(environment, "CAPTAIN_BENCHMARK_MODEL")
-        try:
-            suite_version = int(_required(environment, "CAPTAIN_BENCHMARK_SUITE_VERSION"))
-        except ValueError as exc:
-            raise ValueError("benchmark suite version must be a positive integer") from exc
-        if suite_version <= 0:
-            raise ValueError("benchmark suite version must be a positive integer")
-        remaining = _positive_decimal(
-            _required(environment, "CAPTAIN_JOB_REMAINING_USD"),
-            "remaining Captain budget",
+        selections = (
+            tuple(
+                _team_selection_from_environment(environment, selected_profile)
+                for selected_profile in ("claims", "renewal")
+            )
+            if profile == "all"
+            else (
+                _team_selection_from_environment(
+                    environment,
+                    profile,
+                    allow_generic=True,
+                    aggregate_maximum=maximum,
+                ),
+            )
         )
-        if maximum > remaining:
-            raise ValueError("maximum benchmark cost exceeds remaining Captain budget")
         allowed_models = tuple(
             item.strip()
             for item in _required(environment, "CAPTAIN_JOB_ALLOWED_MODELS").split(",")
@@ -603,11 +693,13 @@ class LiveBusinessBenchmarkSettings(_FrozenModel):
             profile=profile,
             provider=provider,
             model=model,
-            suite_version=suite_version,
-            candidate_id=_required(environment, "CAPTAIN_BENCHMARK_CANDIDATE_ID"),
-            job_id=UUID(_required(environment, "CAPTAIN_BENCHMARK_JOB_ID")),
+            redaction_policy_sha256=environment.get(
+                "CAPTAIN_BENCHMARK_REDACTION_POLICY_SHA256",
+                _DEFAULT_REDACTION_POLICY_SHA256,
+            ).strip()
+            or _DEFAULT_REDACTION_POLICY_SHA256,
+            selections=selections,
             maximum_usd=maximum,
-            captain_remaining_usd=remaining,
             allowed_models=allowed_models,
             evidence_root=evidence_root,
             runtime_url=_required(environment, "CAPTAIN_RUNTIME_URL"),
@@ -677,7 +769,7 @@ class BusinessBenchmarkExpectedScopeV1(_FrozenModel):
     candidate_id: str = Field(min_length=1)
     candidate_ref: ArtifactRef
     suites: tuple[BusinessBenchmarkExpectedSuiteV1, ...] = Field(
-        min_length=1, max_length=2
+        min_length=1, max_length=1
     )
 
     @model_validator(mode="after")
@@ -692,6 +784,9 @@ class BusinessBenchmarkLiveRunResultV1(_FrozenModel):
     """Final provider-live receipts plus Captain summary/evidence references."""
 
     profile: Literal["claims", "renewal", "all"]
+    selections: tuple[BusinessBenchmarkTeamSelectionV1, ...] = Field(
+        min_length=1, max_length=2
+    )
     receipts: tuple[BusinessBenchmarkFinalizedReceiptV1, ...]
     summary_refs: tuple[ArtifactRef, ...]
     evidence_refs: tuple[ArtifactRef, ...]
@@ -699,6 +794,11 @@ class BusinessBenchmarkLiveRunResultV1(_FrozenModel):
 
     @model_validator(mode="after")
     def require_complete_finalized_scope(self) -> "BusinessBenchmarkLiveRunResultV1":
+        expected_profiles = (
+            ("claims", "renewal") if self.profile == "all" else (self.profile,)
+        )
+        if tuple(selection.profile for selection in self.selections) != expected_profiles:
+            raise ValueError("live result selections do not match selected profiles")
         per_variant = 30 if self.profile == "all" else 15
         expected_total = per_variant * 2
         candidate = tuple(
@@ -727,7 +827,6 @@ class BusinessBenchmarkLiveRunResultV1(_FrozenModel):
             }
         ) != expected_total:
             raise ValueError("live receipts must cover each case and variant exactly once")
-        expected_profiles = ("claims", "renewal") if self.profile == "all" else (self.profile,)
         for profile in expected_profiles:
             for variant in ("candidate", "single_agent_baseline"):
                 if (
@@ -745,6 +844,8 @@ class BusinessBenchmarkLiveRunResultV1(_FrozenModel):
         expected_summaries = 2 if self.profile == "all" else 1
         if len(self.summary_refs) != expected_summaries:
             raise ValueError("live run requires one Captain summary per selected profile")
+        if len(set(self.summary_refs)) != expected_summaries:
+            raise ValueError("live run requires distinct Captain summaries per profile")
         required_evidence = {
             *(item.receipt_ref for item in self.receipts),
             *(
@@ -766,7 +867,7 @@ class ProductionBusinessBenchmarkCompositionPort(Protocol):
 
     runtime_bundle: ProductionBusinessBenchmarkRuntimeBundlePort
     fence_store: DurableProviderFencePort
-    expected_scope: BusinessBenchmarkExpectedScopeV1
+    expected_scopes: tuple[BusinessBenchmarkExpectedScopeV1, ...]
 
     async def health_check(self, url: str) -> bool: ...
 
@@ -819,60 +920,127 @@ async def run_provider_business_benchmarks(
         for method in ("register_fence", "assert_current")
     ):
         raise ProductionAdapterUnavailableError("durable provider fence store is unavailable")
-    raw_expected_scope = getattr(composition, "expected_scope", None)
-    if raw_expected_scope is None:
-        raise ProductionAdapterUnavailableError(
-            "authoritative expected suite and candidate scope is unavailable"
-        )
-    expected_scope = BusinessBenchmarkExpectedScopeV1.model_validate(
-        raw_expected_scope.model_dump(mode="python")
-        if isinstance(raw_expected_scope, BaseModel)
-        else raw_expected_scope
-    )
-    _validate_expected_scope_settings(expected_scope, settings)
+    expected_scopes = _load_expected_scopes(composition, settings)
+    _validate_expected_scope_settings(expected_scopes, settings)
     await LiveBusinessBenchmarkPreflight(
         health_check=composition.health_check,
         runtime_bundle=composition.runtime_bundle,
     ).validate_environment(environment, repository_root=repository_root)
-    raw = await composition.run(settings)
-    result = BusinessBenchmarkLiveRunResultV1.model_validate(
-        raw.model_dump(mode="python") if isinstance(raw, BaseModel) else raw
+    scopes_by_profile = {scope.suites[0].profile: scope for scope in expected_scopes}
+    team_results: list[BusinessBenchmarkLiveRunResultV1] = []
+    for selection in settings.selections:
+        team_settings = settings.for_selection(selection)
+        raw = await composition.run(team_settings)
+        result = BusinessBenchmarkLiveRunResultV1.model_validate(
+            raw.model_dump(mode="python") if isinstance(raw, BaseModel) else raw
+        )
+        if result.profile != selection.profile:
+            raise ValueError("live result profile does not match selected settings")
+        if result.selections != (selection,):
+            raise ValueError("live result selections do not match configured team selections")
+        _validate_result_against_expected_scope(
+            result, (scopes_by_profile[selection.profile],), team_settings
+        )
+        team_results.append(result)
+    aggregate = _aggregate_team_results(settings, tuple(team_results))
+    _validate_result_against_expected_scope(aggregate, expected_scopes, settings)
+    return aggregate
+
+
+def _aggregate_team_results(
+    settings: LiveBusinessBenchmarkSettings,
+    results: tuple[BusinessBenchmarkLiveRunResultV1, ...],
+) -> BusinessBenchmarkLiveRunResultV1:
+    if len(results) == 1:
+        return results[0]
+    receipts = tuple(item for result in results for item in result.receipts)
+    summaries = tuple(item for result in results for item in result.summary_refs)
+    evidence = _unique_refs(
+        tuple(item for result in results for item in result.evidence_refs)
     )
-    if result.profile != settings.profile:
-        raise ValueError("live result profile does not match selected settings")
-    _validate_result_against_expected_scope(result, expected_scope, settings)
-    return result
+    return BusinessBenchmarkLiveRunResultV1(
+        profile=settings.profile,
+        selections=settings.selections,
+        receipts=receipts,
+        summary_refs=summaries,
+        evidence_refs=evidence,
+        completed_at=max(result.completed_at for result in results),
+    )
+
+
+def _load_expected_scopes(
+    composition: ProductionBusinessBenchmarkCompositionPort,
+    settings: LiveBusinessBenchmarkSettings,
+) -> tuple[BusinessBenchmarkExpectedScopeV1, ...]:
+    raw_scopes = getattr(composition, "expected_scopes", None)
+    if raw_scopes is None and settings.profile != "all":
+        legacy_scope = getattr(composition, "expected_scope", None)
+        raw_scopes = (legacy_scope,) if legacy_scope is not None else None
+    if raw_scopes is None:
+        raise ProductionAdapterUnavailableError(
+            "authoritative expected team scopes are unavailable"
+        )
+    try:
+        return tuple(
+            BusinessBenchmarkExpectedScopeV1.model_validate(
+                item.model_dump(mode="python") if isinstance(item, BaseModel) else item
+            )
+            for item in raw_scopes
+        )
+    except TypeError as exc:
+        raise ProductionAdapterUnavailableError(
+            "authoritative expected team scopes are unavailable"
+        ) from exc
 
 
 def _validate_expected_scope_settings(
-    scope: BusinessBenchmarkExpectedScopeV1,
+    scopes: tuple[BusinessBenchmarkExpectedScopeV1, ...],
     settings: LiveBusinessBenchmarkSettings,
 ) -> None:
-    selected_profiles = (
-        {"claims", "renewal"} if settings.profile == "all" else {settings.profile}
-    )
-    if (
-        scope.job_id != settings.job_id
-        or scope.model_version != settings.model
-        or scope.candidate_id != settings.candidate_id
-        or {suite.profile for suite in scope.suites} != selected_profiles
-        or any(suite.suite_version != settings.suite_version for suite in scope.suites)
-    ):
+    if len(scopes) != len(settings.selections):
         raise ValueError(
-            "authoritative benchmark scope does not match configured suite or candidate"
+            "authoritative benchmark scopes do not match configured team selections"
         )
+    by_profile: dict[str, BusinessBenchmarkExpectedScopeV1] = {}
+    for scope in scopes:
+        profile = scope.suites[0].profile
+        if profile in by_profile:
+            raise ValueError("authoritative benchmark scopes contain duplicate profiles")
+        by_profile[profile] = scope
+    if set(by_profile) != {selection.profile for selection in settings.selections}:
+        raise ValueError(
+            "authoritative benchmark scopes do not match configured team selections"
+        )
+    if len({scope.candidate_ref for scope in scopes}) != len(scopes):
+        raise ValueError("business benchmark teams require distinct candidate references")
+    if len({scope.correlation_id for scope in scopes}) != len(scopes):
+        raise ValueError("business benchmark teams require distinct correlation identities")
+    for selection in settings.selections:
+        scope = by_profile[selection.profile]
+        suite = scope.suites[0]
+        if (
+            scope.job_id != selection.job_id
+            or scope.attempt != selection.attempt
+            or scope.model_version != settings.model
+            or scope.candidate_id != selection.candidate_id
+            or suite.suite_version != selection.suite_version
+        ):
+            raise ValueError(
+                "authoritative benchmark scope does not match configured team selection"
+            )
 
 
 def _validate_result_against_expected_scope(
     result: BusinessBenchmarkLiveRunResultV1,
-    scope: BusinessBenchmarkExpectedScopeV1,
+    scopes: tuple[BusinessBenchmarkExpectedScopeV1, ...],
     settings: LiveBusinessBenchmarkSettings,
 ) -> None:
-    suites = {suite.profile: suite for suite in scope.suites}
+    scopes_by_profile = {scope.suites[0].profile: scope for scope in scopes}
     observed: dict[tuple[str, str], set[tuple[str, str]]] = {}
     for item in result.receipts:
         receipt = item.receipt
-        suite = suites[item.profile]
+        scope = scopes_by_profile[item.profile]
+        suite = scope.suites[0]
         expected_candidate_ref = (
             scope.candidate_ref if receipt.variant == "candidate" else None
         )
@@ -894,7 +1062,8 @@ def _validate_result_against_expected_scope(
             raise ValueError("live receipt does not match authoritative benchmark scope")
         observed.setdefault((item.profile, receipt.variant), set()).add(case_identity)
 
-    for suite in scope.suites:
+    for scope in scopes:
+        suite = scope.suites[0]
         expected_cases = {
             (expected.case_id, expected.case_sha256) for expected in suite.cases
         }
@@ -902,10 +1071,21 @@ def _validate_result_against_expected_scope(
             if observed.get((suite.profile, variant), set()) != expected_cases:
                 raise ValueError("live receipt does not match authoritative benchmark scope")
 
-    maximum_micro_usd = settings.maximum_usd * Decimal(1_000_000)
-    if maximum_micro_usd != maximum_micro_usd.to_integral_value() or sum(
-        item.receipt.cost_micro_usd for item in result.receipts
-    ) > int(maximum_micro_usd):
+    for selection in settings.selections:
+        team_maximum_micro_usd = _maximum_micro_usd(
+            selection.maximum_usd, f"{selection.profile} team"
+        )
+        team_cost = sum(
+            item.receipt.cost_micro_usd
+            for item in result.receipts
+            if item.profile == selection.profile
+        )
+        if team_cost > team_maximum_micro_usd:
+            raise ValueError(
+                f"{selection.profile} team cost exceeds configured benchmark maximum"
+            )
+    maximum_micro_usd = _maximum_micro_usd(settings.maximum_usd, "aggregate")
+    if sum(item.receipt.cost_micro_usd for item in result.receipts) > maximum_micro_usd:
         raise ValueError("live receipt cost exceeds configured benchmark maximum")
 
 
@@ -952,6 +1132,13 @@ def _usage_micro_usd(receipts: tuple[FactoryUsageReceiptV1, ...]) -> int:
     return int(micro)
 
 
+def _maximum_micro_usd(value: Decimal, label: str) -> int:
+    micro = value * Decimal(1_000_000)
+    if micro != micro.to_integral_value():
+        raise ValueError(f"{label} benchmark budget is not integral micro-USD")
+    return int(micro)
+
+
 def _unique_refs(references: tuple[ArtifactRef, ...]) -> tuple[ArtifactRef, ...]:
     result: list[ArtifactRef] = []
     seen: set[tuple[str, str]] = set()
@@ -968,6 +1155,65 @@ def _required(environment: Mapping[str, str], name: str) -> str:
     if not value:
         raise ValueError(f"required benchmark setting is missing: {name}")
     return value
+
+
+def _team_selection_from_environment(
+    environment: Mapping[str, str],
+    profile: Literal["claims", "renewal"],
+    *,
+    allow_generic: bool = False,
+    aggregate_maximum: Decimal | None = None,
+) -> BusinessBenchmarkTeamSelectionV1:
+    prefix = f"CAPTAIN_BENCHMARK_{profile.upper()}_"
+
+    def selected(name: str, *, default: str | None = None) -> str:
+        prefixed_name = prefix + name
+        if prefixed_name in environment and environment[prefixed_name].strip():
+            return environment[prefixed_name].strip()
+        if allow_generic:
+            generic_name = (
+                "CAPTAIN_JOB_REMAINING_USD"
+                if name == "REMAINING_USD"
+                else f"CAPTAIN_BENCHMARK_{name}"
+            )
+            if generic_name in environment and environment[generic_name].strip():
+                return environment[generic_name].strip()
+            if default is not None:
+                return default
+            raise ValueError(f"required benchmark setting is missing: {generic_name}")
+        raise ValueError(f"required benchmark setting is missing: {prefixed_name}")
+
+    maximum = (
+        aggregate_maximum
+        if allow_generic and aggregate_maximum is not None
+        else _positive_decimal(selected("MAX_USD"), f"{profile} maximum benchmark cost")
+    )
+    remaining = _positive_decimal(
+        selected("REMAINING_USD"), f"{profile} remaining Captain budget"
+    )
+    try:
+        suite_version = int(selected("SUITE_VERSION"))
+    except ValueError as exc:
+        raise ValueError(
+            f"{profile} benchmark suite version must be a positive integer"
+        ) from exc
+    try:
+        attempt = int(selected("ATTEMPT", default="1"))
+    except ValueError as exc:
+        raise ValueError(f"{profile} benchmark attempt must be an integer") from exc
+    try:
+        job_id = UUID(selected("JOB_ID"))
+    except ValueError as exc:
+        raise ValueError(f"{profile} benchmark job ID must be a UUID") from exc
+    return BusinessBenchmarkTeamSelectionV1(
+        profile=profile,
+        job_id=job_id,
+        candidate_id=selected("CANDIDATE_ID"),
+        suite_version=suite_version,
+        attempt=attempt,
+        maximum_usd=maximum,
+        captain_remaining_usd=remaining,
+    )
 
 
 def _positive_decimal(value: str, label: str) -> Decimal:

@@ -11,17 +11,35 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$allowedEnvironment = @(
+$globalRequiredEnvironment = @(
     'CAPTAIN_BENCHMARK_PROVIDER',
     'CAPTAIN_BENCHMARK_MODEL',
-    'CAPTAIN_BENCHMARK_SUITE_VERSION',
-    'CAPTAIN_BENCHMARK_CANDIDATE_ID',
-    'CAPTAIN_BENCHMARK_JOB_ID',
+    'CAPTAIN_BENCHMARK_REDACTION_POLICY_SHA256',
     'CAPTAIN_BENCHMARK_MAX_USD',
-    'CAPTAIN_JOB_REMAINING_USD',
     'CAPTAIN_JOB_ALLOWED_MODELS',
     'CAPTAIN_RUNTIME_URL',
     'CAPTAIN_BENCHMARK_PROVIDER_SECRET'
+)
+$singleTeamRequiredEnvironment = @(
+    'CAPTAIN_BENCHMARK_SUITE_VERSION',
+    'CAPTAIN_BENCHMARK_CANDIDATE_ID',
+    'CAPTAIN_BENCHMARK_JOB_ID',
+    'CAPTAIN_BENCHMARK_ATTEMPT',
+    'CAPTAIN_JOB_REMAINING_USD'
+)
+$allTeamRequiredEnvironment = @(
+    'CAPTAIN_BENCHMARK_CLAIMS_SUITE_VERSION',
+    'CAPTAIN_BENCHMARK_CLAIMS_CANDIDATE_ID',
+    'CAPTAIN_BENCHMARK_CLAIMS_JOB_ID',
+    'CAPTAIN_BENCHMARK_CLAIMS_ATTEMPT',
+    'CAPTAIN_BENCHMARK_CLAIMS_MAX_USD',
+    'CAPTAIN_BENCHMARK_CLAIMS_REMAINING_USD',
+    'CAPTAIN_BENCHMARK_RENEWAL_SUITE_VERSION',
+    'CAPTAIN_BENCHMARK_RENEWAL_CANDIDATE_ID',
+    'CAPTAIN_BENCHMARK_RENEWAL_JOB_ID',
+    'CAPTAIN_BENCHMARK_RENEWAL_ATTEMPT',
+    'CAPTAIN_BENCHMARK_RENEWAL_MAX_USD',
+    'CAPTAIN_BENCHMARK_RENEWAL_REMAINING_USD'
 )
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $evidenceBase = Join-Path $repositoryRoot '.captain-cook/evidence/business-benchmarks'
@@ -45,7 +63,14 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw 'TODO_TOOL.v1: validated Python interpreter could not execute'
     }
-    foreach ($name in $allowedEnvironment) {
+    $requiredEnvironment = @($globalRequiredEnvironment)
+    if ($Profile -eq 'all') {
+        $requiredEnvironment += $allTeamRequiredEnvironment
+    }
+    else {
+        $requiredEnvironment += $singleTeamRequiredEnvironment
+    }
+    foreach ($name in $requiredEnvironment) {
         $value = [Environment]::GetEnvironmentVariable($name, 'Process')
         if ([string]::IsNullOrWhiteSpace($value)) {
             throw "Required allowlisted environment setting is missing: $name"
