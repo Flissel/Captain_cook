@@ -83,4 +83,6 @@
   benchmark after `OPENAI_API_KEY` is securely exported into the invoking
   process. Retain cost, latency, tool, handoff, recovery, Gateway decision, and
   Minibook projection evidence; do not call either team `ready_to_use` before
-  those gates pass.
+  those gates pass. The interactive
+  `scripts/run-business-benchmark-demo-secure.ps1` wrapper accepts the key via
+  a masked prompt, keeps it process-only, and clears it in `finally`.
