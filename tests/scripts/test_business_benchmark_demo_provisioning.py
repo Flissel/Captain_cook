@@ -53,6 +53,7 @@ from agenten.agent_factory.skill_workflow_contracts import (
 )
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from agenten.agent_factory.team_execution import CaptainReleasedSkillAuthority
+from agenten.validation.contracts import AssertionKind, WorkBatch
 
 
 ISSUED_AT = datetime(2026, 7, 28, 18, 0, tzinfo=timezone.utc)
@@ -67,6 +68,7 @@ class RecordingGateway:
         ] = {}
         self.blocks: dict[UUID, FactoryEvidenceBlock] = {}
         self.leases: dict[str, FactoryLease] = {}
+        self.work_batches: dict[str, tuple[UUID, WorkBatch]] = {}
 
     def register(self, job: AgentFactoryJobV3) -> None:
         current = self.jobs.setdefault(job.job_id, job)
@@ -93,6 +95,11 @@ class RecordingGateway:
         current = self.leases.setdefault(lease.lease_id, lease)
         if current != lease:
             raise ValueError("factory lease conflict")
+
+    def persist_work_batch(self, job: AgentFactoryJobV3, batch: WorkBatch) -> None:
+        current = self.work_batches.setdefault(batch.batch_id, (job.job_id, batch))
+        if current != (job.job_id, batch):
+            raise ValueError("work batch conflict")
 
     def budget_projection(self, job_id: UUID) -> FactoryBudgetProjection:
         job = self.jobs[job_id]
@@ -167,6 +174,44 @@ def test_dry_run_is_side_effect_free_and_contains_two_redacted_stable_plans(
     assert "password" not in serialized
     assert LOCAL_DSN not in serialized
     assert not (tmp_path / ".captain-cook").exists()
+
+
+def test_dry_run_plans_one_job_bound_public_read_only_renewal_work_batch(
+    tmp_path: Path,
+) -> None:
+    first = BusinessBenchmarkDemoProvisioner(settings(tmp_path)).plan()
+    second = BusinessBenchmarkDemoProvisioner(settings(tmp_path)).plan()
+    claims, renewal = first.teams
+
+    assert claims.profile == "claims"
+    assert claims.work_batch is None
+    assert renewal.profile == "renewal"
+    assert renewal.work_batch == second.teams[1].work_batch
+    assert renewal.work_batch is not None
+    batch = renewal.work_batch
+    assert batch.batch_id == f"renewal-{renewal.job.job_id.hex[:24]}"
+    assert len(batch.batch_id) == 32
+    assert batch.subtask_ids == ["renewal_context_read"]
+    assert batch.target == "n8n"
+    assert batch.runtime == "n8n"
+    assert batch.interface_schema == "captain-n8n-artifact/v1"
+    assert batch.capability_tags == ["n8n-builder"]
+    assert batch.constraints == [
+        f"factory-job-id:{renewal.job.job_id}",
+        "effect:read_only",
+        "external-mutation:forbidden",
+    ]
+    assert len(batch.acceptance_criteria) == 1
+    assertion = batch.acceptance_criteria[0]
+    assert assertion.assertion_id == "read-only"
+    assert assertion.kind is AssertionKind.STATUS_EQUALS
+    assert assertion.expected == "succeeded"
+    assert "read-only" in assertion.description
+    assert "mutation" in assertion.description
+    public = json.dumps(batch.model_dump(mode="json"), sort_keys=True).lower()
+    assert "holdout://" not in public
+    assert "password" not in public
+    assert LOCAL_DSN not in public
 
 
 def test_execute_team_release_uses_canonical_factory_workflow_capability(
@@ -253,6 +298,12 @@ def test_apply_persists_only_legal_initial_gateway_authority_and_is_idempotent(
     assert len(gateway.blocks) == 2
     assert all(block.phase is FactoryPhase.FORGE_REQUESTED for block in gateway.blocks.values())
     assert len(gateway.leases) == 2
+    assert len(gateway.work_batches) == 1
+    renewal = next(team for team in first.teams if team.profile == "renewal")
+    assert renewal.work_batch is not None
+    assert gateway.work_batches == {
+        renewal.work_batch.batch_id: (renewal.job.job_id, renewal.work_batch)
+    }
     assert all(lease.role is FactoryRole.AGENT_ARCHITECT for lease in gateway.leases.values())
     assert all(team.gateway_budget_remaining_usd == Decimal("5.00") for team in first.teams)
     cas = BusinessBenchmarkContentAddressedArtifactStore(

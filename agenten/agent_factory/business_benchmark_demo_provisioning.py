@@ -75,6 +75,11 @@ from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillStep,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
+from agenten.validation.contracts import (
+    AcceptanceAssertion,
+    AssertionKind,
+    WorkBatch,
+)
 
 
 _ARTIFACT_PREFIX = "artifact://business-benchmark-production/"
@@ -178,6 +183,7 @@ class BusinessBenchmarkDemoTeamPlanV1(_FrozenModel):
     released_skills: tuple[ReleasedHermesSkill, ...]
     initial_lease: FactoryLease
     blocker: ToolGapMarker
+    work_batch: WorkBatch | None = None
     released_workflow_steps: tuple[FactorySkillStep, ...]
     initial_workflow_steps: tuple[FactorySkillStep, ...]
     missing_gateway_evidence: tuple[str, ...]
@@ -213,6 +219,12 @@ class BusinessBenchmarkDemoGatewayPort(Protocol):
     def append_forge_requested(self, block: FactoryEvidenceBlock) -> None: ...
 
     def record_lease(self, lease: FactoryLease) -> None: ...
+
+    def persist_work_batch(
+        self,
+        job: AgentFactoryJobV3,
+        batch: WorkBatch,
+    ) -> None: ...
 
     def budget_projection(self, job_id: UUID) -> FactoryBudgetProjection: ...
 
@@ -314,6 +326,8 @@ class BusinessBenchmarkDemoProvisioner:
                 raise ValueError("immutable demo team job binding changed") from exc
 
             gateway.register(item.plan.job)
+            if item.plan.work_batch is not None:
+                gateway.persist_work_batch(item.plan.job, item.plan.work_batch)
             gateway.assign_released_skills(
                 item.plan.job,
                 {
@@ -452,6 +466,11 @@ class BusinessBenchmarkDemoProvisioner:
                             released_skills=ordered_skills,
                             initial_lease=initial_lease,
                             blocker=blocker,
+                            work_batch=(
+                                _renewal_work_batch(job)
+                                if profile == "renewal"
+                                else None
+                            ),
                             released_workflow_steps=tuple(FactorySkillStep),
                             initial_workflow_steps=_INITIAL_WORKFLOW_STEPS,
                             missing_gateway_evidence=_MISSING_WORKFLOW_EVIDENCE,
@@ -473,6 +492,37 @@ class BusinessBenchmarkDemoProvisioner:
                     )
                 )
         return prepared[0], prepared[1]
+
+
+def _renewal_work_batch(job: AgentFactoryJobV3) -> WorkBatch:
+    """Return the public Captain authority for one read-only Renewal n8n node."""
+
+    return WorkBatch(
+        batch_id=f"renewal-{job.job_id.hex[:24]}",
+        title="Renewal benchmark context read",
+        goal="Authorize one Captain-scoped read-only renewal context operation.",
+        subtask_ids=["renewal_context_read"],
+        target="n8n",
+        runtime="n8n",
+        runtime_version="v1",
+        interface_schema="captain-n8n-artifact/v1",
+        capability_tags=["n8n-builder"],
+        constraints=[
+            f"factory-job-id:{job.job_id}",
+            "effect:read_only",
+            "external-mutation:forbidden",
+        ],
+        acceptance_criteria=[
+            AcceptanceAssertion(
+                assertion_id="read-only",
+                kind=AssertionKind.STATUS_EQUALS,
+                expected="succeeded",
+                description=(
+                    "renewal_context_read is read-only and performs no external mutation."
+                ),
+            )
+        ],
+    )
 
 
 def assert_local_captain_test_dsn(dsn: str) -> None:

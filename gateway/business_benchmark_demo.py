@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Callable, TypeVar
+from dataclasses import dataclass, field
+from typing import Any, Callable, TypeVar
 from uuid import UUID
 
 from fastapi import HTTPException
@@ -22,11 +23,21 @@ from agenten.agent_factory.execution_budget import FactoryBudgetProjection
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import FactorySkillStep
 from agenten.agent_factory.service import FactoryRepositoryError
+from agenten.validation.contracts import WorkBatch
 from gateway.factory_repository import GatewayFactoryRepository
 from gateway.store import GatewayStore
 
 
 _T = TypeVar("_T")
+
+
+@dataclass(frozen=True)
+class _RootWorkBatchWrite:
+    block_type: str
+    data: dict[str, Any]
+    status: str = "pending"
+    parent_index: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class GatewayBusinessBenchmarkDemoError(RuntimeError):
@@ -73,6 +84,28 @@ class GatewayBusinessBenchmarkDemoAuthority:
 
     def record_lease(self, lease: FactoryLease) -> None:
         self._translate(lambda: self._store.record_factory_lease(lease))
+
+    def persist_work_batch(
+        self,
+        job: AgentFactoryJobV3,
+        batch: WorkBatch,
+    ) -> None:
+        if (
+            batch.batch_id != f"renewal-{job.job_id.hex[:24]}"
+            or f"factory-job-id:{job.job_id}" not in batch.constraints
+        ):
+            raise GatewayBusinessBenchmarkDemoError(
+                "Renewal WorkBatch is not bound to the factory job"
+            )
+        request = _RootWorkBatchWrite(
+            block_type="work_batch",
+            data=batch.model_dump(mode="json"),
+            metadata={
+                "factory_job_id": str(job.job_id),
+                "purpose": "business_benchmark_renewal_n8n",
+            },
+        )
+        self._translate(lambda: self._store.append(request, None))
 
     def budget_projection(self, job_id: UUID) -> FactoryBudgetProjection:
         return self._translate(
