@@ -1,23 +1,42 @@
-"""Concrete authority adapters for the provider-backed business benchmark.
+"""Fail-closed production bootstrap for the provider-backed business benchmark.
 
-The module intentionally stops at external authorities that do not yet have a
-production implementation in this checkout.  It never substitutes an
-in-memory repository, automatic human approval, or an unscoped n8n client.
+Claims is composed from MariaDB/Gateway, stable Captain CAS/state roots, fresh
+budgeted OpenAI clients and host AutoGen sessions.  Renewal remains blocked at
+the exact baseline n8n seam until both variants can use the same grant-bound
+tool path.  No in-memory authority, automatic human approval, or unscoped n8n
+client is substituted.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable
+import math
+import os
+import re
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from agenten.agent_factory.business_benchmark_contracts import (
+    BusinessBenchmarkCaseV1,
     BusinessBenchmarkRunReceiptV1,
     BusinessBenchmarkSuiteV1,
+    canonical_business_benchmark_model_bytes,
+)
+from agenten.agent_factory.business_benchmark import BusinessBenchmarkEvaluator
+from agenten.agent_factory.business_benchmark_execution import (
+    BenchmarkExecutionPolicyV1,
+    BusinessBenchmarkExecutorPort,
+)
+from agenten.agent_factory.business_benchmark_factory import (
+    BusinessBenchmarkGatewayPort,
+    BusinessBenchmarkFactoryComposition,
 )
 from agenten.agent_factory.business_benchmark_live import (
     BusinessBenchmarkFinalizedReceiptV1,
@@ -29,20 +48,59 @@ from agenten.agent_factory.business_benchmark_provisioning import (
     CanonicalPrivateBusinessBenchmarkProvisioner,
     CaptainPrivateBusinessBenchmarkSuiteLoader,
 )
+from agenten.agent_factory.business_benchmark_replay import (
+    FilesystemBusinessBenchmarkReplayStore,
+)
+from agenten.agent_factory.business_benchmark_provider_state import (
+    BusinessBenchmarkProviderStateStore,
+)
+from agenten.agent_factory.business_benchmark_runtime import (
+    BusinessBenchmarkDurableFenceAdapter,
+    BusinessBenchmarkProviderRuntimeBridge,
+    BusinessBenchmarkSessionRequestV1,
+    BusinessBenchmarkTeamRuntimeScopeV1,
+)
 from agenten.agent_factory.business_benchmark_store import (
     FilesystemBusinessBenchmarkEvidenceStore,
 )
+from agenten.agent_factory.business_benchmark_human_review import (
+    CaptainHumanReviewStore,
+)
 from agenten.agent_factory.business_benchmark_production import (
+    BusinessBenchmarkCasePolicyPort,
     CaptainBusinessBenchmarkPolicyBindingV1,
+    ProductionBusinessBenchmarkComposition,
     ProductionBusinessBenchmarkScope,
+    ProductionBusinessBenchmarkScopeResolver,
 )
 from agenten.agent_factory.business_benchmark_production_ports import (
+    BusinessBenchmarkCandidateAuthority,
     BusinessBenchmarkContentAddressedArtifactStore,
     BusinessBenchmarkProductionPortError,
+    BusinessBenchmarkPricingAuthority,
+    ConfiguredBusinessBenchmarkPricingSource,
+    OpenAIBusinessBenchmarkModelClientBuilder,
+    factory_execution_policy_sha256,
+)
+from agenten.agent_factory.business_benchmark_live import BusinessBenchmarkLiveAdapter
+from agenten.agent_factory.candidate_evaluation import FactoryCandidateEvaluator
+from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
+from agenten.agent_factory.factory_feedback import FactoryFeedbackBuilder
+from agenten.agent_factory.team_evaluation import TeamEvaluationService
+from agenten.agent_factory.team_execution import (
+    BudgetedChatCompletionClient,
+    CaptainReleasedSkillAuthority,
+    FactoryHoldoutEvaluationReceiptV1,
+    HostAutoGenSessionExecutor,
+    ResolvedFactoryHoldoutCase,
+    SealedSingleAgentPolicyV1,
 )
 from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryLease, FactoryRole
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
-from agenten.agent_factory.execution_budget import FactoryBudgetProjection
+from agenten.agent_factory.execution_budget import (
+    FactoryBudgetPort,
+    FactoryBudgetProjection,
+)
 from agenten.agent_factory.leases import validate_factory_lease
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import (
@@ -55,7 +113,99 @@ from agenten.agent_factory.skill_workflow_contracts import (
 from agenten.agent_runtime.contracts import ArtifactRef
 
 
-class GatewayBusinessBenchmarkRepositoryPort(Protocol):
+_SAFE_VERSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+@dataclass(frozen=True)
+class ProductionBusinessBenchmarkBootstrapConfig:
+    """Side-effect-free paths and operator policy for the live bootstrap.
+
+    Restart-critical CAS, suite, replay, provider and human-review state uses a
+    stable Captain authority root.  Only finalized run evidence is derived
+    from the timestamped evidence root.  Both roots remain inside a gitignored
+    ``.captain-cook`` namespace.
+    """
+
+    seed_version_id: str
+    authority_root: Path
+    cas_root: Path
+    private_suite_root: Path
+    evidence_store_root: Path
+    human_review_root: Path
+    replay_root: Path
+    provider_state_root: Path
+    human_review_timeout_seconds: float
+
+    @classmethod
+    def from_environment(
+        cls,
+        settings: LiveBusinessBenchmarkSettings,
+        environment: Mapping[str, str],
+    ) -> "ProductionBusinessBenchmarkBootstrapConfig":
+        canonical = LiveBusinessBenchmarkSettings.model_validate(
+            settings.model_dump(mode="python")
+        )
+        root = canonical.evidence_root.resolve()
+        if ".captain-cook" not in {part.casefold() for part in root.parts}:
+            raise ValueError(
+                "business benchmark evidence root must use the gitignored "
+                ".captain-cook namespace"
+            )
+        seed_version_id = environment.get(
+            "CAPTAIN_BENCHMARK_SEED_VERSION_ID", ""
+        ).strip()
+        if not seed_version_id:
+            raise ValueError(
+                "required benchmark bootstrap setting is missing: "
+                "CAPTAIN_BENCHMARK_SEED_VERSION_ID"
+            )
+        if _SAFE_VERSION_ID.fullmatch(seed_version_id) is None:
+            raise ValueError("business benchmark seed version is invalid")
+        configured_authority_root = environment.get(
+            "CAPTAIN_BENCHMARK_AUTHORITY_ROOT", ""
+        ).strip()
+        authority_root = (
+            Path(configured_authority_root)
+            if configured_authority_root
+            else Path.cwd() / ".captain-cook" / "private" / "business-benchmarks"
+        ).resolve()
+        if ".captain-cook" not in {
+            part.casefold() for part in authority_root.parts
+        }:
+            raise ValueError(
+                "business benchmark authority root must use the gitignored "
+                ".captain-cook namespace"
+            )
+        raw_timeout = environment.get(
+            "CAPTAIN_BENCHMARK_HUMAN_REVIEW_TIMEOUT_SECONDS", "0"
+        ).strip()
+        try:
+            human_review_timeout_seconds = float(raw_timeout)
+        except ValueError as exc:
+            raise ValueError("business benchmark human review timeout is invalid") from exc
+        if (
+            not math.isfinite(human_review_timeout_seconds)
+            or human_review_timeout_seconds < 0
+            or human_review_timeout_seconds > 300
+        ):
+            raise ValueError("business benchmark human review timeout is invalid")
+        return cls(
+            seed_version_id=seed_version_id,
+            authority_root=authority_root,
+            cas_root=authority_root / "cas",
+            private_suite_root=authority_root / "suites",
+            evidence_store_root=root / "captain" / "receipts",
+            human_review_root=authority_root / "human-review",
+            replay_root=authority_root / "runtime-state" / "replay",
+            provider_state_root=authority_root / "runtime-state" / "provider-state",
+            human_review_timeout_seconds=human_review_timeout_seconds,
+        )
+
+
+class GatewayBusinessBenchmarkRepositoryPort(
+    BusinessBenchmarkGatewayPort,
+    Protocol,
+):
     """Read-only Gateway projection used by the benchmark scope resolver."""
 
     def job(self, job_id: UUID) -> object: ...
@@ -65,6 +215,417 @@ class GatewayBusinessBenchmarkRepositoryPort(Protocol):
     def workflow_budget_projection(
         self, job_id: UUID
     ) -> FactoryBudgetProjection | None: ...
+
+
+class CaptainBusinessBenchmarkExecutorBuilderPort(Protocol):
+    """Build one scope-bound provider executor from Captain authorities only."""
+
+    def __call__(
+        self,
+        scope: ProductionBusinessBenchmarkScope,
+        authorities: "ProductionBusinessBenchmarkRuntimeAuthorities",
+    ) -> BusinessBenchmarkExecutorPort: ...
+
+
+class CaptainBusinessBenchmarkExecutionPolicyBuilderPort(Protocol):
+    """Materialize exact per-case provider limits selected by Captain."""
+
+    def __call__(
+        self,
+        scope: ProductionBusinessBenchmarkScope,
+    ) -> BusinessBenchmarkCasePolicyPort: ...
+
+
+@dataclass(frozen=True)
+class ProductionBusinessBenchmarkRuntimeAuthorities:
+    """Durable authorities handed to the request-scoped executor builder."""
+
+    artifacts: BusinessBenchmarkContentAddressedArtifactStore
+    human_review: CaptainHumanReviewStore
+    provider_state_root: Path
+
+
+@dataclass(frozen=True)
+class ProductionBusinessBenchmarkBootstrapPorts:
+    """External Captain ports that cannot be reconstructed from public settings."""
+
+    gateway_repository: GatewayBusinessBenchmarkRepositoryPort
+    released_skills: ReleasedSkillCatalogPort
+    leases: ActiveFactoryLeasePort
+    executor_builder: CaptainBusinessBenchmarkExecutorBuilderPort
+    execution_policy_builder: CaptainBusinessBenchmarkExecutionPolicyBuilderPort
+    clock: Callable[[], datetime]
+
+
+@dataclass(frozen=True)
+class ConfiguredBusinessBenchmarkExecutionPolicyBuilder:
+    """Captain-selected per-case limits shared by scope preflight and runtime."""
+
+    model: str
+    redaction_policy_version: str
+    maximum_cost_micro_usd: int
+    maximum_latency_ms: int
+    baseline_system_policy_version: str = "single-agent-baseline-v1"
+
+    @classmethod
+    def from_environment(
+        cls,
+        settings: LiveBusinessBenchmarkSettings,
+        environment: Mapping[str, str],
+    ) -> "ConfiguredBusinessBenchmarkExecutionPolicyBuilder":
+        raw_cost = environment.get(
+            "CAPTAIN_BENCHMARK_CASE_MAX_COST_USD", ""
+        ).strip()
+        raw_latency = environment.get(
+            "CAPTAIN_BENCHMARK_CASE_MAX_LATENCY_MS", ""
+        ).strip()
+        redaction_version = environment.get(
+            "CAPTAIN_BENCHMARK_REDACTION_POLICY_VERSION", ""
+        ).strip()
+        if not raw_cost:
+            raise ValueError(
+                "required benchmark bootstrap setting is missing: "
+                "CAPTAIN_BENCHMARK_CASE_MAX_COST_USD"
+            )
+        if not raw_latency:
+            raise ValueError(
+                "required benchmark bootstrap setting is missing: "
+                "CAPTAIN_BENCHMARK_CASE_MAX_LATENCY_MS"
+            )
+        if not redaction_version:
+            raise ValueError(
+                "required benchmark bootstrap setting is missing: "
+                "CAPTAIN_BENCHMARK_REDACTION_POLICY_VERSION"
+            )
+        try:
+            cost = Decimal(raw_cost)
+            cost_micro = cost * Decimal(1_000_000)
+            latency = int(raw_latency)
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError("business benchmark case limits are invalid") from exc
+        if (
+            not cost.is_finite()
+            or cost <= 0
+            or cost_micro != cost_micro.to_integral_value()
+            or latency < 1
+        ):
+            raise ValueError("business benchmark case limits are invalid")
+        redaction_sha256 = hashlib.sha256(
+            json.dumps(
+                {"redaction_policy_version": redaction_version},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if redaction_sha256 != settings.redaction_policy_sha256:
+            raise ValueError(
+                "business benchmark redaction policy version does not match settings"
+            )
+        return cls(
+            model=settings.model,
+            redaction_policy_version=redaction_version,
+            maximum_cost_micro_usd=int(cost_micro),
+            maximum_latency_ms=latency,
+        )
+
+    def __call__(
+        self,
+        scope: ProductionBusinessBenchmarkScope,
+    ) -> BusinessBenchmarkCasePolicyPort:
+        if scope.settings.model != self.model:
+            raise ValueError("benchmark policy model does not match the resolved scope")
+
+        def for_case(
+            benchmark_case: BusinessBenchmarkCaseV1,
+        ) -> BenchmarkExecutionPolicyV1:
+            return BenchmarkExecutionPolicyV1(
+                schema="captain.business-benchmark-execution-policy.v1",
+                model_version=self.model,
+                allowed_tool_intents=benchmark_case.allowed_tool_intents,
+                maximum_cost_micro_usd=self.maximum_cost_micro_usd,
+                maximum_latency_ms=self.maximum_latency_ms,
+                redaction_policy_version=self.redaction_policy_version,
+                baseline_system_policy_version=self.baseline_system_policy_version,
+            )
+
+        return for_case
+
+
+class _RequestBoundBenchmarkHoldoutResolver:
+    """Expose exactly one already-redacted task to one fresh host session."""
+
+    def __init__(self, request: BusinessBenchmarkSessionRequestV1) -> None:
+        self._request = request
+        self._body = request.redacted_case_task.encode("utf-8")
+
+    async def resolve(self, reference: PrivateHoldoutRef) -> ResolvedFactoryHoldoutCase:
+        expected_sha = hashlib.sha256(self._body).hexdigest()
+        if (
+            reference.sha256 != expected_sha
+            or reference != self._request.identity.case_ref
+        ):
+            raise ValueError("host session requested a different redacted benchmark task")
+        return ResolvedFactoryHoldoutCase(reference=reference, body=self._body)
+
+    async def evaluate(
+        self,
+        reference: PrivateHoldoutRef,
+        result: object,
+        assertion_ids: tuple[str, ...],
+    ) -> FactoryHoldoutEvaluationReceiptV1:
+        raise RuntimeError(
+            "business benchmark host sessions do not own Factory holdout decisions"
+        )
+
+
+class CaptainBusinessBenchmarkHostSessionFactory:
+    """Create a fresh budgeted OpenAI client and Host AutoGen executor per case."""
+
+    def __init__(
+        self,
+        *,
+        scope: ProductionBusinessBenchmarkScope,
+        model_client_builder: OpenAIBusinessBenchmarkModelClientBuilder,
+        budget: FactoryBudgetPort,
+        pricing_authority: BusinessBenchmarkPricingAuthority,
+        paid_effect_authority: CaptainReleasedSkillAuthority,
+        evidence_store: FilesystemFactoryEvidenceStore,
+        provider: str,
+        model: str,
+        max_cost_per_call: Decimal,
+        clock: Callable[[], datetime],
+    ) -> None:
+        self._scope = scope
+        self._model_client_builder = model_client_builder
+        self._budget = budget
+        self._pricing_authority = pricing_authority
+        self._paid_effect_authority = paid_effect_authority
+        self._evidence_store = evidence_store
+        self._provider = provider
+        self._model = model
+        self._max_cost_per_call = max_cost_per_call
+        self._clock = clock
+
+    def create(
+        self,
+        request: BusinessBenchmarkSessionRequestV1,
+    ) -> HostAutoGenSessionExecutor:
+        if (
+            request.identity.job_id != self._scope.job.job_id
+            or request.identity.correlation_id != self._scope.job.correlation_id
+            or request.identity.attempt != self._scope.selection.attempt
+            or request.identity.model != self._model
+        ):
+            raise ValueError("host session request is outside the resolved benchmark scope")
+
+        def model_client_for(identity):
+            if identity != request.identity:
+                raise ValueError("host requested a model client for a different session")
+            delegate = self._model_client_builder(
+                self._scope.job,
+                self._scope.runtime_invocation,
+            )
+            return BudgetedChatCompletionClient(
+                job=self._scope.job,
+                invocation=self._scope.runtime_invocation,
+                attempt=self._scope.selection.attempt,
+                delegate=delegate,
+                budget=self._budget,
+                evidence_store=self._evidence_store,
+                provider=self._provider,
+                model=self._model,
+                max_cost_per_call=self._max_cost_per_call,
+                paid_effect_authority=self._paid_effect_authority,
+                pricing_authority=self._pricing_authority,
+                clock=self._clock,
+            )
+
+        return HostAutoGenSessionExecutor(
+            model_client_factory=model_client_for,
+            evidence_store=self._evidence_store,
+            holdouts=_RequestBoundBenchmarkHoldoutResolver(request),
+            tools={},
+            baseline_tools={},
+            clock=self._clock,
+        )
+
+
+class CaptainClaimsBusinessBenchmarkExecutorBuilder:
+    """Concrete live executor for the no-integration Claims benchmark team."""
+
+    _BASELINE_PROMPT = """Captain Claims single-agent public policy
+Policy version: claims-public-policy-v1
+
+You are the sealed single-agent Claims baseline. Use only the redacted facts supplied by Captain. You have no tools. Never infer personal data, inspect benchmark storage, invent evidence, or claim that a human review is completed.
+
+Apply this public decision policy:
+- Complete ordinary evidence with active coverage routes to route_standard_review using coverage_state_verified and evidence_complete.
+- A complete near-boundary record also routes to route_standard_review using boundary_condition_identified and coverage_state_verified.
+- Missing or unverified required evidence returns request_information using required_evidence_missing and decision_deferred.
+- Conflicting sources or internally inconsistent evidence yields escalate_coverage using evidence_conflict_detected and specialist_review_required.
+- Specialist interpretation, critical complexity, or any explicit escalation trigger yields escalate_coverage using critical_coverage_question_detected and human_authority_required.
+
+The only allowed decisions are:
+- route_standard_review
+- request_information
+- escalate_coverage
+
+The only allowed rationale fact identifiers are:
+- coverage_state_verified
+- evidence_complete
+- boundary_condition_identified
+- required_evidence_missing
+- decision_deferred
+- evidence_conflict_detected
+- specialist_review_required
+- critical_coverage_question_detected
+- human_authority_required
+
+Emit exactly one JSON object and nothing else, with no prose or markdown:
+{"schema":"captain.business-benchmark-terminal.v1","observed_decision":"decision_identifier","observed_rationale_fact_ids":["fact_identifier_1","fact_identifier_2"]}
+
+Use only rationale identifiers justified by supplied fields. Never reveal hidden labels, benchmark storage, raw identifiers, or credentials.
+""".encode("utf-8")
+
+    def __init__(
+        self,
+        *,
+        model_client_builder: OpenAIBusinessBenchmarkModelClientBuilder,
+        budget: FactoryBudgetPort,
+        pricing_authority: BusinessBenchmarkPricingAuthority,
+        paid_effect_authority: CaptainReleasedSkillAuthority,
+        evidence_store: FilesystemFactoryEvidenceStore,
+        policy_builder: ConfiguredBusinessBenchmarkExecutionPolicyBuilder,
+        provider: str,
+        model: str,
+        max_cost_per_call: Decimal,
+        clock: Callable[[], datetime],
+    ) -> None:
+        self._model_client_builder = model_client_builder
+        self._budget = budget
+        self._pricing_authority = pricing_authority
+        self._paid_effect_authority = paid_effect_authority
+        self._evidence_store = evidence_store
+        self._policy_builder = policy_builder
+        self._provider = provider
+        self._model = model
+        self._max_cost_per_call = max_cost_per_call
+        self._clock = clock
+
+    def __call__(
+        self,
+        scope: ProductionBusinessBenchmarkScope,
+        authorities: ProductionBusinessBenchmarkRuntimeAuthorities,
+    ) -> BusinessBenchmarkExecutorPort:
+        if scope.selection.profile != "claims":
+            raise ProductionAdapterUnavailableError(
+                "Captain renewal n8n session binding is required for this profile"
+            )
+        remaining = (scope.job.deadline_at - self._clock()).total_seconds()
+        if remaining <= 0:
+            raise ValueError("benchmark candidate deadline has expired")
+        preflight = FactoryCandidateEvaluator().validate(
+            scope.candidate,
+            max_seconds=max(0.001, min(scope.candidate.candidate.timeout_seconds, remaining)),
+        )
+        if preflight.status != "succeeded" or preflight.team_execution_manifest is None:
+            raise ValueError("benchmark candidate failed host AutoGen preflight")
+        manifest = preflight.team_execution_manifest
+        allowed_host_tools = tuple(
+            dict.fromkeys(tool for agent in manifest.agents for tool in agent.tools)
+        )
+        if allowed_host_tools:
+            raise ValueError("Claims benchmark candidate must not request integration tools")
+
+        case_policy = self._policy_builder(scope)
+        policies = {
+            (
+                item.case_id,
+                hashlib.sha256(
+                    canonical_business_benchmark_model_bytes(item)
+                ).hexdigest(),
+            ): case_policy(item)
+            for item in scope.suite.cases
+        }
+        configured_call_micro_usd = self._max_cost_per_call * Decimal(1_000_000)
+        if (
+            configured_call_micro_usd != configured_call_micro_usd.to_integral_value()
+            or any(
+                configured_call_micro_usd > policy.maximum_cost_micro_usd
+                for policy in policies.values()
+            )
+        ):
+            raise ValueError(
+                "provider per-call maximum exceeds the benchmark case maximum"
+            )
+        baseline_ref = authorities.artifacts.put(
+            self._BASELINE_PROMPT,
+            "text/plain",
+            namespace="baseline-system-prompt",
+        )
+        baseline = SealedSingleAgentPolicyV1.seal(
+            agent_name="business_benchmark_baseline",
+            system_prompt_ref=baseline_ref,
+            execution_policy_sha256=factory_execution_policy_sha256(scope.job),
+            model=self._model,
+            allowed_tools=(),
+            max_messages=manifest.max_messages,
+            max_tool_calls=0,
+        )
+        runtime_scope = BusinessBenchmarkTeamRuntimeScopeV1(
+            job=scope.job,
+            invocation=scope.runtime_invocation,
+            candidate_id=scope.candidate.candidate.candidate_id,
+            candidate_ref=scope.candidate_ref,
+            resolved_candidate=scope.candidate,
+            candidate_workspace=authorities.artifacts.root,
+            team_manifest=manifest,
+            team_manifest_ref=scope.candidate.candidate.team_manifest.reference,
+            model=self._model,
+            suite_ref=scope.suite_ref,
+            suite_id=scope.suite_id,
+            benchmark_policies=policies,
+            baseline_policy=baseline,
+            baseline_system_policy_version="single-agent-baseline-v1",
+            allowed_host_tools=(),
+            tool_intents={},
+        )
+        state = BusinessBenchmarkProviderStateStore(
+            authorities.provider_state_root
+        )
+        session_factory = CaptainBusinessBenchmarkHostSessionFactory(
+            scope=scope,
+            model_client_builder=self._model_client_builder,
+            budget=self._budget,
+            pricing_authority=self._pricing_authority,
+            paid_effect_authority=self._paid_effect_authority,
+            evidence_store=self._evidence_store,
+            provider=self._provider,
+            model=self._model,
+            max_cost_per_call=self._max_cost_per_call,
+            clock=self._clock,
+        )
+        runtime = BusinessBenchmarkProviderRuntimeBridge(
+            scopes={scope.job.job_id: runtime_scope},
+            session_factory=session_factory,
+            artifacts=authorities.artifacts,
+            provider_state=state,
+            human_review=authorities.human_review,
+            clock=self._clock,
+        )
+        fence = BusinessBenchmarkDurableFenceAdapter(
+            provider_state=state,
+            artifacts=authorities.artifacts,
+            preparation_for_effect=runtime.preparation_binding_for,
+            clock=self._clock,
+        )
+        return BusinessBenchmarkLiveAdapter(
+            runtime_bundle=runtime,
+            fence_store=fence,
+            trusted_tool_intents={},
+            monotonic_clock=time.monotonic,
+            clock=self._clock,
+        )
 
 
 class GatewayBusinessBenchmarkAuthority:
@@ -177,6 +738,34 @@ class CaptainCanonicalSuiteAuthority:
             expected_suite_version=suite_version,
         )
         return item.suite_ref, suite
+
+
+class CaptainCanonicalSuiteRepository:
+    """Expose the same canonical suite authority to the Factory composition."""
+
+    def __init__(self, authority: CaptainCanonicalSuiteAuthority) -> None:
+        self._authority = authority
+        self._by_reference: dict[PrivateHoldoutRef, BusinessBenchmarkSuiteV1] = {}
+
+    def suite_ref(self, profile_id: str, suite_version: int) -> PrivateHoldoutRef:
+        reference, suite = self._authority.canonical_suite(
+            profile_id=profile_id,
+            suite_version=suite_version,
+        )
+        previous = self._by_reference.setdefault(reference, suite)
+        if previous != suite:
+            raise ValueError("canonical benchmark suite changed after resolution")
+        return reference
+
+    def private_suite(
+        self, reference: PrivateHoldoutRef
+    ) -> BusinessBenchmarkSuiteV1:
+        try:
+            return self._by_reference[reference]
+        except KeyError as exc:
+            raise ValueError(
+                "canonical benchmark suite must be resolved before its private body"
+            ) from exc
 
 
 class ReleasedSkillCatalogPort(Protocol):
@@ -354,30 +943,163 @@ class FilesystemBenchmarkReceiptFinalizer:
         )
 
 
+def compose_production_business_benchmark_composition(
+    settings: LiveBusinessBenchmarkSettings,
+    *,
+    config: ProductionBusinessBenchmarkBootstrapConfig,
+    ports: ProductionBusinessBenchmarkBootstrapPorts,
+) -> ProductionBusinessBenchmarkComposition:
+    """Compose the product gate from durable Captain authorities.
+
+    This function performs no provider or n8n call.  The injected executor
+    builder receives only the resolved scope and durable runtime authorities;
+    it is the sole remaining deployment-specific boundary for fresh Host
+    AutoGen sessions and command/grant-bound n8n access.
+    """
+
+    canonical = LiveBusinessBenchmarkSettings.model_validate(
+        settings.model_dump(mode="python")
+    )
+    expected_receipt_root = canonical.evidence_root.resolve() / "captain" / "receipts"
+    if config.evidence_store_root.resolve() != expected_receipt_root:
+        raise ValueError("benchmark bootstrap config belongs to a different run root")
+    if not callable(ports.executor_builder) or not callable(
+        ports.execution_policy_builder
+    ):
+        raise ValueError("benchmark executor and policy builders must be callable")
+    now = ports.clock()
+    if now.tzinfo is None or now.utcoffset() != timezone.utc.utcoffset(now):
+        raise ValueError("benchmark bootstrap clock must be UTC")
+
+    artifacts = BusinessBenchmarkContentAddressedArtifactStore(config.cas_root)
+    human_review = CaptainHumanReviewStore(
+        config.human_review_root,
+        completion_timeout_seconds=config.human_review_timeout_seconds,
+    )
+    runtime_authorities = ProductionBusinessBenchmarkRuntimeAuthorities(
+        artifacts=artifacts,
+        human_review=human_review,
+        provider_state_root=config.provider_state_root,
+    )
+    suite_authority = CaptainCanonicalSuiteAuthority(
+        root=config.private_suite_root,
+        seed_version_id=config.seed_version_id,
+    )
+    private_repository = CaptainCanonicalSuiteRepository(suite_authority)
+    gateway = GatewayBusinessBenchmarkAuthority(ports.gateway_repository)
+    invocations = GatewayBenchmarkInvocationAuthority(
+        repository=ports.gateway_repository,
+        released_skills=ports.released_skills,
+        leases=ports.leases,
+        clock=ports.clock,
+    )
+    resolver = ProductionBusinessBenchmarkScopeResolver(
+        gateway=gateway,
+        suites=suite_authority,
+        candidates=BusinessBenchmarkCandidateAuthority(artifacts),
+        invocations=invocations,
+    )
+    factory = BusinessBenchmarkFactoryComposition(
+        private_repository=private_repository,
+        gateway_repository=ports.gateway_repository,
+        evaluator=BusinessBenchmarkEvaluator(clock=ports.clock),
+        team_evaluator=TeamEvaluationService(clock=ports.clock),
+        feedback_builder=FactoryFeedbackBuilder(clock=ports.clock),
+    )
+    evidence = FilesystemBusinessBenchmarkEvidenceStore(
+        config.evidence_store_root
+    )
+
+    return ProductionBusinessBenchmarkComposition(
+        resolver=resolver,
+        factory_composition=factory,
+        invocation_authority=invocations,
+        executor_factory=lambda scope: ports.executor_builder(
+            scope,
+            runtime_authorities,
+        ),
+        replay_store_factory=lambda scope: FilesystemBusinessBenchmarkReplayStore(
+            config.replay_root / str(scope.job.job_id) / f"attempt-{scope.selection.attempt}"
+        ),
+        execution_policy_factory=ports.execution_policy_builder,
+        benchmark_policy_authority=ContentAddressedBenchmarkPolicyAuthority(
+            artifacts
+        ),
+        receipt_finalizer=FilesystemBenchmarkReceiptFinalizer(evidence),
+        clock=ports.clock,
+    )
+
+
 def build_production_business_benchmark_composition(
     settings: LiveBusinessBenchmarkSettings,
 ) -> ProductionBusinessBenchmarkCompositionPort:
     """Build from real ports, or report the first exact missing authority.
 
-    ``CaptainHumanReviewPort`` is required for the mandatory-escalation cases
-    in both canonical suites.  No durable Captain implementation exists in the
-    current checkout, so construction must stop before a Gateway connection,
-    provider client, or n8n call can be created.
+    Static bootstrap validation is deliberately completed before any Gateway,
+    provider, or n8n connection.  Durable human review is available through
+    :class:`CaptainHumanReviewStore`; automatic approval is never substituted.
+    The concrete request-scoped Claims executor below constructs fresh Host
+    AutoGen sessions.  Default loading still requires a complete Gateway HTTP
+    client; it must never open MariaDB from this agent-runtime package.
     """
 
-    LiveBusinessBenchmarkSettings.model_validate(settings.model_dump(mode="python"))
+    canonical = LiveBusinessBenchmarkSettings.model_validate(
+        settings.model_dump(mode="python")
+    )
+    environment = os.environ
+    ProductionBusinessBenchmarkBootstrapConfig.from_environment(
+        canonical,
+        environment,
+    )
+    ConfiguredBusinessBenchmarkExecutionPolicyBuilder.from_environment(
+        canonical,
+        environment,
+    )
+    if any(selection.profile == "renewal" for selection in canonical.selections):
+        raise ProductionAdapterUnavailableError(
+            "CaptainRenewalBaselineN8nGrantPort is not implemented: the current "
+            "Host AutoGen baseline registry cannot attach command/grant-bound n8n "
+            "evidence; an authority-free fallback is forbidden"
+        )
+
+    if canonical.provider != "openai" or canonical.provider_secret_name != "OPENAI_API_KEY":
+        raise ValueError("benchmark provider authority is not allowlisted")
+    _required_bootstrap_setting(environment, "CAPTAIN_GATEWAY_URL")
+    _required_bootstrap_setting(environment, "CAPTAIN_GATEWAY_TOKEN")
     raise ProductionAdapterUnavailableError(
-        "CaptainHumanReviewPort has no durable Captain implementation; "
-        "automatic completion or an in-memory receipt is forbidden"
+        "CaptainBusinessBenchmarkGatewayClientPort is not implemented: the "
+        "existing Gateway HTTP surface does not expose every exact skill-assignment, "
+        "lease, budget-reservation, usage, job, workflow-evidence, and benchmark-write "
+        "operation required by the production composition; direct MariaDB access "
+        "outside gateway is forbidden"
     )
 
 
+def _required_bootstrap_setting(
+    environment: Mapping[str, str],
+    name: str,
+) -> str:
+    value = environment.get(name, "").strip()
+    if not value:
+        raise ValueError(f"required benchmark bootstrap setting is missing: {name}")
+    return value
+
+
 __all__ = [
+    "CaptainBusinessBenchmarkExecutorBuilderPort",
+    "CaptainBusinessBenchmarkHostSessionFactory",
+    "CaptainClaimsBusinessBenchmarkExecutorBuilder",
     "CaptainCanonicalSuiteAuthority",
+    "CaptainCanonicalSuiteRepository",
+    "ConfiguredBusinessBenchmarkExecutionPolicyBuilder",
     "ContentAddressedBenchmarkPolicyAuthority",
     "FilesystemBenchmarkReceiptFinalizer",
     "GatewayBenchmarkInvocationAuthority",
     "GatewayBusinessBenchmarkAuthority",
     "GatewayBusinessBenchmarkRepositoryPort",
+    "ProductionBusinessBenchmarkBootstrapConfig",
+    "ProductionBusinessBenchmarkBootstrapPorts",
+    "ProductionBusinessBenchmarkRuntimeAuthorities",
     "build_production_business_benchmark_composition",
+    "compose_production_business_benchmark_composition",
 ]
