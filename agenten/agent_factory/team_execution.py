@@ -1458,7 +1458,11 @@ class HostAutoGenSessionExecutor:
             max_tool_calls=manifest.max_tool_calls,
         )
         if "task_completed" in manifest.termination_conditions:
-            termination = TextMentionTermination("TERMINATE") | termination
+            termination = (
+                TextMentionTermination("TERMINATE")
+                | TextMentionTermination("captain.business-benchmark-terminal.v1")
+                | termination
+            )
         team: Swarm | SelectorGroupChat | RoundRobinGroupChat | None = None
         if manifest.conversation_pattern == "swarm":
             team = Swarm(

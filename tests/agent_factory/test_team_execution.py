@@ -1490,12 +1490,21 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
     budget = InMemoryFactoryBudgetLedger()
     evidence_store = FilesystemFactoryEvidenceStore(tmp_path / "host-evidence")
     invocation = _invocation(job)
+    benchmark_terminal = json.dumps(
+        {
+            "schema": "captain.business-benchmark-terminal.v1",
+            "observed_decision": "route_standard_review",
+            "observed_rationale_fact_ids": ["evidence_complete"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     model_client = BudgetedChatCompletionClient(
         job=job,
         invocation=invocation,
         attempt=1,
         delegate=ReplayChatCompletionClient(
-            ["TERMINATE"],
+            [benchmark_terminal],
             model_info=ModelInfo(
                 vision=False,
                 function_calling=True,
