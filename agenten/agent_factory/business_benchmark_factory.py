@@ -17,6 +17,7 @@ from agenten.agent_factory.business_benchmark_contracts import (
     BusinessBenchmarkRunReceiptV1,
     BusinessBenchmarkSuiteV1,
     BusinessBenchmarkSummaryV1,
+    canonical_business_benchmark_model_bytes,
 )
 from agenten.agent_factory.business_benchmark_execution import (
     BenchmarkExecutionPolicyV1,
@@ -122,6 +123,8 @@ class BusinessBenchmarkFactoryComposition:
         job: AgentFactoryJobV3,
         profile_id: str,
         suite_version: int,
+        expected_suite_ref: PrivateHoldoutRef | None = None,
+        expected_suite: BusinessBenchmarkSuiteV1 | None = None,
         attempt: int,
         candidate_ref: ArtifactRef,
         executor: BusinessBenchmarkExecutorPort,
@@ -138,6 +141,21 @@ class BusinessBenchmarkFactoryComposition:
     ) -> BusinessBenchmarkFactoryResult:
         suite_ref = self._private_repository.suite_ref(profile_id, suite_version)
         suite = self._private_repository.private_suite(suite_ref)
+        if (expected_suite_ref is None) != (expected_suite is None):
+            raise ValueError(
+                "preflighted benchmark suite reference and body must be supplied together"
+            )
+        if expected_suite_ref is not None and expected_suite is not None:
+            canonical_expected = BusinessBenchmarkSuiteV1.model_validate(
+                expected_suite.model_dump(mode="json", by_alias=True)
+            )
+            if suite_ref != expected_suite_ref or (
+                canonical_business_benchmark_model_bytes(suite)
+                != canonical_business_benchmark_model_bytes(canonical_expected)
+            ):
+                raise ValueError(
+                    "Factory benchmark suite changed after production preflight"
+                )
         self._validate_release_bindings(
             job=job,
             profile_id=profile_id,

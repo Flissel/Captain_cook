@@ -8,15 +8,19 @@ provider, and n8n adapters are deliberately outside this composition root.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Protocol
 from uuid import UUID
 
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
 from agenten.agent_factory.business_benchmark_contracts import (
     BusinessBenchmarkCaseV1,
     BusinessBenchmarkPolicyV1,
+    BusinessBenchmarkReceiptV1,
     BusinessBenchmarkRunReceiptV1,
     BusinessBenchmarkSuiteV1,
     BusinessBenchmarkSummaryV1,
@@ -47,6 +51,7 @@ from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillInvocationV1,
     FactorySkillStep,
+    FactoryFeedbackV1,
     TeamEvaluationV1,
     TeamExecutionEvidenceV1,
 )
@@ -63,6 +68,49 @@ class BusinessBenchmarkProductionScopeError(ValueError):
     """Captain production evidence is missing, stale, or inconsistently bound."""
 
 
+class CaptainBusinessBenchmarkPolicyBindingV1(BaseModel):
+    """Digest-bound Captain policy for one exact Factory job attempt."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    schema_name: str = Field(
+        default="captain.business-benchmark-policy-binding.v1",
+        alias="schema",
+        serialization_alias="schema",
+        pattern=r"^captain\.business-benchmark-policy-binding\.v1$",
+    )
+    job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    policy: BusinessBenchmarkPolicyV1
+    policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def require_exact_policy_digest(self) -> "CaptainBusinessBenchmarkPolicyBindingV1":
+        if self.policy_sha256 != _model_sha256(self.policy):
+            raise ValueError("Captain benchmark policy digest changed")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        job: AgentFactoryJobV3,
+        attempt: int,
+        policy: BusinessBenchmarkPolicyV1,
+    ) -> "CaptainBusinessBenchmarkPolicyBindingV1":
+        return cls(
+            schema="captain.business-benchmark-policy-binding.v1",
+            job_id=job.job_id,
+            correlation_id=job.correlation_id,
+            subject_version=job.subject_version,
+            attempt=attempt,
+            policy=policy,
+            policy_sha256=_model_sha256(policy),
+        )
+
+
 class BusinessBenchmarkProductionGatewayPort(Protocol):
     def factory_job(self, job_id: UUID) -> object | None: ...
 
@@ -72,6 +120,10 @@ class BusinessBenchmarkProductionGatewayPort(Protocol):
 
     def budget_projection(self, job_id: UUID) -> FactoryBudgetProjection | None: ...
 
+    def candidate_ref(
+        self, job_id: UUID, attempt: int, candidate_id: str
+    ) -> ArtifactRef | None: ...
+
 
 class BusinessBenchmarkCanonicalSuiteAuthorityPort(Protocol):
     def canonical_suite(
@@ -80,9 +132,19 @@ class BusinessBenchmarkCanonicalSuiteAuthorityPort(Protocol):
 
 
 class BusinessBenchmarkCandidateAuthorityPort(Protocol):
-    def resolve_for_job(
-        self, *, job: AgentFactoryJobV3, candidate_id: str
+    def resolve(
+        self,
+        *,
+        job: AgentFactoryJobV3,
+        expected_candidate_id: str,
+        expected_candidate_ref: ArtifactRef,
     ) -> ResolvedFactoryCandidate: ...
+
+
+class BusinessBenchmarkPolicyAuthorityPort(Protocol):
+    def policy_for(
+        self, scope: "ProductionBusinessBenchmarkScope"
+    ) -> CaptainBusinessBenchmarkPolicyBindingV1: ...
 
 
 class BusinessBenchmarkInvocationAuthorityPort(Protocol):
@@ -124,11 +186,13 @@ class BusinessBenchmarkFactoryCompositionPort(Protocol):
 class ProductionBusinessBenchmarkScope:
     """Resolved private execution material plus its public-safe expected scope."""
 
+    settings: LiveBusinessBenchmarkSettings
     selection: BusinessBenchmarkTeamSelectionV1
     job: AgentFactoryJobV3
     profile_id: str
     suite_ref: PrivateHoldoutRef
     suite_id: str
+    suite: BusinessBenchmarkSuiteV1
     candidate: ResolvedFactoryCandidate
     candidate_ref: ArtifactRef
     runtime_invocation: FactorySkillInvocationV1
@@ -185,15 +249,25 @@ class ProductionBusinessBenchmarkScopeResolver:
                 private_suite=private_suite,
             )
 
-            candidate = self._candidates.resolve_for_job(
+            expected_candidate_ref = self._gateway.candidate_ref(
+                job.job_id,
+                selection.attempt,
+                selection.candidate_id,
+            )
+            if not isinstance(expected_candidate_ref, ArtifactRef):
+                raise ValueError("authoritative candidate reference is unavailable")
+            candidate = self._candidates.resolve(
                 job=job,
-                candidate_id=selection.candidate_id,
+                expected_candidate_id=selection.candidate_id,
+                expected_candidate_ref=expected_candidate_ref,
             )
             if not isinstance(candidate, ResolvedFactoryCandidate):
                 raise ValueError("candidate authority returned an invalid candidate")
             if candidate.candidate.candidate_id != selection.candidate_id:
                 raise ValueError("candidate authority returned a different candidate")
             candidate_ref = candidate.candidate.source_archive_ref
+            if candidate_ref != expected_candidate_ref:
+                raise ValueError("candidate authority returned a different reference")
 
             runtime_invocation = self._invocations.runtime_invocation(
                 job=job,
@@ -267,11 +341,13 @@ class ProductionBusinessBenchmarkScopeResolver:
                 suites=(expected_suite,),
             )
             return ProductionBusinessBenchmarkScope(
+                settings=canonical_settings,
                 selection=selection,
                 job=job,
                 profile_id=profile_id,
                 suite_ref=suite_ref,
                 suite_id=private_suite.suite_id,
+                suite=private_suite,
                 candidate=candidate,
                 candidate_ref=candidate_ref,
                 runtime_invocation=runtime_invocation,
@@ -360,10 +436,15 @@ class ProductionBusinessBenchmarkScopeResolver:
         suite_ref: PrivateHoldoutRef,
         runtime_invocation: FactorySkillInvocationV1,
     ) -> None:
-        if not executions or len({item.run_number for item in executions}) != len(
-            executions
+        required_runs = job.execution_policy.required_live_runs
+        if (
+            len(executions) != required_runs
+            or tuple(sorted(item.run_number for item in executions))
+            != tuple(range(1, required_runs + 1))
         ):
-            raise ValueError("required team execution evidence is missing or duplicated")
+            raise ValueError(
+                "required team execution evidence run numbers are incomplete"
+            )
         if any(
             not isinstance(item, TeamExecutionEvidenceV1)
             or item.job_id != job.job_id
@@ -373,6 +454,7 @@ class ProductionBusinessBenchmarkScopeResolver:
             or item.candidate_ref != candidate_ref
             or item.holdout_ref != suite_ref
             or item.invocation_id != runtime_invocation.invocation_id
+            or item.invocation != runtime_invocation
             or item.status != "succeeded"
             for item in executions
         ):
@@ -419,12 +501,6 @@ class BusinessBenchmarkExecutionPolicyFactoryPort(Protocol):
     ) -> BusinessBenchmarkCasePolicyPort: ...
 
 
-class BusinessBenchmarkPolicyFactoryPort(Protocol):
-    def __call__(
-        self, scope: ProductionBusinessBenchmarkScope
-    ) -> BusinessBenchmarkPolicyV1: ...
-
-
 class BusinessBenchmarkClockPort(Protocol):
     def __call__(self) -> datetime: ...
 
@@ -441,7 +517,7 @@ class ProductionBusinessBenchmarkComposition:
         executor_factory: BusinessBenchmarkExecutorFactoryPort,
         replay_store_factory: BusinessBenchmarkReplayStoreFactoryPort,
         execution_policy_factory: BusinessBenchmarkExecutionPolicyFactoryPort,
-        benchmark_policy_factory: BusinessBenchmarkPolicyFactoryPort,
+        benchmark_policy_authority: BusinessBenchmarkPolicyAuthorityPort,
         receipt_finalizer: BusinessBenchmarkReceiptFinalizerPort,
         clock: BusinessBenchmarkClockPort,
     ) -> None:
@@ -451,7 +527,7 @@ class ProductionBusinessBenchmarkComposition:
         self._executor_factory = executor_factory
         self._replay_store_factory = replay_store_factory
         self._execution_policy_factory = execution_policy_factory
-        self._benchmark_policy_factory = benchmark_policy_factory
+        self._benchmark_policy_authority = benchmark_policy_authority
         self._receipt_finalizer = receipt_finalizer
         self._clock = clock
         self._scope_lock = Lock()
@@ -490,33 +566,70 @@ class ProductionBusinessBenchmarkComposition:
         scope = self._resolver.resolve(settings)
         self._remember_scope(scope)
 
+        case_policy_factory = self._execution_policy_factory(scope)
+        case_policies = self._materialize_case_policies(
+            scope,
+            case_policy_factory,
+        )
+        policy_binding = self._captain_policy(scope)
+
+        # Runtime dependencies are created only after every immutable policy,
+        # suite, candidate, invocation, technical run, and budget check passed.
         executor = self._executor_factory(scope)
         replay_store = self._replay_store_factory(scope)
-        case_policy_factory = self._execution_policy_factory(scope)
-        benchmark_policy = self._benchmark_policy_factory(scope)
-        if not isinstance(benchmark_policy, BusinessBenchmarkPolicyV1):
-            raise BusinessBenchmarkProductionScopeError(
-                "benchmark policy factory returned an invalid policy"
+
+        def exact_case_policy(
+            benchmark_case: BusinessBenchmarkCaseV1,
+        ) -> BenchmarkExecutionPolicyV1:
+            expected_case = next(
+                (
+                    item
+                    for item in scope.suite.cases
+                    if item.case_id == benchmark_case.case_id
+                ),
+                None,
             )
+            if expected_case is None or canonical_business_benchmark_model_bytes(
+                expected_case
+            ) != canonical_business_benchmark_model_bytes(benchmark_case):
+                raise BusinessBenchmarkProductionScopeError(
+                    "Factory requested a case outside the preflighted suite"
+                )
+            return case_policies[benchmark_case.case_id]
+
+        report_invocations: list[FactorySkillInvocationV1] = []
+
+        def report_invocation_factory(
+            evaluation: TeamEvaluationV1,
+        ) -> FactorySkillInvocationV1:
+            invocation = self._report_invocation(scope, evaluation)
+            report_invocations.append(invocation)
+            return invocation
 
         result = await self._factory_composition.run(
             job=scope.job,
             profile_id=scope.profile_id,
             suite_version=scope.selection.suite_version,
+            expected_suite_ref=scope.suite_ref,
+            expected_suite=scope.suite,
             attempt=scope.selection.attempt,
             candidate_ref=scope.candidate_ref,
             executor=executor,
             replay_store=replay_store,
-            execution_policy_factory=case_policy_factory,
-            benchmark_policy=benchmark_policy,
+            execution_policy_factory=exact_case_policy,
+            benchmark_policy=policy_binding.policy,
             evaluation_invocation=scope.evaluation_invocation,
-            report_invocation_factory=lambda evaluation: self._report_invocation(
-                scope, evaluation
-            ),
+            report_invocation_factory=report_invocation_factory,
             technical_executions=scope.technical_executions,
             budget_projection=scope.budget_projection,
         )
-        self._require_factory_result(scope, result)
+        self._require_factory_result(
+            scope,
+            result,
+            policy_binding=policy_binding,
+            case_policies=case_policies,
+            report_invocations=tuple(report_invocations),
+        )
 
         finalized = tuple(
             self._finalize(scope, receipt)
@@ -557,6 +670,82 @@ class ProductionBusinessBenchmarkComposition:
             evidence_refs=evidence_refs,
             completed_at=completed_at,
         )
+
+    @staticmethod
+    def _materialize_case_policies(
+        scope: ProductionBusinessBenchmarkScope,
+        factory: BusinessBenchmarkCasePolicyPort,
+    ) -> dict[str, BenchmarkExecutionPolicyV1]:
+        policies: dict[str, BenchmarkExecutionPolicyV1] = {}
+        for benchmark_case in scope.suite.cases:
+            try:
+                supplied = factory(benchmark_case)
+                if not isinstance(supplied, BenchmarkExecutionPolicyV1):
+                    raise ValueError("case policy has the wrong contract")
+                policy = BenchmarkExecutionPolicyV1.model_validate(
+                    supplied.model_dump(mode="json", by_alias=True)
+                )
+            except (TypeError, ValueError) as exc:
+                raise BusinessBenchmarkProductionScopeError(
+                    "benchmark execution policy is invalid"
+                ) from exc
+            if (
+                policy.model_version != scope.settings.model
+                or policy.model_version not in scope.job.execution_policy.allowed_models
+                or policy.allowed_tool_intents != benchmark_case.allowed_tool_intents
+                or _redaction_policy_sha256(policy.redaction_policy_version)
+                != scope.settings.redaction_policy_sha256
+            ):
+                raise BusinessBenchmarkProductionScopeError(
+                    "benchmark execution policy binding is stale or mixed"
+                )
+            policies[benchmark_case.case_id] = policy
+
+        maximum_cost_micro_usd = int(scope.selection.maximum_usd * 1_000_000)
+        remaining_cost_micro_usd = int(
+            scope.budget_projection.remaining_usd * 1_000_000
+        )
+        total_cost_micro_usd = 2 * sum(
+            policy.maximum_cost_micro_usd for policy in policies.values()
+        )
+        total_latency_ms = 2 * sum(
+            policy.maximum_latency_ms for policy in policies.values()
+        )
+        if (
+            total_cost_micro_usd > maximum_cost_micro_usd
+            or total_cost_micro_usd > remaining_cost_micro_usd
+        ):
+            raise BusinessBenchmarkProductionScopeError(
+                "benchmark execution policy exceeds the Gateway budget"
+            )
+        if total_latency_ms > scope.job.execution_policy.max_runtime_seconds * 1000:
+            raise BusinessBenchmarkProductionScopeError(
+                "benchmark execution policy exceeds the job latency budget"
+            )
+        return policies
+
+    def _captain_policy(
+        self, scope: ProductionBusinessBenchmarkScope
+    ) -> CaptainBusinessBenchmarkPolicyBindingV1:
+        try:
+            supplied = self._benchmark_policy_authority.policy_for(scope)
+            binding = CaptainBusinessBenchmarkPolicyBindingV1.model_validate(
+                supplied.model_dump(mode="json", by_alias=True)
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise BusinessBenchmarkProductionScopeError(
+                "Captain benchmark policy binding is invalid"
+            ) from exc
+        if (
+            binding.job_id != scope.job.job_id
+            or binding.correlation_id != scope.job.correlation_id
+            or binding.subject_version != scope.job.subject_version
+            or binding.attempt != scope.selection.attempt
+        ):
+            raise BusinessBenchmarkProductionScopeError(
+                "Captain benchmark policy binding is stale or mixed"
+            )
+        return binding
 
     def _remember_scope(self, scope: ProductionBusinessBenchmarkScope) -> None:
         key = (
@@ -616,6 +805,10 @@ class ProductionBusinessBenchmarkComposition:
     def _require_factory_result(
         scope: ProductionBusinessBenchmarkScope,
         result: BusinessBenchmarkFactoryResult,
+        *,
+        policy_binding: CaptainBusinessBenchmarkPolicyBindingV1,
+        case_policies: dict[str, BenchmarkExecutionPolicyV1],
+        report_invocations: tuple[FactorySkillInvocationV1, ...],
     ) -> None:
         candidate_receipts = tuple(result.candidate_receipts)
         baseline_receipts = tuple(result.baseline_receipts)
@@ -650,6 +843,14 @@ class ProductionBusinessBenchmarkComposition:
                 or item.suite_id != scope.suite_id
                 or item.case_sha256 != expected_cases[item.case_id]
                 or item.model_version != scope.expected_scope.model_version
+                or item.allowed_tool_intents
+                != case_policies[item.case_id].allowed_tool_intents
+                or item.maximum_cost_micro_usd
+                != case_policies[item.case_id].maximum_cost_micro_usd
+                or item.maximum_latency_ms
+                != case_policies[item.case_id].maximum_latency_ms
+                or item.execution_policy_sha256
+                != _model_sha256(case_policies[item.case_id])
                 or item.status != "succeeded"
                 or (
                     item.candidate_ref != scope.candidate_ref
@@ -661,8 +862,15 @@ class ProductionBusinessBenchmarkComposition:
                 raise BusinessBenchmarkProductionScopeError(
                     "production benchmark receipt binding is stale or mixed"
                 )
-        summary = result.summary
-        if not isinstance(summary, BusinessBenchmarkSummaryV1) or (
+        try:
+            summary = BusinessBenchmarkSummaryV1.model_validate(
+                result.summary.model_dump(mode="json", by_alias=True)
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise BusinessBenchmarkProductionScopeError(
+                "production benchmark summary is invalid"
+            ) from exc
+        if (
             summary.job_id != scope.job.job_id
             or summary.correlation_id != scope.job.correlation_id
             or summary.subject_version != scope.job.subject_version
@@ -670,9 +878,85 @@ class ProductionBusinessBenchmarkComposition:
             or summary.candidate_ref != scope.candidate_ref
             or summary.suite_ref != scope.suite_ref
             or summary.suite_id != scope.suite_id
+            or summary.policy != policy_binding.policy
         ):
             raise BusinessBenchmarkProductionScopeError(
                 "production benchmark summary is stale or mixed"
+            )
+
+        try:
+            case_receipts = tuple(
+                BusinessBenchmarkReceiptV1.model_validate(
+                    item.model_dump(mode="json", by_alias=True)
+                )
+                for item in result.case_receipts
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise BusinessBenchmarkProductionScopeError(
+                "production benchmark case receipt is invalid"
+            ) from exc
+        candidate_by_case = {item.case_id: item for item in candidate_receipts}
+        baseline_by_case = {item.case_id: item for item in baseline_receipts}
+        if (
+            len(case_receipts) != 15
+            or {item.candidate.case_id for item in case_receipts}
+            != set(expected_cases)
+            or any(
+                item.candidate != candidate_by_case[item.candidate.case_id]
+                or item.baseline != baseline_by_case[item.candidate.case_id]
+                or item.case_ref.sha256 != expected_cases[item.candidate.case_id]
+                for item in case_receipts
+            )
+        ):
+            raise BusinessBenchmarkProductionScopeError(
+                "production benchmark case receipt binding is stale or mixed"
+            )
+
+        try:
+            evaluation = TeamEvaluationV1.model_validate(
+                result.evaluation.model_dump(mode="json", by_alias=True)
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise BusinessBenchmarkProductionScopeError(
+                "production benchmark evaluation is invalid"
+            ) from exc
+        if (
+            evaluation.job_id != scope.job.job_id
+            or evaluation.correlation_id != scope.job.correlation_id
+            or evaluation.subject_version != scope.job.subject_version
+            or evaluation.attempt != scope.selection.attempt
+            or evaluation.invocation != scope.evaluation_invocation
+            or evaluation.benchmark_summary_ref != summary.artifact_ref
+            or evaluation.benchmark_policy_id != summary.policy.policy_id
+            or evaluation.benchmark_disposition != summary.disposition.value
+            or scope.candidate_ref not in evaluation.evidence_refs
+            or summary.artifact_ref not in evaluation.evidence_refs
+        ):
+            raise BusinessBenchmarkProductionScopeError(
+                "production benchmark evaluation binding is stale or mixed"
+            )
+
+        try:
+            feedback = FactoryFeedbackV1.model_validate(
+                result.feedback.model_dump(mode="json", by_alias=True)
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise BusinessBenchmarkProductionScopeError(
+                "production benchmark feedback is invalid"
+            ) from exc
+        if (
+            len(report_invocations) != 1
+            or feedback.job_id != scope.job.job_id
+            or feedback.correlation_id != scope.job.correlation_id
+            or feedback.subject_version != scope.job.subject_version
+            or feedback.attempt != scope.selection.attempt
+            or feedback.invocation != report_invocations[0]
+            or feedback.invocation.input_ref != evaluation.artifact_ref
+            or evaluation.artifact_ref not in feedback.evidence_refs
+            or scope.candidate_ref not in feedback.evidence_refs
+        ):
+            raise BusinessBenchmarkProductionScopeError(
+                "production benchmark feedback binding is stale or mixed"
             )
 
 
@@ -686,6 +970,20 @@ def _unique_refs(references: tuple[ArtifactRef, ...]) -> tuple[ArtifactRef, ...]
     return tuple(unique.values())
 
 
+def _model_sha256(model: BaseModel) -> str:
+    return hashlib.sha256(canonical_business_benchmark_model_bytes(model)).hexdigest()
+
+
+def _redaction_policy_sha256(version: str) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {"redaction_policy_version": version},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 __all__ = [
     "BusinessBenchmarkCandidateAuthorityPort",
     "BusinessBenchmarkCasePolicyPort",
@@ -694,11 +992,12 @@ __all__ = [
     "BusinessBenchmarkExecutionPolicyFactoryPort",
     "BusinessBenchmarkExecutorFactoryPort",
     "BusinessBenchmarkInvocationAuthorityPort",
-    "BusinessBenchmarkPolicyFactoryPort",
+    "BusinessBenchmarkPolicyAuthorityPort",
     "BusinessBenchmarkProductionGatewayPort",
     "BusinessBenchmarkProductionScopeError",
     "BusinessBenchmarkReceiptFinalizerPort",
     "BusinessBenchmarkReplayStoreFactoryPort",
+    "CaptainBusinessBenchmarkPolicyBindingV1",
     "ProductionBusinessBenchmarkComposition",
     "ProductionBusinessBenchmarkScope",
     "ProductionBusinessBenchmarkScopeResolver",
