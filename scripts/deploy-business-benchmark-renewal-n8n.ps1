@@ -350,7 +350,7 @@ function Select-TemplateShape {
             @($Template.Keys | ForEach-Object { [string]$_ })
         }
         else {
-            @($Template.PSObject.Properties.Name)
+            @($Template.PSObject.Properties | ForEach-Object { $_.Name })
         }
         foreach ($name in $names) {
             $remoteProperty = if ($Remote -is [System.Collections.IDictionary]) {
@@ -388,11 +388,13 @@ function Select-TemplateShape {
         if ($remoteItems.Count -ne $templateItems.Count) {
             throw "Captain n8n workflow changed a published array length."
         }
-        $result = @()
+        $result = [System.Collections.Generic.List[object]]::new()
         for ($index = 0; $index -lt $templateItems.Count; $index++) {
-            $result += ,(Select-TemplateShape -Remote $remoteItems[$index] -Template $templateItems[$index])
+            $result.Add((Select-TemplateShape -Remote $remoteItems[$index] -Template $templateItems[$index]))
         }
-        return $result
+        # A typed list remains a single function result while retaining array
+        # semantics for canonical JSON, including nested one-item arrays.
+        return ,$result
     }
     return $Remote
 }
@@ -420,7 +422,9 @@ function Get-ComparableRemotePayload {
     }
     return [ordered]@{
         name = $Remote.name
-        nodes = $Remote.nodes
+        nodes = Select-TemplateShape -Remote $Remote.nodes -Template $PublishedTemplate.nodes
+        # n8n currently normalizes node provider metadata (for example
+        # webhookId), while connections are part of the exact published state.
         connections = $Remote.connections
         settings = $settings
     }
@@ -590,16 +594,12 @@ function Test-StrictPayloadSubsumption {
     return $true
 }
 
-function Find-MatchingDeploymentReceipt {
-    param(
-        [Parameter(Mandatory = $true)][string]$WorkflowId,
-        [Parameter(Mandatory = $true)][object]$Remote
-    )
+function Get-AuthorizedDeploymentReceipts {
+    param([Parameter(Mandatory = $true)][string]$WorkflowId)
 
     if (-not (Test-Path -LiteralPath $deploymentReceiptDirectory -PathType Container)) {
-        throw "Captain n8n remote workflow has no matching immutable deployment receipt."
+        return
     }
-    $matches = [System.Collections.Generic.List[object]]::new()
     foreach ($file in @(Get-ChildItem -LiteralPath $deploymentReceiptDirectory -Filter "*.json" -File)) {
         $receipt = Read-JsonEvidence -Path $file.FullName
         if (
@@ -610,10 +610,27 @@ function Find-MatchingDeploymentReceipt {
             $receipt.ownership_binding_sha256 -cne (Get-OwnershipBindingSha256 -WorkflowId $WorkflowId) -or
             $receipt.verification -cne "provider_read_back_matched" -or
             $null -eq $receipt.PSObject.Properties["published_payload"] -or
-            $file.BaseName -cne $receipt.published_sha256
+            $file.BaseName -cne $receipt.published_sha256 -or
+            (Get-ObjectSha256 -Value $receipt.published_payload) -cne $receipt.published_sha256
         ) {
             continue
         }
+        Write-Output $receipt
+    }
+}
+
+function Find-MatchingDeploymentReceipt {
+    param(
+        [Parameter(Mandatory = $true)][string]$WorkflowId,
+        [Parameter(Mandatory = $true)][object]$Remote
+    )
+
+    $authorizedReceipts = @(Get-AuthorizedDeploymentReceipts -WorkflowId $WorkflowId)
+    if ($authorizedReceipts.Count -eq 0) {
+        throw "Captain n8n remote workflow has no matching immutable deployment receipt."
+    }
+    $matches = [System.Collections.Generic.List[object]]::new()
+    foreach ($receipt in $authorizedReceipts) {
         try {
             $projected = Get-ComparableRemotePayload -Remote $Remote -PublishedTemplate $receipt.published_payload
             if ((Get-ObjectSha256 -Value $projected) -ceq $receipt.published_sha256) {
@@ -1073,8 +1090,35 @@ else {
         $deploymentStatus = "recovered"
     }
     else {
-        $remoteReceipt = Find-MatchingDeploymentReceipt -WorkflowId $workflowId -Remote $remote
-        $remotePublishedSha256 = $remoteReceipt.published_sha256
+        $authorizedReceipts = @(Get-AuthorizedDeploymentReceipts -WorkflowId $workflowId)
+        $desiredRemoteSha256 = $null
+        try {
+            $desiredProjection = Get-ComparableRemotePayload -Remote $remote -PublishedTemplate $validated.PublishPayload
+            $desiredRemoteSha256 = Get-ObjectSha256 -Value $desiredProjection
+        }
+        catch {
+            if ($_.Exception.Message -ceq "Captain n8n workflow contains unauthorized sensitive node state.") {
+                throw
+            }
+            # A prior authorized shape can legitimately omit fields introduced
+            # by the current canonical template; receipt matching handles it.
+        }
+        $desiredReceipt = @($authorizedReceipts | Where-Object { $_.published_sha256 -ceq $validated.PublishedSha256 })
+        if (
+            $desiredRemoteSha256 -ceq $validated.PublishedSha256 -and
+            $authorizedReceipts.Count -gt 0 -and
+            $desiredReceipt.Count -eq 0
+        ) {
+            # A provider-completed PUT may lose its response before Captain can
+            # write the new receipt. Adopt only an exactly canonical remote,
+            # under the existing ownership binding and proven receipt history.
+            $remotePublishedSha256 = $validated.PublishedSha256
+            $deploymentStatus = "recovered"
+        }
+        else {
+            $remoteReceipt = Find-MatchingDeploymentReceipt -WorkflowId $workflowId -Remote $remote
+            $remotePublishedSha256 = $remoteReceipt.published_sha256
+        }
     }
     if ($remotePublishedSha256 -cne $validated.PublishedSha256) {
         $stored = Invoke-CaptainRest -Verb PUT -Path "/api/v1/workflows/$([uri]::EscapeDataString($workflowId))" -ApiKey $apiKey -Body $validated.PublishPayload

@@ -138,6 +138,16 @@ def test_renewal_seed_has_one_read_only_idempotent_n8n_workflow(
         "responseMode": "lastNode",
         "options": {},
     }
+    code = workflow["nodes"][1]["parameters"]["jsCode"]
+    assert "const envelope = $json" in code
+    assert "const input = envelope.body" in code
+    assert "isPlainObject(envelope.body)" in code
+    assert "const inputKeys" in code
+    assert "const snapshotKeys" in code
+    assert "inputKeys.every" in code
+    assert "snapshotKeys.every" in code
+    assert "const input = $json" not in code
+    assert "envelope.body ||" not in code
     assert workflow["settings"] == {
         "availableInMCP": True,
         "executionOrder": "v1",

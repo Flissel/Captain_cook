@@ -259,6 +259,7 @@ function Invoke-WebRequest {{
         $global:postFields = @($payload.PSObject.Properties | ForEach-Object {{ $_.Name }} | Sort-Object)
         $payload | Add-Member -NotePropertyName id -NotePropertyValue 'renewal-owned-1'
         $payload | Add-Member -NotePropertyName active -NotePropertyValue $false
+        $payload.nodes[0] | Add-Member -NotePropertyName webhookId -NotePropertyValue '8e0f7a21-bd25-4bc8-a2c8-8ee720f73a55'
         $payload.settings | Add-Member -NotePropertyName saveExecutionProgress -NotePropertyValue $false
         $global:remote = $payload
         return [pscustomobject]@{{ StatusCode = 200; Content = ($payload | ConvertTo-Json -Depth 40 -Compress) }}
@@ -322,11 +323,25 @@ try {{
     $secondFailed = $true
     $secondError = $_.Exception.Message
 }}
+$global:remote.nodes[0].webhookId = '9ac8b6b8-63ee-4f6d-8a1e-b47f3914a8dd'
+$webhookIdError = $null
+try {{ $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)} }} catch {{ $webhookIdError = $_.Exception.Message }}
+$originalCode = $global:remote.nodes[1].parameters.jsCode
+$global:remote.nodes[1].parameters.jsCode = 'return [{{ json: {{ changed: true }} }}];'
+$canonicalChangeError = $null
+try {{ $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)} }} catch {{ $canonicalChangeError = $_.Exception.Message }}
+$global:remote.nodes[1].parameters.jsCode = $originalCode
+$global:remote.nodes[0] | Add-Member -NotePropertyName credentialToken -NotePropertyValue 'forbidden-provider-state'
+$sensitiveExtraError = $null
+try {{ $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)} }} catch {{ $sensitiveExtraError = $_.Exception.Message }}
 @{{
     first_failed = $firstFailed
     first_error = $firstError
     second_failed = $secondFailed
     second_error = $secondError
+    webhook_id_error = $webhookIdError
+    canonical_change_error = $canonicalChangeError
+    sensitive_extra_error = $sensitiveExtraError
     posts = $global:posts
     puts = $global:puts
     executes = $global:executes
@@ -354,10 +369,13 @@ try {{
         "first_error": "Captain n8n REST request failed closed.",
         "second_failed": False,
         "second_error": None,
+        "webhook_id_error": None,
+        "canonical_change_error": "Captain n8n remote workflow has no unambiguous immutable deployment receipt.",
+        "sensitive_extra_error": "Captain n8n workflow contains unauthorized sensitive node state.",
         "posts": 1,
         "puts": 0,
-        "executes": 1,
-        "gets": 1,
+        "executes": 2,
+        "gets": 2,
         "post_fields": ["connections", "name", "nodes", "settings"],
         "activations": 1,
         "activation_json": True,
@@ -549,7 +567,7 @@ def test_mcp_structured_error_fails_as_tool_error_before_execution_id_lookup(
     assert "error" in source
 
 
-def test_owned_pre_mcp_workflow_is_updated_and_revalidated(
+def test_completed_update_with_lost_response_is_recovered_without_second_put(
     tmp_path: Path,
 ) -> None:
     evidence = tmp_path / "evidence"
@@ -633,6 +651,8 @@ function Invoke-WebRequest {{
         $global:remote = $Body | ConvertFrom-Json -Depth 40
         $global:remote | Add-Member -NotePropertyName id -NotePropertyValue '{workflow_id}'
         $global:remote | Add-Member -NotePropertyName active -NotePropertyValue $false
+        $global:remote.nodes[0] | Add-Member -NotePropertyName webhookId -NotePropertyValue 'f513b578-744e-47d1-a94b-743ea543da60'
+        if ($global:puts -eq 1) {{ throw 'simulated transport loss after provider completed update' }}
         return [pscustomobject]@{{ StatusCode = 200; Content = ($global:remote | ConvertTo-Json -Depth 40 -Compress) }}
     }}
     if ($target -eq 'http://127.0.0.1:5679/api/v1/workflows/{workflow_id}/activate' -and $verb -eq 'POST') {{
@@ -657,25 +677,36 @@ function Invoke-WebRequest {{
 $failed = $false
 $failure = $null
 try {{ $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)} }} catch {{ $failed = $true; $failure = $_.Exception.Message }}
+$putsBeforeRecovery = $global:puts
+$canonicalCode = $global:remote.nodes[1].parameters.jsCode
+$global:remote.nodes[1].parameters.jsCode = 'return [{{ json: {{ nearMatch: true }} }}];'
+$nearMatchError = $null
+try {{ $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)} }} catch {{ $nearMatchError = $_.Exception.Message }}
+$putsAfterNearMatch = $global:puts
+$global:remote.nodes[1].parameters.jsCode = $canonicalCode
 $secondFailed = $false
 $secondFailure = $null
-try {{ $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)} }} catch {{ $secondFailed = $true; $secondFailure = $_.Exception.Message }}
-@{{ failed = $failed; failure = $failure; second_failed = $secondFailed; second_failure = $secondFailure; posts = $global:posts; puts = $global:puts; activations = $global:activations; executes = $global:executes; gets = $global:gets; available_in_mcp = $global:remote.settings.availableInMCP }} | ConvertTo-Json -Compress
+try {{ $secondResult = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)} | ConvertFrom-Json }} catch {{ $secondFailed = $true; $secondFailure = $_.Exception.Message }}
+@{{ failed = $failed; failure = $failure; near_match_error = $nearMatchError; second_failed = $secondFailed; second_failure = $secondFailure; deployment_status = $secondResult.deployment_status; posts = $global:posts; puts_before_recovery = $putsBeforeRecovery; puts_after_near_match = $putsAfterNearMatch; puts = $global:puts; activations = $global:activations; executes = $global:executes; gets = $global:gets; available_in_mcp = $global:remote.settings.availableInMCP }} | ConvertTo-Json -Compress
 """
 
     result = _run_harness(tmp_path, harness)
 
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {
-        "failed": False,
-        "failure": None,
+        "failed": True,
+        "failure": "Captain n8n REST request failed closed.",
+        "near_match_error": "Captain n8n remote workflow has no unambiguous immutable deployment receipt.",
         "second_failed": False,
         "second_failure": None,
+        "deployment_status": "recovered",
         "posts": 0,
+        "puts_before_recovery": 1,
+        "puts_after_near_match": 1,
         "puts": 1,
         "activations": 1,
-        "executes": 2,
-        "gets": 2,
+        "executes": 1,
+        "gets": 1,
         "available_in_mcp": True,
     }
 
