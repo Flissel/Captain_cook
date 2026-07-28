@@ -56,6 +56,7 @@ from agenten.agent_factory.team_execution import (
     HostAutoGenSessionExecutor,
     HostAutoGenSessionIdentityV1,
     HostAutoGenSessionResult,
+    HostAutoGenSessionTimeoutError,
     SealedSingleAgentPolicyV1,
     ResolvedFactoryHoldoutCase,
     TeamExecutionService,
@@ -712,13 +713,22 @@ async def test_host_autogen_session_executor_uses_fresh_digest_bound_baselines(
     invocation = _invocation(job)
     evidence_store = FilesystemFactoryEvidenceStore(tmp_path / "session-evidence")
     clients: list[BudgetedChatCompletionClient] = []
+    factory_binding = {"foreign": False}
 
     def model_client_for(
         _: HostAutoGenSessionIdentityV1,
     ) -> BudgetedChatCompletionClient:
+        bound_job = (
+            job.model_copy(
+                update={"job_id": UUID("72000000-0000-0000-0000-000000000003")}
+            )
+            if factory_binding["foreign"]
+            else job
+        )
+        bound_invocation = _invocation(bound_job)
         client = BudgetedChatCompletionClient(
-            job=job,
-            invocation=invocation,
+            job=bound_job,
+            invocation=bound_invocation,
             attempt=1,
             delegate=ReplayChatCompletionClient(
                 ["TERMINATE"],
@@ -736,7 +746,7 @@ async def test_host_autogen_session_executor_uses_fresh_digest_bound_baselines(
             model="approved-model-id",
             max_cost_per_call=Decimal("0.50"),
             paid_effect_authority=_PaidEffectAuthority(),
-            pricing_authority=_PricingAuthority(_pricing_quote(job)),
+            pricing_authority=_PricingAuthority(_pricing_quote(bound_job)),
             clock=lambda: NOW,
         )
         clients.append(client)
@@ -778,16 +788,16 @@ async def test_host_autogen_session_executor_uses_fresh_digest_bound_baselines(
         model_client_factory=model_client_for,
         evidence_store=evidence_store,
         holdouts=Holdouts(),  # type: ignore[arg-type]
-        tools={},
+        tools={"publish_candidate": lambda: "forbidden"},
         clock=lambda: NOW,
     )
-    seen_agents: list[int] = []
-    seen_contexts: list[int] = []
+    seen_agents: list[AssistantAgent] = []
+    seen_contexts: list[object] = []
     original_run = AssistantAgent.run
 
     async def observed_run(self: AssistantAgent, **kwargs: object) -> object:
-        seen_agents.append(id(self))
-        seen_contexts.append(id(self.model_context))
+        seen_agents.append(self)
+        seen_contexts.append(self.model_context)
         return await original_run(self, **kwargs)  # type: ignore[arg-type,return-value]
 
     monkeypatch.setattr(AssistantAgent, "run", observed_run)
@@ -827,8 +837,8 @@ async def test_host_autogen_session_executor_uses_fresh_digest_bound_baselines(
         max_seconds=10,
     )
 
-    assert len(set(seen_agents)) == 2
-    assert len(set(seen_contexts)) == 2
+    assert seen_agents[0] is not seen_agents[1]
+    assert seen_contexts[0] is not seen_contexts[1]
     assert len({id(client) for client in clients}) == 2
     assert tuple(len(client.usage_receipts) for client in clients) == (1, 1)
     assert first.runtime_evidence_ref != second.runtime_evidence_ref
@@ -836,6 +846,67 @@ async def test_host_autogen_session_executor_uses_fresh_digest_bound_baselines(
     assert first.handoffs == second.handoffs == ()
     assert first.human_handoff_completed is False
     assert "Private benchmark case" not in repr(first)
+
+    fixed_client_executor = HostAutoGenSessionExecutor(
+        model_client=clients[0],
+        evidence_store=evidence_store,
+        holdouts=Holdouts(),  # type: ignore[arg-type]
+        tools={},
+        clock=lambda: NOW,
+    )
+    with pytest.raises(ValueError, match="fresh model client factory"):
+        await fixed_client_executor.run_baseline(
+            job=job,
+            invocation=invocation,
+            case_ref=job.private_holdout_refs[0],
+            identity=identity(5),
+            policy=policy,
+            workspace=workspace,
+            allowed_models=job.execution_policy.allowed_models,
+            max_seconds=10,
+        )
+
+    authority_policy = SealedSingleAgentPolicyV1.seal(
+        agent_name="single_agent_baseline",
+        system_prompt_ref=prompt_ref,
+        execution_policy_sha256=_policy_digest(job),
+        model="approved-model-id",
+        allowed_tools=("publish_candidate",),
+        max_messages=20,
+        max_tool_calls=1,
+    )
+    with pytest.raises(ValueError, match="host tool is not registered"):
+        await executor.run_baseline(
+            job=job,
+            invocation=invocation,
+            case_ref=job.private_holdout_refs[0],
+            identity=identity(6),
+            policy=authority_policy,
+            workspace=workspace,
+            allowed_models=job.execution_policy.allowed_models,
+            max_seconds=10,
+        )
+
+    zero_tool_policy = SealedSingleAgentPolicyV1.seal(
+        agent_name="single_agent_baseline",
+        system_prompt_ref=prompt_ref,
+        execution_policy_sha256=_policy_digest(job),
+        model="approved-model-id",
+        allowed_tools=(),
+        max_messages=20,
+        max_tool_calls=0,
+    )
+    zero_tool_result = await executor.run_baseline(
+        job=job,
+        invocation=invocation,
+        case_ref=job.private_holdout_refs[0],
+        identity=identity(7),
+        policy=zero_tool_policy,
+        workspace=workspace,
+        allowed_models=job.execution_policy.allowed_models,
+        max_seconds=10,
+    )
+    assert zero_tool_result.tool_call_count == 0
     persisted = tuple(
         path.read_text(encoding="utf-8")
         for path in (tmp_path / "session-evidence").rglob("*.json")
@@ -845,13 +916,28 @@ async def test_host_autogen_session_executor_uses_fresh_digest_bound_baselines(
     assert any(str(identity(1).claim_id) in item for item in persisted)
     assert any(str(identity(2).claim_id) in item for item in persisted)
 
+    factory_binding["foreign"] = True
+    with pytest.raises(ValueError, match="model client does not match session identity"):
+        await executor.run_baseline(
+            job=job,
+            invocation=invocation,
+            case_ref=job.private_holdout_refs[0],
+            identity=identity(3),
+            policy=policy,
+            workspace=workspace,
+            allowed_models=job.execution_policy.allowed_models,
+            max_seconds=10,
+        )
+    assert clients[-1].any_provider_effect_started is False
+
+    factory_binding["foreign"] = False
     (workspace / "system.txt").write_text("tampered", encoding="utf-8")
     with pytest.raises(ValueError, match="system prompt artifact is missing"):
         await executor.run_baseline(
             job=job,
             invocation=invocation,
             case_ref=job.private_holdout_refs[0],
-            identity=identity(3),
+            identity=identity(4),
             policy=policy,
             workspace=workspace,
             allowed_models=job.execution_policy.allowed_models,
@@ -1555,7 +1641,7 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
         raise AssertionError("unreachable")
 
     monkeypatch.setattr(Swarm, "run", blocked_run)
-    with pytest.raises(asyncio.TimeoutError):
+    with pytest.raises(HostAutoGenSessionTimeoutError) as timeout:
         await runner.run(
             job=job,
             invocation=_invocation(job),
@@ -1566,6 +1652,10 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
             max_seconds=0.01,
         )
     assert timeout_tokens[0].is_cancelled()  # type: ignore[attr-defined]
+    assert timeout.value.provider_started is False
+    assert timeout.value.provider_usage_unresolved is False
+    assert len(timeout.value.usage_receipts) == 0
+    assert timeout.value.identity.case_sha256 == job.private_holdout_refs[0].sha256
 
 
 def test_n8n_execution_requires_separate_scope_and_matching_digest() -> None:

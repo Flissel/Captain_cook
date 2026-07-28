@@ -82,6 +82,9 @@ from agenten.agent_runtime.capabilities import validate_grant
 from agenten.targets.n8n import N8nExecutionEvidence
 
 
+_HOST_SESSION_RESOURCE_LOCKS: dict[tuple[str, int], asyncio.Lock] = {}
+
+
 class FactoryPricingQuoteV1(BaseModel):
     """Versioned provider pricing evidence used for host-computed receipts."""
 
@@ -155,6 +158,18 @@ class FactoryPricingAuthorityPort(Protocol):
         model: str,
         now: datetime,
     ) -> FactoryPricingQuoteV1: ...
+
+
+class FactoryModelClientBindingV1(BaseModel):
+    """Immutable pre-effect identity of one host-owned budgeted model client."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, strict=True)
+    model: str = Field(min_length=1, max_length=128)
 
 
 class FactoryPaidEffectAuthorityPort(Protocol):
@@ -258,6 +273,13 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
         if model not in job.execution_policy.allowed_models:
             raise ValueError("budgeted model is not allowed by the execution policy")
         self._job = job
+        self._binding = FactoryModelClientBindingV1(
+            job_id=job.job_id,
+            correlation_id=job.correlation_id,
+            subject_version=job.subject_version,
+            attempt=attempt,
+            model=model,
+        )
         self._invocation = invocation
         self._attempt = attempt
         self._delegate = delegate
@@ -271,6 +293,7 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
         self._clock = clock
         self._usage_receipts: list[FactoryUsageReceiptV1] = []
         self._provider_dispatched = False
+        self._provider_dispatch_count = 0
         self._provider_effects_with_unknown_usage: set[UUID] = set()
 
     @property
@@ -280,6 +303,10 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
     @property
     def model(self) -> str:
         return self._model
+
+    @property
+    def binding(self) -> FactoryModelClientBindingV1:
+        return self._binding
 
     @property
     def provider_dispatched(self) -> bool:
@@ -297,6 +324,14 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
 
         return bool(self._provider_effects_with_unknown_usage)
 
+    @property
+    def provider_dispatch_count(self) -> int:
+        return self._provider_dispatch_count
+
+    @property
+    def unresolved_reservation_ids(self) -> frozenset[UUID]:
+        return frozenset(self._provider_effects_with_unknown_usage)
+
     async def create(
         self,
         messages: Sequence[LLMMessage],
@@ -310,6 +345,7 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
         reservation, pricing_quote = self._reserve()
         try:
             self._provider_dispatched = True
+            self._provider_dispatch_count += 1
             self._provider_effects_with_unknown_usage.add(reservation.reservation_id)
             result = await self._delegate.create(
                 messages,
@@ -340,6 +376,7 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
         finalized = False
         try:
             self._provider_dispatched = True
+            self._provider_dispatch_count += 1
             self._provider_effects_with_unknown_usage.add(reservation.reservation_id)
             async for item in self._delegate.create_stream(
                 messages,
@@ -1089,6 +1126,98 @@ class HostAutoGenSessionResult(BaseModel):
         return self
 
 
+class _HostAutoGenSessionInterruption:
+    identity: HostAutoGenSessionIdentityV1
+    provider_started: bool
+    provider_usage_unresolved: bool
+    usage_receipts: tuple[FactoryUsageReceiptV1, ...]
+
+    def _capture_session_state(
+        self,
+        *,
+        identity: HostAutoGenSessionIdentityV1,
+        model_client: BudgetedChatCompletionClient,
+        receipt_offset: int,
+        dispatch_offset: int,
+        unresolved_before: frozenset[UUID],
+    ) -> None:
+        self.identity = identity
+        self.provider_started = model_client.provider_dispatch_count > dispatch_offset
+        self.provider_usage_unresolved = bool(
+            model_client.unresolved_reservation_ids - unresolved_before
+        )
+        self.usage_receipts = model_client.usage_receipts[receipt_offset:]
+
+
+class HostAutoGenSessionTimeoutError(
+    _HostAutoGenSessionInterruption,
+    asyncio.TimeoutError,
+):
+    """Timed-out session retaining the exact paid-effect reconciliation state."""
+
+    def __init__(
+        self,
+        *,
+        identity: HostAutoGenSessionIdentityV1,
+        model_client: BudgetedChatCompletionClient,
+        receipt_offset: int,
+        dispatch_offset: int,
+        unresolved_before: frozenset[UUID],
+    ) -> None:
+        asyncio.TimeoutError.__init__(self, "host AutoGen session timed out")
+        self._capture_session_state(
+            identity=identity,
+            model_client=model_client,
+            receipt_offset=receipt_offset,
+            dispatch_offset=dispatch_offset,
+            unresolved_before=unresolved_before,
+        )
+
+
+class HostAutoGenSessionCancelledError(
+    _HostAutoGenSessionInterruption,
+    asyncio.CancelledError,
+):
+    """Cancelled session retaining the exact paid-effect reconciliation state."""
+
+    def __init__(
+        self,
+        *,
+        identity: HostAutoGenSessionIdentityV1,
+        model_client: BudgetedChatCompletionClient,
+        receipt_offset: int,
+        dispatch_offset: int,
+        unresolved_before: frozenset[UUID],
+    ) -> None:
+        asyncio.CancelledError.__init__(self, "host AutoGen session cancelled")
+        self._capture_session_state(
+            identity=identity,
+            model_client=model_client,
+            receipt_offset=receipt_offset,
+            dispatch_offset=dispatch_offset,
+            unresolved_before=unresolved_before,
+        )
+
+
+@dataclass(frozen=True)
+class AuthorityFreeBaselineTool:
+    """Explicitly non-authoritative callable available to the fair baseline."""
+
+    name: str
+    function: Callable[..., Any]
+    integration_intent: Literal[IntegrationIntent.NONE] = IntegrationIntent.NONE
+    mutates_external_state: Literal[False] = False
+    routing_authority: Literal[False] = False
+    publication_authority: Literal[False] = False
+    grant_authority: Literal[False] = False
+
+    def __post_init__(self) -> None:
+        if not self.name or not self.name.replace("_", "a").isalnum():
+            raise ValueError("authority-free baseline tool name is invalid")
+        if not callable(self.function):
+            raise ValueError("authority-free baseline tool must be callable")
+
+
 class HostAutoGenSessionExecutor:
     """Execute candidate or authority-free baseline sessions under one host boundary."""
 
@@ -1103,6 +1232,8 @@ class HostAutoGenSessionExecutor:
         evidence_store: FactoryEvidenceStore,
         holdouts: FactoryHoldoutEvaluatorPort,
         tools: Mapping[str, Callable[..., Any]],
+        baseline_tools: Mapping[str, AuthorityFreeBaselineTool] | None = None,
+        evaluator: FactoryCandidateEvaluator | None = None,
         n8n_adapter: FactoryN8nToolAdapterPort | None = None,
         n8n_authority: FactoryN8nGrantAuthorityPort | None = None,
         clock: Callable[[], datetime],
@@ -1114,9 +1245,26 @@ class HostAutoGenSessionExecutor:
         self._evidence_store = evidence_store
         self._holdouts = holdouts
         self._tools = dict(tools)
+        self._baseline_tools = {
+            name: tool.function for name, tool in (baseline_tools or {}).items()
+        }
+        if any(name != tool.name for name, tool in (baseline_tools or {}).items()):
+            raise ValueError("baseline tool registry key does not match sealed tool")
+        self._evaluator = evaluator or FactoryCandidateEvaluator()
         self._n8n_adapter = n8n_adapter
         self._n8n_authority = n8n_authority
         self._clock = clock
+        lock_resources: set[tuple[str, int]] = set()
+        if n8n_adapter is not None:
+            lock_resources.add(("n8n_adapter", id(n8n_adapter)))
+        if model_client is not None:
+            lock_resources.add(("model_client", id(model_client)))
+        if not lock_resources:
+            lock_resources.add(("executor", id(self)))
+        self._session_locks = tuple(
+            _HOST_SESSION_RESOURCE_LOCKS.setdefault(resource, asyncio.Lock())
+            for resource in sorted(lock_resources)
+        )
 
     async def run_baseline(
         self,
@@ -1138,6 +1286,8 @@ class HostAutoGenSessionExecutor:
             subject_id="single_agent_baseline",
             variant="single_agent_baseline",
         )
+        if self._model_client_factory is None:
+            raise ValueError("baseline execution requires a fresh model client factory")
         model_client = self._client_for(identity)
         if (
             policy.execution_policy_sha256 != _execution_policy_digest(job)
@@ -1150,6 +1300,7 @@ class HostAutoGenSessionExecutor:
             policy.allowed_tools,
             maximum=policy.max_tool_calls,
             n8n_tools={},
+            registry=self._baseline_tools,
         )
         agent = AssistantAgent(
             name=policy.agent_name,
@@ -1160,11 +1311,13 @@ class HostAutoGenSessionExecutor:
                 buffer_size=policy.max_messages
             ),
             system_message=_sealed_text(workspace, policy.system_prompt_ref),
-            max_tool_iterations=policy.max_tool_calls,
+            max_tool_iterations=max(1, policy.max_tool_calls),
         )
         task = await self._resolve_task(case_ref)
         cancellation_token = CancellationToken()
         receipt_offset = len(model_client.usage_receipts)
+        dispatch_offset = model_client.provider_dispatch_count
+        unresolved_before = model_client.unresolved_reservation_ids
         n8n_evidence_offset = (
             len(self._n8n_adapter.observed_evidence())
             if self._n8n_adapter is not None
@@ -1175,15 +1328,32 @@ class HostAutoGenSessionExecutor:
                 agent.run(task=task, cancellation_token=cancellation_token),
                 timeout=max_seconds,
             )
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+        except asyncio.TimeoutError as exc:
             cancellation_token.cancel()
-            raise
+            raise HostAutoGenSessionTimeoutError(
+                identity=identity,
+                model_client=model_client,
+                receipt_offset=receipt_offset,
+                dispatch_offset=dispatch_offset,
+                unresolved_before=unresolved_before,
+            ) from exc
+        except asyncio.CancelledError as exc:
+            cancellation_token.cancel()
+            raise HostAutoGenSessionCancelledError(
+                identity=identity,
+                model_client=model_client,
+                receipt_offset=receipt_offset,
+                dispatch_offset=dispatch_offset,
+                unresolved_before=unresolved_before,
+            ) from exc
         return await self._observe(
             job=job,
             identity=identity,
             model_client=model_client,
             result=result,
             receipt_offset=receipt_offset,
+            dispatch_offset=dispatch_offset,
+            unresolved_before=unresolved_before,
             conversation_pattern="single_agent",
             max_messages=policy.max_messages,
             max_handoffs=0,
@@ -1194,6 +1364,39 @@ class HostAutoGenSessionExecutor:
         )
 
     async def run_candidate(
+        self,
+        *,
+        job: AgentFactoryJobV3,
+        invocation: FactorySkillInvocationV1,
+        case_ref: PrivateHoldoutRef,
+        identity: HostAutoGenSessionIdentityV1,
+        candidate: ResolvedFactoryCandidate,
+        allowed_models: tuple[str, ...],
+        max_seconds: float,
+    ) -> HostAutoGenSessionResult:
+        for lock in self._session_locks:
+            await lock.acquire()
+        try:
+            with self._evaluator.verified_team_workspace(candidate) as (
+                workspace,
+                manifest,
+            ):
+                return await self._run_candidate_session(
+                    job=job,
+                    invocation=invocation,
+                    case_ref=case_ref,
+                    identity=identity,
+                    workspace=workspace,
+                    manifest=manifest,
+                    candidate=candidate,
+                    allowed_models=allowed_models,
+                    max_seconds=max_seconds,
+                )
+        finally:
+            for lock in reversed(self._session_locks):
+                lock.release()
+
+    async def _run_candidate_session(
         self,
         *,
         job: AgentFactoryJobV3,
@@ -1228,6 +1431,7 @@ class HostAutoGenSessionExecutor:
             required_tools,
             maximum=manifest.max_tool_calls,
             n8n_tools=n8n_tools,
+            registry=self._tools,
         )
         participants = [
             AssistantAgent(
@@ -1241,7 +1445,7 @@ class HostAutoGenSessionExecutor:
                     else None
                 ),
                 system_message=_sealed_text(workspace, agent.system_prompt_ref),
-                max_tool_iterations=manifest.max_tool_calls,
+                max_tool_iterations=max(1, manifest.max_tool_calls),
             )
             for agent in manifest.agents
         ]
@@ -1278,6 +1482,8 @@ class HostAutoGenSessionExecutor:
         task = await self._resolve_task(case_ref)
         cancellation_token = CancellationToken()
         receipt_offset = len(model_client.usage_receipts)
+        dispatch_offset = model_client.provider_dispatch_count
+        unresolved_before = model_client.unresolved_reservation_ids
         n8n_evidence_offset = (
             len(self._n8n_adapter.observed_evidence())
             if self._n8n_adapter is not None
@@ -1300,15 +1506,32 @@ class HostAutoGenSessionExecutor:
                     team.run(task=task, cancellation_token=cancellation_token),
                     timeout=max_seconds,
                 )
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+        except asyncio.TimeoutError as exc:
             cancellation_token.cancel()
-            raise
+            raise HostAutoGenSessionTimeoutError(
+                identity=identity,
+                model_client=model_client,
+                receipt_offset=receipt_offset,
+                dispatch_offset=dispatch_offset,
+                unresolved_before=unresolved_before,
+            ) from exc
+        except asyncio.CancelledError as exc:
+            cancellation_token.cancel()
+            raise HostAutoGenSessionCancelledError(
+                identity=identity,
+                model_client=model_client,
+                receipt_offset=receipt_offset,
+                dispatch_offset=dispatch_offset,
+                unresolved_before=unresolved_before,
+            ) from exc
         return await self._observe(
             job=job,
             identity=identity,
             model_client=model_client,
             result=result,
             receipt_offset=receipt_offset,
+            dispatch_offset=dispatch_offset,
+            unresolved_before=unresolved_before,
             conversation_pattern=manifest.conversation_pattern,
             max_messages=manifest.max_messages,
             max_handoffs=manifest.max_handoffs,
@@ -1333,6 +1556,7 @@ class HostAutoGenSessionExecutor:
         *,
         maximum: int,
         n8n_tools: Mapping[str, OpaqueN8nToolReference],
+        registry: Mapping[str, Callable[..., Any]],
     ) -> dict[str, BaseTool[BaseModel, Any]]:
         required_n8n_tools = set(required_tools).intersection(n8n_tools)
         if required_n8n_tools and (
@@ -1342,7 +1566,7 @@ class HostAutoGenSessionExecutor:
                 "candidate n8n tools require trusted n8n adapter and grant authority"
             )
         resolved: dict[str, Callable[..., Any] | BaseTool[BaseModel, Any]] = dict(
-            self._tools
+            registry
         )
         if self._n8n_adapter is not None:
             assert self._n8n_authority is not None or not required_n8n_tools
@@ -1385,6 +1609,8 @@ class HostAutoGenSessionExecutor:
         model_client: BudgetedChatCompletionClient,
         result: TaskResult,
         receipt_offset: int,
+        dispatch_offset: int,
+        unresolved_before: frozenset[UUID],
         conversation_pattern: Literal[
             "swarm", "selector_group_chat", "round_robin_group_chat", "single_agent"
         ],
@@ -1415,6 +1641,15 @@ class HostAutoGenSessionExecutor:
             termination_conditions=termination_conditions,
             max_messages=max_messages,
         )
+        usage_receipts = model_client.usage_receipts[receipt_offset:]
+        if any(
+            receipt.job_id != identity.job_id
+            or receipt.correlation_id != identity.correlation_id
+            or receipt.attempt != identity.attempt
+            or receipt.model != identity.model
+            for receipt in usage_receipts
+        ):
+            raise ValueError("usage receipt does not match session identity")
         observation_ref = await self._evidence_store.persist(
             job,
             json.dumps(
@@ -1459,6 +1694,19 @@ class HostAutoGenSessionExecutor:
             raise ValueError("n8n evidence requires trusted grant authority")
         for n8n_execution in n8n_executions:
             assert self._n8n_authority is not None
+            if (
+                n8n_execution.runtime_command.correlation_id
+                != identity.correlation_id
+                or n8n_execution.runtime_command.subject_version
+                != identity.subject_version
+                or n8n_execution.runtime_result.correlation_id
+                != identity.correlation_id
+                or n8n_execution.runtime_result.subject_version
+                != identity.subject_version
+                or n8n_execution.execution.correlation_id
+                != str(identity.correlation_id)
+            ):
+                raise ValueError("n8n evidence does not match session identity")
             await self._n8n_authority.authorize(n8n_execution, now=self._clock())
         observed_n8n_calls = tuple(
             item for item in tool_executions if item.tool_name in n8n_tool_names
@@ -1478,7 +1726,7 @@ class HostAutoGenSessionExecutor:
         return HostAutoGenSessionResult(
             task_result=result,
             runtime_evidence_ref=observation_ref,
-            usage_receipts=model_client.usage_receipts[receipt_offset:],
+            usage_receipts=usage_receipts,
             handoffs=handoffs,
             tool_executions=tool_executions,
             n8n_executions=n8n_executions,
@@ -1488,9 +1736,11 @@ class HostAutoGenSessionExecutor:
             handoff_count=len(handoffs),
             tool_call_count=tool_call_count,
             termination_reason=termination_reason,
-            provider_started=model_client.any_provider_effect_started,
-            provider_usage_unresolved=(
-                model_client.provider_effect_dispatched_with_unknown_usage
+            provider_started=(
+                model_client.provider_dispatch_count > dispatch_offset
+            ),
+            provider_usage_unresolved=bool(
+                model_client.unresolved_reservation_ids - unresolved_before
             ),
             human_handoff_completed=False,
         )
@@ -1499,9 +1749,20 @@ class HostAutoGenSessionExecutor:
         self, identity: HostAutoGenSessionIdentityV1
     ) -> BudgetedChatCompletionClient:
         if self._model_client_factory is not None:
-            return self._model_client_factory(identity)
-        assert self._fixed_model_client is not None
-        return self._fixed_model_client
+            client = self._model_client_factory(identity)
+        else:
+            assert self._fixed_model_client is not None
+            client = self._fixed_model_client
+        binding = client.binding
+        if (
+            binding.job_id != identity.job_id
+            or binding.correlation_id != identity.correlation_id
+            or binding.subject_version != identity.subject_version
+            or binding.attempt != identity.attempt
+            or binding.model != identity.model
+        ):
+            raise ValueError("model client does not match session identity")
+        return client
 
     @staticmethod
     def _validate_identity(
@@ -1561,6 +1822,7 @@ class HostAutoGenTeamRunner:
             evidence_store=evidence_store,
             holdouts=holdouts,
             tools=tools,
+            evaluator=self._evaluator,
             n8n_adapter=n8n_adapter,
             n8n_authority=n8n_authority,
             clock=clock,
@@ -1601,160 +1863,154 @@ class HostAutoGenTeamRunner:
     ) -> FactoryTeamRunResult:
         if self._model_client.model not in allowed_models:
             raise ValueError("host model client is not allowed by the factory job")
-        with self._evaluator.verified_team_workspace(candidate) as (
-            workspace,
-            manifest,
+        request_id = uuid5(
+            invocation.invocation_id,
+            f"factory-autogen-request:{case_ref.holdout_id}:{case_ref.sha256}",
+        )
+        runtime_session_id = (
+            f"autogen-team-{invocation.attempt}-{request_id.hex}"
+        )
+        identity_payload = "|".join(
+            (
+                str(job.job_id),
+                str(job.correlation_id),
+                candidate.candidate.candidate_id,
+                str(job.subject_version),
+                str(invocation.attempt),
+                str(invocation.invocation_id),
+                str(request_id),
+                case_ref.holdout_id,
+                case_ref.sha256,
+                self._model_client.model,
+            )
+        )
+        identity = HostAutoGenSessionIdentityV1.for_factory_execution(
+            job=job,
+            invocation=invocation,
+            case_ref=case_ref,
+            subject_id=candidate.candidate.candidate_id,
+            variant="candidate",
+            request_id=request_id,
+            runtime_session_id=runtime_session_id,
+            effect_id=hashlib.sha256(identity_payload.encode("utf-8")).hexdigest(),
+            claim_id=uuid5(request_id, "factory-autogen-claim"),
+            fence=1,
+            model=self._model_client.model,
+        )
+        session = await self._session_executor.run_candidate(
+            job=job,
+            invocation=invocation,
+            case_ref=case_ref,
+            identity=identity,
+            candidate=candidate,
+            allowed_models=allowed_models,
+            max_seconds=max_seconds,
+        )
+        result = session.task_result
+        raw_holdout_receipt = await self._holdouts.evaluate(
+            case_ref,
+            result,
+            invocation.acceptance_assertion_ids,
+        )
+        holdout_receipt = FactoryHoldoutEvaluationReceiptV1.model_validate(
+            raw_holdout_receipt.model_dump(mode="python", by_alias=True)
+            if isinstance(raw_holdout_receipt, BaseModel)
+            else raw_holdout_receipt
+        )
+        if (
+            holdout_receipt.holdout_ref != case_ref
+            or holdout_receipt.candidate_ref
+            != candidate.candidate.source_archive_ref
+            or holdout_receipt.assertion_ids
+            != invocation.acceptance_assertion_ids
         ):
-            request_id = uuid5(
-                invocation.invocation_id,
-                f"factory-autogen-request:{case_ref.holdout_id}:{case_ref.sha256}",
+            raise ValueError("holdout evaluator receipt does not match this run")
+        decision_ref = await self._evidence_store.persist(
+            job,
+            holdout_receipt.model_dump_json(
+                by_alias=True,
+                exclude_none=True,
+            ).encode("utf-8"),
+        )
+        normalized_results = {
+            item.assertion_id: item.passed
+            for item in holdout_receipt.decisions
+        }
+        resolved_status: Literal["succeeded", "unresolved"] = (
+            "succeeded" if all(normalized_results.values()) else "unresolved"
+        )
+        observation_ref = session.runtime_evidence_ref
+        handoffs = session.handoffs
+        tool_executions = session.tool_executions
+        n8n_executions = session.n8n_executions
+        n8n_refs = session.workflow_evidence_refs
+        command_id = uuid5(
+            NAMESPACE_URL,
+            f"factory-autogen-command|{invocation.invocation_id}",
+        )
+        result_id = uuid5(command_id, "result")
+        assertions = tuple(
+            AssertionOutcome(
+                assertion_id=assertion_id,
+                status="passed" if normalized_results[assertion_id] else "failed",
+                integration_intent=IntegrationIntent.NONE,
+                evidence_refs=(observation_ref, decision_ref),
             )
-            runtime_session_id = (
-                f"autogen-team-{invocation.attempt}-{request_id.hex}"
-            )
-            identity_payload = "|".join(
-                (
-                    str(job.job_id),
-                    str(job.correlation_id),
-                    candidate.candidate.candidate_id,
-                    str(job.subject_version),
-                    str(invocation.attempt),
-                    str(invocation.invocation_id),
-                    str(request_id),
-                    case_ref.holdout_id,
-                    case_ref.sha256,
-                    self._model_client.model,
-                )
-            )
-            identity = HostAutoGenSessionIdentityV1.for_factory_execution(
-                job=job,
-                invocation=invocation,
-                case_ref=case_ref,
-                subject_id=candidate.candidate.candidate_id,
-                variant="candidate",
-                request_id=request_id,
-                runtime_session_id=runtime_session_id,
-                effect_id=hashlib.sha256(identity_payload.encode("utf-8")).hexdigest(),
-                claim_id=uuid5(request_id, "factory-autogen-claim"),
-                fence=1,
-                model=self._model_client.model,
-            )
-            session = await self._session_executor.run_candidate(
-                job=job,
-                invocation=invocation,
-                case_ref=case_ref,
-                identity=identity,
-                workspace=workspace,
-                manifest=manifest,
-                candidate=candidate,
-                allowed_models=allowed_models,
-                max_seconds=max_seconds,
-            )
-            result = session.task_result
-            raw_holdout_receipt = await self._holdouts.evaluate(
-                case_ref,
-                result,
-                invocation.acceptance_assertion_ids,
-            )
-            holdout_receipt = FactoryHoldoutEvaluationReceiptV1.model_validate(
-                raw_holdout_receipt.model_dump(mode="python", by_alias=True)
-                if isinstance(raw_holdout_receipt, BaseModel)
-                else raw_holdout_receipt
-            )
-            if (
-                holdout_receipt.holdout_ref != case_ref
-                or holdout_receipt.candidate_ref
-                != candidate.candidate.source_archive_ref
-                or holdout_receipt.assertion_ids
-                != invocation.acceptance_assertion_ids
-            ):
-                raise ValueError("holdout evaluator receipt does not match this run")
-            decision_ref = await self._evidence_store.persist(
-                job,
-                holdout_receipt.model_dump_json(
-                    by_alias=True,
-                    exclude_none=True,
-                ).encode("utf-8"),
-            )
-            normalized_results = {
-                item.assertion_id: item.passed
-                for item in holdout_receipt.decisions
-            }
-            resolved_status: Literal["succeeded", "unresolved"] = (
-                "succeeded" if all(normalized_results.values()) else "unresolved"
-            )
-            observation_ref = session.runtime_evidence_ref
-            handoffs = session.handoffs
-            tool_executions = session.tool_executions
-            n8n_executions = session.n8n_executions
-            n8n_refs = session.workflow_evidence_refs
-            command_id = uuid5(
-                NAMESPACE_URL,
-                f"factory-autogen-command|{invocation.invocation_id}",
-            )
-            result_id = uuid5(command_id, "result")
-            assertions = tuple(
-                AssertionOutcome(
-                    assertion_id=assertion_id,
-                    status="passed" if normalized_results[assertion_id] else "failed",
-                    integration_intent=IntegrationIntent.NONE,
-                    evidence_refs=(observation_ref, decision_ref),
-                )
-                for assertion_id in invocation.acceptance_assertion_ids
-            )
-            succeeded = resolved_status == "succeeded"
-            runtime = AgentRuntimeResult(
-                schema_name="captain.agent-runtime-result.v1",
-                event_id=result_id,
-                command_id=command_id,
-                correlation_id=job.correlation_id,
-                occurred_at=self._clock(),
-                producer="agent-runtime",
-                subject_id=candidate.candidate.candidate_id,
-                subject_version=job.subject_version,
-                grant_id=lease.lease_id,
-                operation=RuntimeOperation.CODEX_RUN,
-                status=(RuntimeStatus.SUCCEEDED if succeeded else RuntimeStatus.FAILED),
-                session_id=runtime_session_id,
-                artifact_refs=(observation_ref,),
-                evidence_refs=(observation_ref, decision_ref, *n8n_refs),
-                error=None if succeeded else "Captain holdout assertions unresolved",
-            )
-            outcome = ExecutionOutcomeV1(
-                schema_name="captain.execution-outcome.v1",
-                capability_id=job.required_capability,
-                capability_version=1,
-                team_version=1,
-                correlation_id=job.correlation_id,
-                command_id=command_id,
-                result_id=result_id,
-                output_ref=observation_ref,
-                assertion_outcomes=assertions,
-                tool_versions=tuple(
-                    sorted({f"{item.tool_name}@1" for item in tool_executions})
-                ),
-                evidence_refs=(observation_ref, decision_ref, *n8n_refs),
-                status="succeeded" if succeeded else "failed",
-            )
-            return FactoryTeamRunResult(
-                status=resolved_status,
-                runtime_result=runtime,
-                execution_outcome=outcome,
-                usage_receipts=session.usage_receipts,
-                handoff_evidence_refs=tuple(item.evidence_ref for item in handoffs),
-                tool_evidence_refs=tuple(
-                    item.evidence_ref for item in tool_executions
-                ),
-                handoffs=handoffs,
-                tool_executions=tool_executions,
-                n8n_executions=n8n_executions,
-                workflow_evidence_refs=n8n_refs,
-                conversation_pattern=session.conversation_pattern,
-                message_count=session.message_count,
-                handoff_count=session.handoff_count,
-                tool_call_count=session.tool_call_count,
-                termination_reason=session.termination_reason,
-            )
+            for assertion_id in invocation.acceptance_assertion_ids
+        )
+        succeeded = resolved_status == "succeeded"
+        runtime = AgentRuntimeResult(
+            schema_name="captain.agent-runtime-result.v1",
+            event_id=result_id,
+            command_id=command_id,
+            correlation_id=job.correlation_id,
+            occurred_at=self._clock(),
+            producer="agent-runtime",
+            subject_id=candidate.candidate.candidate_id,
+            subject_version=job.subject_version,
+            grant_id=lease.lease_id,
+            operation=RuntimeOperation.CODEX_RUN,
+            status=(RuntimeStatus.SUCCEEDED if succeeded else RuntimeStatus.FAILED),
+            session_id=runtime_session_id,
+            artifact_refs=(observation_ref,),
+            evidence_refs=(observation_ref, decision_ref, *n8n_refs),
+            error=None if succeeded else "Captain holdout assertions unresolved",
+        )
+        outcome = ExecutionOutcomeV1(
+            schema_name="captain.execution-outcome.v1",
+            capability_id=job.required_capability,
+            capability_version=1,
+            team_version=1,
+            correlation_id=job.correlation_id,
+            command_id=command_id,
+            result_id=result_id,
+            output_ref=observation_ref,
+            assertion_outcomes=assertions,
+            tool_versions=tuple(
+                sorted({f"{item.tool_name}@1" for item in tool_executions})
+            ),
+            evidence_refs=(observation_ref, decision_ref, *n8n_refs),
+            status="succeeded" if succeeded else "failed",
+        )
+        return FactoryTeamRunResult(
+            status=resolved_status,
+            runtime_result=runtime,
+            execution_outcome=outcome,
+            usage_receipts=session.usage_receipts,
+            handoff_evidence_refs=tuple(item.evidence_ref for item in handoffs),
+            tool_evidence_refs=tuple(
+                item.evidence_ref for item in tool_executions
+            ),
+            handoffs=handoffs,
+            tool_executions=tool_executions,
+            n8n_executions=n8n_executions,
+            workflow_evidence_refs=n8n_refs,
+            conversation_pattern=session.conversation_pattern,
+            message_count=session.message_count,
+            handoff_count=session.handoff_count,
+            tool_call_count=session.tool_call_count,
+            termination_reason=session.termination_reason,
+        )
 
 
 class TeamExecutionService:
