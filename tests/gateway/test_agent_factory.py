@@ -179,7 +179,7 @@ def test_business_benchmark_summary_is_restart_safe_and_rejects_changed_replay(
     changed_payload["summary_id"] = "00000000-0000-0000-0000-000000000999"
     changed_payload["evaluated_at"] = (
         summary.evaluated_at + timedelta(seconds=1)
-    )
+    ).isoformat().replace("+00:00", "Z")
     changed = business_summary(**changed_payload)
     with TestClient(application(storage)) as restarted:
         conflict = restarted.post(
@@ -238,9 +238,14 @@ def _second_workflow_job_and_execution():
             "job_id": second_job_id,
             "correlation_id": second_correlation_id,
             "invocation_id": second_invocation_id,
-            "idempotency_key": "factory-job-two-real-case-tester-attempt-1",
+            "idempotency_key": hashlib.sha256(
+                b"factory-job-two-real-case-tester-attempt-1"
+            ).hexdigest(),
             "lease": second_lease,
         }
+    )
+    second_outcome = first_execution.execution_outcome.model_copy(
+        update={"correlation_id": second_correlation_id}
     )
     second_execution = first_execution.model_copy(
         update={
@@ -248,6 +253,7 @@ def _second_workflow_job_and_execution():
             "correlation_id": second_correlation_id,
             "invocation_id": second_invocation_id,
             "invocation": second_invocation,
+            "execution_outcome": second_outcome,
         }
     )
     return second_job, second_execution
@@ -344,7 +350,9 @@ def test_factory_budget_routes_keep_reservations_captain_owned_and_usage_worker_
         assert captain.post(
             "/v1/factory/budget/reservations", json=reservation_payload
         ).status_code == 201
-        usage = FactoryUsageReceiptV1.model_validate(usage_payload(reservation))
+        usage = FactoryUsageReceiptV1.model_validate(
+            usage_payload(reservation, cost_usd="0.80")
+        )
         usage_submission = FactoryUsageSubmissionV2(
             subject_version=job_v3.subject_version,
             lease_id=lease.lease_id,

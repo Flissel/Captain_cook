@@ -602,6 +602,14 @@ def test_mariadb_workflow_artifact_is_append_only_and_restart_readable(
     job_v3,
 ) -> None:
     artifact = CodebaseInventoryV1.model_validate(inventory_payload())
+    bound_input_ref = artifact.invocation.input_ref.model_copy(
+        update={
+            "uri": (
+                "artifact://workflow/input/"
+                f"{artifact.invocation.input_ref.sha256}"
+            )
+        }
+    )
     factory_job = job_v3.model_copy(
         update={
             "job_id": artifact.job_id,
@@ -609,9 +617,24 @@ def test_mariadb_workflow_artifact_is_append_only_and_restart_readable(
             "subject_version": artifact.subject_version,
             "occurred_at": artifact.invocation.lease.issued_at,
             "deadline_at": artifact.invocation.lease.expires_at + timedelta(minutes=5),
-            "input_ref": artifact.invocation.input_ref,
+            "input_ref": bound_input_ref,
             "acceptance_assertion_ids": artifact.acceptance_assertion_ids,
             "required_capability": artifact.invocation.released_skill.capability,
+        }
+    )
+    bound_lease = issue_factory_lease(
+        job=factory_job,
+        role=artifact.invocation.lease.role,
+        attempt=artifact.attempt,
+        workspace_ref=artifact.invocation.lease.workspace_ref,
+        now=artifact.invocation.lease.issued_at,
+        integration_intent=artifact.invocation.lease.integration_intent,
+    )
+    artifact = artifact.model_copy(
+        update={
+            "invocation": artifact.invocation.model_copy(
+                update={"input_ref": bound_input_ref, "lease": bound_lease}
+            )
         }
     )
     forge = block(FactoryPhase.FORGE_REQUESTED).model_copy(
@@ -624,7 +647,7 @@ def test_mariadb_workflow_artifact_is_append_only_and_restart_readable(
     )
     mariadb_store.record_factory_job(factory_job)
     mariadb_store.record_factory_block(forge)
-    mariadb_store.record_factory_lease(artifact.invocation.lease)
+    mariadb_store.record_factory_lease(bound_lease)
     mariadb_store.record_released_factory_skill(
         artifact.invocation.released_skill
     )

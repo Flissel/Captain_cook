@@ -2042,7 +2042,7 @@ async def test_skill_usage_timeout_terminates_the_verified_hermes_process_tree(
     with pytest.raises(FactoryDispatchError, match="timed out"):
         await HermesCliFactory(
             settings=HermesCliSettings(released_skill_root=skill_root)
-        ).issue_skill_usage(request, max_seconds=0.1)
+        ).issue_skill_usage(request, max_seconds=0.5)
 
     assert terminated == [4242]
 
@@ -2202,6 +2202,6 @@ async def test_skill_usage_timeout_terminates_the_hermes_subprocess(
     with pytest.raises(FactoryDispatchError, match="timed out"):
         await HermesCliFactory(
             settings=HermesCliSettings(released_skill_root=skill_root)
-        ).issue_skill_usage(request, max_seconds=0.1)
+        ).issue_skill_usage(request, max_seconds=0.5)
 
     assert terminated is True
