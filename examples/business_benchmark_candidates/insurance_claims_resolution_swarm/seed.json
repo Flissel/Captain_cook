@@ -1,0 +1,35 @@
+{
+  "candidate_id": "insurance_claims_resolution_swarm_v1",
+  "conversation_pattern": "swarm",
+  "max_messages": 10,
+  "max_handoffs": 2,
+  "max_tool_calls": 0,
+  "termination_conditions": ["max_messages", "max_handoffs"],
+  "agents": [
+    {
+      "name": "intake_specialist",
+      "prompt_path": "prompts/intake_specialist.txt",
+      "tools": [],
+      "handoffs": ["coverage_specialist"]
+    },
+    {
+      "name": "coverage_specialist",
+      "prompt_path": "prompts/coverage_specialist.txt",
+      "tools": [],
+      "handoffs": ["escalation_specialist"]
+    },
+    {
+      "name": "escalation_specialist",
+      "prompt_path": "prompts/escalation_specialist.txt",
+      "tools": [],
+      "handoffs": []
+    }
+  ],
+  "workflow_path": "workflows/unused_manifest_tool_descriptor.json",
+  "input_schema_path": "schemas/unused_manifest_tool.input.json",
+  "output_schema_path": "schemas/unused_manifest_tool.output.json",
+  "tool": {
+    "name": "claims_manifest_placeholder",
+    "description": "Inactive typed descriptor retained only for candidate manifest compatibility."
+  }
+}

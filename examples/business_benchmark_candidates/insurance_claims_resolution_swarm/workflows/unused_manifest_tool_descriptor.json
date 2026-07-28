@@ -1,0 +1,7 @@
+{
+  "schema": "captain.inactive-candidate-tool-descriptor.v1",
+  "active": false,
+  "purpose": "manifest_cardinality_compatibility_only",
+  "effect": "none",
+  "tool_name": "claims_manifest_placeholder"
+}

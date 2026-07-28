@@ -1,0 +1,35 @@
+{
+  "candidate_id": "customer_renewal_orchestration_team_v1",
+  "conversation_pattern": "selector_group_chat",
+  "max_messages": 12,
+  "max_handoffs": 2,
+  "max_tool_calls": 1,
+  "termination_conditions": ["max_messages", "max_handoffs", "max_tool_calls"],
+  "agents": [
+    {
+      "name": "renewal_analyst",
+      "prompt_path": "prompts/renewal_analyst.txt",
+      "tools": ["renewal_context_read"],
+      "handoffs": ["commercial_advisor"]
+    },
+    {
+      "name": "commercial_advisor",
+      "prompt_path": "prompts/commercial_advisor.txt",
+      "tools": [],
+      "handoffs": ["human_review_coordinator"]
+    },
+    {
+      "name": "human_review_coordinator",
+      "prompt_path": "prompts/human_review_coordinator.txt",
+      "tools": [],
+      "handoffs": []
+    }
+  ],
+  "workflow_path": "workflows/renewal_context_read.json",
+  "input_schema_path": "schemas/renewal_context_read.input.json",
+  "output_schema_path": "schemas/renewal_context_read.output.json",
+  "tool": {
+    "name": "renewal_context_read",
+    "description": "Read a Captain-scoped synthetic renewal context without mutation."
+  }
+}

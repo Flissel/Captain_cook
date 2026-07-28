@@ -1,0 +1,38 @@
+{
+  "name": "Captain Renewal Context Read v1",
+  "active": false,
+  "contract": {
+    "schema": "captain.n8n-read-only-workflow.v1",
+    "intent": "n8n",
+    "effect": "read_only",
+    "idempotency": "required",
+    "allowed_partitions": ["ordinary", "boundary"],
+    "mutation_operations": []
+  },
+  "nodes": [
+    {
+      "id": "renewal-input",
+      "name": "Typed Renewal Input",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [0, 0],
+      "parameters": {"inputSource": "passthrough"}
+    },
+    {
+      "id": "renewal-read",
+      "name": "Read Synthetic Renewal Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [260, 0],
+      "parameters": {
+        "jsCode": "const input = $json; const allowed = ['ordinary', 'boundary']; if (input.operation !== 'read_renewal_context' || !allowed.includes(input.evidence_partition)) { throw new Error('read-only contract rejected'); } const facts = Object.entries(input.commercial_snapshot).map(([key, value]) => `${key}.${String(value)}`); return [{ json: { operation: input.operation, idempotency_key: input.idempotency_key, status: 'read', facts } }];"
+      }
+    }
+  ],
+  "connections": {
+    "Typed Renewal Input": {
+      "main": [[{"node": "Read Synthetic Renewal Context", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {"executionOrder": "v1"}
+}
