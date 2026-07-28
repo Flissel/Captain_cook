@@ -66,6 +66,7 @@ def _powershell_object_digest(tmp_path: Path, value: object) -> str:
     pwsh = shutil.which("pwsh")
     if pwsh is None:
         pytest.skip("PowerShell 7 is unavailable")
+    tmp_path.mkdir(parents=True, exist_ok=True)
     value_path = tmp_path / "digest-value.json"
     helper_path = tmp_path / "digest.ps1"
     value_path.write_text(json.dumps(value), encoding="utf-8")
@@ -656,7 +657,10 @@ function Invoke-WebRequest {{
 $failed = $false
 $failure = $null
 try {{ $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)} }} catch {{ $failed = $true; $failure = $_.Exception.Message }}
-@{{ failed = $failed; failure = $failure; posts = $global:posts; puts = $global:puts; activations = $global:activations; executes = $global:executes; gets = $global:gets; available_in_mcp = $global:remote.settings.availableInMCP }} | ConvertTo-Json -Compress
+$secondFailed = $false
+$secondFailure = $null
+try {{ $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)} }} catch {{ $secondFailed = $true; $secondFailure = $_.Exception.Message }}
+@{{ failed = $failed; failure = $failure; second_failed = $secondFailed; second_failure = $secondFailure; posts = $global:posts; puts = $global:puts; activations = $global:activations; executes = $global:executes; gets = $global:gets; available_in_mcp = $global:remote.settings.availableInMCP }} | ConvertTo-Json -Compress
 """
 
     result = _run_harness(tmp_path, harness)
@@ -665,10 +669,96 @@ try {{ $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pws
     assert json.loads(result.stdout) == {
         "failed": False,
         "failure": None,
+        "second_failed": False,
+        "second_failure": None,
         "posts": 0,
         "puts": 1,
         "activations": 1,
-        "executes": 1,
-        "gets": 1,
+        "executes": 2,
+        "gets": 2,
         "available_in_mcp": True,
+    }
+
+
+def test_incomparable_matching_receipts_remain_fail_closed(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence"
+    workflow_id = "renewal-owned-ambiguous"
+    workflow = json.loads(WORKFLOW.read_text(encoding="utf-8"))
+    base = {
+        key: workflow[key] for key in ("name", "nodes", "connections", "settings")
+    }
+    payloads = []
+    for extra in ({}, {"providerDefaultA": False}, {"providerDefaultB": False}):
+        payload = json.loads(json.dumps(base))
+        payload["settings"].update(extra)
+        payloads.append(payload)
+    ownership_digest = hashlib.sha256(
+        (
+            "captain.business-benchmark-renewal-n8n.v1|"
+            f"Captain Renewal Context Read v1|{workflow_id}"
+        ).encode()
+    ).hexdigest()
+    evidence.mkdir(parents=True)
+    ownership = {
+        "schema": "captain.business-benchmark-renewal-n8n-ownership.v1",
+        "ownership": "captain",
+        "endpoint_id": "captain-n8n-local-5679",
+        "workflow_name": "Captain Renewal Context Read v1",
+        "workflow_id": workflow_id,
+        "ownership_binding_sha256": ownership_digest,
+    }
+    (evidence / "renewal-context-n8n-ownership.v1.json").write_bytes(
+        (json.dumps(ownership, indent=2).replace("\n", "\r\n") + "\n").encode()
+    )
+    deployment_dir = evidence / "renewal-context-n8n-deployments"
+    deployment_dir.mkdir()
+    for index, payload in enumerate(payloads):
+        digest = _powershell_object_digest(tmp_path / f"digest-{index}", payload)
+        receipt = {
+            "schema": "captain.business-benchmark-renewal-n8n-deployment-receipt.v1",
+            "ownership_binding_sha256": ownership_digest,
+            "workflow_id": workflow_id,
+            "workflow_name": "Captain Renewal Context Read v1",
+            "canonical_sha256": str(index) * 64,
+            "published_sha256": digest,
+            "published_payload": payload,
+            "verification": "provider_read_back_matched",
+        }
+        (deployment_dir / f"{digest}.json").write_text(
+            json.dumps(receipt), encoding="utf-8"
+        )
+    remote = json.loads(json.dumps(base))
+    remote["settings"].update(
+        {"providerDefaultA": False, "providerDefaultB": False}
+    )
+    remote.update({"id": workflow_id, "active": True})
+    remote_json = json.dumps(remote).replace("'", "''")
+    harness = f"""
+$ErrorActionPreference = 'Stop'
+$env:CAPTAIN_N8N_API_KEY = 'dummy-api-value-for-test'
+$env:CAPTAIN_N8N_MCP_TOKEN = 'dummy-mcp-value-for-test'
+$env:CAPTAIN_N8N_PORT = '5679'
+$remote = '{remote_json}' | ConvertFrom-Json -Depth 40
+$global:mutations = 0
+function Invoke-WebRequest {{
+    param($Uri, $Method = 'GET', $Headers, $Body, $ContentType, [switch]$UseBasicParsing, $TimeoutSec, $ErrorAction)
+    $target = [string]$Uri
+    $verb = [string]$Method
+    if ($target -eq 'http://127.0.0.1:5679/healthz') {{ return [pscustomobject]@{{ StatusCode = 200; Content = '{{}}' }} }}
+    if ($target.StartsWith('http://127.0.0.1:5679/api/v1/workflows?') -and $verb -eq 'GET') {{ return [pscustomobject]@{{ StatusCode = 200; Content = (@{{ data = @($remote); nextCursor = $null }} | ConvertTo-Json -Depth 40 -Compress) }} }}
+    if ($target -eq 'http://127.0.0.1:5679/api/v1/workflows/{workflow_id}' -and $verb -eq 'GET') {{ return [pscustomobject]@{{ StatusCode = 200; Content = ($remote | ConvertTo-Json -Depth 40 -Compress) }} }}
+    $global:mutations++
+    throw 'mutation forbidden'
+}}
+$failure = $null
+try {{ $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)} }} catch {{ $failure = $_.Exception.Message }}
+@{{ failure = $failure; mutations = $global:mutations }} | ConvertTo-Json -Compress
+"""
+
+    result = _run_harness(tmp_path, harness)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "failure": "Captain n8n remote workflow has no unambiguous immutable deployment receipt.",
+        "mutations": 0,
     }

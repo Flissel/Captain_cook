@@ -533,6 +533,63 @@ function Write-DeploymentReceipt {
     return $receipt
 }
 
+function Get-PayloadClaimSet {
+    param([Parameter(Mandatory = $true)][object]$Payload)
+
+    $claims = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    function Add-Claims([AllowNull()][object]$Value, [string]$Path) {
+        if ($null -eq $Value) {
+            $null = $claims.Add("$Path#value:null")
+            return
+        }
+        if ($Value -is [pscustomobject] -or $Value -is [System.Collections.IDictionary]) {
+            $null = $claims.Add("$Path#object")
+            $names = if ($Value -is [System.Collections.IDictionary]) {
+                @($Value.Keys | ForEach-Object { [string]$_ } | Sort-Object)
+            }
+            else {
+                @($Value.PSObject.Properties | ForEach-Object { $_.Name } | Sort-Object)
+            }
+            foreach ($name in $names) {
+                $nested = if ($Value -is [System.Collections.IDictionary]) {
+                    $Value[$name]
+                }
+                else {
+                    $Value.PSObject.Properties[$name].Value
+                }
+                Add-Claims -Value $nested -Path "$Path/$name"
+            }
+            return
+        }
+        if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+            $items = @($Value)
+            $null = $claims.Add("$Path#array:$($items.Count)")
+            for ($index = 0; $index -lt $items.Count; $index++) {
+                Add-Claims -Value $items[$index] -Path "$Path/$index"
+            }
+            return
+        }
+        $null = $claims.Add("$Path#value:$(ConvertTo-CanonicalJson -Value $Value)")
+    }
+    Add-Claims -Value $Payload -Path "`$"
+    return ,$claims
+}
+
+function Test-StrictPayloadSubsumption {
+    param(
+        [Parameter(Mandatory = $true)][object]$Candidate,
+        [Parameter(Mandatory = $true)][object]$Other
+    )
+
+    $candidateClaims = Get-PayloadClaimSet -Payload $Candidate
+    $otherClaims = Get-PayloadClaimSet -Payload $Other
+    if ($candidateClaims.Count -le $otherClaims.Count) { return $false }
+    foreach ($claim in $otherClaims) {
+        if (-not $candidateClaims.Contains($claim)) { return $false }
+    }
+    return $true
+}
+
 function Find-MatchingDeploymentReceipt {
     param(
         [Parameter(Mandatory = $true)][string]$WorkflowId,
@@ -567,10 +624,30 @@ function Find-MatchingDeploymentReceipt {
             continue
         }
     }
+    if ($matches.Count -eq 1) {
+        return $matches[0]
+    }
+    if ($matches.Count -gt 1) {
+        $maximal = @(
+            foreach ($candidate in $matches) {
+                $subsumesAll = $true
+                foreach ($other in $matches) {
+                    if ($candidate.published_sha256 -ceq $other.published_sha256) { continue }
+                    if (-not (Test-StrictPayloadSubsumption -Candidate $candidate.published_payload -Other $other.published_payload)) {
+                        $subsumesAll = $false
+                        break
+                    }
+                }
+                if ($subsumesAll) { $candidate }
+            }
+        )
+        if ($maximal.Count -eq 1) {
+            return $maximal[0]
+        }
+    }
     if ($matches.Count -ne 1) {
         throw "Captain n8n remote workflow has no unambiguous immutable deployment receipt."
     }
-    return $matches[0]
 }
 
 function Write-ActivationReceipt {
