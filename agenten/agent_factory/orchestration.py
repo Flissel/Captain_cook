@@ -542,6 +542,12 @@ class FactoryDispatcher:
         self._clock = clock
         self._improvements = improvements
 
+    @property
+    def lease_authority(self) -> FactoryLeasePort:
+        """Expose identity only so the production runner can reject split authority."""
+
+        return self._leases
+
     async def dispatch_next(self, job_id: UUID) -> FactoryAction:
         action = self._coordinator.next_action(job_id)
         projection = self._coordinator.projection(job_id)
