@@ -1,0 +1,87 @@
+"""Captain operator CLI for the durable business-benchmark review queue."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime
+import json
+from pathlib import Path
+from typing import Sequence
+from uuid import UUID
+
+from agenten.agent_factory.business_benchmark_human_review import (
+    CaptainHumanReviewError,
+    CaptainHumanReviewStore,
+)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        store = CaptainHumanReviewStore(Path(args.root))
+        if args.command == "list":
+            reviews = store.list_reviews(status=args.status)
+            payload = {
+                "schema": "captain.business-benchmark-human-review-list.v1",
+                "status": args.status,
+                "count": len(reviews),
+                "reviews": [
+                    item.model_dump(mode="json", by_alias=True) for item in reviews
+                ],
+            }
+        else:
+            receipt = store.complete_review_as_operator(
+                UUID(args.review_request_id),
+                operator_id=args.operator_id,
+                decision_code=args.decision_code,
+                completed_at=datetime.fromisoformat(args.completed_at),
+            )
+            payload = receipt.model_dump(mode="json", by_alias=True)
+    except (OSError, ValueError, CaptainHumanReviewError) as exc:
+        print(
+            json.dumps(
+                {"status": "failed", "error": type(exc).__name__},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return 1
+    print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "List redacted Captain human-review requests or explicitly complete one "
+            "with immutable redacted evidence."
+        )
+    )
+    parser.add_argument(
+        "--root",
+        required=True,
+        help="Gitignored .captain-cook business-benchmark human-review root.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    list_command = commands.add_parser("list", help="List redacted review metadata.")
+    list_command.add_argument(
+        "--status",
+        choices=("pending", "completed", "all"),
+        default="pending",
+    )
+    complete = commands.add_parser(
+        "complete", help="Explicitly complete one already accepted review."
+    )
+    complete.add_argument("--review-request-id", required=True)
+    complete.add_argument("--operator-id", required=True)
+    complete.add_argument("--decision-code", required=True)
+    complete.add_argument(
+        "--completed-at",
+        required=True,
+        help="Explicit timezone-aware ISO-8601 timestamp; required for exact replay.",
+    )
+    return parser
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

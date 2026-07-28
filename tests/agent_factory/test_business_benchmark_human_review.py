@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
@@ -55,6 +56,12 @@ def binding(
         variant=variant,
         model_version="gpt-5-business-v1",
     )
+
+
+def baseline_binding() -> BusinessBenchmarkProviderBindingV1:
+    payload = binding().model_dump(mode="json", by_alias=True)
+    payload["variant"] = "single_agent_baseline"
+    return BusinessBenchmarkProviderBindingV1.model_validate(payload)
 
 
 def request(
@@ -177,6 +184,16 @@ async def test_mixed_request_or_binding_for_same_effect_and_fence_is_rejected(
 
 
 @pytest.mark.asyncio
+async def test_baseline_can_never_request_captain_human_review(tmp_path: Path) -> None:
+    store = CaptainHumanReviewStore(review_root(tmp_path))
+
+    with pytest.raises(CaptainHumanReviewConflictError, match="candidate"):
+        await store.request_review(request(selected_binding=baseline_binding()))
+
+    assert not tuple(review_root(tmp_path).rglob("request.json"))
+
+
+@pytest.mark.asyncio
 async def test_larger_fence_wins_and_stale_review_request_fails_closed(
     tmp_path: Path,
 ) -> None:
@@ -249,3 +266,182 @@ def test_root_is_captain_private_and_gitignored(tmp_path: Path) -> None:
     assert default_captain_human_review_root(tmp_path) == review_root(tmp_path)
     with pytest.raises(ValueError, match=".captain-cook"):
         CaptainHumanReviewStore(tmp_path / "human-review")
+
+
+@pytest.mark.asyncio
+async def test_configured_wait_observes_only_explicit_completion_after_acceptance(
+    tmp_path: Path,
+) -> None:
+    expected_request = request()
+    root = review_root(tmp_path)
+    waiting_store = CaptainHumanReviewStore(
+        root,
+        completion_timeout_seconds=0.5,
+        completion_poll_interval_seconds=0.01,
+    )
+
+    pending = asyncio.create_task(waiting_store.request_review(expected_request))
+    for _ in range(100):
+        if tuple(root.rglob("accepted.json")):
+            break
+        await asyncio.sleep(0.005)
+    else:
+        pytest.fail("review request was not durably accepted before polling")
+
+    completed = CaptainHumanReviewStore(root).complete_review(
+        expected_request,
+        evidence_ref=evidence("operator-review"),
+        completed_at=NOW + timedelta(minutes=3),
+    )
+
+    assert await pending == completed
+    assert completed.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_configured_wait_times_out_as_accepted_without_auto_completion(
+    tmp_path: Path,
+) -> None:
+    store = CaptainHumanReviewStore(
+        review_root(tmp_path),
+        completion_timeout_seconds=0.02,
+        completion_poll_interval_seconds=0.005,
+    )
+
+    receipt = await store.request_review(request())
+
+    assert receipt.status == "accepted"
+    assert not tuple(review_root(tmp_path).rglob("completed.json"))
+
+
+def test_wait_configuration_is_finite_and_bounded(tmp_path: Path) -> None:
+    root = review_root(tmp_path)
+
+    for invalid in (-1.0, float("inf"), 301.0):
+        with pytest.raises(ValueError, match="completion timeout"):
+            CaptainHumanReviewStore(root, completion_timeout_seconds=invalid)
+    with pytest.raises(ValueError, match="poll interval"):
+        CaptainHumanReviewStore(root, completion_poll_interval_seconds=0.0)
+
+
+@pytest.mark.asyncio
+async def test_pending_queue_lists_only_latest_redacted_restart_safe_metadata(
+    tmp_path: Path,
+) -> None:
+    root = review_root(tmp_path)
+    store = CaptainHumanReviewStore(root)
+    await store.request_review(request())
+    newer = request(
+        selected_binding=binding(fence=2),
+        review_request_id=UUID(int=REVIEW_ID.int + 1),
+        requested_at=NOW + timedelta(minutes=1),
+    )
+    await store.request_review(newer)
+
+    pending = CaptainHumanReviewStore(root).list_reviews(status="pending")
+
+    assert len(pending) == 1
+    assert pending[0].review_request_id == newer.review_request_id
+    assert pending[0].effect_id == newer.binding.effect_id
+    assert pending[0].fence == 2
+    assert pending[0].status == "accepted"
+    serialized = pending[0].model_dump_json(by_alias=True)
+    assert "case_sha256" in serialized
+    assert "case_body" not in serialized
+    assert "task" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_operator_cli_lists_and_explicitly_completes_with_redacted_artifact(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from agenten.agent_factory.business_benchmark_human_review_cli import (
+        main as operator_main,
+    )
+
+    root = review_root(tmp_path)
+    expected_request = request()
+    await CaptainHumanReviewStore(root).request_review(expected_request)
+
+    assert operator_main(["--root", str(root), "list", "--status", "pending"]) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert listed["count"] == 1
+    assert listed["reviews"][0]["review_request_id"] == str(REVIEW_ID)
+
+    completed_at = (NOW + timedelta(minutes=4)).isoformat()
+    complete_args = [
+        "--root",
+        str(root),
+        "complete",
+        "--review-request-id",
+        str(REVIEW_ID),
+        "--operator-id",
+        "captain-demo-operator",
+        "--decision-code",
+        "reviewed",
+        "--completed-at",
+        completed_at,
+    ]
+    assert operator_main(complete_args) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["status"] == "completed"
+
+    # Exact operator replay after a process restart is byte-identical.
+    assert operator_main(complete_args) == 0
+    replay = json.loads(capsys.readouterr().out)
+    assert replay == first
+    assert await CaptainHumanReviewStore(root).request_review(expected_request) == (
+        CaptainHumanReviewStore(root).find_receipt(REVIEW_ID)
+    )
+
+    artifacts = tuple(root.rglob("evidence.json"))
+    assert len(artifacts) == 1
+    artifact_bytes = artifacts[0].read_bytes()
+    artifact_payload = json.loads(artifact_bytes)
+    assert artifact_payload == {
+        "authority": "captain_human_review",
+        "completed_at": completed_at.replace("+00:00", "Z"),
+        "decision_code": "reviewed",
+        "effect_id": "a" * 64,
+        "fence": 1,
+        "operator_id": "captain-demo-operator",
+        "review_request_id": str(REVIEW_ID),
+        "schema": "captain.business-benchmark-human-review-evidence.v1",
+    }
+    assert first["evidence_ref"]["sha256"] == hashlib.sha256(
+        artifact_bytes
+    ).hexdigest()
+    assert "case" not in artifact_bytes.decode("utf-8")
+    assert "task" not in artifact_bytes.decode("utf-8")
+
+    assert operator_main(["--root", str(root), "list", "--status", "pending"]) == 0
+    assert json.loads(capsys.readouterr().out)["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_invalid_operator_completion_leaves_no_evidence_artifact(
+    tmp_path: Path,
+) -> None:
+    root = review_root(tmp_path)
+    store = CaptainHumanReviewStore(root)
+    await store.request_review(request())
+
+    with pytest.raises(ValueError, match="before the request"):
+        store.complete_review_as_operator(
+            REVIEW_ID,
+            operator_id="captain-demo-operator",
+            decision_code="reviewed",
+            completed_at=NOW - timedelta(seconds=1),
+        )
+
+    assert not tuple(root.rglob("evidence.json"))
+    assert store.find_receipt(REVIEW_ID).status == "accepted"
+
+    corrected = store.complete_review_as_operator(
+        REVIEW_ID,
+        operator_id="captain-demo-operator",
+        decision_code="reviewed",
+        completed_at=NOW + timedelta(seconds=1),
+    )
+    assert corrected.status == "completed"

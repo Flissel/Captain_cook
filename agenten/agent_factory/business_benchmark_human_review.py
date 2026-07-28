@@ -7,17 +7,20 @@ handoff can never turn itself into evidence that a human review happened.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
-import json
+import math
 import os
 import tempfile
 import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator
+from time import monotonic
+from typing import Iterator, Literal
+from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agenten.agent_factory.business_benchmark_contracts import (
     canonical_business_benchmark_model_bytes,
@@ -32,6 +35,57 @@ from agenten.agent_factory.business_benchmark_provider_state import (
 )
 from agenten.agent_factory.business_benchmark_store import _reject_unsafe_evidence
 from agenten.agent_runtime.contracts import ArtifactRef
+from agenten.agent_runtime.contracts import IDENTIFIER_PATTERN
+
+
+_MAX_COMPLETION_TIMEOUT_SECONDS = 300.0
+
+
+class _FrozenContract(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+
+class CaptainHumanReviewQueueItemV1(_FrozenContract):
+    """Redacted operator projection; it deliberately contains no case body."""
+
+    schema_name: Literal["captain.business-benchmark-human-review-queue-item.v1"] = (
+        Field(alias="schema", serialization_alias="schema")
+    )
+    review_request_id: UUID
+    effect_id: str
+    fence: int
+    job_id: UUID
+    correlation_id: UUID
+    attempt: int
+    request_id: UUID
+    case_sha256: str
+    variant: Literal["candidate"]
+    model_version: str
+    reason_code: str
+    requested_at: datetime
+    status: Literal["accepted", "completed"]
+
+
+class CaptainHumanReviewEvidenceV1(_FrozenContract):
+    """Minimal evidence written only by the explicit Captain operator path."""
+
+    schema_name: Literal["captain.business-benchmark-human-review-evidence.v1"] = (
+        Field(alias="schema", serialization_alias="schema")
+    )
+    review_request_id: UUID
+    effect_id: str
+    fence: int
+    authority: Literal["captain_human_review"]
+    operator_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    decision_code: str = Field(pattern=IDENTIFIER_PATTERN)
+    completed_at: datetime
+
+    @field_validator("completed_at")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("human review completion timestamp must be timezone-aware")
+        return value
 
 
 class CaptainHumanReviewError(ValueError):
@@ -63,13 +117,37 @@ class CaptainHumanReviewStore:
     _thread_locks: dict[str, threading.RLock] = {}
     _thread_locks_guard = threading.Lock()
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        completion_timeout_seconds: float = 0.0,
+        completion_poll_interval_seconds: float = 0.1,
+    ) -> None:
         resolved = Path(root).resolve()
         if ".captain-cook" not in {part.lower() for part in resolved.parts}:
             raise ValueError(
                 "human review root must be inside the gitignored .captain-cook namespace"
             )
+        if (
+            not math.isfinite(completion_timeout_seconds)
+            or completion_timeout_seconds < 0
+            or completion_timeout_seconds > _MAX_COMPLETION_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                "completion timeout must be finite and between 0 and 300 seconds"
+            )
+        if (
+            not math.isfinite(completion_poll_interval_seconds)
+            or completion_poll_interval_seconds <= 0
+            or completion_poll_interval_seconds > _MAX_COMPLETION_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                "completion poll interval must be finite and between 0 and 300 seconds"
+            )
         self._root = resolved
+        self._completion_timeout_seconds = completion_timeout_seconds
+        self._completion_poll_interval_seconds = completion_poll_interval_seconds
 
     async def request_review(
         self, request: CaptainHumanReviewRequestV1
@@ -80,7 +158,12 @@ class CaptainHumanReviewStore:
             request.model_dump(mode="json", by_alias=True)
         )
         binding = canonical_request.binding
+        if binding.variant != "candidate":
+            raise CaptainHumanReviewConflictError(
+                "only a candidate may request Captain human review"
+            )
         with self._effect_lock(binding.effect_id):
+            receipt: CaptainHumanReviewReceiptV1 | None = None
             latest = self._latest_request(binding.effect_id)
             if latest is not None:
                 if binding.fence < latest.binding.fence:
@@ -92,29 +175,166 @@ class CaptainHumanReviewStore:
                         raise CaptainHumanReviewConflictError(
                             "human review request already has different content"
                         )
-                    return self._terminal_receipt(canonical_request)
-                self._require_same_effect_scope(latest.binding, binding)
-                if canonical_request.requested_at < latest.requested_at:
-                    raise CaptainHumanReviewConflictError(
-                        "human review request time cannot move backwards"
-                    )
+                    receipt = self._terminal_receipt(canonical_request)
+                else:
+                    self._require_same_effect_scope(latest.binding, binding)
+                    if canonical_request.requested_at < latest.requested_at:
+                        raise CaptainHumanReviewConflictError(
+                            "human review request time cannot move backwards"
+                        )
 
-            request_bytes = _canonical(canonical_request)
-            request_path = self._request_path(binding)
-            self._write_once(request_path, request_bytes)
-            evidence_ref = _request_artifact_ref(request_bytes)
-            accepted = CaptainHumanReviewReceiptV1(
-                schema="captain.business-benchmark-human-review-receipt.v1",
-                review_request_id=canonical_request.review_request_id,
-                binding=binding,
-                authority="captain_human_review",
-                status="accepted",
-                evidence_ref=evidence_ref,
-                recorded_at=canonical_request.requested_at,
+            if receipt is None:
+                request_bytes = _canonical(canonical_request)
+                request_path = self._request_path(binding)
+                self._write_once(request_path, request_bytes)
+                evidence_ref = _request_artifact_ref(request_bytes)
+                accepted = CaptainHumanReviewReceiptV1(
+                    schema="captain.business-benchmark-human-review-receipt.v1",
+                    review_request_id=canonical_request.review_request_id,
+                    binding=binding,
+                    authority="captain_human_review",
+                    status="accepted",
+                    evidence_ref=evidence_ref,
+                    recorded_at=canonical_request.requested_at,
+                )
+                validate_captain_human_review_receipt(canonical_request, accepted)
+                self._write_once(self._accepted_path(binding), _canonical(accepted))
+                receipt = self._terminal_receipt(canonical_request)
+        return await self._wait_for_completion(canonical_request, receipt)
+
+    async def _wait_for_completion(
+        self,
+        request: CaptainHumanReviewRequestV1,
+        initial: CaptainHumanReviewReceiptV1,
+    ) -> CaptainHumanReviewReceiptV1:
+        if initial.status == "completed" or self._completion_timeout_seconds == 0:
+            return initial
+        deadline = monotonic() + self._completion_timeout_seconds
+        while True:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return initial
+            await asyncio.sleep(min(self._completion_poll_interval_seconds, remaining))
+            with self._effect_lock(request.binding.effect_id):
+                terminal = self._terminal_receipt(request)
+            if terminal.status == "completed":
+                return terminal
+
+    def list_reviews(
+        self,
+        *,
+        status: Literal["pending", "completed", "all"] = "pending",
+    ) -> tuple[CaptainHumanReviewQueueItemV1, ...]:
+        """List only latest-fence redacted metadata for Captain operators."""
+
+        if status not in {"pending", "completed", "all"}:
+            raise ValueError("human review list status is invalid")
+        items: list[CaptainHumanReviewQueueItemV1] = []
+        effects_root = self._root / "effects"
+        if not effects_root.exists():
+            return ()
+        for effect_root in sorted(path for path in effects_root.iterdir() if path.is_dir()):
+            with self._effect_lock(effect_root.name):
+                request = self._latest_request(effect_root.name)
+                if request is None:
+                    continue
+                receipt = self._terminal_receipt(request)
+                if status == "pending" and receipt.status != "accepted":
+                    continue
+                if status == "completed" and receipt.status != "completed":
+                    continue
+                binding = request.binding
+                items.append(
+                    CaptainHumanReviewQueueItemV1(
+                        schema="captain.business-benchmark-human-review-queue-item.v1",
+                        review_request_id=request.review_request_id,
+                        effect_id=binding.effect_id,
+                        fence=binding.fence,
+                        job_id=binding.job_id,
+                        correlation_id=binding.correlation_id,
+                        attempt=binding.attempt,
+                        request_id=binding.request_id,
+                        case_sha256=binding.case_sha256,
+                        variant=binding.variant,
+                        model_version=binding.model_version,
+                        reason_code=request.reason_code,
+                        requested_at=request.requested_at,
+                        status=receipt.status,
+                    )
+                )
+        return tuple(items)
+
+    def find_request(self, review_request_id: UUID) -> CaptainHumanReviewRequestV1:
+        """Resolve one immutable request identity for an explicit operator action."""
+
+        matches: list[CaptainHumanReviewRequestV1] = []
+        for path in (self._root / "effects").glob("*/[0-9]*/request.json"):
+            candidate = self._read_request(path)
+            if candidate.review_request_id == review_request_id:
+                matches.append(candidate)
+        if len(matches) != 1:
+            raise CaptainHumanReviewConflictError(
+                "human review request identity is missing or ambiguous"
             )
-            validate_captain_human_review_receipt(canonical_request, accepted)
-            self._write_once(self._accepted_path(binding), _canonical(accepted))
-            return self._terminal_receipt(canonical_request)
+        request = matches[0]
+        latest = self._latest_request(request.binding.effect_id)
+        if latest != request:
+            raise CaptainHumanReviewStaleFenceError("human review fence is stale")
+        return request
+
+    def find_receipt(self, review_request_id: UUID) -> CaptainHumanReviewReceiptV1:
+        request = self.find_request(review_request_id)
+        with self._effect_lock(request.binding.effect_id):
+            return self._terminal_receipt(request)
+
+    def complete_review_as_operator(
+        self,
+        review_request_id: UUID,
+        *,
+        operator_id: str,
+        decision_code: str,
+        completed_at: datetime,
+    ) -> CaptainHumanReviewReceiptV1:
+        """Create redacted evidence and explicitly complete one accepted request."""
+
+        request = self.find_request(review_request_id)
+        binding = request.binding
+        evidence = CaptainHumanReviewEvidenceV1(
+            schema="captain.business-benchmark-human-review-evidence.v1",
+            review_request_id=request.review_request_id,
+            effect_id=binding.effect_id,
+            fence=binding.fence,
+            authority="captain_human_review",
+            operator_id=operator_id,
+            decision_code=decision_code,
+            completed_at=completed_at,
+        )
+        evidence_bytes = _canonical(evidence)
+        digest = hashlib.sha256(evidence_bytes).hexdigest()
+        evidence_ref = ArtifactRef(
+            uri=f"artifact://captain-human-review/evidence/{digest}",
+            sha256=digest,
+            media_type="application/json",
+        )
+        with self._effect_lock(binding.effect_id):
+            completed = self._prepare_completion(
+                request,
+                evidence_ref=evidence_ref,
+                completed_at=completed_at,
+            )
+            evidence_path = self._fence_root(binding) / "evidence.json"
+            completed_path = self._completed_path(binding)
+            if completed_path.exists() and not evidence_path.exists():
+                raise CaptainHumanReviewConflictError(
+                    "durable human review completion is missing operator evidence"
+                )
+            self._write_once(evidence_path, evidence_bytes)
+            self._write_once(completed_path, _canonical(completed))
+            return self._read_receipt(
+                completed_path,
+                request,
+                expected_status="completed",
+            )
 
     def complete_review(
         self,
@@ -138,36 +358,64 @@ class CaptainHumanReviewStore:
         )
         binding = canonical_request.binding
         with self._effect_lock(binding.effect_id):
-            latest = self._latest_request(binding.effect_id)
-            if latest is None:
-                raise CaptainHumanReviewConflictError(
-                    "human review must be accepted before it can be completed"
-                )
-            if binding.fence < latest.binding.fence:
-                raise CaptainHumanReviewStaleFenceError("human review fence is stale")
-            if latest != canonical_request:
-                raise CaptainHumanReviewConflictError(
-                    "human review completion does not match the accepted request"
-                )
-            self._read_receipt(
-                self._accepted_path(binding), canonical_request, expected_status="accepted"
-            )
-            completed = CaptainHumanReviewReceiptV1(
-                schema="captain.business-benchmark-human-review-receipt.v1",
-                review_request_id=canonical_request.review_request_id,
-                binding=binding,
-                authority="captain_human_review",
-                status="completed",
+            completed = self._prepare_completion(
+                canonical_request,
                 evidence_ref=canonical_evidence,
-                recorded_at=completed_at,
+                completed_at=completed_at,
             )
-            validate_captain_human_review_receipt(canonical_request, completed)
             self._write_once(self._completed_path(binding), _canonical(completed))
             return self._read_receipt(
                 self._completed_path(binding),
                 canonical_request,
                 expected_status="completed",
             )
+
+    def _prepare_completion(
+        self,
+        request: CaptainHumanReviewRequestV1,
+        *,
+        evidence_ref: ArtifactRef,
+        completed_at: datetime,
+    ) -> CaptainHumanReviewReceiptV1:
+        """Validate every immutable predecessor before any completion write."""
+
+        binding = request.binding
+        latest = self._latest_request(binding.effect_id)
+        if latest is None:
+            raise CaptainHumanReviewConflictError(
+                "human review must be accepted before it can be completed"
+            )
+        if binding.fence < latest.binding.fence:
+            raise CaptainHumanReviewStaleFenceError("human review fence is stale")
+        if latest != request:
+            raise CaptainHumanReviewConflictError(
+                "human review completion does not match the accepted request"
+            )
+        self._read_receipt(
+            self._accepted_path(binding), request, expected_status="accepted"
+        )
+        completed = CaptainHumanReviewReceiptV1(
+            schema="captain.business-benchmark-human-review-receipt.v1",
+            review_request_id=request.review_request_id,
+            binding=binding,
+            authority="captain_human_review",
+            status="completed",
+            evidence_ref=evidence_ref,
+            recorded_at=completed_at,
+        )
+        validate_captain_human_review_receipt(request, completed)
+        completed_path = self._completed_path(binding)
+        if completed_path.exists():
+            persisted = self._read_receipt(
+                completed_path,
+                request,
+                expected_status="completed",
+            )
+            if persisted != completed:
+                raise CaptainHumanReviewConflictError(
+                    "durable human review already has different content"
+                )
+        return completed
 
     def _terminal_receipt(
         self, request: CaptainHumanReviewRequestV1
@@ -352,7 +600,9 @@ else:
 
 __all__ = [
     "CaptainHumanReviewConflictError",
+    "CaptainHumanReviewEvidenceV1",
     "CaptainHumanReviewError",
+    "CaptainHumanReviewQueueItemV1",
     "CaptainHumanReviewStaleFenceError",
     "CaptainHumanReviewStore",
     "default_captain_human_review_root",
