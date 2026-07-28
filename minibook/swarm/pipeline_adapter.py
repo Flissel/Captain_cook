@@ -3,12 +3,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
+from io import BytesIO
 from enum import Enum
-from typing import Any, Callable
+from pathlib import PurePosixPath
+from typing import Any, Callable, Protocol
+import zipfile
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .contracts import ArtifactRef, CreationFailure, CreationJobV1, CreationResultV1
+from .contracts import (
+    ArtifactRef,
+    CreationFailure,
+    CreationJobV1,
+    CreationPackageManifestV1,
+    CreationResultV1,
+)
 from .runner import StepOutcome
 
 
@@ -45,6 +55,166 @@ class SwarmSnapshot(BaseModel):
     skill_usage_receipt_ref: ArtifactRef | None = None
 
 
+@dataclass(frozen=True)
+class CreationExportBundle:
+    """Typed bytes produced by an upgraded Builder/Export implementation."""
+
+    source_archive: bytes
+    candidate_manifest: dict[str, Any]
+    skill_usage_receipt: bytes
+
+
+class CreationExportReceiptV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+    schema_name: str = Field(
+        default="minibook.creation-export-receipt.v1",
+        alias="schema",
+        serialization_alias="schema",
+        pattern=r"^minibook\.creation-export-receipt\.v1$",
+    )
+    receipt_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    package_manifest_ref: ArtifactRef
+    candidate_manifest_ref: ArtifactRef
+    source_archive_ref: ArtifactRef
+    skill_usage_receipt_ref: ArtifactRef
+
+
+class CreationArtifactSink(Protocol):
+    def put(self, content: bytes, media_type: str, *, namespace: str) -> object: ...
+
+
+class CreationArtifactPublisher(Protocol):
+    def publish(
+        self,
+        job: CreationJobV1,
+        bundle: CreationExportBundle,
+    ) -> CreationExportReceiptV1: ...
+
+
+class ContentAddressedCreationArtifactPublisher:
+    """Publish real export bytes and return only digest-bound immutable refs."""
+
+    def __init__(self, sink: CreationArtifactSink) -> None:
+        self._sink = sink
+
+    def publish(
+        self,
+        job: CreationJobV1,
+        bundle: CreationExportBundle,
+    ) -> CreationExportReceiptV1:
+        self._validate_archive(bundle.source_archive)
+        source_ref = self._put_checked(
+            bundle.source_archive,
+            "application/zip",
+            namespace="forge-source",
+        )
+        manifest = dict(bundle.candidate_manifest)
+        existing_source = manifest.get("source_archive_ref")
+        serialized_source = source_ref.model_dump(mode="json")
+        if existing_source is not None and existing_source != serialized_source:
+            raise ValueError("candidate manifest source archive binding changed")
+        manifest["source_archive_ref"] = serialized_source
+        if manifest.get("schema", manifest.get("schema_name")) != "captain.factory-candidate.v1":
+            raise ValueError("candidate manifest schema is invalid")
+        candidate_bytes = _canonical_json(manifest)
+        candidate_ref = self._put_checked(
+            candidate_bytes,
+            "application/json",
+            namespace="forge-candidate-manifest",
+        )
+        self._validate_json_object(bundle.skill_usage_receipt, "skill usage receipt")
+        skill_ref = self._put_checked(
+            bundle.skill_usage_receipt,
+            "application/json",
+            namespace="forge-skill-receipt",
+        )
+        package = CreationPackageManifestV1(
+            creation_job_id=job.creation_job_id,
+            factory_job_id=job.factory_job_id,
+            correlation_id=job.correlation_id,
+            subject_version=job.subject_version,
+            attempt=job.attempt,
+            candidate_manifest_ref=candidate_ref,
+            source_archive_ref=source_ref,
+        )
+        package_ref = self._put_checked(
+            _canonical_json(package.model_dump(mode="json", by_alias=True)),
+            "application/json",
+            namespace="forge-package-manifest",
+        )
+        receipt_id = hashlib.sha256(
+            "|".join(
+                (
+                    str(job.creation_job_id),
+                    package_ref.sha256,
+                    candidate_ref.sha256,
+                    source_ref.sha256,
+                    skill_ref.sha256,
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        return CreationExportReceiptV1(
+            receipt_id=receipt_id,
+            package_manifest_ref=package_ref,
+            candidate_manifest_ref=candidate_ref,
+            source_archive_ref=source_ref,
+            skill_usage_receipt_ref=skill_ref,
+        )
+
+    def _put_checked(
+        self,
+        content: bytes,
+        media_type: str,
+        *,
+        namespace: str,
+    ) -> ArtifactRef:
+        reference = self._sink.put(content, media_type, namespace=namespace)
+        dump = getattr(reference, "model_dump", None)
+        if not callable(dump):
+            raise ValueError("artifact sink returned an invalid reference")
+        parsed = ArtifactRef.model_validate(dump(mode="json"))
+        if (
+            parsed.sha256 != hashlib.sha256(content).hexdigest()
+            or parsed.media_type != media_type
+        ):
+            raise ValueError("artifact sink returned an unbound reference")
+        return parsed
+
+    @staticmethod
+    def _validate_archive(content: bytes) -> None:
+        if not content:
+            raise ValueError("candidate source archive is empty")
+        try:
+            with zipfile.ZipFile(BytesIO(content)) as archive:
+                names = archive.namelist()
+                if not names:
+                    raise ValueError("candidate source archive is empty")
+                for name in names:
+                    path = PurePosixPath(name.replace("\\", "/"))
+                    if path.is_absolute() or ".." in path.parts:
+                        raise ValueError("candidate source archive path is unsafe")
+        except zipfile.BadZipFile as exc:
+            raise ValueError("candidate source archive is not a ZIP") from exc
+
+    @staticmethod
+    def _validate_json_object(content: bytes, label: str) -> None:
+        try:
+            value = json.loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{label} is not valid JSON") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"{label} must be a JSON object")
+
+
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
 _KNOWN_FAILURES = {
     "DocumentationUnavailable": "documentation_unavailable",
     "ToolResolutionError": "tool_unresolved",
@@ -78,9 +248,16 @@ class SwarmPipelineAdapter:
         }
     )
 
-    def __init__(self, pipeline_factory: Callable[[SwarmSnapshot], Any], *, session: object) -> None:
+    def __init__(
+        self,
+        pipeline_factory: Callable[[SwarmSnapshot], Any],
+        *,
+        session: object,
+        artifact_publisher: CreationArtifactPublisher | None = None,
+    ) -> None:
         self._pipeline_factory = pipeline_factory
         self._session = session
+        self._artifact_publisher = artifact_publisher
 
     async def run_step(
         self,
@@ -96,26 +273,72 @@ class SwarmPipelineAdapter:
         output: Any = accepted_effect
         if accepted_effect is None:
             output = await self._dispatch(pipeline, named_step, job)
+        export_receipt = self._export_receipt(job, named_step, output, accepted_effect)
+        digest_output = (
+            export_receipt.model_dump(mode="json", by_alias=True)
+            if export_receipt is not None
+            else output
+        )
         digest = hashlib.sha256(
-            json.dumps(output, sort_keys=True, default=str).encode("utf-8")
+            json.dumps(digest_output, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
         completed = tuple(dict.fromkeys((*prior.completed_steps, named_step.value)))
         receipts = dict(prior.external_receipt_ids)
         receipt = None
         if named_step.value in self.effectful_steps:
-            receipt = accepted_effect or {
+            receipt = (
+                export_receipt.model_dump(mode="json", by_alias=True)
+                if export_receipt is not None
+                else accepted_effect
+            ) or {
                 "receipt_id": effect_key,
                 "output_sha256": digest,
             }
             receipts[named_step.value] = str(receipt["receipt_id"])
+        artifact_bindings = dict(prior.artifact_bindings)
+        package_manifest_ref = prior.package_manifest_ref
+        skill_usage_receipt_ref = prior.skill_usage_receipt_ref
+        if export_receipt is not None:
+            artifact_bindings.update(
+                {
+                    "candidate_manifest": export_receipt.candidate_manifest_ref,
+                    "source_archive": export_receipt.source_archive_ref,
+                }
+            )
+            package_manifest_ref = export_receipt.package_manifest_ref
+            skill_usage_receipt_ref = export_receipt.skill_usage_receipt_ref
         snapshot = prior.model_copy(
             update={
                 "completed_steps": completed,
                 "output_digests": prior.output_digests | {named_step.value: digest},
                 "external_receipt_ids": receipts,
+                "artifact_bindings": artifact_bindings,
+                "package_manifest_ref": package_manifest_ref,
+                "skill_usage_receipt_ref": skill_usage_receipt_ref,
             }
         )
         return StepOutcome(snapshot=snapshot.model_dump(mode="json"), effect_receipt=receipt)
+
+    def _export_receipt(
+        self,
+        job: CreationJobV1,
+        step: SwarmStep,
+        output: Any,
+        accepted_effect: dict[str, Any] | None,
+    ) -> CreationExportReceiptV1 | None:
+        if step is not SwarmStep.EXPORT:
+            return None
+        if accepted_effect is not None:
+            try:
+                return CreationExportReceiptV1.model_validate(accepted_effect)
+            except ValueError:
+                return None
+        if not isinstance(output, CreationExportBundle):
+            # TODO_TOOL[required]: upgrade legacy step_export to return verified bundle bytes.
+            return None
+        if self._artifact_publisher is None:
+            return None
+        return self._artifact_publisher.publish(job, output)
 
     async def _dispatch(self, pipeline: Any, step: SwarmStep, job: CreationJobV1) -> Any:
         if step is SwarmStep.MANAGER:

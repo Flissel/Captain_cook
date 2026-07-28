@@ -31,11 +31,15 @@ from agenten.agent_factory.contracts import (
     AgentFactoryJob,
     FactoryBlockStatus,
     FactoryEvidenceBlock,
+    FactoryJob,
     FactoryPhase,
     FactoryRole,
 )
 from agenten.agent_factory.evidence_store import FactoryEvidenceStore
-from agenten.agent_factory.forge_contracts import CreationResultV1
+from agenten.agent_factory.forge_contracts import (
+    CreationPackageManifestV1,
+    CreationResultV1,
+)
 from agenten.agent_factory.leases import validate_factory_lease
 from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference, TypedN8nTool
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
@@ -778,7 +782,14 @@ class ResolvedFactoryCandidate(_FrozenModel):
 class FactoryCandidateProvider:
     """Explicit candidate lookup; production wiring may resolve it from Minibook artifacts."""
 
-    def candidate_for(self, job: AgentFactoryJob) -> ResolvedFactoryCandidate:
+    def accept_creation_result(
+        self,
+        job: FactoryJob,
+        result: CreationResultV1,
+    ) -> ResolvedFactoryCandidate:
+        raise NotImplementedError
+
+    def candidate_for(self, job: FactoryJob) -> ResolvedFactoryCandidate:
         raise NotImplementedError
 
 
@@ -788,11 +799,203 @@ class StaticFactoryCandidateProvider(FactoryCandidateProvider):
     def __init__(self, candidates: dict[object, ResolvedFactoryCandidate]) -> None:
         self._candidates = dict(candidates)
 
-    def candidate_for(self, job: AgentFactoryJob) -> ResolvedFactoryCandidate:
+    def accept_creation_result(
+        self,
+        job: FactoryJob,
+        result: CreationResultV1,
+    ) -> ResolvedFactoryCandidate:
+        resolved = self.candidate_for(job)
+        source_refs = tuple(
+            ArtifactRef.model_validate(reference.model_dump(mode="json"))
+            for reference in result.artifact_refs
+        )
+        if resolved.candidate.source_archive_ref not in source_refs:
+            raise FactoryDispatchError(
+                "static candidate source is not bound by CreationResultV1"
+            )
+        return resolved
+
+    def candidate_for(self, job: FactoryJob) -> ResolvedFactoryCandidate:
         try:
             return self._candidates[job.job_id]
         except KeyError as exc:
             raise FileNotFoundError("no sealed candidate is registered for the factory job") from exc
+
+
+class ForgeCandidateArtifactStore(Protocol):
+    """Read verified immutable Forge bytes without granting write authority."""
+
+    def read_bytes(self, reference: ArtifactRef) -> bytes: ...
+
+    def local_path(self, reference: ArtifactRef) -> Path: ...
+
+
+class FactoryBlockSource(Protocol):
+    def blocks(self, job_id: object) -> tuple[FactoryEvidenceBlock, ...]: ...
+
+
+class GatewayForgeCandidateProvider(FactoryCandidateProvider):
+    """Resolve candidates only from SHA-verified Forge bytes and Gateway blocks."""
+
+    def __init__(
+        self,
+        *,
+        repository: FactoryBlockSource,
+        artifacts: ForgeCandidateArtifactStore,
+    ) -> None:
+        self._repository = repository
+        self._artifacts = artifacts
+
+    def accept_creation_result(
+        self,
+        job: FactoryJob,
+        result: CreationResultV1,
+    ) -> ResolvedFactoryCandidate:
+        if result.package_manifest_ref is None:
+            raise FactoryDispatchError("Forge package manifest reference is missing")
+        package_ref = _runtime_ref(result.package_manifest_ref)
+        artifact_refs = tuple(_runtime_ref(reference) for reference in result.artifact_refs)
+        resolved, package = self._resolve(
+            job=job,
+            attempt=result.attempt,
+            package_ref=package_ref,
+            artifact_refs=artifact_refs,
+        )
+        if (
+            package.creation_job_id != result.creation_job_id
+            or package.correlation_id != result.correlation_id
+            or package.subject_version != result.subject_version
+        ):
+            raise FactoryDispatchError(
+                "Forge package manifest does not match CreationResultV1"
+            )
+        return resolved
+
+    def candidate_for(self, job: FactoryJob) -> ResolvedFactoryCandidate:
+        block = self._authoritative_block(job)
+        resolved, _ = self._resolve_block(job, block)
+        return resolved
+
+    def current_candidate_ref(
+        self,
+        job: FactoryJob,
+        attempt: int,
+    ) -> ArtifactRef | None:
+        try:
+            block = self._authoritative_block(job, attempt=attempt)
+        except FileNotFoundError:
+            return None
+        resolved, _ = self._resolve_block(job, block)
+        return resolved.candidate.source_archive_ref
+
+    def _authoritative_block(
+        self,
+        job: FactoryJob,
+        *,
+        attempt: int | None = None,
+    ) -> FactoryEvidenceBlock:
+        candidates = tuple(
+            block
+            for block in self._repository.blocks(job.job_id)
+            if block.phase is FactoryPhase.AGENT_CODE_CREATED
+            and block.status is FactoryBlockStatus.SUCCEEDED
+            and block.job_id == job.job_id
+            and block.correlation_id == job.correlation_id
+            and block.subject_version == job.subject_version
+            and (attempt is None or block.attempt == attempt)
+        )
+        if not candidates:
+            raise FileNotFoundError("authoritative Gateway candidate reference is unavailable")
+        highest_attempt = max(block.attempt for block in candidates)
+        latest = tuple(block for block in candidates if block.attempt == highest_attempt)
+        package_refs = {
+            _artifact_identity(block.artifact_refs[0])
+            for block in latest
+            if block.artifact_refs
+        }
+        if len(package_refs) != 1 or any(not block.artifact_refs for block in latest):
+            raise FactoryDispatchError(
+                "authoritative Gateway candidate reference is conflicting"
+            )
+        return max(latest, key=lambda block: (block.occurred_at, str(block.event_id)))
+
+    def _resolve_block(
+        self,
+        job: FactoryJob,
+        block: FactoryEvidenceBlock,
+    ) -> tuple[ResolvedFactoryCandidate, CreationPackageManifestV1]:
+        return self._resolve(
+            job=job,
+            attempt=block.attempt,
+            package_ref=block.artifact_refs[0],
+            artifact_refs=block.artifact_refs[1:],
+        )
+
+    def _resolve(
+        self,
+        *,
+        job: FactoryJob,
+        attempt: int,
+        package_ref: ArtifactRef,
+        artifact_refs: tuple[ArtifactRef, ...],
+    ) -> tuple[ResolvedFactoryCandidate, CreationPackageManifestV1]:
+        if package_ref.media_type != "application/json":
+            raise FactoryDispatchError("Forge package manifest media type is invalid")
+        try:
+            package = CreationPackageManifestV1.model_validate_json(
+                self._artifacts.read_bytes(package_ref)
+            )
+        except (OSError, ValueError) as exc:
+            raise FactoryDispatchError(
+                "Forge package manifest bytes are unavailable or invalid"
+            ) from exc
+        if (
+            package.factory_job_id != job.job_id
+            or package.correlation_id != job.correlation_id
+            or package.subject_version != job.subject_version
+            or package.attempt != attempt
+        ):
+            raise FactoryDispatchError("Forge package manifest does not match factory job")
+
+        candidate_ref = _runtime_ref(package.candidate_manifest_ref)
+        source_ref = _runtime_ref(package.source_archive_ref)
+        bound = {_artifact_identity(reference) for reference in artifact_refs}
+        if {
+            _artifact_identity(candidate_ref),
+            _artifact_identity(source_ref),
+        } - bound:
+            raise FactoryDispatchError(
+                "Forge package manifest references are not bound by agent-code evidence"
+            )
+        try:
+            candidate = FactoryCandidateManifest.model_validate_json(
+                self._artifacts.read_bytes(candidate_ref)
+            )
+            self._artifacts.read_bytes(source_ref)
+            source_path = self._artifacts.local_path(source_ref)
+        except (OSError, ValueError) as exc:
+            raise FactoryDispatchError(
+                "Forge candidate bytes are unavailable or invalid"
+            ) from exc
+        if _artifact_identity(candidate.source_archive_ref) != _artifact_identity(source_ref):
+            raise FactoryDispatchError(
+                "Forge candidate manifest does not match source archive"
+            )
+        return (
+            ResolvedFactoryCandidate(candidate=candidate, source_archive=source_path),
+            package,
+        )
+
+
+def _runtime_ref(reference: object) -> ArtifactRef:
+    dump = getattr(reference, "model_dump", None)
+    if not callable(dump):
+        raise FactoryDispatchError("Forge artifact reference is invalid")
+    return ArtifactRef.model_validate(dump(mode="json"))
+
+
+def _artifact_identity(reference: ArtifactRef) -> tuple[str, str, str]:
+    return reference.uri, reference.sha256, reference.media_type
 
 
 class FactoryTeamExecutionPort(Protocol):
@@ -953,6 +1156,7 @@ class CandidateEvaluationFactory:
             raise FactoryDispatchError(
                 "successful Minibook CreationResultV1 has no generated code artifacts"
             )
+        self._provider.accept_creation_result(request.job, result)
         assert result.package_manifest_ref is not None
         assert result.skill_usage_receipt_ref is not None
         content = json.dumps(

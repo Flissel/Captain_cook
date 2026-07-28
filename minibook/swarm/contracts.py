@@ -172,6 +172,29 @@ class CreationProgressV1(_FrozenContract):
     version: int = Field(ge=1, strict=True)
 
 
+class CreationPackageManifestV1(_FrozenContract):
+    schema_name: Literal["minibook.creation-package-manifest.v1"] = Field(
+        default="minibook.creation-package-manifest.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    creation_job_id: UUID
+    factory_job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    candidate_manifest_ref: ArtifactRef
+    source_archive_ref: ArtifactRef
+
+    @model_validator(mode="after")
+    def require_executable_media_types(self) -> "CreationPackageManifestV1":
+        if self.candidate_manifest_ref.media_type != "application/json":
+            raise ValueError("candidate manifest must be application/json")
+        if self.source_archive_ref.media_type != "application/zip":
+            raise ValueError("candidate source must be application/zip")
+        return self
+
+
 class CreationResultV1(_FrozenContract):
     schema_name: Literal["minibook.creation-result.v1"] = Field(default="minibook.creation-result.v1", alias="schema", serialization_alias="schema")
     creation_job_id: UUID

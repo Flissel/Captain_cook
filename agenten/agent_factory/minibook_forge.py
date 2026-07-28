@@ -19,6 +19,13 @@ from agenten.agent_factory.forge_contracts import (
     CreationResultV1,
     CreationSubmissionReceipt,
 )
+from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
+from agenten.agent_factory.skill_workflow_contracts import (
+    CodebaseInventoryV1,
+    CodexBuildBriefV1,
+    FactorySkillStep,
+)
+from agenten.agent_factory.state_machine import FactoryActionKind
 
 
 class FactoryInputMaterializer(Protocol):
@@ -28,6 +35,115 @@ class FactoryInputMaterializer(Protocol):
 
 class CreationJobMapper(Protocol):
     def map(self, request: FactoryDispatch) -> CreationJobV1: ...
+
+
+class CaptainForgeEvidencePort(Protocol):
+    """Read only Captain-owned evidence required to authorize a Forge job."""
+
+    def workflow_artifacts(self, job_id: UUID) -> tuple[object, ...]: ...
+
+    def released_for(
+        self,
+        job: object,
+        step: FactorySkillStep,
+    ) -> ReleasedHermesSkill: ...
+
+
+class CaptainCreationJobMapper:
+    """Map one exact Captain-approved Codex brief to Minibook's boundary."""
+
+    def __init__(self, *, evidence: CaptainForgeEvidencePort) -> None:
+        self._evidence = evidence
+
+    def map(self, request: FactoryDispatch) -> CreationJobV1:
+        if request.action.kind is not FactoryActionKind.SUBMIT_FORGE_JOB:
+            raise FactoryDispatchError("creation job requires Captain's submit-forge action")
+        if request.role is not None or request.lease is not None:
+            raise FactoryDispatchError("creation job must not receive a Hermes role lease")
+
+        job = request.job
+        attempt = request.action.attempt
+        artifacts = self._evidence.workflow_artifacts(job.job_id)
+        inventories = tuple(
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, CodebaseInventoryV1)
+            and _matches_dispatch(artifact, job, attempt)
+        )
+        briefs = tuple(
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, CodexBuildBriefV1)
+            and _matches_dispatch(artifact, job, attempt)
+        )
+        if len(inventories) != 1 or len(briefs) != 1:
+            raise FactoryDispatchError(
+                "creation job requires exactly one Captain inventory and Codex brief"
+            )
+        inventory = inventories[0]
+        brief = briefs[0]
+
+        if inventory.artifact_ref not in brief.context_refs:
+            raise FactoryDispatchError("Codex brief is not bound to the Captain inventory")
+
+        assignment = brief.build_assignment
+        released = self._evidence.released_for(job, FactorySkillStep.BRIEF_CODEX)
+        invoked = brief.invocation.released_skill
+        if released != invoked:
+            raise FactoryDispatchError("Codex brief does not use Captain's released skill")
+        if (
+            not _same_artifact_ref(brief.invocation.input_ref, job.input_ref)
+            or not _same_artifact_ref(assignment.compiled_spec_ref, job.compiled_spec_ref)
+            or not _same_artifact_ref(
+                assignment.dependency_graph_ref, job.dependency_graph_ref
+            )
+            or assignment.deadline_at != job.deadline_at
+            or tuple(assignment.public_assertion_ids)
+            != tuple(job.acceptance_assertion_ids)
+        ):
+            raise FactoryDispatchError("Codex assignment does not match the dispatched job")
+
+        return CreationJobV1.model_validate(
+            {
+                "creation_job_id": assignment.creation_job_id,
+                "factory_job_id": job.job_id,
+                "correlation_id": job.correlation_id,
+                "causation_id": brief.invocation_id,
+                "subject_version": job.subject_version,
+                "attempt": attempt,
+                "idempotency_key": assignment.idempotency_key,
+                "input_ref": job.input_ref.model_dump(mode="json"),
+                "compiled_spec_ref": assignment.compiled_spec_ref.model_dump(mode="json"),
+                "dependency_graph_ref": assignment.dependency_graph_ref.model_dump(mode="json"),
+                "released_skill": {
+                    "skill_id": released.skill_id,
+                    "version": released.version,
+                    "content_ref": released.content_ref.model_dump(mode="json"),
+                    "content_sha256": released.content_sha256,
+                },
+                "public_assertion_ids": assignment.public_assertion_ids,
+                "deadline_at": assignment.deadline_at,
+            }
+        )
+
+
+def _same_artifact_ref(left: object, right: object) -> bool:
+    left_dump = getattr(left, "model_dump", None)
+    right_dump = getattr(right, "model_dump", None)
+    if not callable(left_dump) or not callable(right_dump):
+        return False
+    return left_dump(mode="json") == right_dump(mode="json")
+
+
+def _matches_dispatch(artifact: object, job: object, attempt: int) -> bool:
+    return (
+        getattr(artifact, "job_id", None) == getattr(job, "job_id", None)
+        and getattr(artifact, "correlation_id", None)
+        == getattr(job, "correlation_id", None)
+        and getattr(artifact, "subject_version", None)
+        == getattr(job, "subject_version", None)
+        and getattr(artifact, "attempt", None) == attempt
+    )
 
 
 @dataclass(frozen=True)

@@ -10,6 +10,7 @@ import pytest
 from agenten.agent_factory.forge_contracts import CreationJobV1
 from agenten.agent_factory.contracts import AgentFactoryJob
 from agenten.agent_factory.minibook_forge import (
+    CaptainCreationJobMapper,
     MinibookForgeHttpClient,
     MinibookForgeHttpSettings,
     MinibookForgeSettings,
@@ -17,6 +18,16 @@ from agenten.agent_factory.minibook_forge import (
 )
 from agenten.agent_factory.orchestration import FactoryDispatch
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
+from agenten.agent_factory.skill_workflow_contracts import (
+    CodebaseInventoryV1,
+    CodexBuildBriefV1,
+    FactorySkillStep,
+)
+from tests.agent_factory.test_skill_workflow_contracts import (
+    brief_payload,
+    inventory_payload,
+)
+from tests.agent_factory.test_state_machine import job_v3
 
 
 def job() -> AgentFactoryJob:
@@ -47,6 +58,156 @@ class Mapper:
     def map(self, _request: FactoryDispatch) -> CreationJobV1:
         fixture = Path("tests/fixtures/contracts/minibook_creation_job.v1.json")
         return CreationJobV1.model_validate_json(fixture.read_text(encoding="utf-8"))
+
+
+def _workflow_evidence():
+    factory_job = job_v3(mode="demo")
+
+    def bind(payload: dict[str, object]) -> dict[str, object]:
+        invocation = payload["invocation"]
+        assert isinstance(invocation, dict)
+        lease = invocation["lease"]
+        assert isinstance(lease, dict)
+        invocation.update(
+            {
+                "job_id": str(factory_job.job_id),
+                "correlation_id": str(factory_job.correlation_id),
+                "subject_version": factory_job.subject_version,
+                "attempt": 1,
+                "input_ref": factory_job.input_ref.model_dump(mode="json"),
+                "input_sha256": factory_job.input_ref.sha256,
+                "acceptance_assertion_ids": list(factory_job.acceptance_assertion_ids),
+            }
+        )
+        lease.update(
+            {
+                "job_id": str(factory_job.job_id),
+                "correlation_id": str(factory_job.correlation_id),
+                "subject_version": factory_job.subject_version,
+                "attempt": 1,
+            }
+        )
+        payload.update(
+            {
+                "job_id": str(factory_job.job_id),
+                "correlation_id": str(factory_job.correlation_id),
+                "subject_version": factory_job.subject_version,
+                "attempt": 1,
+                "acceptance_assertion_ids": list(factory_job.acceptance_assertion_ids),
+            }
+        )
+        return payload
+
+    inventory = CodebaseInventoryV1.model_validate(bind(inventory_payload()))
+    brief_data = bind(brief_payload())
+    brief_data["context_refs"] = [inventory.artifact_ref.model_dump(mode="json")]
+    invocation = brief_data["invocation"]
+    assert isinstance(invocation, dict)
+    assignment = brief_data["build_assignment"]
+    assert isinstance(assignment, dict)
+    assignment.update(
+        {
+            "correlation_id": str(factory_job.correlation_id),
+            "subject_version": factory_job.subject_version,
+            "attempt": 1,
+            "compiled_spec_ref": factory_job.compiled_spec_ref.model_dump(mode="json"),
+            "dependency_graph_ref": factory_job.dependency_graph_ref.model_dump(mode="json"),
+            "released_skill": {
+                "skill_id": invocation["released_skill"]["skill_id"],
+                "version": invocation["released_skill"]["version"],
+                "content_ref": invocation["released_skill"]["content_ref"],
+                "content_sha256": invocation["released_skill"]["content_sha256"],
+            },
+            "public_assertion_ids": list(factory_job.acceptance_assertion_ids),
+            "idempotency_key": invocation["idempotency_key"],
+            "workspace_ref": invocation["lease"]["workspace_ref"],
+            "deadline_at": factory_job.deadline_at,
+        }
+    )
+    brief = CodexBuildBriefV1.model_validate(brief_data)
+    return factory_job, inventory, brief
+
+
+class ForgeEvidence:
+    def __init__(self, inventory, brief) -> None:
+        self.artifacts = (inventory, brief)
+
+    def workflow_artifacts(self, job_id):
+        assert job_id == self.artifacts[0].job_id
+        return self.artifacts
+
+    def released_for(self, job, step):
+        assert job.job_id == self.artifacts[1].job_id
+        assert step is FactorySkillStep.BRIEF_CODEX
+        return self.artifacts[1].invocation.released_skill
+
+
+def test_creation_job_mapper_uses_exact_captain_brief_and_is_deterministic() -> None:
+    factory_job, inventory, brief = _workflow_evidence()
+    request = FactoryDispatch(
+        job=factory_job,
+        action=FactoryAction(kind=FactoryActionKind.SUBMIT_FORGE_JOB, attempt=1),
+        role=None,
+        lease=None,
+    )
+    mapper = CaptainCreationJobMapper(evidence=ForgeEvidence(inventory, brief))
+
+    first = mapper.map(request)
+    second = mapper.map(request)
+
+    assignment = brief.build_assignment
+    assert first == second
+    assert first.creation_job_id == assignment.creation_job_id
+    assert first.factory_job_id == factory_job.job_id
+    assert first.correlation_id == factory_job.correlation_id
+    assert first.causation_id == brief.invocation_id
+    assert first.subject_version == factory_job.subject_version
+    assert first.attempt == request.action.attempt
+    assert first.idempotency_key == assignment.idempotency_key
+    assert first.input_ref.sha256 == factory_job.input_ref.sha256
+    assert first.compiled_spec_ref.sha256 == factory_job.compiled_spec_ref.sha256
+    assert first.dependency_graph_ref.sha256 == factory_job.dependency_graph_ref.sha256
+    assert first.released_skill.content_sha256 == brief.invocation.released_skill.content_sha256
+    assert first.public_assertion_ids == factory_job.acceptance_assertion_ids
+    assert first.deadline_at == factory_job.deadline_at
+
+
+def test_creation_job_mapper_rejects_missing_blueprint_inventory_binding() -> None:
+    factory_job, inventory, brief = _workflow_evidence()
+    changed = brief.model_copy(update={"context_refs": ()})
+    mapper = CaptainCreationJobMapper(evidence=ForgeEvidence(inventory, changed))
+
+    with pytest.raises(RuntimeError, match="inventory"):
+        mapper.map(
+            FactoryDispatch(
+                job=factory_job,
+                action=FactoryAction(kind=FactoryActionKind.SUBMIT_FORGE_JOB, attempt=1),
+                role=None,
+                lease=None,
+            )
+        )
+
+
+def test_creation_job_mapper_rejects_brief_for_different_input() -> None:
+    factory_job, inventory, brief = _workflow_evidence()
+    changed_invocation = brief.invocation.model_copy(
+        update={"input_ref": inventory.artifact_ref}
+    )
+    changed = brief.model_copy(update={"invocation": changed_invocation})
+    mapper = CaptainCreationJobMapper(evidence=ForgeEvidence(inventory, changed))
+
+    with pytest.raises(RuntimeError, match="assignment"):
+        mapper.map(
+            FactoryDispatch(
+                job=factory_job,
+                action=FactoryAction(
+                    kind=FactoryActionKind.SUBMIT_FORGE_JOB,
+                    attempt=1,
+                ),
+                role=None,
+                lease=None,
+            )
+        )
 
 
 @pytest.mark.asyncio
