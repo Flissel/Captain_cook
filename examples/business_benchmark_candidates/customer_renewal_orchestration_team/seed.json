@@ -4,7 +4,7 @@
   "max_messages": 12,
   "max_handoffs": 2,
   "max_tool_calls": 1,
-  "termination_conditions": ["max_messages", "max_handoffs", "max_tool_calls"],
+  "termination_conditions": ["task_completed", "max_messages", "max_handoffs", "max_tool_calls"],
   "agents": [
     {
       "name": "renewal_analyst",

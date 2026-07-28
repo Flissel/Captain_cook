@@ -4,7 +4,7 @@
   "max_messages": 10,
   "max_handoffs": 2,
   "max_tool_calls": 0,
-  "termination_conditions": ["max_messages", "max_handoffs"],
+  "termination_conditions": ["task_completed", "max_messages", "max_handoffs"],
   "agents": [
     {
       "name": "intake_specialist",
