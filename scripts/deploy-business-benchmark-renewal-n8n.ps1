@@ -195,6 +195,14 @@ function Read-AndValidateWorkflow {
     if (Test-ForbiddenProperty -Value $workflow) {
         throw "Canonical renewal workflow contains a forbidden sensitive field."
     }
+    $settingNames = @($workflow.settings.PSObject.Properties | ForEach-Object { $_.Name } | Sort-Object)
+    if (
+        ($settingNames -join "|") -cne "availableInMCP|executionOrder" -or
+        $workflow.settings.availableInMCP -ne $true -or
+        $workflow.settings.executionOrder -cne "v1"
+    ) {
+        throw "Canonical renewal workflow MCP availability settings are invalid."
+    }
 
     $publishPayload = [ordered]@{}
     foreach ($field in $allowedPublishFields) {
@@ -670,6 +678,33 @@ function ConvertFrom-NestedJson {
     return $current
 }
 
+function Test-McpStructuredError {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) { return $false }
+    if ($Value -is [pscustomobject]) {
+        $status = $Value.PSObject.Properties["status"]
+        if ($null -ne $status -and ([string]$status.Value).Trim().ToLowerInvariant() -in @("error", "failed", "failure")) {
+            return $true
+        }
+        $errorProperty = $Value.PSObject.Properties["error"]
+        if ($null -ne $errorProperty -and $null -ne $errorProperty.Value) {
+            if ($errorProperty.Value -isnot [string] -or -not [string]::IsNullOrWhiteSpace($errorProperty.Value)) {
+                return $true
+            }
+        }
+        foreach ($property in $Value.PSObject.Properties) {
+            if (Test-McpStructuredError -Value $property.Value) { return $true }
+        }
+    }
+    elseif ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        foreach ($item in $Value) {
+            if (Test-McpStructuredError -Value $item) { return $true }
+        }
+    }
+    return $false
+}
+
 function Invoke-McpTool {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
@@ -703,7 +738,11 @@ function Invoke-McpTool {
         throw "Captain n8n MCP tool failed."
     }
     if ($null -ne $result.PSObject.Properties["structuredContent"] -and $null -ne $result.structuredContent) {
-        return ConvertFrom-NestedJson -Value $result.structuredContent
+        $structured = ConvertFrom-NestedJson -Value $result.structuredContent
+        if (Test-McpStructuredError -Value $structured) {
+            throw "Captain n8n MCP tool reported an error."
+        }
+        return $structured
     }
     $texts = @(
         @($result.content) |
@@ -713,7 +752,11 @@ function Invoke-McpTool {
     if ($texts.Count -eq 0) {
         throw "Captain n8n MCP tool returned no structured output."
     }
-    return ConvertFrom-NestedJson -Value ($texts -join "`n")
+    $structured = ConvertFrom-NestedJson -Value ($texts -join "`n")
+    if (Test-McpStructuredError -Value $structured) {
+        throw "Captain n8n MCP tool reported an error."
+    }
+    return $structured
 }
 
 function Find-UniqueValues {

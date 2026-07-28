@@ -73,6 +73,11 @@ def test_validate_accepts_canonical_workflow_and_reports_exact_digest() -> None:
         "workflow_name": "Captain Renewal Context Read v1",
         "canonical_sha256": hashlib.sha256(WORKFLOW.read_bytes()).hexdigest(),
     }
+    workflow = json.loads(WORKFLOW.read_text(encoding="utf-8"))
+    assert workflow["settings"] == {
+        "availableInMCP": True,
+        "executionOrder": "v1",
+    }
 
 
 @pytest.mark.parametrize(
@@ -184,6 +189,7 @@ $global:postFields = @()
 $global:activations = 0
 $global:detailReads = 0
 $global:activationJson = $false
+$global:publishedMcpAvailability = $false
 function Invoke-WebRequest {{
     param($Uri, $Method = 'GET', $Headers, $Body, $ContentType, [switch]$UseBasicParsing, $TimeoutSec, $ErrorAction)
     $target = [string]$Uri
@@ -198,6 +204,7 @@ function Invoke-WebRequest {{
     if ($target -eq 'http://127.0.0.1:5679/api/v1/workflows' -and $verb -eq 'POST') {{
         $global:posts++
         $payload = $Body | ConvertFrom-Json -Depth 40
+        $global:publishedMcpAvailability = $payload.settings.availableInMCP
         $global:postFields = @($payload.PSObject.Properties | ForEach-Object {{ $_.Name }} | Sort-Object)
         $payload | Add-Member -NotePropertyName id -NotePropertyValue 'renewal-owned-1'
         $payload | Add-Member -NotePropertyName active -NotePropertyValue $false
@@ -276,6 +283,7 @@ try {{
     post_fields = @($global:postFields)
     activations = $global:activations
     activation_json = $global:activationJson
+    published_mcp_availability = $global:publishedMcpAvailability
     ownership_after_failure = $ownershipAfterFailure
     deployment_after_failure = $deploymentAfterFailure
     ownership_receipts = @(Get-ChildItem -LiteralPath {_pwsh_literal(evidence)} -Filter 'renewal-context-n8n-ownership.v1.json' -File -ErrorAction SilentlyContinue).Count
@@ -302,6 +310,7 @@ try {{
         "post_fields": ["connections", "name", "nodes", "settings"],
         "activations": 1,
         "activation_json": True,
+        "published_mcp_availability": True,
         "ownership_after_failure": 1,
         "deployment_after_failure": 0,
         "ownership_receipts": 1,
@@ -372,6 +381,7 @@ $global:puts = 0
 $global:activations = 0
 $global:executes = 0
 $global:gets = 0
+$global:returnMcpError = $false
 function Invoke-WebRequest {{
     param($Uri, $Method = 'GET', $Headers, $Body, $ContentType, [switch]$UseBasicParsing, $TimeoutSec, $ErrorAction)
     $target = [string]$Uri
@@ -406,7 +416,11 @@ function Invoke-WebRequest {{
         $request = $Body | ConvertFrom-Json -Depth 40
         if ($request.params.name -eq 'execute_workflow') {{
             $global:executes++
-            $value = @{{ workflowId = 'renewal-owned-activation'; executionId = 'activation-execution-1'; status = 'running' }}
+            $value = if ($global:returnMcpError) {{
+                @{{ executionId = $null; status = 'error'; error = 'Workflow is not available in MCP' }}
+            }} else {{
+                @{{ workflowId = 'renewal-owned-activation'; executionId = 'activation-execution-1'; status = 'running' }}
+            }}
         }} elseif ($request.params.name -eq 'get_execution') {{
             $global:gets++
             $value = @{{
@@ -435,9 +449,15 @@ $secondFailed = $false
 try {{
     $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)}
 }} catch {{ $secondFailed = $true }}
+$global:returnMcpError = $true
+$thirdError = $null
+try {{
+    $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)}
+}} catch {{ $thirdError = $_.Exception.Message }}
 @{{
     first_failed = $firstFailed
     second_failed = $secondFailed
+    third_error = $thirdError
     posts = $global:posts
     puts = $global:puts
     activations = $global:activations
@@ -455,12 +475,148 @@ try {{
     assert json.loads(result.stdout) == {
         "first_failed": True,
         "second_failed": False,
+        "third_error": "Captain n8n MCP tool reported an error.",
         "posts": 1,
         "puts": 0,
         "activations": 1,
-        "executes": 1,
+        "executes": 2,
         "gets": 1,
         "activation_after_failure": 0,
         "activation_receipts": 1,
         "smoke_receipts": 1,
+    }
+
+
+def test_mcp_structured_error_fails_as_tool_error_before_execution_id_lookup(
+    tmp_path: Path,
+) -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+
+    assert "Captain n8n MCP tool reported an error." in source
+    assert "structuredContent" in source
+    assert "status" in source
+    assert "error" in source
+
+
+def test_owned_pre_mcp_workflow_is_updated_and_revalidated(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "evidence"
+    workflow_id = "renewal-owned-pre-mcp"
+    workflow = json.loads(WORKFLOW.read_text(encoding="utf-8"))
+    old_payload = {
+        key: workflow[key] for key in ("name", "nodes", "connections", "settings")
+    }
+    old_payload["settings"] = {"executionOrder": "v1"}
+    old_digest = hashlib.sha256(
+        json.dumps(old_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    ownership_digest = hashlib.sha256(
+        (
+            "captain.business-benchmark-renewal-n8n.v1|"
+            f"Captain Renewal Context Read v1|{workflow_id}"
+        ).encode()
+    ).hexdigest()
+    evidence.mkdir(parents=True)
+    (evidence / "renewal-context-n8n-ownership.v1.json").write_text(
+        json.dumps(
+            {
+                "schema": "captain.business-benchmark-renewal-n8n-ownership.v1",
+                "ownership": "captain",
+                "endpoint_id": "captain-n8n-local-5679",
+                "workflow_name": "Captain Renewal Context Read v1",
+                "workflow_id": workflow_id,
+                "ownership_binding_sha256": ownership_digest,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    deployment_dir = evidence / "renewal-context-n8n-deployments"
+    deployment_dir.mkdir()
+    (deployment_dir / f"{old_digest}.json").write_text(
+        json.dumps(
+            {
+                "schema": "captain.business-benchmark-renewal-n8n-deployment-receipt.v1",
+                "ownership_binding_sha256": ownership_digest,
+                "workflow_id": workflow_id,
+                "workflow_name": "Captain Renewal Context Read v1",
+                "canonical_sha256": "0" * 64,
+                "published_sha256": old_digest,
+                "published_payload": old_payload,
+                "verification": "provider_read_back_matched",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    old_remote = {**old_payload, "id": workflow_id, "active": True}
+    remote_json = json.dumps(old_remote).replace("'", "''")
+    canonical_sha = hashlib.sha256(WORKFLOW.read_bytes()).hexdigest()
+    harness = f"""
+$ErrorActionPreference = 'Stop'
+$env:CAPTAIN_N8N_API_KEY = 'dummy-api-value-for-test'
+$env:CAPTAIN_N8N_MCP_TOKEN = 'dummy-mcp-value-for-test'
+$env:CAPTAIN_N8N_PORT = '5679'
+$global:remote = '{remote_json}' | ConvertFrom-Json -Depth 40
+$global:posts = 0
+$global:puts = 0
+$global:activations = 0
+$global:executes = 0
+$global:gets = 0
+function Invoke-WebRequest {{
+    param($Uri, $Method = 'GET', $Headers, $Body, $ContentType, [switch]$UseBasicParsing, $TimeoutSec, $ErrorAction)
+    $target = [string]$Uri
+    $verb = [string]$Method
+    if ($target -eq 'http://127.0.0.1:5679/healthz') {{ return [pscustomobject]@{{ StatusCode = 200; Content = '{{}}' }} }}
+    if ($target.StartsWith('http://127.0.0.1:5679/api/v1/workflows?') -and $verb -eq 'GET') {{
+        return [pscustomobject]@{{ StatusCode = 200; Content = (@{{ data = @($global:remote); nextCursor = $null }} | ConvertTo-Json -Depth 40 -Compress) }}
+    }}
+    if ($target -eq 'http://127.0.0.1:5679/api/v1/workflows' -and $verb -eq 'POST') {{ $global:posts++; throw 'unexpected create' }}
+    if ($target -eq 'http://127.0.0.1:5679/api/v1/workflows/{workflow_id}' -and $verb -eq 'GET') {{
+        return [pscustomobject]@{{ StatusCode = 200; Content = ($global:remote | ConvertTo-Json -Depth 40 -Compress) }}
+    }}
+    if ($target -eq 'http://127.0.0.1:5679/api/v1/workflows/{workflow_id}' -and $verb -eq 'PUT') {{
+        if ($ContentType -ne 'application/json') {{ throw 'update requires JSON' }}
+        $global:puts++
+        $global:remote = $Body | ConvertFrom-Json -Depth 40
+        $global:remote | Add-Member -NotePropertyName id -NotePropertyValue '{workflow_id}'
+        $global:remote | Add-Member -NotePropertyName active -NotePropertyValue $false
+        return [pscustomobject]@{{ StatusCode = 200; Content = ($global:remote | ConvertTo-Json -Depth 40 -Compress) }}
+    }}
+    if ($target -eq 'http://127.0.0.1:5679/api/v1/workflows/{workflow_id}/activate' -and $verb -eq 'POST') {{
+        $global:activations++
+        $global:remote.active = $true
+        return [pscustomobject]@{{ StatusCode = 200; Content = (@{{ id = '{workflow_id}'; active = $true }} | ConvertTo-Json -Compress) }}
+    }}
+    if ($target -eq 'http://127.0.0.1:5679/mcp-server/http' -and $verb -eq 'POST') {{
+        $request = $Body | ConvertFrom-Json -Depth 40
+        if ($request.params.name -eq 'execute_workflow') {{
+            $global:executes++
+            $value = @{{ workflowId = '{workflow_id}'; executionId = 'updated-execution-1'; status = 'running' }}
+        }} else {{
+            $global:gets++
+            $value = @{{ workflowId = '{workflow_id}'; executionId = 'updated-execution-1'; status = 'success'; output = @{{ operation = 'read_renewal_context'; idempotency_key = 'captain-renewal-smoke-{canonical_sha[:32]}'; status = 'read'; facts = @('renewal_window.synthetic-90d', 'engagement_band.synthetic-medium', 'commercial_evidence_state.synthetic-complete', 'consent_state.synthetic-consented') }} }}
+        }}
+        $response = @{{ jsonrpc = '2.0'; id = $request.id; result = @{{ structuredContent = $value }} }}
+        return [pscustomobject]@{{ StatusCode = 200; Content = ($response | ConvertTo-Json -Depth 40 -Compress) }}
+    }}
+    throw "unexpected request $verb $target"
+}}
+$failed = $false
+try {{ $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)} }} catch {{ $failed = $true }}
+@{{ failed = $failed; posts = $global:posts; puts = $global:puts; activations = $global:activations; executes = $global:executes; gets = $global:gets; available_in_mcp = $global:remote.settings.availableInMCP }} | ConvertTo-Json -Compress
+"""
+
+    result = _run_harness(tmp_path, harness)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "failed": False,
+        "posts": 0,
+        "puts": 1,
+        "activations": 1,
+        "executes": 1,
+        "gets": 1,
+        "available_in_mcp": True,
     }

@@ -34,5 +34,5 @@
       "main": [[{"node": "Read Synthetic Renewal Context", "type": "main", "index": 0}]]
     }
   },
-  "settings": {"executionOrder": "v1"}
+  "settings": {"availableInMCP": true, "executionOrder": "v1"}
 }
