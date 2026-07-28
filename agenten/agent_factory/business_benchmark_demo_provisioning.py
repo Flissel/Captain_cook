@@ -84,7 +84,7 @@ _PROFILE_ORDER: tuple[tuple[Literal["claims", "renewal"], str], ...] = (
     ("claims", CLAIMS_SEED_PROFILE),
     ("renewal", RENEWAL_SEED_PROFILE),
 )
-_CAPABILITY = "business_benchmark_team"
+_CAPABILITY = "factory_workflow"
 _ASSERTION_IDS = (
     "business_value",
     "safe_tool_use",

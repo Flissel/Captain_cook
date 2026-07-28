@@ -44,10 +44,15 @@ from agenten.agent_factory.contracts import (
 )
 from agenten.agent_factory.execution_budget import FactoryBudgetProjection
 from agenten.agent_factory.hermes_cli import HermesCliFactory, HermesCliSettings
+from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.orchestration import FactoryDispatch
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
-from agenten.agent_factory.skill_workflow_contracts import FactorySkillStep
+from agenten.agent_factory.skill_workflow_contracts import (
+    FactorySkillInvocationV1,
+    FactorySkillStep,
+)
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
+from agenten.agent_factory.team_execution import CaptainReleasedSkillAuthority
 
 
 ISSUED_AT = datetime(2026, 7, 28, 18, 0, tzinfo=timezone.utc)
@@ -162,6 +167,65 @@ def test_dry_run_is_side_effect_free_and_contains_two_redacted_stable_plans(
     assert "password" not in serialized
     assert LOCAL_DSN not in serialized
     assert not (tmp_path / ".captain-cook").exists()
+
+
+def test_execute_team_release_uses_canonical_factory_workflow_capability(
+    tmp_path: Path,
+) -> None:
+    team = BusinessBenchmarkDemoProvisioner(settings(tmp_path)).plan().teams[0]
+    released_by_step = dict(
+        zip(team.released_workflow_steps, team.released_skills, strict=True)
+    )
+    released = released_by_step[FactorySkillStep.EXECUTE_TEAM]
+    lease = issue_factory_lease(
+        job=team.job,
+        role=FactoryRole.REAL_CASE_TESTER,
+        attempt=1,
+        workspace_ref="workspace://factory/business-benchmark-execute-team",
+        now=ISSUED_AT,
+    )
+    invocation = FactorySkillInvocationV1(
+        schema_name="captain.factory-skill-invocation.v1",
+        invocation_id=UUID("71000000-0000-0000-0000-000000000001"),
+        job_id=team.job.job_id,
+        correlation_id=team.job.correlation_id,
+        subject_version=team.job.subject_version,
+        attempt=1,
+        step=FactorySkillStep.EXECUTE_TEAM,
+        released_skill=released,
+        input_ref=team.job.input_ref,
+        input_sha256=team.job.input_ref.sha256,
+        lease=lease,
+        idempotency_key="f" * 64,
+        acceptance_assertion_ids=team.job.acceptance_assertion_ids,
+        execution_scope_ref=team.job.private_holdout_refs[0],
+    )
+
+    class Catalog:
+        def released_for(
+            self, job: AgentFactoryJobV3, step: FactorySkillStep
+        ) -> ReleasedHermesSkill:
+            assert job == team.job
+            assert step is FactorySkillStep.EXECUTE_TEAM
+            return released
+
+    authorized = CaptainReleasedSkillAuthority(
+        catalog=Catalog(),  # type: ignore[arg-type]
+        skill_root=(
+            Path(__file__).resolve().parents[2]
+            / "agenten"
+            / "agent_factory"
+            / "skills"
+        ),
+    ).authorize(
+        job=team.job,
+        invocation=invocation,
+        now=ISSUED_AT + timedelta(minutes=1),
+    )
+
+    assert team.job.required_capability == "factory_workflow"
+    assert released.capability == team.job.required_capability
+    assert authorized == released
 
 
 def test_apply_persists_only_legal_initial_gateway_authority_and_is_idempotent(
