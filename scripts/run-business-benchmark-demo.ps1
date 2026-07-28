@@ -348,10 +348,15 @@ try {
         $null = Require-NonEmpty $team.candidate_id "$($team.profile).candidate_id"
         if (
             [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
-            [string]$team.gateway_budget_remaining_usd -cne $maximumUsdPerTeam -or
             @($team.job.execution_policy.allowed_models) -notcontains $model
         ) {
             throw 'Provisioned team model or budget does not match the demo authority.'
+        }
+        if (
+            $Action -ceq 'Run' -and
+            [string]$team.gateway_budget_remaining_usd -cne $maximumUsdPerTeam
+        ) {
+            throw 'Applied team Gateway budget does not match the demo authority.'
         }
     }
     $renewalBatchId = Require-NonEmpty $renewal.work_batch.batch_id 'renewal.work_batch.batch_id'

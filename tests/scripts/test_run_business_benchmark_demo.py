@@ -39,6 +39,8 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "OPENAI_API_KEY" not in source.split("$rootEnvAllowlist", 1)[1].split(
         ")", 1
     )[0]
+    assert "$Action -ceq 'Run' -and" in source
+    assert "Applied team Gateway budget does not match" in source
     assert "docker compose down" not in source
     assert "VibeMind" not in source
     assert PREFLIGHT.is_file()
