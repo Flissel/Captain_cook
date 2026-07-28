@@ -97,12 +97,22 @@ class MinibookForgePort(Protocol):
 
     async def result(self, creation_job_id: UUID) -> CreationResultV1: ...
 
+    async def wait_for_result(self, creation_job_id: UUID) -> CreationResultV1:
+        """Return a bounded terminal result for an accepted async submission."""
+
 
 class FactoryCandidateValidationPort(Protocol):
     """Evaluate the sealed generated candidate in an isolated workspace."""
 
     async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
         """Return build, real-case, or quality evidence for the leased role."""
+
+    async def record_creation_result(
+        self,
+        request: FactoryDispatch,
+        result: CreationResultV1,
+    ) -> FactoryEvidenceBlock:
+        """Validate and seal exact Forge output as agent-code evidence."""
 
 
 class FactoryBusinessBenchmarkPort(Protocol):
@@ -585,7 +595,53 @@ class FactoryDispatcher:
             self._coordinator.record(evidence)
             return action
         if action.kind is FactoryActionKind.SUBMIT_FORGE_JOB:
-            await self._forge.submit(FactoryDispatch(job=job, action=action, role=None, lease=None))
+            if self._candidate_validator is None:
+                raise FactoryDispatchError(
+                    "Forge submission requires the candidate evidence validator"
+                )
+            submission = await self._forge.submit(
+                FactoryDispatch(job=job, action=action, role=None, lease=None)
+            )
+            if isinstance(submission, CreationSubmissionReceipt):
+                if submission.subject_version != job.subject_version:
+                    raise FactoryDispatchError(
+                        "Minibook creation receipt does not match the factory subject version"
+                    )
+                result = await self._forge.wait_for_result(submission.creation_job_id)
+                if result.creation_job_id != submission.creation_job_id:
+                    raise FactoryDispatchError(
+                        "Minibook creation result does not match the submitted creation job"
+                    )
+            elif isinstance(submission, CreationResultV1):
+                # The offline Forge returns no separate receipt. Its strongest
+                # available binding is validated below from correlation,
+                # subject version, attempt, status, and content references.
+                result = submission
+            else:
+                raise FactoryDispatchError(
+                    "Minibook Forge did not return a creation receipt or result"
+                )
+            now = self._clock.now()
+            evidence_action = FactoryAction(
+                kind=FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE,
+                attempt=action.attempt,
+            )
+            evidence_request = FactoryDispatch(
+                job=job,
+                action=evidence_action,
+                role=FactoryRole.TOOL_INTEGRATOR,
+                lease=self._leases.active(
+                    job,
+                    FactoryRole.TOOL_INTEGRATOR,
+                    action.attempt,
+                    now,
+                ),
+            )
+            evidence = await self._candidate_validator.record_creation_result(
+                evidence_request,
+                result,
+            )
+            self._coordinator.record(evidence)
             return action
         raise FactoryDispatchError(
             f"{action.kind.value} is a Captain state transition, not an external dispatch"

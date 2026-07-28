@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 from types import SimpleNamespace
+from uuid import uuid4
 import zipfile
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from agenten.agent_factory.candidate_evaluation import (
 )
 from agenten.agent_factory.contracts import FactoryPhase, FactoryRole
 from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
+from agenten.agent_factory.forge_contracts import CreationResultV1
 from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
@@ -763,7 +765,7 @@ async def test_real_case_dispatch_never_accepts_candidate_owned_offline_evaluato
 
 
 @pytest.mark.asyncio
-async def test_validator_emits_agent_code_evidence_for_a_leased_forge_result(tmp_path: Path) -> None:
+async def test_validator_rejects_agent_code_evidence_without_exact_forge_result(tmp_path: Path) -> None:
     archive_path = tmp_path / "candidate.zip"
     team_ref, workflow_ref, input_schema_ref, output_schema_ref, source_ref = _write_candidate_archive(archive_path)
     candidate = FactoryCandidateManifest(
@@ -787,15 +789,140 @@ async def test_validator_emits_agent_code_evidence_for_a_leased_forge_result(tmp
         evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
     )
 
-    block = await validator.dispatch(
-        FactoryDispatch(
-            job=factory_job,
-            action=FactoryAction(kind=FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE, attempt=1),
-            role=FactoryRole.TOOL_INTEGRATOR,
-            lease=lease,
+    with pytest.raises(FactoryDispatchError, match="CreationResultV1"):
+        await validator.dispatch(
+            FactoryDispatch(
+                job=factory_job,
+                action=FactoryAction(kind=FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE, attempt=1),
+                role=FactoryRole.TOOL_INTEGRATOR,
+                lease=lease,
+            )
         )
+
+
+@pytest.mark.asyncio
+async def test_validator_records_digest_bound_agent_code_from_exact_forge_result(tmp_path: Path) -> None:
+    archive_path = tmp_path / "candidate.zip"
+    team_ref, workflow_ref, input_schema_ref, output_schema_ref, source_ref = _write_candidate_archive(archive_path)
+    candidate = FactoryCandidateManifest(
+        candidate_id="support_triage_v1",
+        source_archive_ref=source_ref,
+        team_manifest={"reference": team_ref, "relative_path": "team_manifest.json"},
+        workflow_artifacts=({"reference": workflow_ref, "relative_path": "workflows/support_triage.json"},),
+        tool_schema_artifacts=(
+            {"reference": input_schema_ref, "relative_path": "schemas/support_triage.input.json"},
+            {"reference": output_schema_ref, "relative_path": "schemas/support_triage.output.json"},
+        ),
+        n8n_tools=(TypedN8nTool(name="support_triage", description="Route a support request.", input_schema_ref=input_schema_ref.uri, output_schema_ref=output_schema_ref.uri),),
+        build_command=("python", "-m", "compileall", "-q", "."),
+        real_case_command=("python", "run_case.py"),
+        timeout_seconds=10,
+    )
+    factory_job = job()
+    lease = issue_factory_lease(job=factory_job, role=FactoryRole.TOOL_INTEGRATOR, attempt=1, workspace_ref="workspace://factory/support-triage", now=factory_job.occurred_at)
+    evidence_store = FilesystemFactoryEvidenceStore(tmp_path / "evidence")
+    validator = CandidateEvaluationFactory(
+        provider=StaticFactoryCandidateProvider({factory_job.job_id: ResolvedFactoryCandidate(candidate=candidate, source_archive=archive_path)}),
+        evidence_store=evidence_store,
+    )
+    package_manifest_ref = _ref("artifact://factory/package-manifest", b"package manifest")
+    skill_receipt_ref = _ref("artifact://factory/skill-usage", b"skill usage")
+    forge_evidence_ref = _ref("artifact://factory/forge-evidence", b"forge evidence")
+    result = CreationResultV1(
+        creation_job_id=uuid4(),
+        correlation_id=factory_job.correlation_id,
+        subject_version=factory_job.subject_version,
+        attempt=1,
+        status="succeeded",
+        package_manifest_ref=package_manifest_ref.model_dump(mode="json"),
+        artifact_refs=(source_ref.model_dump(mode="json"),),
+        evidence_refs=(forge_evidence_ref.model_dump(mode="json"),),
+        skill_usage_receipt_ref=skill_receipt_ref.model_dump(mode="json"),
+    )
+    request = FactoryDispatch(
+        job=factory_job,
+        action=FactoryAction(kind=FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE, attempt=1),
+        role=FactoryRole.TOOL_INTEGRATOR,
+        lease=lease,
     )
 
-    assert block.phase is FactoryPhase.AGENT_CODE_CREATED
-    assert block.status.value == "succeeded"
-    assert block.assertion_ids == ()
+    code_block = await validator.record_creation_result(request, result)
+    replayed_block = await validator.record_creation_result(request, result)
+
+    assert code_block.phase is FactoryPhase.AGENT_CODE_CREATED
+    assert code_block.status.value == "succeeded"
+    assert code_block.artifact_refs == (package_manifest_ref, source_ref)
+    assert code_block.evidence_refs[1:] == (forge_evidence_ref, skill_receipt_ref)
+    expected_content = json.dumps(
+        result.model_dump(mode="json", by_alias=True, exclude_none=True),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    assert await evidence_store.read(code_block.evidence_refs[0]) == expected_content
+    assert replayed_block.event_id == code_block.event_id
+    assert replayed_block.evidence_refs == code_block.evidence_refs
+
+
+@pytest.mark.asyncio
+async def test_validator_rejects_unbound_direct_forge_result(tmp_path: Path) -> None:
+    factory_job = job()
+    lease = issue_factory_lease(job=factory_job, role=FactoryRole.TOOL_INTEGRATOR, attempt=1, workspace_ref="workspace://factory/support-triage", now=factory_job.occurred_at)
+    validator = CandidateEvaluationFactory(
+        provider=StaticFactoryCandidateProvider({}),
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
+    )
+    result = CreationResultV1(
+        creation_job_id=uuid4(),
+        correlation_id=uuid4(),
+        subject_version=factory_job.subject_version,
+        attempt=1,
+        status="succeeded",
+        package_manifest_ref=_ref("artifact://factory/package-manifest", b"package manifest").model_dump(mode="json"),
+        artifact_refs=(
+            _ref("artifact://factory/generated-code", b"generated code", "application/zip").model_dump(mode="json"),
+        ),
+        skill_usage_receipt_ref=_ref("artifact://factory/skill-usage", b"skill usage").model_dump(mode="json"),
+    )
+
+    with pytest.raises(FactoryDispatchError, match="does not match"):
+        await validator.record_creation_result(
+            FactoryDispatch(
+                job=factory_job,
+                action=FactoryAction(kind=FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE, attempt=1),
+                role=FactoryRole.TOOL_INTEGRATOR,
+                lease=lease,
+            ),
+            result,
+        )
+
+
+@pytest.mark.asyncio
+async def test_validator_rejects_artifactless_successful_forge_result(tmp_path: Path) -> None:
+    factory_job = job()
+    lease = issue_factory_lease(job=factory_job, role=FactoryRole.TOOL_INTEGRATOR, attempt=1, workspace_ref="workspace://factory/support-triage", now=factory_job.occurred_at)
+    validator = CandidateEvaluationFactory(
+        provider=StaticFactoryCandidateProvider({}),
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
+    )
+    result = CreationResultV1(
+        creation_job_id=uuid4(),
+        correlation_id=factory_job.correlation_id,
+        subject_version=factory_job.subject_version,
+        attempt=1,
+        status="succeeded",
+        package_manifest_ref=_ref("artifact://factory/package-manifest", b"package manifest").model_dump(mode="json"),
+        artifact_refs=(),
+        skill_usage_receipt_ref=_ref("artifact://factory/skill-usage", b"skill usage").model_dump(mode="json"),
+    )
+
+    with pytest.raises(FactoryDispatchError, match="code artifacts"):
+        await validator.record_creation_result(
+            FactoryDispatch(
+                job=factory_job,
+                action=FactoryAction(kind=FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE, attempt=1),
+                role=FactoryRole.TOOL_INTEGRATOR,
+                lease=lease,
+            ),
+            result,
+        )

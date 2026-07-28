@@ -35,6 +35,7 @@ from agenten.agent_factory.contracts import (
     FactoryRole,
 )
 from agenten.agent_factory.evidence_store import FactoryEvidenceStore
+from agenten.agent_factory.forge_contracts import CreationResultV1
 from agenten.agent_factory.leases import validate_factory_lease
 from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference, TypedN8nTool
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
@@ -826,6 +827,10 @@ class CandidateEvaluationFactory:
         self._team_execution = team_execution
 
     async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
+        if request.action.kind is FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE:
+            raise FactoryDispatchError(
+                "agent code evidence requires the exact Forge CreationResultV1"
+            )
         phase, role = _validation_phase(request.action.kind)
         if request.role is not role or request.lease is None or request.lease.role is not role:
             raise FactoryDispatchError("candidate validation requires the matching active factory lease")
@@ -908,6 +913,88 @@ class CandidateEvaluationFactory:
             ),
             evidence_refs=(evidence,),
             assertion_ids=assertions,
+            lease_id=request.lease.lease_id,
+        )
+
+    async def record_creation_result(
+        self,
+        request: FactoryDispatch,
+        result: CreationResultV1,
+    ) -> FactoryEvidenceBlock:
+        if request.action.kind is not FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE:
+            raise FactoryDispatchError(
+                "CreationResultV1 may only produce agent code evidence"
+            )
+        role = FactoryRole.TOOL_INTEGRATOR
+        if request.role is not role or request.lease is None or request.lease.role is not role:
+            raise FactoryDispatchError(
+                "agent code evidence requires the matching active factory lease"
+            )
+        validate_factory_lease(
+            request.lease,
+            job=request.job,
+            role=role,
+            attempt=request.action.attempt,
+            now=request.lease.issued_at,
+        )
+        if (
+            result.correlation_id != request.job.correlation_id
+            or result.subject_version != request.job.subject_version
+            or result.attempt != request.action.attempt
+        ):
+            raise FactoryDispatchError(
+                "Minibook CreationResultV1 does not match the factory dispatch"
+            )
+        if result.status != "succeeded":
+            raise FactoryDispatchError(
+                "Minibook CreationResultV1 did not produce successful agent code"
+            )
+        if not result.artifact_refs:
+            raise FactoryDispatchError(
+                "successful Minibook CreationResultV1 has no generated code artifacts"
+            )
+        assert result.package_manifest_ref is not None
+        assert result.skill_usage_receipt_ref is not None
+        content = json.dumps(
+            result.model_dump(mode="json", by_alias=True, exclude_none=True),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        sealed = await self._evidence_store.persist(request.job, content)
+        package_manifest_ref = ArtifactRef.model_validate(
+            result.package_manifest_ref.model_dump(mode="json")
+        )
+        artifact_refs = tuple(
+            ArtifactRef.model_validate(reference.model_dump(mode="json"))
+            for reference in result.artifact_refs
+        )
+        forge_evidence_refs = tuple(
+            ArtifactRef.model_validate(reference.model_dump(mode="json"))
+            for reference in result.evidence_refs
+        )
+        skill_usage_receipt_ref = ArtifactRef.model_validate(
+            result.skill_usage_receipt_ref.model_dump(mode="json")
+        )
+        return FactoryEvidenceBlock(
+            schema_name="captain.agent-factory-block.v1",
+            event_id=uuid5(
+                NAMESPACE_URL,
+                f"factory-creation-result|{request.job.job_id}|{request.action.attempt}|{sealed.sha256}",
+            ),
+            job_id=request.job.job_id,
+            correlation_id=request.job.correlation_id,
+            causation_id=request.job.event_id,
+            occurred_at=request.lease.issued_at,
+            producer="hermes",
+            subject_version=request.job.subject_version,
+            attempt=request.action.attempt,
+            phase=FactoryPhase.AGENT_CODE_CREATED,
+            role=role,
+            status=FactoryBlockStatus.SUCCEEDED,
+            artifact_refs=(package_manifest_ref, *artifact_refs),
+            evidence_refs=(sealed, *forge_evidence_refs, skill_usage_receipt_ref),
+            assertion_ids=(),
             lease_id=request.lease.lease_id,
         )
 
