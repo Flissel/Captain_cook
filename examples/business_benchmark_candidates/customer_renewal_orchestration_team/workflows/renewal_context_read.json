@@ -13,10 +13,15 @@
     {
       "id": "renewal-input",
       "name": "Typed Renewal Input",
-      "type": "n8n-nodes-base.executeWorkflowTrigger",
-      "typeVersion": 1.1,
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
       "position": [0, 0],
-      "parameters": {"inputSource": "passthrough"}
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "captain-renewal-context-read-v1",
+        "responseMode": "lastNode",
+        "options": {}
+      }
     },
     {
       "id": "renewal-read",

@@ -126,9 +126,22 @@ def test_renewal_seed_has_one_read_only_idempotent_n8n_workflow(
     assert workflow["contract"]["allowed_partitions"] == ["ordinary", "boundary"]
     assert workflow["contract"]["mutation_operations"] == []
     assert [node["type"] for node in workflow["nodes"]] == [
-        "n8n-nodes-base.executeWorkflowTrigger",
+        "n8n-nodes-base.webhook",
         "n8n-nodes-base.code",
     ]
+    webhook = workflow["nodes"][0]
+    assert webhook["name"] == "Typed Renewal Input"
+    assert webhook["typeVersion"] == 2
+    assert webhook["parameters"] == {
+        "httpMethod": "POST",
+        "path": "captain-renewal-context-read-v1",
+        "responseMode": "lastNode",
+        "options": {},
+    }
+    assert workflow["settings"] == {
+        "availableInMCP": True,
+        "executionOrder": "v1",
+    }
     assert input_schema["additionalProperties"] is False
     assert input_schema["properties"]["operation"]["const"] == "read_renewal_context"
     assert set(input_schema["required"]) == {

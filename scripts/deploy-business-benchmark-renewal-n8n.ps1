@@ -188,12 +188,29 @@ function Read-AndValidateWorkflow {
         throw "Canonical renewal workflow node inventory is invalid."
     }
     $nodeTypes = @($workflow.nodes | ForEach-Object { $_.type } | Sort-Object)
-    $expectedNodeTypes = @("n8n-nodes-base.code", "n8n-nodes-base.executeWorkflowTrigger")
+    $expectedNodeTypes = @("n8n-nodes-base.code", "n8n-nodes-base.webhook")
     if (($nodeTypes -join "|") -cne ($expectedNodeTypes -join "|")) {
         throw "Canonical renewal workflow contains an unauthorized node type."
     }
     if (Test-ForbiddenProperty -Value $workflow) {
         throw "Canonical renewal workflow contains a forbidden sensitive field."
+    }
+    $webhooks = @($workflow.nodes | Where-Object { $_.type -ceq "n8n-nodes-base.webhook" })
+    if ($webhooks.Count -ne 1) {
+        throw "Canonical renewal workflow webhook inventory is invalid."
+    }
+    $webhook = $webhooks[0]
+    $webhookParameterNames = @($webhook.parameters.PSObject.Properties | ForEach-Object { $_.Name } | Sort-Object)
+    if (
+        $webhook.name -cne "Typed Renewal Input" -or
+        $webhook.typeVersion -ne 2 -or
+        ($webhookParameterNames -join "|") -cne "httpMethod|options|path|responseMode" -or
+        $webhook.parameters.httpMethod -cne "POST" -or
+        $webhook.parameters.path -cne "captain-renewal-context-read-v1" -or
+        $webhook.parameters.responseMode -cne "lastNode" -or
+        @($webhook.parameters.options.PSObject.Properties).Count -ne 0
+    ) {
+        throw "Canonical renewal workflow webhook contract is invalid."
     }
     $settingNames = @($workflow.settings.PSObject.Properties | ForEach-Object { $_.Name } | Sort-Object)
     if (

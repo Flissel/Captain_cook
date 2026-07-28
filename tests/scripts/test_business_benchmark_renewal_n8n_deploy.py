@@ -62,6 +62,47 @@ def _run_harness(tmp_path: Path, source: str) -> subprocess.CompletedProcess[str
     )
 
 
+def _powershell_object_digest(tmp_path: Path, value: object) -> str:
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        pytest.skip("PowerShell 7 is unavailable")
+    value_path = tmp_path / "digest-value.json"
+    helper_path = tmp_path / "digest.ps1"
+    value_path.write_text(json.dumps(value), encoding="utf-8")
+    helper_path.write_text(
+        r"""
+param([string]$Path)
+function Sort-Value([object]$Value) {
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [pscustomobject]) {
+        $ordered = [ordered]@{}
+        foreach ($name in @($Value.PSObject.Properties | ForEach-Object { $_.Name } | Sort-Object)) {
+            $ordered[$name] = Sort-Value $Value.PSObject.Properties[$name].Value
+        }
+        return $ordered
+    }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        return @($Value | ForEach-Object { Sort-Value $_ })
+    }
+    return $Value
+}
+$value = [IO.File]::ReadAllText($Path) | ConvertFrom-Json -Depth 40
+$json = (Sort-Value $value) | ConvertTo-Json -Compress -Depth 32
+$hash = [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($json))
+[Convert]::ToHexString($hash).ToLowerInvariant()
+""".strip(),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [pwsh, "-NoProfile", "-File", str(helper_path), "-Path", str(value_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
 def test_validate_accepts_canonical_workflow_and_reports_exact_digest() -> None:
     result = _run_validate(WORKFLOW)
 
@@ -77,6 +118,15 @@ def test_validate_accepts_canonical_workflow_and_reports_exact_digest() -> None:
     assert workflow["settings"] == {
         "availableInMCP": True,
         "executionOrder": "v1",
+    }
+    webhook = next(node for node in workflow["nodes"] if node["name"] == "Typed Renewal Input")
+    assert webhook["type"] == "n8n-nodes-base.webhook"
+    assert webhook["typeVersion"] == 2
+    assert webhook["parameters"] == {
+        "httpMethod": "POST",
+        "path": "captain-renewal-context-read-v1",
+        "responseMode": "lastNode",
+        "options": {},
     }
 
 
@@ -508,9 +558,7 @@ def test_owned_pre_mcp_workflow_is_updated_and_revalidated(
         key: workflow[key] for key in ("name", "nodes", "connections", "settings")
     }
     old_payload["settings"] = {"executionOrder": "v1"}
-    old_digest = hashlib.sha256(
-        json.dumps(old_payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    old_digest = _powershell_object_digest(tmp_path, old_payload)
     ownership_digest = hashlib.sha256(
         (
             "captain.business-benchmark-renewal-n8n.v1|"
@@ -518,8 +566,9 @@ def test_owned_pre_mcp_workflow_is_updated_and_revalidated(
         ).encode()
     ).hexdigest()
     evidence.mkdir(parents=True)
-    (evidence / "renewal-context-n8n-ownership.v1.json").write_text(
-        json.dumps(
+    (evidence / "renewal-context-n8n-ownership.v1.json").write_bytes(
+        (
+            json.dumps(
             {
                 "schema": "captain.business-benchmark-renewal-n8n-ownership.v1",
                 "ownership": "captain",
@@ -527,10 +576,11 @@ def test_owned_pre_mcp_workflow_is_updated_and_revalidated(
                 "workflow_name": "Captain Renewal Context Read v1",
                 "workflow_id": workflow_id,
                 "ownership_binding_sha256": ownership_digest,
-            }
-        )
-        + "\n",
-        encoding="utf-8",
+            },
+                indent=2,
+            ).replace("\n", "\r\n")
+            + "\n"
+        ).encode("utf-8")
     )
     deployment_dir = evidence / "renewal-context-n8n-deployments"
     deployment_dir.mkdir()
@@ -604,8 +654,9 @@ function Invoke-WebRequest {{
     throw "unexpected request $verb $target"
 }}
 $failed = $false
-try {{ $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)} }} catch {{ $failed = $true }}
-@{{ failed = $failed; posts = $global:posts; puts = $global:puts; activations = $global:activations; executes = $global:executes; gets = $global:gets; available_in_mcp = $global:remote.settings.availableInMCP }} | ConvertTo-Json -Compress
+$failure = $null
+try {{ $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)} }} catch {{ $failed = $true; $failure = $_.Exception.Message }}
+@{{ failed = $failed; failure = $failure; posts = $global:posts; puts = $global:puts; activations = $global:activations; executes = $global:executes; gets = $global:gets; available_in_mcp = $global:remote.settings.availableInMCP }} | ConvertTo-Json -Compress
 """
 
     result = _run_harness(tmp_path, harness)
@@ -613,6 +664,7 @@ try {{ $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pws
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {
         "failed": False,
+        "failure": None,
         "posts": 0,
         "puts": 1,
         "activations": 1,
