@@ -7,6 +7,7 @@ import signal
 import time
 from types import SimpleNamespace
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
@@ -337,6 +338,71 @@ async def test_module_root_runs_only_the_checkout_cli_with_bound_cwd_and_pythonp
     assert Path(observed_options["cwd"]) == resolved_root
     assert environment["PYTHONPATH"] == str(resolved_root)
     assert environment["PYTHONPATH"] != "global-hermes-location"
+
+
+@pytest.mark.asyncio
+async def test_pinned_hermes_model_requires_usage_evidence_and_stops_after_ceiling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_root = tmp_path / "hermes-agent"
+    entrypoint = module_root / "hermes_cli" / "main.py"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("# checkout entrypoint\n", encoding="utf-8")
+    observed_commands: list[tuple[str, ...]] = []
+
+    class Process:
+        returncode = 0
+
+        def __init__(self, command: tuple[str, ...]) -> None:
+            self.command = command
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            usage_path = Path(self.command[self.command.index("--usage-file") + 1])
+            usage_path.write_text(
+                json.dumps(
+                    {
+                        "estimated_cost_usd": "0.03",
+                        "cost_status": "estimated",
+                        "model": "gpt-4.1-mini",
+                        "provider": "openai-api",
+                        "api_calls": 1,
+                        "failed": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return b"{}", b""
+
+    async def create_process(*command: str, **_: object) -> Process:
+        observed_commands.append(command)
+        return Process(command)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    factory = HermesCliFactory(
+        settings=HermesCliSettings(
+            executable="python.exe",
+            module_root=module_root,
+            evidence_root=tmp_path / "evidence",
+            provider="openai-api",
+            model="gpt-4.1-mini",
+            maximum_total_cost_usd=Decimal("0.05"),
+        )
+    )
+
+    assert await factory._run_skill_prompt("first", max_seconds=30) == b"{}"
+    with pytest.raises(FactoryDispatchError, match="cost ceiling"):
+        await factory._run_skill_prompt("second", max_seconds=30)
+
+    assert factory.observed_cost_usd == Decimal("0.06")
+    assert len(observed_commands) == 2
+    assert observed_commands[0][3:7] == (
+        "--provider",
+        "openai-api",
+        "-m",
+        "gpt-4.1-mini",
+    )
+    assert "--usage-file" in observed_commands[0]
 
 
 @pytest.mark.asyncio

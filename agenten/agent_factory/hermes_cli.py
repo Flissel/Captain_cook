@@ -13,6 +13,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal, Protocol
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -66,6 +67,30 @@ class HermesCliSettings:
     evidence_root: Path = Path("artifacts/agent-factory/evidence")
     released_skill_root: Path = Path("agenten/agent_factory/released-skills")
     module_root: Path | None = None
+    provider: str | None = None
+    model: str | None = None
+    maximum_total_cost_usd: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        if (self.provider is None) != (self.model is None):
+            raise ValueError("Hermes provider and model must be configured together")
+        for value, label in ((self.provider, "provider"), (self.model, "model")):
+            if value is not None and (
+                not value.strip()
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", value) is None
+            ):
+                raise ValueError(f"Hermes {label} is invalid")
+        maximum = self.maximum_total_cost_usd
+        if maximum is not None and (
+            isinstance(maximum, (bool, float))
+            or not isinstance(maximum, Decimal)
+            or not maximum.is_finite()
+            or maximum <= 0
+            or self.provider is None
+        ):
+            raise ValueError(
+                "Hermes cost ceiling requires a positive Decimal and pinned model"
+            )
 
 
 class ReleasedFactorySkillCatalog(Protocol):
@@ -130,6 +155,11 @@ class HermesCliFactory(HermesFactoryPort):
             )
         )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._observed_cost_usd = Decimal("0")
+
+    @property
+    def observed_cost_usd(self) -> Decimal:
+        return self._observed_cost_usd
 
     async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
         if request.role is None or request.lease is None:
@@ -348,23 +378,34 @@ class HermesCliFactory(HermesFactoryPort):
 
     async def _run_skill_prompt(self, prompt: str, *, max_seconds: float) -> bytes:
         deadline = _deadline(min(float(self._settings.timeout_seconds), max_seconds))
-        command = (self._settings.executable, "-z", prompt)
+        maximum_cost = self._settings.maximum_total_cost_usd
+        if maximum_cost is not None and self._observed_cost_usd >= maximum_cost:
+            raise FactoryDispatchError("Hermes cost ceiling is already exhausted")
+        command_prefix = [self._settings.executable]
         process_options: dict[str, object] = _async_process_group_options()
         if self._settings.module_root is not None:
             module_root = _resolve_hermes_module_root(self._settings.module_root)
             environment = os.environ.copy()
             environment["PYTHONPATH"] = str(module_root)
-            command = (
-                self._settings.executable,
-                "-m",
-                "hermes_cli.main",
-                "-z",
-                prompt,
-            )
+            command_prefix.extend(("-m", "hermes_cli.main"))
             process_options.update(
                 cwd=str(module_root),
                 env=environment,
             )
+        if self._settings.provider is not None:
+            assert self._settings.model is not None
+            command_prefix.extend(
+                ("--provider", self._settings.provider, "-m", self._settings.model)
+            )
+        usage_directory: tempfile.TemporaryDirectory[str] | None = None
+        usage_path: Path | None = None
+        if maximum_cost is not None:
+            usage_directory = tempfile.TemporaryDirectory(
+                prefix="captain-hermes-usage-"
+            )
+            usage_path = Path(usage_directory.name) / "usage.json"
+            command_prefix.extend(("--usage-file", str(usage_path)))
+        command = (*command_prefix, "-z", prompt)
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -373,6 +414,8 @@ class HermesCliFactory(HermesFactoryPort):
                 **process_options,
             )
         except FileNotFoundError as exc:
+            if usage_directory is not None:
+                usage_directory.cleanup()
             raise FactoryDispatchError("Hermes CLI executable is not available") from exc
         try:
             stdout, stderr = await asyncio.wait_for(
@@ -384,6 +427,8 @@ class HermesCliFactory(HermesFactoryPort):
                 process,
                 executable=self._settings.executable,
             )
+            if usage_directory is not None:
+                usage_directory.cleanup()
             raise FactoryDispatchError("Hermes skill evaluation timed out") from exc
         except asyncio.CancelledError:
             await asyncio.shield(
@@ -392,12 +437,54 @@ class HermesCliFactory(HermesFactoryPort):
                     executable=self._settings.executable,
                 )
             )
+            if usage_directory is not None:
+                usage_directory.cleanup()
             raise
         _remaining_deadline_seconds(deadline)
+        try:
+            if usage_path is not None:
+                self._account_usage(usage_path)
+        finally:
+            if usage_directory is not None:
+                usage_directory.cleanup()
         if process.returncode != 0:
             detail = stderr.decode("utf-8", errors="replace").strip()
             raise FactoryDispatchError(f"Hermes skill evaluation failed: {detail[:500]}")
         return stdout
+
+    def _account_usage(self, path: Path) -> None:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"), parse_float=Decimal)
+            if not isinstance(raw, dict):
+                raise ValueError
+            cost = Decimal(str(raw["estimated_cost_usd"]))
+            api_calls = raw["api_calls"]
+        except (
+            OSError,
+            KeyError,
+            TypeError,
+            ValueError,
+            InvalidOperation,
+            json.JSONDecodeError,
+        ) as exc:
+            raise FactoryDispatchError(
+                "Hermes usage evidence is missing or invalid"
+            ) from exc
+        if (
+            not cost.is_finite()
+            or cost < 0
+            or isinstance(api_calls, bool)
+            or not isinstance(api_calls, int)
+            or api_calls < 1
+            or raw.get("model") != self._settings.model
+            or raw.get("provider") != self._settings.provider
+        ):
+            raise FactoryDispatchError("Hermes usage evidence does not match its pin")
+        self._observed_cost_usd += cost
+        maximum = self._settings.maximum_total_cost_usd
+        assert maximum is not None
+        if self._observed_cost_usd > maximum:
+            raise FactoryDispatchError("Hermes cost ceiling was exceeded")
 
 
 _FactoryWorkflowArtifact = (
