@@ -41,8 +41,13 @@ from agenten.agent_factory.business_benchmark_paths import (
     canonical_business_benchmark_authority_root,
 )
 from agenten.agent_factory.business_benchmark_provisioning import (
+    CaptainPrivateBusinessBenchmarkSuiteLoader,
     CanonicalPrivateBusinessBenchmarkProvisioner,
     ProvisionedBusinessBenchmarkSuiteRefV1,
+)
+from agenten.agent_factory.business_benchmark_technical_holdout import (
+    CanonicalTechnicalBusinessHoldoutProvisioner,
+    ProvisionedTechnicalBusinessHoldoutV1,
 )
 from agenten.agent_factory.candidate_evaluation import (
     FactoryCandidateArtifact,
@@ -175,6 +180,7 @@ class BusinessBenchmarkDemoTeamPlanV1(_FrozenModel):
     profile_id: str
     job: AgentFactoryJobV3
     suite: ProvisionedBusinessBenchmarkSuiteRefV1
+    technical_holdout: ProvisionedTechnicalBusinessHoldoutV1
     candidate_id: str
     candidate_ref: ArtifactRef
     candidate_manifest_ref: ArtifactRef
@@ -309,6 +315,22 @@ class BusinessBenchmarkDemoProvisioner:
             suite_version=self._settings.suite_version,
             seed_version_id=self._settings.seed_version_id,
         )
+        suite_loader = CaptainPrivateBusinessBenchmarkSuiteLoader(
+            authority_root / "suites"
+        )
+        technical_provisioner = CanonicalTechnicalBusinessHoldoutProvisioner(
+            authority_root / "technical-holdouts"
+        )
+        technical_holdouts = {
+            item.profile_id: technical_provisioner.provision(
+                suite_loader.load_suite(
+                    item.suite_ref,
+                    expected_profile_id=item.profile_id,
+                    expected_suite_version=item.suite_version,
+                )
+            )
+            for item in suites.suites
+        }
         cas = BusinessBenchmarkContentAddressedArtifactStore(authority_root / "cas")
         prepared = tuple(
             self._prepare_for_apply(
@@ -334,6 +356,10 @@ class BusinessBenchmarkDemoProvisioner:
             )
             if expected_suite != item.plan.suite:
                 raise ValueError("canonical benchmark suite changed after dry-run planning")
+            if technical_holdouts[item.plan.profile_id] != item.plan.technical_holdout:
+                raise ValueError(
+                    "canonical technical holdout changed after dry-run planning"
+                )
             for expected_ref, content in item.artifacts:
                 actual = cas.put(
                     content,
@@ -584,6 +610,13 @@ class BusinessBenchmarkDemoProvisioner:
                 suite_version=self._settings.suite_version,
                 seed_version_id=self._settings.seed_version_id,
             )
+            preview_suite_root = temporary / ".captain-cook" / "private" / "suites"
+            preview_suite_loader = CaptainPrivateBusinessBenchmarkSuiteLoader(
+                preview_suite_root
+            )
+            preview_technical_provisioner = CanonicalTechnicalBusinessHoldoutProvisioner(
+                temporary / ".captain-cook" / "private" / "technical-holdouts"
+            )
             skills, skill_artifacts = _prepare_released_skills(
                 Path(__file__).resolve().parents[2],
             )
@@ -591,6 +624,13 @@ class BusinessBenchmarkDemoProvisioner:
             for profile, profile_id in _PROFILE_ORDER:
                 suite = next(
                     item for item in preview.suites if item.profile_id == profile_id
+                )
+                technical_holdout = preview_technical_provisioner.provision(
+                    preview_suite_loader.load_suite(
+                        suite.suite_ref,
+                        expected_profile_id=suite.profile_id,
+                        expected_suite_version=suite.suite_version,
+                    )
                 )
                 seed = package_business_benchmark_seed(
                     profile_id,
@@ -602,6 +642,7 @@ class BusinessBenchmarkDemoProvisioner:
                     profile=profile,
                     profile_id=profile_id,
                     suite=suite,
+                    technical_holdout=technical_holdout,
                     candidate=manifest,
                 )
                 policy = CaptainBusinessBenchmarkPolicyBindingV1.create(
@@ -653,6 +694,7 @@ class BusinessBenchmarkDemoProvisioner:
                             profile_id=profile_id,
                             job=job,
                             suite=suite,
+                            technical_holdout=technical_holdout,
                             candidate_id=manifest.candidate_id,
                             candidate_ref=manifest.source_archive_ref,
                             candidate_manifest_ref=_manifest_ref(manifest),
@@ -834,6 +876,7 @@ def _prepare_job(
     profile: str,
     profile_id: str,
     suite: ProvisionedBusinessBenchmarkSuiteRefV1,
+    technical_holdout: ProvisionedTechnicalBusinessHoldoutV1,
     candidate: FactoryCandidateManifest,
 ) -> tuple[AgentFactoryJobV3, tuple[tuple[ArtifactRef, bytes], ...]]:
     public_input = _canonical_json(
@@ -902,7 +945,7 @@ def _prepare_job(
         dependency_graph_ref=graph_ref,
         required_capability=_CAPABILITY,
         acceptance_assertion_ids=_ASSERTION_IDS,
-        private_holdout_refs=(suite.suite_ref,),
+        private_holdout_refs=(technical_holdout.holdout_ref, suite.suite_ref),
         max_behavioral_iterations=5,
         deadline_at=settings.issued_at + timedelta(seconds=policy.max_runtime_seconds),
         execution_policy=policy,

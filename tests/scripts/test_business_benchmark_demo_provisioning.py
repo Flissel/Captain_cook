@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import importlib.util
@@ -35,6 +36,9 @@ from agenten.agent_factory.business_benchmark_production_ports import (
 )
 from agenten.agent_factory.business_benchmark_provisioning import (
     CaptainPrivateBusinessBenchmarkSuiteLoader,
+)
+from agenten.agent_factory.business_benchmark_technical_holdout import (
+    CaptainTechnicalBusinessHoldoutEvaluator,
 )
 from agenten.agent_factory.contracts import (
     AgentFactoryJobV3,
@@ -187,6 +191,12 @@ def test_dry_run_is_side_effect_free_and_contains_two_redacted_stable_plans(
     )
     assert all(
         team.team_manifest_ref.uri.endswith(team.team_manifest_ref.sha256)
+        for team in first.teams
+    )
+    assert all(len(team.job.private_holdout_refs) == 2 for team in first.teams)
+    assert all(
+        team.job.private_holdout_refs
+        == (team.technical_holdout.holdout_ref, team.suite.suite_ref)
         for team in first.teams
     )
     serialized = first.model_dump_json().lower()
@@ -346,6 +356,18 @@ def test_apply_persists_only_legal_initial_gateway_authority_and_is_idempotent(
         )
         assert candidate.candidate.team_manifest.reference == team.team_manifest_ref
         assert cas.binding("benchmark-policy", f"{team.job.job_id}:1") == team.policy_binding_ref
+        technical = CaptainTechnicalBusinessHoldoutEvaluator(
+            tmp_path
+            / ".captain-cook"
+            / "private"
+            / "business-benchmarks"
+            / "technical-holdouts",
+            candidate_ref=team.candidate_ref,
+            allowed_tools=(),
+            clock=lambda: ISSUED_AT,
+        )
+        resolved = asyncio.run(technical.resolve(team.technical_holdout.holdout_ref))
+        assert resolved.reference == team.job.private_holdout_refs[0]
     assert {
         path.relative_to(tmp_path): path.read_bytes()
         for path in (tmp_path / ".captain-cook").rglob("*")

@@ -1876,6 +1876,11 @@ class HostAutoGenTeamRunner:
         n8n_adapter: FactoryN8nToolAdapterPort | None = None,
         n8n_authority: FactoryN8nGrantAuthorityPort | None = None,
         session_executor: HostAutoGenSessionExecutor | None = None,
+        allowed_tools_for: Callable[
+            [PrivateHoldoutRef, ResolvedFactoryCandidate],
+            tuple[str, ...] | None,
+        ]
+        | None = None,
         clock: Callable[[], datetime],
     ) -> None:
         self._model_client = model_client
@@ -1885,6 +1890,7 @@ class HostAutoGenTeamRunner:
         self._tools = dict(tools)
         self._n8n_adapter = n8n_adapter
         self._n8n_authority = n8n_authority
+        self._allowed_tools_for = allowed_tools_for
         self._clock = clock
         self._session_executor = session_executor or HostAutoGenSessionExecutor(
             model_client=model_client,
@@ -1972,6 +1978,11 @@ class HostAutoGenTeamRunner:
             case_ref=case_ref,
             identity=identity,
             candidate=candidate,
+            allowed_tools=(
+                self._allowed_tools_for(case_ref, candidate)
+                if self._allowed_tools_for is not None
+                else None
+            ),
             allowed_models=allowed_models,
             max_seconds=max_seconds,
         )
@@ -2623,6 +2634,10 @@ class FactoryLiveTeamExecutionPorts:
     model: str
     max_cost_per_call: Decimal
     clock: Callable[[], datetime]
+    allowed_tools_for: Callable[
+        [PrivateHoldoutRef, ResolvedFactoryCandidate],
+        tuple[str, ...] | None,
+    ] | None = None
 
 
 def compose_live_team_execution(
@@ -2759,6 +2774,7 @@ def compose_live_team_execution(
             tools=ports.tools,
             n8n_adapter=ports.n8n_adapter,
             n8n_authority=ports.n8n_authority,
+            allowed_tools_for=ports.allowed_tools_for,
             clock=ports.clock,
         )
         return TeamExecutionService(

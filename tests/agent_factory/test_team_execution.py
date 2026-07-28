@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 from uuid import uuid4
 
@@ -91,6 +92,8 @@ from autogen_core.tools import FunctionTool
 from autogen_ext.models.replay import ReplayChatCompletionClient
 from autogen_agentchat.teams import Swarm
 from autogen_agentchat.agents import AssistantAgent
+from autogen_agentchat.base import TaskResult
+from autogen_agentchat.messages import TextMessage
 
 
 NOW = datetime(2026, 7, 21, 13, tzinfo=timezone.utc)
@@ -1865,6 +1868,95 @@ async def test_team_execution_rejects_forged_lease_authority(
             replay_store=InMemoryFactorySkillReplayStore(),
             clock=lambda: NOW,
         ).execute(forged, _candidate(tmp_path), job.private_holdout_refs[0])
+
+
+@pytest.mark.asyncio
+async def test_host_runner_forwards_captain_scoped_tool_subset_to_session_executor(
+    tmp_path: Path,
+) -> None:
+    holdout_body = b"Resolve the private support case."
+    job = _job_v3(holdout_body=holdout_body)
+    candidate = _sealed_team_candidate(tmp_path)
+    invocation = _invocation(job)
+    observed: dict[str, object] = {}
+
+    class SessionExecutor:
+        async def run_candidate(self, **kwargs: object) -> HostAutoGenSessionResult:
+            observed.update(kwargs)
+            return HostAutoGenSessionResult(
+                task_result=TaskResult(
+                    messages=[TextMessage(source="agent", content="TERMINATE")],
+                    stop_reason="task_completed",
+                ),
+                runtime_evidence_ref=ArtifactRef(
+                    uri="artifact://runtime/technical-holdout",
+                    sha256="9" * 64,
+                    media_type="application/json",
+                ),
+                usage_receipts=(),
+                conversation_pattern="swarm",
+                message_count=1,
+                handoff_count=0,
+                tool_call_count=0,
+                termination_reason="task_completed",
+                provider_started=False,
+                provider_usage_unresolved=False,
+            )
+
+    class Holdouts:
+        async def resolve(self, reference: PrivateHoldoutRef) -> ResolvedFactoryHoldoutCase:
+            return ResolvedFactoryHoldoutCase(reference=reference, body=holdout_body)
+
+        async def evaluate(
+            self,
+            reference: PrivateHoldoutRef,
+            result: TaskResult,
+            assertion_ids: tuple[str, ...],
+        ) -> FactoryHoldoutEvaluationReceiptV1:
+            assert result.messages
+            return FactoryHoldoutEvaluationReceiptV1(
+                schema="captain.factory-holdout-evaluation-receipt.v1",
+                holdout_ref=reference,
+                candidate_ref=candidate.candidate.source_archive_ref,
+                assertion_ids=assertion_ids,
+                decisions=tuple(
+                    FactoryHoldoutAssertionDecisionV1(
+                        assertion_id=item,
+                        passed=False,
+                        provenance_code="captain_private_rule_fail",
+                    )
+                    for item in assertion_ids
+                ),
+                evaluator_id="captain_test_evaluator",
+                evaluator_version="1",
+                evaluated_at=NOW,
+            )
+
+    runner = HostAutoGenTeamRunner(
+        model_client=SimpleNamespace(model="approved-model-id"),  # type: ignore[arg-type]
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
+        holdouts=Holdouts(),  # type: ignore[arg-type]
+        tools={},
+        session_executor=SessionExecutor(),  # type: ignore[arg-type]
+        allowed_tools_for=lambda reference, resolved: (
+            ()
+            if reference == job.private_holdout_refs[0] and resolved == candidate
+            else None
+        ),
+        clock=lambda: NOW,
+    )
+
+    await runner.run(
+        job=job,
+        invocation=invocation,
+        candidate=candidate,
+        case_ref=job.private_holdout_refs[0],
+        lease=invocation.lease,
+        allowed_models=job.execution_policy.allowed_models,
+        max_seconds=10,
+    )
+
+    assert observed["allowed_tools"] == ()
 
 
 @pytest.mark.asyncio
