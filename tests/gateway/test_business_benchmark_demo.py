@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from agenten.agent_factory.business_benchmark_demo_provisioning import (
     BusinessBenchmarkDemoProvisioner,
 )
 import pytest
+from fastapi import HTTPException
 
 from gateway.business_benchmark_demo import (
     GatewayBusinessBenchmarkDemoAuthority,
@@ -68,3 +71,37 @@ def test_gateway_authority_rejects_work_batch_bound_to_another_factory_job(
         authority.persist_work_batch(claims.job, renewal.work_batch)
 
     assert store.requests == []
+
+
+def test_gateway_authority_reads_existing_v3_job_for_typed_resume(tmp_path) -> None:
+    expected = BusinessBenchmarkDemoProvisioner(settings(tmp_path)).plan().teams[0].job
+
+    class Store:
+        def factory_job(self, job_id):
+            assert job_id == expected.job_id
+            return SimpleNamespace(
+                job=expected,
+                projection=SimpleNamespace(phase=None, attempt=1),
+            )
+
+    authority = object.__new__(GatewayBusinessBenchmarkDemoAuthority)
+    authority._store = Store()
+
+    state = authority.resume_state(expected.job_id)
+    assert state is not None
+    assert state.job == expected
+    assert state.phase is None
+    assert state.attempt == 1
+
+
+def test_gateway_authority_returns_none_only_for_missing_resume_job(tmp_path) -> None:
+    expected = BusinessBenchmarkDemoProvisioner(settings(tmp_path)).plan().teams[0].job
+
+    class Store:
+        def factory_job(self, job_id):
+            raise HTTPException(status_code=404, detail="factory job not found")
+
+    authority = object.__new__(GatewayBusinessBenchmarkDemoAuthority)
+    authority._store = Store()
+
+    assert authority.resume_state(expected.job_id) is None

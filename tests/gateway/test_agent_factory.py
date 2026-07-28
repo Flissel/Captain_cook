@@ -399,16 +399,28 @@ def test_factory_gateway_records_only_the_next_role_lease(storage: MariaDBStorag
         workspace_ref="workspace://factory/support-triage",
         now=datetime(2026, 7, 19, 10, tzinfo=timezone.utc),
     )
+    renewed = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.AGENT_ARCHITECT,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage/epoch-renewed",
+        now=datetime(2026, 7, 19, 10, 5, tzinfo=timezone.utc),
+    )
     with TestClient(application(storage)) as client:
         assert client.post("/v1/factory/jobs", json=factory_job.model_dump(mode="json", by_alias=True)).status_code == 202
         assert client.post("/v1/factory/blocks", json=forge.model_dump(mode="json", by_alias=True)).status_code == 201
         first = client.post("/v1/factory/leases", json=lease.model_dump(mode="json", by_alias=True))
         replay = client.post("/v1/factory/leases", json=lease.model_dump(mode="json", by_alias=True))
+        renewal = client.post(
+            "/v1/factory/leases",
+            json=renewed.model_dump(mode="json", by_alias=True),
+        )
         projection = client.get(f"/v1/factory/jobs/{factory_job.job_id}")
 
     assert first.status_code == 201
     assert replay.status_code == 200
-    assert len(projection.json()["leases"]) == 1
+    assert renewal.status_code == 201
+    assert len(projection.json()["leases"]) == 2
 
 
 def test_factory_gateway_allows_tool_integrator_lease_for_build_validation(storage: MariaDBStorage) -> None:

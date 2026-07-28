@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory, Position=0)]
-    [ValidateSet("start", "health", "stop")]
+    [ValidateSet("start", "benchmark-start", "health", "stop")]
     [string]$Action,
     [switch]$RecoverDemoCredentials,
     [string]$CredentialSourceEnv
@@ -261,6 +261,15 @@ function Invoke-StartServices([switch]$RecoverDemoCredentials, [string]$SourceEn
     & (Join-Path $PSScriptRoot 'minibook-demo.ps1') bootstrap -RecoverDemoCredentials:$RecoverDemoCredentials
     Invoke-Health
 }
+function Invoke-BenchmarkStart([switch]$RecoverDemoCredentials, [string]$SourceEnv) {
+    $values = Initialize-LocalEnvironment
+    Set-ProcessEnvironment $values
+    Initialize-CaptainN8n $values -Recover:$RecoverDemoCredentials -SourceEnv $SourceEnv
+    docker compose --project-name $project --env-file $rootEnv --file $testCompose up -d --wait mariadb-test
+    if ($LASTEXITCODE -ne 0) { throw 'Isolated captain_test MariaDB failed to start.' }
+    Start-Gateway $values
+    Write-Host '[ready] isolated business benchmark infrastructure database=captain_test'
+}
 function Invoke-Health {
     $values = Read-Env $rootEnv @('CAPTAIN_RUNTIME_URL')
     if (-not $values.Contains('CAPTAIN_RUNTIME_URL')) { throw 'Runtime URL is not configured.' }
@@ -278,6 +287,9 @@ try {
     switch ($Action) {
         start {
             Invoke-StartServices -Recover:$RecoverDemoCredentials -SourceEnv $CredentialSourceEnv
+        }
+        benchmark-start {
+            Invoke-BenchmarkStart -Recover:$RecoverDemoCredentials -SourceEnv $CredentialSourceEnv
         }
         health { Invoke-Health }
         stop {

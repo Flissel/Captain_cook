@@ -15,6 +15,7 @@ import pytest
 from agenten.agent_factory.business_benchmark_demo_provisioning import (
     BusinessBenchmarkDemoProvisioner,
     BusinessBenchmarkDemoProvisioningSettings,
+    BusinessBenchmarkDemoResumeStateV1,
     BusinessBenchmarkDemoTeamPlanV1,
     assert_local_captain_test_dsn,
 )
@@ -69,8 +70,28 @@ class RecordingGateway:
         self.blocks: dict[UUID, FactoryEvidenceBlock] = {}
         self.leases: dict[str, FactoryLease] = {}
         self.work_batches: dict[str, tuple[UUID, WorkBatch]] = {}
+        self.register_calls = 0
+        self.resume_overrides: dict[UUID, BusinessBenchmarkDemoResumeStateV1] = {}
+
+    def resume_state(self, job_id: UUID) -> BusinessBenchmarkDemoResumeStateV1 | None:
+        if job_id in self.resume_overrides:
+            return self.resume_overrides[job_id]
+        current = self.jobs.get(job_id)
+        if current is None:
+            return None
+        phase = (
+            FactoryPhase.FORGE_REQUESTED
+            if any(block.job_id == job_id for block in self.blocks.values())
+            else None
+        )
+        return BusinessBenchmarkDemoResumeStateV1(
+            job=current,
+            phase=phase,
+            attempt=1,
+        )
 
     def register(self, job: AgentFactoryJobV3) -> None:
+        self.register_calls += 1
         current = self.jobs.setdefault(job.job_id, job)
         if current != job:
             raise ValueError("factory job already exists with different content")
@@ -291,9 +312,13 @@ def test_apply_persists_only_legal_initial_gateway_authority_and_is_idempotent(
     }
     second = provisioner.apply()
 
-    assert first == second
+    assert first.created_job_ids == tuple(team.job.job_id for team in first.teams)
+    assert first.resumed_job_ids == ()
+    assert second.created_job_ids == ()
+    assert second.resumed_job_ids == tuple(team.job.job_id for team in second.teams)
     assert first.mode == "applied"
     assert len(gateway.jobs) == 2
+    assert gateway.register_calls == 2
     assert len(gateway.skill_assignments) == 12
     assert len(gateway.blocks) == 2
     assert all(block.phase is FactoryPhase.FORGE_REQUESTED for block in gateway.blocks.values())
@@ -326,6 +351,133 @@ def test_apply_persists_only_legal_initial_gateway_authority_and_is_idempotent(
         for path in (tmp_path / ".captain-cook").rglob("*")
         if path.is_file()
     } == snapshot
+
+
+def test_apply_resumes_stable_jobs_with_fresh_epoch_and_renews_active_leases(
+    tmp_path: Path,
+) -> None:
+    gateway = RecordingGateway()
+    first = BusinessBenchmarkDemoProvisioner(
+        settings(tmp_path),
+        gateway=gateway,
+        clock=lambda: ISSUED_AT + timedelta(minutes=1),
+    ).apply()
+    original_jobs = dict(gateway.jobs)
+    original_blocks = dict(gateway.blocks)
+    original_assignments = dict(gateway.skill_assignments)
+    original_files = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in (tmp_path / ".captain-cook").rglob("*")
+        if path.is_file()
+    }
+
+    fresh_epoch = ISSUED_AT + timedelta(minutes=5)
+    resumed = BusinessBenchmarkDemoProvisioner(
+        settings(tmp_path, issued_at=fresh_epoch),
+        gateway=gateway,
+        clock=lambda: fresh_epoch + timedelta(minutes=1),
+    ).apply()
+
+    assert resumed.issued_at == fresh_epoch
+    assert resumed.created_job_ids == ()
+    assert resumed.resumed_job_ids == tuple(team.job.job_id for team in resumed.teams)
+    assert tuple(team.job for team in resumed.teams) == tuple(
+        original_jobs[team.job.job_id] for team in first.teams
+    )
+    assert gateway.jobs == original_jobs
+    assert gateway.register_calls == 2
+    assert gateway.blocks == original_blocks
+    assert gateway.skill_assignments == original_assignments
+    assert len(gateway.leases) == 4
+    renewed = tuple(team.initial_lease for team in resumed.teams)
+    assert all(lease is not None for lease in renewed)
+    assert all(lease.issued_at == fresh_epoch for lease in renewed)
+    assert all(lease.expires_at > fresh_epoch for lease in renewed)
+    assert {team.initial_lease.lease_id for team in first.teams}.isdisjoint(
+        {lease.lease_id for lease in renewed}
+    )
+    assert all(block.phase is FactoryPhase.FORGE_REQUESTED for block in gateway.blocks.values())
+    assert {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in (tmp_path / ".captain-cook").rglob("*")
+        if path.is_file()
+    } == original_files
+    assert tuple(team.policy_binding_ref for team in resumed.teams) == tuple(
+        team.policy_binding_ref for team in first.teams
+    )
+
+
+def test_apply_reports_later_projection_without_rewinding_or_renewing_lease(
+    tmp_path: Path,
+) -> None:
+    gateway = RecordingGateway()
+    first = BusinessBenchmarkDemoProvisioner(
+        settings(tmp_path),
+        gateway=gateway,
+        clock=lambda: ISSUED_AT + timedelta(minutes=1),
+    ).apply()
+    for team in first.teams:
+        gateway.resume_overrides[team.job.job_id] = BusinessBenchmarkDemoResumeStateV1(
+            job=team.job,
+            phase=FactoryPhase.BLUEPRINT_CREATED,
+            attempt=1,
+        )
+    snapshot = (
+        dict(gateway.jobs),
+        dict(gateway.blocks),
+        dict(gateway.skill_assignments),
+        dict(gateway.leases),
+    )
+    fresh_epoch = ISSUED_AT + timedelta(minutes=5)
+
+    resumed = BusinessBenchmarkDemoProvisioner(
+        settings(tmp_path, issued_at=fresh_epoch),
+        gateway=gateway,
+        clock=lambda: fresh_epoch + timedelta(minutes=1),
+    ).apply()
+
+    assert resumed.created_job_ids == ()
+    assert resumed.resumed_job_ids == ()
+    assert resumed.checkpoint_job_ids == tuple(team.job.job_id for team in resumed.teams)
+    assert all(team.next_action == "continue_existing_lifecycle" for team in resumed.teams)
+    assert all(team.next_dispatch is None for team in resumed.teams)
+    assert all(team.initial_lease is None for team in resumed.teams)
+    assert (
+        gateway.jobs,
+        gateway.blocks,
+        gateway.skill_assignments,
+        gateway.leases,
+    ) == snapshot
+
+
+def test_apply_rejects_changed_static_job_before_resume_writes(tmp_path: Path) -> None:
+    gateway = RecordingGateway()
+    BusinessBenchmarkDemoProvisioner(
+        settings(tmp_path),
+        gateway=gateway,
+        clock=lambda: ISSUED_AT + timedelta(minutes=1),
+    ).apply()
+    snapshot = (
+        dict(gateway.jobs),
+        dict(gateway.blocks),
+        dict(gateway.skill_assignments),
+        dict(gateway.leases),
+    )
+    fresh_epoch = ISSUED_AT + timedelta(minutes=5)
+
+    with pytest.raises(ValueError, match="stable demo job binding changed"):
+        BusinessBenchmarkDemoProvisioner(
+            settings(tmp_path, issued_at=fresh_epoch, model="gpt-4.1"),
+            gateway=gateway,
+            clock=lambda: fresh_epoch + timedelta(minutes=1),
+        ).apply()
+
+    assert (
+        gateway.jobs,
+        gateway.blocks,
+        gateway.skill_assignments,
+        gateway.leases,
+    ) == snapshot
 
 
 def test_apply_rejects_expired_initial_lease_before_writing(tmp_path: Path) -> None:

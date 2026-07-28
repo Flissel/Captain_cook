@@ -88,7 +88,7 @@ def test_minibook_demo_bootstrap_is_local_reusable_and_redacted() -> None:
 
 def test_live_demo_services_only_operates_captain_resources() -> None:
     source = SERVICES.read_text(encoding="utf-8")
-    assert 'ValidateSet("start", "health", "stop")' in source
+    assert 'ValidateSet("start", "benchmark-start", "health", "stop")' in source
     assert "captain-n8n.ps1" in source
     assert "minibook-demo.ps1" in source
     assert "docker compose" in source

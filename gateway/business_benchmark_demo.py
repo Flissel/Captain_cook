@@ -12,6 +12,7 @@ from pymysql.err import MySQLError
 
 from blockchain.mariadb_storage import MariaDBStorage
 from agenten.agent_factory.business_benchmark_demo_provisioning import (
+    BusinessBenchmarkDemoResumeStateV1,
     assert_local_captain_test_dsn,
 )
 from agenten.agent_factory.contracts import (
@@ -56,6 +57,27 @@ class GatewayBusinessBenchmarkDemoAuthority:
                 "Captain Gateway MariaDB is unavailable"
             ) from exc
         self._repository = GatewayFactoryRepository(self._store)
+
+    def resume_state(self, job_id: UUID) -> BusinessBenchmarkDemoResumeStateV1 | None:
+        try:
+            stored = self._store.factory_job(job_id)
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                return None
+            raise GatewayBusinessBenchmarkDemoError(str(exc.detail)) from exc
+        except MySQLError as exc:
+            raise GatewayBusinessBenchmarkDemoError(
+                "Captain Gateway MariaDB operation failed"
+            ) from exc
+        if not isinstance(stored.job, AgentFactoryJobV3):
+            raise GatewayBusinessBenchmarkDemoError(
+                "existing stable benchmark job is not a V3 job"
+            )
+        return BusinessBenchmarkDemoResumeStateV1(
+            job=stored.job,
+            phase=stored.projection.phase,
+            attempt=stored.projection.attempt,
+        )
 
     def register(self, job: AgentFactoryJobV3) -> None:
         self._translate(lambda: self._repository.register(job))

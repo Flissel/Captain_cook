@@ -20,7 +20,7 @@ from typing import Literal, Protocol
 from urllib.parse import unquote, urlparse
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agenten.agent_factory.business_benchmark_candidate_seeds import (
     CLAIMS_SEED_PROFILE,
@@ -181,14 +181,14 @@ class BusinessBenchmarkDemoTeamPlanV1(_FrozenModel):
     team_manifest_ref: ArtifactRef
     policy_binding_ref: ArtifactRef
     released_skills: tuple[ReleasedHermesSkill, ...]
-    initial_lease: FactoryLease
+    initial_lease: FactoryLease | None
     blocker: ToolGapMarker
     work_batch: WorkBatch | None = None
     released_workflow_steps: tuple[FactorySkillStep, ...]
     initial_workflow_steps: tuple[FactorySkillStep, ...]
     missing_gateway_evidence: tuple[str, ...]
-    next_action: Literal["dispatch_agent_architect"]
-    next_dispatch: BusinessBenchmarkNextDispatchV1
+    next_action: Literal["dispatch_agent_architect", "continue_existing_lifecycle"]
+    next_dispatch: BusinessBenchmarkNextDispatchV1 | None
     production_scope_resolvable: Literal[False] = False
     gateway_budget_remaining_usd: Decimal | None = None
 
@@ -203,10 +203,39 @@ class BusinessBenchmarkDemoProvisioningResultV1(_FrozenModel):
     issued_at: datetime
     database: Literal["captain_test"] = "captain_test"
     teams: tuple[BusinessBenchmarkDemoTeamPlanV1, BusinessBenchmarkDemoTeamPlanV1]
+    created_job_ids: tuple[UUID, ...] = ()
+    resumed_job_ids: tuple[UUID, ...] = ()
+    checkpoint_job_ids: tuple[UUID, ...] = ()
+
+    @model_validator(mode="after")
+    def require_exact_apply_disposition(self) -> "BusinessBenchmarkDemoProvisioningResultV1":
+        created = set(self.created_job_ids)
+        resumed = set(self.resumed_job_ids)
+        checkpoint = set(self.checkpoint_job_ids)
+        if created & resumed or created & checkpoint or resumed & checkpoint:
+            raise ValueError("benchmark job apply dispositions must be disjoint")
+        if self.mode == "dry_run":
+            if created or resumed or checkpoint:
+                raise ValueError("dry-run benchmark provisioning cannot report writes")
+            return self
+        team_ids = {team.job.job_id for team in self.teams}
+        if created | resumed | checkpoint != team_ids:
+            raise ValueError("applied benchmark jobs require one exact disposition")
+        return self
+
+
+class BusinessBenchmarkDemoResumeStateV1(_FrozenModel):
+    """Read-only Gateway projection needed to resume without rewinding lifecycle."""
+
+    job: AgentFactoryJobV3
+    phase: FactoryPhase | None
+    attempt: int = Field(ge=1, le=5, strict=True)
 
 
 class BusinessBenchmarkDemoGatewayPort(Protocol):
     """The narrow sole-writer surface used by the bootstrap."""
+
+    def resume_state(self, job_id: UUID) -> BusinessBenchmarkDemoResumeStateV1 | None: ...
 
     def register(self, job: AgentFactoryJobV3) -> None: ...
 
@@ -236,6 +265,8 @@ class _PreparedTeam:
     artifacts: tuple[tuple[ArtifactRef, bytes], ...]
     policy_binding: CaptainBusinessBenchmarkPolicyBindingV1
     forge_requested: FactoryEvidenceBlock
+    resumed: bool = False
+    checkpoint: bool = False
 
 
 class BusinessBenchmarkDemoProvisioner:
@@ -271,6 +302,10 @@ class BusinessBenchmarkDemoProvisioner:
                 "Gateway business benchmark provisioning authority is required for --apply"
             )
         gateway = self._gateway
+        prepared = tuple(
+            self._resume_prepared(item, gateway.resume_state(item.plan.job.job_id))
+            for item in prepared
+        )
         authority_root = self._authority_root
         suites = CanonicalPrivateBusinessBenchmarkProvisioner(
             authority_root / "suites"
@@ -282,6 +317,14 @@ class BusinessBenchmarkDemoProvisioner:
 
         applied: list[BusinessBenchmarkDemoTeamPlanV1] = []
         for item in prepared:
+            if item.checkpoint:
+                budget = gateway.budget_projection(item.plan.job.job_id)
+                applied.append(
+                    item.plan.model_copy(
+                        update={"gateway_budget_remaining_usd": budget.remaining_usd}
+                    )
+                )
+                continue
             expected_suite = next(
                 suite for suite in suites.suites if suite.profile_id == item.plan.profile_id
             )
@@ -325,7 +368,8 @@ class BusinessBenchmarkDemoProvisioner:
             except ValueError as exc:
                 raise ValueError("immutable demo team job binding changed") from exc
 
-            gateway.register(item.plan.job)
+            if not item.resumed:
+                gateway.register(item.plan.job)
             if item.plan.work_batch is not None:
                 gateway.persist_work_batch(item.plan.job, item.plan.work_batch)
             gateway.assign_released_skills(
@@ -340,6 +384,8 @@ class BusinessBenchmarkDemoProvisioner:
                 },
             )
             gateway.append_forge_requested(item.forge_requested)
+            if item.plan.initial_lease is None:
+                raise ValueError("resumable benchmark dispatch requires an active lease")
             gateway.record_lease(item.plan.initial_lease)
             budget = gateway.budget_projection(item.plan.job.job_id)
             if (
@@ -359,6 +405,113 @@ class BusinessBenchmarkDemoProvisioner:
             mode="applied",
             issued_at=self._settings.issued_at,
             teams=(applied[0], applied[1]),
+            created_job_ids=tuple(
+                item.plan.job.job_id for item in prepared if not item.resumed
+            ),
+            resumed_job_ids=tuple(
+                item.plan.job.job_id
+                for item in prepared
+                if item.resumed and not item.checkpoint
+            ),
+            checkpoint_job_ids=tuple(
+                item.plan.job.job_id for item in prepared if item.checkpoint
+            ),
+        )
+
+    def _resume_prepared(
+        self,
+        item: _PreparedTeam,
+        state: BusinessBenchmarkDemoResumeStateV1 | None,
+    ) -> _PreparedTeam:
+        if state is None:
+            return item
+        existing = state.job
+        planned_binding = item.plan.job.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude={"occurred_at", "deadline_at"},
+        )
+        existing_binding = existing.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude={"occurred_at", "deadline_at"},
+        )
+        if existing_binding != planned_binding:
+            raise ValueError("immutable stable demo job binding changed")
+        if state.phase not in {None, FactoryPhase.FORGE_REQUESTED} or state.attempt != 1:
+            return _PreparedTeam(
+                plan=item.plan.model_copy(
+                    update={
+                        "job": existing,
+                        "initial_lease": None,
+                        "next_action": "continue_existing_lifecycle",
+                        "next_dispatch": None,
+                        "work_batch": (
+                            _renewal_work_batch(existing)
+                            if item.plan.profile == "renewal"
+                            else None
+                        ),
+                    }
+                ),
+                candidate_manifest=item.candidate_manifest,
+                artifacts=item.artifacts,
+                policy_binding=CaptainBusinessBenchmarkPolicyBindingV1.create(
+                    job=existing,
+                    attempt=1,
+                    policy=item.policy_binding.policy,
+                ),
+                forge_requested=_forge_requested(
+                    existing,
+                    candidate_ref=item.plan.candidate_ref,
+                    manifest_ref=item.plan.candidate_manifest_ref,
+                    team_ref=item.plan.team_manifest_ref,
+                ),
+                resumed=True,
+                checkpoint=True,
+            )
+        lease = issue_factory_lease(
+            job=existing,
+            role=FactoryRole.AGENT_ARCHITECT,
+            attempt=1,
+            workspace_ref=_demo_workspace_ref(
+                item.plan.profile,
+                self._settings.issued_at,
+            ),
+            now=self._settings.issued_at,
+        )
+        blocker, _ = _prepare_blocker(existing, item.plan.profile)
+        forge = _forge_requested(
+            existing,
+            candidate_ref=item.plan.candidate_ref,
+            manifest_ref=item.plan.candidate_manifest_ref,
+            team_ref=item.plan.team_manifest_ref,
+        )
+        plan = item.plan.model_copy(
+            update={
+                "job": existing,
+                "initial_lease": lease,
+                "blocker": blocker,
+                "work_batch": (
+                    _renewal_work_batch(existing)
+                    if item.plan.profile == "renewal"
+                    else None
+                ),
+                "next_dispatch": item.plan.next_dispatch.model_copy(
+                    update={"lease_id": lease.lease_id}
+                ),
+            }
+        )
+        return _PreparedTeam(
+            plan=plan,
+            candidate_manifest=item.candidate_manifest,
+            artifacts=item.artifacts,
+            policy_binding=CaptainBusinessBenchmarkPolicyBindingV1.create(
+                job=existing,
+                attempt=1,
+                policy=item.policy_binding.policy,
+            ),
+            forge_requested=forge,
+            resumed=True,
         )
 
     def validate_apply_preconditions(self) -> None:
@@ -432,7 +585,10 @@ class BusinessBenchmarkDemoProvisioner:
                     job=job,
                     role=FactoryRole.AGENT_ARCHITECT,
                     attempt=1,
-                    workspace_ref=f"workspace://business-benchmark-demo/{profile}",
+                    workspace_ref=_demo_workspace_ref(
+                        profile,
+                        self._settings.issued_at,
+                    ),
                     now=self._settings.issued_at,
                 )
                 ordered_skills = tuple(skills[step] for step in FactorySkillStep)
@@ -492,6 +648,11 @@ class BusinessBenchmarkDemoProvisioner:
                     )
                 )
         return prepared[0], prepared[1]
+
+
+def _demo_workspace_ref(profile: str, issued_at: datetime) -> str:
+    epoch = hashlib.sha256(issued_at.isoformat().encode("utf-8")).hexdigest()[:16]
+    return f"workspace://business-benchmark-demo/{profile}/epoch-{epoch}"
 
 
 def _renewal_work_batch(job: AgentFactoryJobV3) -> WorkBatch:

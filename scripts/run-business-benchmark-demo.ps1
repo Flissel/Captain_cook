@@ -1,0 +1,452 @@
+#requires -Version 7
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('Plan', 'Run')]
+    [string]$Action,
+
+    [string]$PythonPath = ''
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+$rootEnvPath = Join-Path $repositoryRoot '.env'
+$captainN8nEnvPath = Join-Path $repositoryRoot '.env.captain-n8n'
+$provisionScript = Join-Path $PSScriptRoot 'provision-business-benchmark-demo.py'
+$preflightScript = Join-Path $PSScriptRoot 'preflight-business-benchmark-demo.py'
+$liveRunner = Join-Path $PSScriptRoot 'run-business-benchmark-live.ps1'
+$serviceRunner = Join-Path $PSScriptRoot 'live-demo-services.ps1'
+$canonicalRenewalWorkflow = Join-Path $repositoryRoot 'examples/business_benchmark_candidates/customer_renewal_orchestration_team/workflows/renewal_context_read.json'
+$maximumUsdPerTeam = '0.50'
+$seedVersion = 'business-benchmark-demo-2026-07'
+
+$rootEnvAllowlist = @(
+    'TEST_MARIADB_DSN',
+    'MARIADB_TEST_PORT',
+    'CAPTAIN_GATEWAY_URL',
+    'CAPTAIN_GATEWAY_TOKEN',
+    'WORKER_GATEWAY_TOKEN',
+    'CAPTAIN_BENCHMARK_MODEL'
+)
+$captainN8nAllowlist = @(
+    'CAPTAIN_N8N_PORT',
+    'CAPTAIN_N8N_API_KEY',
+    'CAPTAIN_N8N_MCP_TOKEN',
+    'CAPTAIN_N8N_MCP_BROKER_URL',
+    'CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET'
+)
+
+function Read-AllowlistedEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string[]]$AllowedNames
+    )
+    $values = [ordered]@{}
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Required gitignored demo environment file is missing: $([IO.Path]::GetFileName($Path))"
+    }
+    foreach ($line in [IO.File]::ReadAllLines($Path)) {
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.TrimStart().StartsWith('#')) {
+            continue
+        }
+        if ($line -notmatch '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {
+            throw "Invalid local environment line in $([IO.Path]::GetFileName($Path))."
+        }
+        $name = $Matches[1]
+        if ($AllowedNames -notcontains $name) {
+            continue
+        }
+        if ($values.Contains($name)) {
+            throw "Duplicate allowlisted local environment key: $name"
+        }
+        $values[$name] = $Matches[2].Trim().Trim('"').Trim("'")
+    }
+    return $values
+}
+
+function Merge-Environment {
+    param(
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Target,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Source
+    )
+    foreach ($entry in $Source.GetEnumerator()) {
+        if ($Target.Contains($entry.Key)) {
+            throw "Allowlisted demo environment key appears in multiple sources: $($entry.Key)"
+        }
+        $Target[$entry.Key] = [string]$entry.Value
+    }
+}
+
+function Set-ProcessEnvironment {
+    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Values)
+    foreach ($entry in $Values.GetEnumerator()) {
+        [Environment]::SetEnvironmentVariable(
+            [string]$entry.Key,
+            [string]$entry.Value,
+            'Process'
+        )
+    }
+}
+
+function Resolve-Python311 {
+    param([string]$ConfiguredPath)
+    $resolved = $ConfiguredPath
+    if ([string]::IsNullOrWhiteSpace($resolved)) {
+        $candidate = Join-Path $repositoryRoot '.venv\Scripts\python.exe'
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $resolved = $candidate
+        }
+        else {
+            $command = Get-Command python -CommandType Application -ErrorAction SilentlyContinue
+            if ($null -eq $command) {
+                throw 'TODO_TOOL.v1: validated Python 3.11 interpreter is unavailable'
+            }
+            $resolved = $command.Source
+        }
+    }
+    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+        throw 'TODO_TOOL.v1: validated Python interpreter path is not a file'
+    }
+    & $resolved -c 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 11) else 1)' *> $null
+    if ($LASTEXITCODE -ne 0) {
+        throw 'TODO_TOOL.v1: validated Python interpreter must be Python 3.11'
+    }
+    return (Resolve-Path -LiteralPath $resolved).Path
+}
+
+function Assert-ExactCaptainTestDsn {
+    param(
+        [Parameter(Mandatory = $true)][string]$Dsn,
+        [Parameter(Mandatory = $true)][string]$ExpectedPort
+    )
+    try {
+        $uri = [Uri]$Dsn
+        $port = [int]$ExpectedPort
+    }
+    catch {
+        throw 'TEST_MARIADB_DSN must be a valid local captain_test DSN.'
+    }
+    if (
+        $uri.Scheme -cne 'mariadb' -or
+        $uri.Host -notin @('127.0.0.1', 'localhost') -or
+        $uri.AbsolutePath.TrimEnd('/') -cne '/captain_test' -or
+        $uri.Port -ne $port -or
+        $port -lt 1024 -or
+        $port -gt 65535
+    ) {
+        throw 'TEST_MARIADB_DSN must target the exact isolated local captain_test database.'
+    }
+}
+
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$Value)
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Value)
+    return [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData($bytes)
+    ).ToLowerInvariant()
+}
+
+function Require-NonEmpty {
+    param(
+        [Parameter(Mandatory = $true)][object]$Value,
+        [Parameter(Mandatory = $true)][string]$Field
+    )
+    if ([string]::IsNullOrWhiteSpace([string]$Value)) {
+        throw "Provisioning result is missing typed field: $Field"
+    }
+    return [string]$Value
+}
+
+function New-FactoryDispatchCheckpoint {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Teams,
+        [Parameter(Mandatory = $true)][string]$IssuedAt,
+        [Parameter(Mandatory = $true)][string]$RenewalBatchId
+    )
+    $jobs = @(
+        foreach ($team in $Teams) {
+            [ordered]@{
+                profile = [string]$team.profile
+                job_id = [string]$team.job.job_id
+                candidate_id = [string]$team.candidate_id
+                missing_gateway_evidence = @($team.missing_gateway_evidence)
+            }
+        }
+    )
+    return [ordered]@{
+        schema = 'captain.business-benchmark-demo-run.v1'
+        status = 'factory_dispatch_required'
+        database = 'captain_test'
+        issued_at = $IssuedAt
+        maximum_usd_per_team = $maximumUsdPerTeam
+        jobs = $jobs
+        renewal_batch_id = $RenewalBatchId
+        instruction = 'Run the Captain Factory dispatch composition for both job IDs, then rerun this command.'
+    }
+}
+
+function New-InfrastructureCheckpoint {
+    param([Parameter(Mandatory = $true)][string]$IssuedAt)
+    return [ordered]@{
+        schema = 'captain.business-benchmark-demo-run.v1'
+        status = 'infrastructure_required'
+        database = 'captain_test'
+        issued_at = $IssuedAt
+        component = 'captain_test_gateway_n8n'
+        instruction = 'Restore or start only the Captain-owned benchmark infrastructure, then rerun this command.'
+    }
+}
+
+function Get-HumanReviewCheckpoint {
+    param(
+        [Parameter(Mandatory = $true)][string]$Python,
+        [Parameter(Mandatory = $true)][string]$IssuedAt
+    )
+    $root = Join-Path $repositoryRoot '.captain-cook/private/business-benchmarks/human-review'
+    $raw = @(
+        & $Python -m agenten.agent_factory.business_benchmark_human_review_cli `
+            --root $root list --status pending 2>$null
+    )
+    if ($LASTEXITCODE -ne 0 -or $raw.Count -eq 0) {
+        return $null
+    }
+    try {
+        $pending = ($raw -join [Environment]::NewLine) | ConvertFrom-Json -Depth 20
+    }
+    catch {
+        return $null
+    }
+    if ([int]$pending.count -lt 1) {
+        return $null
+    }
+    return [ordered]@{
+        schema = 'captain.business-benchmark-demo-run.v1'
+        status = 'human_review_required'
+        database = 'captain_test'
+        issued_at = $IssuedAt
+        review_count = [int]$pending.count
+        instruction = 'List pending reviews with the Captain human-review CLI; an operator must complete them explicitly, then rerun this command.'
+    }
+}
+
+Push-Location $repositoryRoot
+try {
+    $python = Resolve-Python311 $PythonPath
+    $issuedAt = [DateTimeOffset]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+
+    if ($Action -ceq 'Run') {
+        try {
+            & $serviceRunner benchmark-start *> $null
+            if ($LASTEXITCODE -ne 0) {
+                throw 'Captain benchmark infrastructure returned a non-zero exit code.'
+            }
+        }
+        catch {
+            New-InfrastructureCheckpoint -IssuedAt $issuedAt |
+                ConvertTo-Json -Compress -Depth 10
+            exit 4
+        }
+    }
+
+    $environment = [ordered]@{}
+    Merge-Environment $environment (Read-AllowlistedEnvironment $rootEnvPath $rootEnvAllowlist)
+    Merge-Environment $environment (Read-AllowlistedEnvironment $captainN8nEnvPath $captainN8nAllowlist)
+    foreach ($required in @(
+        'TEST_MARIADB_DSN',
+        'MARIADB_TEST_PORT',
+        'CAPTAIN_N8N_PORT',
+        'CAPTAIN_N8N_API_KEY',
+        'CAPTAIN_N8N_MCP_TOKEN',
+        'CAPTAIN_N8N_MCP_BROKER_URL',
+        'CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET'
+    )) {
+        if (-not $environment.Contains($required) -or [string]::IsNullOrWhiteSpace([string]$environment[$required])) {
+            throw "Required allowlisted Captain demo setting is missing: $required"
+        }
+    }
+    Assert-ExactCaptainTestDsn `
+        -Dsn ([string]$environment['TEST_MARIADB_DSN']) `
+        -ExpectedPort ([string]$environment['MARIADB_TEST_PORT'])
+
+    $model = if (
+        $environment.Contains('CAPTAIN_BENCHMARK_MODEL') -and
+        -not [string]::IsNullOrWhiteSpace([string]$environment['CAPTAIN_BENCHMARK_MODEL'])
+    ) {
+        [string]$environment['CAPTAIN_BENCHMARK_MODEL']
+    }
+    else {
+        'gpt-4.1-mini'
+    }
+    $redactionVersion = 'benchmark-redaction-v1'
+    $environment['CAPTAIN_BENCHMARK_PROVIDER'] = 'openai'
+    $environment['CAPTAIN_BENCHMARK_MODEL'] = $model
+    $environment['CAPTAIN_BENCHMARK_PROVIDER_SECRET'] = 'OPENAI_API_KEY'
+    $environment['CAPTAIN_BENCHMARK_REDACTION_POLICY_VERSION'] = $redactionVersion
+    $environment['CAPTAIN_BENCHMARK_REDACTION_POLICY_SHA256'] = Get-Sha256Hex `
+        '{"redaction_policy_version":"benchmark-redaction-v1"}'
+    $environment['CAPTAIN_BENCHMARK_CASE_MAX_COST_USD'] = '0.01'
+    $environment['CAPTAIN_BENCHMARK_CASE_MAX_LATENCY_MS'] = '30000'
+    $environment['CAPTAIN_BENCHMARK_MAX_COST_PER_CALL_USD'] = '0.01'
+    $environment['CAPTAIN_BENCHMARK_PRICING_MINIMUM_COST_USD'] = '0'
+    $environment['CAPTAIN_BENCHMARK_PRICING_INPUT_COST_PER_MILLION_USD'] = '0.40'
+    $environment['CAPTAIN_BENCHMARK_PRICING_OUTPUT_COST_PER_MILLION_USD'] = '1.60'
+    $environment['CAPTAIN_BENCHMARK_PRICING_VERSION'] = 'openai-demo-2026-07'
+    $environment['CAPTAIN_BENCHMARK_PRICING_EFFECTIVE_AT'] = '2026-07-01T00:00:00Z'
+    $environment['CAPTAIN_BENCHMARK_SEED_VERSION_ID'] = $seedVersion
+    $environment['CAPTAIN_BENCHMARK_AUTHORITY_ROOT'] = Join-Path $repositoryRoot '.captain-cook/private/business-benchmarks'
+    $environment['CAPTAIN_BENCHMARK_SKILL_ROOT'] = Join-Path $repositoryRoot 'agenten/agent_factory/skills'
+    $environment['CAPTAIN_BENCHMARK_HUMAN_REVIEW_TIMEOUT_SECONDS'] = '0'
+    $environment['CAPTAIN_BENCHMARK_RENEWAL_N8N_EVIDENCE_ROOT'] = Join-Path $repositoryRoot '.captain-cook/business-benchmark'
+    $environment['CAPTAIN_BENCHMARK_RENEWAL_WORKFLOW_PATH'] = $canonicalRenewalWorkflow
+    $environment['N8N_MODE'] = 'captain-builder'
+    $environment['CAPTAIN_N8N_URL'] = "http://127.0.0.1:$($environment['CAPTAIN_N8N_PORT'])"
+    Set-ProcessEnvironment $environment
+
+    $arguments = @(
+        $provisionScript,
+        '--workspace-root', $repositoryRoot,
+        '--issued-at', $issuedAt,
+        '--model', $model,
+        '--maximum-usd-per-team', '0.50',
+        '--suite-version', '1',
+        '--seed-version-id', $seedVersion
+    )
+    if ($Action -ceq 'Run') {
+        $arguments += '--apply'
+    }
+    $rawProvisioning = @(& $python @arguments)
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Captain business benchmark provisioning failed closed.'
+    }
+    try {
+        $provisioning = ($rawProvisioning -join [Environment]::NewLine) | ConvertFrom-Json -Depth 100
+    }
+    catch {
+        throw 'Captain business benchmark provisioning returned invalid JSON.'
+    }
+    $expectedMode = if ($Action -ceq 'Run') { 'applied' } else { 'dry_run' }
+    if (
+        $provisioning.schema -cne 'captain.business-benchmark-demo-provisioning.v1' -or
+        $provisioning.mode -cne $expectedMode -or
+        $provisioning.database -cne 'captain_test' -or
+        @($provisioning.teams).Count -ne 2
+    ) {
+        throw 'Captain business benchmark provisioning result is not canonical.'
+    }
+    $teams = @($provisioning.teams)
+    $claims = @($teams | Where-Object { $_.profile -ceq 'claims' })
+    $renewal = @($teams | Where-Object { $_.profile -ceq 'renewal' })
+    if ($claims.Count -ne 1 -or $renewal.Count -ne 1) {
+        throw 'Provisioning must return exactly one Claims and one Renewal team.'
+    }
+    $claims = $claims[0]
+    $renewal = $renewal[0]
+    foreach ($team in $teams) {
+        $null = Require-NonEmpty $team.job.job_id "$($team.profile).job.job_id"
+        $null = Require-NonEmpty $team.candidate_id "$($team.profile).candidate_id"
+        if (
+            [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
+            [string]$team.gateway_budget_remaining_usd -cne $maximumUsdPerTeam -or
+            @($team.job.execution_policy.allowed_models) -notcontains $model
+        ) {
+            throw 'Provisioned team model or budget does not match the demo authority.'
+        }
+    }
+    $renewalBatchId = Require-NonEmpty $renewal.work_batch.batch_id 'renewal.work_batch.batch_id'
+
+    $environment['CAPTAIN_BENCHMARK_PROFILE'] = 'all'
+    $environment['CAPTAIN_BENCHMARK_MAX_USD'] = '1.00'
+    $environment['CAPTAIN_JOB_ALLOWED_MODELS'] = $model
+    foreach ($binding in @(
+        @('CLAIMS', $claims),
+        @('RENEWAL', $renewal)
+    )) {
+        $prefix = "CAPTAIN_BENCHMARK_$($binding[0])"
+        $team = $binding[1]
+        $environment["${prefix}_SUITE_VERSION"] = [string]$team.suite.suite_version
+        $environment["${prefix}_CANDIDATE_ID"] = [string]$team.candidate_id
+        $environment["${prefix}_JOB_ID"] = [string]$team.job.job_id
+        $environment["${prefix}_ATTEMPT"] = '1'
+        $environment["${prefix}_MAX_USD"] = $maximumUsdPerTeam
+        $environment["${prefix}_REMAINING_USD"] = [string]$team.gateway_budget_remaining_usd
+    }
+    $environment['CAPTAIN_BENCHMARK_RENEWAL_BATCH_ID'] = $renewalBatchId
+    $environment['CAPTAIN_BENCHMARK_RENEWAL_WORKSPACE_REF'] = "workspace://business-benchmark-renewal/$renewalBatchId"
+    $environment['CAPTAIN_BENCHMARK_EVIDENCE_ROOT'] = Join-Path $repositoryRoot '.captain-cook/evidence/business-benchmarks/preflight'
+    Set-ProcessEnvironment $environment
+
+    if ($Action -ceq 'Plan') {
+        [ordered]@{
+            schema = 'captain.business-benchmark-demo-run.v1'
+            status = 'planned'
+            database = 'captain_test'
+            issued_at = $issuedAt
+            maximum_usd_per_team = $maximumUsdPerTeam
+        } | ConvertTo-Json -Compress -Depth 10
+        exit 0
+    }
+
+    $rawPreflight = @(& $python $preflightScript)
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Captain business benchmark default composition preflight failed closed.'
+    }
+    try {
+        $preflight = ($rawPreflight -join [Environment]::NewLine) | ConvertFrom-Json -Depth 20
+    }
+    catch {
+        throw 'Captain business benchmark default composition preflight returned invalid JSON.'
+    }
+    if (
+        $preflight.schema -cne 'captain.business-benchmark-default-preflight.v1' -or
+        $preflight.database -cne 'captain_test' -or
+        $preflight.status -notin @('resolvable', 'factory_dispatch_required') -or
+        ($preflight.production_scope_resolvable -isnot [bool])
+    ) {
+        throw 'Captain business benchmark default composition preflight is not canonical.'
+    }
+    if ($preflight.production_scope_resolvable -ne $true) {
+        New-FactoryDispatchCheckpoint `
+            -Teams $teams `
+            -IssuedAt $issuedAt `
+            -RenewalBatchId $renewalBatchId |
+            ConvertTo-Json -Compress -Depth 20
+        exit 2
+    }
+
+    $processOpenAiKey = [Environment]::GetEnvironmentVariable('OPENAI_API_KEY', 'Process')
+    if ([string]::IsNullOrWhiteSpace($processOpenAiKey)) {
+        throw 'OPENAI_API_KEY must already exist in the process; demo env files are never read for it.'
+    }
+
+    $liveFailure = $null
+    try {
+        $null = @(& $liveRunner -Profile all -PythonPath $python)
+        if ($LASTEXITCODE -ne 0) {
+            $liveFailure = 'provider runner returned a non-zero exit code'
+        }
+    }
+    catch {
+        $liveFailure = 'provider runner failed'
+    }
+    if ($null -ne $liveFailure) {
+        $review = Get-HumanReviewCheckpoint -Python $python -IssuedAt $issuedAt
+        if ($null -ne $review) {
+            $review | ConvertTo-Json -Compress -Depth 20
+            exit 3
+        }
+        throw 'Business benchmark provider gate failed closed; inspect private evidence.'
+    }
+
+    [ordered]@{
+        schema = 'captain.business-benchmark-demo-run.v1'
+        status = 'completed'
+        database = 'captain_test'
+        issued_at = $issuedAt
+        maximum_usd_per_team = $maximumUsdPerTeam
+    } | ConvertTo-Json -Compress -Depth 10
+}
+finally {
+    Pop-Location
+}
