@@ -44,6 +44,7 @@ from agenten.agent_factory.team_execution import (
     CaptainN8nGrantAuthority,
     CaptainAuthorizedN8nTool,
     CaptainReleasedSkillAuthority,
+    FactoryHandoffEvidenceV1,
     FactoryN8nExecutionEvidenceV1,
     FactoryN8nToolAuthorizationV1,
     FactoryHoldoutAssertionDecisionV1,
@@ -52,6 +53,10 @@ from agenten.agent_factory.team_execution import (
     FactoryPricingQuoteV1,
     FactoryTeamRunResult,
     HostAutoGenTeamRunner,
+    HostAutoGenSessionExecutor,
+    HostAutoGenSessionIdentityV1,
+    HostAutoGenSessionResult,
+    SealedSingleAgentPolicyV1,
     ResolvedFactoryHoldoutCase,
     TeamExecutionService,
     compose_live_team_execution,
@@ -77,6 +82,7 @@ from autogen_core import CancellationToken
 from autogen_core.tools import FunctionTool
 from autogen_ext.models.replay import ReplayChatCompletionClient
 from autogen_agentchat.teams import Swarm
+from autogen_agentchat.agents import AssistantAgent
 
 
 NOW = datetime(2026, 7, 21, 13, tzinfo=timezone.utc)
@@ -694,6 +700,188 @@ async def test_live_run_reserves_records_usage_handoffs_and_termination(
     projection = budget.projection(job.job_id)
     assert projection.consumed_usd == Decimal("1.26")
     assert projection.reserved_usd == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_host_autogen_session_executor_uses_fresh_digest_bound_baselines(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    holdout_body = b"Private benchmark case that must never be persisted."
+    job = _job_v3(holdout_body=holdout_body)
+    invocation = _invocation(job)
+    evidence_store = FilesystemFactoryEvidenceStore(tmp_path / "session-evidence")
+    clients: list[BudgetedChatCompletionClient] = []
+
+    def model_client_for(
+        _: HostAutoGenSessionIdentityV1,
+    ) -> BudgetedChatCompletionClient:
+        client = BudgetedChatCompletionClient(
+            job=job,
+            invocation=invocation,
+            attempt=1,
+            delegate=ReplayChatCompletionClient(
+                ["TERMINATE"],
+                model_info=ModelInfo(
+                    vision=False,
+                    function_calling=True,
+                    json_output=True,
+                    family=ModelFamily.UNKNOWN,
+                    structured_output=True,
+                ),
+            ),
+            budget=InMemoryFactoryBudgetLedger(),
+            evidence_store=evidence_store,
+            provider="deterministic-replay",
+            model="approved-model-id",
+            max_cost_per_call=Decimal("0.50"),
+            paid_effect_authority=_PaidEffectAuthority(),
+            pricing_authority=_PricingAuthority(_pricing_quote(job)),
+            clock=lambda: NOW,
+        )
+        clients.append(client)
+        return client
+
+    class Holdouts:
+        async def resolve(self, reference: PrivateHoldoutRef) -> ResolvedFactoryHoldoutCase:
+            return ResolvedFactoryHoldoutCase(reference=reference, body=holdout_body)
+
+        async def evaluate(self, *_: object) -> object:
+            raise AssertionError("session executor must not evaluate business outcomes")
+
+    prompt = b"Return only the sealed benchmark terminal JSON."
+    workspace = tmp_path / "baseline-policy"
+    workspace.mkdir()
+    (workspace / "system.txt").write_bytes(prompt)
+    prompt_ref = _artifact(
+        "baseline-policy",
+        hashlib.sha256(prompt).hexdigest(),
+        media_type="text/plain",
+    )
+    policy = SealedSingleAgentPolicyV1.seal(
+        agent_name="single_agent_baseline",
+        system_prompt_ref=prompt_ref,
+        execution_policy_sha256=_policy_digest(job),
+        model="approved-model-id",
+        allowed_tools=(),
+        max_messages=20,
+        max_tool_calls=6,
+    )
+    with pytest.raises(ValueError, match="policy digest"):
+        SealedSingleAgentPolicyV1.model_validate(
+            {
+                **policy.model_dump(mode="json"),
+                "max_messages": policy.max_messages - 1,
+            }
+        )
+    executor = HostAutoGenSessionExecutor(
+        model_client_factory=model_client_for,
+        evidence_store=evidence_store,
+        holdouts=Holdouts(),  # type: ignore[arg-type]
+        tools={},
+        clock=lambda: NOW,
+    )
+    seen_agents: list[int] = []
+    seen_contexts: list[int] = []
+    original_run = AssistantAgent.run
+
+    async def observed_run(self: AssistantAgent, **kwargs: object) -> object:
+        seen_agents.append(id(self))
+        seen_contexts.append(id(self.model_context))
+        return await original_run(self, **kwargs)  # type: ignore[arg-type,return-value]
+
+    monkeypatch.setattr(AssistantAgent, "run", observed_run)
+
+    def identity(number: int) -> HostAutoGenSessionIdentityV1:
+        return HostAutoGenSessionIdentityV1.for_factory_execution(
+            job=job,
+            invocation=invocation,
+            case_ref=job.private_holdout_refs[0],
+            subject_id="single_agent_baseline",
+            variant="single_agent_baseline",
+            request_id=UUID(f"70000000-0000-0000-0000-{number:012d}"),
+            runtime_session_id=f"baseline-session-{number}",
+            effect_id=hashlib.sha256(f"effect-{number}".encode()).hexdigest(),
+            claim_id=UUID(f"71000000-0000-0000-0000-{number:012d}"),
+            fence=number,
+            model="approved-model-id",
+        )
+    first = await executor.run_baseline(
+        job=job,
+        invocation=invocation,
+        case_ref=job.private_holdout_refs[0],
+        identity=identity(1),
+        policy=policy,
+        workspace=workspace,
+        allowed_models=job.execution_policy.allowed_models,
+        max_seconds=10,
+    )
+    second = await executor.run_baseline(
+        job=job,
+        invocation=invocation,
+        case_ref=job.private_holdout_refs[0],
+        identity=identity(2),
+        policy=policy,
+        workspace=workspace,
+        allowed_models=job.execution_policy.allowed_models,
+        max_seconds=10,
+    )
+
+    assert len(set(seen_agents)) == 2
+    assert len(set(seen_contexts)) == 2
+    assert len({id(client) for client in clients}) == 2
+    assert tuple(len(client.usage_receipts) for client in clients) == (1, 1)
+    assert first.runtime_evidence_ref != second.runtime_evidence_ref
+    assert len(first.usage_receipts) == len(second.usage_receipts) == 1
+    assert first.handoffs == second.handoffs == ()
+    assert first.human_handoff_completed is False
+    assert "Private benchmark case" not in repr(first)
+    persisted = tuple(
+        path.read_text(encoding="utf-8")
+        for path in (tmp_path / "session-evidence").rglob("*.json")
+    )
+    assert all(holdout_body.decode() not in item for item in persisted)
+    assert any('"variant":"single_agent_baseline"' in item for item in persisted)
+    assert any(str(identity(1).claim_id) in item for item in persisted)
+    assert any(str(identity(2).claim_id) in item for item in persisted)
+
+    (workspace / "system.txt").write_text("tampered", encoding="utf-8")
+    with pytest.raises(ValueError, match="system prompt artifact is missing"):
+        await executor.run_baseline(
+            job=job,
+            invocation=invocation,
+            case_ref=job.private_holdout_refs[0],
+            identity=identity(3),
+            policy=policy,
+            workspace=workspace,
+            allowed_models=job.execution_policy.allowed_models,
+            max_seconds=10,
+        )
+
+
+def test_internal_autogen_handoff_cannot_claim_human_completion() -> None:
+    observation = _artifact("session-observation", "9" * 64)
+    internal_handoff = FactoryHandoffEvidenceV1(
+        from_agent="triage",
+        to_agent="resolver",
+        evidence_ref=observation,
+    )
+
+    with pytest.raises(ValueError, match="human_handoff_completed"):
+        HostAutoGenSessionResult(
+            task_result=object(),  # type: ignore[arg-type]
+            runtime_evidence_ref=observation,
+            usage_receipts=(),
+            handoffs=(internal_handoff,),
+            conversation_pattern="swarm",
+            message_count=1,
+            handoff_count=1,
+            tool_call_count=0,
+            termination_reason="task_completed",
+            provider_started=False,
+            provider_usage_unresolved=False,
+            human_handoff_completed=True,
+        )
 
 
 @pytest.mark.asyncio
