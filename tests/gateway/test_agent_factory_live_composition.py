@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,6 +15,10 @@ from agenten.agent_factory.business_benchmark_dispatch import (
 from agenten.agent_factory.candidate_evaluation import CandidateEvaluationFactory
 from agenten.agent_factory.candidate_evaluation import ResolvedFactoryCandidate
 from agenten.agent_factory.contracts import AgentFactoryJobV3
+from agenten.agent_factory.business_benchmark_demo_provisioning import (
+    BusinessBenchmarkDemoProvisioner,
+    BusinessBenchmarkDemoProvisioningSettings,
+)
 from agenten.agent_factory.hermes_cli import HermesCliFactory, HermesCliSettings
 from agenten.agent_factory.orchestration import FactoryDispatcher
 from agenten.agent_factory.production_dispatch_runner import (
@@ -21,9 +27,11 @@ from agenten.agent_factory.production_dispatch_runner import (
 from gateway.agent_factory_dispatch_runner import GatewayNextActionLeaseIssuer
 from gateway.agent_factory_live_composition import (
     CaptainImprovementAuthorityRequired,
+    GatewayTechnicalTeamExecutionPortsProvider,
     GatewayBoundBusinessBenchmarkInputPort,
     ProductionFactoryTeamExecutionPort,
     compose_agent_factory_live,
+    select_technical_business_holdout,
 )
 from gateway.factory_repository import GatewayFactoryRepository
 from agenten.agent_runtime.contracts import ArtifactRef
@@ -105,6 +113,82 @@ def test_composes_real_factory_runner_without_provider_effects(tmp_path: Path) -
         )
     )
 
+
+def test_gateway_technical_ports_bind_candidate_private_holdout_and_no_tools(
+    tmp_path: Path,
+) -> None:
+    configured = BusinessBenchmarkDemoProvisioningSettings(
+        workspace_root=tmp_path,
+        test_mariadb_dsn=(
+            "mariadb://captain_test:redacted@127.0.0.1:3306/captain_test"
+        ),
+        issued_at=NOW,
+        model="gpt-4.1-mini",
+        maximum_usd_per_team=Decimal("0.50"),
+        suite_version=3,
+        seed_version_id="business-benchmark-demo-2026-07-v3",
+    )
+    team = BusinessBenchmarkDemoProvisioner(configured).plan().teams[0]
+    applied = BusinessBenchmarkDemoProvisioner(
+        configured,
+        gateway=SimpleNamespace(
+            resume_state=lambda _job_id: None,
+            register=lambda _job: None,
+            assign_released_skills=lambda _job, _skills: None,
+            append_forge_requested=lambda _block: None,
+            record_lease=lambda _lease: None,
+            persist_work_batch=lambda _job, _batch: None,
+            budget_projection=lambda job_id: SimpleNamespace(
+                job_id=job_id,
+                limit_usd=Decimal("0.50"),
+                consumed_usd=Decimal("0"),
+                reserved_usd=Decimal("0"),
+                remaining_usd=Decimal("0.50"),
+            ),
+        ),
+        clock=lambda: NOW,
+    ).apply().teams[0]
+    assert applied.technical_holdout == team.technical_holdout
+    candidate = ResolvedFactoryCandidate.model_construct(
+        candidate=SimpleNamespace(source_archive_ref=team.candidate_ref),
+        source_archive=tmp_path / "candidate.zip",
+    )
+
+    class Candidates:
+        def candidate_for(self, job: AgentFactoryJobV3) -> ResolvedFactoryCandidate:
+            assert job == team.job
+            return candidate
+
+    provider = GatewayTechnicalTeamExecutionPortsProvider.from_environment(
+        environment={
+            "CAPTAIN_BENCHMARK_PROVIDER": "openai",
+            "CAPTAIN_BENCHMARK_MODEL": "gpt-4.1-mini",
+            "CAPTAIN_BENCHMARK_MAX_COST_PER_CALL_USD": "0.01",
+            "CAPTAIN_BENCHMARK_PRICING_MINIMUM_COST_USD": "0",
+            "CAPTAIN_BENCHMARK_PRICING_INPUT_COST_PER_MILLION_USD": "0.40",
+            "CAPTAIN_BENCHMARK_PRICING_OUTPUT_COST_PER_MILLION_USD": "1.60",
+            "CAPTAIN_BENCHMARK_PRICING_VERSION": "test-price-v1",
+            "CAPTAIN_BENCHMARK_PRICING_EFFECTIVE_AT": "2026-07-01T00:00:00Z",
+        },
+        store=_EffectTrap(),
+        candidate_bindings=Candidates(),
+        authority_root=(
+            tmp_path / ".captain-cook" / "private" / "business-benchmarks"
+        ),
+        skill_root=tmp_path / "skills",
+        clock=lambda: NOW,
+    )
+
+    ports = provider(team.job)
+    selected = select_technical_business_holdout(team.job)
+    resolved = asyncio.run(ports.holdouts.resolve(selected))
+
+    assert selected == team.technical_holdout.holdout_ref
+    assert resolved.reference == selected
+    assert ports.allowed_tools_for is not None
+    assert ports.allowed_tools_for(selected, candidate) == ()
+    with pytest.raises(ValueError, match="not available"):
+        ports.n8n_adapter.authorization("renewal_context_read")
 
 def test_missing_forge_candidate_binding_fails_before_any_external_port(
     tmp_path: Path,

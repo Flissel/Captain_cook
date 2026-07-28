@@ -5,9 +5,12 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Protocol, cast
 from uuid import UUID
+
+from autogen_core.models import ChatCompletionClient
 
 from agenten.agent_factory.business_benchmark import BusinessBenchmarkEvaluator
 from agenten.agent_factory.business_benchmark_dispatch import (
@@ -19,8 +22,17 @@ from agenten.agent_factory.business_benchmark_dispatch import (
 from agenten.agent_factory.business_benchmark_factory import (
     BusinessBenchmarkFactoryComposition,
 )
+from agenten.agent_factory.business_benchmark_production_ports import (
+    BusinessBenchmarkContentAddressedArtifactStore,
+    BusinessBenchmarkPricingAuthority,
+    ConfiguredBusinessBenchmarkPricingSource,
+    OpenAIBusinessBenchmarkModelClientBuilder,
+)
 from agenten.agent_factory.business_benchmark_store import (
     BusinessBenchmarkRepository,
+)
+from agenten.agent_factory.business_benchmark_technical_holdout import (
+    CaptainTechnicalBusinessHoldoutEvaluator,
 )
 from agenten.agent_factory.candidate_evaluation import (
     CandidateEvaluationFactory,
@@ -30,8 +42,15 @@ from agenten.agent_factory.candidate_evaluation import (
 )
 from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryJob
 from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
+from agenten.agent_factory.execution_budget import FactoryBudgetPort
 from agenten.agent_factory.factory_feedback import FactoryFeedbackBuilder
-from agenten.agent_factory.hermes_cli import HermesCliFactory, HermesCliSettings
+from agenten.agent_factory.hermes_cli import (
+    FactorySkillReplayStore,
+    FilesystemFactorySkillReplayStore,
+    HermesCliFactory,
+    HermesCliSettings,
+    ReleasedFactorySkillCatalog,
+)
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.orchestration import (
     FactoryClock,
@@ -54,13 +73,15 @@ from agenten.agent_factory.skill_workflow_contracts import (
 from agenten.agent_factory.state_machine import FactoryAction, FactoryProjection
 from agenten.agent_factory.team_evaluation import TeamEvaluationService
 from agenten.agent_factory.team_execution import (
+    FactoryN8nExecutionEvidenceV1,
     FactoryLiveTeamExecutionPorts,
+    FactoryPricingAuthorityPort,
     TeamExecutionCandidateAdapter,
     compose_live_team_execution,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.agent_factory_dispatch_runner import GatewayNextActionLeaseIssuer
-from gateway.factory_repository import GatewayFactoryRepository
+from gateway.factory_repository import GatewayFactoryBudgetLedger, GatewayFactoryRepository
 from gateway.store import GatewayStore
 
 
@@ -83,6 +104,150 @@ class FactoryLiveTeamExecutionPortsProvider(Protocol):
     """Resolve the complete authoritative live port set for one V3 job."""
 
     def __call__(self, job: AgentFactoryJobV3) -> FactoryLiveTeamExecutionPorts: ...
+
+
+def select_technical_business_holdout(job: AgentFactoryJobV3) -> PrivateHoldoutRef:
+    """Select the canonical redacted execution case, never the private suite."""
+
+    if len(job.private_holdout_refs) != 2:
+        raise ValueError(
+            "technical benchmark execution requires technical and suite holdouts"
+        )
+    return job.private_holdout_refs[0]
+
+
+class _UnavailableTechnicalN8nAdapter:
+    """Fail closed because the selected escalation case has no integration intent."""
+
+    def tool(self, _name: str) -> object:
+        raise ValueError("n8n is not available for the technical escalation holdout")
+
+    def authorization(self, _name: str) -> object:
+        raise ValueError("n8n is not available for the technical escalation holdout")
+
+    def observed_evidence(self) -> tuple[FactoryN8nExecutionEvidenceV1, ...]:
+        return ()
+
+
+class _UnavailableTechnicalN8nAuthority:
+    async def authorize_command(self, _claim: object, *, now: datetime) -> object:
+        del now
+        raise ValueError("n8n is not available for the technical escalation holdout")
+
+    async def authorize(self, _evidence: object, *, now: datetime) -> object:
+        del now
+        raise ValueError("n8n is not available for the technical escalation holdout")
+
+
+class GatewayTechnicalTeamExecutionPortsProvider:
+    """Build one candidate-bound live port graph for the technical holdout."""
+
+    def __init__(
+        self,
+        *,
+        candidate_bindings: ForgeCandidateBindingPort,
+        technical_holdout_root: Path,
+        model_client_for: Callable[
+            [AgentFactoryJobV3, FactorySkillInvocationV1], ChatCompletionClient
+        ],
+        budget: FactoryBudgetPort,
+        pricing_authority: FactoryPricingAuthorityPort,
+        replay_store: FactorySkillReplayStore,
+        released_skill_catalog: ReleasedFactorySkillCatalog,
+        skill_root: Path,
+        provider: str,
+        model: str,
+        max_cost_per_call: Decimal,
+        clock: Callable[[], datetime],
+    ) -> None:
+        if provider != "openai" or not model.strip() or max_cost_per_call <= 0:
+            raise ValueError("technical team provider configuration is invalid")
+        self._candidate_bindings = candidate_bindings
+        self._technical_holdout_root = technical_holdout_root.resolve()
+        self._model_client_for = model_client_for
+        self._budget = budget
+        self._pricing_authority = pricing_authority
+        self._replay_store = replay_store
+        self._released_skill_catalog = released_skill_catalog
+        self._skill_root = skill_root.resolve()
+        self._provider = provider
+        self._model = model
+        self._max_cost_per_call = max_cost_per_call
+        self._clock = clock
+
+    @classmethod
+    def from_environment(
+        cls,
+        *,
+        environment: Mapping[str, str],
+        store: GatewayStore,
+        candidate_bindings: ForgeCandidateBindingPort,
+        authority_root: Path,
+        skill_root: Path,
+        clock: Callable[[], datetime],
+    ) -> "GatewayTechnicalTeamExecutionPortsProvider":
+        provider = _required_environment(environment, "CAPTAIN_BENCHMARK_PROVIDER")
+        model = _required_environment(environment, "CAPTAIN_BENCHMARK_MODEL")
+        maximum = _positive_decimal_environment(
+            environment,
+            "CAPTAIN_BENCHMARK_MAX_COST_PER_CALL_USD",
+        )
+        root = authority_root.resolve()
+        artifacts = BusinessBenchmarkContentAddressedArtifactStore(root / "cas")
+        repository = GatewayFactoryRepository(store)
+        return cls(
+            candidate_bindings=candidate_bindings,
+            technical_holdout_root=root / "technical-holdouts",
+            model_client_for=(
+                OpenAIBusinessBenchmarkModelClientBuilder.from_environment_deferred(
+                    environment
+                )
+            ),
+            budget=GatewayFactoryBudgetLedger(store),
+            pricing_authority=BusinessBenchmarkPricingAuthority(
+                ConfiguredBusinessBenchmarkPricingSource.from_environment(
+                    environment,
+                    artifacts=artifacts,
+                )
+            ),
+            replay_store=FilesystemFactorySkillReplayStore(
+                root / "runtime-state" / "factory-team-replays"
+            ),
+            released_skill_catalog=repository,
+            skill_root=skill_root,
+            provider=provider,
+            model=model,
+            max_cost_per_call=maximum,
+            clock=clock,
+        )
+
+    def __call__(self, job: AgentFactoryJobV3) -> FactoryLiveTeamExecutionPorts:
+        candidate = self._candidate_bindings.candidate_for(job)
+        if not isinstance(candidate, ResolvedFactoryCandidate):
+            raise ValueError("technical team candidate is not resolved")
+        holdouts = CaptainTechnicalBusinessHoldoutEvaluator(
+            self._technical_holdout_root,
+            candidate_ref=candidate.candidate.source_archive_ref,
+            allowed_tools=(),
+            clock=self._clock,
+        )
+        return FactoryLiveTeamExecutionPorts(
+            model_client_for=self._model_client_for,
+            budget=self._budget,
+            pricing_authority=self._pricing_authority,
+            replay_store=self._replay_store,
+            holdouts=holdouts,
+            n8n_adapter=_UnavailableTechnicalN8nAdapter(),  # type: ignore[arg-type]
+            n8n_authority=_UnavailableTechnicalN8nAuthority(),  # type: ignore[arg-type]
+            released_skill_catalog=self._released_skill_catalog,
+            skill_root=self._skill_root,
+            tools={},
+            provider=self._provider,
+            model=self._model,
+            max_cost_per_call=self._max_cost_per_call,
+            clock=self._clock,
+            allowed_tools_for=holdouts.allowed_tools_for,
+        )
 
 
 class CaptainImprovementAuthorityRequired(FactoryDispatchError):
@@ -349,12 +514,35 @@ def compose_agent_factory_live(
     )
 
 
+def _required_environment(environment: Mapping[str, str], name: str) -> str:
+    value = environment.get(name, "").strip()
+    if not value:
+        raise ValueError(f"required Factory live setting is missing: {name}")
+    return value
+
+
+def _positive_decimal_environment(
+    environment: Mapping[str, str],
+    name: str,
+) -> Decimal:
+    raw = _required_environment(environment, name)
+    try:
+        value = Decimal(raw)
+    except InvalidOperation as exc:
+        raise ValueError(f"Factory live setting is not a decimal: {name}") from exc
+    if not value.is_finite() or value <= 0:
+        raise ValueError(f"Factory live setting must be positive: {name}")
+    return value
+
+
 __all__ = [
     "AgentFactoryLiveComposition",
     "CaptainImprovementAuthorityRequired",
     "FactoryLiveTeamExecutionPortsProvider",
     "ForgeCandidateBindingPort",
+    "GatewayTechnicalTeamExecutionPortsProvider",
     "GatewayBoundBusinessBenchmarkInputPort",
     "ProductionFactoryTeamExecutionPort",
     "compose_agent_factory_live",
+    "select_technical_business_holdout",
 ]
