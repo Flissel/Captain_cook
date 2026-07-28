@@ -953,7 +953,13 @@ async def run_provider_business_benchmarks(
     fence_store = getattr(composition, "fence_store", None)
     if fence_store is None or any(
         not callable(getattr(fence_store, method, None))
-        for method in ("register_fence", "assert_current")
+        for method in (
+            "register_fence",
+            "assert_current",
+            "begin_dispatch",
+            "record_provider_terminal",
+            "finalize",
+        )
     ):
         raise ProductionAdapterUnavailableError("durable provider fence store is unavailable")
     expected_scopes = _load_expected_scopes(composition, settings)
