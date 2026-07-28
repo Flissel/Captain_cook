@@ -920,12 +920,13 @@ BusinessBenchmarkCompositionLoader = Callable[
 def load_production_business_benchmark_composition(
     settings: LiveBusinessBenchmarkSettings,
 ) -> ProductionBusinessBenchmarkCompositionPort:
-    """Fail closed until the real adapter/capability bundle is integrated."""
+    """Build the concrete production graph and fail on its exact missing port."""
 
-    del settings
-    raise ProductionAdapterUnavailableError(
-        "production_adapter_bundle and capability live bridges are not integrated"
+    from agenten.agent_factory.business_benchmark_bootstrap import (
+        build_production_business_benchmark_composition,
     )
+
+    return build_production_business_benchmark_composition(settings)
 
 
 async def run_provider_business_benchmarks(
