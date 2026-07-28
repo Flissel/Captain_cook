@@ -1,0 +1,92 @@
+"""Dry-run or apply the isolated Claims/Renewal benchmark bootstrap."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import os
+from pathlib import Path
+import sys
+from typing import Sequence
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from agenten.agent_factory.business_benchmark_demo_provisioning import (
+    BusinessBenchmarkDemoProvisioner,
+    BusinessBenchmarkDemoProvisioningSettings,
+)
+from gateway.business_benchmark_demo import GatewayBusinessBenchmarkDemoError
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Provision two idempotent Agent Factory benchmark jobs against the "
+            "local isolated captain_test Gateway. Defaults to a side-effect-free dry-run."
+        )
+    )
+    parser.add_argument("--apply", action="store_true", help="write through Gateway/MariaDB")
+    parser.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    parser.add_argument(
+        "--issued-at",
+        help=(
+            "UTC provisioning epoch; reuse the dry-run value for --apply within 15 minutes"
+        ),
+    )
+    parser.add_argument("--model", default="gpt-4.1-mini")
+    parser.add_argument("--maximum-usd-per-team", default="5.00")
+    parser.add_argument("--suite-version", type=int, default=1)
+    parser.add_argument(
+        "--seed-version-id",
+        default="business-benchmark-demo-2026-07",
+    )
+    return parser.parse_args(argv)
+
+
+def _issued_at(value: str | None) -> datetime:
+    if value is None:
+        return datetime.now(timezone.utc).replace(microsecond=0)
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise ValueError("--issued-at must be an RFC3339 UTC timestamp")
+    return parsed.astimezone(timezone.utc)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    dsn = os.environ.get("TEST_MARIADB_DSN", "")
+    try:
+        settings = BusinessBenchmarkDemoProvisioningSettings(
+            workspace_root=args.workspace_root,
+            test_mariadb_dsn=dsn,
+            issued_at=_issued_at(args.issued_at),
+            model=args.model,
+            maximum_usd_per_team=args.maximum_usd_per_team,
+            suite_version=args.suite_version,
+            seed_version_id=args.seed_version_id,
+        )
+        gateway = None
+        provisioner = BusinessBenchmarkDemoProvisioner(settings)
+        if args.apply:
+            from gateway.business_benchmark_demo import (
+                GatewayBusinessBenchmarkDemoAuthority,
+            )
+
+            provisioner.validate_apply_preconditions()
+            gateway = GatewayBusinessBenchmarkDemoAuthority(dsn)
+            provisioner = BusinessBenchmarkDemoProvisioner(settings, gateway=gateway)
+        result = provisioner.apply() if args.apply else provisioner.plan()
+    except (GatewayBusinessBenchmarkDemoError, OSError, ValueError) as exc:
+        message = str(exc)
+        if dsn:
+            message = message.replace(dsn, "[redacted]")
+        print(f"provisioning failed: {message}", file=sys.stderr)
+        return 1
+    print(result.model_dump_json(by_alias=True, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
