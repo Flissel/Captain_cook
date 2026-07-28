@@ -9,7 +9,10 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 
-from agenten.agent_factory.business_benchmark_contracts import BusinessBenchmarkCaseV1
+from agenten.agent_factory.business_benchmark_contracts import (
+    BusinessBenchmarkCaseV1,
+    BusinessBenchmarkRunReceiptV1,
+)
 from agenten.agent_factory.business_benchmark_execution import (
     BusinessBenchmarkExecutionEnvelopeV1,
 )
@@ -172,8 +175,11 @@ def usage(env: BusinessBenchmarkExecutionEnvelopeV1, cost: str, label: str) -> F
 class DurableFenceStore:
     def __init__(self) -> None:
         self.greatest: dict[str, int] = {}
+        self.calls: list[str] = []
+        self.finalized_receipt: BusinessBenchmarkRunReceiptV1 | None = None
 
     async def register_fence(self, item, effect_claim):
+        self.calls.append("register_fence")
         self.greatest[item.identity.effect_id] = max(
             effect_claim.fence, self.greatest.get(item.identity.effect_id, 0)
         )
@@ -188,7 +194,25 @@ class DurableFenceStore:
         )
 
     async def assert_current(self, item, effect_claim, receipt) -> None:
+        self.calls.append("assert_current")
         assert receipt.fence == self.greatest[item.identity.effect_id] == effect_claim.fence
+
+    async def begin_dispatch(self, item, effect_claim, receipt) -> None:
+        self.calls.append("begin_dispatch")
+        await self.assert_current(item, effect_claim, receipt)
+
+    async def record_provider_terminal(
+        self, item, effect_claim, fence_receipt, run_receipt
+    ) -> None:
+        self.calls.append("record_provider_terminal")
+        await self.assert_current(item, effect_claim, fence_receipt)
+        self.finalized_receipt = run_receipt
+
+    async def finalize(self, item, effect_claim, fence_receipt, run_receipt):
+        self.calls.append("finalize")
+        await self.assert_current(item, effect_claim, fence_receipt)
+        assert self.finalized_receipt == run_receipt
+        return run_receipt
 
 
 class RuntimeBundle:
@@ -359,9 +383,10 @@ async def test_adapter_maps_exact_usage_latency_terminal_and_deduplicated_eviden
     )
     bundle = RuntimeBundle(provider)
     ticks = iter((10.000, 10.125))
+    fence_store = DurableFenceStore()
     adapter = BusinessBenchmarkLiveAdapter(
         runtime_bundle=bundle,
-        fence_store=DurableFenceStore(),
+        fence_store=fence_store,
         trusted_tool_intents={"read_policy": IntegrationIntent.NONE},
         monotonic_clock=lambda: next(ticks),
         clock=lambda: NOW,
@@ -377,15 +402,27 @@ async def test_adapter_maps_exact_usage_latency_terminal_and_deduplicated_eviden
     assert receipt.human_handoff_completed is False
     assert len(receipt.evidence_refs) == len(set(receipt.evidence_refs)) == 6
     assert bundle.policies == [None]
+    assert fence_store.finalized_receipt == receipt
+    assert fence_store.calls == [
+        "register_fence",
+        "assert_current",
+        "begin_dispatch",
+        "assert_current",
+        "record_provider_terminal",
+        "assert_current",
+        "finalize",
+        "assert_current",
+    ]
 
 
 @pytest.mark.asyncio
 async def test_provider_result_must_bind_exact_case_budget_redaction_and_candidate() -> None:
     env = envelope()
     mismatched = result(env, redaction_policy_sha256="f" * 64)
+    fence_store = DurableFenceStore()
     adapter = BusinessBenchmarkLiveAdapter(
         runtime_bundle=RuntimeBundle(mismatched),
-        fence_store=DurableFenceStore(),
+        fence_store=fence_store,
         trusted_tool_intents={},
         monotonic_clock=iter((0.0, 0.1)).__next__,
         clock=lambda: NOW,
@@ -394,6 +431,9 @@ async def test_provider_result_must_bind_exact_case_budget_redaction_and_candida
     fence = await adapter.register_fence(effect_claim.prepared_effect, effect_claim)
     with pytest.raises(ValueError, match="provider execution bindings"):
         await adapter.execute(env, effect_claim, fence)
+    assert fence_store.finalized_receipt is None
+    assert "begin_dispatch" in fence_store.calls
+    assert "record_provider_terminal" not in fence_store.calls
 
 
 @pytest.mark.asyncio

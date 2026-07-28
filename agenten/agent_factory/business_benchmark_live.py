@@ -244,6 +244,29 @@ class DurableProviderFencePort(Protocol):
         receipt: BusinessBenchmarkFenceReceiptV1,
     ) -> None: ...
 
+    async def begin_dispatch(
+        self,
+        prepared: BusinessBenchmarkPreparedEffectV1,
+        claim: BusinessBenchmarkEffectClaimV1,
+        receipt: BusinessBenchmarkFenceReceiptV1,
+    ) -> None: ...
+
+    async def record_provider_terminal(
+        self,
+        prepared: BusinessBenchmarkPreparedEffectV1,
+        claim: BusinessBenchmarkEffectClaimV1,
+        fence_receipt: BusinessBenchmarkFenceReceiptV1,
+        run_receipt: BusinessBenchmarkRunReceiptV1,
+    ) -> None: ...
+
+    async def finalize(
+        self,
+        prepared: BusinessBenchmarkPreparedEffectV1,
+        claim: BusinessBenchmarkEffectClaimV1,
+        fence_receipt: BusinessBenchmarkFenceReceiptV1,
+        run_receipt: BusinessBenchmarkRunReceiptV1,
+    ) -> BusinessBenchmarkRunReceiptV1: ...
+
 
 class ProductionBusinessBenchmarkRuntimeBundlePort(Protocol):
     """Required bridge to provider model, candidate package, and approved tools."""
@@ -317,6 +340,7 @@ class BusinessBenchmarkLiveAdapter:
         if prepared.runtime_session_id != envelope.runtime_session_id:
             raise ValueError("claimed runtime session does not match benchmark envelope")
         await self._fence_store.assert_current(prepared, claim, fence_receipt)
+        await self._fence_store.begin_dispatch(prepared, claim, fence_receipt)
 
         baseline_policy = (
             self._baseline_policy(envelope)
@@ -390,7 +414,7 @@ class BusinessBenchmarkLiveAdapter:
             )
         )
         succeeded = provider.status == "succeeded"
-        return BusinessBenchmarkRunReceiptV1(
+        receipt = BusinessBenchmarkRunReceiptV1(
             schema="captain.business-benchmark-run-receipt.v1",
             run_id=uuid5(NAMESPACE_URL, f"business-benchmark-run:{envelope.idempotency_key}"),
             request_id=envelope.request_id,
@@ -426,6 +450,18 @@ class BusinessBenchmarkLiveAdapter:
             latency_ms=latency_ms,
             evidence_refs=evidence_refs,
             completed_at=provider.completed_at,
+        )
+        await self._fence_store.record_provider_terminal(
+            prepared,
+            claim,
+            fence_receipt,
+            receipt,
+        )
+        return await self._fence_store.finalize(
+            prepared,
+            claim,
+            fence_receipt,
+            receipt,
         )
 
     async def recover(
