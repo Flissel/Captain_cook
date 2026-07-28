@@ -898,10 +898,11 @@ function Find-UniqueValues {
 
 function Test-SmokeOutput {
     param(
-        [Parameter(Mandatory = $true)][object]$Value,
+        [Parameter(Mandatory = $true)][AllowNull()][object]$Value,
         [Parameter(Mandatory = $true)][string]$IdempotencyKey
     )
 
+    if ($null -eq $Value) { return $false }
     if ($Value -is [pscustomobject]) {
         $operation = $Value.PSObject.Properties["operation"]
         $idempotency = $Value.PSObject.Properties["idempotency_key"]

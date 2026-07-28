@@ -496,11 +496,18 @@ function Invoke-WebRequest {{
                 workflowId = 'renewal-owned-activation'
                 executionId = 'activation-execution-1'
                 status = 'success'
-                output = @{{
-                    operation = 'read_renewal_context'
-                    idempotency_key = 'captain-renewal-smoke-{canonical_sha[:32]}'
-                    status = 'read'
-                    facts = @('renewal_window.synthetic-90d', 'engagement_band.synthetic-medium', 'commercial_evidence_state.synthetic-complete', 'consent_state.synthetic-consented')
+                metadata = $null
+                data = @{{
+                    providerMetadata = $null
+                    nested = @(@{{
+                        ignored = $null
+                        output = @{{
+                            operation = 'read_renewal_context'
+                            idempotency_key = 'captain-renewal-smoke-{canonical_sha[:32]}'
+                            status = 'read'
+                            facts = @('renewal_window.synthetic-90d', 'engagement_band.synthetic-medium', 'commercial_evidence_state.synthetic-complete', 'consent_state.synthetic-consented')
+                        }}
+                    }})
                 }}
             }}
         }} else {{ throw 'unexpected MCP tool' }}
