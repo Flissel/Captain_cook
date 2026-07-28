@@ -659,6 +659,7 @@ def test_team_plan_exposes_exact_next_workflow_requirement(tmp_path: Path) -> No
         assert team.initial_workflow_steps == (
             FactorySkillStep.DISCOVER,
             FactorySkillStep.BRIEF_CODEX,
+            FactorySkillStep.SEAL_CODEX_BUILD,
             FactorySkillStep.EXECUTE_TEAM,
             FactorySkillStep.EVALUATE_TEAM,
             FactorySkillStep.REPORT_CAPTAIN,
@@ -666,6 +667,7 @@ def test_team_plan_exposes_exact_next_workflow_requirement(tmp_path: Path) -> No
         assert team.missing_gateway_evidence == (
             "codebase_inventory",
             "codex_build_brief",
+            "codex_build_evidence",
             "team_execution_evidence",
             "real_case_tester_lease",
             "quality_warden_lease",

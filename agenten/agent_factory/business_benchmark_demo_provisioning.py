@@ -103,6 +103,7 @@ _ASSERTION_IDS = (
 _MISSING_WORKFLOW_EVIDENCE = (
     "codebase_inventory",
     "codex_build_brief",
+    "codex_build_evidence",
     "team_execution_evidence",
     "real_case_tester_lease",
     "quality_warden_lease",
@@ -110,6 +111,7 @@ _MISSING_WORKFLOW_EVIDENCE = (
 _INITIAL_WORKFLOW_STEPS = (
     FactorySkillStep.DISCOVER,
     FactorySkillStep.BRIEF_CODEX,
+    FactorySkillStep.SEAL_CODEX_BUILD,
     FactorySkillStep.EXECUTE_TEAM,
     FactorySkillStep.EVALUATE_TEAM,
     FactorySkillStep.REPORT_CAPTAIN,

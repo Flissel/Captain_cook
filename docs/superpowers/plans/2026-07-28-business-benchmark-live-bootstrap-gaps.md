@@ -67,9 +67,12 @@
   benchmark team. Claims job `98a8c3d5-b6a5-5c59-8c0f-811280f319e4` and Renewal
   job `7eaa2fad-2b1f-5eed-a902-9af7fc9f60c5` currently stop at the redacted
   `factory_dispatch_required` checkpoint. No provider call was made.
-- [ ] Provision immutable v5 demo jobs after the Captain Codex seal release.
+- [x] Provision immutable v5 demo jobs after the Captain Codex seal release.
   V5 replaces, rather than mutates, the v4 jobs and includes the seventh
   `seal_codex_build` release plus exact Codex-to-Minibook source provenance.
+  Claims job `2113392c-c5f0-5bb1-95ee-48c4c31bc14d` and Renewal job
+  `6c156f2e-dd52-54bd-97f5-a3fe788815f9` stop at the expected
+  `factory_dispatch_required` checkpoint. No provider call was made.
 - [x] Prove that the generated source archive is the exact implementation
   produced from Hermes' Captain-approved Codex brief. The current receipt binds
   the brief, isolated Codex worktree, redacted CLI session evidence, candidate
