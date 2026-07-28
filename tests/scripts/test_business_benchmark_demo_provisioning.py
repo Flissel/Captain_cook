@@ -177,7 +177,7 @@ def test_dry_run_is_side_effect_free_and_contains_two_redacted_stable_plans(
     assert first == second
     assert first.mode == "dry_run"
     assert tuple(team.profile for team in first.teams) == ("claims", "renewal")
-    assert all(len(team.released_skills) == 6 for team in first.teams)
+    assert all(len(team.released_skills) == 7 for team in first.teams)
     assert all(
         team.initial_lease.role is FactoryRole.AGENT_ARCHITECT
         for team in first.teams
@@ -329,7 +329,7 @@ def test_apply_persists_only_legal_initial_gateway_authority_and_is_idempotent(
     assert first.mode == "applied"
     assert len(gateway.jobs) == 2
     assert gateway.register_calls == 2
-    assert len(gateway.skill_assignments) == 12
+    assert len(gateway.skill_assignments) == 14
     assert len(gateway.blocks) == 2
     assert all(block.phase is FactoryPhase.FORGE_REQUESTED for block in gateway.blocks.values())
     assert len(gateway.leases) == 2

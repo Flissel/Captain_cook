@@ -24,8 +24,8 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "$maximumUsdPerTeam = '0.45'" in source
     assert "$maximumHermesUsd = '0.10'" in source
     assert "$environment['CAPTAIN_BENCHMARK_MAX_USD'] = '0.90'" in source
-    assert "$seedVersion = 'business-benchmark-demo-2026-07-v4'" in source
-    assert "'--suite-version', '4'" in source
+    assert "$seedVersion = 'business-benchmark-demo-2026-07-v5'" in source
+    assert "'--suite-version', '5'" in source
     assert "run-agent-factory-business-demo.py" in source
     assert "--apply" in source
     assert "preflight-business-benchmark-demo.py" in source
@@ -208,7 +208,7 @@ print(json.dumps({
     arguments = json.loads((repository / "provision-args.json").read_text("utf-8"))
     assert "--apply" in arguments
     assert arguments[arguments.index("--maximum-usd-per-team") + 1] == "0.45"
-    assert arguments[arguments.index("--suite-version") + 1] == "4"
+    assert arguments[arguments.index("--suite-version") + 1] == "5"
     issued_at = arguments[arguments.index("--issued-at") + 1]
     assert issued_at.endswith("Z")
     combined = completed.stdout + completed.stderr

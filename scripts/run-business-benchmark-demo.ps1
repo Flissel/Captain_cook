@@ -22,7 +22,7 @@ $serviceRunner = Join-Path $PSScriptRoot 'live-demo-services.ps1'
 $canonicalRenewalWorkflow = Join-Path $repositoryRoot 'examples/business_benchmark_candidates/customer_renewal_orchestration_team/workflows/renewal_context_read.json'
 $maximumUsdPerTeam = '0.45'
 $maximumHermesUsd = '0.10'
-$seedVersion = 'business-benchmark-demo-2026-07-v4'
+$seedVersion = 'business-benchmark-demo-2026-07-v5'
 
 $rootEnvAllowlist = @(
     'TEST_MARIADB_DSN',
@@ -281,6 +281,21 @@ try {
     else {
         'gpt-4.1-mini'
     }
+    $codexCommand = Get-Command codex.exe -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    $pwshCommand = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    $userProfileRoot = [Environment]::GetFolderPath('UserProfile')
+    $codexHomePath = Join-Path $userProfileRoot '.codex'
+    if (
+        $null -eq $codexCommand -or
+        $null -eq $pwshCommand -or
+        -not (Test-Path -LiteralPath $codexCommand.Source -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $pwshCommand.Source -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $codexHomePath -PathType Container)
+    ) {
+        throw 'TODO_TOOL.v1: Codex CLI, PowerShell 7, or Codex home is unavailable'
+    }
     $redactionVersion = 'benchmark-redaction-v1'
     $environment['CAPTAIN_BENCHMARK_PROVIDER'] = 'openai'
     $environment['CAPTAIN_BENCHMARK_MODEL'] = $model
@@ -302,6 +317,9 @@ try {
     $environment['CAPTAIN_BENCHMARK_HUMAN_REVIEW_TIMEOUT_SECONDS'] = '0'
     $environment['CAPTAIN_BENCHMARK_RENEWAL_N8N_EVIDENCE_ROOT'] = Join-Path $repositoryRoot '.captain-cook/business-benchmark'
     $environment['CAPTAIN_BENCHMARK_RENEWAL_WORKFLOW_PATH'] = $canonicalRenewalWorkflow
+    $environment['CAPTAIN_CODEX_EXECUTABLE'] = $codexCommand.Source
+    $environment['CAPTAIN_PWSH_EXECUTABLE'] = $pwshCommand.Source
+    $environment['CAPTAIN_CODEX_HOME'] = $codexHomePath
     $environment['N8N_MODE'] = 'captain-builder'
     $environment['CAPTAIN_N8N_URL'] = "http://127.0.0.1:$($environment['CAPTAIN_N8N_PORT'])"
     Set-ProcessEnvironment $environment
@@ -312,7 +330,7 @@ try {
         '--issued-at', $issuedAt,
         '--model', $model,
         '--maximum-usd-per-team', $maximumUsdPerTeam,
-        '--suite-version', '4',
+        '--suite-version', '5',
         '--seed-version-id', $seedVersion
     )
     if ($Action -ceq 'Run') {

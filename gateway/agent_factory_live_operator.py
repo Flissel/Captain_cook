@@ -30,6 +30,16 @@ from agenten.agent_factory.business_benchmark_production_ports import (
     BusinessBenchmarkContentAddressedArtifactStore,
 )
 from agenten.agent_factory.candidate_evaluation import GatewayForgeCandidateProvider
+from agenten.agent_factory.codex_build_execution import (
+    CaptainCodexBuildSealer,
+    CodexCliFactoryBuildExecutor,
+    CodexCliFactoryBuildSettings,
+    GitDetachedFactoryWorkspacePreparer,
+)
+from agenten.agent_factory.codex_build_provenance import (
+    CaptainCodexBuildReceiptIssuer,
+    CodexBuildArtifactCas,
+)
 from agenten.agent_factory.hermes_cli import HermesCliSettings
 from agenten.agent_factory.minibook_forge import (
     CaptainCreationJobMapper,
@@ -41,6 +51,8 @@ from agenten.agent_factory.production_dispatch_runner import (
     ProductionFactoryDispatchResult,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
+from agenten.execution.codex_policy import CodexExecutionPolicy
+from agenten.execution.codex_supervisor import PowerShellCodexRunner
 from gateway.agent_factory_live_composition import (
     AgentFactoryLiveComposition,
     GatewayTechnicalTeamExecutionPortsProvider,
@@ -177,6 +189,65 @@ def compose_business_demo_factory_operator(
     benchmark_cas = BusinessBenchmarkContentAddressedArtifactStore(
         authority_root / "cas"
     )
+    codex_workspace_root = (
+        workspace / ".captain-cook" / "private" / "codex-workspaces"
+    ).resolve()
+    codex_state_root = (authority_root / "runtime-state" / "codex").resolve()
+    codex_executable = Path(
+        _required(environment, "CAPTAIN_CODEX_EXECUTABLE")
+    ).resolve(strict=True)
+    pwsh_executable = Path(
+        _required(environment, "CAPTAIN_PWSH_EXECUTABLE")
+    ).resolve(strict=True)
+    codex_home = Path(_required(environment, "CAPTAIN_CODEX_HOME")).resolve(
+        strict=True
+    )
+    codex_session_script = (workspace / "scripts" / "codex-session.ps1").resolve(
+        strict=True
+    )
+    codex_authorizer = CodexExecutionPolicy(
+        workspace_root=codex_workspace_root,
+        environment=environment,
+    )
+
+    def codex_runner_factory(
+        *,
+        session_id: str,
+        state_path: Path,
+        maximum_runtime_seconds: int,
+    ) -> PowerShellCodexRunner:
+        return PowerShellCodexRunner(
+            pwsh_path=pwsh_executable,
+            script_path=codex_session_script,
+            codex_path=codex_executable,
+            session_id=session_id,
+            state_path=state_path,
+            artifact_references=(),
+            codex_home=codex_home,
+            timeout_seconds=maximum_runtime_seconds,
+        )
+
+    codex_sealer = CaptainCodexBuildSealer(
+        executor=CodexCliFactoryBuildExecutor(
+            settings=CodexCliFactoryBuildSettings(
+                state_root=codex_state_root,
+                maximum_runtime_seconds=900,
+            ),
+            workspace_preparer=GitDetachedFactoryWorkspacePreparer(
+                repository_root=workspace,
+                workspaces_root=codex_workspace_root,
+            ),
+            artifact_reader=benchmark_cas,
+            authorizer=codex_authorizer,
+            runner_factory=codex_runner_factory,
+            clock=current_time,
+        ),
+        issuer=CaptainCodexBuildReceiptIssuer(
+            CodexBuildArtifactCas(
+                workspace / ".captain-cook" / "private" / "codex-build-cas"
+            )
+        ),
+    )
     forge = MinibookSwarmForge(
         materializer=_ContentAddressedInputMaterializer(benchmark_cas),
         mapper=mapper,
@@ -252,6 +323,7 @@ def compose_business_demo_factory_operator(
             )
         },
         holdout_selector=select_technical_business_holdout,
+        codex_build_sealer=codex_sealer,
     )
 
 

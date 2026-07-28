@@ -45,6 +45,7 @@ from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
 from agenten.agent_factory.execution_budget import FactoryBudgetPort
 from agenten.agent_factory.factory_feedback import FactoryFeedbackBuilder
 from agenten.agent_factory.hermes_cli import (
+    CaptainCodexBuildSealerPort,
     FactorySkillReplayStore,
     FilesystemFactorySkillReplayStore,
     HermesCliFactory,
@@ -426,6 +427,7 @@ def compose_agent_factory_live(
     n8n_work_batches: Mapping[UUID, str] | None = None,
     holdout_selector: Callable[[AgentFactoryJobV3], PrivateHoldoutRef] | None = None,
     improvements: FactoryImprovementAuthorizationPort | None = None,
+    codex_build_sealer: CaptainCodexBuildSealerPort | None = None,
 ) -> AgentFactoryLiveComposition:
     """Wire production ports without executing Hermes, providers, n8n, or Forge."""
 
@@ -452,6 +454,7 @@ def compose_agent_factory_live(
         settings=hermes_settings,
         evidence_store=evidence_store,
         released_skill_catalog=repository,
+        codex_build_sealer=codex_build_sealer,
         clock=clock,
     )
     team_execution = ProductionFactoryTeamExecutionPort(

@@ -67,11 +67,15 @@
   benchmark team. Claims job `98a8c3d5-b6a5-5c59-8c0f-811280f319e4` and Renewal
   job `7eaa2fad-2b1f-5eed-a902-9af7fc9f60c5` currently stop at the redacted
   `factory_dispatch_required` checkpoint. No provider call was made.
-- [ ] Prove that the generated source archive is the exact implementation
+- [ ] Provision immutable v5 demo jobs after the Captain Codex seal release.
+  V5 replaces, rather than mutates, the v4 jobs and includes the seventh
+  `seal_codex_build` release plus exact Codex-to-Minibook source provenance.
+- [x] Prove that the generated source archive is the exact implementation
   produced from Hermes' Captain-approved Codex brief. The current receipt binds
-  the brief to Forge, but the one-shot Minibook process still starts from the
-  canonical input artifact; this provenance gap must fail closed before a
-  production-quality generation claim.
+  the brief, isolated Codex worktree, redacted CLI session evidence, candidate
+  manifest, test evidence, and exact source ZIP in a Captain-issued receipt.
+  Minibook V2 imports those already-sealed source bytes unchanged and preserves
+  the Captain receipt as a separate package edge.
 - [ ] Run the two provider-backed Factory jobs and 30-case team/baseline
   benchmark after `OPENAI_API_KEY` is securely exported into the invoking
   process. Retain cost, latency, tool, handoff, recovery, Gateway decision, and
