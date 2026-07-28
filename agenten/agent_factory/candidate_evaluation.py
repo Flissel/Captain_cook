@@ -312,13 +312,12 @@ class FactoryCandidateEvaluator:
                         name="build", status="passed", detail="compile and build succeeded"
                     )
                 )
-            return FactoryCandidateEvaluationResult(
+            return self._preflight_result(
                 status="succeeded",
-                trace_id=manifest.candidate_id,
+                manifest=manifest,
                 tool_names=tool_names,
-                checks=tuple(checks),
-                candidate_manifest=manifest,
-                team_execution_manifest=topology,
+                checks=checks,
+                topology=topology,
             )
         except (FileNotFoundError, OSError, zipfile.BadZipFile) as exc:
             checks.append(
@@ -332,13 +331,35 @@ class FactoryCandidateEvaluator:
                 FactoryEvaluationCheck(name="validation", status="failed", detail=str(exc))
             )
             status = "failed"
-        return FactoryCandidateEvaluationResult(
+        return self._preflight_result(
             status=status,
-            trace_id=manifest.candidate_id,
+            manifest=manifest,
             tool_names=tool_names,
-            checks=tuple(checks),
-            candidate_manifest=manifest,
-            team_execution_manifest=topology,
+            checks=checks,
+            topology=topology,
+        )
+
+    @staticmethod
+    def _preflight_result(
+        *,
+        status: Literal["succeeded", "failed", "infrastructure_failed"],
+        manifest: FactoryCandidateManifest,
+        tool_names: tuple[str, ...],
+        checks: list[FactoryEvaluationCheck],
+        topology: FactoryAutoGenTeamManifestV1 | None,
+    ) -> FactoryCandidateEvaluationResult:
+        """Preserve the sealed candidate tool authority during nested validation."""
+
+        return FactoryCandidateEvaluationResult.model_validate(
+            {
+                "status": status,
+                "trace_id": manifest.candidate_id,
+                "tool_names": tool_names,
+                "checks": tuple(checks),
+                "candidate_manifest": manifest,
+                "team_execution_manifest": topology,
+            },
+            context={"allowed_tools": set(tool_names)},
         )
 
     @contextmanager

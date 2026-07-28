@@ -47,16 +47,10 @@ def test_seed_candidate_is_reproducible_and_evaluator_verified(
     assert first.candidate.source_archive_ref.sha256 == second.candidate.source_archive_ref.sha256
 
     evaluator = FactoryCandidateEvaluator()
-    if profile_id == CLAIMS_SEED_PROFILE:
-        result = evaluator.validate(first, max_seconds=10)
-        assert result.status == "succeeded"
-        assert result.team_execution_manifest is not None
-        topology = result.team_execution_manifest
-    else:
-        # The verified-workspace API preserves the allowed-tool validation
-        # context while returning the parsed executable topology.
-        with evaluator.verified_team_workspace(first) as (_, topology):
-            assert topology.conversation_pattern == pattern
+    result = evaluator.validate(first, max_seconds=10)
+    assert result.status == "succeeded"
+    assert result.team_execution_manifest is not None
+    topology = result.team_execution_manifest
     assert topology.conversation_pattern == pattern
     assert tuple(agent.name for agent in topology.agents) == agent_names
 
