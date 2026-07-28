@@ -21,6 +21,8 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert source.startswith("#requires -Version 7")
     assert "[ValidateSet('Plan', 'Run')]" in source
     assert "--maximum-usd-per-team', '0.50'" in source
+    assert "$seedVersion = 'business-benchmark-demo-2026-07-v2'" in source
+    assert "'--suite-version', '2'" in source
     assert "--apply" in source
     assert "preflight-business-benchmark-demo.py" in source
     assert "& $serviceRunner benchmark-start" in source
@@ -202,6 +204,7 @@ print(json.dumps({
     arguments = json.loads((repository / "provision-args.json").read_text("utf-8"))
     assert "--apply" in arguments
     assert arguments[arguments.index("--maximum-usd-per-team") + 1] == "0.50"
+    assert arguments[arguments.index("--suite-version") + 1] == "2"
     issued_at = arguments[arguments.index("--issued-at") + 1]
     assert issued_at.endswith("Z")
     combined = completed.stdout + completed.stderr
