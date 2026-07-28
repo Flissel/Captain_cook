@@ -24,12 +24,5 @@
       "tools": [],
       "handoffs": []
     }
-  ],
-  "workflow_path": "workflows/unused_manifest_tool_descriptor.json",
-  "input_schema_path": "schemas/unused_manifest_tool.input.json",
-  "output_schema_path": "schemas/unused_manifest_tool.output.json",
-  "tool": {
-    "name": "claims_manifest_placeholder",
-    "description": "Inactive typed descriptor retained only for candidate manifest compatibility."
-  }
+  ]
 }

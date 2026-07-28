@@ -17,7 +17,7 @@ from agenten.agent_factory.candidate_evaluation import (
     FactoryCandidateManifest,
     ResolvedFactoryCandidate,
 )
-from agenten.agent_factory.n8n_tools import TypedN8nTool
+from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference, TypedN8nTool
 from agenten.agent_runtime.contracts import ArtifactRef
 
 
@@ -43,7 +43,14 @@ def package_business_benchmark_seed(
     config = _read_json(source / "seed.json")
     candidate_id = _required_string(config, "candidate_id")
     agents = _build_agents(source, candidate_id, config)
-    tool = _build_tool(source, candidate_id, config)
+    has_n8n_integration = "tool" in config
+    tool = _build_tool(source, candidate_id, config) if has_n8n_integration else None
+    if not has_n8n_integration and (
+        {"workflow_path", "input_schema_path", "output_schema_path"} & set(config)
+        or _contains_files(source / "workflows")
+        or _contains_files(source / "schemas")
+    ):
+        raise ValueError("tool-free seed must not contain n8n artifacts")
     team_payload = {
         "schema": "autogen-team.v1",
         "name": profile_id,
@@ -65,14 +72,52 @@ def package_business_benchmark_seed(
     _write_reproducible_zip(archive_path, archive_files)
 
     team_bytes = archive_files["team_manifest.json"]
-    workflow_path = _safe_relative_path(_required_string(config, "workflow_path"))
-    input_schema_path = _safe_relative_path(_required_string(config, "input_schema_path"))
-    output_schema_path = _safe_relative_path(_required_string(config, "output_schema_path"))
-    workflow = _artifact(candidate_id, "workflow", archive_files[workflow_path], "application/json")
-    input_schema = _artifact(candidate_id, "tool-input", archive_files[input_schema_path], "application/schema+json")
-    output_schema = _artifact(candidate_id, "tool-output", archive_files[output_schema_path], "application/schema+json")
-    if tool.input_schema_ref != input_schema.uri or tool.output_schema_ref != output_schema.uri:
-        raise ValueError("seed tool schema references were not content bound")
+    workflow_artifacts: tuple[FactoryCandidateArtifact, ...] = ()
+    schema_artifacts: tuple[FactoryCandidateArtifact, ...] = ()
+    n8n_tools: tuple[TypedN8nTool, ...] = ()
+    n8n_tool_references: tuple[OpaqueN8nToolReference, ...] = ()
+    if tool is not None:
+        workflow_path = _safe_relative_path(_required_string(config, "workflow_path"))
+        input_schema_path = _safe_relative_path(_required_string(config, "input_schema_path"))
+        output_schema_path = _safe_relative_path(_required_string(config, "output_schema_path"))
+        workflow = _artifact(
+            candidate_id,
+            "workflow",
+            archive_files[workflow_path],
+            "application/json",
+        )
+        input_schema = _artifact(
+            candidate_id,
+            "tool-input",
+            archive_files[input_schema_path],
+            "application/schema+json",
+        )
+        output_schema = _artifact(
+            candidate_id,
+            "tool-output",
+            archive_files[output_schema_path],
+            "application/schema+json",
+        )
+        if (
+            tool.input_schema_ref != input_schema.uri
+            or tool.output_schema_ref != output_schema.uri
+        ):
+            raise ValueError("seed tool schema references were not content bound")
+        workflow_artifacts = (
+            FactoryCandidateArtifact(reference=workflow, relative_path=workflow_path),
+        )
+        schema_artifacts = (
+            FactoryCandidateArtifact(
+                reference=input_schema,
+                relative_path=input_schema_path,
+            ),
+            FactoryCandidateArtifact(
+                reference=output_schema,
+                relative_path=output_schema_path,
+            ),
+        )
+        n8n_tools = (tool,)
+        n8n_tool_references = (tool.opaque_reference(),)
     source_bytes = archive_path.read_bytes()
     manifest = FactoryCandidateManifest(
         candidate_id=candidate_id,
@@ -81,15 +126,10 @@ def package_business_benchmark_seed(
             reference=_artifact(candidate_id, "team", team_bytes, "application/json"),
             relative_path="team_manifest.json",
         ),
-        workflow_artifacts=(
-            FactoryCandidateArtifact(reference=workflow, relative_path=workflow_path),
-        ),
-        tool_schema_artifacts=(
-            FactoryCandidateArtifact(reference=input_schema, relative_path=input_schema_path),
-            FactoryCandidateArtifact(reference=output_schema, relative_path=output_schema_path),
-        ),
-        n8n_tools=(tool,),
-        n8n_tool_references=(tool.opaque_reference(),),
+        workflow_artifacts=workflow_artifacts,
+        tool_schema_artifacts=schema_artifacts,
+        n8n_tools=n8n_tools,
+        n8n_tool_references=n8n_tool_references,
         build_command=("python", "-m", "compileall", "-q", "."),
         real_case_command=("python", "-m", "compileall", "-q", "."),
         timeout_seconds=30,
@@ -165,6 +205,10 @@ def _source_files(source: Path) -> dict[str, bytes]:
         for path in sorted(source.rglob("*"), key=lambda item: item.as_posix())
         if path.is_file()
     }
+
+
+def _contains_files(path: Path) -> bool:
+    return path.is_dir() and any(item.is_file() for item in path.rglob("*"))
 
 
 def _write_reproducible_zip(path: Path, files: dict[str, bytes]) -> None:

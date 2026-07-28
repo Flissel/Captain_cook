@@ -156,6 +156,135 @@ def test_autogen_manifest_rejects_unknown_tools_and_handoffs(
         )
 
 
+def _candidate_manifest_payload() -> dict[str, object]:
+    workflow_ref = _ref("artifact://factory/workflow/support-triage", b"workflow")
+    input_ref = _ref("artifact://factory/schema/support-triage-input", b"input")
+    output_ref = _ref("artifact://factory/schema/support-triage-output", b"output")
+    payload: dict[str, object] = {
+        "candidate_id": "support_triage_v1",
+        "source_archive_ref": _ref(
+            "artifact://factory/source/support-triage",
+            b"source",
+            "application/zip",
+        ),
+        "team_manifest": {
+            "reference": _ref("artifact://factory/team/support-triage", b"team"),
+            "relative_path": "team_manifest.json",
+        },
+        "workflow_artifacts": (
+            {
+                "reference": workflow_ref,
+                "relative_path": "workflows/support_triage.json",
+            },
+        ),
+        "tool_schema_artifacts": (
+            {
+                "reference": input_ref,
+                "relative_path": "schemas/support_triage.input.json",
+            },
+            {
+                "reference": output_ref,
+                "relative_path": "schemas/support_triage.output.json",
+            },
+        ),
+        "n8n_tools": (
+            TypedN8nTool(
+                name="support_triage",
+                description="Route a support request.",
+                input_schema_ref=input_ref.uri,
+                output_schema_ref=output_ref.uri,
+            ),
+        ),
+        "build_command": ("python", "-m", "compileall", "-q", "."),
+        "real_case_command": ("python", "run_case.py"),
+        "timeout_seconds": 10,
+    }
+    configured_tools = payload["n8n_tools"]
+    assert isinstance(configured_tools, tuple)
+    tool = configured_tools[0]
+    assert isinstance(tool, TypedN8nTool)
+    payload["n8n_tool_references"] = (tool.opaque_reference(),)
+    return payload
+
+
+def test_candidate_manifest_allows_exactly_empty_n8n_artifacts_for_tool_free_team() -> None:
+    payload = _candidate_manifest_payload()
+    payload.update(
+        workflow_artifacts=(),
+        tool_schema_artifacts=(),
+        n8n_tools=(),
+        n8n_tool_references=(),
+    )
+
+    manifest = FactoryCandidateManifest.model_validate(payload)
+
+    assert manifest.workflow_artifacts == ()
+    assert manifest.tool_schema_artifacts == ()
+    assert manifest.n8n_tools == ()
+    assert manifest.n8n_tool_references == ()
+
+
+@pytest.mark.parametrize(
+    "orphaned_field",
+    ("workflow_artifacts", "tool_schema_artifacts", "n8n_tool_references"),
+)
+def test_candidate_manifest_rejects_n8n_artifacts_without_n8n_tool(
+    orphaned_field: str,
+) -> None:
+    payload = _candidate_manifest_payload()
+    orphaned = payload[orphaned_field]
+    payload.update(
+        workflow_artifacts=(),
+        tool_schema_artifacts=(),
+        n8n_tools=(),
+        n8n_tool_references=(),
+    )
+    payload[orphaned_field] = orphaned
+
+    with pytest.raises(ValueError, match="without n8n tools"):
+        FactoryCandidateManifest.model_validate(payload)
+
+
+def test_candidate_manifest_requires_workflow_when_n8n_tool_is_present() -> None:
+    payload = _candidate_manifest_payload()
+    payload["workflow_artifacts"] = ()
+
+    with pytest.raises(ValueError, match="requires at least one workflow"):
+        FactoryCandidateManifest.model_validate(payload)
+
+
+def test_candidate_manifest_rejects_shared_n8n_input_or_output_schemas() -> None:
+    payload = _candidate_manifest_payload()
+    configured_tools = payload["n8n_tools"]
+    assert isinstance(configured_tools, tuple)
+    first_tool = configured_tools[0]
+    assert isinstance(first_tool, TypedN8nTool)
+    second_output = _ref("artifact://factory/schema/second-output", b"second-output")
+    tools = (
+        first_tool,
+        TypedN8nTool(
+            name="second_tool",
+            description="Second integration.",
+            input_schema_ref=first_tool.input_schema_ref,
+            output_schema_ref=second_output.uri,
+        ),
+    )
+    payload["n8n_tools"] = tools
+    payload["n8n_tool_references"] = tuple(tool.opaque_reference() for tool in tools)
+    configured_schemas = payload["tool_schema_artifacts"]
+    assert isinstance(configured_schemas, tuple)
+    payload["tool_schema_artifacts"] = (
+        *configured_schemas,
+        {
+            "reference": second_output,
+            "relative_path": "schemas/second.output.json",
+        },
+    )
+
+    with pytest.raises(ValueError, match="unique input/output schemas"):
+        FactoryCandidateManifest.model_validate(payload)
+
+
 def test_evaluator_runs_a_sealed_candidate_in_a_temporary_workspace(tmp_path: Path) -> None:
     archive_path = tmp_path / "candidate.zip"
     team_ref, workflow_ref, input_schema_ref, output_schema_ref, source_ref = _write_candidate_archive(archive_path)

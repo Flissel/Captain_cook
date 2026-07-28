@@ -1038,28 +1038,6 @@ async def test_assert_current_rejects_forged_fence_evidence_reference(tmp_path: 
         )
 
 
-def test_runtime_scope_allows_unused_candidate_tool_descriptor(tmp_path: Path) -> None:
-    _, scope = create_scope(tmp_path)
-    existing_tool = scope.resolved_candidate.candidate.n8n_tools[0]
-    unused = TypedN8nTool(
-        name="claims_manifest_placeholder",
-        description="Compatibility descriptor not assigned to an agent.",
-        input_schema_ref=existing_tool.input_schema_ref,
-        output_schema_ref=existing_tool.output_schema_ref,
-    )
-    candidate = scope.resolved_candidate.candidate.model_copy(
-        update={"n8n_tools": (*scope.resolved_candidate.candidate.n8n_tools, unused)}
-    )
-    resolved = ResolvedFactoryCandidate(
-        candidate=candidate,
-        source_archive=scope.resolved_candidate.source_archive,
-    )
-
-    updated = replace(scope, resolved_candidate=resolved)
-
-    assert updated.allowed_host_tools == ("claims_lookup",)
-
-
 @pytest.mark.asyncio
 async def test_runtime_selects_exact_case_policy_for_n8n_and_none_cases(
     tmp_path: Path,

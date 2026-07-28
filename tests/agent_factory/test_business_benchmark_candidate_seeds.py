@@ -68,16 +68,17 @@ def test_claims_seed_is_a_tool_free_swarm_with_sealed_business_rules(
     assert team.agents[0].handoffs == ("coverage_specialist",)
     assert team.agents[1].handoffs == ("escalation_specialist",)
     assert team.agents[2].handoffs == ()
-    assert len(resolved.candidate.n8n_tools) == 1
+    assert resolved.candidate.workflow_artifacts == ()
+    assert resolved.candidate.tool_schema_artifacts == ()
+    assert resolved.candidate.n8n_tools == ()
+    assert resolved.candidate.n8n_tool_references == ()
 
     with zipfile.ZipFile(resolved.source_archive) as archive:
+        archived_names = set(archive.namelist())
         prompt_text = "\n".join(
             archive.read(name).decode("utf-8")
             for name in sorted(archive.namelist())
             if name.startswith("prompts/")
-        )
-        descriptor = json.loads(
-            archive.read("workflows/unused_manifest_tool_descriptor.json")
         )
 
     assert "captain.business-benchmark-terminal.v1" in prompt_text
@@ -89,8 +90,21 @@ def test_claims_seed_is_a_tool_free_swarm_with_sealed_business_rules(
     assert "expected_decision" not in prompt_text
     assert "required_rationale_fact_ids" not in prompt_text
     assert "case_id" not in prompt_text
-    assert descriptor["active"] is False
-    assert descriptor["purpose"] == "manifest_cardinality_compatibility_only"
+    assert not any(name.startswith("workflows/") for name in archived_names)
+    assert not any(name.startswith("schemas/") for name in archived_names)
+
+    source = (
+        Path(__file__).parents[2]
+        / "examples"
+        / "business_benchmark_candidates"
+        / CLAIMS_SEED_PROFILE
+    )
+    config = json.loads((source / "seed.json").read_text(encoding="utf-8"))
+    assert not {"workflow_path", "input_schema_path", "output_schema_path", "tool"} & set(
+        config
+    )
+    assert not any(path.is_file() for path in (source / "workflows").rglob("*"))
+    assert not any(path.is_file() for path in (source / "schemas").rglob("*"))
 
 
 def test_renewal_seed_has_one_read_only_idempotent_n8n_workflow(
@@ -109,6 +123,8 @@ def test_renewal_seed_has_one_read_only_idempotent_n8n_workflow(
         (),
     )
     assert len(resolved.candidate.workflow_artifacts) == 1
+    assert len(resolved.candidate.tool_schema_artifacts) == 2
+    assert len(resolved.candidate.n8n_tool_references) == 1
 
     with zipfile.ZipFile(resolved.source_archive) as archive:
         workflow = json.loads(archive.read("workflows/renewal_context_read.json"))

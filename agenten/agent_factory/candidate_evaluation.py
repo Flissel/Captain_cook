@@ -196,9 +196,9 @@ class FactoryCandidateManifest(_FrozenModel):
     candidate_id: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
     source_archive_ref: ArtifactRef
     team_manifest: FactoryCandidateArtifact
-    workflow_artifacts: tuple[FactoryCandidateArtifact, ...] = Field(min_length=1)
-    tool_schema_artifacts: tuple[FactoryCandidateArtifact, ...] = Field(min_length=2)
-    n8n_tools: tuple[TypedN8nTool, ...] = Field(min_length=1)
+    workflow_artifacts: tuple[FactoryCandidateArtifact, ...] = ()
+    tool_schema_artifacts: tuple[FactoryCandidateArtifact, ...] = ()
+    n8n_tools: tuple[TypedN8nTool, ...] = ()
     n8n_tool_references: tuple[OpaqueN8nToolReference, ...] = ()
     build_command: tuple[str, ...] = Field(min_length=1)
     real_case_command: tuple[str, ...] = Field(min_length=1)
@@ -215,12 +215,30 @@ class FactoryCandidateManifest(_FrozenModel):
 
     @model_validator(mode="after")
     def require_sealed_tool_schemas(self) -> "FactoryCandidateManifest":
+        if not self.n8n_tools:
+            if (
+                self.workflow_artifacts
+                or self.tool_schema_artifacts
+                or self.n8n_tool_references
+            ):
+                raise ValueError(
+                    "candidate cannot contain n8n artifacts without n8n tools"
+                )
+            return self
+        if not self.workflow_artifacts:
+            raise ValueError("candidate with n8n tools requires at least one workflow")
+        tool_names = tuple(tool.name for tool in self.n8n_tools)
+        if len(tool_names) != len(set(tool_names)):
+            raise ValueError("candidate n8n tool names must be unique")
         references = {item.reference.uri for item in self.tool_schema_artifacts}
-        expected = {
+        expected_sequence = tuple(
             reference
             for tool in self.n8n_tools
             for reference in (tool.input_schema_ref, tool.output_schema_ref)
-        }
+        )
+        expected = set(expected_sequence)
+        if len(expected) != len(expected_sequence):
+            raise ValueError("candidate n8n tools require unique input/output schemas")
         if references != expected:
             raise ValueError("each typed n8n input/output schema must be sealed in the candidate archive")
         if len(references) != len(self.tool_schema_artifacts):
