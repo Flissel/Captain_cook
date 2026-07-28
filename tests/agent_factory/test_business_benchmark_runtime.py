@@ -640,6 +640,7 @@ async def test_candidate_execution_uses_fresh_bound_session_and_strict_evidence(
     call = factory.executors[0].calls[0][1]
     assert call["candidate"] == scope.resolved_candidate
     assert call["manifest"] == scope.team_manifest
+    assert call["allowed_tools"] == scope.allowed_host_tools
     assert call["allowed_models"] == (scope.model,)
     assert call["max_seconds"] == env.maximum_latency_ms / 1_000
     assert result.status == "succeeded"
@@ -1123,6 +1124,7 @@ async def test_runtime_selects_exact_case_policy_for_n8n_and_none_cases(
     assert n8n_env.allowed_tool_intents == (IntegrationIntent.N8N,)
     assert none_env.allowed_tool_intents == (IntegrationIntent.NONE,)
     assert factory.requests[-1].allowed_host_tools == ()
+    assert factory.executors[-1].calls[0][1]["allowed_tools"] == ()
 
 
 def test_runtime_scope_defensively_freezes_policy_and_tool_mappings(

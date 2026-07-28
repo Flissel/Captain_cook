@@ -1393,6 +1393,7 @@ class HostAutoGenSessionExecutor:
         identity: HostAutoGenSessionIdentityV1,
         candidate: ResolvedFactoryCandidate,
         manifest: FactoryAutoGenTeamManifestV1 | None = None,
+        allowed_tools: tuple[str, ...] | None = None,
         allowed_models: tuple[str, ...],
         max_seconds: float,
     ) -> HostAutoGenSessionResult:
@@ -1413,6 +1414,7 @@ class HostAutoGenSessionExecutor:
                     manifest=verified_manifest,
                     expected_manifest=expected_manifest,
                     candidate=candidate,
+                    allowed_tools=allowed_tools,
                     allowed_models=allowed_models,
                     max_seconds=max_seconds,
                 )
@@ -1431,6 +1433,7 @@ class HostAutoGenSessionExecutor:
         manifest: FactoryAutoGenTeamManifestV1,
         expected_manifest: FactoryAutoGenTeamManifestV1 | None,
         candidate: ResolvedFactoryCandidate,
+        allowed_tools: tuple[str, ...] | None,
         allowed_models: tuple[str, ...],
         max_seconds: float,
     ) -> HostAutoGenSessionResult:
@@ -1447,13 +1450,29 @@ class HostAutoGenSessionExecutor:
         model_client = self._client_for(identity)
         if model_client.model != identity.model or model_client.model not in allowed_models:
             raise ValueError("host model client is not allowed by the factory job")
-        n8n_tools = {
-            tool.name: tool.opaque_reference() for tool in candidate.candidate.n8n_tools
-        }
-        n8n_tool_names = set(n8n_tools)
-        required_tools = tuple(
+        declared_tools = tuple(
             dict.fromkeys(tool for agent in manifest.agents for tool in agent.tools)
         )
+        if allowed_tools is None:
+            required_tools = declared_tools
+        else:
+            allowed_set = set(allowed_tools)
+            if (
+                len(allowed_tools) != len(allowed_set)
+                or allowed_set - set(declared_tools)
+            ):
+                raise ValueError(
+                    "allowed tools must be a subset of the sealed candidate manifest"
+                )
+            required_tools = tuple(
+                name for name in declared_tools if name in allowed_set
+            )
+        required_tool_names = set(required_tools)
+        n8n_tools = {
+            tool.name: tool.opaque_reference()
+            for tool in candidate.candidate.n8n_tools
+            if tool.name in required_tool_names
+        }
         resolved_tools = self._resolve_tools(
             required_tools,
             maximum=manifest.max_tool_calls,
@@ -1464,7 +1483,11 @@ class HostAutoGenSessionExecutor:
             AssistantAgent(
                 name=agent.name,
                 model_client=model_client,
-                tools=[resolved_tools[name] for name in agent.tools],
+                tools=[
+                    resolved_tools[name]
+                    for name in agent.tools
+                    if name in required_tool_names
+                ],
                 handoffs=list(agent.handoffs),
                 model_context=(
                     BufferedChatCompletionContext(buffer_size=manifest.max_messages)
@@ -1568,7 +1591,7 @@ class HostAutoGenSessionExecutor:
             max_handoffs=manifest.max_handoffs,
             max_tool_calls=manifest.max_tool_calls,
             termination_conditions=manifest.termination_conditions,
-            n8n_tools={name: n8n_tools[name] for name in n8n_tool_names},
+            n8n_tools=n8n_tools,
             n8n_evidence_offset=n8n_evidence_offset,
         )
 

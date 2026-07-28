@@ -2031,6 +2031,75 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
         )
     assert model_client.any_provider_effect_started is False
 
+    tool_free_client = BudgetedChatCompletionClient(
+        job=job,
+        invocation=invocation,
+        attempt=1,
+        delegate=ReplayChatCompletionClient(
+            [benchmark_terminal],
+            model_info=ModelInfo(
+                vision=False,
+                function_calling=True,
+                json_output=True,
+                family=ModelFamily.UNKNOWN,
+                structured_output=True,
+            ),
+        ),
+        budget=InMemoryFactoryBudgetLedger(),
+        evidence_store=evidence_store,
+        provider="deterministic-replay",
+        model="approved-model-id",
+        max_cost_per_call=Decimal("0.50"),
+        paid_effect_authority=_PaidEffectAuthority(),
+        pricing_authority=_PricingAuthority(_pricing_quote(job)),
+        clock=lambda: NOW,
+    )
+    tool_free_executor = HostAutoGenSessionExecutor(
+        model_client=tool_free_client,
+        evidence_store=evidence_store,
+        holdouts=Holdouts(),  # type: ignore[arg-type]
+        tools={},
+        clock=lambda: NOW,
+    )
+    tool_free_identity = HostAutoGenSessionIdentityV1.for_factory_execution(
+        job=job,
+        invocation=invocation,
+        case_ref=job.private_holdout_refs[0],
+        subject_id=sealed_candidate.candidate.candidate_id,
+        variant="candidate",
+        request_id=UUID("77000000-0000-0000-0000-000000000001"),
+        runtime_session_id="candidate-tool-free-sensitive-case",
+        effect_id="7" * 64,
+        claim_id=UUID("78000000-0000-0000-0000-000000000001"),
+        fence=1,
+        model="approved-model-id",
+    )
+    with pytest.raises(ValueError, match="sealed candidate manifest"):
+        await tool_free_executor.run_candidate(
+            job=job,
+            invocation=invocation,
+            case_ref=job.private_holdout_refs[0],
+            identity=tool_free_identity,
+            candidate=sealed_candidate,
+            allowed_tools=("forged_tool",),
+            allowed_models=job.execution_policy.allowed_models,
+            max_seconds=10,
+        )
+    assert tool_free_client.any_provider_effect_started is False
+    tool_free_result = await tool_free_executor.run_candidate(
+        job=job,
+        invocation=invocation,
+        case_ref=job.private_holdout_refs[0],
+        identity=tool_free_identity,
+        candidate=sealed_candidate,
+        allowed_tools=(),
+        allowed_models=job.execution_policy.allowed_models,
+        max_seconds=10,
+    )
+    assert tool_free_result.tool_call_count == 0
+    assert tool_free_result.n8n_executions == ()
+    assert tool_free_client.any_provider_effect_started is True
+
     runner = HostAutoGenTeamRunner(
         model_client=model_client,
         evaluator=FactoryCandidateEvaluator(),

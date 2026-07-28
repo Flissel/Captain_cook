@@ -472,12 +472,12 @@ def test_default_renewal_build_stops_at_exact_grant_bound_baseline_gap(
     )
     with pytest.raises(
         ProductionAdapterUnavailableError,
-        match="CaptainRenewalBaselineN8nGrantPort",
+        match="CaptainRenewalN8nBootstrapPorts",
     ) as caught:
         bootstrap.build_production_business_benchmark_composition(configured)
 
     assert "TODO_TOOL.v1" in str(caught.value)
-    assert "authority-free fallback is forbidden" in str(caught.value)
+    assert "injected" in str(caught.value)
 
 
 def test_claims_executor_builder_creates_durable_host_runtime_without_provider_call(
@@ -643,6 +643,314 @@ def test_claims_baseline_prompt_has_equal_public_policy_without_private_labels()
         "Swarm",
         "coverage_specialist",
         "escalation_specialist",
+    )
+    assert not any(item in prompt for item in forbidden)
+
+
+def test_renewal_builder_wires_equal_request_scoped_n8n_authority(
+    tmp_path: Path,
+) -> None:
+    import httpx
+
+    from agenten.agent_factory.business_benchmark_bootstrap import (
+        CaptainRenewalBusinessBenchmarkExecutorBuilder,
+        CaptainRenewalBusinessBenchmarkN8nPorts,
+        CaptainCanonicalSuiteAuthority,
+        ConfiguredBusinessBenchmarkExecutionPolicyBuilder,
+        ProductionBusinessBenchmarkRuntimeAuthorities,
+    )
+    from agenten.agent_factory.business_benchmark_candidate_seeds import (
+        RENEWAL_SEED_PROFILE,
+        package_business_benchmark_seed,
+    )
+    from agenten.agent_factory.business_benchmark_contracts import (
+        BusinessCaseCategory,
+    )
+    from agenten.agent_factory.business_benchmark_human_review import (
+        CaptainHumanReviewStore,
+    )
+    from agenten.agent_factory.business_benchmark_live import BusinessBenchmarkLiveAdapter
+    from agenten.agent_factory.business_benchmark_n8n import (
+        CaptainRenewalContextN8nAdapter,
+    )
+    from agenten.agent_factory.business_benchmark_n8n_transport import (
+        CaptainNativeMcpRenewalContextTransport,
+    )
+    from agenten.agent_factory.business_benchmark_runtime import (
+        BusinessBenchmarkSessionRequestV1,
+    )
+    from agenten.agent_factory.candidate_evaluation import ResolvedFactoryCandidate
+    from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
+    from agenten.agent_factory.team_execution import HostAutoGenSessionIdentityV1
+    from agenten.agent_runtime.contracts import IntegrationIntent
+    from agenten.agent_runtime.n8n_endpoint import N8nEndpoint
+    from tests.agent_factory.test_team_execution import _baseline_n8n_contract
+
+    job = live_job()
+    now = job.deadline_at - timedelta(minutes=1)
+    artifacts = BusinessBenchmarkContentAddressedArtifactStore(
+        tmp_path / ".captain-cook" / "private" / "business-benchmarks" / "cas"
+    )
+    packaged = package_business_benchmark_seed(
+        RENEWAL_SEED_PROFILE,
+        tmp_path / "renewal-seed",
+    )
+    source_ref = artifacts.put(
+        packaged.source_archive.read_bytes(),
+        "application/zip",
+        namespace="candidate-archive",
+    )
+    candidate = ResolvedFactoryCandidate(
+        candidate=packaged.candidate.model_copy(
+            update={"source_archive_ref": source_ref}
+        ),
+        source_archive=artifacts.local_path(source_ref),
+    )
+    _, renewal_suite = CaptainCanonicalSuiteAuthority(
+        root=tmp_path / ".captain-cook" / "private" / "renewal-suite",
+        seed_version_id="renewal-builder-test-v1",
+    ).canonical_suite(
+        profile_id=RENEWAL_SEED_PROFILE,
+        suite_version=1,
+    )
+    configured = _settings(job).model_copy(
+        update={
+            "profile": "renewal",
+            "selections": (
+                _settings(job).selections[0].model_copy(
+                    update={"profile": "renewal"}
+                ),
+            ),
+        }
+    )
+    policy_builder = ConfiguredBusinessBenchmarkExecutionPolicyBuilder(
+        model=configured.model,
+        redaction_policy_version="benchmark-redaction-v1",
+        maximum_cost_micro_usd=1000,
+        maximum_latency_ms=2500,
+    )
+    runtime_invocation = _invocation(job, FactorySkillStep.EXECUTE_TEAM)
+    scope = SimpleNamespace(
+        selection=SimpleNamespace(profile="renewal", attempt=1),
+        job=job,
+        candidate=candidate,
+        candidate_ref=source_ref,
+        runtime_invocation=runtime_invocation,
+        suite=renewal_suite,
+        suite_ref=job.private_holdout_refs[0],
+        suite_id=renewal_suite.suite_id,
+        settings=configured,
+    )
+    runtime_authorities = ProductionBusinessBenchmarkRuntimeAuthorities(
+        artifacts=artifacts,
+        human_review=CaptainHumanReviewStore(
+            tmp_path / ".captain-cook" / "private" / "business-benchmarks" / "human-review"
+        ),
+        provider_state_root=(
+            tmp_path
+            / ".captain-cook"
+            / "private"
+            / "business-benchmarks"
+            / "runtime-state"
+            / "provider-state"
+        ),
+    )
+    tool_ref = candidate.candidate.n8n_tools[0].opaque_reference()
+    authorization, _ = _baseline_n8n_contract(job, tool_ref, suffix="6")
+    authorization_to_return = {"value": authorization}
+
+    class AuthorizationPort:
+        def __init__(self) -> None:
+            self.calls: list[object] = []
+
+        def authorization_for(self, **kwargs: object):
+            assert kwargs["job"] == job
+            assert kwargs["invocation"] == runtime_invocation
+            assert kwargs["tool_reference"] == tool_ref
+            self.calls.append(kwargs["request"])
+            return authorization_to_return["value"]
+
+    authorization_port = AuthorizationPort()
+
+    class GrantAuthority:
+        async def authorize_command(self, claim, *, now):
+            del now
+            return claim.capability_grant
+
+        async def authorize(self, evidence, *, now):
+            del now
+            return evidence.capability_grant
+
+    endpoint = N8nEndpoint(
+        mode="captain-builder",
+        api_base_url="http://localhost:5679",
+        webhook_base_url="http://localhost:5679",
+        api_key="test-only-api-key",
+        mcp_token="test-only-upstream-token",
+        mcp_broker_url="http://localhost:5680",
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(500)))
+    workflow_ref = candidate.candidate.workflow_artifacts[0].reference
+    n8n_ports = CaptainRenewalBusinessBenchmarkN8nPorts(
+        endpoint=endpoint,
+        allowed_endpoint_urls=frozenset({"http://localhost:5679"}),
+        client=client,
+        workflow_id="renewal-context-workflow",
+        workflow_ref=workflow_ref,
+        authorization_port=authorization_port,  # type: ignore[arg-type]
+        grant_authority=GrantAuthority(),  # type: ignore[arg-type]
+        broker_token_issuer=lambda _: "request-bound-test-token",
+    )
+    builder = CaptainRenewalBusinessBenchmarkExecutorBuilder(
+        model_client_builder=SimpleNamespace(),
+        budget=SimpleNamespace(),
+        pricing_authority=SimpleNamespace(),
+        paid_effect_authority=SimpleNamespace(),
+        evidence_store=FilesystemFactoryEvidenceStore(
+            tmp_path / ".captain-cook" / "evidence" / "factory"
+        ),
+        policy_builder=policy_builder,
+        provider="openai",
+        model=configured.model,
+        max_cost_per_call=Decimal("0.001"),
+        n8n=n8n_ports,
+        clock=lambda: now,
+    )
+
+    executor = builder(scope, runtime_authorities)
+
+    assert isinstance(executor, BusinessBenchmarkLiveAdapter)
+    runtime_scope = executor._runtime_bundle._scopes[job.job_id]
+    assert runtime_scope.allowed_host_tools == (tool_ref.tool_name,)
+    assert runtime_scope.baseline_policy.allowed_tools == (tool_ref.tool_name,)
+    assert runtime_scope.tool_intents == {tool_ref.tool_name: IntegrationIntent.N8N}
+    assert tuple(
+        policy.allowed_tool_intents
+        for (_, _), policy in runtime_scope.benchmark_policies.items()
+    ) == tuple(
+        (IntegrationIntent.N8N,)
+        if item.category in {BusinessCaseCategory.ORDINARY, BusinessCaseCategory.BOUNDARY}
+        else (IntegrationIntent.NONE,)
+        for item in renewal_suite.cases
+    )
+
+    session_factory = executor._runtime_bundle._session_factory
+
+    def request(variant: str, allowed_tools: tuple[str, ...], ordinal: int):
+        task = f'Renewal case {ordinal}: {{"evidence_partition":"ordinary"}}'
+        case_ref = job.private_holdout_refs[0].model_copy(
+            update={
+                "holdout_id": f"redacted-renewal-{ordinal:02d}",
+                "uri": f"holdout://redacted-renewal-{ordinal:02d}",
+                "sha256": hashlib.sha256(task.encode("utf-8")).hexdigest(),
+            }
+        )
+        identity = HostAutoGenSessionIdentityV1.for_factory_execution(
+            job=job,
+            invocation=runtime_invocation,
+            case_ref=case_ref,
+            subject_id=(
+                candidate.candidate.candidate_id
+                if variant == "candidate"
+                else "single_agent_baseline"
+            ),
+            variant=variant,
+            request_id=UUID(f"7a000000-0000-0000-0000-{ordinal:012d}"),
+            runtime_session_id=f"renewal-session-{variant}-{ordinal}",
+            effect_id=hashlib.sha256(f"effect-{ordinal}".encode()).hexdigest(),
+            claim_id=UUID(f"7b000000-0000-0000-0000-{ordinal:012d}"),
+            fence=ordinal,
+            model=configured.model,
+        )
+        return BusinessBenchmarkSessionRequestV1(
+            identity=identity,
+            benchmark_case_sha256="c" * 64,
+            redacted_case_task=task,
+            allowed_host_tools=allowed_tools,
+            maximum_cost_micro_usd=1000,
+            maximum_latency_ms=2500,
+        )
+
+    candidate_session = session_factory.create(
+        request("candidate", (tool_ref.tool_name,), 1)
+    )
+    baseline_session = session_factory.create(
+        request("single_agent_baseline", (tool_ref.tool_name,), 2)
+    )
+    sensitive_session = session_factory.create(request("candidate", (), 3))
+    sensitive_baseline_session = session_factory.create(
+        request("single_agent_baseline", (), 5)
+    )
+
+    assert isinstance(candidate_session._n8n_adapter, CaptainRenewalContextN8nAdapter)
+    assert isinstance(baseline_session._n8n_adapter, CaptainRenewalContextN8nAdapter)
+    assert isinstance(
+        candidate_session._n8n_adapter._transport,
+        CaptainNativeMcpRenewalContextTransport,
+    )
+    assert candidate_session._baseline_n8n_tools == {tool_ref.tool_name: tool_ref}
+    assert baseline_session._baseline_n8n_tools == {tool_ref.tool_name: tool_ref}
+    assert candidate_session._n8n_adapter.authorization(tool_ref.tool_name) == authorization
+    assert baseline_session._n8n_adapter.authorization(tool_ref.tool_name) == authorization
+    assert candidate_session._n8n_adapter._workflow_ref == workflow_ref
+    assert baseline_session._n8n_adapter._workflow_ref == workflow_ref
+    assert sensitive_session._n8n_adapter is None
+    assert sensitive_session._baseline_n8n_tools == {}
+    assert sensitive_baseline_session._n8n_adapter is None
+    assert sensitive_baseline_session._baseline_n8n_tools == {}
+    assert len(authorization_port.calls) == 2
+
+    different_authorization, _ = _baseline_n8n_contract(
+        job, tool_ref, suffix="8"
+    )
+    authorization_to_return["value"] = different_authorization
+    with pytest.raises(ValueError, match="exact same command/grant"):
+        session_factory.create(
+            request("single_agent_baseline", (tool_ref.tool_name,), 4)
+        )
+
+
+def test_renewal_baseline_prompt_has_equal_public_policy_without_private_labels() -> None:
+    from agenten.agent_factory.business_benchmark_bootstrap import (
+        CaptainRenewalBusinessBenchmarkExecutorBuilder,
+    )
+
+    prompt = CaptainRenewalBusinessBenchmarkExecutorBuilder._BASELINE_PROMPT.decode(
+        "utf-8"
+    )
+
+    assert "renewal-public-policy-v1" in prompt
+    assert "ordinary" in prompt
+    assert "boundary" in prompt
+    assert "renewal_context_read" in prompt
+    assert {
+        "propose_next_best_action",
+        "request_information",
+        "human_commercial_review",
+        "renewal_window_verified",
+        "next_action_supported",
+        "commercial_boundary_identified",
+        "next_action_bounded",
+        "required_signal_missing",
+        "action_deferred",
+        "commercial_conflict_detected",
+        "human_review_required",
+        "strategic_authority_threshold_met",
+        "human_commercial_authority_required",
+    }.issubset(set(prompt.replace(".", " ").replace(",", " ").split()))
+    forbidden = (
+        "renewal-ordinary-",
+        "renewal-boundary-",
+        "renewal-incomplete-",
+        "renewal-contradictory-",
+        "renewal-mandatory-escalation-",
+        "expected_decision",
+        "required_rationale_fact_ids",
+        "case_id",
+        "SelectorGroupChat",
+        "renewal_analyst",
+        "commercial_advisor",
+        "human_review_coordinator",
     )
     assert not any(item in prompt for item in forbidden)
 

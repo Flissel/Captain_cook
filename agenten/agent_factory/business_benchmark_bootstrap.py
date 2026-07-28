@@ -1,10 +1,10 @@
 """Fail-closed production bootstrap for the provider-backed business benchmark.
 
 Claims is composed from MariaDB/Gateway, stable Captain CAS/state roots, fresh
-budgeted OpenAI clients and host AutoGen sessions.  Renewal remains blocked at
-the exact baseline n8n seam until both variants can use the same grant-bound
-tool path.  No in-memory authority, automatic human approval, or unscoped n8n
-client is substituted.
+budgeted OpenAI clients and host AutoGen sessions. Renewal uses the same
+request-scoped, grant-bound n8n workflow path for Candidate and baseline when
+its injected deployment ports are available. No in-memory authority, automatic
+human approval, or unscoped n8n client is substituted.
 """
 
 from __future__ import annotations
@@ -23,10 +23,13 @@ from pathlib import Path
 from typing import Literal, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+import httpx
+
 from agenten.agent_factory.business_benchmark_contracts import (
     BusinessBenchmarkCaseV1,
     BusinessBenchmarkRunReceiptV1,
     BusinessBenchmarkSuiteV1,
+    BusinessCaseCategory,
     canonical_business_benchmark_model_bytes,
 )
 from agenten.agent_factory.business_benchmark import BusinessBenchmarkEvaluator
@@ -39,6 +42,7 @@ from agenten.agent_factory.business_benchmark_factory import (
     BusinessBenchmarkFactoryComposition,
 )
 from agenten.agent_factory.business_benchmark_live import (
+    BusinessBenchmarkLiveAdapter,
     BusinessBenchmarkFinalizedReceiptV1,
     LiveBusinessBenchmarkSettings,
     ProductionAdapterUnavailableError,
@@ -47,6 +51,14 @@ from agenten.agent_factory.business_benchmark_live import (
 from agenten.agent_factory.business_benchmark_provisioning import (
     CanonicalPrivateBusinessBenchmarkProvisioner,
     CaptainPrivateBusinessBenchmarkSuiteLoader,
+    RENEWAL_PROFILE_ID,
+)
+from agenten.agent_factory.business_benchmark_n8n import (
+    CaptainRenewalContextN8nAdapter,
+    RenewalContextN8nProviderRequestV1,
+)
+from agenten.agent_factory.business_benchmark_n8n_transport import (
+    CaptainNativeMcpRenewalContextTransport,
 )
 from agenten.agent_factory.business_benchmark_replay import (
     FilesystemBusinessBenchmarkReplayStore,
@@ -82,7 +94,6 @@ from agenten.agent_factory.business_benchmark_production_ports import (
     OpenAIBusinessBenchmarkModelClientBuilder,
     factory_execution_policy_sha256,
 )
-from agenten.agent_factory.business_benchmark_live import BusinessBenchmarkLiveAdapter
 from agenten.agent_factory.candidate_evaluation import FactoryCandidateEvaluator
 from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
 from agenten.agent_factory.factory_feedback import FactoryFeedbackBuilder
@@ -91,6 +102,8 @@ from agenten.agent_factory.team_execution import (
     BudgetedChatCompletionClient,
     CaptainReleasedSkillAuthority,
     FactoryHoldoutEvaluationReceiptV1,
+    FactoryN8nGrantAuthorityPort,
+    FactoryN8nToolAuthorizationV1,
     HostAutoGenSessionExecutor,
     ResolvedFactoryHoldoutCase,
     SealedSingleAgentPolicyV1,
@@ -110,7 +123,9 @@ from agenten.agent_factory.skill_workflow_contracts import (
     TeamEvaluationV1,
     TeamExecutionEvidenceV1,
 )
-from agenten.agent_runtime.contracts import ArtifactRef
+from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent
+from agenten.agent_runtime.n8n_endpoint import N8nEndpoint
+from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference
 
 
 _SAFE_VERSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -234,6 +249,51 @@ class CaptainBusinessBenchmarkExecutionPolicyBuilderPort(Protocol):
         self,
         scope: ProductionBusinessBenchmarkScope,
     ) -> BusinessBenchmarkCasePolicyPort: ...
+
+
+class CaptainRenewalN8nAuthorizationPort(Protocol):
+    """Issue one request-scoped command/grant claim without exposing credentials."""
+
+    def authorization_for(
+        self,
+        *,
+        job: AgentFactoryJobV3,
+        invocation: FactorySkillInvocationV1,
+        request: BusinessBenchmarkSessionRequestV1,
+        tool_reference: OpaqueN8nToolReference,
+    ) -> FactoryN8nToolAuthorizationV1: ...
+
+
+@dataclass(frozen=True)
+class CaptainRenewalBusinessBenchmarkN8nPorts:
+    """Injected least-privilege authorities for the Renewal n8n read path."""
+
+    endpoint: N8nEndpoint
+    allowed_endpoint_urls: frozenset[str]
+    client: httpx.AsyncClient
+    workflow_id: str
+    workflow_ref: ArtifactRef
+    authorization_port: CaptainRenewalN8nAuthorizationPort
+    grant_authority: FactoryN8nGrantAuthorityPort
+    broker_token_issuer: Callable[[RenewalContextN8nProviderRequestV1], str]
+
+    def __post_init__(self) -> None:
+        if (
+            self.endpoint.mode != "captain-builder"
+            or not self.endpoint.mcp_broker_url
+            or not self.endpoint.mcp_token
+            or not self.allowed_endpoint_urls
+            or self.endpoint.api_base_url.rstrip("/")
+            not in {item.rstrip("/") for item in self.allowed_endpoint_urls}
+            or not isinstance(self.client, httpx.AsyncClient)
+            or not self.workflow_id.strip()
+            or self.workflow_ref.media_type != "application/json"
+            or not callable(getattr(self.authorization_port, "authorization_for", None))
+            or not callable(getattr(self.grant_authority, "authorize_command", None))
+            or not callable(getattr(self.grant_authority, "authorize", None))
+            or not callable(self.broker_token_issuer)
+        ):
+            raise ValueError("Renewal n8n bootstrap ports are incomplete or unscoped")
 
 
 @dataclass(frozen=True)
@@ -450,6 +510,139 @@ class CaptainBusinessBenchmarkHostSessionFactory:
         )
 
 
+class CaptainRenewalBusinessBenchmarkHostSessionFactory:
+    """Create one Renewal host session with only its case-allowed n8n tool."""
+
+    def __init__(
+        self,
+        *,
+        scope: ProductionBusinessBenchmarkScope,
+        model_client_builder: OpenAIBusinessBenchmarkModelClientBuilder,
+        budget: FactoryBudgetPort,
+        pricing_authority: BusinessBenchmarkPricingAuthority,
+        paid_effect_authority: CaptainReleasedSkillAuthority,
+        evidence_store: FilesystemFactoryEvidenceStore,
+        provider: str,
+        model: str,
+        max_cost_per_call: Decimal,
+        tool_reference: OpaqueN8nToolReference,
+        n8n: CaptainRenewalBusinessBenchmarkN8nPorts,
+        clock: Callable[[], datetime],
+    ) -> None:
+        self._scope = scope
+        self._model_client_builder = model_client_builder
+        self._budget = budget
+        self._pricing_authority = pricing_authority
+        self._paid_effect_authority = paid_effect_authority
+        self._evidence_store = evidence_store
+        self._provider = provider
+        self._model = model
+        self._max_cost_per_call = max_cost_per_call
+        self._tool_reference = tool_reference
+        self._n8n = n8n
+        self._clock = clock
+        self._authorization_by_case_sha256: dict[
+            str, FactoryN8nToolAuthorizationV1
+        ] = {}
+
+    def create(
+        self,
+        request: BusinessBenchmarkSessionRequestV1,
+    ) -> HostAutoGenSessionExecutor:
+        if (
+            request.identity.job_id != self._scope.job.job_id
+            or request.identity.correlation_id != self._scope.job.correlation_id
+            or request.identity.attempt != self._scope.selection.attempt
+            or request.identity.model != self._model
+        ):
+            raise ValueError("host session request is outside the resolved benchmark scope")
+        allowed = request.allowed_host_tools
+        if allowed not in {(), (self._tool_reference.tool_name,)}:
+            raise ValueError("Renewal request contains an unauthorized host tool subset")
+
+        def model_client_for(identity):
+            if identity != request.identity:
+                raise ValueError("host requested a model client for a different session")
+            delegate = self._model_client_builder(
+                self._scope.job,
+                self._scope.runtime_invocation,
+            )
+            return BudgetedChatCompletionClient(
+                job=self._scope.job,
+                invocation=self._scope.runtime_invocation,
+                attempt=self._scope.selection.attempt,
+                delegate=delegate,
+                budget=self._budget,
+                evidence_store=self._evidence_store,
+                provider=self._provider,
+                model=self._model,
+                max_cost_per_call=self._max_cost_per_call,
+                paid_effect_authority=self._paid_effect_authority,
+                pricing_authority=self._pricing_authority,
+                clock=self._clock,
+            )
+
+        adapter = None
+        baseline_n8n_tools: dict[str, OpaqueN8nToolReference] = {}
+        if allowed:
+            raw_authorization = self._n8n.authorization_port.authorization_for(
+                job=self._scope.job,
+                invocation=self._scope.runtime_invocation,
+                request=request,
+                tool_reference=self._tool_reference,
+            )
+            authorization = FactoryN8nToolAuthorizationV1.model_validate(
+                raw_authorization.model_dump(mode="python")
+            )
+            if (
+                authorization.tool_name != self._tool_reference.tool_name
+                or authorization.approved_tool_ref != self._tool_reference
+            ):
+                raise ValueError("Renewal n8n authorization is bound to a different tool")
+            paired_authorization = self._authorization_by_case_sha256.setdefault(
+                request.benchmark_case_sha256,
+                authorization,
+            )
+            if paired_authorization != authorization:
+                raise ValueError(
+                    "Renewal candidate and baseline require the exact same command/grant"
+                )
+            transport = CaptainNativeMcpRenewalContextTransport(
+                client=self._n8n.client,
+                workflow_id=self._n8n.workflow_id,
+                workflow_ref=self._n8n.workflow_ref,
+                clock=self._clock,
+                broker_token_issuer=self._n8n.broker_token_issuer,
+            )
+            adapter = CaptainRenewalContextN8nAdapter(
+                job=self._scope.job,
+                invocation=self._scope.runtime_invocation,
+                identity=request.identity,
+                authorization=authorization,
+                endpoint=self._n8n.endpoint,
+                allowed_endpoint_urls=self._n8n.allowed_endpoint_urls,
+                workflow_ref=self._n8n.workflow_ref,
+                transport=transport,
+                evidence_store=self._evidence_store,
+                clock=self._clock,
+                timeout_seconds=request.maximum_latency_ms / 1_000,
+                max_attempts=2,
+            )
+            baseline_n8n_tools[self._tool_reference.tool_name] = self._tool_reference
+
+        return HostAutoGenSessionExecutor(
+            model_client_factory=model_client_for,
+            evidence_store=self._evidence_store,
+            holdouts=_RequestBoundBenchmarkHoldoutResolver(request),
+            tools={},
+            baseline_tools={},
+            baseline_n8n_tools=baseline_n8n_tools,
+            n8n_adapter=adapter,
+            n8n_authority=(self._n8n.grant_authority if adapter is not None else None),
+            clock=self._clock,
+        )
+
+
 class CaptainClaimsBusinessBenchmarkExecutorBuilder:
     """Concrete live executor for the no-integration Claims benchmark team."""
 
@@ -623,6 +816,217 @@ Use only rationale identifiers justified by supplied fields. Never reveal hidden
             runtime_bundle=runtime,
             fence_store=fence,
             trusted_tool_intents={},
+            monotonic_clock=time.monotonic,
+            clock=self._clock,
+        )
+
+
+class CaptainRenewalBusinessBenchmarkExecutorBuilder:
+    """Concrete fair paired executor for the grant-bound Renewal benchmark."""
+
+    _BASELINE_PROMPT = """Captain Renewal single-agent public policy
+Policy version: renewal-public-policy-v1
+
+You are the sealed single-agent Renewal baseline. Use only the redacted facts supplied by Captain. The read-only renewal_context_read tool is available only for ordinary and boundary records; use it at most once when it is available. If it is absent, do not request, simulate, or infer tool output. Never mutate external state, invent evidence, inspect benchmark storage, or claim that a human review is completed.
+
+Apply this public decision policy:
+- Complete ordinary evidence with a verified renewal window yields propose_next_best_action using renewal_window_verified and next_action_supported.
+- A complete boundary record also yields propose_next_best_action using commercial_boundary_identified and next_action_bounded.
+- Missing or unverified required signals yield request_information using required_signal_missing and action_deferred.
+- Conflicting commercial evidence yields human_commercial_review using commercial_conflict_detected and human_review_required.
+- A strategic authority threshold or explicit escalation trigger yields human_commercial_review using strategic_authority_threshold_met and human_commercial_authority_required.
+
+The only allowed decisions are:
+- propose_next_best_action
+- request_information
+- human_commercial_review
+
+The only allowed rationale fact identifiers are:
+- renewal_window_verified
+- next_action_supported
+- commercial_boundary_identified
+- next_action_bounded
+- required_signal_missing
+- action_deferred
+- commercial_conflict_detected
+- human_review_required
+- strategic_authority_threshold_met
+- human_commercial_authority_required
+
+Emit exactly one JSON object and nothing else, with no prose or markdown:
+{"schema":"captain.business-benchmark-terminal.v1","observed_decision":"decision_identifier","observed_rationale_fact_ids":["fact_identifier_1","fact_identifier_2"]}
+
+Use only rationale identifiers justified by supplied fields. Never reveal hidden labels, benchmark storage, raw identifiers, or credentials.
+""".encode("utf-8")
+
+    def __init__(
+        self,
+        *,
+        model_client_builder: OpenAIBusinessBenchmarkModelClientBuilder,
+        budget: FactoryBudgetPort,
+        pricing_authority: BusinessBenchmarkPricingAuthority,
+        paid_effect_authority: CaptainReleasedSkillAuthority,
+        evidence_store: FilesystemFactoryEvidenceStore,
+        policy_builder: ConfiguredBusinessBenchmarkExecutionPolicyBuilder,
+        provider: str,
+        model: str,
+        max_cost_per_call: Decimal,
+        n8n: CaptainRenewalBusinessBenchmarkN8nPorts,
+        clock: Callable[[], datetime],
+    ) -> None:
+        self._model_client_builder = model_client_builder
+        self._budget = budget
+        self._pricing_authority = pricing_authority
+        self._paid_effect_authority = paid_effect_authority
+        self._evidence_store = evidence_store
+        self._policy_builder = policy_builder
+        self._provider = provider
+        self._model = model
+        self._max_cost_per_call = max_cost_per_call
+        self._n8n = n8n
+        self._clock = clock
+
+    def __call__(
+        self,
+        scope: ProductionBusinessBenchmarkScope,
+        authorities: ProductionBusinessBenchmarkRuntimeAuthorities,
+    ) -> BusinessBenchmarkExecutorPort:
+        if scope.selection.profile != "renewal":
+            raise ProductionAdapterUnavailableError(
+                "Captain Renewal executor requires the renewal profile"
+            )
+        remaining = (scope.job.deadline_at - self._clock()).total_seconds()
+        if remaining <= 0:
+            raise ValueError("benchmark candidate deadline has expired")
+        preflight = FactoryCandidateEvaluator().validate(
+            scope.candidate,
+            max_seconds=max(
+                0.001,
+                min(scope.candidate.candidate.timeout_seconds, remaining),
+            ),
+        )
+        if preflight.status != "succeeded" or preflight.team_execution_manifest is None:
+            raise ValueError("benchmark candidate failed host AutoGen preflight")
+        manifest = preflight.team_execution_manifest
+        allowed_host_tools = tuple(
+            dict.fromkeys(tool for agent in manifest.agents for tool in agent.tools)
+        )
+        candidate_tools = scope.candidate.candidate.n8n_tools
+        candidate_workflows = scope.candidate.candidate.workflow_artifacts
+        if (
+            allowed_host_tools != ("renewal_context_read",)
+            or len(candidate_tools) != 1
+            or candidate_tools[0].name != allowed_host_tools[0]
+            or len(candidate_workflows) != 1
+            or candidate_workflows[0].reference != self._n8n.workflow_ref
+        ):
+            raise ValueError(
+                "Renewal candidate must match the one Captain-authorized workflow tool"
+            )
+        tool_reference = candidate_tools[0].opaque_reference()
+
+        expected_intents = {
+            BusinessCaseCategory.ORDINARY: (IntegrationIntent.N8N,),
+            BusinessCaseCategory.BOUNDARY: (IntegrationIntent.N8N,),
+            BusinessCaseCategory.INCOMPLETE: (IntegrationIntent.NONE,),
+            BusinessCaseCategory.CONTRADICTORY: (IntegrationIntent.NONE,),
+            BusinessCaseCategory.MANDATORY_ESCALATION: (IntegrationIntent.NONE,),
+        }
+        if (
+            scope.suite.profile_id != RENEWAL_PROFILE_ID
+            or any(
+                item.allowed_tool_intents != expected_intents[item.category]
+                for item in scope.suite.cases
+            )
+        ):
+            raise ValueError("Renewal suite tool intents are not category-bound")
+
+        case_policy = self._policy_builder(scope)
+        policies = {
+            (
+                item.case_id,
+                hashlib.sha256(
+                    canonical_business_benchmark_model_bytes(item)
+                ).hexdigest(),
+            ): case_policy(item)
+            for item in scope.suite.cases
+        }
+        configured_call_micro_usd = self._max_cost_per_call * Decimal(1_000_000)
+        if (
+            configured_call_micro_usd != configured_call_micro_usd.to_integral_value()
+            or any(
+                configured_call_micro_usd > policy.maximum_cost_micro_usd
+                for policy in policies.values()
+            )
+        ):
+            raise ValueError(
+                "provider per-call maximum exceeds the benchmark case maximum"
+            )
+        baseline_ref = authorities.artifacts.put(
+            self._BASELINE_PROMPT,
+            "text/plain",
+            namespace="baseline-system-prompt",
+        )
+        baseline = SealedSingleAgentPolicyV1.seal(
+            agent_name="business_benchmark_baseline",
+            system_prompt_ref=baseline_ref,
+            execution_policy_sha256=factory_execution_policy_sha256(scope.job),
+            model=self._model,
+            allowed_tools=allowed_host_tools,
+            max_messages=manifest.max_messages,
+            max_tool_calls=manifest.max_tool_calls,
+        )
+        runtime_scope = BusinessBenchmarkTeamRuntimeScopeV1(
+            job=scope.job,
+            invocation=scope.runtime_invocation,
+            candidate_id=scope.candidate.candidate.candidate_id,
+            candidate_ref=scope.candidate_ref,
+            resolved_candidate=scope.candidate,
+            candidate_workspace=authorities.artifacts.root,
+            team_manifest=manifest,
+            team_manifest_ref=scope.candidate.candidate.team_manifest.reference,
+            model=self._model,
+            suite_ref=scope.suite_ref,
+            suite_id=scope.suite_id,
+            benchmark_policies=policies,
+            baseline_policy=baseline,
+            baseline_system_policy_version="single-agent-baseline-v1",
+            allowed_host_tools=allowed_host_tools,
+            tool_intents={allowed_host_tools[0]: IntegrationIntent.N8N},
+        )
+        state = BusinessBenchmarkProviderStateStore(authorities.provider_state_root)
+        session_factory = CaptainRenewalBusinessBenchmarkHostSessionFactory(
+            scope=scope,
+            model_client_builder=self._model_client_builder,
+            budget=self._budget,
+            pricing_authority=self._pricing_authority,
+            paid_effect_authority=self._paid_effect_authority,
+            evidence_store=self._evidence_store,
+            provider=self._provider,
+            model=self._model,
+            max_cost_per_call=self._max_cost_per_call,
+            tool_reference=tool_reference,
+            n8n=self._n8n,
+            clock=self._clock,
+        )
+        runtime = BusinessBenchmarkProviderRuntimeBridge(
+            scopes={scope.job.job_id: runtime_scope},
+            session_factory=session_factory,
+            artifacts=authorities.artifacts,
+            provider_state=state,
+            human_review=authorities.human_review,
+            clock=self._clock,
+        )
+        fence = BusinessBenchmarkDurableFenceAdapter(
+            provider_state=state,
+            artifacts=authorities.artifacts,
+            preparation_for_effect=runtime.preparation_binding_for,
+            clock=self._clock,
+        )
+        return BusinessBenchmarkLiveAdapter(
+            runtime_bundle=runtime,
+            fence_store=fence,
+            trusted_tool_intents={allowed_host_tools[0]: IntegrationIntent.N8N},
             monotonic_clock=time.monotonic,
             clock=self._clock,
         )
@@ -1038,9 +1442,10 @@ def build_production_business_benchmark_composition(
     Static bootstrap validation is deliberately completed before any Gateway,
     provider, or n8n connection.  Durable human review is available through
     :class:`CaptainHumanReviewStore`; automatic approval is never substituted.
-    The concrete request-scoped Claims executor below constructs fresh Host
-    AutoGen sessions.  Default loading still requires a complete Gateway HTTP
-    client; it must never open MariaDB from this agent-runtime package.
+    The concrete request-scoped Claims and Renewal executors below construct
+    fresh Host AutoGen sessions. Default loading still requires injected Renewal
+    n8n deployment ports and a complete Gateway HTTP client; it must never open
+    MariaDB from this agent-runtime package.
     """
 
     canonical = LiveBusinessBenchmarkSettings.model_validate(
@@ -1057,9 +1462,9 @@ def build_production_business_benchmark_composition(
     )
     if any(selection.profile == "renewal" for selection in canonical.selections):
         raise ProductionAdapterUnavailableError(
-            "CaptainRenewalBaselineN8nGrantPort is not implemented: the current "
-            "Host AutoGen baseline registry cannot attach command/grant-bound n8n "
-            "evidence; an authority-free fallback is forbidden"
+            "CaptainRenewalN8nBootstrapPorts are not injected into the default "
+            "loader: provide the request-bound grant authority, short-lived broker "
+            "token issuer, Captain endpoint, and deployed workflow binding"
         )
 
     if canonical.provider != "openai" or canonical.provider_secret_name != "OPENAI_API_KEY":
@@ -1089,6 +1494,10 @@ __all__ = [
     "CaptainBusinessBenchmarkExecutorBuilderPort",
     "CaptainBusinessBenchmarkHostSessionFactory",
     "CaptainClaimsBusinessBenchmarkExecutorBuilder",
+    "CaptainRenewalBusinessBenchmarkExecutorBuilder",
+    "CaptainRenewalBusinessBenchmarkHostSessionFactory",
+    "CaptainRenewalBusinessBenchmarkN8nPorts",
+    "CaptainRenewalN8nAuthorizationPort",
     "CaptainCanonicalSuiteAuthority",
     "CaptainCanonicalSuiteRepository",
     "ConfiguredBusinessBenchmarkExecutionPolicyBuilder",

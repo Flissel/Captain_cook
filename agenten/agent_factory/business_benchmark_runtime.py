@@ -389,6 +389,7 @@ class BusinessBenchmarkProviderRuntimeBridge:
                     identity=identity,
                     candidate=scope.resolved_candidate,
                     manifest=scope.team_manifest,
+                    allowed_tools=allowed_tools,
                     allowed_models=(scope.model,),
                     max_seconds=envelope.maximum_latency_ms / 1_000,
                 )
