@@ -108,6 +108,15 @@ class LegacyProjectionAdoption:
     posts: tuple[LegacyProjectionPostIdentity, ...]
 
 SessionLocal = None
+_creation_store = None
+_creation_scheduler = None
+
+
+def _creation_runner_for(job_id: UUID):
+    """Fail closed until the provider-specific pipeline factory is installed."""
+
+    del job_id
+    raise RuntimeError("Minibook creation pipeline is not configured")
 
 
 # --- App ---
@@ -117,7 +126,13 @@ async def lifespan(app: FastAPI):
     global SessionLocal
     SessionLocal = init_db(DB_PATH)
     init_rate_limiter(config)
-    yield
+    if _creation_scheduler is not None:
+        await _creation_scheduler.start()
+    try:
+        yield
+    finally:
+        if _creation_scheduler is not None:
+            await _creation_scheduler.stop()
 
 app = FastAPI(
     title="Minibook",
@@ -132,8 +147,19 @@ _creation_db = os.environ.get("MINIBOOK_CREATION_DB")
 if _creation_db:
     from minibook.swarm.api import create_creation_router
     from minibook.swarm.job_store import CreationJobStore
+    from minibook.swarm.scheduler import CreationScheduler
 
-    app.include_router(create_creation_router(CreationJobStore(Path(_creation_db))))
+    _creation_store = CreationJobStore(Path(_creation_db))
+    _creation_scheduler = CreationScheduler(
+        store=_creation_store,
+        runner_for=lambda job_id: _creation_runner_for(job_id),
+    )
+    app.include_router(
+        create_creation_router(
+            _creation_store,
+            schedule=_creation_scheduler.schedule,
+        )
+    )
 else:
     @app.get("/api/v1/creation-capabilities")
     def creation_capabilities() -> dict[str, object]:

@@ -70,6 +70,7 @@ class CreationJobStore:
     def submit(self, job: CreationJobV1) -> CreationSubmissionReceipt:
         job_id = str(job.creation_job_id)
         payload = _json(job)
+        initial_snapshot = _json({"creation_job_id": job_id})
         with self._connect() as db:
             existing = db.execute(
                 "SELECT payload FROM creation_jobs WHERE job_id = ?", (job_id,)
@@ -85,8 +86,8 @@ class CreationJobStore:
                 )
             db.execute("INSERT INTO creation_jobs VALUES (?, ?)", (job_id, payload))
             db.execute(
-                "INSERT INTO creation_heads VALUES (?, 1, 'queued', NULL, '{}')",
-                (job_id,),
+                "INSERT INTO creation_heads VALUES (?, 1, 'queued', NULL, ?)",
+                (job_id, initial_snapshot),
             )
         return CreationSubmissionReceipt(
             creation_job_id=job.creation_job_id,
@@ -139,6 +140,27 @@ class CreationJobStore:
                 "SELECT step FROM creation_step_receipts WHERE job_id = ?", (str(job_id),)
             ).fetchall()
         return {row["step"] for row in rows}
+
+    def resumable_job_ids(self) -> tuple[UUID, ...]:
+        """Return queued/running jobs in durable submission order."""
+
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT jobs.job_id
+                FROM creation_jobs AS jobs
+                JOIN creation_heads AS heads
+                  ON heads.job_id = jobs.job_id
+                 AND heads.version = (
+                    SELECT MAX(current.version)
+                    FROM creation_heads AS current
+                    WHERE current.job_id = jobs.job_id
+                 )
+                WHERE heads.status IN ('queued', 'running')
+                ORDER BY jobs.rowid
+                """
+            ).fetchall()
+        return tuple(UUID(row["job_id"]) for row in rows)
 
     def external_effect(self, job_id: UUID, effect_key: str) -> dict[str, Any] | None:
         with self._connect() as db:
