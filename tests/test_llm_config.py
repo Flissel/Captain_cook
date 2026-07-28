@@ -26,3 +26,5 @@ def test_local_env_file_supplies_legacy_model_configuration(monkeypatch, tmp_pat
 
     assert reloaded.API_KEY == "test-key"
     assert reloaded.MODEL == "test-model"
+    assert "OPENAI_API_KEY" not in __import__("os").environ
+    assert "CAPTAIN_MODEL" not in __import__("os").environ
