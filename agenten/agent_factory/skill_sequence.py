@@ -128,8 +128,12 @@ class SkillSequencePolicy:
                 return (
                     FactorySkillStep.IMPROVE_TEAM,
                     FactorySkillStep.BRIEF_CODEX,
+                    FactorySkillStep.SEAL_CODEX_BUILD,
                 )
-            return (FactorySkillStep.BRIEF_CODEX,)
+            return (
+                FactorySkillStep.BRIEF_CODEX,
+                FactorySkillStep.SEAL_CODEX_BUILD,
+            )
         if role is FactoryRole.REAL_CASE_TESTER:
             return (FactorySkillStep.EXECUTE_TEAM,)
         if role is FactoryRole.QUALITY_WARDEN:

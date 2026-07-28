@@ -1,6 +1,8 @@
 """Strict JSON contracts for the Minibook creation boundary."""
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from datetime import datetime, timezone
 from typing import Literal
@@ -291,3 +293,94 @@ class FactoryBuildAssignmentV1(_FrozenContract):
         if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
             raise ValueError("deadline_at must be UTC")
         return value
+
+
+class CodexBuildReceiptV1(_FrozenContract):
+    """Captain-issued seal over one concrete Codex build and its evidence."""
+
+    schema_name: Literal["captain.codex-build-receipt.v1"] = Field(
+        default="captain.codex-build-receipt.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    receipt_id: UUID
+    producer: Literal["captain"]
+    outcome: Literal["sealed"]
+    factory_job_id: UUID
+    creation_job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    assignment_id: UUID
+    idempotency_key: str = Field(pattern=SHA256_PATTERN)
+    build_brief_ref: ArtifactRef
+    workspace_ref: str = Field(pattern=r"^workspace://[A-Za-z0-9._:/-]+$")
+    codex_session_ref: ArtifactRef
+    workspace_snapshot_ref: ArtifactRef
+    candidate_manifest_ref: ArtifactRef
+    source_archive_ref: ArtifactRef
+    test_evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
+    acceptance_assertion_ids: tuple[str, ...] = Field(min_length=1)
+    completed_at: datetime
+
+    @field_validator("completed_at")
+    @classmethod
+    def require_completed_at_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("completed_at must be UTC")
+        return value
+
+    @field_validator("test_evidence_refs")
+    @classmethod
+    def require_unique_test_evidence_refs(
+        cls,
+        value: tuple[ArtifactRef, ...],
+    ) -> tuple[ArtifactRef, ...]:
+        identities = tuple((ref.uri, ref.sha256, ref.media_type) for ref in value)
+        if len(identities) != len(set(identities)):
+            raise ValueError("test evidence refs must be unique")
+        return value
+
+    @field_validator("acceptance_assertion_ids")
+    @classmethod
+    def require_unique_acceptance_assertions(
+        cls,
+        value: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if len(value) != len(set(value)) or any(not item for item in value):
+            raise ValueError("acceptance assertion IDs must be unique and nonblank")
+        return value
+
+    @model_validator(mode="after")
+    def require_sealed_media_and_distinct_refs(self) -> "CodexBuildReceiptV1":
+        if self.candidate_manifest_ref.media_type != "application/json":
+            raise ValueError("candidate manifest must be application/json")
+        if self.source_archive_ref.media_type != "application/zip":
+            raise ValueError("source archive must be application/zip")
+        if self.workspace_snapshot_ref.media_type != "application/zip":
+            raise ValueError("workspace snapshot must be application/zip")
+        sealed_refs = (
+            self.build_brief_ref,
+            self.codex_session_ref,
+            self.workspace_snapshot_ref,
+            self.candidate_manifest_ref,
+            self.source_archive_ref,
+            *self.test_evidence_refs,
+        )
+        identities = tuple(
+            (ref.uri, ref.sha256, ref.media_type) for ref in sealed_refs
+        )
+        if len(identities) != len(set(identities)):
+            raise ValueError("sealed Codex build refs must be distinct")
+        return self
+
+
+def codex_build_receipt_sha256(receipt: CodexBuildReceiptV1) -> str:
+    """Return the canonical digest used by a Captain receipt ArtifactRef."""
+
+    canonical = json.dumps(
+        receipt.model_dump(mode="json", by_alias=True),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()

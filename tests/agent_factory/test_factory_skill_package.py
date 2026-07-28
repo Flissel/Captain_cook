@@ -13,6 +13,7 @@ SKILL_DIR = Path("agenten/agent_factory/skills/autogen-agent-factory")
 SKILLS = {
     "captain-factory-discover": ("CodebaseInventoryV1", "do not change code"),
     "captain-factory-brief-codex": ("CodexBuildBriefV1", "codex.run"),
+    "captain-factory-seal-codex-build": ("CodexBuildEvidenceV1", "Captain-issued"),
     "captain-factory-execute-team": ("TeamExecutionEvidenceV1", "max_cost_usd"),
     "captain-factory-evaluate-team": ("TeamEvaluationV1", "do not repair"),
     "captain-factory-improve-team": ("CandidateRevisionV1", "prior green"),
@@ -22,11 +23,18 @@ SKILLS = {
 SKILL_RESOURCES = {
     "captain-factory-discover": ("references/output-schema.md",),
     "captain-factory-brief-codex": ("templates/codex-assignment.md",),
+    "captain-factory-seal-codex-build": ("references/evidence-contract.md",),
     "captain-factory-execute-team": ("references/evidence-contract.md",),
     "captain-factory-evaluate-team": ("references/rubric.md",),
     "captain-factory-improve-team": ("templates/repair-assignment.md",),
     "captain-factory-report-captain": ("references/recommendations.md",),
 }
+
+LEGACY_BUNDLE_SKILLS = tuple(
+    skill_name
+    for skill_name in SKILLS
+    if skill_name != "captain-factory-seal-codex-build"
+)
 
 
 @pytest.mark.parametrize("skill_name,required", SKILLS.items())
@@ -57,7 +65,7 @@ def test_factory_workflow_bundle_is_non_authoritative_operator_aid() -> None:
     assert manifest == {
         "name": "captain-agent-factory-loop",
         "description": "Captain-controlled six-skill AutoGen factory workflow",
-        "skills": list(SKILLS),
+        "skills": list(LEGACY_BUNDLE_SKILLS),
         "instruction": "Use only the step released by the current Captain invocation.",
     }
 

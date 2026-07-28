@@ -25,11 +25,19 @@ from tests.agent_factory.test_state_machine import block
     [
         (FactoryRole.AGENT_ARCHITECT, 1, (FactorySkillStep.DISCOVER,)),
         (FactoryRole.AGENT_ARCHITECT, 2, (FactorySkillStep.DISCOVER,)),
-        (FactoryRole.TOOL_INTEGRATOR, 1, (FactorySkillStep.BRIEF_CODEX,)),
+        (
+            FactoryRole.TOOL_INTEGRATOR,
+            1,
+            (FactorySkillStep.BRIEF_CODEX, FactorySkillStep.SEAL_CODEX_BUILD),
+        ),
         (
             FactoryRole.TOOL_INTEGRATOR,
             2,
-            (FactorySkillStep.IMPROVE_TEAM, FactorySkillStep.BRIEF_CODEX),
+            (
+                FactorySkillStep.IMPROVE_TEAM,
+                FactorySkillStep.BRIEF_CODEX,
+                FactorySkillStep.SEAL_CODEX_BUILD,
+            ),
         ),
         (FactoryRole.REAL_CASE_TESTER, 1, (FactorySkillStep.EXECUTE_TEAM,)),
         (

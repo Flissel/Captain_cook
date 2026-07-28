@@ -18,7 +18,11 @@ from .business_benchmark_contracts import (
     BusinessBenchmarkReasonCode,
 )
 from .contracts import FactoryLease, FactoryRole
-from .forge_contracts import FactoryBuildAssignmentV1
+from .forge_contracts import (
+    CodexBuildReceiptV1,
+    FactoryBuildAssignmentV1,
+    codex_build_receipt_sha256,
+)
 from .holdout_contracts import PrivateHoldoutRef
 from .outcome_contracts import AssertionOutcome, ExecutionOutcomeV1
 from .skill_evaluation import ReleasedHermesSkill, ToolGapMarker
@@ -47,6 +51,7 @@ class _FrozenContract(BaseModel):
 class FactorySkillStep(str, Enum):
     DISCOVER = "discover"
     BRIEF_CODEX = "brief_codex"
+    SEAL_CODEX_BUILD = "seal_codex_build"
     EXECUTE_TEAM = "execute_team"
     EVALUATE_TEAM = "evaluate_team"
     IMPROVE_TEAM = "improve_team"
@@ -56,6 +61,7 @@ class FactorySkillStep(str, Enum):
 FACTORY_SKILL_ID_BY_STEP: dict[FactorySkillStep, str] = {
     FactorySkillStep.DISCOVER: "captain-factory-discover",
     FactorySkillStep.BRIEF_CODEX: "captain-factory-brief-codex",
+    FactorySkillStep.SEAL_CODEX_BUILD: "captain-factory-seal-codex-build",
     FactorySkillStep.EXECUTE_TEAM: "captain-factory-execute-team",
     FactorySkillStep.EVALUATE_TEAM: "captain-factory-evaluate-team",
     FactorySkillStep.IMPROVE_TEAM: "captain-factory-improve-team",
@@ -137,6 +143,7 @@ class FactorySkillInvocationV1(_FrozenContract):
 _STEP_ROLES: dict[FactorySkillStep, FactoryRole] = {
     FactorySkillStep.DISCOVER: FactoryRole.AGENT_ARCHITECT,
     FactorySkillStep.BRIEF_CODEX: FactoryRole.TOOL_INTEGRATOR,
+    FactorySkillStep.SEAL_CODEX_BUILD: FactoryRole.TOOL_INTEGRATOR,
     FactorySkillStep.EXECUTE_TEAM: FactoryRole.REAL_CASE_TESTER,
     FactorySkillStep.EVALUATE_TEAM: FactoryRole.QUALITY_WARDEN,
     FactorySkillStep.IMPROVE_TEAM: FactoryRole.TOOL_INTEGRATOR,
@@ -320,6 +327,50 @@ class CodexBuildBriefV1(_WorkflowArtifactBase):
             raise ValueError(
                 "failed and regression benchmark metric IDs must be disjoint"
             )
+        return self
+
+
+class CodexBuildEvidenceV1(_WorkflowArtifactBase):
+    """Hermes evidence for the Captain-sealed result of one Codex assignment."""
+
+    schema_name: Literal["hermes.factory-codex-build-evidence.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    build_receipt_ref: ArtifactRef
+    build_receipt: CodexBuildReceiptV1
+    status: Literal["sealed"]
+
+    _required_step: ClassVar[FactorySkillStep] = FactorySkillStep.SEAL_CODEX_BUILD
+
+    @model_validator(mode="after")
+    def require_captain_receipt_bindings(self) -> "CodexBuildEvidenceV1":
+        receipt = self.build_receipt
+        invocation = self.invocation
+        if receipt.factory_job_id != self.job_id:
+            raise ValueError("Codex build receipt job mismatch")
+        if receipt.correlation_id != self.correlation_id:
+            raise ValueError("Codex build receipt correlation mismatch")
+        if receipt.subject_version != self.subject_version:
+            raise ValueError("Codex build receipt version mismatch")
+        if receipt.attempt != self.attempt:
+            raise ValueError("Codex build receipt attempt mismatch")
+        if receipt.idempotency_key != invocation.idempotency_key:
+            raise ValueError("Codex build receipt idempotency mismatch")
+        if receipt.workspace_ref != invocation.lease.workspace_ref:
+            raise ValueError("Codex build receipt workspace mismatch")
+        if not _same_ref(receipt.build_brief_ref, invocation.input_ref):
+            raise ValueError("Codex build brief does not match invocation input")
+        if receipt.acceptance_assertion_ids != self.acceptance_assertion_ids:
+            raise ValueError("Codex build receipt assertion mismatch")
+        if receipt.completed_at > self.occurred_at:
+            raise ValueError("Codex build receipt was issued after workflow evidence")
+        if self.build_receipt_ref.media_type != "application/json":
+            raise ValueError("Codex build receipt ref must be application/json")
+        if self.build_receipt_ref.sha256 != codex_build_receipt_sha256(receipt):
+            raise ValueError("Codex build receipt digest mismatch")
+        if self.evidence_refs != (self.build_receipt_ref,):
+            raise ValueError("Codex build evidence may reference only its Captain receipt")
         return self
 
 
@@ -594,10 +645,22 @@ def _require_unique_ids(value: tuple[str, ...], label: str) -> tuple[str, ...]:
 
 
 def _require_unique_refs(value: tuple[ArtifactRef, ...], label: str) -> tuple[ArtifactRef, ...]:
-    identities = tuple((item.uri, item.sha256, item.media_type) for item in value)
+    identities = tuple(_ref_identity(item) for item in value)
     if len(identities) != len(set(identities)):
         raise ValueError(f"{label} must not contain duplicates")
     return value
+
+
+def _ref_identity(value: object) -> tuple[str, str, str]:
+    return (
+        str(getattr(value, "uri")),
+        str(getattr(value, "sha256")),
+        str(getattr(value, "media_type")),
+    )
+
+
+def _same_ref(left: object, right: object) -> bool:
+    return _ref_identity(left) == _ref_identity(right)
 
 
 def _reject_private_content(value: object, context: str) -> None:
