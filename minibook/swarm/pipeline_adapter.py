@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from enum import Enum
 from pathlib import PurePosixPath
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, get_type_hints
 import zipfile
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -82,12 +82,20 @@ class CreationExportReceiptV1(BaseModel):
 class CreationArtifactSink(Protocol):
     def put(self, content: bytes, media_type: str, *, namespace: str) -> object: ...
 
+    def read_bytes(self, reference: object) -> bytes: ...
+
 
 class CreationArtifactPublisher(Protocol):
     def publish(
         self,
         job: CreationJobV1,
         bundle: CreationExportBundle,
+    ) -> CreationExportReceiptV1: ...
+
+    def accept_receipt(
+        self,
+        job: CreationJobV1,
+        receipt: CreationExportReceiptV1,
     ) -> CreationExportReceiptV1: ...
 
 
@@ -142,7 +150,128 @@ class ContentAddressedCreationArtifactPublisher:
             "application/json",
             namespace="forge-package-manifest",
         )
-        receipt_id = hashlib.sha256(
+        receipt = CreationExportReceiptV1(
+            receipt_id=self._receipt_id(
+                job,
+                package_ref=package_ref,
+                candidate_ref=candidate_ref,
+                source_ref=source_ref,
+                skill_ref=skill_ref,
+            ),
+            package_manifest_ref=package_ref,
+            candidate_manifest_ref=candidate_ref,
+            source_archive_ref=source_ref,
+            skill_usage_receipt_ref=skill_ref,
+        )
+        return self.accept_receipt(job, receipt)
+
+    def accept_receipt(
+        self,
+        job: CreationJobV1,
+        receipt: CreationExportReceiptV1,
+    ) -> CreationExportReceiptV1:
+        canonical = CreationExportReceiptV1.model_validate(
+            receipt.model_dump(mode="json", by_alias=True)
+        )
+        package_bytes = self._read_checked(
+            canonical.package_manifest_ref,
+            "application/json",
+            label="creation package manifest",
+        )
+        candidate_bytes = self._read_checked(
+            canonical.candidate_manifest_ref,
+            "application/json",
+            label="candidate manifest",
+        )
+        source_bytes = self._read_checked(
+            canonical.source_archive_ref,
+            "application/zip",
+            label="candidate source archive",
+        )
+        skill_bytes = self._read_checked(
+            canonical.skill_usage_receipt_ref,
+            "application/json",
+            label="skill usage receipt",
+        )
+        try:
+            package = CreationPackageManifestV1.model_validate_json(package_bytes)
+        except ValueError as exc:
+            raise ValueError("creation package manifest is invalid") from exc
+        if (
+            package.creation_job_id != job.creation_job_id
+            or package.factory_job_id != job.factory_job_id
+            or package.correlation_id != job.correlation_id
+            or package.subject_version != job.subject_version
+            or package.attempt != job.attempt
+        ):
+            raise ValueError("creation package does not match replay job")
+        if (
+            package.candidate_manifest_ref != canonical.candidate_manifest_ref
+            or package.source_archive_ref != canonical.source_archive_ref
+        ):
+            raise ValueError("creation package artifact bindings changed")
+        self._validate_json_object(candidate_bytes, "candidate manifest")
+        self._validate_archive(source_bytes)
+        self._validate_json_object(skill_bytes, "skill usage receipt")
+        expected_receipt_id = self._receipt_id(
+            job,
+            package_ref=canonical.package_manifest_ref,
+            candidate_ref=canonical.candidate_manifest_ref,
+            source_ref=canonical.source_archive_ref,
+            skill_ref=canonical.skill_usage_receipt_ref,
+        )
+        if canonical.receipt_id != expected_receipt_id:
+            raise ValueError("creation export receipt ID does not match CAS bindings")
+        return canonical
+
+    def _read_checked(
+        self,
+        reference: ArtifactRef,
+        media_type: str,
+        *,
+        label: str,
+    ) -> bytes:
+        reader = getattr(self._sink, "read_bytes", None)
+        if not callable(reader):
+            raise ValueError("creation artifact CAS read authority is unavailable")
+        try:
+            content = reader(self._native_read_reference(reader, reference))
+        except (OSError, TypeError, ValueError) as exc:
+            raise ValueError(f"{label} is unavailable from CAS") from exc
+        if (
+            not isinstance(content, bytes)
+            or reference.media_type != media_type
+            or reference.sha256 != hashlib.sha256(content).hexdigest()
+        ):
+            raise ValueError(f"{label} is not bound to its CAS reference")
+        return content
+
+    @staticmethod
+    def _native_read_reference(
+        reader: Callable[[object], bytes],
+        reference: ArtifactRef,
+    ) -> object:
+        """Rehydrate a sink-owned reference without importing its contract package."""
+
+        try:
+            reference_type = get_type_hints(reader).get("reference")
+        except (NameError, TypeError):
+            reference_type = None
+        validator = getattr(reference_type, "model_validate", None)
+        if not callable(validator):
+            return reference
+        return validator(reference.model_dump(mode="json"))
+
+    @staticmethod
+    def _receipt_id(
+        job: CreationJobV1,
+        *,
+        package_ref: ArtifactRef,
+        candidate_ref: ArtifactRef,
+        source_ref: ArtifactRef,
+        skill_ref: ArtifactRef,
+    ) -> str:
+        return hashlib.sha256(
             "|".join(
                 (
                     str(job.creation_job_id),
@@ -153,13 +282,6 @@ class ContentAddressedCreationArtifactPublisher:
                 )
             ).encode("utf-8")
         ).hexdigest()
-        return CreationExportReceiptV1(
-            receipt_id=receipt_id,
-            package_manifest_ref=package_ref,
-            candidate_manifest_ref=candidate_ref,
-            source_archive_ref=source_ref,
-            skill_usage_receipt_ref=skill_ref,
-        )
 
     def _put_checked(
         self,
@@ -329,10 +451,10 @@ class SwarmPipelineAdapter:
         if step is not SwarmStep.EXPORT:
             return None
         if accepted_effect is not None:
-            try:
-                return CreationExportReceiptV1.model_validate(accepted_effect)
-            except ValueError:
-                return None
+            if self._artifact_publisher is None:
+                raise ValueError("creation artifact CAS read authority is unavailable")
+            receipt = CreationExportReceiptV1.model_validate(accepted_effect)
+            return self._artifact_publisher.accept_receipt(job, receipt)
         if not isinstance(output, CreationExportBundle):
             # TODO_TOOL[required]: upgrade legacy step_export to return verified bundle bytes.
             return None
@@ -366,7 +488,12 @@ class SwarmPipelineAdapter:
         self, job: CreationJobV1, snapshot: dict[str, Any]
     ) -> CreationResultV1:
         state = SwarmSnapshot.model_validate(snapshot)
-        if state.package_manifest_ref is None or state.skill_usage_receipt_ref is None:
+        required_bindings = ("candidate_manifest", "source_archive")
+        if (
+            state.package_manifest_ref is None
+            or state.skill_usage_receipt_ref is None
+            or set(state.artifact_bindings) != set(required_bindings)
+        ):
             return CreationResultV1(
                 creation_job_id=job.creation_job_id,
                 correlation_id=job.correlation_id,
@@ -385,6 +512,8 @@ class SwarmPipelineAdapter:
             attempt=job.attempt,
             status="succeeded",
             package_manifest_ref=state.package_manifest_ref,
-            artifact_refs=tuple(state.artifact_bindings.values()),
+            artifact_refs=tuple(
+                state.artifact_bindings[name] for name in required_bindings
+            ),
             skill_usage_receipt_ref=state.skill_usage_receipt_ref,
         )

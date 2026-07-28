@@ -4,10 +4,11 @@ import json
 import zipfile
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
-from minibook.swarm.contracts import CreationJobV1
+from minibook.swarm.contracts import ArtifactRef, CreationJobV1
 from minibook.swarm.pipeline_adapter import (
     ContentAddressedCreationArtifactPublisher,
     CreationExportBundle,
@@ -156,16 +157,16 @@ async def test_export_publishes_real_bytes_and_rehydrates_accepted_receipt(
     )
     assert package.creation_job_id == job().creation_job_id
     assert package.factory_job_id == job().factory_job_id
-    assert set(result.artifact_refs) == {
+    assert result.artifact_refs == (
         package.candidate_manifest_ref,
         package.source_archive_ref,
-    }
+    )
 
     replay_pipeline = ExportPipeline(None)
     replay_adapter = SwarmPipelineAdapter(
         lambda prior: replay_pipeline,
         session=object(),
-        artifact_publisher=publisher,
+        artifact_publisher=ContentAddressedCreationArtifactPublisher(store),
     )
     replay = await replay_adapter.run_step(
         job(),
@@ -176,6 +177,98 @@ async def test_export_publishes_real_bytes_and_rehydrates_accepted_receipt(
     )
     assert replay.snapshot == outcome.snapshot
     assert replay_pipeline.calls == 0
+
+    tampered_receipt = dict(outcome.effect_receipt)
+    tampered_receipt["receipt_id"] = "f" * 64
+    with pytest.raises(ValueError, match="receipt"):
+        await replay_adapter.run_step(
+            job(),
+            SwarmStep.EXPORT.value,
+            prior.model_dump(),
+            "effect",
+            tampered_receipt,
+        )
+
+    changed_job = job().model_copy(update={"creation_job_id": uuid4()})
+    with pytest.raises(ValueError, match="package.*job"):
+        await replay_adapter.run_step(
+            changed_job,
+            SwarmStep.EXPORT.value,
+            prior.model_dump(),
+            "effect",
+            outcome.effect_receipt,
+        )
+
+
+@pytest.mark.asyncio
+async def test_export_replay_without_cas_read_authority_fails_closed(
+    tmp_path: Path,
+) -> None:
+    store = BusinessBenchmarkContentAddressedArtifactStore(
+        tmp_path / ".captain-cook" / "minibook-export"
+    )
+    producer = SwarmPipelineAdapter(
+        lambda prior: ExportPipeline(_export_bundle(tmp_path)),
+        session=object(),
+        artifact_publisher=ContentAddressedCreationArtifactPublisher(store),
+    )
+    prior = SwarmSnapshot(creation_job_id=job().creation_job_id)
+    published = await producer.run_step(
+        job(), SwarmStep.EXPORT.value, prior.model_dump(), "effect", None
+    )
+    replay = SwarmPipelineAdapter(
+        lambda prior: ExportPipeline(None),
+        session=object(),
+    )
+
+    with pytest.raises(ValueError, match="read authority"):
+        await replay.run_step(
+            job(),
+            SwarmStep.EXPORT.value,
+            prior.model_dump(),
+            "effect",
+            published.effect_receipt,
+        )
+
+
+def test_assemble_result_rejects_missing_or_unknown_artifact_bindings() -> None:
+    adapter = SwarmPipelineAdapter(lambda prior: ExportPipeline(None), session=object())
+    reference = ArtifactRef.model_validate(
+        {
+            "uri": "artifact://forge/test/" + "a" * 64,
+            "sha256": "a" * 64,
+            "media_type": "application/json",
+        }
+    )
+    source_reference = ArtifactRef.model_validate(
+        reference.model_dump(mode="json") | {"media_type": "application/zip"}
+    )
+    base = SwarmSnapshot(
+        creation_job_id=job().creation_job_id,
+        package_manifest_ref=reference,
+        skill_usage_receipt_ref=reference,
+        artifact_bindings={"candidate_manifest": reference},
+    )
+
+    missing = adapter.assemble_result(job(), base.model_dump(mode="json"))
+    extra = adapter.assemble_result(
+        job(),
+        base.model_copy(
+            update={
+                "artifact_bindings": {
+                    "candidate_manifest": reference,
+                    "source_archive": source_reference,
+                    "unexpected": reference,
+                }
+            }
+        ).model_dump(mode="json"),
+    )
+
+    assert missing.status == "blocked"
+    assert extra.status == "blocked"
+    assert missing.failure is not None
+    assert extra.failure is not None
+    assert missing.failure.code == extra.failure.code == "validation_failed"
 
 
 @pytest.mark.asyncio
