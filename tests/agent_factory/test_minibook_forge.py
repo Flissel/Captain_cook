@@ -228,6 +228,35 @@ async def test_forge_rejects_a_non_file_input_before_spawning(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_forge_rejects_non_private_artifact_root_before_spawning(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.md"
+    input_path.write_text("# Team", encoding="utf-8")
+    forge = MinibookSwarmForge(
+        materializer=Materializer(input_path),
+        mapper=Mapper(),
+        settings=MinibookForgeSettings(
+            working_directory=tmp_path,
+            artifact_root=tmp_path / "public-cas",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match=r"\.captain-cook namespace"):
+        await forge.submit(
+            FactoryDispatch(
+                job=job(),
+                action=FactoryAction(
+                    kind=FactoryActionKind.SUBMIT_FORGE_JOB,
+                    attempt=1,
+                ),
+                role=None,
+                lease=None,
+            )
+        )
+
+
+@pytest.mark.asyncio
 async def test_forge_starts_a_noninteractive_deadline_bounded_input_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -291,6 +320,10 @@ async def test_forge_starts_a_noninteractive_deadline_bounded_input_run(
     ]
     assert Path(received[5]).name == "creation-job.json"
     assert Path(received[10]).name == "creation-result.json"
+    assert received[11:13] == [
+        "--artifact-root",
+        str((tmp_path / ".captain-cook" / "minibook-creation-cas").resolve()),
+    ]
     assert observed_job_payloads == [
         Mapper().map(request).model_dump(mode="json", by_alias=True)
     ]

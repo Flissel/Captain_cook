@@ -219,6 +219,7 @@ class MinibookForgeSettings:
     swarm_script: Path = Path("minibook/autogen_swarm.py")
     working_directory: Path = Path(".")
     max_runtime_seconds: int = 1800
+    artifact_root: Path = Path(".captain-cook/minibook-creation-cas")
 
 
 class MinibookSwarmForge(MinibookForgePort):
@@ -247,6 +248,14 @@ class MinibookSwarmForge(MinibookForgePort):
         working_directory = self._settings.working_directory.resolve()
         if not working_directory.is_dir():
             raise FactoryDispatchError("Minibook Forge working directory is unavailable")
+        artifact_root = self._settings.artifact_root
+        if not artifact_root.is_absolute():
+            artifact_root = working_directory / artifact_root
+        artifact_root = artifact_root.resolve()
+        if ".captain-cook" not in {part.casefold() for part in artifact_root.parts}:
+            raise FactoryDispatchError(
+                "Minibook Forge artifact root must use the .captain-cook namespace"
+            )
         with tempfile.TemporaryDirectory(
             prefix=f"captain-forge-{creation_job.creation_job_id}-a{creation_job.attempt}-",
             dir=working_directory,
@@ -276,6 +285,8 @@ class MinibookSwarmForge(MinibookForgePort):
                     str(self._settings.max_runtime_seconds),
                     "--result-file",
                     str(result_path),
+                    "--artifact-root",
+                    str(artifact_root),
                     cwd=str(working_directory),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,

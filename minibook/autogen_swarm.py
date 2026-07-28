@@ -53,7 +53,11 @@ from swarm.input_designer import InputDesignPipeline
 from swarm.local_services import default_npm_command, ensure_frontend_dependencies
 from swarm.runtime_options import parse_runtime_options
 from swarm.contracts import CreationFailure, CreationResultV1
-from swarm.creation_cli import load_creation_job, write_creation_result_atomic
+from swarm.creation_cli import (
+    load_creation_job,
+    publish_creation_output,
+    write_creation_result_atomic,
+)
 
 
 # --- Setup ---
@@ -744,6 +748,35 @@ async def _publish_to_registry(
 
 MAX_TEAM_RETRIES = 2  # retries per team on FAIL (total attempts = 3)
 
+
+def _complete_input_file_output(
+    merged: Path | None,
+    checkpoint: dict,
+    checkpoint_dir: Path,
+    *,
+    export_to_github: bool,
+) -> Path | None:
+    """Persist the merged path and optionally run the legacy GitHub exporter."""
+
+    if merged is None:
+        return None
+    checkpoint["merged_output"] = str(merged)
+    _save_checkpoint(checkpoint_dir, checkpoint)
+    print(f"  Merged output: {merged}")
+    if not export_to_github:
+        return merged
+
+    print(f"\n{'=' * 70}")
+    print("  PHASE 4: EXPORT TO GITHUB")
+    print(f"{'=' * 70}")
+    try:
+        exported = export_agent_team(str(merged), private=True)
+        checkpoint["exported"] = str(exported)
+        _save_checkpoint(checkpoint_dir, checkpoint)
+    except Exception as exc:
+        print(f"  [Export] Failed: {exc}")
+    return merged
+
 async def run_input_file_pipeline(
     session,
     agents,
@@ -1020,24 +1053,15 @@ async def run_input_file_pipeline(
 
     # -- Create merged output --
     merged = _create_merged_output(cp, manifest)
-    if merged and export_to_github:
-        cp["merged_output"] = str(merged)
-        _save_checkpoint(checkpoint_dir, cp)
-        print(f"  Merged output: {merged}")
-
-    # -- Phase 4: Export to GitHub --
-    if merged:
-        print(f"\n{'=' * 70}")
-        print(f"  PHASE 4: EXPORT TO GITHUB")
-        print(f"{'=' * 70}")
-        try:
-            exported = export_agent_team(str(merged), private=True)
-            cp["exported"] = str(exported)
-            _save_checkpoint(checkpoint_dir, cp)
-        except Exception as e:
-            print(f"  [Export] Failed: {e}")
+    merged = _complete_input_file_output(
+        merged,
+        cp,
+        checkpoint_dir,
+        export_to_github=export_to_github,
+    )
 
     print(f"{'=' * 70}")
+    return merged
 
 
 # --- Main (Single-Run Mode) ---
@@ -1164,6 +1188,8 @@ async def main():
             i += 2
         elif argv[i] == "--result-file" and i + 1 < len(argv):
             i += 2
+        elif argv[i] == "--artifact-root" and i + 1 < len(argv):
+            i += 2
         elif argv[i].startswith("--"):
             i += 1  # skip unknown flags
         else:
@@ -1278,11 +1304,16 @@ async def main():
             raise SystemExit(124) from exc
 
         if creation_job is not None:
-            if isinstance(run_result, CreationResultV1):
-                creation_result = run_result
-            else:
-                # TODO_TOOL[required]: creation export must assemble and CAS-publish
-                # the generated AutoGen team before a succeeded result is possible.
+            try:
+                if not isinstance(run_result, Path):
+                    raise ValueError("creation pipeline has no merged output")
+                assert runtime_options.artifact_root is not None
+                creation_result = publish_creation_output(
+                    creation_job,
+                    output_path=run_result,
+                    artifact_root=Path(runtime_options.artifact_root),
+                )
+            except (OSError, RuntimeError, TypeError, ValueError):
                 creation_result = CreationResultV1(
                     creation_job_id=creation_job.creation_job_id,
                     correlation_id=creation_job.correlation_id,

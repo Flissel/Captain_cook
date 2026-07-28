@@ -19,11 +19,14 @@ def test_runtime_options_bind_creation_job_and_result_files() -> None:
             "work/creation-job.json",
             "--result-file",
             "work/creation-result.json",
+            "--artifact-root",
+            "work/.captain-cook/creation-cas",
         )
     )
 
     assert options.creation_job_file == "work/creation-job.json"
     assert options.result_file == "work/creation-result.json"
+    assert options.artifact_root == "work/.captain-cook/creation-cas"
 
 
 @pytest.mark.parametrize(
@@ -31,10 +34,17 @@ def test_runtime_options_bind_creation_job_and_result_files() -> None:
     (
         ("--creation-job-file", "work/creation-job.json"),
         ("--result-file", "work/creation-result.json"),
+        (
+            "--creation-job-file",
+            "work/creation-job.json",
+            "--result-file",
+            "work/creation-result.json",
+        ),
+        ("--artifact-root", "work/.captain-cook/creation-cas"),
     ),
 )
-def test_runtime_options_require_both_creation_paths(argv: tuple[str, str]) -> None:
-    with pytest.raises(ValueError, match="creation-job-file.*result-file"):
+def test_runtime_options_require_complete_creation_paths(argv: tuple[str, ...]) -> None:
+    with pytest.raises(ValueError, match="creation-job-file.*result-file.*artifact-root"):
         parse_runtime_options(argv)
 
 

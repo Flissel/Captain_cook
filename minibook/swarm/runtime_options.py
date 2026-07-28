@@ -12,6 +12,7 @@ class RuntimeOptions:
     max_runtime_seconds: float | None = None
     creation_job_file: str | None = None
     result_file: str | None = None
+    artifact_root: str | None = None
 
 
 def parse_runtime_options(argv: Sequence[str]) -> RuntimeOptions:
@@ -20,8 +21,14 @@ def parse_runtime_options(argv: Sequence[str]) -> RuntimeOptions:
     max_runtime_seconds: float | None = None
     creation_job_file = _option_value(argv, "--creation-job-file")
     result_file = _option_value(argv, "--result-file")
-    if (creation_job_file is None) != (result_file is None):
-        raise ValueError("--creation-job-file and --result-file must be provided together")
+    artifact_root = _option_value(argv, "--artifact-root")
+    creation_values = (creation_job_file, result_file, artifact_root)
+    if any(value is not None for value in creation_values) and not all(
+        value is not None for value in creation_values
+    ):
+        raise ValueError(
+            "--creation-job-file, --result-file, and --artifact-root must be provided together"
+        )
     if "--max-runtime-seconds" in argv:
         index = argv.index("--max-runtime-seconds")
         if index + 1 >= len(argv):
@@ -37,6 +44,7 @@ def parse_runtime_options(argv: Sequence[str]) -> RuntimeOptions:
         max_runtime_seconds=max_runtime_seconds,
         creation_job_file=creation_job_file,
         result_file=result_file,
+        artifact_root=artifact_root,
     )
 
 

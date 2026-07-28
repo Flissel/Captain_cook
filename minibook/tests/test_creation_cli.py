@@ -8,6 +8,7 @@ import pytest
 from minibook.swarm.contracts import CreationJobV1, CreationResultV1
 from minibook.swarm.creation_cli import (
     load_creation_job,
+    publish_creation_output,
     write_creation_result_atomic,
 )
 
@@ -51,3 +52,58 @@ def test_creation_cli_rejects_invalid_or_non_file_job(tmp_path: Path) -> None:
         load_creation_job(invalid)
     with pytest.raises(FileNotFoundError):
         load_creation_job(tmp_path / "missing.json")
+
+
+def test_creation_cli_publishes_sealed_output_to_persistent_cas(tmp_path: Path) -> None:
+    job = CreationJobV1.model_validate_json(
+        (FIXTURE_ROOT / "minibook_creation_job.v1.json").read_text(encoding="utf-8")
+    )
+    output = tmp_path / "candidate"
+    (output / "evidence").mkdir(parents=True)
+    (output / "factory-candidate.json").write_text(
+        json.dumps(
+            {
+                "schema": "captain.factory-candidate.v1",
+                "candidate_id": "demo-team",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (output / "evidence/hermes-factory-skill-usage-receipt.json").write_text(
+        json.dumps(
+            {
+                "schema": "hermes.forge-build-skill-usage-receipt.v1",
+                "producer": "hermes",
+                "outcome": "fulfilled",
+                "creation_job_id": str(job.creation_job_id),
+                "factory_job_id": str(job.factory_job_id),
+                "correlation_id": str(job.correlation_id),
+                "subject_version": job.subject_version,
+                "attempt": job.attempt,
+                "idempotency_key": job.idempotency_key,
+                "released_skill": job.released_skill.model_dump(mode="json"),
+                "public_assertion_ids": list(job.public_assertion_ids),
+                "evidence_refs": [
+                    {
+                        "uri": "artifact://forge/evidence/" + "9" * 64,
+                        "sha256": "9" * 64,
+                        "media_type": "application/json",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (output / "run_team.py").write_text("print('ready')\n", encoding="utf-8")
+
+    result = publish_creation_output(
+        job,
+        output_path=output,
+        artifact_root=tmp_path / ".captain-cook" / "creation-cas",
+    )
+
+    assert result.status == "succeeded"
+    assert result.package_manifest_ref is not None
+    assert result.skill_usage_receipt_ref is not None
+    assert len(result.artifact_refs) == 2
+    assert all(ref.uri.startswith("artifact://minibook-creation/") for ref in result.artifact_refs)
