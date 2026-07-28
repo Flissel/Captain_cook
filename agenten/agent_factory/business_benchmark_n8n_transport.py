@@ -71,6 +71,10 @@ class CaptainNativeMcpRenewalContextTransport:
         workflow_id: str,
         workflow_ref: ArtifactRef,
         clock: Callable[[], datetime],
+        broker_token_issuer: Callable[
+            [RenewalContextN8nProviderRequestV1], str
+        ]
+        | None = None,
         poll_attempts: int = 8,
         poll_delay_seconds: float = 0.1,
     ) -> None:
@@ -87,6 +91,7 @@ class CaptainNativeMcpRenewalContextTransport:
         self._workflow_id = normalized_workflow_id
         self._workflow_ref = workflow_ref
         self._clock = clock
+        self._broker_token_issuer = broker_token_issuer
         self._poll_attempts = poll_attempts
         self._poll_delay_seconds = poll_delay_seconds
 
@@ -105,7 +110,11 @@ class CaptainNativeMcpRenewalContextTransport:
     ) -> RenewalContextN8nProviderResponseV1:
         if timeout_seconds <= 0:
             raise ValueError("renewal MCP timeout must be positive")
-        mcp_url, token = _captain_mcp_connection(endpoint)
+        mcp_url, token = _captain_mcp_connection(
+            endpoint,
+            request=request,
+            broker_token_issuer=self._broker_token_issuer,
+        )
         execute_call_id = _call_id("execute", request, self._workflow_id)
         arguments = {
             "workflowId": self._workflow_id,
@@ -312,7 +321,13 @@ class CaptainNativeMcpRenewalContextTransport:
         )
 
 
-def _captain_mcp_connection(endpoint: N8nEndpoint) -> tuple[str, str]:
+def _captain_mcp_connection(
+    endpoint: N8nEndpoint,
+    *,
+    request: RenewalContextN8nProviderRequestV1,
+    broker_token_issuer: Callable[[RenewalContextN8nProviderRequestV1], str]
+    | None,
+) -> tuple[str, str]:
     try:
         _require_captain_endpoint(endpoint, _CAPTAIN_N8N_ALLOWLIST)
     except ValueError:
@@ -323,14 +338,31 @@ def _captain_mcp_connection(endpoint: N8nEndpoint) -> tuple[str, str]:
         raise RenewalContextMcpProviderError(
             "Captain n8n MCP credential is unavailable"
         )
-    selected = endpoint.mcp_broker_url or endpoint.api_base_url
+    selected = endpoint.api_base_url
+    token = endpoint.mcp_token
+    if broker_token_issuer is not None:
+        if not endpoint.mcp_broker_url:
+            raise RenewalContextMcpProviderError(
+                "Captain n8n MCP broker endpoint is unavailable"
+            )
+        try:
+            token = broker_token_issuer(request).strip()
+        except Exception:
+            raise RenewalContextMcpProviderError(
+                "Captain n8n MCP broker credential issuance failed"
+            ) from None
+        if not token or token == endpoint.mcp_token:
+            raise RenewalContextMcpProviderError(
+                "Captain n8n MCP broker credential is invalid"
+            )
+        selected = endpoint.mcp_broker_url
     parsed = urlsplit(selected)
-    expected_port = 5680 if endpoint.mcp_broker_url else 5679
+    expected_port = 5680 if broker_token_issuer is not None else 5679
     if parsed.port != expected_port:
         raise RenewalContextMcpProviderError(
             "Captain n8n MCP endpoint is not authorized"
         )
-    return f"{selected.rstrip('/')}/mcp-server/http", endpoint.mcp_token
+    return f"{selected.rstrip('/')}/mcp-server/http", token
 
 
 def _webhook_body(

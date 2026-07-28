@@ -31,7 +31,8 @@ WORKFLOW_REF = ArtifactRef(
     sha256=WORKFLOW_DIGEST,
     media_type="application/json",
 )
-MCP_TOKEN = "captain-mcp-token-must-never-escape"
+UPSTREAM_TOKEN = "captain-upstream-token-must-never-escape"
+BROKER_TOKEN = "captain-short-lived-broker-token-must-never-escape"
 
 
 def endpoint(*, port: int = 5679, broker_port: int = 5680) -> N8nEndpoint:
@@ -40,7 +41,7 @@ def endpoint(*, port: int = 5679, broker_port: int = 5680) -> N8nEndpoint:
         api_base_url=f"http://localhost:{port}",
         webhook_base_url=f"http://localhost:{port}",
         api_key="captain-api-key-must-never-escape",
-        mcp_token=MCP_TOKEN,
+        mcp_token=UPSTREAM_TOKEN,
         mcp_broker_url=f"http://localhost:{broker_port}",
     )
 
@@ -164,8 +165,8 @@ async def test_execute_calls_exact_production_webhook_and_builds_bound_response(
     observed: list[dict[str, object]] = []
 
     async def handler(raw: httpx.Request) -> httpx.Response:
-        assert raw.url == httpx.URL("http://localhost:5680/mcp-server/http")
-        assert raw.headers["authorization"] == f"Bearer {MCP_TOKEN}"
+        assert raw.url == httpx.URL("http://localhost:5679/mcp-server/http")
+        assert raw.headers["authorization"] == f"Bearer {UPSTREAM_TOKEN}"
         assert raw.headers["accept"] == "application/json, text/event-stream"
         body = json.loads(raw.content)
         observed.append(body)
@@ -243,6 +244,63 @@ async def test_sse_execute_response_polls_get_execution_until_success() -> None:
 
 
 @pytest.mark.asyncio
+async def test_injected_request_bound_broker_token_uses_broker_and_is_redacted() -> None:
+    current = request_value()
+    issued_for: list[RenewalContextN8nProviderRequestV1] = []
+
+    def issue_broker_token(
+        request: RenewalContextN8nProviderRequestV1,
+    ) -> str:
+        issued_for.append(request)
+        return BROKER_TOKEN
+
+    async def handler(raw: httpx.Request) -> httpx.Response:
+        assert raw.url == httpx.URL("http://localhost:5680/mcp-server/http")
+        assert raw.headers["authorization"] == f"Bearer {BROKER_TOKEN}"
+        body = json.loads(raw.content)
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "error": {"code": -32000, "message": f"Bearer {BROKER_TOKEN}"},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        selected = transport(client, broker_token_issuer=issue_broker_token)
+        assert BROKER_TOKEN not in repr(selected)
+        assert UPSTREAM_TOKEN not in repr(selected)
+        with pytest.raises(RenewalContextMcpProviderError) as error:
+            await selected.execute(
+                endpoint=endpoint(), request=current, timeout_seconds=1
+            )
+
+    assert issued_for == [current]
+    assert BROKER_TOKEN not in str(error.value)
+    assert UPSTREAM_TOKEN not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_upstream_token_is_never_sent_to_configured_broker_without_issuer() -> None:
+    current = request_value()
+    urls: list[httpx.URL] = []
+
+    async def handler(raw: httpx.Request) -> httpx.Response:
+        urls.append(raw.url)
+        assert raw.headers["authorization"] == f"Bearer {UPSTREAM_TOKEN}"
+        body = json.loads(raw.content)
+        return httpx.Response(200, json=rpc(body["id"], provider_payload(current)))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await transport(client).execute(
+            endpoint=endpoint(), request=current, timeout_seconds=1
+        )
+
+    assert urls == [httpx.URL("http://localhost:5679/mcp-server/http")]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -297,7 +355,7 @@ async def test_provider_errors_are_sanitized_and_never_expose_auth(kind: str) ->
             payload = {
                 "jsonrpc": "2.0",
                 "id": body["id"],
-                "error": {"code": -32000, "message": f"Bearer {MCP_TOKEN}"},
+                "error": {"code": -32000, "message": f"Bearer {UPSTREAM_TOKEN}"},
             }
         else:
             payload = {
@@ -305,20 +363,20 @@ async def test_provider_errors_are_sanitized_and_never_expose_auth(kind: str) ->
                 "id": body["id"],
                 "result": {
                     "isError": True,
-                    "content": [{"type": "text", "text": f"token={MCP_TOKEN}"}],
+                    "content": [{"type": "text", "text": f"token={UPSTREAM_TOKEN}"}],
                 },
             }
         return httpx.Response(200, json=payload)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         selected = transport(client)
-        assert MCP_TOKEN not in repr(selected)
+        assert UPSTREAM_TOKEN not in repr(selected)
         with pytest.raises(RenewalContextMcpProviderError) as error:
             await selected.execute(
                 endpoint=endpoint(), request=current, timeout_seconds=1
             )
 
-    assert MCP_TOKEN not in str(error.value)
+    assert UPSTREAM_TOKEN not in str(error.value)
     assert "Bearer" not in str(error.value)
     assert "token=" not in str(error.value)
 
@@ -331,7 +389,7 @@ async def test_unknown_execute_dispatch_is_not_retried_and_is_sanitized() -> Non
     async def handler(raw: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
-        raise httpx.ReadTimeout(f"Bearer {MCP_TOKEN}", request=raw)
+        raise httpx.ReadTimeout(f"Bearer {UPSTREAM_TOKEN}", request=raw)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(RenewalContextMcpDispatchUnknownError) as error:
@@ -340,7 +398,7 @@ async def test_unknown_execute_dispatch_is_not_retried_and_is_sanitized() -> Non
             )
 
     assert calls == 1
-    assert MCP_TOKEN not in str(error.value)
+    assert UPSTREAM_TOKEN not in str(error.value)
 
 
 @pytest.mark.asyncio
