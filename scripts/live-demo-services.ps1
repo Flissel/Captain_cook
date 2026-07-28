@@ -119,6 +119,33 @@ function Recover-CaptainN8nEnvironment($Values, [string]$SourceEnv) {
     Save-Env $Values $rootEnv
     Write-Host '[ready] Captain n8n demo credentials recovered after REST/MCP verification (values redacted)'
 }
+function Test-CaptainN8nCredentials($Values) {
+    foreach ($name in @('CAPTAIN_N8N_PORT','CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','CAPTAIN_N8N_MCP_BROKER_URL')) {
+        if (-not $Values.Contains($name) -or [string]::IsNullOrWhiteSpace([string]$Values[$name])) {
+            throw "Captain n8n stored credential verification requires $name."
+        }
+    }
+    $baseUrl = "http://127.0.0.1:$($Values['CAPTAIN_N8N_PORT'])"
+    $verified = $false
+    foreach ($attempt in 1..10) {
+        try {
+            $rest = Invoke-WebRequest "$baseUrl/api/v1/workflows?limit=1" -Headers @{'X-N8N-API-KEY'=[string]$Values['CAPTAIN_N8N_API_KEY']} -UseBasicParsing -TimeoutSec 5
+            $body = '{"jsonrpc":"2.0","id":"stored-credential-verification","method":"tools/list","params":{}}'
+            $mcp = Invoke-WebRequest "$baseUrl/mcp-server/http" -Method Post -Headers @{Authorization="Bearer $([string]$Values['CAPTAIN_N8N_MCP_TOKEN'])";Accept='application/json, text/event-stream'} -Body $body -ContentType 'application/json' -UseBasicParsing -TimeoutSec 5
+            $brokerPort = ([Uri][string]$Values['CAPTAIN_N8N_MCP_BROKER_URL']).Port
+            $brokerReady = Test-NetConnection -ComputerName '127.0.0.1' -Port $brokerPort -InformationLevel Quiet -WarningAction SilentlyContinue
+            if ($rest.StatusCode -eq 200 -and $mcp.StatusCode -eq 200 -and $brokerReady) {
+                $verified = $true
+                break
+            }
+        } catch {}
+        Start-Sleep -Milliseconds 500
+    }
+    if (-not $verified) {
+        throw 'Captain n8n stored REST/MCP credentials failed verification.'
+    }
+    Write-Host '[ready] Captain n8n stored REST/MCP credentials verified (values redacted)'
+}
 function Initialize-CaptainN8n($Values, [switch]$Recover, [string]$SourceEnv) {
     $n8n = Join-Path $PSScriptRoot 'captain-n8n.ps1'
     $running = @(& docker ps --filter 'label=com.docker.compose.project=captain-n8n-builder' --filter 'label=com.docker.compose.service=n8n' --format '{{.ID}}')
@@ -136,7 +163,9 @@ function Initialize-CaptainN8n($Values, [switch]$Recover, [string]$SourceEnv) {
     if ($running.Count -gt 0) {
         if ($Recover) { Recover-CaptainN8nEnvironment $Values $SourceEnv; return }
         if (-not (Test-Path $n8nEnv)) { throw 'Captain n8n is running, but .env.captain-n8n is missing. Use -RecoverDemoCredentials only with already validated local demo aliases.' }
-        & $n8n bootstrap
+        Sync-CaptainN8nEnvironment $Values
+        Test-CaptainN8nCredentials $Values
+        return
     } else {
         & $n8n init
         & $n8n start

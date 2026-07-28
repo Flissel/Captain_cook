@@ -285,6 +285,25 @@ class OpenAIBusinessBenchmarkModelClientBuilder:
             _client_factory=client_factory,
         )
 
+    @classmethod
+    def from_environment_deferred(
+        cls,
+        environment: Mapping[str, str],
+        *,
+        client_factory: BenchmarkModelClientFactory = _build_openai_client,
+    ) -> "OpenAIBusinessBenchmarkModelClientBuilder":
+        """Validate public provider settings while deferring the secret to effects."""
+
+        provider = _required(environment, "CAPTAIN_BENCHMARK_PROVIDER")
+        if provider != "openai":
+            raise ValueError("business benchmark provider must be openai")
+        return cls(
+            provider=provider,
+            model=_required(environment, "CAPTAIN_BENCHMARK_MODEL"),
+            _api_key=environment.get("OPENAI_API_KEY", "").strip(),
+            _client_factory=client_factory,
+        )
+
     def __call__(
         self,
         job: AgentFactoryJobV3,
@@ -296,6 +315,8 @@ class OpenAIBusinessBenchmarkModelClientBuilder:
             or invocation.subject_version != job.subject_version
         ):
             raise ValueError("model invocation is not bound to the Captain job")
+        if not self._api_key:
+            raise ValueError("OpenAI provider secret is not present")
         policy = job.execution_policy
         if (
             self.provider != "openai"

@@ -319,6 +319,26 @@ def test_openai_builder_rejects_wrong_provider_and_non_live_job() -> None:
         builder(offline, invocation(job))
 
 
+def test_openai_builder_can_defer_process_secret_until_paid_effect() -> None:
+    from agenten.agent_factory.business_benchmark_production_ports import (
+        OpenAIBusinessBenchmarkModelClientBuilder,
+    )
+
+    builder = OpenAIBusinessBenchmarkModelClientBuilder.from_environment_deferred(
+        {
+            "CAPTAIN_BENCHMARK_PROVIDER": "openai",
+            "CAPTAIN_BENCHMARK_MODEL": "approved-model-id",
+        },
+        client_factory=lambda **_: (_ for _ in ()).throw(
+            AssertionError("provider client must not be constructed without a secret")
+        ),
+    )
+
+    job = live_job()
+    with pytest.raises(ValueError, match="provider secret is not present"):
+        builder(job, invocation(job))
+
+
 def test_production_module_does_not_import_global_llm_environment_config() -> None:
     import agenten.agent_factory.business_benchmark_production_ports as ports
 

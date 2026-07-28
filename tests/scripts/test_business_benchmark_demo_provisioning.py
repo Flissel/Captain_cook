@@ -407,6 +407,34 @@ def test_apply_resumes_stable_jobs_with_fresh_epoch_and_renews_active_leases(
     )
 
 
+def test_apply_restores_canonical_jobs_from_cas_after_database_reset(
+    tmp_path: Path,
+) -> None:
+    first_gateway = RecordingGateway()
+    first = BusinessBenchmarkDemoProvisioner(
+        settings(tmp_path),
+        gateway=first_gateway,
+        clock=lambda: ISSUED_AT + timedelta(minutes=1),
+    ).apply()
+    canonical_jobs = tuple(team.job for team in first.teams)
+    reset_gateway = RecordingGateway()
+    fresh_epoch = ISSUED_AT + timedelta(minutes=5)
+
+    restored = BusinessBenchmarkDemoProvisioner(
+        settings(tmp_path, issued_at=fresh_epoch),
+        gateway=reset_gateway,
+        clock=lambda: fresh_epoch + timedelta(minutes=1),
+    ).apply()
+
+    assert restored.created_job_ids == tuple(job.job_id for job in canonical_jobs)
+    assert restored.resumed_job_ids == ()
+    assert restored.checkpoint_job_ids == ()
+    assert tuple(team.job for team in restored.teams) == canonical_jobs
+    assert tuple(reset_gateway.jobs.values()) == canonical_jobs
+    assert all(team.initial_lease is not None for team in restored.teams)
+    assert all(team.initial_lease.issued_at == fresh_epoch for team in restored.teams)
+
+
 def test_apply_reports_later_projection_without_rewinding_or_renewing_lease(
     tmp_path: Path,
 ) -> None:

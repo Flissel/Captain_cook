@@ -544,7 +544,7 @@ class GatewayBusinessBenchmarkLiveCompositionLoader:
             )
         )
         artifacts = BusinessBenchmarkContentAddressedArtifactStore(config.cas_root)
-        model_builder = OpenAIBusinessBenchmarkModelClientBuilder.from_environment(
+        model_builder = OpenAIBusinessBenchmarkModelClientBuilder.from_environment_deferred(
             environment
         )
         if model_builder.model != canonical.model:

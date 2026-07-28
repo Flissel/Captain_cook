@@ -354,7 +354,7 @@ try {
         }
         if (
             $Action -ceq 'Run' -and
-            [string]$team.gateway_budget_remaining_usd -cne $maximumUsdPerTeam
+            [decimal]$team.gateway_budget_remaining_usd -ne [decimal]$maximumUsdPerTeam
         ) {
             throw 'Applied team Gateway budget does not match the demo authority.'
         }

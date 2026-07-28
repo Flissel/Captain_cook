@@ -92,6 +92,8 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "captain-n8n.ps1" in source
     assert "minibook-demo.ps1" in source
     assert "docker compose" in source
+    assert "function Test-CaptainN8nCredentials" in source
+    assert "Captain n8n stored REST/MCP credentials failed verification" in source
     assert "mailpit" in source
     assert "evidence/live-demo-services.json" in source
     assert "docker-compose.test.yml" in source

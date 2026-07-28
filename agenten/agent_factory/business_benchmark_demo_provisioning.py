@@ -12,7 +12,7 @@ import json
 import tempfile
 import zipfile
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -302,10 +302,6 @@ class BusinessBenchmarkDemoProvisioner:
                 "Gateway business benchmark provisioning authority is required for --apply"
             )
         gateway = self._gateway
-        prepared = tuple(
-            self._resume_prepared(item, gateway.resume_state(item.plan.job.job_id))
-            for item in prepared
-        )
         authority_root = self._authority_root
         suites = CanonicalPrivateBusinessBenchmarkProvisioner(
             authority_root / "suites"
@@ -314,6 +310,14 @@ class BusinessBenchmarkDemoProvisioner:
             seed_version_id=self._settings.seed_version_id,
         )
         cas = BusinessBenchmarkContentAddressedArtifactStore(authority_root / "cas")
+        prepared = tuple(
+            self._prepare_for_apply(
+                item,
+                gateway.resume_state(item.plan.job.job_id),
+                cas,
+            )
+            for item in prepared
+        )
 
         applied: list[BusinessBenchmarkDemoTeamPlanV1] = []
         for item in prepared:
@@ -358,11 +362,7 @@ class BusinessBenchmarkDemoProvisioner:
             try:
                 cas.bind(
                     "demo-team-job",
-                    (
-                        f"{item.plan.profile_id}:"
-                        f"{self._settings.suite_version}:"
-                        f"{self._settings.seed_version_id}"
-                    ),
+                    self._demo_team_job_identity(item.plan.profile_id),
                     job_binding_ref,
                 )
             except ValueError as exc:
@@ -416,6 +416,45 @@ class BusinessBenchmarkDemoProvisioner:
             checkpoint_job_ids=tuple(
                 item.plan.job.job_id for item in prepared if item.checkpoint
             ),
+        )
+
+    def _prepare_for_apply(
+        self,
+        item: _PreparedTeam,
+        state: BusinessBenchmarkDemoResumeStateV1 | None,
+        cas: BusinessBenchmarkContentAddressedArtifactStore,
+    ) -> _PreparedTeam:
+        if state is not None:
+            return self._resume_prepared(item, state)
+        binding = cas.binding(
+            "demo-team-job",
+            self._demo_team_job_identity(item.plan.profile_id),
+        )
+        if binding is None:
+            return item
+        try:
+            canonical_job = AgentFactoryJobV3.model_validate_json(
+                cas.read_bytes(binding)
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                "canonical demo team job binding is unavailable or invalid"
+            ) from exc
+        restored = self._resume_prepared(
+            item,
+            BusinessBenchmarkDemoResumeStateV1(
+                job=canonical_job,
+                phase=None,
+                attempt=1,
+            ),
+        )
+        return replace(restored, resumed=False)
+
+    def _demo_team_job_identity(self, profile_id: str) -> str:
+        return (
+            f"{profile_id}:"
+            f"{self._settings.suite_version}:"
+            f"{self._settings.seed_version_id}"
         )
 
     def _resume_prepared(
