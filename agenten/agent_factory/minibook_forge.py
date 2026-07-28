@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import tempfile
 from typing import Protocol
 from uuid import UUID
 
@@ -227,50 +228,91 @@ class MinibookSwarmForge(MinibookForgePort):
         self,
         *,
         materializer: FactoryInputMaterializer,
+        mapper: CreationJobMapper,
         settings: MinibookForgeSettings = MinibookForgeSettings(),
     ) -> None:
         self._materializer = materializer
+        self._mapper = mapper
         self._settings = settings
 
     async def submit(self, request: FactoryDispatch) -> CreationResultV1:
         if request.role is not None or request.lease is not None:
             raise FactoryDispatchError("Minibook Forge must not receive a Hermes role lease")
+        creation_job = self._mapper.map(request)
         input_path = self._materializer.materialize(request.job.input_ref)
         if not input_path.is_file():
             raise FactoryDispatchError("factory input artifact did not materialize to a file")
         if self._settings.max_runtime_seconds <= 0:
             raise FactoryDispatchError("Minibook Forge runtime limit must be positive")
-        try:
-            result_path = self._settings.working_directory / "creation-result.json"
-            process = await asyncio.create_subprocess_exec(
-                self._settings.python_executable,
-                str(self._settings.swarm_script),
-                "--input-file",
-                str(input_path),
-                "--non-interactive",
-                "--max-runtime-seconds",
-                str(self._settings.max_runtime_seconds),
-                "--result-file",
-                str(result_path),
-                cwd=str(self._settings.working_directory),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+        working_directory = self._settings.working_directory.resolve()
+        if not working_directory.is_dir():
+            raise FactoryDispatchError("Minibook Forge working directory is unavailable")
+        with tempfile.TemporaryDirectory(
+            prefix=f"captain-forge-{creation_job.creation_job_id}-a{creation_job.attempt}-",
+            dir=working_directory,
+        ) as temporary:
+            run_directory = Path(temporary)
+            creation_job_path = run_directory / "creation-job.json"
+            result_path = run_directory / "creation-result.json"
+            creation_job_path.write_text(
+                json.dumps(
+                    creation_job.model_dump(mode="json", by_alias=True),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
             )
-            await asyncio.wait_for(
-                process.communicate(), timeout=self._settings.max_runtime_seconds
-            )
-        except FileNotFoundError as exc:
-            raise FactoryDispatchError("Minibook Forge executable or script is unavailable") from exc
-        except asyncio.TimeoutError as exc:
-            raise FactoryDispatchError("Minibook Forge exceeded its runtime limit") from exc
-        if process.returncode != 0:
-            raise FactoryDispatchError("Minibook Forge process failed")
-        if not result_path.is_file():
-            raise FactoryDispatchError("Minibook Forge did not write a creation result")
-        try:
-            return CreationResultV1.model_validate_json(result_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            raise FactoryDispatchError("Minibook Forge wrote an invalid creation result") from exc
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    self._settings.python_executable,
+                    str(self._settings.swarm_script),
+                    "--input-file",
+                    str(input_path),
+                    "--creation-job-file",
+                    str(creation_job_path),
+                    "--non-interactive",
+                    "--max-runtime-seconds",
+                    str(self._settings.max_runtime_seconds),
+                    "--result-file",
+                    str(result_path),
+                    cwd=str(working_directory),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(
+                    process.communicate(), timeout=self._settings.max_runtime_seconds
+                )
+            except FileNotFoundError as exc:
+                raise FactoryDispatchError(
+                    "Minibook Forge executable or script is unavailable"
+                ) from exc
+            except asyncio.TimeoutError as exc:
+                raise FactoryDispatchError(
+                    "Minibook Forge exceeded its runtime limit"
+                ) from exc
+            if process.returncode != 0:
+                raise FactoryDispatchError("Minibook Forge process failed")
+            if not result_path.is_file():
+                raise FactoryDispatchError("Minibook Forge did not write a creation result")
+            try:
+                result = CreationResultV1.model_validate_json(
+                    result_path.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                raise FactoryDispatchError(
+                    "Minibook Forge wrote an invalid creation result"
+                ) from exc
+            if (
+                result.creation_job_id != creation_job.creation_job_id
+                or result.correlation_id != creation_job.correlation_id
+                or result.subject_version != creation_job.subject_version
+                or result.attempt != creation_job.attempt
+            ):
+                raise FactoryDispatchError(
+                    "Minibook Forge result does not match the submitted creation job"
+                )
+            return result
 
     async def status(self, creation_job_id):
         raise FactoryDispatchError("offline Minibook Forge has no status endpoint")

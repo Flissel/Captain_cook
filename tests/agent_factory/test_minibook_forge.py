@@ -218,7 +218,10 @@ async def test_forge_rejects_a_non_file_input_before_spawning(tmp_path: Path) ->
         role=None,
         lease=None,
     )
-    forge = MinibookSwarmForge(materializer=Materializer(tmp_path / "missing.md"))
+    forge = MinibookSwarmForge(
+        materializer=Materializer(tmp_path / "missing.md"),
+        mapper=Mapper(),
+    )
 
     with pytest.raises(RuntimeError, match="materialize"):
         await forge.submit(request)
@@ -231,12 +234,21 @@ async def test_forge_starts_a_noninteractive_deadline_bounded_input_run(
     input_path = tmp_path / "input.md"
     input_path.write_text("# Team", encoding="utf-8")
     received: list[object] = []
+    observed_job_payloads: list[dict[str, object]] = []
 
     class Process:
         returncode = 0
 
         async def communicate(self):
-            result_path = tmp_path / "creation-result.json"
+            creation_job_path = Path(
+                received[received.index("--creation-job-file") + 1]
+            )
+            result_path = Path(received[received.index("--result-file") + 1])
+            observed_job_payloads.append(
+                json.loads(creation_job_path.read_text(encoding="utf-8"))
+            )
+            assert result_path.parent == creation_job_path.parent
+            assert not result_path.exists()
             result_path.write_text(
                 (Path("tests/fixtures/contracts/minibook_creation_result.v1.json")).read_text(encoding="utf-8"),
                 encoding="utf-8",
@@ -257,23 +269,84 @@ async def test_forge_starts_a_noninteractive_deadline_bounded_input_run(
     )
     forge = MinibookSwarmForge(
         materializer=Materializer(input_path),
+        mapper=Mapper(),
         settings=MinibookForgeSettings(working_directory=tmp_path, max_runtime_seconds=120),
     )
 
     result = await forge.submit(request)
 
-    assert received == [
+    assert received[:6] == [
         "python",
         str(Path("minibook/autogen_swarm.py")),
         "--input-file",
         str(input_path),
+        "--creation-job-file",
+        received[5],
+    ]
+    assert received[6:10] == [
         "--non-interactive",
         "--max-runtime-seconds",
         "120",
         "--result-file",
-        str(tmp_path / "creation-result.json"),
+    ]
+    assert Path(received[5]).name == "creation-job.json"
+    assert Path(received[10]).name == "creation-result.json"
+    assert observed_job_payloads == [
+        Mapper().map(request).model_dump(mode="json", by_alias=True)
     ]
     assert result.status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_forge_rejects_result_bound_to_a_different_creation_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_path = tmp_path / "input.md"
+    input_path.write_text("# Team", encoding="utf-8")
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self):
+            payload = json.loads(
+                Path("tests/fixtures/contracts/minibook_creation_result.v1.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            payload["creation_job_id"] = "22222222-2222-4222-8222-222222222222"
+            Path(self.result_path).write_text(json.dumps(payload), encoding="utf-8")
+            return b"", b""
+
+    async def start(*command: str, **_kwargs: object) -> object:
+        process = Process()
+        process.result_path = command[command.index("--result-file") + 1]
+        return process
+
+    monkeypatch.setattr(
+        "agenten.agent_factory.minibook_forge.asyncio.create_subprocess_exec",
+        start,
+    )
+    forge = MinibookSwarmForge(
+        materializer=Materializer(input_path),
+        mapper=Mapper(),
+        settings=MinibookForgeSettings(
+            working_directory=tmp_path,
+            max_runtime_seconds=120,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="does not match the submitted creation job"):
+        await forge.submit(
+            FactoryDispatch(
+                job=job(),
+                action=FactoryAction(
+                    kind=FactoryActionKind.SUBMIT_FORGE_JOB,
+                    attempt=1,
+                ),
+                role=None,
+                lease=None,
+            )
+        )
 
 
 @pytest.mark.asyncio

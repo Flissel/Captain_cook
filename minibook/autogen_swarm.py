@@ -19,6 +19,7 @@ EvalReporterAgent produces final evaluation report.
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -51,6 +52,8 @@ from swarm.forge_orchestrator import ForgeOrchestrator, ForgeAPI
 from swarm.input_designer import InputDesignPipeline
 from swarm.local_services import default_npm_command, ensure_frontend_dependencies
 from swarm.runtime_options import parse_runtime_options
+from swarm.contracts import CreationFailure, CreationResultV1
+from swarm.creation_cli import load_creation_job, write_creation_result_atomic
 
 
 # --- Setup ---
@@ -749,6 +752,7 @@ async def run_input_file_pipeline(
     manifest,
     registry_agent_api_key=None,
     interactive: bool = True,
+    export_to_github: bool = True,
 ):
     """Multi-phase pipeline: core → sub-teams → wiring.
 
@@ -1016,7 +1020,7 @@ async def run_input_file_pipeline(
 
     # -- Create merged output --
     merged = _create_merged_output(cp, manifest)
-    if merged:
+    if merged and export_to_github:
         cp["merged_output"] = str(merged)
         _save_checkpoint(checkpoint_dir, cp)
         print(f"  Merged output: {merged}")
@@ -1130,6 +1134,11 @@ async def main():
     except ValueError as exc:
         print(f"ERROR: {exc}")
         raise SystemExit(2) from exc
+    creation_job = (
+        load_creation_job(Path(runtime_options.creation_job_file))
+        if runtime_options.creation_job_file is not None
+        else None
+    )
     i = 0
     while i < len(argv):
         if argv[i] == "--cascade-from" and i + 1 < len(argv):
@@ -1143,6 +1152,8 @@ async def main():
             i += 2
         elif argv[i] == "--input-file" and i + 1 < len(argv):
             input_file = argv[i + 1]
+            i += 2
+        elif argv[i] == "--creation-job-file" and i + 1 < len(argv):
             i += 2
         elif argv[i] == "--input-image" and i + 1 < len(argv):
             input_image = argv[i + 1]
@@ -1160,6 +1171,9 @@ async def main():
             i += 1
 
     task = " ".join(positional_args) if positional_args else None
+    if creation_job is not None and input_file is None:
+        print("ERROR: Captain creation jobs require --input-file")
+        raise SystemExit(2)
 
     # Load cascade spec from YAML file if provided
     features = []
@@ -1189,6 +1203,11 @@ async def main():
         if not input_path.exists():
             print(f"ERROR: Input file not found: {input_file}")
             sys.exit(1)
+        if creation_job is not None:
+            input_sha256 = hashlib.sha256(input_path.read_bytes()).hexdigest()
+            if input_sha256 != creation_job.input_ref.sha256:
+                print("ERROR: Input file does not match the Captain creation job")
+                raise SystemExit(2)
         # Resolve image path: explicit flag > auto-detect in same directory
         if input_image:
             image_path = Path(input_image)
@@ -1230,6 +1249,7 @@ async def main():
                 session, agents, project_id, task, manifest,
                 registry_agent_api_key=registry_key,
                 interactive=runtime_options.interactive,
+                export_to_github=creation_job is None,
             )
         elif is_cascade and features:
             # CASCADE MODE: run multiple iterations
@@ -1248,12 +1268,36 @@ async def main():
 
         try:
             if runtime_options.max_runtime_seconds is None:
-                await run
+                run_result = await run
             else:
-                await asyncio.wait_for(run, timeout=runtime_options.max_runtime_seconds)
+                run_result = await asyncio.wait_for(
+                    run, timeout=runtime_options.max_runtime_seconds
+                )
         except asyncio.TimeoutError as exc:
             print(f"ERROR: Swarm run exceeded {runtime_options.max_runtime_seconds:g} seconds")
             raise SystemExit(124) from exc
+
+        if creation_job is not None:
+            if isinstance(run_result, CreationResultV1):
+                creation_result = run_result
+            else:
+                # TODO_TOOL[required]: creation export must assemble and CAS-publish
+                # the generated AutoGen team before a succeeded result is possible.
+                creation_result = CreationResultV1(
+                    creation_job_id=creation_job.creation_job_id,
+                    correlation_id=creation_job.correlation_id,
+                    subject_version=creation_job.subject_version,
+                    attempt=creation_job.attempt,
+                    status="blocked",
+                    failure=CreationFailure(
+                        code="validation_failed",
+                        summary="creation pipeline did not produce sealed package evidence",
+                    ),
+                )
+            assert runtime_options.result_file is not None
+            write_creation_result_atomic(
+                Path(runtime_options.result_file), creation_result
+            )
 
         print(f"\nView on Minibook: http://localhost:3457/forum")
 
