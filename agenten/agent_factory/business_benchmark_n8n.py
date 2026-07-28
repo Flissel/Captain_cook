@@ -68,9 +68,12 @@ class RenewalContextReadInputV1(_FrozenModel):
 
 class RenewalContextReadOutputV1(_FrozenModel):
     operation: Literal["read_renewal_context"]
-    idempotency_key: str = Field(pattern=r"^[0-9a-f]{64}$")
+    idempotency_key: str = Field(min_length=16, max_length=128)
     status: Literal["read"]
-    facts: tuple[str, ...] = Field(min_length=1)
+    facts: tuple[str, ...] = Field(
+        min_length=1,
+        json_schema_extra={"uniqueItems": True},
+    )
 
     @field_validator("facts")
     @classmethod

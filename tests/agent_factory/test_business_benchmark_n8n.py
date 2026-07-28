@@ -468,6 +468,29 @@ def test_input_model_matches_the_seed_contract_without_hidden_restrictions() -> 
         assert {key: value for key, value in actual.items() if key != "title"} == expected
 
 
+def test_output_model_matches_the_seed_contract() -> None:
+    seed_schema = json.loads(
+        Path(
+            "examples/business_benchmark_candidates/"
+            "customer_renewal_orchestration_team/schemas/"
+            "renewal_context_read.output.json"
+        ).read_text(encoding="utf-8")
+    )
+    model_schema = RenewalContextReadOutputV1.model_json_schema()
+
+    assert model_schema["additionalProperties"] == seed_schema["additionalProperties"]
+    assert set(model_schema["required"]) == set(seed_schema["required"])
+    for name, expected in seed_schema["properties"].items():
+        actual = {
+            key: value
+            for key, value in model_schema["properties"][name].items()
+            if key != "title"
+        }
+        if "const" in actual:
+            actual.pop("type", None)
+        assert actual == expected
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("field", ["fence", "invocation_id", "workspace_ref", "tool"])
 async def test_provider_binding_tamper_fails_closed_without_evidence(
