@@ -220,3 +220,27 @@ async def test_gateway_rejects_creation_result_when_package_bytes_are_unavailabl
             ),
             forged,
         )
+
+
+def test_gateway_rejects_local_source_path_that_differs_from_verified_cas_bytes(
+    tmp_path: Path,
+) -> None:
+    factory_job = job_v3(mode="demo")
+    store, _, result, _ = _sealed_result(tmp_path, factory_job)
+    divergent_path = tmp_path / "divergent-candidate.zip"
+    divergent_path.write_bytes(b"not-the-verified-source-archive")
+
+    class DivergentArtifactStore:
+        def read_bytes(self, reference):
+            return store.read_bytes(reference)
+
+        def local_path(self, _reference):
+            return divergent_path
+
+    provider = GatewayForgeCandidateProvider(
+        repository=Blocks(),
+        artifacts=DivergentArtifactStore(),
+    )
+
+    with pytest.raises(FactoryDispatchError, match="local source archive"):
+        provider.accept_creation_result(factory_job, result)

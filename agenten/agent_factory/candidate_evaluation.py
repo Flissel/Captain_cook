@@ -989,8 +989,17 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
             candidate = FactoryCandidateManifest.model_validate_json(
                 self._artifacts.read_bytes(candidate_ref)
             )
-            self._artifacts.read_bytes(source_ref)
+            source_bytes = self._artifacts.read_bytes(source_ref)
             source_path = self._artifacts.local_path(source_ref)
+            if (
+                not source_path.is_file()
+                or hashlib.sha256(source_path.read_bytes()).hexdigest()
+                != source_ref.sha256
+                or hashlib.sha256(source_bytes).hexdigest() != source_ref.sha256
+            ):
+                raise FactoryDispatchError(
+                    "Forge local source archive differs from verified CAS bytes"
+                )
         except (OSError, ValueError) as exc:
             raise FactoryDispatchError(
                 "Forge candidate bytes are unavailable or invalid"
