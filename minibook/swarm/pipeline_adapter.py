@@ -18,6 +18,7 @@ from .contracts import (
     CreationJobV1,
     CreationPackageManifestV1,
     CreationResultV1,
+    ForgeBuildSkillUsageReceiptV1,
 )
 from .runner import StepOutcome
 
@@ -130,7 +131,10 @@ class ContentAddressedCreationArtifactPublisher:
             "application/json",
             namespace="forge-candidate-manifest",
         )
-        self._validate_json_object(bundle.skill_usage_receipt, "skill usage receipt")
+        skill_usage_receipt = self._parse_skill_usage_receipt(
+            bundle.skill_usage_receipt
+        )
+        self._require_exact_skill_usage_receipt(job, skill_usage_receipt)
         skill_ref = self._put_checked(
             bundle.skill_usage_receipt,
             "application/json",
@@ -144,6 +148,7 @@ class ContentAddressedCreationArtifactPublisher:
             attempt=job.attempt,
             candidate_manifest_ref=candidate_ref,
             source_archive_ref=source_ref,
+            skill_usage_receipt_ref=skill_ref,
         )
         package_ref = self._put_checked(
             _canonical_json(package.model_dump(mode="json", by_alias=True)),
@@ -210,9 +215,15 @@ class ContentAddressedCreationArtifactPublisher:
             or package.source_archive_ref != canonical.source_archive_ref
         ):
             raise ValueError("creation package artifact bindings changed")
+        if (
+            package.skill_usage_receipt_ref
+            != canonical.skill_usage_receipt_ref
+        ):
+            raise ValueError("creation package skill usage receipt binding changed")
         self._validate_json_object(candidate_bytes, "candidate manifest")
         self._validate_archive(source_bytes)
-        self._validate_json_object(skill_bytes, "skill usage receipt")
+        skill_usage_receipt = self._parse_skill_usage_receipt(skill_bytes)
+        self._require_exact_skill_usage_receipt(job, skill_usage_receipt)
         expected_receipt_id = self._receipt_id(
             job,
             package_ref=canonical.package_manifest_ref,
@@ -326,6 +337,32 @@ class ContentAddressedCreationArtifactPublisher:
             raise ValueError(f"{label} is not valid JSON") from exc
         if not isinstance(value, dict):
             raise ValueError(f"{label} must be a JSON object")
+
+    @staticmethod
+    def _parse_skill_usage_receipt(
+        content: bytes,
+    ) -> ForgeBuildSkillUsageReceiptV1:
+        try:
+            return ForgeBuildSkillUsageReceiptV1.model_validate_json(content)
+        except ValueError as exc:
+            raise ValueError("skill usage receipt is invalid") from exc
+
+    @staticmethod
+    def _require_exact_skill_usage_receipt(
+        job: CreationJobV1,
+        receipt: ForgeBuildSkillUsageReceiptV1,
+    ) -> None:
+        if (
+            receipt.creation_job_id != job.creation_job_id
+            or receipt.factory_job_id != job.factory_job_id
+            or receipt.correlation_id != job.correlation_id
+            or receipt.subject_version != job.subject_version
+            or receipt.attempt != job.attempt
+            or receipt.idempotency_key != job.idempotency_key
+            or receipt.released_skill != job.released_skill
+            or receipt.public_assertion_ids != job.public_assertion_ids
+        ):
+            raise ValueError("skill usage receipt does not match creation job")
 
 
 def _canonical_json(value: object) -> bytes:
@@ -456,7 +493,8 @@ class SwarmPipelineAdapter:
             receipt = CreationExportReceiptV1.model_validate(accepted_effect)
             return self._artifact_publisher.accept_receipt(job, receipt)
         if not isinstance(output, CreationExportBundle):
-            # TODO_TOOL[required]: upgrade legacy step_export to return verified bundle bytes.
+            # A creation export must expose verified local bytes. Any legacy
+            # exporter result remains deliberately non-promotable.
             return None
         if self._artifact_publisher is None:
             return None
@@ -479,7 +517,7 @@ class SwarmPipelineAdapter:
             SwarmStep.TOOLFORGE: "step_toolforge",
             SwarmStep.FEEDBACK_LOOP: "step_feedback_loop",
             SwarmStep.EVALUATION_REPORT: "step_eval_reporter",
-            SwarmStep.EXPORT: "step_export",
+            SwarmStep.EXPORT: "step_creation_export",
         }
         method = getattr(pipeline, method_names[step])
         return await method(self._session)

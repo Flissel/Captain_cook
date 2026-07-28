@@ -2039,6 +2039,27 @@ class SwarmPipeline:
         self.completed_steps.add("EvalReporterAgent")
         print(f"[EvalReporterAgent] DONE ({elapsed()}) — final report posted")
 
+    async def step_creation_export(self, session):
+        """Build a deterministic local Factory bundle from ``output_path``.
+
+        This creation-specific path deliberately does not delegate to the
+        legacy GitHub export and does not access the Minibook session.
+        """
+        del session
+        from .creation_export import CreationExportError, build_creation_export
+        from .pipeline_adapter import CreationExportBundle
+
+        if self.output_path is None:
+            raise CreationExportError("creation output path is not configured")
+        source_archive, candidate_manifest, skill_usage_receipt = (
+            build_creation_export(Path(self.output_path))
+        )
+        return CreationExportBundle(
+            source_archive=source_archive,
+            candidate_manifest=candidate_manifest,
+            skill_usage_receipt=skill_usage_receipt,
+        )
+
     async def step_export(self, session):
         """ExportAgent: Export validated output as a standalone git repo + push to GitHub."""
         elapsed = lambda: f"{time.time() - self.start_time:.1f}s"

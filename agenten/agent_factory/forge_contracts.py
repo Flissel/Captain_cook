@@ -172,6 +172,45 @@ class CreationProgressV1(_FrozenContract):
     version: int = Field(ge=1, strict=True)
 
 
+class ForgeBuildSkillUsageReceiptV1(_FrozenContract):
+    """Hermes evidence that the exact released build skill fulfilled one Forge job."""
+
+    schema_name: Literal["hermes.forge-build-skill-usage-receipt.v1"] = Field(
+        default="hermes.forge-build-skill-usage-receipt.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    producer: Literal["hermes"]
+    outcome: Literal["fulfilled"]
+    creation_job_id: UUID
+    factory_job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    idempotency_key: str = Field(pattern=SHA256_PATTERN)
+    released_skill: ReleasedSkillRefV1
+    public_assertion_ids: tuple[str, ...] = Field(min_length=1)
+    evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
+
+    @field_validator("public_assertion_ids")
+    @classmethod
+    def require_unique_assertions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)) or any(not item for item in value):
+            raise ValueError("public assertion ids must be unique and nonblank")
+        return value
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def require_unique_evidence_refs(
+        cls,
+        value: tuple[ArtifactRef, ...],
+    ) -> tuple[ArtifactRef, ...]:
+        identities = tuple((ref.uri, ref.sha256, ref.media_type) for ref in value)
+        if len(identities) != len(set(identities)):
+            raise ValueError("skill usage evidence refs must be unique")
+        return value
+
+
 class CreationPackageManifestV1(_FrozenContract):
     """Content-addressed binding from one Forge result to executable bytes."""
 
@@ -187,6 +226,7 @@ class CreationPackageManifestV1(_FrozenContract):
     attempt: int = Field(ge=1, le=5, strict=True)
     candidate_manifest_ref: ArtifactRef
     source_archive_ref: ArtifactRef
+    skill_usage_receipt_ref: ArtifactRef
 
     @model_validator(mode="after")
     def require_executable_media_types(self) -> "CreationPackageManifestV1":
@@ -194,6 +234,8 @@ class CreationPackageManifestV1(_FrozenContract):
             raise ValueError("candidate manifest must be application/json")
         if self.source_archive_ref.media_type != "application/zip":
             raise ValueError("candidate source must be application/zip")
+        if self.skill_usage_receipt_ref.media_type != "application/json":
+            raise ValueError("skill usage receipt must be application/json")
         return self
 
 

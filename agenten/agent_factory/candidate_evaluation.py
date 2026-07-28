@@ -39,11 +39,15 @@ from agenten.agent_factory.evidence_store import FactoryEvidenceStore
 from agenten.agent_factory.forge_contracts import (
     CreationPackageManifestV1,
     CreationResultV1,
+    ForgeBuildSkillUsageReceiptV1,
 )
 from agenten.agent_factory.leases import validate_factory_lease
 from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference, TypedN8nTool
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
-from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationRequest
+from agenten.agent_factory.skill_evaluation import (
+    HermesSkillEvaluationRequest,
+    ReleasedHermesSkill,
+)
 from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillInvocationV1,
     FactorySkillStep,
@@ -851,6 +855,12 @@ class ForgeCandidateArtifactStore(Protocol):
 class FactoryBlockSource(Protocol):
     def blocks(self, job_id: object) -> tuple[FactoryEvidenceBlock, ...]: ...
 
+    def released_for(
+        self,
+        job: FactoryJob,
+        step: FactorySkillStep,
+    ) -> ReleasedHermesSkill: ...
+
 
 class GatewayForgeCandidateProvider(FactoryCandidateProvider):
     """Resolve candidates only from SHA-verified Forge bytes and Gateway blocks."""
@@ -871,13 +881,17 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
     ) -> ResolvedFactoryCandidate:
         if result.package_manifest_ref is None:
             raise FactoryDispatchError("Forge package manifest reference is missing")
+        if result.skill_usage_receipt_ref is None:
+            raise FactoryDispatchError("Forge skill usage receipt reference is missing")
         package_ref = _runtime_ref(result.package_manifest_ref)
+        skill_usage_receipt_ref = _runtime_ref(result.skill_usage_receipt_ref)
         artifact_refs = tuple(_runtime_ref(reference) for reference in result.artifact_refs)
         resolved, package = self._resolve(
             job=job,
             attempt=result.attempt,
             package_ref=package_ref,
             artifact_refs=artifact_refs,
+            skill_usage_receipt_ref=skill_usage_receipt_ref,
         )
         if (
             package.creation_job_id != result.creation_job_id
@@ -947,6 +961,9 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
             attempt=block.attempt,
             package_ref=block.artifact_refs[0],
             artifact_refs=block.artifact_refs[1:],
+            skill_usage_receipt_ref=(
+                block.evidence_refs[-1] if block.evidence_refs else None
+            ),
         )
 
     def _resolve(
@@ -956,6 +973,7 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
         attempt: int,
         package_ref: ArtifactRef,
         artifact_refs: tuple[ArtifactRef, ...],
+        skill_usage_receipt_ref: ArtifactRef | None,
     ) -> tuple[ResolvedFactoryCandidate, CreationPackageManifestV1]:
         if package_ref.media_type != "application/json":
             raise FactoryDispatchError("Forge package manifest media type is invalid")
@@ -974,6 +992,29 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
             or package.attempt != attempt
         ):
             raise FactoryDispatchError("Forge package manifest does not match factory job")
+        package_skill_ref = _runtime_ref(package.skill_usage_receipt_ref)
+        if (
+            skill_usage_receipt_ref is None
+            or _artifact_identity(package_skill_ref)
+            != _artifact_identity(skill_usage_receipt_ref)
+        ):
+            raise FactoryDispatchError(
+                "Forge skill usage receipt reference is not bound by agent-code evidence"
+            )
+        try:
+            skill_usage_receipt = ForgeBuildSkillUsageReceiptV1.model_validate_json(
+                self._artifacts.read_bytes(package_skill_ref)
+            )
+        except (OSError, ValueError) as exc:
+            raise FactoryDispatchError(
+                "Forge skill usage receipt bytes are unavailable or invalid"
+            ) from exc
+        self._require_skill_usage_receipt(
+            job=job,
+            attempt=attempt,
+            package=package,
+            receipt=skill_usage_receipt,
+        )
 
         candidate_ref = _runtime_ref(package.candidate_manifest_ref)
         source_ref = _runtime_ref(package.source_archive_ref)
@@ -1012,6 +1053,37 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
             ResolvedFactoryCandidate(candidate=candidate, source_archive=source_path),
             package,
         )
+
+    def _require_skill_usage_receipt(
+        self,
+        *,
+        job: FactoryJob,
+        attempt: int,
+        package: CreationPackageManifestV1,
+        receipt: ForgeBuildSkillUsageReceiptV1,
+    ) -> None:
+        if (
+            receipt.creation_job_id != package.creation_job_id
+            or receipt.factory_job_id != job.job_id
+            or receipt.correlation_id != job.correlation_id
+            or receipt.subject_version != job.subject_version
+            or receipt.attempt != attempt
+            or receipt.public_assertion_ids != job.acceptance_assertion_ids
+        ):
+            raise FactoryDispatchError(
+                "Forge skill usage receipt does not match factory job"
+            )
+        released = self._repository.released_for(job, FactorySkillStep.BRIEF_CODEX)
+        if (
+            receipt.released_skill.skill_id != released.skill_id
+            or receipt.released_skill.version != released.version
+            or receipt.released_skill.content_sha256 != released.content_sha256
+            or _artifact_identity(_runtime_ref(receipt.released_skill.content_ref))
+            != _artifact_identity(released.content_ref)
+        ):
+            raise FactoryDispatchError(
+                "Forge skill usage receipt does not match Captain released skill"
+            )
 
 
 def _runtime_ref(reference: object) -> ArtifactRef:
