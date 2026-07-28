@@ -65,6 +65,7 @@ class HermesCliSettings:
     timeout_seconds: int = 900
     evidence_root: Path = Path("artifacts/agent-factory/evidence")
     released_skill_root: Path = Path("agenten/agent_factory/released-skills")
+    module_root: Path | None = None
 
 
 class ReleasedFactorySkillCatalog(Protocol):
@@ -347,14 +348,29 @@ class HermesCliFactory(HermesFactoryPort):
 
     async def _run_skill_prompt(self, prompt: str, *, max_seconds: float) -> bytes:
         deadline = _deadline(min(float(self._settings.timeout_seconds), max_seconds))
-        try:
-            process = await asyncio.create_subprocess_exec(
+        command = (self._settings.executable, "-z", prompt)
+        process_options: dict[str, object] = _async_process_group_options()
+        if self._settings.module_root is not None:
+            module_root = _resolve_hermes_module_root(self._settings.module_root)
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(module_root)
+            command = (
                 self._settings.executable,
+                "-m",
+                "hermes_cli.main",
                 "-z",
                 prompt,
+            )
+            process_options.update(
+                cwd=str(module_root),
+                env=environment,
+            )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                **_async_process_group_options(),
+                **process_options,
             )
         except FileNotFoundError as exc:
             raise FactoryDispatchError("Hermes CLI executable is not available") from exc
@@ -1326,6 +1342,20 @@ def _async_process_group_options() -> dict[str, object]:
     if os.name == "nt":
         return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
     return {"start_new_session": True}
+
+
+def _resolve_hermes_module_root(module_root: Path) -> Path:
+    try:
+        root = module_root.resolve(strict=True)
+        entrypoint = (root / "hermes_cli" / "main.py").resolve(strict=True)
+        entrypoint.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise FactoryDispatchError(
+            "Hermes module root is not a valid checkout"
+        ) from exc
+    if not root.is_dir() or not entrypoint.is_file():
+        raise FactoryDispatchError("Hermes module root is not a valid checkout")
+    return root
 
 
 async def _terminate_async_process_tree(

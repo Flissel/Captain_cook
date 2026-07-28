@@ -288,6 +288,90 @@ async def test_dispatch_uses_oneshot_mode_for_parseable_evidence(
     )
 
 
+@pytest.mark.asyncio
+async def test_module_root_runs_only_the_checkout_cli_with_bound_cwd_and_pythonpath(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_root = tmp_path / "hermes-agent"
+    entrypoint = module_root / "hermes_cli" / "main.py"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("# checkout entrypoint\n", encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", "global-hermes-location")
+    observed_command: tuple[str, ...] = ()
+    observed_options: dict[str, object] = {}
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"{}", b""
+
+    async def create_process(*command: str, **options: object) -> Process:
+        nonlocal observed_command, observed_options
+        observed_command = command
+        observed_options = options
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    output = await HermesCliFactory(
+        settings=HermesCliSettings(
+            executable="python.exe",
+            module_root=module_root,
+            evidence_root=tmp_path / "evidence",
+        )
+    )._run_skill_prompt("sealed prompt", max_seconds=30)
+
+    resolved_root = module_root.resolve()
+    environment = observed_options["env"]
+    assert isinstance(environment, dict)
+    assert output == b"{}"
+    assert observed_command == (
+        "python.exe",
+        "-m",
+        "hermes_cli.main",
+        "-z",
+        "sealed prompt",
+    )
+    assert Path(observed_options["cwd"]) == resolved_root
+    assert environment["PYTHONPATH"] == str(resolved_root)
+    assert environment["PYTHONPATH"] != "global-hermes-location"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("layout", ["missing", "missing_entrypoint", "file"])
+async def test_invalid_module_root_fails_closed_before_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    layout: str,
+) -> None:
+    module_root = tmp_path / "hermes-agent"
+    if layout == "missing_entrypoint":
+        module_root.mkdir()
+    elif layout == "file":
+        module_root.write_text("not a checkout\n", encoding="utf-8")
+    spawned = False
+
+    async def create_process(*_: str, **__: object) -> object:
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("invalid Hermes checkout must not be spawned")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    with pytest.raises(FactoryDispatchError, match="Hermes module root"):
+        await HermesCliFactory(
+            settings=HermesCliSettings(
+                executable="python.exe",
+                module_root=module_root,
+                evidence_root=tmp_path / "evidence",
+            )
+        )._run_skill_prompt("sealed prompt", max_seconds=30)
+
+    assert spawned is False
+
+
 def _architect_dispatch() -> tuple[FactoryDispatch, object]:
     factory_job = job()
     lease = issue_factory_lease(
