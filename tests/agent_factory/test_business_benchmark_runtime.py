@@ -802,6 +802,19 @@ async def test_preparation_binding_survives_restart_before_fence_registration(
     assert receipt.effect_id == effect_claim.identity.effect_id
 
 
+@pytest.mark.asyncio
+async def test_same_claim_fence_registration_replays_identically(tmp_path: Path) -> None:
+    _, scope, _, _, _, runtime, fence = runtime_parts(tmp_path)
+    env = envelope(scope.job, scope.candidate_ref)
+    await runtime.prepare(env)
+    effect_claim = claimed(env)
+
+    first = await fence.register_fence(effect_claim.prepared_effect, effect_claim)
+    second = await fence.register_fence(effect_claim.prepared_effect, effect_claim)
+
+    assert second == first
+
+
 def test_runtime_module_documents_deferred_provider_state_transitions() -> None:
     import inspect
 

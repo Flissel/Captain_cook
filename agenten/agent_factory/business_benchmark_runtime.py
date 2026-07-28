@@ -706,7 +706,7 @@ class BusinessBenchmarkDurableFenceAdapter:
     ) -> BusinessBenchmarkFenceReceiptV1:
         binding = self.binding_for(prepared, claim)
         state = self._provider_state.register_fence(
-            binding, registered_at=self._utc_now()
+            binding, registered_at=claim.acquired_at
         )
         evidence_ref = self._artifacts.put(
             canonical_business_benchmark_model_bytes(state),
