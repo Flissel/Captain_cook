@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from agenten.agent_factory.forge_contracts import (
     CodexBuildReceiptV1,
+    CreationJobV1,
+    CreationJobV2,
     codex_build_receipt_sha256,
 )
 from agenten.agent_factory.skill_workflow_contracts import (
@@ -49,6 +52,7 @@ def receipt_payload(**overrides: object) -> dict[str, object]:
         "attempt": 1,
         "assignment_id": ASSIGNMENT_ID,
         "idempotency_key": "b" * 64,
+        "seal_idempotency_key": "7" * 64,
         "build_brief_ref": ref("brief_codex-artifact", "b" * 64),
         "workspace_ref": "workspace://factory/workflow",
         "codex_session_ref": ref("codex-session", "c" * 64),
@@ -83,7 +87,7 @@ def seal_invocation_payload(**overrides: object) -> dict[str, object]:
         "input_ref": ref("brief_codex-artifact", "b" * 64),
         "input_sha256": "b" * 64,
         "lease": lease_payload("tool_integrator", "factory-tool-integrator"),
-        "idempotency_key": "b" * 64,
+        "idempotency_key": "7" * 64,
         "acceptance_assertion_ids": ["schema_valid", "real_case_green"],
     }
     payload.update(overrides)
@@ -174,7 +178,7 @@ def test_codex_build_evidence_binds_receipt_brief_and_captain_invocation() -> No
         ({"correlation_id": "00000000-0000-0000-0000-000000000399"}, "correlation"),
         ({"subject_version": 2}, "version"),
         ({"attempt": 2}, "attempt"),
-        ({"idempotency_key": "9" * 64}, "idempotency"),
+        ({"seal_idempotency_key": "9" * 64}, "idempotency"),
         ({"build_brief_ref": ref("different-brief", "9" * 64)}, "brief"),
         ({"workspace_ref": "workspace://factory/different"}, "workspace"),
         ({"acceptance_assertion_ids": ["schema_valid"]}, "assertion"),
@@ -219,3 +223,39 @@ def test_codex_build_evidence_requires_json_receipt_artifact() -> None:
 
     with pytest.raises(ValidationError, match="receipt.*application/json"):
         CodexBuildEvidenceV1.model_validate(payload)
+
+
+def test_creation_job_v2_binds_exact_captain_receipt_and_source() -> None:
+    legacy = CreationJobV1.model_validate_json(
+        Path("tests/fixtures/contracts/minibook_creation_job.v1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    receipt_data = receipt_payload(
+        factory_job_id=str(legacy.factory_job_id),
+        creation_job_id=str(legacy.creation_job_id),
+        correlation_id=str(legacy.correlation_id),
+        subject_version=legacy.subject_version,
+        attempt=legacy.attempt,
+        idempotency_key=legacy.idempotency_key,
+        acceptance_assertion_ids=list(legacy.public_assertion_ids),
+    )
+    receipt = CodexBuildReceiptV1.model_validate(receipt_data)
+    sealed_ref = receipt_ref(receipt_data)
+    payload = legacy.model_dump(mode="json", by_alias=True) | {
+        "schema": "minibook.creation-job.v2",
+        "source_archive_ref": receipt.source_archive_ref.model_dump(mode="json"),
+        "codex_build_receipt_ref": sealed_ref,
+        "codex_build_receipt": receipt.model_dump(mode="json", by_alias=True),
+    }
+
+    parsed = CreationJobV2.model_validate(payload)
+
+    assert parsed.codex_build_receipt == receipt
+    assert parsed.codex_build_receipt_ref.sha256 == codex_build_receipt_sha256(receipt)
+    changed = dict(payload)
+    changed["source_archive_ref"] = ref(
+        "different-source", "9" * 64, "application/zip"
+    )
+    with pytest.raises(ValidationError, match="receipt.*creation job"):
+        CreationJobV2.model_validate(changed)

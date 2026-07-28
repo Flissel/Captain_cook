@@ -171,6 +171,7 @@ class CaptainCodexBuildReceiptIssuer:
         build_brief: CodexBuildBriefV1,
         workspace_root: Path,
         codex_session_receipt: bytes,
+        seal_idempotency_key: str,
         candidate_manifest_path: str,
         source_archive_path: str,
         test_evidence_paths: Iterable[str],
@@ -208,19 +209,20 @@ class CaptainCodexBuildReceiptIssuer:
         manifest_bytes = snapshot_files[manifest_file.relative_to(root).as_posix()]
         manifest = _require_json_object(manifest_bytes, label="candidate manifest")
         source_bytes = snapshot_files[source_file.relative_to(root).as_posix()]
-        _require_safe_source_zip(source_bytes)
+        archived_manifest_bytes = _require_safe_source_zip(source_bytes)
+        if "source_archive_ref" in manifest:
+            raise CodexBuildProvenanceError(
+                "candidate manifest must not contain a self-referential source archive"
+            )
+        if archived_manifest_bytes != manifest_bytes:
+            raise CodexBuildProvenanceError(
+                "candidate manifest does not match the sealed source archive"
+            )
         test_bytes = tuple(
             snapshot_files[path.relative_to(root).as_posix()] for path in evidence_files
         )
         for content in test_bytes:
             _require_json_object(content, label="test evidence")
-
-        expected_source_ref = self._cas.reference_for(
-            source_bytes,
-            media_type="application/zip",
-            namespace="codex-source",
-        )
-        _require_manifest_source_binding(manifest, expected_source_ref)
 
         session_ref = self._cas.put_bytes(
             codex_session_receipt,
@@ -262,6 +264,7 @@ class CaptainCodexBuildReceiptIssuer:
                 "creation_job_id": str(assignment.creation_job_id),
                 "assignment_id": str(assignment.assignment_id),
                 "idempotency_key": assignment.idempotency_key,
+                "seal_idempotency_key": seal_idempotency_key,
                 "workspace_ref": assignment.workspace_ref,
                 "build_brief_ref": brief_ref.model_dump(mode="json"),
                 "codex_session_ref": session_ref.model_dump(mode="json"),
@@ -285,6 +288,7 @@ class CaptainCodexBuildReceiptIssuer:
                 "attempt": assignment.attempt,
                 "assignment_id": str(assignment.assignment_id),
                 "idempotency_key": assignment.idempotency_key,
+                "seal_idempotency_key": seal_idempotency_key,
                 "build_brief_ref": brief_ref.model_dump(mode="json"),
                 "workspace_ref": assignment.workspace_ref,
                 "codex_session_ref": session_ref.model_dump(mode="json"),
@@ -412,10 +416,11 @@ def _is_excluded(path: PurePosixPath, *, is_directory: bool) -> bool:
     return False
 
 
-def _require_safe_source_zip(content: bytes) -> None:
+def _require_safe_source_zip(content: bytes) -> bytes:
     try:
         with ZipFile(BytesIO(content)) as archive:
             names: set[str] = set()
+            candidate_manifest: bytes | None = None
             for item in archive.infolist():
                 normalized = item.filename.replace("\\", "/")
                 path = PurePosixPath(normalized)
@@ -447,6 +452,18 @@ def _require_safe_source_zip(content: bytes) -> None:
                     raise CodexBuildProvenanceError(
                         "source archive must not contain encrypted entries"
                     )
+                if normalized == "factory-candidate.json":
+                    if item.is_dir() or candidate_manifest is not None:
+                        raise CodexBuildProvenanceError(
+                            "source archive candidate manifest is ambiguous"
+                        )
+                    candidate_manifest = archive.read(item)
+            if candidate_manifest is None:
+                raise CodexBuildProvenanceError(
+                    "source archive candidate manifest is missing"
+                )
+            _require_json_object(candidate_manifest, label="candidate manifest")
+            return candidate_manifest
     except BadZipFile as exc:
         raise CodexBuildProvenanceError("source archive is not a valid ZIP") from exc
 
@@ -459,23 +476,6 @@ def _require_json_object(content: bytes, *, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise CodexBuildProvenanceError(f"{label} must be a UTF-8 JSON object")
     return value
-
-
-def _require_manifest_source_binding(
-    manifest: dict[str, Any],
-    source_ref: ArtifactRef,
-) -> None:
-    raw = manifest.get("source_archive_ref")
-    try:
-        bound = ArtifactRef.model_validate(raw)
-    except ValueError as exc:
-        raise CodexBuildProvenanceError(
-            "candidate manifest must contain a valid source archive reference"
-        ) from exc
-    if bound != source_ref:
-        raise CodexBuildProvenanceError(
-            "candidate manifest does not match the sealed source archive"
-        )
 
 
 def _canonical_json(value: object) -> bytes:

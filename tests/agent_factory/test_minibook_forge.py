@@ -9,6 +9,7 @@ import pytest
 
 from agenten.agent_factory.forge_contracts import (
     CreationJobV1,
+    CreationJobV2,
     ForgeBuildSkillUsageReceiptV1,
 )
 from agenten.agent_factory.contracts import AgentFactoryJob
@@ -24,7 +25,12 @@ from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from agenten.agent_factory.skill_workflow_contracts import (
     CodebaseInventoryV1,
     CodexBuildBriefV1,
+    CodexBuildEvidenceV1,
     FactorySkillStep,
+)
+from tests.agent_factory.test_codex_build_provenance_contracts import (
+    evidence_payload as codex_build_evidence_payload,
+    receipt_ref as codex_build_receipt_ref,
 )
 from tests.agent_factory.test_skill_workflow_contracts import (
     brief_payload,
@@ -155,12 +161,69 @@ def _workflow_evidence():
         }
     )
     brief = CodexBuildBriefV1.model_validate(brief_data)
-    return factory_job, inventory, brief
+    build_data = codex_build_evidence_payload()
+    build_invocation = build_data["invocation"]
+    assert isinstance(build_invocation, dict)
+    build_lease = build_invocation["lease"]
+    assert isinstance(build_lease, dict)
+    build_invocation.update(
+        {
+            "job_id": str(factory_job.job_id),
+            "correlation_id": str(factory_job.correlation_id),
+            "subject_version": factory_job.subject_version,
+            "attempt": 1,
+            "input_ref": brief.artifact_ref.model_dump(mode="json"),
+            "input_sha256": brief.artifact_ref.sha256,
+            "acceptance_assertion_ids": list(factory_job.acceptance_assertion_ids),
+        }
+    )
+    build_lease.update(
+        {
+            "job_id": str(factory_job.job_id),
+            "correlation_id": str(factory_job.correlation_id),
+            "subject_version": factory_job.subject_version,
+            "attempt": 1,
+            "workspace_ref": assignment["workspace_ref"],
+        }
+    )
+    receipt = build_data["build_receipt"]
+    assert isinstance(receipt, dict)
+    receipt.update(
+        {
+            "factory_job_id": str(factory_job.job_id),
+            "creation_job_id": assignment["creation_job_id"],
+            "correlation_id": str(factory_job.correlation_id),
+            "subject_version": factory_job.subject_version,
+            "attempt": 1,
+            "assignment_id": assignment["assignment_id"],
+            "idempotency_key": assignment["idempotency_key"],
+            "seal_idempotency_key": build_invocation["idempotency_key"],
+            "build_brief_ref": brief.artifact_ref.model_dump(mode="json"),
+            "workspace_ref": assignment["workspace_ref"],
+            "acceptance_assertion_ids": list(factory_job.acceptance_assertion_ids),
+        }
+    )
+    sealed_ref = codex_build_receipt_ref(receipt)
+    build_data.update(
+        {
+            "invocation": build_invocation,
+            "job_id": str(factory_job.job_id),
+            "correlation_id": str(factory_job.correlation_id),
+            "subject_version": factory_job.subject_version,
+            "attempt": 1,
+            "acceptance_assertion_ids": list(factory_job.acceptance_assertion_ids),
+            "build_receipt_ref": sealed_ref,
+            "evidence_refs": [sealed_ref],
+            "build_receipt": receipt,
+        }
+    )
+    build = CodexBuildEvidenceV1.model_validate(build_data)
+    return factory_job, inventory, brief, build
 
 
 class ForgeEvidence:
-    def __init__(self, inventory, brief) -> None:
-        self.artifacts = (inventory, brief)
+    def __init__(self, inventory, brief, build) -> None:
+        self.artifacts = (inventory, brief, build)
 
     def workflow_artifacts(self, job_id):
         assert job_id == self.artifacts[0].job_id
@@ -173,14 +236,14 @@ class ForgeEvidence:
 
 
 def test_creation_job_mapper_uses_exact_captain_brief_and_is_deterministic() -> None:
-    factory_job, inventory, brief = _workflow_evidence()
+    factory_job, inventory, brief, build = _workflow_evidence()
     request = FactoryDispatch(
         job=factory_job,
         action=FactoryAction(kind=FactoryActionKind.SUBMIT_FORGE_JOB, attempt=1),
         role=None,
         lease=None,
     )
-    mapper = CaptainCreationJobMapper(evidence=ForgeEvidence(inventory, brief))
+    mapper = CaptainCreationJobMapper(evidence=ForgeEvidence(inventory, brief, build))
 
     first = mapper.map(request)
     second = mapper.map(request)
@@ -188,6 +251,7 @@ def test_creation_job_mapper_uses_exact_captain_brief_and_is_deterministic() -> 
 
     assignment = brief.build_assignment
     assert first == second
+    assert isinstance(first, CreationJobV2)
     assert first.creation_job_id == assignment.creation_job_id
     assert first.factory_job_id == factory_job.job_id
     assert first.correlation_id == factory_job.correlation_id
@@ -201,6 +265,11 @@ def test_creation_job_mapper_uses_exact_captain_brief_and_is_deterministic() -> 
     assert first.released_skill.content_sha256 == brief.invocation.released_skill.content_sha256
     assert first.public_assertion_ids == factory_job.acceptance_assertion_ids
     assert first.deadline_at == factory_job.deadline_at
+    assert first.codex_build_receipt == build.build_receipt
+    assert first.codex_build_receipt_ref.model_dump(mode="json") == (
+        build.build_receipt_ref.model_dump(mode="json")
+    )
+    assert first.source_archive_ref == build.build_receipt.source_archive_ref
     assert receipt.producer == "hermes"
     assert receipt.outcome == "fulfilled"
     assert receipt.creation_job_id == first.creation_job_id
@@ -209,12 +278,16 @@ def test_creation_job_mapper_uses_exact_captain_brief_and_is_deterministic() -> 
     assert receipt.public_assertion_ids == first.public_assertion_ids
     assert any(ref.sha256 == inventory.artifact_ref.sha256 for ref in receipt.evidence_refs)
     assert any(ref.sha256 == brief.artifact_ref.sha256 for ref in receipt.evidence_refs)
+    assert any(ref.sha256 == build.artifact_ref.sha256 for ref in receipt.evidence_refs)
+    assert any(
+        ref.sha256 == build.build_receipt_ref.sha256 for ref in receipt.evidence_refs
+    )
 
 
 def test_creation_job_mapper_rejects_missing_blueprint_inventory_binding() -> None:
-    factory_job, inventory, brief = _workflow_evidence()
+    factory_job, inventory, brief, build = _workflow_evidence()
     changed = brief.model_copy(update={"context_refs": ()})
-    mapper = CaptainCreationJobMapper(evidence=ForgeEvidence(inventory, changed))
+    mapper = CaptainCreationJobMapper(evidence=ForgeEvidence(inventory, changed, build))
 
     with pytest.raises(RuntimeError, match="inventory"):
         mapper.map(
@@ -228,12 +301,12 @@ def test_creation_job_mapper_rejects_missing_blueprint_inventory_binding() -> No
 
 
 def test_creation_job_mapper_rejects_brief_for_different_input() -> None:
-    factory_job, inventory, brief = _workflow_evidence()
+    factory_job, inventory, brief, build = _workflow_evidence()
     changed_invocation = brief.invocation.model_copy(
         update={"input_ref": inventory.artifact_ref}
     )
     changed = brief.model_copy(update={"invocation": changed_invocation})
-    mapper = CaptainCreationJobMapper(evidence=ForgeEvidence(inventory, changed))
+    mapper = CaptainCreationJobMapper(evidence=ForgeEvidence(inventory, changed, build))
 
     with pytest.raises(RuntimeError, match="assignment"):
         mapper.map(
@@ -384,6 +457,86 @@ async def test_forge_starts_a_noninteractive_deadline_bounded_input_run(
     assert observed_skill_receipts == [
         Mapper().build_skill_receipt(request, Mapper().map(request))
     ]
+    assert result.status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_forge_v2_imports_exact_captain_source_without_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_path = tmp_path / "captain-source.zip"
+    source_path.write_bytes(b"captain-sealed-source")
+    received: list[str] = []
+    factory_job, inventory, brief, build = _workflow_evidence()
+    mapper = CaptainCreationJobMapper(
+        evidence=ForgeEvidence(inventory, brief, build)
+    )
+    request = FactoryDispatch(
+        job=factory_job,
+        action=FactoryAction(kind=FactoryActionKind.SUBMIT_FORGE_JOB, attempt=1),
+        role=None,
+        lease=None,
+    )
+    creation_job = mapper.map(request)
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self):
+            result_path = Path(received[received.index("--result-file") + 1])
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "minibook.creation-result.v1",
+                        "creation_job_id": str(creation_job.creation_job_id),
+                        "correlation_id": str(creation_job.correlation_id),
+                        "subject_version": creation_job.subject_version,
+                        "attempt": creation_job.attempt,
+                        "status": "succeeded",
+                        "package_manifest_ref": {
+                            "uri": "artifact://sha256/package",
+                            "sha256": "f" * 64,
+                            "media_type": "application/json",
+                        },
+                        "artifact_refs": [],
+                        "evidence_refs": [],
+                        "tool_gaps": [],
+                        "skill_usage_receipt_ref": {
+                            "uri": "artifact://sha256/skill-receipt",
+                            "sha256": "e" * 64,
+                            "media_type": "application/json",
+                        },
+                        "private_skill_candidate_ref": None,
+                        "failure": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return b"", b""
+
+    async def start(*command: str, **_kwargs: object) -> object:
+        received.extend(command)
+        return Process()
+
+    monkeypatch.setattr(
+        "agenten.agent_factory.minibook_forge.asyncio.create_subprocess_exec",
+        start,
+    )
+    forge = MinibookSwarmForge(
+        materializer=Materializer(source_path),
+        mapper=mapper,
+        skill_receipts=mapper,
+        settings=MinibookForgeSettings(
+            working_directory=tmp_path,
+            max_runtime_seconds=120,
+        ),
+    )
+
+    result = await forge.submit(request)
+
+    assert "--source-archive-file" in received
+    assert received[received.index("--source-archive-file") + 1] == str(source_path)
+    assert "--input-file" not in received
     assert result.status == "succeeded"
 
 

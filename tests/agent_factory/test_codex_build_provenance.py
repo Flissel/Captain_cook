@@ -60,23 +60,21 @@ def _workspace(tmp_path: Path, cas: CodexBuildArtifactCas) -> Path:
     (workspace / "src").mkdir(parents=True)
     (workspace / "src" / "team.py").write_text("TEAM = 'claims'\n", encoding="utf-8")
 
-    source_bytes = _zip_bytes({"src/team.py": b"TEAM = 'claims'\n"})
-    source_ref = cas.put_bytes(
-        source_bytes,
-        media_type="application/zip",
-        namespace="codex-source",
+    candidate_manifest = json.dumps(
+        {
+            "schema": "captain.factory-candidate.v1",
+            "candidate_id": "claims_team_v1",
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    source_bytes = _zip_bytes(
+        {
+            "factory-candidate.json": candidate_manifest,
+            "src/team.py": b"TEAM = 'claims'\n",
+        }
     )
     (workspace / "candidate.zip").write_bytes(source_bytes)
-    (workspace / "factory-candidate.json").write_text(
-        json.dumps(
-            {
-                "candidate_id": "claims_team_v1",
-                "source_archive_ref": source_ref.model_dump(mode="json"),
-            },
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
+    (workspace / "factory-candidate.json").write_bytes(candidate_manifest)
     (workspace / "test-evidence.json").write_text(
         json.dumps(
             {
@@ -111,6 +109,7 @@ def test_issuer_seals_deterministic_safe_workspace_and_exact_build_bindings(
         build_brief=brief,
         workspace_root=workspace,
         codex_session_receipt=b'{"provider":"codex","session_id":"session-123"}',
+        seal_idempotency_key="7" * 64,
         candidate_manifest_path="factory-candidate.json",
         source_archive_path="candidate.zip",
         test_evidence_paths=("test-evidence.json",),
@@ -122,6 +121,7 @@ def test_issuer_seals_deterministic_safe_workspace_and_exact_build_bindings(
         build_brief=brief,
         workspace_root=workspace,
         codex_session_receipt=b'{"provider":"codex","session_id":"session-123"}',
+        seal_idempotency_key="7" * 64,
         candidate_manifest_path="factory-candidate.json",
         source_archive_path="candidate.zip",
         test_evidence_paths=("test-evidence.json",),
@@ -142,6 +142,7 @@ def test_issuer_seals_deterministic_safe_workspace_and_exact_build_bindings(
     assert first.creation_job_id == brief.build_assignment.creation_job_id
     assert first.assignment_id == brief.build_assignment.assignment_id
     assert first.idempotency_key == brief.build_assignment.idempotency_key
+    assert first.seal_idempotency_key == "7" * 64
     assert first.workspace_ref == brief.build_assignment.workspace_ref
     assert first.build_brief_ref.model_dump(mode="json") == brief.artifact_ref.model_dump(
         mode="json"
@@ -184,6 +185,7 @@ def test_issuer_fails_closed_for_changed_binding_or_unbound_candidate_archive(
             build_brief=brief,
             workspace_root=workspace,
             codex_session_receipt=b'{"session_id":"session-123"}',
+            seal_idempotency_key="7" * 64,
             candidate_manifest_path="factory-candidate.json",
             source_archive_path="candidate.zip",
             test_evidence_paths=("test-evidence.json",),
@@ -191,7 +193,7 @@ def test_issuer_fails_closed_for_changed_binding_or_unbound_candidate_archive(
         )
 
     manifest = json.loads((workspace / "factory-candidate.json").read_text("utf-8"))
-    manifest["source_archive_ref"]["sha256"] = "f" * 64
+    manifest["candidate_id"] = "substituted_team_v1"
     (workspace / "factory-candidate.json").write_text(
         json.dumps(manifest, sort_keys=True), encoding="utf-8"
     )
@@ -201,6 +203,7 @@ def test_issuer_fails_closed_for_changed_binding_or_unbound_candidate_archive(
             build_brief=brief,
             workspace_root=workspace,
             codex_session_receipt=b'{"session_id":"session-123"}',
+            seal_idempotency_key="7" * 64,
             candidate_manifest_path="factory-candidate.json",
             source_archive_path="candidate.zip",
             test_evidence_paths=("test-evidence.json",),
@@ -220,6 +223,7 @@ def test_snapshot_rejects_symlinks_traversal_and_unsafe_source_zip(tmp_path: Pat
             build_brief=brief,
             workspace_root=workspace,
             codex_session_receipt=b'{"session_id":"session-123"}',
+            seal_idempotency_key="7" * 64,
             candidate_manifest_path="../outside.json",
             source_archive_path="candidate.zip",
             test_evidence_paths=("test-evidence.json",),
@@ -233,6 +237,7 @@ def test_snapshot_rejects_symlinks_traversal_and_unsafe_source_zip(tmp_path: Pat
             build_brief=brief,
             workspace_root=workspace,
             codex_session_receipt=b'{"session_id":"session-123"}',
+            seal_idempotency_key="7" * 64,
             candidate_manifest_path=".env",
             source_archive_path="candidate.zip",
             test_evidence_paths=("test-evidence.json",),
@@ -247,6 +252,7 @@ def test_snapshot_rejects_symlinks_traversal_and_unsafe_source_zip(tmp_path: Pat
             build_brief=brief,
             workspace_root=workspace,
             codex_session_receipt=b'{"session_id":"session-123"}',
+            seal_idempotency_key="7" * 64,
             candidate_manifest_path="factory-candidate.json",
             source_archive_path="candidate.zip",
             test_evidence_paths=("test-evidence.json",),
@@ -267,6 +273,7 @@ def test_snapshot_rejects_symlinks_traversal_and_unsafe_source_zip(tmp_path: Pat
             build_brief=brief,
             workspace_root=workspace,
             codex_session_receipt=b'{"session_id":"session-123"}',
+            seal_idempotency_key="7" * 64,
             candidate_manifest_path="factory-candidate.json",
             source_archive_path="candidate.zip",
             test_evidence_paths=("test-evidence.json",),

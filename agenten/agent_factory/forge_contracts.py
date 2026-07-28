@@ -313,6 +313,7 @@ class CodexBuildReceiptV1(_FrozenContract):
     attempt: int = Field(ge=1, le=5, strict=True)
     assignment_id: UUID
     idempotency_key: str = Field(pattern=SHA256_PATTERN)
+    seal_idempotency_key: str = Field(pattern=SHA256_PATTERN)
     build_brief_ref: ArtifactRef
     workspace_ref: str = Field(pattern=r"^workspace://[A-Za-z0-9._:/-]+$")
     codex_session_ref: ArtifactRef
@@ -384,3 +385,38 @@ def codex_build_receipt_sha256(receipt: CodexBuildReceiptV1) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
+
+class CreationJobV2(CreationJobV1):
+    """Minibook request bound to one Captain-sealed Codex build."""
+
+    schema_name: Literal["minibook.creation-job.v2"] = Field(
+        default="minibook.creation-job.v2",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    source_archive_ref: ArtifactRef
+    codex_build_receipt_ref: ArtifactRef
+    codex_build_receipt: CodexBuildReceiptV1
+
+    @model_validator(mode="after")
+    def require_exact_codex_build_binding(self) -> "CreationJobV2":
+        receipt = self.codex_build_receipt
+        if (
+            self.source_archive_ref.media_type != "application/zip"
+            or self.codex_build_receipt_ref.media_type != "application/json"
+            or self.codex_build_receipt_ref.sha256
+            != codex_build_receipt_sha256(receipt)
+            or receipt.creation_job_id != self.creation_job_id
+            or receipt.factory_job_id != self.factory_job_id
+            or receipt.correlation_id != self.correlation_id
+            or receipt.subject_version != self.subject_version
+            or receipt.attempt != self.attempt
+            or receipt.idempotency_key != self.idempotency_key
+            or receipt.acceptance_assertion_ids != self.public_assertion_ids
+            or receipt.source_archive_ref.sha256 != self.source_archive_ref.sha256
+            or receipt.source_archive_ref.media_type
+            != self.source_archive_ref.media_type
+        ):
+            raise ValueError("Codex build receipt does not match creation job")
+        return self

@@ -16,6 +16,7 @@ from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatch
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.forge_contracts import (
     CreationJobV1,
+    CreationJobV2,
     CreationProgressV1,
     CreationResultV1,
     CreationSubmissionReceipt,
@@ -25,6 +26,7 @@ from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import (
     CodebaseInventoryV1,
     CodexBuildBriefV1,
+    CodexBuildEvidenceV1,
     FactorySkillStep,
 )
 from agenten.agent_factory.state_machine import FactoryActionKind
@@ -86,17 +88,25 @@ class CaptainCreationJobMapper:
             if isinstance(artifact, CodexBuildBriefV1)
             and _matches_dispatch(artifact, job, attempt)
         )
-        if len(inventories) != 1 or len(briefs) != 1:
+        builds = tuple(
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, CodexBuildEvidenceV1)
+            and _matches_dispatch(artifact, job, attempt)
+        )
+        if len(inventories) != 1 or len(briefs) != 1 or len(builds) != 1:
             raise FactoryDispatchError(
-                "creation job requires exactly one Captain inventory and Codex brief"
+                "creation job requires exactly one Captain inventory, Codex brief, and sealed build"
             )
         inventory = inventories[0]
         brief = briefs[0]
+        build = builds[0]
 
         if inventory.artifact_ref not in brief.context_refs:
             raise FactoryDispatchError("Codex brief is not bound to the Captain inventory")
 
         assignment = brief.build_assignment
+        receipt = build.build_receipt
         released = self._evidence.released_for(job, FactorySkillStep.BRIEF_CODEX)
         invoked = brief.invocation.released_skill
         if released != invoked:
@@ -112,9 +122,21 @@ class CaptainCreationJobMapper:
             != tuple(job.acceptance_assertion_ids)
         ):
             raise FactoryDispatchError("Codex assignment does not match the dispatched job")
+        if (
+            build.invocation.input_ref != brief.artifact_ref
+            or not _same_artifact_ref(receipt.build_brief_ref, brief.artifact_ref)
+            or receipt.assignment_id != assignment.assignment_id
+            or receipt.creation_job_id != assignment.creation_job_id
+            or receipt.idempotency_key != assignment.idempotency_key
+            or receipt.workspace_ref != assignment.workspace_ref
+        ):
+            raise FactoryDispatchError(
+                "Captain-sealed Codex build does not match the build assignment"
+            )
 
-        return CreationJobV1.model_validate(
+        return CreationJobV2.model_validate(
             {
+                "schema": "minibook.creation-job.v2",
                 "creation_job_id": assignment.creation_job_id,
                 "factory_job_id": job.job_id,
                 "correlation_id": job.correlation_id,
@@ -133,6 +155,15 @@ class CaptainCreationJobMapper:
                 },
                 "public_assertion_ids": assignment.public_assertion_ids,
                 "deadline_at": assignment.deadline_at,
+                "source_archive_ref": receipt.source_archive_ref.model_dump(
+                    mode="json"
+                ),
+                "codex_build_receipt_ref": build.build_receipt_ref.model_dump(
+                    mode="json"
+                ),
+                "codex_build_receipt": receipt.model_dump(
+                    mode="json", by_alias=True
+                ),
             }
         )
 
@@ -160,17 +191,26 @@ class CaptainCreationJobMapper:
             if isinstance(artifact, CodexBuildBriefV1)
             and _matches_dispatch(artifact, request.job, request.action.attempt)
         )
-        if len(inventories) != 1 or len(briefs) != 1:
+        builds = tuple(
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, CodexBuildEvidenceV1)
+            and _matches_dispatch(artifact, request.job, request.action.attempt)
+        )
+        if len(inventories) != 1 or len(briefs) != 1 or len(builds) != 1:
             raise FactoryDispatchError(
-                "Forge skill receipt requires exact Hermes inventory and brief evidence"
+                "Forge skill receipt requires exact inventory, brief, and build evidence"
             )
         inventory = inventories[0]
         brief = briefs[0]
+        build = builds[0]
         evidence_refs_by_identity = {
             (reference.uri, reference.sha256, reference.media_type): reference
             for reference in (
                 inventory.artifact_ref,
                 brief.artifact_ref,
+                build.artifact_ref,
+                build.build_receipt_ref,
                 *inventory.evidence_refs,
                 *brief.evidence_refs,
             )
@@ -312,7 +352,12 @@ class MinibookSwarmForge(MinibookForgePort):
             request,
             creation_job,
         )
-        input_path = self._materializer.materialize(request.job.input_ref)
+        materialized_ref = (
+            creation_job.source_archive_ref
+            if isinstance(creation_job, CreationJobV2)
+            else request.job.input_ref
+        )
+        input_path = self._materializer.materialize(materialized_ref)
         if not input_path.is_file():
             raise FactoryDispatchError("factory input artifact did not materialize to a file")
         if self._settings.max_runtime_seconds <= 0:
@@ -355,10 +400,15 @@ class MinibookSwarmForge(MinibookForgePort):
                 encoding="utf-8",
             )
             try:
+                source_option = (
+                    "--source-archive-file"
+                    if isinstance(creation_job, CreationJobV2)
+                    else "--input-file"
+                )
                 process = await asyncio.create_subprocess_exec(
                     self._settings.python_executable,
                     str(self._settings.swarm_script),
-                    "--input-file",
+                    source_option,
                     str(input_path),
                     "--creation-job-file",
                     str(creation_job_path),

@@ -44,6 +44,7 @@ from agenten.agent_factory.skill_evaluation import (
 from agenten.agent_factory.skill_workflow_contracts import (
     CandidateRevisionV1,
     CodexBuildBriefV1,
+    CodexBuildEvidenceV1,
     FactorySkillInvocationV1,
     FactorySkillStep,
     TeamEvaluationV1,
@@ -63,16 +64,77 @@ from tests.agent_factory.test_skill_workflow_contracts import (
     invocation_payload,
     revision_payload,
 )
+from tests.agent_factory.test_codex_build_provenance_contracts import (
+    evidence_payload as codex_build_evidence_payload,
+    receipt_ref as codex_build_receipt_ref,
+)
 
 
 _STEP_SKILL_NAMES = {
     FactorySkillStep.DISCOVER: "captain-factory-discover",
     FactorySkillStep.BRIEF_CODEX: "captain-factory-brief-codex",
+    FactorySkillStep.SEAL_CODEX_BUILD: "captain-factory-seal-codex-build",
     FactorySkillStep.EXECUTE_TEAM: "captain-factory-execute-team",
     FactorySkillStep.EVALUATE_TEAM: "captain-factory-evaluate-team",
     FactorySkillStep.IMPROVE_TEAM: "captain-factory-improve-team",
     FactorySkillStep.REPORT_CAPTAIN: "captain-factory-report-captain",
 }
+
+
+class CaptainBuildSealer:
+    def __init__(self) -> None:
+        self.calls: list[
+            tuple[FactoryDispatch, FactorySkillInvocationV1, CodexBuildBriefV1]
+        ] = []
+
+    async def seal(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+    ) -> CodexBuildEvidenceV1:
+        self.calls.append((request, invocation, brief))
+        assignment = brief.build_assignment
+        payload = codex_build_evidence_payload()
+        receipt = payload["build_receipt"]
+        assert isinstance(receipt, dict)
+        receipt.update(
+            {
+                "factory_job_id": str(request.job.job_id),
+                "creation_job_id": str(assignment.creation_job_id),
+                "correlation_id": str(request.job.correlation_id),
+                "subject_version": request.job.subject_version,
+                "attempt": invocation.attempt,
+                "assignment_id": str(assignment.assignment_id),
+                "idempotency_key": assignment.idempotency_key,
+                "seal_idempotency_key": invocation.idempotency_key,
+                "build_brief_ref": brief.artifact_ref.model_dump(mode="json"),
+                "workspace_ref": assignment.workspace_ref,
+                "acceptance_assertion_ids": list(
+                    request.job.acceptance_assertion_ids
+                ),
+                "completed_at": invocation.lease.issued_at,
+            }
+        )
+        receipt_reference = codex_build_receipt_ref(receipt)
+        payload.update(
+            {
+                "invocation": invocation.model_dump(mode="json", by_alias=True),
+                "invocation_id": str(invocation.invocation_id),
+                "job_id": str(request.job.job_id),
+                "correlation_id": str(request.job.correlation_id),
+                "subject_version": request.job.subject_version,
+                "attempt": invocation.attempt,
+                "occurred_at": invocation.lease.issued_at,
+                "evidence_refs": [receipt_reference],
+                "acceptance_assertion_ids": list(
+                    request.job.acceptance_assertion_ids
+                ),
+                "build_receipt_ref": receipt_reference,
+                "build_receipt": receipt,
+            }
+        )
+        return CodexBuildEvidenceV1.model_validate(payload)
 
 
 def _directory_digest(path: Path) -> str:
@@ -923,8 +985,8 @@ async def test_retry_sequence_requires_captain_improvement_authority(
         tmp_path,
         FactorySkillStep.IMPROVE_TEAM,
         FactorySkillStep.BRIEF_CODEX,
+        FactorySkillStep.SEAL_CODEX_BUILD,
     )
-
     async def create_process(*_: str, **__: object) -> object:
         raise AssertionError("Hermes must not run without Captain retry authority")
 
@@ -976,7 +1038,9 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
         tmp_path,
         FactorySkillStep.IMPROVE_TEAM,
         FactorySkillStep.BRIEF_CODEX,
+        FactorySkillStep.SEAL_CODEX_BUILD,
     )
+    sealer = CaptainBuildSealer()
     invocations: list[dict[str, object]] = []
 
     class Process:
@@ -1013,6 +1077,7 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
             evidence_root=tmp_path / "evidence",
         ),
         released_skill_catalog=catalog,
+        codex_build_sealer=sealer,
         clock=lambda: lease.issued_at,
     ).dispatch(request)
 
@@ -1024,8 +1089,11 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
         mode="json"
     )
     assert invocations[1]["input_ref"] == revision_payload()["artifact_ref"]
+    assert len(sealer.calls) == 1
+    assert sealer.calls[0][1].step is FactorySkillStep.SEAL_CODEX_BUILD
+    assert sealer.calls[0][1].input_ref == sealer.calls[0][2].artifact_ref
     assert evidence.phase is FactoryPhase.TOOL_CANDIDATE_TESTED
-    assert len(evidence.artifact_refs) == 2
+    assert len(evidence.artifact_refs) == 3
 
 
 @pytest.mark.asyncio

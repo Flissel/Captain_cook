@@ -355,7 +355,7 @@ class CodexBuildEvidenceV1(_WorkflowArtifactBase):
             raise ValueError("Codex build receipt version mismatch")
         if receipt.attempt != self.attempt:
             raise ValueError("Codex build receipt attempt mismatch")
-        if receipt.idempotency_key != invocation.idempotency_key:
+        if receipt.seal_idempotency_key != invocation.idempotency_key:
             raise ValueError("Codex build receipt idempotency mismatch")
         if receipt.workspace_ref != invocation.lease.workspace_ref:
             raise ValueError("Codex build receipt workspace mismatch")

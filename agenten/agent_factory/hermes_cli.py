@@ -46,6 +46,7 @@ from agenten.agent_factory.skill_workflow_contracts import (
     CandidateRevisionV1,
     CodebaseInventoryV1,
     CodexBuildBriefV1,
+    CodexBuildEvidenceV1,
     FactoryFeedbackRecommendation,
     FactoryFeedbackV1,
     FactorySkillInvocationV1,
@@ -103,6 +104,17 @@ class ReleasedFactorySkillCatalog(Protocol):
     ) -> ReleasedHermesSkill: ...
 
 
+class CaptainCodexBuildSealerPort(Protocol):
+    """Captain-only bridge from an approved brief to sealed build evidence."""
+
+    async def seal(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+    ) -> CodexBuildEvidenceV1: ...
+
+
 class FilesystemReleasedFactorySkillCatalog:
     """Load Captain release envelopes from an exact job/step catalog path."""
 
@@ -141,12 +153,14 @@ class HermesCliFactory(HermesFactoryPort):
         released_skill_catalog: ReleasedFactorySkillCatalog | None = None,
         sequence_policy: SkillSequencePolicy | None = None,
         replay_store: FactorySkillReplayStore | None = None,
+        codex_build_sealer: CaptainCodexBuildSealerPort | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._settings = settings
         self._evidence_store = evidence_store or FilesystemFactoryEvidenceStore(settings.evidence_root)
         self._released_skill_catalog = released_skill_catalog
         self._sequence_policy = sequence_policy or SkillSequencePolicy()
+        self._codex_build_sealer = codex_build_sealer
         self._replay_store = (
             replay_store
             if replay_store is not None
@@ -217,11 +231,28 @@ class HermesCliFactory(HermesFactoryPort):
                     break
                 continue
             try:
-                stdout = await self._run_skill_prompt(
-                    _factory_skill_prompt(invocation, skill_name=skill_name),
-                    max_seconds=_remaining_deadline_seconds(deadline),
-                )
-                artifact = _parse_workflow_artifact(stdout, step=step)
+                if step is FactorySkillStep.SEAL_CODEX_BUILD:
+                    if self._codex_build_sealer is None:
+                        raise FactoryDispatchError(
+                            "Captain Codex build sealer is not configured"
+                        )
+                    if not artifacts or not isinstance(
+                        artifacts[-1], CodexBuildBriefV1
+                    ):
+                        raise FactoryDispatchError(
+                            "Codex build sealing requires the exact preceding brief"
+                        )
+                    artifact = await self._codex_build_sealer.seal(
+                        request,
+                        invocation,
+                        artifacts[-1],
+                    )
+                else:
+                    stdout = await self._run_skill_prompt(
+                        _factory_skill_prompt(invocation, skill_name=skill_name),
+                        max_seconds=_remaining_deadline_seconds(deadline),
+                    )
+                    artifact = _parse_workflow_artifact(stdout, step=step)
                 if artifact.invocation != invocation:
                     raise FactoryDispatchError(
                         f"Hermes {step.value} artifact does not match the Captain invocation"
@@ -285,6 +316,11 @@ class HermesCliFactory(HermesFactoryPort):
         now = self._clock()
         _validate_factory_dispatch(request, now=now)
         _validated_improvement_authorization(request)
+        if (
+            request.role is FactoryRole.TOOL_INTEGRATOR
+            and self._codex_build_sealer is None
+        ):
+            raise FactoryDispatchError("Captain Codex build sealer is not configured")
         for step in self._sequence_policy.steps_for(
             role=request.role,
             attempt=request.action.attempt,
@@ -490,6 +526,7 @@ class HermesCliFactory(HermesFactoryPort):
 _FactoryWorkflowArtifact = (
     CodebaseInventoryV1
     | CodexBuildBriefV1
+    | CodexBuildEvidenceV1
     | TeamExecutionEvidenceV1
     | TeamEvaluationV1
     | CandidateRevisionV1
@@ -877,6 +914,7 @@ def _existing_replay_claim(
 _STEP_RESULT_MODELS: dict[FactorySkillStep, type[BaseModel]] = {
     FactorySkillStep.DISCOVER: CodebaseInventoryV1,
     FactorySkillStep.BRIEF_CODEX: CodexBuildBriefV1,
+    FactorySkillStep.SEAL_CODEX_BUILD: CodexBuildEvidenceV1,
     FactorySkillStep.EXECUTE_TEAM: TeamExecutionEvidenceV1,
     FactorySkillStep.EVALUATE_TEAM: TeamEvaluationV1,
     FactorySkillStep.IMPROVE_TEAM: CandidateRevisionV1,
@@ -1113,6 +1151,7 @@ def _parse_workflow_artifact(
         (
             CodebaseInventoryV1,
             CodexBuildBriefV1,
+            CodexBuildEvidenceV1,
             TeamExecutionEvidenceV1,
             TeamEvaluationV1,
             CandidateRevisionV1,
