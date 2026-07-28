@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -122,6 +123,7 @@ GATEWAY_OWNED_EVENT_TYPES = frozenset(
 )
 TRANSIENT_TRANSACTION_ERRORS = frozenset({1020, 1213})
 TRANSACTION_ATTEMPTS = 3
+TRANSACTION_RETRY_DELAYS_SECONDS = (0.05, 0.1)
 WriteResult = TypeVar("WriteResult")
 
 
@@ -867,6 +869,14 @@ class GatewayStore:
         return FactoryWriteReceipt(event_id=job.event_id, replayed=False)
 
     def reserve_factory_budget(
+        self,
+        reservation: FactoryBudgetReservationV1,
+    ) -> FactoryBudgetReservationWriteReceipt:
+        return self._retry_write(
+            lambda: self._reserve_factory_budget_once(reservation)
+        )
+
+    def _reserve_factory_budget_once(
         self,
         reservation: FactoryBudgetReservationV1,
     ) -> FactoryBudgetReservationWriteReceipt:
@@ -3536,6 +3546,7 @@ class GatewayStore:
                     or attempt == TRANSACTION_ATTEMPTS - 1
                 ):
                     raise
+                time.sleep(TRANSACTION_RETRY_DELAYS_SECONDS[attempt])
         raise RuntimeError("unreachable transaction retry state")
 
     def append(self, request: BlockWrite, claim_token: str | None) -> dict[str, Any]:

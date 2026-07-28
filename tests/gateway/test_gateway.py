@@ -591,6 +591,8 @@ def test_append_retries_only_documented_transaction_errors(
     request = BlockRequest(block_type="work_batch", data=batch_payload())
     original = store._append_once
     attempts = 0
+    retry_delays: list[float] = []
+    monkeypatch.setattr("gateway.store.time.sleep", retry_delays.append)
 
     def transient_then_success(request: BlockRequest, claim_token: str | None) -> dict[str, Any]:
         nonlocal attempts
@@ -602,6 +604,7 @@ def test_append_retries_only_documented_transaction_errors(
     monkeypatch.setattr(store, "_append_once", transient_then_success)
     assert store.append(request, None)["block_type"] == "work_batch"
     assert attempts == 3
+    assert retry_delays == [0.05, 0.1]
 
     monkeypatch.setattr(
         store,
@@ -611,6 +614,7 @@ def test_append_retries_only_documented_transaction_errors(
     with pytest.raises(OperationalError) as error:
         store.append(BlockRequest(block_type="work_batch", data=batch_payload("batch-2")), None)
     assert error.value.args[0] == 9999
+    assert retry_delays == [0.05, 0.1]
 
     exhausted_attempts = 0
 
@@ -624,6 +628,7 @@ def test_append_retries_only_documented_transaction_errors(
         store.append(BlockRequest(block_type="work_batch", data=batch_payload("batch-3")), None)
     assert exhausted.value.args[0] == 1213
     assert exhausted_attempts == 3
+    assert retry_delays == [0.05, 0.1, 0.05, 0.1]
 
 
 def test_claim_heartbeat_and_approval_share_bounded_transaction_retry(
