@@ -32,6 +32,9 @@ from agenten.agent_factory.business_benchmark_execution import (
     BenchmarkExecutionPolicyV1,
     BusinessBenchmarkExecutorPort,
 )
+from agenten.agent_factory.business_benchmark_dispatch import (
+    BusinessBenchmarkDispatchInputs,
+)
 from agenten.agent_factory.business_benchmark_factory import BusinessBenchmarkFactoryResult
 from agenten.agent_factory.business_benchmark_live import (
     BusinessBenchmarkExpectedCaseV1,
@@ -46,10 +49,12 @@ from agenten.agent_factory.business_benchmark_replay import (
     BusinessBenchmarkReplayStore,
 )
 from agenten.agent_factory.candidate_evaluation import ResolvedFactoryCandidate
-from agenten.agent_factory.contracts import AgentFactoryJobV3
+from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryRole
 from agenten.agent_factory.execution_budget import FactoryBudgetProjection
 from agenten.agent_factory.execution_policy import FactoryLiveCapability
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
+from agenten.agent_factory.orchestration import FactoryDispatch
+from agenten.agent_factory.state_machine import FactoryActionKind
 from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillInvocationV1,
     FactorySkillStep,
@@ -595,6 +600,76 @@ class ProductionBusinessBenchmarkComposition:
             for selection in canonical.selections
         )
         return tuple(item.scope.expected_scope for item in prepared)
+
+    def dispatch_inputs(
+        self,
+        settings: LiveBusinessBenchmarkSettings,
+        request: FactoryDispatch,
+    ) -> BusinessBenchmarkDispatchInputs:
+        """Resolve the exact Quality-Warden inputs without running a provider."""
+
+        canonical = LiveBusinessBenchmarkSettings.model_validate(
+            settings.model_dump(mode="python")
+        )
+        if canonical.profile == "all" or len(canonical.selections) != 1:
+            raise BusinessBenchmarkProductionScopeError(
+                "production dispatch inputs require single team settings"
+            )
+        selection = canonical.selections[0]
+        if (
+            not isinstance(request.job, AgentFactoryJobV3)
+            or request.job.job_id != selection.job_id
+            or request.action.job_id != selection.job_id
+            or request.action.attempt != selection.attempt
+            or request.action.kind is not FactoryActionKind.DISPATCH_QUALITY_WARDEN
+            or request.role is not FactoryRole.QUALITY_WARDEN
+            or request.lease is None
+        ):
+            raise BusinessBenchmarkProductionScopeError(
+                "production dispatch request is outside the benchmark selection"
+            )
+        prepared = self._prepare_scope(canonical)
+        scope = prepared.scope
+        if request.job != scope.job or request.lease != scope.evaluation_invocation.lease:
+            raise BusinessBenchmarkProductionScopeError(
+                "production dispatch lease or job does not match resolved authority"
+            )
+
+        def exact_case_policy(
+            benchmark_case: BusinessBenchmarkCaseV1,
+        ) -> BenchmarkExecutionPolicyV1:
+            expected_case = next(
+                (
+                    item
+                    for item in scope.suite.cases
+                    if item.case_id == benchmark_case.case_id
+                ),
+                None,
+            )
+            if expected_case is None or canonical_business_benchmark_model_bytes(
+                expected_case
+            ) != canonical_business_benchmark_model_bytes(benchmark_case):
+                raise BusinessBenchmarkProductionScopeError(
+                    "Factory requested a case outside the preflighted suite"
+                )
+            return prepared.case_policies[benchmark_case.case_id]
+
+        return BusinessBenchmarkDispatchInputs(
+            profile_id=scope.profile_id,
+            suite_version=scope.selection.suite_version,
+            candidate_ref=scope.candidate_ref,
+            executor=prepared.executor,
+            replay_store=prepared.replay_store,
+            execution_policy_factory=exact_case_policy,
+            benchmark_policy=prepared.policy_binding.policy,
+            evaluation_invocation=scope.evaluation_invocation,
+            report_invocation_factory=lambda evaluation: self._report_invocation(
+                scope,
+                evaluation,
+            ),
+            technical_executions=scope.technical_executions,
+            budget_projection=scope.budget_projection,
+        )
 
     async def run(
         self, settings: LiveBusinessBenchmarkSettings

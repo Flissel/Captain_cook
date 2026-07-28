@@ -22,6 +22,9 @@ from agenten.agent_factory.business_benchmark_contracts import (
 from agenten.agent_factory.business_benchmark_execution import (
     BenchmarkExecutionPolicyV1,
 )
+from agenten.agent_factory.business_benchmark_dispatch import (
+    BusinessBenchmarkDispatchInputs,
+)
 from agenten.agent_factory.business_benchmark_live import (
     BusinessBenchmarkFinalizedReceiptV1,
     BusinessBenchmarkTeamSelectionV1,
@@ -41,6 +44,8 @@ from agenten.agent_factory.business_benchmark_production_ports import (
 )
 from agenten.agent_factory.candidate_evaluation import ResolvedFactoryCandidate
 from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryRole
+from agenten.agent_factory.orchestration import FactoryDispatch
+from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from agenten.agent_factory.execution_budget import FactoryBudgetProjection
 from agenten.agent_factory.execution_policy import (
     FactoryExecutionMode,
@@ -736,6 +741,60 @@ async def test_production_composition_runs_one_isolated_team_and_returns_exact_e
     assert report.input_ref == factory.last_result.evaluation.artifact_ref
     assert set(result.summary_refs).issubset(result.evidence_refs)
     assert all(item.receipt_ref in result.evidence_refs for item in result.receipts)
+
+
+def test_production_composition_prepares_dispatch_inputs_without_provider_effects(
+    tmp_path: Path,
+) -> None:
+    job, manifest, _, invocations, resolver = authorities(tmp_path)
+    factory = FactoryComposition(job, manifest.source_archive_ref)
+    executor = object()
+    replay = object()
+    execution_policy = BenchmarkExecutionPolicyV1(
+        schema="captain.business-benchmark-execution-policy.v1",
+        model_version="approved-model-id",
+        baseline_system_policy_version="baseline-v1",
+        maximum_cost_micro_usd=100,
+        maximum_latency_ms=1000,
+        redaction_policy_version="redaction-v1",
+    )
+    composition = ProductionBusinessBenchmarkComposition(
+        resolver=resolver,
+        factory_composition=factory,
+        invocation_authority=invocations,
+        executor_factory=lambda scope: executor,
+        replay_store_factory=lambda scope: replay,
+        execution_policy_factory=lambda scope: (lambda case: execution_policy),
+        benchmark_policy_authority=PolicyAuthority(job),
+        receipt_finalizer=Finalizer(),
+        clock=lambda: NOW,
+    )
+    evaluation_invocation = invocations.evaluation_invocation(job=job, attempt=1)
+    request = FactoryDispatch(
+        job=job,
+        action=FactoryAction(
+            kind=FactoryActionKind.DISPATCH_QUALITY_WARDEN,
+            attempt=1,
+            job_id=job.job_id,
+        ),
+        role=FactoryRole.QUALITY_WARDEN,
+        lease=evaluation_invocation.lease,
+    )
+
+    inputs = composition.dispatch_inputs(
+        settings(job, manifest.candidate_id),
+        request,
+    )
+
+    assert isinstance(inputs, BusinessBenchmarkDispatchInputs)
+    assert inputs.candidate_ref == manifest.source_archive_ref
+    assert inputs.executor is executor
+    assert inputs.replay_store is replay
+    assert inputs.evaluation_invocation == evaluation_invocation
+    assert inputs.technical_executions
+    assert inputs.budget_projection.job_id == job.job_id
+    assert inputs.execution_policy_factory(suite().cases[0]) == execution_policy
+    assert factory.calls == []
 
 
 @pytest.mark.asyncio
