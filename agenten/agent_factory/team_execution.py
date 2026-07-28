@@ -1371,15 +1371,17 @@ class HostAutoGenSessionExecutor:
         case_ref: PrivateHoldoutRef,
         identity: HostAutoGenSessionIdentityV1,
         candidate: ResolvedFactoryCandidate,
+        manifest: FactoryAutoGenTeamManifestV1 | None = None,
         allowed_models: tuple[str, ...],
         max_seconds: float,
     ) -> HostAutoGenSessionResult:
+        expected_manifest = manifest
         for lock in self._session_locks:
             await lock.acquire()
         try:
             with self._evaluator.verified_team_workspace(candidate) as (
                 workspace,
-                manifest,
+                verified_manifest,
             ):
                 return await self._run_candidate_session(
                     job=job,
@@ -1387,7 +1389,8 @@ class HostAutoGenSessionExecutor:
                     case_ref=case_ref,
                     identity=identity,
                     workspace=workspace,
-                    manifest=manifest,
+                    manifest=verified_manifest,
+                    expected_manifest=expected_manifest,
                     candidate=candidate,
                     allowed_models=allowed_models,
                     max_seconds=max_seconds,
@@ -1405,10 +1408,13 @@ class HostAutoGenSessionExecutor:
         identity: HostAutoGenSessionIdentityV1,
         workspace: Path,
         manifest: FactoryAutoGenTeamManifestV1,
+        expected_manifest: FactoryAutoGenTeamManifestV1 | None,
         candidate: ResolvedFactoryCandidate,
         allowed_models: tuple[str, ...],
         max_seconds: float,
     ) -> HostAutoGenSessionResult:
+        if expected_manifest is not None and manifest != expected_manifest:
+            raise ValueError("verified candidate manifest changed after runtime preflight")
         self._validate_identity(
             job=job,
             invocation=invocation,
