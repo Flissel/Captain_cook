@@ -104,6 +104,10 @@
   v13 exposed missing Captain job context, while v14 exposed a narrowly
   malformed Hermes nesting/Invocation echo. Those failures triggered the
   architectural replacement above instead of further prompt tuning. Brief skill
-  release v2 and immutable suite/seed v15 are prepared with a `0.09` USD Hermes
-  ceiling, but v15 has not been executed. No run reached a benchmark, Gateway
-  promotion, or Minibook projection.
+  release v2 and immutable suite/seed v15 were executed with a `0.09` USD Hermes
+  ceiling and reached the Codex build boundary, where the WindowsApps native
+  binary failed ProcessStart with access denied. The next resumable execution
+  probes a launchable native npm Codex binary. Because the v15 failure replay is
+  immutable, the repaired path uses fresh suite/seed v16 with a reduced `0.08`
+  USD Hermes ceiling so cumulative worst-case spend remains below `1.00` USD.
+  No run has yet reached a benchmark, Gateway promotion, or Minibook projection.

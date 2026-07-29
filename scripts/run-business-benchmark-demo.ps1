@@ -13,6 +13,61 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Test-NativeExecutableLaunch {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (
+        -not (Test-Path -LiteralPath $Path -PathType Leaf) -or
+        [IO.Path]::GetExtension($Path) -cne '.exe'
+    ) {
+        return $false
+    }
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = [IO.Path]::GetFullPath($Path)
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.ArgumentList.Add("--version")
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            return $false
+        }
+        if (-not $process.WaitForExit(10000)) {
+            $process.Kill($true)
+            $process.WaitForExit()
+            return $false
+        }
+        return $process.ExitCode -eq 0
+    }
+    catch {
+        return $false
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
+function Resolve-LaunchableCodexExecutable {
+    $candidates = [Collections.Generic.List[string]]::new()
+    $applicationData = [Environment]::GetFolderPath('ApplicationData')
+    $npmOptionalDependencies = Join-Path $applicationData 'npm\node_modules\@openai\codex\node_modules'
+    if (Test-Path -LiteralPath $npmOptionalDependencies -PathType Container) {
+        Get-ChildItem -Path (Join-Path $npmOptionalDependencies '@openai\codex-win32-*\vendor\*\bin\codex.exe') -File -ErrorAction SilentlyContinue |
+            ForEach-Object { $candidates.Add($_.FullName) }
+    }
+    Get-Command codex.exe -CommandType Application -All -ErrorAction SilentlyContinue |
+        ForEach-Object { $candidates.Add($_.Source) }
+    foreach ($candidate in $candidates | Select-Object -Unique) {
+        if (Test-NativeExecutableLaunch -Path $candidate) {
+            return [IO.Path]::GetFullPath($candidate)
+        }
+    }
+    throw 'TODO_TOOL.v1: no ProcessStart-launchable native Codex CLI is available'
+}
+
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $rootEnvPath = Join-Path $repositoryRoot '.env'
 $captainN8nEnvPath = Join-Path $repositoryRoot '.env.captain-n8n'
@@ -23,8 +78,8 @@ $liveRunner = Join-Path $PSScriptRoot 'run-business-benchmark-live.ps1'
 $serviceRunner = Join-Path $PSScriptRoot 'live-demo-services.ps1'
 $canonicalRenewalWorkflow = Join-Path $repositoryRoot 'examples/business_benchmark_candidates/customer_renewal_orchestration_team/workflows/renewal_context_read.json'
 $maximumUsdPerTeam = '0.30'
-$maximumHermesUsd = '0.09'
-$seedVersion = 'business-benchmark-demo-2026-07-v15'
+$maximumHermesUsd = '0.08'
+$seedVersion = 'business-benchmark-demo-2026-07-v16'
 
 $rootEnvAllowlist = @(
     'TEST_MARIADB_DSN',
@@ -299,16 +354,14 @@ try {
     else {
         'gpt-4.1-mini'
     }
-    $codexCommand = Get-Command codex.exe -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
+    $codexCommand = Resolve-LaunchableCodexExecutable
     $pwshCommand = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue |
         Select-Object -First 1
     $userProfileRoot = [Environment]::GetFolderPath('UserProfile')
     $codexHomePath = Join-Path $userProfileRoot '.codex'
     if (
-        $null -eq $codexCommand -or
         $null -eq $pwshCommand -or
-        -not (Test-Path -LiteralPath $codexCommand.Source -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $codexCommand -PathType Leaf) -or
         -not (Test-Path -LiteralPath $pwshCommand.Source -PathType Leaf) -or
         -not (Test-Path -LiteralPath $codexHomePath -PathType Container)
     ) {
@@ -335,7 +388,7 @@ try {
     $environment['CAPTAIN_BENCHMARK_HUMAN_REVIEW_TIMEOUT_SECONDS'] = '0'
     $environment['CAPTAIN_BENCHMARK_RENEWAL_N8N_EVIDENCE_ROOT'] = Join-Path $repositoryRoot '.captain-cook/business-benchmark'
     $environment['CAPTAIN_BENCHMARK_RENEWAL_WORKFLOW_PATH'] = $canonicalRenewalWorkflow
-    $environment['CAPTAIN_CODEX_EXECUTABLE'] = $codexCommand.Source
+    $environment['CAPTAIN_CODEX_EXECUTABLE'] = $codexCommand
     $environment['CAPTAIN_PWSH_EXECUTABLE'] = $pwshCommand.Source
     $environment['CAPTAIN_CODEX_HOME'] = $codexHomePath
     $environment['N8N_MODE'] = 'captain-builder'
@@ -348,7 +401,7 @@ try {
         '--issued-at', $issuedAt,
         '--model', $model,
         '--maximum-usd-per-team', $maximumUsdPerTeam,
-        '--suite-version', '15',
+        '--suite-version', '16',
         '--seed-version-id', $seedVersion
     )
     if ($Action -ceq 'Run') {
