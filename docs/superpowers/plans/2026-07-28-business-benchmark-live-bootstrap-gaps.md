@@ -107,7 +107,9 @@
   release v2 and immutable suite/seed v15 were executed with a `0.09` USD Hermes
   ceiling and reached the Codex build boundary, where the WindowsApps native
   binary failed ProcessStart with access denied. The next resumable execution
-  probes a launchable native npm Codex binary. Because the v15 failure replay is
-  immutable, the repaired path uses fresh suite/seed v16 with a reduced `0.08`
-  USD Hermes ceiling so cumulative worst-case spend remains below `1.00` USD.
-  No run has yet reached a benchmark, Gateway promotion, or Minibook projection.
+  probes a launchable native npm Codex binary. Because each failed replay is
+  immutable, v16 retained the expected dirty-base rejection while the fix was
+  still uncommitted. The clean-checkout path uses fresh suite/seed v17 with a
+  reduced `0.07` USD Hermes ceiling so cumulative worst-case spend remains below
+  `1.00` USD. No run has yet reached a benchmark, Gateway promotion, or Minibook
+  projection.
