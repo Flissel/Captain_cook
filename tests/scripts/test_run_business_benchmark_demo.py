@@ -21,12 +21,16 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert source.startswith("#requires -Version 7")
     assert "[ValidateSet('Plan', 'Run')]" in source
     assert "--maximum-usd-per-team', $maximumUsdPerTeam" in source
-    assert "$maximumUsdPerTeam = '0.45'" in source
-    assert "$maximumHermesUsd = '0.10'" in source
-    assert "$environment['CAPTAIN_BENCHMARK_MAX_USD'] = '0.90'" in source
-    assert "$seedVersion = 'business-benchmark-demo-2026-07-v5'" in source
-    assert "'--suite-version', '5'" in source
+    assert "$maximumUsdPerTeam = '0.30'" in source
+    assert "$maximumHermesUsd = '0.12'" in source
+    assert "$environment['CAPTAIN_BENCHMARK_MAX_USD'] = '0.60'" in source
+    assert "$seedVersion = 'business-benchmark-demo-2026-07-v12'" in source
+    assert "'--suite-version', '12'" in source
     assert "run-agent-factory-business-demo.py" in source
+    assert "Resolve-HermesPython" in source
+    assert "'--hermes-python-executable', $hermesPython" in source
+    assert "factory-operator-stderr.log" in source
+    assert "@(& $python @factoryArguments 2>$factoryErrorPath)" in source
     assert "--apply" in source
     assert "preflight-business-benchmark-demo.py" in source
     assert "& $serviceRunner benchmark-start" in source
@@ -107,12 +111,12 @@ def team(profile, job_id, candidate_id, batch=None):
             'job_id': job_id,
             'execution_policy': {
                 'allowed_models': ['gpt-4.1-mini'],
-                'max_cost_usd': '0.45',
+                'max_cost_usd': '0.30',
             },
         },
         'suite': {'suite_version': 1},
         'candidate_id': candidate_id,
-        'gateway_budget_remaining_usd': '0.45',
+        'gateway_budget_remaining_usd': '0.30',
         'work_batch': None if batch is None else {'batch_id': batch},
         'production_scope_resolvable': True,
         'missing_gateway_evidence': ['team_execution_evidence'],
@@ -165,6 +169,8 @@ print(json.dumps({
             "Run",
             "-PythonPath",
             sys.executable,
+            "-HermesPythonPath",
+            sys.executable,
         ],
         cwd=repository,
         env=environment,
@@ -181,7 +187,7 @@ print(json.dumps({
         "status": "factory_dispatch_required",
         "database": "captain_test",
         "issued_at": checkpoint["issued_at"],
-        "maximum_usd_per_team": "0.45",
+        "maximum_usd_per_team": "0.30",
         "jobs": [
             {
                 "profile": "claims",
@@ -207,8 +213,8 @@ print(json.dumps({
     assert not (repository / "provider-called").exists()
     arguments = json.loads((repository / "provision-args.json").read_text("utf-8"))
     assert "--apply" in arguments
-    assert arguments[arguments.index("--maximum-usd-per-team") + 1] == "0.45"
-    assert arguments[arguments.index("--suite-version") + 1] == "5"
+    assert arguments[arguments.index("--maximum-usd-per-team") + 1] == "0.30"
+    assert arguments[arguments.index("--suite-version") + 1] == "12"
     issued_at = arguments[arguments.index("--issued-at") + 1]
     assert issued_at.endswith("Z")
     combined = completed.stdout + completed.stderr
@@ -242,6 +248,8 @@ print(json.dumps({
             "-Action",
             "Run",
             "-PythonPath",
+            sys.executable,
+            "-HermesPythonPath",
             sys.executable,
         ],
         cwd=repository,
@@ -326,6 +334,8 @@ Set-Content (Join-Path $root 'provider-called') 'yes'
             "Run",
             "-PythonPath",
             sys.executable,
+            "-HermesPythonPath",
+            sys.executable,
         ],
         cwd=repository,
         env=environment,
@@ -342,7 +352,10 @@ Set-Content (Join-Path $root 'provider-called') 'yes'
     factory_arguments = json.loads(
         (repository / "factory-args.json").read_text("utf-8")
     )
-    assert factory_arguments[factory_arguments.index("--hermes-max-usd") + 1] == "0.10"
+    assert factory_arguments[factory_arguments.index("--hermes-max-usd") + 1] == "0.12"
+    assert factory_arguments[
+        factory_arguments.index("--hermes-python-executable") + 1
+    ] == sys.executable
     assert factory_arguments[factory_arguments.index("--hermes-model") + 1] == "gpt-4.1-mini"
     assert factory_arguments.count("--job-id") == 2
     assert "process-only-demo-key" not in successful.stdout + successful.stderr

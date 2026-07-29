@@ -970,6 +970,7 @@ def _prepare_released_skills(
     root = workspace_root / "agenten" / "agent_factory" / "skills"
     for step in FactorySkillStep:
         skill_id = FACTORY_SKILL_ID_BY_STEP[step]
+        release_version = 5 if step is FactorySkillStep.DISCOVER else 1
         directory = root / skill_id
         content = _directory_zip_bytes(directory)
         archived_reference = _predicted_ref(
@@ -977,14 +978,14 @@ def _prepare_released_skills(
         )
         directory_digest = _skill_directory_digest(directory)
         release_reference = ArtifactRef(
-            uri=f"artifact://released-skills/{skill_id}/v1",
+            uri=f"artifact://released-skills/{skill_id}/v{release_version}",
             sha256=directory_digest,
             media_type="application/json",
         )
         skills[step] = ReleasedHermesSkill(
             schema="captain.released-hermes-skill.v1",
             skill_id=skill_id,
-            version=1,
+            version=release_version,
             capability=_CAPABILITY,
             content_ref=release_reference,
             content_sha256=directory_digest,

@@ -5,7 +5,9 @@ param(
     [ValidateSet('Plan', 'Run')]
     [string]$Action,
 
-    [string]$PythonPath = ''
+    [string]$PythonPath = '',
+
+    [string]$HermesPythonPath = ''
 )
 
 Set-StrictMode -Version Latest
@@ -20,9 +22,9 @@ $factoryRunner = Join-Path $PSScriptRoot 'run-agent-factory-business-demo.py'
 $liveRunner = Join-Path $PSScriptRoot 'run-business-benchmark-live.ps1'
 $serviceRunner = Join-Path $PSScriptRoot 'live-demo-services.ps1'
 $canonicalRenewalWorkflow = Join-Path $repositoryRoot 'examples/business_benchmark_candidates/customer_renewal_orchestration_team/workflows/renewal_context_read.json'
-$maximumUsdPerTeam = '0.45'
-$maximumHermesUsd = '0.10'
-$seedVersion = 'business-benchmark-demo-2026-07-v5'
+$maximumUsdPerTeam = '0.30'
+$maximumHermesUsd = '0.12'
+$seedVersion = 'business-benchmark-demo-2026-07-v12'
 
 $rootEnvAllowlist = @(
     'TEST_MARIADB_DSN',
@@ -114,6 +116,21 @@ function Resolve-Python311 {
     & $resolved -c 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 11) else 1)' *> $null
     if ($LASTEXITCODE -ne 0) {
         throw 'TODO_TOOL.v1: validated Python interpreter must be Python 3.11'
+    }
+    return (Resolve-Path -LiteralPath $resolved).Path
+}
+
+function Resolve-HermesPython {
+    param([string]$ConfiguredPath)
+
+    $resolved = $ConfiguredPath
+    if ([string]::IsNullOrWhiteSpace($resolved)) {
+        $resolved = Join-Path (
+            [Environment]::GetFolderPath('ApplicationData')
+        ) 'uv\tools\hermes-agent\Scripts\python.exe'
+    }
+    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+        throw 'TODO_TOOL.v1: dedicated Hermes Python interpreter is unavailable'
     }
     return (Resolve-Path -LiteralPath $resolved).Path
 }
@@ -236,6 +253,7 @@ function Get-HumanReviewCheckpoint {
 Push-Location $repositoryRoot
 try {
     $python = Resolve-Python311 $PythonPath
+    $hermesPython = Resolve-HermesPython $HermesPythonPath
     $issuedAt = [DateTimeOffset]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
 
     if ($Action -ceq 'Run') {
@@ -330,7 +348,7 @@ try {
         '--issued-at', $issuedAt,
         '--model', $model,
         '--maximum-usd-per-team', $maximumUsdPerTeam,
-        '--suite-version', '5',
+        '--suite-version', '12',
         '--seed-version-id', $seedVersion
     )
     if ($Action -ceq 'Run') {
@@ -382,7 +400,7 @@ try {
     $renewalBatchId = Require-NonEmpty $renewal.work_batch.batch_id 'renewal.work_batch.batch_id'
 
     $environment['CAPTAIN_BENCHMARK_PROFILE'] = 'all'
-    $environment['CAPTAIN_BENCHMARK_MAX_USD'] = '0.90'
+    $environment['CAPTAIN_BENCHMARK_MAX_USD'] = '0.60'
     $environment['CAPTAIN_JOB_ALLOWED_MODELS'] = $model
     foreach ($binding in @(
         @('CLAIMS', $claims),
@@ -454,6 +472,7 @@ try {
             $factoryRunner,
             '--workspace-root', $repositoryRoot,
             '--python-executable', $python,
+            '--hermes-python-executable', $hermesPython,
             '--job-id', [string]$claims.job.job_id,
             '--job-id', [string]$renewal.job.job_id,
             '--hermes-provider', 'openai-api',
@@ -461,10 +480,16 @@ try {
             '--hermes-max-usd', $maximumHermesUsd,
             '--maximum-dispatches', '12'
         )
-        $rawFactory = @(& $python @factoryArguments 2>$null)
+        $factoryErrorPath = Join-Path `
+            $environment['CAPTAIN_BENCHMARK_AUTHORITY_ROOT'] `
+            'runtime-state/factory-operator-stderr.log'
+        $null = New-Item -ItemType Directory -Force -Path (Split-Path $factoryErrorPath)
+        Remove-Item -LiteralPath $factoryErrorPath -Force -ErrorAction SilentlyContinue
+        $rawFactory = @(& $python @factoryArguments 2>$factoryErrorPath)
         if ($LASTEXITCODE -ne 0) {
             throw 'Captain Factory live operator failed closed; inspect private evidence.'
         }
+        Remove-Item -LiteralPath $factoryErrorPath -Force -ErrorAction SilentlyContinue
         try {
             $factoryResult = ($rawFactory -join [Environment]::NewLine) |
                 ConvertFrom-Json -Depth 100
