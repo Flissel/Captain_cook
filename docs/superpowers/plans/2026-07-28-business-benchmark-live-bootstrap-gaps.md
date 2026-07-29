@@ -97,6 +97,9 @@
   a masked prompt, keeps it process-only, and clears it in `finally`.
   The v11 run failed closed during seeded discovery after Hermes changed typed
   bindings; v12 proved the new discovery attestation and then failed closed at
-  `brief_codex` before any benchmark, Gateway promotion, or Minibook projection.
-  Both defects are fixed and deterministically verified, but another paid live
-  run requires a fresh explicit budget authorization.
+  `brief_codex`. The authorized v13 and v14 retries also failed closed there:
+  v13 exposed missing Captain job context, while v14 exposed a narrowly
+  malformed Hermes nesting/Invocation echo. Captain now binds the exact V3 job
+  into the tool-free prompt and normalizes only Captain-authoritative identity
+  fields plus the two schema-defined assignment collections before validation.
+  No run reached a benchmark, Gateway promotion, or Minibook projection.

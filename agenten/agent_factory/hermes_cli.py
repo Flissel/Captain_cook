@@ -303,7 +303,11 @@ class HermesCliFactory(HermesFactoryPort):
                         )
                         artifact = CodebaseInventoryV1.model_validate(discovery_seed)
                     else:
-                        artifact = _parse_workflow_artifact(stdout, step=step)
+                        artifact = _parse_workflow_artifact(
+                            stdout,
+                            step=step,
+                            invocation=invocation,
+                        )
                 if artifact.invocation != invocation:
                     raise FactoryDispatchError(
                         f"Hermes {step.value} artifact does not match the Captain invocation"
@@ -1470,10 +1474,36 @@ def _parse_workflow_artifact(
     stdout: bytes,
     *,
     step: FactorySkillStep,
+    invocation: FactorySkillInvocationV1,
 ) -> _FactoryWorkflowArtifact:
     model = _STEP_RESULT_MODELS[step]
     try:
-        parsed = model.model_validate(_parse_evidence_payload(stdout))
+        payload = _parse_evidence_payload(stdout)
+        if step is FactorySkillStep.BRIEF_CODEX and isinstance(payload, dict):
+            payload = dict(payload)
+            payload["invocation"] = invocation.model_dump(mode="json", by_alias=True)
+            payload["invocation_id"] = str(invocation.invocation_id)
+            payload["job_id"] = str(invocation.job_id)
+            payload["correlation_id"] = str(invocation.correlation_id)
+            payload["subject_version"] = invocation.subject_version
+            payload["attempt"] = invocation.attempt
+            payload["occurred_at"] = invocation.lease.issued_at.isoformat().replace(
+                "+00:00", "Z"
+            )
+            payload["acceptance_assertion_ids"] = list(
+                invocation.acceptance_assertion_ids
+            )
+            assignment = payload.get("build_assignment")
+            if isinstance(assignment, dict):
+                assignment = dict(assignment)
+                if "documentation_queries" in payload:
+                    assignment["documentation_queries"] = payload.pop(
+                        "documentation_queries"
+                    )
+                if "integrations" in payload:
+                    assignment["integrations"] = payload.pop("integrations")
+                payload["build_assignment"] = assignment
+        parsed = model.model_validate(payload)
     except (TypeError, ValueError, ValidationError) as exc:
         raise FactoryDispatchError(
             f"Hermes must return exactly one typed {step.value} artifact"

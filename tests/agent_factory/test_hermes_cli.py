@@ -1162,6 +1162,12 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
                 payload["regression_benchmark_metric_ids"] = list(
                     authorization.prior_green_benchmark_metric_ids
                 )
+                payload["invocation"].pop("idempotency_key")
+                assignment_payload = payload["build_assignment"]
+                payload["documentation_queries"] = assignment_payload.pop(
+                    "documentation_queries"
+                )
+                payload["integrations"] = assignment_payload.pop("integrations", [])
             return json.dumps(payload).encode(), b""
 
     async def create_process(*command: str, **__: object) -> Process:
