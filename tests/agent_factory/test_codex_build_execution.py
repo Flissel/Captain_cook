@@ -274,6 +274,11 @@ async def test_cli_executor_authorizes_before_materializing_and_records_redacted
     assert len(runner.calls) == 1
     assert authorizer.requests[0].workspace == workspace
     assert authorizer.requests[0].command[:3] == ("codex", "exec", "--json")
+    prompt = authorizer.requests[0].command[3]
+    assert "python -m compileall -q generated-candidate" in prompt
+    assert "python -m pytest -q --no-cov generated-candidate/tests" in prompt
+    assert "Do not run the repository-wide test suite" in prompt
+    assert "pytest.live.demo is deferred to Captain" in prompt
     assert (workspace / ".captain-inputs" / "job-input.md").is_file()
     assert (workspace / ".captain-inputs" / "compiled-spec.json").is_file()
     assert (workspace / ".captain-inputs" / "dependency-graph.json").is_file()

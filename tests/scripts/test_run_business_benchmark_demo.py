@@ -22,10 +22,10 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "[ValidateSet('Plan', 'Run')]" in source
     assert "--maximum-usd-per-team', $maximumUsdPerTeam" in source
     assert "$maximumUsdPerTeam = '0.30'" in source
-    assert "$maximumHermesUsd = '0.07'" in source
+    assert "$maximumHermesUsd = '0.06'" in source
     assert "$environment['CAPTAIN_BENCHMARK_MAX_USD'] = '0.60'" in source
-    assert "$seedVersion = 'business-benchmark-demo-2026-07-v17'" in source
-    assert "'--suite-version', '17'" in source
+    assert "$seedVersion = 'business-benchmark-demo-2026-07-v18'" in source
+    assert "'--suite-version', '18'" in source
     assert "run-agent-factory-business-demo.py" in source
     assert "Resolve-HermesPython" in source
     assert "'--hermes-python-executable', $hermesPython" in source
@@ -225,7 +225,7 @@ print(json.dumps({
     arguments = json.loads((repository / "provision-args.json").read_text("utf-8"))
     assert "--apply" in arguments
     assert arguments[arguments.index("--maximum-usd-per-team") + 1] == "0.30"
-    assert arguments[arguments.index("--suite-version") + 1] == "17"
+    assert arguments[arguments.index("--suite-version") + 1] == "18"
     issued_at = arguments[arguments.index("--issued-at") + 1]
     assert issued_at.endswith("Z")
     combined = completed.stdout + completed.stderr
@@ -363,7 +363,7 @@ Set-Content (Join-Path $root 'provider-called') 'yes'
     factory_arguments = json.loads(
         (repository / "factory-args.json").read_text("utf-8")
     )
-    assert factory_arguments[factory_arguments.index("--hermes-max-usd") + 1] == "0.07"
+    assert factory_arguments[factory_arguments.index("--hermes-max-usd") + 1] == "0.06"
     assert factory_arguments[
         factory_arguments.index("--hermes-python-executable") + 1
     ] == sys.executable

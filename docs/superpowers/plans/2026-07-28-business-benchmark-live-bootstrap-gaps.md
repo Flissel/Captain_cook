@@ -109,7 +109,10 @@
   binary failed ProcessStart with access denied. The next resumable execution
   probes a launchable native npm Codex binary. Because each failed replay is
   immutable, v16 retained the expected dirty-base rejection while the fix was
-  still uncommitted. The clean-checkout path uses fresh suite/seed v17 with a
-  reduced `0.07` USD Hermes ceiling so cumulative worst-case spend remains below
-  `1.00` USD. No run has yet reached a benchmark, Gateway promotion, or Minibook
-  projection.
+  still uncommitted. The clean v17 run reached a real generated Claims candidate
+  but timed out at 900 seconds because Codex started the repository-wide test
+  suite instead of candidate-scoped verification. Fresh suite/seed v18 carries
+  explicit generated-candidate compile/pytest commands, defers `pytest.live.demo`
+  to Captain's sealed holdout, and uses a reduced `0.06` USD Hermes ceiling so
+  cumulative worst-case spend remains below `1.00` USD. No run has yet reached a
+  benchmark, Gateway promotion, or Minibook projection.
