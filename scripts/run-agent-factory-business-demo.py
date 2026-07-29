@@ -25,6 +25,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--workspace-root", type=Path, required=True)
     parser.add_argument("--python-executable", type=Path, required=True)
+    parser.add_argument("--hermes-python-executable", type=Path, required=True)
     parser.add_argument("--job-id", type=UUID, action="append", required=True)
     parser.add_argument("--maximum-dispatches", type=int, default=12)
     parser.add_argument("--hermes-provider", default="openai-api")
@@ -40,6 +41,7 @@ def main() -> int:
     settings = FactoryLiveOperatorSettings(
         workspace_root=args.workspace_root,
         python_executable=args.python_executable,
+        hermes_python_executable=args.hermes_python_executable,
         test_mariadb_dsn=os.environ.get("TEST_MARIADB_DSN", ""),
         job_ids=(args.job_id[0], args.job_id[1]),
         hermes_provider=args.hermes_provider,

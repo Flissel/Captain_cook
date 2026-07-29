@@ -77,6 +77,38 @@ def test_gateway_issuer_reuses_the_active_next_action_lease() -> None:
     assert store.recorded == [lease]
 
 
+def test_gateway_issuer_uses_latest_renewed_active_lease() -> None:
+    job = workflow_job(mode="demo")
+    older = issue_factory_lease(
+        job=job,
+        role=FactoryRole.AGENT_ARCHITECT,
+        attempt=1,
+        workspace_ref="workspace://factory/older",
+        now=NOW - timedelta(minutes=5),
+    )
+    renewed = issue_factory_lease(
+        job=job,
+        role=FactoryRole.AGENT_ARCHITECT,
+        attempt=1,
+        workspace_ref="workspace://factory/renewed",
+        now=NOW - timedelta(minutes=1),
+    )
+    store = RecordingGatewayStore(job, leases=(older, renewed))
+
+    recovered = GatewayNextActionLeaseIssuer(
+        store=store,
+        workspace_namespace="business-benchmark-demo",
+    ).ensure_for(
+        job,
+        _action(FactoryActionKind.DISPATCH_AGENT_ARCHITECT),
+        FactoryRole.AGENT_ARCHITECT,
+        NOW,
+    )
+
+    assert recovered == renewed
+    assert store.recorded == [renewed]
+
+
 def test_gateway_revalidates_a_reused_lease_under_the_current_action_lock() -> None:
     job = workflow_job(mode="demo")
     lease = issue_factory_lease(

@@ -6,7 +6,9 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+import os
 from pathlib import Path
+import subprocess
 from typing import Protocol
 from uuid import UUID
 
@@ -79,6 +81,7 @@ class _DispatchInputComposition(Protocol):
 class FactoryLiveOperatorSettings:
     workspace_root: Path
     python_executable: Path
+    hermes_python_executable: Path
     test_mariadb_dsn: str
     job_ids: tuple[UUID, UUID]
     hermes_provider: str
@@ -90,8 +93,17 @@ class FactoryLiveOperatorSettings:
         assert_local_captain_test_dsn(self.test_mariadb_dsn)
         workspace = self.workspace_root.resolve()
         python = self.python_executable.resolve()
-        if not workspace.is_dir() or not python.is_file():
+        hermes_python = self.hermes_python_executable.resolve()
+        if (
+            not workspace.is_dir()
+            or not python.is_file()
+            or not hermes_python.is_file()
+        ):
             raise ValueError("Factory live operator paths are unavailable")
+        _assert_hermes_python_runtime(
+            hermes_python,
+            module_root=workspace / "hermes-agent",
+        )
         if len(set(self.job_ids)) != 2:
             raise ValueError("Factory live operator requires two distinct jobs")
         if (
@@ -99,7 +111,7 @@ class FactoryLiveOperatorSettings:
             or not self.hermes_model.strip()
             or not self.hermes_maximum_total_cost_usd.is_finite()
             or self.hermes_maximum_total_cost_usd <= 0
-            or self.hermes_maximum_total_cost_usd > Decimal("0.10")
+            or self.hermes_maximum_total_cost_usd > Decimal("0.25")
         ):
             raise ValueError("Factory Hermes pin or cost allocation is invalid")
         if self.maximum_dispatches < 1 or self.maximum_dispatches > 24:
@@ -303,7 +315,7 @@ def compose_business_demo_factory_operator(
         workspace_namespace="business-benchmark-factory-v3",
         evidence_root=authority_root / "runtime-state" / "factory-evidence",
         hermes_settings=HermesCliSettings(
-            executable=str(settings.python_executable.resolve()),
+            executable=str(settings.hermes_python_executable.resolve()),
             skill_root=workspace / "agenten" / "agent_factory" / "skills",
             timeout_seconds=900,
             evidence_root=authority_root / "runtime-state" / "hermes-evidence",
@@ -311,6 +323,7 @@ def compose_business_demo_factory_operator(
                 workspace / "agenten" / "agent_factory" / "released-skills"
             ),
             module_root=workspace / "hermes-agent",
+            working_directory=workspace,
             provider=settings.hermes_provider,
             model=settings.hermes_model,
             maximum_total_cost_usd=settings.hermes_maximum_total_cost_usd,
@@ -355,6 +368,39 @@ def _required(environment: Mapping[str, str], name: str) -> str:
     if not value:
         raise ValueError(f"required Factory operator setting is missing: {name}")
     return value
+
+
+def _assert_hermes_python_runtime(
+    python_executable: Path,
+    *,
+    module_root: Path,
+) -> None:
+    environment = os.environ.copy()
+    environment.pop("OPENAI_API_KEY", None)
+    environment["PYTHONPATH"] = str(module_root.resolve())
+    environment["CAPTAIN_EXPECTED_HERMES_MODULE_ROOT"] = str(
+        module_root.resolve()
+    )
+    probe = subprocess.run(
+        [
+            str(python_executable),
+            "-c",
+            (
+                "import os; from pathlib import Path; "
+                "import concurrent_log_handler, hermes_cli; "
+                "Path(hermes_cli.__file__).resolve().relative_to("
+                "Path(os.environ['CAPTAIN_EXPECTED_HERMES_MODULE_ROOT']).resolve())"
+            ),
+        ],
+        cwd=module_root.parent,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if probe.returncode != 0:
+        raise ValueError("dedicated Hermes Python runtime is incomplete")
 
 
 __all__ = [

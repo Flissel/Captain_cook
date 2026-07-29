@@ -22,36 +22,67 @@ JOB_IDS = (
 )
 
 
+def _write_hermes_runtime(root: Path, *, include_logging: bool = True) -> None:
+    module_root = root / "hermes-agent"
+    package = module_root / "hermes_cli"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    if include_logging:
+        (module_root / "concurrent_log_handler.py").write_text("", encoding="utf-8")
+
+
 def test_operator_settings_enforce_isolated_database_two_jobs_and_cost_allocation(
     tmp_path: Path,
 ) -> None:
+    _write_hermes_runtime(tmp_path)
+    hermes_python = Path(sys.executable)
     settings = FactoryLiveOperatorSettings(
         workspace_root=tmp_path,
         python_executable=Path(sys.executable),
+        hermes_python_executable=hermes_python,
         test_mariadb_dsn=LOCAL_DSN,
         job_ids=JOB_IDS,
         hermes_provider="openai-api",
         hermes_model="gpt-4.1-mini",
-        hermes_maximum_total_cost_usd=Decimal("0.10"),
+        hermes_maximum_total_cost_usd=Decimal("0.25"),
     )
 
     assert settings.job_ids == JOB_IDS
+    assert settings.hermes_python_executable == hermes_python
     with pytest.raises(ValueError, match="cost allocation"):
         FactoryLiveOperatorSettings(
             workspace_root=tmp_path,
             python_executable=Path(sys.executable),
+            hermes_python_executable=hermes_python,
             test_mariadb_dsn=LOCAL_DSN,
             job_ids=JOB_IDS,
             hermes_provider="openai-api",
             hermes_model="gpt-4.1-mini",
-            hermes_maximum_total_cost_usd=Decimal("0.11"),
+            hermes_maximum_total_cost_usd=Decimal("0.26"),
         )
     with pytest.raises(ValueError, match="distinct jobs"):
         FactoryLiveOperatorSettings(
             workspace_root=tmp_path,
             python_executable=Path(sys.executable),
+            hermes_python_executable=hermes_python,
             test_mariadb_dsn=LOCAL_DSN,
             job_ids=(JOB_IDS[0], JOB_IDS[0]),
+            hermes_provider="openai-api",
+            hermes_model="gpt-4.1-mini",
+            hermes_maximum_total_cost_usd=Decimal("0.10"),
+        )
+
+
+def test_operator_settings_reject_incomplete_hermes_runtime(tmp_path: Path) -> None:
+    _write_hermes_runtime(tmp_path, include_logging=False)
+
+    with pytest.raises(ValueError, match="Hermes Python runtime is incomplete"):
+        FactoryLiveOperatorSettings(
+            workspace_root=tmp_path,
+            python_executable=Path(sys.executable),
+            hermes_python_executable=Path(sys.executable),
+            test_mariadb_dsn=LOCAL_DSN,
+            job_ids=JOB_IDS,
             hermes_provider="openai-api",
             hermes_model="gpt-4.1-mini",
             hermes_maximum_total_cost_usd=Decimal("0.10"),
@@ -104,3 +135,4 @@ def test_operator_cli_is_importable_from_scripts_directory() -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert "--hermes-max-usd" in completed.stdout
+    assert "--hermes-python-executable" in completed.stdout

@@ -191,11 +191,17 @@ class GatewayNextActionLeaseIssuer:
                 matches.append(candidate)
         if not matches:
             return None
-        if len(matches) != 1:
+        latest_issued_at = max(candidate.issued_at for candidate in matches)
+        latest = [
+            candidate
+            for candidate in matches
+            if candidate.issued_at == latest_issued_at
+        ]
+        if len(latest) != 1:
             raise FactoryLeaseDenied(
                 "Gateway next-action Factory lease is ambiguous"
             )
-        return matches[0]
+        return latest[0]
 
     def _workspace_prefix(self, job: FactoryJob, action: FactoryAction) -> str:
         return (
