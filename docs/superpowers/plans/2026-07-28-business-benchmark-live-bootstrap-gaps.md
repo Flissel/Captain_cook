@@ -79,6 +79,15 @@
   manifest, test evidence, and exact source ZIP in a Captain-issued receipt.
   Minibook V2 imports those already-sealed source bytes unchanged and preserves
   the Captain receipt as a separate package edge.
+- [x] Replace seeded discovery's large model-authored inventory echo with a
+  small digest-bound Hermes attestation. Captain now materializes the exact
+  content-addressed inventory only after validating that attestation, and the
+  Hermes one-shot runtime preserves an explicit empty tool scope instead of
+  falling back to configured tools.
+- [x] Pass the validated prior Factory artifact directly into sequential
+  `brief_codex` prompts and disable tools for that pure transformation. This
+  removes the observed browser/file rediscovery path while preserving tools for
+  implementation and execution steps that actually require them.
 - [ ] Run the two provider-backed Factory jobs and 30-case team/baseline
   benchmark after `OPENAI_API_KEY` is securely exported into the invoking
   process. Retain cost, latency, tool, handoff, recovery, Gateway decision, and
@@ -86,3 +95,8 @@
   those gates pass. The interactive
   `scripts/run-business-benchmark-demo-secure.ps1` wrapper accepts the key via
   a masked prompt, keeps it process-only, and clears it in `finally`.
+  The v11 run failed closed during seeded discovery after Hermes changed typed
+  bindings; v12 proved the new discovery attestation and then failed closed at
+  `brief_codex` before any benchmark, Gateway promotion, or Minibook projection.
+  Both defects are fixed and deterministically verified, but another paid live
+  run requires a fresh explicit budget authorization.
