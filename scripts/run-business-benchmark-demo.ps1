@@ -24,7 +24,7 @@ $serviceRunner = Join-Path $PSScriptRoot 'live-demo-services.ps1'
 $canonicalRenewalWorkflow = Join-Path $repositoryRoot 'examples/business_benchmark_candidates/customer_renewal_orchestration_team/workflows/renewal_context_read.json'
 $maximumUsdPerTeam = '0.30'
 $maximumHermesUsd = '0.10'
-$seedVersion = 'business-benchmark-demo-2026-07-v13'
+$seedVersion = 'business-benchmark-demo-2026-07-v14'
 
 $rootEnvAllowlist = @(
     'TEST_MARIADB_DSN',
@@ -348,7 +348,7 @@ try {
         '--issued-at', $issuedAt,
         '--model', $model,
         '--maximum-usd-per-team', $maximumUsdPerTeam,
-        '--suite-version', '13',
+        '--suite-version', '14',
         '--seed-version-id', $seedVersion
     )
     if ($Action -ceq 'Run') {
