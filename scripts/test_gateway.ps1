@@ -198,9 +198,8 @@ try {
         Assert-SelectedPytestSummary -SelectedOutput $liveOutput -MinimumPassed 1 | Out-Null
     }
 
-    # The root coverage configuration includes the Hermes submodule, so this
-    # integration runner verifies behavior without turning external source
-    # coverage into a false failure.
+    # This integration runner verifies behavior without mixing service-process
+    # execution into the parent unit-test coverage gate.
     $fullArguments = @("-m", "pytest", "-q", "--no-cov", "-rs", "-m", "not live")
     $fullOutput = Invoke-Pytest -Python $pythonCommand -Arguments $fullArguments -Label "Full non-live suite"
     $AllowedFullSuiteSkipPatterns = @(

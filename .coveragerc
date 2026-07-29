@@ -1,0 +1,7 @@
+[run]
+omit =
+    hermes-agent/*
+
+[report]
+omit =
+    hermes-agent/*
