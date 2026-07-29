@@ -77,6 +77,19 @@ class _DispatchInputComposition(Protocol):
     ) -> BusinessBenchmarkDispatchInputs: ...
 
 
+class _BenchmarkCodexPromptArtifactStore:
+    def __init__(self, artifacts: BusinessBenchmarkContentAddressedArtifactStore) -> None:
+        self._artifacts = artifacts
+
+    def persist(self, job_id: UUID, content: bytes) -> ArtifactRef:
+        del job_id
+        return self._artifacts.put(
+            content,
+            "application/json",
+            namespace="codex-brief-prompt",
+        )
+
+
 @dataclass(frozen=True)
 class FactoryLiveOperatorSettings:
     workspace_root: Path
@@ -337,6 +350,9 @@ def compose_business_demo_factory_operator(
         },
         holdout_selector=select_technical_business_holdout,
         codex_build_sealer=codex_sealer,
+        codex_prompt_artifact_store=_BenchmarkCodexPromptArtifactStore(
+            benchmark_cas
+        ),
     )
 
 

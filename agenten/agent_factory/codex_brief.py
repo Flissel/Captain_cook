@@ -176,7 +176,7 @@ class CodexBriefBuilder:
             inventory.job_id != invocation.job_id
             or inventory.correlation_id != invocation.correlation_id
             or inventory.subject_version != invocation.subject_version
-            or inventory.attempt != invocation.attempt
+            or inventory.attempt != 1
             or inventory.acceptance_assertion_ids
             != invocation.acceptance_assertion_ids
         ):

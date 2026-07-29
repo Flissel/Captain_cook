@@ -82,6 +82,7 @@ def test_composes_real_factory_runner_without_provider_effects(tmp_path: Path) -
     benchmark_repository = _EffectTrap()
     benchmark_inputs = _EffectTrap()
     codex_build_sealer = object()
+    codex_prompt_artifact_store = object()
 
     composition = _compose(
         tmp_path,
@@ -92,6 +93,7 @@ def test_composes_real_factory_runner_without_provider_effects(tmp_path: Path) -
         business_benchmark_repository=benchmark_repository,
         business_benchmark_inputs=benchmark_inputs,
         codex_build_sealer=codex_build_sealer,
+        codex_prompt_artifact_store=codex_prompt_artifact_store,
     )
 
     assert isinstance(composition.repository, GatewayFactoryRepository)
@@ -103,6 +105,10 @@ def test_composes_real_factory_runner_without_provider_effects(tmp_path: Path) -
     assert isinstance(composition.dispatcher, FactoryDispatcher)
     assert isinstance(composition.runner, ProductionFactoryDispatchRunner)
     assert composition.hermes._codex_build_sealer is codex_build_sealer
+    assert (
+        composition.hermes._codex_prompt_artifact_store
+        is codex_prompt_artifact_store
+    )
     assert composition.dispatcher.lease_authority is composition.lease_issuer
     assert all(
         port.calls == 0

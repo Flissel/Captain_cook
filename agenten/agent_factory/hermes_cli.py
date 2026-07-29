@@ -28,6 +28,10 @@ from agenten.agent_factory.contracts import (
     FactoryPhase,
     FactoryRole,
 )
+from agenten.agent_factory.codex_brief import (
+    CodexBriefBuilder,
+    CodexPromptArtifactStore,
+)
 from agenten.agent_factory.evidence_store import FactoryEvidenceStore, FilesystemFactoryEvidenceStore
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError, HermesFactoryPort
 from agenten.agent_factory.skill_evaluation import (
@@ -55,7 +59,8 @@ from agenten.agent_factory.skill_workflow_contracts import (
     TeamEvaluationV1,
     TeamExecutionEvidenceV1,
 )
-from agenten.agent_runtime.contracts import ArtifactRef
+from agenten.agent_factory.forge_contracts import FactoryBuildAssignmentV1
+from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent
 
 if TYPE_CHECKING:
     from agenten.agent_factory.candidate_evaluation import FactoryCandidateEvaluationResult
@@ -108,6 +113,17 @@ class _HermesDiscoveryAttestationV1(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     schema_name: Literal["hermes.factory-discovery-attestation.v1"] = Field(
+        alias="schema"
+    )
+    invocation_id: UUID
+    seed_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    accepted: Literal[True]
+
+
+class _HermesCodexBriefAttestationV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    schema_name: Literal["hermes.factory-codex-brief-attestation.v1"] = Field(
         alias="schema"
     )
     invocation_id: UUID
@@ -175,6 +191,7 @@ class HermesCliFactory(HermesFactoryPort):
         sequence_policy: SkillSequencePolicy | None = None,
         replay_store: FactorySkillReplayStore | None = None,
         codex_build_sealer: CaptainCodexBuildSealerPort | None = None,
+        codex_prompt_artifact_store: CodexPromptArtifactStore | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._settings = settings
@@ -182,6 +199,7 @@ class HermesCliFactory(HermesFactoryPort):
         self._released_skill_catalog = released_skill_catalog
         self._sequence_policy = sequence_policy or SkillSequencePolicy()
         self._codex_build_sealer = codex_build_sealer
+        self._codex_prompt_artifact_store = codex_prompt_artifact_store
         self._replay_store = (
             replay_store
             if replay_store is not None
@@ -271,6 +289,7 @@ class HermesCliFactory(HermesFactoryPort):
                     )
                 else:
                     discovery_seed = None
+                    codex_brief_seed = None
                     if step is FactorySkillStep.DISCOVER:
                         if self._settings.working_directory is None:
                             raise FactoryDispatchError(
@@ -280,18 +299,43 @@ class HermesCliFactory(HermesFactoryPort):
                             self._settings.working_directory,
                             invocation,
                         )
+                    elif step is FactorySkillStep.BRIEF_CODEX and isinstance(
+                        request.job, AgentFactoryJobV3
+                    ):
+                        if self._codex_prompt_artifact_store is None:
+                            raise FactoryDispatchError(
+                                "Captain Codex prompt artifact store is not configured"
+                            )
+                        discovery = await self._replay_store.completed(
+                            request.job,
+                            step=FactorySkillStep.DISCOVER,
+                            attempt=1,
+                        )
+                        if not isinstance(discovery.artifact, CodebaseInventoryV1):
+                            raise FactoryDispatchError(
+                                "completed discovery replay is not a codebase inventory"
+                            )
+                        codex_brief_seed = _captain_codex_brief_seed(
+                            request,
+                            invocation,
+                            discovery.artifact,
+                            artifact_store=self._codex_prompt_artifact_store,
+                            improvement_authorization=improvement,
+                        )
                     stdout = await self._run_skill_prompt(
                         _factory_skill_prompt(
                             invocation,
                             skill_name=skill_name,
                             job=request.job,
                             discovery_seed=discovery_seed,
+                            codex_brief_seed=codex_brief_seed,
                             previous_artifact=artifacts[-1] if artifacts else None,
                         ),
                         max_seconds=_remaining_deadline_seconds(deadline),
                         skill_name=skill_name,
                         disable_tools=(
                             discovery_seed is not None
+                            or codex_brief_seed is not None
                             or step is FactorySkillStep.BRIEF_CODEX
                         ),
                     )
@@ -302,6 +346,13 @@ class HermesCliFactory(HermesFactoryPort):
                             discovery_seed=discovery_seed,
                         )
                         artifact = CodebaseInventoryV1.model_validate(discovery_seed)
+                    elif codex_brief_seed is not None:
+                        _parse_codex_brief_attestation(
+                            stdout,
+                            invocation=invocation,
+                            codex_brief_seed=codex_brief_seed,
+                        )
+                        artifact = codex_brief_seed
                     else:
                         artifact = _parse_workflow_artifact(
                             stdout,
@@ -666,6 +717,14 @@ class FactorySkillReplayClaim:
 
 
 class FactorySkillReplayStore(Protocol):
+    async def completed(
+        self,
+        job: FactoryJob,
+        *,
+        step: FactorySkillStep,
+        attempt: int,
+    ) -> FactorySkillReplayRecord: ...
+
     async def claim(
         self,
         invocation: FactorySkillInvocationV1,
@@ -695,6 +754,23 @@ class InMemoryFactorySkillReplayStore:
     def __init__(self) -> None:
         self._records: dict[str, FactorySkillReplayRecord] = {}
         self._lock = asyncio.Lock()
+
+    async def completed(
+        self,
+        job: FactoryJob,
+        *,
+        step: FactorySkillStep,
+        attempt: int,
+    ) -> FactorySkillReplayRecord:
+        key = _factory_step_idempotency_key(job, step=step, attempt=attempt)
+        async with self._lock:
+            record = self._records.get(key)
+        return _require_completed_prior_replay(
+            record,
+            job=job,
+            step=step,
+            attempt=attempt,
+        )
 
     async def claim(
         self,
@@ -758,6 +834,29 @@ class FilesystemFactorySkillReplayStore:
 
     def __init__(self, root: Path) -> None:
         self._root = root
+
+    async def completed(
+        self,
+        job: FactoryJob,
+        *,
+        step: FactorySkillStep,
+        attempt: int,
+    ) -> FactorySkillReplayRecord:
+        key = _factory_step_idempotency_key(job, step=step, attempt=attempt)
+        path = self._path_for(key)
+        try:
+            record = await asyncio.to_thread(self._read_record, path)
+        except FactoryDispatchError as exc:
+            if not path.exists():
+                record = None
+            else:
+                raise
+        return _require_completed_prior_replay(
+            record,
+            job=job,
+            step=step,
+            attempt=attempt,
+        )
 
     async def claim(
         self,
@@ -1168,16 +1267,11 @@ def _factory_invocation(
     assert request.lease is not None
     if input_ref.uri.startswith("holdout://"):
         raise FactoryDispatchError("private holdout references cannot enter Hermes prompts")
-    binding = _canonical_json(
-        {
-            "job_id": str(request.job.job_id),
-            "correlation_id": str(request.job.correlation_id),
-            "subject_version": request.job.subject_version,
-            "attempt": request.action.attempt,
-            "step": step.value,
-        }
+    idempotency_key = _factory_step_idempotency_key(
+        request.job,
+        step=step,
+        attempt=request.action.attempt,
     )
-    idempotency_key = hashlib.sha256(binding.encode("utf-8")).hexdigest()
     return FactorySkillInvocationV1(
         schema_name="captain.factory-skill-invocation.v1",
         invocation_id=uuid5(NAMESPACE_URL, f"captain.factory-skill:{idempotency_key}"),
@@ -1195,12 +1289,56 @@ def _factory_invocation(
     )
 
 
+def _factory_step_idempotency_key(
+    job: FactoryJob,
+    *,
+    step: FactorySkillStep,
+    attempt: int,
+) -> str:
+    binding = _canonical_json(
+        {
+            "job_id": str(job.job_id),
+            "correlation_id": str(job.correlation_id),
+            "subject_version": job.subject_version,
+            "attempt": attempt,
+            "step": step.value,
+        }
+    )
+    return hashlib.sha256(binding.encode("utf-8")).hexdigest()
+
+
+def _require_completed_prior_replay(
+    record: FactorySkillReplayRecord | None,
+    *,
+    job: FactoryJob,
+    step: FactorySkillStep,
+    attempt: int,
+) -> FactorySkillReplayRecord:
+    if record is None or record.state != "completed" or record.artifact is None:
+        raise FactoryDispatchError(
+            f"completed {step.value} replay is required before the next Factory stage"
+        )
+    invocation = record.invocation
+    if (
+        invocation.idempotency_key
+        != _factory_step_idempotency_key(job, step=step, attempt=attempt)
+        or invocation.job_id != job.job_id
+        or invocation.correlation_id != job.correlation_id
+        or invocation.subject_version != job.subject_version
+        or invocation.attempt != attempt
+        or invocation.step is not step
+    ):
+        raise FactoryDispatchError("prior Factory replay does not match the Captain job")
+    return record
+
+
 def _factory_skill_prompt(
     invocation: FactorySkillInvocationV1,
     *,
     skill_name: str,
     job: FactoryJob | None = None,
     discovery_seed: dict[str, object] | None = None,
+    codex_brief_seed: CodexBuildBriefV1 | None = None,
     previous_artifact: _FactoryWorkflowArtifact | None = None,
 ) -> str:
     invocation_payload = invocation.model_dump(mode="json", by_alias=True)
@@ -1215,6 +1353,18 @@ def _factory_skill_prompt(
         }
         output_schema = _canonical_json(
             _HermesDiscoveryAttestationV1.model_json_schema(by_alias=True)
+        )
+    elif codex_brief_seed is not None:
+        schema = "hermes.factory-codex-brief-attestation.v1"
+        seed_sha256 = _codex_brief_seed_sha256(codex_brief_seed)
+        required_bindings = {
+            "schema": schema,
+            "invocation_id": str(invocation.invocation_id),
+            "seed_sha256": seed_sha256,
+            "accepted": True,
+        }
+        output_schema = _canonical_json(
+            _HermesCodexBriefAttestationV1.model_json_schema(by_alias=True)
         )
     else:
         schema_field = _STEP_RESULT_MODELS[invocation.step].model_fields["schema_name"]
@@ -1300,6 +1450,15 @@ def _factory_skill_prompt(
                 "Validate the supplied Captain seed and return only its digest-bound attestation; do not call tools or reproduce the seed.",
             )
         )
+    if codex_brief_seed is not None:
+        lines.extend(
+            (
+                "captain_codex_brief_seed="
+                + codex_brief_seed.model_dump_json(by_alias=True),
+                f"captain_codex_brief_seed_sha256={seed_sha256}",
+                "Validate the supplied Captain Codex brief and return only its digest-bound attestation; do not call tools or reproduce the brief.",
+            )
+        )
     lines.extend(
         (
             f"Return exactly one {schema} JSON object and no markdown or prose.",
@@ -1310,6 +1469,107 @@ def _factory_skill_prompt(
         )
     )
     return "\n".join(lines)
+
+
+def _captain_codex_brief_seed(
+    request: FactoryDispatch,
+    invocation: FactorySkillInvocationV1,
+    inventory: CodebaseInventoryV1,
+    *,
+    artifact_store: CodexPromptArtifactStore,
+    improvement_authorization: FactoryImprovementAuthorizationV1 | None,
+) -> CodexBuildBriefV1:
+    if not isinstance(request.job, AgentFactoryJobV3):
+        raise FactoryDispatchError("Captain Codex brief seed requires a V3 job")
+    job = request.job
+    released_skill = invocation.released_skill
+    documentation_queries: list[dict[str, object]] = [
+        {
+            "ecosystem": "autogen",
+            "package_id": "autogen-agentchat",
+            "installed_version": inventory.autogen_version,
+            "query": (
+                "Validate AgentChat team patterns, handoffs, termination, memory, "
+                "model clients, and typed tool contracts for this build."
+            ),
+            "required": True,
+        }
+    ]
+    integrations: list[dict[str, object]] = []
+    if invocation.lease.integration_intent is IntegrationIntent.N8N:
+        documentation_queries.append(
+            {
+                "ecosystem": "n8n",
+                "package_id": "n8n-workflow",
+                "installed_version": "captain-builder",
+                "query": (
+                    "Validate the Captain-approved n8n workflow nodes, inputs, "
+                    "outputs, credentials boundary, and MCP tool contract."
+                ),
+                "required": True,
+            }
+        )
+        integrations.append(
+            {
+                "integration_id": "captain-n8n-workflow",
+                "kind": "n8n",
+                "severity": "required",
+                "input_contract_ref": job.compiled_spec_ref.model_dump(mode="json"),
+                "output_contract_ref": job.dependency_graph_ref.model_dump(
+                    mode="json"
+                ),
+            }
+        )
+    assignment = FactoryBuildAssignmentV1.model_validate(
+        {
+            "schema": "hermes.factory-build-assignment.v1",
+            "assignment_id": str(
+                uuid5(
+                    NAMESPACE_URL,
+                    f"captain.factory-assignment:{invocation.idempotency_key}",
+                )
+            ),
+            "creation_job_id": str(
+                uuid5(
+                    NAMESPACE_URL,
+                    f"captain.creation-job:{invocation.idempotency_key}",
+                )
+            ),
+            "correlation_id": str(job.correlation_id),
+            "subject_version": job.subject_version,
+            "attempt": invocation.attempt,
+            "idempotency_key": invocation.idempotency_key,
+            "released_skill": {
+                "skill_id": released_skill.skill_id,
+                "version": released_skill.version,
+                "content_ref": released_skill.content_ref.model_dump(mode="json"),
+                "content_sha256": released_skill.content_sha256,
+            },
+            "compiled_spec_ref": job.compiled_spec_ref.model_dump(mode="json"),
+            "dependency_graph_ref": job.dependency_graph_ref.model_dump(mode="json"),
+            "workspace_ref": invocation.lease.workspace_ref,
+            "documentation_queries": documentation_queries,
+            "integrations": integrations,
+            "public_assertion_ids": list(job.acceptance_assertion_ids),
+            "deadline_at": job.deadline_at,
+        }
+    )
+    try:
+        return CodexBriefBuilder(artifact_store=artifact_store).build(
+            invocation,
+            assignment,
+            inventory,
+            job.execution_policy,
+            improvement_authorization=improvement_authorization,
+        )
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise FactoryDispatchError("Captain Codex brief seed is invalid") from exc
+
+
+def _codex_brief_seed_sha256(brief: CodexBuildBriefV1) -> str:
+    return hashlib.sha256(
+        _canonical_json(brief.model_dump(mode="json", by_alias=True)).encode("utf-8")
+    ).hexdigest()
 
 
 def _discovery_seed_sha256(discovery_seed: dict[str, object]) -> str:
@@ -1336,6 +1596,30 @@ def _parse_discovery_attestation(
     ):
         raise FactoryDispatchError(
             "Hermes discovery attestation does not match Captain's seed"
+        )
+    return attestation
+
+
+def _parse_codex_brief_attestation(
+    stdout: bytes,
+    *,
+    invocation: FactorySkillInvocationV1,
+    codex_brief_seed: CodexBuildBriefV1,
+) -> _HermesCodexBriefAttestationV1:
+    try:
+        attestation = _HermesCodexBriefAttestationV1.model_validate(
+            _parse_evidence_payload(stdout)
+        )
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise FactoryDispatchError(
+            "Hermes must return exactly one typed Codex brief attestation"
+        ) from exc
+    if (
+        attestation.invocation_id != invocation.invocation_id
+        or attestation.seed_sha256 != _codex_brief_seed_sha256(codex_brief_seed)
+    ):
+        raise FactoryDispatchError(
+            "Hermes Codex brief attestation does not match Captain's seed"
         )
     return attestation
 

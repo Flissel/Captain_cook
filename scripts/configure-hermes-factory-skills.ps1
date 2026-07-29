@@ -32,7 +32,7 @@ $textAssetExtensions = @(
 # CRLF and standalone CR to LF before hashing; binary files remain byte-exact.
 $releasedSkillDigests = @{
     'captain-factory-discover' = 'b3490d5ef05f18f5ca38464c59d546196cdc3ed8b0d058da9fe7fd2df5f859fa'
-    'captain-factory-brief-codex' = 'ab15e81bf383fe64ab9b1a7c018f5577025fcbed3eaec47ffdb1d1692808648b'
+    'captain-factory-brief-codex' = '9cae3f24d43e9d4660803025a13c72bc9e5a73940a2cd11c2de9e4e691c1c67f'
     'captain-factory-execute-team' = '5e885c4ab70985d7b4f41a1129b4e3d62e815e201da58e0d695b7caf35305897'
     'captain-factory-evaluate-team' = '468f49b870d19554812216eefd82542b51fd09e3563cfde3dc9d0332704157c7'
     'captain-factory-improve-team' = '4c1bd1a3981832d9ddd6051fd35a3885621f898c305cf99eb8f11b71ced0d35f'

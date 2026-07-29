@@ -411,6 +411,151 @@ async def test_dispatch_uses_oneshot_mode_for_parseable_evidence(
 
 
 @pytest.mark.asyncio
+async def test_v3_brief_reuses_discovery_and_accepts_only_digest_attestation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory_job = job_v3(mode="demo")
+    architect_lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.AGENT_ARCHITECT,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage/discovery",
+        now=datetime(2026, 7, 19, 10, tzinfo=timezone.utc),
+    )
+    tool_lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage/build",
+        now=datetime(2026, 7, 19, 10, tzinfo=timezone.utc),
+    )
+    catalog = _catalog_for(
+        tmp_path,
+        FactorySkillStep.DISCOVER,
+        FactorySkillStep.BRIEF_CODEX,
+        FactorySkillStep.SEAL_CODEX_BUILD,
+    )
+    replay_store = InMemoryFactorySkillReplayStore()
+    sealer = CaptainBuildSealer()
+    prompts: list[str] = []
+    commands: list[tuple[str, ...]] = []
+
+    class PromptStore:
+        def __init__(self) -> None:
+            self.content: dict[str, bytes] = {}
+
+        def persist(self, job_id: UUID, content: bytes) -> ArtifactRef:
+            digest = hashlib.sha256(content).hexdigest()
+            reference = ArtifactRef(
+                uri=f"artifact://factory-prompts/{job_id}/{digest}",
+                sha256=digest,
+                media_type="application/json",
+            )
+            self.content[reference.uri] = content
+            return reference
+
+    prompt_store = PromptStore()
+
+    class EvidenceStore:
+        async def persist(self, _, content: bytes) -> ArtifactRef:
+            digest = hashlib.sha256(content).hexdigest()
+            return ArtifactRef(
+                uri=f"artifact://factory-evidence/test/{digest}",
+                sha256=digest,
+                media_type="application/json",
+            )
+
+    class Process:
+        returncode = 0
+
+        def __init__(self, prompt: str) -> None:
+            self.prompt = prompt
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            prompts.append(self.prompt)
+            if "captain_discovery_seed_sha256=" in self.prompt:
+                return json.dumps(_typed_payload(self.prompt)).encode(), b""
+            digest_prefix = "captain_codex_brief_seed_sha256="
+            digest = next(
+                line.removeprefix(digest_prefix)
+                for line in self.prompt.splitlines()
+                if line.startswith(digest_prefix)
+            )
+            return json.dumps(
+                {
+                    "schema": "hermes.factory-codex-brief-attestation.v1",
+                    "invocation_id": _invocation_from_prompt(self.prompt)[
+                        "invocation_id"
+                    ],
+                    "seed_sha256": digest,
+                    "accepted": True,
+                }
+            ).encode(), b""
+
+    async def create_process(*command: str, **__: object) -> Process:
+        commands.append(command)
+        return Process(command[-1])
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    factory = HermesCliFactory(
+        settings=HermesCliSettings(
+            skill_root=tmp_path,
+            working_directory=_CAPTAIN_WORKSPACE_ROOT,
+            evidence_root=tmp_path / "evidence",
+        ),
+        evidence_store=EvidenceStore(),
+        released_skill_catalog=catalog,
+        replay_store=replay_store,
+        codex_build_sealer=sealer,
+        codex_prompt_artifact_store=prompt_store,
+        clock=lambda: architect_lease.issued_at,
+    )
+
+    await factory.dispatch(
+        FactoryDispatch(
+            job=factory_job,
+            action=FactoryAction(
+                kind=FactoryActionKind.DISPATCH_AGENT_ARCHITECT,
+                attempt=1,
+                job_id=factory_job.job_id,
+            ),
+            role=FactoryRole.AGENT_ARCHITECT,
+            lease=architect_lease,
+        )
+    )
+    evidence = await factory.dispatch(
+        FactoryDispatch(
+            job=factory_job,
+            action=FactoryAction(
+                kind=FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,
+                attempt=1,
+                job_id=factory_job.job_id,
+            ),
+            role=FactoryRole.TOOL_INTEGRATOR,
+            lease=tool_lease,
+        )
+    )
+
+    assert len(prompts) == 2
+    assert "captain_codex_brief_seed=" in prompts[1]
+    assert "Return exactly one hermes.factory-codex-brief-attestation.v1" in prompts[1]
+    assert "--no-tools" in commands[1]
+    assert len(prompt_store.content) == 1
+    assert len(sealer.calls) == 1
+    brief = sealer.calls[0][2]
+    assert brief.prompt_ref.uri in prompt_store.content
+    assert brief.build_assignment.compiled_spec_ref.model_dump(mode="json") == (
+        factory_job.compiled_spec_ref.model_dump(mode="json")
+    )
+    assert brief.build_assignment.dependency_graph_ref.model_dump(mode="json") == (
+        factory_job.dependency_graph_ref.model_dump(mode="json")
+    )
+    assert brief.build_assignment.workspace_ref == tool_lease.workspace_ref
+    assert evidence.phase is FactoryPhase.TOOL_CANDIDATE_TESTED
+
+
+@pytest.mark.asyncio
 async def test_module_root_runs_only_the_checkout_cli_with_bound_cwd_and_pythonpath(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1081,6 +1226,13 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
             "subject_version": authorization.request_block.subject_version,
         }
     )
+    architect_lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.AGENT_ARCHITECT,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage/discovery",
+        now=datetime(2026, 7, 19, 10, tzinfo=timezone.utc),
+    )
     lease = issue_factory_lease(
         job=factory_job,
         role=FactoryRole.TOOL_INTEGRATOR,
@@ -1101,13 +1253,24 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
     )
     catalog = _catalog_for(
         tmp_path,
+        FactorySkillStep.DISCOVER,
         FactorySkillStep.IMPROVE_TEAM,
         FactorySkillStep.BRIEF_CODEX,
         FactorySkillStep.SEAL_CODEX_BUILD,
     )
     sealer = CaptainBuildSealer()
+    replay_store = InMemoryFactorySkillReplayStore()
     invocations: list[dict[str, object]] = []
     commands: list[tuple[str, ...]] = []
+
+    class PromptStore:
+        def persist(self, job_id: UUID, content: bytes) -> ArtifactRef:
+            digest = hashlib.sha256(content).hexdigest()
+            return ArtifactRef(
+                uri=f"artifact://factory-prompts/{job_id}/{digest}",
+                sha256=digest,
+                media_type="application/json",
+            )
 
     class Process:
         returncode = 0
@@ -1117,58 +1280,22 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
 
         async def communicate(self) -> tuple[bytes, bytes]:
             invocations.append(_invocation_from_prompt(self.prompt))
-            payload = _typed_payload(self.prompt)
-            if invocations[-1]["step"] == "brief_codex":
-                job_prefix = "captain_job_json="
-                prompt_job = json.loads(
-                    next(
-                        line.removeprefix(job_prefix)
-                        for line in self.prompt.splitlines()
-                        if line.startswith(job_prefix)
-                    )
+            if "captain_codex_brief_seed_sha256=" in self.prompt:
+                digest_prefix = "captain_codex_brief_seed_sha256="
+                digest = next(
+                    line.removeprefix(digest_prefix)
+                    for line in self.prompt.splitlines()
+                    if line.startswith(digest_prefix)
                 )
-                assert prompt_job["job_id"] == str(factory_job.job_id)
-                assignment_prefix = "captain_required_build_assignment_bindings="
-                assignment = json.loads(
-                    next(
-                        line.removeprefix(assignment_prefix)
-                        for line in self.prompt.splitlines()
-                        if line.startswith(assignment_prefix)
-                    )
-                )
-                assert assignment["compiled_spec_ref"] == prompt_job["compiled_spec_ref"]
-                assert assignment["dependency_graph_ref"] == prompt_job["dependency_graph_ref"]
-                assert assignment["workspace_ref"] == lease.workspace_ref
-                assert assignment["public_assertion_ids"] == list(
-                    factory_job.acceptance_assertion_ids
-                )
-                previous_prefix = "captain_previous_artifact_json="
-                previous = json.loads(
-                    next(
-                        line.removeprefix(previous_prefix)
-                        for line in self.prompt.splitlines()
-                        if line.startswith(previous_prefix)
-                    )
-                )
-                assert previous["schema"] == "hermes.factory-candidate-revision.v1"
-                payload["context_refs"] = [
-                    authorization.authorization_ref.model_dump(mode="json"),
-                    authorization.failed_evaluation.artifact_ref.model_dump(mode="json"),
-                    authorization.prior_candidate_ref.model_dump(mode="json"),
-                ]
-                payload["failed_benchmark_metric_ids"] = list(
-                    authorization.failed_evaluation.failed_benchmark_metric_ids
-                )
-                payload["regression_benchmark_metric_ids"] = list(
-                    authorization.prior_green_benchmark_metric_ids
-                )
-                payload["invocation"].pop("idempotency_key")
-                assignment_payload = payload["build_assignment"]
-                payload["documentation_queries"] = assignment_payload.pop(
-                    "documentation_queries"
-                )
-                payload["integrations"] = assignment_payload.pop("integrations", [])
-            return json.dumps(payload).encode(), b""
+                return json.dumps(
+                    {
+                        "schema": "hermes.factory-codex-brief-attestation.v1",
+                        "invocation_id": invocations[-1]["invocation_id"],
+                        "seed_sha256": digest,
+                        "accepted": True,
+                    }
+                ).encode(), b""
+            return json.dumps(_typed_payload(self.prompt)).encode(), b""
 
     async def create_process(*command: str, **__: object) -> Process:
         commands.append(command)
@@ -1176,26 +1303,44 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
 
-    evidence = await HermesCliFactory(
+    factory = HermesCliFactory(
         settings=HermesCliSettings(
             skill_root=tmp_path,
+            working_directory=_CAPTAIN_WORKSPACE_ROOT,
             evidence_root=tmp_path / "evidence",
         ),
         released_skill_catalog=catalog,
+        replay_store=replay_store,
         codex_build_sealer=sealer,
+        codex_prompt_artifact_store=PromptStore(),
         clock=lambda: lease.issued_at,
-    ).dispatch(request)
+    )
+    await factory.dispatch(
+        FactoryDispatch(
+            job=factory_job,
+            action=FactoryAction(
+                kind=FactoryActionKind.DISPATCH_AGENT_ARCHITECT,
+                attempt=1,
+                job_id=factory_job.job_id,
+            ),
+            role=FactoryRole.AGENT_ARCHITECT,
+            lease=architect_lease,
+        )
+    )
+    evidence = await factory.dispatch(request)
 
     assert [item["step"] for item in invocations] == [
+        "discover",
         "improve_team",
         "brief_codex",
     ]
-    assert invocations[0]["input_ref"] == authorization.authorization_ref.model_dump(
+    assert invocations[1]["input_ref"] == authorization.authorization_ref.model_dump(
         mode="json"
     )
-    assert invocations[1]["input_ref"] == revision_payload()["artifact_ref"]
-    assert "--no-tools" not in commands[0]
-    assert "--no-tools" in commands[1]
+    assert invocations[2]["input_ref"] == revision_payload()["artifact_ref"]
+    assert "--no-tools" in commands[0]
+    assert "--no-tools" not in commands[1]
+    assert "--no-tools" in commands[2]
     assert len(sealer.calls) == 1
     assert sealer.calls[0][1].step is FactorySkillStep.SEAL_CODEX_BUILD
     assert sealer.calls[0][1].input_ref == sealer.calls[0][2].artifact_ref
@@ -1250,6 +1395,15 @@ async def test_dispatch_replay_uses_identical_invocation_and_idempotency_key(
 
     assert len(invocations) == 1
     assert first == second
+
+    prior = await FilesystemFactorySkillReplayStore(
+        tmp_path / "replays"
+    ).completed(
+        request.job,
+        step=FactorySkillStep.DISCOVER,
+        attempt=1,
+    )
+    assert isinstance(prior.artifact, CodebaseInventoryV1)
 
     invocation = FactorySkillInvocationV1.model_validate(invocations[0])
     accepted = await replay_store.claim(invocation)

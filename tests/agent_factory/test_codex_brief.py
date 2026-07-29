@@ -225,15 +225,6 @@ def test_retry_brief_binds_failed_evaluation_candidate_and_prior_green() -> None
     assignment_data["attempt"] = 2
     assignment = FactoryBuildAssignmentV1.model_validate(assignment_data)
     inventory_data = inventory_payload()
-    inventory_invocation = inventory_data["invocation"]
-    assert isinstance(inventory_invocation, dict)
-    inventory_invocation["attempt"] = 2
-    inventory_invocation["lease"] = lease_payload(
-        "agent_architect",
-        "factory-architect",
-        attempt=2,
-    )
-    inventory_data["attempt"] = 2
     inventory = CodebaseInventoryV1.model_validate(inventory_data)
     store = PromptArtifactStore()
 

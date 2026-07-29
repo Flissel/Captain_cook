@@ -84,10 +84,13 @@
   content-addressed inventory only after validating that attestation, and the
   Hermes one-shot runtime preserves an explicit empty tool scope instead of
   falling back to configured tools.
-- [x] Pass the validated prior Factory artifact directly into sequential
-  `brief_codex` prompts and disable tools for that pure transformation. This
-  removes the observed browser/file rediscovery path while preserving tools for
-  implementation and execution steps that actually require them.
+- [x] Persist Attempt-1 discovery in the durable Factory replay store and load
+  that exact typed inventory across the later Tool Integrator lease. Captain now
+  builds the canonical V3 `CodexBuildBriefV1` and prompt in its private CAS;
+  tool-free Hermes returns only
+  `hermes.factory-codex-brief-attestation.v1` bound to the brief digest. Retry
+  attempts reuse the same inventory and add only Captain-authorized improvement
+  evidence. Full model-authored brief reproduction is no longer on the V3 path.
 - [ ] Run the two provider-backed Factory jobs and 30-case team/baseline
   benchmark after `OPENAI_API_KEY` is securely exported into the invoking
   process. Retain cost, latency, tool, handoff, recovery, Gateway decision, and
@@ -99,7 +102,8 @@
   bindings; v12 proved the new discovery attestation and then failed closed at
   `brief_codex`. The authorized v13 and v14 retries also failed closed there:
   v13 exposed missing Captain job context, while v14 exposed a narrowly
-  malformed Hermes nesting/Invocation echo. Captain now binds the exact V3 job
-  into the tool-free prompt and normalizes only Captain-authoritative identity
-  fields plus the two schema-defined assignment collections before validation.
-  No run reached a benchmark, Gateway promotion, or Minibook projection.
+  malformed Hermes nesting/Invocation echo. Those failures triggered the
+  architectural replacement above instead of further prompt tuning. Brief skill
+  release v2 and immutable suite/seed v15 are prepared with a `0.09` USD Hermes
+  ceiling, but v15 has not been executed. No run reached a benchmark, Gateway
+  promotion, or Minibook projection.

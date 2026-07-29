@@ -40,6 +40,7 @@ from agenten.agent_factory.candidate_evaluation import (
     FactoryTeamExecutionPort,
     ResolvedFactoryCandidate,
 )
+from agenten.agent_factory.codex_brief import CodexPromptArtifactStore
 from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryJob
 from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
 from agenten.agent_factory.execution_budget import FactoryBudgetPort
@@ -428,6 +429,7 @@ def compose_agent_factory_live(
     holdout_selector: Callable[[AgentFactoryJobV3], PrivateHoldoutRef] | None = None,
     improvements: FactoryImprovementAuthorizationPort | None = None,
     codex_build_sealer: CaptainCodexBuildSealerPort | None = None,
+    codex_prompt_artifact_store: CodexPromptArtifactStore | None = None,
 ) -> AgentFactoryLiveComposition:
     """Wire production ports without executing Hermes, providers, n8n, or Forge."""
 
@@ -455,6 +457,7 @@ def compose_agent_factory_live(
         evidence_store=evidence_store,
         released_skill_catalog=repository,
         codex_build_sealer=codex_build_sealer,
+        codex_prompt_artifact_store=codex_prompt_artifact_store,
         clock=clock,
     )
     team_execution = ProductionFactoryTeamExecutionPort(

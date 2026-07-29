@@ -970,7 +970,10 @@ def _prepare_released_skills(
     root = workspace_root / "agenten" / "agent_factory" / "skills"
     for step in FactorySkillStep:
         skill_id = FACTORY_SKILL_ID_BY_STEP[step]
-        release_version = 5 if step is FactorySkillStep.DISCOVER else 1
+        release_version = {
+            FactorySkillStep.DISCOVER: 5,
+            FactorySkillStep.BRIEF_CODEX: 2,
+        }.get(step, 1)
         directory = root / skill_id
         content = _directory_zip_bytes(directory)
         archived_reference = _predicted_ref(

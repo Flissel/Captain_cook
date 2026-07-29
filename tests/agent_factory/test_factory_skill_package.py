@@ -12,7 +12,10 @@ SKILL_DIR = Path("agenten/agent_factory/skills/autogen-agent-factory")
 
 SKILLS = {
     "captain-factory-discover": ("CodebaseInventoryV1", "do not change code"),
-    "captain-factory-brief-codex": ("CodexBuildBriefV1", "codex.run"),
+    "captain-factory-brief-codex": (
+        "hermes.factory-codex-brief-attestation.v1",
+        "do not call tools",
+    ),
     "captain-factory-seal-codex-build": ("CodexBuildEvidenceV1", "Captain-issued"),
     "captain-factory-execute-team": ("TeamExecutionEvidenceV1", "max_cost_usd"),
     "captain-factory-evaluate-team": ("TeamEvaluationV1", "do not repair"),
@@ -149,6 +152,8 @@ def test_brief_codex_selects_builtin_skills_by_assignment_phase() -> None:
         "its repair step"
     ) in text
     assert "load `requesting-code-review` before completion" in text
+    assert "digest-bound attestation" in text
+    assert "do not reproduce the captain-authored brief" in text
     assert "skills as mandatory instructions" not in text
 
 

@@ -21,6 +21,32 @@ acceptance assertions.  Captain alone publishes a evaluated candidate and
 records the final promotion.  The `hermes-agent/` submodule is a leased worker
 runtime and never a shared-registry writer.
 
+### Discovery-to-Codex brief authority
+
+The V3 build path separates model judgment from authoritative artifact
+construction. The Agent Architect uses the released discovery skill and returns
+a digest attestation; Captain materializes and durably replays the typed
+Attempt-1 inventory. A later Tool Integrator lease loads that exact inventory,
+and Captain builds `FactoryBuildAssignmentV1`, the bounded Codex prompt, and
+`CodexBuildBriefV1` in its private content-addressed store. Hermes applies brief
+skill release v2 without tools and returns only a digest-bound attestation.
+Captain then gives the exact brief to the separately leased Codex seal step.
+
+```text
+Hermes discovery attestation
+  -> Captain typed inventory + durable replay
+  -> Captain V3 assignment and Codex brief
+  -> Hermes brief digest attestation
+  -> Captain Codex execution/seal
+  -> Minibook Forge import of sealed source bytes
+```
+
+Retries reuse the Attempt-1 inventory and add only the exact Captain improvement
+authorization, failed evaluation, prior candidate, and regression guards. A
+missing/failed replay, changed digest, stale lease, or malformed attestation
+stops before Codex. Hermes never authors Captain lifecycle identity or release
+evidence.
+
 ### Business benchmark release validation
 
 Every V3 Factory candidate must pass a Captain-owned paired business benchmark
