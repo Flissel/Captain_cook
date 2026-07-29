@@ -114,5 +114,11 @@
   suite instead of candidate-scoped verification. Fresh suite/seed v18 carries
   explicit generated-candidate compile/pytest commands, defers `pytest.live.demo`
   to Captain's sealed holdout, and uses a reduced `0.06` USD Hermes ceiling so
-  cumulative worst-case spend remains below `1.00` USD. No run has yet reached a
-  benchmark, Gateway promotion, or Minibook projection.
+  cumulative worst-case spend remains below `1.00` USD. V18 still exhausted the
+  900-second Codex lease before producing the three required output artifacts.
+  `PowerShellCodexRunner` returned exit code 124 with empty buffered JSONL, which
+  `_session_receipt` currently masks as `Codex JSONL evidence is empty`. Further
+  paid retries are stopped until Codex output is streamed durably, timeout
+  evidence retains its real terminal cause, and the build is split into
+  resumable Captain-authored scaffold/test and Codex implementation phases. No
+  run has yet reached a benchmark, Gateway promotion, or Minibook projection.
