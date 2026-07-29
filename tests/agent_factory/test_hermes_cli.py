@@ -29,6 +29,7 @@ from agenten.agent_factory.hermes_cli import (
     FilesystemReleasedFactorySkillCatalog,
     HermesCliFactory,
     HermesCliSettings,
+    _captain_discovery_seed,
     _require_improvement_artifact_binding,
     InMemoryFactorySkillReplayStore,
 )
@@ -43,6 +44,7 @@ from agenten.agent_factory.skill_evaluation import (
 )
 from agenten.agent_factory.skill_workflow_contracts import (
     CandidateRevisionV1,
+    CodebaseInventoryV1,
     CodexBuildBriefV1,
     CodexBuildEvidenceV1,
     FactorySkillInvocationV1,
@@ -79,6 +81,8 @@ _STEP_SKILL_NAMES = {
     FactorySkillStep.IMPROVE_TEAM: "captain-factory-improve-team",
     FactorySkillStep.REPORT_CAPTAIN: "captain-factory-report-captain",
 }
+
+_CAPTAIN_WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 
 
 class CaptainBuildSealer:
@@ -231,7 +235,18 @@ def _typed_payload(prompt: str, *, step: FactorySkillStep | None = None) -> dict
     if step is not None:
         actual_step = step
     if actual_step is FactorySkillStep.DISCOVER:
-        payload = inventory_payload()
+        digest_prefix = "captain_discovery_seed_sha256="
+        seed_sha256 = next(
+            line.removeprefix(digest_prefix)
+            for line in prompt.splitlines()
+            if line.startswith(digest_prefix)
+        )
+        return {
+            "schema": "hermes.factory-discovery-attestation.v1",
+            "invocation_id": invocation["invocation_id"],
+            "seed_sha256": seed_sha256,
+            "accepted": True,
+        }
     elif actual_step is FactorySkillStep.BRIEF_CODEX:
         payload = brief_payload()
         released = invocation["released_skill"]
@@ -277,6 +292,24 @@ def _typed_payload(prompt: str, *, step: FactorySkillStep | None = None) -> dict
         }
     )
     return payload
+
+
+def test_captain_discovery_seed_is_typed_and_content_addressed() -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    invocation = FactorySkillInvocationV1.model_validate(
+        invocation_payload("discover")
+    )
+
+    seed = _captain_discovery_seed(repository_root, invocation)
+    parsed = CodebaseInventoryV1.model_validate(seed)
+
+    assert parsed.invocation == invocation
+    assert parsed.inspected_revision
+    assert parsed.autogen_version == "0.7.5"
+    assert parsed.source_refs
+    assert parsed.test_refs
+    assert parsed.schema_refs
+    assert parsed.artifact_ref.uri.endswith(parsed.artifact_ref.sha256)
 
 
 @pytest.mark.asyncio
@@ -332,6 +365,7 @@ async def test_dispatch_uses_oneshot_mode_for_parseable_evidence(
     evidence = await HermesCliFactory(
         settings=HermesCliSettings(
             skill_root=tmp_path,
+            working_directory=Path(__file__).resolve().parents[2],
             evidence_root=tmp_path / "evidence",
         ),
         evidence_store=EvidenceStore(),
@@ -339,10 +373,35 @@ async def test_dispatch_uses_oneshot_mode_for_parseable_evidence(
         clock=lambda: lease.issued_at,
     ).dispatch(request)
 
-    assert observed[:2] == ("hermes", "-z")
+    assert observed[0] == "hermes"
+    assert observed[1:4] == (
+        "--skills",
+        "captain-factory-discover",
+        "--ignore-rules",
+    )
+    assert "-z" in observed
+    assert "--no-tools" in observed
     assert "chat" not in observed
     assert "/captain-factory-discover" in observed[-1]
     assert "captain_invocation_json=" in observed[-1]
+    assert (
+        "Return exactly one hermes.factory-discovery-attestation.v1 JSON object"
+        in observed[-1]
+    )
+    assert "PydanticUndefined" not in observed[-1]
+    assert "captain_output_json_schema=" in observed[-1]
+    assert "captain_discovery_seed=" in observed[-1]
+    assert "captain_discovery_seed_sha256=" in observed[-1]
+    assert "do not call tools" in observed[-1]
+    binding_prefix = "captain_required_output_bindings="
+    binding_line = next(
+        line for line in observed[-1].splitlines() if line.startswith(binding_prefix)
+    )
+    bindings = json.loads(binding_line.removeprefix(binding_prefix))
+    assert bindings["schema"] == "hermes.factory-discovery-attestation.v1"
+    assert bindings["invocation_id"] == _invocation_from_prompt(observed[-1])["invocation_id"]
+    assert bindings["seed_sha256"]
+    assert bindings["accepted"] is True
     assert f'"lease_id":"{lease.lease_id}"' in observed[-1]
     assert evidence.phase is FactoryPhase.BLUEPRINT_CREATED
     assert any(
@@ -356,7 +415,8 @@ async def test_module_root_runs_only_the_checkout_cli_with_bound_cwd_and_pythonp
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_root = tmp_path / "hermes-agent"
+    workspace_root = tmp_path / "workspace"
+    module_root = workspace_root / "hermes-agent"
     entrypoint = module_root / "hermes_cli" / "main.py"
     entrypoint.parent.mkdir(parents=True)
     entrypoint.write_text("# checkout entrypoint\n", encoding="utf-8")
@@ -382,6 +442,7 @@ async def test_module_root_runs_only_the_checkout_cli_with_bound_cwd_and_pythonp
         settings=HermesCliSettings(
             executable="python.exe",
             module_root=module_root,
+            working_directory=workspace_root,
             evidence_root=tmp_path / "evidence",
         )
     )._run_skill_prompt("sealed prompt", max_seconds=30)
@@ -397,9 +458,10 @@ async def test_module_root_runs_only_the_checkout_cli_with_bound_cwd_and_pythonp
         "-z",
         "sealed prompt",
     )
-    assert Path(observed_options["cwd"]) == resolved_root
+    assert Path(observed_options["cwd"]) == workspace_root.resolve()
     assert environment["PYTHONPATH"] == str(resolved_root)
     assert environment["PYTHONPATH"] != "global-hermes-location"
+    assert environment["HERMES_MAX_ITERATIONS"] == "16"
 
 
 @pytest.mark.asyncio
@@ -628,6 +690,7 @@ async def test_dispatch_rejects_changed_released_skill_bytes_before_hermes(
             settings=HermesCliSettings(
                 skill_root=tmp_path,
                 evidence_root=tmp_path / "evidence",
+                working_directory=_CAPTAIN_WORKSPACE_ROOT,
             ),
             released_skill_catalog=catalog,
             clock=lambda: lease.issued_at,
@@ -704,6 +767,7 @@ async def test_dispatch_rejects_result_for_the_wrong_skill_step(
             settings=HermesCliSettings(
                 skill_root=tmp_path,
                 evidence_root=tmp_path / "evidence",
+                working_directory=_CAPTAIN_WORKSPACE_ROOT,
             ),
             released_skill_catalog=catalog,
             clock=lambda: lease.issued_at,
@@ -803,6 +867,7 @@ async def test_dispatch_timeout_terminates_hermes_process_tree(
                     skill_root=tmp_path,
                     timeout_seconds=0.2,
                     evidence_root=tmp_path / "evidence",
+                    working_directory=_CAPTAIN_WORKSPACE_ROOT,
                 ),
             released_skill_catalog=catalog,
             clock=lambda: lease.issued_at,
@@ -1042,6 +1107,7 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
     )
     sealer = CaptainBuildSealer()
     invocations: list[dict[str, object]] = []
+    commands: list[tuple[str, ...]] = []
 
     class Process:
         returncode = 0
@@ -1053,6 +1119,15 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
             invocations.append(_invocation_from_prompt(self.prompt))
             payload = _typed_payload(self.prompt)
             if invocations[-1]["step"] == "brief_codex":
+                previous_prefix = "captain_previous_artifact_json="
+                previous = json.loads(
+                    next(
+                        line.removeprefix(previous_prefix)
+                        for line in self.prompt.splitlines()
+                        if line.startswith(previous_prefix)
+                    )
+                )
+                assert previous["schema"] == "hermes.factory-candidate-revision.v1"
                 payload["context_refs"] = [
                     authorization.authorization_ref.model_dump(mode="json"),
                     authorization.failed_evaluation.artifact_ref.model_dump(mode="json"),
@@ -1067,6 +1142,7 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
             return json.dumps(payload).encode(), b""
 
     async def create_process(*command: str, **__: object) -> Process:
+        commands.append(command)
         return Process(command[-1])
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
@@ -1089,6 +1165,8 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
         mode="json"
     )
     assert invocations[1]["input_ref"] == revision_payload()["artifact_ref"]
+    assert "--no-tools" not in commands[0]
+    assert "--no-tools" in commands[1]
     assert len(sealer.calls) == 1
     assert sealer.calls[0][1].step is FactorySkillStep.SEAL_CODEX_BUILD
     assert sealer.calls[0][1].input_ref == sealer.calls[0][2].artifact_ref
@@ -1123,6 +1201,7 @@ async def test_dispatch_replay_uses_identical_invocation_and_idempotency_key(
     settings = HermesCliSettings(
         skill_root=tmp_path,
         evidence_root=tmp_path / "evidence",
+        working_directory=_CAPTAIN_WORKSPACE_ROOT,
     )
     replay_store = FilesystemFactorySkillReplayStore(tmp_path / "replays")
     first_factory = HermesCliFactory(
@@ -1193,6 +1272,7 @@ async def test_concurrent_dispatch_claims_logical_step_before_spawning_hermes(
     settings = HermesCliSettings(
         skill_root=tmp_path,
         evidence_root=tmp_path / "evidence",
+        working_directory=_CAPTAIN_WORKSPACE_ROOT,
     )
     first = asyncio.create_task(
         HermesCliFactory(
@@ -1297,6 +1377,7 @@ async def test_changed_input_conflicts_on_same_logical_step_without_new_effect(
     settings = HermesCliSettings(
         skill_root=tmp_path,
         evidence_root=tmp_path / "evidence",
+        working_directory=_CAPTAIN_WORKSPACE_ROOT,
     )
     first = HermesCliFactory(
         settings=settings,
@@ -1374,6 +1455,7 @@ async def test_factory_uses_durable_filesystem_replay_store_by_default(
     settings = HermesCliSettings(
         skill_root=tmp_path,
         evidence_root=tmp_path / "evidence",
+        working_directory=_CAPTAIN_WORKSPACE_ROOT,
     )
 
     first = await HermesCliFactory(
@@ -1416,6 +1498,7 @@ async def test_failed_effect_is_durable_and_never_respawned_after_restart(
     settings = HermesCliSettings(
         skill_root=tmp_path,
         evidence_root=tmp_path / "evidence",
+        working_directory=_CAPTAIN_WORKSPACE_ROOT,
     )
 
     with pytest.raises(FactoryDispatchError, match="provider failed"):
@@ -1483,6 +1566,7 @@ async def test_dispatch_accepts_one_json_block_followed_by_hermes_tool_telemetry
         settings=HermesCliSettings(
             skill_root=tmp_path,
             evidence_root=tmp_path / "evidence",
+            working_directory=_CAPTAIN_WORKSPACE_ROOT,
         ),
         evidence_store=EvidenceStore(),
         released_skill_catalog=catalog,
