@@ -1119,6 +1119,29 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
             invocations.append(_invocation_from_prompt(self.prompt))
             payload = _typed_payload(self.prompt)
             if invocations[-1]["step"] == "brief_codex":
+                job_prefix = "captain_job_json="
+                prompt_job = json.loads(
+                    next(
+                        line.removeprefix(job_prefix)
+                        for line in self.prompt.splitlines()
+                        if line.startswith(job_prefix)
+                    )
+                )
+                assert prompt_job["job_id"] == str(factory_job.job_id)
+                assignment_prefix = "captain_required_build_assignment_bindings="
+                assignment = json.loads(
+                    next(
+                        line.removeprefix(assignment_prefix)
+                        for line in self.prompt.splitlines()
+                        if line.startswith(assignment_prefix)
+                    )
+                )
+                assert assignment["compiled_spec_ref"] == prompt_job["compiled_spec_ref"]
+                assert assignment["dependency_graph_ref"] == prompt_job["dependency_graph_ref"]
+                assert assignment["workspace_ref"] == lease.workspace_ref
+                assert assignment["public_assertion_ids"] == list(
+                    factory_job.acceptance_assertion_ids
+                )
                 previous_prefix = "captain_previous_artifact_json="
                 previous = json.loads(
                     next(

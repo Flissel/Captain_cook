@@ -284,6 +284,7 @@ class HermesCliFactory(HermesFactoryPort):
                         _factory_skill_prompt(
                             invocation,
                             skill_name=skill_name,
+                            job=request.job,
                             discovery_seed=discovery_seed,
                             previous_artifact=artifacts[-1] if artifacts else None,
                         ),
@@ -1194,6 +1195,7 @@ def _factory_skill_prompt(
     invocation: FactorySkillInvocationV1,
     *,
     skill_name: str,
+    job: FactoryJob | None = None,
     discovery_seed: dict[str, object] | None = None,
     previous_artifact: _FactoryWorkflowArtifact | None = None,
 ) -> str:
@@ -1238,6 +1240,46 @@ def _factory_skill_prompt(
             f"captain_required_output_bindings={_canonical_json(required_bindings)}",
             f"captain_output_json_schema={output_schema}",
     ]
+    if invocation.step is FactorySkillStep.BRIEF_CODEX:
+        if job is None or not isinstance(job, AgentFactoryJobV3):
+            raise FactoryDispatchError(
+                "Hermes Codex brief requires Captain's exact V3 job bindings"
+            )
+        released_skill = invocation.released_skill
+        assignment_bindings = {
+            "assignment_id": str(
+                uuid5(
+                    NAMESPACE_URL,
+                    f"captain.factory-assignment:{invocation.idempotency_key}",
+                )
+            ),
+            "creation_job_id": str(job.job_id),
+            "correlation_id": str(job.correlation_id),
+            "subject_version": job.subject_version,
+            "attempt": invocation.attempt,
+            "idempotency_key": invocation.idempotency_key,
+            "released_skill": {
+                "skill_id": released_skill.skill_id,
+                "version": released_skill.version,
+                "content_ref": released_skill.content_ref.model_dump(mode="json"),
+                "content_sha256": released_skill.content_sha256,
+            },
+            "compiled_spec_ref": job.compiled_spec_ref.model_dump(mode="json"),
+            "dependency_graph_ref": job.dependency_graph_ref.model_dump(mode="json"),
+            "workspace_ref": invocation.lease.workspace_ref,
+            "public_assertion_ids": list(job.acceptance_assertion_ids),
+            "deadline_at": job.deadline_at.isoformat().replace("+00:00", "Z"),
+        }
+        lines.extend(
+            (
+                "captain_job_json=" + job.model_dump_json(by_alias=True),
+                "captain_required_build_assignment_bindings="
+                + _canonical_json(assignment_bindings),
+                "captain_required_authorized_path_roots="
+                + _canonical_json([invocation.lease.workspace_ref]),
+                "Copy every Captain build-assignment binding and the authorized path roots exactly; only documentation_queries and integrations may be derived.",
+            )
+        )
     if previous_artifact is not None:
         lines.extend(
             (
