@@ -139,17 +139,21 @@ replay; every conflict raises `FactoryDispatchError`.
 - [ ] **Step 4: Write failing executor recovery tests**
 
 Assert the first call creates the detached workspace and `.captain-inputs` once,
-records `scaffold_ready`, and starts implementation. Simulate timeout, create a
-matching retry authorization fixture, and assert a second call reuses the same
-workspace and materialized input digests. Assert artifacts are checked only
-after `implementation_complete`, and `sealed` is terminal/idempotent.
+records `scaffold_ready`, and starts implementation. Simulate timeout and assert
+the checkpoint retains the same workspace and materialized input digests. A
+second ordinary call must stop at `implementation_interrupted`; Task 3 supplies
+the matching Captain authorization that permits the transition back to
+`implementation_running`. Assert artifacts are checked only after
+`implementation_complete`, and `sealed` is terminal/idempotent.
 
 - [ ] **Step 5: Integrate phased execution**
 
 Split `CodexCliFactoryBuildExecutor.execute` into private scaffold,
 implementation, and seal methods. Record the terminal session receipt digest in
-the interrupted/completed checkpoint. On recovery, validate the existing
-worktree HEAD and every materialized input digest rather than recreating them.
+the interrupted/completed checkpoint. Expose a narrow authorized-resume hook
+that Task 3 can call; it must reject use without the authorization decision that
+Task 3 injects. On recovery, validate the existing worktree HEAD and every
+materialized input digest rather than recreating them.
 
 - [ ] **Step 6: Verify and commit Task 2**
 
