@@ -13,9 +13,14 @@ from agenten.agent_factory.codex_build_execution import (
     CodexCliFactoryBuildExecutor,
     CodexCliFactoryBuildSettings,
     CompletedCodexBuild,
+    FactoryCodexBuildInterrupted,
     GitDetachedFactoryWorkspacePreparer,
     PreparedFactoryWorkspace,
     _session_receipt,
+)
+from agenten.agent_factory.codex_build_recovery import (
+    FactoryCodexBuildCheckpointV1,
+    FilesystemFactoryCodexBuildCheckpointStore,
 )
 from agenten.agent_factory.codex_build_provenance import (
     CaptainCodexBuildReceiptIssuer,
@@ -47,10 +52,14 @@ class FakeBuildExecutor:
     def __init__(self, completed: CompletedCodexBuild) -> None:
         self.completed = completed
         self.calls: list[tuple[object, object, object]] = []
+        self.sealed: list[tuple[object, object]] = []
 
     async def execute(self, request, invocation, brief) -> CompletedCodexBuild:
         self.calls.append((request, invocation, brief))
         return self.completed
+
+    def mark_sealed(self, invocation, completed) -> None:
+        self.sealed.append((invocation, completed))
 
 
 class RecordingAuthorizer:
@@ -242,6 +251,7 @@ async def test_captain_sealer_issues_and_persists_exact_build_evidence(
     assert evidence.build_receipt.producer == "captain"
     assert evidence.build_receipt.seal_idempotency_key == invocation.idempotency_key
     assert cas.read_bytes(evidence.build_receipt_ref)
+    assert executor.sealed == [(invocation, executor.completed)]
 
 
 @pytest.mark.asyncio
@@ -363,6 +373,12 @@ async def test_cli_executor_fails_closed_when_codex_omits_required_outputs(
 
     with pytest.raises(FactoryDispatchError, match="required build artifact"):
         await executor.execute(_dispatch(job, invocation), invocation, brief)
+
+    checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
+        tmp_path / "state" / "checkpoints"
+    ).load(invocation)
+    assert checkpoint is not None
+    assert checkpoint.phase == "implementation_complete"
 
 
 def _run_result(
@@ -501,7 +517,7 @@ async def test_cli_executor_persists_timeout_receipt_before_raising_timeout_124(
         clock=lambda: NOW,
     )
 
-    with pytest.raises(FactoryDispatchError, match=r"timed out \(exit 124\)"):
+    with pytest.raises(FactoryCodexBuildInterrupted, match=r"timed out \(exit 124\)"):
         await executor.execute(_dispatch(job, invocation), invocation, brief)
 
     receipt_path = state_root / "sessions" / f"{invocation.idempotency_key}.json"
@@ -509,6 +525,301 @@ async def test_cli_executor_persists_timeout_receipt_before_raising_timeout_124(
     assert receipt["status"] == "timed_out"
     assert receipt["exit_code"] == 124
     assert receipt["event_count"] == 0
+    checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert checkpoint is not None
+    assert checkpoint.phase == "implementation_interrupted"
+    assert checkpoint.terminal_receipt_sha256 == hashlib.sha256(
+        receipt_path.read_bytes()
+    ).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_ordinary_redispatch_revalidates_workspace_and_never_runs(
+    tmp_path: Path,
+) -> None:
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+    preparer_calls: list[object | None] = []
+
+    class RecoveringPreparer:
+        def prepare_or_recover(self, _request, _invocation, _brief, checkpoint):
+            preparer_calls.append(checkpoint)
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    class TimedOutRunner:
+        async def run(self, _authorized) -> CodexRunResult:
+            journal_path = state_root / "journals" / f"{invocation.idempotency_key}.jsonl"
+            journal_path.parent.mkdir(parents=True, exist_ok=True)
+            journal_path.write_bytes(b"")
+            return CodexRunResult(
+                exit_code=124,
+                terminal_status="timed_out",
+                process_cleanup_status="verified_cancelled",
+                journal_path=journal_path,
+                journal_sha256=hashlib.sha256(b"").hexdigest(),
+                artifact_references=(),
+                jsonl_lines=(),
+            )
+
+    runner_calls: list[object] = []
+
+    def runner_factory(**_kwargs):
+        runner_calls.append(object())
+        return TimedOutRunner()
+
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=RecoveringPreparer(),
+        artifact_reader=artifact_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=runner_factory,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FactoryCodexBuildInterrupted):
+        await executor.execute(_dispatch(job, invocation), invocation, brief)
+    input_digests = {
+        item.name: hashlib.sha256(item.read_bytes()).hexdigest()
+        for item in (workspace / ".captain-inputs").iterdir()
+    }
+
+    with pytest.raises(FactoryCodexBuildInterrupted, match="Captain-authorized"):
+        await executor.execute(_dispatch(job, invocation), invocation, brief)
+    with pytest.raises(FactoryDispatchError, match="authorization decision"):
+        await executor.execute_authorized_resume(
+            _dispatch(job, invocation),
+            invocation,
+            brief,
+            authorization_decision=None,
+        )
+
+    assert len(runner_calls) == 1
+    assert len(preparer_calls) == 2
+    assert preparer_calls[0] is None
+    assert preparer_calls[1].phase == "implementation_interrupted"
+    assert input_digests == {
+        item.name: hashlib.sha256(item.read_bytes()).hexdigest()
+        for item in (workspace / ".captain-inputs").iterdir()
+    }
+    (workspace / ".captain-inputs" / "job-input.md").write_bytes(b"tampered")
+    with pytest.raises(FactoryDispatchError, match="input digest changed"):
+        await executor.execute(_dispatch(job, invocation), invocation, brief)
+    assert len(runner_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_authorized_resume_uses_next_ordinal_without_replacing_timeout_receipt(
+    tmp_path: Path,
+) -> None:
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+
+    class RecoveringPreparer:
+        def prepare_or_recover(self, _request, _invocation, _brief, _checkpoint):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    class TimedOutRunner:
+        def __init__(self, journal_path: Path) -> None:
+            self.journal_path = journal_path
+
+        async def run(self, _authorized) -> CodexRunResult:
+            self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+            self.journal_path.write_bytes(b"")
+            return CodexRunResult(
+                exit_code=124,
+                terminal_status="timed_out",
+                process_cleanup_status="verified_cancelled",
+                journal_path=self.journal_path,
+                journal_sha256=hashlib.sha256(b"").hexdigest(),
+                artifact_references=(),
+                jsonl_lines=(),
+            )
+
+    runner_count = 0
+
+    def runner_factory(**kwargs):
+        nonlocal runner_count
+        runner_count += 1
+        if runner_count == 1:
+            return TimedOutRunner(kwargs["journal_path"])
+        return SuccessfulRunner(workspace, kwargs["journal_path"])
+
+    class ResumeAuthorizer:
+        def authorize_resume(self, *, decision, checkpoint) -> int:
+            assert decision == "captain-decision"
+            assert checkpoint.phase == "implementation_interrupted"
+            return 1
+
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=RecoveringPreparer(),
+        artifact_reader=artifact_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=runner_factory,
+        resume_authorizer=ResumeAuthorizer(),
+        clock=lambda: NOW,
+    )
+    dispatch = _dispatch(job, invocation)
+
+    with pytest.raises(FactoryCodexBuildInterrupted):
+        await executor.execute(dispatch, invocation, brief)
+    timeout_receipt = (
+        state_root / "sessions" / f"{invocation.idempotency_key}.json"
+    ).read_bytes()
+
+    class RejectingAuthorizer:
+        def authorize(self, _request):
+            raise FactoryDispatchError("execution policy rejected resume")
+
+    rejecting_executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=RecoveringPreparer(),
+        artifact_reader=artifact_reader,
+        authorizer=RejectingAuthorizer(),
+        runner_factory=runner_factory,
+        resume_authorizer=ResumeAuthorizer(),
+        clock=lambda: NOW,
+    )
+    with pytest.raises(FactoryDispatchError, match="execution policy rejected"):
+        await rejecting_executor.execute_authorized_resume(
+            dispatch,
+            invocation,
+            brief,
+            authorization_decision="captain-decision",
+        )
+    still_interrupted = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert still_interrupted is not None
+    assert still_interrupted.phase == "implementation_interrupted"
+
+    completed = await executor.execute_authorized_resume(
+        dispatch,
+        invocation,
+        brief,
+        authorization_decision="captain-decision",
+    )
+
+    checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert checkpoint is not None
+    assert checkpoint.phase == "implementation_complete"
+    assert checkpoint.resume_ordinal == 1
+    assert runner_count == 2
+    assert (
+        state_root / "sessions" / f"{invocation.idempotency_key}.json"
+    ).read_bytes() == timeout_receipt
+    assert completed.codex_session_receipt == (
+        state_root
+        / "sessions"
+        / f"{invocation.idempotency_key}.resume-1.json"
+    ).read_bytes()
+    executor.mark_sealed(invocation, completed)
+    executor.mark_sealed(invocation, completed)
+    sealed = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert sealed is not None
+    assert sealed.phase == "sealed"
+    replayed = await executor.execute(dispatch, invocation, brief)
+    assert replayed == completed
+    assert runner_count == 2
+
+
+def test_git_workspace_preparer_recovers_exact_head_and_rejects_missing_workspace(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(("git", "init", str(repository)), check=True, capture_output=True)
+    (repository / "README.md").write_text("factory seed\n", encoding="utf-8")
+    subprocess.run(("git", "-C", str(repository), "add", "README.md"), check=True)
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(repository),
+            "-c",
+            "user.name=Captain",
+            "-c",
+            "user.email=captain@example.invalid",
+            "commit",
+            "-m",
+            "chore: seed",
+        ),
+        check=True,
+        capture_output=True,
+    )
+    job, brief = _bound_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    preparer = GitDetachedFactoryWorkspacePreparer(
+        repository_root=repository,
+        workspaces_root=repository / ".captain-cook" / "private" / "codex-workspaces",
+    )
+    prepared = preparer.prepare_or_recover(
+        _dispatch(job, invocation), invocation, brief, None
+    )
+    checkpoint = FactoryCodexBuildCheckpointV1(
+        job_id=job.job_id,
+        correlation_id=job.correlation_id,
+        attempt=invocation.attempt,
+        invocation_id=invocation.invocation_id,
+        workspace_ref=brief.build_assignment.workspace_ref,
+        workspace_root=prepared.root,
+        base_revision=prepared.base_revision,
+        brief_sha256=brief.artifact_ref.sha256,
+        phase="scaffold_ready",
+        resume_ordinal=0,
+        updated_at=NOW,
+    )
+
+    assert preparer.prepare_or_recover(
+        _dispatch(job, invocation), invocation, brief, checkpoint
+    ) == prepared
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(prepared.root),
+            "-c",
+            "user.name=Captain",
+            "-c",
+            "user.email=captain@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "test: move head",
+        ),
+        check=True,
+        capture_output=True,
+    )
+    with pytest.raises(FactoryDispatchError, match="HEAD changed"):
+        preparer.prepare_or_recover(
+            _dispatch(job, invocation), invocation, brief, checkpoint
+        )
+    prepared.root.rename(prepared.root.with_name(prepared.root.name + "-missing"))
+    with pytest.raises(FactoryDispatchError, match="missing"):
+        preparer.prepare_or_recover(
+            _dispatch(job, invocation), invocation, brief, checkpoint
+        )
 
 
 @pytest.mark.asyncio

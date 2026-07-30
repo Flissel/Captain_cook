@@ -9,12 +9,17 @@ import re
 import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol
 
 from agenten.agent_factory.codex_build_provenance import (
     CaptainCodexBuildReceiptIssuer,
+)
+from agenten.agent_factory.codex_build_recovery import (
+    FactoryCodexBuildCheckpointV1,
+    FactoryCodexBuildPhase,
+    FilesystemFactoryCodexBuildCheckpointStore,
 )
 from agenten.agent_factory.contracts import AgentFactoryJobV3
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
@@ -53,6 +58,22 @@ class CompletedCodexBuild:
     completed_at: datetime
 
 
+class FactoryCodexBuildInterrupted(FactoryDispatchError):
+    """One terminal Codex runtime interruption retained for Captain recovery."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        checkpoint: FactoryCodexBuildCheckpointV1,
+        terminal_receipt_path: Path,
+    ) -> None:
+        super().__init__(message)
+        self.checkpoint = checkpoint
+        self.terminal_receipt_path = terminal_receipt_path
+        self.terminal_receipt_sha256 = checkpoint.terminal_receipt_sha256
+
+
 @dataclass(frozen=True)
 class PreparedFactoryWorkspace:
     """One clean detached worktree and its immutable base revision."""
@@ -81,14 +102,30 @@ class CaptainCodexBuildExecutorPort(Protocol):
         brief: CodexBuildBriefV1,
     ) -> CompletedCodexBuild: ...
 
+    def mark_sealed(
+        self,
+        invocation: FactorySkillInvocationV1,
+        completed: CompletedCodexBuild,
+    ) -> None: ...
+
 
 class FactoryCodexWorkspacePreparerPort(Protocol):
-    def prepare(
+    def prepare_or_recover(
         self,
         request: FactoryDispatch,
         invocation: FactorySkillInvocationV1,
         brief: CodexBuildBriefV1,
+        checkpoint: FactoryCodexBuildCheckpointV1 | None,
     ) -> PreparedFactoryWorkspace: ...
+
+
+class FactoryCodexResumeAuthorizerPort(Protocol):
+    def authorize_resume(
+        self,
+        *,
+        decision: object,
+        checkpoint: FactoryCodexBuildCheckpointV1,
+    ) -> int: ...
 
 
 class FactoryBuildArtifactReaderPort(Protocol):
@@ -152,7 +189,7 @@ class CaptainCodexBuildSealer:
         workflow_receipt_ref = ArtifactRef.model_validate(
             receipt_ref.model_dump(mode="json")
         )
-        return CodexBuildEvidenceV1(
+        evidence = CodexBuildEvidenceV1(
             schema_name="hermes.factory-codex-build-evidence.v1",
             invocation=invocation,
             invocation_id=invocation.invocation_id,
@@ -169,6 +206,8 @@ class CaptainCodexBuildSealer:
             build_receipt=receipt,
             status="sealed",
         )
+        self._executor.mark_sealed(invocation, completed)
+        return evidence
 
 
 class GitDetachedFactoryWorkspacePreparer:
@@ -185,6 +224,15 @@ class GitDetachedFactoryWorkspacePreparer:
         request: FactoryDispatch,
         invocation: FactorySkillInvocationV1,
         brief: CodexBuildBriefV1,
+    ) -> PreparedFactoryWorkspace:
+        return self.prepare_or_recover(request, invocation, brief, None)
+
+    def prepare_or_recover(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+        checkpoint: FactoryCodexBuildCheckpointV1 | None,
     ) -> PreparedFactoryWorkspace:
         if (
             request.job.job_id != invocation.job_id
@@ -203,6 +251,21 @@ class GitDetachedFactoryWorkspacePreparer:
         ).resolve()
         if not _is_relative_to(target, self._workspaces_root):
             raise FactoryDispatchError("Codex workspace path escaped its authority root")
+        if checkpoint is not None:
+            if (
+                checkpoint.workspace_root != target
+                or checkpoint.workspace_ref != brief.build_assignment.workspace_ref
+                or checkpoint.brief_sha256 != brief.artifact_ref.sha256
+            ):
+                raise FactoryDispatchError(
+                    "Codex recovery workspace binding does not match checkpoint"
+                )
+            if not target.is_dir():
+                raise FactoryDispatchError("Codex recovery workspace is missing")
+            revision = self._git_in(target, "rev-parse", "HEAD")
+            if revision != checkpoint.base_revision:
+                raise FactoryDispatchError("Codex recovery workspace HEAD changed")
+            return PreparedFactoryWorkspace(root=target, base_revision=revision)
         if target.exists():
             raise FactoryDispatchError(
                 "Codex workspace already exists; recovery is required before retry"
@@ -268,6 +331,8 @@ class CodexCliFactoryBuildExecutor:
         artifact_reader: FactoryBuildArtifactReaderPort,
         authorizer: CodexExecutionAuthorizerPort,
         runner_factory: FactoryCodexRunnerFactory,
+        checkpoint_store: FilesystemFactoryCodexBuildCheckpointStore | None = None,
+        resume_authorizer: FactoryCodexResumeAuthorizerPort | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._settings = settings
@@ -275,6 +340,10 @@ class CodexCliFactoryBuildExecutor:
         self._artifact_reader = artifact_reader
         self._authorizer = authorizer
         self._runner_factory = runner_factory
+        self._checkpoint_store = checkpoint_store or FilesystemFactoryCodexBuildCheckpointStore(
+            settings.state_root.resolve() / "checkpoints"
+        )
+        self._resume_authorizer = resume_authorizer
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     async def execute(
@@ -282,6 +351,59 @@ class CodexCliFactoryBuildExecutor:
         request: FactoryDispatch,
         invocation: FactorySkillInvocationV1,
         brief: CodexBuildBriefV1,
+    ) -> CompletedCodexBuild:
+        return await self._execute(
+            request,
+            invocation,
+            brief,
+            authorized_resume_ordinal=None,
+        )
+
+    async def execute_authorized_resume(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+        *,
+        authorization_decision: object | None,
+    ) -> CompletedCodexBuild:
+        if authorization_decision is None:
+            raise FactoryDispatchError(
+                "Factory Codex resume requires an authorization decision"
+            )
+        if self._resume_authorizer is None:
+            raise FactoryDispatchError(
+                "Factory Codex resume authorization validator is not configured"
+            )
+        checkpoint = self._checkpoint_store.load(invocation)
+        if checkpoint is None or checkpoint.phase != "implementation_interrupted":
+            raise FactoryDispatchError("Factory Codex build is not interrupted")
+        resume_ordinal = self._resume_authorizer.authorize_resume(
+            decision=authorization_decision,
+            checkpoint=checkpoint,
+        )
+        if (
+            not isinstance(resume_ordinal, int)
+            or isinstance(resume_ordinal, bool)
+            or resume_ordinal != checkpoint.resume_ordinal + 1
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex resume authorization decision is invalid"
+            )
+        return await self._execute(
+            request,
+            invocation,
+            brief,
+            authorized_resume_ordinal=resume_ordinal,
+        )
+
+    async def _execute(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+        *,
+        authorized_resume_ordinal: int | None,
     ) -> CompletedCodexBuild:
         if not isinstance(request.job, AgentFactoryJobV3):
             raise FactoryDispatchError("Codex execution requires a V3 Factory job")
@@ -297,21 +419,121 @@ class CodexCliFactoryBuildExecutor:
             self._settings.maximum_runtime_seconds,
             max(1, int(remaining_seconds)),
         )
-        prepared = self._workspace_preparer.prepare(request, invocation, brief)
+        checkpoint = self._checkpoint_store.load(invocation)
+        prepared = self._prepare_or_recover(
+            request,
+            invocation,
+            brief,
+            checkpoint,
+        )
+        if checkpoint is None:
+            run_request = self._run_request(request, invocation, brief, prepared)
+            authorized = self._authorizer.authorize(run_request)
+            self._materialize_inputs(request, brief, prepared.root)
+            checkpoint = self._checkpoint_store.advance(
+                None,
+                self._checkpoint(
+                    request,
+                    invocation,
+                    brief,
+                    prepared,
+                    phase="scaffold_ready",
+                    resume_ordinal=0,
+                    terminal_receipt_sha256=None,
+                    previous=None,
+                ),
+            )
+        else:
+            self._validate_materialized_inputs(request, brief, prepared.root)
+            if checkpoint.phase in {"implementation_complete", "sealed"}:
+                return self._seal_phase(invocation, prepared, checkpoint)
+            if checkpoint.phase == "implementation_running":
+                raise FactoryDispatchError(
+                    "Factory Codex implementation is already running or unresolved"
+                )
+            if checkpoint.phase == "implementation_interrupted":
+                if authorized_resume_ordinal is None:
+                    raise FactoryCodexBuildInterrupted(
+                        "Factory Codex implementation requires Captain-authorized resume",
+                        checkpoint=checkpoint,
+                        terminal_receipt_path=self._session_receipt_path(
+                            invocation, checkpoint.resume_ordinal
+                        ),
+                    )
+                run_request = self._run_request(request, invocation, brief, prepared)
+                authorized = self._authorizer.authorize(run_request)
+                checkpoint = self._checkpoint_store.advance(
+                    checkpoint,
+                    self._checkpoint(
+                        request,
+                        invocation,
+                        brief,
+                        prepared,
+                        phase="implementation_running",
+                        resume_ordinal=authorized_resume_ordinal,
+                        terminal_receipt_sha256=None,
+                        previous=checkpoint,
+                    ),
+                )
+            else:
+                run_request = self._run_request(request, invocation, brief, prepared)
+                authorized = self._authorizer.authorize(run_request)
+
+        if checkpoint.phase == "scaffold_ready":
+            checkpoint = self._checkpoint_store.advance(
+                checkpoint,
+                self._checkpoint(
+                    request,
+                    invocation,
+                    brief,
+                    prepared,
+                    phase="implementation_running",
+                    resume_ordinal=checkpoint.resume_ordinal,
+                    terminal_receipt_sha256=None,
+                    previous=checkpoint,
+                ),
+            )
+        checkpoint = await self._implementation_phase(
+            request=request,
+            invocation=invocation,
+            brief=brief,
+            prepared=prepared,
+            checkpoint=checkpoint,
+            run_request=run_request,
+            authorized=authorized,
+            runtime_seconds=runtime_seconds,
+        )
+        return self._seal_phase(invocation, prepared, checkpoint)
+
+    def _prepare_or_recover(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+        checkpoint: FactoryCodexBuildCheckpointV1 | None,
+    ) -> PreparedFactoryWorkspace:
+        recover = getattr(self._workspace_preparer, "prepare_or_recover", None)
+        if callable(recover):
+            return recover(request, invocation, brief, checkpoint)
+        if checkpoint is not None:
+            raise FactoryDispatchError(
+                "Codex workspace preparer cannot recover an existing checkpoint"
+            )
+        prepare = getattr(self._workspace_preparer, "prepare", None)
+        if not callable(prepare):
+            raise FactoryDispatchError("Codex workspace preparer is invalid")
+        return prepare(request, invocation, brief)
+
+    def _run_request(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+        prepared: PreparedFactoryWorkspace,
+    ) -> CodexRunRequest:
         session_id = f"factory-{invocation.invocation_id.hex[:24]}"
-        state_path = (
-            self._settings.state_root.resolve()
-            / "processes"
-            / f"{invocation.idempotency_key}.json"
-        )
-        journal_path = (
-            self._settings.state_root.resolve()
-            / "journals"
-            / f"{invocation.idempotency_key}.jsonl"
-        )
-        state_path.parent.mkdir(parents=True, exist_ok=True)
         prompt = _codex_prompt(request, invocation, brief)
-        run_request = CodexRunRequest(
+        return CodexRunRequest(
             run_id=invocation.invocation_id.hex,
             trace_id=request.job.correlation_id.hex,
             batch_id=f"factory-{request.job.job_id.hex[:24]}",
@@ -326,10 +548,30 @@ class CodexCliFactoryBuildExecutor:
             fencing_token=invocation.subject_version,
             project_root=prepared.root,
         )
-        # Authorization includes the clean-worktree check. Captain writes only
-        # the three already-released inputs after this point and before Codex.
-        authorized = self._authorizer.authorize(run_request)
-        self._materialize_inputs(request, brief, prepared.root)
+
+    async def _implementation_phase(
+        self,
+        *,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+        prepared: PreparedFactoryWorkspace,
+        checkpoint: FactoryCodexBuildCheckpointV1,
+        run_request: CodexRunRequest,
+        authorized: AuthorizedCodexRun,
+        runtime_seconds: int,
+    ) -> FactoryCodexBuildCheckpointV1:
+        session_id = f"factory-{invocation.invocation_id.hex[:24]}"
+        ordinal_suffix = (
+            "" if checkpoint.resume_ordinal == 0 else f".resume-{checkpoint.resume_ordinal}"
+        )
+        state_path = self._settings.state_root.resolve() / "processes" / (
+            f"{invocation.idempotency_key}{ordinal_suffix}.json"
+        )
+        journal_path = self._settings.state_root.resolve() / "journals" / (
+            f"{invocation.idempotency_key}{ordinal_suffix}.jsonl"
+        )
+        state_path.parent.mkdir(parents=True, exist_ok=True)
         runner = self._runner_factory(
             session_id=session_id,
             state_path=state_path,
@@ -351,14 +593,37 @@ class CodexCliFactoryBuildExecutor:
             command=run_request.command,
             completed_at=completed_at,
         )
-        self._persist_session_receipt(invocation, session_receipt)
+        receipt_path = self._persist_session_receipt(
+            invocation,
+            session_receipt,
+            checkpoint.resume_ordinal,
+        )
+        receipt_sha256 = hashlib.sha256(session_receipt).hexdigest()
+        if result.terminal_status != "succeeded" or result.exit_code != 0:
+            interrupted = self._checkpoint_store.advance(
+                checkpoint,
+                self._checkpoint(
+                    request,
+                    invocation,
+                    brief,
+                    prepared,
+                    phase="implementation_interrupted",
+                    resume_ordinal=checkpoint.resume_ordinal,
+                    terminal_receipt_sha256=receipt_sha256,
+                    previous=checkpoint,
+                ),
+            )
         if result.terminal_status == "timed_out":
-            raise FactoryDispatchError(
-                f"Codex build process timed out (exit {result.exit_code})"
+            raise FactoryCodexBuildInterrupted(
+                f"Codex build process timed out (exit {result.exit_code})",
+                checkpoint=interrupted,
+                terminal_receipt_path=receipt_path,
             )
         if result.terminal_status == "cancelled":
-            raise FactoryDispatchError(
-                f"Codex build process was cancelled (exit {result.exit_code})"
+            raise FactoryCodexBuildInterrupted(
+                f"Codex build process was cancelled (exit {result.exit_code})",
+                checkpoint=interrupted,
+                terminal_receipt_path=receipt_path,
             )
         if result.exit_code != 0:
             raise FactoryDispatchError(
@@ -369,12 +634,46 @@ class CodexCliFactoryBuildExecutor:
             and completed_at <= request.job.deadline_at
         ):
             raise FactoryDispatchError("Codex build completed outside Captain authority")
+        return self._checkpoint_store.advance(
+            checkpoint,
+            self._checkpoint(
+                request,
+                invocation,
+                brief,
+                prepared,
+                phase="implementation_complete",
+                resume_ordinal=checkpoint.resume_ordinal,
+                terminal_receipt_sha256=receipt_sha256,
+                previous=checkpoint,
+            ),
+        )
+
+    def _seal_phase(
+        self,
+        invocation: FactorySkillInvocationV1,
+        prepared: PreparedFactoryWorkspace,
+        checkpoint: FactoryCodexBuildCheckpointV1,
+    ) -> CompletedCodexBuild:
+        receipt_path = self._session_receipt_path(
+            invocation, checkpoint.resume_ordinal
+        )
+        try:
+            session_receipt = receipt_path.read_bytes()
+        except OSError as exc:
+            raise FactoryDispatchError("Codex terminal session receipt is missing") from exc
+        if hashlib.sha256(session_receipt).hexdigest() != checkpoint.terminal_receipt_sha256:
+            raise FactoryDispatchError("Codex terminal session receipt digest changed")
         for relative in _OUTPUT_PATHS:
             target = prepared.root / relative
             if not target.is_file():
                 raise FactoryDispatchError(
                     f"Codex omitted required build artifact: {relative}"
                 )
+        try:
+            receipt_payload = json.loads(session_receipt)
+            completed_at = datetime.fromisoformat(receipt_payload["completed_at"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            raise FactoryDispatchError("Codex terminal session receipt is invalid") from None
         return CompletedCodexBuild(
             workspace_root=prepared.root,
             codex_session_receipt=session_receipt,
@@ -383,6 +682,27 @@ class CodexCliFactoryBuildExecutor:
             test_evidence_paths=(_OUTPUT_PATHS[2],),
             completed_at=completed_at,
         )
+
+    def mark_sealed(
+        self,
+        invocation: FactorySkillInvocationV1,
+        completed: CompletedCodexBuild,
+    ) -> None:
+        checkpoint = self._checkpoint_store.load(invocation)
+        if checkpoint is None or checkpoint.phase not in {"implementation_complete", "sealed"}:
+            raise FactoryDispatchError("Factory Codex build is not ready to seal")
+        receipt_sha256 = hashlib.sha256(completed.codex_session_receipt).hexdigest()
+        if checkpoint.terminal_receipt_sha256 != receipt_sha256:
+            raise FactoryDispatchError("Factory Codex seal receipt binding changed")
+        if checkpoint.phase == "sealed":
+            return
+        target = checkpoint.model_copy(
+            update={
+                "phase": "sealed",
+                "updated_at": self._checkpoint_time(checkpoint),
+            }
+        )
+        self._checkpoint_store.advance(checkpoint, target)
 
     def _materialize_inputs(
         self,
@@ -407,18 +727,92 @@ class CodexCliFactoryBuildExecutor:
             encoding="utf-8",
         )
 
+    def _validate_materialized_inputs(
+        self,
+        request: FactoryDispatch,
+        brief: CodexBuildBriefV1,
+        workspace: Path,
+    ) -> None:
+        destination = workspace / ".captain-inputs"
+        expected = {
+            "job-input.md": request.job.input_ref.sha256,
+            "compiled-spec.json": request.job.compiled_spec_ref.sha256,
+            "dependency-graph.json": request.job.dependency_graph_ref.sha256,
+            "codex-build-brief.json": hashlib.sha256(
+                brief.model_dump_json(by_alias=True).encode("utf-8")
+            ).hexdigest(),
+        }
+        try:
+            actual_names = {item.name for item in destination.iterdir()}
+        except OSError as exc:
+            raise FactoryDispatchError("Factory build materialized inputs are missing") from exc
+        if actual_names != set(expected):
+            raise FactoryDispatchError("Factory build materialized input set changed")
+        for name, digest in expected.items():
+            target = destination / name
+            if target.is_symlink() or not target.is_file():
+                raise FactoryDispatchError("Factory build materialized input changed")
+            if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+                raise FactoryDispatchError("Factory build materialized input digest changed")
+
+    def _checkpoint(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+        prepared: PreparedFactoryWorkspace,
+        *,
+        phase: FactoryCodexBuildPhase,
+        resume_ordinal: int,
+        terminal_receipt_sha256: str | None,
+        previous: FactoryCodexBuildCheckpointV1 | None,
+    ) -> FactoryCodexBuildCheckpointV1:
+        return FactoryCodexBuildCheckpointV1(
+            job_id=request.job.job_id,
+            correlation_id=request.job.correlation_id,
+            attempt=invocation.attempt,
+            invocation_id=invocation.invocation_id,
+            workspace_ref=brief.build_assignment.workspace_ref,
+            workspace_root=prepared.root.resolve(),
+            base_revision=prepared.base_revision,
+            brief_sha256=brief.artifact_ref.sha256,
+            phase=phase,
+            resume_ordinal=resume_ordinal,
+            terminal_receipt_sha256=terminal_receipt_sha256,
+            updated_at=self._checkpoint_time(previous),
+        )
+
+    def _checkpoint_time(
+        self,
+        previous: FactoryCodexBuildCheckpointV1 | None,
+    ) -> datetime:
+        current = self._clock()
+        if previous is not None and current <= previous.updated_at:
+            return previous.updated_at + timedelta(microseconds=1)
+        return current
+
     def _persist_session_receipt(
         self,
         invocation: FactorySkillInvocationV1,
         content: bytes,
-    ) -> None:
-        target = (
-            self._settings.state_root.resolve()
-            / "sessions"
-            / f"{invocation.idempotency_key}.json"
-        )
+        resume_ordinal: int,
+    ) -> Path:
+        target = self._session_receipt_path(invocation, resume_ordinal)
         target.parent.mkdir(parents=True, exist_ok=True)
         _write_once(target, content)
+        return target
+
+    def _session_receipt_path(
+        self,
+        invocation: FactorySkillInvocationV1,
+        resume_ordinal: int,
+    ) -> Path:
+        ordinal_suffix = (
+            "" if resume_ordinal == 0 else f".resume-{resume_ordinal}"
+        )
+        return self._settings.state_root.resolve() / "sessions" / (
+            f"{invocation.idempotency_key}{ordinal_suffix}.json"
+        )
 
 
 def _codex_prompt(
@@ -617,8 +1011,10 @@ __all__ = [
     "CodexCliFactoryBuildExecutor",
     "CodexCliFactoryBuildSettings",
     "CompletedCodexBuild",
+    "FactoryCodexBuildInterrupted",
     "FactoryBuildArtifactReaderPort",
     "FactoryCodexRunnerFactory",
+    "FactoryCodexResumeAuthorizerPort",
     "FactoryCodexWorkspacePreparerPort",
     "GitDetachedFactoryWorkspacePreparer",
     "PreparedFactoryWorkspace",

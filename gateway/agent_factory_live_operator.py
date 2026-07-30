@@ -38,6 +38,9 @@ from agenten.agent_factory.codex_build_execution import (
     CodexCliFactoryBuildSettings,
     GitDetachedFactoryWorkspacePreparer,
 )
+from agenten.agent_factory.codex_build_recovery import (
+    FilesystemFactoryCodexBuildCheckpointStore,
+)
 from agenten.agent_factory.codex_build_provenance import (
     CaptainCodexBuildReceiptIssuer,
     CodexBuildArtifactCas,
@@ -267,6 +270,9 @@ def compose_business_demo_factory_operator(
             artifact_reader=benchmark_cas,
             authorizer=codex_authorizer,
             runner_factory=codex_runner_factory,
+            checkpoint_store=FilesystemFactoryCodexBuildCheckpointStore(
+                codex_state_root / "checkpoints"
+            ),
             clock=current_time,
         ),
         issuer=CaptainCodexBuildReceiptIssuer(
