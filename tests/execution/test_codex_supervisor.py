@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -21,6 +22,24 @@ from agenten.execution.codex_supervisor import (
 )
 from agenten.delivery.codex_runs import ActiveCodexSessionRecoveryRequired, CodexOutcome
 from agenten.execution.process import PackageExecutionStatus
+
+
+def _codex_result(
+    *,
+    exit_code: int,
+    artifact_references: tuple[str, ...],
+    jsonl_lines: tuple[str, ...],
+) -> CodexRunResult:
+    journal = b"".join(f"{line}\n".encode() for line in jsonl_lines)
+    terminal_status = "succeeded" if exit_code == 0 else "failed"
+    return CodexRunResult(
+        exit_code=exit_code,
+        terminal_status=terminal_status,
+        journal_path=Path(".captain-cook/private/test-codex.jsonl"),
+        journal_sha256=hashlib.sha256(journal).hexdigest(),
+        artifact_references=artifact_references,
+        jsonl_lines=jsonl_lines,
+    )
 
 
 class RecordingPolicy:
@@ -85,7 +104,7 @@ class RecordingRunner:
         self.command = authorized.command
         self.cwd = authorized.workspace
         self.env = authorized.child_environment()
-        return CodexRunResult(
+        return _codex_result(
             exit_code=self.exit_code,
             artifact_references=self.artifacts,
             jsonl_lines=(),
@@ -111,7 +130,7 @@ class BlockingRunner:
         del authorized
         self.started.set()
         await self.release.wait()
-        return CodexRunResult(
+        return _codex_result(
             exit_code=0,
             artifact_references=("artifact://build/1",),
             jsonl_lines=(),
@@ -394,7 +413,7 @@ async def test_authorized_jsonl_lifecycle_is_persisted_before_exit_evidence(
     )
     policy = RecordingPolicy(authorized)
     runner = StreamingRunner(
-        CodexRunResult(
+        _codex_result(
             exit_code=0,
             artifact_references=("artifact://build/1",),
             jsonl_lines=(
@@ -436,7 +455,7 @@ async def test_jsonl_warning_is_persisted_and_prevents_success_on_zero_exit(
     gateway = RecordingGateway()
     supervisor = CodexSupervisor(
         runner=StreamingRunner(
-            CodexRunResult(
+            _codex_result(
                 exit_code=0,
                 artifact_references=("artifact://build/1",),
                 jsonl_lines=("{malformed",),
@@ -469,7 +488,7 @@ async def test_failed_jsonl_lifecycle_prevents_success_without_persisting_messag
     gateway = RecordingGateway()
     supervisor = CodexSupervisor(
         runner=StreamingRunner(
-            CodexRunResult(
+            _codex_result(
                 exit_code=0,
                 artifact_references=("artifact://build/1",),
                 jsonl_lines=(
@@ -492,7 +511,7 @@ async def test_failed_jsonl_lifecycle_prevents_success_without_persisting_messag
 
 
 def test_run_result_is_frozen_and_strict() -> None:
-    result = CodexRunResult(
+    result = _codex_result(
         exit_code=0,
         artifact_references=("artifact://build/1",),
         jsonl_lines=(),

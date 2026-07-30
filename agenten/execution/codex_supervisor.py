@@ -7,7 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, BinaryIO, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from agenten.execution.codex_policy import AuthorizedCodexRun
 
 Identifier = str
+CodexRunTerminalStatus = Literal["succeeded", "failed", "timed_out", "cancelled"]
 
 
 class CodexRunRequest(BaseModel):
@@ -70,6 +71,9 @@ class CodexRunResult(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     exit_code: int
+    terminal_status: CodexRunTerminalStatus
+    journal_path: Path
+    journal_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     artifact_references: tuple[str, ...]
     jsonl_lines: tuple[str, ...]
 
@@ -105,6 +109,7 @@ class PowerShellCodexRunner:
         codex_path: Path,
         session_id: str,
         state_path: Path,
+        journal_path: Path,
         artifact_references: tuple[str, ...],
         codex_home: Path,
         timeout_seconds: float = 600,
@@ -114,6 +119,7 @@ class PowerShellCodexRunner:
         self._codex_path = codex_path.resolve(strict=True)
         self._session_id = session_id
         self._state_path = state_path.resolve()
+        self._journal_path = journal_path.resolve()
         self._artifact_references = artifact_references
         self._codex_home = codex_home.resolve(strict=True)
         self._timeout_seconds = timeout_seconds
@@ -121,6 +127,13 @@ class PowerShellCodexRunner:
     async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
         if len(authorized.command) != 4:
             raise ValueError("PowerShell Codex runner requires one prompt argument")
+        self._journal_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        journal_descriptor = os.open(
+            self._journal_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        os.close(journal_descriptor)
         child_environment = authorized.child_environment()
         child_environment["CODEX_HOME"] = str(self._codex_home)
         process = await asyncio.create_subprocess_exec(
@@ -143,38 +156,79 @@ class PowerShellCodexRunner:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        try:
-            stdout, _ = await asyncio.wait_for(
-                process.communicate(),
-                timeout=self._timeout_seconds,
+        assert process.stdout is not None
+        assert process.stderr is not None
+        timed_out = False
+        with self._journal_path.open("ab") as journal:
+            stdout_reader = asyncio.create_task(
+                self._journal_stdout(process.stdout, journal)
             )
-        except TimeoutError:
-            cancelled = await self._cancel_timed_out_process()
+            stderr_reader = asyncio.create_task(self._drain_stderr(process.stderr))
             try:
-                await asyncio.wait_for(process.wait(), timeout=10)
+                await asyncio.wait_for(
+                    process.wait(),
+                    timeout=self._timeout_seconds,
+                )
             except TimeoutError:
-                process.kill()
-                await process.wait()
-            if not cancelled:
-                if process.returncode is None:
+                timed_out = True
+                cancelled = await self._cancel_timed_out_process()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=10)
+                except TimeoutError:
                     process.kill()
                     await process.wait()
-                raise RuntimeError(
-                    "Codex process exceeded timeout and tree cancellation failed"
-                ) from None
-            return CodexRunResult(
-                exit_code=124,
-                artifact_references=(),
-                jsonl_lines=(),
-            )
+                if not cancelled:
+                    if process.returncode is None:
+                        process.kill()
+                        await process.wait()
+                    raise RuntimeError(
+                        "Codex process exceeded timeout and tree cancellation failed"
+                    ) from None
+            finally:
+                await asyncio.gather(stdout_reader, stderr_reader)
+
+        journal_bytes = self._journal_path.read_bytes()
+        exit_code = 124 if timed_out else process.returncode
+        assert exit_code is not None
+        terminal_status: CodexRunTerminalStatus
+        if timed_out or exit_code == 124:
+            terminal_status = "timed_out"
+        elif exit_code == 0:
+            terminal_status = "succeeded"
+        else:
+            terminal_status = "failed"
         return CodexRunResult(
-            exit_code=process.returncode,
-            artifact_references=self._artifact_references,
+            exit_code=exit_code,
+            terminal_status=terminal_status,
+            journal_path=self._journal_path,
+            journal_sha256=hashlib.sha256(journal_bytes).hexdigest(),
+            artifact_references=(
+                () if terminal_status == "timed_out" else self._artifact_references
+            ),
             jsonl_lines=tuple(
-                line for line in stdout.decode("utf-8", errors="replace").splitlines()
+                line.decode("utf-8", errors="replace")
+                for line in journal_bytes.splitlines()
                 if line.strip()
             ),
         )
+
+    @staticmethod
+    async def _journal_stdout(
+        stdout: asyncio.StreamReader,
+        journal: BinaryIO,
+    ) -> None:
+        while raw_line := await stdout.readline():
+            line = raw_line.rstrip(b"\r\n")
+            if not line.strip():
+                continue
+            journal.write(line + b"\n")
+            journal.flush()
+            os.fsync(journal.fileno())
+
+    @staticmethod
+    async def _drain_stderr(stderr: asyncio.StreamReader) -> None:
+        while await stderr.read(64 * 1024):
+            pass
 
 
 

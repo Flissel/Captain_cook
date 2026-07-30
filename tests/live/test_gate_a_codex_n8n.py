@@ -146,6 +146,9 @@ class HermesAppServerRunner:
             self.failure_type = type(exc).__name__
             return CodexRunResult(
                 exit_code=1,
+                terminal_status="failed",
+                journal_path=self._codex_home / "gate-a-exception.jsonl",
+                journal_sha256=hashlib.sha256(b"").hexdigest(),
                 artifact_references=(),
                 jsonl_lines=(),
             )
@@ -173,8 +176,13 @@ class HermesAppServerRunner:
                 }
             ),
         )
+        exit_code = 0 if outcome.error is None and not outcome.interrupted else 1
+        journal = b"".join(f"{line}\n".encode() for line in lines)
         return CodexRunResult(
-            exit_code=0 if outcome.error is None and not outcome.interrupted else 1,
+            exit_code=exit_code,
+            terminal_status="succeeded" if exit_code == 0 else "failed",
+            journal_path=self._codex_home / "gate-a-session.jsonl",
+            journal_sha256=hashlib.sha256(journal).hexdigest(),
             artifact_references=self._artifact_references,
             jsonl_lines=lines,
         )

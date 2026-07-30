@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -38,6 +39,7 @@ from agenten.execution.process import PackageExecutionStatus
 
 
 NOW = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
 class RevocationReader:
@@ -139,6 +141,9 @@ async def test_supervisor_persists_started_session_before_runner(
                 assert history.events[0]["event_type"] == "codex_session_started"
                 return CodexRunResult(
                     exit_code=0,
+                    terminal_status="succeeded",
+                    journal_path=tmp_path / "runner.jsonl",
+                    journal_sha256=EMPTY_SHA256,
                     artifact_references=("artifact://sealed/1",),
                     jsonl_lines=(
                         '{"type":"thread.started","thread_id":"session-1"}',
@@ -291,6 +296,9 @@ async def test_nonzero_process_exit_is_infrastructure_not_behavioral_repair(
             async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
                 return CodexRunResult(
                     exit_code=23,
+                    terminal_status="failed",
+                    journal_path=tmp_path / "runner.jsonl",
+                    journal_sha256=EMPTY_SHA256,
                     artifact_references=(),
                     jsonl_lines=(),
                 )
@@ -337,6 +345,142 @@ def _process_identity(pid: int) -> dict[str, str]:
     return json.loads(completed.stdout)
 
 
+def _compile_streaming_fixture(
+    tmp_path: Path,
+    *,
+    jsonl_line: str | None,
+) -> Path:
+    executable = tmp_path / f"streaming-fixture-{uuid4().hex}.exe"
+    write_line = ""
+    if jsonl_line is not None:
+        escaped = jsonl_line.replace('"', '""')
+        write_line = (
+            f'Console.Out.WriteLine(@"{escaped}");'
+            "Console.Out.Flush();"
+            'Console.Error.WriteLine("private diagnostic");'
+            "Console.Error.Flush();"
+        )
+    source_path = executable.with_suffix(".cs")
+    source_path.write_text(
+        (
+            "using System;using System.Threading;"
+            "public static class Program {"
+            "public static int Main(string[] args) {"
+            f"{write_line}Thread.Sleep(60000);return 0;"
+            "}}"
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe",
+            "/nologo",
+            f"/out:{executable}",
+            str(source_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return executable
+
+
+@pytest.mark.asyncio
+async def test_powershell_launcher_streams_complete_line_before_child_exit(
+    tmp_path: Path,
+) -> None:
+    line = '{"type":"thread.started","thread_id":"fixture-thread"}'
+    fixture = _compile_streaming_fixture(tmp_path, jsonl_line=line)
+    state_path = tmp_path / "streaming-process.json"
+    process = await asyncio.create_subprocess_exec(
+        _pwsh(),
+        "-NoProfile",
+        "-File",
+        str(Path("scripts/codex-session.ps1").resolve()),
+        "-Workspace",
+        str(tmp_path),
+        "-Prompt",
+        "harmless streaming test",
+        "-CodexPath",
+        str(fixture),
+        "-SessionId",
+        "runner-stream-1",
+        "-StatePath",
+        str(state_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    identity: dict[str, object] | None = None
+    try:
+        observed = await asyncio.wait_for(process.stdout.readline(), timeout=5)
+        assert observed.endswith(b"\n")
+        assert observed.rstrip(b"\r\n") == line.encode()
+        assert process.returncode is None
+        identity = json.loads(state_path.read_text(encoding="utf-8"))
+    finally:
+        if identity is None and state_path.is_file():
+            identity = json.loads(state_path.read_text(encoding="utf-8"))
+        if identity is not None:
+            subprocess.run(
+                ["taskkill.exe", "/PID", str(identity["pid"]), "/T", "/F"],
+                capture_output=True,
+            )
+        if process.returncode is None:
+            process.kill()
+        await process.wait()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("line", "expected_lines"),
+    [
+        (None, ()),
+        ('{"type":"turn.started"}', ('{"type":"turn.started"}',)),
+    ],
+    ids=("zero-jsonl", "partial-jsonl"),
+)
+async def test_powershell_runner_timeout_retains_durable_journal(
+    tmp_path: Path,
+    line: str | None,
+    expected_lines: tuple[str, ...],
+) -> None:
+    fixture = _compile_streaming_fixture(tmp_path, jsonl_line=line)
+    journal_path = tmp_path / "private" / "session.jsonl"
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    runner = PowerShellCodexRunner(
+        pwsh_path=Path(_pwsh()),
+        script_path=Path("scripts/codex-session.ps1").resolve(),
+        codex_path=fixture,
+        session_id=f"runner-timeout-{uuid4().hex}",
+        state_path=tmp_path / "timed-out-process.json",
+        journal_path=journal_path,
+        artifact_references=(),
+        codex_home=codex_home,
+        timeout_seconds=1.0,
+    )
+
+    result = await runner.run(
+        AuthorizedCodexRun(
+            workspace=tmp_path,
+            command=("codex", "exec", "--json", "harmless timeout test"),
+            environment=FrozenEnvironment({"PATH": os.environ["PATH"]}),
+        )
+    )
+
+    journal_bytes = journal_path.read_bytes()
+    assert result.exit_code == 124
+    assert result.terminal_status == "timed_out"
+    assert result.journal_path == journal_path.resolve()
+    assert result.journal_sha256 == hashlib.sha256(journal_bytes).hexdigest()
+    assert result.jsonl_lines == expected_lines
+    assert journal_bytes == b"".join(
+        f"{jsonl_line}\n".encode() for jsonl_line in expected_lines
+    )
+    assert b"private diagnostic" not in journal_bytes
+
+
 
 @pytest.mark.asyncio
 async def test_powershell_runner_bridges_authorized_run_to_real_launcher(
@@ -351,6 +495,7 @@ async def test_powershell_runner_bridges_authorized_run_to_real_launcher(
         codex_path=Path(r"C:\Windows\System32\timeout.exe"),
         session_id="runner-session-1",
         state_path=state_path,
+        journal_path=tmp_path / "runner.jsonl",
         artifact_references=("artifact://sealed/runner-test",),
         codex_home=codex_home,
     )
@@ -363,6 +508,7 @@ async def test_powershell_runner_bridges_authorized_run_to_real_launcher(
     )
 
     assert result.exit_code != 0
+    assert result.terminal_status == "failed"
     assert result.artifact_references == ("artifact://sealed/runner-test",)
     assert result.jsonl_lines == ()
     assert 'ArgumentList.Add("--sandbox")' in Path(
@@ -438,8 +584,14 @@ async def test_powershell_runner_sets_a_scoped_codex_home_for_the_child(
     class Process:
         returncode = 0
 
-        async def communicate(self) -> tuple[bytes, bytes]:
-            return b"", b""
+        def __init__(self) -> None:
+            self.stdout = asyncio.StreamReader()
+            self.stdout.feed_eof()
+            self.stderr = asyncio.StreamReader()
+            self.stderr.feed_eof()
+
+        async def wait(self) -> int:
+            return self.returncode
 
     async def create_process(*args: object, **kwargs: object) -> Process:
         captured["args"] = args
@@ -458,11 +610,12 @@ async def test_powershell_runner_sets_a_scoped_codex_home_for_the_child(
         codex_path=Path(r"C:\Windows\System32\timeout.exe"),
         session_id="runner-scoped-home-1",
         state_path=tmp_path / "runner-process.json",
+        journal_path=tmp_path / "runner.jsonl",
         artifact_references=(),
         codex_home=codex_home,
     )
 
-    await runner.run(
+    result = await runner.run(
         AuthorizedCodexRun(
             workspace=tmp_path,
             command=("codex", "exec", "--json", "harmless test"),
@@ -473,6 +626,9 @@ async def test_powershell_runner_sets_a_scoped_codex_home_for_the_child(
     environment = captured["environment"]
     assert isinstance(environment, dict)
     assert environment["CODEX_HOME"] == str(codex_home.resolve())
+    assert result.exit_code == 0
+    assert result.terminal_status == "succeeded"
+    assert result.journal_sha256 == EMPTY_SHA256
 
 
 @pytest.mark.asyncio
@@ -509,6 +665,7 @@ async def test_powershell_runner_timeout_cancels_recorded_child_tree(
         codex_path=sleeper,
         session_id="runner-timeout-1",
         state_path=state_path,
+        journal_path=tmp_path / "runner.jsonl",
         artifact_references=(),
         codex_home=codex_home,
         timeout_seconds=2.0,
@@ -949,6 +1106,9 @@ async def test_supervisor_terminalizes_infrastructure_when_event_append_fails(
             async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
                 return CodexRunResult(
                     exit_code=0,
+                    terminal_status="succeeded",
+                    journal_path=tmp_path / "runner.jsonl",
+                    journal_sha256=EMPTY_SHA256,
                     artifact_references=(),
                     jsonl_lines=('{"type":"turn.started"}',),
                 )
@@ -992,6 +1152,9 @@ async def test_supervisor_reports_unresolved_evidence_when_lifecycle_and_termina
             async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
                 return CodexRunResult(
                     exit_code=0,
+                    terminal_status="succeeded",
+                    journal_path=tmp_path / "runner.jsonl",
+                    journal_sha256=EMPTY_SHA256,
                     artifact_references=(),
                     jsonl_lines=('{"type":"turn.started"}',),
                 )
@@ -1022,6 +1185,9 @@ async def test_supervisor_assigns_stable_source_sequence_to_each_jsonl_line(
             async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
                 return CodexRunResult(
                     exit_code=0,
+                    terminal_status="succeeded",
+                    journal_path=tmp_path / "runner.jsonl",
+                    journal_sha256=EMPTY_SHA256,
                     artifact_references=("artifact://sealed/sequence",),
                     jsonl_lines=(
                         '{"type":"turn.started"}',

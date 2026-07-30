@@ -155,12 +155,13 @@ try {
     )
     Move-Item -LiteralPath $temporaryStatePath -Destination $resolvedStatePath -Force
 
-    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()
+    while (($line = $process.StandardOutput.ReadLine()) -ne $null) {
+        [Console]::Out.WriteLine($line)
+        [Console]::Out.Flush()
+    }
     $process.WaitForExit()
-    $stdout = $stdoutTask.GetAwaiter().GetResult()
     [void] $stderrTask.GetAwaiter().GetResult()
-    [Console]::Out.Write($stdout)
     exit $process.ExitCode
 } finally {
     $process.Dispose()
