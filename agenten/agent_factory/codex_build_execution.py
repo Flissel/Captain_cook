@@ -247,6 +247,12 @@ class CaptainCodexBuildExecutorPort(Protocol):
         invocation: FactorySkillInvocationV1,
     ) -> CodexBuildEvidenceV1 | None: ...
 
+    def validate_replay_authority(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+    ) -> None: ...
+
     def persist_sealed(
         self,
         invocation: FactorySkillInvocationV1,
@@ -435,6 +441,7 @@ class CaptainCodexBuildSealer:
             raise FactoryDispatchError("Codex build sealing authority does not match")
         replay = self._executor.replay_sealed(invocation)
         if replay is not None:
+            self._executor.validate_replay_authority(request, invocation)
             return replay
         if request.runtime_retry_authorization is None:
             completed = await self._executor.execute(request, invocation, brief)
@@ -456,6 +463,7 @@ class CaptainCodexBuildSealer:
             raise FactoryDispatchError("Codex reconciliation requires a V3 Factory job")
         replay = self._executor.replay_sealed(invocation)
         if replay is not None:
+            self._executor.validate_replay_authority(request, invocation)
             return replay
         completed = await self._executor.reconcile_pending(
             request,
@@ -796,16 +804,37 @@ class CodexCliFactoryBuildExecutor:
             prepared.root,
             checkpoint,
         )
+        if checkpoint.phase in {"implementation_running", "implementation_complete"}:
+            self._require_checkpoint_runtime_retry_authority(request, checkpoint)
         if checkpoint.phase == "sealed":
             raise FactoryDispatchError(
                 "Factory Codex sealed replay requires original persisted evidence"
             )
         if checkpoint.phase == "implementation_complete":
+            self._load_reconciliation_receipt(
+                request=request,
+                invocation=invocation,
+                brief=brief,
+                prepared=prepared,
+                checkpoint=checkpoint,
+            )
             return self._seal_phase(invocation, prepared, checkpoint)
         if checkpoint.phase == "implementation_interrupted":
+            _, receipt = self._load_reconciliation_receipt(
+                request=request,
+                invocation=invocation,
+                brief=brief,
+                prepared=prepared,
+                checkpoint=checkpoint,
+            )
+            reason: FactoryCodexBuildInterruptionReason = (
+                "codex_timed_out"
+                if receipt["status"] == "timed_out"
+                else "runtime_cancelled"
+            )
             raise FactoryCodexBuildInterrupted(
-                reason="resume_authorization_required",
-                exit_code=None,
+                reason=reason,
+                exit_code=int(receipt["exit_code"]),
                 **_interruption_details(request, invocation, checkpoint),
             )
         if checkpoint.phase != "implementation_running":
@@ -958,6 +987,36 @@ class CodexCliFactoryBuildExecutor:
         else:
             deadlines.append(invocation.lease.expires_at)
         return min(deadlines)
+
+    @staticmethod
+    def _runtime_retry_checkpoint_binding(
+        authorization: FactoryRuntimeRetryAuthorizationV1 | None,
+    ) -> tuple[str | None, str | None, str | None]:
+        if authorization is None:
+            return None, None, None
+        return (
+            authorization.authorization_ref.uri,
+            authorization.authorization_ref.sha256,
+            hashlib.sha256(canonical_factory_codex_model(authorization)).hexdigest(),
+        )
+
+    def _require_checkpoint_runtime_retry_authority(
+        self,
+        request: FactoryDispatch,
+        checkpoint: FactoryCodexBuildCheckpointV1,
+    ) -> None:
+        expected = (
+            checkpoint.runtime_retry_authorization_uri,
+            checkpoint.runtime_retry_authorization_sha256,
+            checkpoint.runtime_retry_authorization_binding_sha256,
+        )
+        actual = self._runtime_retry_checkpoint_binding(
+            request.runtime_retry_authorization
+        )
+        if actual != expected:
+            raise FactoryDispatchError(
+                "Factory Codex checkpoint runtime retry authority changed"
+            )
 
     def _prepare_or_recover(
         self,
@@ -1456,6 +1515,16 @@ class CodexCliFactoryBuildExecutor:
             evidence,
         )
 
+    def validate_replay_authority(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+    ) -> None:
+        checkpoint = self._checkpoint_store.load(invocation)
+        if checkpoint is None or checkpoint.phase != "sealed":
+            raise FactoryDispatchError("Factory Codex sealed checkpoint is unavailable")
+        self._require_checkpoint_runtime_retry_authority(request, checkpoint)
+
     def persist_sealed(
         self,
         invocation: FactorySkillInvocationV1,
@@ -1650,6 +1719,13 @@ class CodexCliFactoryBuildExecutor:
         scaffold_manifest_sha256: str,
         previous: FactoryCodexBuildCheckpointV1 | None,
     ) -> FactoryCodexBuildCheckpointV1:
+        retry_uri, retry_sha256, retry_binding_sha256 = (
+            self._runtime_retry_checkpoint_binding(
+                request.runtime_retry_authorization
+                if resume_ordinal > 0
+                else None
+            )
+        )
         return FactoryCodexBuildCheckpointV1(
             job_id=request.job.job_id,
             correlation_id=request.job.correlation_id,
@@ -1665,6 +1741,9 @@ class CodexCliFactoryBuildExecutor:
             phase=phase,
             resume_ordinal=resume_ordinal,
             terminal_receipt_sha256=terminal_receipt_sha256,
+            runtime_retry_authorization_uri=retry_uri,
+            runtime_retry_authorization_sha256=retry_sha256,
+            runtime_retry_authorization_binding_sha256=retry_binding_sha256,
             updated_at=self._checkpoint_time(previous),
         )
 

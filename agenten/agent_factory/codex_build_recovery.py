@@ -61,6 +61,9 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
     phase: FactoryCodexBuildPhase
     resume_ordinal: int = Field(ge=0)
     terminal_receipt_sha256: str | None = None
+    runtime_retry_authorization_uri: str | None = None
+    runtime_retry_authorization_sha256: str | None = None
+    runtime_retry_authorization_binding_sha256: str | None = None
     sealed_evidence_sha256: str | None = None
     sealed_build_receipt_uri: str | None = None
     sealed_build_receipt_sha256: str | None = None
@@ -85,6 +88,8 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
         "scaffold_manifest_sha256",
         "sealed_evidence_sha256",
         "sealed_build_receipt_sha256",
+        "runtime_retry_authorization_sha256",
+        "runtime_retry_authorization_binding_sha256",
     )
     @classmethod
     def _require_sha256(cls, value: str | None) -> str | None:
@@ -125,6 +130,19 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
                 raise ValueError("sealed checkpoint requires original evidence binding")
         elif any(value is not None for value in sealed_values):
             raise ValueError("unsealed checkpoint cannot bind sealed evidence")
+        retry_values = (
+            self.runtime_retry_authorization_uri,
+            self.runtime_retry_authorization_sha256,
+            self.runtime_retry_authorization_binding_sha256,
+        )
+        if any(value is not None for value in retry_values) and any(
+            value is None for value in retry_values
+        ):
+            raise ValueError("runtime retry checkpoint binding is incomplete")
+        if self.resume_ordinal == 0 and any(value is not None for value in retry_values):
+            raise ValueError("original runtime checkpoint cannot bind retry authority")
+        if self.resume_ordinal > 0 and any(value is None for value in retry_values):
+            raise ValueError("resumed runtime checkpoint requires retry authority")
         return self
 
 
@@ -522,6 +540,22 @@ def _require_transition(
     )
     if next_checkpoint.resume_ordinal != expected_ordinal:
         raise FactoryDispatchError("Factory Codex checkpoint resume ordinal is invalid")
+    previous_retry = (
+        previous.runtime_retry_authorization_uri,
+        previous.runtime_retry_authorization_sha256,
+        previous.runtime_retry_authorization_binding_sha256,
+    )
+    next_retry = (
+        next_checkpoint.runtime_retry_authorization_uri,
+        next_checkpoint.runtime_retry_authorization_sha256,
+        next_checkpoint.runtime_retry_authorization_binding_sha256,
+    )
+    if transition != ("implementation_interrupted", "implementation_running") and (
+        previous_retry != next_retry
+    ):
+        raise FactoryDispatchError(
+            "Factory Codex checkpoint retry authority binding changed"
+        )
     if transition == ("implementation_complete", "sealed") and (
         next_checkpoint.terminal_receipt_sha256
         != previous.terminal_receipt_sha256

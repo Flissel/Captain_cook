@@ -81,6 +81,15 @@ def _next(
             "terminal_receipt_sha256": terminal_receipt_sha256,
             "updated_at": checkpoint.updated_at + timedelta(seconds=seconds),
         }
+    effective_ordinal = updates["resume_ordinal"]
+    if isinstance(effective_ordinal, int) and effective_ordinal > 0:
+        updates.update(
+            {
+                "runtime_retry_authorization_uri": "artifact://factory/runtime-retry/test",
+                "runtime_retry_authorization_sha256": "3" * 64,
+                "runtime_retry_authorization_binding_sha256": "4" * 64,
+            }
+        )
     if phase == "sealed":
         updates.update(
             {

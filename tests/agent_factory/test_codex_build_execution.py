@@ -76,6 +76,9 @@ class FakeBuildExecutor:
     def replay_sealed(self, _invocation):
         return self.sealed_evidence
 
+    def validate_replay_authority(self, _request, _invocation):
+        return None
+
     def persist_sealed(self, invocation, completed, evidence):
         self.sealed.append((invocation, completed, evidence))
         self.sealed_evidence = evidence
@@ -549,6 +552,18 @@ async def test_sealed_replay_returns_original_evidence_without_resnapshotting_wo
     ).encode("utf-8") == first_bytes
     assert issuer.issue_calls == 1
     assert issuer.persist_calls == 1
+
+    sealed_checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert sealed_checkpoint is not None
+    arbitrary_retry = _authorized_runtime_retry_dispatch(
+        dispatch,
+        invocation,
+        sealed_checkpoint,
+    )
+    with pytest.raises(FactoryDispatchError, match="checkpoint.*retry authority"):
+        await sealer.seal(arbitrary_retry, invocation, brief)
 
     (state_root / "sealed-evidence" / f"{invocation.invocation_id.hex}.json").unlink()
     with pytest.raises(
@@ -1551,6 +1566,37 @@ async def test_authorized_resume_uses_next_ordinal_without_replacing_timeout_rec
         / "sessions"
         / f"{invocation.idempotency_key}.resume-1.json"
     ).read_bytes()
+    assert checkpoint.runtime_retry_authorization_uri == (
+        authorized_dispatch.runtime_retry_authorization.authorization_ref.uri
+    )
+    assert checkpoint.runtime_retry_authorization_sha256 == (
+        authorized_dispatch.runtime_retry_authorization.authorization_ref.sha256
+    )
+    assert checkpoint.runtime_retry_authorization_binding_sha256 is not None
+    with pytest.raises(FactoryDispatchError, match="checkpoint.*retry authority"):
+        await executor.reconcile_pending(
+            replace(authorized_dispatch, runtime_retry_authorization=None),
+            invocation,
+            brief,
+        )
+    different_authorization = authorized_dispatch.runtime_retry_authorization.model_copy(
+        update={
+            "authorization_ref": ArtifactRef(
+                uri=f"artifact://factory/runtime-retry/{'8' * 64}",
+                sha256="8" * 64,
+                media_type="application/json",
+            )
+        }
+    )
+    with pytest.raises(FactoryDispatchError, match="checkpoint.*retry authority"):
+        await executor.reconcile_pending(
+            replace(
+                authorized_dispatch,
+                runtime_retry_authorization=different_authorization,
+            ),
+            invocation,
+            brief,
+        )
 
 
 @pytest.mark.asyncio
@@ -2281,6 +2327,16 @@ async def test_restart_reconciliation_terminalizes_running_from_valid_receipt(
     assert checkpoint.phase == "implementation_interrupted"
     assert checkpoint.terminal_receipt_sha256 == caught.value.terminal_receipt_ref.sha256
     assert runner_calls() == 1
+    receipt_path = state_root / "sessions" / f"{invocation.idempotency_key}.json"
+    original_receipt = receipt_path.read_bytes()
+    receipt_path.unlink()
+    with pytest.raises(FactoryDispatchError, match="receipt.*missing|missing.*receipt"):
+        await executor.reconcile_pending(dispatch, invocation, brief)
+    receipt_path.write_bytes(original_receipt)
+    journal_path = state_root / "journals" / f"{invocation.idempotency_key}.jsonl"
+    journal_path.write_text('{"type":"tampered"}\n', encoding="utf-8")
+    with pytest.raises(FactoryDispatchError, match="journal.*digest|digest.*journal"):
+        await executor.reconcile_pending(dispatch, invocation, brief)
 
 
 @pytest.mark.asyncio
@@ -2324,3 +2380,13 @@ async def test_restart_reconciliation_completes_successful_receipt_then_replays_
     assert checkpoint.phase == "implementation_complete"
     assert runner_calls() == 1
     assert await executor.reconcile_pending(dispatch, invocation, brief) == completed
+    receipt_path.unlink()
+    with pytest.raises(FactoryDispatchError, match="receipt.*missing|missing.*receipt"):
+        await executor.reconcile_pending(dispatch, invocation, brief)
+    receipt_path.write_bytes(receipt)
+    (state_root / "journals" / f"{invocation.idempotency_key}.jsonl").write_text(
+        '{"type":"tampered"}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(FactoryDispatchError, match="journal.*digest|digest.*journal"):
+        await executor.reconcile_pending(dispatch, invocation, brief)
