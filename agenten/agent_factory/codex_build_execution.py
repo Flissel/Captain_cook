@@ -337,6 +337,11 @@ class CodexCliFactoryBuildExecutor:
             maximum_runtime_seconds=runtime_seconds,
         )
         result = await runner.run(authorized)
+        _validate_factory_codex_run_result(
+            result=result,
+            expected_journal_path=journal_path,
+            journals_root=self._settings.state_root.resolve() / "journals",
+        )
         completed_at = self._clock()
         session_receipt = _session_receipt(
             result=result,
@@ -537,6 +542,48 @@ def _session_receipt(
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def _validate_factory_codex_run_result(
+    *,
+    result: CodexRunResult,
+    expected_journal_path: Path,
+    journals_root: Path,
+) -> None:
+    try:
+        actual_journal_path = result.journal_path.resolve(strict=True)
+    except OSError as exc:
+        raise FactoryDispatchError("Codex runner journal path is unavailable") from exc
+    expected_path = expected_journal_path.resolve()
+    expected_root = journals_root.resolve()
+    if (
+        actual_journal_path != expected_path
+        or not _is_relative_to(actual_journal_path, expected_root)
+    ):
+        raise FactoryDispatchError(
+            "Codex runner journal path does not match the Factory invocation"
+        )
+
+    if result.terminal_status == "cancelled":
+        raise FactoryDispatchError(
+            "Codex runner terminal status has no defined cancellation exit code"
+        )
+    if result.exit_code == 0:
+        expected_status = "succeeded"
+        cleanup_is_valid = result.process_cleanup_status == "not_required"
+    elif result.exit_code == 124:
+        expected_status = "timed_out"
+        cleanup_is_valid = result.process_cleanup_status in {
+            "verified_cancelled",
+            "unresolved",
+        }
+    else:
+        expected_status = "failed"
+        cleanup_is_valid = result.process_cleanup_status == "not_required"
+    if result.terminal_status != expected_status or not cleanup_is_valid:
+        raise FactoryDispatchError(
+            "Codex runner terminal status or process cleanup status is inconsistent"
+        )
 
 
 def _write_once(target: Path, content: bytes) -> None:

@@ -511,6 +511,103 @@ async def test_cli_executor_persists_timeout_receipt_before_raising_timeout_124(
     assert receipt["event_count"] == 0
 
 
+@pytest.mark.asyncio
+async def test_cli_executor_rejects_runner_journal_path_other_than_its_receipt_path(
+    tmp_path: Path,
+) -> None:
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+
+    class Preparer:
+        def prepare(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    runner = SuccessfulRunner(
+        workspace,
+        state_root / "journals" / "different-invocation.jsonl",
+    )
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=Preparer(),
+        artifact_reader=artifact_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=lambda **_kwargs: runner,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FactoryDispatchError, match="journal path"):
+        await executor.execute(_dispatch(job, invocation), invocation, brief)
+
+    assert not (state_root / "sessions" / f"{invocation.idempotency_key}.json").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exit_code", "terminal_status", "process_cleanup_status"),
+    (
+        (0, "failed", "not_required"),
+        (124, "failed", "verified_cancelled"),
+    ),
+)
+async def test_cli_executor_rejects_terminal_status_exit_code_mismatch_before_receipt(
+    tmp_path: Path,
+    exit_code: int,
+    terminal_status: str,
+    process_cleanup_status: str,
+) -> None:
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+
+    class Preparer:
+        def prepare(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    class MismatchedRunner(SuccessfulRunner):
+        async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
+            result = await super().run(authorized)
+            return result.model_copy(
+                update={
+                    "exit_code": exit_code,
+                    "terminal_status": terminal_status,
+                    "process_cleanup_status": process_cleanup_status,
+                }
+            )
+
+    runners: list[MismatchedRunner] = []
+
+    def runner_factory(**kwargs) -> MismatchedRunner:
+        runner = MismatchedRunner(workspace, kwargs["journal_path"])
+        runners.append(runner)
+        return runner
+
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=Preparer(),
+        artifact_reader=artifact_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=runner_factory,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FactoryDispatchError, match="terminal status"):
+        await executor.execute(_dispatch(job, invocation), invocation, brief)
+
+    assert len(runners) == 1
+    assert not (state_root / "sessions" / f"{invocation.idempotency_key}.json").exists()
+
+
 def test_git_workspace_preparer_creates_clean_detached_worktree(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     repository.mkdir()
