@@ -94,7 +94,7 @@ def _validate_runtime_retry(
         "brief_sha256": "1" * 64,
         "current_resume_ordinal": 0,
         "remaining_runtime_seconds": 300,
-        "now": RUNTIME_RETRY_NOW + timedelta(seconds=1),
+        "now": RUNTIME_RETRY_NOW,
     }
     values.update(updates)
     return validate_factory_runtime_retry_authorization(authorization, **values)
@@ -405,6 +405,16 @@ def test_runtime_retry_authorization_rejects_stale_overbound_or_reused_authority
 
     with pytest.raises(ValueError, match=diagnostic):
         _validate_runtime_retry(authorization, **updates)
+
+
+def test_runtime_retry_authorization_runtime_cannot_outlive_its_expiry() -> None:
+    payload = _runtime_retry_payload()
+    payload["maximum_runtime_seconds"] = 60
+    payload["expires_at"] = RUNTIME_RETRY_NOW + timedelta(seconds=30)
+    authorization = FactoryRuntimeRetryAuthorizationV1.model_validate(payload)
+
+    with pytest.raises(ValueError, match="authorization window"):
+        _validate_runtime_retry(authorization)
 
 
 @pytest.mark.parametrize("resume_ordinal", [0, 3])

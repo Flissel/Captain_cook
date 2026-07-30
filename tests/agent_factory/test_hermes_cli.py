@@ -25,6 +25,7 @@ from agenten.agent_factory.candidate_evaluation import (
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.hermes_cli import (
     FactorySkillReplayPendingError,
+    FactorySkillReplayClaim,
     FilesystemFactorySkillReplayStore,
     FilesystemReleasedFactorySkillCatalog,
     HermesCliFactory,
@@ -1504,10 +1505,27 @@ async def test_runtime_retry_replay_requires_atomic_authorized_resume(
         issued_at=invocation.lease.issued_at,
         expires_at=invocation.lease.issued_at + timedelta(minutes=1),
     )
-    resumed = await replay_store.resume(
-        interrupted,
-        authorization=authorization,
-    )
+    if durable:
+        competing_store = FilesystemFactorySkillReplayStore(
+            tmp_path / "runtime-replays"
+        )
+        outcomes = await asyncio.gather(
+            replay_store.resume(interrupted, authorization=authorization),
+            competing_store.resume(interrupted, authorization=authorization),
+            return_exceptions=True,
+        )
+        acquired = [
+            item for item in outcomes if isinstance(item, FactorySkillReplayClaim)
+        ]
+        rejected = [item for item in outcomes if isinstance(item, FactoryDispatchError)]
+        assert len(acquired) == 1
+        assert len(rejected) == 1
+        resumed = acquired[0]
+    else:
+        resumed = await replay_store.resume(
+            interrupted,
+            authorization=authorization,
+        )
 
     assert resumed.acquired is True
     assert resumed.record.state == "pending"
@@ -1623,7 +1641,8 @@ async def test_authorized_runtime_retry_resumes_only_seal_without_new_hermes_cal
             self.calls.append((request, invocation, brief))
             if len(self.calls) == 1:
                 raise FactoryCodexBuildInterrupted(
-                    "Codex timed out",
+                    reason="runtime_timed_out",
+                    exit_code=124,
                     checkpoint_ref=checkpoint_ref,
                     terminal_receipt_ref=receipt_ref,
                     resume_ordinal=0,

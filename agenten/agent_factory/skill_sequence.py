@@ -173,6 +173,13 @@ def validate_factory_runtime_retry_authorization(
         raise ValueError("runtime retry authority is not active")
     if now >= authorization.expires_at:
         raise ValueError("runtime retry authority is expired")
+    authorization_remaining_seconds = int(
+        (authorization.expires_at - now).total_seconds()
+    )
+    if authorization.maximum_runtime_seconds > authorization_remaining_seconds:
+        raise ValueError(
+            "runtime retry maximum runtime exceeds authorization window"
+        )
     if (
         isinstance(remaining_runtime_seconds, bool)
         or remaining_runtime_seconds < 1
