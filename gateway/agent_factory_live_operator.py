@@ -40,6 +40,8 @@ from agenten.agent_factory.codex_build_execution import (
 )
 from agenten.agent_factory.codex_build_recovery import (
     FilesystemFactoryCodexBuildCheckpointStore,
+    FilesystemFactoryCodexScaffoldManifestStore,
+    FilesystemFactoryCodexSealedEvidenceStore,
 )
 from agenten.agent_factory.codex_build_provenance import (
     CaptainCodexBuildReceiptIssuer,
@@ -272,6 +274,12 @@ def compose_business_demo_factory_operator(
             runner_factory=codex_runner_factory,
             checkpoint_store=FilesystemFactoryCodexBuildCheckpointStore(
                 codex_state_root / "checkpoints"
+            ),
+            scaffold_manifest_store=FilesystemFactoryCodexScaffoldManifestStore(
+                codex_state_root / "scaffold-manifests"
+            ),
+            sealed_evidence_store=FilesystemFactoryCodexSealedEvidenceStore(
+                codex_state_root / "sealed-evidence"
             ),
             clock=current_time,
         ),

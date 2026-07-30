@@ -35,6 +35,15 @@ def _bound_checkpoint(
         "sealed",
     } and terminal_receipt_sha256 is None:
         terminal_receipt_sha256 = "b" * 64
+    sealed_bindings = (
+        {
+            "sealed_evidence_sha256": "1" * 64,
+            "sealed_build_receipt_uri": "artifact://sealed/original",
+            "sealed_build_receipt_sha256": "2" * 64,
+        }
+        if phase == "sealed"
+        else {}
+    )
     checkpoint = FactoryCodexBuildCheckpointV1(
         job_id=job.job_id,
         correlation_id=job.correlation_id,
@@ -44,10 +53,12 @@ def _bound_checkpoint(
         workspace_root=(tmp_path / "workspace").resolve(),
         base_revision="a" * 40,
         brief_sha256=brief.artifact_ref.sha256,
+        scaffold_manifest_sha256="f" * 64,
         phase=phase,
         resume_ordinal=resume_ordinal,
         terminal_receipt_sha256=terminal_receipt_sha256,
         updated_at=updated_at,
+        **sealed_bindings,
     )
     return checkpoint, invocation
 
@@ -60,8 +71,7 @@ def _next(
     resume_ordinal: int | None = None,
     terminal_receipt_sha256: str | None = None,
 ) -> FactoryCodexBuildCheckpointV1:
-    return checkpoint.model_copy(
-        update={
+    updates = {
             "phase": phase,
             "resume_ordinal": (
                 checkpoint.resume_ordinal
@@ -71,7 +81,15 @@ def _next(
             "terminal_receipt_sha256": terminal_receipt_sha256,
             "updated_at": checkpoint.updated_at + timedelta(seconds=seconds),
         }
-    )
+    if phase == "sealed":
+        updates.update(
+            {
+                "sealed_evidence_sha256": "1" * 64,
+                "sealed_build_receipt_uri": "artifact://sealed/original",
+                "sealed_build_receipt_sha256": "2" * 64,
+            }
+        )
+    return checkpoint.model_copy(update=updates)
 
 
 def test_checkpoint_store_advances_full_monotonic_lifecycle_and_replays_target(

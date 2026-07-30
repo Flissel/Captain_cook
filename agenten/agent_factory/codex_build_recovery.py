@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -14,7 +15,10 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from agenten.agent_factory.orchestration import FactoryDispatchError
-from agenten.agent_factory.skill_workflow_contracts import FactorySkillInvocationV1
+from agenten.agent_factory.skill_workflow_contracts import (
+    CodexBuildEvidenceV1,
+    FactorySkillInvocationV1,
+)
 
 
 FactoryCodexBuildPhase = Literal[
@@ -53,9 +57,13 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
     workspace_root: Path
     base_revision: str
     brief_sha256: str
+    scaffold_manifest_sha256: str
     phase: FactoryCodexBuildPhase
     resume_ordinal: int = Field(ge=0)
     terminal_receipt_sha256: str | None = None
+    sealed_evidence_sha256: str | None = None
+    sealed_build_receipt_uri: str | None = None
+    sealed_build_receipt_sha256: str | None = None
     updated_at: datetime
 
     @field_validator("workspace_root")
@@ -72,11 +80,16 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
             raise ValueError("base_revision must be a lowercase Git revision")
         return value
 
-    @field_validator("brief_sha256")
+    @field_validator(
+        "brief_sha256",
+        "scaffold_manifest_sha256",
+        "sealed_evidence_sha256",
+        "sealed_build_receipt_sha256",
+    )
     @classmethod
-    def _require_brief_digest(cls, value: str) -> str:
-        if _DIGEST_PATTERN.fullmatch(value) is None:
-            raise ValueError("brief_sha256 must be a SHA-256 digest")
+    def _require_sha256(cls, value: str | None) -> str | None:
+        if value is not None and _DIGEST_PATTERN.fullmatch(value) is None:
+            raise ValueError("checkpoint digest must be a SHA-256 digest")
         return value
 
     @field_validator("terminal_receipt_sha256")
@@ -102,7 +115,144 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
         }
         if receipt_required != (self.terminal_receipt_sha256 is not None):
             raise ValueError("terminal receipt does not match checkpoint phase")
+        sealed_values = (
+            self.sealed_evidence_sha256,
+            self.sealed_build_receipt_uri,
+            self.sealed_build_receipt_sha256,
+        )
+        if self.phase == "sealed":
+            if any(value is None for value in sealed_values):
+                raise ValueError("sealed checkpoint requires original evidence binding")
+        elif any(value is not None for value in sealed_values):
+            raise ValueError("unsealed checkpoint cannot bind sealed evidence")
         return self
+
+
+class FactoryCodexScaffoldFileV1(BaseModel):
+    """One exact file in the immutable Captain scaffold."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    filename: str = Field(pattern=r"^[a-z0-9][a-z0-9.-]{0,127}$")
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class FactoryCodexScaffoldManifestV1(BaseModel):
+    """Original caller bindings and bytes admitted before workspace mutation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_name: Literal["captain.factory-codex-scaffold-manifest.v1"] = Field(
+        default="captain.factory-codex-scaffold-manifest.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    job_id: UUID
+    correlation_id: UUID
+    attempt: int = Field(ge=1)
+    invocation_id: UUID
+    workspace_ref: str = Field(min_length=1)
+    files: tuple[FactoryCodexScaffoldFileV1, ...] = Field(min_length=1)
+
+    @field_validator("files")
+    @classmethod
+    def _require_sorted_unique_files(
+        cls,
+        value: tuple[FactoryCodexScaffoldFileV1, ...],
+    ) -> tuple[FactoryCodexScaffoldFileV1, ...]:
+        names = tuple(item.filename for item in value)
+        if names != tuple(sorted(names)) or len(names) != len(set(names)):
+            raise ValueError("scaffold files must be sorted and unique")
+        return value
+
+
+class FilesystemFactoryCodexScaffoldManifestStore:
+    """Write-once original scaffold bindings for one invocation."""
+
+    def __init__(self, root: Path) -> None:
+        self._root = root.resolve()
+
+    def persist(self, manifest: FactoryCodexScaffoldManifestV1) -> str:
+        content = canonical_factory_codex_model(manifest)
+        _atomic_write_once(
+            self._path(manifest.invocation_id),
+            content,
+            conflict="Factory Codex original scaffold manifest conflicts",
+        )
+        return hashlib.sha256(content).hexdigest()
+
+    def load(
+        self,
+        invocation: FactorySkillInvocationV1,
+    ) -> FactoryCodexScaffoldManifestV1 | None:
+        path = self._path(invocation.invocation_id)
+        if not path.exists():
+            return None
+        try:
+            content = path.read_bytes()
+            manifest = FactoryCodexScaffoldManifestV1.model_validate_json(content)
+        except (OSError, ValidationError, ValueError):
+            raise FactoryDispatchError(
+                "Factory Codex original scaffold manifest is invalid"
+            ) from None
+        if content != canonical_factory_codex_model(manifest):
+            raise FactoryDispatchError(
+                "Factory Codex original scaffold manifest is not canonical"
+            )
+        if (
+            manifest.invocation_id != invocation.invocation_id
+            or manifest.job_id != invocation.job_id
+            or manifest.correlation_id != invocation.correlation_id
+            or manifest.attempt != invocation.attempt
+            or manifest.workspace_ref != invocation.lease.workspace_ref
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex original scaffold manifest binding changed"
+            )
+        return manifest
+
+    def _path(self, invocation_id: UUID) -> Path:
+        return self._root / f"{invocation_id.hex}.json"
+
+
+class FilesystemFactoryCodexSealedEvidenceStore:
+    """Write-once canonical workflow evidence used for byte-stable seal replay."""
+
+    def __init__(self, root: Path) -> None:
+        self._root = root.resolve()
+
+    def persist(self, evidence: CodexBuildEvidenceV1) -> str:
+        content = canonical_factory_codex_model(evidence)
+        _atomic_write_once(
+            self._path(evidence.invocation_id),
+            content,
+            conflict="Factory Codex sealed evidence replay conflicts",
+        )
+        return hashlib.sha256(content).hexdigest()
+
+    def load(
+        self,
+        invocation: FactorySkillInvocationV1,
+    ) -> CodexBuildEvidenceV1 | None:
+        path = self._path(invocation.invocation_id)
+        if not path.exists():
+            return None
+        try:
+            content = path.read_bytes()
+            evidence = CodexBuildEvidenceV1.model_validate_json(content)
+        except (OSError, ValidationError, ValueError):
+            raise FactoryDispatchError("Factory Codex sealed evidence is invalid") from None
+        if content != canonical_factory_codex_model(evidence):
+            raise FactoryDispatchError("Factory Codex sealed evidence is not canonical")
+        if evidence.invocation != invocation:
+            raise FactoryDispatchError("Factory Codex sealed evidence invocation changed")
+        return evidence
+
+    def digest(self, evidence: CodexBuildEvidenceV1) -> str:
+        return hashlib.sha256(canonical_factory_codex_model(evidence)).hexdigest()
+
+    def _path(self, invocation_id: UUID) -> Path:
+        return self._root / f"{invocation_id.hex}.json"
 
 
 class FilesystemFactoryCodexBuildCheckpointStore:
@@ -292,12 +442,44 @@ def _validated_checkpoint(
 
 
 def _canonical_checkpoint(checkpoint: FactoryCodexBuildCheckpointV1) -> bytes:
+    return canonical_factory_codex_model(checkpoint)
+
+
+def canonical_factory_codex_model(model: BaseModel) -> bytes:
+    """Return the one canonical JSON representation used by recovery stores."""
+
     return json.dumps(
-        checkpoint.model_dump(mode="json"),
+        model.model_dump(mode="json", by_alias=True),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def _atomic_write_once(path: Path, content: bytes, *, conflict: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    descriptor = os.open(
+        temporary,
+        getattr(os, "O_BINARY", 0) | os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            try:
+                existing = path.read_bytes()
+            except OSError as exc:
+                raise FactoryDispatchError(conflict) from exc
+            if existing != content:
+                raise FactoryDispatchError(conflict)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _require_initial_checkpoint(checkpoint: FactoryCodexBuildCheckpointV1) -> None:
@@ -320,6 +502,7 @@ def _require_immutable_bindings(
         "workspace_root",
         "base_revision",
         "brief_sha256",
+        "scaffold_manifest_sha256",
     )
     if any(getattr(previous, field) != getattr(next_checkpoint, field) for field in fields):
         raise FactoryDispatchError("Factory Codex checkpoint immutable binding changed")
@@ -349,5 +532,10 @@ def _require_transition(
 __all__ = [
     "FactoryCodexBuildCheckpointV1",
     "FactoryCodexBuildPhase",
+    "FactoryCodexScaffoldFileV1",
+    "FactoryCodexScaffoldManifestV1",
     "FilesystemFactoryCodexBuildCheckpointStore",
+    "FilesystemFactoryCodexScaffoldManifestStore",
+    "FilesystemFactoryCodexSealedEvidenceStore",
+    "canonical_factory_codex_model",
 ]

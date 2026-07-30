@@ -29,6 +29,7 @@ from agenten.agent_factory.codex_build_provenance import (
 from agenten.agent_factory.forge_contracts import ArtifactRef as ForgeArtifactRef
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
 from agenten.agent_factory.skill_workflow_contracts import (
+    CodexBuildBriefV1,
     CodexBuildEvidenceV1,
     FactorySkillInvocationV1,
 )
@@ -52,14 +53,20 @@ class FakeBuildExecutor:
     def __init__(self, completed: CompletedCodexBuild) -> None:
         self.completed = completed
         self.calls: list[tuple[object, object, object]] = []
-        self.sealed: list[tuple[object, object]] = []
+        self.sealed: list[tuple[object, object, object]] = []
+        self.sealed_evidence = None
 
     async def execute(self, request, invocation, brief) -> CompletedCodexBuild:
         self.calls.append((request, invocation, brief))
         return self.completed
 
-    def mark_sealed(self, invocation, completed) -> None:
-        self.sealed.append((invocation, completed))
+    def replay_sealed(self, _invocation):
+        return self.sealed_evidence
+
+    def persist_sealed(self, invocation, completed, evidence):
+        self.sealed.append((invocation, completed, evidence))
+        self.sealed_evidence = evidence
+        return evidence
 
 
 class RecordingAuthorizer:
@@ -219,6 +226,30 @@ def _dispatch(job, invocation: FactorySkillInvocationV1) -> FactoryDispatch:
     )
 
 
+def _seed_git_repository(root: Path) -> Path:
+    root.mkdir()
+    subprocess.run(("git", "init", str(root)), check=True, capture_output=True)
+    (root / "README.md").write_text("factory seed\n", encoding="utf-8")
+    subprocess.run(("git", "-C", str(root), "add", "README.md"), check=True)
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=Captain",
+            "-c",
+            "user.email=captain@example.invalid",
+            "commit",
+            "-m",
+            "chore: seed",
+        ),
+        check=True,
+        capture_output=True,
+    )
+    return root
+
+
 @pytest.mark.asyncio
 async def test_captain_sealer_issues_and_persists_exact_build_evidence(
     tmp_path: Path,
@@ -251,7 +282,106 @@ async def test_captain_sealer_issues_and_persists_exact_build_evidence(
     assert evidence.build_receipt.producer == "captain"
     assert evidence.build_receipt.seal_idempotency_key == invocation.idempotency_key
     assert cas.read_bytes(evidence.build_receipt_ref)
-    assert executor.sealed == [(invocation, executor.completed)]
+    assert executor.sealed == [(invocation, executor.completed, evidence)]
+
+
+@pytest.mark.asyncio
+async def test_sealed_replay_returns_original_evidence_without_resnapshotting_workspace(
+    tmp_path: Path,
+) -> None:
+    cas = CodexBuildArtifactCas(tmp_path / "cas")
+    workspace = _workspace(tmp_path, cas)
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    state_root = tmp_path / "state"
+
+    class Preparer:
+        def prepare(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+        def prepare_or_recover(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    class EvidenceOnlyRunner:
+        def __init__(self, journal_path: Path) -> None:
+            self.journal_path = journal_path
+
+        async def run(self, _authorized) -> CodexRunResult:
+            line = json.dumps(
+                {"type": "thread.started", "thread_id": "sealed-replay-thread"}
+            )
+            content = f"{line}\n".encode("utf-8")
+            self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+            self.journal_path.write_bytes(content)
+            return CodexRunResult(
+                exit_code=0,
+                terminal_status="succeeded",
+                process_cleanup_status="not_required",
+                journal_path=self.journal_path,
+                journal_sha256=hashlib.sha256(content).hexdigest(),
+                artifact_references=(),
+                jsonl_lines=(line,),
+            )
+
+    class CountingIssuer(CaptainCodexBuildReceiptIssuer):
+        def __init__(self, artifact_cas: CodexBuildArtifactCas) -> None:
+            super().__init__(artifact_cas)
+            self.issue_calls = 0
+            self.persist_calls = 0
+
+        def issue(self, **kwargs):
+            self.issue_calls += 1
+            return super().issue(**kwargs)
+
+        def persist_receipt(self, receipt):
+            self.persist_calls += 1
+            return super().persist_receipt(receipt)
+
+    issuer = CountingIssuer(cas)
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=Preparer(),
+        artifact_reader=artifact_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=lambda **kwargs: EvidenceOnlyRunner(kwargs["journal_path"]),
+        clock=lambda: NOW,
+    )
+    sealer = CaptainCodexBuildSealer(executor=executor, issuer=issuer)
+    dispatch = _dispatch(job, invocation)
+
+    first = await sealer.seal(dispatch, invocation, brief)
+    first_bytes = json.dumps(
+        first.model_dump(mode="json", by_alias=True),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    (workspace / "src" / "team.py").write_text(
+        "TEAM = 'mutated-after-seal'\n", encoding="utf-8"
+    )
+
+    replay = await sealer.seal(dispatch, invocation, brief)
+
+    assert json.dumps(
+        replay.model_dump(mode="json", by_alias=True),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8") == first_bytes
+    assert issuer.issue_calls == 1
+    assert issuer.persist_calls == 1
+
+    (state_root / "sealed-evidence" / f"{invocation.invocation_id.hex}.json").unlink()
+    with pytest.raises(
+        FactoryDispatchError,
+        match="original sealed evidence is missing",
+    ):
+        await sealer.seal(dispatch, invocation, brief)
+    assert issuer.issue_calls == 1
+    assert issuer.persist_calls == 1
 
 
 @pytest.mark.asyncio
@@ -325,6 +455,143 @@ async def test_cli_executor_authorizes_before_materializing_and_records_redacted
     assert runner.journal_path == (
         state_root / "journals" / f"{invocation.idempotency_key}.jsonl"
     )
+
+
+@pytest.mark.asyncio
+async def test_authorization_failure_retries_same_uncheckpointed_detached_workspace(
+    tmp_path: Path,
+) -> None:
+    repository = _seed_git_repository(tmp_path / "repo")
+    workspaces_root = repository / ".factory-workspaces"
+    state_root = tmp_path / "state"
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    preparer = GitDetachedFactoryWorkspacePreparer(
+        repository_root=repository,
+        workspaces_root=workspaces_root,
+    )
+    runner_calls = 0
+
+    class RejectingAuthorizer:
+        def authorize(self, _request):
+            raise FactoryDispatchError("authorization rejected scaffold")
+
+    def forbidden_runner(**_kwargs):
+        raise AssertionError("runner must not start before authorization")
+
+    first = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=preparer,
+        artifact_reader=artifact_reader,
+        authorizer=RejectingAuthorizer(),
+        runner_factory=forbidden_runner,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FactoryDispatchError, match="authorization rejected scaffold"):
+        await first.execute(_dispatch(job, invocation), invocation, brief)
+
+    assert FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation) is None
+    target = next(workspaces_root.rglob("attempt-*"))
+    assert not (target / ".captain-inputs").exists()
+
+    def successful_runner(**kwargs):
+        nonlocal runner_calls
+        runner_calls += 1
+        return SuccessfulRunner(target, kwargs["journal_path"])
+
+    second = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=preparer,
+        artifact_reader=artifact_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=successful_runner,
+        clock=lambda: NOW,
+    )
+
+    completed = await second.execute(_dispatch(job, invocation), invocation, brief)
+
+    assert completed.workspace_root == target
+    assert runner_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_partial_scaffold_materialization_retries_without_runner_duplication(
+    tmp_path: Path,
+) -> None:
+    repository = _seed_git_repository(tmp_path / "repo")
+    workspaces_root = repository / ".factory-workspaces"
+    state_root = tmp_path / "state"
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    preparer = GitDetachedFactoryWorkspacePreparer(
+        repository_root=repository,
+        workspaces_root=workspaces_root,
+    )
+    runner_calls = 0
+
+    def forbidden_runner(**_kwargs):
+        raise AssertionError("runner must not start before scaffold checkpoint")
+
+    first = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=preparer,
+        artifact_reader=artifact_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=forbidden_runner,
+        clock=lambda: NOW,
+    )
+
+    def interrupt_materialization(files, workspace):
+        destination = workspace / ".captain-inputs"
+        destination.mkdir()
+        name = sorted(files)[0]
+        (destination / name).write_bytes(files[name])
+        raise FactoryDispatchError("simulated scaffold interruption")
+
+    first._materialize_inputs = interrupt_materialization
+
+    with pytest.raises(FactoryDispatchError, match="simulated scaffold interruption"):
+        await first.execute(_dispatch(job, invocation), invocation, brief)
+
+    assert FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation) is None
+    target = next(workspaces_root.rglob("attempt-*"))
+    assert (target / ".captain-inputs").is_dir()
+
+    def successful_runner(**kwargs):
+        nonlocal runner_calls
+        runner_calls += 1
+        return SuccessfulRunner(target, kwargs["journal_path"])
+
+    second = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=preparer,
+        artifact_reader=artifact_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=successful_runner,
+        clock=lambda: NOW,
+    )
+
+    completed = await second.execute(_dispatch(job, invocation), invocation, brief)
+
+    assert completed.workspace_root == target
+    assert runner_calls == 1
 
 
 @pytest.mark.asyncio
@@ -616,6 +883,100 @@ async def test_interrupted_ordinary_redispatch_revalidates_workspace_and_never_r
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_binds_canonical_brief_and_rejects_coordinated_replacement(
+    tmp_path: Path,
+) -> None:
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+
+    class RecoveringPreparer:
+        def prepare_or_recover(self, _request, _invocation, _brief, _checkpoint):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    class TimedOutRunner:
+        def __init__(self, journal_path: Path) -> None:
+            self.journal_path = journal_path
+
+        async def run(self, _authorized) -> CodexRunResult:
+            self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+            self.journal_path.write_bytes(b"")
+            return CodexRunResult(
+                exit_code=124,
+                terminal_status="timed_out",
+                process_cleanup_status="verified_cancelled",
+                journal_path=self.journal_path,
+                journal_sha256=hashlib.sha256(b"").hexdigest(),
+                artifact_references=(),
+                jsonl_lines=(),
+            )
+
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=RecoveringPreparer(),
+        artifact_reader=artifact_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=lambda **kwargs: TimedOutRunner(kwargs["journal_path"]),
+        clock=lambda: NOW,
+    )
+    dispatch = _dispatch(job, invocation)
+    with pytest.raises(FactoryCodexBuildInterrupted):
+        await executor.execute(dispatch, invocation, brief)
+
+    checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert checkpoint is not None
+    canonical_brief = json.dumps(
+        brief.model_dump(mode="json", by_alias=True),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert checkpoint.brief_sha256 == hashlib.sha256(canonical_brief).hexdigest()
+    assert checkpoint.scaffold_manifest_sha256
+
+    changed_input = b'{"input":"coordinated replacement"}'
+    changed_ref = ArtifactRef(
+        uri=f"artifact://test/{hashlib.sha256(changed_input).hexdigest()}",
+        sha256=hashlib.sha256(changed_input).hexdigest(),
+        media_type="application/json",
+    )
+    changed_job = job.model_copy(update={"input_ref": changed_ref})
+    payload = brief.model_dump(mode="json", by_alias=True)
+    payload["required_test_command_ids"] = ["pytest.changed"]
+    changed_brief = CodexBuildBriefV1.model_validate(payload)
+    changed_contents = dict(artifact_reader._contents)
+    changed_contents[changed_ref.sha256] = changed_input
+    changed_reader = StaticArtifactReader(changed_contents)
+    (workspace / ".captain-inputs" / "job-input.md").write_bytes(changed_input)
+    (workspace / ".captain-inputs" / "codex-build-brief.json").write_text(
+        changed_brief.model_dump_json(by_alias=True), encoding="utf-8"
+    )
+    changed_executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=RecoveringPreparer(),
+        artifact_reader=changed_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=lambda **kwargs: TimedOutRunner(kwargs["journal_path"]),
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FactoryDispatchError, match="original scaffold manifest"):
+        await changed_executor.execute(
+            _dispatch(changed_job, invocation), invocation, changed_brief
+        )
+
+
+@pytest.mark.asyncio
 async def test_authorized_resume_uses_next_ordinal_without_replacing_timeout_receipt(
     tmp_path: Path,
 ) -> None:
@@ -732,16 +1093,6 @@ async def test_authorized_resume_uses_next_ordinal_without_replacing_timeout_rec
         / "sessions"
         / f"{invocation.idempotency_key}.resume-1.json"
     ).read_bytes()
-    executor.mark_sealed(invocation, completed)
-    executor.mark_sealed(invocation, completed)
-    sealed = FilesystemFactoryCodexBuildCheckpointStore(
-        state_root / "checkpoints"
-    ).load(invocation)
-    assert sealed is not None
-    assert sealed.phase == "sealed"
-    replayed = await executor.execute(dispatch, invocation, brief)
-    assert replayed == completed
-    assert runner_count == 2
 
 
 def test_git_workspace_preparer_recovers_exact_head_and_rejects_missing_workspace(
@@ -785,7 +1136,15 @@ def test_git_workspace_preparer_recovers_exact_head_and_rejects_missing_workspac
         workspace_ref=brief.build_assignment.workspace_ref,
         workspace_root=prepared.root,
         base_revision=prepared.base_revision,
-        brief_sha256=brief.artifact_ref.sha256,
+        brief_sha256=hashlib.sha256(
+            json.dumps(
+                brief.model_dump(mode="json", by_alias=True),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        scaffold_manifest_sha256="f" * 64,
         phase="scaffold_ready",
         resume_ordinal=0,
         updated_at=NOW,
@@ -794,6 +1153,20 @@ def test_git_workspace_preparer_recovers_exact_head_and_rejects_missing_workspac
     assert preparer.prepare_or_recover(
         _dispatch(job, invocation), invocation, brief, checkpoint
     ) == prepared
+    subprocess.run(
+        ("git", "-C", str(prepared.root), "switch", "-c", "attached-recovery"),
+        check=True,
+        capture_output=True,
+    )
+    with pytest.raises(FactoryDispatchError, match="detached HEAD"):
+        preparer.prepare_or_recover(
+            _dispatch(job, invocation), invocation, brief, checkpoint
+        )
+    subprocess.run(
+        ("git", "-C", str(prepared.root), "switch", "--detach", checkpoint.base_revision),
+        check=True,
+        capture_output=True,
+    )
     subprocess.run(
         (
             "git",
@@ -960,5 +1333,5 @@ def test_git_workspace_preparer_creates_clean_detached_worktree(tmp_path: Path) 
         text=True,
     )
     assert status.stdout == ""
-    with pytest.raises(FactoryDispatchError, match="recovery"):
-        preparer.prepare(_dispatch(job, invocation), invocation, brief)
+    retried = preparer.prepare(_dispatch(job, invocation), invocation, brief)
+    assert retried == prepared
