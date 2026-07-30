@@ -215,15 +215,17 @@ if ($resolved -ne '{_pwsh_literal(supplied_python)}') {{
 
 
 @pytest.mark.parametrize(
-    ("python_script", "expected_error"),
+    ("python_script", "python_path", "expected_error"),
     (
-        (None, "existing file"),
-        ("@echo off\r\nexit /b 1\r\n", "Python 3.11"),
+        (None, None, "existing file"),
+        (None, r"\tools\python.exe", "fully qualified"),
+        ("@echo off\r\nexit /b 1\r\n", None, "Python 3.11"),
         (
             "@echo off\r\n"
             "echo %*| %SystemRoot%\\System32\\findstr.exe /C:\"version_info\" >nul\r\n"
             "if not errorlevel 1 exit /b 0\r\n"
             "exit /b 1\r\n",
+            None,
             "import pytest",
         ),
     ),
@@ -231,6 +233,7 @@ if ($resolved -ne '{_pwsh_literal(supplied_python)}') {{
 def test_gate_rejects_invalid_explicit_python_before_docker_startup(
     tmp_path: Path,
     python_script: str | None,
+    python_path: str | None,
     expected_error: str,
 ) -> None:
     sandbox_root = tmp_path / "captain"
@@ -250,6 +253,7 @@ def test_gate_rejects_invalid_explicit_python_before_docker_startup(
     if python_script is not None:
         supplied_python = tmp_path / "supplied-python.cmd"
         supplied_python.write_text(python_script, encoding="utf-8")
+    supplied_path_argument = python_path or str(supplied_python)
 
     environment = os.environ.copy()
     environment["PATH"] = f"{bin_dir}{os.pathsep}{environment['PATH']}"
@@ -261,7 +265,7 @@ def test_gate_rejects_invalid_explicit_python_before_docker_startup(
             "-File",
             str(script_path),
             "-PythonPath",
-            str(supplied_python),
+            supplied_path_argument,
         ],
         cwd=sandbox_root,
         env=environment,

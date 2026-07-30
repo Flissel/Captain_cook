@@ -73,11 +73,8 @@ function Resolve-GatewayPython {
     )
 
     if (-not [string]::IsNullOrWhiteSpace($PythonPath)) {
-        if (
-            -not [System.IO.Path]::IsPathRooted($PythonPath) -or
-            $PythonPath -match '^[A-Za-z]:[^\\/]'
-        ) {
-            throw "Explicit -PythonPath must be an absolute path"
+        if (-not [System.IO.Path]::IsPathFullyQualified($PythonPath)) {
+            throw "Explicit -PythonPath must be fully qualified"
         }
         if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
             throw "Explicit -PythonPath must reference an existing file"
