@@ -171,7 +171,7 @@ class PowerShellCodexRunner:
             self._timeout_seconds,
             deadline_remaining_seconds,
         )
-        wrapper_launch_started = self._monotonic()
+        wrapper_stop_at = self._monotonic() + wrapper_timeout_seconds
         process = await asyncio.create_subprocess_exec(
             str(self._pwsh_path),
             "-NoProfile",
@@ -198,17 +198,15 @@ class PowerShellCodexRunner:
         assert process.stderr is not None
         timed_out = False
         process_cleanup_status: CodexProcessCleanupStatus = "not_required"
-        wrapper_timeout_remaining = wrapper_timeout_seconds - max(
-            0.0,
-            self._monotonic() - wrapper_launch_started,
-        )
+        wrapper_expired_during_launch = self._monotonic() >= wrapper_stop_at
         with self._journal_path.open("ab") as journal:
             stdout_reader = asyncio.create_task(
                 self._journal_stdout(process.stdout, journal)
             )
             stderr_reader = asyncio.create_task(self._drain_stderr(process.stderr))
             try:
-                if wrapper_timeout_remaining <= 0:
+                wrapper_timeout_remaining = wrapper_stop_at - self._monotonic()
+                if wrapper_expired_during_launch or wrapper_timeout_remaining <= 0:
                     raise TimeoutError
                 await asyncio.wait_for(process.wait(), timeout=wrapper_timeout_remaining)
             except TimeoutError:

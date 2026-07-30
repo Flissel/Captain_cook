@@ -548,7 +548,7 @@ async def test_powershell_runner_budget_starts_when_wrapper_launch_begins(
         captured["timeout"] = timeout
         return await awaitable
 
-    monotonic_values = iter((100.0, 103.0))
+    monotonic_values = iter((100.0, 103.0, 104.0))
     monkeypatch.setattr(
         "agenten.execution.codex_supervisor.asyncio.create_subprocess_exec",
         create_process,
@@ -582,7 +582,7 @@ async def test_powershell_runner_budget_starts_when_wrapper_launch_begins(
         )
     )
 
-    assert captured["timeout"] == 2.0
+    assert captured["timeout"] == 1.0
     args = captured["args"]
     assert isinstance(args, tuple)
     deadline_index = args.index("-DeadlineAt")
