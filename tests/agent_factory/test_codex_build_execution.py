@@ -16,6 +16,7 @@ from agenten.agent_factory.codex_build_execution import (
     CodexCliFactoryBuildSettings,
     CompletedCodexBuild,
     FactoryCodexBuildInterrupted,
+    FactoryCodexProcessState,
     GitDetachedFactoryWorkspacePreparer,
     PreparedFactoryWorkspace,
     _session_receipt,
@@ -2107,3 +2108,219 @@ def test_git_workspace_preparer_creates_clean_detached_worktree(tmp_path: Path) 
     assert status.stdout == ""
     retried = preparer.prepare(_dispatch(job, invocation), invocation, brief)
     assert retried == prepared
+
+
+class _StaticProcessInspector:
+    def __init__(self, status: FactoryCodexProcessState) -> None:
+        self.status = status
+        self.calls: list[tuple[str, Path]] = []
+
+    async def inspect(self, *, session_id: str, state_path: Path) -> FactoryCodexProcessState:
+        self.calls.append((session_id, state_path))
+        return self.status
+
+
+async def _running_crash_fixture(
+    tmp_path: Path,
+    *,
+    inspector: _StaticProcessInspector,
+):
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+    authorizer = RecordingAuthorizer()
+    runner_calls = 0
+
+    class Preparer:
+        def prepare_or_recover(self, _request, _invocation, _brief, _checkpoint):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    class CrashRunner:
+        def __init__(self, *, state_path: Path, journal_path: Path) -> None:
+            self.state_path = state_path
+            self.journal_path = journal_path
+
+        async def run(self, _authorized):
+            nonlocal runner_calls
+            runner_calls += 1
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            self.state_path.write_text('{"private":"process-identity"}', encoding="utf-8")
+            self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+            self.journal_path.write_text(
+                json.dumps({"type": "thread.started", "thread_id": "restart-thread"})
+                + "\n",
+                encoding="utf-8",
+            )
+            raise RuntimeError("simulated host crash")
+
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=Preparer(),
+        artifact_reader=artifact_reader,
+        authorizer=authorizer,
+        runner_factory=lambda **kwargs: CrashRunner(
+            state_path=kwargs["state_path"],
+            journal_path=kwargs["journal_path"],
+        ),
+        process_inspector=inspector,
+        clock=lambda: NOW,
+    )
+    dispatch = _dispatch(job, invocation)
+    with pytest.raises(RuntimeError, match="simulated host crash"):
+        await executor.execute(dispatch, invocation, brief)
+    checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert checkpoint is not None
+    assert checkpoint.phase == "implementation_running"
+    return (
+        executor,
+        dispatch,
+        invocation,
+        brief,
+        workspace,
+        state_root,
+        authorizer,
+        lambda: runner_calls,
+    )
+
+
+def _persist_crash_receipt(
+    *,
+    state_root: Path,
+    invocation: FactorySkillInvocationV1,
+    brief: CodexBuildBriefV1,
+    command: tuple[str, ...],
+    exit_code: int,
+    terminal_status: str,
+    process_cleanup_status: str,
+) -> bytes:
+    journal_path = state_root / "journals" / f"{invocation.idempotency_key}.jsonl"
+    journal = journal_path.read_bytes()
+    lines = tuple(line.decode("utf-8") for line in journal.splitlines() if line.strip())
+    receipt = _session_receipt(
+        result=CodexRunResult(
+            exit_code=exit_code,
+            terminal_status=terminal_status,
+            process_cleanup_status=process_cleanup_status,
+            journal_path=journal_path,
+            journal_sha256=hashlib.sha256(journal).hexdigest(),
+            artifact_references=(),
+            jsonl_lines=lines,
+        ),
+        session_id=f"factory-{invocation.invocation_id.hex[:24]}",
+        workspace_ref=brief.build_assignment.workspace_ref,
+        base_revision="a" * 40,
+        command=command,
+        completed_at=NOW,
+    )
+    path = state_root / "sessions" / f"{invocation.idempotency_key}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(receipt)
+    return receipt
+
+
+@pytest.mark.asyncio
+async def test_restart_reconciliation_never_duplicates_an_active_running_process(
+    tmp_path: Path,
+) -> None:
+    inspector = _StaticProcessInspector("active")
+    executor, dispatch, invocation, brief, _, _, _, runner_calls = (
+        await _running_crash_fixture(tmp_path, inspector=inspector)
+    )
+
+    with pytest.raises(FactoryDispatchError, match="active.*inspection|inspection.*active"):
+        await executor.reconcile_pending(dispatch, invocation, brief)
+
+    assert runner_calls() == 1
+    assert len(inspector.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exit_code", "terminal_status", "cleanup_status", "reason"),
+    (
+        (124, "timed_out", "verified_cancelled", "codex_timed_out"),
+        (130, "cancelled", "verified_cancelled", "runtime_cancelled"),
+    ),
+)
+async def test_restart_reconciliation_terminalizes_running_from_valid_receipt(
+    tmp_path: Path,
+    exit_code: int,
+    terminal_status: str,
+    cleanup_status: str,
+    reason: str,
+) -> None:
+    inspector = _StaticProcessInspector("lost")
+    executor, dispatch, invocation, brief, _, state_root, authorizer, runner_calls = (
+        await _running_crash_fixture(tmp_path, inspector=inspector)
+    )
+    _persist_crash_receipt(
+        state_root=state_root,
+        invocation=invocation,
+        brief=brief,
+        command=authorizer.requests[0].command,
+        exit_code=exit_code,
+        terminal_status=terminal_status,
+        process_cleanup_status=cleanup_status,
+    )
+
+    with pytest.raises(FactoryCodexBuildInterrupted) as caught:
+        await executor.reconcile_pending(dispatch, invocation, brief)
+
+    assert caught.value.reason == reason
+    checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert checkpoint is not None
+    assert checkpoint.phase == "implementation_interrupted"
+    assert checkpoint.terminal_receipt_sha256 == caught.value.terminal_receipt_ref.sha256
+    assert runner_calls() == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_reconciliation_completes_successful_receipt_then_replays_complete(
+    tmp_path: Path,
+) -> None:
+    inspector = _StaticProcessInspector("lost")
+    executor, dispatch, invocation, brief, workspace, state_root, authorizer, runner_calls = (
+        await _running_crash_fixture(tmp_path, inspector=inspector)
+    )
+    successful = SuccessfulRunner(
+        workspace,
+        state_root / "journals" / f"{invocation.idempotency_key}.jsonl",
+    )
+    result = await successful.run(
+        AuthorizedCodexRun(
+            workspace=workspace,
+            command=authorizer.requests[0].command,
+            environment=FrozenEnvironment({}),
+        )
+    )
+    receipt = _session_receipt(
+        result=result,
+        session_id=f"factory-{invocation.invocation_id.hex[:24]}",
+        workspace_ref=brief.build_assignment.workspace_ref,
+        base_revision="a" * 40,
+        command=authorizer.requests[0].command,
+        completed_at=NOW,
+    )
+    receipt_path = state_root / "sessions" / f"{invocation.idempotency_key}.json"
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    receipt_path.write_bytes(receipt)
+
+    completed = await executor.reconcile_pending(dispatch, invocation, brief)
+    checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+
+    assert completed.codex_session_receipt == receipt
+    assert checkpoint is not None
+    assert checkpoint.phase == "implementation_complete"
+    assert runner_calls() == 1
+    assert await executor.reconcile_pending(dispatch, invocation, brief) == completed

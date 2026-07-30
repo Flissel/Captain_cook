@@ -153,6 +153,13 @@ class CaptainCodexBuildSealerPort(Protocol):
         brief: CodexBuildBriefV1,
     ) -> CodexBuildEvidenceV1: ...
 
+    async def reconcile_pending(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+    ) -> CodexBuildEvidenceV1: ...
+
     def validate_runtime_retry(
         self,
         request: FactoryDispatch,
@@ -271,6 +278,28 @@ class HermesCliFactory(HermesFactoryPort):
             )
             try:
                 claim = await self._replay_store.claim(invocation)
+            except FactorySkillReplayPendingError as pending:
+                if (
+                    step is not FactorySkillStep.SEAL_CODEX_BUILD
+                    or self._codex_build_sealer is None
+                    or not artifacts
+                    or not isinstance(artifacts[-1], CodexBuildBriefV1)
+                ):
+                    raise
+                accepted = await self._reconcile_pending_codex_seal(
+                    request,
+                    invocation,
+                    artifacts[-1],
+                    pending.record,
+                )
+                assert accepted.artifact is not None
+                assert accepted.transcript_ref is not None
+                artifacts.append(accepted.artifact)
+                transcript_refs.append(accepted.transcript_ref)
+                input_ref = accepted.artifact.artifact_ref
+                if not _may_continue_after(accepted.artifact):
+                    break
+                continue
             except FactorySkillReplayInterruptedError as interrupted:
                 authorization = request.runtime_retry_authorization
                 if (
@@ -452,6 +481,59 @@ class HermesCliFactory(HermesFactoryPort):
             request,
             artifacts=tuple(artifacts),
             transcript_refs=tuple(transcript_refs),
+        )
+
+    async def _reconcile_pending_codex_seal(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+        pending: FactorySkillReplayRecord,
+    ) -> FactorySkillReplayRecord:
+        assert self._codex_build_sealer is not None
+        try:
+            artifact = await self._codex_build_sealer.reconcile_pending(
+                request,
+                invocation,
+                brief,
+            )
+            if artifact.invocation != invocation:
+                raise FactoryDispatchError(
+                    "reconciled Codex build evidence does not match invocation"
+                )
+            transcript_ref = await self._evidence_store.persist(
+                request.job,
+                artifact.model_dump_json(by_alias=True).encode("utf-8"),
+            )
+        except FactoryCodexBuildInterrupted as exc:
+            try:
+                if exc.resume_ordinal == pending.resume_ordinal:
+                    await self._replay_store.interrupt(
+                        pending,
+                        checkpoint_ref=exc.checkpoint_ref,
+                        terminal_receipt_ref=exc.terminal_receipt_ref,
+                        resume_ordinal=exc.resume_ordinal,
+                    )
+                elif exc.resume_ordinal == pending.resume_ordinal - 1:
+                    await self._replay_store.reconcile_interrupted(
+                        pending,
+                        checkpoint_ref=exc.checkpoint_ref,
+                        terminal_receipt_ref=exc.terminal_receipt_ref,
+                        resume_ordinal=exc.resume_ordinal,
+                    )
+                else:
+                    raise FactoryDispatchError(
+                        "factory skill replay reconciliation ordinal conflicts"
+                    )
+            except Exception as replay_exc:
+                raise FactoryDispatchError(
+                    "factory skill replay reconciliation could not be persisted"
+                ) from replay_exc
+            raise
+        return await self._replay_store.complete(
+            pending,
+            artifact=artifact,
+            transcript_ref=transcript_ref,
         )
 
     async def _require_runtime_recovery_replays(
@@ -889,6 +971,15 @@ class FactorySkillReplayStore(Protocol):
         resume_ordinal: int,
     ) -> FactorySkillReplayRecord: ...
 
+    async def reconcile_interrupted(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        checkpoint_ref: ArtifactRef,
+        terminal_receipt_ref: ArtifactRef,
+        resume_ordinal: int,
+    ) -> FactorySkillReplayRecord: ...
+
     async def resume(
         self,
         interrupted: FactorySkillReplayRecord,
@@ -971,6 +1062,24 @@ class InMemoryFactorySkillReplayStore:
         return await self._transition(
             pending,
             _interrupted_replay_record(
+                pending,
+                checkpoint_ref=checkpoint_ref,
+                terminal_receipt_ref=terminal_receipt_ref,
+                resume_ordinal=resume_ordinal,
+            ),
+        )
+
+    async def reconcile_interrupted(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        checkpoint_ref: ArtifactRef,
+        terminal_receipt_ref: ArtifactRef,
+        resume_ordinal: int,
+    ) -> FactorySkillReplayRecord:
+        return await self._transition(
+            pending,
+            _reconciled_interrupted_replay_record(
                 pending,
                 checkpoint_ref=checkpoint_ref,
                 terminal_receipt_ref=terminal_receipt_ref,
@@ -1093,6 +1202,24 @@ class FilesystemFactorySkillReplayStore:
         return await self._transition(
             pending,
             _interrupted_replay_record(
+                pending,
+                checkpoint_ref=checkpoint_ref,
+                terminal_receipt_ref=terminal_receipt_ref,
+                resume_ordinal=resume_ordinal,
+            ),
+        )
+
+    async def reconcile_interrupted(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        checkpoint_ref: ArtifactRef,
+        terminal_receipt_ref: ArtifactRef,
+        resume_ordinal: int,
+    ) -> FactorySkillReplayRecord:
+        return await self._transition(
+            pending,
+            _reconciled_interrupted_replay_record(
                 pending,
                 checkpoint_ref=checkpoint_ref,
                 terminal_receipt_ref=terminal_receipt_ref,
@@ -1413,6 +1540,31 @@ def _interrupted_replay_record(
         raise FactoryDispatchError("factory skill replay claim is no longer pending")
     if resume_ordinal != pending.resume_ordinal:
         raise FactoryDispatchError("factory skill replay interruption ordinal conflicts")
+    return FactorySkillReplayRecord(
+        invocation=pending.invocation,
+        invocation_sha256=pending.invocation_sha256,
+        claim_token=pending.claim_token,
+        state="interrupted",
+        failure_kind="codex_runtime_interrupted",
+        checkpoint_ref=checkpoint_ref,
+        terminal_receipt_ref=terminal_receipt_ref,
+        resume_ordinal=resume_ordinal,
+    )
+
+
+def _reconciled_interrupted_replay_record(
+    pending: FactorySkillReplayRecord,
+    *,
+    checkpoint_ref: ArtifactRef,
+    terminal_receipt_ref: ArtifactRef,
+    resume_ordinal: int,
+) -> FactorySkillReplayRecord:
+    if pending.state != "pending":
+        raise FactoryDispatchError("factory skill replay claim is no longer pending")
+    if pending.resume_ordinal < 1 or resume_ordinal != pending.resume_ordinal - 1:
+        raise FactoryDispatchError(
+            "factory skill replay reconciliation ordinal conflicts"
+        )
     return FactorySkillReplayRecord(
         invocation=pending.invocation,
         invocation_sha256=pending.invocation_sha256,

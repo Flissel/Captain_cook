@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -75,6 +76,8 @@ FactoryCodexBuildInterruptionReason = Literal[
     "runtime_cancelled",
     "resume_authorization_required",
 ]
+
+FactoryCodexProcessState = Literal["active", "lost", "identity_mismatch"]
 
 
 @dataclass(frozen=True)
@@ -232,6 +235,13 @@ class CaptainCodexBuildExecutorPort(Protocol):
         brief: CodexBuildBriefV1,
     ) -> CompletedCodexBuild: ...
 
+    async def reconcile_pending(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+    ) -> CompletedCodexBuild: ...
+
     def replay_sealed(
         self,
         invocation: FactorySkillInvocationV1,
@@ -330,6 +340,66 @@ class FactoryCodexRunnerFactory(Protocol):
     ) -> CodexRunner: ...
 
 
+class FactoryCodexProcessInspectorPort(Protocol):
+    async def inspect(
+        self,
+        *,
+        session_id: str,
+        state_path: Path,
+    ) -> FactoryCodexProcessState: ...
+
+
+class PowerShellFactoryCodexProcessInspector:
+    """Inspect the exact persisted Codex child identity without mutating it."""
+
+    def __init__(self, *, pwsh_path: Path, script_path: Path) -> None:
+        self._pwsh_path = pwsh_path.resolve(strict=True)
+        self._script_path = script_path.resolve(strict=True)
+
+    async def inspect(
+        self,
+        *,
+        session_id: str,
+        state_path: Path,
+    ) -> FactoryCodexProcessState:
+        if not state_path.is_file():
+            raise FactoryDispatchError("Factory Codex process state is missing")
+        process = await asyncio.create_subprocess_exec(
+            str(self._pwsh_path),
+            "-NoProfile",
+            "-File",
+            str(self._script_path),
+            "-InspectStatePath",
+            str(state_path),
+            "-SessionId",
+            session_id,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await process.communicate()
+        if process.returncode != 0:
+            raise FactoryDispatchError("Factory Codex process inspection failed")
+        try:
+            payload = json.loads(stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise FactoryDispatchError(
+                "Factory Codex process inspection returned invalid evidence"
+            ) from None
+        if not isinstance(payload, dict):
+            raise FactoryDispatchError(
+                "Factory Codex process inspection returned invalid evidence"
+            )
+        status = payload.get("status")
+        if (
+            payload.get("session_id") != session_id
+            or status not in {"active", "lost", "identity_mismatch"}
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex process inspection returned invalid evidence"
+            )
+        return status
+
+
 class CaptainCodexBuildSealer:
     """Run one exact assignment, then issue only Captain-owned build evidence."""
 
@@ -374,6 +444,33 @@ class CaptainCodexBuildSealer:
                 invocation,
                 brief,
             )
+        return self._seal_completed(request, invocation, brief, completed)
+
+    async def reconcile_pending(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+    ) -> CodexBuildEvidenceV1:
+        if not isinstance(request.job, AgentFactoryJobV3):
+            raise FactoryDispatchError("Codex reconciliation requires a V3 Factory job")
+        replay = self._executor.replay_sealed(invocation)
+        if replay is not None:
+            return replay
+        completed = await self._executor.reconcile_pending(
+            request,
+            invocation,
+            brief,
+        )
+        return self._seal_completed(request, invocation, brief, completed)
+
+    def _seal_completed(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+        completed: CompletedCodexBuild,
+    ) -> CodexBuildEvidenceV1:
         receipt = self._issuer.issue(
             job=request.job,
             build_brief=brief,
@@ -578,6 +675,7 @@ class CodexCliFactoryBuildExecutor:
         scaffold_manifest_store: FilesystemFactoryCodexScaffoldManifestStore | None = None,
         sealed_evidence_store: FilesystemFactoryCodexSealedEvidenceStore | None = None,
         resume_authorizer: FactoryCodexResumeAuthorizerPort | None = None,
+        process_inspector: FactoryCodexProcessInspectorPort | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._settings = settings
@@ -601,6 +699,7 @@ class CodexCliFactoryBuildExecutor:
             )
         )
         self._resume_authorizer = resume_authorizer
+        self._process_inspector = process_inspector
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     async def execute(
@@ -668,6 +767,77 @@ class CodexCliFactoryBuildExecutor:
                 "Factory Codex resume authorization decision is invalid"
             )
         return authorization
+
+    async def reconcile_pending(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+    ) -> CompletedCodexBuild:
+        """Reconcile only a previously claimed seal from durable local evidence."""
+
+        if not isinstance(request.job, AgentFactoryJobV3):
+            raise FactoryDispatchError("Codex reconciliation requires a V3 Factory job")
+        checkpoint = self._checkpoint_store.load(invocation)
+        if checkpoint is None:
+            raise FactoryDispatchError(
+                "Factory Codex pending seal has no checkpoint; inspection is required"
+            )
+        prepared = self._prepare_or_recover(
+            request,
+            invocation,
+            brief,
+            checkpoint,
+        )
+        self._validate_original_scaffold(
+            request,
+            invocation,
+            brief,
+            prepared.root,
+            checkpoint,
+        )
+        if checkpoint.phase == "sealed":
+            raise FactoryDispatchError(
+                "Factory Codex sealed replay requires original persisted evidence"
+            )
+        if checkpoint.phase == "implementation_complete":
+            return self._seal_phase(invocation, prepared, checkpoint)
+        if checkpoint.phase == "implementation_interrupted":
+            raise FactoryCodexBuildInterrupted(
+                reason="resume_authorization_required",
+                exit_code=None,
+                **_interruption_details(request, invocation, checkpoint),
+            )
+        if checkpoint.phase != "implementation_running":
+            raise FactoryDispatchError(
+                "Factory Codex pending seal checkpoint is not reconcilable"
+            )
+        checkpoint = await self._reconcile_running(
+            request=request,
+            invocation=invocation,
+            brief=brief,
+            prepared=prepared,
+            checkpoint=checkpoint,
+        )
+        if checkpoint.phase == "implementation_interrupted":
+            receipt = self._load_reconciliation_receipt(
+                request=request,
+                invocation=invocation,
+                brief=brief,
+                prepared=prepared,
+                checkpoint=checkpoint,
+            )[1]
+            reason: FactoryCodexBuildInterruptionReason = (
+                "codex_timed_out"
+                if receipt["status"] == "timed_out"
+                else "runtime_cancelled"
+            )
+            raise FactoryCodexBuildInterrupted(
+                reason=reason,
+                exit_code=int(receipt["exit_code"]),
+                **_interruption_details(request, invocation, checkpoint),
+            )
+        return self._seal_phase(invocation, prepared, checkpoint)
 
     async def _execute(
         self,
@@ -867,15 +1037,8 @@ class CodexCliFactoryBuildExecutor:
             else authorized_resume_ordinal
         )
         session_id = f"factory-{invocation.invocation_id.hex[:24]}"
-        ordinal_suffix = (
-            "" if next_ordinal == 0 else f".resume-{next_ordinal}"
-        )
-        state_path = self._settings.state_root.resolve() / "processes" / (
-            f"{invocation.idempotency_key}{ordinal_suffix}.json"
-        )
-        journal_path = self._settings.state_root.resolve() / "journals" / (
-            f"{invocation.idempotency_key}{ordinal_suffix}.jsonl"
-        )
+        state_path = self._process_state_path(invocation, next_ordinal)
+        journal_path = self._journal_path(invocation, next_ordinal)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         runtime_seconds = min(
             self._settings.maximum_runtime_seconds,
@@ -998,6 +1161,238 @@ class CodexCliFactoryBuildExecutor:
                 previous=checkpoint,
             ),
         )
+
+    async def _reconcile_running(
+        self,
+        *,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+        prepared: PreparedFactoryWorkspace,
+        checkpoint: FactoryCodexBuildCheckpointV1,
+    ) -> FactoryCodexBuildCheckpointV1:
+        state_path = self._process_state_path(invocation, checkpoint.resume_ordinal)
+        inspected_state: FactoryCodexProcessState | None = None
+        if state_path.is_file():
+            if self._process_inspector is None:
+                raise FactoryDispatchError(
+                    "Factory Codex process inspection is not configured"
+                )
+            inspected_state = await self._process_inspector.inspect(
+                session_id=f"factory-{invocation.invocation_id.hex[:24]}",
+                state_path=state_path,
+            )
+            if inspected_state == "active":
+                raise FactoryDispatchError(
+                    "Factory Codex process is active; inspection or cancellation is required"
+                )
+            if inspected_state != "lost":
+                raise FactoryDispatchError(
+                    "Factory Codex process identity is unresolved; inspection is required"
+                )
+        receipt_content, receipt = self._load_reconciliation_receipt(
+            request=request,
+            invocation=invocation,
+            brief=brief,
+            prepared=prepared,
+            checkpoint=checkpoint,
+        )
+        cleanup_status = receipt["process_cleanup_status"]
+        if cleanup_status == "unresolved":
+            raise FactoryDispatchError(
+                "Factory Codex process cleanup is unresolved; inspection is required"
+            )
+        if inspected_state is None and not (
+            receipt["status"] == "timed_out"
+            and cleanup_status == "not_required"
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex process state is missing; inspection is required"
+            )
+
+        receipt_sha256 = hashlib.sha256(receipt_content).hexdigest()
+        if receipt["status"] in {"timed_out", "cancelled"}:
+            phase: FactoryCodexBuildPhase = "implementation_interrupted"
+        elif receipt["status"] == "succeeded":
+            phase = "implementation_complete"
+        else:
+            raise FactoryDispatchError(
+                "Factory Codex failed terminal receipt requires operator inspection"
+            )
+        return self._checkpoint_store.advance(
+            checkpoint,
+            self._checkpoint(
+                request,
+                invocation,
+                brief,
+                prepared,
+                phase=phase,
+                resume_ordinal=checkpoint.resume_ordinal,
+                terminal_receipt_sha256=receipt_sha256,
+                scaffold_manifest_sha256=checkpoint.scaffold_manifest_sha256,
+                previous=checkpoint,
+            ),
+        )
+
+    def _load_reconciliation_receipt(
+        self,
+        *,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+        prepared: PreparedFactoryWorkspace,
+        checkpoint: FactoryCodexBuildCheckpointV1,
+    ) -> tuple[bytes, dict[str, object]]:
+        receipt_path = self._session_receipt_path(
+            invocation, checkpoint.resume_ordinal
+        )
+        try:
+            content = receipt_path.read_bytes()
+            receipt = json.loads(content)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            raise FactoryDispatchError(
+                "Factory Codex terminal session receipt is missing or invalid"
+            ) from None
+        if not isinstance(receipt, dict) or content != json.dumps(
+            receipt,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8"):
+            raise FactoryDispatchError(
+                "Factory Codex terminal session receipt is not canonical"
+            )
+        expected_keys = {
+            "schema",
+            "provider",
+            "session_id",
+            "codex_thread_id",
+            "status",
+            "exit_code",
+            "process_cleanup_status",
+            "workspace_ref",
+            "base_revision",
+            "command_sha256",
+            "jsonl_sha256",
+            "journal_sha256",
+            "event_count",
+            "event_types",
+            "completed_at",
+        }
+        run_request = self._run_request(request, invocation, brief, prepared)
+        if (
+            set(receipt) != expected_keys
+            or receipt["schema"] != "captain.codex-session-receipt.v1"
+            or receipt["provider"] != "codex-cli"
+            or receipt["session_id"]
+            != f"factory-{invocation.invocation_id.hex[:24]}"
+            or receipt["workspace_ref"] != checkpoint.workspace_ref
+            or receipt["base_revision"] != checkpoint.base_revision
+            or receipt["command_sha256"]
+            != hashlib.sha256(
+                "\0".join(run_request.command).encode("utf-8")
+            ).hexdigest()
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex terminal session receipt binding changed"
+            )
+        exit_code = receipt["exit_code"]
+        status = receipt["status"]
+        cleanup = receipt["process_cleanup_status"]
+        if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+            raise FactoryDispatchError("Factory Codex terminal receipt is inconsistent")
+        expected_terminal = {
+            0: ("succeeded", {"not_required"}),
+            124: ("timed_out", {"not_required", "verified_cancelled", "unresolved"}),
+            130: ("cancelled", {"verified_cancelled", "unresolved"}),
+        }.get(exit_code)
+        if expected_terminal is None or status != expected_terminal[0] or cleanup not in expected_terminal[1]:
+            raise FactoryDispatchError("Factory Codex terminal receipt is inconsistent")
+
+        journal_path = self._journal_path(invocation, checkpoint.resume_ordinal)
+        try:
+            journal = journal_path.read_bytes()
+        except OSError:
+            raise FactoryDispatchError("Factory Codex JSONL journal is missing") from None
+        journal_sha256 = hashlib.sha256(journal).hexdigest()
+        if (
+            receipt["jsonl_sha256"] != journal_sha256
+            or receipt["journal_sha256"] != journal_sha256
+        ):
+            raise FactoryDispatchError("Factory Codex JSONL journal digest changed")
+        events: list[dict[str, object]] = []
+        try:
+            for line in journal.splitlines():
+                if not line.strip():
+                    continue
+                event = json.loads(line)
+                if not isinstance(event, dict):
+                    raise ValueError
+                events.append(event)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            raise FactoryDispatchError("Factory Codex JSONL journal is invalid") from None
+        thread_ids = {
+            value
+            for event in events
+            for value in (event.get("thread_id"),)
+            if isinstance(value, str) and value.strip()
+        }
+        event_types = sorted(
+            {
+                value
+                for event in events
+                for value in (event.get("type"),)
+                if isinstance(value, str) and value.strip()
+            }
+        )
+        if (
+            len(thread_ids) > 1
+            or receipt["event_count"] != len(events)
+            or receipt["event_types"] != event_types
+            or receipt["codex_thread_id"] != next(iter(thread_ids), None)
+            or (status == "succeeded" and not events)
+        ):
+            raise FactoryDispatchError("Factory Codex JSONL journal receipt changed")
+        try:
+            completed_at = datetime.fromisoformat(str(receipt["completed_at"]))
+        except ValueError:
+            raise FactoryDispatchError(
+                "Factory Codex terminal receipt completion time is invalid"
+            ) from None
+        if (
+            completed_at.tzinfo is None
+            or completed_at.utcoffset() != timezone.utc.utcoffset(completed_at)
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex terminal receipt completion time is invalid"
+            )
+        authorized_resume = checkpoint.resume_ordinal > 0
+        authority_deadline = self._authority_deadline(
+            request,
+            invocation,
+            authorized_resume=authorized_resume,
+        )
+        authority_start = invocation.lease.issued_at
+        if authorized_resume:
+            authorization = request.runtime_retry_authorization
+            if authorization is None or authorization.resume_ordinal != checkpoint.resume_ordinal:
+                raise FactoryDispatchError(
+                    "Factory Codex reconciliation requires original retry authority"
+                )
+            authority_start = authorization.issued_at
+        if not authority_start <= completed_at < authority_deadline:
+            raise FactoryDispatchError(
+                "Factory Codex terminal receipt is outside Captain authority"
+            )
+        digest = hashlib.sha256(content).hexdigest()
+        if (
+            checkpoint.terminal_receipt_sha256 is not None
+            and checkpoint.terminal_receipt_sha256 != digest
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex terminal session receipt digest changed"
+            )
+        return content, receipt
 
     def _seal_phase(
         self,
@@ -1305,6 +1700,30 @@ class CodexCliFactoryBuildExecutor:
             f"{invocation.idempotency_key}{ordinal_suffix}.json"
         )
 
+    def _process_state_path(
+        self,
+        invocation: FactorySkillInvocationV1,
+        resume_ordinal: int,
+    ) -> Path:
+        ordinal_suffix = (
+            "" if resume_ordinal == 0 else f".resume-{resume_ordinal}"
+        )
+        return self._settings.state_root.resolve() / "processes" / (
+            f"{invocation.idempotency_key}{ordinal_suffix}.json"
+        )
+
+    def _journal_path(
+        self,
+        invocation: FactorySkillInvocationV1,
+        resume_ordinal: int,
+    ) -> Path:
+        ordinal_suffix = (
+            "" if resume_ordinal == 0 else f".resume-{resume_ordinal}"
+        )
+        return self._settings.state_root.resolve() / "journals" / (
+            f"{invocation.idempotency_key}{ordinal_suffix}.jsonl"
+        )
+
 
 def _codex_prompt(
     request: FactoryDispatch,
@@ -1514,10 +1933,13 @@ __all__ = [
     "CodexCliFactoryBuildSettings",
     "CompletedCodexBuild",
     "FactoryCodexBuildInterrupted",
+    "FactoryCodexProcessInspectorPort",
+    "FactoryCodexProcessState",
     "FactoryBuildArtifactReaderPort",
     "FactoryCodexRunnerFactory",
     "FactoryCodexResumeAuthorizerPort",
     "FactoryCodexWorkspacePreparerPort",
     "GitDetachedFactoryWorkspacePreparer",
     "PreparedFactoryWorkspace",
+    "PowerShellFactoryCodexProcessInspector",
 ]

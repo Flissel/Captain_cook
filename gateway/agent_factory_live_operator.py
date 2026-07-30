@@ -38,6 +38,7 @@ from agenten.agent_factory.codex_build_execution import (
     CodexCliFactoryBuildExecutor,
     CodexCliFactoryBuildSettings,
     GitDetachedFactoryWorkspacePreparer,
+    PowerShellFactoryCodexProcessInspector,
 )
 from agenten.agent_factory.codex_build_recovery import (
     FilesystemFactoryCodexBuildCheckpointStore,
@@ -286,6 +287,10 @@ def compose_business_demo_factory_operator(
             ),
             resume_authorizer=CaptainFactoryCodexResumeAuthorizer(
                 clock=current_time
+            ),
+            process_inspector=PowerShellFactoryCodexProcessInspector(
+                pwsh_path=pwsh_executable,
+                script_path=codex_session_script,
             ),
             clock=current_time,
         ),

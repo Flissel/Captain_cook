@@ -1928,6 +1928,78 @@ async def test_filesystem_replay_exposes_pending_claim_after_restart(
 
 
 @pytest.mark.asyncio
+async def test_resume_claim_restart_restores_only_the_exact_prior_interruption(
+    tmp_path: Path,
+) -> None:
+    invocation = FactorySkillInvocationV1.model_validate(seal_invocation_payload())
+    store = FilesystemFactorySkillReplayStore(tmp_path / "replays")
+    checkpoint_ref = ArtifactRef(
+        uri=f"artifact://factory/codex-checkpoint/{'c' * 64}",
+        sha256="c" * 64,
+        media_type="application/json",
+    )
+    receipt_ref = ArtifactRef(
+        uri=f"artifact://factory/codex-terminal-receipt/{'d' * 64}",
+        sha256="d" * 64,
+        media_type="application/json",
+    )
+    claimed = await store.claim(invocation)
+    interrupted = await store.interrupt(
+        claimed.record,
+        checkpoint_ref=checkpoint_ref,
+        terminal_receipt_ref=receipt_ref,
+        resume_ordinal=0,
+    )
+    authorization = FactoryRuntimeRetryAuthorizationV1(
+        schema_name="captain.factory-runtime-retry-authorization.v1",
+        authorization_ref=ArtifactRef(
+            uri=f"artifact://factory/runtime-retry/{'a' * 64}",
+            sha256="a" * 64,
+            media_type="application/json",
+        ),
+        producer="captain",
+        status="succeeded",
+        job_id=invocation.job_id,
+        correlation_id=invocation.correlation_id,
+        subject_version=invocation.subject_version,
+        attempt=invocation.attempt,
+        invocation_id=invocation.invocation_id,
+        idempotency_key=invocation.idempotency_key,
+        lease_id=invocation.lease.lease_id,
+        checkpoint_ref=checkpoint_ref,
+        terminal_receipt_ref=receipt_ref,
+        workspace_ref=invocation.lease.workspace_ref,
+        base_revision="e" * 40,
+        scaffold_manifest_sha256="f" * 64,
+        brief_sha256="1" * 64,
+        resume_ordinal=1,
+        maximum_runtime_seconds=60,
+        issued_at=invocation.lease.issued_at,
+        expires_at=invocation.lease.issued_at + timedelta(minutes=1),
+    )
+    resumed = await store.resume(interrupted, authorization=authorization)
+
+    restored = await store.reconcile_interrupted(
+        resumed.record,
+        checkpoint_ref=checkpoint_ref,
+        terminal_receipt_ref=receipt_ref,
+        resume_ordinal=0,
+    )
+
+    assert restored.state == "interrupted"
+    assert restored.resume_ordinal == 0
+    assert restored.checkpoint_ref == checkpoint_ref
+    assert restored.terminal_receipt_ref == receipt_ref
+    with pytest.raises(FactoryDispatchError, match="no longer pending"):
+        await store.reconcile_interrupted(
+            restored,
+            checkpoint_ref=checkpoint_ref,
+            terminal_receipt_ref=receipt_ref,
+            resume_ordinal=0,
+        )
+
+
+@pytest.mark.asyncio
 async def test_in_memory_replay_claim_is_serialized() -> None:
     invocation = FactorySkillInvocationV1.model_validate(
         invocation_payload(FactorySkillStep.DISCOVER.value)
