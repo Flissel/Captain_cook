@@ -30,8 +30,10 @@ from agenten.delivery.gateway_client import GatewayDeliveryClient
 from agenten.execution.codex_events import CodexParseWarning, CodexProcessEvent
 from agenten.execution.codex_policy import AuthorizedCodexRun, FrozenEnvironment
 from agenten.execution.codex_supervisor import (
+    CodexJournalPersistenceError,
     CodexRunRequest,
     CodexRunResult,
+    CodexRunTerminalStatus,
     CodexSupervisor,
     PowerShellCodexRunner,
 )
@@ -40,6 +42,31 @@ from agenten.execution.process import PackageExecutionStatus
 
 NOW = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+
+
+def _durable_codex_result(
+    *,
+    journal_path: Path,
+    exit_code: int,
+    terminal_status: CodexRunTerminalStatus,
+    artifact_references: tuple[str, ...],
+    jsonl_lines: tuple[str, ...],
+) -> CodexRunResult:
+    journal_bytes = b"".join(f"{line}\n".encode() for line in jsonl_lines)
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    with journal_path.open("wb") as journal:
+        journal.write(journal_bytes)
+        journal.flush()
+        os.fsync(journal.fileno())
+    return CodexRunResult(
+        exit_code=exit_code,
+        terminal_status=terminal_status,
+        process_cleanup_status="not_required",
+        journal_path=journal_path.resolve(),
+        journal_sha256=hashlib.sha256(journal_bytes).hexdigest(),
+        artifact_references=artifact_references,
+        jsonl_lines=jsonl_lines,
+    )
 
 
 class RevocationReader:
@@ -139,12 +166,10 @@ async def test_supervisor_persists_started_session_before_runner(
         class AssertingRunner:
             async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
                 assert history.events[0]["event_type"] == "codex_session_started"
-                return CodexRunResult(
+                return _durable_codex_result(
+                    journal_path=tmp_path / "runner.jsonl",
                     exit_code=0,
                     terminal_status="succeeded",
-                    process_cleanup_status="not_required",
-                    journal_path=tmp_path / "runner.jsonl",
-                    journal_sha256=EMPTY_SHA256,
                     artifact_references=("artifact://sealed/1",),
                     jsonl_lines=(
                         '{"type":"thread.started","thread_id":"session-1"}',
@@ -159,6 +184,11 @@ async def test_supervisor_persists_started_session_before_runner(
         ).run(request(tmp_path))
 
     assert result.status is PackageExecutionStatus.SUCCEEDED
+    journal_path = tmp_path / "runner.jsonl"
+    assert journal_path.is_file()
+    assert journal_path.read_bytes() == (
+        b'{"type":"thread.started","thread_id":"session-1"}\n'
+    )
     assert [event["event_type"] for event in history.events] == [
         "codex_session_started",
         "codex_session_event",
@@ -295,12 +325,10 @@ async def test_nonzero_process_exit_is_infrastructure_not_behavioral_repair(
 
         class FailedRunner:
             async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
-                return CodexRunResult(
+                return _durable_codex_result(
+                    journal_path=tmp_path / "runner.jsonl",
                     exit_code=23,
                     terminal_status="failed",
-                    process_cleanup_status="not_required",
-                    journal_path=tmp_path / "runner.jsonl",
-                    journal_sha256=EMPTY_SHA256,
                     artifact_references=(),
                     jsonl_lines=(),
                 )
@@ -506,6 +534,70 @@ class _UnverifiedTimeoutProcess:
         self.returncode = -9
         self.stdout.feed_eof()
         self.stderr.feed_eof()
+
+
+class _CompletedStreamingProcess:
+    def __init__(self, line: str) -> None:
+        self.returncode: int | None = None
+        self.stdout = asyncio.StreamReader()
+        self.stdout.feed_data(f"{line}\n".encode())
+        self.stdout.feed_eof()
+        self.stderr = asyncio.StreamReader()
+        self.stderr.feed_eof()
+
+    async def wait(self) -> int:
+        self.returncode = 0
+        return self.returncode
+
+
+@pytest.mark.asyncio
+async def test_powershell_runner_fails_closed_when_journal_fsync_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _CompletedStreamingProcess('{"type":"turn.started"}')
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    runner = PowerShellCodexRunner(
+        pwsh_path=Path(_pwsh()),
+        script_path=Path("scripts/codex-session.ps1").resolve(),
+        codex_path=Path(r"C:\Windows\System32\timeout.exe"),
+        session_id="runner-fsync-failure",
+        state_path=tmp_path / "process-state.json",
+        journal_path=tmp_path / "private" / "fsync-failure.jsonl",
+        artifact_references=(),
+        codex_home=codex_home,
+        timeout_seconds=1,
+    )
+
+    async def create_process(*args: object, **kwargs: object) -> object:
+        return process
+
+    def fsync_fails(file_descriptor: int) -> None:
+        del file_descriptor
+        raise OSError("private journal device failure")
+
+    monkeypatch.setattr(
+        "agenten.execution.codex_supervisor.asyncio.create_subprocess_exec",
+        create_process,
+    )
+    monkeypatch.setattr(
+        "agenten.execution.codex_supervisor.os.fsync",
+        fsync_fails,
+    )
+
+    with pytest.raises(
+        CodexJournalPersistenceError,
+        match="Codex JSONL journal persistence failed",
+    ) as error:
+        await runner.run(
+            AuthorizedCodexRun(
+                workspace=tmp_path,
+                command=("codex", "exec", "--json", "harmless persistence test"),
+                environment=FrozenEnvironment({"PATH": "safe"}),
+            )
+        )
+    assert "private journal device failure" not in str(error.value)
 
 
 class _BrokenCleanupProcess(_UnverifiedTimeoutProcess):
@@ -1253,12 +1345,10 @@ async def test_supervisor_terminalizes_infrastructure_when_event_append_fails(
 
         class Runner:
             async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
-                return CodexRunResult(
+                return _durable_codex_result(
+                    journal_path=tmp_path / "runner.jsonl",
                     exit_code=0,
                     terminal_status="succeeded",
-                    process_cleanup_status="not_required",
-                    journal_path=tmp_path / "runner.jsonl",
-                    journal_sha256=EMPTY_SHA256,
                     artifact_references=(),
                     jsonl_lines=('{"type":"turn.started"}',),
                 )
@@ -1300,12 +1390,10 @@ async def test_supervisor_reports_unresolved_evidence_when_lifecycle_and_termina
 
         class Runner:
             async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
-                return CodexRunResult(
+                return _durable_codex_result(
+                    journal_path=tmp_path / "runner.jsonl",
                     exit_code=0,
                     terminal_status="succeeded",
-                    process_cleanup_status="not_required",
-                    journal_path=tmp_path / "runner.jsonl",
-                    journal_sha256=EMPTY_SHA256,
                     artifact_references=(),
                     jsonl_lines=('{"type":"turn.started"}',),
                 )
@@ -1334,12 +1422,10 @@ async def test_supervisor_assigns_stable_source_sequence_to_each_jsonl_line(
 
         class Runner:
             async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
-                return CodexRunResult(
+                return _durable_codex_result(
+                    journal_path=tmp_path / "runner.jsonl",
                     exit_code=0,
                     terminal_status="succeeded",
-                    process_cleanup_status="not_required",
-                    journal_path=tmp_path / "runner.jsonl",
-                    journal_sha256=EMPTY_SHA256,
                     artifact_references=("artifact://sealed/sequence",),
                     jsonl_lines=(
                         '{"type":"turn.started"}',

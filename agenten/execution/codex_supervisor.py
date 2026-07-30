@@ -31,6 +31,10 @@ CodexProcessCleanupStatus = Literal[
 ]
 
 
+class CodexJournalPersistenceError(RuntimeError):
+    """The private Codex JSONL journal could not be durably persisted."""
+
+
 class CodexRunRequest(BaseModel):
     """Fully validated immutable input for one supervised Codex process."""
 
@@ -186,7 +190,11 @@ class PowerShellCodexRunner:
                     else "unresolved"
                 )
             finally:
-                await self._finish_readers(stdout_reader, stderr_reader)
+                await self._finish_readers(
+                    stdout_reader,
+                    stderr_reader,
+                    allow_bounded_cancellation=timed_out,
+                )
 
         journal_bytes = self._journal_path.read_bytes()
         exit_code = 124 if timed_out else process.returncode
@@ -223,9 +231,14 @@ class PowerShellCodexRunner:
             line = raw_line.rstrip(b"\r\n")
             if not line.strip():
                 continue
-            journal.write(line + b"\n")
-            journal.flush()
-            os.fsync(journal.fileno())
+            try:
+                journal.write(line + b"\n")
+                journal.flush()
+                os.fsync(journal.fileno())
+            except OSError:
+                raise CodexJournalPersistenceError(
+                    "Codex JSONL journal persistence failed"
+                ) from None
 
     @staticmethod
     async def _drain_stderr(stderr: asyncio.StreamReader) -> None:
@@ -264,13 +277,29 @@ class PowerShellCodexRunner:
             return False
 
     @staticmethod
-    async def _finish_readers(*readers: asyncio.Task[None]) -> None:
-        try:
-            await asyncio.wait_for(asyncio.gather(*readers), timeout=5)
-        except Exception:
-            for reader in readers:
-                reader.cancel()
-            await asyncio.gather(*readers, return_exceptions=True)
+    async def _finish_readers(
+        *readers: asyncio.Task[None],
+        allow_bounded_cancellation: bool,
+    ) -> None:
+        _, pending = await asyncio.wait(readers, timeout=5)
+        cancelled_by_cleanup = frozenset(pending)
+        for reader in pending:
+            reader.cancel()
+        results = await asyncio.gather(*readers, return_exceptions=True)
+        for reader, result in zip(readers, results, strict=True):
+            if not isinstance(result, BaseException):
+                continue
+            expected_cancellation = (
+                allow_bounded_cancellation
+                and reader in cancelled_by_cleanup
+                and isinstance(result, asyncio.CancelledError)
+            )
+            if not expected_cancellation:
+                raise result
+        if pending and not allow_bounded_cancellation:
+            raise CodexJournalPersistenceError(
+                "Codex process output evidence did not settle"
+            )
 
 
 
