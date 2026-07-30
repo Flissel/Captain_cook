@@ -252,8 +252,8 @@ Expected: same-attempt recovery passes and behavioral retry tests remain green.
 ### Task 4: Local gate and immutable v19 preparation
 
 **Files:**
-- Modify: `scripts/run-business-benchmark-demo.py`
-- Modify: `scripts/run-business-benchmark-demo-secure.ps1`
+- Modify: `scripts/run-business-benchmark-demo.ps1`
+- Modify only if its invocation contract changes: `scripts/run-business-benchmark-demo-secure.ps1`
 - Modify: `tests/scripts/test_run_business_benchmark_demo.py`
 - Modify: `docs/superpowers/plans/2026-07-28-business-benchmark-live-bootstrap-gaps.md`
 
@@ -266,7 +266,7 @@ Expected: same-attempt recovery passes and behavioral retry tests remain green.
 - [ ] **Step 1: Write failing CLI/preflight tests**
 
 Assert interrupted output retains exit `124`, exposes only redacted resume
-bindings, and exits non-zero. Assert `--dry-run` performs no provider or live
+bindings, and exits non-zero. Assert `-Action Plan` performs no provider or live
 service call and reports the immutable next suite version as `v19`.
 
 - [ ] **Step 2: Run the script tests and confirm RED**
@@ -308,7 +308,7 @@ Expected: every command exits `0`; report skipped/deselected tests separately.
 - [ ] **Step 6: Commit Task 4**
 
 ```powershell
-git add scripts/run-business-benchmark-demo.py scripts/run-business-benchmark-demo-secure.ps1 tests/scripts/test_run_business_benchmark_demo.py docs/superpowers/plans/2026-07-28-business-benchmark-live-bootstrap-gaps.md
+git add scripts/run-business-benchmark-demo.ps1 scripts/run-business-benchmark-demo-secure.ps1 tests/scripts/test_run_business_benchmark_demo.py docs/superpowers/plans/2026-07-28-business-benchmark-live-bootstrap-gaps.md
 git commit -m "chore: prepare Factory benchmark v19 recovery"
 ```
 
