@@ -235,6 +235,8 @@ class HermesCliFactory(HermesFactoryPort):
             require_codex_seal=isinstance(request.job, AgentFactoryJobV3),
         )
         improvement = _validated_improvement_authorization(request)
+        if now >= request.lease.expires_at:
+            await self._require_runtime_recovery_replays(request, steps=steps)
 
         deadline = _deadline(
             min(
@@ -451,6 +453,64 @@ class HermesCliFactory(HermesFactoryPort):
             artifacts=tuple(artifacts),
             transcript_refs=tuple(transcript_refs),
         )
+
+    async def _require_runtime_recovery_replays(
+        self,
+        request: FactoryDispatch,
+        *,
+        steps: tuple[FactorySkillStep, ...],
+    ) -> None:
+        """Prove recovery can execute only the already-interrupted seal step."""
+
+        authorization = request.runtime_retry_authorization
+        if authorization is None:
+            raise FactoryDispatchError(
+                "Factory runtime recovery requires Captain retry authority"
+            )
+        discovery = await self._replay_store.completed(
+            request.job,
+            step=FactorySkillStep.DISCOVER,
+            attempt=1,
+        )
+        if not isinstance(discovery.artifact, CodebaseInventoryV1):
+            raise FactoryDispatchError(
+                "completed discovery replay is not a codebase inventory"
+            )
+        brief: CodexBuildBriefV1 | None = None
+        for step in steps:
+            if step is FactorySkillStep.SEAL_CODEX_BUILD:
+                break
+            replay = await self._replay_store.completed(
+                request.job,
+                step=step,
+                attempt=request.action.attempt,
+            )
+            if step is FactorySkillStep.BRIEF_CODEX:
+                if not isinstance(replay.artifact, CodexBuildBriefV1):
+                    raise FactoryDispatchError(
+                        "completed brief replay is not a Codex build brief"
+                    )
+                brief = replay.artifact
+        if brief is None or brief.invocation.lease != request.lease:
+            raise FactoryDispatchError(
+                "completed brief replay does not bind the original Factory lease"
+            )
+        expected_key = _factory_step_idempotency_key(
+            request.job,
+            step=FactorySkillStep.SEAL_CODEX_BUILD,
+            attempt=request.action.attempt,
+        )
+        expected_invocation_id = uuid5(
+            NAMESPACE_URL,
+            f"captain.factory-skill:{expected_key}",
+        )
+        if (
+            authorization.idempotency_key != expected_key
+            or authorization.invocation_id != expected_invocation_id
+        ):
+            raise FactoryDispatchError(
+                "Factory runtime recovery does not bind the original seal invocation"
+            )
 
     def validate_dispatch_configuration(self, request: FactoryDispatch) -> None:
         """Fail before external setup when a released sequence cannot be resolved."""

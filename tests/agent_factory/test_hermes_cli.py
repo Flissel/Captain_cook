@@ -1753,6 +1753,100 @@ async def test_authorized_runtime_retry_resumes_only_seal_without_new_hermes_cal
 
 
 @pytest.mark.asyncio
+async def test_expired_lease_recovery_requires_completed_predecessors_before_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    issued_at = datetime(2026, 7, 19, 10, tzinfo=timezone.utc)
+    current = issued_at + timedelta(minutes=16)
+    factory_job = job_v3(mode="demo").model_copy(
+        update={"deadline_at": issued_at + timedelta(minutes=30)}
+    )
+    lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/runtime-retry/missing-predecessors",
+        now=issued_at,
+    )
+    authorization = FactoryRuntimeRetryAuthorizationV1(
+        schema_name="captain.factory-runtime-retry-authorization.v1",
+        authorization_ref=ArtifactRef(
+            uri=f"artifact://factory/runtime-retry/{'a' * 64}",
+            sha256="a" * 64,
+            media_type="application/json",
+        ),
+        producer="captain",
+        status="succeeded",
+        job_id=factory_job.job_id,
+        correlation_id=factory_job.correlation_id,
+        subject_version=factory_job.subject_version,
+        attempt=1,
+        invocation_id=UUID("00000000-0000-0000-0000-000000000999"),
+        idempotency_key="b" * 64,
+        lease_id=lease.lease_id,
+        checkpoint_ref=ArtifactRef(
+            uri=f"artifact://factory/codex-checkpoint/{'c' * 64}",
+            sha256="c" * 64,
+            media_type="application/json",
+        ),
+        terminal_receipt_ref=ArtifactRef(
+            uri=f"artifact://factory/codex-terminal-receipt/{'d' * 64}",
+            sha256="d" * 64,
+            media_type="application/json",
+        ),
+        workspace_ref=lease.workspace_ref,
+        base_revision="e" * 40,
+        scaffold_manifest_sha256="f" * 64,
+        brief_sha256="1" * 64,
+        resume_ordinal=1,
+        maximum_runtime_seconds=60,
+        issued_at=current,
+        expires_at=current + timedelta(minutes=2),
+    )
+    calls = 0
+
+    async def forbidden_process(*_args: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("recovery must not invoke Hermes without predecessors")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden_process)
+    factory = HermesCliFactory(
+        settings=HermesCliSettings(
+            skill_root=tmp_path,
+            working_directory=_CAPTAIN_WORKSPACE_ROOT,
+            evidence_root=tmp_path / "evidence",
+        ),
+        released_skill_catalog=_catalog_for(
+            tmp_path,
+            FactorySkillStep.BRIEF_CODEX,
+            FactorySkillStep.SEAL_CODEX_BUILD,
+        ),
+        replay_store=FilesystemFactorySkillReplayStore(tmp_path / "replays"),
+        codex_build_sealer=object(),
+        clock=lambda: current,
+    )
+
+    with pytest.raises(FactoryDispatchError, match="completed discover replay"):
+        await factory.dispatch(
+            FactoryDispatch(
+                job=factory_job,
+                action=FactoryAction(
+                    kind=FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,
+                    attempt=1,
+                    job_id=factory_job.job_id,
+                ),
+                role=FactoryRole.TOOL_INTEGRATOR,
+                lease=lease,
+                runtime_retry_authorization=authorization,
+            )
+        )
+
+    assert calls == 0
+
+
+@pytest.mark.asyncio
 async def test_concurrent_dispatch_claims_logical_step_before_spawning_hermes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -6,8 +6,11 @@ import pytest
 
 from agenten.agent_factory.contracts import FactoryRole
 from agenten.agent_factory.leases import FactoryLeaseDenied, issue_factory_lease
+from agenten.agent_factory.skill_sequence import FactoryRuntimeRetryAuthorizationV1
+from agenten.agent_factory.production_dispatch_runner import ProductionFactoryDispatchRunner
+from agenten.agent_factory.state_machine import FactoryLifecycleStatus
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
-from agenten.agent_runtime.contracts import IntegrationIntent
+from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent
 from gateway.agent_factory_dispatch_runner import GatewayNextActionLeaseIssuer
 from tests.agent_factory.test_release_gate import workflow_job
 
@@ -50,6 +53,44 @@ class RecordingGatewayStore:
 
 def _action(kind: FactoryActionKind) -> FactoryAction:
     return FactoryAction(kind=kind, attempt=1)
+
+
+def _runtime_retry_authorization(job, lease) -> FactoryRuntimeRetryAuthorizationV1:
+    return FactoryRuntimeRetryAuthorizationV1(
+        schema_name="captain.factory-runtime-retry-authorization.v1",
+        authorization_ref=ArtifactRef(
+            uri=f"artifact://factory/runtime-retry/{'a' * 64}",
+            sha256="a" * 64,
+            media_type="application/json",
+        ),
+        producer="captain",
+        status="succeeded",
+        job_id=job.job_id,
+        correlation_id=job.correlation_id,
+        subject_version=job.subject_version,
+        attempt=1,
+        invocation_id=job.job_id,
+        idempotency_key="b" * 64,
+        lease_id=lease.lease_id,
+        checkpoint_ref=ArtifactRef(
+            uri=f"artifact://factory/codex-checkpoint/{'c' * 64}",
+            sha256="c" * 64,
+            media_type="application/json",
+        ),
+        terminal_receipt_ref=ArtifactRef(
+            uri=f"artifact://factory/codex-terminal-receipt/{'d' * 64}",
+            sha256="d" * 64,
+            media_type="application/json",
+        ),
+        workspace_ref=lease.workspace_ref,
+        base_revision="e" * 40,
+        scaffold_manifest_sha256="f" * 64,
+        brief_sha256="1" * 64,
+        resume_ordinal=1,
+        maximum_runtime_seconds=60,
+        issued_at=NOW,
+        expires_at=NOW + timedelta(minutes=2),
+    )
 
 
 def test_gateway_issuer_reuses_the_active_next_action_lease() -> None:
@@ -320,6 +361,114 @@ def test_expired_action_lease_is_renewed_with_a_unique_lease_id() -> None:
     assert renewed.workspace_ref != expired.workspace_ref
     assert renewed.integration_intent is IntegrationIntent.NONE
     assert store.recorded == [renewed]
+
+
+def test_gateway_issuer_recovers_exact_expired_lease_under_successor_authority() -> None:
+    job = workflow_job(mode="demo")
+    action = _action(FactoryActionKind.DISPATCH_TOOL_INTEGRATOR)
+    original = issue_factory_lease(
+        job=job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/recovery/original",
+        now=NOW - timedelta(minutes=16),
+    )
+    store = RecordingGatewayStore(job, leases=(original,))
+    authorization = _runtime_retry_authorization(job, original)
+    issuer = GatewayNextActionLeaseIssuer(
+        store=store,
+        workspace_namespace="business-benchmark-demo",
+    )
+
+    recovered = issuer.ensure_recovery_for(
+        job,
+        action,
+        FactoryRole.TOOL_INTEGRATOR,
+        NOW,
+        authorization,
+    )
+
+    assert recovered == original
+    assert issuer.active(job, FactoryRole.TOOL_INTEGRATOR, 1, NOW) == original
+    assert store.recorded == []
+
+
+@pytest.mark.asyncio
+async def test_composed_runner_recovers_original_lease_after_expiry() -> None:
+    job = workflow_job(mode="demo")
+    action = FactoryAction(
+        kind=FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,
+        attempt=1,
+        job_id=job.job_id,
+    )
+    original = issue_factory_lease(
+        job=job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/recovery/composed",
+        now=NOW - timedelta(minutes=16),
+    )
+    authorization = _runtime_retry_authorization(job, original)
+    store = RecordingGatewayStore(job, leases=(original,))
+    issuer = GatewayNextActionLeaseIssuer(
+        store=store,
+        workspace_namespace="business-benchmark-demo",
+    )
+
+    class Coordinator:
+        complete = False
+
+        def next_action(self, job_id):
+            assert job_id == job.job_id
+            return (
+                FactoryAction(
+                    kind=FactoryActionKind.COMPLETE,
+                    attempt=1,
+                    job_id=job.job_id,
+                )
+                if self.complete
+                else action
+            )
+
+        def projection(self, job_id):
+            assert job_id == job.job_id
+            return type(
+                "Projection",
+                (),
+                {"job": job, "status": FactoryLifecycleStatus.RUNNING},
+            )()
+
+    coordinator = Coordinator()
+
+    class Dispatcher:
+        lease_authority = issuer
+
+        async def dispatch_next(self, job_id):
+            recovered = issuer.active(
+                job,
+                FactoryRole.TOOL_INTEGRATOR,
+                1,
+                NOW,
+            )
+            assert recovered == original
+            coordinator.complete = True
+            return action
+
+    class RuntimeRetries:
+        def active(self, *_args):
+            return authorization
+
+    result = await ProductionFactoryDispatchRunner(
+        coordinator=coordinator,
+        dispatcher=Dispatcher(),
+        lease_issuer=issuer,
+        runtime_retries=RuntimeRetries(),
+        clock=lambda: NOW,
+    ).run(job.job_id)
+
+    assert result.status == "complete"
+    assert result.dispatched_actions == (FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,)
+    assert store.recorded == []
 
 
 def test_dispatcher_lease_lookup_fails_without_immediate_ensure() -> None:

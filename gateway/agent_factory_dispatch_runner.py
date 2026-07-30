@@ -14,6 +14,7 @@ from agenten.agent_factory.leases import (
     validate_factory_lease,
 )
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
+from agenten.agent_factory.skill_sequence import FactoryRuntimeRetryAuthorizationV1
 from agenten.agent_runtime.contracts import IntegrationIntent
 from agenten.validation.contracts import WorkBatch
 from gateway.contracts import FactoryJobProjection, FactoryWriteReceipt
@@ -65,6 +66,10 @@ class GatewayNextActionLeaseIssuer:
         self._n8n_work_batches = dict(n8n_work_batches or {})
         self._authorized: dict[
             tuple[UUID, FactoryRole, int], tuple[FactoryJob, FactoryLease]
+        ] = {}
+        self._recovery_authorized: dict[
+            tuple[UUID, FactoryRole, int],
+            tuple[FactoryJob, FactoryLease, FactoryRuntimeRetryAuthorizationV1],
         ] = {}
 
     def ensure_for(
@@ -129,7 +134,26 @@ class GatewayNextActionLeaseIssuer:
     ) -> FactoryLease:
         """Resolve only the lease immediately authorized for this dispatcher."""
 
-        authorized = self._authorized.pop((job.job_id, role, attempt), None)
+        key = (job.job_id, role, attempt)
+        recovery = self._recovery_authorized.pop(key, None)
+        if recovery is not None:
+            bound_job, lease, authorization = recovery
+            if (
+                bound_job != job
+                or authorization.job_id != job.job_id
+                or authorization.correlation_id != job.correlation_id
+                or authorization.subject_version != job.subject_version
+                or authorization.attempt != attempt
+                or authorization.lease_id != lease.lease_id
+                or authorization.workspace_ref != lease.workspace_ref
+                or now < authorization.issued_at
+                or now >= authorization.expires_at
+            ):
+                raise FactoryLeaseDenied(
+                    "Factory recovery lease authority is stale or mismatched"
+                )
+            return lease
+        authorized = self._authorized.pop(key, None)
         if authorized is None or authorized[0] != job:
             raise FactoryLeaseDenied(
                 "Factory dispatcher lease was not immediately authorized"
@@ -150,6 +174,59 @@ class GatewayNextActionLeaseIssuer:
             attempt=attempt,
             now=now,
         )
+
+    def ensure_recovery_for(
+        self,
+        job: FactoryJob,
+        action: FactoryAction,
+        role: FactoryRole,
+        now: datetime,
+        authorization: FactoryRuntimeRetryAuthorizationV1,
+    ) -> FactoryLease:
+        """Recover the original expired lease identity under exact successor authority."""
+
+        if (
+            _ACTION_ROLES.get(action.kind) is not role
+            or role is not FactoryRole.TOOL_INTEGRATOR
+            or action.attempt < 1
+            or authorization.job_id != job.job_id
+            or authorization.correlation_id != job.correlation_id
+            or authorization.subject_version != job.subject_version
+            or authorization.attempt != action.attempt
+            or now < authorization.issued_at
+            or now >= authorization.expires_at
+        ):
+            raise FactoryLeaseDenied(
+                "Factory recovery authority does not match the next action"
+            )
+        matches = [
+            lease
+            for lease in self._store.factory_job(job.job_id).leases
+            if lease.lease_id == authorization.lease_id
+            and lease.workspace_ref == authorization.workspace_ref
+        ]
+        if len(matches) != 1:
+            raise FactoryLeaseDenied(
+                "Factory recovery authority does not identify one original lease"
+            )
+        lease = matches[0]
+        if lease.expires_at > now:
+            raise FactoryLeaseDenied(
+                "Factory recovery successor cannot replace an active ordinary lease"
+            )
+        validated = validate_factory_lease(
+            lease,
+            job=job,
+            role=role,
+            attempt=action.attempt,
+            now=lease.issued_at,
+        )
+        self._recovery_authorized[(job.job_id, role, action.attempt)] = (
+            job,
+            validated,
+            authorization,
+        )
+        return validated
 
     def _exact_active_lease(
         self,

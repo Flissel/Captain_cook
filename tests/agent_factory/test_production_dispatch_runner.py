@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -61,6 +62,11 @@ class RecordingLeaseIssuer:
     def ensure_for(self, job, action: FactoryAction, role: FactoryRole, now: datetime):
         assert now == NOW
         self.roles.append((action.kind, role))
+
+    def ensure_recovery_for(
+        self, job, action: FactoryAction, role: FactoryRole, now: datetime, authorization
+    ):
+        raise AssertionError("ordinary tests must not select recovery authority")
 
 
 @pytest.mark.asyncio
@@ -201,3 +207,50 @@ def test_runner_rejects_a_dispatcher_with_a_different_lease_authority() -> None:
             lease_issuer=RecordingLeaseIssuer(),
             clock=lambda: NOW,
         )
+
+
+@pytest.mark.asyncio
+async def test_runner_selects_exact_recovery_lease_without_minting_ordinary_lease() -> None:
+    coordinator = ScriptedCoordinator(
+        (
+            FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,
+            FactoryActionKind.COMPLETE,
+        )
+    )
+    dispatcher = RecordingDispatcher(coordinator)
+    authorization = SimpleNamespace(authorization_ref="runtime-retry")
+
+    class RecoveryAuthority:
+        def active(self, job, action, projection, now):
+            assert job is coordinator.job
+            assert action.kind is FactoryActionKind.DISPATCH_TOOL_INTEGRATOR
+            assert projection.status is FactoryLifecycleStatus.RUNNING
+            assert now == NOW
+            return authorization
+
+    class RecoveryLeaseIssuer(RecordingLeaseIssuer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.recoveries = []
+
+        def ensure_for(self, *_args, **_kwargs):
+            raise AssertionError("recovery must not mint an ordinary Factory lease")
+
+        def ensure_recovery_for(self, job, action, role, now, current):
+            assert current is authorization
+            self.recoveries.append((action.kind, role, now))
+
+    leases = RecoveryLeaseIssuer()
+    result = await ProductionFactoryDispatchRunner(
+        coordinator=coordinator,
+        dispatcher=dispatcher,
+        lease_issuer=leases,
+        runtime_retries=RecoveryAuthority(),
+        clock=lambda: NOW,
+    ).run(JOB_ID, maximum_dispatches=1)
+
+    assert result.dispatched_actions == (FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,)
+    assert leases.roles == []
+    assert leases.recoveries == [
+        (FactoryActionKind.DISPATCH_TOOL_INTEGRATOR, FactoryRole.TOOL_INTEGRATOR, NOW)
+    ]

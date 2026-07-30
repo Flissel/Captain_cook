@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
@@ -211,17 +213,13 @@ class _WorkflowArtifactBase(_FrozenContract):
             <= self.occurred_at
             < invocation.lease.expires_at
         )
-        recovery_issued_at = getattr(
-            self, "runtime_retry_authority_issued_at", None
-        )
-        recovery_expires_at = getattr(
-            self, "runtime_retry_authority_expires_at", None
-        )
+        recovery_binding = getattr(self, "runtime_retry_binding", None)
         recovery_authority_active = (
             self._required_step is FactorySkillStep.SEAL_CODEX_BUILD
-            and recovery_issued_at is not None
-            and recovery_expires_at is not None
-            and recovery_issued_at <= self.occurred_at < recovery_expires_at
+            and recovery_binding is not None
+            and recovery_binding.issued_at
+            <= self.occurred_at
+            < recovery_binding.expires_at
         )
         if not original_lease_active and not recovery_authority_active:
             raise ValueError(
@@ -349,6 +347,72 @@ class CodexBuildBriefV1(_WorkflowArtifactBase):
         return self
 
 
+class FactoryRuntimeRetryEvidenceBindingV1(_FrozenContract):
+    """Public exact binding of one Captain-issued Codex recovery authority."""
+
+    schema_name: Literal["captain.factory-runtime-retry-evidence-binding.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    producer: Literal["captain"]
+    status: Literal["succeeded"]
+    job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    invocation_id: UUID
+    idempotency_key: str = Field(pattern=SHA256_PATTERN)
+    lease_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    checkpoint_ref: ArtifactRef
+    terminal_receipt_ref: ArtifactRef
+    workspace_ref: str = Field(pattern=r"^workspace://")
+    base_revision: str = Field(pattern=r"^[0-9a-f]{40,64}$")
+    scaffold_manifest_sha256: str = Field(pattern=SHA256_PATTERN)
+    brief_sha256: str = Field(pattern=SHA256_PATTERN)
+    resume_ordinal: int = Field(ge=1, le=2, strict=True)
+    maximum_runtime_seconds: int = Field(ge=1, le=900, strict=True)
+    issued_at: datetime
+    expires_at: datetime
+
+    @field_validator("issued_at", "expires_at")
+    @classmethod
+    def require_utc_timestamp(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("runtime retry evidence timestamp must be UTC")
+        return value
+
+    @model_validator(mode="after")
+    def require_bounded_window(self) -> "FactoryRuntimeRetryEvidenceBindingV1":
+        if self.expires_at <= self.issued_at:
+            raise ValueError("runtime retry evidence expiry must follow issuance")
+        if self.maximum_runtime_seconds > int(
+            (self.expires_at - self.issued_at).total_seconds()
+        ):
+            raise ValueError("runtime retry evidence runtime exceeds its window")
+        return self
+
+
+def factory_runtime_retry_evidence_binding(
+    authorization: BaseModel,
+) -> FactoryRuntimeRetryEvidenceBindingV1:
+    payload = authorization.model_dump(mode="json", by_alias=True)
+    payload.pop("authorization_ref", None)
+    payload["schema"] = "captain.factory-runtime-retry-evidence-binding.v1"
+    return FactoryRuntimeRetryEvidenceBindingV1.model_validate(payload)
+
+
+def factory_runtime_retry_evidence_binding_sha256(
+    binding: FactoryRuntimeRetryEvidenceBindingV1,
+) -> str:
+    content = json.dumps(
+        binding.model_dump(mode="json", by_alias=True),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(content).hexdigest()
+
+
 class CodexBuildEvidenceV1(_WorkflowArtifactBase):
     """Hermes evidence for the Captain-sealed result of one Codex assignment."""
 
@@ -359,8 +423,7 @@ class CodexBuildEvidenceV1(_WorkflowArtifactBase):
     build_receipt_ref: ArtifactRef
     build_receipt: CodexBuildReceiptV1
     runtime_retry_ref: ArtifactRef | None = None
-    runtime_retry_authority_issued_at: datetime | None = None
-    runtime_retry_authority_expires_at: datetime | None = None
+    runtime_retry_binding: FactoryRuntimeRetryEvidenceBindingV1 | None = None
     status: Literal["sealed"]
 
     _required_step: ClassVar[FactorySkillStep] = FactorySkillStep.SEAL_CODEX_BUILD
@@ -391,33 +454,38 @@ class CodexBuildEvidenceV1(_WorkflowArtifactBase):
             raise ValueError("Codex build receipt ref must be application/json")
         if self.build_receipt_ref.sha256 != codex_build_receipt_sha256(receipt):
             raise ValueError("Codex build receipt digest mismatch")
-        if self.evidence_refs != (self.build_receipt_ref,):
-            raise ValueError("Codex build evidence may reference only its Captain receipt")
-        recovery_values = (
-            self.runtime_retry_ref,
-            self.runtime_retry_authority_issued_at,
-            self.runtime_retry_authority_expires_at,
-        )
-        if any(value is not None for value in recovery_values):
-            if any(value is None for value in recovery_values):
-                raise ValueError("Codex build recovery authority is incomplete")
-            assert self.runtime_retry_authority_issued_at is not None
-            assert self.runtime_retry_authority_expires_at is not None
-            if (
-                self.runtime_retry_authority_issued_at.tzinfo is None
-                or self.runtime_retry_authority_issued_at.utcoffset()
-                != timezone.utc.utcoffset(self.runtime_retry_authority_issued_at)
-                or self.runtime_retry_authority_expires_at.tzinfo is None
-                or self.runtime_retry_authority_expires_at.utcoffset()
-                != timezone.utc.utcoffset(self.runtime_retry_authority_expires_at)
-            ):
-                raise ValueError("Codex build recovery authority timestamps must be UTC")
-            if not (
-                self.runtime_retry_authority_issued_at
-                <= self.occurred_at
-                < self.runtime_retry_authority_expires_at
-            ):
-                raise ValueError("Codex build occurred outside recovery authority")
+        if self.runtime_retry_ref is None and self.runtime_retry_binding is None:
+            if self.evidence_refs != (self.build_receipt_ref,):
+                raise ValueError(
+                    "Codex build evidence may reference only its Captain receipt"
+                )
+            return self
+        if self.runtime_retry_ref is None or self.runtime_retry_binding is None:
+            raise ValueError("Codex build recovery authority is incomplete")
+        if self.evidence_refs != (self.build_receipt_ref, self.runtime_retry_ref):
+            raise ValueError(
+                "Codex build recovery authority ref must be retained in evidence refs"
+            )
+        binding = self.runtime_retry_binding
+        binding_sha256 = factory_runtime_retry_evidence_binding_sha256(binding)
+        if (
+            self.runtime_retry_ref.sha256 != binding_sha256
+            or not self.runtime_retry_ref.uri.endswith(f"/{binding_sha256}")
+        ):
+            raise ValueError("Codex build recovery binding digest does not match authority ref")
+        if (
+            binding.job_id != invocation.job_id
+            or binding.correlation_id != invocation.correlation_id
+            or binding.subject_version != invocation.subject_version
+            or binding.attempt != invocation.attempt
+            or binding.invocation_id != invocation.invocation_id
+            or binding.idempotency_key != invocation.idempotency_key
+            or binding.lease_id != invocation.lease.lease_id
+            or binding.workspace_ref != invocation.lease.workspace_ref
+        ):
+            raise ValueError("Codex build recovery binding does not match invocation")
+        if not binding.issued_at <= self.occurred_at < binding.expires_at:
+            raise ValueError("Codex build occurred outside recovery authority")
         return self
 
 

@@ -36,6 +36,8 @@ from agenten.agent_factory.skill_workflow_contracts import (
     CodexBuildBriefV1,
     CodexBuildEvidenceV1,
     FactorySkillInvocationV1,
+    factory_runtime_retry_evidence_binding,
+    factory_runtime_retry_evidence_binding_sha256,
 )
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from agenten.execution.codex_policy import AuthorizedCodexRun, FrozenEnvironment
@@ -407,6 +409,17 @@ async def test_captain_sealer_records_successor_authority_after_original_lease_e
         issued_at=resumed_at - timedelta(seconds=1),
         expires_at=resumed_at + timedelta(minutes=1),
     )
+    retry_binding = factory_runtime_retry_evidence_binding(authorization)
+    retry_digest = factory_runtime_retry_evidence_binding_sha256(retry_binding)
+    authorization = authorization.model_copy(
+        update={
+            "authorization_ref": ArtifactRef(
+                uri=f"artifact://factory/runtime-retry/{retry_digest}",
+                sha256=retry_digest,
+                media_type="application/json",
+            )
+        }
+    )
     request = replace(
         _dispatch(job, invocation),
         runtime_retry_authorization=authorization,
@@ -417,6 +430,23 @@ async def test_captain_sealer_records_successor_authority_after_original_lease_e
     assert evidence.invocation == invocation
     assert evidence.occurred_at == resumed_at
     assert evidence.runtime_retry_ref == authorization.authorization_ref
+    assert evidence.evidence_refs == (
+        evidence.build_receipt_ref,
+        authorization.authorization_ref,
+    )
+    serialized = evidence.model_dump(mode="json", by_alias=True)
+    mutated = json.loads(json.dumps(serialized))
+    mutated["runtime_retry_binding"]["invocation_id"] = str(job.event_id)
+    with pytest.raises(ValueError, match="recovery binding"):
+        CodexBuildEvidenceV1.model_validate(mutated)
+    mutated = json.loads(json.dumps(serialized))
+    mutated["runtime_retry_binding"]["checkpoint_ref"]["sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="binding digest"):
+        CodexBuildEvidenceV1.model_validate(mutated)
+    mutated = json.loads(json.dumps(serialized))
+    mutated["evidence_refs"] = [mutated["build_receipt_ref"]]
+    with pytest.raises(ValueError, match="recovery authority ref"):
+        CodexBuildEvidenceV1.model_validate(mutated)
 
 
 @pytest.mark.asyncio

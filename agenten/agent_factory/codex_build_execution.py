@@ -39,6 +39,7 @@ from agenten.agent_factory.skill_workflow_contracts import (
     CodexBuildEvidenceV1,
     FactorySkillInvocationV1,
     FactorySkillStep,
+    factory_runtime_retry_evidence_binding,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.execution.codex_policy import AuthorizedCodexRun
@@ -388,6 +389,15 @@ class CaptainCodexBuildSealer:
         workflow_receipt_ref = ArtifactRef.model_validate(
             receipt_ref.model_dump(mode="json")
         )
+        runtime_retry = request.runtime_retry_authorization
+        runtime_retry_ref = (
+            runtime_retry.authorization_ref if runtime_retry is not None else None
+        )
+        runtime_retry_binding = (
+            factory_runtime_retry_evidence_binding(runtime_retry)
+            if runtime_retry is not None
+            else None
+        )
         evidence = CodexBuildEvidenceV1(
             schema_name="hermes.factory-codex-build-evidence.v1",
             invocation=invocation,
@@ -399,25 +409,16 @@ class CaptainCodexBuildSealer:
             occurred_at=completed.completed_at,
             producer="hermes",
             artifact_ref=workflow_receipt_ref,
-            evidence_refs=(workflow_receipt_ref,),
+            evidence_refs=(
+                (workflow_receipt_ref, runtime_retry_ref)
+                if runtime_retry_ref is not None
+                else (workflow_receipt_ref,)
+            ),
             acceptance_assertion_ids=invocation.acceptance_assertion_ids,
             build_receipt_ref=workflow_receipt_ref,
             build_receipt=receipt,
-            runtime_retry_ref=(
-                request.runtime_retry_authorization.authorization_ref
-                if request.runtime_retry_authorization is not None
-                else None
-            ),
-            runtime_retry_authority_issued_at=(
-                request.runtime_retry_authorization.issued_at
-                if request.runtime_retry_authorization is not None
-                else None
-            ),
-            runtime_retry_authority_expires_at=(
-                request.runtime_retry_authorization.expires_at
-                if request.runtime_retry_authorization is not None
-                else None
-            ),
+            runtime_retry_ref=runtime_retry_ref,
+            runtime_retry_binding=runtime_retry_binding,
             status="sealed",
         )
         return self._executor.persist_sealed(invocation, completed, evidence)

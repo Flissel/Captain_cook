@@ -509,6 +509,7 @@ def compose_agent_factory_live(
         coordinator=coordinator,
         dispatcher=dispatcher,
         lease_issuer=lease_issuer,
+        runtime_retries=runtime_retries,
         clock=clock,
     )
     return AgentFactoryLiveComposition(

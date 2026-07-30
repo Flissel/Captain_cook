@@ -10,7 +10,11 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from agenten.agent_factory.contracts import FactoryJob, FactoryLease, FactoryRole
-from agenten.agent_factory.orchestration import FactoryDispatcher
+from agenten.agent_factory.orchestration import (
+    FactoryDispatcher,
+    FactoryRuntimeRetryAuthorizationPort,
+)
+from agenten.agent_factory.skill_sequence import FactoryRuntimeRetryAuthorizationV1
 from agenten.agent_factory.state_machine import (
     FactoryAction,
     FactoryActionKind,
@@ -59,6 +63,15 @@ class CaptainNextActionLeaseIssuerPort(Protocol):
         now: datetime,
     ) -> FactoryLease: ...
 
+    def ensure_recovery_for(
+        self,
+        job: FactoryJob,
+        action: FactoryAction,
+        role: FactoryRole,
+        now: datetime,
+        authorization: FactoryRuntimeRetryAuthorizationV1,
+    ) -> FactoryLease: ...
+
 
 class ProductionFactoryDispatchResult(BaseModel):
     """Redacted checkpoint returned without taking Captain-only decisions."""
@@ -96,6 +109,7 @@ class ProductionFactoryDispatchRunner:
         coordinator: FactoryDispatchCoordinatorPort,
         dispatcher: FactoryDispatcher | FactoryDispatcherPort,
         lease_issuer: CaptainNextActionLeaseIssuerPort,
+        runtime_retries: FactoryRuntimeRetryAuthorizationPort | None = None,
         clock: Callable[[], datetime],
     ) -> None:
         dispatcher_lease_authority = getattr(dispatcher, "lease_authority", None)
@@ -109,6 +123,7 @@ class ProductionFactoryDispatchRunner:
         self._coordinator = coordinator
         self._dispatcher = dispatcher
         self._lease_issuer = lease_issuer
+        self._runtime_retries = runtime_retries
         self._clock = clock
 
     async def run(
@@ -155,7 +170,26 @@ class ProductionFactoryDispatchRunner:
                     f"unsupported Factory dispatch action: {action.kind.value}"
                 ) from exc
             now = self._utc_now()
-            self._lease_issuer.ensure_for(projection.job, action, role, now)
+            runtime_retry = (
+                self._runtime_retries.active(
+                    projection.job,
+                    action,
+                    projection,
+                    now,
+                )
+                if self._runtime_retries is not None
+                else None
+            )
+            if runtime_retry is None:
+                self._lease_issuer.ensure_for(projection.job, action, role, now)
+            else:
+                self._lease_issuer.ensure_recovery_for(
+                    projection.job,
+                    action,
+                    role,
+                    now,
+                    runtime_retry,
+                )
             completed = await self._dispatcher.dispatch_next(job_id)
             if completed != action:
                 raise ValueError("Factory dispatcher returned a different action")
