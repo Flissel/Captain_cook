@@ -79,7 +79,7 @@ $serviceRunner = Join-Path $PSScriptRoot 'live-demo-services.ps1'
 $canonicalRenewalWorkflow = Join-Path $repositoryRoot 'examples/business_benchmark_candidates/customer_renewal_orchestration_team/workflows/renewal_context_read.json'
 $maximumUsdPerTeam = '0.30'
 $maximumHermesUsd = '0.06'
-$seedVersion = 'business-benchmark-demo-2026-07-v18'
+$seedVersion = 'business-benchmark-demo-2026-07-v19'
 
 $rootEnvAllowlist = @(
     'TEST_MARIADB_DSN',
@@ -261,6 +261,105 @@ function New-FactoryDispatchCheckpoint {
     }
 }
 
+function New-DryRunPlan {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Teams,
+        [Parameter(Mandatory = $true)][string]$IssuedAt
+    )
+    return [ordered]@{
+        schema = 'captain.business-benchmark-demo-run.v1'
+        status = 'planned'
+        mode = 'dry_run'
+        database = 'captain_test'
+        issued_at = $IssuedAt
+        suite_version = 19
+        seed_version_id = $seedVersion
+        maximum_usd_per_team = $maximumUsdPerTeam
+        jobs = @(
+            foreach ($team in $Teams) {
+                [ordered]@{
+                    profile = [string]$team.profile
+                    job_id = [string]$team.job.job_id
+                }
+            }
+        )
+        effects = [ordered]@{
+            provider_calls = $false
+            live_service_calls = $false
+            provisioning_apply = $false
+            gateway_mutation = $false
+            minibook_mutation = $false
+        }
+    }
+}
+
+function Test-CodexBuildInterruptedCheckpoint {
+    param([Parameter(Mandatory = $true)][object]$Checkpoint)
+
+    $expectedTopLevel = @(
+        'schema', 'database', 'status', 'exit_code', 'reason', 'checkpoint_ref',
+        'terminal_receipt_ref', 'next_resume_ordinal', 'captain_authorization_binding'
+    ) | Sort-Object
+    $actualTopLevel = @($Checkpoint.PSObject.Properties.Name | Sort-Object)
+    if (($expectedTopLevel -join ',') -cne ($actualTopLevel -join ',')) {
+        return $false
+    }
+    if (
+        $Checkpoint.schema -cne 'captain.business-demo-factory-operator.v1' -or
+        $Checkpoint.database -cne 'captain_test' -or
+        $Checkpoint.status -cne 'codex_build_interrupted' -or
+        $Checkpoint.reason -notin @(
+            'runtime_timed_out', 'runtime_cancelled', 'resume_authorization_required'
+        )
+    ) {
+        return $false
+    }
+    if (
+        ($Checkpoint.reason -ceq 'runtime_timed_out' -and [int]$Checkpoint.exit_code -ne 124) -or
+        ($Checkpoint.reason -ceq 'resume_authorization_required' -and $null -ne $Checkpoint.exit_code) -or
+        [int]$Checkpoint.next_resume_ordinal -lt 1 -or
+        [int]$Checkpoint.next_resume_ordinal -gt 3
+    ) {
+        return $false
+    }
+    foreach ($reference in @($Checkpoint.checkpoint_ref, $Checkpoint.terminal_receipt_ref)) {
+        $expectedReference = @('media_type', 'sha256', 'uri')
+        $actualReference = @($reference.PSObject.Properties.Name | Sort-Object)
+        if (
+            ($expectedReference -join ',') -cne ($actualReference -join ',') -or
+            $reference.media_type -cne 'application/json' -or
+            [string]$reference.sha256 -notmatch '^[0-9a-f]{64}$' -or
+            [string]::IsNullOrWhiteSpace([string]$reference.uri)
+        ) {
+            return $false
+        }
+    }
+    $binding = $Checkpoint.captain_authorization_binding
+    $expectedBinding = @(
+        'attempt', 'base_revision', 'brief_sha256', 'correlation_id', 'idempotency_key',
+        'invocation_id', 'job_id', 'lease_id', 'scaffold_manifest_sha256',
+        'subject_version', 'workspace_ref'
+    ) | Sort-Object
+    $actualBinding = @($binding.PSObject.Properties.Name | Sort-Object)
+    if (
+        ($expectedBinding -join ',') -cne ($actualBinding -join ',') -or
+        [string]$binding.job_id -notmatch '^[0-9a-f-]{36}$' -or
+        [string]$binding.correlation_id -notmatch '^[0-9a-f-]{36}$' -or
+        [string]$binding.invocation_id -notmatch '^[0-9a-f-]{36}$' -or
+        [int]$binding.subject_version -lt 1 -or
+        [int]$binding.attempt -lt 1 -or
+        [string]$binding.idempotency_key -notmatch '^[0-9a-f]{64}$' -or
+        [string]::IsNullOrWhiteSpace([string]$binding.lease_id) -or
+        [string]$binding.workspace_ref -notmatch '^workspace://' -or
+        [string]$binding.base_revision -notmatch '^[0-9a-f]{40,64}$' -or
+        [string]$binding.scaffold_manifest_sha256 -notmatch '^[0-9a-f]{64}$' -or
+        [string]$binding.brief_sha256 -notmatch '^[0-9a-f]{64}$'
+    ) {
+        return $false
+    }
+    return $true
+}
+
 function New-InfrastructureCheckpoint {
     param([Parameter(Mandatory = $true)][string]$IssuedAt)
     return [ordered]@{
@@ -401,7 +500,7 @@ try {
         '--issued-at', $issuedAt,
         '--model', $model,
         '--maximum-usd-per-team', $maximumUsdPerTeam,
-        '--suite-version', '18',
+        '--suite-version', '19',
         '--seed-version-id', $seedVersion
     )
     if ($Action -ceq 'Run') {
@@ -439,7 +538,8 @@ try {
         $null = Require-NonEmpty $team.candidate_id "$($team.profile).candidate_id"
         if (
             [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
-            @($team.job.execution_policy.allowed_models) -notcontains $model
+            @($team.job.execution_policy.allowed_models) -notcontains $model -or
+            [int]$team.suite.suite_version -ne 19
         ) {
             throw 'Provisioned team model or budget does not match the demo authority.'
         }
@@ -474,13 +574,8 @@ try {
     Set-ProcessEnvironment $environment
 
     if ($Action -ceq 'Plan') {
-        [ordered]@{
-            schema = 'captain.business-benchmark-demo-run.v1'
-            status = 'planned'
-            database = 'captain_test'
-            issued_at = $issuedAt
-            maximum_usd_per_team = $maximumUsdPerTeam
-        } | ConvertTo-Json -Compress -Depth 10
+        New-DryRunPlan -Teams $teams -IssuedAt $issuedAt |
+            ConvertTo-Json -Compress -Depth 10
         exit 0
     }
 
@@ -539,7 +634,23 @@ try {
         $null = New-Item -ItemType Directory -Force -Path (Split-Path $factoryErrorPath)
         Remove-Item -LiteralPath $factoryErrorPath -Force -ErrorAction SilentlyContinue
         $rawFactory = @(& $python @factoryArguments 2>$factoryErrorPath)
-        if ($LASTEXITCODE -ne 0) {
+        $factoryExitCode = $LASTEXITCODE
+        if ($factoryExitCode -eq 2) {
+            try {
+                $factoryInterruption = ($rawFactory -join [Environment]::NewLine) |
+                    ConvertFrom-Json -Depth 20
+            }
+            catch {
+                throw 'Captain Factory interruption checkpoint returned invalid JSON.'
+            }
+            if (-not (Test-CodexBuildInterruptedCheckpoint -Checkpoint $factoryInterruption)) {
+                throw 'Captain Factory interruption checkpoint is not canonical.'
+            }
+            Remove-Item -LiteralPath $factoryErrorPath -Force -ErrorAction SilentlyContinue
+            $factoryInterruption | ConvertTo-Json -Compress -Depth 20
+            exit 2
+        }
+        if ($factoryExitCode -ne 0) {
             throw 'Captain Factory live operator failed closed; inspect private evidence.'
         }
         Remove-Item -LiteralPath $factoryErrorPath -Force -ErrorAction SilentlyContinue

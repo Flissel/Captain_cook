@@ -91,8 +91,13 @@
   `hermes.factory-codex-brief-attestation.v1` bound to the brief digest. Retry
   attempts reuse the same inventory and add only Captain-authorized improvement
   evidence. Full model-authored brief reproduction is no longer on the V3 path.
-- [ ] Run the two provider-backed Factory jobs and 30-case team/baseline
-  benchmark after `OPENAI_API_KEY` is securely exported into the invoking
+- [x] Retain streamed Codex terminal evidence and a typed, redacted recovery
+  checkpoint for timeout/cancellation. The local recovery path preserves the
+  terminal exit cause, checkpoint/receipt references, and immutable Captain
+  resume bindings without exposing workspace paths, journals, prompts, or
+  stderr. This is local implementation evidence only, not a provider run.
+- [ ] Run the prepared immutable v19 two-profile Factory scope and 30-case
+  team/baseline benchmark after `OPENAI_API_KEY` is securely exported into the invoking
   process. Retain cost, latency, tool, handoff, recovery, Gateway decision, and
   Minibook projection evidence; do not call either team `ready_to_use` before
   those gates pass. The interactive
@@ -118,7 +123,10 @@
   900-second Codex lease before producing the three required output artifacts.
   `PowerShellCodexRunner` returned exit code 124 with empty buffered JSONL, which
   `_session_receipt` currently masks as `Codex JSONL evidence is empty`. Further
-  paid retries are stopped until Codex output is streamed durably, timeout
-  evidence retains its real terminal cause, and the build is split into
-  resumable Captain-authored scaffold/test and Codex implementation phases. No
-  run has yet reached a benchmark, Gateway promotion, or Minibook projection.
+  paid retries were stopped until Codex output was streamed durably, timeout
+  evidence retained its real terminal cause, and the build was split into
+  resumable Captain-authored scaffold/test and Codex implementation phases.
+  Those local recovery changes are now complete. Suite/seed v19 is prepared
+  only through the no-apply `-Action Plan` contract; it has not been
+  provisioned, applied, or provider-executed. No run has yet reached a
+  benchmark, Gateway promotion, or Minibook projection.

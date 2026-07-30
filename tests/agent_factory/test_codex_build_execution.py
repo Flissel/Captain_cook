@@ -847,6 +847,30 @@ async def test_cli_executor_persists_timeout_receipt_before_raising_timeout_124(
     assert str(captured.value) == "Factory Codex build interrupted"
     assert captured.value.reason == "runtime_timed_out"
     assert captured.value.exit_code == 124
+    binding = captured.value.authorization_binding
+    assert binding is not None
+    assert binding.job_id == job.job_id
+    assert binding.correlation_id == job.correlation_id
+    assert binding.subject_version == job.subject_version
+    assert binding.attempt == invocation.attempt
+    assert binding.invocation_id == invocation.invocation_id
+    assert binding.idempotency_key == invocation.idempotency_key
+    assert binding.lease_id == invocation.lease.lease_id
+    assert binding.workspace_ref == invocation.lease.workspace_ref
+    assert binding.base_revision == "a" * 40
+    assert set(binding.as_dict()) == {
+        "job_id",
+        "correlation_id",
+        "subject_version",
+        "attempt",
+        "invocation_id",
+        "idempotency_key",
+        "lease_id",
+        "workspace_ref",
+        "base_revision",
+        "scaffold_manifest_sha256",
+        "brief_sha256",
+    }
 
     receipt_path = state_root / "sessions" / f"{invocation.idempotency_key}.json"
     receipt = json.loads(receipt_path.read_bytes())

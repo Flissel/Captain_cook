@@ -6,6 +6,8 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from importlib.util import module_from_spec, spec_from_file_location
+from types import ModuleType
 
 import pytest
 
@@ -24,8 +26,12 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "$maximumUsdPerTeam = '0.30'" in source
     assert "$maximumHermesUsd = '0.06'" in source
     assert "$environment['CAPTAIN_BENCHMARK_MAX_USD'] = '0.60'" in source
-    assert "$seedVersion = 'business-benchmark-demo-2026-07-v18'" in source
-    assert "'--suite-version', '18'" in source
+    assert "$seedVersion = 'business-benchmark-demo-2026-07-v19'" in source
+    assert "'--suite-version', '19'" in source
+    assert "New-DryRunPlan" in source
+    assert "provider_calls = $false" in source
+    assert "gateway_mutation = $false" in source
+    assert "minibook_mutation = $false" in source
     assert "run-agent-factory-business-demo.py" in source
     assert "Resolve-HermesPython" in source
     assert "'--hermes-python-executable', $hermesPython" in source
@@ -68,6 +74,138 @@ def test_runner_probes_a_process_start_launchable_native_codex_binary() -> None:
     assert "$environment['CAPTAIN_CODEX_EXECUTABLE'] = $codexCommand" in source
 
 
+def test_factory_operator_cli_emits_only_redacted_codex_interruption(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeRef:
+        def __init__(self, *, uri: str, sha256: str) -> None:
+            self._uri = uri
+            self._sha256 = sha256
+
+        def model_dump(self, *, mode: str) -> dict[str, str]:
+            assert mode == "json"
+            return {
+                "uri": self._uri,
+                "sha256": self._sha256,
+                "media_type": "application/json",
+            }
+
+    class FakeBindings:
+        def as_dict(self) -> dict[str, object]:
+            return {
+                "job_id": "71000000-0000-0000-0000-000000000001",
+                "correlation_id": "72000000-0000-0000-0000-000000000001",
+                "subject_version": 3,
+                "attempt": 1,
+                "invocation_id": "73000000-0000-0000-0000-000000000001",
+                "idempotency_key": "a" * 64,
+                "lease_id": "factory-lease-1",
+                "workspace_ref": "workspace://factory/job-1/attempt-1",
+                "base_revision": "b" * 40,
+                "scaffold_manifest_sha256": "c" * 64,
+                "brief_sha256": "d" * 64,
+            }
+
+    class FakeInterrupted(Exception):
+        def __init__(self) -> None:
+            self.reason = "runtime_timed_out"
+            self.exit_code = 124
+            self.checkpoint_ref = FakeRef(
+                uri=f"artifact://factory/codex-checkpoint/{'e' * 64}",
+                sha256="e" * 64,
+            )
+            self.terminal_receipt_ref = FakeRef(
+                uri=f"artifact://factory/codex-terminal-receipt/{'f' * 64}",
+                sha256="f" * 64,
+            )
+            self.resume_ordinal = 0
+            self.authorization_binding = FakeBindings()
+
+    gateway_module = ModuleType("gateway")
+    operator_module = ModuleType("gateway.agent_factory_live_operator")
+    operator_module.FactoryLiveOperatorSettings = object
+    operator_module.run_business_demo_factory_jobs = object
+    monkeypatch.setitem(sys.modules, "gateway", gateway_module)
+    monkeypatch.setitem(sys.modules, "gateway.agent_factory_live_operator", operator_module)
+    agenten_module = ModuleType("agenten")
+    factory_module = ModuleType("agenten.agent_factory")
+    execution_module = ModuleType("agenten.agent_factory.codex_build_execution")
+    execution_module.FactoryCodexBuildInterrupted = FakeInterrupted
+    monkeypatch.setitem(sys.modules, "agenten", agenten_module)
+    monkeypatch.setitem(sys.modules, "agenten.agent_factory", factory_module)
+    monkeypatch.setitem(
+        sys.modules, "agenten.agent_factory.codex_build_execution", execution_module
+    )
+    script = ROOT / "scripts" / "run-agent-factory-business-demo.py"
+    spec = spec_from_file_location("factory_operator_cli", script)
+    assert spec is not None and spec.loader is not None
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    interruption = FakeInterrupted()
+
+    async def interrupted_run(*_args: object, **_kwargs: object) -> object:
+        raise interruption
+
+    monkeypatch.setattr(module, "FactoryLiveOperatorSettings", lambda **_kwargs: object())
+    monkeypatch.setattr(module, "run_business_demo_factory_jobs", interrupted_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(script),
+            "--workspace-root",
+            str(ROOT),
+            "--python-executable",
+            sys.executable,
+            "--hermes-python-executable",
+            sys.executable,
+            "--job-id",
+            "71000000-0000-0000-0000-000000000001",
+            "--job-id",
+            "71000000-0000-0000-0000-000000000002",
+            "--hermes-model",
+            "gpt-4.1-mini",
+        ],
+    )
+
+    assert module.main() == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result == {
+        "schema": "captain.business-demo-factory-operator.v1",
+        "database": "captain_test",
+        "status": "codex_build_interrupted",
+        "exit_code": 124,
+        "reason": "runtime_timed_out",
+        "checkpoint_ref": {
+            "uri": f"artifact://factory/codex-checkpoint/{'e' * 64}",
+            "sha256": "e" * 64,
+            "media_type": "application/json",
+        },
+        "terminal_receipt_ref": {
+            "uri": f"artifact://factory/codex-terminal-receipt/{'f' * 64}",
+            "sha256": "f" * 64,
+            "media_type": "application/json",
+        },
+        "next_resume_ordinal": 1,
+        "captain_authorization_binding": {
+            "job_id": "71000000-0000-0000-0000-000000000001",
+            "correlation_id": "72000000-0000-0000-0000-000000000001",
+            "subject_version": 3,
+            "attempt": 1,
+            "invocation_id": "73000000-0000-0000-0000-000000000001",
+            "idempotency_key": "a" * 64,
+            "lease_id": "factory-lease-1",
+            "workspace_ref": "workspace://factory/job-1/attempt-1",
+            "base_revision": "b" * 40,
+            "scaffold_manifest_sha256": "c" * 64,
+            "brief_sha256": "d" * 64,
+        },
+    }
+    serialized = json.dumps(result)
+    for forbidden in ("workspace_root", "journal", "prompt", "stderr"):
+        assert forbidden not in serialized
+
+
 def test_unresolved_provisioning_returns_factory_checkpoint_without_provider(
     tmp_path: Path,
 ) -> None:
@@ -90,19 +228,7 @@ def test_unresolved_provisioning_returns_factory_checkpoint_without_provider(
 param([string]$Action)
 if ($Action -cne 'benchmark-start') { throw 'only benchmark-start is accepted' }
 $root = Split-Path -Parent $PSScriptRoot
-@'
-TEST_MARIADB_DSN=mariadb://captain_test:test-only@127.0.0.1:33306/captain_test
-MARIADB_TEST_PORT=33306
-CAPTAIN_BENCHMARK_MODEL=gpt-4.1-mini
-CAPTAIN_N8N_URL=http://127.0.0.1:5679
-'@ | Set-Content (Join-Path $root '.env') -Encoding utf8
-@'
-CAPTAIN_N8N_PORT=5679
-CAPTAIN_N8N_API_KEY=file-api-secret
-CAPTAIN_N8N_MCP_TOKEN=file-mcp-secret
-CAPTAIN_N8N_MCP_BROKER_URL=http://127.0.0.1:5680
-CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET=file-signing-secret
-'@ | Set-Content (Join-Path $root '.env.captain-n8n') -Encoding utf8
+Set-Content (Join-Path $root 'service-called') 'unsafe'
 """.strip(),
         encoding="utf-8",
     )
@@ -115,6 +241,11 @@ import sys
 Path(__file__).resolve().parents[1].joinpath('provision-args.json').write_text(
     json.dumps(sys.argv[1:]), encoding='utf-8'
 )
+if '--apply' in sys.argv:
+    Path(__file__).resolve().parents[1].joinpath('gateway-mutated').write_text(
+        'unsafe', encoding='utf-8'
+    )
+suite_version = int(sys.argv[sys.argv.index('--suite-version') + 1])
 def team(profile, job_id, candidate_id, batch=None):
     return {
         'profile': profile,
@@ -125,7 +256,7 @@ def team(profile, job_id, candidate_id, batch=None):
                 'max_cost_usd': '0.30',
             },
         },
-        'suite': {'suite_version': 1},
+        'suite': {'suite_version': suite_version},
         'candidate_id': candidate_id,
         'gateway_budget_remaining_usd': '0.30',
         'work_batch': None if batch is None else {'batch_id': batch},
@@ -135,7 +266,7 @@ def team(profile, job_id, candidate_id, batch=None):
     }
 print(json.dumps({
     'schema': 'captain.business-benchmark-demo-provisioning.v1',
-    'mode': 'applied',
+    'mode': 'applied' if '--apply' in sys.argv else 'dry_run',
     'issued_at': '2026-07-28T20:00:00Z',
     'database': 'captain_test',
     'teams': [
@@ -144,6 +275,31 @@ print(json.dumps({
     ],
 }))
 """.strip(),
+        encoding="utf-8",
+    )
+    (repository / ".env").write_text(
+        "\n".join(
+            (
+                "TEST_MARIADB_DSN=mariadb://captain_test:test-only@127.0.0.1:33306/captain_test",
+                "MARIADB_TEST_PORT=33306",
+                "CAPTAIN_BENCHMARK_MODEL=gpt-4.1-mini",
+                "CAPTAIN_N8N_URL=http://127.0.0.1:5679",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (repository / ".env.captain-n8n").write_text(
+        "\n".join(
+            (
+                "CAPTAIN_N8N_PORT=5679",
+                "CAPTAIN_N8N_API_KEY=file-api-secret",
+                "CAPTAIN_N8N_MCP_TOKEN=file-mcp-secret",
+                "CAPTAIN_N8N_MCP_BROKER_URL=http://127.0.0.1:5680",
+                "CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET=file-signing-secret",
+            )
+        )
+        + "\n",
         encoding="utf-8",
     )
     (scripts / "preflight-business-benchmark-demo.py").write_text(
@@ -169,6 +325,59 @@ print(json.dumps({
     )
     environment = dict(os.environ)
     environment.pop("OPENAI_API_KEY", None)
+
+    planned = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(scripts / SCRIPT.name),
+            "-Action",
+            "Plan",
+            "-PythonPath",
+            sys.executable,
+            "-HermesPythonPath",
+            sys.executable,
+        ],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert planned.returncode == 0, planned.stderr
+    plan = json.loads(planned.stdout)
+    assert plan == {
+        "schema": "captain.business-benchmark-demo-run.v1",
+        "status": "planned",
+        "mode": "dry_run",
+        "database": "captain_test",
+        "issued_at": plan["issued_at"],
+        "suite_version": 19,
+        "seed_version_id": "business-benchmark-demo-2026-07-v19",
+        "maximum_usd_per_team": "0.30",
+        "jobs": [
+            {"profile": "claims", "job_id": "71000000-0000-0000-0000-000000000001"},
+            {"profile": "renewal", "job_id": "71000000-0000-0000-0000-000000000002"},
+        ],
+        "effects": {
+            "provider_calls": False,
+            "live_service_calls": False,
+            "provisioning_apply": False,
+            "gateway_mutation": False,
+            "minibook_mutation": False,
+        },
+    }
+    assert plan["issued_at"].endswith("Z")
+    plan_arguments = json.loads((repository / "provision-args.json").read_text("utf-8"))
+    assert "--apply" not in plan_arguments
+    assert plan_arguments[plan_arguments.index("--suite-version") + 1] == "19"
+    assert not (repository / "service-called").exists()
+    assert not (repository / "preflight-called").exists()
+    assert not (repository / "provider-called").exists()
+    assert not (repository / "gateway-mutated").exists()
 
     completed = subprocess.run(
         [
@@ -225,7 +434,7 @@ print(json.dumps({
     arguments = json.loads((repository / "provision-args.json").read_text("utf-8"))
     assert "--apply" in arguments
     assert arguments[arguments.index("--maximum-usd-per-team") + 1] == "0.30"
-    assert arguments[arguments.index("--suite-version") + 1] == "18"
+    assert arguments[arguments.index("--suite-version") + 1] == "19"
     issued_at = arguments[arguments.index("--issued-at") + 1]
     assert issued_at.endswith("Z")
     combined = completed.stdout + completed.stderr
@@ -295,6 +504,71 @@ print(json.dumps({
     (scripts / "run-agent-factory-business-demo.py").write_text(
         r"""
 import json
+
+print(json.dumps({
+    'schema': 'captain.business-demo-factory-operator.v1',
+    'database': 'captain_test',
+    'status': 'codex_build_interrupted',
+    'exit_code': 124,
+    'reason': 'runtime_timed_out',
+    'checkpoint_ref': {
+        'uri': 'artifact://factory/codex-checkpoint/' + 'e' * 64,
+        'sha256': 'e' * 64,
+        'media_type': 'application/json',
+    },
+    'terminal_receipt_ref': {
+        'uri': 'artifact://factory/codex-terminal-receipt/' + 'f' * 64,
+        'sha256': 'f' * 64,
+        'media_type': 'application/json',
+    },
+    'next_resume_ordinal': 1,
+    'captain_authorization_binding': {
+        'job_id': '71000000-0000-0000-0000-000000000001',
+        'correlation_id': '72000000-0000-0000-0000-000000000001',
+        'subject_version': 3,
+        'attempt': 1,
+        'invocation_id': '73000000-0000-0000-0000-000000000001',
+        'idempotency_key': 'a' * 64,
+        'lease_id': 'factory-lease-1',
+        'workspace_ref': 'workspace://factory/job-1/attempt-1',
+        'base_revision': 'b' * 40,
+        'scaffold_manifest_sha256': 'c' * 64,
+        'brief_sha256': 'd' * 64,
+    },
+}))
+raise SystemExit(2)
+""".strip(),
+        encoding="utf-8",
+    )
+    environment["OPENAI_API_KEY"] = "process-only-demo-key"
+    interrupted = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(scripts / SCRIPT.name),
+            "-Action",
+            "Run",
+            "-PythonPath",
+            sys.executable,
+            "-HermesPythonPath",
+            sys.executable,
+        ],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert interrupted.returncode == 2, interrupted.stderr
+    assert json.loads(interrupted.stdout)["status"] == "codex_build_interrupted"
+    assert "process-only-demo-key" not in interrupted.stdout + interrupted.stderr
+    assert not (repository / "provider-called").exists()
+
+    (scripts / "run-agent-factory-business-demo.py").write_text(
+        r"""
+import json
 from pathlib import Path
 import sys
 
@@ -333,8 +607,6 @@ Set-Content (Join-Path $root 'provider-called') 'yes'
 """.strip(),
         encoding="utf-8",
     )
-    environment["OPENAI_API_KEY"] = "process-only-demo-key"
-
     successful = subprocess.run(
         [
             pwsh,

@@ -17,6 +17,7 @@ from gateway.agent_factory_live_operator import (
     FactoryLiveOperatorSettings,
     run_business_demo_factory_jobs,
 )
+from agenten.agent_factory.codex_build_execution import FactoryCodexBuildInterrupted
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -49,9 +50,38 @@ def main() -> int:
         hermes_maximum_total_cost_usd=Decimal(args.hermes_max_usd),
         maximum_dispatches=args.maximum_dispatches,
     )
-    results = asyncio.run(
-        run_business_demo_factory_jobs(settings, environment=os.environ)
-    )
+    try:
+        results = asyncio.run(
+            run_business_demo_factory_jobs(settings, environment=os.environ)
+        )
+    except FactoryCodexBuildInterrupted as interruption:
+        binding = interruption.authorization_binding
+        if binding is None:
+            raise RuntimeError(
+                "Factory Codex interruption lacks Captain resume bindings"
+            ) from interruption
+        print(
+            json.dumps(
+                {
+                    "schema": "captain.business-demo-factory-operator.v1",
+                    "database": "captain_test",
+                    "status": "codex_build_interrupted",
+                    "exit_code": interruption.exit_code,
+                    "reason": interruption.reason,
+                    "checkpoint_ref": interruption.checkpoint_ref.model_dump(
+                        mode="json"
+                    ),
+                    "terminal_receipt_ref": (
+                        interruption.terminal_receipt_ref.model_dump(mode="json")
+                    ),
+                    "next_resume_ordinal": interruption.resume_ordinal + 1,
+                    "captain_authorization_binding": binding.as_dict(),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return 2
     print(
         json.dumps(
             {

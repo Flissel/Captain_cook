@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Protocol
+from uuid import UUID
 
 from agenten.agent_factory.codex_build_provenance import (
     CaptainCodexBuildReceiptIssuer,
@@ -75,6 +76,38 @@ FactoryCodexBuildInterruptionReason = Literal[
 ]
 
 
+@dataclass(frozen=True)
+class FactoryCodexBuildInterruptionBindings:
+    """Redacted immutable inputs Captain must bind before a runtime resume."""
+
+    job_id: UUID
+    correlation_id: UUID
+    subject_version: int
+    attempt: int
+    invocation_id: UUID
+    idempotency_key: str
+    lease_id: str
+    workspace_ref: str
+    base_revision: str
+    scaffold_manifest_sha256: str
+    brief_sha256: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "job_id": str(self.job_id),
+            "correlation_id": str(self.correlation_id),
+            "subject_version": self.subject_version,
+            "attempt": self.attempt,
+            "invocation_id": str(self.invocation_id),
+            "idempotency_key": self.idempotency_key,
+            "lease_id": self.lease_id,
+            "workspace_ref": self.workspace_ref,
+            "base_revision": self.base_revision,
+            "scaffold_manifest_sha256": self.scaffold_manifest_sha256,
+            "brief_sha256": self.brief_sha256,
+        }
+
+
 class FactoryCodexBuildInterrupted(FactoryDispatchError):
     """One terminal Codex runtime interruption retained for Captain recovery."""
 
@@ -86,6 +119,7 @@ class FactoryCodexBuildInterrupted(FactoryDispatchError):
         checkpoint_ref: ArtifactRef,
         terminal_receipt_ref: ArtifactRef,
         resume_ordinal: int,
+        authorization_binding: FactoryCodexBuildInterruptionBindings | None = None,
     ) -> None:
         if reason not in {
             "runtime_timed_out",
@@ -111,6 +145,7 @@ class FactoryCodexBuildInterrupted(FactoryDispatchError):
         self.checkpoint_ref = checkpoint_ref
         self.terminal_receipt_ref = terminal_receipt_ref
         self.resume_ordinal = resume_ordinal
+        self.authorization_binding = authorization_binding
 
 
 def _interruption_references(
@@ -135,6 +170,28 @@ def _interruption_references(
         ),
         "resume_ordinal": checkpoint.resume_ordinal,
     }
+
+
+def _interruption_details(
+    request: FactoryDispatch,
+    invocation: FactorySkillInvocationV1,
+    checkpoint: FactoryCodexBuildCheckpointV1,
+) -> dict[str, object]:
+    details = _interruption_references(checkpoint)
+    details["authorization_binding"] = FactoryCodexBuildInterruptionBindings(
+        job_id=request.job.job_id,
+        correlation_id=request.job.correlation_id,
+        subject_version=request.job.subject_version,
+        attempt=invocation.attempt,
+        invocation_id=invocation.invocation_id,
+        idempotency_key=invocation.idempotency_key,
+        lease_id=invocation.lease.lease_id,
+        workspace_ref=checkpoint.workspace_ref,
+        base_revision=checkpoint.base_revision,
+        scaffold_manifest_sha256=checkpoint.scaffold_manifest_sha256,
+        brief_sha256=checkpoint.brief_sha256,
+    )
+    return details
 
 
 @dataclass(frozen=True)
@@ -682,7 +739,7 @@ class CodexCliFactoryBuildExecutor:
                     raise FactoryCodexBuildInterrupted(
                         reason="resume_authorization_required",
                         exit_code=None,
-                        **_interruption_references(checkpoint),
+                        **_interruption_details(request, invocation, checkpoint),
                     )
                 run_request = self._run_request(request, invocation, brief, prepared)
                 authorized = self._authorizer.authorize(run_request)
@@ -895,13 +952,13 @@ class CodexCliFactoryBuildExecutor:
             raise FactoryCodexBuildInterrupted(
                 reason="runtime_timed_out",
                 exit_code=result.exit_code,
-                **_interruption_references(interrupted),
+                **_interruption_details(request, invocation, interrupted),
             )
         if result.terminal_status == "cancelled":
             raise FactoryCodexBuildInterrupted(
                 reason="runtime_cancelled",
                 exit_code=result.exit_code,
-                **_interruption_references(interrupted),
+                **_interruption_details(request, invocation, interrupted),
             )
         if result.exit_code != 0:
             raise FactoryDispatchError(
