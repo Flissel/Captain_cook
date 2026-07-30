@@ -933,7 +933,11 @@ class CodexCliFactoryBuildExecutor:
             checkpoint.resume_ordinal,
         )
         receipt_sha256 = hashlib.sha256(session_receipt).hexdigest()
-        if result.terminal_status != "succeeded" or result.exit_code != 0:
+        if result.process_cleanup_status == "unresolved":
+            raise FactoryDispatchError(
+                "Codex process cleanup is unresolved; runtime resume is denied"
+            )
+        if result.terminal_status in {"timed_out", "cancelled"}:
             interrupted = self._checkpoint_store.advance(
                 checkpoint,
                 self._checkpoint(
@@ -1432,10 +1436,15 @@ def _validate_factory_codex_run_result(
         )
 
     if result.terminal_status == "cancelled":
-        raise FactoryDispatchError(
-            "Codex runner terminal status has no defined cancellation exit code"
+        expected_status = "cancelled"
+        cleanup_is_valid = (
+            result.exit_code != 0
+            and result.process_cleanup_status in {
+                "verified_cancelled",
+                "unresolved",
+            }
         )
-    if result.exit_code == 0:
+    elif result.exit_code == 0:
         expected_status = "succeeded"
         cleanup_is_valid = result.process_cleanup_status == "not_required"
     elif result.exit_code == 124:
