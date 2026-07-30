@@ -27,6 +27,7 @@ from agenten.agent_factory.skill_workflow_contracts import (
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.execution.codex_policy import AuthorizedCodexRun
 from agenten.execution.codex_supervisor import (
+    CodexRunResult,
     CodexRunRequest,
     CodexRunner,
 )
@@ -104,6 +105,7 @@ class FactoryCodexRunnerFactory(Protocol):
         *,
         session_id: str,
         state_path: Path,
+        journal_path: Path,
         maximum_runtime_seconds: int,
     ) -> CodexRunner: ...
 
@@ -302,6 +304,11 @@ class CodexCliFactoryBuildExecutor:
             / "processes"
             / f"{invocation.idempotency_key}.json"
         )
+        journal_path = (
+            self._settings.state_root.resolve()
+            / "journals"
+            / f"{invocation.idempotency_key}.jsonl"
+        )
         state_path.parent.mkdir(parents=True, exist_ok=True)
         prompt = _codex_prompt(request, invocation, brief)
         run_request = CodexRunRequest(
@@ -326,6 +333,7 @@ class CodexCliFactoryBuildExecutor:
         runner = self._runner_factory(
             session_id=session_id,
             state_path=state_path,
+            journal_path=journal_path,
             maximum_runtime_seconds=runtime_seconds,
         )
         result = await runner.run(authorized)
@@ -339,8 +347,18 @@ class CodexCliFactoryBuildExecutor:
             completed_at=completed_at,
         )
         self._persist_session_receipt(invocation, session_receipt)
+        if result.terminal_status == "timed_out":
+            raise FactoryDispatchError(
+                f"Codex build process timed out (exit {result.exit_code})"
+            )
+        if result.terminal_status == "cancelled":
+            raise FactoryDispatchError(
+                f"Codex build process was cancelled (exit {result.exit_code})"
+            )
         if result.exit_code != 0:
-            raise FactoryDispatchError("Codex build process failed")
+            raise FactoryDispatchError(
+                f"Codex build process failed (exit {result.exit_code})"
+            )
         if not (
             invocation.lease.issued_at <= completed_at < invocation.lease.expires_at
             and completed_at <= request.job.deadline_at
@@ -442,7 +460,7 @@ def _codex_prompt(
 
 def _session_receipt(
     *,
-    result,
+    result: CodexRunResult,
     session_id: str,
     workspace_ref: str,
     base_revision: str,
@@ -453,6 +471,21 @@ def _session_receipt(
         completed_at
     ):
         raise FactoryDispatchError("Codex completion timestamp must be UTC")
+    try:
+        journal_path = result.journal_path.resolve(strict=True)
+        journal_bytes = journal_path.read_bytes()
+    except OSError as exc:
+        raise FactoryDispatchError("Codex JSONL journal is unavailable") from exc
+    journal_sha256 = hashlib.sha256(journal_bytes).hexdigest()
+    if journal_sha256 != result.journal_sha256:
+        raise FactoryDispatchError("Codex JSONL journal digest does not match result")
+    journal_lines = tuple(
+        line.decode("utf-8", errors="replace")
+        for line in journal_bytes.splitlines()
+        if line.strip()
+    )
+    if journal_lines != result.jsonl_lines:
+        raise FactoryDispatchError("Codex JSONL journal snapshot does not match result")
     events: list[Mapping[str, object]] = []
     for line in result.jsonl_lines:
         try:
@@ -462,7 +495,7 @@ def _session_receipt(
         if not isinstance(value, dict):
             raise FactoryDispatchError("Codex JSONL evidence must contain objects")
         events.append(value)
-    if not events:
+    if not events and result.terminal_status == "succeeded":
         raise FactoryDispatchError("Codex JSONL evidence is empty")
     thread_ids = {
         value
@@ -472,20 +505,21 @@ def _session_receipt(
     }
     if len(thread_ids) > 1:
         raise FactoryDispatchError("Codex JSONL contains conflicting thread IDs")
-    joined = "\n".join(result.jsonl_lines).encode("utf-8")
     payload = {
         "schema": "captain.codex-session-receipt.v1",
         "provider": "codex-cli",
         "session_id": session_id,
         "codex_thread_id": next(iter(thread_ids), None),
-        "status": "succeeded" if result.exit_code == 0 else "failed",
+        "status": result.terminal_status,
         "exit_code": result.exit_code,
+        "process_cleanup_status": result.process_cleanup_status,
         "workspace_ref": workspace_ref,
         "base_revision": base_revision,
         "command_sha256": hashlib.sha256(
             "\0".join(command).encode("utf-8")
         ).hexdigest(),
-        "jsonl_sha256": hashlib.sha256(joined).hexdigest(),
+        "jsonl_sha256": journal_sha256,
+        "journal_sha256": journal_sha256,
         "event_count": len(events),
         "event_types": sorted(
             {

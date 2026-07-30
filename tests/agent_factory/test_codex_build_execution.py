@@ -15,6 +15,7 @@ from agenten.agent_factory.codex_build_execution import (
     CompletedCodexBuild,
     GitDetachedFactoryWorkspacePreparer,
     PreparedFactoryWorkspace,
+    _session_receipt,
 )
 from agenten.agent_factory.codex_build_provenance import (
     CaptainCodexBuildReceiptIssuer,
@@ -66,8 +67,9 @@ class RecordingAuthorizer:
 
 
 class SuccessfulRunner:
-    def __init__(self, workspace: Path) -> None:
+    def __init__(self, workspace: Path, journal_path: Path) -> None:
         self.workspace = workspace
+        self.journal_path = journal_path
         self.calls: list[AuthorizedCodexRun] = []
 
     async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
@@ -98,18 +100,26 @@ class SuccessfulRunner:
             json.dumps({"status": "passed", "command_ids": ["pytest.not-live"]}),
             encoding="utf-8",
         )
+        jsonl_lines = (
+            json.dumps(
+                {
+                    "type": "thread.started",
+                    "thread_id": "codex-thread-123",
+                }
+            ),
+            json.dumps({"type": "turn.completed"}),
+        )
+        journal = "".join(f"{line}\n" for line in jsonl_lines).encode("utf-8")
+        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+        self.journal_path.write_bytes(journal)
         return CodexRunResult(
             exit_code=0,
+            terminal_status="succeeded",
+            process_cleanup_status="not_required",
+            journal_path=self.journal_path,
+            journal_sha256=hashlib.sha256(journal).hexdigest(),
             artifact_references=(),
-            jsonl_lines=(
-                json.dumps(
-                    {
-                        "type": "thread.started",
-                        "thread_id": "codex-thread-123",
-                    }
-                ),
-                json.dumps({"type": "turn.completed"}),
-            ),
+            jsonl_lines=jsonl_lines,
         )
 
 
@@ -253,7 +263,13 @@ async def test_cli_executor_authorizes_before_materializing_and_records_redacted
             )
 
     authorizer = RecordingAuthorizer()
-    runner = SuccessfulRunner(workspace)
+    runners: list[SuccessfulRunner] = []
+
+    def runner_factory(**kwargs) -> SuccessfulRunner:
+        runner = SuccessfulRunner(workspace, kwargs["journal_path"])
+        runners.append(runner)
+        return runner
+
     state_root = tmp_path / "state"
     executor = CodexCliFactoryBuildExecutor(
         settings=CodexCliFactoryBuildSettings(
@@ -263,7 +279,7 @@ async def test_cli_executor_authorizes_before_materializing_and_records_redacted
         workspace_preparer=Preparer(),
         artifact_reader=artifact_reader,
         authorizer=authorizer,
-        runner_factory=lambda **_kwargs: runner,
+        runner_factory=runner_factory,
         clock=lambda: NOW,
     )
 
@@ -271,6 +287,8 @@ async def test_cli_executor_authorizes_before_materializing_and_records_redacted
 
     assert len(preparer_calls) == 1
     assert len(authorizer.requests) == 1
+    assert len(runners) == 1
+    runner = runners[0]
     assert len(runner.calls) == 1
     assert authorizer.requests[0].workspace == workspace
     assert authorizer.requests[0].command[:3] == ("codex", "exec", "--json")
@@ -286,14 +304,17 @@ async def test_cli_executor_authorizes_before_materializing_and_records_redacted
     assert session["status"] == "succeeded"
     assert session["codex_thread_id"] == "codex-thread-123"
     assert session["jsonl_sha256"] == hashlib.sha256(
-        "\n".join(runner.calls[0] and (
+        ("\n".join(runner.calls[0] and (
             json.dumps({"type": "thread.started", "thread_id": "codex-thread-123"}),
             json.dumps({"type": "turn.completed"}),
-        )).encode("utf-8")
+        )) + "\n").encode("utf-8")
     ).hexdigest()
     assert "OPENAI_API_KEY" not in completed.codex_session_receipt.decode("utf-8")
     assert completed.test_evidence_paths == ("test-evidence.json",)
     assert tuple(state_root.glob("sessions/*.json"))
+    assert runner.journal_path == (
+        state_root / "journals" / f"{invocation.idempotency_key}.jsonl"
+    )
 
 
 @pytest.mark.asyncio
@@ -310,11 +331,22 @@ async def test_cli_executor_fails_closed_when_codex_omits_required_outputs(
             return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
 
     class IncompleteRunner:
+        def __init__(self, journal_path: Path) -> None:
+            self.journal_path = journal_path
+
         async def run(self, _authorized):
+            line = json.dumps({"type": "thread.started"})
+            journal = f"{line}\n".encode("utf-8")
+            self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+            self.journal_path.write_bytes(journal)
             return CodexRunResult(
                 exit_code=0,
+                terminal_status="succeeded",
+                process_cleanup_status="not_required",
+                journal_path=self.journal_path,
+                journal_sha256=hashlib.sha256(journal).hexdigest(),
                 artifact_references=(),
-                jsonl_lines=(json.dumps({"type": "thread.started"}),),
+                jsonl_lines=(line,),
             )
 
     executor = CodexCliFactoryBuildExecutor(
@@ -325,12 +357,158 @@ async def test_cli_executor_fails_closed_when_codex_omits_required_outputs(
         workspace_preparer=Preparer(),
         artifact_reader=artifact_reader,
         authorizer=RecordingAuthorizer(),
-        runner_factory=lambda **_kwargs: IncompleteRunner(),
+        runner_factory=lambda **kwargs: IncompleteRunner(kwargs["journal_path"]),
         clock=lambda: NOW,
     )
 
     with pytest.raises(FactoryDispatchError, match="required build artifact"):
         await executor.execute(_dispatch(job, invocation), invocation, brief)
+
+
+def _run_result(
+    tmp_path: Path,
+    *,
+    exit_code: int,
+    terminal_status: str,
+    jsonl_lines: tuple[str, ...],
+    process_cleanup_status: str = "not_required",
+) -> CodexRunResult:
+    journal_path = tmp_path / "journal.jsonl"
+    journal = "".join(f"{line}\n" for line in jsonl_lines).encode("utf-8")
+    journal_path.write_bytes(journal)
+    return CodexRunResult(
+        exit_code=exit_code,
+        terminal_status=terminal_status,
+        process_cleanup_status=process_cleanup_status,
+        journal_path=journal_path,
+        journal_sha256=hashlib.sha256(journal).hexdigest(),
+        artifact_references=(),
+        jsonl_lines=jsonl_lines,
+    )
+
+
+@pytest.mark.parametrize(
+    ("jsonl_lines", "event_count", "thread_id", "event_types"),
+    (
+        ((), 0, None, []),
+        (
+            (
+                json.dumps({"type": "thread.started", "thread_id": "thread-123"}),
+                json.dumps({"type": "turn.started"}),
+            ),
+            2,
+            "thread-123",
+            ["thread.started", "turn.started"],
+        ),
+    ),
+)
+def test_session_receipt_retains_zero_or_partial_timeout_journal(
+    tmp_path: Path,
+    jsonl_lines: tuple[str, ...],
+    event_count: int,
+    thread_id: str | None,
+    event_types: list[str],
+) -> None:
+    result = _run_result(
+        tmp_path,
+        exit_code=124,
+        terminal_status="timed_out",
+        jsonl_lines=jsonl_lines,
+        process_cleanup_status="verified_cancelled",
+    )
+
+    receipt = json.loads(
+        _session_receipt(
+            result=result,
+            session_id="factory-session-123",
+            workspace_ref="workspace://factory/123",
+            base_revision="a" * 40,
+            command=("codex", "exec", "--json", "private prompt"),
+            completed_at=NOW,
+        )
+    )
+
+    assert receipt["status"] == "timed_out"
+    assert receipt["exit_code"] == 124
+    assert receipt["process_cleanup_status"] == "verified_cancelled"
+    assert receipt["journal_sha256"] == result.journal_sha256
+    assert receipt["event_count"] == event_count
+    assert receipt["event_types"] == event_types
+    assert receipt["codex_thread_id"] == thread_id
+    assert "private prompt" not in json.dumps(receipt)
+
+
+def test_session_receipt_rejects_empty_succeeded_journal(tmp_path: Path) -> None:
+    result = _run_result(
+        tmp_path,
+        exit_code=0,
+        terminal_status="succeeded",
+        jsonl_lines=(),
+    )
+
+    with pytest.raises(FactoryDispatchError, match="Codex JSONL evidence is empty"):
+        _session_receipt(
+            result=result,
+            session_id="factory-session-123",
+            workspace_ref="workspace://factory/123",
+            base_revision="a" * 40,
+            command=("codex", "exec", "--json", "private prompt"),
+            completed_at=NOW,
+        )
+
+
+@pytest.mark.asyncio
+async def test_cli_executor_persists_timeout_receipt_before_raising_timeout_124(
+    tmp_path: Path,
+) -> None:
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    class Preparer:
+        def prepare(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    class TimedOutRunner:
+        def __init__(self, journal_path: Path) -> None:
+            self.journal_path = journal_path
+
+        async def run(self, _authorized) -> CodexRunResult:
+            journal = b""
+            self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+            self.journal_path.write_bytes(journal)
+            return CodexRunResult(
+                exit_code=124,
+                terminal_status="timed_out",
+                process_cleanup_status="verified_cancelled",
+                journal_path=self.journal_path,
+                journal_sha256=hashlib.sha256(journal).hexdigest(),
+                artifact_references=(),
+                jsonl_lines=(),
+            )
+
+    state_root = tmp_path / "state"
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=Preparer(),
+        artifact_reader=artifact_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=lambda **kwargs: TimedOutRunner(kwargs["journal_path"]),
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FactoryDispatchError, match=r"timed out \(exit 124\)"):
+        await executor.execute(_dispatch(job, invocation), invocation, brief)
+
+    receipt_path = state_root / "sessions" / f"{invocation.idempotency_key}.json"
+    receipt = json.loads(receipt_path.read_bytes())
+    assert receipt["status"] == "timed_out"
+    assert receipt["exit_code"] == 124
+    assert receipt["event_count"] == 0
 
 
 def test_git_workspace_preparer_creates_clean_detached_worktree(tmp_path: Path) -> None:
