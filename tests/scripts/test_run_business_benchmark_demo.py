@@ -100,7 +100,7 @@ def test_factory_operator_cli_emits_only_redacted_codex_interruption(
                 "invocation_id": "73000000-0000-0000-0000-000000000001",
                 "idempotency_key": "a" * 64,
                 "lease_id": "factory-lease-1",
-                "workspace_ref": "workspace://factory/job-1/attempt-1",
+                "workspace_ref": "workspace://business-benchmark-demo/claims/epoch-aaaaaaaaaaaaaaaa",
                 "base_revision": "b" * 40,
                 "scaffold_manifest_sha256": "c" * 64,
                 "brief_sha256": "d" * 64,
@@ -195,12 +195,16 @@ def test_factory_operator_cli_emits_only_redacted_codex_interruption(
             "invocation_id": "73000000-0000-0000-0000-000000000001",
             "idempotency_key": "a" * 64,
             "lease_id": "factory-lease-1",
-            "workspace_ref": "workspace://factory/job-1/attempt-1",
+            "workspace_ref": "workspace://business-benchmark-demo/claims/epoch-aaaaaaaaaaaaaaaa",
             "base_revision": "b" * 40,
             "scaffold_manifest_sha256": "c" * 64,
             "brief_sha256": "d" * 64,
         },
     }
+    interruption.resume_ordinal = 2
+    assert module.main() == 2
+    exhausted = json.loads(capsys.readouterr().out)
+    assert exhausted["next_resume_ordinal"] is None
     serialized = json.dumps(result)
     for forbidden in ("workspace_root", "journal", "prompt", "stderr"):
         assert forbidden not in serialized
@@ -530,7 +534,7 @@ print(json.dumps({
         'invocation_id': '73000000-0000-0000-0000-000000000001',
         'idempotency_key': 'a' * 64,
         'lease_id': 'factory-lease-1',
-        'workspace_ref': 'workspace://factory/job-1/attempt-1',
+        'workspace_ref': 'workspace://business-benchmark-demo/claims/epoch-aaaaaaaaaaaaaaaa',
         'base_revision': 'b' * 40,
         'scaffold_manifest_sha256': 'c' * 64,
         'brief_sha256': 'd' * 64,
@@ -756,7 +760,9 @@ print(json.dumps({
         {"profile": "renewal", "job_id": "71000000-0000-0000-0000-000000000002"},
     ]
     assert not (repository / "run-only-called").exists()
-    assert "--apply" not in json.loads((repository / "provision-called").read_text("utf-8"))
+    plan_arguments = json.loads((repository / "provision-called").read_text("utf-8"))
+    assert "--apply" not in plan_arguments
+    assert "--plan-only" in plan_arguments
 
 
 def test_interruption_validator_rejects_noncanonical_recovery_payloads(
@@ -803,7 +809,7 @@ def test_interruption_validator_rejects_noncanonical_recovery_payloads(
             "invocation_id": "73000000-0000-0000-0000-000000000001",
             "idempotency_key": digest,
             "lease_id": "factory-lease-1",
-            "workspace_ref": "workspace://factory/job-1/attempt-1",
+            "workspace_ref": "workspace://business-benchmark-demo/claims/epoch-aaaaaaaaaaaaaaaa",
             "base_revision": "b" * 40,
             "scaffold_manifest_sha256": "c" * 64,
             "brief_sha256": "d" * 64,
@@ -823,6 +829,16 @@ def test_interruption_validator_rejects_noncanonical_recovery_payloads(
         )
 
     assert validate(checkpoint).returncode == 0
+    factory_workspace = json.loads(json.dumps(checkpoint))
+    factory_workspace["captain_authorization_binding"]["workspace_ref"] = (
+        "workspace://business-benchmark-demo/71000000-0000-0000-0000-000000000001/"
+        "dispatch_agent_architect/1/20260730T120000123456Z"
+    )
+    assert validate(factory_workspace).returncode == 0
+    cancelled = json.loads(json.dumps(checkpoint))
+    cancelled["reason"] = "runtime_cancelled"
+    cancelled["exit_code"] = 1
+    assert validate(cancelled).returncode == 0
     invalid_payloads = []
     host_path = json.loads(json.dumps(checkpoint))
     host_path["checkpoint_ref"]["uri"] = "file:///C:/captain/checkpoint.json"

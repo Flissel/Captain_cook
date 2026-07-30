@@ -74,7 +74,11 @@ def main() -> int:
                     "terminal_receipt_ref": (
                         interruption.terminal_receipt_ref.model_dump(mode="json")
                     ),
-                    "next_resume_ordinal": interruption.resume_ordinal + 1,
+                    "next_resume_ordinal": (
+                        interruption.resume_ordinal + 1
+                        if interruption.resume_ordinal < 2
+                        else None
+                    ),
                     "captain_authorization_binding": binding.as_dict(),
                 },
                 sort_keys=True,

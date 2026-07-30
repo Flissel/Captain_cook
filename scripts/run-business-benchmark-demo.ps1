@@ -315,10 +315,10 @@ function Test-CodexBuildInterruptedCheckpoint {
         return $false
     }
     if (
-        ($Checkpoint.reason -ceq 'codex_timed_out' -and [string]$Checkpoint.exit_code -cne '124') -or
-        ($Checkpoint.reason -ceq 'runtime_cancelled' -and [string]$Checkpoint.exit_code -notin @('130', '143')) -or
+        ($Checkpoint.reason -ceq 'codex_timed_out' -and -not (Test-StrictInteger -Value $Checkpoint.exit_code -Expected 124)) -or
+        ($Checkpoint.reason -ceq 'runtime_cancelled' -and -not (Test-StrictNonzeroInteger -Value $Checkpoint.exit_code)) -or
         ($Checkpoint.reason -ceq 'resume_authorization_required' -and $null -ne $Checkpoint.exit_code) -or
-        [string]$Checkpoint.next_resume_ordinal -notmatch '^[12]$'
+        ($null -ne $Checkpoint.next_resume_ordinal -and [string]$Checkpoint.next_resume_ordinal -notmatch '^[12]$')
     ) {
         return $false
     }
@@ -354,7 +354,7 @@ function Test-CodexBuildInterruptedCheckpoint {
         [string]$binding.attempt -notmatch '^[1-9][0-9]{0,8}$' -or
         [string]$binding.idempotency_key -notmatch '^[0-9a-f]{64}$' -or
         [string]$binding.lease_id -notmatch '^[a-z0-9][a-z0-9._-]{0,127}$' -or
-        [string]$binding.workspace_ref -notmatch '^workspace://factory/[a-z0-9][a-z0-9._-]{0,127}/attempt-[1-9][0-9]{0,5}$' -or
+        -not (Test-FactoryWorkspaceReference -Value ([string]$binding.workspace_ref)) -or
         [string]$binding.base_revision -notmatch '^[0-9a-f]{40,64}$' -or
         [string]$binding.scaffold_manifest_sha256 -notmatch '^[0-9a-f]{64}$' -or
         [string]$binding.brief_sha256 -notmatch '^[0-9a-f]{64}$'
@@ -369,6 +369,30 @@ function Test-CanonicalUuid {
 
     $parsed = [guid]::Empty
     return [guid]::TryParse($Value, [ref]$parsed) -and $parsed.ToString('D') -ceq $Value
+}
+
+function Test-StrictInteger {
+    param(
+        [Parameter(Mandatory = $true)][object]$Value,
+        [Parameter(Mandatory = $true)][long]$Expected
+    )
+
+    return ($Value -is [int] -or $Value -is [long]) -and [long]$Value -eq $Expected
+}
+
+function Test-StrictNonzeroInteger {
+    param([Parameter(Mandatory = $true)][object]$Value)
+
+    return ($Value -is [int] -or $Value -is [long]) -and [long]$Value -ne 0
+}
+
+function Test-FactoryWorkspaceReference {
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    return (
+        $Value -match '^workspace://business-benchmark-demo/(claims|renewal)/epoch-[0-9a-f]{16}$' -or
+        $Value -match '^workspace://[a-z0-9][a-z0-9-]{0,127}/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/(dispatch_agent_architect|dispatch_tool_integrator|submit_forge_job|dispatch_build_validator|dispatch_real_case_tester|dispatch_quality_warden)/[1-9][0-9]{0,5}/[0-9]{8}T[0-9]{12}Z$'
+    )
 }
 
 function New-InfrastructureCheckpoint {
@@ -423,6 +447,7 @@ try {
     if ($Action -ceq 'Plan') {
         $planArguments = @(
             $provisionScript,
+            '--plan-only',
             '--workspace-root', $repositoryRoot,
             '--issued-at', $issuedAt,
             '--model', 'gpt-4.1-mini',

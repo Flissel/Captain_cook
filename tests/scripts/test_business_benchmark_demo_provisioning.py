@@ -15,6 +15,7 @@ import pytest
 
 from agenten.agent_factory.business_benchmark_demo_provisioning import (
     BusinessBenchmarkDemoProvisioner,
+    BusinessBenchmarkDemoPlanSettings,
     BusinessBenchmarkDemoProvisioningSettings,
     BusinessBenchmarkDemoResumeStateV1,
     BusinessBenchmarkDemoTeamPlanV1,
@@ -752,6 +753,87 @@ def test_cli_defaults_to_dry_run_and_never_echoes_the_dsn(tmp_path: Path) -> Non
     assert payload["database"] == "captain_test"
     assert LOCAL_DSN not in completed.stdout
     assert not (tmp_path / ".captain-cook").exists()
+
+
+def test_plan_only_cli_needs_no_dsn_or_credential_environment(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sentinel = workspace / "no-writes-marker"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if "DSN" not in key and "TOKEN" not in key and "KEY" not in key and "SECRET" not in key
+    }
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/provision-business-benchmark-demo.py",
+            "--plan-only",
+            "--workspace-root",
+            str(workspace),
+            "--issued-at",
+            ISSUED_AT.isoformat(),
+            "--model",
+            "gpt-4.1-mini",
+            "--maximum-usd-per-team",
+            "5.00",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["mode"] == "dry_run"
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    assert not (workspace / ".captain-cook").exists()
+    assert "provider" not in completed.stdout.lower()
+
+    inherited_environment = dict(environment)
+    inherited_environment["TEST_MARIADB_DSN"] = "mariadb://poison.invalid/not-captain-test"
+    inherited = subprocess.run(
+        [
+            sys.executable,
+            "scripts/provision-business-benchmark-demo.py",
+            "--plan-only",
+            "--workspace-root",
+            str(workspace),
+            "--issued-at",
+            ISSUED_AT.isoformat(),
+            "--model",
+            "gpt-4.1-mini",
+            "--maximum-usd-per-team",
+            "5.00",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        env=inherited_environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert inherited.returncode == 0, inherited.stderr
+    assert "poison.invalid" not in inherited.stdout + inherited.stderr
+
+
+def test_plan_settings_cannot_be_applied(tmp_path: Path) -> None:
+    plan_settings = BusinessBenchmarkDemoPlanSettings(
+        workspace_root=tmp_path,
+        issued_at=ISSUED_AT,
+        model="gpt-4.1-mini",
+        maximum_usd_per_team="5.00",
+        suite_version=1,
+        seed_version_id="business-benchmark-demo-2026-07",
+    )
+    provisioner = BusinessBenchmarkDemoProvisioner(plan_settings)
+
+    assert provisioner.plan().mode == "dry_run"
+    with pytest.raises(ValueError, match="plan-only settings"):
+        provisioner.apply()
 
 
 def test_cli_does_not_swallow_unexpected_programming_errors(

@@ -122,11 +122,10 @@ class _FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
 
 
-class BusinessBenchmarkDemoProvisioningSettings(_FrozenModel):
-    """Explicit non-secret inputs for a reproducible isolated bootstrap."""
+class BusinessBenchmarkDemoPlanSettings(_FrozenModel):
+    """Credential-free inputs for deterministic, side-effect-free planning."""
 
     workspace_root: Path
-    test_mariadb_dsn: str = Field(repr=False, exclude=True)
     issued_at: datetime
     model: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
     maximum_usd_per_team: Decimal
@@ -149,6 +148,12 @@ class BusinessBenchmarkDemoProvisioningSettings(_FrozenModel):
         if not amount.is_finite() or amount <= 0 or amount.as_tuple().exponent < -2:
             raise ValueError("maximum USD must be positive and use cents")
         return amount
+
+
+class BusinessBenchmarkDemoProvisioningSettings(BusinessBenchmarkDemoPlanSettings):
+    """Apply-capable settings that bind the exact isolated Gateway database."""
+
+    test_mariadb_dsn: str = Field(repr=False, exclude=True)
 
     @field_validator("test_mariadb_dsn")
     @classmethod
@@ -282,15 +287,22 @@ class BusinessBenchmarkDemoProvisioner:
 
     def __init__(
         self,
-        settings: BusinessBenchmarkDemoProvisioningSettings,
+        settings: BusinessBenchmarkDemoPlanSettings,
         *,
         gateway: BusinessBenchmarkDemoGatewayPort | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
-        self._settings = BusinessBenchmarkDemoProvisioningSettings.model_validate(
-            settings.model_dump(mode="python")
-            | {"test_mariadb_dsn": settings.test_mariadb_dsn}
-        )
+        if isinstance(settings, BusinessBenchmarkDemoProvisioningSettings):
+            self._settings: BusinessBenchmarkDemoPlanSettings = (
+                BusinessBenchmarkDemoProvisioningSettings.model_validate(
+                    settings.model_dump(mode="python")
+                    | {"test_mariadb_dsn": settings.test_mariadb_dsn}
+                )
+            )
+        else:
+            self._settings = BusinessBenchmarkDemoPlanSettings.model_validate(
+                settings.model_dump(mode="python")
+            )
         self._gateway = gateway
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
@@ -584,6 +596,8 @@ class BusinessBenchmarkDemoProvisioner:
     def validate_apply_preconditions(self) -> None:
         """Fail before opening Gateway resources when the initial lease is stale."""
 
+        if not isinstance(self._settings, BusinessBenchmarkDemoProvisioningSettings):
+            raise ValueError("plan-only settings cannot apply benchmark provisioning")
         now = self._clock()
         if now.tzinfo is None or now.utcoffset() != timezone.utc.utcoffset(now):
             raise ValueError("provisioning clock must be UTC")
@@ -603,7 +617,6 @@ class BusinessBenchmarkDemoProvisioner:
         )
 
     def _prepare(self) -> tuple[_PreparedTeam, _PreparedTeam]:
-        assert_local_captain_test_dsn(self._settings.test_mariadb_dsn)
         with tempfile.TemporaryDirectory(prefix="captain-benchmark-demo-plan-") as raw:
             temporary = Path(raw)
             preview = CanonicalPrivateBusinessBenchmarkProvisioner(
@@ -1176,6 +1189,7 @@ def _canonical_json(value: object) -> bytes:
 
 __all__ = [
     "BusinessBenchmarkDemoProvisioner",
+    "BusinessBenchmarkDemoPlanSettings",
     "BusinessBenchmarkDemoProvisioningResultV1",
     "BusinessBenchmarkDemoProvisioningSettings",
     "BusinessBenchmarkDemoTeamPlanV1",

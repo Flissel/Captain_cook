@@ -15,6 +15,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from agenten.agent_factory.business_benchmark_demo_provisioning import (
     BusinessBenchmarkDemoProvisioner,
+    BusinessBenchmarkDemoPlanSettings,
     BusinessBenchmarkDemoProvisioningSettings,
 )
 from gateway.business_benchmark_demo import GatewayBusinessBenchmarkDemoError
@@ -28,6 +29,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
     )
     parser.add_argument("--apply", action="store_true", help="write through Gateway/MariaDB")
+    parser.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="require the credential-free dry-run planning contract",
+    )
     parser.add_argument("--workspace-root", type=Path, default=Path.cwd())
     parser.add_argument(
         "--issued-at",
@@ -56,16 +62,26 @@ def _issued_at(value: str | None) -> datetime:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    dsn = os.environ.get("TEST_MARIADB_DSN", "")
+    if args.apply and args.plan_only:
+        print("provisioning failed: --apply and --plan-only are mutually exclusive", file=sys.stderr)
+        return 1
+    dsn = os.environ.get("TEST_MARIADB_DSN", "") if args.apply else ""
     try:
-        settings = BusinessBenchmarkDemoProvisioningSettings(
-            workspace_root=args.workspace_root,
-            test_mariadb_dsn=dsn,
-            issued_at=_issued_at(args.issued_at),
-            model=args.model,
-            maximum_usd_per_team=args.maximum_usd_per_team,
-            suite_version=args.suite_version,
-            seed_version_id=args.seed_version_id,
+        common_settings = {
+            "workspace_root": args.workspace_root,
+            "issued_at": _issued_at(args.issued_at),
+            "model": args.model,
+            "maximum_usd_per_team": args.maximum_usd_per_team,
+            "suite_version": args.suite_version,
+            "seed_version_id": args.seed_version_id,
+        }
+        settings = (
+            BusinessBenchmarkDemoProvisioningSettings(
+                **common_settings,
+                test_mariadb_dsn=dsn,
+            )
+            if args.apply
+            else BusinessBenchmarkDemoPlanSettings(**common_settings)
         )
         gateway = None
         provisioner = BusinessBenchmarkDemoProvisioner(settings)
