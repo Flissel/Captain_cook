@@ -1293,6 +1293,93 @@ async def test_authorized_resume_rejects_completion_after_authorization_expiry(
     assert observed_timeouts[-1] <= 2
 
 
+@pytest.mark.asyncio
+async def test_authorized_resume_revalidates_deadline_after_runner_construction(
+    tmp_path: Path,
+) -> None:
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+    current = NOW
+
+    class RecoveringPreparer:
+        def prepare_or_recover(self, _request, _invocation, _brief, _checkpoint):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    class TimedOutRunner:
+        def __init__(self, journal_path: Path) -> None:
+            self.journal_path = journal_path
+
+        async def run(self, _authorized) -> CodexRunResult:
+            self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+            self.journal_path.write_bytes(b"")
+            return CodexRunResult(
+                exit_code=124,
+                terminal_status="timed_out",
+                process_cleanup_status="verified_cancelled",
+                journal_path=self.journal_path,
+                journal_sha256=hashlib.sha256(b"").hexdigest(),
+                artifact_references=(),
+                jsonl_lines=(),
+            )
+
+    runner_count = 0
+    resume_runner: SuccessfulRunner | None = None
+
+    def runner_factory(**kwargs):
+        nonlocal current, resume_runner, runner_count
+        runner_count += 1
+        if runner_count == 1:
+            return TimedOutRunner(kwargs["journal_path"])
+        current = NOW + timedelta(seconds=3)
+        resume_runner = SuccessfulRunner(workspace, kwargs["journal_path"])
+        return resume_runner
+
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=RecoveringPreparer(),
+        artifact_reader=artifact_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=runner_factory,
+        resume_authorizer=CaptainFactoryCodexResumeAuthorizer(
+            clock=lambda: current
+        ),
+        clock=lambda: current,
+    )
+    dispatch = _dispatch(job, invocation)
+    with pytest.raises(FactoryCodexBuildInterrupted):
+        await executor.execute(dispatch, invocation, brief)
+    interrupted = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert interrupted is not None
+    authorized = _authorized_runtime_retry_dispatch(
+        dispatch,
+        invocation,
+        interrupted,
+        maximum_runtime_seconds=2,
+        expires_at=NOW + timedelta(seconds=2),
+    )
+
+    with pytest.raises(FactoryDispatchError, match="remaining runtime"):
+        await executor.execute_authorized_resume(authorized, invocation, brief)
+
+    assert resume_runner is not None
+    assert resume_runner.calls == []
+    recoverable = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert recoverable == interrupted
+    assert not (
+        state_root / "sessions" / f"{invocation.idempotency_key}.resume-1.json"
+    ).exists()
+
+
 def test_git_workspace_preparer_recovers_exact_head_and_rejects_missing_workspace(
     tmp_path: Path,
 ) -> None:

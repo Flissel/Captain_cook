@@ -794,23 +794,9 @@ class CodexCliFactoryBuildExecutor:
             if authorized_resume_ordinal is None
             else authorized_resume_ordinal
         )
-        checkpoint = self._checkpoint_store.advance(
-            checkpoint,
-            self._checkpoint(
-                request,
-                invocation,
-                brief,
-                prepared,
-                phase="implementation_running",
-                resume_ordinal=next_ordinal,
-                terminal_receipt_sha256=None,
-                scaffold_manifest_sha256=checkpoint.scaffold_manifest_sha256,
-                previous=checkpoint,
-            ),
-        )
         session_id = f"factory-{invocation.invocation_id.hex[:24]}"
         ordinal_suffix = (
-            "" if checkpoint.resume_ordinal == 0 else f".resume-{checkpoint.resume_ordinal}"
+            "" if next_ordinal == 0 else f".resume-{next_ordinal}"
         )
         state_path = self._settings.state_root.resolve() / "processes" / (
             f"{invocation.idempotency_key}{ordinal_suffix}.json"
@@ -835,6 +821,37 @@ class CodexCliFactoryBuildExecutor:
             state_path=state_path,
             journal_path=journal_path,
             maximum_runtime_seconds=runtime_seconds,
+        )
+        authority_deadline = self._authority_deadline(
+            request,
+            invocation,
+            authorized_resume=authorized_resume_ordinal is not None,
+        )
+        before_runner_run = self._clock()
+        final_remaining_whole_seconds = int(
+            (authority_deadline - before_runner_run).total_seconds()
+        )
+        if (
+            before_runner_run < invocation.lease.issued_at
+            or final_remaining_whole_seconds < 1
+            or runtime_seconds > final_remaining_whole_seconds
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex build has insufficient remaining runtime"
+            )
+        checkpoint = self._checkpoint_store.advance(
+            checkpoint,
+            self._checkpoint(
+                request,
+                invocation,
+                brief,
+                prepared,
+                phase="implementation_running",
+                resume_ordinal=next_ordinal,
+                terminal_receipt_sha256=None,
+                scaffold_manifest_sha256=checkpoint.scaffold_manifest_sha256,
+                previous=checkpoint,
+            ),
         )
         result = await runner.run(authorized)
         _validate_factory_codex_run_result(
