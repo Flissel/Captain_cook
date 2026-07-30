@@ -1368,7 +1368,7 @@ def _session_receipt(
             raise FactoryDispatchError("Codex JSONL evidence must contain objects")
         events.append(value)
     if not events and result.terminal_status == "succeeded":
-        raise FactoryDispatchError("Codex JSONL evidence was previously empty")
+        raise FactoryDispatchError("Codex JSONL evidence is empty")
     thread_ids = {
         value
         for event in events

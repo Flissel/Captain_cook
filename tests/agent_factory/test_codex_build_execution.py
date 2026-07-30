@@ -786,7 +786,7 @@ def test_session_receipt_reports_empty_succeeded_journal_truthfully(tmp_path: Pa
         jsonl_lines=(),
     )
 
-    with pytest.raises(FactoryDispatchError, match="Codex JSONL evidence was previously empty"):
+    with pytest.raises(FactoryDispatchError, match="Codex JSONL evidence is empty"):
         _session_receipt(
             result=result,
             session_id="factory-session-123",

@@ -122,7 +122,7 @@
   cumulative worst-case spend remains below `1.00` USD. V18 still exhausted the
   900-second Codex lease before producing the three required output artifacts.
   `PowerShellCodexRunner` returned exit code 124 with empty buffered JSONL, which
-  `_session_receipt` currently masks as `Codex JSONL evidence is empty`. Further
+  `_session_receipt` previously masked it as `Codex JSONL evidence is empty`. Further
   paid retries were stopped until Codex output was streamed durably, timeout
   evidence retained its real terminal cause, and the build was split into
   resumable Captain-authored scaffold/test and Codex implementation phases.
