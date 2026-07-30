@@ -272,6 +272,7 @@ class FactoryCodexRunnerFactory(Protocol):
         state_path: Path,
         journal_path: Path,
         maximum_runtime_seconds: int,
+        deadline_at: datetime,
     ) -> CodexRunner: ...
 
 
@@ -821,6 +822,7 @@ class CodexCliFactoryBuildExecutor:
             state_path=state_path,
             journal_path=journal_path,
             maximum_runtime_seconds=runtime_seconds,
+            deadline_at=authority_deadline,
         )
         authority_deadline = self._authority_deadline(
             request,
@@ -1382,6 +1384,7 @@ def _validate_factory_codex_run_result(
     elif result.exit_code == 124:
         expected_status = "timed_out"
         cleanup_is_valid = result.process_cleanup_status in {
+            "not_required",
             "verified_cancelled",
             "unresolved",
         }

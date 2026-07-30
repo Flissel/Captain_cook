@@ -17,6 +17,9 @@ param(
     [Parameter(Mandatory, ParameterSetName = "Run")]
     [string] $StatePath,
 
+    [Parameter(Mandatory, ParameterSetName = "Run")]
+    [DateTimeOffset] $DeadlineAt,
+
     [Parameter(ParameterSetName = "Run")]
     [ValidateSet("read-only", "workspace-write")]
     [string] $Sandbox = "workspace-write",
@@ -104,6 +107,10 @@ if ($PSCmdlet.ParameterSetName -eq "Cancel") {
     exit 0
 }
 
+if ($DeadlineAt.Offset -ne [TimeSpan]::Zero) {
+    throw "Codex deadline must be a UTC timestamp."
+}
+
 $resolvedWorkspace = (Resolve-Path -LiteralPath $Workspace -ErrorAction Stop).Path
 if (-not (Test-Path -LiteralPath $resolvedWorkspace -PathType Container)) {
     throw "Authorized workspace is not a directory."
@@ -135,6 +142,9 @@ $startInfo.ArgumentList.Add($Prompt)
 $process = [System.Diagnostics.Process]::new()
 $process.StartInfo = $startInfo
 try {
+    if ([DateTimeOffset]::UtcNow -ge $DeadlineAt) {
+        exit 124
+    }
     if (-not $process.Start()) {
         throw "Codex process did not start."
     }

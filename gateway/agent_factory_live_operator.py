@@ -247,6 +247,7 @@ def compose_business_demo_factory_operator(
         state_path: Path,
         journal_path: Path,
         maximum_runtime_seconds: int,
+        deadline_at: datetime,
     ) -> PowerShellCodexRunner:
         return PowerShellCodexRunner(
             pwsh_path=pwsh_executable,
@@ -257,6 +258,7 @@ def compose_business_demo_factory_operator(
             journal_path=journal_path,
             artifact_references=(),
             codex_home=codex_home,
+            deadline_at=deadline_at,
             timeout_seconds=maximum_runtime_seconds,
         )
 

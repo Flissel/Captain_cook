@@ -6,6 +6,9 @@ import asyncio
 import hashlib
 import json
 import os
+import time
+from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, Literal, Protocol
 
@@ -122,8 +125,17 @@ class PowerShellCodexRunner:
         journal_path: Path,
         artifact_references: tuple[str, ...],
         codex_home: Path,
+        deadline_at: datetime,
         timeout_seconds: float = 600,
+        clock: Callable[[], datetime] | None = None,
+        monotonic: Callable[[], float] | None = None,
     ) -> None:
+        if (
+            not isinstance(deadline_at, datetime)
+            or deadline_at.tzinfo is None
+            or deadline_at.utcoffset() != timezone.utc.utcoffset(deadline_at)
+        ):
+            raise ValueError("Codex runner deadline must be a UTC timestamp")
         self._pwsh_path = pwsh_path.resolve(strict=True)
         self._script_path = script_path.resolve(strict=True)
         self._codex_path = codex_path.resolve(strict=True)
@@ -132,7 +144,10 @@ class PowerShellCodexRunner:
         self._journal_path = journal_path.resolve()
         self._artifact_references = artifact_references
         self._codex_home = codex_home.resolve(strict=True)
+        self._deadline_at = deadline_at
         self._timeout_seconds = timeout_seconds
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._monotonic = monotonic or time.monotonic
 
     async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
         if len(authorized.command) != 4:
@@ -146,6 +161,17 @@ class PowerShellCodexRunner:
         os.close(journal_descriptor)
         child_environment = authorized.child_environment()
         child_environment["CODEX_HOME"] = str(self._codex_home)
+        wrapper_launch_at = self._clock()
+        deadline_remaining_seconds = (
+            self._deadline_at - wrapper_launch_at
+        ).total_seconds()
+        if deadline_remaining_seconds <= 0:
+            return self._prelaunch_timeout_result()
+        wrapper_timeout_seconds = min(
+            self._timeout_seconds,
+            deadline_remaining_seconds,
+        )
+        wrapper_launch_started = self._monotonic()
         process = await asyncio.create_subprocess_exec(
             str(self._pwsh_path),
             "-NoProfile",
@@ -161,6 +187,8 @@ class PowerShellCodexRunner:
             self._session_id,
             "-StatePath",
             str(self._state_path),
+            "-DeadlineAt",
+            self._deadline_at.isoformat(),
             cwd=authorized.workspace,
             env=child_environment,
             stdout=asyncio.subprocess.PIPE,
@@ -170,16 +198,19 @@ class PowerShellCodexRunner:
         assert process.stderr is not None
         timed_out = False
         process_cleanup_status: CodexProcessCleanupStatus = "not_required"
+        wrapper_timeout_remaining = wrapper_timeout_seconds - max(
+            0.0,
+            self._monotonic() - wrapper_launch_started,
+        )
         with self._journal_path.open("ab") as journal:
             stdout_reader = asyncio.create_task(
                 self._journal_stdout(process.stdout, journal)
             )
             stderr_reader = asyncio.create_task(self._drain_stderr(process.stderr))
             try:
-                await asyncio.wait_for(
-                    process.wait(),
-                    timeout=self._timeout_seconds,
-                )
+                if wrapper_timeout_remaining <= 0:
+                    raise TimeoutError
+                await asyncio.wait_for(process.wait(), timeout=wrapper_timeout_remaining)
             except TimeoutError:
                 timed_out = True
                 cancelled = await self._attempt_verified_timeout_cancellation()
@@ -220,6 +251,18 @@ class PowerShellCodexRunner:
                 for line in journal_bytes.splitlines()
                 if line.strip()
             ),
+        )
+
+    def _prelaunch_timeout_result(self) -> CodexRunResult:
+        journal_bytes = self._journal_path.read_bytes()
+        return CodexRunResult(
+            exit_code=124,
+            terminal_status="timed_out",
+            process_cleanup_status="not_required",
+            journal_path=self._journal_path,
+            journal_sha256=hashlib.sha256(journal_bytes).hexdigest(),
+            artifact_references=(),
+            jsonl_lines=(),
         )
 
     @staticmethod

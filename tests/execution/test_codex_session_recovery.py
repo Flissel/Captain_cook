@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -41,6 +41,7 @@ from agenten.execution.process import PackageExecutionStatus
 
 
 NOW = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+FUTURE_DEADLINE = datetime(2100, 1, 1, tzinfo=timezone.utc)
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
@@ -415,6 +416,214 @@ def _compile_streaming_fixture(
     return executable
 
 
+def _compile_marker_fixture(tmp_path: Path, marker_path: Path) -> Path:
+    executable = tmp_path / f"marker-fixture-{uuid4().hex}.exe"
+    escaped_marker = marker_path.as_posix().replace('"', '""')
+    source_path = executable.with_suffix(".cs")
+    source_path.write_text(
+        (
+            "using System.IO;"
+            "public static class Program {"
+            "public static int Main(string[] args) {"
+            f'File.WriteAllText(@"{escaped_marker}", "started");return 0;'
+            "}}"
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe",
+            "/nologo",
+            f"/out:{executable}",
+            str(source_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return executable
+
+
+@pytest.mark.asyncio
+async def test_powershell_runner_expired_deadline_never_starts_wrapper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper_starts: list[object] = []
+
+    async def forbidden_wrapper_start(*_args: object, **_kwargs: object) -> object:
+        wrapper_starts.append(object())
+        raise AssertionError("expired authority must not start PowerShell")
+
+    monkeypatch.setattr(
+        "agenten.execution.codex_supervisor.asyncio.create_subprocess_exec",
+        forbidden_wrapper_start,
+    )
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    journal_path = tmp_path / "private" / "expired.jsonl"
+    runner = PowerShellCodexRunner(
+        pwsh_path=Path(_pwsh()),
+        script_path=Path("scripts/codex-session.ps1").resolve(),
+        codex_path=Path(r"C:\Windows\System32\timeout.exe"),
+        session_id="runner-expired-1",
+        state_path=tmp_path / "expired-process.json",
+        journal_path=journal_path,
+        artifact_references=("artifact://must-not-escape",),
+        codex_home=codex_home,
+        deadline_at=NOW,
+        clock=lambda: NOW,
+    )
+
+    result = await runner.run(
+        AuthorizedCodexRun(
+            workspace=tmp_path,
+            command=("codex", "exec", "--json", "must not run"),
+            environment=FrozenEnvironment({"PATH": "safe"}),
+        )
+    )
+
+    assert wrapper_starts == []
+    assert result.exit_code == 124
+    assert result.terminal_status == "timed_out"
+    assert result.process_cleanup_status == "not_required"
+    assert result.artifact_references == ()
+    assert result.journal_path == journal_path.resolve()
+    assert journal_path.read_bytes() == b""
+
+
+@pytest.mark.parametrize(
+    "deadline_at",
+    (
+        NOW.replace(tzinfo=None),
+        NOW.astimezone(timezone(timedelta(hours=1))),
+    ),
+    ids=("naive", "non-utc-offset"),
+)
+def test_powershell_runner_rejects_non_utc_deadline(
+    tmp_path: Path,
+    deadline_at: datetime,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+
+    with pytest.raises(ValueError, match="UTC timestamp"):
+        PowerShellCodexRunner(
+            pwsh_path=Path(_pwsh()),
+            script_path=Path("scripts/codex-session.ps1").resolve(),
+            codex_path=Path(r"C:\Windows\System32\timeout.exe"),
+            session_id="runner-invalid-deadline-1",
+            state_path=tmp_path / "invalid-process.json",
+            journal_path=tmp_path / "invalid.jsonl",
+            artifact_references=(),
+            codex_home=codex_home,
+            deadline_at=deadline_at,
+        )
+
+
+@pytest.mark.asyncio
+async def test_powershell_runner_budget_starts_when_wrapper_launch_begins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class Process:
+        returncode = 0
+
+        def __init__(self) -> None:
+            self.stdout = asyncio.StreamReader()
+            self.stdout.feed_eof()
+            self.stderr = asyncio.StreamReader()
+            self.stderr.feed_eof()
+
+        async def wait(self) -> int:
+            return self.returncode
+
+    async def create_process(*args: object, **_kwargs: object) -> Process:
+        captured["args"] = args
+        return Process()
+
+    async def capture_wait_for(awaitable, *, timeout: float):
+        captured["timeout"] = timeout
+        return await awaitable
+
+    monotonic_values = iter((100.0, 103.0))
+    monkeypatch.setattr(
+        "agenten.execution.codex_supervisor.asyncio.create_subprocess_exec",
+        create_process,
+    )
+    monkeypatch.setattr(
+        "agenten.execution.codex_supervisor.asyncio.wait_for",
+        capture_wait_for,
+    )
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    runner = PowerShellCodexRunner(
+        pwsh_path=Path(_pwsh()),
+        script_path=Path("scripts/codex-session.ps1").resolve(),
+        codex_path=Path(r"C:\Windows\System32\timeout.exe"),
+        session_id="runner-budget-1",
+        state_path=tmp_path / "budget-process.json",
+        journal_path=tmp_path / "budget.jsonl",
+        artifact_references=(),
+        codex_home=codex_home,
+        timeout_seconds=5,
+        deadline_at=NOW + timedelta(seconds=10),
+        clock=lambda: NOW,
+        monotonic=lambda: next(monotonic_values),
+    )
+
+    await runner.run(
+        AuthorizedCodexRun(
+            workspace=tmp_path,
+            command=("codex", "exec", "--json", "harmless test"),
+            environment=FrozenEnvironment({"PATH": "safe"}),
+        )
+    )
+
+    assert captured["timeout"] == 2.0
+    args = captured["args"]
+    assert isinstance(args, tuple)
+    deadline_index = args.index("-DeadlineAt")
+    assert args[deadline_index + 1] == (NOW + timedelta(seconds=10)).isoformat()
+
+
+def test_powershell_launcher_expired_deadline_never_starts_codex_child(
+    tmp_path: Path,
+) -> None:
+    marker_path = tmp_path / "child-started.txt"
+    fixture = _compile_marker_fixture(tmp_path, marker_path)
+    state_path = tmp_path / "expired-child-process.json"
+
+    completed = subprocess.run(
+        [
+            _pwsh(),
+            "-NoProfile",
+            "-File",
+            str(Path("scripts/codex-session.ps1").resolve()),
+            "-Workspace",
+            str(tmp_path),
+            "-Prompt",
+            "must not run",
+            "-CodexPath",
+            str(fixture),
+            "-SessionId",
+            "expired-child-1",
+            "-StatePath",
+            str(state_path),
+            "-DeadlineAt",
+            (NOW - timedelta(seconds=1)).isoformat(),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 124
+    assert not marker_path.exists()
+    assert not state_path.exists()
+
+
 @pytest.mark.asyncio
 async def test_powershell_launcher_streams_complete_line_before_child_exit(
     tmp_path: Path,
@@ -437,6 +646,8 @@ async def test_powershell_launcher_streams_complete_line_before_child_exit(
         "runner-stream-1",
         "-StatePath",
         str(state_path),
+        "-DeadlineAt",
+        FUTURE_DEADLINE.isoformat(),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -488,6 +699,7 @@ async def test_powershell_runner_timeout_retains_durable_journal(
         journal_path=journal_path,
         artifact_references=(),
         codex_home=codex_home,
+        deadline_at=FUTURE_DEADLINE,
         timeout_seconds=1.0,
     )
 
@@ -567,6 +779,7 @@ async def test_powershell_runner_fails_closed_when_journal_fsync_fails(
         journal_path=tmp_path / "private" / "fsync-failure.jsonl",
         artifact_references=(),
         codex_home=codex_home,
+        deadline_at=FUTURE_DEADLINE,
         timeout_seconds=1,
     )
 
@@ -622,6 +835,7 @@ def _unverified_timeout_runner(tmp_path: Path) -> PowerShellCodexRunner:
         journal_path=tmp_path / "private" / "unverified.jsonl",
         artifact_references=(),
         codex_home=codex_home,
+        deadline_at=FUTURE_DEADLINE,
         timeout_seconds=0.001,
     )
 
@@ -737,6 +951,7 @@ async def test_powershell_runner_bridges_authorized_run_to_real_launcher(
         journal_path=tmp_path / "runner.jsonl",
         artifact_references=("artifact://sealed/runner-test",),
         codex_home=codex_home,
+        deadline_at=FUTURE_DEADLINE,
     )
     result = await runner.run(
         AuthorizedCodexRun(
@@ -853,6 +1068,7 @@ async def test_powershell_runner_sets_a_scoped_codex_home_for_the_child(
         journal_path=tmp_path / "runner.jsonl",
         artifact_references=(),
         codex_home=codex_home,
+        deadline_at=FUTURE_DEADLINE,
     )
 
     result = await runner.run(
@@ -909,6 +1125,7 @@ async def test_powershell_runner_timeout_cancels_recorded_child_tree(
         journal_path=tmp_path / "runner.jsonl",
         artifact_references=(),
         codex_home=codex_home,
+        deadline_at=FUTURE_DEADLINE,
         timeout_seconds=2.0,
     )
 
@@ -970,6 +1187,8 @@ def test_powershell_7_launcher_emits_session_bound_process_identity(
             "session-pwsh-1",
             "-StatePath",
             str(state_path),
+            "-DeadlineAt",
+            FUTURE_DEADLINE.isoformat(),
         ],
         capture_output=True,
         text=True,
