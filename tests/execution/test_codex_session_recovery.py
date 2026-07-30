@@ -142,6 +142,7 @@ async def test_supervisor_persists_started_session_before_runner(
                 return CodexRunResult(
                     exit_code=0,
                     terminal_status="succeeded",
+                    process_cleanup_status="not_required",
                     journal_path=tmp_path / "runner.jsonl",
                     journal_sha256=EMPTY_SHA256,
                     artifact_references=("artifact://sealed/1",),
@@ -297,6 +298,7 @@ async def test_nonzero_process_exit_is_infrastructure_not_behavioral_repair(
                 return CodexRunResult(
                     exit_code=23,
                     terminal_status="failed",
+                    process_cleanup_status="not_required",
                     journal_path=tmp_path / "runner.jsonl",
                     journal_sha256=EMPTY_SHA256,
                     artifact_references=(),
@@ -472,6 +474,7 @@ async def test_powershell_runner_timeout_retains_durable_journal(
     journal_bytes = journal_path.read_bytes()
     assert result.exit_code == 124
     assert result.terminal_status == "timed_out"
+    assert result.process_cleanup_status == "verified_cancelled"
     assert result.journal_path == journal_path.resolve()
     assert result.journal_sha256 == hashlib.sha256(journal_bytes).hexdigest()
     assert result.jsonl_lines == expected_lines
@@ -479,6 +482,150 @@ async def test_powershell_runner_timeout_retains_durable_journal(
         f"{jsonl_line}\n".encode() for jsonl_line in expected_lines
     )
     assert b"private diagnostic" not in journal_bytes
+
+
+class _UnverifiedTimeoutProcess:
+    def __init__(self, line: str | None) -> None:
+        self.returncode: int | None = None
+        self.stdout = asyncio.StreamReader()
+        if line is not None:
+            self.stdout.feed_data(f"{line}\n".encode())
+        self.stderr = asyncio.StreamReader()
+        self._wait_calls = 0
+
+    async def wait(self) -> int:
+        self._wait_calls += 1
+        if self._wait_calls == 1:
+            await asyncio.Future()
+        self.returncode = 1
+        self.stdout.feed_eof()
+        self.stderr.feed_eof()
+        return self.returncode
+
+    def kill(self) -> None:
+        self.returncode = -9
+        self.stdout.feed_eof()
+        self.stderr.feed_eof()
+
+
+class _BrokenCleanupProcess(_UnverifiedTimeoutProcess):
+    async def wait(self) -> int:
+        self._wait_calls += 1
+        if self._wait_calls == 1:
+            await asyncio.Future()
+        self.stdout.feed_eof()
+        self.stderr.feed_eof()
+        raise RuntimeError("private cleanup failure")
+
+
+def _unverified_timeout_runner(tmp_path: Path) -> PowerShellCodexRunner:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    return PowerShellCodexRunner(
+        pwsh_path=Path(_pwsh()),
+        script_path=Path("scripts/codex-session.ps1").resolve(),
+        codex_path=Path(r"C:\Windows\System32\timeout.exe"),
+        session_id=f"runner-unverified-{uuid4().hex}",
+        state_path=tmp_path / "missing-process-state.json",
+        journal_path=tmp_path / "private" / "unverified.jsonl",
+        artifact_references=(),
+        codex_home=codex_home,
+        timeout_seconds=0.001,
+    )
+
+
+async def _run_unverified_timeout(
+    runner: PowerShellCodexRunner,
+    tmp_path: Path,
+) -> CodexRunResult:
+    return await runner.run(
+        AuthorizedCodexRun(
+            workspace=tmp_path,
+            command=("codex", "exec", "--json", "harmless timeout test"),
+            environment=FrozenEnvironment({"PATH": "safe"}),
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_powershell_runner_timeout_with_missing_state_returns_unresolved_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    line = '{"type":"turn.started"}'
+    process = _UnverifiedTimeoutProcess(line)
+
+    async def create_process(*args: object, **kwargs: object) -> object:
+        return process
+
+    monkeypatch.setattr(
+        "agenten.execution.codex_supervisor.asyncio.create_subprocess_exec",
+        create_process,
+    )
+    result = await _run_unverified_timeout(
+        _unverified_timeout_runner(tmp_path),
+        tmp_path,
+    )
+
+    assert result.exit_code == 124
+    assert result.terminal_status == "timed_out"
+    assert result.process_cleanup_status == "unresolved"
+    assert result.jsonl_lines == (line,)
+
+
+@pytest.mark.asyncio
+async def test_powershell_runner_timeout_with_failed_verified_cancellation_returns_unresolved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _UnverifiedTimeoutProcess(None)
+    runner = _unverified_timeout_runner(tmp_path)
+    cancellation_attempted = False
+
+    async def create_process(*args: object, **kwargs: object) -> object:
+        return process
+
+    async def cancellation_fails() -> bool:
+        nonlocal cancellation_attempted
+        cancellation_attempted = True
+        return False
+
+    monkeypatch.setattr(
+        "agenten.execution.codex_supervisor.asyncio.create_subprocess_exec",
+        create_process,
+    )
+    monkeypatch.setattr(runner, "_cancel_timed_out_process", cancellation_fails)
+    result = await _run_unverified_timeout(runner, tmp_path)
+
+    assert cancellation_attempted is True
+    assert result.exit_code == 124
+    assert result.terminal_status == "timed_out"
+    assert result.process_cleanup_status == "unresolved"
+    assert result.jsonl_lines == ()
+
+
+@pytest.mark.asyncio
+async def test_powershell_runner_timeout_with_wrapper_cleanup_error_returns_unresolved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _BrokenCleanupProcess(None)
+
+    async def create_process(*args: object, **kwargs: object) -> object:
+        return process
+
+    monkeypatch.setattr(
+        "agenten.execution.codex_supervisor.asyncio.create_subprocess_exec",
+        create_process,
+    )
+    result = await _run_unverified_timeout(
+        _unverified_timeout_runner(tmp_path),
+        tmp_path,
+    )
+
+    assert result.exit_code == 124
+    assert result.terminal_status == "timed_out"
+    assert result.process_cleanup_status == "unresolved"
 
 
 
@@ -509,6 +656,7 @@ async def test_powershell_runner_bridges_authorized_run_to_real_launcher(
 
     assert result.exit_code != 0
     assert result.terminal_status == "failed"
+    assert result.process_cleanup_status == "not_required"
     assert result.artifact_references == ("artifact://sealed/runner-test",)
     assert result.jsonl_lines == ()
     assert 'ArgumentList.Add("--sandbox")' in Path(
@@ -628,6 +776,7 @@ async def test_powershell_runner_sets_a_scoped_codex_home_for_the_child(
     assert environment["CODEX_HOME"] == str(codex_home.resolve())
     assert result.exit_code == 0
     assert result.terminal_status == "succeeded"
+    assert result.process_cleanup_status == "not_required"
     assert result.journal_sha256 == EMPTY_SHA256
 
 
@@ -1107,6 +1256,7 @@ async def test_supervisor_terminalizes_infrastructure_when_event_append_fails(
                 return CodexRunResult(
                     exit_code=0,
                     terminal_status="succeeded",
+                    process_cleanup_status="not_required",
                     journal_path=tmp_path / "runner.jsonl",
                     journal_sha256=EMPTY_SHA256,
                     artifact_references=(),
@@ -1153,6 +1303,7 @@ async def test_supervisor_reports_unresolved_evidence_when_lifecycle_and_termina
                 return CodexRunResult(
                     exit_code=0,
                     terminal_status="succeeded",
+                    process_cleanup_status="not_required",
                     journal_path=tmp_path / "runner.jsonl",
                     journal_sha256=EMPTY_SHA256,
                     artifact_references=(),
@@ -1186,6 +1337,7 @@ async def test_supervisor_assigns_stable_source_sequence_to_each_jsonl_line(
                 return CodexRunResult(
                     exit_code=0,
                     terminal_status="succeeded",
+                    process_cleanup_status="not_required",
                     journal_path=tmp_path / "runner.jsonl",
                     journal_sha256=EMPTY_SHA256,
                     artifact_references=("artifact://sealed/sequence",),

@@ -27,15 +27,19 @@ from agenten.execution.process import PackageExecutionStatus
 def _codex_result(
     *,
     exit_code: int,
+    journal_path: Path,
     artifact_references: tuple[str, ...],
     jsonl_lines: tuple[str, ...],
 ) -> CodexRunResult:
     journal = b"".join(f"{line}\n".encode() for line in jsonl_lines)
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    journal_path.write_bytes(journal)
     terminal_status = "succeeded" if exit_code == 0 else "failed"
     return CodexRunResult(
         exit_code=exit_code,
         terminal_status=terminal_status,
-        journal_path=Path(".captain-cook/private/test-codex.jsonl"),
+        process_cleanup_status="not_required",
+        journal_path=journal_path.resolve(),
         journal_sha256=hashlib.sha256(journal).hexdigest(),
         artifact_references=artifact_references,
         jsonl_lines=jsonl_lines,
@@ -106,6 +110,7 @@ class RecordingRunner:
         self.env = authorized.child_environment()
         return _codex_result(
             exit_code=self.exit_code,
+            journal_path=authorized.workspace / ".captain-cook/private/recording.jsonl",
             artifact_references=self.artifacts,
             jsonl_lines=(),
         )
@@ -127,11 +132,11 @@ class BlockingRunner:
         self.release = asyncio.Event()
 
     async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
-        del authorized
         self.started.set()
         await self.release.wait()
         return _codex_result(
             exit_code=0,
+            journal_path=authorized.workspace / ".captain-cook/private/blocking.jsonl",
             artifact_references=("artifact://build/1",),
             jsonl_lines=(),
         )
@@ -415,6 +420,7 @@ async def test_authorized_jsonl_lifecycle_is_persisted_before_exit_evidence(
     runner = StreamingRunner(
         _codex_result(
             exit_code=0,
+            journal_path=workspace / ".captain-cook/private/streaming.jsonl",
             artifact_references=("artifact://build/1",),
             jsonl_lines=(
                 '{"type":"thread.started","thread_id":"thread-1"}',
@@ -429,6 +435,11 @@ async def test_authorized_jsonl_lifecycle_is_persisted_before_exit_evidence(
 
     assert result.status is PackageExecutionStatus.SUCCEEDED
     assert runner.authorized is authorized
+    expected_journal = b"".join(
+        f"{line}\n".encode() for line in runner.result.jsonl_lines
+    )
+    assert runner.result.journal_path.read_bytes() == expected_journal
+    assert runner.result.journal_sha256 == hashlib.sha256(expected_journal).hexdigest()
     assert [event[0] for event in gateway.events] == [
         "codex_session",
         "codex_process",
@@ -457,6 +468,7 @@ async def test_jsonl_warning_is_persisted_and_prevents_success_on_zero_exit(
         runner=StreamingRunner(
             _codex_result(
                 exit_code=0,
+                journal_path=workspace / ".captain-cook/private/malformed.jsonl",
                 artifact_references=("artifact://build/1",),
                 jsonl_lines=("{malformed",),
             )
@@ -490,6 +502,7 @@ async def test_failed_jsonl_lifecycle_prevents_success_without_persisting_messag
         runner=StreamingRunner(
             _codex_result(
                 exit_code=0,
+                journal_path=workspace / ".captain-cook/private/failed.jsonl",
                 artifact_references=("artifact://build/1",),
                 jsonl_lines=(
                     '{"type":"error","message":"untrusted-secret-text"}',
@@ -510,13 +523,15 @@ async def test_failed_jsonl_lifecycle_prevents_success_without_persisting_messag
     assert "untrusted-secret-text" not in event.model_dump_json()
 
 
-def test_run_result_is_frozen_and_strict() -> None:
+def test_run_result_is_frozen_and_strict(tmp_path: Path) -> None:
     result = _codex_result(
         exit_code=0,
+        journal_path=tmp_path / "private/test-codex.jsonl",
         artifact_references=("artifact://build/1",),
         jsonl_lines=(),
     )
 
+    assert result.journal_path.read_bytes() == b""
     with pytest.raises(ValidationError):
         result.exit_code = 1
     with pytest.raises(ValidationError):

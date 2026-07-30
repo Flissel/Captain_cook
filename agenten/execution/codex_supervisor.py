@@ -24,6 +24,11 @@ if TYPE_CHECKING:
 
 Identifier = str
 CodexRunTerminalStatus = Literal["succeeded", "failed", "timed_out", "cancelled"]
+CodexProcessCleanupStatus = Literal[
+    "not_required",
+    "verified_cancelled",
+    "unresolved",
+]
 
 
 class CodexRunRequest(BaseModel):
@@ -72,6 +77,7 @@ class CodexRunResult(BaseModel):
 
     exit_code: int
     terminal_status: CodexRunTerminalStatus
+    process_cleanup_status: CodexProcessCleanupStatus
     journal_path: Path
     journal_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     artifact_references: tuple[str, ...]
@@ -159,6 +165,7 @@ class PowerShellCodexRunner:
         assert process.stdout is not None
         assert process.stderr is not None
         timed_out = False
+        process_cleanup_status: CodexProcessCleanupStatus = "not_required"
         with self._journal_path.open("ab") as journal:
             stdout_reader = asyncio.create_task(
                 self._journal_stdout(process.stdout, journal)
@@ -171,21 +178,15 @@ class PowerShellCodexRunner:
                 )
             except TimeoutError:
                 timed_out = True
-                cancelled = await self._cancel_timed_out_process()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=10)
-                except TimeoutError:
-                    process.kill()
-                    await process.wait()
-                if not cancelled:
-                    if process.returncode is None:
-                        process.kill()
-                        await process.wait()
-                    raise RuntimeError(
-                        "Codex process exceeded timeout and tree cancellation failed"
-                    ) from None
+                cancelled = await self._attempt_verified_timeout_cancellation()
+                wrapper_stopped = await self._settle_timed_out_wrapper(process)
+                process_cleanup_status = (
+                    "verified_cancelled"
+                    if cancelled and wrapper_stopped
+                    else "unresolved"
+                )
             finally:
-                await asyncio.gather(stdout_reader, stderr_reader)
+                await self._finish_readers(stdout_reader, stderr_reader)
 
         journal_bytes = self._journal_path.read_bytes()
         exit_code = 124 if timed_out else process.returncode
@@ -200,6 +201,7 @@ class PowerShellCodexRunner:
         return CodexRunResult(
             exit_code=exit_code,
             terminal_status=terminal_status,
+            process_cleanup_status=process_cleanup_status,
             journal_path=self._journal_path,
             journal_sha256=hashlib.sha256(journal_bytes).hexdigest(),
             artifact_references=(
@@ -229,6 +231,46 @@ class PowerShellCodexRunner:
     async def _drain_stderr(stderr: asyncio.StreamReader) -> None:
         while await stderr.read(64 * 1024):
             pass
+
+    async def _attempt_verified_timeout_cancellation(self) -> bool:
+        try:
+            return await asyncio.wait_for(
+                self._cancel_timed_out_process(),
+                timeout=20,
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    async def _settle_timed_out_wrapper(
+        process: asyncio.subprocess.Process,
+    ) -> bool:
+        try:
+            await asyncio.wait_for(process.wait(), timeout=10)
+            return True
+        except TimeoutError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                return True
+            except Exception:
+                return False
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+                return True
+            except Exception:
+                return False
+        except Exception:
+            return False
+
+    @staticmethod
+    async def _finish_readers(*readers: asyncio.Task[None]) -> None:
+        try:
+            await asyncio.wait_for(asyncio.gather(*readers), timeout=5)
+        except Exception:
+            for reader in readers:
+                reader.cancel()
+            await asyncio.gather(*readers, return_exceptions=True)
 
 
 
