@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import re
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -19,6 +22,164 @@ from agenten.agent_factory.skill_workflow_contracts import (
     TeamEvaluationV1,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
+
+
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
+
+
+class FactoryRuntimeRetryAuthorizationV1(BaseModel):
+    """One successful Captain authority for one exact Codex continuation."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        populate_by_name=True,
+        strict=True,
+    )
+
+    schema_name: Literal["captain.factory-runtime-retry-authorization.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    authorization_ref: ArtifactRef
+    producer: Literal["captain"]
+    status: Literal["succeeded"]
+    job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    invocation_id: UUID
+    idempotency_key: str = Field(pattern=r"^[0-9a-f]{64}$")
+    lease_id: str = Field(min_length=1, max_length=200)
+    checkpoint_ref: ArtifactRef
+    terminal_receipt_ref: ArtifactRef
+    workspace_ref: str = Field(min_length=1, max_length=500)
+    base_revision: str
+    scaffold_manifest_sha256: str
+    brief_sha256: str
+    resume_ordinal: int = Field(ge=1, le=2, strict=True)
+    maximum_runtime_seconds: int = Field(ge=1, le=900, strict=True)
+    issued_at: datetime
+    expires_at: datetime
+
+    @field_validator("producer", mode="before")
+    @classmethod
+    def require_captain_producer(cls, value: object) -> object:
+        if value != "captain":
+            raise ValueError("runtime retry authority must be Captain-produced")
+        return value
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def require_successful_status(cls, value: object) -> object:
+        if value != "succeeded":
+            raise ValueError("runtime retry authority must be successful")
+        return value
+
+    @field_validator("base_revision")
+    @classmethod
+    def require_base_revision(cls, value: str) -> str:
+        if _REVISION_PATTERN.fullmatch(value) is None:
+            raise ValueError("base_revision must be a lowercase Git revision")
+        return value
+
+    @field_validator("scaffold_manifest_sha256", "brief_sha256")
+    @classmethod
+    def require_sha256(cls, value: str) -> str:
+        if _SHA256_PATTERN.fullmatch(value) is None:
+            raise ValueError("runtime retry binding must be a SHA-256 digest")
+        return value
+
+    @field_validator("issued_at", "expires_at")
+    @classmethod
+    def require_utc_timestamp(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("runtime retry timestamp must be UTC")
+        return value
+
+    @model_validator(mode="after")
+    def require_bounded_window(self) -> "FactoryRuntimeRetryAuthorizationV1":
+        if self.expires_at <= self.issued_at:
+            raise ValueError("runtime retry authority expiry must follow issuance")
+        return self
+
+
+def validate_factory_runtime_retry_authorization(
+    authorization: FactoryRuntimeRetryAuthorizationV1,
+    *,
+    job_id: UUID,
+    correlation_id: UUID,
+    subject_version: int,
+    attempt: int,
+    invocation_id: UUID,
+    idempotency_key: str,
+    lease_id: str,
+    checkpoint_ref: ArtifactRef,
+    terminal_receipt_ref: ArtifactRef,
+    workspace_ref: str,
+    base_revision: str,
+    scaffold_manifest_sha256: str,
+    brief_sha256: str,
+    current_resume_ordinal: int,
+    remaining_runtime_seconds: int,
+    now: datetime,
+) -> FactoryRuntimeRetryAuthorizationV1:
+    """Validate one authorization against the exact interrupted transition."""
+
+    if now.tzinfo is None or now.utcoffset() != timezone.utc.utcoffset(now):
+        raise ValueError("runtime retry validation time must be UTC")
+    identity = (
+        authorization.job_id,
+        authorization.correlation_id,
+        authorization.subject_version,
+        authorization.attempt,
+        authorization.invocation_id,
+        authorization.idempotency_key,
+        authorization.lease_id,
+    )
+    expected_identity = (
+        job_id,
+        correlation_id,
+        subject_version,
+        attempt,
+        invocation_id,
+        idempotency_key,
+        lease_id,
+    )
+    if identity != expected_identity:
+        raise ValueError("runtime retry authority binding does not match dispatch")
+    if authorization.checkpoint_ref != checkpoint_ref:
+        raise ValueError("runtime retry checkpoint binding does not match")
+    if authorization.terminal_receipt_ref != terminal_receipt_ref:
+        raise ValueError("runtime retry receipt binding does not match")
+    checkpoint_bindings = (
+        authorization.workspace_ref,
+        authorization.base_revision,
+        authorization.scaffold_manifest_sha256,
+        authorization.brief_sha256,
+    )
+    expected_checkpoint_bindings = (
+        workspace_ref,
+        base_revision,
+        scaffold_manifest_sha256,
+        brief_sha256,
+    )
+    if checkpoint_bindings != expected_checkpoint_bindings:
+        raise ValueError("runtime retry checkpoint immutable binding does not match")
+    if authorization.resume_ordinal != current_resume_ordinal + 1:
+        raise ValueError("runtime retry ordinal is stale or already used")
+    if now < authorization.issued_at:
+        raise ValueError("runtime retry authority is not active")
+    if now >= authorization.expires_at:
+        raise ValueError("runtime retry authority is expired")
+    if (
+        isinstance(remaining_runtime_seconds, bool)
+        or remaining_runtime_seconds < 1
+        or authorization.maximum_runtime_seconds > remaining_runtime_seconds
+    ):
+        raise ValueError("runtime retry maximum runtime exceeds remaining authority")
+    return authorization
 
 
 class FactoryImprovementAuthorizationV1(BaseModel):

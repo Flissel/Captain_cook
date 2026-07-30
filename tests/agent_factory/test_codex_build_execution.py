@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 
 from agenten.agent_factory.codex_build_execution import (
     CaptainCodexBuildSealer,
+    CaptainFactoryCodexResumeAuthorizer,
     CodexCliFactoryBuildExecutor,
     CodexCliFactoryBuildSettings,
     CompletedCodexBuild,
@@ -21,6 +23,7 @@ from agenten.agent_factory.codex_build_execution import (
 from agenten.agent_factory.codex_build_recovery import (
     FactoryCodexBuildCheckpointV1,
     FilesystemFactoryCodexBuildCheckpointStore,
+    canonical_factory_codex_model,
 )
 from agenten.agent_factory.codex_build_provenance import (
     CaptainCodexBuildReceiptIssuer,
@@ -28,6 +31,7 @@ from agenten.agent_factory.codex_build_provenance import (
 )
 from agenten.agent_factory.forge_contracts import ArtifactRef as ForgeArtifactRef
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
+from agenten.agent_factory.skill_sequence import FactoryRuntimeRetryAuthorizationV1
 from agenten.agent_factory.skill_workflow_contracts import (
     CodexBuildBriefV1,
     CodexBuildEvidenceV1,
@@ -224,6 +228,58 @@ def _dispatch(job, invocation: FactorySkillInvocationV1) -> FactoryDispatch:
         role=invocation.lease.role,
         lease=invocation.lease,
     )
+
+
+def _authorized_runtime_retry_dispatch(
+    dispatch: FactoryDispatch,
+    invocation: FactorySkillInvocationV1,
+    checkpoint: FactoryCodexBuildCheckpointV1,
+    *,
+    maximum_runtime_seconds: int = 60,
+) -> FactoryDispatch:
+    checkpoint_sha256 = hashlib.sha256(
+        canonical_factory_codex_model(checkpoint)
+    ).hexdigest()
+    assert checkpoint.terminal_receipt_sha256 is not None
+    authorization = FactoryRuntimeRetryAuthorizationV1(
+        schema_name="captain.factory-runtime-retry-authorization.v1",
+        authorization_ref=ArtifactRef(
+            uri=f"artifact://factory/runtime-retry/{'9' * 64}",
+            sha256="9" * 64,
+            media_type="application/json",
+        ),
+        producer="captain",
+        status="succeeded",
+        job_id=dispatch.job.job_id,
+        correlation_id=dispatch.job.correlation_id,
+        subject_version=dispatch.job.subject_version,
+        attempt=invocation.attempt,
+        invocation_id=invocation.invocation_id,
+        idempotency_key=invocation.idempotency_key,
+        lease_id=invocation.lease.lease_id,
+        checkpoint_ref=ArtifactRef(
+            uri=f"artifact://factory/codex-checkpoint/{checkpoint_sha256}",
+            sha256=checkpoint_sha256,
+            media_type="application/json",
+        ),
+        terminal_receipt_ref=ArtifactRef(
+            uri=(
+                "artifact://factory/codex-terminal-receipt/"
+                f"{checkpoint.terminal_receipt_sha256}"
+            ),
+            sha256=checkpoint.terminal_receipt_sha256,
+            media_type="application/json",
+        ),
+        workspace_ref=checkpoint.workspace_ref,
+        base_revision=checkpoint.base_revision,
+        scaffold_manifest_sha256=checkpoint.scaffold_manifest_sha256,
+        brief_sha256=checkpoint.brief_sha256,
+        resume_ordinal=checkpoint.resume_ordinal + 1,
+        maximum_runtime_seconds=maximum_runtime_seconds,
+        issued_at=NOW,
+        expires_at=NOW.replace(minute=NOW.minute + 2),
+    )
+    return replace(dispatch, runtime_retry_authorization=authorization)
 
 
 def _seed_git_repository(root: Path) -> Path:
@@ -860,12 +916,20 @@ async def test_interrupted_ordinary_redispatch_revalidates_workspace_and_never_r
 
     with pytest.raises(FactoryCodexBuildInterrupted, match="Captain-authorized"):
         await executor.execute(_dispatch(job, invocation), invocation, brief)
-    with pytest.raises(FactoryDispatchError, match="authorization decision"):
+    checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert checkpoint is not None
+    authorized_dispatch = _authorized_runtime_retry_dispatch(
+        _dispatch(job, invocation),
+        invocation,
+        checkpoint,
+    )
+    with pytest.raises(FactoryDispatchError, match="validator is not configured"):
         await executor.execute_authorized_resume(
-            _dispatch(job, invocation),
+            authorized_dispatch,
             invocation,
             brief,
-            authorization_decision=None,
         )
 
     assert len(runner_calls) == 1
@@ -1016,12 +1080,6 @@ async def test_authorized_resume_uses_next_ordinal_without_replacing_timeout_rec
             return TimedOutRunner(kwargs["journal_path"])
         return SuccessfulRunner(workspace, kwargs["journal_path"])
 
-    class ResumeAuthorizer:
-        def authorize_resume(self, *, decision, checkpoint) -> int:
-            assert decision == "captain-decision"
-            assert checkpoint.phase == "implementation_interrupted"
-            return 1
-
     executor = CodexCliFactoryBuildExecutor(
         settings=CodexCliFactoryBuildSettings(
             state_root=state_root,
@@ -1031,13 +1089,22 @@ async def test_authorized_resume_uses_next_ordinal_without_replacing_timeout_rec
         artifact_reader=artifact_reader,
         authorizer=RecordingAuthorizer(),
         runner_factory=runner_factory,
-        resume_authorizer=ResumeAuthorizer(),
+        resume_authorizer=CaptainFactoryCodexResumeAuthorizer(clock=lambda: NOW),
         clock=lambda: NOW,
     )
     dispatch = _dispatch(job, invocation)
 
     with pytest.raises(FactoryCodexBuildInterrupted):
         await executor.execute(dispatch, invocation, brief)
+    checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert checkpoint is not None
+    authorized_dispatch = _authorized_runtime_retry_dispatch(
+        dispatch,
+        invocation,
+        checkpoint,
+    )
     timeout_receipt = (
         state_root / "sessions" / f"{invocation.idempotency_key}.json"
     ).read_bytes()
@@ -1055,15 +1122,14 @@ async def test_authorized_resume_uses_next_ordinal_without_replacing_timeout_rec
         artifact_reader=artifact_reader,
         authorizer=RejectingAuthorizer(),
         runner_factory=runner_factory,
-        resume_authorizer=ResumeAuthorizer(),
+        resume_authorizer=CaptainFactoryCodexResumeAuthorizer(clock=lambda: NOW),
         clock=lambda: NOW,
     )
     with pytest.raises(FactoryDispatchError, match="execution policy rejected"):
         await rejecting_executor.execute_authorized_resume(
-            dispatch,
+            authorized_dispatch,
             invocation,
             brief,
-            authorization_decision="captain-decision",
         )
     still_interrupted = FilesystemFactoryCodexBuildCheckpointStore(
         state_root / "checkpoints"
@@ -1072,10 +1138,9 @@ async def test_authorized_resume_uses_next_ordinal_without_replacing_timeout_rec
     assert still_interrupted.phase == "implementation_interrupted"
 
     completed = await executor.execute_authorized_resume(
-        dispatch,
+        authorized_dispatch,
         invocation,
         brief,
-        authorization_decision="captain-decision",
     )
 
     checkpoint = FilesystemFactoryCodexBuildCheckpointStore(

@@ -60,6 +60,7 @@ from agenten.agent_factory.orchestration import (
     FactoryDispatchError,
     FactoryDispatcher,
     FactoryImprovementAuthorizationPort,
+    FactoryRuntimeRetryAuthorizationPort,
     MinibookForgePort,
 )
 from agenten.agent_factory.production_dispatch_runner import (
@@ -400,6 +401,7 @@ class AgentFactoryLiveComposition:
     dispatcher: FactoryDispatcher
     runner: ProductionFactoryDispatchRunner
     improvement_authority: FactoryImprovementAuthorizationPort
+    runtime_retry_authority: FactoryRuntimeRetryAuthorizationPort | None
 
     async def run(
         self,
@@ -428,6 +430,7 @@ def compose_agent_factory_live(
     n8n_work_batches: Mapping[UUID, str] | None = None,
     holdout_selector: Callable[[AgentFactoryJobV3], PrivateHoldoutRef] | None = None,
     improvements: FactoryImprovementAuthorizationPort | None = None,
+    runtime_retries: FactoryRuntimeRetryAuthorizationPort | None = None,
     codex_build_sealer: CaptainCodexBuildSealerPort | None = None,
     codex_prompt_artifact_store: CodexPromptArtifactStore | None = None,
 ) -> AgentFactoryLiveComposition:
@@ -500,6 +503,7 @@ def compose_agent_factory_live(
         leases=lease_issuer,
         clock=_CallableFactoryClock(clock),
         improvements=improvement_authority,
+        runtime_retries=runtime_retries,
     )
     runner = ProductionFactoryDispatchRunner(
         coordinator=coordinator,
@@ -517,6 +521,7 @@ def compose_agent_factory_live(
         dispatcher=dispatcher,
         runner=runner,
         improvement_authority=improvement_authority,
+        runtime_retry_authority=runtime_retries,
     )
 
 

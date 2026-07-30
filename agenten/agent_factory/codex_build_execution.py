@@ -29,6 +29,10 @@ from agenten.agent_factory.codex_build_recovery import (
 )
 from agenten.agent_factory.contracts import AgentFactoryJobV3
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
+from agenten.agent_factory.skill_sequence import (
+    FactoryRuntimeRetryAuthorizationV1,
+    validate_factory_runtime_retry_authorization,
+)
 from agenten.agent_factory.skill_workflow_contracts import (
     CodexBuildBriefV1,
     CodexBuildEvidenceV1,
@@ -71,13 +75,40 @@ class FactoryCodexBuildInterrupted(FactoryDispatchError):
         self,
         message: str,
         *,
-        checkpoint: FactoryCodexBuildCheckpointV1,
-        terminal_receipt_path: Path,
+        checkpoint_ref: ArtifactRef,
+        terminal_receipt_ref: ArtifactRef,
+        resume_ordinal: int,
     ) -> None:
         super().__init__(message)
-        self.checkpoint = checkpoint
-        self.terminal_receipt_path = terminal_receipt_path
-        self.terminal_receipt_sha256 = checkpoint.terminal_receipt_sha256
+        if isinstance(resume_ordinal, bool) or not 0 <= resume_ordinal <= 2:
+            raise ValueError("Factory Codex interruption ordinal is invalid")
+        self.checkpoint_ref = checkpoint_ref
+        self.terminal_receipt_ref = terminal_receipt_ref
+        self.resume_ordinal = resume_ordinal
+
+
+def _interruption_references(
+    checkpoint: FactoryCodexBuildCheckpointV1,
+) -> dict[str, object]:
+    receipt_sha256 = checkpoint.terminal_receipt_sha256
+    if checkpoint.phase != "implementation_interrupted" or receipt_sha256 is None:
+        raise FactoryDispatchError("Factory Codex interruption checkpoint is invalid")
+    checkpoint_sha256 = hashlib.sha256(
+        canonical_factory_codex_model(checkpoint)
+    ).hexdigest()
+    return {
+        "checkpoint_ref": ArtifactRef(
+            uri=f"artifact://factory/codex-checkpoint/{checkpoint_sha256}",
+            sha256=checkpoint_sha256,
+            media_type="application/json",
+        ),
+        "terminal_receipt_ref": ArtifactRef(
+            uri=f"artifact://factory/codex-terminal-receipt/{receipt_sha256}",
+            sha256=receipt_sha256,
+            media_type="application/json",
+        ),
+        "resume_ordinal": checkpoint.resume_ordinal,
+    }
 
 
 @dataclass(frozen=True)
@@ -102,6 +133,19 @@ class CodexCliFactoryBuildSettings:
 
 class CaptainCodexBuildExecutorPort(Protocol):
     async def execute(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+    ) -> CompletedCodexBuild: ...
+
+    def validate_authorized_resume(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+    ) -> FactoryRuntimeRetryAuthorizationV1: ...
+
+    async def execute_authorized_resume(
         self,
         request: FactoryDispatch,
         invocation: FactorySkillInvocationV1,
@@ -134,10 +178,56 @@ class FactoryCodexWorkspacePreparerPort(Protocol):
 class FactoryCodexResumeAuthorizerPort(Protocol):
     def authorize_resume(
         self,
-        *,
-        decision: object,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
         checkpoint: FactoryCodexBuildCheckpointV1,
     ) -> int: ...
+
+
+class CaptainFactoryCodexResumeAuthorizer:
+    """Validate already-issued Captain authority; never mint retry evidence."""
+
+    def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def authorize_resume(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        checkpoint: FactoryCodexBuildCheckpointV1,
+    ) -> int:
+        authorization = request.runtime_retry_authorization
+        if authorization is None:
+            raise FactoryDispatchError(
+                "Factory Codex resume requires Captain runtime retry authority"
+            )
+        references = _interruption_references(checkpoint)
+        authority_deadline = min(invocation.lease.expires_at, request.job.deadline_at)
+        now = self._clock()
+        remaining_seconds = int((authority_deadline - now).total_seconds())
+        try:
+            validate_factory_runtime_retry_authorization(
+                authorization,
+                job_id=request.job.job_id,
+                correlation_id=request.job.correlation_id,
+                subject_version=request.job.subject_version,
+                attempt=invocation.attempt,
+                invocation_id=invocation.invocation_id,
+                idempotency_key=invocation.idempotency_key,
+                lease_id=invocation.lease.lease_id,
+                checkpoint_ref=references["checkpoint_ref"],
+                terminal_receipt_ref=references["terminal_receipt_ref"],
+                workspace_ref=checkpoint.workspace_ref,
+                base_revision=checkpoint.base_revision,
+                scaffold_manifest_sha256=checkpoint.scaffold_manifest_sha256,
+                brief_sha256=checkpoint.brief_sha256,
+                current_resume_ordinal=checkpoint.resume_ordinal,
+                remaining_runtime_seconds=remaining_seconds,
+                now=now,
+            )
+        except ValueError as exc:
+            raise FactoryDispatchError("Factory Codex runtime retry authority is invalid") from exc
+        return authorization.resume_ordinal
 
 
 class FactoryBuildArtifactReaderPort(Protocol):
@@ -171,6 +261,13 @@ class CaptainCodexBuildSealer:
         self._executor = executor
         self._issuer = issuer
 
+    def validate_runtime_retry(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+    ) -> FactoryRuntimeRetryAuthorizationV1:
+        return self._executor.validate_authorized_resume(request, invocation)
+
     async def seal(
         self,
         request: FactoryDispatch,
@@ -188,7 +285,14 @@ class CaptainCodexBuildSealer:
         replay = self._executor.replay_sealed(invocation)
         if replay is not None:
             return replay
-        completed = await self._executor.execute(request, invocation, brief)
+        if request.runtime_retry_authorization is None:
+            completed = await self._executor.execute(request, invocation, brief)
+        else:
+            completed = await self._executor.execute_authorized_resume(
+                request,
+                invocation,
+                brief,
+            )
         receipt = self._issuer.issue(
             job=request.job,
             build_brief=brief,
@@ -421,24 +525,11 @@ class CodexCliFactoryBuildExecutor:
         request: FactoryDispatch,
         invocation: FactorySkillInvocationV1,
         brief: CodexBuildBriefV1,
-        *,
-        authorization_decision: object | None,
     ) -> CompletedCodexBuild:
-        if authorization_decision is None:
-            raise FactoryDispatchError(
-                "Factory Codex resume requires an authorization decision"
-            )
-        if self._resume_authorizer is None:
-            raise FactoryDispatchError(
-                "Factory Codex resume authorization validator is not configured"
-            )
+        authorization = self.validate_authorized_resume(request, invocation)
+        resume_ordinal = authorization.resume_ordinal
         checkpoint = self._checkpoint_store.load(invocation)
-        if checkpoint is None or checkpoint.phase != "implementation_interrupted":
-            raise FactoryDispatchError("Factory Codex build is not interrupted")
-        resume_ordinal = self._resume_authorizer.authorize_resume(
-            decision=authorization_decision,
-            checkpoint=checkpoint,
-        )
+        assert checkpoint is not None
         if (
             not isinstance(resume_ordinal, int)
             or isinstance(resume_ordinal, bool)
@@ -453,6 +544,34 @@ class CodexCliFactoryBuildExecutor:
             brief,
             authorized_resume_ordinal=resume_ordinal,
         )
+
+    def validate_authorized_resume(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+    ) -> FactoryRuntimeRetryAuthorizationV1:
+        if self._resume_authorizer is None:
+            raise FactoryDispatchError(
+                "Factory Codex resume authorization validator is not configured"
+            )
+        checkpoint = self._checkpoint_store.load(invocation)
+        if checkpoint is None or checkpoint.phase != "implementation_interrupted":
+            raise FactoryDispatchError("Factory Codex build is not interrupted")
+        resume_ordinal = self._resume_authorizer.authorize_resume(
+            request,
+            invocation,
+            checkpoint,
+        )
+        authorization = request.runtime_retry_authorization
+        if authorization is None:
+            raise FactoryDispatchError(
+                "Factory Codex resume requires Captain runtime retry authority"
+            )
+        if resume_ordinal != authorization.resume_ordinal:
+            raise FactoryDispatchError(
+                "Factory Codex resume authorization decision is invalid"
+            )
+        return authorization
 
     async def _execute(
         self,
@@ -476,6 +595,16 @@ class CodexCliFactoryBuildExecutor:
             self._settings.maximum_runtime_seconds,
             max(1, int(remaining_seconds)),
         )
+        if authorized_resume_ordinal is not None:
+            authorization = request.runtime_retry_authorization
+            if authorization is None:
+                raise FactoryDispatchError(
+                    "Factory Codex resume requires Captain runtime retry authority"
+                )
+            runtime_seconds = min(
+                runtime_seconds,
+                authorization.maximum_runtime_seconds,
+            )
         checkpoint = self._checkpoint_store.load(invocation)
         if checkpoint is None:
             scaffold_files = self._scaffold_files(request, brief)
@@ -535,10 +664,7 @@ class CodexCliFactoryBuildExecutor:
                 if authorized_resume_ordinal is None:
                     raise FactoryCodexBuildInterrupted(
                         "Factory Codex implementation requires Captain-authorized resume",
-                        checkpoint=checkpoint,
-                        terminal_receipt_path=self._session_receipt_path(
-                            invocation, checkpoint.resume_ordinal
-                        ),
+                        **_interruption_references(checkpoint),
                     )
                 run_request = self._run_request(request, invocation, brief, prepared)
                 authorized = self._authorizer.authorize(run_request)
@@ -699,14 +825,12 @@ class CodexCliFactoryBuildExecutor:
         if result.terminal_status == "timed_out":
             raise FactoryCodexBuildInterrupted(
                 f"Codex build process timed out (exit {result.exit_code})",
-                checkpoint=interrupted,
-                terminal_receipt_path=receipt_path,
+                **_interruption_references(interrupted),
             )
         if result.terminal_status == "cancelled":
             raise FactoryCodexBuildInterrupted(
                 f"Codex build process was cancelled (exit {result.exit_code})",
-                checkpoint=interrupted,
-                terminal_receipt_path=receipt_path,
+                **_interruption_references(interrupted),
             )
         if result.exit_code != 0:
             raise FactoryDispatchError(

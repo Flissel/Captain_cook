@@ -34,6 +34,7 @@ from agenten.agent_factory.business_benchmark_production_ports import (
 from agenten.agent_factory.candidate_evaluation import GatewayForgeCandidateProvider
 from agenten.agent_factory.codex_build_execution import (
     CaptainCodexBuildSealer,
+    CaptainFactoryCodexResumeAuthorizer,
     CodexCliFactoryBuildExecutor,
     CodexCliFactoryBuildSettings,
     GitDetachedFactoryWorkspacePreparer,
@@ -280,6 +281,9 @@ def compose_business_demo_factory_operator(
             ),
             sealed_evidence_store=FilesystemFactoryCodexSealedEvidenceStore(
                 codex_state_root / "sealed-evidence"
+            ),
+            resume_authorizer=CaptainFactoryCodexResumeAuthorizer(
+                clock=current_time
             ),
             clock=current_time,
         ),

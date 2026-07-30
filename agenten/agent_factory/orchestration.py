@@ -29,7 +29,10 @@ from agenten.agent_factory.skill_evaluation import (
     ToolGapMarker,
     required_tool_gaps,
 )
-from agenten.agent_factory.skill_sequence import FactoryImprovementAuthorizationV1
+from agenten.agent_factory.skill_sequence import (
+    FactoryImprovementAuthorizationV1,
+    FactoryRuntimeRetryAuthorizationV1,
+)
 from agenten.agent_factory.state_machine import (
     FactoryAction,
     FactoryActionKind,
@@ -64,6 +67,7 @@ class FactoryDispatch:
     role: FactoryRole | None
     lease: FactoryLease | None
     improvement_authorization: FactoryImprovementAuthorizationV1 | None = None
+    runtime_retry_authorization: FactoryRuntimeRetryAuthorizationV1 | None = None
 
 
 class FactoryClock(Protocol):
@@ -78,6 +82,18 @@ class FactoryImprovementAuthorizationPort(Protocol):
         projection: FactoryProjection,
         now: datetime,
     ) -> FactoryImprovementAuthorizationV1: ...
+
+
+class FactoryRuntimeRetryAuthorizationPort(Protocol):
+    """Look up already-issued Captain authority; never create it in composition."""
+
+    def active(
+        self,
+        job: FactoryJob,
+        action: FactoryAction,
+        projection: FactoryProjection,
+        now: datetime,
+    ) -> FactoryRuntimeRetryAuthorizationV1 | None: ...
 
 
 class HermesFactoryPort(Protocol):
@@ -532,6 +548,7 @@ class FactoryDispatcher:
         leases: FactoryLeasePort,
         clock: FactoryClock,
         improvements: FactoryImprovementAuthorizationPort | None = None,
+        runtime_retries: FactoryRuntimeRetryAuthorizationPort | None = None,
     ) -> None:
         self._coordinator = coordinator
         self._hermes = hermes
@@ -541,6 +558,7 @@ class FactoryDispatcher:
         self._leases = leases
         self._clock = clock
         self._improvements = improvements
+        self._runtime_retries = runtime_retries
 
     @property
     def lease_authority(self) -> FactoryLeasePort:
@@ -556,6 +574,7 @@ class FactoryDispatcher:
             role = _ROLE_ACTIONS[action.kind]
             now = self._clock.now()
             improvement_authorization = None
+            runtime_retry_authorization = None
             if role is FactoryRole.TOOL_INTEGRATOR and action.attempt > 1:
                 if self._improvements is None:
                     raise FactoryDispatchError(
@@ -567,12 +586,20 @@ class FactoryDispatcher:
                     projection,
                     now,
                 )
+            if role is FactoryRole.TOOL_INTEGRATOR and self._runtime_retries is not None:
+                runtime_retry_authorization = self._runtime_retries.active(
+                    job,
+                    action,
+                    projection,
+                    now,
+                )
             request = FactoryDispatch(
                 job=job,
                 action=action,
                 role=role,
                 lease=self._leases.active(job, role, action.attempt, now),
                 improvement_authorization=improvement_authorization,
+                runtime_retry_authorization=runtime_retry_authorization,
             )
             if action.kind is FactoryActionKind.DISPATCH_BUILD_VALIDATOR:
                 if self._candidate_validator is None:

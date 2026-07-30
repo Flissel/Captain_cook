@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Literal, Protocol, get_args
+from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, Protocol, get_args
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -32,6 +32,7 @@ from agenten.agent_factory.codex_brief import (
     CodexBriefBuilder,
     CodexPromptArtifactStore,
 )
+from agenten.agent_factory.codex_build_execution import FactoryCodexBuildInterrupted
 from agenten.agent_factory.evidence_store import FactoryEvidenceStore, FilesystemFactoryEvidenceStore
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError, HermesFactoryPort
 from agenten.agent_factory.skill_evaluation import (
@@ -42,6 +43,7 @@ from agenten.agent_factory.skill_evaluation import (
 )
 from agenten.agent_factory.skill_sequence import (
     FactoryImprovementAuthorizationV1,
+    FactoryRuntimeRetryAuthorizationV1,
     SkillSequencePolicy,
 )
 from agenten.agent_factory.skill_store import reject_sensitive_data
@@ -151,6 +153,12 @@ class CaptainCodexBuildSealerPort(Protocol):
         brief: CodexBuildBriefV1,
     ) -> CodexBuildEvidenceV1: ...
 
+    def validate_runtime_retry(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+    ) -> FactoryRuntimeRetryAuthorizationV1: ...
+
 
 class FilesystemReleasedFactorySkillCatalog:
     """Load Captain release envelopes from an exact job/step catalog path."""
@@ -259,7 +267,28 @@ class HermesCliFactory(HermesFactoryPort):
             _validate_serialized_prompt_value(
                 invocation.model_dump(mode="json", by_alias=True)
             )
-            claim = await self._replay_store.claim(invocation)
+            try:
+                claim = await self._replay_store.claim(invocation)
+            except FactorySkillReplayInterruptedError as interrupted:
+                authorization = request.runtime_retry_authorization
+                if (
+                    step is not FactorySkillStep.SEAL_CODEX_BUILD
+                    or authorization is None
+                    or self._codex_build_sealer is None
+                ):
+                    raise
+                validated = self._codex_build_sealer.validate_runtime_retry(
+                    request,
+                    invocation,
+                )
+                if validated is not authorization:
+                    raise FactoryDispatchError(
+                        "Captain Codex runtime retry validation changed authority"
+                    )
+                claim = await self._replay_store.resume(
+                    interrupted.record,
+                    authorization=validated,
+                )
             if not claim.acquired:
                 accepted = claim.record
                 assert accepted.artifact is not None
@@ -379,6 +408,19 @@ class HermesCliFactory(HermesFactoryPort):
                         failure_kind="cancelled",
                     )
                 )
+                raise
+            except FactoryCodexBuildInterrupted as exc:
+                try:
+                    await self._replay_store.interrupt(
+                        claim.record,
+                        checkpoint_ref=exc.checkpoint_ref,
+                        terminal_receipt_ref=exc.terminal_receipt_ref,
+                        resume_ordinal=exc.resume_ordinal,
+                    )
+                except Exception as replay_exc:
+                    raise FactoryDispatchError(
+                        "factory skill interruption state could not be persisted"
+                    ) from replay_exc
                 raise
             except Exception as exc:
                 try:
@@ -672,38 +714,71 @@ class FactorySkillReplayPendingError(FactoryDispatchError):
         self.record = record
 
 
+class FactorySkillReplayInterruptedError(FactoryDispatchError):
+    """An exact Codex seal is durable and awaits Captain retry authority."""
+
+    def __init__(self, record: "FactorySkillReplayRecord") -> None:
+        super().__init__(
+            "factory skill replay is interrupted and requires authorization"
+        )
+        self.record = record
+
+
 @dataclass(frozen=True)
 class FactorySkillReplayRecord:
     invocation: FactorySkillInvocationV1
     invocation_sha256: str
     claim_token: str
-    state: Literal["pending", "completed", "failed"]
+    state: Literal["pending", "completed", "failed", "interrupted"]
     artifact: _FactoryWorkflowArtifact | None = None
     transcript_ref: ArtifactRef | None = None
     failure_kind: str | None = None
+    checkpoint_ref: ArtifactRef | None = None
+    terminal_receipt_ref: ArtifactRef | None = None
+    resume_ordinal: int = 0
 
     def __post_init__(self) -> None:
         if self.invocation_sha256 != _factory_invocation_digest(self.invocation):
             raise FactoryDispatchError("factory skill replay invocation digest conflicts")
         if not self.claim_token:
             raise FactoryDispatchError("factory skill replay claim token is missing")
+        if isinstance(self.resume_ordinal, bool) or not 0 <= self.resume_ordinal <= 2:
+            raise FactoryDispatchError("factory skill replay resume ordinal is invalid")
         if self.state == "pending" and any(
             item is not None
-            for item in (self.artifact, self.transcript_ref, self.failure_kind)
+            for item in (
+                self.artifact,
+                self.transcript_ref,
+                self.failure_kind,
+                self.checkpoint_ref,
+                self.terminal_receipt_ref,
+            )
         ):
             raise FactoryDispatchError("pending factory skill replay contains an outcome")
         if self.state == "completed" and (
             self.artifact is None
             or self.transcript_ref is None
             or self.failure_kind is not None
+            or self.checkpoint_ref is not None
+            or self.terminal_receipt_ref is not None
         ):
             raise FactoryDispatchError("completed factory skill replay is incomplete")
         if self.state == "failed" and (
             self.artifact is not None
             or self.transcript_ref is not None
             or self.failure_kind is None
+            or self.checkpoint_ref is not None
+            or self.terminal_receipt_ref is not None
         ):
             raise FactoryDispatchError("failed factory skill replay is incomplete")
+        if self.state == "interrupted" and (
+            self.artifact is not None
+            or self.transcript_ref is not None
+            or self.failure_kind != "codex_runtime_interrupted"
+            or self.checkpoint_ref is None
+            or self.terminal_receipt_ref is None
+        ):
+            raise FactoryDispatchError("interrupted factory skill replay is incomplete")
         if self.artifact is not None and self.artifact.invocation != self.invocation:
             raise FactoryDispatchError(
                 "factory skill replay artifact conflicts with its invocation"
@@ -744,6 +819,22 @@ class FactorySkillReplayStore(Protocol):
         *,
         failure_kind: str,
     ) -> FactorySkillReplayRecord: ...
+
+    async def interrupt(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        checkpoint_ref: ArtifactRef,
+        terminal_receipt_ref: ArtifactRef,
+        resume_ordinal: int,
+    ) -> FactorySkillReplayRecord: ...
+
+    async def resume(
+        self,
+        interrupted: FactorySkillReplayRecord,
+        *,
+        authorization: FactoryRuntimeRetryAuthorizationV1,
+    ) -> FactorySkillReplayClaim: ...
 
     async def abandon(self, pending: FactorySkillReplayRecord) -> None: ...
 
@@ -808,6 +899,38 @@ class InMemoryFactorySkillReplayStore:
             pending,
             _failed_replay_record(pending, failure_kind=failure_kind),
         )
+
+    async def interrupt(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        checkpoint_ref: ArtifactRef,
+        terminal_receipt_ref: ArtifactRef,
+        resume_ordinal: int,
+    ) -> FactorySkillReplayRecord:
+        return await self._transition(
+            pending,
+            _interrupted_replay_record(
+                pending,
+                checkpoint_ref=checkpoint_ref,
+                terminal_receipt_ref=terminal_receipt_ref,
+                resume_ordinal=resume_ordinal,
+            ),
+        )
+
+    async def resume(
+        self,
+        interrupted: FactorySkillReplayRecord,
+        *,
+        authorization: FactoryRuntimeRetryAuthorizationV1,
+    ) -> FactorySkillReplayClaim:
+        resumed = _resumed_replay_record(interrupted, authorization=authorization)
+        async with self._lock:
+            existing = self._records.get(interrupted.invocation.idempotency_key)
+            if existing != interrupted or existing.state != "interrupted":
+                raise FactoryDispatchError("factory skill replay is no longer interrupted")
+            self._records[interrupted.invocation.idempotency_key] = resumed
+        return FactorySkillReplayClaim(record=resumed, acquired=True)
 
     async def abandon(self, pending: FactorySkillReplayRecord) -> None:
         async with self._lock:
@@ -899,6 +1022,40 @@ class FilesystemFactorySkillReplayStore:
             _failed_replay_record(pending, failure_kind=failure_kind),
         )
 
+    async def interrupt(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        checkpoint_ref: ArtifactRef,
+        terminal_receipt_ref: ArtifactRef,
+        resume_ordinal: int,
+    ) -> FactorySkillReplayRecord:
+        return await self._transition(
+            pending,
+            _interrupted_replay_record(
+                pending,
+                checkpoint_ref=checkpoint_ref,
+                terminal_receipt_ref=terminal_receipt_ref,
+                resume_ordinal=resume_ordinal,
+            ),
+        )
+
+    async def resume(
+        self,
+        interrupted: FactorySkillReplayRecord,
+        *,
+        authorization: FactoryRuntimeRetryAuthorizationV1,
+    ) -> FactorySkillReplayClaim:
+        resumed = _resumed_replay_record(interrupted, authorization=authorization)
+        path = self._path_for(interrupted.invocation.idempotency_key)
+        await asyncio.to_thread(
+            self._replace_interrupted,
+            path,
+            interrupted,
+            resumed,
+        )
+        return FactorySkillReplayClaim(record=resumed, acquired=True)
+
     async def abandon(self, pending: FactorySkillReplayRecord) -> None:
         path = self._path_for(pending.invocation.idempotency_key)
         await asyncio.to_thread(self._remove_pending, path, pending)
@@ -944,22 +1101,102 @@ class FilesystemFactorySkillReplayStore:
         pending: FactorySkillReplayRecord,
         outcome: FactorySkillReplayRecord,
     ) -> None:
-        if cls._read_record(path) != pending:
-            raise FactoryDispatchError("factory skill replay claim is no longer pending")
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
+        cls._replace_exact(
+            path,
+            pending,
+            outcome,
+            expected_state="pending",
+            diagnostic="factory skill replay claim is no longer pending",
         )
-        temporary = Path(temporary_name)
+
+    @classmethod
+    def _replace_interrupted(
+        cls,
+        path: Path,
+        interrupted: FactorySkillReplayRecord,
+        resumed: FactorySkillReplayRecord,
+    ) -> None:
+        cls._replace_exact(
+            path,
+            interrupted,
+            resumed,
+            expected_state="interrupted",
+            diagnostic="factory skill replay is no longer interrupted",
+        )
+
+    @classmethod
+    def _replace_exact(
+        cls,
+        path: Path,
+        expected: FactorySkillReplayRecord,
+        outcome: FactorySkillReplayRecord,
+        *,
+        expected_state: Literal["pending", "interrupted"],
+        diagnostic: str,
+    ) -> None:
+        lock = cls._acquire_file_lock(path.with_suffix(".lock"))
+        temporary: Path | None = None
         try:
+            if cls._read_record(path) != expected or expected.state != expected_state:
+                raise FactoryDispatchError(diagnostic)
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+            )
+            temporary = Path(temporary_name)
             with os.fdopen(descriptor, "wb") as handle:
                 handle.write(_factory_skill_replay_content(outcome))
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, path)
         finally:
-            temporary.unlink(missing_ok=True)
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            cls._release_file_lock(lock)
+
+    @staticmethod
+    def _acquire_file_lock(path: Path) -> BinaryIO:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a+b")
+        try:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                while True:
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        time.sleep(0.01)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            return handle
+        except BaseException:
+            handle.close()
+            raise
+
+    @staticmethod
+    def _release_file_lock(handle: BinaryIO) -> None:
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
     @classmethod
     def _remove_pending(
@@ -977,8 +1214,16 @@ class FilesystemFactorySkillReplayStore:
             value = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(value, dict):
                 raise ValueError("replay record must be an object")
+            schema = value.get("schema")
+            if schema not in {
+                "captain.factory-skill-replay.v2",
+                "captain.factory-skill-replay.v3",
+            }:
+                raise ValueError("replay record schema is unsupported")
             invocation = FactorySkillInvocationV1.model_validate(value["invocation"])
             state = value["state"]
+            if schema == "captain.factory-skill-replay.v2" and state == "interrupted":
+                raise ValueError("v2 replay records cannot be interrupted")
             artifact = None
             transcript_ref = None
             if state == "completed":
@@ -993,6 +1238,17 @@ class FilesystemFactorySkillReplayStore:
                 artifact=artifact,
                 transcript_ref=transcript_ref,
                 failure_kind=value.get("failure_kind"),
+                checkpoint_ref=(
+                    ArtifactRef.model_validate(value["checkpoint_ref"])
+                    if value.get("checkpoint_ref") is not None
+                    else None
+                ),
+                terminal_receipt_ref=(
+                    ArtifactRef.model_validate(value["terminal_receipt_ref"])
+                    if value.get("terminal_receipt_ref") is not None
+                    else None
+                ),
+                resume_ordinal=value.get("resume_ordinal", 0),
             )
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise FactoryDispatchError("factory skill replay record is invalid") from exc
@@ -1001,7 +1257,7 @@ class FilesystemFactorySkillReplayStore:
 def _factory_skill_replay_content(record: FactorySkillReplayRecord) -> bytes:
     return _canonical_json(
         {
-            "schema": "captain.factory-skill-replay.v2",
+            "schema": "captain.factory-skill-replay.v3",
             "state": record.state,
             "invocation_sha256": record.invocation_sha256,
             "claim_token": record.claim_token,
@@ -1017,6 +1273,17 @@ def _factory_skill_replay_content(record: FactorySkillReplayRecord) -> bytes:
                 else record.transcript_ref.model_dump(mode="json")
             ),
             "failure_kind": record.failure_kind,
+            "checkpoint_ref": (
+                None
+                if record.checkpoint_ref is None
+                else record.checkpoint_ref.model_dump(mode="json")
+            ),
+            "terminal_receipt_ref": (
+                None
+                if record.terminal_receipt_ref is None
+                else record.terminal_receipt_ref.model_dump(mode="json")
+            ),
+            "resume_ordinal": record.resume_ordinal,
         }
     ).encode("utf-8")
 
@@ -1052,6 +1319,7 @@ def _completed_replay_record(
         state="completed",
         artifact=artifact,
         transcript_ref=transcript_ref,
+        resume_ordinal=pending.resume_ordinal,
     )
 
 
@@ -1070,6 +1338,62 @@ def _failed_replay_record(
         claim_token=pending.claim_token,
         state="failed",
         failure_kind=failure_kind,
+        resume_ordinal=pending.resume_ordinal,
+    )
+
+
+def _interrupted_replay_record(
+    pending: FactorySkillReplayRecord,
+    *,
+    checkpoint_ref: ArtifactRef,
+    terminal_receipt_ref: ArtifactRef,
+    resume_ordinal: int,
+) -> FactorySkillReplayRecord:
+    if pending.state != "pending":
+        raise FactoryDispatchError("factory skill replay claim is no longer pending")
+    if resume_ordinal != pending.resume_ordinal:
+        raise FactoryDispatchError("factory skill replay interruption ordinal conflicts")
+    return FactorySkillReplayRecord(
+        invocation=pending.invocation,
+        invocation_sha256=pending.invocation_sha256,
+        claim_token=pending.claim_token,
+        state="interrupted",
+        failure_kind="codex_runtime_interrupted",
+        checkpoint_ref=checkpoint_ref,
+        terminal_receipt_ref=terminal_receipt_ref,
+        resume_ordinal=resume_ordinal,
+    )
+
+
+def _resumed_replay_record(
+    interrupted: FactorySkillReplayRecord,
+    *,
+    authorization: FactoryRuntimeRetryAuthorizationV1,
+) -> FactorySkillReplayRecord:
+    invocation = interrupted.invocation
+    if interrupted.state != "interrupted":
+        raise FactoryDispatchError("factory skill replay is no longer interrupted")
+    if (
+        authorization.job_id != invocation.job_id
+        or authorization.correlation_id != invocation.correlation_id
+        or authorization.subject_version != invocation.subject_version
+        or authorization.attempt != invocation.attempt
+        or authorization.invocation_id != invocation.invocation_id
+        or authorization.idempotency_key != invocation.idempotency_key
+        or authorization.lease_id != invocation.lease.lease_id
+        or authorization.checkpoint_ref != interrupted.checkpoint_ref
+        or authorization.terminal_receipt_ref != interrupted.terminal_receipt_ref
+        or authorization.resume_ordinal != interrupted.resume_ordinal + 1
+    ):
+        raise FactoryDispatchError(
+            "factory skill replay runtime authorization does not match interruption"
+        )
+    return FactorySkillReplayRecord(
+        invocation=invocation,
+        invocation_sha256=interrupted.invocation_sha256,
+        claim_token=uuid4().hex,
+        state="pending",
+        resume_ordinal=authorization.resume_ordinal,
     )
 
 
@@ -1086,6 +1410,8 @@ def _existing_replay_claim(
         raise FactorySkillReplayPendingError(existing)
     if existing.state == "failed":
         raise FactoryDispatchError("factory skill replay previously failed")
+    if existing.state == "interrupted":
+        raise FactorySkillReplayInterruptedError(existing)
     return FactorySkillReplayClaim(record=existing, acquired=False)
 
 

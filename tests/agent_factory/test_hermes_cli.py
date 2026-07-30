@@ -6,7 +6,7 @@ import json
 import signal
 import time
 from types import SimpleNamespace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
@@ -33,9 +33,13 @@ from agenten.agent_factory.hermes_cli import (
     _require_improvement_artifact_binding,
     InMemoryFactorySkillReplayStore,
 )
+from agenten.agent_factory.codex_build_execution import FactoryCodexBuildInterrupted
 from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
-from agenten.agent_factory.skill_sequence import FactoryImprovementAuthorizationV1
+from agenten.agent_factory.skill_sequence import (
+    FactoryImprovementAuthorizationV1,
+    FactoryRuntimeRetryAuthorizationV1,
+)
 from agenten.agent_factory.skill_evaluation import (
     HermesSkillEvaluationEvidence,
     HermesSkillEvaluationRequest,
@@ -69,6 +73,7 @@ from tests.agent_factory.test_skill_workflow_contracts import (
 from tests.agent_factory.test_codex_build_provenance_contracts import (
     evidence_payload as codex_build_evidence_payload,
     receipt_ref as codex_build_receipt_ref,
+    seal_invocation_payload,
 )
 
 
@@ -1396,6 +1401,17 @@ async def test_dispatch_replay_uses_identical_invocation_and_idempotency_key(
     assert len(invocations) == 1
     assert first == second
 
+    replay_path = next((tmp_path / "replays").glob("*.json"))
+    legacy_payload = json.loads(replay_path.read_text(encoding="utf-8"))
+    legacy_payload["schema"] = "captain.factory-skill-replay.v2"
+    legacy_payload.pop("checkpoint_ref")
+    legacy_payload.pop("terminal_receipt_ref")
+    legacy_payload.pop("resume_ordinal")
+    replay_path.write_text(
+        json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
     prior = await FilesystemFactorySkillReplayStore(
         tmp_path / "replays"
     ).completed(
@@ -1420,6 +1436,298 @@ async def test_dispatch_replay_uses_identical_invocation_and_idempotency_key(
                 media_type="application/json",
             ),
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("durable", [False, True])
+async def test_runtime_retry_replay_requires_atomic_authorized_resume(
+    tmp_path: Path,
+    durable: bool,
+) -> None:
+    replay_store = (
+        FilesystemFactorySkillReplayStore(tmp_path / "runtime-replays")
+        if durable
+        else InMemoryFactorySkillReplayStore()
+    )
+    invocation_data = seal_invocation_payload()
+    invocation = FactorySkillInvocationV1.model_validate(invocation_data)
+    checkpoint_ref = ArtifactRef(
+        uri=f"artifact://factory/codex-checkpoint/{'c' * 64}",
+        sha256="c" * 64,
+        media_type="application/json",
+    )
+    receipt_ref = ArtifactRef(
+        uri=f"artifact://factory/codex-terminal-receipt/{'d' * 64}",
+        sha256="d" * 64,
+        media_type="application/json",
+    )
+    claimed = await replay_store.claim(invocation)
+
+    interrupted = await replay_store.interrupt(
+        claimed.record,
+        checkpoint_ref=checkpoint_ref,
+        terminal_receipt_ref=receipt_ref,
+        resume_ordinal=0,
+    )
+
+    assert interrupted.state == "interrupted"
+    assert interrupted.failure_kind == "codex_runtime_interrupted"
+    assert interrupted.checkpoint_ref == checkpoint_ref
+    assert interrupted.terminal_receipt_ref == receipt_ref
+    with pytest.raises(FactoryDispatchError, match="interrupted"):
+        await replay_store.claim(invocation)
+
+    authorization = FactoryRuntimeRetryAuthorizationV1(
+        schema_name="captain.factory-runtime-retry-authorization.v1",
+        authorization_ref=ArtifactRef(
+            uri=f"artifact://factory/runtime-retry/{'a' * 64}",
+            sha256="a" * 64,
+            media_type="application/json",
+        ),
+        producer="captain",
+        status="succeeded",
+        job_id=invocation.job_id,
+        correlation_id=invocation.correlation_id,
+        subject_version=invocation.subject_version,
+        attempt=invocation.attempt,
+        invocation_id=invocation.invocation_id,
+        idempotency_key=invocation.idempotency_key,
+        lease_id=invocation.lease.lease_id,
+        checkpoint_ref=checkpoint_ref,
+        terminal_receipt_ref=receipt_ref,
+        workspace_ref=invocation.lease.workspace_ref,
+        base_revision="e" * 40,
+        scaffold_manifest_sha256="f" * 64,
+        brief_sha256="1" * 64,
+        resume_ordinal=1,
+        maximum_runtime_seconds=60,
+        issued_at=invocation.lease.issued_at,
+        expires_at=invocation.lease.issued_at + timedelta(minutes=1),
+    )
+    resumed = await replay_store.resume(
+        interrupted,
+        authorization=authorization,
+    )
+
+    assert resumed.acquired is True
+    assert resumed.record.state == "pending"
+    assert resumed.record.resume_ordinal == 1
+    assert resumed.record.claim_token != interrupted.claim_token
+    with pytest.raises(FactoryDispatchError, match="interrupted"):
+        await replay_store.resume(interrupted, authorization=authorization)
+
+
+@pytest.mark.asyncio
+async def test_authorized_runtime_retry_resumes_only_seal_without_new_hermes_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory_job = job_v3(mode="demo")
+    now = datetime(2026, 7, 19, 10, tzinfo=timezone.utc)
+    architect_lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.AGENT_ARCHITECT,
+        attempt=1,
+        workspace_ref="workspace://factory/runtime-retry/discovery",
+        now=now,
+    )
+    tool_lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/runtime-retry/build",
+        now=now,
+    )
+    checkpoint_ref = ArtifactRef(
+        uri=f"artifact://factory/codex-checkpoint/{'c' * 64}",
+        sha256="c" * 64,
+        media_type="application/json",
+    )
+    receipt_ref = ArtifactRef(
+        uri=f"artifact://factory/codex-terminal-receipt/{'d' * 64}",
+        sha256="d" * 64,
+        media_type="application/json",
+    )
+    prompts: list[str] = []
+
+    class PromptStore:
+        def __init__(self) -> None:
+            self.refs: list[ArtifactRef] = []
+
+        def persist(self, job_id: UUID, content: bytes) -> ArtifactRef:
+            digest = hashlib.sha256(content).hexdigest()
+            reference = ArtifactRef(
+                uri=f"artifact://factory-prompts/{job_id}/{digest}",
+                sha256=digest,
+                media_type="application/json",
+            )
+            self.refs.append(reference)
+            return reference
+
+    prompt_store = PromptStore()
+
+    class Process:
+        returncode = 0
+
+        def __init__(self, prompt: str) -> None:
+            self.prompt = prompt
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            prompts.append(self.prompt)
+            digest_prefix = "captain_codex_brief_seed_sha256="
+            if digest_prefix in self.prompt:
+                digest = next(
+                    line.removeprefix(digest_prefix)
+                    for line in self.prompt.splitlines()
+                    if line.startswith(digest_prefix)
+                )
+                return json.dumps(
+                    {
+                        "schema": "hermes.factory-codex-brief-attestation.v1",
+                        "invocation_id": _invocation_from_prompt(self.prompt)[
+                            "invocation_id"
+                        ],
+                        "seed_sha256": digest,
+                        "accepted": True,
+                    }
+                ).encode(), b""
+            return json.dumps(_typed_payload(self.prompt)).encode(), b""
+
+    async def create_process(*command: str, **__: object) -> Process:
+        return Process(command[-1])
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    class InterruptOnceSealer:
+        def __init__(self) -> None:
+            self.calls: list[
+                tuple[FactoryDispatch, FactorySkillInvocationV1, CodexBuildBriefV1]
+            ] = []
+            self.success = CaptainBuildSealer()
+
+        def validate_runtime_retry(
+            self,
+            request: FactoryDispatch,
+            invocation: FactorySkillInvocationV1,
+        ) -> FactoryRuntimeRetryAuthorizationV1:
+            assert request.runtime_retry_authorization is not None
+            assert request.runtime_retry_authorization.invocation_id == invocation.invocation_id
+            return request.runtime_retry_authorization
+
+        async def seal(
+            self,
+            request: FactoryDispatch,
+            invocation: FactorySkillInvocationV1,
+            brief: CodexBuildBriefV1,
+        ) -> CodexBuildEvidenceV1:
+            self.calls.append((request, invocation, brief))
+            if len(self.calls) == 1:
+                raise FactoryCodexBuildInterrupted(
+                    "Codex timed out",
+                    checkpoint_ref=checkpoint_ref,
+                    terminal_receipt_ref=receipt_ref,
+                    resume_ordinal=0,
+                )
+            return await self.success.seal(request, invocation, brief)
+
+    sealer = InterruptOnceSealer()
+    replay_store = FilesystemFactorySkillReplayStore(tmp_path / "runtime-replays")
+    factory = HermesCliFactory(
+        settings=HermesCliSettings(
+            skill_root=tmp_path,
+            working_directory=_CAPTAIN_WORKSPACE_ROOT,
+            evidence_root=tmp_path / "evidence",
+        ),
+        released_skill_catalog=_catalog_for(
+            tmp_path,
+            FactorySkillStep.DISCOVER,
+            FactorySkillStep.BRIEF_CODEX,
+            FactorySkillStep.SEAL_CODEX_BUILD,
+        ),
+        replay_store=replay_store,
+        codex_build_sealer=sealer,
+        codex_prompt_artifact_store=prompt_store,
+        clock=lambda: now,
+    )
+    await factory.dispatch(
+        FactoryDispatch(
+            job=factory_job,
+            action=FactoryAction(
+                kind=FactoryActionKind.DISPATCH_AGENT_ARCHITECT,
+                attempt=1,
+                job_id=factory_job.job_id,
+            ),
+            role=FactoryRole.AGENT_ARCHITECT,
+            lease=architect_lease,
+        )
+    )
+    tool_request = FactoryDispatch(
+        job=factory_job,
+        action=FactoryAction(
+            kind=FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,
+            attempt=1,
+            job_id=factory_job.job_id,
+        ),
+        role=FactoryRole.TOOL_INTEGRATOR,
+        lease=tool_lease,
+    )
+
+    with pytest.raises(FactoryCodexBuildInterrupted):
+        await factory.dispatch(tool_request)
+
+    assert len(prompts) == 2
+    assert len(sealer.calls) == 1
+    assert len(prompt_store.refs) == 1
+    with pytest.raises(FactoryDispatchError, match="interrupted"):
+        await factory.dispatch(tool_request)
+    assert len(prompts) == 2
+    assert len(sealer.calls) == 1
+
+    invocation = sealer.calls[0][1]
+    authorization = FactoryRuntimeRetryAuthorizationV1(
+        schema_name="captain.factory-runtime-retry-authorization.v1",
+        authorization_ref=ArtifactRef(
+            uri=f"artifact://factory/runtime-retry/{'a' * 64}",
+            sha256="a" * 64,
+            media_type="application/json",
+        ),
+        producer="captain",
+        status="succeeded",
+        job_id=factory_job.job_id,
+        correlation_id=factory_job.correlation_id,
+        subject_version=factory_job.subject_version,
+        attempt=1,
+        invocation_id=invocation.invocation_id,
+        idempotency_key=invocation.idempotency_key,
+        lease_id=tool_lease.lease_id,
+        checkpoint_ref=checkpoint_ref,
+        terminal_receipt_ref=receipt_ref,
+        workspace_ref=tool_lease.workspace_ref,
+        base_revision="e" * 40,
+        scaffold_manifest_sha256="f" * 64,
+        brief_sha256="1" * 64,
+        resume_ordinal=1,
+        maximum_runtime_seconds=60,
+        issued_at=now,
+        expires_at=now + timedelta(minutes=1),
+    )
+    authorized_request = FactoryDispatch(
+        job=tool_request.job,
+        action=tool_request.action,
+        role=tool_request.role,
+        lease=tool_request.lease,
+        runtime_retry_authorization=authorization,
+    )
+
+    evidence = await factory.dispatch(authorized_request)
+
+    assert evidence.phase is FactoryPhase.TOOL_CANDIDATE_TESTED
+    assert len(prompts) == 2
+    assert len(sealer.calls) == 2
+    assert len(prompt_store.refs) == 1
+    assert sealer.calls[1][1] == sealer.calls[0][1]
+    assert sealer.calls[1][2] == sealer.calls[0][2]
+    assert factory_job.private_holdout_refs == tool_request.job.private_holdout_refs
 
 
 @pytest.mark.asyncio
