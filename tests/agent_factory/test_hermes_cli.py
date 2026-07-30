@@ -1540,8 +1540,10 @@ async def test_authorized_runtime_retry_resumes_only_seal_without_new_hermes_cal
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    factory_job = job_v3(mode="demo")
     now = datetime(2026, 7, 19, 10, tzinfo=timezone.utc)
+    factory_job = job_v3(mode="demo").model_copy(
+        update={"deadline_at": now + timedelta(minutes=30)}
+    )
     architect_lease = issue_factory_lease(
         job=factory_job,
         role=FactoryRole.AGENT_ARCHITECT,
@@ -1697,7 +1699,8 @@ async def test_authorized_runtime_retry_resumes_only_seal_without_new_hermes_cal
     assert len(prompts) == 2
     assert len(sealer.calls) == 1
     assert len(prompt_store.refs) == 1
-    with pytest.raises(FactoryDispatchError, match="interrupted"):
+    now = tool_lease.expires_at + timedelta(seconds=1)
+    with pytest.raises(FactoryDispatchError, match="active lease"):
         await factory.dispatch(tool_request)
     assert len(prompts) == 2
     assert len(sealer.calls) == 1

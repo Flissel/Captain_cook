@@ -228,7 +228,7 @@ class HermesCliFactory(HermesFactoryPort):
         if self._released_skill_catalog is None:
             raise FactoryDispatchError("released factory skill catalog is not configured")
         now = self._clock()
-        _validate_factory_dispatch(request, now=now)
+        authority_expires_at = _validate_factory_dispatch(request, now=now)
         steps = self._sequence_policy.steps_for(
             role=request.role,
             attempt=request.action.attempt,
@@ -239,7 +239,7 @@ class HermesCliFactory(HermesFactoryPort):
         deadline = _deadline(
             min(
                 float(self._settings.timeout_seconds),
-                (request.lease.expires_at - now).total_seconds(),
+                (authority_expires_at - now).total_seconds(),
             )
         )
         input_ref = (
@@ -1426,7 +1426,9 @@ _STEP_RESULT_MODELS: dict[FactorySkillStep, type[BaseModel]] = {
 }
 
 
-def _validate_factory_dispatch(request: FactoryDispatch, *, now: datetime) -> None:
+def _validate_factory_dispatch(
+    request: FactoryDispatch, *, now: datetime
+) -> datetime:
     assert request.role is not None
     assert request.lease is not None
     lease = request.lease
@@ -1450,8 +1452,30 @@ def _validate_factory_dispatch(request: FactoryDispatch, *, now: datetime) -> No
         or lease.role is not request.role
     ):
         raise FactoryDispatchError("Hermes factory dispatch lease is stale or mismatched")
-    if lease.issued_at > now or lease.expires_at <= now:
-        raise FactoryDispatchError("Hermes factory dispatch requires an active lease")
+    if lease.issued_at > now:
+        raise FactoryDispatchError(
+            "Hermes factory dispatch requires an active lease or Captain recovery authority"
+        )
+    if now < lease.expires_at:
+        return lease.expires_at
+    authorization = request.runtime_retry_authorization
+    if (
+        request.role is not FactoryRole.TOOL_INTEGRATOR
+        or authorization is None
+        or authorization.job_id != request.job.job_id
+        or authorization.correlation_id != request.job.correlation_id
+        or authorization.subject_version != request.job.subject_version
+        or authorization.attempt != request.action.attempt
+        or authorization.lease_id != lease.lease_id
+        or authorization.workspace_ref != lease.workspace_ref
+        or now < authorization.issued_at
+        or now >= authorization.expires_at
+        or now >= request.job.deadline_at
+    ):
+        raise FactoryDispatchError(
+            "Hermes factory dispatch requires an active lease or Captain recovery authority"
+        )
+    return min(authorization.expires_at, request.job.deadline_at)
 
 
 def _validated_improvement_authorization(

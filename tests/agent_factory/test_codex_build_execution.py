@@ -64,6 +64,12 @@ class FakeBuildExecutor:
         self.calls.append((request, invocation, brief))
         return self.completed
 
+    async def execute_authorized_resume(
+        self, request, invocation, brief
+    ) -> CompletedCodexBuild:
+        self.calls.append((request, invocation, brief))
+        return self.completed
+
     def replay_sealed(self, _invocation):
         return self.sealed_evidence
 
@@ -236,6 +242,7 @@ def _authorized_runtime_retry_dispatch(
     checkpoint: FactoryCodexBuildCheckpointV1,
     *,
     maximum_runtime_seconds: int = 60,
+    issued_at: datetime = NOW,
     expires_at: datetime | None = None,
 ) -> FactoryDispatch:
     checkpoint_sha256 = hashlib.sha256(
@@ -277,8 +284,8 @@ def _authorized_runtime_retry_dispatch(
         brief_sha256=checkpoint.brief_sha256,
         resume_ordinal=checkpoint.resume_ordinal + 1,
         maximum_runtime_seconds=maximum_runtime_seconds,
-        issued_at=NOW,
-        expires_at=expires_at or NOW + timedelta(minutes=2),
+        issued_at=issued_at,
+        expires_at=expires_at or issued_at + timedelta(minutes=2),
     )
     return replace(dispatch, runtime_retry_authorization=authorization)
 
@@ -340,6 +347,76 @@ async def test_captain_sealer_issues_and_persists_exact_build_evidence(
     assert evidence.build_receipt.seal_idempotency_key == invocation.idempotency_key
     assert cas.read_bytes(evidence.build_receipt_ref)
     assert executor.sealed == [(invocation, executor.completed, evidence)]
+
+
+@pytest.mark.asyncio
+async def test_captain_sealer_records_successor_authority_after_original_lease_expiry(
+    tmp_path: Path,
+) -> None:
+    cas = CodexBuildArtifactCas(tmp_path / "cas")
+    workspace = _workspace(tmp_path, cas)
+    job, brief, _artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    resumed_at = invocation.lease.expires_at + timedelta(seconds=1)
+    executor = FakeBuildExecutor(
+        CompletedCodexBuild(
+            workspace_root=workspace,
+            codex_session_receipt=b'{"session_id":"codex-session-resumed"}',
+            candidate_manifest_path="factory-candidate.json",
+            source_archive_path="candidate.zip",
+            test_evidence_paths=("test-evidence.json",),
+            completed_at=resumed_at,
+        )
+    )
+    sealer = CaptainCodexBuildSealer(
+        executor=executor,
+        issuer=CaptainCodexBuildReceiptIssuer(cas),
+    )
+    authorization = FactoryRuntimeRetryAuthorizationV1(
+        schema_name="captain.factory-runtime-retry-authorization.v1",
+        authorization_ref=ArtifactRef(
+            uri=f"artifact://factory/runtime-retry/{'9' * 64}",
+            sha256="9" * 64,
+            media_type="application/json",
+        ),
+        producer="captain",
+        status="succeeded",
+        job_id=job.job_id,
+        correlation_id=job.correlation_id,
+        subject_version=job.subject_version,
+        attempt=invocation.attempt,
+        invocation_id=invocation.invocation_id,
+        idempotency_key=invocation.idempotency_key,
+        lease_id=invocation.lease.lease_id,
+        checkpoint_ref=ArtifactRef(
+            uri=f"artifact://factory/codex-checkpoint/{'c' * 64}",
+            sha256="c" * 64,
+            media_type="application/json",
+        ),
+        terminal_receipt_ref=ArtifactRef(
+            uri=f"artifact://factory/codex-terminal-receipt/{'d' * 64}",
+            sha256="d" * 64,
+            media_type="application/json",
+        ),
+        workspace_ref=invocation.lease.workspace_ref,
+        base_revision="e" * 40,
+        scaffold_manifest_sha256="f" * 64,
+        brief_sha256="1" * 64,
+        resume_ordinal=1,
+        maximum_runtime_seconds=60,
+        issued_at=resumed_at - timedelta(seconds=1),
+        expires_at=resumed_at + timedelta(minutes=1),
+    )
+    request = replace(
+        _dispatch(job, invocation),
+        runtime_retry_authorization=authorization,
+    )
+
+    evidence = await sealer.seal(request, invocation, brief)
+
+    assert evidence.invocation == invocation
+    assert evidence.occurred_at == resumed_at
+    assert evidence.runtime_retry_ref == authorization.authorization_ref
 
 
 @pytest.mark.asyncio
@@ -1293,6 +1370,8 @@ async def test_authorized_resume_uses_next_ordinal_without_replacing_timeout_rec
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     state_root = tmp_path / "state"
+    current = NOW
+    observed_deadlines: list[datetime] = []
 
     class RecoveringPreparer:
         def prepare_or_recover(self, _request, _invocation, _brief, _checkpoint):
@@ -1320,6 +1399,7 @@ async def test_authorized_resume_uses_next_ordinal_without_replacing_timeout_rec
     def runner_factory(**kwargs):
         nonlocal runner_count
         runner_count += 1
+        observed_deadlines.append(kwargs["deadline_at"])
         if runner_count == 1:
             return TimedOutRunner(kwargs["journal_path"])
         return SuccessfulRunner(workspace, kwargs["journal_path"])
@@ -1333,8 +1413,8 @@ async def test_authorized_resume_uses_next_ordinal_without_replacing_timeout_rec
         artifact_reader=artifact_reader,
         authorizer=RecordingAuthorizer(),
         runner_factory=runner_factory,
-        resume_authorizer=CaptainFactoryCodexResumeAuthorizer(clock=lambda: NOW),
-        clock=lambda: NOW,
+        resume_authorizer=CaptainFactoryCodexResumeAuthorizer(clock=lambda: current),
+        clock=lambda: current,
     )
     dispatch = _dispatch(job, invocation)
 
@@ -1344,10 +1424,13 @@ async def test_authorized_resume_uses_next_ordinal_without_replacing_timeout_rec
         state_root / "checkpoints"
     ).load(invocation)
     assert checkpoint is not None
+    current = invocation.lease.expires_at + timedelta(seconds=1)
     authorized_dispatch = _authorized_runtime_retry_dispatch(
         dispatch,
         invocation,
         checkpoint,
+        issued_at=current,
+        expires_at=current + timedelta(minutes=2),
     )
     timeout_receipt = (
         state_root / "sessions" / f"{invocation.idempotency_key}.json"
@@ -1366,8 +1449,8 @@ async def test_authorized_resume_uses_next_ordinal_without_replacing_timeout_rec
         artifact_reader=artifact_reader,
         authorizer=RejectingAuthorizer(),
         runner_factory=runner_factory,
-        resume_authorizer=CaptainFactoryCodexResumeAuthorizer(clock=lambda: NOW),
-        clock=lambda: NOW,
+        resume_authorizer=CaptainFactoryCodexResumeAuthorizer(clock=lambda: current),
+        clock=lambda: current,
     )
     with pytest.raises(FactoryDispatchError, match="execution policy rejected"):
         await rejecting_executor.execute_authorized_resume(
@@ -1394,6 +1477,10 @@ async def test_authorized_resume_uses_next_ordinal_without_replacing_timeout_rec
     assert checkpoint.phase == "implementation_complete"
     assert checkpoint.resume_ordinal == 1
     assert runner_count == 2
+    assert observed_deadlines == [
+        min(invocation.lease.expires_at, job.deadline_at),
+        min(authorized_dispatch.runtime_retry_authorization.expires_at, job.deadline_at),
+    ]
     assert (
         state_root / "sessions" / f"{invocation.idempotency_key}.json"
     ).read_bytes() == timeout_receipt

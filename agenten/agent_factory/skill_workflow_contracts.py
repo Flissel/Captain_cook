@@ -206,8 +206,27 @@ class _WorkflowArtifactBase(_FrozenContract):
             raise ValueError("workflow artifact invocation step does not match result type")
         if self.acceptance_assertion_ids != invocation.acceptance_assertion_ids:
             raise ValueError("workflow artifact invocation assertion binding does not match")
-        if not invocation.lease.issued_at <= self.occurred_at < invocation.lease.expires_at:
-            raise ValueError("workflow artifact must occur under an active lease")
+        original_lease_active = (
+            invocation.lease.issued_at
+            <= self.occurred_at
+            < invocation.lease.expires_at
+        )
+        recovery_issued_at = getattr(
+            self, "runtime_retry_authority_issued_at", None
+        )
+        recovery_expires_at = getattr(
+            self, "runtime_retry_authority_expires_at", None
+        )
+        recovery_authority_active = (
+            self._required_step is FactorySkillStep.SEAL_CODEX_BUILD
+            and recovery_issued_at is not None
+            and recovery_expires_at is not None
+            and recovery_issued_at <= self.occurred_at < recovery_expires_at
+        )
+        if not original_lease_active and not recovery_authority_active:
+            raise ValueError(
+                "workflow artifact must occur under an active lease or Captain recovery authority"
+            )
         return self
 
 
@@ -339,6 +358,9 @@ class CodexBuildEvidenceV1(_WorkflowArtifactBase):
     )
     build_receipt_ref: ArtifactRef
     build_receipt: CodexBuildReceiptV1
+    runtime_retry_ref: ArtifactRef | None = None
+    runtime_retry_authority_issued_at: datetime | None = None
+    runtime_retry_authority_expires_at: datetime | None = None
     status: Literal["sealed"]
 
     _required_step: ClassVar[FactorySkillStep] = FactorySkillStep.SEAL_CODEX_BUILD
@@ -371,6 +393,31 @@ class CodexBuildEvidenceV1(_WorkflowArtifactBase):
             raise ValueError("Codex build receipt digest mismatch")
         if self.evidence_refs != (self.build_receipt_ref,):
             raise ValueError("Codex build evidence may reference only its Captain receipt")
+        recovery_values = (
+            self.runtime_retry_ref,
+            self.runtime_retry_authority_issued_at,
+            self.runtime_retry_authority_expires_at,
+        )
+        if any(value is not None for value in recovery_values):
+            if any(value is None for value in recovery_values):
+                raise ValueError("Codex build recovery authority is incomplete")
+            assert self.runtime_retry_authority_issued_at is not None
+            assert self.runtime_retry_authority_expires_at is not None
+            if (
+                self.runtime_retry_authority_issued_at.tzinfo is None
+                or self.runtime_retry_authority_issued_at.utcoffset()
+                != timezone.utc.utcoffset(self.runtime_retry_authority_issued_at)
+                or self.runtime_retry_authority_expires_at.tzinfo is None
+                or self.runtime_retry_authority_expires_at.utcoffset()
+                != timezone.utc.utcoffset(self.runtime_retry_authority_expires_at)
+            ):
+                raise ValueError("Codex build recovery authority timestamps must be UTC")
+            if not (
+                self.runtime_retry_authority_issued_at
+                <= self.occurred_at
+                < self.runtime_retry_authority_expires_at
+            ):
+                raise ValueError("Codex build occurred outside recovery authority")
         return self
 
 

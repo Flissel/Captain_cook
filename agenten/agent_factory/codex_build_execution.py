@@ -281,8 +281,8 @@ class CaptainFactoryCodexResumeAuthorizer:
                 "Factory Codex resume requires Captain runtime retry authority"
             )
         references = _interruption_references(checkpoint)
-        authority_deadline = min(invocation.lease.expires_at, request.job.deadline_at)
         now = self._clock()
+        authority_deadline = min(authorization.expires_at, request.job.deadline_at)
         remaining_seconds = int((authority_deadline - now).total_seconds())
         try:
             validate_factory_runtime_retry_authorization(
@@ -403,6 +403,21 @@ class CaptainCodexBuildSealer:
             acceptance_assertion_ids=invocation.acceptance_assertion_ids,
             build_receipt_ref=workflow_receipt_ref,
             build_receipt=receipt,
+            runtime_retry_ref=(
+                request.runtime_retry_authorization.authorization_ref
+                if request.runtime_retry_authorization is not None
+                else None
+            ),
+            runtime_retry_authority_issued_at=(
+                request.runtime_retry_authorization.issued_at
+                if request.runtime_retry_authorization is not None
+                else None
+            ),
+            runtime_retry_authority_expires_at=(
+                request.runtime_retry_authorization.expires_at
+                if request.runtime_retry_authorization is not None
+                else None
+            ),
             status="sealed",
         )
         return self._executor.persist_sealed(invocation, completed, evidence)
@@ -761,7 +776,7 @@ class CodexCliFactoryBuildExecutor:
         *,
         authorized_resume: bool,
     ) -> datetime:
-        deadlines = [invocation.lease.expires_at, request.job.deadline_at]
+        deadlines = [request.job.deadline_at]
         if authorized_resume:
             authorization = request.runtime_retry_authorization
             if authorization is None:
@@ -769,6 +784,8 @@ class CodexCliFactoryBuildExecutor:
                     "Factory Codex resume requires Captain runtime retry authority"
                 )
             deadlines.append(authorization.expires_at)
+        else:
+            deadlines.append(invocation.lease.expires_at)
         return min(deadlines)
 
     def _prepare_or_recover(
