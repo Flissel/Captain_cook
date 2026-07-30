@@ -797,6 +797,31 @@ def test_session_receipt_reports_empty_succeeded_journal_truthfully(tmp_path: Pa
         )
 
 
+@pytest.mark.parametrize("exit_code", (0, 1, 124))
+def test_factory_interruption_rejects_noncanonical_cancellation_exit_code(
+    exit_code: int,
+) -> None:
+    checkpoint_ref = ArtifactRef(
+        uri="artifact://factory/codex-checkpoint/" + "a" * 64,
+        sha256="a" * 64,
+        media_type="application/json",
+    )
+    receipt_ref = ArtifactRef(
+        uri="artifact://factory/codex-terminal-receipt/" + "b" * 64,
+        sha256="b" * 64,
+        media_type="application/json",
+    )
+
+    with pytest.raises(ValueError, match="requires exit 130"):
+        FactoryCodexBuildInterrupted(
+            reason="runtime_cancelled",
+            exit_code=exit_code,
+            checkpoint_ref=checkpoint_ref,
+            terminal_receipt_ref=receipt_ref,
+            resume_ordinal=0,
+        )
+
+
 @pytest.mark.asyncio
 async def test_cli_executor_persists_timeout_receipt_before_raising_timeout_124(
     tmp_path: Path,
@@ -1832,6 +1857,10 @@ async def test_cli_executor_rejects_runner_journal_path_other_than_its_receipt_p
     (
         (0, "failed", "not_required"),
         (124, "failed", "verified_cancelled"),
+        (0, "cancelled", "verified_cancelled"),
+        (1, "cancelled", "verified_cancelled"),
+        (124, "cancelled", "verified_cancelled"),
+        (130, "failed", "not_required"),
     ),
 )
 async def test_cli_executor_rejects_terminal_status_exit_code_mismatch_before_receipt(

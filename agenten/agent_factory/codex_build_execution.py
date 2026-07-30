@@ -129,12 +129,8 @@ class FactoryCodexBuildInterrupted(FactoryDispatchError):
             raise ValueError("Factory Codex interruption reason is invalid")
         if reason == "codex_timed_out" and exit_code != 124:
             raise ValueError("Factory Codex timeout interruption requires exit 124")
-        if reason == "runtime_cancelled" and (
-            isinstance(exit_code, bool)
-            or not isinstance(exit_code, int)
-            or exit_code == 0
-        ):
-            raise ValueError("Factory Codex cancellation requires a non-zero exit code")
+        if reason == "runtime_cancelled" and exit_code != 130:
+            raise ValueError("Factory Codex cancellation requires exit 130")
         if reason == "resume_authorization_required" and exit_code is not None:
             raise ValueError("Factory Codex resume interruption cannot carry an exit code")
         super().__init__("Factory Codex build interrupted")
@@ -1435,22 +1431,19 @@ def _validate_factory_codex_run_result(
             "Codex runner journal path does not match the Factory invocation"
         )
 
-    if result.terminal_status == "cancelled":
-        expected_status = "cancelled"
-        cleanup_is_valid = (
-            result.exit_code != 0
-            and result.process_cleanup_status in {
-                "verified_cancelled",
-                "unresolved",
-            }
-        )
-    elif result.exit_code == 0:
+    if result.exit_code == 0:
         expected_status = "succeeded"
         cleanup_is_valid = result.process_cleanup_status == "not_required"
     elif result.exit_code == 124:
         expected_status = "timed_out"
         cleanup_is_valid = result.process_cleanup_status in {
             "not_required",
+            "verified_cancelled",
+            "unresolved",
+        }
+    elif result.exit_code == 130:
+        expected_status = "cancelled"
+        cleanup_is_valid = result.process_cleanup_status in {
             "verified_cancelled",
             "unresolved",
         }
