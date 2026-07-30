@@ -19,6 +19,8 @@ from agenten.agent_factory.skill_sequence import (
 from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillStep,
     TeamEvaluationV1,
+    factory_runtime_retry_evidence_binding,
+    factory_runtime_retry_evidence_binding_sha256,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
 from tests.agent_factory.test_skill_workflow_contracts import evaluation_payload
@@ -29,7 +31,7 @@ RUNTIME_RETRY_NOW = datetime(2026, 7, 30, 10, 0, tzinfo=timezone.utc)
 
 
 def _runtime_retry_payload() -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "schema": "captain.factory-runtime-retry-authorization.v1",
         "authorization_ref": {
             "uri": f"artifact://factory/runtime-retry/{'a' * 64}",
@@ -64,6 +66,16 @@ def _runtime_retry_payload() -> dict[str, object]:
         "issued_at": RUNTIME_RETRY_NOW,
         "expires_at": RUNTIME_RETRY_NOW + timedelta(minutes=5),
     }
+    authorization = FactoryRuntimeRetryAuthorizationV1.model_validate(payload)
+    digest = factory_runtime_retry_evidence_binding_sha256(
+        factory_runtime_retry_evidence_binding(authorization)
+    )
+    payload["authorization_ref"] = {
+        "uri": f"artifact://factory/runtime-retry/{digest}",
+        "sha256": digest,
+        "media_type": "application/json",
+    }
+    return payload
 
 
 def _validate_runtime_retry(
@@ -323,6 +335,23 @@ def test_runtime_retry_authorization_accepts_exact_captain_binding() -> None:
     )
 
     assert _validate_runtime_retry(authorization) is authorization
+
+
+def test_runtime_retry_authorization_rejects_noncanonical_authority_ref() -> None:
+    authorization = FactoryRuntimeRetryAuthorizationV1.model_validate(
+        _runtime_retry_payload()
+    ).model_copy(
+        update={
+            "authorization_ref": ArtifactRef(
+                uri=f"artifact://factory/runtime-retry/{'0' * 64}",
+                sha256="0" * 64,
+                media_type="application/json",
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="authority ref content binding"):
+        _validate_runtime_retry(authorization)
 
 
 @pytest.mark.parametrize(

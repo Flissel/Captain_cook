@@ -289,6 +289,17 @@ def _authorized_runtime_retry_dispatch(
         issued_at=issued_at,
         expires_at=expires_at or issued_at + timedelta(minutes=2),
     )
+    binding = factory_runtime_retry_evidence_binding(authorization)
+    binding_sha256 = factory_runtime_retry_evidence_binding_sha256(binding)
+    authorization = authorization.model_copy(
+        update={
+            "authorization_ref": ArtifactRef(
+                uri=f"artifact://factory/runtime-retry/{binding_sha256}",
+                sha256=binding_sha256,
+                media_type="application/json",
+            )
+        }
+    )
     return replace(dispatch, runtime_retry_authorization=authorization)
 
 
@@ -1465,6 +1476,26 @@ async def test_authorized_resume_uses_next_ordinal_without_replacing_timeout_rec
     timeout_receipt = (
         state_root / "sessions" / f"{invocation.idempotency_key}.json"
     ).read_bytes()
+    assert authorized_dispatch.runtime_retry_authorization is not None
+    invalid_authorization = authorized_dispatch.runtime_retry_authorization.model_copy(
+        update={
+            "authorization_ref": ArtifactRef(
+                uri=f"artifact://factory/runtime-retry/{'0' * 64}",
+                sha256="0" * 64,
+                media_type="application/json",
+            )
+        }
+    )
+    with pytest.raises(FactoryDispatchError, match="runtime retry authority is invalid"):
+        await executor.execute_authorized_resume(
+            replace(
+                authorized_dispatch,
+                runtime_retry_authorization=invalid_authorization,
+            ),
+            invocation,
+            brief,
+        )
+    assert runner_count == 1
 
     class RejectingAuthorizer:
         def authorize(self, _request):

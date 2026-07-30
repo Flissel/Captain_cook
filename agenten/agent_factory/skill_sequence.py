@@ -20,6 +20,8 @@ from agenten.agent_factory.skill_workflow_contracts import (
     FactoryFeedbackRecommendation,
     FactorySkillStep,
     TeamEvaluationV1,
+    factory_runtime_retry_evidence_binding,
+    factory_runtime_retry_evidence_binding_sha256,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
 
@@ -186,6 +188,17 @@ def validate_factory_runtime_retry_authorization(
         or authorization.maximum_runtime_seconds > remaining_runtime_seconds
     ):
         raise ValueError("runtime retry maximum runtime exceeds remaining authority")
+    authority_binding = factory_runtime_retry_evidence_binding(authorization)
+    authority_sha256 = factory_runtime_retry_evidence_binding_sha256(
+        authority_binding
+    )
+    expected_authority_uri = f"artifact://factory/runtime-retry/{authority_sha256}"
+    if (
+        authorization.authorization_ref.sha256 != authority_sha256
+        or authorization.authorization_ref.uri != expected_authority_uri
+        or authorization.authorization_ref.media_type != "application/json"
+    ):
+        raise ValueError("runtime retry authority ref content binding does not match")
     return authorization
 
 
