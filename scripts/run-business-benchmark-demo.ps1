@@ -309,27 +309,31 @@ function Test-CodexBuildInterruptedCheckpoint {
         $Checkpoint.database -cne 'captain_test' -or
         $Checkpoint.status -cne 'codex_build_interrupted' -or
         $Checkpoint.reason -notin @(
-            'runtime_timed_out', 'runtime_cancelled', 'resume_authorization_required'
+            'codex_timed_out', 'runtime_cancelled', 'resume_authorization_required'
         )
     ) {
         return $false
     }
     if (
-        ($Checkpoint.reason -ceq 'runtime_timed_out' -and [int]$Checkpoint.exit_code -ne 124) -or
+        ($Checkpoint.reason -ceq 'codex_timed_out' -and [string]$Checkpoint.exit_code -cne '124') -or
+        ($Checkpoint.reason -ceq 'runtime_cancelled' -and [string]$Checkpoint.exit_code -notin @('130', '143')) -or
         ($Checkpoint.reason -ceq 'resume_authorization_required' -and $null -ne $Checkpoint.exit_code) -or
-        [int]$Checkpoint.next_resume_ordinal -lt 1 -or
-        [int]$Checkpoint.next_resume_ordinal -gt 3
+        [string]$Checkpoint.next_resume_ordinal -notmatch '^[12]$'
     ) {
         return $false
     }
-    foreach ($reference in @($Checkpoint.checkpoint_ref, $Checkpoint.terminal_receipt_ref)) {
+    foreach ($expected in @(
+        [ordered]@{ reference = $Checkpoint.checkpoint_ref; namespace = 'codex-checkpoint' },
+        [ordered]@{ reference = $Checkpoint.terminal_receipt_ref; namespace = 'codex-terminal-receipt' }
+    )) {
+        $reference = $expected.reference
         $expectedReference = @('media_type', 'sha256', 'uri')
         $actualReference = @($reference.PSObject.Properties.Name | Sort-Object)
         if (
             ($expectedReference -join ',') -cne ($actualReference -join ',') -or
             $reference.media_type -cne 'application/json' -or
             [string]$reference.sha256 -notmatch '^[0-9a-f]{64}$' -or
-            [string]::IsNullOrWhiteSpace([string]$reference.uri)
+            [string]$reference.uri -cne "artifact://factory/$($expected.namespace)/$($reference.sha256)"
         ) {
             return $false
         }
@@ -343,14 +347,14 @@ function Test-CodexBuildInterruptedCheckpoint {
     $actualBinding = @($binding.PSObject.Properties.Name | Sort-Object)
     if (
         ($expectedBinding -join ',') -cne ($actualBinding -join ',') -or
-        [string]$binding.job_id -notmatch '^[0-9a-f-]{36}$' -or
-        [string]$binding.correlation_id -notmatch '^[0-9a-f-]{36}$' -or
-        [string]$binding.invocation_id -notmatch '^[0-9a-f-]{36}$' -or
-        [int]$binding.subject_version -lt 1 -or
-        [int]$binding.attempt -lt 1 -or
+        -not (Test-CanonicalUuid -Value ([string]$binding.job_id)) -or
+        -not (Test-CanonicalUuid -Value ([string]$binding.correlation_id)) -or
+        -not (Test-CanonicalUuid -Value ([string]$binding.invocation_id)) -or
+        [string]$binding.subject_version -notmatch '^[1-9][0-9]{0,8}$' -or
+        [string]$binding.attempt -notmatch '^[1-9][0-9]{0,8}$' -or
         [string]$binding.idempotency_key -notmatch '^[0-9a-f]{64}$' -or
-        [string]::IsNullOrWhiteSpace([string]$binding.lease_id) -or
-        [string]$binding.workspace_ref -notmatch '^workspace://' -or
+        [string]$binding.lease_id -notmatch '^[a-z0-9][a-z0-9._-]{0,127}$' -or
+        [string]$binding.workspace_ref -notmatch '^workspace://factory/[a-z0-9][a-z0-9._-]{0,127}/attempt-[1-9][0-9]{0,5}$' -or
         [string]$binding.base_revision -notmatch '^[0-9a-f]{40,64}$' -or
         [string]$binding.scaffold_manifest_sha256 -notmatch '^[0-9a-f]{64}$' -or
         [string]$binding.brief_sha256 -notmatch '^[0-9a-f]{64}$'
@@ -358,6 +362,13 @@ function Test-CodexBuildInterruptedCheckpoint {
         return $false
     }
     return $true
+}
+
+function Test-CanonicalUuid {
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    $parsed = [guid]::Empty
+    return [guid]::TryParse($Value, [ref]$parsed) -and $parsed.ToString('D') -ceq $Value
 }
 
 function New-InfrastructureCheckpoint {
@@ -407,8 +418,56 @@ function Get-HumanReviewCheckpoint {
 Push-Location $repositoryRoot
 try {
     $python = Resolve-Python311 $PythonPath
-    $hermesPython = Resolve-HermesPython $HermesPythonPath
     $issuedAt = [DateTimeOffset]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+
+    if ($Action -ceq 'Plan') {
+        $planArguments = @(
+            $provisionScript,
+            '--workspace-root', $repositoryRoot,
+            '--issued-at', $issuedAt,
+            '--model', 'gpt-4.1-mini',
+            '--maximum-usd-per-team', $maximumUsdPerTeam,
+            '--suite-version', '19',
+            '--seed-version-id', $seedVersion
+        )
+        $rawPlanProvisioning = @(& $python @planArguments)
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Captain business benchmark dry-run provisioning failed closed.'
+        }
+        try {
+            $planProvisioning = ($rawPlanProvisioning -join [Environment]::NewLine) |
+                ConvertFrom-Json -Depth 100
+        }
+        catch {
+            throw 'Captain business benchmark dry-run provisioning returned invalid JSON.'
+        }
+        $planTeams = @($planProvisioning.teams)
+        $planProfiles = @($planTeams | ForEach-Object { [string]$_.profile } | Sort-Object)
+        if (
+            $planProvisioning.schema -cne 'captain.business-benchmark-demo-provisioning.v1' -or
+            $planProvisioning.mode -cne 'dry_run' -or
+            $planProvisioning.database -cne 'captain_test' -or
+            $planTeams.Count -ne 2 -or
+            ($planProfiles -join ',') -cne 'claims,renewal'
+        ) {
+            throw 'Captain business benchmark dry-run provisioning result is not canonical.'
+        }
+        foreach ($team in $planTeams) {
+            $null = Require-NonEmpty $team.job.job_id "$($team.profile).job.job_id"
+            if (
+                [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
+                @($team.job.execution_policy.allowed_models) -notcontains 'gpt-4.1-mini' -or
+                [int]$team.suite.suite_version -ne 19
+            ) {
+                throw 'Dry-run team model or budget does not match the demo authority.'
+            }
+        }
+        New-DryRunPlan -Teams $planTeams -IssuedAt $issuedAt |
+            ConvertTo-Json -Compress -Depth 10
+        exit 0
+    }
+
+    $hermesPython = Resolve-HermesPython $HermesPythonPath
 
     if ($Action -ceq 'Run') {
         try {
@@ -572,12 +631,6 @@ try {
     $environment['CAPTAIN_BENCHMARK_RENEWAL_WORKSPACE_REF'] = "workspace://business-benchmark-renewal/$renewalBatchId"
     $environment['CAPTAIN_BENCHMARK_EVIDENCE_ROOT'] = Join-Path $repositoryRoot '.captain-cook/evidence/business-benchmarks/preflight'
     Set-ProcessEnvironment $environment
-
-    if ($Action -ceq 'Plan') {
-        New-DryRunPlan -Teams $teams -IssuedAt $issuedAt |
-            ConvertTo-Json -Compress -Depth 10
-        exit 0
-    }
 
     $rawPreflight = @(& $python $preflightScript)
     if ($LASTEXITCODE -ne 0) {

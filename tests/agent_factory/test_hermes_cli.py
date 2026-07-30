@@ -1641,7 +1641,7 @@ async def test_authorized_runtime_retry_resumes_only_seal_without_new_hermes_cal
             self.calls.append((request, invocation, brief))
             if len(self.calls) == 1:
                 raise FactoryCodexBuildInterrupted(
-                    reason="runtime_timed_out",
+                    reason="codex_timed_out",
                     exit_code=124,
                     checkpoint_ref=checkpoint_ref,
                     terminal_receipt_ref=receipt_ref,

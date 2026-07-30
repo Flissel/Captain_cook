@@ -70,7 +70,7 @@ class CompletedCodexBuild:
 
 
 FactoryCodexBuildInterruptionReason = Literal[
-    "runtime_timed_out",
+    "codex_timed_out",
     "runtime_cancelled",
     "resume_authorization_required",
 ]
@@ -122,12 +122,12 @@ class FactoryCodexBuildInterrupted(FactoryDispatchError):
         authorization_binding: FactoryCodexBuildInterruptionBindings | None = None,
     ) -> None:
         if reason not in {
-            "runtime_timed_out",
+            "codex_timed_out",
             "runtime_cancelled",
             "resume_authorization_required",
         }:
             raise ValueError("Factory Codex interruption reason is invalid")
-        if reason == "runtime_timed_out" and exit_code != 124:
+        if reason == "codex_timed_out" and exit_code != 124:
             raise ValueError("Factory Codex timeout interruption requires exit 124")
         if reason == "runtime_cancelled" and (
             isinstance(exit_code, bool)
@@ -950,7 +950,7 @@ class CodexCliFactoryBuildExecutor:
             )
         if result.terminal_status == "timed_out":
             raise FactoryCodexBuildInterrupted(
-                reason="runtime_timed_out",
+                reason="codex_timed_out",
                 exit_code=result.exit_code,
                 **_interruption_details(request, invocation, interrupted),
             )
@@ -1368,7 +1368,7 @@ def _session_receipt(
             raise FactoryDispatchError("Codex JSONL evidence must contain objects")
         events.append(value)
     if not events and result.terminal_status == "succeeded":
-        raise FactoryDispatchError("Codex JSONL evidence is empty")
+        raise FactoryDispatchError("Codex JSONL evidence was previously empty")
     thread_ids = {
         value
         for event in events

@@ -778,7 +778,7 @@ def test_session_receipt_retains_zero_or_partial_timeout_journal(
     assert "private prompt" not in json.dumps(receipt)
 
 
-def test_session_receipt_rejects_empty_succeeded_journal(tmp_path: Path) -> None:
+def test_session_receipt_reports_empty_succeeded_journal_truthfully(tmp_path: Path) -> None:
     result = _run_result(
         tmp_path,
         exit_code=0,
@@ -786,7 +786,7 @@ def test_session_receipt_rejects_empty_succeeded_journal(tmp_path: Path) -> None
         jsonl_lines=(),
     )
 
-    with pytest.raises(FactoryDispatchError, match="Codex JSONL evidence is empty"):
+    with pytest.raises(FactoryDispatchError, match="Codex JSONL evidence was previously empty"):
         _session_receipt(
             result=result,
             session_id="factory-session-123",
@@ -845,7 +845,7 @@ async def test_cli_executor_persists_timeout_receipt_before_raising_timeout_124(
         await executor.execute(_dispatch(job, invocation), invocation, brief)
 
     assert str(captured.value) == "Factory Codex build interrupted"
-    assert captured.value.reason == "runtime_timed_out"
+    assert captured.value.reason == "codex_timed_out"
     assert captured.value.exit_code == 124
     binding = captured.value.authorization_binding
     assert binding is not None
@@ -1523,7 +1523,7 @@ async def test_authorized_resume_deadline_survives_checkpoint_fsync_delay(
     with pytest.raises(FactoryCodexBuildInterrupted) as captured:
         await executor.execute_authorized_resume(authorized, invocation, brief)
 
-    assert captured.value.reason == "runtime_timed_out"
+    assert captured.value.reason == "codex_timed_out"
     assert captured.value.exit_code == 124
     assert child_calls == []
     recoverable = checkpoint_store.load(invocation)

@@ -108,7 +108,7 @@ def test_factory_operator_cli_emits_only_redacted_codex_interruption(
 
     class FakeInterrupted(Exception):
         def __init__(self) -> None:
-            self.reason = "runtime_timed_out"
+            self.reason = "codex_timed_out"
             self.exit_code = 124
             self.checkpoint_ref = FakeRef(
                 uri=f"artifact://factory/codex-checkpoint/{'e' * 64}",
@@ -175,7 +175,7 @@ def test_factory_operator_cli_emits_only_redacted_codex_interruption(
         "database": "captain_test",
         "status": "codex_build_interrupted",
         "exit_code": 124,
-        "reason": "runtime_timed_out",
+        "reason": "codex_timed_out",
         "checkpoint_ref": {
             "uri": f"artifact://factory/codex-checkpoint/{'e' * 64}",
             "sha256": "e" * 64,
@@ -510,7 +510,7 @@ print(json.dumps({
     'database': 'captain_test',
     'status': 'codex_build_interrupted',
     'exit_code': 124,
-    'reason': 'runtime_timed_out',
+    'reason': 'codex_timed_out',
     'checkpoint_ref': {
         'uri': 'artifact://factory/codex-checkpoint/' + 'e' * 64,
         'sha256': 'e' * 64,
@@ -683,3 +683,171 @@ def test_missing_provider_key_does_not_block_infrastructure_checkpoint(
     assert json.loads(completed.stdout)["status"] == "infrastructure_required"
     assert "OPENAI_API_KEY must already exist in the process" not in completed.stderr
     assert "file-openai-secret" not in completed.stdout + completed.stderr
+
+
+def test_plan_isolated_from_run_only_credentials_tools_and_services(tmp_path: Path) -> None:
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        pytest.skip("PowerShell 7 is unavailable")
+
+    repository = tmp_path / "repo"
+    scripts = repository / "scripts"
+    scripts.mkdir(parents=True)
+    shutil.copy2(SCRIPT, scripts / SCRIPT.name)
+    (repository / ".env").write_text("POISONED_ENV_MUST_NOT_BE_READ\n", encoding="utf-8")
+    (repository / ".env.captain-n8n").write_text(
+        "POISONED_N8N_ENV_MUST_NOT_BE_READ\n", encoding="utf-8"
+    )
+    (scripts / "provision-business-benchmark-demo.py").write_text(
+        r"""
+import json
+from pathlib import Path
+import sys
+
+root = Path(__file__).resolve().parents[1]
+root.joinpath('provision-called').write_text(json.dumps(sys.argv[1:]), encoding='utf-8')
+print(json.dumps({
+    'schema': 'captain.business-benchmark-demo-provisioning.v1',
+    'mode': 'dry_run',
+    'database': 'captain_test',
+    'teams': [
+        {'profile': 'claims', 'job': {'job_id': '71000000-0000-0000-0000-000000000001', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.30'}}, 'suite': {'suite_version': 19}, 'candidate_id': 'claims-candidate'},
+        {'profile': 'renewal', 'job': {'job_id': '71000000-0000-0000-0000-000000000002', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.30'}}, 'suite': {'suite_version': 19}, 'candidate_id': 'renewal-candidate'},
+    ],
+}))
+""".strip(),
+        encoding="utf-8",
+    )
+    for name in (
+        "live-demo-services.ps1",
+        "preflight-business-benchmark-demo.py",
+        "run-agent-factory-business-demo.py",
+        "run-business-benchmark-live.ps1",
+    ):
+        (scripts / name).write_text(
+            "Set-Content (Join-Path (Split-Path -Parent $PSScriptRoot) 'run-only-called') 'unsafe'",
+            encoding="utf-8",
+        )
+
+    completed = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(scripts / SCRIPT.name),
+            "-Action",
+            "Plan",
+            "-PythonPath",
+            sys.executable,
+            "-HermesPythonPath",
+            str(repository / "absent-hermes-python.exe"),
+        ],
+        cwd=repository,
+        env={**os.environ, "PATH": ""},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["jobs"] == [
+        {"profile": "claims", "job_id": "71000000-0000-0000-0000-000000000001"},
+        {"profile": "renewal", "job_id": "71000000-0000-0000-0000-000000000002"},
+    ]
+    assert not (repository / "run-only-called").exists()
+    assert "--apply" not in json.loads((repository / "provision-called").read_text("utf-8"))
+
+
+def test_interruption_validator_rejects_noncanonical_recovery_payloads(
+    tmp_path: Path,
+) -> None:
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        pytest.skip("PowerShell 7 is unavailable")
+
+    function_source = SCRIPT.read_text(encoding="utf-8").split(
+        "Push-Location $repositoryRoot", 1
+    )[0]
+    harness = tmp_path / "validate-interruption.ps1"
+    harness.write_text(
+        function_source
+        + "\n$checkpoint = Get-Content -Raw $env:CHECKPOINT_PATH | ConvertFrom-Json -Depth 20\n"
+        + "if (Test-CodexBuildInterruptedCheckpoint -Checkpoint $checkpoint) { exit 0 }\n"
+        + "exit 1\n",
+        encoding="utf-8",
+    )
+    digest = "a" * 64
+    checkpoint = {
+        "schema": "captain.business-demo-factory-operator.v1",
+        "database": "captain_test",
+        "status": "codex_build_interrupted",
+        "exit_code": 124,
+        "reason": "codex_timed_out",
+        "checkpoint_ref": {
+            "uri": f"artifact://factory/codex-checkpoint/{digest}",
+            "sha256": digest,
+            "media_type": "application/json",
+        },
+        "terminal_receipt_ref": {
+            "uri": f"artifact://factory/codex-terminal-receipt/{digest}",
+            "sha256": digest,
+            "media_type": "application/json",
+        },
+        "next_resume_ordinal": 1,
+        "captain_authorization_binding": {
+            "job_id": "71000000-0000-0000-0000-000000000001",
+            "correlation_id": "72000000-0000-0000-0000-000000000001",
+            "subject_version": 3,
+            "attempt": 1,
+            "invocation_id": "73000000-0000-0000-0000-000000000001",
+            "idempotency_key": digest,
+            "lease_id": "factory-lease-1",
+            "workspace_ref": "workspace://factory/job-1/attempt-1",
+            "base_revision": "b" * 40,
+            "scaffold_manifest_sha256": "c" * 64,
+            "brief_sha256": "d" * 64,
+        },
+    }
+
+    def validate(payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
+        checkpoint_path = tmp_path / "checkpoint.json"
+        checkpoint_path.write_text(json.dumps(payload), encoding="utf-8")
+        return subprocess.run(
+            [pwsh, "-NoProfile", "-File", str(harness), "-Action", "Plan"],
+            env={**os.environ, "CHECKPOINT_PATH": str(checkpoint_path)},
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+    assert validate(checkpoint).returncode == 0
+    invalid_payloads = []
+    host_path = json.loads(json.dumps(checkpoint))
+    host_path["checkpoint_ref"]["uri"] = "file:///C:/captain/checkpoint.json"
+    invalid_payloads.append(host_path)
+    mismatched_hash = json.loads(json.dumps(checkpoint))
+    mismatched_hash["terminal_receipt_ref"]["uri"] = (
+        f"artifact://factory/codex-terminal-receipt/{'e' * 64}"
+    )
+    invalid_payloads.append(mismatched_hash)
+    traversal_workspace = json.loads(json.dumps(checkpoint))
+    traversal_workspace["captain_authorization_binding"]["workspace_ref"] = (
+        "workspace://factory/../../host/attempt-1"
+    )
+    invalid_payloads.append(traversal_workspace)
+    malformed_uuid_and_identifier = json.loads(json.dumps(checkpoint))
+    malformed_uuid_and_identifier["captain_authorization_binding"]["job_id"] = "7100"
+    malformed_uuid_and_identifier["captain_authorization_binding"]["lease_id"] = "../lease"
+    invalid_payloads.append(malformed_uuid_and_identifier)
+    invalid_reason_exit = json.loads(json.dumps(checkpoint))
+    invalid_reason_exit["reason"] = "runtime_cancelled"
+    invalid_reason_exit["exit_code"] = 0
+    invalid_payloads.append(invalid_reason_exit)
+    invalid_resume = json.loads(json.dumps(checkpoint))
+    invalid_resume["next_resume_ordinal"] = 3
+    invalid_payloads.append(invalid_resume)
+
+    for payload in invalid_payloads:
+        assert validate(payload).returncode == 1
