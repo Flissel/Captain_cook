@@ -139,6 +139,33 @@ async def test_runner_stops_before_quality_warden_without_lease_or_dispatch() ->
 
 
 @pytest.mark.asyncio
+async def test_runner_rejects_raw_string_stop_point_before_dispatch() -> None:
+    coordinator = ScriptedCoordinator(
+        (
+            FactoryActionKind.DISPATCH_QUALITY_WARDEN,
+            FactoryActionKind.COMPLETE,
+        )
+    )
+    dispatcher = RecordingDispatcher(coordinator)
+    leases = RecordingLeaseIssuer()
+
+    with pytest.raises(ValueError, match="FactoryActionKind"):
+        await ProductionFactoryDispatchRunner(
+            coordinator=coordinator,
+            dispatcher=dispatcher,
+            lease_issuer=leases,
+            clock=lambda: NOW,
+        ).run(
+            JOB_ID,
+            maximum_dispatches=1,
+            stop_before_action="dispatch_quality_warden",  # type: ignore[arg-type]
+        )
+
+    assert dispatcher.actions == []
+    assert leases.roles == []
+
+
+@pytest.mark.asyncio
 async def test_runner_never_dispatches_or_promotes_a_captain_only_action() -> None:
     coordinator = ScriptedCoordinator((FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED,))
     dispatcher = RecordingDispatcher(coordinator)

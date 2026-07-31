@@ -858,37 +858,50 @@ print(json.dumps({
 """.strip(),
         encoding="utf-8",
     )
-    (scripts / "run-agent-factory-business-demo.py").write_text(
-        factory_runner_source.replace(
+    invalid_factory_sources = {
+        "wrong stop action": factory_runner_source.replace(
             "'dispatch_quality_warden' if stop_before_warden else 'validate_for_promotion'",
             "'dispatch_real_case_tester'",
         ),
-        encoding="utf-8",
-    )
-    (repository / "factory-called").unlink(missing_ok=True)
-    blocked_build = subprocess.run(
-        [
-            pwsh,
-            "-NoProfile",
-            "-File",
-            str(scripts / SCRIPT.name),
-            "-Action",
-            "Build",
-            "-PythonPath",
-            sys.executable,
-            "-HermesPythonPath",
-            sys.executable,
-        ],
-        cwd=repository,
-        env=environment,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    assert blocked_build.returncode != 0
-    assert "candidates_ready" not in blocked_build.stdout
-    assert not (repository / "provider-called").exists()
+        "mismatched next-action job": factory_runner_source.replace(
+            "                'job_id': job_id,\n"
+            "            },\n"
+            "            'dispatched_actions'",
+            "                'job_id': "
+            "'71000000-0000-0000-0000-000000000099',\n"
+            "            },\n"
+            "            'dispatched_actions'",
+        ),
+    }
+    for failure_name, invalid_source in invalid_factory_sources.items():
+        (scripts / "run-agent-factory-business-demo.py").write_text(
+            invalid_source,
+            encoding="utf-8",
+        )
+        (repository / "factory-called").unlink(missing_ok=True)
+        blocked_build = subprocess.run(
+            [
+                pwsh,
+                "-NoProfile",
+                "-File",
+                str(scripts / SCRIPT.name),
+                "-Action",
+                "Build",
+                "-PythonPath",
+                sys.executable,
+                "-HermesPythonPath",
+                sys.executable,
+            ],
+            cwd=repository,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert blocked_build.returncode != 0, failure_name
+        assert "candidates_ready" not in blocked_build.stdout, failure_name
+        assert not (repository / "provider-called").exists(), failure_name
     (scripts / "run-agent-factory-business-demo.py").write_text(
         factory_runner_source,
         encoding="utf-8",

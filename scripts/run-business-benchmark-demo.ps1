@@ -835,7 +835,8 @@ try {
         if ($Action -ceq 'BUILD') {
             $invalidStops = @($factoryResult.results | Where-Object {
                 $_.status -cne 'stop_point_reached' -or
-                $_.next_action.kind -cne 'dispatch_quality_warden'
+                $_.next_action.kind -cne 'dispatch_quality_warden' -or
+                [string]$_.next_action.job_id -cne [string]$_.job_id
             })
             if ($invalidStops.Count -ne 0) {
                 throw 'Captain Factory Build did not stop both jobs before Quality Warden.'

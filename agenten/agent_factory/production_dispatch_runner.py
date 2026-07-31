@@ -136,6 +136,11 @@ class ProductionFactoryDispatchRunner:
     ) -> ProductionFactoryDispatchResult:
         if maximum_dispatches < 1:
             raise ValueError("maximum_dispatches must be positive")
+        if (
+            stop_before_action is not None
+            and type(stop_before_action) is not FactoryActionKind
+        ):
+            raise ValueError("Factory stop point must be a FactoryActionKind")
         if stop_before_action is not None and stop_before_action not in _ACTION_ROLES:
             raise ValueError("Factory stop point must be an externally dispatched action")
         dispatched: list[FactoryActionKind] = []
