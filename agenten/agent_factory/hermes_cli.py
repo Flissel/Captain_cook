@@ -13,12 +13,12 @@ import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, Protocol, get_args
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from agenten.agent_factory.contracts import (
     AgentFactoryJobV3,
@@ -38,6 +38,11 @@ from agenten.agent_factory.codex_build_execution import (
     FactoryCodexBuildInterrupted,
 )
 from agenten.agent_factory.evidence_store import FactoryEvidenceStore, FilesystemFactoryEvidenceStore
+from agenten.agent_factory.hermes_effect_evidence import (
+    FilesystemHermesProviderEffectStore,
+    HermesUsageSnapshot,
+    parse_hermes_usage,
+)
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError, HermesFactoryPort
 from agenten.agent_factory.skill_evaluation import (
     HermesSkillEvaluationEvidence,
@@ -58,6 +63,7 @@ from agenten.agent_factory.state_machine import FactoryActionKind
 from agenten.agent_factory.skill_workflow_contracts import (
     FACTORY_SKILL_ID_BY_STEP,
     CandidateRevisionV1,
+    CandidateChangedComponent,
     CodebaseInventoryV1,
     CodexBuildBriefV1,
     CodexBuildEvidenceV1,
@@ -88,6 +94,7 @@ class HermesCliSettings:
     model: str | None = None
     maximum_total_cost_usd: Decimal | None = None
     maximum_iterations: int = 16
+    maximum_output_tokens: int = 2048
 
     def __post_init__(self) -> None:
         if (self.provider is None) != (self.model is None):
@@ -116,6 +123,13 @@ class HermesCliSettings:
             or self.maximum_iterations > 32
         ):
             raise ValueError("Hermes maximum iterations must be between 1 and 32")
+        if (
+            isinstance(self.maximum_output_tokens, bool)
+            or not isinstance(self.maximum_output_tokens, int)
+            or self.maximum_output_tokens < 128
+            or self.maximum_output_tokens > 8192
+        ):
+            raise ValueError("Hermes maximum output tokens must be between 128 and 8192")
 
 
 class _HermesDiscoveryAttestationV1(BaseModel):
@@ -138,6 +152,28 @@ class _HermesCodexBriefAttestationV1(BaseModel):
     invocation_id: UUID
     seed_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     accepted: Literal[True]
+
+
+class _HermesImprovementAttestationV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    schema_name: Literal["hermes.factory-improvement-attestation.v1"] = Field(
+        alias="schema"
+    )
+    invocation_id: UUID
+    seed_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    changed_components: tuple[CandidateChangedComponent, ...] = Field(min_length=1)
+    accepted: Literal[True]
+
+    @field_validator("changed_components")
+    @classmethod
+    def require_unique_components(
+        cls,
+        value: tuple[CandidateChangedComponent, ...],
+    ) -> tuple[CandidateChangedComponent, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("improvement components must be unique")
+        return value
 
 
 class ReleasedFactorySkillCatalog(Protocol):
@@ -239,6 +275,7 @@ class HermesCliFactory(HermesFactoryPort):
         codex_build_sealer: CaptainCodexBuildSealerPort | None = None,
         codex_prompt_artifact_store: CodexPromptArtifactStore | None = None,
         hermes_retry_authority: CaptainHermesReplayRetryAuthorizationPort | None = None,
+        provider_effect_store: FilesystemHermesProviderEffectStore | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._settings = settings
@@ -248,6 +285,13 @@ class HermesCliFactory(HermesFactoryPort):
         self._codex_build_sealer = codex_build_sealer
         self._codex_prompt_artifact_store = codex_prompt_artifact_store
         self._hermes_retry_authority = hermes_retry_authority
+        self._provider_effect_store = (
+            provider_effect_store
+            if provider_effect_store is not None
+            else FilesystemHermesProviderEffectStore(
+                settings.evidence_root / "provider-effects"
+            )
+        )
         self._replay_store = (
             replay_store
             if replay_store is not None
@@ -458,6 +502,7 @@ class HermesCliFactory(HermesFactoryPort):
                 else:
                     discovery_seed = None
                     codex_brief_seed = None
+                    improvement_seed = None
                     if step is FactorySkillStep.DISCOVER:
                         if self._settings.working_directory is None:
                             raise FactoryDispatchError(
@@ -490,6 +535,15 @@ class HermesCliFactory(HermesFactoryPort):
                             artifact_store=self._codex_prompt_artifact_store,
                             improvement_authorization=improvement,
                         )
+                    elif step is FactorySkillStep.IMPROVE_TEAM:
+                        if improvement is None:
+                            raise FactoryDispatchError(
+                                "improve_team requires exact Captain repair evidence"
+                            )
+                        improvement_seed = _captain_improvement_seed(
+                            invocation,
+                            improvement,
+                        )
                     stdout = await self._run_skill_prompt(
                         _factory_skill_prompt(
                             invocation,
@@ -497,13 +551,19 @@ class HermesCliFactory(HermesFactoryPort):
                             job=request.job,
                             discovery_seed=discovery_seed,
                             codex_brief_seed=codex_brief_seed,
+                            improvement_seed=improvement_seed,
                             previous_artifact=artifacts[-1] if artifacts else None,
                         ),
                         max_seconds=_remaining_deadline_seconds(deadline),
                         skill_name=skill_name,
+                        effect_identity=_hermes_effect_identity(
+                            invocation,
+                            claim.record.claim_token,
+                        ),
                         disable_tools=(
                             discovery_seed is not None
                             or codex_brief_seed is not None
+                            or improvement_seed is not None
                             or step is FactorySkillStep.BRIEF_CODEX
                         ),
                     )
@@ -521,6 +581,19 @@ class HermesCliFactory(HermesFactoryPort):
                             codex_brief_seed=codex_brief_seed,
                         )
                         artifact = codex_brief_seed
+                    elif improvement_seed is not None:
+                        attestation = _parse_improvement_attestation(
+                            stdout,
+                            invocation=invocation,
+                            improvement_seed=improvement_seed,
+                        )
+                        assert improvement is not None
+                        artifact = _captain_candidate_revision(
+                            invocation,
+                            authorization=improvement,
+                            attestation=attestation,
+                            occurred_at=self._clock(),
+                        )
                     else:
                         artifact = _parse_workflow_artifact(
                             stdout,
@@ -977,6 +1050,7 @@ class HermesCliFactory(HermesFactoryPort):
         max_seconds: float,
         skill_name: str | None = None,
         disable_tools: bool = False,
+        effect_identity: str | None = None,
     ) -> bytes:
         deadline = _deadline(min(float(self._settings.timeout_seconds), max_seconds))
         maximum_cost = self._settings.maximum_total_cost_usd
@@ -991,6 +1065,9 @@ class HermesCliFactory(HermesFactoryPort):
             command_prefix.extend(("-m", "hermes_cli.main"))
         environment["HERMES_MAX_ITERATIONS"] = str(
             self._settings.maximum_iterations
+        )
+        environment["HERMES_MAX_TOKENS"] = str(
+            self._settings.maximum_output_tokens
         )
         process_options["env"] = environment
         working_directory = self._settings.working_directory
@@ -1056,9 +1133,37 @@ class HermesCliFactory(HermesFactoryPort):
                 usage_directory.cleanup()
             raise
         _remaining_deadline_seconds(deadline)
+        usage: HermesUsageSnapshot | None = None
+        usage_content: bytes | None = None
+        usage_error: FactoryDispatchError | None = None
+        cost_ceiling_exceeded = False
         try:
             if usage_path is not None:
-                self._account_usage(usage_path)
+                try:
+                    usage_content = usage_path.read_bytes()
+                    usage, cost_ceiling_exceeded = self._account_usage(
+                        usage_content
+                    )
+                except (OSError, FactoryDispatchError) as exc:
+                    if isinstance(exc, OSError):
+                        exc = FactoryDispatchError(
+                            "Hermes usage evidence is missing or invalid"
+                        )
+                    usage_error = exc
+            if effect_identity is not None:
+                self._provider_effect_store.persist(
+                    effect_identity=effect_identity,
+                    stdout=stdout,
+                    stderr=stderr,
+                    usage_content=usage_content,
+                    usage=usage,
+                    return_code=process.returncode,
+                    cost_ceiling_exceeded=cost_ceiling_exceeded,
+                )
+            if usage_error is not None:
+                raise usage_error
+            if cost_ceiling_exceeded:
+                raise FactoryDispatchError("Hermes cost ceiling was exceeded")
         finally:
             if usage_directory is not None:
                 usage_directory.cleanup()
@@ -1067,39 +1172,26 @@ class HermesCliFactory(HermesFactoryPort):
             raise FactoryDispatchError(f"Hermes skill evaluation failed: {detail[:500]}")
         return stdout
 
-    def _account_usage(self, path: Path) -> None:
+    def _account_usage(
+        self,
+        content: bytes,
+    ) -> tuple[HermesUsageSnapshot, bool]:
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"), parse_float=Decimal)
-            if not isinstance(raw, dict):
-                raise ValueError
-            cost = Decimal(str(raw["estimated_cost_usd"]))
-            api_calls = raw["api_calls"]
-        except (
-            OSError,
-            KeyError,
-            TypeError,
-            ValueError,
-            InvalidOperation,
-            json.JSONDecodeError,
-        ) as exc:
+            assert self._settings.provider is not None
+            assert self._settings.model is not None
+            usage = parse_hermes_usage(
+                content,
+                provider=self._settings.provider,
+                model=self._settings.model,
+            )
+        except ValueError as exc:
             raise FactoryDispatchError(
                 "Hermes usage evidence is missing or invalid"
             ) from exc
-        if (
-            not cost.is_finite()
-            or cost < 0
-            or isinstance(api_calls, bool)
-            or not isinstance(api_calls, int)
-            or api_calls < 1
-            or raw.get("model") != self._settings.model
-            or raw.get("provider") != self._settings.provider
-        ):
-            raise FactoryDispatchError("Hermes usage evidence does not match its pin")
-        self._observed_cost_usd += cost
+        self._observed_cost_usd += usage.estimated_cost_usd
         maximum = self._settings.maximum_total_cost_usd
         assert maximum is not None
-        if self._observed_cost_usd > maximum:
-            raise FactoryDispatchError("Hermes cost ceiling was exceeded")
+        return usage, self._observed_cost_usd > maximum
 
 
 _FactoryWorkflowArtifact = (
@@ -2105,6 +2197,15 @@ def _factory_invocation_digest(invocation: FactorySkillInvocationV1) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def _hermes_effect_identity(
+    invocation: FactorySkillInvocationV1,
+    claim_token: str,
+) -> str:
+    return hashlib.sha256(
+        f"{invocation.idempotency_key}:{claim_token}".encode("utf-8")
+    ).hexdigest()
+
+
 def _pending_replay_record(
     invocation: FactorySkillInvocationV1,
 ) -> FactorySkillReplayRecord:
@@ -2761,6 +2862,7 @@ def _factory_skill_prompt(
     job: FactoryJob | None = None,
     discovery_seed: dict[str, object] | None = None,
     codex_brief_seed: CodexBuildBriefV1 | None = None,
+    improvement_seed: dict[str, object] | None = None,
     previous_artifact: _FactoryWorkflowArtifact | None = None,
 ) -> str:
     invocation_payload = invocation.model_dump(mode="json", by_alias=True)
@@ -2787,6 +2889,18 @@ def _factory_skill_prompt(
         }
         output_schema = _canonical_json(
             _HermesCodexBriefAttestationV1.model_json_schema(by_alias=True)
+        )
+    elif improvement_seed is not None:
+        schema = "hermes.factory-improvement-attestation.v1"
+        seed_sha256 = _improvement_seed_sha256(improvement_seed)
+        required_bindings = {
+            "schema": schema,
+            "invocation_id": str(invocation.invocation_id),
+            "seed_sha256": seed_sha256,
+            "accepted": True,
+        }
+        output_schema = _canonical_json(
+            _HermesImprovementAttestationV1.model_json_schema(by_alias=True)
         )
     else:
         schema_field = _STEP_RESULT_MODELS[invocation.step].model_fields["schema_name"]
@@ -2879,6 +2993,15 @@ def _factory_skill_prompt(
                 + codex_brief_seed.model_dump_json(by_alias=True),
                 f"captain_codex_brief_seed_sha256={seed_sha256}",
                 "Validate the supplied Captain Codex brief and return only its digest-bound attestation; do not call tools or reproduce the brief.",
+            )
+        )
+    if improvement_seed is not None:
+        lines.extend(
+            (
+                "captain_improvement_seed="
+                + _canonical_json(improvement_seed),
+                f"captain_improvement_seed_sha256={seed_sha256}",
+                "Select only the bounded changed_components required by the supplied failed evidence, then return its digest-bound attestation; do not call tools or invent artifact references.",
             )
         )
     lines.extend(
@@ -2992,6 +3115,166 @@ def _codex_brief_seed_sha256(brief: CodexBuildBriefV1) -> str:
     return hashlib.sha256(
         _canonical_json(brief.model_dump(mode="json", by_alias=True)).encode("utf-8")
     ).hexdigest()
+
+
+def _captain_improvement_seed(
+    invocation: FactorySkillInvocationV1,
+    authorization: FactoryImprovementAuthorizationV1,
+) -> dict[str, object]:
+    evaluation = authorization.failed_evaluation
+    return {
+        "invocation_id": str(invocation.invocation_id),
+        "request_ref": authorization.authorization_ref.model_dump(mode="json"),
+        "failed_evaluation_ref": evaluation.artifact_ref.model_dump(mode="json"),
+        "prior_candidate_ref": authorization.prior_candidate_ref.model_dump(
+            mode="json"
+        ),
+        "failure_class": evaluation.failure_class,
+        "failed_assertion_ids": [
+            outcome.assertion_id
+            for outcome in evaluation.assertion_outcomes
+            if outcome.status == "failed"
+        ],
+        "failed_benchmark_metric_ids": list(
+            evaluation.failed_benchmark_metric_ids
+        ),
+        "regression_assertion_ids": list(
+            authorization.prior_green_assertion_ids
+        ),
+        "regression_benchmark_metric_ids": list(
+            authorization.prior_green_benchmark_metric_ids
+        ),
+        "permitted_changed_components": [
+            item.value for item in CandidateChangedComponent
+        ],
+    }
+
+
+def _improvement_seed_sha256(seed: dict[str, object]) -> str:
+    return hashlib.sha256(_canonical_json(seed).encode("utf-8")).hexdigest()
+
+
+def _parse_improvement_attestation(
+    stdout: bytes,
+    *,
+    invocation: FactorySkillInvocationV1,
+    improvement_seed: dict[str, object],
+) -> _HermesImprovementAttestationV1:
+    try:
+        attestation = _HermesImprovementAttestationV1.model_validate(
+            _parse_evidence_payload(stdout)
+        )
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise FactoryDispatchError(
+            "Hermes must return exactly one typed improvement attestation"
+        ) from exc
+    if (
+        attestation.invocation_id != invocation.invocation_id
+        or attestation.seed_sha256 != _improvement_seed_sha256(improvement_seed)
+    ):
+        raise FactoryDispatchError(
+            "Hermes improvement attestation does not match Captain's seed"
+        )
+    return attestation
+
+
+def _captain_candidate_revision(
+    invocation: FactorySkillInvocationV1,
+    *,
+    authorization: FactoryImprovementAuthorizationV1,
+    attestation: _HermesImprovementAttestationV1,
+    occurred_at: datetime,
+) -> CandidateRevisionV1:
+    evaluation = authorization.failed_evaluation
+    revision_binding = {
+        "invocation_id": str(invocation.invocation_id),
+        "idempotency_key": invocation.idempotency_key,
+        "request_sha256": authorization.authorization_ref.sha256,
+        "failed_evaluation_sha256": evaluation.artifact_ref.sha256,
+        "prior_candidate_sha256": authorization.prior_candidate_ref.sha256,
+        "changed_components": [
+            item.value for item in attestation.changed_components
+        ],
+    }
+    candidate_digest = hashlib.sha256(
+        _canonical_json(revision_binding).encode("utf-8")
+    ).hexdigest()
+    candidate_ref = ArtifactRef(
+        uri=f"artifact://factory/candidate-revision-target/{candidate_digest}",
+        sha256=candidate_digest,
+        media_type="application/json",
+    )
+    session_digest = hashlib.sha256(
+        _canonical_json(
+            {
+                "candidate_sha256": candidate_digest,
+                "purpose": "codex_session_request",
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+    placeholder = ArtifactRef(
+        uri=f"artifact://factory/candidate-revisions/{'0' * 64}",
+        sha256="0" * 64,
+        media_type="application/json",
+    )
+    revision = CandidateRevisionV1(
+        schema_name="hermes.factory-candidate-revision.v1",
+        invocation=invocation,
+        invocation_id=invocation.invocation_id,
+        job_id=invocation.job_id,
+        correlation_id=invocation.correlation_id,
+        subject_version=invocation.subject_version,
+        attempt=invocation.attempt,
+        occurred_at=occurred_at,
+        producer="hermes",
+        artifact_ref=placeholder,
+        evidence_refs=tuple(
+            dict.fromkeys(
+                (
+                    authorization.authorization_ref,
+                    evaluation.artifact_ref,
+                    authorization.prior_candidate_ref,
+                )
+            )
+        ),
+        acceptance_assertion_ids=invocation.acceptance_assertion_ids,
+        parent_candidate_ref=authorization.prior_candidate_ref,
+        candidate_ref=candidate_ref,
+        failed_assertion_ids=tuple(
+            outcome.assertion_id
+            for outcome in evaluation.assertion_outcomes
+            if outcome.status == "failed"
+        ),
+        failed_benchmark_metric_ids=evaluation.failed_benchmark_metric_ids,
+        changed_components=attestation.changed_components,
+        regression_assertion_ids=authorization.prior_green_assertion_ids,
+        regression_benchmark_metric_ids=(
+            authorization.prior_green_benchmark_metric_ids
+        ),
+        codex_session_ref=ArtifactRef(
+            uri=f"artifact://factory/codex-session-request/{session_digest}",
+            sha256=session_digest,
+            media_type="application/json",
+        ),
+    )
+    artifact_digest = hashlib.sha256(
+        _canonical_json(
+            revision.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude={"artifact_ref"},
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+    return revision.model_copy(
+        update={
+            "artifact_ref": ArtifactRef(
+                uri=f"artifact://factory/candidate-revisions/{artifact_digest}",
+                sha256=artifact_digest,
+                media_type="application/json",
+            )
+        }
+    )
 
 
 def _discovery_seed_sha256(discovery_seed: dict[str, object]) -> str:

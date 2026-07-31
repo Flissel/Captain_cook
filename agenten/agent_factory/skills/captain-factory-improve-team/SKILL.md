@@ -12,8 +12,10 @@ authority, digest mismatch, terminal state, missing required evidence, or an
 effect outside the lease. Never publish a skill, write the ledger, weaken Captain
 assertions, expose secrets, or claim ready_to_use.
 
-1. Start only after `IMPROVEMENT_REQUESTED`; bind each failure to exact assertion
-   and evidence references using the [repair assignment](templates/repair-assignment.md).
+1. Start only after `IMPROVEMENT_REQUESTED`. Validate the supplied
+   `captain_improvement_seed` digest; it contains the exact failed assertion,
+   benchmark, evidence, prior-candidate, and prior-green bindings described by
+   the [repair assignment](templates/repair-assignment.md).
 2. Change only evidence-implicated code, prompts, context, tools, model clients,
    memory, conversation/handoffs, termination, n8n workflow/nodes, tests, or
    technical documentation. Only the Tool Integrator may use a separate
@@ -21,8 +23,12 @@ assertions, expose secrets, or claim ready_to_use.
    specification declares `integration_intent=n8n`. Limit changes to an isolated
    draft; never allow activation, production adoption, service administration,
    or volume management.
-3. Rerun every prior green assertion. Seal the result as a child candidate with
-   precise change-to-evidence mapping, then return it to build, execution, and
-   independent evaluation.
-4. Return `CandidateRevisionV1`. Never promote; behavioral failure consumes the
-   released attempt while infrastructure recovery resumes the same attempt.
+3. Select only the smallest evidence-implicated `changed_components` enum set.
+   Do not invent artifact references, lifecycle identity, timestamps, candidate
+   IDs, Codex sessions, or test results. Captain materializes `CandidateRevisionV1`
+   from the digest-bound response and later Codex/test evidence.
+4. Return exactly one `hermes.factory-improvement-attestation.v1` JSON object
+   with the supplied invocation ID and seed digest, the selected unique
+   `changed_components`, and `accepted=true`. Use no tools. Never promote;
+   behavioral failure consumes the released attempt while authorized runtime
+   recovery resumes the same attempt.

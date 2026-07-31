@@ -185,11 +185,16 @@ def test_dry_run_is_side_effect_free_and_contains_two_redacted_stable_plans(
         )
         assert releases[FactorySkillStep.DISCOVER].version == 5
         assert releases[FactorySkillStep.BRIEF_CODEX].version == 2
+        assert releases[FactorySkillStep.IMPROVE_TEAM].version == 2
         assert all(
             release.version == 1
             for step, release in releases.items()
             if step
-            not in {FactorySkillStep.DISCOVER, FactorySkillStep.BRIEF_CODEX}
+            not in {
+                FactorySkillStep.DISCOVER,
+                FactorySkillStep.BRIEF_CODEX,
+                FactorySkillStep.IMPROVE_TEAM,
+            }
         )
     assert all(
         team.initial_lease.role is FactoryRole.AGENT_ARCHITECT

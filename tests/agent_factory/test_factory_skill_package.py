@@ -19,7 +19,10 @@ SKILLS = {
     "captain-factory-seal-codex-build": ("CodexBuildEvidenceV1", "Captain-issued"),
     "captain-factory-execute-team": ("TeamExecutionEvidenceV1", "max_cost_usd"),
     "captain-factory-evaluate-team": ("TeamEvaluationV1", "do not repair"),
-    "captain-factory-improve-team": ("CandidateRevisionV1", "prior green"),
+    "captain-factory-improve-team": (
+        "hermes.factory-improvement-attestation.v1",
+        "prior-green",
+    ),
     "captain-factory-report-captain": ("FactoryFeedbackV1", "Captain decides"),
 }
 

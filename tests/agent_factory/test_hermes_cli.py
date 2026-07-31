@@ -602,6 +602,7 @@ async def test_module_root_runs_only_the_checkout_cli_with_bound_cwd_and_pythonp
             module_root=module_root,
             working_directory=workspace_root,
             evidence_root=tmp_path / "evidence",
+            maximum_output_tokens=1536,
         )
     )._run_skill_prompt("sealed prompt", max_seconds=30)
 
@@ -620,6 +621,14 @@ async def test_module_root_runs_only_the_checkout_cli_with_bound_cwd_and_pythonp
     assert environment["PYTHONPATH"] == str(resolved_root)
     assert environment["PYTHONPATH"] != "global-hermes-location"
     assert environment["HERMES_MAX_ITERATIONS"] == "16"
+    assert environment["HERMES_MAX_TOKENS"] == "1536"
+
+
+def test_hermes_output_token_bound_is_strict() -> None:
+    with pytest.raises(ValueError, match="output tokens"):
+        HermesCliSettings(maximum_output_tokens=0)
+    with pytest.raises(ValueError, match="output tokens"):
+        HermesCliSettings(maximum_output_tokens=8193)
 
 
 @pytest.mark.asyncio
@@ -672,9 +681,17 @@ async def test_pinned_hermes_model_requires_usage_evidence_and_stops_after_ceili
         )
     )
 
-    assert await factory._run_skill_prompt("first", max_seconds=30) == b"{}"
+    assert await factory._run_skill_prompt(
+        "first",
+        max_seconds=30,
+        effect_identity="1" * 64,
+    ) == b"{}"
     with pytest.raises(FactoryDispatchError, match="cost ceiling"):
-        await factory._run_skill_prompt("second", max_seconds=30)
+        await factory._run_skill_prompt(
+            "second",
+            max_seconds=30,
+            effect_identity="2" * 64,
+        )
 
     assert factory.observed_cost_usd == Decimal("0.06")
     assert len(observed_commands) == 2
@@ -685,6 +702,81 @@ async def test_pinned_hermes_model_requires_usage_evidence_and_stops_after_ceili
         "gpt-4.1-mini",
     )
     assert "--usage-file" in observed_commands[0]
+    effect_root = tmp_path / "evidence" / "provider-effects"
+    first_effect = json.loads(
+        (effect_root / "effects" / f"{'1' * 64}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    second_effect = json.loads(
+        (effect_root / "effects" / f"{'2' * 64}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert first_effect["estimated_cost_usd"] == "0.03"
+    assert first_effect["usage_ref"]["sha256"] == first_effect["usage_sha256"]
+    assert second_effect["estimated_cost_usd"] == "0.03"
+    assert first_effect["stdout_ref"]["sha256"] == hashlib.sha256(b"{}").hexdigest()
+    assert second_effect["cost_ceiling_exceeded"] is True
+
+
+@pytest.mark.asyncio
+async def test_invalid_usage_is_preserved_before_the_call_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_root = tmp_path / "hermes-agent"
+    entrypoint = module_root / "hermes_cli" / "main.py"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("# checkout entrypoint\n", encoding="utf-8")
+    invalid_usage = b'{"bad":"usage"}'
+
+    class Process:
+        returncode = 0
+
+        def __init__(self, command: tuple[str, ...]) -> None:
+            self.command = command
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            usage_path = Path(self.command[self.command.index("--usage-file") + 1])
+            usage_path.write_bytes(invalid_usage)
+            return b'{"partial":true}', b""
+
+    async def create_process(*command: str, **_: object) -> Process:
+        return Process(command)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    effect_identity = "3" * 64
+    factory = HermesCliFactory(
+        settings=HermesCliSettings(
+            executable="python.exe",
+            module_root=module_root,
+            evidence_root=tmp_path / "evidence",
+            provider="openai-api",
+            model="gpt-4.1-mini",
+            maximum_total_cost_usd=Decimal("0.10"),
+        )
+    )
+
+    with pytest.raises(FactoryDispatchError, match="usage evidence"):
+        await factory._run_skill_prompt(
+            "prompt",
+            max_seconds=30,
+            effect_identity=effect_identity,
+        )
+
+    effect = json.loads(
+        (
+            tmp_path
+            / "evidence"
+            / "provider-effects"
+            / "effects"
+            / f"{effect_identity}.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert effect["usage_sha256"] == hashlib.sha256(invalid_usage).hexdigest()
+    assert effect["usage_ref"]["sha256"] == effect["usage_sha256"]
+    assert effect["estimated_cost_usd"] is None
 
 
 @pytest.mark.asyncio
@@ -1293,6 +1385,22 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
 
         async def communicate(self) -> tuple[bytes, bytes]:
             invocations.append(_invocation_from_prompt(self.prompt))
+            if "captain_improvement_seed_sha256=" in self.prompt:
+                digest_prefix = "captain_improvement_seed_sha256="
+                digest = next(
+                    line.removeprefix(digest_prefix)
+                    for line in self.prompt.splitlines()
+                    if line.startswith(digest_prefix)
+                )
+                return json.dumps(
+                    {
+                        "schema": "hermes.factory-improvement-attestation.v1",
+                        "invocation_id": invocations[-1]["invocation_id"],
+                        "seed_sha256": digest,
+                        "changed_components": ["system_prompt", "tests"],
+                        "accepted": True,
+                    }
+                ).encode(), b""
             if "captain_codex_brief_seed_sha256=" in self.prompt:
                 digest_prefix = "captain_codex_brief_seed_sha256="
                 digest = next(
@@ -1350,9 +1458,16 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
     assert invocations[1]["input_ref"] == authorization.authorization_ref.model_dump(
         mode="json"
     )
-    assert invocations[2]["input_ref"] == revision_payload()["artifact_ref"]
+    assert invocations[2]["input_ref"] != authorization.prior_candidate_ref.model_dump(
+        mode="json"
+    )
+    improve_prompt = commands[1][-1]
+    assert "captain_improvement_seed=" in improve_prompt
+    assert authorization.prior_candidate_ref.uri in improve_prompt
+    assert authorization.failed_evaluation.artifact_ref.uri in improve_prompt
+    assert "Return exactly one hermes.factory-improvement-attestation.v1" in improve_prompt
     assert "--no-tools" in commands[0]
-    assert "--no-tools" not in commands[1]
+    assert "--no-tools" in commands[1]
     assert "--no-tools" in commands[2]
     assert len(sealer.calls) == 1
     assert sealer.calls[0][1].step is FactorySkillStep.SEAL_CODEX_BUILD
