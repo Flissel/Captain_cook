@@ -396,6 +396,37 @@ async def test_forge_evidence_bridge_rejects_scalar_coercion_in_typed_json(
         bridge.workflow_artifacts(job.job_id)
 
 
+@pytest.mark.asyncio
+async def test_forge_evidence_bridge_accepts_strict_json_timestamp_normalization(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "evidence"
+    job, artifacts, _, repository = await _persist_forge_evidence(root)
+    inventory = artifacts[0].model_dump(mode="json", by_alias=True)
+    inventory["occurred_at"] = "2026-07-21T10:01:00+00:00"
+    content = json.dumps(inventory, sort_keys=True).encode("utf-8")
+    digest = hashlib.sha256(content).hexdigest()
+    path = root / str(job.job_id) / f"{digest}.json"
+    path.write_bytes(content)
+    normalized_ref = ArtifactRef(
+        uri=f"artifact://factory-evidence/{job.job_id}/{digest}",
+        sha256=digest,
+        media_type="application/json",
+    )
+    repository._blocks = (
+        _forge_block(job, FactoryPhase.BLUEPRINT_CREATED, (normalized_ref,)),
+    )
+    bridge = CaptainForgeEvidenceBridge(
+        repository=repository,
+        evidence_store=FilesystemFactoryEvidenceStore(root),
+    )
+
+    recovered = bridge.workflow_artifacts(job.job_id)
+
+    assert len(recovered) == 1
+    assert recovered[0].occurred_at == artifacts[0].occurred_at
+
+
 def test_operator_cli_is_importable_from_scripts_directory() -> None:
     script = (
         Path(__file__).resolve().parents[2]

@@ -115,11 +115,13 @@ class FactorySkillInvocationV1(_FrozenContract):
     acceptance_assertion_ids: tuple[str, ...] = Field(min_length=1)
     execution_scope_ref: PrivateHoldoutRef | None = None
 
-    @model_validator(mode="before")
-    @classmethod
-    def reject_private_content(cls, value: object) -> object:
-        _reject_private_content(value, "skill invocation")
-        return value
+    @model_validator(mode="after")
+    def reject_private_content(self) -> "FactorySkillInvocationV1":
+        _reject_private_content(
+            self.model_dump(mode="json", by_alias=True),
+            "skill invocation",
+        )
+        return self
 
     @field_validator("acceptance_assertion_ids")
     @classmethod
@@ -168,11 +170,13 @@ class _WorkflowArtifactBase(_FrozenContract):
 
     _required_step: ClassVar[FactorySkillStep | None] = None
 
-    @model_validator(mode="before")
-    @classmethod
-    def reject_private_content(cls, value: object) -> object:
-        _reject_private_content(value, "workflow artifact")
-        return value
+    @model_validator(mode="after")
+    def reject_private_content(self) -> "_WorkflowArtifactBase":
+        _reject_private_content(
+            self.model_dump(mode="json", by_alias=True),
+            "workflow artifact",
+        )
+        return self
 
     @field_validator("occurred_at")
     @classmethod
