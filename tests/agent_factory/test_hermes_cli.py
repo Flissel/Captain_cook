@@ -1598,6 +1598,12 @@ async def test_failed_improve_replay_requires_exact_budget_bound_captain_retry(
     lease_payload = payload["lease"]
     assert isinstance(lease_payload, dict)
     lease_payload["attempt"] = 2
+    lease_issued_at = lease_payload["issued_at"]
+    assert isinstance(lease_issued_at, datetime)
+    lease_payload["workspace_ref"] = (
+        "workspace://factory/improve/2/"
+        + lease_issued_at.strftime("%Y%m%dT%H%M%S%fZ")
+    )
     invocation = FactorySkillInvocationV1.model_validate(payload)
     claimed = await replay_store.claim(invocation)
     failed = await replay_store.fail(
@@ -1611,6 +1617,11 @@ async def test_failed_improve_replay_requires_exact_budget_bound_captain_retry(
             "lease_id": "factory-successor-retry",
             "issued_at": invocation.lease.expires_at,
             "expires_at": invocation.lease.expires_at + timedelta(minutes=15),
+            "workspace_ref": (
+                invocation.lease.workspace_ref.rsplit("/", 1)[0]
+                + "/"
+                + invocation.lease.expires_at.strftime("%Y%m%dT%H%M%S%fZ")
+            ),
         }
     )
     successor_invocation = invocation.model_copy(

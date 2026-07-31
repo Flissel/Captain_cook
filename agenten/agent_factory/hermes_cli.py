@@ -2418,10 +2418,25 @@ def _same_or_valid_successor_lease(left: FactoryLease, right: FactoryLease) -> b
         right_issued = right.issued_at
     except AttributeError:
         return False
+    left_workspace = str(left_payload.pop("workspace_ref", ""))
+    right_workspace = str(right_payload.pop("workspace_ref", ""))
     for key in ("lease_id", "issued_at", "expires_at"):
         left_payload.pop(key, None)
         right_payload.pop(key, None)
-    return left_payload == right_payload and right_issued >= left_expires
+    try:
+        left_prefix, left_suffix = left_workspace.rsplit("/", 1)
+        right_prefix, right_suffix = right_workspace.rsplit("/", 1)
+    except ValueError:
+        return False
+    expected_left_suffix = left.issued_at.strftime("%Y%m%dT%H%M%S%fZ")
+    expected_right_suffix = right.issued_at.strftime("%Y%m%dT%H%M%S%fZ")
+    return (
+        left_payload == right_payload
+        and right_issued >= left_expires
+        and left_prefix == right_prefix
+        and left_suffix == expected_left_suffix
+        and right_suffix == expected_right_suffix
+    )
 
 
 _STEP_RESULT_MODELS: dict[FactorySkillStep, type[BaseModel]] = {
