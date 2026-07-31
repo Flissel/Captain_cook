@@ -25,6 +25,7 @@ from agenten.agent_factory.contracts import (
     FactoryBlockStatus,
     FactoryEvidenceBlock,
     FactoryJob,
+    FactoryLease,
     FactoryPhase,
     FactoryRole,
 )
@@ -45,9 +46,12 @@ from agenten.agent_factory.skill_evaluation import (
     ReleasedHermesSkill,
 )
 from agenten.agent_factory.skill_sequence import (
+    FactoryHermesReplayRetryAuthorizationV1,
     FactoryImprovementAuthorizationV1,
     FactoryRuntimeRetryAuthorizationV1,
     SkillSequencePolicy,
+    factory_hermes_replay_retry_authorization_sha256,
+    validate_factory_hermes_replay_retry_authorization,
 )
 from agenten.agent_factory.skill_store import reject_sensitive_data
 from agenten.agent_factory.state_machine import FactoryActionKind
@@ -182,6 +186,18 @@ class CaptainCodexBuildSealerPort(Protocol):
     ) -> FactoryRuntimeRetryAuthorizationV1: ...
 
 
+class CaptainHermesReplayRetryAuthorizationPort(Protocol):
+    """Captain lookup for one exact, budget-bound failed Hermes replay."""
+
+    def active(
+        self,
+        failed: "FactorySkillReplayRecord",
+        *,
+        requested_invocation: FactorySkillInvocationV1,
+        now: datetime,
+    ) -> FactoryHermesReplayRetryAuthorizationV1: ...
+
+
 class FilesystemReleasedFactorySkillCatalog:
     """Load Captain release envelopes from an exact job/step catalog path."""
 
@@ -222,6 +238,7 @@ class HermesCliFactory(HermesFactoryPort):
         replay_store: FactorySkillReplayStore | None = None,
         codex_build_sealer: CaptainCodexBuildSealerPort | None = None,
         codex_prompt_artifact_store: CodexPromptArtifactStore | None = None,
+        hermes_retry_authority: CaptainHermesReplayRetryAuthorizationPort | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._settings = settings
@@ -230,6 +247,7 @@ class HermesCliFactory(HermesFactoryPort):
         self._sequence_policy = sequence_policy or SkillSequencePolicy()
         self._codex_build_sealer = codex_build_sealer
         self._codex_prompt_artifact_store = codex_prompt_artifact_store
+        self._hermes_retry_authority = hermes_retry_authority
         self._replay_store = (
             replay_store
             if replay_store is not None
@@ -386,6 +404,29 @@ class HermesCliFactory(HermesFactoryPort):
                 claim = await self._replay_store.retry_failed(
                     failed.record,
                     authorization=validated,
+                )
+            except FactorySkillReplayHermesRetryableFailureError as failed:
+                if self._hermes_retry_authority is None:
+                    raise FactoryDispatchError(
+                        "failed Hermes replay requires Captain recovery authority"
+                    ) from failed
+                authorization = self._hermes_retry_authority.active(
+                    failed.record,
+                    requested_invocation=failed.requested_invocation,
+                    now=self._clock(),
+                )
+                if (
+                    self._settings.maximum_total_cost_usd is None
+                    or self._settings.maximum_total_cost_usd
+                    > authorization.maximum_additional_cost_usd
+                ):
+                    raise FactoryDispatchError(
+                        "Hermes retry settings exceed Captain recovery budget"
+                    )
+                claim = await self._replay_store.retry_failed_hermes(
+                    failed.record,
+                    requested_invocation=failed.requested_invocation,
+                    authorization=authorization,
                 )
             if not claim.acquired:
                 accepted = claim.record
@@ -1100,6 +1141,21 @@ class FactorySkillReplayRetryableFailureError(FactoryDispatchError):
         self.record = record
 
 
+class FactorySkillReplayHermesRetryableFailureError(FactoryDispatchError):
+    """An improve-team provider failure awaits exact Captain recovery authority."""
+
+    def __init__(
+        self,
+        record: "FactorySkillReplayRecord",
+        requested_invocation: FactorySkillInvocationV1,
+    ) -> None:
+        super().__init__(
+            "failed Hermes replay requires exact Captain recovery authority"
+        )
+        self.record = record
+        self.requested_invocation = requested_invocation
+
+
 @dataclass(frozen=True)
 class FactorySkillReplayRecord:
     invocation: FactorySkillInvocationV1
@@ -1114,6 +1170,9 @@ class FactorySkillReplayRecord:
     resume_ordinal: int = 0
     runtime_retry_authorization_ref: ArtifactRef | None = None
     runtime_retry_authorization_binding_sha256: str | None = None
+    hermes_retry_authorization_ref: ArtifactRef | None = None
+    hermes_retry_authorization_binding_sha256: str | None = None
+    prior_failure_ref: ArtifactRef | None = None
 
     def __post_init__(self) -> None:
         if self.invocation_sha256 != _factory_invocation_digest(self.invocation):
@@ -1148,6 +1207,34 @@ class FactorySkillReplayRecord:
         ):
             raise FactoryDispatchError(
                 "factory skill replay retry authority digest is invalid"
+            )
+        hermes_retry_binding = (
+            self.hermes_retry_authorization_ref,
+            self.hermes_retry_authorization_binding_sha256,
+            self.prior_failure_ref,
+        )
+        if any(value is None for value in hermes_retry_binding) != all(
+            value is None for value in hermes_retry_binding
+        ):
+            raise FactoryDispatchError(
+                "factory skill replay Hermes retry binding is incomplete"
+            )
+        if self.resume_ordinal == 0 and any(
+            value is not None for value in hermes_retry_binding
+        ):
+            raise FactoryDispatchError(
+                "original factory skill replay cannot bind Hermes retry authority"
+            )
+        if (
+            self.hermes_retry_authorization_binding_sha256 is not None
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                self.hermes_retry_authorization_binding_sha256,
+            )
+            is None
+        ):
+            raise FactoryDispatchError(
+                "factory skill replay Hermes retry authority digest is invalid"
             )
         if self.state == "pending" and any(
             item is not None
@@ -1263,6 +1350,14 @@ class FactorySkillReplayStore(Protocol):
         failed: FactorySkillReplayRecord,
         *,
         authorization: FactoryRuntimeRetryAuthorizationV1,
+    ) -> FactorySkillReplayClaim: ...
+
+    async def retry_failed_hermes(
+        self,
+        failed: FactorySkillReplayRecord,
+        *,
+        requested_invocation: FactorySkillInvocationV1,
+        authorization: FactoryHermesReplayRetryAuthorizationV1,
     ) -> FactorySkillReplayClaim: ...
 
     async def abandon(self, pending: FactorySkillReplayRecord) -> None: ...
@@ -1404,6 +1499,25 @@ class InMemoryFactorySkillReplayStore:
     ) -> FactorySkillReplayClaim:
         resumed = _retried_failed_replay_record(
             failed,
+            authorization=authorization,
+        )
+        async with self._lock:
+            existing = self._records.get(failed.invocation.idempotency_key)
+            if existing != failed or existing.state != "failed":
+                raise FactoryDispatchError("factory skill replay failure changed")
+            self._records[failed.invocation.idempotency_key] = resumed
+        return FactorySkillReplayClaim(record=resumed, acquired=True)
+
+    async def retry_failed_hermes(
+        self,
+        failed: FactorySkillReplayRecord,
+        *,
+        requested_invocation: FactorySkillInvocationV1,
+        authorization: FactoryHermesReplayRetryAuthorizationV1,
+    ) -> FactorySkillReplayClaim:
+        resumed = _retried_failed_hermes_replay_record(
+            failed,
+            requested_invocation=requested_invocation,
             authorization=authorization,
         )
         async with self._lock:
@@ -1597,6 +1711,27 @@ class FilesystemFactorySkillReplayStore:
         )
         return FactorySkillReplayClaim(record=resumed, acquired=True)
 
+    async def retry_failed_hermes(
+        self,
+        failed: FactorySkillReplayRecord,
+        *,
+        requested_invocation: FactorySkillInvocationV1,
+        authorization: FactoryHermesReplayRetryAuthorizationV1,
+    ) -> FactorySkillReplayClaim:
+        resumed = _retried_failed_hermes_replay_record(
+            failed,
+            requested_invocation=requested_invocation,
+            authorization=authorization,
+        )
+        path = self._path_for(failed.invocation.idempotency_key)
+        await asyncio.to_thread(
+            self._replace_failed_with_archive,
+            path,
+            failed,
+            resumed,
+        )
+        return FactorySkillReplayClaim(record=resumed, acquired=True)
+
     async def abandon(self, pending: FactorySkillReplayRecord) -> None:
         path = self._path_for(pending.invocation.idempotency_key)
         await asyncio.to_thread(self._remove_pending, path, pending)
@@ -1679,6 +1814,53 @@ class FilesystemFactorySkillReplayStore:
             expected_state="failed",
             diagnostic="factory skill replay failure changed",
         )
+
+    @classmethod
+    def _replace_failed_with_archive(
+        cls,
+        path: Path,
+        failed: FactorySkillReplayRecord,
+        resumed: FactorySkillReplayRecord,
+    ) -> None:
+        lock = cls._acquire_file_lock(path.with_suffix(".lock"))
+        temporary: Path | None = None
+        try:
+            if cls._read_record(path) != failed or failed.state != "failed":
+                raise FactoryDispatchError("factory skill replay failure changed")
+            failed_content = _factory_skill_replay_content(failed)
+            failure_ref = factory_skill_replay_failure_ref(failed)
+            if resumed.prior_failure_ref != failure_ref:
+                raise FactoryDispatchError(
+                    "factory skill replay archive binding does not match retry"
+                )
+            archive = path.parent / "failure-history" / f"{failure_ref.sha256}.json"
+            created = cls._create_exclusive(archive, failed_content)
+            if not created:
+                try:
+                    existing = archive.read_bytes()
+                except OSError as exc:
+                    raise FactoryDispatchError(
+                        "factory skill replay failure archive is unavailable"
+                    ) from exc
+                if existing != failed_content:
+                    raise FactoryDispatchError(
+                        "factory skill replay failure archive conflicts"
+                    )
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+            )
+            temporary = Path(temporary_name)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(_factory_skill_replay_content(resumed))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            cls._release_file_lock(lock)
 
     @classmethod
     def _replace_exact(
@@ -1775,6 +1957,7 @@ class FilesystemFactorySkillReplayStore:
                 "captain.factory-skill-replay.v2",
                 "captain.factory-skill-replay.v3",
                 "captain.factory-skill-replay.v4",
+                "captain.factory-skill-replay.v5",
             }:
                 raise ValueError("replay record schema is unsupported")
             invocation = FactorySkillInvocationV1.model_validate(value["invocation"])
@@ -1816,15 +1999,35 @@ class FilesystemFactorySkillReplayStore:
                 runtime_retry_authorization_binding_sha256=value.get(
                     "runtime_retry_authorization_binding_sha256"
                 ),
+                hermes_retry_authorization_ref=(
+                    ArtifactRef.model_validate(
+                        value["hermes_retry_authorization_ref"]
+                    )
+                    if value.get("hermes_retry_authorization_ref") is not None
+                    else None
+                ),
+                hermes_retry_authorization_binding_sha256=value.get(
+                    "hermes_retry_authorization_binding_sha256"
+                ),
+                prior_failure_ref=(
+                    ArtifactRef.model_validate(value["prior_failure_ref"])
+                    if value.get("prior_failure_ref") is not None
+                    else None
+                ),
             )
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise FactoryDispatchError("factory skill replay record is invalid") from exc
 
 
 def _factory_skill_replay_content(record: FactorySkillReplayRecord) -> bytes:
+    schema = (
+        "captain.factory-skill-replay.v5"
+        if record.hermes_retry_authorization_ref is not None
+        else "captain.factory-skill-replay.v4"
+    )
     return _canonical_json(
         {
-            "schema": "captain.factory-skill-replay.v4",
+            "schema": schema,
             "state": record.state,
             "invocation_sha256": record.invocation_sha256,
             "claim_token": record.claim_token,
@@ -1859,8 +2062,42 @@ def _factory_skill_replay_content(record: FactorySkillReplayRecord) -> bytes:
             "runtime_retry_authorization_binding_sha256": (
                 record.runtime_retry_authorization_binding_sha256
             ),
+            "hermes_retry_authorization_ref": (
+                None
+                if record.hermes_retry_authorization_ref is None
+                else record.hermes_retry_authorization_ref.model_dump(mode="json")
+            ),
+            "hermes_retry_authorization_binding_sha256": (
+                record.hermes_retry_authorization_binding_sha256
+            ),
+            "prior_failure_ref": (
+                None
+                if record.prior_failure_ref is None
+                else record.prior_failure_ref.model_dump(mode="json")
+            ),
         }
     ).encode("utf-8")
+
+
+def factory_skill_replay_failure_ref(
+    record: FactorySkillReplayRecord,
+) -> ArtifactRef:
+    """Return the exact canonical content ref archived before Hermes retry."""
+
+    if record.state != "failed":
+        raise FactoryDispatchError("only failed factory skill replays can be archived")
+    digest = hashlib.sha256(_factory_skill_replay_content(record)).hexdigest()
+    return ArtifactRef(
+        uri=f"artifact://factory/skill-replay-failure/{digest}",
+        sha256=digest,
+        media_type="application/json",
+    )
+
+
+def load_factory_skill_replay_record(path: Path) -> FactorySkillReplayRecord:
+    """Load one durable replay record without exposing store mutation helpers."""
+
+    return FilesystemFactorySkillReplayStore._read_record(path)
 
 
 def _factory_invocation_digest(invocation: FactorySkillInvocationV1) -> str:
@@ -1901,6 +2138,11 @@ def _completed_replay_record(
         runtime_retry_authorization_binding_sha256=(
             pending.runtime_retry_authorization_binding_sha256
         ),
+        hermes_retry_authorization_ref=pending.hermes_retry_authorization_ref,
+        hermes_retry_authorization_binding_sha256=(
+            pending.hermes_retry_authorization_binding_sha256
+        ),
+        prior_failure_ref=pending.prior_failure_ref,
     )
 
 
@@ -1926,6 +2168,11 @@ def _failed_replay_record(
         runtime_retry_authorization_binding_sha256=(
             pending.runtime_retry_authorization_binding_sha256
         ),
+        hermes_retry_authorization_ref=pending.hermes_retry_authorization_ref,
+        hermes_retry_authorization_binding_sha256=(
+            pending.hermes_retry_authorization_binding_sha256
+        ),
+        prior_failure_ref=pending.prior_failure_ref,
     )
 
 
@@ -2061,6 +2308,54 @@ def _retried_failed_replay_record(
     )
 
 
+def _retried_failed_hermes_replay_record(
+    failed: FactorySkillReplayRecord,
+    *,
+    requested_invocation: FactorySkillInvocationV1,
+    authorization: FactoryHermesReplayRetryAuthorizationV1,
+) -> FactorySkillReplayRecord:
+    invocation = failed.invocation
+    failed_ref = factory_skill_replay_failure_ref(failed)
+    authorization_digest = factory_hermes_replay_retry_authorization_sha256(
+        authorization
+    )
+    if (
+        failed.state != "failed"
+        or failed.failure_kind != authorization.failure_kind
+        or failed.resume_ordinal != 0
+        or failed.hermes_retry_authorization_ref is not None
+        or invocation.step is not FactorySkillStep.IMPROVE_TEAM
+        or authorization.step is not invocation.step
+        or authorization.retry_ordinal != 1
+        or authorization.failed_replay_ref != failed_ref
+        or authorization.job_id != invocation.job_id
+        or authorization.correlation_id != invocation.correlation_id
+        or authorization.subject_version != invocation.subject_version
+        or authorization.attempt != invocation.attempt
+        or authorization.invocation_id != invocation.invocation_id
+        or authorization.idempotency_key != invocation.idempotency_key
+        or authorization.lease_id != invocation.lease.lease_id
+        or not _same_invocation_except_lease(invocation, requested_invocation)
+        or not _same_or_valid_successor_lease(
+            invocation.lease,
+            requested_invocation.lease,
+        )
+    ):
+        raise FactoryDispatchError(
+            "failed Hermes replay does not match Captain recovery authority"
+        )
+    return FactorySkillReplayRecord(
+        invocation=requested_invocation,
+        invocation_sha256=_factory_invocation_digest(requested_invocation),
+        claim_token=uuid4().hex,
+        state="pending",
+        resume_ordinal=authorization.retry_ordinal,
+        hermes_retry_authorization_ref=authorization.authorization_ref,
+        hermes_retry_authorization_binding_sha256=authorization_digest,
+        prior_failure_ref=failed_ref,
+    )
+
+
 def _existing_replay_claim(
     existing: FactorySkillReplayRecord,
     invocation: FactorySkillInvocationV1,
@@ -2069,6 +2364,18 @@ def _existing_replay_claim(
         existing.invocation_sha256 != _factory_invocation_digest(invocation)
         or existing.invocation != invocation
     ):
+        if (
+            existing.state == "failed"
+            and existing.invocation.step is FactorySkillStep.IMPROVE_TEAM
+            and existing.failure_kind == "FactoryDispatchError"
+            and existing.resume_ordinal == 0
+            and existing.hermes_retry_authorization_ref is None
+            and _same_invocation_except_lease(existing.invocation, invocation)
+        ):
+            raise FactorySkillReplayHermesRetryableFailureError(
+                existing,
+                invocation,
+            )
         raise FactoryDispatchError("factory skill replay invocation conflicts")
     if existing.state == "pending":
         raise FactorySkillReplayPendingError(existing)
@@ -2078,10 +2385,43 @@ def _existing_replay_claim(
             and existing.runtime_retry_authorization_ref is not None
         ):
             raise FactorySkillReplayRetryableFailureError(existing)
+        if (
+            existing.invocation.step is FactorySkillStep.IMPROVE_TEAM
+            and existing.failure_kind == "FactoryDispatchError"
+            and existing.resume_ordinal == 0
+            and existing.hermes_retry_authorization_ref is None
+        ):
+            raise FactorySkillReplayHermesRetryableFailureError(
+                existing,
+                invocation,
+            )
         raise FactoryDispatchError("factory skill replay previously failed")
     if existing.state == "interrupted":
         raise FactorySkillReplayInterruptedError(existing)
     return FactorySkillReplayClaim(record=existing, acquired=False)
+
+
+def _same_invocation_except_lease(
+    left: FactorySkillInvocationV1,
+    right: FactorySkillInvocationV1,
+) -> bool:
+    return left == right.model_copy(update={"lease": left.lease})
+
+
+def _same_or_valid_successor_lease(left: FactoryLease, right: FactoryLease) -> bool:
+    if left == right:
+        return True
+    try:
+        left_payload = left.model_dump(mode="json", by_alias=True)
+        right_payload = right.model_dump(mode="json", by_alias=True)
+        left_expires = left.expires_at
+        right_issued = right.issued_at
+    except AttributeError:
+        return False
+    for key in ("lease_id", "issued_at", "expires_at"):
+        left_payload.pop(key, None)
+        right_payload.pop(key, None)
+    return left_payload == right_payload and right_issued >= left_expires
 
 
 _STEP_RESULT_MODELS: dict[FactorySkillStep, type[BaseModel]] = {

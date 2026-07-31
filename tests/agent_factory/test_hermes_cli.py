@@ -25,12 +25,14 @@ from agenten.agent_factory.candidate_evaluation import (
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.hermes_cli import (
     FactorySkillReplayPendingError,
+    FactorySkillReplayHermesRetryableFailureError,
     FactorySkillReplayClaim,
     FactorySkillReplayRetryableFailureError,
     FilesystemFactorySkillReplayStore,
     FilesystemReleasedFactorySkillCatalog,
     HermesCliFactory,
     HermesCliSettings,
+    factory_skill_replay_failure_ref,
     _captain_discovery_seed,
     _require_improvement_artifact_binding,
     InMemoryFactorySkillReplayStore,
@@ -43,6 +45,7 @@ from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
 from agenten.agent_factory.skill_sequence import (
     FactoryImprovementAuthorizationV1,
+    build_factory_hermes_replay_retry_authorization,
     FactoryRuntimeRetryAuthorizationV1,
 )
 from agenten.agent_factory.skill_evaluation import (
@@ -1577,6 +1580,98 @@ async def test_runtime_retry_replay_requires_atomic_authorized_resume(
     )
     with pytest.raises(FactoryDispatchError, match="failure changed"):
         await replay_store.retry_failed(failed, authorization=authorization)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("durable", [False, True])
+async def test_failed_improve_replay_requires_exact_budget_bound_captain_retry(
+    tmp_path: Path,
+    durable: bool,
+) -> None:
+    replay_root = tmp_path / "hermes-replays"
+    replay_store = (
+        FilesystemFactorySkillReplayStore(replay_root)
+        if durable
+        else InMemoryFactorySkillReplayStore()
+    )
+    payload = invocation_payload("improve_team", attempt=2)
+    lease_payload = payload["lease"]
+    assert isinstance(lease_payload, dict)
+    lease_payload["attempt"] = 2
+    invocation = FactorySkillInvocationV1.model_validate(payload)
+    claimed = await replay_store.claim(invocation)
+    failed = await replay_store.fail(
+        claimed.record,
+        failure_kind="FactoryDispatchError",
+    )
+    with pytest.raises(FactorySkillReplayHermesRetryableFailureError):
+        await replay_store.claim(invocation)
+    successor_lease = invocation.lease.model_copy(
+        update={
+            "lease_id": "factory-successor-retry",
+            "issued_at": invocation.lease.expires_at,
+            "expires_at": invocation.lease.expires_at + timedelta(minutes=15),
+        }
+    )
+    successor_invocation = invocation.model_copy(
+        update={"lease": successor_lease}
+    )
+    with pytest.raises(FactorySkillReplayHermesRetryableFailureError):
+        await replay_store.claim(successor_invocation)
+    failure_ref = factory_skill_replay_failure_ref(failed)
+    with pytest.raises(ValueError, match="user team cap"):
+        build_factory_hermes_replay_retry_authorization(
+            job_id=invocation.job_id,
+            correlation_id=invocation.correlation_id,
+            subject_version=invocation.subject_version,
+            attempt=invocation.attempt,
+            invocation_id=invocation.invocation_id,
+            idempotency_key=invocation.idempotency_key,
+            lease_id=invocation.lease.lease_id,
+            failed_replay_ref=failure_ref,
+            issued_at=invocation.lease.issued_at,
+            expires_at=invocation.lease.issued_at + timedelta(minutes=5),
+            user_total_cap_eur=Decimal("1.01"),
+        )
+    authorization = build_factory_hermes_replay_retry_authorization(
+        job_id=invocation.job_id,
+        correlation_id=invocation.correlation_id,
+        subject_version=invocation.subject_version,
+        attempt=invocation.attempt,
+        invocation_id=invocation.invocation_id,
+        idempotency_key=invocation.idempotency_key,
+        lease_id=invocation.lease.lease_id,
+        failed_replay_ref=failure_ref,
+        issued_at=invocation.lease.issued_at,
+        expires_at=invocation.lease.issued_at + timedelta(minutes=5),
+    )
+
+    retried = await replay_store.retry_failed_hermes(
+        failed,
+        requested_invocation=successor_invocation,
+        authorization=authorization,
+    )
+
+    assert retried.acquired is True
+    assert retried.record.state == "pending"
+    assert retried.record.invocation.lease == successor_lease
+    assert retried.record.resume_ordinal == 1
+    assert retried.record.prior_failure_ref == failure_ref
+    assert retried.record.hermes_retry_authorization_ref == (
+        authorization.authorization_ref
+    )
+    if durable:
+        archive = replay_root / "failure-history" / f"{failure_ref.sha256}.json"
+        assert archive.is_file()
+        assert factory_skill_replay_failure_ref(
+            FilesystemFactorySkillReplayStore._read_record(archive)
+        ) == failure_ref
+    with pytest.raises(FactoryDispatchError, match="failure changed"):
+        await replay_store.retry_failed_hermes(
+            failed,
+            requested_invocation=successor_invocation,
+            authorization=authorization,
+        )
 
 
 @pytest.mark.asyncio

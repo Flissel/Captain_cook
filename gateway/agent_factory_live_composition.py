@@ -47,6 +47,7 @@ from agenten.agent_factory.execution_budget import FactoryBudgetPort
 from agenten.agent_factory.factory_feedback import FactoryFeedbackBuilder
 from agenten.agent_factory.hermes_cli import (
     CaptainCodexBuildSealerPort,
+    CaptainHermesReplayRetryAuthorizationPort,
     FactorySkillReplayStore,
     FilesystemFactorySkillReplayStore,
     HermesCliFactory,
@@ -437,6 +438,7 @@ def compose_agent_factory_live(
     holdout_selector: Callable[[AgentFactoryJobV3], PrivateHoldoutRef] | None = None,
     improvements: FactoryImprovementAuthorizationPort | None = None,
     runtime_retries: FactoryRuntimeRetryAuthorizationPort | None = None,
+    hermes_retry_authority: CaptainHermesReplayRetryAuthorizationPort | None = None,
     codex_build_sealer: CaptainCodexBuildSealerPort | None = None,
     codex_prompt_artifact_store: CodexPromptArtifactStore | None = None,
 ) -> AgentFactoryLiveComposition:
@@ -470,6 +472,7 @@ def compose_agent_factory_live(
         released_skill_catalog=repository,
         codex_build_sealer=codex_build_sealer,
         codex_prompt_artifact_store=codex_prompt_artifact_store,
+        hermes_retry_authority=hermes_retry_authority,
         clock=clock,
     )
     team_execution = ProductionFactoryTeamExecutionPort(

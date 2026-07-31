@@ -81,6 +81,9 @@ from gateway.factory_runtime_retry_authority import (
 from gateway.factory_improvement_authority import (
     FilesystemFactoryImprovementAuthority,
 )
+from gateway.factory_hermes_retry_authority import (
+    FilesystemFactoryHermesRetryAuthority,
+)
 from gateway.minibook_creation_artifacts import GatewayMinibookCreationArtifactStore
 from gateway.store import GatewayStore
 
@@ -314,6 +317,9 @@ def compose_business_demo_factory_operator(
     improvement_authority = FilesystemFactoryImprovementAuthority(
         authority_root / "runtime-state" / "improvement-authorizations"
     )
+    hermes_retry_authority = FilesystemFactoryHermesRetryAuthority(
+        authority_root / "runtime-state" / "hermes-retry-authorizations"
+    )
     repository = GatewayFactoryRepository(
         store,
         runtime_retries=runtime_retry_authority,
@@ -499,6 +505,7 @@ def compose_business_demo_factory_operator(
         ),
         improvements=improvement_authority,
         runtime_retries=runtime_retry_authority,
+        hermes_retry_authority=hermes_retry_authority,
     )
 
 

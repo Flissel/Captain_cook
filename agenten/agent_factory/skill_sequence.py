@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 import hashlib
 import json
 import re
@@ -111,6 +112,173 @@ class FactoryRuntimeRetryAuthorizationV1(BaseModel):
         if self.expires_at <= self.issued_at:
             raise ValueError("runtime retry authority expiry must follow issuance")
         return self
+
+
+class FactoryHermesReplayRetryAuthorizationV1(BaseModel):
+    """One Captain authority to repeat one exact failed Hermes skill effect."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        populate_by_name=True,
+        strict=True,
+    )
+
+    schema_name: Literal["captain.factory-hermes-replay-retry-authorization.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    authorization_ref: ArtifactRef
+    producer: Literal["captain"]
+    status: Literal["succeeded"]
+    reason: Literal["cost_ceiling_reconfigured"]
+    job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=2, le=5, strict=True)
+    invocation_id: UUID
+    idempotency_key: str = Field(pattern=r"^[0-9a-f]{64}$")
+    lease_id: str = Field(min_length=1, max_length=200)
+    step: Literal[FactorySkillStep.IMPROVE_TEAM]
+    failure_kind: Literal["FactoryDispatchError"]
+    failed_replay_ref: ArtifactRef
+    retry_ordinal: Literal[1]
+    maximum_additional_cost_usd: Decimal = Field(gt=Decimal("0"))
+    prior_attempt_reserve_usd: Decimal = Field(ge=Decimal("0"))
+    benchmark_reserve_usd: Decimal = Field(ge=Decimal("0"))
+    internal_total_cap_usd: Decimal = Field(gt=Decimal("0"))
+    user_total_cap_eur: Decimal = Field(gt=Decimal("0"))
+    issued_at: datetime
+    expires_at: datetime
+
+    @field_validator("issued_at", "expires_at")
+    @classmethod
+    def require_utc_timestamp(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("Hermes retry timestamp must be UTC")
+        return value
+
+    @model_validator(mode="after")
+    def require_bounded_budget_and_window(
+        self,
+    ) -> "FactoryHermesReplayRetryAuthorizationV1":
+        if self.expires_at <= self.issued_at:
+            raise ValueError("Hermes retry authority expiry must follow issuance")
+        if self.internal_total_cap_usd > Decimal("0.75"):
+            raise ValueError("Hermes retry internal team cap exceeds policy")
+        if self.user_total_cap_eur > Decimal("1.00"):
+            raise ValueError("Hermes retry user team cap exceeds policy")
+        allocated = (
+            self.maximum_additional_cost_usd
+            + self.prior_attempt_reserve_usd
+            + self.benchmark_reserve_usd
+        )
+        if allocated > self.internal_total_cap_usd:
+            raise ValueError("Hermes retry allocations exceed internal team cap")
+        return self
+
+
+def build_factory_hermes_replay_retry_authorization(
+    *,
+    job_id: UUID,
+    correlation_id: UUID,
+    subject_version: int,
+    attempt: int,
+    invocation_id: UUID,
+    idempotency_key: str,
+    lease_id: str,
+    failed_replay_ref: ArtifactRef,
+    issued_at: datetime,
+    expires_at: datetime,
+    maximum_additional_cost_usd: Decimal = Decimal("0.25"),
+    prior_attempt_reserve_usd: Decimal = Decimal("0.20"),
+    benchmark_reserve_usd: Decimal = Decimal("0.30"),
+    internal_total_cap_usd: Decimal = Decimal("0.75"),
+    user_total_cap_eur: Decimal = Decimal("1.00"),
+) -> FactoryHermesReplayRetryAuthorizationV1:
+    """Build content-addressed, single-replay Captain recovery authority."""
+
+    placeholder = ArtifactRef(
+        uri=f"artifact://factory/hermes-replay-request/{'0' * 64}",
+        sha256="0" * 64,
+        media_type="application/json",
+    )
+    authorization = FactoryHermesReplayRetryAuthorizationV1(
+        schema_name="captain.factory-hermes-replay-retry-authorization.v1",
+        authorization_ref=placeholder,
+        producer="captain",
+        status="succeeded",
+        reason="cost_ceiling_reconfigured",
+        job_id=job_id,
+        correlation_id=correlation_id,
+        subject_version=subject_version,
+        attempt=attempt,
+        invocation_id=invocation_id,
+        idempotency_key=idempotency_key,
+        lease_id=lease_id,
+        step=FactorySkillStep.IMPROVE_TEAM,
+        failure_kind="FactoryDispatchError",
+        failed_replay_ref=failed_replay_ref,
+        retry_ordinal=1,
+        maximum_additional_cost_usd=maximum_additional_cost_usd,
+        prior_attempt_reserve_usd=prior_attempt_reserve_usd,
+        benchmark_reserve_usd=benchmark_reserve_usd,
+        internal_total_cap_usd=internal_total_cap_usd,
+        user_total_cap_eur=user_total_cap_eur,
+        issued_at=issued_at,
+        expires_at=expires_at,
+    )
+    digest = factory_hermes_replay_retry_authorization_sha256(authorization)
+    return authorization.model_copy(
+        update={
+            "authorization_ref": ArtifactRef(
+                uri=f"artifact://factory/hermes-replay-request/{digest}",
+                sha256=digest,
+                media_type="application/json",
+            )
+        }
+    )
+
+
+def factory_hermes_replay_retry_authorization_binding(
+    authorization: FactoryHermesReplayRetryAuthorizationV1,
+) -> dict[str, object]:
+    return authorization.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude={"authorization_ref"},
+    )
+
+
+def factory_hermes_replay_retry_authorization_sha256(
+    authorization: FactoryHermesReplayRetryAuthorizationV1,
+) -> str:
+    content = json.dumps(
+        factory_hermes_replay_retry_authorization_binding(authorization),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(content).hexdigest()
+
+
+def validate_factory_hermes_replay_retry_authorization(
+    authorization: FactoryHermesReplayRetryAuthorizationV1,
+    *,
+    now: datetime,
+) -> FactoryHermesReplayRetryAuthorizationV1:
+    if now.tzinfo is None or now.utcoffset() != timezone.utc.utcoffset(now):
+        raise ValueError("Hermes retry validation time must be UTC")
+    if now < authorization.issued_at or now >= authorization.expires_at:
+        raise ValueError("Hermes retry authority is inactive or expired")
+    digest = factory_hermes_replay_retry_authorization_sha256(authorization)
+    if authorization.authorization_ref != ArtifactRef(
+        uri=f"artifact://factory/hermes-replay-request/{digest}",
+        sha256=digest,
+        media_type="application/json",
+    ):
+        raise ValueError("Hermes retry authority content binding does not match")
+    return authorization
 
 
 def validate_factory_runtime_retry_authorization(
