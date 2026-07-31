@@ -532,7 +532,10 @@ def _require_safe_source_zip(content: bytes) -> bytes:
                             "source archive candidate manifest exceeds the size limit"
                         )
                     candidate_manifest_info = item
-            _require_nonoverlapping_source_zip_records(occupied_ranges)
+            _require_nonoverlapping_source_zip_records(
+                occupied_ranges,
+                central_directory_offset=layout.central_directory_offset,
+            )
             if candidate_manifest_info is None:
                 raise CodexBuildProvenanceError(
                     "source archive candidate manifest is missing"
@@ -957,12 +960,20 @@ def _require_source_zip_data_descriptor(
 
 def _require_nonoverlapping_source_zip_records(
     ranges: Iterable[tuple[int, int]],
+    *,
+    central_directory_offset: int,
 ) -> None:
     previous_end = 0
     for start, end in sorted(ranges):
-        if start < previous_end or end < start:
-            raise CodexBuildProvenanceError("source archive local records overlap")
+        if start != previous_end or end < start:
+            raise CodexBuildProvenanceError(
+                "source archive local records are not contiguous"
+            )
         previous_end = end
+    if previous_end != central_directory_offset:
+        raise CodexBuildProvenanceError(
+            "source archive local records do not reach the central directory"
+        )
 
 
 def _stream_source_zip_entries(

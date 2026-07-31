@@ -818,6 +818,40 @@ def test_source_zip_accepts_utf8_names_and_data_descriptors() -> None:
     assert _require_safe_source_zip(archive) == manifest
 
 
+def test_source_zip_rejects_bytes_before_first_local_record() -> None:
+    output = BytesIO(b"SENSITIVE_MARKER_OUTSIDE_MEMBERS")
+    with ZipFile(output, "a", compression=ZIP_STORED) as archive:
+        archive.writestr("factory-candidate.json", b"{}")
+
+    with pytest.raises(CodexBuildProvenanceError, match="local records"):
+        _require_safe_source_zip(output.getvalue())
+
+
+def test_source_zip_rejects_gap_before_central_directory() -> None:
+    archive = bytearray(
+        _zip_bytes(
+            {
+                "factory-candidate.json": b"{}",
+                "src/team.py": b"TEAM = 'claims'\n",
+            }
+        )
+    )
+    original_eocd = _eocd_offset(archive)
+    central_offset = struct.unpack_from("<I", archive, original_eocd + 16)[0]
+    gap = b"SENSITIVE_MARKER_OUTSIDE_MEMBERS"
+    archive[central_offset:central_offset] = gap
+    shifted_eocd = original_eocd + len(gap)
+    struct.pack_into(
+        "<I",
+        archive,
+        shifted_eocd + 16,
+        central_offset + len(gap),
+    )
+
+    with pytest.raises(CodexBuildProvenanceError, match="local records"):
+        _require_safe_source_zip(bytes(archive))
+
+
 def test_cas_is_content_addressed_write_once_and_detects_tampering(tmp_path: Path) -> None:
     cas = CodexBuildArtifactCas(tmp_path / "cas")
     reference = cas.put_bytes(
