@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import UUID
 
@@ -16,12 +17,17 @@ from agenten.agent_factory.execution_policy import (
 )
 from agenten.agent_factory.forge_contracts import FactoryBuildAssignmentV1
 from agenten.agent_factory.skill_sequence import FactoryImprovementAuthorizationV1
+from agenten.agent_factory.technical_improvement_contracts import (
+    build_captain_technical_failure_evaluation,
+)
+from agenten.agent_factory.outcome_contracts import AssertionOutcome
 from agenten.agent_factory.skill_workflow_contracts import (
     CodebaseInventoryV1,
+    FactoryFeedbackRecommendation,
     FactorySkillInvocationV1,
     TeamEvaluationV1,
 )
-from agenten.agent_runtime.contracts import ArtifactRef
+from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent
 from tests.agent_factory.test_skill_workflow_contracts import (
     artifact,
     build_assignment_payload,
@@ -113,6 +119,79 @@ def retry_authorization() -> FactoryImprovementAuthorizationV1:
         prior_candidate_ref=prior_candidate,
         prior_green_assertion_ids=("schema_valid",),
         prior_green_benchmark_metric_ids=("coverage",),
+    )
+
+
+def technical_retry_authorization() -> FactoryImprovementAuthorizationV1:
+    evidence_ref = ArtifactRef(
+        uri="artifact://factory/candidate-evaluation/" + "7" * 64,
+        sha256="7" * 64,
+        media_type="application/json",
+    )
+    candidate_ref = ArtifactRef(
+        uri="artifact://factory/candidate/" + "8" * 64,
+        sha256="8" * 64,
+        media_type="application/zip",
+    )
+    invocation = invocation_payload("brief_codex")
+    occurred_at = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
+    evaluation = build_captain_technical_failure_evaluation(
+        job_id=UUID(str(invocation["job_id"])),
+        correlation_id=UUID(str(invocation["correlation_id"])),
+        subject_version=1,
+        attempt=1,
+        source_phase=FactoryPhase.BUILD_FAILED,
+        source_block_id=UUID("00000000-0000-0000-0000-000000000399"),
+        occurred_at=occurred_at,
+        candidate_ref=candidate_ref,
+        acceptance_assertion_ids=("schema_valid", "real_case_green"),
+        assertion_outcomes=(
+            AssertionOutcome(
+                assertion_id="schema_valid",
+                status="failed",
+                integration_intent=IntegrationIntent.NONE,
+                evidence_refs=(evidence_ref,),
+            ),
+            AssertionOutcome(
+                assertion_id="real_case_green",
+                status="failed",
+                integration_intent=IntegrationIntent.NONE,
+                evidence_refs=(evidence_ref,),
+            ),
+        ),
+        evidence_refs=(evidence_ref,),
+        technical_diagnostic_codes=("real_case_trace_id_mismatch",),
+        failure_class="test_regression",
+        recommendation=FactoryFeedbackRecommendation.RETRY_BUILD,
+    )
+    request = FactoryEvidenceBlock(
+        schema_name="captain.agent-factory-block.v1",
+        event_id=UUID("00000000-0000-0000-0000-000000000398"),
+        job_id=evaluation.job_id,
+        correlation_id=evaluation.correlation_id,
+        causation_id=evaluation.source_block_id,
+        occurred_at=occurred_at,
+        producer="captain",
+        subject_version=evaluation.subject_version,
+        attempt=evaluation.attempt,
+        phase=FactoryPhase.IMPROVEMENT_REQUESTED,
+        status="succeeded",
+        artifact_refs=(candidate_ref,),
+        evidence_refs=(evaluation.artifact_ref,),
+        assertion_ids=(),
+    )
+    return FactoryImprovementAuthorizationV1(
+        schema_name="captain.factory-improvement-authorization.v1",
+        authorization_ref=ArtifactRef(
+            uri="artifact://factory/improvement-request/" + "9" * 64,
+            sha256="9" * 64,
+            media_type="application/json",
+        ),
+        authorized_attempt=2,
+        request_block=request,
+        failed_evaluation=evaluation,
+        prior_candidate_ref=candidate_ref,
+        prior_green_assertion_ids=(),
     )
 
 
@@ -247,3 +326,35 @@ def test_retry_brief_binds_failed_evaluation_candidate_and_prior_green() -> None
     assert brief.failed_benchmark_metric_ids == ("tool_safety",)
     assert brief.regression_benchmark_metric_ids == ("coverage",)
     assert authorization.prior_candidate_ref.uri in rendered
+
+
+def test_technical_retry_brief_explains_exact_real_case_runner_contract() -> None:
+    authorization = technical_retry_authorization()
+    invocation_data = invocation_payload(
+        "brief_codex",
+        attempt=2,
+        input_ref=authorization.authorization_ref.model_dump(mode="json"),
+        input_sha256=authorization.authorization_ref.sha256,
+        lease=lease_payload(
+            "tool_integrator",
+            "factory-tool-integrator",
+            attempt=2,
+        ),
+    )
+    assignment_data = build_assignment_payload()
+    assignment_data["attempt"] = 2
+    store = PromptArtifactStore()
+
+    brief = CodexBriefBuilder(artifact_store=store).build(
+        FactorySkillInvocationV1.model_validate(invocation_data),
+        FactoryBuildAssignmentV1.model_validate(assignment_data),
+        CodebaseInventoryV1.model_validate(inventory_payload()),
+        policy(),
+        improvement_authorization=authorization,
+    )
+
+    rendered = store.read(brief.prompt_ref)
+    assert '"technical diagnostic codes": [\n      "real_case_trace_id_mismatch"' in rendered
+    assert "receives no stdin" in rendered
+    assert "CAPTAIN_TRACE_ID" in rendered
+    assert "exactly one JSON object" in rendered

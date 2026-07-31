@@ -37,6 +37,7 @@ from agenten.agent_factory.state_machine import (
 )
 from agenten.agent_factory.technical_improvement_contracts import (
     CaptainTechnicalFailureEvaluationV1,
+    TechnicalFailureDiagnosticCode,
     build_captain_technical_failure_evaluation,
 )
 from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent
@@ -118,10 +119,10 @@ class CaptainTechnicalFailureEvaluator:
             acceptance_assertion_ids=job.acceptance_assertion_ids,
             assertion_outcomes=outcomes,
             evidence_refs=(evidence_ref,),
+            technical_diagnostic_codes=_technical_diagnostic_codes(result),
             failure_class="test_regression",
             recommendation=FactoryFeedbackRecommendation.RETRY_BUILD,
         )
-
     def from_team_execution(
         self,
         *,
@@ -175,6 +176,37 @@ class CaptainTechnicalFailureEvaluator:
             failure_class="behavioral_failure",
             recommendation=FactoryFeedbackRecommendation.RETRY_BUILD,
         )
+
+
+def _technical_diagnostic_codes(
+    result: FactoryCandidateEvaluationResult,
+) -> tuple[TechnicalFailureDiagnosticCode, ...]:
+    """Map public evaluator messages to a bounded, prompt-safe repair vocabulary."""
+
+    failed = tuple(
+        check
+        for check in result.checks
+        if check.name == "real_case" and check.status == "failed"
+    )
+    if len(failed) != 1:
+        return ("real_case_contract_failed",)
+    detail = failed[0].detail
+    if detail.startswith("candidate command failed:"):
+        return ("real_case_command_failed",)
+    if detail == "real-case command must emit exactly one JSON object":
+        return ("real_case_output_not_json",)
+    if detail == "real-case result does not carry the Captain trace ID":
+        return ("real_case_trace_id_mismatch",)
+    if detail in {
+        "real-case result must contain non-empty assertion_ids",
+        "real-case result assertion_ids must be unique",
+    }:
+        return ("real_case_assertion_ids_invalid",)
+    if detail == (
+        "real-case result does not prove exactly the Captain acceptance assertions"
+    ):
+        return ("real_case_assertion_ids_mismatch",)
+    return ("real_case_contract_failed",)
 
 
 class CaptainFactoryImprovementAuthorizationStore:

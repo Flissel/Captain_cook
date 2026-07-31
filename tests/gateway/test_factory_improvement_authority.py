@@ -113,7 +113,10 @@ def test_captain_converts_failed_build_preflight_to_fail_closed_assertions() -> 
             FactoryEvaluationCheck(
                 name="real_case",
                 status="failed",
-                detail="candidate did not emit a runtime result",
+                detail=(
+                    "candidate command failed: rejected: Expecting value: "
+                    "line 1 column 1 (char 0)"
+                ),
             ),
         ),
     )
@@ -132,6 +135,43 @@ def test_captain_converts_failed_build_preflight_to_fail_closed_assertions() -> 
         "failed",
     )
     assert evaluation.failure_class == "test_regression"
+    assert evaluation.technical_diagnostic_codes == (
+        "real_case_command_failed",
+    )
+
+
+def test_captain_classifies_missing_trace_without_copying_raw_failure_text() -> None:
+    job = _job()
+    evidence_ref = _ref("candidate-evaluation", "7" * 64)
+    source = _source_block(FactoryPhase.BUILD_FAILED, evidence_ref)
+    candidate_ref = _ref("candidate", "8" * 64)
+    result = FactoryCandidateEvaluationResult(
+        status="failed",
+        trace_id="trace-build-failed",
+        assertion_ids=(),
+        tool_names=(),
+        checks=(
+            FactoryEvaluationCheck(
+                name="real_case",
+                status="failed",
+                detail="real-case result does not carry the Captain trace ID",
+            ),
+        ),
+    )
+
+    evaluation = CaptainTechnicalFailureEvaluator().from_build_failure(
+        job=job,
+        source_block=source,
+        candidate_ref=candidate_ref,
+        result=result,
+        evidence_ref=evidence_ref,
+        occurred_at=NOW,
+    )
+
+    assert evaluation.technical_diagnostic_codes == (
+        "real_case_trace_id_mismatch",
+    )
+    assert "detail" not in evaluation.model_dump(mode="json")
 
 
 def test_captain_retains_only_passed_technical_assertions_as_regression_guards() -> None:

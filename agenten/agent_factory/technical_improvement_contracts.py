@@ -23,6 +23,15 @@ _TECHNICAL_FAILURE_PHASES = {
     FactoryPhase.REAL_CASE_EVIDENCE,
 }
 
+TechnicalFailureDiagnosticCode = Literal[
+    "real_case_command_failed",
+    "real_case_contract_failed",
+    "real_case_output_not_json",
+    "real_case_trace_id_mismatch",
+    "real_case_assertion_ids_invalid",
+    "real_case_assertion_ids_mismatch",
+]
+
 
 class CaptainTechnicalFailureEvaluationV1(BaseModel):
     """Public-safe failed technical gate used only to authorize a rebuild."""
@@ -56,6 +65,7 @@ class CaptainTechnicalFailureEvaluationV1(BaseModel):
     failed_benchmark_metric_ids: tuple[()] = ()
     prior_green_benchmark_metric_ids: tuple[()] = ()
     benchmark_reason_codes: tuple[()] = ()
+    technical_diagnostic_codes: tuple[TechnicalFailureDiagnosticCode, ...] = ()
     failure_class: Literal["behavioral_failure", "test_regression"]
     recommendation: Literal[FactoryFeedbackRecommendation.RETRY_BUILD]
 
@@ -71,6 +81,16 @@ class CaptainTechnicalFailureEvaluationV1(BaseModel):
     def require_unique_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if len(value) != len(set(value)) or any(not item for item in value):
             raise ValueError("technical failure assertion IDs must be unique and non-empty")
+        return value
+
+    @field_validator("technical_diagnostic_codes")
+    @classmethod
+    def require_unique_diagnostic_codes(
+        cls,
+        value: tuple[TechnicalFailureDiagnosticCode, ...],
+    ) -> tuple[TechnicalFailureDiagnosticCode, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("technical diagnostic codes must be unique")
         return value
 
     @field_validator("evidence_refs")
@@ -103,6 +123,11 @@ class CaptainTechnicalFailureEvaluationV1(BaseModel):
         )
         if self.prior_green_regression_ids != passed_ids:
             raise ValueError("technical prior-green assertions must be exactly the passed assertions")
+        if (
+            self.source_phase is FactoryPhase.BUILD_FAILED
+            and not self.technical_diagnostic_codes
+        ):
+            raise ValueError("build failure evaluation requires a technical diagnostic code")
         return self
 
 
@@ -119,6 +144,7 @@ def build_captain_technical_failure_evaluation(
     acceptance_assertion_ids: tuple[str, ...],
     assertion_outcomes: tuple[AssertionOutcome, ...],
     evidence_refs: tuple[ArtifactRef, ...],
+    technical_diagnostic_codes: tuple[TechnicalFailureDiagnosticCode, ...] = (),
     failure_class: Literal["behavioral_failure", "test_regression"],
     recommendation: FactoryFeedbackRecommendation,
 ) -> CaptainTechnicalFailureEvaluationV1:
@@ -150,6 +176,7 @@ def build_captain_technical_failure_evaluation(
         acceptance_assertion_ids=acceptance_assertion_ids,
         assertion_outcomes=assertion_outcomes,
         evidence_refs=evidence_refs,
+        technical_diagnostic_codes=technical_diagnostic_codes,
         prior_green_regression_ids=passed_ids,
         failure_class=failure_class,
         recommendation=recommendation,
@@ -203,6 +230,7 @@ def validate_captain_technical_failure_evaluation(
 
 __all__ = [
     "CaptainTechnicalFailureEvaluationV1",
+    "TechnicalFailureDiagnosticCode",
     "build_captain_technical_failure_evaluation",
     "captain_technical_failure_evaluation_binding",
     "captain_technical_failure_evaluation_sha256",

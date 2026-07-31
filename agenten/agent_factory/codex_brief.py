@@ -16,6 +16,9 @@ from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillStep,
 )
 from agenten.agent_factory.skill_sequence import FactoryImprovementAuthorizationV1
+from agenten.agent_factory.technical_improvement_contracts import (
+    CaptainTechnicalFailureEvaluationV1,
+)
 from agenten.agent_factory.skill_store import reject_sensitive_data
 from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent
 
@@ -241,6 +244,31 @@ class CodexBriefBuilder:
                 improvement_authorization.failed_evaluation.benchmark_reason_codes
             )
         )
+        failed_evaluation = (
+            None
+            if improvement_authorization is None
+            else improvement_authorization.failed_evaluation
+        )
+        technical_diagnostic_codes = (
+            []
+            if not isinstance(
+                failed_evaluation,
+                CaptainTechnicalFailureEvaluationV1,
+            )
+            else list(failed_evaluation.technical_diagnostic_codes)
+        )
+        technical_retry_contract = (
+            []
+            if not technical_diagnostic_codes
+            else [
+                "The real-case command receives no stdin.",
+                "Read CAPTAIN_TRACE_ID from the process environment.",
+                "Emit exactly one JSON object on stdout and no prose.",
+                "Set trace_id to CAPTAIN_TRACE_ID.",
+                "Set assertion_ids to exactly the Captain acceptance assertion IDs.",
+                "Exit zero only after the deterministic real-case fixture is evaluated.",
+            ]
+        )
         document = {
             "Goal": (
                 "Implement the dependency-ready node described by "
@@ -253,6 +281,8 @@ class CodexBriefBuilder:
                 "prior green benchmark metrics": prior_green_benchmark_metric_ids,
                 "failed benchmark metric IDs": failed_benchmark_metric_ids,
                 "benchmark reason codes": benchmark_reason_codes,
+                "technical diagnostic codes": technical_diagnostic_codes,
+                "technical retry contract": technical_retry_contract,
             },
             "selected reusable components": list(inventory.reusable_component_ids),
             "authorized workspace roots": [assignment.workspace_ref],

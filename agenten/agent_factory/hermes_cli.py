@@ -3142,6 +3142,9 @@ def _captain_improvement_seed(
         "failed_benchmark_metric_ids": list(
             evaluation.failed_benchmark_metric_ids
         ),
+        "technical_diagnostic_codes": list(
+            getattr(evaluation, "technical_diagnostic_codes", ())
+        ),
         "regression_assertion_ids": list(
             authorization.prior_green_assertion_ids
         ),
