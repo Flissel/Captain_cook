@@ -976,7 +976,7 @@ print(json.dumps({
     factory_arguments = json.loads(
         (repository / "factory-args.json").read_text("utf-8")
     )
-    assert factory_arguments[factory_arguments.index("--hermes-max-usd") + 1] == "0.06"
+    assert factory_arguments[factory_arguments.index("--hermes-max-usd") + 1] == "0.25"
     assert factory_arguments[
         factory_arguments.index("--hermes-python-executable") + 1
     ] == sys.executable
