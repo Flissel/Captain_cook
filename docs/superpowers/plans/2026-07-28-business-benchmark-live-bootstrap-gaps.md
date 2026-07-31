@@ -219,15 +219,16 @@
 - [x] Enforce the operator's `1.00 EUR` marginal-cost ceiling per team before
   provider construction. The live demo reserves at most `0.30 USD` for one
   team's candidate/baseline benchmark and conservatively assigns the complete
-  two-team Hermes ceiling of `0.06 USD` to either team. Codex is admitted only
+  two-team Hermes ceiling to either team. Codex is admitted only
   when `codex login status` proves ChatGPT subscription authentication, so its
-  metered API reserve is exactly zero. The prior V20 and first V21 attempts are
-  each additionally reserved at `0.06 USD` per team because their actual
-  Hermes usage was not materialized durably. Captain rejects any composition
-  whose cumulative worst-case `0.48 USD` per
-  team exceeds the internal `0.50 USD` ceiling, any
+  metered API reserve is exactly zero. The prior V20 and first V21 attempts,
+  plus the first failed Attempt-2 call, are covered by a `0.20 USD` prior-attempt
+  reserve because their actual Hermes usage was not materialized durably. The
+  active Hermes sequence is capped at `0.25 USD` across both teams. Captain
+  rejects any composition whose cumulative worst-case `0.75 USD` per team
+  exceeds the internal `0.75 USD` ceiling, any
   API-key-authenticated Codex session, or any missing/non-canonical cost field.
-  The internal ceiling is intentionally far below the user ceiling rather than
+  The internal ceiling remains below the user ceiling rather than
   depending on a live exchange-rate lookup during dispatch. This guard was
   verified without another provider call. Both prior configured reserves are
   counted conservatively; this does not claim that V19 or V20 can resume or

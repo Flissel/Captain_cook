@@ -210,10 +210,10 @@ def test_total_cost_envelope_requires_subscription_codex_and_keeps_each_team_bel
     environment = {
         "CAPTAIN_CODEX_AUTH_MODE": "chatgpt_subscription",
         "CAPTAIN_FACTORY_USER_MAX_EUR_PER_TEAM": "1.00",
-        "CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM": "0.50",
+        "CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM": "0.75",
         "CAPTAIN_FACTORY_CODEX_METERED_USD_PER_TEAM": "0",
-        "CAPTAIN_FACTORY_HERMES_MAX_TOTAL_USD": "0.06",
-        "CAPTAIN_FACTORY_PRIOR_ATTEMPT_RESERVE_USD_PER_TEAM": "0.12",
+        "CAPTAIN_FACTORY_HERMES_MAX_TOTAL_USD": "0.25",
+        "CAPTAIN_FACTORY_PRIOR_ATTEMPT_RESERVE_USD_PER_TEAM": "0.20",
     }
 
     validate_factory_total_cost_envelope(
@@ -230,7 +230,7 @@ def test_total_cost_envelope_requires_subscription_codex_and_keeps_each_team_bel
         validate_factory_total_cost_envelope(
             environment={
                 **environment,
-                "CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM": "0.47",
+                "CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM": "0.74",
             },
             benchmark_maximum_usd_per_team=(Decimal("0.30"), Decimal("0.30")),
         )

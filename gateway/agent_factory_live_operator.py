@@ -156,7 +156,7 @@ def validate_factory_total_cost_envelope(
         any(not value.is_finite() or value < 0 for value in values)
         or user_maximum_eur != Decimal("1.00")
         or total_maximum_usd <= 0
-        or total_maximum_usd > Decimal("0.50")
+        or total_maximum_usd > Decimal("0.75")
         or codex_metered_usd != 0
         or len(benchmark_maximum_usd_per_team) != 2
         or any(
