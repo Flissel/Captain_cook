@@ -49,6 +49,7 @@ from agenten.agent_factory.codex_build_provenance import (
     CaptainCodexBuildReceiptIssuer,
     CodexBuildArtifactCas,
 )
+from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
 from agenten.agent_factory.hermes_cli import HermesCliSettings
 from agenten.agent_factory.minibook_forge import (
     CaptainCreationJobMapper,
@@ -72,6 +73,7 @@ from gateway.business_benchmark_live_composition import (
     GatewayBusinessBenchmarkLiveCompositionLoader,
 )
 from gateway.factory_repository import GatewayFactoryRepository
+from gateway.factory_forge_evidence import CaptainForgeEvidenceBridge
 from gateway.minibook_creation_artifacts import GatewayMinibookCreationArtifactStore
 from gateway.store import GatewayStore
 
@@ -217,7 +219,15 @@ def compose_business_demo_factory_operator(
         repository=repository,
         artifacts=GatewayMinibookCreationArtifactStore(creation_artifact_root),
     )
-    mapper = CaptainCreationJobMapper(evidence=repository)
+    factory_evidence_root = (
+        authority_root / "runtime-state" / "factory-evidence"
+    ).resolve()
+    mapper = CaptainCreationJobMapper(
+        evidence=CaptainForgeEvidenceBridge(
+            repository=repository,
+            evidence_store=FilesystemFactoryEvidenceStore(factory_evidence_root),
+        )
+    )
     benchmark_cas = BusinessBenchmarkContentAddressedArtifactStore(
         authority_root / "cas"
     )
@@ -353,7 +363,7 @@ def compose_business_demo_factory_operator(
         business_benchmark_repository=suite_repository,
         business_benchmark_inputs=benchmark_inputs,
         workspace_namespace="business-benchmark-factory-v3",
-        evidence_root=authority_root / "runtime-state" / "factory-evidence",
+        evidence_root=factory_evidence_root,
         hermes_settings=HermesCliSettings(
             executable=str(settings.hermes_python_executable.resolve()),
             skill_root=workspace / "agenten" / "agent_factory" / "skills",
