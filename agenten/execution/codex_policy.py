@@ -139,7 +139,8 @@ class CodexExecutionPolicy:
             raise CodexPolicyViolation("project root is outside the approved root")
         self._require_allowed_command(request.command)
         self._reject_secret_paths(request.command)
-        self._reject_dirty_project(project_root)
+        if not self._is_resume_command(request.command):
+            self._reject_dirty_project(project_root)
         return AuthorizedCodexRun(
             workspace=workspace,
             command=request.command,
@@ -205,6 +206,14 @@ class CodexExecutionPolicy:
         )
         if not standard and not resumed:
             raise CodexPolicyViolation("command is not in the Codex allowlist")
+
+    @classmethod
+    def _is_resume_command(cls, command: tuple[str, ...]) -> bool:
+        return (
+            len(command) == len(cls._ALLOWED_RESUME_COMMAND_PREFIX) + 2
+            and command[: len(cls._ALLOWED_RESUME_COMMAND_PREFIX)]
+            == cls._ALLOWED_RESUME_COMMAND_PREFIX
+        )
 
     @classmethod
     def _reject_secret_paths(cls, command: tuple[str, ...]) -> None:

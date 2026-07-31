@@ -203,6 +203,31 @@ def test_exact_codex_resume_thread_command_is_authorized(tmp_path: Path) -> None
     assert authorized.command == command
 
 
+def test_exact_codex_resume_preserves_interrupted_dirty_workspace(
+    tmp_path: Path,
+) -> None:
+    approved_root, project, workspace = _clean_project(tmp_path)
+    (project / "tracked.txt").write_text("interrupted implementation\n", encoding="utf-8")
+    command = (
+        "codex",
+        "exec",
+        "resume",
+        "--json",
+        "019f0000-0000-7000-8000-000000000001",
+        "continue the exact Captain build",
+    )
+
+    authorized = CodexExecutionPolicy(
+        workspace_root=approved_root,
+        environment={},
+    ).authorize(_request(project, workspace, command=command))
+
+    assert authorized.command == command
+    assert (project / "tracked.txt").read_text(encoding="utf-8") == (
+        "interrupted implementation\n"
+    )
+
+
 @pytest.mark.parametrize(
     "command",
     [
