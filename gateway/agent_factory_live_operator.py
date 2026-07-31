@@ -57,6 +57,7 @@ from agenten.agent_factory.minibook_forge import (
     MinibookSwarmForge,
 )
 from agenten.agent_factory.orchestration import FactoryDispatch
+from agenten.agent_factory.state_machine import FactoryActionKind
 from agenten.agent_factory.production_dispatch_runner import (
     ProductionFactoryDispatchResult,
 )
@@ -110,6 +111,7 @@ class FactoryLiveOperatorSettings:
     hermes_model: str
     hermes_maximum_total_cost_usd: Decimal
     maximum_dispatches: int = 12
+    stop_before_quality_warden: bool = False
 
     def __post_init__(self) -> None:
         assert_local_captain_test_dsn(self.test_mariadb_dsn)
@@ -398,6 +400,11 @@ async def run_business_demo_factory_jobs(
     *,
     environment: Mapping[str, str],
 ) -> tuple[ProductionFactoryDispatchResult, ProductionFactoryDispatchResult]:
+    stop_before_action = (
+        FactoryActionKind.DISPATCH_QUALITY_WARDEN
+        if settings.stop_before_quality_warden
+        else None
+    )
     async with httpx.AsyncClient(timeout=30.0) as n8n_client:
         composition = compose_business_demo_factory_operator(
             settings,
@@ -409,6 +416,7 @@ async def run_business_demo_factory_jobs(
                 await composition.run(
                     job_id,
                     maximum_dispatches=settings.maximum_dispatches,
+                    stop_before_action=stop_before_action,
                 )
                 for job_id in settings.job_ids
             ]

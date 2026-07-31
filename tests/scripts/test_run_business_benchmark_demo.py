@@ -210,6 +210,95 @@ def test_factory_operator_cli_emits_only_redacted_codex_interruption(
         assert forbidden not in serialized
 
 
+def test_factory_operator_cli_threads_stop_flag_and_emits_typed_results(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured_settings: dict[str, object] = {}
+
+    class FakeResult:
+        def __init__(self, job_id: str) -> None:
+            self.job_id = job_id
+
+        def model_dump(self, *, mode: str, by_alias: bool) -> dict[str, object]:
+            assert mode == "json"
+            assert by_alias is True
+            return {
+                "schema": "captain.factory-dispatch-run-result.v1",
+                "job_id": self.job_id,
+                "status": "stop_point_reached",
+                "lifecycle_status": "running",
+                "next_action": {
+                    "kind": "dispatch_quality_warden",
+                    "attempt": 1,
+                    "job_id": self.job_id,
+                },
+                "dispatched_actions": ["dispatch_real_case_tester"],
+            }
+
+    gateway_module = ModuleType("gateway")
+    operator_module = ModuleType("gateway.agent_factory_live_operator")
+
+    def settings_factory(**kwargs: object) -> object:
+        captured_settings.update(kwargs)
+        return object()
+
+    async def stopped_run(*_args: object, **_kwargs: object) -> tuple[FakeResult, FakeResult]:
+        return (
+            FakeResult("71000000-0000-0000-0000-000000000001"),
+            FakeResult("71000000-0000-0000-0000-000000000002"),
+        )
+
+    operator_module.FactoryLiveOperatorSettings = settings_factory
+    operator_module.run_business_demo_factory_jobs = stopped_run
+    monkeypatch.setitem(sys.modules, "gateway", gateway_module)
+    monkeypatch.setitem(sys.modules, "gateway.agent_factory_live_operator", operator_module)
+    agenten_module = ModuleType("agenten")
+    factory_module = ModuleType("agenten.agent_factory")
+    execution_module = ModuleType("agenten.agent_factory.codex_build_execution")
+    execution_module.FactoryCodexBuildInterrupted = RuntimeError
+    monkeypatch.setitem(sys.modules, "agenten", agenten_module)
+    monkeypatch.setitem(sys.modules, "agenten.agent_factory", factory_module)
+    monkeypatch.setitem(
+        sys.modules, "agenten.agent_factory.codex_build_execution", execution_module
+    )
+    script = ROOT / "scripts" / "run-agent-factory-business-demo.py"
+    spec = spec_from_file_location("factory_operator_stop_cli", script)
+    assert spec is not None and spec.loader is not None
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(script),
+            "--workspace-root",
+            str(ROOT),
+            "--python-executable",
+            sys.executable,
+            "--hermes-python-executable",
+            sys.executable,
+            "--job-id",
+            "71000000-0000-0000-0000-000000000001",
+            "--job-id",
+            "71000000-0000-0000-0000-000000000002",
+            "--hermes-model",
+            "gpt-4.1-mini",
+            "--stop-before-quality-warden",
+        ],
+    )
+
+    assert module.main() == 0
+    output = json.loads(capsys.readouterr().out)
+    assert captured_settings["stop_before_quality_warden"] is True
+    assert [result["status"] for result in output["results"]] == [
+        "stop_point_reached",
+        "stop_point_reached",
+    ]
+    assert {
+        result["next_action"]["kind"] for result in output["results"]
+    } == {"dispatch_quality_warden"}
+
+
 def test_unresolved_provisioning_returns_factory_checkpoint_without_provider(
     tmp_path: Path,
 ) -> None:
@@ -593,8 +682,7 @@ raise SystemExit(2)
     assert "process-only-demo-key" not in interrupted.stdout + interrupted.stderr
     assert not (repository / "provider-called").exists()
 
-    (scripts / "run-agent-factory-business-demo.py").write_text(
-        r"""
+    factory_runner_source = r"""
 import json
 from pathlib import Path
 import sys
@@ -604,6 +692,7 @@ root.joinpath('factory-called').write_text('yes', encoding='utf-8')
 root.joinpath('factory-args.json').write_text(
     json.dumps(sys.argv[1:]), encoding='utf-8'
 )
+stop_before_warden = '--stop-before-quality-warden' in sys.argv[1:]
 job_ids = [
     value for index, value in enumerate(sys.argv[1:])
     if index > 0 and sys.argv[index] == '--job-id'
@@ -615,12 +704,21 @@ print(json.dumps({
         {
             'schema': 'captain.factory-dispatch-run-result.v1',
             'job_id': job_id,
-            'status': 'captain_action_required',
+            'status': 'stop_point_reached' if stop_before_warden else 'captain_action_required',
+            'lifecycle_status': 'running',
+            'next_action': {
+                'kind': 'dispatch_quality_warden' if stop_before_warden else 'validate_for_promotion',
+                'attempt': 1,
+                'job_id': job_id,
+            },
+            'dispatched_actions': ['dispatch_real_case_tester'],
         }
         for job_id in job_ids
     ],
 }))
-""".strip(),
+""".strip()
+    (scripts / "run-agent-factory-business-demo.py").write_text(
+        factory_runner_source,
         encoding="utf-8",
     )
     (scripts / "run-business-benchmark-live.ps1").write_text(
@@ -687,6 +785,7 @@ Set-Content (Join-Path $root 'provider-called') 'yes'
         (repository / "factory-args.json").read_text("utf-8")
     )
     assert build_factory_arguments.count("--job-id") == 2
+    assert "--stop-before-quality-warden" in build_factory_arguments
     assert "process-only-demo-key" not in built.stdout + built.stderr
 
     for invalid_jobs in (
@@ -759,6 +858,14 @@ print(json.dumps({
 """.strip(),
         encoding="utf-8",
     )
+    (scripts / "run-agent-factory-business-demo.py").write_text(
+        factory_runner_source.replace(
+            "'dispatch_quality_warden' if stop_before_warden else 'validate_for_promotion'",
+            "'dispatch_real_case_tester'",
+        ),
+        encoding="utf-8",
+    )
+    (repository / "factory-called").unlink(missing_ok=True)
     blocked_build = subprocess.run(
         [
             pwsh,
@@ -779,9 +886,13 @@ print(json.dumps({
         timeout=60,
         check=False,
     )
-    assert blocked_build.returncode == 2, blocked_build.stderr
-    assert json.loads(blocked_build.stdout)["status"] == "factory_dispatch_required"
+    assert blocked_build.returncode != 0
+    assert "candidates_ready" not in blocked_build.stdout
     assert not (repository / "provider-called").exists()
+    (scripts / "run-agent-factory-business-demo.py").write_text(
+        factory_runner_source,
+        encoding="utf-8",
+    )
     (scripts / "preflight-business-benchmark-demo.py").write_text(
         factory_preflight.strip(),
         encoding="utf-8",
@@ -822,6 +933,7 @@ print(json.dumps({
     ] == sys.executable
     assert factory_arguments[factory_arguments.index("--hermes-model") + 1] == "gpt-4.1-mini"
     assert factory_arguments.count("--job-id") == 2
+    assert "--stop-before-quality-warden" not in factory_arguments
     assert "process-only-demo-key" not in successful.stdout + successful.stderr
 
 

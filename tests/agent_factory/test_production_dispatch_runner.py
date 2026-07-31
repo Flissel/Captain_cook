@@ -106,6 +106,39 @@ async def test_runner_resumes_external_actions_and_stops_before_captain_transiti
 
 
 @pytest.mark.asyncio
+async def test_runner_stops_before_quality_warden_without_lease_or_dispatch() -> None:
+    coordinator = ScriptedCoordinator(
+        (
+            FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
+            FactoryActionKind.DISPATCH_QUALITY_WARDEN,
+        )
+    )
+    dispatcher = RecordingDispatcher(coordinator)
+    leases = RecordingLeaseIssuer()
+
+    result = await ProductionFactoryDispatchRunner(
+        coordinator=coordinator,
+        dispatcher=dispatcher,
+        lease_issuer=leases,
+        clock=lambda: NOW,
+    ).run(
+        JOB_ID,
+        maximum_dispatches=1,
+        stop_before_action=FactoryActionKind.DISPATCH_QUALITY_WARDEN,
+    )
+
+    assert result.status == "stop_point_reached"
+    assert result.next_action.kind is FactoryActionKind.DISPATCH_QUALITY_WARDEN
+    assert result.dispatched_actions == (
+        FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
+    )
+    assert dispatcher.actions == [FactoryActionKind.DISPATCH_REAL_CASE_TESTER]
+    assert leases.roles == [
+        (FactoryActionKind.DISPATCH_REAL_CASE_TESTER, FactoryRole.REAL_CASE_TESTER),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_runner_never_dispatches_or_promotes_a_captain_only_action() -> None:
     coordinator = ScriptedCoordinator((FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED,))
     dispatcher = RecordingDispatcher(coordinator)

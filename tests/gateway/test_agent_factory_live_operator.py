@@ -26,6 +26,7 @@ from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.agent_factory_live_operator import (
     FactoryLiveOperatorSettings,
     _LazyProductionBenchmarkInputs,
+    run_business_demo_factory_jobs,
 )
 from gateway.factory_forge_evidence import CaptainForgeEvidenceBridge
 from tests.agent_factory.test_minibook_forge import _workflow_evidence
@@ -131,10 +132,12 @@ def test_operator_settings_enforce_isolated_database_two_jobs_and_cost_allocatio
         hermes_provider="openai-api",
         hermes_model="gpt-4.1-mini",
         hermes_maximum_total_cost_usd=Decimal("0.25"),
+        stop_before_quality_warden=True,
     )
 
     assert settings.job_ids == JOB_IDS
     assert settings.hermes_python_executable == hermes_python
+    assert settings.stop_before_quality_warden is True
     with pytest.raises(ValueError, match="cost allocation"):
         FactoryLiveOperatorSettings(
             workspace_root=tmp_path,
@@ -157,6 +160,59 @@ def test_operator_settings_enforce_isolated_database_two_jobs_and_cost_allocatio
             hermes_model="gpt-4.1-mini",
             hermes_maximum_total_cost_usd=Decimal("0.10"),
         )
+
+
+@pytest.mark.asyncio
+async def test_operator_threads_quality_warden_stop_to_both_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[UUID, int, FactoryActionKind | None]] = []
+
+    class FakeAsyncClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def __aenter__(self) -> object:
+            return object()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class Composition:
+        async def run(
+            self,
+            job_id: UUID,
+            *,
+            maximum_dispatches: int,
+            stop_before_action: FactoryActionKind | None,
+        ) -> object:
+            calls.append((job_id, maximum_dispatches, stop_before_action))
+            return SimpleNamespace(job_id=job_id)
+
+    monkeypatch.setattr(
+        "gateway.agent_factory_live_operator.httpx.AsyncClient",
+        FakeAsyncClient,
+    )
+    monkeypatch.setattr(
+        "gateway.agent_factory_live_operator.compose_business_demo_factory_operator",
+        lambda *_args, **_kwargs: Composition(),
+    )
+    settings = SimpleNamespace(
+        job_ids=JOB_IDS,
+        maximum_dispatches=9,
+        stop_before_quality_warden=True,
+    )
+
+    results = await run_business_demo_factory_jobs(
+        settings,  # type: ignore[arg-type]
+        environment={},
+    )
+
+    assert tuple(result.job_id for result in results) == JOB_IDS
+    assert calls == [
+        (JOB_IDS[0], 9, FactoryActionKind.DISPATCH_QUALITY_WARDEN),
+        (JOB_IDS[1], 9, FactoryActionKind.DISPATCH_QUALITY_WARDEN),
+    ]
 
 
 def test_operator_settings_reject_incomplete_hermes_runtime(tmp_path: Path) -> None:

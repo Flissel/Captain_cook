@@ -759,7 +759,7 @@ try {
         throw 'OPENAI_API_KEY must already exist in the process; demo env files are never read for it.'
     }
 
-    if ($preflight.production_scope_resolvable -ne $true) {
+    if ($preflight.production_scope_resolvable -ne $true -or $Action -ceq 'BUILD') {
         $factoryArguments = @(
             $factoryRunner,
             '--workspace-root', $repositoryRoot,
@@ -772,6 +772,9 @@ try {
             '--hermes-max-usd', $maximumHermesUsd,
             '--maximum-dispatches', '12'
         )
+        if ($Action -ceq 'BUILD') {
+            $factoryArguments += '--stop-before-quality-warden'
+        }
         $factoryErrorPath = Join-Path `
             $environment['CAPTAIN_BENCHMARK_AUTHORITY_ROOT'] `
             'runtime-state/factory-operator-stderr.log'
@@ -822,45 +825,62 @@ try {
                     'complete',
                     'captain_action_required',
                     'infrastructure_blocked',
-                    'dispatch_limit_reached'
+                    'dispatch_limit_reached',
+                    'stop_point_reached'
                 )
             }).Count -ne 0
         ) {
             throw 'Captain Factory live operator result is not canonical.'
         }
+        if ($Action -ceq 'BUILD') {
+            $invalidStops = @($factoryResult.results | Where-Object {
+                $_.status -cne 'stop_point_reached' -or
+                $_.next_action.kind -cne 'dispatch_quality_warden'
+            })
+            if ($invalidStops.Count -ne 0) {
+                throw 'Captain Factory Build did not stop both jobs before Quality Warden.'
+            }
+        }
+        elseif (@($factoryResult.results | Where-Object {
+            $_.status -ceq 'stop_point_reached'
+        }).Count -ne 0) {
+            throw 'Captain Factory Run stopped before Quality Warden unexpectedly.'
+        }
 
-        $rawPreflight = @(& $python $preflightScript)
-        if ($LASTEXITCODE -ne 0) {
-            throw 'Captain business benchmark post-Factory preflight failed closed.'
-        }
-        try {
-            $preflight = ($rawPreflight -join [Environment]::NewLine) |
-                ConvertFrom-Json -Depth 20
-        }
-        catch {
-            throw 'Captain business benchmark post-Factory preflight returned invalid JSON.'
-        }
-        if (
-            $preflight.schema -cne 'captain.business-benchmark-default-preflight.v1' -or
-            $preflight.database -cne 'captain_test' -or
-            $preflight.status -notin @('resolvable', 'factory_dispatch_required') -or
-            ($preflight.production_scope_resolvable -isnot [bool])
-        ) {
-            throw 'Captain business benchmark post-Factory preflight is not canonical.'
-        }
-        if (
-            $preflight.production_scope_resolvable -eq $true -and
-            -not (Test-ResolvedPreflightBindings -Preflight $preflight -Teams $teams)
-        ) {
-            throw 'Captain business benchmark post-Factory scope does not bind the provisioned Claims and Renewal candidates.'
-        }
-        if ($preflight.production_scope_resolvable -ne $true) {
-            New-FactoryDispatchCheckpoint `
-                -Teams $teams `
-                -IssuedAt $issuedAt `
-                -RenewalBatchId $renewalBatchId |
-                ConvertTo-Json -Compress -Depth 20
-            exit 2
+        if ($Action -ceq 'RUN') {
+            $rawPreflight = @(& $python $preflightScript)
+            if ($LASTEXITCODE -ne 0) {
+                throw 'Captain business benchmark post-Factory preflight failed closed.'
+            }
+            try {
+                $preflight = ($rawPreflight -join [Environment]::NewLine) |
+                    ConvertFrom-Json -Depth 20
+            }
+            catch {
+                throw 'Captain business benchmark post-Factory preflight returned invalid JSON.'
+            }
+            if (
+                $preflight.schema -cne 'captain.business-benchmark-default-preflight.v1' -or
+                $preflight.database -cne 'captain_test' -or
+                $preflight.status -notin @('resolvable', 'factory_dispatch_required') -or
+                ($preflight.production_scope_resolvable -isnot [bool])
+            ) {
+                throw 'Captain business benchmark post-Factory preflight is not canonical.'
+            }
+            if (
+                $preflight.production_scope_resolvable -eq $true -and
+                -not (Test-ResolvedPreflightBindings -Preflight $preflight -Teams $teams)
+            ) {
+                throw 'Captain business benchmark post-Factory scope does not bind the provisioned Claims and Renewal candidates.'
+            }
+            if ($preflight.production_scope_resolvable -ne $true) {
+                New-FactoryDispatchCheckpoint `
+                    -Teams $teams `
+                    -IssuedAt $issuedAt `
+                    -RenewalBatchId $renewalBatchId |
+                    ConvertTo-Json -Compress -Depth 20
+                exit 2
+            }
         }
     }
 

@@ -73,7 +73,11 @@ from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillInvocationV1,
     TeamExecutionEvidenceV1,
 )
-from agenten.agent_factory.state_machine import FactoryAction, FactoryProjection
+from agenten.agent_factory.state_machine import (
+    FactoryAction,
+    FactoryActionKind,
+    FactoryProjection,
+)
 from agenten.agent_factory.team_evaluation import TeamEvaluationService
 from agenten.agent_factory.team_execution import (
     FactoryN8nExecutionEvidenceV1,
@@ -408,10 +412,12 @@ class AgentFactoryLiveComposition:
         job_id: UUID,
         *,
         maximum_dispatches: int = 12,
+        stop_before_action: FactoryActionKind | None = None,
     ) -> ProductionFactoryDispatchResult:
         return await self.runner.run(
             job_id,
             maximum_dispatches=maximum_dispatches,
+            stop_before_action=stop_before_action,
         )
 
 

@@ -89,6 +89,7 @@ class ProductionFactoryDispatchResult(BaseModel):
         "captain_action_required",
         "infrastructure_blocked",
         "dispatch_limit_reached",
+        "stop_point_reached",
     ]
     lifecycle_status: FactoryLifecycleStatus
     next_action: FactoryAction
@@ -131,14 +132,25 @@ class ProductionFactoryDispatchRunner:
         job_id: UUID,
         *,
         maximum_dispatches: int = 12,
+        stop_before_action: FactoryActionKind | None = None,
     ) -> ProductionFactoryDispatchResult:
         if maximum_dispatches < 1:
             raise ValueError("maximum_dispatches must be positive")
+        if stop_before_action is not None and stop_before_action not in _ACTION_ROLES:
+            raise ValueError("Factory stop point must be an externally dispatched action")
         dispatched: list[FactoryActionKind] = []
         while len(dispatched) < maximum_dispatches:
             action = self._coordinator.next_action(job_id)
             projection = self._coordinator.projection(job_id)
             self._require_job_identity(job_id, action, projection)
+            if action.kind is stop_before_action:
+                return self._result(
+                    job_id,
+                    status="stop_point_reached",
+                    action=action,
+                    projection_status=projection.status,
+                    dispatched=dispatched,
+                )
             if action.kind is FactoryActionKind.COMPLETE:
                 return self._result(
                     job_id,
@@ -198,6 +210,14 @@ class ProductionFactoryDispatchRunner:
         action = self._coordinator.next_action(job_id)
         projection = self._coordinator.projection(job_id)
         self._require_job_identity(job_id, action, projection)
+        if action.kind is stop_before_action:
+            return self._result(
+                job_id,
+                status="stop_point_reached",
+                action=action,
+                projection_status=projection.status,
+                dispatched=dispatched,
+            )
         return self._result(
             job_id,
             status="dispatch_limit_reached",
@@ -221,6 +241,7 @@ class ProductionFactoryDispatchRunner:
             "captain_action_required",
             "infrastructure_blocked",
             "dispatch_limit_reached",
+            "stop_point_reached",
         ],
         action: FactoryAction,
         projection_status: FactoryLifecycleStatus,
