@@ -210,6 +210,26 @@ class CaptainFactoryImprovementAuthorizationStore:
         _write_once(authorization_path, _canonical_model(validated))
         return validated
 
+    def existing(
+        self,
+        *,
+        job: FactoryJob,
+        projection: FactoryProjection,
+    ) -> FactoryImprovementAuthorizationV1:
+        matches = _matching_authorizations(
+            root=self._root,
+            job=job,
+            authorized_attempt=projection.attempt,
+            block_ids=projection.block_ids,
+        )
+        if len(matches) != 1:
+            raise ValueError(
+                "Captain improvement authority is unavailable"
+                if not matches
+                else "Captain improvement authority is conflicting"
+            )
+        return matches[0]
+
 
 class CaptainTechnicalImprovementIssuer:
     """Append one Captain request derived from the current failed technical gate."""
@@ -240,6 +260,11 @@ class CaptainTechnicalImprovementIssuer:
         deadline = getattr(job, "deadline_at", None)
         if deadline is not None and now >= deadline:
             raise ValueError("improvement issuance is outside the job deadline")
+        if projection.phase is FactoryPhase.IMPROVEMENT_REQUESTED:
+            return self._authorizations.existing(
+                job=job,
+                projection=projection,
+            )
         if projection.phase not in {
             FactoryPhase.BUILD_FAILED,
             FactoryPhase.REAL_CASE_EVIDENCE,
@@ -351,11 +376,22 @@ class CaptainTechnicalImprovementIssuer:
         candidate_ref: ArtifactRef,
         occurred_at: datetime,
     ) -> CaptainTechnicalFailureEvaluationV1:
+        resolved: dict[tuple[UUID, ArtifactRef], TeamExecutionEvidenceV1] = {}
+        for artifact in self._repository.workflow_artifacts(job.job_id):
+            if isinstance(artifact, TeamExecutionEvidenceV1):
+                _add_exact_execution(resolved, artifact)
+        for reference in source_block.evidence_refs:
+            try:
+                artifact = TeamExecutionEvidenceV1.model_validate_json(
+                    self._evidence.read_verified(reference, job_id=job.job_id)
+                )
+            except (OSError, ValueError):
+                continue
+            _add_exact_execution(resolved, artifact)
         executions = tuple(
             artifact
-            for artifact in self._repository.workflow_artifacts(job.job_id)
-            if isinstance(artifact, TeamExecutionEvidenceV1)
-            and artifact.attempt == source_block.attempt
+            for artifact in resolved.values()
+            if artifact.attempt == source_block.attempt
             and artifact.artifact_ref
             in (*source_block.artifact_refs, *source_block.evidence_refs)
         )
@@ -368,6 +404,17 @@ class CaptainTechnicalImprovementIssuer:
             execution=executions[0],
             occurred_at=occurred_at,
         )
+
+
+def _add_exact_execution(
+    resolved: dict[tuple[UUID, ArtifactRef], TeamExecutionEvidenceV1],
+    execution: TeamExecutionEvidenceV1,
+) -> None:
+    key = (execution.invocation_id, execution.artifact_ref)
+    existing = resolved.get(key)
+    if existing is not None and existing != execution:
+        raise ValueError("technical execution evidence binding conflicts")
+    resolved[key] = execution
 
 
 class FilesystemFactoryImprovementAuthority:
@@ -395,29 +442,17 @@ class FilesystemFactoryImprovementAuthority:
         deadline = getattr(job, "deadline_at", None)
         if deadline is not None and now >= deadline:
             raise ValueError("improvement authority is outside the job deadline")
-        directory = (
-            self._root / "authorizations" / str(job.job_id)
-        ).resolve()
-        _require_within(directory, self._root)
-        if not directory.is_dir():
-            raise ValueError("Captain improvement authority is unavailable")
-        matches: list[FactoryImprovementAuthorizationV1] = []
-        stale_request = False
-        for path in sorted(directory.glob("*.json")):
-            authorization = _read_authorization(path)
-            request = authorization.request_block
-            if (
-                request.job_id != job.job_id
-                or request.correlation_id != job.correlation_id
-                or request.subject_version != job.subject_version
-                or authorization.authorized_attempt != action.attempt
-            ):
-                continue
-            if request.event_id not in projection.block_ids:
-                stale_request = True
-                continue
-            matches.append(authorization)
-        if stale_request and not matches:
+        matches = _matching_authorizations(
+            root=self._root,
+            job=job,
+            authorized_attempt=action.attempt,
+            block_ids=projection.block_ids,
+        )
+        if not matches and _has_matching_authorization_without_block(
+            root=self._root,
+            job=job,
+            authorized_attempt=action.attempt,
+        ):
             raise ValueError("improvement authority request block is not in the ledger")
         if len(matches) != 1:
             raise ValueError(
@@ -426,6 +461,54 @@ class FilesystemFactoryImprovementAuthority:
                 else "Captain improvement authority is conflicting"
             )
         return matches[0]
+
+
+def _matching_authorizations(
+    *,
+    root: Path,
+    job: FactoryJob,
+    authorized_attempt: int,
+    block_ids: tuple[UUID, ...],
+) -> tuple[FactoryImprovementAuthorizationV1, ...]:
+    return tuple(
+        authorization
+        for authorization in _authorizations_for_job(root, job.job_id)
+        if authorization.request_block.job_id == job.job_id
+        and authorization.request_block.correlation_id == job.correlation_id
+        and authorization.request_block.subject_version == job.subject_version
+        and authorization.authorized_attempt == authorized_attempt
+        and authorization.request_block.event_id in block_ids
+    )
+
+
+def _has_matching_authorization_without_block(
+    *,
+    root: Path,
+    job: FactoryJob,
+    authorized_attempt: int,
+) -> bool:
+    return any(
+        authorization.request_block.job_id == job.job_id
+        and authorization.request_block.correlation_id == job.correlation_id
+        and authorization.request_block.subject_version == job.subject_version
+        and authorization.authorized_attempt == authorized_attempt
+        for authorization in _authorizations_for_job(root, job.job_id)
+    )
+
+
+def _authorizations_for_job(
+    root: Path,
+    job_id: UUID,
+) -> tuple[FactoryImprovementAuthorizationV1, ...]:
+    directory = (root / "authorizations" / str(job_id)).resolve()
+    _require_within(directory, root)
+    if not directory.is_dir():
+        return ()
+    return tuple(
+        _read_authorization(path)
+        for path in sorted(directory.glob("*.json"))
+        if path.is_file()
+    )
 
 
 def _require_source(

@@ -165,6 +165,65 @@ def test_captain_retains_only_passed_technical_assertions_as_regression_guards()
     ) == ("real_case_green",)
 
 
+def test_issuer_recovers_team_execution_from_block_referenced_evidence(
+    tmp_path: Path,
+) -> None:
+    job = _job()
+    payload = execution_payload(status="unresolved")
+    outcomes = payload["execution_outcome"]
+    assert isinstance(outcomes, dict)
+    assertion_outcomes = outcomes["assertion_outcomes"]
+    assert isinstance(assertion_outcomes, list)
+    assert isinstance(assertion_outcomes[1], dict)
+    assertion_outcomes[1]["status"] = "failed"
+    execution = TeamExecutionEvidenceV1.model_validate(payload)
+    serialized_ref = ArtifactRef(
+        uri=f"artifact://factory-evidence/{job.job_id}/{'6' * 64}",
+        sha256="6" * 64,
+        media_type="application/json",
+    )
+    source = _source_block(
+        FactoryPhase.REAL_CASE_EVIDENCE,
+        serialized_ref,
+    ).model_copy(
+        update={
+            "artifact_refs": (execution.artifact_ref,),
+            "evidence_refs": (serialized_ref, execution.artifact_ref),
+        }
+    )
+
+    class Repository:
+        def workflow_artifacts(self, _job_id):
+            return ()
+
+    class Evidence:
+        def read_verified(self, reference, *, job_id=None):
+            assert job_id == job.job_id
+            if reference == serialized_ref:
+                return execution.model_dump_json(by_alias=True).encode("utf-8")
+            return b"{}"
+
+    issuer = CaptainTechnicalImprovementIssuer(
+        repository=Repository(),  # type: ignore[arg-type]
+        coordinator=object(),  # type: ignore[arg-type]
+        candidates=object(),  # type: ignore[arg-type]
+        evidence=Evidence(),
+        authorizations=CaptainFactoryImprovementAuthorizationStore(
+            tmp_path / ".captain-cook" / "improvements"
+        ),
+        clock=lambda: NOW,
+    )
+
+    evaluation = issuer._evaluate_execution(
+        job=job,
+        source_block=source,
+        candidate_ref=execution.candidate_ref,
+        occurred_at=NOW,
+    )
+
+    assert evaluation.prior_green_regression_ids == ("schema_valid",)
+
+
 def test_persisted_authority_is_returned_only_for_exact_attempt_and_request_block(
     tmp_path: Path,
 ) -> None:
@@ -335,7 +394,7 @@ def test_issuer_appends_attempt_two_request_from_current_build_failure(
     ):
         coordinator.record(item)
 
-    authorization = CaptainTechnicalImprovementIssuer(
+    issuer = CaptainTechnicalImprovementIssuer(
         repository=repository,
         coordinator=coordinator,
         candidates=Candidates(),
@@ -344,9 +403,19 @@ def test_issuer_appends_attempt_two_request_from_current_build_failure(
             tmp_path / ".captain-cook" / "improvements"
         ),
         clock=lambda: NOW,
-    ).issue(job.job_id)
+    )
+    authorization = issuer.issue(job.job_id)
+    replay = issuer.issue(job.job_id)
 
     projection = coordinator.projection(job.job_id)
     assert projection.phase is FactoryPhase.IMPROVEMENT_REQUESTED
     assert projection.attempt == 2
     assert authorization.request_block.event_id in projection.block_ids
+    assert replay == authorization
+    assert len(
+        tuple(
+            block
+            for block in repository.blocks(job.job_id)
+            if block.phase is FactoryPhase.IMPROVEMENT_REQUESTED
+        )
+    ) == 1
