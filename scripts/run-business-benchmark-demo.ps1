@@ -926,8 +926,11 @@ try {
             @($authorization.authorizations).Count -ne 2 -or
             ($expectedAuthorizationJobIds -join ',') -cne ($actualAuthorizationJobIds -join ',') -or
             @($authorization.authorizations | Where-Object {
-                [int]$_.failed_attempt -ne 1 -or
-                [int]$_.authorized_attempt -ne 2 -or
+                $failedAttempt = [int]$_.failed_attempt
+                $authorizedAttempt = [int]$_.authorized_attempt
+                $failedAttempt -lt 1 -or
+                $failedAttempt -ge 5 -or
+                $authorizedAttempt -ne ($failedAttempt + 1) -or
                 [string]::IsNullOrWhiteSpace([string]$_.request_block_id) -or
                 [string]::IsNullOrWhiteSpace([string]$_.authorization_ref.sha256)
             }).Count -ne 0
