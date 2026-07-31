@@ -82,6 +82,41 @@ class FilesystemHermesProviderEffectStore:
     def __init__(self, root: Path) -> None:
         self._root = root.resolve()
 
+    def total_estimated_cost_usd(self) -> Decimal:
+        """Reconstruct the paid-effect reserve across process restarts."""
+
+        total = Decimal("0")
+        effect_root = self._root / "effects"
+        if not effect_root.is_dir():
+            return total
+        for path in sorted(effect_root.glob("*.json")):
+            try:
+                payload = json.loads(path.read_bytes())
+                if (
+                    not isinstance(payload, dict)
+                    or payload.get("schema")
+                    != "captain.hermes-provider-effect.v1"
+                ):
+                    raise ValueError
+                raw_cost = payload["estimated_cost_usd"]
+                if raw_cost is None:
+                    raise ValueError
+                cost = Decimal(str(raw_cost))
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+                InvalidOperation,
+                json.JSONDecodeError,
+            ) as exc:
+                raise ValueError(
+                    "Hermes provider cost evidence is incomplete"
+                ) from exc
+            if not cost.is_finite() or cost < 0:
+                raise ValueError("Hermes provider cost evidence is invalid")
+            total += cost
+        return total
+
     def persist(
         self,
         *,

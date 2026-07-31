@@ -300,7 +300,11 @@ class HermesCliFactory(HermesFactoryPort):
             )
         )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._observed_cost_usd = Decimal("0")
+        self._observed_cost_usd = (
+            self._provider_effect_store.total_estimated_cost_usd()
+            if settings.maximum_total_cost_usd is not None
+            else Decimal("0")
+        )
 
     @property
     def observed_cost_usd(self) -> Decimal:

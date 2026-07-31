@@ -686,14 +686,25 @@ async def test_pinned_hermes_model_requires_usage_evidence_and_stops_after_ceili
         max_seconds=30,
         effect_identity="1" * 64,
     ) == b"{}"
+    restarted = HermesCliFactory(
+        settings=HermesCliSettings(
+            executable="python.exe",
+            module_root=module_root,
+            evidence_root=tmp_path / "evidence",
+            provider="openai-api",
+            model="gpt-4.1-mini",
+            maximum_total_cost_usd=Decimal("0.05"),
+        )
+    )
+    assert restarted.observed_cost_usd == Decimal("0.03")
     with pytest.raises(FactoryDispatchError, match="cost ceiling"):
-        await factory._run_skill_prompt(
+        await restarted._run_skill_prompt(
             "second",
             max_seconds=30,
             effect_identity="2" * 64,
         )
 
-    assert factory.observed_cost_usd == Decimal("0.06")
+    assert restarted.observed_cost_usd == Decimal("0.06")
     assert len(observed_commands) == 2
     assert observed_commands[0][3:7] == (
         "--provider",
