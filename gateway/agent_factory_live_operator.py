@@ -124,6 +124,9 @@ def validate_factory_total_cost_envelope(
         user_maximum_eur = Decimal(
             _required(environment, "CAPTAIN_FACTORY_USER_MAX_EUR_PER_TEAM")
         )
+        budget_eur_per_usd = Decimal(
+            _required(environment, "CAPTAIN_FACTORY_BUDGET_EUR_PER_USD")
+        )
         total_maximum_usd = Decimal(
             _required(
                 environment,
@@ -149,6 +152,7 @@ def validate_factory_total_cost_envelope(
         raise ValueError("Factory total cost envelope is invalid") from exc
     values = (
         user_maximum_eur,
+        budget_eur_per_usd,
         total_maximum_usd,
         codex_metered_usd,
         hermes_total_usd,
@@ -158,8 +162,10 @@ def validate_factory_total_cost_envelope(
     if (
         any(not value.is_finite() or value < 0 for value in values)
         or user_maximum_eur != Decimal("1.00")
+        or budget_eur_per_usd < Decimal("1.00")
         or total_maximum_usd <= 0
         or total_maximum_usd > Decimal("0.75")
+        or total_maximum_usd * budget_eur_per_usd > user_maximum_eur
         or codex_metered_usd != 0
         or len(benchmark_maximum_usd_per_team) != 2
         or any(
