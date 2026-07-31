@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,8 +27,16 @@ FactoryCodexBuildPhase = Literal[
     "implementation_running",
     "implementation_interrupted",
     "implementation_complete",
+    "implementation_failed",
     "sealed",
 ]
+
+MAX_FACTORY_CODEX_CANDIDATE_ARCHIVE_BYTES = 32 * 1024 * 1024
+MAX_FACTORY_CODEX_JSON_ARTIFACT_BYTES = 2 * 1024 * 1024
+MAX_FACTORY_CODEX_OUTPUT_BYTES = (
+    MAX_FACTORY_CODEX_CANDIDATE_ARCHIVE_BYTES
+    + 2 * MAX_FACTORY_CODEX_JSON_ARTIFACT_BYTES
+)
 
 _DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _REVISION_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
@@ -41,6 +50,7 @@ _TRANSITIONS: frozenset[tuple[FactoryCodexBuildPhase, FactoryCodexBuildPhase]] =
             ("scaffold_ready", "implementation_running"),
             ("implementation_running", "implementation_interrupted"),
             ("implementation_running", "implementation_complete"),
+            ("implementation_running", "implementation_failed"),
             ("implementation_interrupted", "implementation_running"),
             ("implementation_complete", "sealed"),
         }
@@ -73,6 +83,12 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
     runtime_retry_authorization_binding_sha256: str | None = None
     output_manifest_uri: str | None = None
     output_manifest_sha256: str | None = None
+    implementation_failure_reason: Literal[
+        "required_output_invalid",
+        "output_size_limit_exceeded",
+        "runtime_failed",
+        "authority_expired",
+    ] | None = None
     sealed_evidence_sha256: str | None = None
     sealed_build_receipt_uri: str | None = None
     sealed_build_receipt_sha256: str | None = None
@@ -135,6 +151,7 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
         receipt_required = self.phase in {
             "implementation_interrupted",
             "implementation_complete",
+            "implementation_failed",
             "sealed",
         }
         if receipt_required != (self.terminal_receipt_sha256 is not None):
@@ -159,6 +176,15 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
                 or match.group("sha256") != self.output_manifest_sha256
             ):
                 raise ValueError("checkpoint output manifest reference is invalid")
+        if self.phase == "implementation_failed":
+            if self.implementation_failure_reason is None:
+                raise ValueError(
+                    "failed implementation checkpoint requires a failure reason"
+                )
+        elif self.implementation_failure_reason is not None:
+            raise ValueError(
+                "non-failed checkpoint cannot bind an implementation failure"
+            )
         sealed_values = (
             self.sealed_evidence_sha256,
             self.sealed_build_receipt_uri,
@@ -248,7 +274,7 @@ class FactoryCodexOutputArtifactV1(BaseModel):
 
     relative_path: FactoryCodexOutputPath
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    size: int = Field(ge=0)
+    size: int = Field(ge=1, le=MAX_FACTORY_CODEX_CANDIDATE_ARCHIVE_BYTES)
 
 
 class FactoryCodexOutputManifestV1(BaseModel):
@@ -266,6 +292,7 @@ class FactoryCodexOutputManifestV1(BaseModel):
     attempt: int = Field(ge=1)
     invocation_id: UUID
     workspace_ref: str = Field(min_length=1)
+    invocation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     resume_ordinal: int = Field(ge=0)
     terminal_receipt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     artifacts: tuple[FactoryCodexOutputArtifactV1, ...] = Field(min_length=3, max_length=3)
@@ -285,7 +312,43 @@ class FactoryCodexOutputManifestV1(BaseModel):
             raise ValueError(
                 "output manifest must bind the exact sorted required artifacts"
             )
+        for artifact in value:
+            maximum = (
+                MAX_FACTORY_CODEX_CANDIDATE_ARCHIVE_BYTES
+                if artifact.relative_path == "candidate.zip"
+                else MAX_FACTORY_CODEX_JSON_ARTIFACT_BYTES
+            )
+            if artifact.size > maximum:
+                raise ValueError("output artifact exceeds its typed size ceiling")
+        if sum(item.size for item in value) > MAX_FACTORY_CODEX_OUTPUT_BYTES:
+            raise ValueError("output manifest exceeds its aggregate size ceiling")
         return value
+
+
+class FactoryCodexOutputManifestPointerV1(BaseModel):
+    """Invocation-scoped pointer published only after snapshot durability."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_name: Literal["captain.factory-codex-output-manifest-pointer.v1"] = Field(
+        default="captain.factory-codex-output-manifest-pointer.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    invocation_id: UUID
+    invocation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    manifest_uri: str = Field(min_length=1)
+    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _require_reference_digest(self) -> FactoryCodexOutputManifestPointerV1:
+        match = _OUTPUT_MANIFEST_URI_PATTERN.fullmatch(self.manifest_uri)
+        if (
+            match is None
+            or match.group("sha256") != self.manifest_sha256
+        ):
+            raise ValueError("output manifest pointer reference is invalid")
+        return self
 
 
 class FilesystemFactoryCodexOutputManifestStore:
@@ -294,18 +357,39 @@ class FilesystemFactoryCodexOutputManifestStore:
     def __init__(self, root: Path) -> None:
         self._root = root.resolve()
 
-    def persist(self, manifest: FactoryCodexOutputManifestV1) -> tuple[str, str]:
+    def persist(
+        self,
+        manifest: FactoryCodexOutputManifestV1,
+        *,
+        snapshot_staging: Path,
+    ) -> tuple[str, str]:
         content = canonical_factory_codex_model(manifest)
         digest = hashlib.sha256(content).hexdigest()
+        snapshot_target = self._snapshot_path(digest)
+        self._persist_snapshot(
+            snapshot_staging=snapshot_staging,
+            snapshot_target=snapshot_target,
+            manifest=manifest,
+        )
         _atomic_write_once(
             self._path(digest),
             content,
             conflict="Factory Codex output manifest conflicts",
         )
-        return (
-            f"artifact://factory/codex-output-manifest/{digest}",
-            digest,
+        uri = f"artifact://factory/codex-output-manifest/{digest}"
+        pointer = FactoryCodexOutputManifestPointerV1(
+            schema="captain.factory-codex-output-manifest-pointer.v1",
+            invocation_id=manifest.invocation_id,
+            invocation_sha256=manifest.invocation_sha256,
+            manifest_uri=uri,
+            manifest_sha256=digest,
         )
+        _atomic_write_once(
+            self._pointer_path(manifest.invocation_id),
+            canonical_factory_codex_model(pointer),
+            conflict="Factory Codex output manifest pointer conflicts",
+        )
+        return uri, digest
 
     def load(
         self,
@@ -344,14 +428,161 @@ class FilesystemFactoryCodexOutputManifestStore:
             or manifest.correlation_id != invocation.correlation_id
             or manifest.attempt != invocation.attempt
             or manifest.workspace_ref != invocation.lease.workspace_ref
+            or manifest.invocation_sha256
+            != hashlib.sha256(
+                canonical_factory_codex_model(invocation)
+            ).hexdigest()
         ):
             raise FactoryDispatchError(
                 "Factory Codex output manifest binding changed"
             )
         return manifest
 
+    def load_pending(
+        self,
+        invocation: FactorySkillInvocationV1,
+    ) -> tuple[FactoryCodexOutputManifestV1, str, str] | None:
+        path = self._pointer_path(invocation.invocation_id)
+        if not path.exists():
+            return None
+        try:
+            content = path.read_bytes()
+            pointer = FactoryCodexOutputManifestPointerV1.model_validate_json(content)
+        except (OSError, ValidationError, ValueError):
+            raise FactoryDispatchError(
+                "Factory Codex output manifest pointer is invalid"
+            ) from None
+        if content != canonical_factory_codex_model(pointer):
+            raise FactoryDispatchError(
+                "Factory Codex output manifest pointer is not canonical"
+            )
+        invocation_sha256 = hashlib.sha256(
+            canonical_factory_codex_model(invocation)
+        ).hexdigest()
+        if (
+            pointer.invocation_id != invocation.invocation_id
+            or pointer.invocation_sha256 != invocation_sha256
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex output manifest pointer binding changed"
+            )
+        manifest = self.load(
+            invocation,
+            uri=pointer.manifest_uri,
+            sha256=pointer.manifest_sha256,
+        )
+        return manifest, pointer.manifest_uri, pointer.manifest_sha256
+
+    def snapshot_root(
+        self,
+        manifest: FactoryCodexOutputManifestV1,
+        *,
+        sha256: str,
+    ) -> Path:
+        if hashlib.sha256(canonical_factory_codex_model(manifest)).hexdigest() != sha256:
+            raise FactoryDispatchError(
+                "Factory Codex output snapshot manifest digest changed"
+            )
+        target = self._snapshot_path(sha256)
+        self._require_snapshot_matches(target, manifest)
+        return target
+
     def _path(self, sha256: str) -> Path:
         return self._root / f"{sha256}.json"
+
+    def _pointer_path(self, invocation_id: UUID) -> Path:
+        return self._root / "by-invocation" / f"{invocation_id.hex}.json"
+
+    def _snapshot_path(self, sha256: str) -> Path:
+        return self._root / "snapshots" / sha256
+
+    def _persist_snapshot(
+        self,
+        *,
+        snapshot_staging: Path,
+        snapshot_target: Path,
+        manifest: FactoryCodexOutputManifestV1,
+    ) -> None:
+        try:
+            resolved_staging = snapshot_staging.resolve(strict=True)
+        except OSError:
+            raise FactoryDispatchError(
+                "Factory Codex output snapshot staging is invalid"
+            ) from None
+        private_root = self._root.parent
+        if (
+            resolved_staging == private_root
+            or private_root not in resolved_staging.parents
+            or snapshot_staging.is_symlink()
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex output snapshot staging is outside private state"
+            )
+        self._require_snapshot_matches(snapshot_staging, manifest)
+        snapshot_target.parent.mkdir(parents=True, exist_ok=True)
+        if snapshot_target.exists():
+            self._require_snapshot_matches(snapshot_target, manifest)
+            shutil.rmtree(snapshot_staging)
+        else:
+            try:
+                os.replace(snapshot_staging, snapshot_target)
+            except OSError as exc:
+                if not snapshot_target.exists():
+                    shutil.rmtree(snapshot_staging, ignore_errors=True)
+                    raise FactoryDispatchError(
+                        "Factory Codex output snapshot persistence failed"
+                    ) from exc
+                self._require_snapshot_matches(snapshot_target, manifest)
+                shutil.rmtree(snapshot_staging, ignore_errors=True)
+        for artifact in manifest.artifacts:
+            try:
+                os.chmod(snapshot_target / artifact.relative_path, 0o400)
+            except OSError as exc:
+                raise FactoryDispatchError(
+                    "Factory Codex output snapshot protection failed"
+                ) from exc
+
+    @staticmethod
+    def _require_snapshot_matches(
+        root: Path,
+        manifest: FactoryCodexOutputManifestV1,
+    ) -> None:
+        try:
+            if root.is_symlink() or not root.is_dir():
+                raise OSError
+            names = {item.name for item in root.iterdir()}
+        except OSError:
+            raise FactoryDispatchError(
+                "Factory Codex output snapshot is missing or invalid"
+            ) from None
+        expected = {item.relative_path: item for item in manifest.artifacts}
+        if names != set(expected):
+            raise FactoryDispatchError(
+                "Factory Codex output snapshot file set changed"
+            )
+        for relative, artifact in expected.items():
+            path = root / relative
+            try:
+                if path.is_symlink() or not path.is_file():
+                    raise OSError
+                digest = hashlib.sha256()
+                size = 0
+                with path.open("rb") as stream:
+                    while chunk := stream.read(64 * 1024):
+                        size += len(chunk)
+                        if size > artifact.size:
+                            raise FactoryDispatchError(
+                                "Factory Codex output snapshot binding changed"
+                            )
+                        digest.update(chunk)
+            except OSError:
+                raise FactoryDispatchError(
+                    "Factory Codex output snapshot is missing or invalid"
+                ) from None
+            if size != artifact.size or digest.hexdigest() != artifact.sha256:
+                raise FactoryDispatchError(
+                    "Factory Codex output snapshot binding changed"
+                )
 
 
 class FilesystemFactoryCodexScaffoldManifestStore:
@@ -766,6 +997,21 @@ def _require_transition(
         raise FactoryDispatchError(
             "Factory Codex checkpoint output manifest binding changed"
         )
+    if transition == ("implementation_running", "implementation_failed"):
+        if (
+            previous.implementation_failure_reason is not None
+            or next_checkpoint.implementation_failure_reason is None
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex implementation failure binding conflicts"
+            )
+    elif (
+        previous.implementation_failure_reason
+        != next_checkpoint.implementation_failure_reason
+    ):
+        raise FactoryDispatchError(
+            "Factory Codex implementation failure binding changed"
+        )
     if transition == ("implementation_complete", "sealed") and (
         next_checkpoint.terminal_receipt_sha256
         != previous.terminal_receipt_sha256
@@ -780,9 +1026,13 @@ __all__ = [
     "FactoryCodexScaffoldManifestV1",
     "FactoryCodexOutputArtifactV1",
     "FactoryCodexOutputManifestV1",
+    "FactoryCodexOutputManifestPointerV1",
     "FilesystemFactoryCodexBuildCheckpointStore",
     "FilesystemFactoryCodexOutputManifestStore",
     "FilesystemFactoryCodexScaffoldManifestStore",
     "FilesystemFactoryCodexSealedEvidenceStore",
+    "MAX_FACTORY_CODEX_CANDIDATE_ARCHIVE_BYTES",
+    "MAX_FACTORY_CODEX_JSON_ARTIFACT_BYTES",
+    "MAX_FACTORY_CODEX_OUTPUT_BYTES",
     "canonical_factory_codex_model",
 ]

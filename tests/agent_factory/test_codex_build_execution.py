@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import subprocess
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -343,6 +344,8 @@ async def test_captain_sealer_issues_and_persists_exact_build_evidence(
 ) -> None:
     cas = CodexBuildArtifactCas(tmp_path / "cas")
     workspace = _workspace(tmp_path, cas)
+    snapshot = tmp_path / "private-output-snapshot"
+    shutil.copytree(workspace, snapshot)
     job, brief, artifact_reader = _executor_job_and_brief()
     invocation = _seal_invocation(job, brief)
     executor = FakeBuildExecutor(
@@ -353,6 +356,7 @@ async def test_captain_sealer_issues_and_persists_exact_build_evidence(
             source_archive_path="candidate.zip",
             test_evidence_paths=("test-evidence.json",),
             completed_at=NOW,
+            output_snapshot_root=snapshot,
         )
     )
     sealer = CaptainCodexBuildSealer(
@@ -373,11 +377,45 @@ async def test_captain_sealer_issues_and_persists_exact_build_evidence(
 
 
 @pytest.mark.asyncio
+async def test_captain_sealer_rejects_mutable_workspace_without_snapshot(
+    tmp_path: Path,
+) -> None:
+    cas = CodexBuildArtifactCas(tmp_path / "cas")
+    workspace = _workspace(tmp_path, cas)
+    job, brief, _artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    executor = FakeBuildExecutor(
+        CompletedCodexBuild(
+            workspace_root=workspace,
+            codex_session_receipt=b'{"session_id":"codex-session-123"}',
+            candidate_manifest_path="factory-candidate.json",
+            source_archive_path="candidate.zip",
+            test_evidence_paths=("test-evidence.json",),
+            completed_at=NOW,
+        )
+    )
+    sealer = CaptainCodexBuildSealer(
+        executor=executor,
+        issuer=CaptainCodexBuildReceiptIssuer(cas),
+    )
+
+    with pytest.raises(
+        FactoryDispatchError,
+        match="requires an immutable output snapshot",
+    ):
+        await sealer.seal(_dispatch(job, invocation), invocation, brief)
+
+    assert executor.sealed == []
+
+
+@pytest.mark.asyncio
 async def test_captain_sealer_records_successor_authority_after_original_lease_expiry(
     tmp_path: Path,
 ) -> None:
     cas = CodexBuildArtifactCas(tmp_path / "cas")
     workspace = _workspace(tmp_path, cas)
+    snapshot = tmp_path / "private-output-snapshot"
+    shutil.copytree(workspace, snapshot)
     job, brief, _artifact_reader = _executor_job_and_brief()
     invocation = _seal_invocation(job, brief)
     resumed_at = invocation.lease.expires_at + timedelta(seconds=1)
@@ -389,6 +427,7 @@ async def test_captain_sealer_records_successor_authority_after_original_lease_e
             source_archive_path="candidate.zip",
             test_evidence_paths=("test-evidence.json",),
             completed_at=resumed_at,
+            output_snapshot_root=snapshot,
         )
     )
     sealer = CaptainCodexBuildSealer(
@@ -665,6 +704,9 @@ async def test_replay_rejects_changed_retry_authority_before_advancing_checkpoin
         attempt=invocation.attempt,
         invocation_id=invocation.invocation_id,
         workspace_ref=invocation.lease.workspace_ref,
+        invocation_sha256=hashlib.sha256(
+            canonical_factory_codex_model(invocation)
+        ).hexdigest(),
         resume_ordinal=1,
         terminal_receipt_sha256=receipt_sha256,
         artifacts=tuple(
@@ -680,10 +722,21 @@ async def test_replay_rejects_changed_retry_authority_before_advancing_checkpoin
             )
         ),
     )
+    manual_snapshot = state_root / "manual-output-snapshot"
+    manual_snapshot.mkdir()
+    for relative in (
+        "candidate.zip",
+        "factory-candidate.json",
+        "test-evidence.json",
+    ):
+        shutil.copyfile(workspace / relative, manual_snapshot / relative)
     output_manifest_uri, output_manifest_sha256 = (
         FilesystemFactoryCodexOutputManifestStore(
             state_root / "output-manifests"
-        ).persist(output_manifest)
+        ).persist(
+            output_manifest,
+            snapshot_staging=manual_snapshot,
+        )
     )
     implementation_complete = resumed.model_copy(
         update={
@@ -739,7 +792,48 @@ async def test_replay_rejects_changed_retry_authority_before_advancing_checkpoin
         source_archive_path="candidate.zip",
         test_evidence_paths=("test-evidence.json",),
         completed_at=NOW,
+        output_snapshot_root=(
+            state_root
+            / "output-manifests"
+            / "snapshots"
+            / output_manifest_sha256
+        ),
     )
+
+    class MismatchedReceiptIssuer(CaptainCodexBuildReceiptIssuer):
+        def issue(self, **kwargs):
+            receipt = super().issue(**kwargs)
+            return receipt.model_copy(
+                update={
+                    "source_archive_ref": receipt.source_archive_ref.model_copy(
+                        update={
+                            "uri": f"artifact://codex-source/{'0' * 64}",
+                            "sha256": "0" * 64,
+                        }
+                    )
+                }
+            )
+
+    mismatch_sealer = CaptainCodexBuildSealer(
+        executor=build_executor(checkpoint_store),
+        issuer=MismatchedReceiptIssuer(cas),
+    )
+    checkpoint_before_mismatch = checkpoint_store.load(invocation)
+    with pytest.raises(
+        FactoryDispatchError,
+        match="issued receipt output binding changed",
+    ):
+        mismatch_sealer._seal_completed(
+            authorized_dispatch,
+            invocation,
+            brief,
+            completed,
+        )
+    assert checkpoint_store.load(invocation) == checkpoint_before_mismatch
+    assert not (
+        state_root / "sealed-evidence" / f"{invocation.invocation_id.hex}.json"
+    ).exists()
+
     crashing_sealer = CaptainCodexBuildSealer(
         executor=build_executor(CrashBeforeSealedCheckpointStore(checkpoint_root)),
         issuer=CaptainCodexBuildReceiptIssuer(cas),
@@ -1013,6 +1107,9 @@ async def test_cli_executor_fails_closed_when_codex_omits_required_outputs(
         def prepare(self, *_args):
             return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
 
+        def prepare_or_recover(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
     class IncompleteRunner:
         def __init__(self, journal_path: Path) -> None:
             self.journal_path = journal_path
@@ -1056,7 +1153,8 @@ async def test_cli_executor_fails_closed_when_codex_omits_required_outputs(
         tmp_path / "state" / "checkpoints"
     ).load(invocation)
     assert checkpoint is not None
-    assert checkpoint.phase == "implementation_running"
+    assert checkpoint.phase == "implementation_failed"
+    assert checkpoint.terminal_receipt_sha256 is not None
     assert (
         tmp_path
         / "state"
@@ -1064,6 +1162,15 @@ async def test_cli_executor_fails_closed_when_codex_omits_required_outputs(
         / f"{invocation.idempotency_key}.json"
     ).is_file()
     assert not (tmp_path / "state" / "output-manifests").exists()
+    (workspace / "candidate.zip").write_bytes(b"late archive")
+    (workspace / "factory-candidate.json").write_text("{}", encoding="utf-8")
+    (workspace / "test-evidence.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(FactoryDispatchError, match="not reconcilable|failed"):
+        await executor.reconcile_pending(
+            _dispatch(job, invocation),
+            invocation,
+            brief,
+        )
 
 
 @pytest.mark.asyncio
@@ -1119,6 +1226,9 @@ async def test_implementation_complete_binds_exact_outputs_and_rejects_archive_r
     )
     manifest = json.loads(manifest_path.read_bytes())
     assert manifest["schema"] == "captain.factory-codex-output-manifest.v1"
+    assert manifest["invocation_sha256"] == hashlib.sha256(
+        canonical_factory_codex_model(invocation)
+    ).hexdigest()
     assert [item["relative_path"] for item in manifest["artifacts"]] == [
         "candidate.zip",
         "factory-candidate.json",
@@ -1126,6 +1236,20 @@ async def test_implementation_complete_binds_exact_outputs_and_rejects_archive_r
     ]
     assert all(item["size"] > 0 for item in manifest["artifacts"])
     assert str(workspace) not in json.dumps(manifest)
+    changed_invocation = invocation.model_copy(
+        update={"acceptance_assertion_ids": ("different_assertion",)}
+    )
+    with pytest.raises(
+        FactoryDispatchError,
+        match="output manifest binding changed",
+    ):
+        FilesystemFactoryCodexOutputManifestStore(
+            state_root / "output-manifests"
+        ).load(
+            changed_invocation,
+            uri=checkpoint.output_manifest_uri,
+            sha256=checkpoint.output_manifest_sha256,
+        )
     checkpoint_bytes = (
         state_root / "checkpoints" / f"{invocation.invocation_id.hex}.json"
     ).read_bytes()
@@ -1159,6 +1283,127 @@ async def test_implementation_complete_binds_exact_outputs_and_rejects_archive_r
     assert (
         state_root / "checkpoints" / f"{invocation.invocation_id.hex}.json"
     ).read_bytes() == checkpoint_bytes
+
+
+@pytest.mark.asyncio
+async def test_issuer_reads_private_snapshot_when_workspace_swaps_after_validation(
+    tmp_path: Path,
+) -> None:
+    cas = CodexBuildArtifactCas(tmp_path / "cas")
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+
+    class Preparer:
+        def prepare(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+        def prepare_or_recover(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=Preparer(),
+        artifact_reader=artifact_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=lambda **kwargs: SuccessfulRunner(
+            workspace,
+            kwargs["journal_path"],
+        ),
+        clock=lambda: NOW,
+    )
+    dispatch = _dispatch(job, invocation)
+    completed = await executor.execute(dispatch, invocation, brief)
+    original = {
+        relative: (workspace / relative).read_bytes()
+        for relative in (
+            "candidate.zip",
+            "factory-candidate.json",
+            "test-evidence.json",
+        )
+    }
+    alternate_root = tmp_path / "alternate"
+    alternate_root.mkdir()
+    alternate_runner = SuccessfulRunner(
+        alternate_root,
+        tmp_path / "alternate-journal.jsonl",
+    )
+    await alternate_runner.run(
+        AuthorizedCodexRun(
+            workspace=alternate_root,
+            command=("codex", "exec", "--json", "alternate"),
+            environment=FrozenEnvironment({}),
+        )
+    )
+    from io import BytesIO
+    from zipfile import ZIP_STORED, ZipFile, ZipInfo
+
+    alternate_zip = BytesIO()
+    with ZipFile(alternate_zip, "w", compression=ZIP_STORED) as archive:
+        for name, content in (
+            (
+                "factory-candidate.json",
+                (alternate_root / "factory-candidate.json").read_bytes(),
+            ),
+            ("src/team.py", b"TEAM = 'alternate'\n"),
+        ):
+            info = ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.create_system = 3
+            info.external_attr = 0o100644 << 16
+            archive.writestr(info, content)
+    (alternate_root / "candidate.zip").write_bytes(alternate_zip.getvalue())
+    alternate = {
+        relative: (alternate_root / relative).read_bytes()
+        for relative in original
+    }
+
+    class SwappingIssuer(CaptainCodexBuildReceiptIssuer):
+        def __init__(self, artifact_cas: CodexBuildArtifactCas) -> None:
+            super().__init__(artifact_cas)
+            self.received_root: Path | None = None
+
+        def issue(self, **kwargs):
+            self.received_root = kwargs["workspace_root"]
+            for relative, content in alternate.items():
+                (workspace / relative).write_bytes(content)
+            try:
+                return super().issue(**kwargs)
+            finally:
+                for relative, content in original.items():
+                    (workspace / relative).write_bytes(content)
+
+    issuer = SwappingIssuer(cas)
+    sealer = CaptainCodexBuildSealer(executor=executor, issuer=issuer)
+
+    evidence = sealer._seal_completed(
+        dispatch,
+        invocation,
+        brief,
+        completed,
+    )
+
+    assert issuer.received_root is not None
+    assert issuer.received_root != workspace
+    assert evidence.build_receipt.candidate_manifest_ref.sha256 == hashlib.sha256(
+        original["factory-candidate.json"]
+    ).hexdigest()
+    assert evidence.build_receipt.source_archive_ref.sha256 == hashlib.sha256(
+        original["candidate.zip"]
+    ).hexdigest()
+    assert tuple(
+        item.sha256 for item in evidence.build_receipt.test_evidence_refs
+    ) == (hashlib.sha256(original["test-evidence.json"]).hexdigest(),)
+    assert (
+        FilesystemFactoryCodexBuildCheckpointStore(
+            state_root / "checkpoints"
+        ).load(invocation).phase
+        == "sealed"
+    )
 
 
 @pytest.mark.asyncio
@@ -1291,6 +1536,228 @@ async def test_mutation_after_sealed_evidence_crash_cannot_advance_checkpoint(
 
     assert checkpoint_path.read_bytes() == checkpoint_bytes
     assert checkpoint_store.load(invocation) == implementation_complete
+
+
+class FixedSizeOutputsRunner:
+    def __init__(
+        self,
+        *,
+        workspace: Path,
+        journal_path: Path,
+        candidate_archive: bytes,
+        candidate_manifest: bytes,
+        test_evidence: bytes,
+    ) -> None:
+        self._workspace = workspace
+        self._journal_path = journal_path
+        self._outputs = {
+            "candidate.zip": candidate_archive,
+            "factory-candidate.json": candidate_manifest,
+            "test-evidence.json": test_evidence,
+        }
+
+    async def run(self, _authorized: AuthorizedCodexRun) -> CodexRunResult:
+        for relative, content in self._outputs.items():
+            (self._workspace / relative).write_bytes(content)
+        line = json.dumps(
+            {"type": "thread.started", "thread_id": "bounded-output-thread"}
+        )
+        journal = f"{line}\n".encode("utf-8")
+        self._journal_path.parent.mkdir(parents=True, exist_ok=True)
+        self._journal_path.write_bytes(journal)
+        return CodexRunResult(
+            exit_code=0,
+            terminal_status="succeeded",
+            process_cleanup_status="not_required",
+            journal_path=self._journal_path,
+            journal_sha256=hashlib.sha256(journal).hexdigest(),
+            artifact_references=(),
+            jsonl_lines=(line,),
+        )
+
+
+@pytest.mark.asyncio
+async def test_nonzero_terminal_result_persists_receipt_and_fails_terminally(
+    tmp_path: Path,
+) -> None:
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+
+    class Preparer:
+        def prepare(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    class FailedRunner(SuccessfulRunner):
+        async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
+            result = await super().run(authorized)
+            return CodexRunResult(
+                exit_code=1,
+                terminal_status="failed",
+                process_cleanup_status="not_required",
+                journal_path=result.journal_path,
+                journal_sha256=result.journal_sha256,
+                artifact_references=result.artifact_references,
+                jsonl_lines=result.jsonl_lines,
+            )
+
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=Preparer(),
+        artifact_reader=artifact_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=lambda **kwargs: FailedRunner(
+            workspace,
+            kwargs["journal_path"],
+        ),
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FactoryDispatchError, match=r"failed \(exit 1\)"):
+        await executor.execute(_dispatch(job, invocation), invocation, brief)
+
+    checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert checkpoint is not None
+    assert checkpoint.phase == "implementation_failed"
+    assert checkpoint.implementation_failure_reason == "runtime_failed"
+    assert checkpoint.terminal_receipt_sha256 is not None
+    assert (
+        state_root / "sessions" / f"{invocation.idempotency_key}.json"
+    ).is_file()
+
+
+@pytest.mark.asyncio
+async def test_output_capture_accepts_exact_per_file_and_aggregate_boundaries(
+    tmp_path: Path,
+) -> None:
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+
+    class Preparer:
+        def prepare(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+            maximum_candidate_archive_bytes=10,
+            maximum_json_artifact_bytes=10,
+            maximum_output_bytes=30,
+        ),
+        workspace_preparer=Preparer(),
+        artifact_reader=artifact_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=lambda **kwargs: FixedSizeOutputsRunner(
+            workspace=workspace,
+            journal_path=kwargs["journal_path"],
+            candidate_archive=b"a" * 10,
+            candidate_manifest=b"b" * 10,
+            test_evidence=b"c" * 10,
+        ),
+        clock=lambda: NOW,
+    )
+
+    await executor.execute(_dispatch(job, invocation), invocation, brief)
+
+    checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert checkpoint is not None
+    assert checkpoint.phase == "implementation_complete"
+    assert checkpoint.output_manifest_sha256 is not None
+    manifest = json.loads(
+        (
+            state_root
+            / "output-manifests"
+            / f"{checkpoint.output_manifest_sha256}.json"
+        ).read_bytes()
+    )
+    assert sum(item["size"] for item in manifest["artifacts"]) == 30
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("candidate_archive", "candidate_manifest", "test_evidence", "aggregate_limit"),
+    (
+        (b"a" * 11, b"b" * 10, b"c" * 10, 31),
+        (b"a" * 10, b"b" * 10, b"c" * 10, 29),
+    ),
+)
+async def test_output_capture_fails_terminally_before_checkpoint_on_size_limit(
+    tmp_path: Path,
+    candidate_archive: bytes,
+    candidate_manifest: bytes,
+    test_evidence: bytes,
+    aggregate_limit: int,
+) -> None:
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+
+    class Preparer:
+        def prepare(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+        def prepare_or_recover(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+            maximum_candidate_archive_bytes=10,
+            maximum_json_artifact_bytes=10,
+            maximum_output_bytes=aggregate_limit,
+        ),
+        workspace_preparer=Preparer(),
+        artifact_reader=artifact_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=lambda **kwargs: FixedSizeOutputsRunner(
+            workspace=workspace,
+            journal_path=kwargs["journal_path"],
+            candidate_archive=candidate_archive,
+            candidate_manifest=candidate_manifest,
+            test_evidence=test_evidence,
+        ),
+        clock=lambda: NOW,
+    )
+    dispatch = _dispatch(job, invocation)
+
+    with pytest.raises(FactoryDispatchError, match="output.*size limit"):
+        await executor.execute(dispatch, invocation, brief)
+
+    checkpoint_store = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    )
+    failed = checkpoint_store.load(invocation)
+    assert failed is not None
+    assert failed.phase == "implementation_failed"
+    assert failed.terminal_receipt_sha256 is not None
+    assert (
+        state_root / "sessions" / f"{invocation.idempotency_key}.json"
+    ).is_file()
+    for relative in (
+        "candidate.zip",
+        "factory-candidate.json",
+        "test-evidence.json",
+    ):
+        (workspace / relative).write_bytes(b"late")
+    with pytest.raises(FactoryDispatchError, match="not reconcilable|failed"):
+        await executor.reconcile_pending(dispatch, invocation, brief)
+    assert checkpoint_store.load(invocation) == failed
 
 
 def _run_result(
@@ -2565,6 +3032,16 @@ async def test_authorized_resume_rejects_completion_after_authorization_expiry(
         await executor.execute_authorized_resume(authorized, invocation, brief)
 
     assert observed_timeouts[-1] <= 2
+    failed = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert failed is not None
+    assert failed.phase == "implementation_failed"
+    assert failed.implementation_failure_reason == "authority_expired"
+    assert failed.terminal_receipt_sha256 is not None
+    assert (
+        state_root / "sessions" / f"{invocation.idempotency_key}.json"
+    ).is_file()
 
 
 @pytest.mark.asyncio
@@ -3250,6 +3727,12 @@ async def test_restart_reconciliation_completes_successful_receipt_then_replays_
         completed_at=NOW,
     )
     receipt_path = state_root / "sessions" / f"{invocation.idempotency_key}.json"
+    executor._capture_and_persist_output_manifest(
+        invocation=invocation,
+        prepared=PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40),
+        resume_ordinal=0,
+        terminal_receipt_sha256=hashlib.sha256(receipt).hexdigest(),
+    )
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
     receipt_path.write_bytes(receipt)
 

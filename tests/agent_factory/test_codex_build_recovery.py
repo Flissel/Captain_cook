@@ -35,6 +35,7 @@ def _bound_checkpoint(
     if phase in {
         "implementation_interrupted",
         "implementation_complete",
+        "implementation_failed",
         "sealed",
     } and terminal_receipt_sha256 is None:
         terminal_receipt_sha256 = "b" * 64
@@ -59,6 +60,11 @@ def _bound_checkpoint(
         if phase in {"implementation_complete", "sealed"}
         else {}
     )
+    failure_bindings = (
+        {"implementation_failure_reason": "required_output_invalid"}
+        if phase == "implementation_failed"
+        else {}
+    )
     checkpoint = FactoryCodexBuildCheckpointV1(
         job_id=job.job_id,
         correlation_id=job.correlation_id,
@@ -77,6 +83,7 @@ def _bound_checkpoint(
         parent_codex_thread_id=parent_codex_thread_id,
         updated_at=updated_at,
         **output_bindings,
+        **failure_bindings,
         **sealed_bindings,
     )
     return checkpoint, invocation
@@ -153,6 +160,10 @@ def _next(
                 "output_manifest_sha256": None,
             }
         )
+    if phase == "implementation_failed":
+        updates["implementation_failure_reason"] = "required_output_invalid"
+    else:
+        updates["implementation_failure_reason"] = None
     return checkpoint.model_copy(update=updates)
 
 
