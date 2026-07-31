@@ -30,11 +30,15 @@
   only after an unresolved preflight and a process-only provider-key check,
   validates its redacted two-job result, and repeats preflight before any full
   benchmark call.
-- [ ] Add a Captain-owned retry/improvement authorization writer. The bounded
-  runner must continue to stop at its typed Captain checkpoint when a failed
-  evaluation needs another attempt; it must never self-authorize an
-  improvement or substitute the pre-provisioned seed candidate for newly
-  generated Forge code.
+- [x] Add a Captain-owned runtime-retry authorization writer. Captain now
+  verifies the immutable interrupted checkpoint plus terminal receipt, issues
+  one time-bounded exact resume authority, stores it write-once below the
+  private runtime namespace, and threads the matching authority into the live
+  composition. The PowerShell runner persists the redacted interruption
+  checkpoint before exiting `2`; a separate explicit issuer consumes it. The
+  build cannot self-authorize. Improvement authorization after a completed
+  failed evaluation remains a distinct pending contract and cannot substitute
+  the pre-provisioned seed candidate for generated Forge code.
 - [ ] Finish the Minibook creation worker. `CreationScheduler`, resumable
   checkpoints, exact one-shot result files, a persistent local CAS, a
   deterministic creation-only exporter, and Gateway CAS replay are now
@@ -193,9 +197,17 @@
   JSON `schema` field because `FactoryCandidateManifest` previously accepted
   only its internal `schema_name`. The contract now reads both spellings for
   backward compatibility and serializes only canonical `schema`; the actual
-  V21 Claims candidate parses under that corrected contract. Renewal,
-  technical holdout execution, all 30 business cases, promotion, and
-  projection remain unproven.
+  V21 Claims candidate parses under that corrected contract. Its technical
+  holdout then rejected the candidate: the archive contains prompts, a static
+  manifest, and manifest-only tests but no executable AutoGen team, while its
+  declared real-case command runs pytest rather than a real team and cannot
+  emit Captain's terminal result contract. It is not ready to promote and must
+  receive a separately authorized improvement attempt. Renewal produced an
+  executable team scaffold but timed out after 900 seconds before its three
+  final artifacts. Captain retained exit `124`, the streamed session evidence,
+  and exact resume ordinal `1`; no new suite or Hermes call is required for the
+  one authorized resume. All 30 business cases, promotion, and projection
+  remain unproven.
 - [x] Enforce the operator's `1.00 EUR` marginal-cost ceiling per team before
   provider construction. The live demo reserves at most `0.30 USD` for one
   team's candidate/baseline benchmark and conservatively assigns the complete

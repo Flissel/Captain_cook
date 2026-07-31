@@ -475,6 +475,49 @@ function Test-CodexBuildInterruptedCheckpoint {
     return $true
 }
 
+function Save-CodexBuildInterruptedCheckpoint {
+    param(
+        [Parameter(Mandatory = $true)][object]$Checkpoint,
+        [Parameter(Mandatory = $true)][string]$AuthorityRoot
+    )
+
+    $directory = Join-Path $AuthorityRoot 'runtime-state/codex/interruption-checkpoints'
+    $null = New-Item -ItemType Directory -Force -Path $directory
+    $target = Join-Path $directory "$([string]$Checkpoint.checkpoint_ref.sha256).json"
+    $bytes = [Text.Encoding]::UTF8.GetBytes(
+        ($Checkpoint | ConvertTo-Json -Compress -Depth 20)
+    )
+    try {
+        $stream = [IO.File]::Open(
+            $target,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::None
+        )
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }
+    catch [IO.IOException] {
+        if (
+            -not (Test-Path -LiteralPath $target -PathType Leaf) -or
+            [Convert]::ToHexString(
+                [Security.Cryptography.SHA256]::HashData(
+                    [IO.File]::ReadAllBytes($target)
+                )
+            ) -cne [Convert]::ToHexString(
+                [Security.Cryptography.SHA256]::HashData($bytes)
+            )
+        ) {
+            throw 'Captain Factory interruption checkpoint immutable binding changed.'
+        }
+    }
+}
+
 function Test-CanonicalUuid {
     param([Parameter(Mandatory = $true)][string]$Value)
 
@@ -862,6 +905,9 @@ try {
             if (-not (Test-CodexBuildInterruptedCheckpoint -Checkpoint $factoryInterruption)) {
                 throw 'Captain Factory interruption checkpoint is not canonical.'
             }
+            Save-CodexBuildInterruptedCheckpoint `
+                -Checkpoint $factoryInterruption `
+                -AuthorityRoot ([string]$environment['CAPTAIN_BENCHMARK_AUTHORITY_ROOT'])
             Remove-Item -LiteralPath $factoryErrorPath -Force -ErrorAction SilentlyContinue
             $factoryInterruption | ConvertTo-Json -Compress -Depth 20
             exit 2

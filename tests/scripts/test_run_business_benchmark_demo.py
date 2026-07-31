@@ -44,6 +44,8 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "Resolve-HermesPython" in source
     assert "'--hermes-python-executable', $hermesPython" in source
     assert "factory-operator-stderr.log" in source
+    assert "Save-CodexBuildInterruptedCheckpoint" in source
+    assert "runtime-state/codex/interruption-checkpoints" in source
     assert "@(& $python @factoryArguments 2>$factoryErrorPath)" in source
     assert "--apply" in source
     assert "preflight-business-benchmark-demo.py" in source

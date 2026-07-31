@@ -75,6 +75,9 @@ from gateway.business_benchmark_live_composition import (
 )
 from gateway.factory_repository import GatewayFactoryRepository
 from gateway.factory_forge_evidence import CaptainForgeEvidenceBridge
+from gateway.factory_runtime_retry_authority import (
+    FilesystemFactoryRuntimeRetryAuthority,
+)
 from gateway.minibook_creation_artifacts import GatewayMinibookCreationArtifactStore
 from gateway.store import GatewayStore
 
@@ -322,6 +325,12 @@ def compose_business_demo_factory_operator(
         workspace / ".captain-cook" / "private" / "codex-workspaces"
     ).resolve()
     codex_state_root = (authority_root / "runtime-state" / "codex").resolve()
+    runtime_retry_authority = FilesystemFactoryRuntimeRetryAuthority(
+        authority_root=(
+            authority_root / "runtime-state" / "runtime-retry-authorizations"
+        ),
+        checkpoint_root=codex_state_root / "checkpoints",
+    )
     codex_executable = Path(
         _required(environment, "CAPTAIN_CODEX_EXECUTABLE")
     ).resolve(strict=True)
@@ -479,6 +488,7 @@ def compose_business_demo_factory_operator(
         codex_prompt_artifact_store=_BenchmarkCodexPromptArtifactStore(
             benchmark_cas
         ),
+        runtime_retries=runtime_retry_authority,
     )
 
 
