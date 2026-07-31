@@ -23,6 +23,7 @@ from agenten.agent_factory.minibook_forge import (
 from agenten.agent_factory.orchestration import FactoryDispatch
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from agenten.agent_factory.skill_workflow_contracts import (
+    CandidateRevisionV1,
     CodebaseInventoryV1,
     CodexBuildBriefV1,
     CodexBuildEvidenceV1,
@@ -35,6 +36,7 @@ from tests.agent_factory.test_codex_build_provenance_contracts import (
 from tests.agent_factory.test_skill_workflow_contracts import (
     brief_payload,
     inventory_payload,
+    revision_payload,
 )
 from tests.agent_factory.test_state_machine import job_v3
 
@@ -228,18 +230,75 @@ def _workflow_evidence(*, attempt: int = 1, inventory_attempt: int | None = None
     return factory_job, inventory, brief, build
 
 
+def _retry_workflow_evidence():
+    factory_job, inventory, brief, build = _workflow_evidence(
+        attempt=2,
+        inventory_attempt=1,
+    )
+    revision_data = revision_payload()
+    invocation = revision_data["invocation"]
+    assert isinstance(invocation, dict)
+    lease = invocation["lease"]
+    assert isinstance(lease, dict)
+    invocation.update(
+        {
+            "job_id": str(factory_job.job_id),
+            "correlation_id": str(factory_job.correlation_id),
+            "subject_version": factory_job.subject_version,
+            "attempt": 2,
+            "input_ref": factory_job.input_ref.model_dump(mode="json"),
+            "input_sha256": factory_job.input_ref.sha256,
+            "acceptance_assertion_ids": list(factory_job.acceptance_assertion_ids),
+        }
+    )
+    lease.update(
+        {
+            "job_id": str(factory_job.job_id),
+            "correlation_id": str(factory_job.correlation_id),
+            "subject_version": factory_job.subject_version,
+            "attempt": 2,
+        }
+    )
+    revision_data.update(
+        {
+            "job_id": str(factory_job.job_id),
+            "correlation_id": str(factory_job.correlation_id),
+            "subject_version": factory_job.subject_version,
+            "attempt": 2,
+            "acceptance_assertion_ids": list(factory_job.acceptance_assertion_ids),
+        }
+    )
+    revision = CandidateRevisionV1.model_validate(revision_data)
+    brief_data = brief.model_dump(mode="json", by_alias=True)
+    brief_invocation = brief_data["invocation"]
+    assert isinstance(brief_invocation, dict)
+    brief_invocation.update(
+        {
+            "input_ref": revision.artifact_ref.model_dump(mode="json"),
+            "input_sha256": revision.artifact_ref.sha256,
+        }
+    )
+    retry_brief = CodexBuildBriefV1.model_validate(brief_data)
+    return factory_job, inventory, revision, retry_brief, build
+
+
 class ForgeEvidence:
-    def __init__(self, inventory, brief, build) -> None:
-        self.artifacts = (inventory, brief, build)
+    def __init__(self, inventory, *artifacts) -> None:
+        self.artifacts = (inventory, *artifacts)
 
     def workflow_artifacts(self, job_id):
         assert job_id == self.artifacts[0].job_id
         return self.artifacts
 
     def released_for(self, job, step):
-        assert job.job_id == self.artifacts[1].job_id
+        brief = next(
+            artifact
+            for artifact in self.artifacts
+            if isinstance(artifact, CodexBuildBriefV1)
+        )
+        assert job.job_id == brief.job_id
         assert step is FactorySkillStep.BRIEF_CODEX
-        return self.artifacts[1].invocation.released_skill
+        return brief.invocation.released_skill
 
 
 def test_creation_job_mapper_uses_exact_captain_brief_and_is_deterministic() -> None:
@@ -292,12 +351,9 @@ def test_creation_job_mapper_uses_exact_captain_brief_and_is_deterministic() -> 
 
 
 def test_creation_job_mapper_retry_uses_brief_bound_baseline_inventory() -> None:
-    factory_job, inventory, brief, build = _workflow_evidence(
-        attempt=2,
-        inventory_attempt=1,
-    )
+    factory_job, inventory, revision, brief, build = _retry_workflow_evidence()
     mapper = CaptainCreationJobMapper(
-        evidence=ForgeEvidence(inventory, brief, build)
+        evidence=ForgeEvidence(inventory, revision, brief, build)
     )
 
     creation_job = mapper.map(
@@ -315,6 +371,7 @@ def test_creation_job_mapper_retry_uses_brief_bound_baseline_inventory() -> None
     assert creation_job.attempt == 2
     assert inventory.attempt == 1
     assert inventory.artifact_ref in brief.context_refs
+    assert brief.invocation.input_ref == revision.artifact_ref
 
 
 def test_creation_job_mapper_rejects_missing_blueprint_inventory_binding() -> None:

@@ -24,6 +24,7 @@ from agenten.agent_factory.forge_contracts import (
 )
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import (
+    CandidateRevisionV1,
     CodebaseInventoryV1,
     CodexBuildBriefV1,
     CodexBuildEvidenceV1,
@@ -107,6 +108,24 @@ class CaptainCreationJobMapper:
                 "creation job requires exactly one Captain inventory, Codex brief, and sealed build"
             )
         inventory = inventories[0]
+        revisions = tuple(
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, CandidateRevisionV1)
+            and _matches_dispatch(artifact, job, attempt)
+        )
+        if attempt == 1:
+            if revisions:
+                raise FactoryDispatchError(
+                    "initial creation job must not contain retry revision evidence"
+                )
+            expected_brief_input = job.input_ref
+        else:
+            if len(revisions) != 1:
+                raise FactoryDispatchError(
+                    "retry creation job requires exactly one Captain candidate revision"
+                )
+            expected_brief_input = revisions[0].artifact_ref
 
         if inventory.artifact_ref not in brief.context_refs:
             raise FactoryDispatchError("Codex brief is not bound to the Captain inventory")
@@ -118,7 +137,10 @@ class CaptainCreationJobMapper:
         if released != invoked:
             raise FactoryDispatchError("Codex brief does not use Captain's released skill")
         if (
-            not _same_artifact_ref(brief.invocation.input_ref, job.input_ref)
+            not _same_artifact_ref(
+                brief.invocation.input_ref,
+                expected_brief_input,
+            )
             or not _same_artifact_ref(assignment.compiled_spec_ref, job.compiled_spec_ref)
             or not _same_artifact_ref(
                 assignment.dependency_graph_ref, job.dependency_graph_ref
