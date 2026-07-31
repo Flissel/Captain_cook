@@ -18,6 +18,7 @@ from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
 from agenten.agent_factory.orchestration import FactoryDispatchError
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import (
+    CandidateRevisionV1,
     CodebaseInventoryV1,
     CodexBuildBriefV1,
     CodexBuildEvidenceV1,
@@ -31,10 +32,12 @@ _ARTIFACT_TYPES = {
     "hermes.factory-codebase-inventory.v1": CodebaseInventoryV1,
     "hermes.factory-codex-build-assignment.v1": CodexBuildBriefV1,
     "hermes.factory-codex-build-evidence.v1": CodexBuildEvidenceV1,
+    "hermes.factory-candidate-revision.v1": CandidateRevisionV1,
 }
 _PHASE_ARTIFACT_TYPES = {
     FactoryPhase.BLUEPRINT_CREATED: (CodebaseInventoryV1,),
     FactoryPhase.TOOL_CANDIDATE_TESTED: (
+        CandidateRevisionV1,
         CodexBuildBriefV1,
         CodexBuildEvidenceV1,
     ),

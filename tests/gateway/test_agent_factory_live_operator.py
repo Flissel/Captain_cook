@@ -25,6 +25,7 @@ from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
 from agenten.agent_factory.minibook_forge import CaptainCreationJobMapper
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
 from agenten.agent_factory.skill_workflow_contracts import FactorySkillStep
+from agenten.agent_factory.skill_workflow_contracts import CandidateRevisionV1
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.agent_factory_live_operator import (
@@ -36,6 +37,7 @@ from gateway.agent_factory_live_operator import (
 )
 from gateway.factory_forge_evidence import CaptainForgeEvidenceBridge
 from tests.agent_factory.test_minibook_forge import _workflow_evidence
+from tests.agent_factory.test_skill_workflow_contracts import revision_payload
 
 
 LOCAL_DSN = "mariadb://captain_test:redacted@127.0.0.1:3306/captain_test"
@@ -362,6 +364,36 @@ async def test_forge_evidence_bridge_maps_block_referenced_captain_artifacts_whe
     assert bridge.released_for(job, FactorySkillStep.BRIEF_CODEX) == (
         artifacts[1].invocation.released_skill
     )
+
+
+@pytest.mark.asyncio
+async def test_forge_evidence_bridge_accepts_revision_evidence_on_retry(
+    tmp_path: Path,
+) -> None:
+    revision = CandidateRevisionV1.model_validate(revision_payload())
+    job = SimpleNamespace(
+        job_id=revision.job_id,
+        correlation_id=revision.correlation_id,
+        event_id=revision.invocation_id,
+        occurred_at=revision.occurred_at,
+        subject_version=revision.subject_version,
+        acceptance_assertion_ids=revision.acceptance_assertion_ids,
+    )
+    store = FilesystemFactoryEvidenceStore(tmp_path / "evidence")
+    reference = await store.persist(
+        job,  # type: ignore[arg-type]
+        revision.model_dump_json(by_alias=True).encode("utf-8"),
+    )
+    repository = _ForgeRepository(
+        (_forge_block(job, FactoryPhase.TOOL_CANDIDATE_TESTED, (reference,)),),
+        revision.invocation.released_skill,
+    )
+    bridge = CaptainForgeEvidenceBridge(
+        repository=repository,
+        evidence_store=store,
+    )
+
+    assert bridge.workflow_artifacts(revision.job_id) == (revision,)
 
 
 @pytest.mark.asyncio
