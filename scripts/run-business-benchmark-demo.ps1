@@ -848,7 +848,7 @@ try {
     $renewalBatchId = Require-NonEmpty $renewal.work_batch.batch_id 'renewal.work_batch.batch_id'
 
     $environment['CAPTAIN_BENCHMARK_PROFILE'] = 'all'
-    $environment['CAPTAIN_BENCHMARK_MAX_USD'] = '0.60'
+    $environment['CAPTAIN_BENCHMARK_MAX_USD'] = '0.40'
     $environment['CAPTAIN_JOB_ALLOWED_MODELS'] = $model
     foreach ($binding in @(
         @('CLAIMS', $claims),
