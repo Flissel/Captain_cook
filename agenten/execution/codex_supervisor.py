@@ -32,10 +32,28 @@ CodexProcessCleanupStatus = Literal[
     "verified_cancelled",
     "unresolved",
 ]
+DEFAULT_MAX_CODEX_JSONL_RECORD_BYTES = 1024 * 1024
+CODEX_JSONL_READ_CHUNK_BYTES = 64 * 1024
 
 
-class CodexJournalPersistenceError(RuntimeError):
+class CodexOutputEvidenceError(RuntimeError):
+    """Codex process output could not be retained as trustworthy evidence."""
+
+
+class CodexJournalPersistenceError(CodexOutputEvidenceError):
     """The private Codex JSONL journal could not be durably persisted."""
+
+
+class CodexOutputReadError(CodexOutputEvidenceError):
+    """The Codex process output stream could not be read."""
+
+
+class CodexJsonlRecordTooLargeError(CodexOutputEvidenceError):
+    """One Codex JSONL record exceeded the bounded evidence envelope."""
+
+
+class CodexJsonlUnterminatedRecordError(CodexOutputEvidenceError):
+    """The Codex output ended with an incomplete JSONL record."""
 
 
 class CodexRunRequest(BaseModel):
@@ -127,6 +145,7 @@ class PowerShellCodexRunner:
         codex_home: Path,
         deadline_at: datetime,
         timeout_seconds: float = 600,
+        max_jsonl_record_bytes: int = DEFAULT_MAX_CODEX_JSONL_RECORD_BYTES,
         clock: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] | None = None,
     ) -> None:
@@ -136,6 +155,14 @@ class PowerShellCodexRunner:
             or deadline_at.utcoffset() != timezone.utc.utcoffset(deadline_at)
         ):
             raise ValueError("Codex runner deadline must be a UTC timestamp")
+        if (
+            isinstance(max_jsonl_record_bytes, bool)
+            or not isinstance(max_jsonl_record_bytes, int)
+            or not 1 <= max_jsonl_record_bytes <= DEFAULT_MAX_CODEX_JSONL_RECORD_BYTES
+        ):
+            raise ValueError(
+                "Codex JSONL record limit must be between 1 byte and 1 MiB"
+            )
         self._pwsh_path = pwsh_path.resolve(strict=True)
         self._script_path = script_path.resolve(strict=True)
         self._codex_path = codex_path.resolve(strict=True)
@@ -146,6 +173,7 @@ class PowerShellCodexRunner:
         self._codex_home = codex_home.resolve(strict=True)
         self._deadline_at = deadline_at
         self._timeout_seconds = timeout_seconds
+        self._max_jsonl_record_bytes = max_jsonl_record_bytes
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._monotonic = monotonic or time.monotonic
 
@@ -212,9 +240,11 @@ class PowerShellCodexRunner:
         assert process.stdout is not None
         assert process.stderr is not None
         timed_out = False
+        evidence_failure: CodexOutputEvidenceError | None = None
         process_cleanup_status: CodexProcessCleanupStatus = "not_required"
         wrapper_expired_during_launch = self._monotonic() >= wrapper_stop_at
         with self._journal_path.open("ab") as journal:
+            process_waiter = asyncio.create_task(process.wait())
             stdout_reader = asyncio.create_task(
                 self._journal_stdout(process.stdout, journal)
             )
@@ -223,7 +253,14 @@ class PowerShellCodexRunner:
                 wrapper_timeout_remaining = wrapper_stop_at - self._monotonic()
                 if wrapper_expired_during_launch or wrapper_timeout_remaining <= 0:
                     raise TimeoutError
-                await asyncio.wait_for(process.wait(), timeout=wrapper_timeout_remaining)
+                await asyncio.wait_for(
+                    self._observe_process_and_readers(
+                        process_waiter,
+                        stdout_reader,
+                        stderr_reader,
+                    ),
+                    timeout=wrapper_timeout_remaining,
+                )
             except TimeoutError:
                 timed_out = True
                 cancelled = await self._attempt_verified_timeout_cancellation()
@@ -233,12 +270,31 @@ class PowerShellCodexRunner:
                     if cancelled and wrapper_stopped
                     else "unresolved"
                 )
-            finally:
-                await self._finish_readers(
-                    stdout_reader,
-                    stderr_reader,
-                    allow_bounded_cancellation=timed_out,
+            except CodexOutputEvidenceError as exc:
+                evidence_failure = exc
+                cancelled = await self._attempt_verified_evidence_failure_cancellation()
+                wrapper_stopped = await self._settle_timed_out_wrapper(process)
+                process_cleanup_status = (
+                    "verified_cancelled"
+                    if cancelled and wrapper_stopped
+                    else "unresolved"
                 )
+            finally:
+                await self._finish_process_waiter(process_waiter)
+                try:
+                    await self._finish_readers(
+                        stdout_reader,
+                        stderr_reader,
+                        allow_bounded_cancellation=(
+                            timed_out or evidence_failure is not None
+                        ),
+                    )
+                except BaseException as exc:
+                    if evidence_failure is None:
+                        evidence_failure = self._redact_reader_failure(exc)
+
+        if evidence_failure is not None:
+            raise evidence_failure
 
         journal_bytes = self._journal_path.read_bytes()
         exit_code = 124 if timed_out else process.returncode
@@ -278,33 +334,134 @@ class PowerShellCodexRunner:
             jsonl_lines=(),
         )
 
-    @staticmethod
     async def _journal_stdout(
+        self,
         stdout: asyncio.StreamReader,
         journal: BinaryIO,
     ) -> None:
-        while raw_line := await stdout.readline():
-            line = raw_line.rstrip(b"\r\n")
-            if not line.strip():
-                continue
+        pending = bytearray()
+        while True:
             try:
-                journal.write(line + b"\n")
-                journal.flush()
-                os.fsync(journal.fileno())
+                chunk = await stdout.read(CODEX_JSONL_READ_CHUNK_BYTES)
             except OSError:
-                raise CodexJournalPersistenceError(
-                    "Codex JSONL journal persistence failed"
+                raise CodexOutputReadError(
+                    "Codex process output stream could not be read"
                 ) from None
+            if not chunk:
+                break
+            cursor = 0
+            while True:
+                newline = chunk.find(b"\n", cursor)
+                if newline < 0:
+                    self._extend_jsonl_record(pending, chunk[cursor:])
+                    break
+                self._extend_jsonl_record(
+                    pending,
+                    chunk[cursor:newline],
+                )
+                record = bytes(pending)
+                pending.clear()
+                if record.endswith(b"\r"):
+                    record = record[:-1]
+                if record.strip():
+                    self._persist_jsonl_record(journal, record)
+                cursor = newline + 1
+                if cursor == len(chunk):
+                    break
+        if pending:
+            raise CodexJsonlUnterminatedRecordError(
+                "Codex JSONL stream ended with an unterminated record"
+            )
+
+    def _extend_jsonl_record(
+        self,
+        pending: bytearray,
+        segment: bytes,
+    ) -> None:
+        candidate_length = len(pending) + len(segment)
+        candidate_ends_with_cr = (
+            segment.endswith(b"\r") if segment else pending.endswith(b"\r")
+        )
+        content_length = candidate_length - int(candidate_ends_with_cr)
+        if content_length > self._max_jsonl_record_bytes:
+            raise CodexJsonlRecordTooLargeError(
+                "Codex JSONL record exceeds configured safe limit"
+            )
+        pending.extend(segment)
+
+    @staticmethod
+    def _persist_jsonl_record(journal: BinaryIO, record: bytes) -> None:
+        serialized = record + b"\n"
+        try:
+            written = journal.write(serialized)
+            if written != len(serialized):
+                raise OSError
+            journal.flush()
+            os.fsync(journal.fileno())
+        except OSError:
+            raise CodexJournalPersistenceError(
+                "Codex JSONL journal persistence failed"
+            ) from None
 
     @staticmethod
     async def _drain_stderr(stderr: asyncio.StreamReader) -> None:
-        while await stderr.read(64 * 1024):
-            pass
+        try:
+            while await stderr.read(CODEX_JSONL_READ_CHUNK_BYTES):
+                pass
+        except OSError:
+            raise CodexOutputReadError(
+                "Codex process output stream could not be read"
+            ) from None
+
+    @staticmethod
+    async def _observe_process_and_readers(
+        process_waiter: asyncio.Task[int],
+        stdout_reader: asyncio.Task[None],
+        stderr_reader: asyncio.Task[None],
+    ) -> None:
+        readers = frozenset((stdout_reader, stderr_reader))
+        pending: set[asyncio.Task[object]] = {
+            process_waiter,
+            stdout_reader,
+            stderr_reader,
+        }
+        while process_waiter in pending:
+            done, _ = await asyncio.wait(
+                pending,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for reader in readers.intersection(done):
+                if reader.cancelled():
+                    raise CodexOutputReadError(
+                        "Codex process output stream ended unexpectedly"
+                    )
+                failure = reader.exception()
+                if failure is not None:
+                    raise PowerShellCodexRunner._redact_reader_failure(failure)
+            if process_waiter in done:
+                await process_waiter
+                return
+            pending.difference_update(done)
+
+    @staticmethod
+    def _redact_reader_failure(exc: BaseException) -> CodexOutputEvidenceError:
+        if isinstance(exc, CodexOutputEvidenceError):
+            return exc
+        return CodexOutputReadError("Codex process output stream could not be read")
 
     async def _attempt_verified_timeout_cancellation(self) -> bool:
         try:
             return await asyncio.wait_for(
                 self._cancel_timed_out_process(),
+                timeout=20,
+            )
+        except Exception:
+            return False
+
+    async def _attempt_verified_evidence_failure_cancellation(self) -> bool:
+        try:
+            return await asyncio.wait_for(
+                self._cancel_evidence_failure_process(),
                 timeout=20,
             )
         except Exception:
@@ -357,9 +514,19 @@ class PowerShellCodexRunner:
                 "Codex process output evidence did not settle"
             )
 
-
+    @staticmethod
+    async def _finish_process_waiter(process_waiter: asyncio.Task[int]) -> None:
+        if not process_waiter.done():
+            process_waiter.cancel()
+        await asyncio.gather(process_waiter, return_exceptions=True)
 
     async def _cancel_timed_out_process(self) -> bool:
+        return await self._cancel_process("timeout")
+
+    async def _cancel_evidence_failure_process(self) -> bool:
+        return await self._cancel_process("operator")
+
+    async def _cancel_process(self, reason: Literal["operator", "timeout"]) -> bool:
         if not self._state_path.is_file():
             return False
         cancellation = await asyncio.create_subprocess_exec(
@@ -372,7 +539,7 @@ class PowerShellCodexRunner:
             "-SessionId",
             self._session_id,
             "-CancellationReason",
-            "timeout",
+            reason,
             env=self._cancellation_environment(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -395,10 +562,8 @@ class PowerShellCodexRunner:
         return result == {
             "session_id": self._session_id,
             "outcome": "cancelled",
-            "cancellation_reason": "timeout",
+            "cancellation_reason": reason,
         }
-
-
 
     @staticmethod
     def _cancellation_environment() -> dict[str, str]:
