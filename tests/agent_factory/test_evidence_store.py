@@ -6,7 +6,11 @@ import hashlib
 import pytest
 
 from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
+from agenten.agent_runtime.contracts import ArtifactRef
 from tests.agent_factory.test_state_machine import job
+
+
+REFERENCE_JOB_ID = "abcdefab-cdef-4abc-8def-abcdefabcdef"
 
 
 @pytest.mark.asyncio
@@ -42,3 +46,29 @@ def test_write_once_rejects_changed_content_for_an_existing_path(tmp_path) -> No
 
     with pytest.raises(ValueError, match="collision"):
         FilesystemFactoryEvidenceStore._write_once(path, b"changed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "job_segment",
+    (
+        REFERENCE_JOB_ID.upper(),
+        REFERENCE_JOB_ID.replace("-", ""),
+        "{" + REFERENCE_JOB_ID + "}",
+    ),
+)
+async def test_filesystem_store_rejects_noncanonical_job_uuid_segments(
+    tmp_path,
+    job_segment: str,
+) -> None:
+    store = FilesystemFactoryEvidenceStore(tmp_path)
+    factory_job = job().model_copy(update={"job_id": REFERENCE_JOB_ID})
+    reference = await store.persist(factory_job, b"canonical")
+    noncanonical = ArtifactRef(
+        uri=f"artifact://factory-evidence/{job_segment}/{reference.sha256}",
+        sha256=reference.sha256,
+        media_type=reference.media_type,
+    )
+
+    with pytest.raises(ValueError, match="canonical"):
+        await store.read(noncanonical)

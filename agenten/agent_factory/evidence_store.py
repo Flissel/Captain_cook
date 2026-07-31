@@ -73,6 +73,9 @@ class FilesystemFactoryEvidenceStore:
             referenced_job_id = UUID(parts[0])
         except ValueError as exc:
             raise ValueError("factory evidence reference contains an invalid job id") from exc
+        canonical_uri = f"{prefix}{referenced_job_id}/{reference.sha256}"
+        if reference.uri != canonical_uri:
+            raise ValueError("factory evidence reference is not canonical")
         if job_id is not None and referenced_job_id != job_id:
             raise ValueError("factory evidence reference does not match requested job")
         return self._contained_path(referenced_job_id, parts[1])

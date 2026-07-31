@@ -41,6 +41,24 @@ _PHASE_ARTIFACT_TYPES = {
 }
 
 
+def _preserves_json_types(source: object, validated: object) -> bool:
+    if type(source) is not type(validated):
+        return False
+    if isinstance(source, dict):
+        assert isinstance(validated, dict)
+        return all(
+            key in validated and _preserves_json_types(value, validated[key])
+            for key, value in source.items()
+        )
+    if isinstance(source, list):
+        assert isinstance(validated, list)
+        return len(source) == len(validated) and all(
+            _preserves_json_types(left, right)
+            for left, right in zip(source, validated, strict=True)
+        )
+    return source == validated
+
+
 class FactoryForgeEvidenceRepository(Protocol):
     def blocks(self, job_id: UUID) -> tuple[FactoryEvidenceBlock, ...]: ...
 
@@ -118,7 +136,12 @@ class CaptainForgeEvidenceBridge:
             model = _ARTIFACT_TYPES.get(schema_name)
             if model is None:
                 raise ValueError("factory evidence schema is not a Forge input")
-            artifact = model.model_validate(payload)
+            artifact = model.model_validate_json(content)
+            if not _preserves_json_types(
+                payload,
+                artifact.model_dump(mode="json", by_alias=True),
+            ):
+                raise ValueError("factory evidence JSON requires scalar coercion")
         except (json.JSONDecodeError, ValidationError, ValueError):
             raise FactoryDispatchError("Captain forge evidence schema is invalid") from None
         if artifact.job_id != job_id:

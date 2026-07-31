@@ -361,6 +361,41 @@ async def test_forge_evidence_bridge_rejects_malformed_or_wrong_job_references(
         bridge.workflow_artifacts(job.job_id)
 
 
+@pytest.mark.asyncio
+async def test_forge_evidence_bridge_rejects_scalar_coercion_in_typed_json(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "evidence"
+    job, artifacts, _, repository = await _persist_forge_evidence(root)
+    scalar_brief = artifacts[1].model_dump(mode="json", by_alias=True)
+    assignment = scalar_brief["build_assignment"]
+    assert isinstance(assignment, dict)
+    documentation_queries = assignment["documentation_queries"]
+    assert isinstance(documentation_queries, list)
+    query = documentation_queries[0]
+    assert isinstance(query, dict)
+    query["required"] = 1
+    content = json.dumps(scalar_brief, sort_keys=True).encode("utf-8")
+    digest = hashlib.sha256(content).hexdigest()
+    path = root / str(job.job_id) / f"{digest}.json"
+    path.write_bytes(content)
+    scalar_ref = ArtifactRef(
+        uri=f"artifact://factory-evidence/{job.job_id}/{digest}",
+        sha256=digest,
+        media_type="application/json",
+    )
+    repository._blocks = (
+        _forge_block(job, FactoryPhase.TOOL_CANDIDATE_TESTED, (scalar_ref,)),
+    )
+    bridge = CaptainForgeEvidenceBridge(
+        repository=repository,
+        evidence_store=FilesystemFactoryEvidenceStore(root),
+    )
+
+    with pytest.raises(FactoryDispatchError, match="schema"):
+        bridge.workflow_artifacts(job.job_id)
+
+
 def test_operator_cli_is_importable_from_scripts_directory() -> None:
     script = (
         Path(__file__).resolve().parents[2]
