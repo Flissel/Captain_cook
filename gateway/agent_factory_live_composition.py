@@ -453,7 +453,10 @@ def compose_agent_factory_live(
     if not callable(clock):
         raise ValueError("Factory live clock is required")
 
-    repository = GatewayFactoryRepository(store)
+    repository = GatewayFactoryRepository(
+        store,
+        runtime_retries=runtime_retries,
+    )
     coordinator = FactoryCoordinator(repository)
     lease_issuer = GatewayNextActionLeaseIssuer(
         store=store,

@@ -1807,6 +1807,13 @@ async def test_authorized_runtime_retry_resumes_only_seal_without_new_hermes_cal
     assert sealer.calls[1][2] == sealer.calls[0][2]
     assert factory_job.private_holdout_refs == tool_request.job.private_holdout_refs
 
+    now = authorization.expires_at + timedelta(seconds=1)
+    historical = await factory.dispatch(authorized_request)
+
+    assert historical == evidence
+    assert len(prompts) == 2
+    assert len(sealer.calls) == 2
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("after_job_deadline", [False, True])

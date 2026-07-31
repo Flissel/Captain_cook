@@ -269,9 +269,21 @@ class HermesCliFactory(HermesFactoryPort):
                 steps=steps,
                 improvement=improvement,
             )
-        authority_expires_at = _validate_factory_dispatch(request, now=now)
+        historical_completed_replay = False
         if now >= request.lease.expires_at:
             await self._require_runtime_recovery_replays(request, steps=steps)
+            authorization = request.runtime_retry_authorization
+            if authorization is not None and now >= authorization.expires_at:
+                await self._require_completed_runtime_recovery_replay(
+                    request,
+                    steps=steps,
+                )
+                historical_completed_replay = True
+        authority_expires_at = _validate_factory_dispatch(
+            request,
+            now=now,
+            allow_expired_completed_replay=historical_completed_replay,
+        )
 
         deadline = _deadline(
             min(
@@ -655,6 +667,39 @@ class HermesCliFactory(HermesFactoryPort):
         ):
             raise FactoryDispatchError(
                 "Factory runtime recovery does not bind the original seal invocation"
+            )
+
+    async def _require_completed_runtime_recovery_replay(
+        self,
+        request: FactoryDispatch,
+        *,
+        steps: tuple[FactorySkillStep, ...],
+    ) -> None:
+        """Allow expired authority only when every external effect is completed."""
+
+        if FactorySkillStep.SEAL_CODEX_BUILD not in steps:
+            raise FactoryDispatchError(
+                "historical Factory recovery requires the Codex seal step"
+            )
+        authorization = request.runtime_retry_authorization
+        if authorization is None:
+            raise FactoryDispatchError(
+                "historical Factory recovery requires Captain retry authority"
+            )
+        replay = await self._replay_store.completed(
+            request.job,
+            step=FactorySkillStep.SEAL_CODEX_BUILD,
+            attempt=request.action.attempt,
+        )
+        artifact = replay.artifact
+        if (
+            not isinstance(artifact, CodexBuildEvidenceV1)
+            or artifact.invocation.lease != request.lease
+            or replay.runtime_retry_authorization_ref
+            != authorization.authorization_ref
+        ):
+            raise FactoryDispatchError(
+                "completed Codex recovery replay does not match Captain authority"
             )
 
     async def _reconcile_expired_pending_codex_failure(
@@ -2048,7 +2093,10 @@ _STEP_RESULT_MODELS: dict[FactorySkillStep, type[BaseModel]] = {
 
 
 def _validate_factory_dispatch(
-    request: FactoryDispatch, *, now: datetime
+    request: FactoryDispatch,
+    *,
+    now: datetime,
+    allow_expired_completed_replay: bool = False,
 ) -> datetime:
     _validate_factory_dispatch_bindings(request, now=now)
     assert request.role is not None
@@ -2067,12 +2115,17 @@ def _validate_factory_dispatch(
         or authorization.lease_id != lease.lease_id
         or authorization.workspace_ref != lease.workspace_ref
         or now < authorization.issued_at
-        or now >= authorization.expires_at
+        or (
+            now >= authorization.expires_at
+            and not allow_expired_completed_replay
+        )
         or now >= request.job.deadline_at
     ):
         raise FactoryDispatchError(
             "Hermes factory dispatch requires an active lease or Captain recovery authority"
         )
+    if allow_expired_completed_replay:
+        return request.job.deadline_at
     return min(authorization.expires_at, request.job.deadline_at)
 
 
