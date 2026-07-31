@@ -181,7 +181,16 @@
   local composition now routes benchmark and Codex-build references to their
   exact owning CAS and verifies content digests before materialization. The
   sealed V21 Claims replay remains immutable and is eligible for reuse only
-  through the same Captain lease/job binding.
+  through the same Captain lease/job binding. A 14-second resume then reused
+  that seal and let Minibook create the V2 projection package without another
+  Codex run, but Gateway failed closed because its candidate provider parsed
+  only the legacy V1 package contract. The shared boundary now accepts V2 only
+  when its Captain Codex receipt is present in the agent-code artifact set,
+  canonical-digest verified, bound to the exact job/attempt/source, and bound
+  to the unique `factory-candidate.json` inside the sealed source archive.
+  Legacy V1 remains supported. This is locally verified adapter evidence;
+  Renewal, technical holdout execution, all 30 business cases, promotion, and
+  projection remain unproven.
 - [x] Enforce the operator's `1.00 EUR` marginal-cost ceiling per team before
   provider construction. The live demo reserves at most `0.30 USD` for one
   team's candidate/baseline benchmark and conservatively assigns the complete

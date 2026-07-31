@@ -241,6 +241,24 @@ class CreationPackageManifestV1(_FrozenContract):
         return self
 
 
+class CreationPackageManifestV2(CreationPackageManifestV1):
+    """Minibook package retaining the exact Captain Codex receipt edge."""
+
+    schema_name: Literal["minibook.creation-package-manifest.v2"] = Field(
+        default="minibook.creation-package-manifest.v2",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    codex_build_receipt_ref: ArtifactRef
+
+    @field_validator("codex_build_receipt_ref")
+    @classmethod
+    def require_codex_receipt_json(cls, value: ArtifactRef) -> ArtifactRef:
+        if value.media_type != "application/json":
+            raise ValueError("Codex build receipt must be application/json")
+        return value
+
+
 class CreationResultV1(_FrozenContract):
     schema_name: Literal["minibook.creation-result.v1"] = Field(default="minibook.creation-result.v1", alias="schema", serialization_alias="schema")
     creation_job_id: UUID

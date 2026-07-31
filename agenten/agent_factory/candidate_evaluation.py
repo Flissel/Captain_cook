@@ -37,9 +37,12 @@ from agenten.agent_factory.contracts import (
 )
 from agenten.agent_factory.evidence_store import FactoryEvidenceStore
 from agenten.agent_factory.forge_contracts import (
+    CodexBuildReceiptV1,
     CreationPackageManifestV1,
+    CreationPackageManifestV2,
     CreationResultV1,
     ForgeBuildSkillUsageReceiptV1,
+    codex_build_receipt_sha256,
 )
 from agenten.agent_factory.leases import validate_factory_lease
 from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference, TypedN8nTool
@@ -955,7 +958,10 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
         self,
         job: FactoryJob,
         block: FactoryEvidenceBlock,
-    ) -> tuple[ResolvedFactoryCandidate, CreationPackageManifestV1]:
+    ) -> tuple[
+        ResolvedFactoryCandidate,
+        CreationPackageManifestV1 | CreationPackageManifestV2,
+    ]:
         return self._resolve(
             job=job,
             attempt=block.attempt,
@@ -974,13 +980,23 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
         package_ref: ArtifactRef,
         artifact_refs: tuple[ArtifactRef, ...],
         skill_usage_receipt_ref: ArtifactRef | None,
-    ) -> tuple[ResolvedFactoryCandidate, CreationPackageManifestV1]:
+    ) -> tuple[
+        ResolvedFactoryCandidate,
+        CreationPackageManifestV1 | CreationPackageManifestV2,
+    ]:
         if package_ref.media_type != "application/json":
             raise FactoryDispatchError("Forge package manifest media type is invalid")
         try:
-            package = CreationPackageManifestV1.model_validate_json(
-                self._artifacts.read_bytes(package_ref)
+            package_payload = json.loads(self._artifacts.read_bytes(package_ref))
+            if not isinstance(package_payload, dict):
+                raise ValueError("package manifest must be an object")
+            package_type = (
+                CreationPackageManifestV2
+                if package_payload.get("schema")
+                == "minibook.creation-package-manifest.v2"
+                else CreationPackageManifestV1
             )
+            package = package_type.model_validate(package_payload)
         except (OSError, ValueError) as exc:
             raise FactoryDispatchError(
                 "Forge package manifest bytes are unavailable or invalid"
@@ -1026,6 +1042,27 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
             raise FactoryDispatchError(
                 "Forge package manifest references are not bound by agent-code evidence"
             )
+        codex_build_receipt: CodexBuildReceiptV1 | None = None
+        if isinstance(package, CreationPackageManifestV2):
+            codex_receipt_ref = _runtime_ref(package.codex_build_receipt_ref)
+            if _artifact_identity(codex_receipt_ref) not in bound:
+                raise FactoryDispatchError(
+                    "Forge Codex build receipt is not bound by agent-code evidence"
+                )
+            try:
+                codex_build_receipt = CodexBuildReceiptV1.model_validate_json(
+                    self._artifacts.read_bytes(codex_receipt_ref)
+                )
+            except (OSError, ValueError) as exc:
+                raise FactoryDispatchError(
+                    "Forge Codex build receipt bytes are unavailable or invalid"
+                ) from exc
+            if codex_build_receipt_sha256(codex_build_receipt) != (
+                codex_receipt_ref.sha256
+            ):
+                raise FactoryDispatchError(
+                    "Forge Codex build receipt canonical digest changed"
+                )
         try:
             candidate = FactoryCandidateManifest.model_validate_json(
                 self._artifacts.read_bytes(candidate_ref)
@@ -1049,10 +1086,66 @@ class GatewayForgeCandidateProvider(FactoryCandidateProvider):
             raise FactoryDispatchError(
                 "Forge candidate manifest does not match source archive"
             )
+        if codex_build_receipt is not None:
+            self._require_codex_build_receipt(
+                job=job,
+                attempt=attempt,
+                package=package,
+                receipt=codex_build_receipt,
+                source_archive=source_path,
+            )
         return (
             ResolvedFactoryCandidate(candidate=candidate, source_archive=source_path),
             package,
         )
+
+    @staticmethod
+    def _require_codex_build_receipt(
+        *,
+        job: FactoryJob,
+        attempt: int,
+        package: CreationPackageManifestV2,
+        receipt: CodexBuildReceiptV1,
+        source_archive: Path,
+    ) -> None:
+        if (
+            receipt.factory_job_id != job.job_id
+            or receipt.creation_job_id != package.creation_job_id
+            or receipt.correlation_id != job.correlation_id
+            or receipt.subject_version != job.subject_version
+            or receipt.attempt != attempt
+            or receipt.acceptance_assertion_ids != job.acceptance_assertion_ids
+            or receipt.source_archive_ref.sha256
+            != package.source_archive_ref.sha256
+            or receipt.source_archive_ref.media_type
+            != package.source_archive_ref.media_type
+        ):
+            raise FactoryDispatchError(
+                "Forge Codex build receipt does not match factory job or source"
+            )
+        try:
+            with zipfile.ZipFile(source_archive) as archive:
+                candidates = tuple(
+                    item
+                    for item in archive.infolist()
+                    if PurePosixPath(item.filename).as_posix()
+                    == "factory-candidate.json"
+                )
+                if len(candidates) != 1:
+                    raise ValueError
+                candidate_bytes = archive.read(candidates[0])
+        except (OSError, KeyError, ValueError, zipfile.BadZipFile) as exc:
+            raise FactoryDispatchError(
+                "Forge source archive lacks the unique Captain candidate manifest"
+            ) from exc
+        if (
+            receipt.candidate_manifest_ref.media_type != "application/json"
+            or hashlib.sha256(candidate_bytes).hexdigest()
+            != receipt.candidate_manifest_ref.sha256
+        ):
+            raise FactoryDispatchError(
+                "Forge source archive does not match the Captain candidate manifest"
+            )
 
     def _require_skill_usage_receipt(
         self,
