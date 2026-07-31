@@ -25,7 +25,13 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "--maximum-usd-per-team', $maximumUsdPerTeam" in source
     assert "$maximumUsdPerTeam = '0.30'" in source
     assert "$maximumHermesUsd = '0.06'" in source
+    assert "$maximumTotalUsdPerTeam = '0.40'" in source
+    assert "$userMaximumEurPerTeam = '1.00'" in source
     assert "$environment['CAPTAIN_BENCHMARK_MAX_USD'] = '0.60'" in source
+    assert "Assert-CodexUsesChatGptSubscription" in source
+    assert "$environment['CAPTAIN_CODEX_AUTH_MODE'] = 'chatgpt_subscription'" in source
+    assert "$environment['CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM']" in source
+    assert "$environment['CAPTAIN_FACTORY_USER_MAX_EUR_PER_TEAM']" in source
     assert "$seedVersion = 'business-benchmark-demo-2026-07-v19'" in source
     assert "'--suite-version', '19'" in source
     assert "New-DryRunPlan" in source

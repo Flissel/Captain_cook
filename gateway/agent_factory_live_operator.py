@@ -100,6 +100,61 @@ class _BenchmarkCodexPromptArtifactStore:
         )
 
 
+def validate_factory_total_cost_envelope(
+    *,
+    environment: Mapping[str, str],
+    benchmark_maximum_usd_per_team: tuple[Decimal, Decimal],
+) -> None:
+    """Reject any demo composition that could exceed its total team reserve."""
+
+    if environment.get("CAPTAIN_CODEX_AUTH_MODE", "").strip() != (
+        "chatgpt_subscription"
+    ):
+        raise ValueError("Factory Codex must use ChatGPT subscription authentication")
+    try:
+        user_maximum_eur = Decimal(
+            _required(environment, "CAPTAIN_FACTORY_USER_MAX_EUR_PER_TEAM")
+        )
+        total_maximum_usd = Decimal(
+            _required(
+                environment,
+                "CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM",
+            )
+        )
+        codex_metered_usd = Decimal(
+            _required(
+                environment,
+                "CAPTAIN_FACTORY_CODEX_METERED_USD_PER_TEAM",
+            )
+        )
+        hermes_total_usd = Decimal(
+            _required(environment, "CAPTAIN_FACTORY_HERMES_MAX_TOTAL_USD")
+        )
+    except ArithmeticError as exc:
+        raise ValueError("Factory total cost envelope is invalid") from exc
+    values = (
+        user_maximum_eur,
+        total_maximum_usd,
+        codex_metered_usd,
+        hermes_total_usd,
+        *benchmark_maximum_usd_per_team,
+    )
+    if (
+        any(not value.is_finite() or value < 0 for value in values)
+        or user_maximum_eur != Decimal("1.00")
+        or total_maximum_usd <= 0
+        or total_maximum_usd > Decimal("0.40")
+        or codex_metered_usd != 0
+        or len(benchmark_maximum_usd_per_team) != 2
+        or any(
+            benchmark_usd + hermes_total_usd + codex_metered_usd
+            > total_maximum_usd
+            for benchmark_usd in benchmark_maximum_usd_per_team
+        )
+    ):
+        raise ValueError("Factory total cost envelope is invalid")
+
+
 @dataclass(frozen=True)
 class FactoryLiveOperatorSettings:
     workspace_root: Path
@@ -209,6 +264,12 @@ def compose_business_demo_factory_operator(
         raise ValueError("Factory operator selections do not match the requested jobs")
     if aggregate.model != settings.hermes_model:
         raise ValueError("Hermes and AutoGen must use the same Captain-allowed model")
+    validate_factory_total_cost_envelope(
+        environment=environment,
+        benchmark_maximum_usd_per_team=tuple(
+            item.maximum_usd for item in aggregate.selections
+        ),
+    )
     if not environment.get("OPENAI_API_KEY", "").strip():
         raise ValueError("Factory provider secret is not present in the process")
 
@@ -468,4 +529,5 @@ __all__ = [
     "FactoryLiveOperatorSettings",
     "compose_business_demo_factory_operator",
     "run_business_demo_factory_jobs",
+    "validate_factory_total_cost_envelope",
 ]

@@ -242,6 +242,10 @@ def _run_powershell_helpers(tmp_path: Path, body: str) -> subprocess.CompletedPr
     assert executable is not None, "PowerShell 7 is required for service lifecycle tests"
     root = Path(__file__).parents[2]
     source = (root / "scripts" / "live-demo-services.ps1").read_text(encoding="utf-8")
+    shutil.copy2(
+        root / "scripts" / "managed-process-identity.ps1",
+        tmp_path / "managed-process-identity.ps1",
+    )
     helpers = source[source.index("Set-StrictMode") : source.index("Push-Location $root")]
     harness = tmp_path / "runtime-service-harness.ps1"
     harness.write_text(helpers + "\n" + body, encoding="utf-8")

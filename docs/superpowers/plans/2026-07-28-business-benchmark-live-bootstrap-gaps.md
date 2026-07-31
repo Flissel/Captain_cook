@@ -147,3 +147,14 @@
   the expected endpoint plus ledger DSN; a merely healthy foreign Gateway fails
   closed. This is infrastructure evidence only; it does not repair v19's
   missing Captain blocks or authorize a benchmark rerun.
+- [x] Enforce the operator's `1.00 EUR` marginal-cost ceiling per team before
+  provider construction. The live demo reserves at most `0.30 USD` for one
+  team's candidate/baseline benchmark and conservatively assigns the complete
+  two-team Hermes ceiling of `0.06 USD` to either team. Codex is admitted only
+  when `codex login status` proves ChatGPT subscription authentication, so its
+  metered API reserve is exactly zero. Captain rejects any composition whose
+  worst-case `0.36 USD` per team exceeds the internal `0.40 USD` ceiling, any
+  API-key-authenticated Codex session, or any missing/non-canonical cost field.
+  The internal ceiling is intentionally far below the user ceiling rather than
+  depending on a live exchange-rate lookup during dispatch. This guard was
+  verified without a provider call; it does not claim that v19 has resumed.

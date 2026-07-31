@@ -69,6 +69,51 @@ function Resolve-LaunchableCodexExecutable {
     throw 'TODO_TOOL.v1: no ProcessStart-launchable native Codex CLI is available'
 }
 
+function Assert-CodexUsesChatGptSubscription {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$CodexHome
+    )
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = [IO.Path]::GetFullPath($Path)
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.Environment['CODEX_HOME'] = [IO.Path]::GetFullPath($CodexHome)
+    $startInfo.ArgumentList.Add('login')
+    $startInfo.ArgumentList.Add('status')
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw 'Codex authentication inspection did not start.'
+        }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(10000)) {
+            $process.Kill($true)
+            $process.WaitForExit()
+            throw 'Codex authentication inspection timed out.'
+        }
+        [string[]]$status = @(
+            $stdout.GetAwaiter().GetResult().Trim()
+            $stderr.GetAwaiter().GetResult().Trim()
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        if (
+            $process.ExitCode -ne 0 -or
+            $status.Count -ne 1 -or
+            $status[0] -cne 'Logged in using ChatGPT'
+        ) {
+            throw 'TODO_TOOL.v1: Codex must use ChatGPT subscription authentication; metered API authentication is denied by the team cost cap.'
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $rootEnvPath = Join-Path $repositoryRoot '.env'
 $captainN8nEnvPath = Join-Path $repositoryRoot '.env.captain-n8n'
@@ -81,6 +126,8 @@ $benchmarkRuntimeEnvPath = Join-Path $repositoryRoot '.captain-cook/private/busi
 $canonicalRenewalWorkflow = Join-Path $repositoryRoot 'examples/business_benchmark_candidates/customer_renewal_orchestration_team/workflows/renewal_context_read.json'
 $maximumUsdPerTeam = '0.30'
 $maximumHermesUsd = '0.06'
+$maximumTotalUsdPerTeam = '0.40'
+$userMaximumEurPerTeam = '1.00'
 $seedVersion = 'business-benchmark-demo-2026-07-v19'
 
 $rootEnvAllowlist = @(
@@ -622,6 +669,9 @@ try {
     ) {
         throw 'TODO_TOOL.v1: Codex CLI, PowerShell 7, or Codex home is unavailable'
     }
+    Assert-CodexUsesChatGptSubscription `
+        -Path $codexCommand `
+        -CodexHome $codexHomePath
     $redactionVersion = 'benchmark-redaction-v1'
     $environment['CAPTAIN_BENCHMARK_PROVIDER'] = 'openai'
     $environment['CAPTAIN_BENCHMARK_MODEL'] = $model
@@ -644,8 +694,13 @@ try {
     $environment['CAPTAIN_BENCHMARK_RENEWAL_N8N_EVIDENCE_ROOT'] = Join-Path $repositoryRoot '.captain-cook/business-benchmark'
     $environment['CAPTAIN_BENCHMARK_RENEWAL_WORKFLOW_PATH'] = $canonicalRenewalWorkflow
     $environment['CAPTAIN_CODEX_EXECUTABLE'] = $codexCommand
+    $environment['CAPTAIN_CODEX_AUTH_MODE'] = 'chatgpt_subscription'
     $environment['CAPTAIN_PWSH_EXECUTABLE'] = $pwshCommand.Source
     $environment['CAPTAIN_CODEX_HOME'] = $codexHomePath
+    $environment['CAPTAIN_FACTORY_USER_MAX_EUR_PER_TEAM'] = $userMaximumEurPerTeam
+    $environment['CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM'] = $maximumTotalUsdPerTeam
+    $environment['CAPTAIN_FACTORY_CODEX_METERED_USD_PER_TEAM'] = '0'
+    $environment['CAPTAIN_FACTORY_HERMES_MAX_TOTAL_USD'] = $maximumHermesUsd
     $environment['N8N_MODE'] = 'captain-builder'
     $environment['CAPTAIN_N8N_URL'] = "http://127.0.0.1:$($environment['CAPTAIN_N8N_PORT'])"
     Set-ProcessEnvironment $environment

@@ -26,6 +26,7 @@ from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.agent_factory_live_operator import (
     FactoryLiveOperatorSettings,
     _LazyProductionBenchmarkInputs,
+    validate_factory_total_cost_envelope,
     run_business_demo_factory_jobs,
 )
 from gateway.factory_forge_evidence import CaptainForgeEvidenceBridge
@@ -159,6 +160,35 @@ def test_operator_settings_enforce_isolated_database_two_jobs_and_cost_allocatio
             hermes_provider="openai-api",
             hermes_model="gpt-4.1-mini",
             hermes_maximum_total_cost_usd=Decimal("0.10"),
+        )
+
+
+def test_total_cost_envelope_requires_subscription_codex_and_keeps_each_team_below_cap() -> None:
+    environment = {
+        "CAPTAIN_CODEX_AUTH_MODE": "chatgpt_subscription",
+        "CAPTAIN_FACTORY_USER_MAX_EUR_PER_TEAM": "1.00",
+        "CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM": "0.40",
+        "CAPTAIN_FACTORY_CODEX_METERED_USD_PER_TEAM": "0",
+        "CAPTAIN_FACTORY_HERMES_MAX_TOTAL_USD": "0.06",
+    }
+
+    validate_factory_total_cost_envelope(
+        environment=environment,
+        benchmark_maximum_usd_per_team=(Decimal("0.30"), Decimal("0.30")),
+    )
+
+    with pytest.raises(ValueError, match="ChatGPT subscription"):
+        validate_factory_total_cost_envelope(
+            environment={**environment, "CAPTAIN_CODEX_AUTH_MODE": "api_key"},
+            benchmark_maximum_usd_per_team=(Decimal("0.30"), Decimal("0.30")),
+        )
+    with pytest.raises(ValueError, match="total cost envelope"):
+        validate_factory_total_cost_envelope(
+            environment={
+                **environment,
+                "CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM": "0.35",
+            },
+            benchmark_maximum_usd_per_team=(Decimal("0.30"), Decimal("0.30")),
         )
 
 
