@@ -308,7 +308,7 @@ def build_factory_improvement_authorization(
     """Build one content-addressed Captain authority for the next attempt."""
 
     placeholder = ArtifactRef(
-        uri=f"artifact://factory/improvement-authorization/{'0' * 64}",
+        uri=f"artifact://factory/improvement-request/{'0' * 64}",
         sha256="0" * 64,
         media_type="application/json",
     )
@@ -328,7 +328,7 @@ def build_factory_improvement_authorization(
     return authorization.model_copy(
         update={
             "authorization_ref": ArtifactRef(
-                uri=f"artifact://factory/improvement-authorization/{digest}",
+                uri=f"artifact://factory/improvement-request/{digest}",
                 sha256=digest,
                 media_type="application/json",
             )
@@ -370,7 +370,7 @@ def validate_factory_improvement_authorization(
         )
     digest = factory_improvement_authorization_sha256(authorization)
     if authorization.authorization_ref != ArtifactRef(
-        uri=f"artifact://factory/improvement-authorization/{digest}",
+        uri=f"artifact://factory/improvement-request/{digest}",
         sha256=digest,
         media_type="application/json",
     ):

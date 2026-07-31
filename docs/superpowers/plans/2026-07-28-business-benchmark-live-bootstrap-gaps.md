@@ -243,7 +243,14 @@
   `.captain-cook` namespace, is accepted only after its request block appears in
   the Gateway ledger, and is wired into the live operator for Attempt 2. The
   `Authorize` action performs this ledger mutation without constructing Hermes,
-  Codex, AutoGen, n8n, or benchmark providers.
+  Codex, AutoGen, n8n, or benchmark providers. The first two-job issuance
+  committed Claims before Renewal exposed an evidence-storage asymmetry:
+  Renewal's typed execution existed only as a block-referenced private record,
+  not in Gateway's workflow-artifact projection. Issuance is now idempotent and
+  recovers that exact digest-verified record. Attempt-2 dispatch also requires a
+  prompt-safe opaque `improvement-request` reference; the earlier word
+  `authorization` was correctly rejected by Hermes' secret-name filter before
+  any Codex or benchmark execution.
 - [ ] Issue the two V21 Attempt-2 authorizations against `captain_test`, rebuild
   Claims and Renewal under the existing 1.00 EUR/team cost envelope, and repeat
   the isolated technical gates. Do not run the 30 business cases until both

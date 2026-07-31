@@ -153,6 +153,7 @@ def test_improvement_authorization_accepts_exact_technical_failure() -> None:
     assert authorization.authorization_ref.uri.endswith(
         authorization.authorization_ref.sha256
     )
+    assert "authorization" not in authorization.authorization_ref.uri
     assert validate_factory_improvement_authorization(authorization) is authorization
 
 
