@@ -3194,7 +3194,7 @@ class GatewayStore:
         authorization = runtime_retry_authorization
         if (
             evidence.role is not FactoryRole.TOOL_INTEGRATOR
-            or evidence.phase is not FactoryPhase.AGENT_CODE_CREATED
+            or evidence.phase is not FactoryPhase.TOOL_CANDIDATE_TESTED
             or authorization is None
             or authorization.producer != "captain"
             or authorization.status != "succeeded"

@@ -211,7 +211,7 @@ def test_gateway_accepts_expired_tool_integrator_evidence_only_with_exact_retry(
             )
         }
     )
-    evidence = block(FactoryPhase.AGENT_CODE_CREATED).model_copy(
+    evidence = block(FactoryPhase.TOOL_CANDIDATE_TESTED).model_copy(
         update={
             "job_id": job_v3.job_id,
             "correlation_id": job_v3.correlation_id,

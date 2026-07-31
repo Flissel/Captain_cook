@@ -89,7 +89,7 @@ class GatewayFactoryRepository(FactoryRepository):
         if (
             self._runtime_retries is not None
             and block.role is FactoryRole.TOOL_INTEGRATOR
-            and block.phase is FactoryPhase.AGENT_CODE_CREATED
+            and block.phase is FactoryPhase.TOOL_CANDIDATE_TESTED
         ):
             projection = self._translate(lambda: self._store.factory_job(block.job_id))
             runtime_retry = self._runtime_retries.active(
