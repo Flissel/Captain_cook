@@ -439,9 +439,9 @@ class CaptainCodexBuildSealer:
             or request.job.job_id != invocation.job_id
         ):
             raise FactoryDispatchError("Codex build sealing authority does not match")
+        self._executor.validate_replay_authority(request, invocation)
         replay = self._executor.replay_sealed(invocation)
         if replay is not None:
-            self._executor.validate_replay_authority(request, invocation)
             return replay
         if request.runtime_retry_authorization is None:
             completed = await self._executor.execute(request, invocation, brief)
@@ -461,9 +461,9 @@ class CaptainCodexBuildSealer:
     ) -> CodexBuildEvidenceV1:
         if not isinstance(request.job, AgentFactoryJobV3):
             raise FactoryDispatchError("Codex reconciliation requires a V3 Factory job")
+        self._executor.validate_replay_authority(request, invocation)
         replay = self._executor.replay_sealed(invocation)
         if replay is not None:
-            self._executor.validate_replay_authority(request, invocation)
             return replay
         completed = await self._executor.reconcile_pending(
             request,
@@ -1521,8 +1521,13 @@ class CodexCliFactoryBuildExecutor:
         invocation: FactorySkillInvocationV1,
     ) -> None:
         checkpoint = self._checkpoint_store.load(invocation)
-        if checkpoint is None or checkpoint.phase != "sealed":
-            raise FactoryDispatchError("Factory Codex sealed checkpoint is unavailable")
+        evidence = self._sealed_evidence_store.load(invocation)
+        if (
+            checkpoint is None
+            or evidence is None
+            or checkpoint.phase not in {"implementation_complete", "sealed"}
+        ):
+            return
         self._require_checkpoint_runtime_retry_authority(request, checkpoint)
 
     def persist_sealed(

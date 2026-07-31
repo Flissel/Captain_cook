@@ -576,6 +576,184 @@ async def test_sealed_replay_returns_original_evidence_without_resnapshotting_wo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("authority_variant", ("absent", "different"))
+async def test_replay_rejects_changed_retry_authority_before_advancing_checkpoint(
+    tmp_path: Path,
+    authority_variant: str,
+) -> None:
+    cas = CodexBuildArtifactCas(tmp_path / "cas")
+    workspace = _workspace(tmp_path, cas)
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    dispatch = _dispatch(job, invocation)
+    state_root = tmp_path / "state"
+    checkpoint_root = state_root / "checkpoints"
+    checkpoint_store = FilesystemFactoryCodexBuildCheckpointStore(checkpoint_root)
+    session_receipt = json.dumps(
+        {
+            "completed_at": NOW.isoformat(),
+            "session_id": "persisted-before-checkpoint-advance",
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    receipt_sha256 = hashlib.sha256(session_receipt).hexdigest()
+    initial = FactoryCodexBuildCheckpointV1(
+        job_id=job.job_id,
+        correlation_id=job.correlation_id,
+        attempt=invocation.attempt,
+        invocation_id=invocation.invocation_id,
+        workspace_ref=invocation.lease.workspace_ref,
+        workspace_root=workspace,
+        base_revision="a" * 40,
+        brief_sha256=hashlib.sha256(canonical_factory_codex_model(brief)).hexdigest(),
+        scaffold_manifest_sha256="b" * 64,
+        phase="scaffold_ready",
+        resume_ordinal=0,
+        updated_at=NOW,
+    )
+    checkpoint_store.advance(None, initial)
+    running = initial.model_copy(
+        update={
+            "phase": "implementation_running",
+            "updated_at": NOW + timedelta(seconds=1),
+        }
+    )
+    checkpoint_store.advance(initial, running)
+    interrupted = running.model_copy(
+        update={
+            "phase": "implementation_interrupted",
+            "terminal_receipt_sha256": receipt_sha256,
+            "updated_at": NOW + timedelta(seconds=2),
+        }
+    )
+    checkpoint_store.advance(running, interrupted)
+    authorized_dispatch = _authorized_runtime_retry_dispatch(
+        dispatch,
+        invocation,
+        interrupted,
+    )
+    authorization = authorized_dispatch.runtime_retry_authorization
+    assert authorization is not None
+    resumed = interrupted.model_copy(
+        update={
+            "phase": "implementation_running",
+            "resume_ordinal": 1,
+            "terminal_receipt_sha256": None,
+            "runtime_retry_authorization_uri": authorization.authorization_ref.uri,
+            "runtime_retry_authorization_sha256": (
+                authorization.authorization_ref.sha256
+            ),
+            "runtime_retry_authorization_binding_sha256": hashlib.sha256(
+                canonical_factory_codex_model(authorization)
+            ).hexdigest(),
+            "updated_at": NOW + timedelta(seconds=3),
+        }
+    )
+    checkpoint_store.advance(interrupted, resumed)
+    implementation_complete = resumed.model_copy(
+        update={
+            "phase": "implementation_complete",
+            "terminal_receipt_sha256": receipt_sha256,
+            "updated_at": NOW + timedelta(seconds=4),
+        }
+    )
+    checkpoint_store.advance(resumed, implementation_complete)
+
+    class CrashBeforeSealedCheckpointStore(FilesystemFactoryCodexBuildCheckpointStore):
+        def advance(
+            self,
+            previous: FactoryCodexBuildCheckpointV1 | None,
+            next_checkpoint: FactoryCodexBuildCheckpointV1,
+        ) -> FactoryCodexBuildCheckpointV1:
+            if (
+                previous is not None
+                and previous.phase == "implementation_complete"
+                and next_checkpoint.phase == "sealed"
+            ):
+                raise RuntimeError("simulated crash before checkpoint advance")
+            return super().advance(previous, next_checkpoint)
+
+    class Preparer:
+        def prepare_or_recover(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    def build_executor(
+        store: FilesystemFactoryCodexBuildCheckpointStore,
+    ) -> CodexCliFactoryBuildExecutor:
+        return CodexCliFactoryBuildExecutor(
+            settings=CodexCliFactoryBuildSettings(
+                state_root=state_root,
+                maximum_runtime_seconds=120,
+            ),
+            workspace_preparer=Preparer(),
+            artifact_reader=artifact_reader,
+            authorizer=RecordingAuthorizer(),
+            runner_factory=lambda **_kwargs: pytest.fail(
+                "sealed replay must not launch Codex"
+            ),
+            checkpoint_store=store,
+            clock=lambda: NOW + timedelta(seconds=5),
+        )
+
+    completed = CompletedCodexBuild(
+        workspace_root=workspace,
+        codex_session_receipt=session_receipt,
+        candidate_manifest_path="factory-candidate.json",
+        source_archive_path="candidate.zip",
+        test_evidence_paths=("test-evidence.json",),
+        completed_at=NOW,
+    )
+    crashing_sealer = CaptainCodexBuildSealer(
+        executor=build_executor(CrashBeforeSealedCheckpointStore(checkpoint_root)),
+        issuer=CaptainCodexBuildReceiptIssuer(cas),
+    )
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        crashing_sealer._seal_completed(
+            authorized_dispatch,
+            invocation,
+            brief,
+            completed,
+        )
+
+    checkpoint_path = checkpoint_root / f"{invocation.invocation_id.hex}.json"
+    checkpoint_bytes = checkpoint_path.read_bytes()
+    checkpoint_before_replay = checkpoint_store.load(invocation)
+    assert checkpoint_before_replay == implementation_complete
+    assert (
+        state_root / "sealed-evidence" / f"{invocation.invocation_id.hex}.json"
+    ).is_file()
+
+    if authority_variant == "absent":
+        replay_dispatch = replace(
+            authorized_dispatch,
+            runtime_retry_authorization=None,
+        )
+    else:
+        replay_dispatch = replace(
+            authorized_dispatch,
+            runtime_retry_authorization=authorization.model_copy(
+                update={
+                    "authorization_ref": ArtifactRef(
+                        uri=f"artifact://factory/runtime-retry/{'8' * 64}",
+                        sha256="8" * 64,
+                        media_type="application/json",
+                    )
+                }
+            ),
+        )
+    replay_sealer = CaptainCodexBuildSealer(
+        executor=build_executor(checkpoint_store),
+        issuer=CaptainCodexBuildReceiptIssuer(cas),
+    )
+
+    with pytest.raises(FactoryDispatchError, match="checkpoint.*retry authority"):
+        await replay_sealer.reconcile_pending(replay_dispatch, invocation, brief)
+
+    assert checkpoint_path.read_bytes() == checkpoint_bytes
+    assert checkpoint_store.load(invocation) == checkpoint_before_replay
+
+
+@pytest.mark.asyncio
 async def test_cli_executor_authorizes_before_materializing_and_records_redacted_session(
     tmp_path: Path,
 ) -> None:
