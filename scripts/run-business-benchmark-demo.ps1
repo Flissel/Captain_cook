@@ -126,9 +126,10 @@ $benchmarkRuntimeEnvPath = Join-Path $repositoryRoot '.captain-cook/private/busi
 $canonicalRenewalWorkflow = Join-Path $repositoryRoot 'examples/business_benchmark_candidates/customer_renewal_orchestration_team/workflows/renewal_context_read.json'
 $maximumUsdPerTeam = '0.30'
 $maximumHermesUsd = '0.06'
-$maximumTotalUsdPerTeam = '0.40'
+$maximumTotalUsdPerTeam = '0.50'
+$priorAttemptReserveUsdPerTeam = '0.06'
 $userMaximumEurPerTeam = '1.00'
-$seedVersion = 'business-benchmark-demo-2026-07-v20'
+$seedVersion = 'business-benchmark-demo-2026-07-v21'
 
 $rootEnvAllowlist = @(
     'CAPTAIN_GATEWAY_TOKEN',
@@ -348,7 +349,7 @@ function New-DryRunPlan {
         mode = 'dry_run'
         database = 'captain_test'
         issued_at = $IssuedAt
-        suite_version = 20
+        suite_version = 21
         seed_version_id = $seedVersion
         maximum_usd_per_team = $maximumUsdPerTeam
         jobs = @(
@@ -562,7 +563,7 @@ try {
             '--issued-at', $issuedAt,
             '--model', 'gpt-4.1-mini',
             '--maximum-usd-per-team', $maximumUsdPerTeam,
-            '--suite-version', '20',
+            '--suite-version', '21',
             '--seed-version-id', $seedVersion
         )
         $rawPlanProvisioning = @(& $python @planArguments)
@@ -592,7 +593,7 @@ try {
             if (
                 [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
                 @($team.job.execution_policy.allowed_models) -notcontains 'gpt-4.1-mini' -or
-                [int]$team.suite.suite_version -ne 20
+                [int]$team.suite.suite_version -ne 21
             ) {
                 throw 'Dry-run team model or budget does not match the demo authority.'
             }
@@ -701,6 +702,7 @@ try {
     $environment['CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM'] = $maximumTotalUsdPerTeam
     $environment['CAPTAIN_FACTORY_CODEX_METERED_USD_PER_TEAM'] = '0'
     $environment['CAPTAIN_FACTORY_HERMES_MAX_TOTAL_USD'] = $maximumHermesUsd
+    $environment['CAPTAIN_FACTORY_PRIOR_ATTEMPT_RESERVE_USD_PER_TEAM'] = $priorAttemptReserveUsdPerTeam
     $environment['N8N_MODE'] = 'captain-builder'
     $environment['CAPTAIN_N8N_URL'] = "http://127.0.0.1:$($environment['CAPTAIN_N8N_PORT'])"
     Set-ProcessEnvironment $environment
@@ -711,7 +713,7 @@ try {
         '--issued-at', $issuedAt,
         '--model', $model,
         '--maximum-usd-per-team', $maximumUsdPerTeam,
-        '--suite-version', '20',
+        '--suite-version', '21',
         '--seed-version-id', $seedVersion
     )
     if ($Action -in @('BUILD', 'RUN')) {
@@ -750,7 +752,7 @@ try {
         if (
             [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
             @($team.job.execution_policy.allowed_models) -notcontains $model -or
-            [int]$team.suite.suite_version -ne 20
+            [int]$team.suite.suite_version -ne 21
         ) {
             throw 'Provisioned team model or budget does not match the demo authority.'
         }

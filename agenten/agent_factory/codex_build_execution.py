@@ -3201,7 +3201,10 @@ def _codex_prompt(
         "(the runnable source with factory-candidate.json at archive root and byte-"
         "identical to the external manifest), and test-evidence.json (JSON object "
         "listing commands, exit codes, assertion IDs, and status). Do not place "
-        "candidate.zip inside itself. Keep generated source separate from "
+        "candidate.zip inside itself. factory-candidate.json MUST omit "
+        "source_archive_ref; Captain adds source_archive_ref only after sealing "
+        "candidate.zip, because a pre-seal archive digest would be self-referential. "
+        "Keep generated source separate from "
         ".captain-inputs. Captain will independently validate every byte.\n\n"
         "CAPTAIN CONTRACT:\n"
         + json.dumps(contract, ensure_ascii=False, sort_keys=True, indent=2)

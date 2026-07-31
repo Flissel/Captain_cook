@@ -960,6 +960,8 @@ async def test_cli_executor_authorizes_before_materializing_and_records_redacted
     assert "python -m pytest -q --no-cov generated-candidate/tests" in prompt
     assert "Do not run the repository-wide test suite" in prompt
     assert "pytest.live.demo is deferred to Captain" in prompt
+    assert "MUST omit source_archive_ref" in prompt
+    assert "Captain adds source_archive_ref only after sealing candidate.zip" in prompt
     assert (workspace / ".captain-inputs" / "job-input.md").is_file()
     assert (workspace / ".captain-inputs" / "compiled-spec.json").is_file()
     assert (workspace / ".captain-inputs" / "dependency-graph.json").is_file()

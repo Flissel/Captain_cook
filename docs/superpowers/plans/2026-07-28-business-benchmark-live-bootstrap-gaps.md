@@ -96,7 +96,7 @@
   terminal exit cause, checkpoint/receipt references, and immutable Captain
   resume bindings without exposing workspace paths, journals, prompts, or
   stderr. This is local implementation evidence only, not a provider run.
-- [ ] Run the prepared immutable v20 two-profile Factory scope and 30-case
+- [ ] Run the prepared immutable v21 two-profile Factory scope and 30-case
   team/baseline benchmark after `OPENAI_API_KEY` is securely exported into the invoking
   process. Retain cost, latency, tool, handoff, recovery, Gateway decision, and
   Minibook projection evidence; do not call either team `ready_to_use` before
@@ -135,7 +135,17 @@
   fresh-lease/replay mismatch. No business benchmark, Gateway promotion, or
   Minibook projection ran. Actual provider cost was not materialized as a
   readable usage receipt; configured ceilings remained `0.06` USD aggregate
-  for Hermes and `0.30` USD per team.
+  for Hermes and `0.30` USD per team. V20 then ran Claims candidate
+  construction against the dedicated ledger. Codex completed, retained its
+  streamed terminal evidence, and produced the manifest, source archive, and
+  test evidence. Captain still failed closed while sealing because the
+  pre-seal manifest contained `source_archive_ref`, whose archive digest is
+  necessarily self-referential. Renewal construction, the 30 business cases,
+  Gateway promotion, and Minibook projection did not run. The Codex prompt now
+  requires the pre-seal manifest to omit that field; Captain remains the only
+  component allowed to add it after sealing. The failed V20 seal replay is
+  immutable, so suite/seed V21 is the next authorized fresh scope rather than
+  a relabelled or edited V20 artifact.
 - [x] Isolate provider-live benchmark state from ordinary MariaDB test cleanup.
   `benchmark-start` now creates a dedicated `captain-cook-business-benchmark`
   Compose project on its own port, uses a named persistent MariaDB volume, and
@@ -152,18 +162,28 @@
   replay remains bound to the lost v19 lease through discovery, Codex brief,
   and sealed-build evidence. Re-provisioning v19 would therefore create a new
   lease that correctly conflicts with the old immutable replay. Suite/seed v20
-  creates fresh Claims job `f5263d6f-5d91-5794-8a5d-8b8aa8b83643` and Renewal
+  created fresh Claims job `f5263d6f-5d91-5794-8a5d-8b8aa8b83643` and Renewal
   job `9b710b88-41dd-59c9-a65b-063e29d422b0` under the same case, model, and
-  cost contracts. This is dry-run evidence only; v20 has not yet called a
-  provider or produced a candidate.
+  cost contracts. V20 Claims provider execution reached Codex completion but
+  failed at the self-referential pre-seal manifest boundary described above.
+  V21 therefore provisions new immutable jobs after the prompt correction.
+  Its no-provider plan binds Claims job
+  `c36882f3-792a-528c-9c99-6dcbf2dfc9cb` and Renewal job
+  `63cc1810-fd20-50cb-a110-d96d016066c2` to suite 21 and seed
+  `business-benchmark-demo-2026-07-v21`; plan evidence explicitly records no
+  provider, live-service, provisioning, Gateway, or Minibook mutation.
 - [x] Enforce the operator's `1.00 EUR` marginal-cost ceiling per team before
   provider construction. The live demo reserves at most `0.30 USD` for one
   team's candidate/baseline benchmark and conservatively assigns the complete
   two-team Hermes ceiling of `0.06 USD` to either team. Codex is admitted only
   when `codex login status` proves ChatGPT subscription authentication, so its
   metered API reserve is exactly zero. Captain rejects any composition whose
-  worst-case `0.36 USD` per team exceeds the internal `0.40 USD` ceiling, any
+  prior V20 Hermes attempt is additionally reserved at `0.06 USD` per team.
+  Captain rejects any composition whose cumulative worst-case `0.42 USD` per
+  team exceeds the internal `0.50 USD` ceiling, any
   API-key-authenticated Codex session, or any missing/non-canonical cost field.
   The internal ceiling is intentionally far below the user ceiling rather than
   depending on a live exchange-rate lookup during dispatch. This guard was
-  verified without a provider call; it does not claim that v19 has resumed.
+  verified without another provider call. Actual V20 Hermes spend was not
+  materialized as durable usage evidence, so the full configured reserve is
+  counted conservatively; this does not claim that V19 or V20 can resume.

@@ -130,6 +130,12 @@ def validate_factory_total_cost_envelope(
         hermes_total_usd = Decimal(
             _required(environment, "CAPTAIN_FACTORY_HERMES_MAX_TOTAL_USD")
         )
+        prior_attempt_usd = Decimal(
+            _required(
+                environment,
+                "CAPTAIN_FACTORY_PRIOR_ATTEMPT_RESERVE_USD_PER_TEAM",
+            )
+        )
     except ArithmeticError as exc:
         raise ValueError("Factory total cost envelope is invalid") from exc
     values = (
@@ -137,17 +143,21 @@ def validate_factory_total_cost_envelope(
         total_maximum_usd,
         codex_metered_usd,
         hermes_total_usd,
+        prior_attempt_usd,
         *benchmark_maximum_usd_per_team,
     )
     if (
         any(not value.is_finite() or value < 0 for value in values)
         or user_maximum_eur != Decimal("1.00")
         or total_maximum_usd <= 0
-        or total_maximum_usd > Decimal("0.40")
+        or total_maximum_usd > Decimal("0.50")
         or codex_metered_usd != 0
         or len(benchmark_maximum_usd_per_team) != 2
         or any(
-            benchmark_usd + hermes_total_usd + codex_metered_usd
+            benchmark_usd
+            + hermes_total_usd
+            + prior_attempt_usd
+            + codex_metered_usd
             > total_maximum_usd
             for benchmark_usd in benchmark_maximum_usd_per_team
         )
