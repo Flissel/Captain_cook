@@ -13,6 +13,7 @@ import subprocess
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Literal, Protocol
 from uuid import UUID, uuid4
@@ -54,6 +55,8 @@ from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.execution.codex_policy import AuthorizedCodexRun
 from agenten.execution.codex_supervisor import (
     DEFAULT_MAX_CODEX_JOURNAL_BYTES,
+    DEFAULT_MAX_CODEX_JOURNAL_RECORDS,
+    DEFAULT_MAX_CODEX_JSONL_RECORD_BYTES,
     CodexOutputEvidenceError,
     CodexRunResult,
     CodexRunRequest,
@@ -1814,7 +1817,7 @@ class CodexCliFactoryBuildExecutor:
             raise FactoryDispatchError("Factory Codex JSONL journal digest changed")
         events: list[dict[str, object]] = []
         try:
-            for line in journal.splitlines():
+            for line in _bounded_codex_journal_lines(journal):
                 if not line.strip():
                     continue
                 event = json.loads(line)
@@ -2752,11 +2755,7 @@ def _session_receipt(
     journal_sha256 = hashlib.sha256(journal_bytes).hexdigest()
     if journal_sha256 != result.journal_sha256:
         raise FactoryDispatchError("Codex JSONL journal digest does not match result")
-    journal_lines = tuple(
-        line.decode("utf-8", errors="replace")
-        for line in journal_bytes.splitlines()
-        if line.strip()
-    )
+    journal_lines = _bounded_codex_journal_lines(journal_bytes)
     if journal_lines != result.jsonl_lines:
         raise FactoryDispatchError("Codex JSONL journal snapshot does not match result")
     events: list[Mapping[str, object]] = []
@@ -2978,6 +2977,30 @@ def _read_bounded_codex_journal(path: Path) -> bytes:
             "Codex JSONL journal snapshot changed or exceeds the Factory size limit"
         )
     return content
+
+
+def _bounded_codex_journal_lines(content: bytes) -> tuple[str, ...]:
+    records: list[str] = []
+    stream = BytesIO(content)
+    while True:
+        raw_record = stream.readline(DEFAULT_MAX_CODEX_JSONL_RECORD_BYTES + 2)
+        if not raw_record:
+            break
+        if not raw_record.endswith(b"\n"):
+            if len(raw_record) > DEFAULT_MAX_CODEX_JSONL_RECORD_BYTES:
+                raise FactoryDispatchError("Codex JSONL record exceeds the size limit")
+            raise FactoryDispatchError("Codex JSONL journal has an incomplete record")
+        record = raw_record[:-1]
+        if record.endswith(b"\r"):
+            record = record[:-1]
+        if len(record) > DEFAULT_MAX_CODEX_JSONL_RECORD_BYTES:
+            raise FactoryDispatchError("Codex JSONL record exceeds the size limit")
+        if not record.strip():
+            continue
+        if len(records) >= DEFAULT_MAX_CODEX_JOURNAL_RECORDS:
+            raise FactoryDispatchError("Codex JSONL journal exceeds the record limit")
+        records.append(record.decode("utf-8", errors="replace"))
+    return tuple(records)
 
 
 def _write_once(target: Path, content: bytes) -> None:

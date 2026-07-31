@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from io import BytesIO
 import json
 import os
 import time
@@ -36,6 +37,7 @@ CodexProcessCleanupStatus = Literal[
 DEFAULT_MAX_CODEX_JSONL_RECORD_BYTES = 1024 * 1024
 CODEX_JSONL_READ_CHUNK_BYTES = 64 * 1024
 DEFAULT_MAX_CODEX_JOURNAL_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_CODEX_JOURNAL_RECORDS = 65_536
 
 
 CodexOutputFailureKind = Literal[
@@ -44,6 +46,7 @@ CodexOutputFailureKind = Literal[
     "record_size_limit_exceeded",
     "unterminated_record",
     "journal_size_limit_exceeded",
+    "journal_record_count_exceeded",
 ]
 
 
@@ -82,7 +85,10 @@ class CodexOutputEvidenceError(RuntimeError):
             raise ValueError("Codex output failure journal digest is invalid")
         if not 0 <= journal_byte_count <= DEFAULT_MAX_CODEX_JOURNAL_BYTES:
             raise ValueError("Codex output failure journal size is invalid")
-        if event_count < 0 or tuple(sorted(set(event_types))) != event_types:
+        if (
+            not 0 <= event_count <= DEFAULT_MAX_CODEX_JOURNAL_RECORDS
+            or tuple(sorted(set(event_types))) != event_types
+        ):
             raise ValueError("Codex output failure event metadata is invalid")
         self.process_cleanup_status = process_cleanup_status
         self.journal_path = resolved
@@ -122,9 +128,16 @@ class CodexJournalSizeLimitError(CodexOutputEvidenceError):
     failure_kind: CodexOutputFailureKind = "journal_size_limit_exceeded"
 
 
+class CodexJournalRecordCountLimitError(CodexOutputEvidenceError):
+    """The aggregate Codex JSONL journal contained too many records."""
+
+    failure_kind: CodexOutputFailureKind = "journal_record_count_exceeded"
+
+
 @dataclass
 class _JournalEvidenceState:
     persisted_bytes: bytearray = field(default_factory=bytearray)
+    record_count: int = 0
 
 
 class CodexRunRequest(BaseModel):
@@ -218,6 +231,7 @@ class PowerShellCodexRunner:
         timeout_seconds: float = 600,
         max_jsonl_record_bytes: int = DEFAULT_MAX_CODEX_JSONL_RECORD_BYTES,
         max_journal_bytes: int = DEFAULT_MAX_CODEX_JOURNAL_BYTES,
+        max_journal_records: int = DEFAULT_MAX_CODEX_JOURNAL_RECORDS,
         clock: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] | None = None,
     ) -> None:
@@ -243,6 +257,16 @@ class PowerShellCodexRunner:
             raise ValueError(
                 "Codex JSONL journal limit must be between 1 byte and 64 MiB"
             )
+        if (
+            isinstance(max_journal_records, bool)
+            or not isinstance(max_journal_records, int)
+            or not 1
+            <= max_journal_records
+            <= DEFAULT_MAX_CODEX_JOURNAL_RECORDS
+        ):
+            raise ValueError(
+                "Codex JSONL journal record limit must be between 1 and 65536"
+            )
         self._pwsh_path = pwsh_path.resolve(strict=True)
         self._script_path = script_path.resolve(strict=True)
         self._codex_path = codex_path.resolve(strict=True)
@@ -255,6 +279,7 @@ class PowerShellCodexRunner:
         self._timeout_seconds = timeout_seconds
         self._max_jsonl_record_bytes = max_jsonl_record_bytes
         self._max_journal_bytes = max_journal_bytes
+        self._max_journal_records = max_journal_records
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._monotonic = monotonic or time.monotonic
 
@@ -326,6 +351,7 @@ class PowerShellCodexRunner:
         wrapper_expired_during_launch = self._monotonic() >= wrapper_stop_at
         journal_state = _JournalEvidenceState()
         journal_bytes = b""
+        journal_lines: tuple[str, ...] = ()
         with self._journal_path.open("a+b") as journal:
             process_waiter = asyncio.create_task(process.wait())
             stdout_reader = asyncio.create_task(
@@ -384,14 +410,26 @@ class PowerShellCodexRunner:
                 if evidence_failure is None:
                     evidence_failure = exc
                 journal_bytes = bytes(journal_state.persisted_bytes)
+            try:
+                journal_lines, event_types = self._parse_journal_snapshot(
+                    journal_bytes,
+                    tolerate_partial=evidence_failure is not None,
+                )
+            except CodexOutputEvidenceError as exc:
+                if evidence_failure is None:
+                    evidence_failure = exc
+                journal_lines, event_types = self._parse_journal_snapshot(
+                    bytes(journal_state.persisted_bytes),
+                    tolerate_partial=True,
+                )
+                journal_bytes = bytes(journal_state.persisted_bytes)
             if evidence_failure is not None:
-                event_count, event_types = self._journal_event_metadata(journal_bytes)
                 evidence_failure.bind_terminal_evidence(
                     process_cleanup_status=process_cleanup_status,
                     journal_path=self._journal_path,
                     journal_sha256=hashlib.sha256(journal_bytes).hexdigest(),
                     journal_byte_count=len(journal_bytes),
-                    event_count=event_count,
+                    event_count=len(journal_lines),
                     event_types=event_types,
                 )
 
@@ -416,11 +454,7 @@ class PowerShellCodexRunner:
             artifact_references=(
                 () if terminal_status == "timed_out" else self._artifact_references
             ),
-            jsonl_lines=tuple(
-                line.decode("utf-8", errors="replace")
-                for line in journal_bytes.splitlines()
-                if line.strip()
-            ),
+            jsonl_lines=journal_lines,
         )
 
     def _prelaunch_timeout_result(self) -> CodexRunResult:
@@ -511,6 +545,10 @@ class PowerShellCodexRunner:
         state: _JournalEvidenceState,
     ) -> None:
         serialized = record + b"\n"
+        if state.record_count >= self._max_journal_records:
+            raise CodexJournalRecordCountLimitError(
+                "Codex JSONL journal exceeds configured record count limit"
+            )
         if len(state.persisted_bytes) + len(serialized) > self._max_journal_bytes:
             raise CodexJournalSizeLimitError(
                 "Codex JSONL journal exceeds configured safe limit"
@@ -526,6 +564,7 @@ class PowerShellCodexRunner:
                 "Codex JSONL journal persistence failed"
             ) from None
         state.persisted_bytes.extend(serialized)
+        state.record_count += 1
 
     def _read_bounded_journal(self, journal: BinaryIO) -> bytes:
         try:
@@ -557,17 +596,48 @@ class PowerShellCodexRunner:
             )
         return snapshot
 
-    @staticmethod
-    def _journal_event_metadata(journal_bytes: bytes) -> tuple[int, tuple[str, ...]]:
-        complete_records = journal_bytes.split(b"\n")
-        if not journal_bytes.endswith(b"\n"):
-            complete_records = complete_records[:-1]
-        event_count = 0
+    def _parse_journal_snapshot(
+        self,
+        journal_bytes: bytes,
+        *,
+        tolerate_partial: bool,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        records: list[str] = []
         event_types: set[str] = set()
-        for record in complete_records:
+        stream = BytesIO(journal_bytes)
+        while True:
+            raw_record = stream.readline(self._max_jsonl_record_bytes + 2)
+            if not raw_record:
+                break
+            if not raw_record.endswith(b"\n"):
+                if tolerate_partial:
+                    break
+                if len(raw_record) > self._max_jsonl_record_bytes:
+                    raise CodexJsonlRecordTooLargeError(
+                        "Codex JSONL record exceeds configured safe limit"
+                    )
+                raise CodexJsonlUnterminatedRecordError(
+                    "Codex JSONL stream ended with an unterminated record"
+                )
+            record = raw_record[:-1]
+            if record.endswith(b"\r"):
+                record = record[:-1]
+            if len(record) > self._max_jsonl_record_bytes:
+                if tolerate_partial:
+                    break
+                raise CodexJsonlRecordTooLargeError(
+                    "Codex JSONL record exceeds configured safe limit"
+                )
             if not record.strip():
                 continue
-            event_count += 1
+            if len(records) >= self._max_journal_records:
+                if tolerate_partial:
+                    break
+                raise CodexJournalRecordCountLimitError(
+                    "Codex JSONL journal exceeds configured record count limit"
+                )
+            decoded = record.decode("utf-8", errors="replace")
+            records.append(decoded)
             try:
                 event = json.loads(record)
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -576,7 +646,7 @@ class PowerShellCodexRunner:
                 event_type = event.get("type")
                 if isinstance(event_type, str) and event_type.strip():
                     event_types.add(event_type)
-        return event_count, tuple(sorted(event_types))
+        return tuple(records), tuple(sorted(event_types))
 
     @staticmethod
     async def _drain_stderr(stderr: asyncio.StreamReader) -> None:

@@ -90,6 +90,18 @@ class _ChunkedStream:
         return chunk
 
 
+class _MillionTinyRecordsStream:
+    def __init__(self) -> None:
+        self.remaining = 1_000_000
+
+    async def read(self, size: int) -> bytes:
+        count = min(self.remaining, max(1, size // 3))
+        if count == 0:
+            return b""
+        self.remaining -= count
+        return b"{}\n" * count
+
+
 class _FailingJournal:
     def __init__(self, journal: BinaryIO) -> None:
         self._journal = journal
@@ -123,6 +135,7 @@ def _runner(
     *,
     max_jsonl_record_bytes: int | None = None,
     max_journal_bytes: int | None = None,
+    max_journal_records: int | None = None,
 ) -> PowerShellCodexRunner:
     pwsh = shutil.which("pwsh")
     assert pwsh is not None
@@ -133,6 +146,8 @@ def _runner(
         kwargs["max_jsonl_record_bytes"] = max_jsonl_record_bytes
     if max_journal_bytes is not None:
         kwargs["max_journal_bytes"] = max_journal_bytes
+    if max_journal_records is not None:
+        kwargs["max_journal_records"] = max_journal_records
     return PowerShellCodexRunner(
         pwsh_path=Path(pwsh),
         script_path=Path("scripts/codex-session.ps1").resolve(),
@@ -384,6 +399,47 @@ async def test_runner_rejects_oversized_final_snapshot_without_unbounded_read(
     assert caught.value.journal_byte_count == len(record) + 1
     assert caught.value.event_count == 1
     assert caught.value.event_types == ("turn.started",)
+
+
+@pytest.mark.asyncio
+async def test_runner_cancels_at_tiny_record_count_limit_plus_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _RunningProcess(_MillionTinyRecordsStream())
+    cancellation_calls = 0
+
+    async def create_process(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        return process
+
+    async def cancel_for_evidence_failure() -> bool:
+        nonlocal cancellation_calls
+        cancellation_calls += 1
+        process.stop()
+        return True
+
+    monkeypatch.setattr(
+        codex_supervisor.asyncio, "create_subprocess_exec", create_process
+    )
+    runner = _runner(tmp_path, max_journal_records=3)
+    monkeypatch.setattr(
+        runner,
+        "_attempt_verified_evidence_failure_cancellation",
+        cancel_for_evidence_failure,
+    )
+    error_type = getattr(codex_supervisor, "CodexJournalRecordCountLimitError")
+
+    with pytest.raises(error_type) as caught:
+        await runner.run(_authorized(tmp_path))
+
+    assert cancellation_calls == 1
+    assert process.alive is False
+    assert process.active_waiters == 0
+    assert caught.value.process_cleanup_status == "verified_cancelled"
+    assert caught.value.journal_byte_count == 9
+    assert caught.value.event_count == 3
+    assert caught.value.event_types == ()
 
 
 @pytest.mark.asyncio
