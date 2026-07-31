@@ -81,6 +81,8 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
     runtime_retry_authorization_uri: str | None = None
     runtime_retry_authorization_sha256: str | None = None
     runtime_retry_authorization_binding_sha256: str | None = None
+    runtime_retry_authorization_issued_at: datetime | None = None
+    runtime_retry_authorization_expires_at: datetime | None = None
     output_manifest_uri: str | None = None
     output_manifest_sha256: str | None = None
     implementation_failure_reason: Literal[
@@ -140,10 +142,17 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
             raise ValueError("parent Codex thread ID is invalid")
         return value
 
-    @field_validator("updated_at")
+    @field_validator(
+        "updated_at",
+        "runtime_retry_authorization_issued_at",
+        "runtime_retry_authorization_expires_at",
+    )
     @classmethod
-    def _require_utc_timestamp(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+    def _require_utc_timestamp(cls, value: datetime | None) -> datetime | None:
+        if value is not None and (
+            value.tzinfo is None
+            or value.utcoffset() != timezone.utc.utcoffset(value)
+        ):
             raise ValueError("updated_at must be UTC")
         return value
 
@@ -200,6 +209,8 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
             self.runtime_retry_authorization_uri,
             self.runtime_retry_authorization_sha256,
             self.runtime_retry_authorization_binding_sha256,
+            self.runtime_retry_authorization_issued_at,
+            self.runtime_retry_authorization_expires_at,
         )
         if any(value is not None for value in retry_values) and any(
             value is None for value in retry_values
@@ -209,6 +220,13 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
             raise ValueError("original runtime checkpoint cannot bind retry authority")
         if self.resume_ordinal > 0 and any(value is None for value in retry_values):
             raise ValueError("resumed runtime checkpoint requires retry authority")
+        if (
+            self.runtime_retry_authorization_issued_at is not None
+            and self.runtime_retry_authorization_expires_at is not None
+            and self.runtime_retry_authorization_expires_at
+            <= self.runtime_retry_authorization_issued_at
+        ):
+            raise ValueError("runtime retry checkpoint window is invalid")
         parent_lineage = (
             self.parent_terminal_receipt_sha256,
             self.parent_journal_sha256,

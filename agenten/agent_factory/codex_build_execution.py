@@ -379,6 +379,10 @@ class CaptainCodexBuildExecutorPort(Protocol):
         request: FactoryDispatch,
         invocation: FactorySkillInvocationV1,
         brief: CodexBuildBriefV1,
+        *,
+        persisted_resume_ordinal: int | None = None,
+        persisted_retry_authorization_ref: ArtifactRef | None = None,
+        persisted_retry_authorization_binding_sha256: str | None = None,
     ) -> FactoryCodexBuildFailed: ...
 
     def replay_sealed(
@@ -630,6 +634,10 @@ class CaptainCodexBuildSealer:
         request: FactoryDispatch,
         invocation: FactorySkillInvocationV1,
         brief: CodexBuildBriefV1,
+        *,
+        persisted_resume_ordinal: int | None = None,
+        persisted_retry_authorization_ref: ArtifactRef | None = None,
+        persisted_retry_authorization_binding_sha256: str | None = None,
     ) -> FactoryCodexBuildFailed:
         if not isinstance(request.job, AgentFactoryJobV3):
             raise FactoryDispatchError(
@@ -640,7 +648,18 @@ class CaptainCodexBuildSealer:
             raise FactoryDispatchError(
                 "Factory Codex sealed replay is not a terminal failure"
             )
-        return self._executor.reconcile_failed(request, invocation, brief)
+        return self._executor.reconcile_failed(
+            request,
+            invocation,
+            brief,
+            persisted_resume_ordinal=persisted_resume_ordinal,
+            persisted_retry_authorization_ref=(
+                persisted_retry_authorization_ref
+            ),
+            persisted_retry_authorization_binding_sha256=(
+                persisted_retry_authorization_binding_sha256
+            ),
+        )
 
     def _seal_completed(
         self,
@@ -993,6 +1012,10 @@ class CodexCliFactoryBuildExecutor:
         request: FactoryDispatch,
         invocation: FactorySkillInvocationV1,
         brief: CodexBuildBriefV1,
+        *,
+        persisted_resume_ordinal: int | None = None,
+        persisted_retry_authorization_ref: ArtifactRef | None = None,
+        persisted_retry_authorization_binding_sha256: str | None = None,
     ) -> FactoryCodexBuildFailed:
         """Validate only an already-terminal failure; never inspect or run work."""
 
@@ -1018,7 +1041,17 @@ class CodexCliFactoryBuildExecutor:
             prepared.root,
             checkpoint,
         )
-        self._require_checkpoint_runtime_retry_authority(request, checkpoint)
+        self._require_checkpoint_runtime_retry_authority(
+            request,
+            checkpoint,
+            persisted_resume_ordinal=persisted_resume_ordinal,
+            persisted_retry_authorization_ref=(
+                persisted_retry_authorization_ref
+            ),
+            persisted_retry_authorization_binding_sha256=(
+                persisted_retry_authorization_binding_sha256
+            ),
+        )
         return self._reconcile_failed(
             request=request,
             invocation=invocation,
@@ -1158,18 +1191,27 @@ class CodexCliFactoryBuildExecutor:
                 "Factory Codex failed checkpoint conflicts with output capture"
             )
         authority_start = invocation.lease.issued_at
+        authority_deadline = min(
+            invocation.lease.expires_at,
+            request.job.deadline_at,
+        )
         if checkpoint.resume_ordinal > 0:
             authorization = request.runtime_retry_authorization
-            if authorization is None:
-                raise FactoryDispatchError(
-                    "Factory Codex failed reconciliation requires retry authority"
+            if authorization is not None:
+                authority_start = authorization.issued_at
+                authority_deadline = min(
+                    authorization.expires_at,
+                    request.job.deadline_at,
                 )
-            authority_start = authorization.issued_at
-        authority_deadline = self._authority_deadline(
-            request,
-            invocation,
-            authorized_resume=checkpoint.resume_ordinal > 0,
-        )
+            else:
+                issued_at = checkpoint.runtime_retry_authorization_issued_at
+                expires_at = checkpoint.runtime_retry_authorization_expires_at
+                if issued_at is None or expires_at is None:
+                    raise FactoryDispatchError(
+                        "Factory Codex failed retry authority window is missing"
+                    )
+                authority_start = issued_at
+                authority_deadline = min(expires_at, request.job.deadline_at)
         within_authority = (
             authority_start <= terminal.completed_at < authority_deadline
         )
@@ -1375,15 +1417,46 @@ class CodexCliFactoryBuildExecutor:
         self,
         request: FactoryDispatch,
         checkpoint: FactoryCodexBuildCheckpointV1,
+        *,
+        persisted_resume_ordinal: int | None = None,
+        persisted_retry_authorization_ref: ArtifactRef | None = None,
+        persisted_retry_authorization_binding_sha256: str | None = None,
     ) -> None:
         expected = (
             checkpoint.runtime_retry_authorization_uri,
             checkpoint.runtime_retry_authorization_sha256,
             checkpoint.runtime_retry_authorization_binding_sha256,
         )
-        actual = self._runtime_retry_checkpoint_binding(
-            request.runtime_retry_authorization
-        )
+        authorization = request.runtime_retry_authorization
+        if authorization is not None:
+            if (
+                persisted_resume_ordinal is not None
+                or persisted_retry_authorization_ref is not None
+                or persisted_retry_authorization_binding_sha256 is not None
+            ):
+                raise FactoryDispatchError(
+                    "Factory Codex retry authority source is ambiguous"
+                )
+            actual = self._runtime_retry_checkpoint_binding(authorization)
+        else:
+            expected_ordinal = checkpoint.resume_ordinal
+            effective_ordinal = (
+                0
+                if persisted_resume_ordinal is None and expected_ordinal == 0
+                else persisted_resume_ordinal
+            )
+            if effective_ordinal != expected_ordinal:
+                raise FactoryDispatchError(
+                    "Factory Codex checkpoint retry authority resume ordinal changed"
+                )
+        if authorization is None and persisted_retry_authorization_ref is not None:
+            actual = (
+                persisted_retry_authorization_ref.uri,
+                persisted_retry_authorization_ref.sha256,
+                persisted_retry_authorization_binding_sha256,
+            )
+        elif authorization is None:
+            actual = (None, None, persisted_retry_authorization_binding_sha256)
         if actual != expected:
             raise FactoryDispatchError(
                 "Factory Codex checkpoint runtime retry authority changed"
@@ -2972,6 +3045,9 @@ class CodexCliFactoryBuildExecutor:
                 else None
             )
         )
+        retry_authorization = (
+            request.runtime_retry_authorization if resume_ordinal > 0 else None
+        )
         return FactoryCodexBuildCheckpointV1(
             job_id=request.job.job_id,
             correlation_id=request.job.correlation_id,
@@ -3020,6 +3096,16 @@ class CodexCliFactoryBuildExecutor:
             runtime_retry_authorization_uri=retry_uri,
             runtime_retry_authorization_sha256=retry_sha256,
             runtime_retry_authorization_binding_sha256=retry_binding_sha256,
+            runtime_retry_authorization_issued_at=(
+                retry_authorization.issued_at
+                if retry_authorization is not None
+                else None
+            ),
+            runtime_retry_authorization_expires_at=(
+                retry_authorization.expires_at
+                if retry_authorization is not None
+                else None
+            ),
             updated_at=self._checkpoint_time(previous),
         )
 

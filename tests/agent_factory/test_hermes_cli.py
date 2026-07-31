@@ -1358,9 +1358,14 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "legacy_schema",
+    ["captain.factory-skill-replay.v2", "captain.factory-skill-replay.v3"],
+)
 async def test_dispatch_replay_uses_identical_invocation_and_idempotency_key(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    legacy_schema: str,
 ) -> None:
     request, lease = _architect_dispatch()
     catalog = _catalog_for(tmp_path, FactorySkillStep.DISCOVER)
@@ -1407,10 +1412,13 @@ async def test_dispatch_replay_uses_identical_invocation_and_idempotency_key(
 
     replay_path = next((tmp_path / "replays").glob("*.json"))
     legacy_payload = json.loads(replay_path.read_text(encoding="utf-8"))
-    legacy_payload["schema"] = "captain.factory-skill-replay.v2"
-    legacy_payload.pop("checkpoint_ref")
-    legacy_payload.pop("terminal_receipt_ref")
-    legacy_payload.pop("resume_ordinal")
+    legacy_payload["schema"] = legacy_schema
+    legacy_payload.pop("runtime_retry_authorization_ref")
+    legacy_payload.pop("runtime_retry_authorization_binding_sha256")
+    if legacy_schema.endswith(".v2"):
+        legacy_payload.pop("checkpoint_ref")
+        legacy_payload.pop("terminal_receipt_ref")
+        legacy_payload.pop("resume_ordinal")
     replay_path.write_text(
         json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")),
         encoding="utf-8",
@@ -1533,6 +1541,19 @@ async def test_runtime_retry_replay_requires_atomic_authorized_resume(
     assert resumed.acquired is True
     assert resumed.record.state == "pending"
     assert resumed.record.resume_ordinal == 1
+    assert resumed.record.runtime_retry_authorization_ref == (
+        authorization.authorization_ref
+    )
+    assert resumed.record.runtime_retry_authorization_binding_sha256 == (
+        hashlib.sha256(
+            json.dumps(
+                authorization.model_dump(mode="json", by_alias=True),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    )
     assert resumed.record.claim_token != interrupted.claim_token
     with pytest.raises(FactoryDispatchError, match="interrupted"):
         await replay_store.resume(interrupted, authorization=authorization)
@@ -1859,7 +1880,11 @@ async def test_restart_reconciles_durable_codex_failure_to_failed_replay_without
             self.seal_calls += 1
             raise durable_failure
 
-        def reconcile_failed(self, *_args: object) -> FactoryCodexBuildFailed:
+        def reconcile_failed(
+            self,
+            *_args: object,
+            **_kwargs: object,
+        ) -> FactoryCodexBuildFailed:
             self.failure_reconcile_calls += 1
             return durable_failure
 
@@ -1971,6 +1996,329 @@ async def test_restart_reconciles_durable_codex_failure_to_failed_replay_without
     assert sealer.seal_calls == 1
     assert sealer.failure_reconcile_calls == 1
     assert len(prompts) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume_ordinal", [1, 2])
+async def test_expired_restart_terminalizes_failed_authorized_resume_without_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resume_ordinal: int,
+) -> None:
+    """Dropping persisted retry lineage would strand a resumed terminal failure."""
+
+    now = datetime(2026, 7, 19, 10, tzinfo=timezone.utc)
+    factory_job = job_v3(mode="demo").model_copy(
+        update={"deadline_at": now + timedelta(minutes=30)}
+    )
+    architect_lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.AGENT_ARCHITECT,
+        attempt=1,
+        workspace_ref="workspace://factory/resumed-failure/discovery",
+        now=now,
+    )
+    tool_lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/resumed-failure/build",
+        now=now,
+    )
+    prompts: list[str] = []
+
+    class PromptStore:
+        def persist(self, job_id: UUID, content: bytes) -> ArtifactRef:
+            digest = hashlib.sha256(content).hexdigest()
+            return ArtifactRef(
+                uri=f"artifact://factory-prompts/{job_id}/{digest}",
+                sha256=digest,
+                media_type="application/json",
+            )
+
+    class Process:
+        returncode = 0
+
+        def __init__(self, prompt: str) -> None:
+            self.prompt = prompt
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            prompts.append(self.prompt)
+            prefix = "captain_codex_brief_seed_sha256="
+            if prefix in self.prompt:
+                digest = next(
+                    line.removeprefix(prefix)
+                    for line in self.prompt.splitlines()
+                    if line.startswith(prefix)
+                )
+                return json.dumps(
+                    {
+                        "schema": "hermes.factory-codex-brief-attestation.v1",
+                        "invocation_id": _invocation_from_prompt(self.prompt)[
+                            "invocation_id"
+                        ],
+                        "seed_sha256": digest,
+                        "accepted": True,
+                    }
+                ).encode(), b""
+            return json.dumps(_typed_payload(self.prompt)).encode(), b""
+
+    async def create_process(*command: str, **__: object) -> Process:
+        return Process(command[-1])
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    def checkpoint_ref(ordinal: int) -> ArtifactRef:
+        digest = f"{ordinal + 1:x}" * 64
+        return ArtifactRef(
+            uri=f"artifact://factory/codex-checkpoint/{digest}",
+            sha256=digest,
+            media_type="application/json",
+        )
+
+    def receipt_ref(ordinal: int) -> ArtifactRef:
+        digest = f"{ordinal + 9:x}" * 64
+        return ArtifactRef(
+            uri=f"artifact://factory/codex-terminal-receipt/{digest}",
+            sha256=digest,
+            media_type="application/json",
+        )
+
+    durable_failure = FactoryCodexBuildFailed(
+        reason="runtime_failed",
+        checkpoint_ref=checkpoint_ref(resume_ordinal),
+        terminal_receipt_ref=receipt_ref(resume_ordinal),
+    )
+
+    class ResumeThenFailSealer:
+        def __init__(self) -> None:
+            self.seal_calls = 0
+            self.failure_reconcile_calls = 0
+            self.expected_authorization: FactoryRuntimeRetryAuthorizationV1 | None = None
+            self.invocation: FactorySkillInvocationV1 | None = None
+
+        def validate_runtime_retry(
+            self,
+            request: FactoryDispatch,
+            _invocation: FactorySkillInvocationV1,
+            _brief: CodexBuildBriefV1,
+        ) -> FactoryRuntimeRetryAuthorizationV1:
+            assert request.runtime_retry_authorization is not None
+            return request.runtime_retry_authorization
+
+        async def seal(
+            self,
+            _request: FactoryDispatch,
+            invocation: FactorySkillInvocationV1,
+            _brief: CodexBuildBriefV1,
+        ) -> CodexBuildEvidenceV1:
+            self.invocation = invocation
+            ordinal = self.seal_calls
+            self.seal_calls += 1
+            if ordinal < resume_ordinal:
+                raise FactoryCodexBuildInterrupted(
+                    reason="codex_timed_out",
+                    exit_code=124,
+                    checkpoint_ref=checkpoint_ref(ordinal),
+                    terminal_receipt_ref=receipt_ref(ordinal),
+                    resume_ordinal=ordinal,
+                )
+            raise durable_failure
+
+        def reconcile_failed(
+            self,
+            *_args: object,
+            persisted_resume_ordinal: int | None = None,
+            persisted_retry_authorization_ref: ArtifactRef | None = None,
+            persisted_retry_authorization_binding_sha256: str | None = None,
+        ) -> FactoryCodexBuildFailed:
+            authorization = self.expected_authorization
+            assert authorization is not None
+            expected_digest = hashlib.sha256(
+                json.dumps(
+                    authorization.model_dump(mode="json", by_alias=True),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            if (
+                persisted_resume_ordinal != resume_ordinal
+                or persisted_retry_authorization_ref
+                != authorization.authorization_ref
+                or persisted_retry_authorization_binding_sha256
+                != expected_digest
+            ):
+                raise FactoryDispatchError(
+                    "persisted Factory retry authority lineage changed"
+                )
+            self.failure_reconcile_calls += 1
+            return durable_failure
+
+        async def reconcile_pending(self, *_args: object) -> CodexBuildEvidenceV1:
+            raise AssertionError("expired failure recovery must not reconcile work")
+
+    replay_root = tmp_path / "resumed-failure-replays"
+
+    class CrashBeforeReplayFailureStore(FilesystemFactorySkillReplayStore):
+        async def fail(self, *args: object, **kwargs: object):
+            del args, kwargs
+            raise RuntimeError("simulated host crash before replay fail")
+
+    sealer = ResumeThenFailSealer()
+    catalog = _catalog_for(
+        tmp_path,
+        FactorySkillStep.DISCOVER,
+        FactorySkillStep.BRIEF_CODEX,
+        FactorySkillStep.SEAL_CODEX_BUILD,
+    )
+    settings = HermesCliSettings(
+        skill_root=tmp_path,
+        working_directory=_CAPTAIN_WORKSPACE_ROOT,
+        evidence_root=tmp_path / "evidence",
+    )
+    prompt_store = PromptStore()
+    await HermesCliFactory(
+        settings=settings,
+        released_skill_catalog=catalog,
+        replay_store=CrashBeforeReplayFailureStore(replay_root),
+        codex_build_sealer=sealer,
+        codex_prompt_artifact_store=prompt_store,
+        clock=lambda: now,
+    ).dispatch(
+        FactoryDispatch(
+            job=factory_job,
+            action=FactoryAction(
+                kind=FactoryActionKind.DISPATCH_AGENT_ARCHITECT,
+                attempt=1,
+                job_id=factory_job.job_id,
+            ),
+            role=FactoryRole.AGENT_ARCHITECT,
+            lease=architect_lease,
+        )
+    )
+    tool_request = FactoryDispatch(
+        job=factory_job,
+        action=FactoryAction(
+            kind=FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,
+            attempt=1,
+            job_id=factory_job.job_id,
+        ),
+        role=FactoryRole.TOOL_INTEGRATOR,
+        lease=tool_lease,
+    )
+    first_factory = HermesCliFactory(
+        settings=settings,
+        released_skill_catalog=catalog,
+        replay_store=CrashBeforeReplayFailureStore(replay_root),
+        codex_build_sealer=sealer,
+        codex_prompt_artifact_store=prompt_store,
+        clock=lambda: now,
+    )
+
+    with pytest.raises(FactoryCodexBuildInterrupted):
+        await first_factory.dispatch(tool_request)
+
+    authorized_request = tool_request
+    for ordinal in range(1, resume_ordinal + 1):
+        now = tool_lease.expires_at + timedelta(seconds=ordinal)
+        invocation = sealer.invocation
+        assert invocation is not None
+        authorization = FactoryRuntimeRetryAuthorizationV1(
+            schema_name="captain.factory-runtime-retry-authorization.v1",
+            authorization_ref=ArtifactRef(
+                uri=f"artifact://factory/runtime-retry/{ordinal:x}{'a' * 63}",
+                sha256=f"{ordinal:x}{'a' * 63}",
+                media_type="application/json",
+            ),
+            producer="captain",
+            status="succeeded",
+            job_id=factory_job.job_id,
+            correlation_id=factory_job.correlation_id,
+            subject_version=factory_job.subject_version,
+            attempt=1,
+            invocation_id=invocation.invocation_id,
+            idempotency_key=invocation.idempotency_key,
+            lease_id=tool_lease.lease_id,
+            checkpoint_ref=checkpoint_ref(ordinal - 1),
+            terminal_receipt_ref=receipt_ref(ordinal - 1),
+            workspace_ref=tool_lease.workspace_ref,
+            base_revision="e" * 40,
+            scaffold_manifest_sha256="f" * 64,
+            brief_sha256="1" * 64,
+            resume_ordinal=ordinal,
+            maximum_runtime_seconds=60,
+            issued_at=now,
+            expires_at=now + timedelta(minutes=1),
+        )
+        authorized_request = FactoryDispatch(
+            job=tool_request.job,
+            action=tool_request.action,
+            role=tool_request.role,
+            lease=tool_request.lease,
+            runtime_retry_authorization=authorization,
+        )
+        if ordinal < resume_ordinal:
+            with pytest.raises(FactoryCodexBuildInterrupted):
+                await first_factory.dispatch(authorized_request)
+        else:
+            sealer.expected_authorization = authorization
+            with pytest.raises(
+                FactoryDispatchError,
+                match="failure state could not be persisted",
+            ):
+                await first_factory.dispatch(authorized_request)
+
+    pending_path = next(
+        path
+        for path in replay_root.glob("*.json")
+        if json.loads(path.read_text(encoding="utf-8"))["state"] == "pending"
+    )
+    original_pending = pending_path.read_bytes()
+    pending_payload = json.loads(original_pending)
+    assert pending_payload["resume_ordinal"] == resume_ordinal
+    assert pending_payload["runtime_retry_authorization_ref"] == (
+        authorization.authorization_ref.model_dump(mode="json")
+    )
+
+    now = factory_job.deadline_at + timedelta(seconds=1)
+    restarted = HermesCliFactory(
+        settings=settings,
+        released_skill_catalog=catalog,
+        replay_store=FilesystemFactorySkillReplayStore(replay_root),
+        codex_build_sealer=sealer,
+        codex_prompt_artifact_store=prompt_store,
+        clock=lambda: now,
+    )
+    with pytest.raises(FactoryDispatchError, match="active lease"):
+        await restarted.dispatch(authorized_request)
+    assert pending_path.read_bytes() == original_pending
+    assert sealer.failure_reconcile_calls == 0
+
+    pending_payload["runtime_retry_authorization_binding_sha256"] = "0" * 64
+    pending_path.write_text(
+        json.dumps(
+            pending_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(FactoryDispatchError, match="retry authority lineage"):
+        await restarted.dispatch(tool_request)
+    assert json.loads(pending_path.read_text(encoding="utf-8"))["state"] == "pending"
+    assert sealer.failure_reconcile_calls == 0
+
+    pending_path.write_bytes(original_pending)
+    with pytest.raises(FactoryCodexBuildFailed) as recovered:
+        await restarted.dispatch(tool_request)
+
+    assert recovered.value.reason == "runtime_failed"
+    assert sealer.seal_calls == resume_ordinal + 1
+    assert sealer.failure_reconcile_calls == 1
+    assert len(prompts) == 2
+    assert json.loads(pending_path.read_text(encoding="utf-8"))["state"] == "failed"
 
 
 @pytest.mark.asyncio

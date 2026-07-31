@@ -132,6 +132,8 @@ def _next(
                 "runtime_retry_authorization_uri": "artifact://factory/runtime-retry/test",
                 "runtime_retry_authorization_sha256": "3" * 64,
                 "runtime_retry_authorization_binding_sha256": "4" * 64,
+                "runtime_retry_authorization_issued_at": NOW,
+                "runtime_retry_authorization_expires_at": NOW + timedelta(minutes=1),
             }
         )
     if phase == "sealed":

@@ -168,6 +168,10 @@ class CaptainCodexBuildSealerPort(Protocol):
         request: FactoryDispatch,
         invocation: FactorySkillInvocationV1,
         brief: CodexBuildBriefV1,
+        *,
+        persisted_resume_ordinal: int | None = None,
+        persisted_retry_authorization_ref: ArtifactRef | None = None,
+        persisted_retry_authorization_binding_sha256: str | None = None,
     ) -> FactoryCodexBuildFailed: ...
 
     def validate_runtime_retry(
@@ -673,17 +677,38 @@ class HermesCliFactory(HermesFactoryPort):
                     step=step,
                     attempt=request.action.attempt,
                 )
-                if (
-                    pending.invocation != expected_invocation
-                    or pending.resume_ordinal != 0
-                ):
+                if pending.invocation != expected_invocation:
                     raise FactoryDispatchError(
                         "expired Factory failure replay binding conflicts"
+                    )
+                persisted_retry_ref = pending.runtime_retry_authorization_ref
+                persisted_retry_digest = (
+                    pending.runtime_retry_authorization_binding_sha256
+                )
+                if pending.resume_ordinal == 0:
+                    if (
+                        persisted_retry_ref is not None
+                        or persisted_retry_digest is not None
+                    ):
+                        raise FactoryDispatchError(
+                            "original Factory failure replay binds retry authority"
+                        )
+                elif (
+                    persisted_retry_ref is None
+                    or persisted_retry_digest is None
+                ):
+                    raise FactoryDispatchError(
+                        "resumed Factory failure replay lacks retry authority lineage"
                     )
                 failure = self._codex_build_sealer.reconcile_failed(
                     request,
                     expected_invocation,
                     brief,
+                    persisted_resume_ordinal=pending.resume_ordinal,
+                    persisted_retry_authorization_ref=persisted_retry_ref,
+                    persisted_retry_authorization_binding_sha256=(
+                        persisted_retry_digest
+                    ),
                 )
                 await self._replay_store.fail(
                     pending,
@@ -1006,6 +1031,8 @@ class FactorySkillReplayRecord:
     checkpoint_ref: ArtifactRef | None = None
     terminal_receipt_ref: ArtifactRef | None = None
     resume_ordinal: int = 0
+    runtime_retry_authorization_ref: ArtifactRef | None = None
+    runtime_retry_authorization_binding_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if self.invocation_sha256 != _factory_invocation_digest(self.invocation):
@@ -1014,6 +1041,33 @@ class FactorySkillReplayRecord:
             raise FactoryDispatchError("factory skill replay claim token is missing")
         if isinstance(self.resume_ordinal, bool) or not 0 <= self.resume_ordinal <= 2:
             raise FactoryDispatchError("factory skill replay resume ordinal is invalid")
+        retry_binding = (
+            self.runtime_retry_authorization_ref,
+            self.runtime_retry_authorization_binding_sha256,
+        )
+        if any(value is None for value in retry_binding) != all(
+            value is None for value in retry_binding
+        ):
+            raise FactoryDispatchError(
+                "factory skill replay retry authority binding is incomplete"
+            )
+        if self.resume_ordinal == 0 and any(
+            value is not None for value in retry_binding
+        ):
+            raise FactoryDispatchError(
+                "original factory skill replay cannot bind retry authority"
+            )
+        if (
+            self.runtime_retry_authorization_binding_sha256 is not None
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                self.runtime_retry_authorization_binding_sha256,
+            )
+            is None
+        ):
+            raise FactoryDispatchError(
+                "factory skill replay retry authority digest is invalid"
+            )
         if self.state == "pending" and any(
             item is not None
             for item in (
@@ -1581,6 +1635,7 @@ class FilesystemFactorySkillReplayStore:
             if schema not in {
                 "captain.factory-skill-replay.v2",
                 "captain.factory-skill-replay.v3",
+                "captain.factory-skill-replay.v4",
             }:
                 raise ValueError("replay record schema is unsupported")
             invocation = FactorySkillInvocationV1.model_validate(value["invocation"])
@@ -1612,6 +1667,16 @@ class FilesystemFactorySkillReplayStore:
                     else None
                 ),
                 resume_ordinal=value.get("resume_ordinal", 0),
+                runtime_retry_authorization_ref=(
+                    ArtifactRef.model_validate(
+                        value["runtime_retry_authorization_ref"]
+                    )
+                    if value.get("runtime_retry_authorization_ref") is not None
+                    else None
+                ),
+                runtime_retry_authorization_binding_sha256=value.get(
+                    "runtime_retry_authorization_binding_sha256"
+                ),
             )
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise FactoryDispatchError("factory skill replay record is invalid") from exc
@@ -1620,7 +1685,7 @@ class FilesystemFactorySkillReplayStore:
 def _factory_skill_replay_content(record: FactorySkillReplayRecord) -> bytes:
     return _canonical_json(
         {
-            "schema": "captain.factory-skill-replay.v3",
+            "schema": "captain.factory-skill-replay.v4",
             "state": record.state,
             "invocation_sha256": record.invocation_sha256,
             "claim_token": record.claim_token,
@@ -1647,6 +1712,14 @@ def _factory_skill_replay_content(record: FactorySkillReplayRecord) -> bytes:
                 else record.terminal_receipt_ref.model_dump(mode="json")
             ),
             "resume_ordinal": record.resume_ordinal,
+            "runtime_retry_authorization_ref": (
+                None
+                if record.runtime_retry_authorization_ref is None
+                else record.runtime_retry_authorization_ref.model_dump(mode="json")
+            ),
+            "runtime_retry_authorization_binding_sha256": (
+                record.runtime_retry_authorization_binding_sha256
+            ),
         }
     ).encode("utf-8")
 
@@ -1683,6 +1756,12 @@ def _completed_replay_record(
         artifact=artifact,
         transcript_ref=transcript_ref,
         resume_ordinal=pending.resume_ordinal,
+        runtime_retry_authorization_ref=(
+            pending.runtime_retry_authorization_ref
+        ),
+        runtime_retry_authorization_binding_sha256=(
+            pending.runtime_retry_authorization_binding_sha256
+        ),
     )
 
 
@@ -1702,6 +1781,12 @@ def _failed_replay_record(
         state="failed",
         failure_kind=failure_kind,
         resume_ordinal=pending.resume_ordinal,
+        runtime_retry_authorization_ref=(
+            pending.runtime_retry_authorization_ref
+        ),
+        runtime_retry_authorization_binding_sha256=(
+            pending.runtime_retry_authorization_binding_sha256
+        ),
     )
 
 
@@ -1725,6 +1810,12 @@ def _interrupted_replay_record(
         checkpoint_ref=checkpoint_ref,
         terminal_receipt_ref=terminal_receipt_ref,
         resume_ordinal=resume_ordinal,
+        runtime_retry_authorization_ref=(
+            pending.runtime_retry_authorization_ref
+        ),
+        runtime_retry_authorization_binding_sha256=(
+            pending.runtime_retry_authorization_binding_sha256
+        ),
     )
 
 
@@ -1782,6 +1873,12 @@ def _resumed_replay_record(
         claim_token=uuid4().hex,
         state="pending",
         resume_ordinal=authorization.resume_ordinal,
+        runtime_retry_authorization_ref=authorization.authorization_ref,
+        runtime_retry_authorization_binding_sha256=hashlib.sha256(
+            _canonical_json(
+                authorization.model_dump(mode="json", by_alias=True)
+            ).encode("utf-8")
+        ).hexdigest(),
     )
 
 

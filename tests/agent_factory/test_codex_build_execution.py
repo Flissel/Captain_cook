@@ -699,6 +699,8 @@ async def test_replay_rejects_changed_retry_authority_before_advancing_checkpoin
                 "runtime_retry_authorization_binding_sha256": hashlib.sha256(
                     canonical_factory_codex_model(authorization)
                 ).hexdigest(),
+                "runtime_retry_authorization_issued_at": authorization.issued_at,
+                "runtime_retry_authorization_expires_at": authorization.expires_at,
                 "parent_terminal_receipt_sha256": receipt_sha256,
                 "parent_journal_sha256": "e" * 64,
                 "updated_at": NOW + timedelta(seconds=3),
@@ -3122,6 +3124,162 @@ async def test_authorized_resume_rejects_completion_after_authorization_expiry(
     assert (
         state_root / "sessions" / f"{invocation.idempotency_key}.json"
     ).is_file()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume_ordinal", [1, 2])
+async def test_terminal_resume_failure_reconciles_from_persisted_authority_after_expiry(
+    tmp_path: Path,
+    resume_ordinal: int,
+) -> None:
+    """Removing tokenless terminal reconciliation would strand the SEAL replay."""
+
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+    current = NOW
+    outcomes = ["timed_out"] * resume_ordinal + ["failed"]
+    runner_calls = 0
+
+    class RecoveringPreparer:
+        def prepare_or_recover(self, _request, _invocation, _brief, _checkpoint):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    class TerminalRunner:
+        def __init__(self, journal_path: Path, outcome: str) -> None:
+            self.journal_path = journal_path
+            self.outcome = outcome
+
+        async def run(self, _authorized: AuthorizedCodexRun) -> CodexRunResult:
+            lines = (
+                json.dumps(
+                    {"type": "thread.started", "thread_id": "codex-thread-123"}
+                ),
+                json.dumps({"type": "turn.completed"}),
+            )
+            journal = "".join(f"{line}\n" for line in lines).encode("utf-8")
+            self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+            self.journal_path.write_bytes(journal)
+            failed = self.outcome == "failed"
+            return CodexRunResult(
+                exit_code=17 if failed else 124,
+                terminal_status="failed" if failed else "timed_out",
+                process_cleanup_status=(
+                    "not_required" if failed else "verified_cancelled"
+                ),
+                journal_path=self.journal_path,
+                journal_sha256=hashlib.sha256(journal).hexdigest(),
+                artifact_references=(),
+                jsonl_lines=lines,
+            )
+
+    def runner_factory(**kwargs):
+        nonlocal runner_calls
+        outcome = outcomes[runner_calls]
+        runner_calls += 1
+        return TerminalRunner(kwargs["journal_path"], outcome)
+
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=RecoveringPreparer(),
+        artifact_reader=artifact_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=runner_factory,
+        resume_authorizer=CaptainFactoryCodexResumeAuthorizer(
+            clock=lambda: current
+        ),
+        clock=lambda: current,
+    )
+    dispatch = _dispatch(job, invocation)
+    with pytest.raises(FactoryCodexBuildInterrupted):
+        await executor.execute(dispatch, invocation, brief)
+
+    authorized = dispatch
+    for ordinal in range(1, resume_ordinal + 1):
+        checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
+            state_root / "checkpoints"
+        ).load(invocation)
+        assert checkpoint is not None
+        current = invocation.lease.expires_at + timedelta(seconds=ordinal)
+        authorized = _authorized_runtime_retry_dispatch(
+            dispatch,
+            invocation,
+            checkpoint,
+            issued_at=current,
+            expires_at=current + timedelta(minutes=2),
+        )
+        if ordinal < resume_ordinal:
+            with pytest.raises(FactoryCodexBuildInterrupted):
+                await executor.execute_authorized_resume(
+                    authorized,
+                    invocation,
+                    brief,
+                )
+        else:
+            with pytest.raises(FactoryDispatchError, match="process failed"):
+                await executor.execute_authorized_resume(
+                    authorized,
+                    invocation,
+                    brief,
+                )
+
+    authorization = authorized.runtime_retry_authorization
+    assert authorization is not None
+    failed_checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert failed_checkpoint is not None
+    assert failed_checkpoint.phase == "implementation_failed"
+    assert failed_checkpoint.resume_ordinal == resume_ordinal
+    checkpoint_path = (
+        state_root / "checkpoints" / f"{invocation.invocation_id.hex}.json"
+    )
+    checkpoint_bytes = checkpoint_path.read_bytes()
+    persisted_binding_sha256 = hashlib.sha256(
+        canonical_factory_codex_model(authorization)
+    ).hexdigest()
+    tokenless = replace(authorized, runtime_retry_authorization=None)
+    current = job.deadline_at + timedelta(seconds=1)
+
+    with pytest.raises(FactoryDispatchError, match="resume ordinal"):
+        executor.reconcile_failed(
+            tokenless,
+            invocation,
+            brief,
+            persisted_resume_ordinal=resume_ordinal - 1,
+            persisted_retry_authorization_ref=authorization.authorization_ref,
+            persisted_retry_authorization_binding_sha256=persisted_binding_sha256,
+        )
+    assert checkpoint_path.read_bytes() == checkpoint_bytes
+
+    with pytest.raises(FactoryDispatchError, match="retry authority"):
+        executor.reconcile_failed(
+            tokenless,
+            invocation,
+            brief,
+            persisted_resume_ordinal=resume_ordinal,
+            persisted_retry_authorization_ref=authorization.authorization_ref,
+            persisted_retry_authorization_binding_sha256="0" * 64,
+        )
+    assert checkpoint_path.read_bytes() == checkpoint_bytes
+
+    recovered = executor.reconcile_failed(
+        tokenless,
+        invocation,
+        brief,
+        persisted_resume_ordinal=resume_ordinal,
+        persisted_retry_authorization_ref=authorization.authorization_ref,
+        persisted_retry_authorization_binding_sha256=persisted_binding_sha256,
+    )
+
+    assert recovered.reason == "runtime_failed"
+    assert runner_calls == resume_ordinal + 1
+    assert checkpoint_path.read_bytes() == checkpoint_bytes
 
 
 @pytest.mark.asyncio
