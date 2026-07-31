@@ -8,6 +8,7 @@ import pytest
 from agenten.agent_factory.technical_improvement_contracts import (
     CaptainTechnicalFailureEvaluationV1,
     build_captain_technical_failure_evaluation,
+    captain_technical_failure_evaluation_binding,
     validate_captain_technical_failure_evaluation,
 )
 from agenten.agent_factory.contracts import (
@@ -86,6 +87,17 @@ def test_technical_failure_evaluation_is_content_bound_and_retains_prior_green()
 
     assert evaluation.artifact_ref.uri.endswith(evaluation.artifact_ref.sha256)
     assert evaluation.prior_green_regression_ids == ("safe_tool_use",)
+    assert validate_captain_technical_failure_evaluation(evaluation) is evaluation
+
+
+def test_v1_binding_preserves_legacy_identity_when_diagnostics_are_absent() -> None:
+    evaluation = _evaluation()
+
+    assert evaluation.technical_diagnostic_codes == ()
+    assert (
+        "technical_diagnostic_codes"
+        not in captain_technical_failure_evaluation_binding(evaluation)
+    )
     assert validate_captain_technical_failure_evaluation(evaluation) is evaluation
 
 

@@ -123,11 +123,6 @@ class CaptainTechnicalFailureEvaluationV1(BaseModel):
         )
         if self.prior_green_regression_ids != passed_ids:
             raise ValueError("technical prior-green assertions must be exactly the passed assertions")
-        if (
-            self.source_phase is FactoryPhase.BUILD_FAILED
-            and not self.technical_diagnostic_codes
-        ):
-            raise ValueError("build failure evaluation requires a technical diagnostic code")
         return self
 
 
@@ -196,11 +191,16 @@ def build_captain_technical_failure_evaluation(
 def captain_technical_failure_evaluation_binding(
     evaluation: CaptainTechnicalFailureEvaluationV1,
 ) -> dict[str, object]:
-    return evaluation.model_dump(
+    binding = evaluation.model_dump(
         mode="json",
         by_alias=True,
         exclude={"artifact_ref"},
     )
+    if not evaluation.technical_diagnostic_codes:
+        # Preserve the content identity of historical v1 evaluations created
+        # before bounded diagnostic codes were added.
+        binding.pop("technical_diagnostic_codes", None)
+    return binding
 
 
 def captain_technical_failure_evaluation_sha256(

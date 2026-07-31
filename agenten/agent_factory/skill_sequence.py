@@ -507,11 +507,22 @@ def build_factory_improvement_authorization(
 def factory_improvement_authorization_binding(
     authorization: FactoryImprovementAuthorizationV1,
 ) -> dict[str, object]:
-    return authorization.model_dump(
+    binding = authorization.model_dump(
         mode="json",
         by_alias=True,
         exclude={"authorization_ref"},
     )
+    failed = binding.get("failed_evaluation")
+    if (
+        isinstance(failed, dict)
+        and failed.get("schema")
+        == "captain.factory-technical-failure-evaluation.v1"
+        and not failed.get("technical_diagnostic_codes")
+    ):
+        # Preserve historical v1 authorization digests while allowing new
+        # evaluations to carry bounded repair diagnostics.
+        failed.pop("technical_diagnostic_codes", None)
+    return binding
 
 
 def factory_improvement_authorization_sha256(
