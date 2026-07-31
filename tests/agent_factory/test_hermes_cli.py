@@ -34,7 +34,10 @@ from agenten.agent_factory.hermes_cli import (
     _require_improvement_artifact_binding,
     InMemoryFactorySkillReplayStore,
 )
-from agenten.agent_factory.codex_build_execution import FactoryCodexBuildInterrupted
+from agenten.agent_factory.codex_build_execution import (
+    FactoryCodexBuildFailed,
+    FactoryCodexBuildInterrupted,
+)
 from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
 from agenten.agent_factory.skill_sequence import (
@@ -1762,6 +1765,198 @@ async def test_authorized_runtime_retry_resumes_only_seal_without_new_hermes_cal
     assert sealer.calls[1][1] == sealer.calls[0][1]
     assert sealer.calls[1][2] == sealer.calls[0][2]
     assert factory_job.private_holdout_refs == tool_request.job.private_holdout_refs
+
+
+@pytest.mark.asyncio
+async def test_restart_reconciles_durable_codex_failure_to_failed_replay_without_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 7, 19, 10, tzinfo=timezone.utc)
+    factory_job = job_v3(mode="demo").model_copy(
+        update={"deadline_at": now + timedelta(minutes=30)}
+    )
+    architect_lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.AGENT_ARCHITECT,
+        attempt=1,
+        workspace_ref="workspace://factory/failed-recovery/discovery",
+        now=now,
+    )
+    tool_lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/failed-recovery/build",
+        now=now,
+    )
+    checkpoint_ref = ArtifactRef(
+        uri=f"artifact://factory/codex-checkpoint/{'c' * 64}",
+        sha256="c" * 64,
+        media_type="application/json",
+    )
+    receipt_ref = ArtifactRef(
+        uri=f"artifact://factory/codex-terminal-receipt/{'d' * 64}",
+        sha256="d" * 64,
+        media_type="application/json",
+    )
+    durable_failure = FactoryCodexBuildFailed(
+        reason="runtime_failed",
+        checkpoint_ref=checkpoint_ref,
+        terminal_receipt_ref=receipt_ref,
+    )
+    prompts: list[str] = []
+
+    class PromptStore:
+        def persist(self, job_id: UUID, content: bytes) -> ArtifactRef:
+            digest = hashlib.sha256(content).hexdigest()
+            return ArtifactRef(
+                uri=f"artifact://factory-prompts/{job_id}/{digest}",
+                sha256=digest,
+                media_type="application/json",
+            )
+
+    class Process:
+        returncode = 0
+
+        def __init__(self, prompt: str) -> None:
+            self.prompt = prompt
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            prompts.append(self.prompt)
+            digest_prefix = "captain_codex_brief_seed_sha256="
+            if digest_prefix in self.prompt:
+                digest = next(
+                    line.removeprefix(digest_prefix)
+                    for line in self.prompt.splitlines()
+                    if line.startswith(digest_prefix)
+                )
+                return json.dumps(
+                    {
+                        "schema": "hermes.factory-codex-brief-attestation.v1",
+                        "invocation_id": _invocation_from_prompt(self.prompt)[
+                            "invocation_id"
+                        ],
+                        "seed_sha256": digest,
+                        "accepted": True,
+                    }
+                ).encode(), b""
+            return json.dumps(_typed_payload(self.prompt)).encode(), b""
+
+    async def create_process(*command: str, **__: object) -> Process:
+        return Process(command[-1])
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    class DurableFailureSealer:
+        def __init__(self) -> None:
+            self.seal_calls = 0
+            self.reconcile_calls = 0
+
+        async def seal(self, *_args: object) -> CodexBuildEvidenceV1:
+            self.seal_calls += 1
+            raise durable_failure
+
+        async def reconcile_pending(self, *_args: object) -> CodexBuildEvidenceV1:
+            self.reconcile_calls += 1
+            raise durable_failure
+
+    replay_root = tmp_path / "failed-replays"
+
+    class CrashBeforeReplayFailureStore(FilesystemFactorySkillReplayStore):
+        async def fail(self, *args: object, **kwargs: object):
+            del args, kwargs
+            raise RuntimeError("simulated host crash before replay fail")
+
+    sealer = DurableFailureSealer()
+    catalog = _catalog_for(
+        tmp_path,
+        FactorySkillStep.DISCOVER,
+        FactorySkillStep.BRIEF_CODEX,
+        FactorySkillStep.SEAL_CODEX_BUILD,
+    )
+    settings = HermesCliSettings(
+        skill_root=tmp_path,
+        working_directory=_CAPTAIN_WORKSPACE_ROOT,
+        evidence_root=tmp_path / "evidence",
+    )
+    prompt_store = PromptStore()
+    await HermesCliFactory(
+        settings=settings,
+        released_skill_catalog=catalog,
+        replay_store=CrashBeforeReplayFailureStore(replay_root),
+        codex_build_sealer=sealer,
+        codex_prompt_artifact_store=prompt_store,
+        clock=lambda: now,
+    ).dispatch(
+        FactoryDispatch(
+            job=factory_job,
+            action=FactoryAction(
+                kind=FactoryActionKind.DISPATCH_AGENT_ARCHITECT,
+                attempt=1,
+                job_id=factory_job.job_id,
+            ),
+            role=FactoryRole.AGENT_ARCHITECT,
+            lease=architect_lease,
+        )
+    )
+    tool_request = FactoryDispatch(
+        job=factory_job,
+        action=FactoryAction(
+            kind=FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,
+            attempt=1,
+            job_id=factory_job.job_id,
+        ),
+        role=FactoryRole.TOOL_INTEGRATOR,
+        lease=tool_lease,
+    )
+    first_factory = HermesCliFactory(
+        settings=settings,
+        released_skill_catalog=catalog,
+        replay_store=CrashBeforeReplayFailureStore(replay_root),
+        codex_build_sealer=sealer,
+        codex_prompt_artifact_store=prompt_store,
+        clock=lambda: now,
+    )
+
+    with pytest.raises(FactoryDispatchError, match="failure state could not be persisted"):
+        await first_factory.dispatch(tool_request)
+
+    pending = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in replay_root.glob("*.json")
+        if json.loads(path.read_text(encoding="utf-8"))["state"] == "pending"
+    ]
+    assert len(pending) == 1
+
+    restarted = HermesCliFactory(
+        settings=settings,
+        released_skill_catalog=catalog,
+        replay_store=FilesystemFactorySkillReplayStore(replay_root),
+        codex_build_sealer=sealer,
+        codex_prompt_artifact_store=prompt_store,
+        clock=lambda: now,
+    )
+    with pytest.raises(FactoryCodexBuildFailed) as recovered:
+        await restarted.dispatch(tool_request)
+
+    assert recovered.value.reason == "runtime_failed"
+    assert sealer.seal_calls == 1
+    assert sealer.reconcile_calls == 1
+    assert len(prompts) == 2
+    failed = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in replay_root.glob("*.json")
+        if json.loads(path.read_text(encoding="utf-8"))["state"] == "failed"
+    ]
+    assert len(failed) == 1
+    assert failed[0]["failure_kind"] == "FactoryCodexBuildFailed"
+
+    with pytest.raises(FactoryDispatchError, match="previously failed"):
+        await restarted.dispatch(tool_request)
+    assert sealer.seal_calls == 1
+    assert sealer.reconcile_calls == 1
+    assert len(prompts) == 2
 
 
 @pytest.mark.asyncio

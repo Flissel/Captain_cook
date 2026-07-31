@@ -17,6 +17,7 @@ from agenten.agent_factory.codex_build_execution import (
     CodexCliFactoryBuildExecutor,
     CodexCliFactoryBuildSettings,
     CompletedCodexBuild,
+    FactoryCodexBuildFailed,
     FactoryCodexBuildInterrupted,
     FactoryCodexEvidenceFailure,
     FactoryCodexProcessState,
@@ -1593,6 +1594,9 @@ async def test_nonzero_terminal_result_persists_receipt_and_fails_terminally(
         def prepare(self, *_args):
             return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
 
+        def prepare_or_recover(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
     class FailedRunner(SuccessfulRunner):
         async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
             result = await super().run(authorized)
@@ -1634,6 +1638,39 @@ async def test_nonzero_terminal_result_persists_receipt_and_fails_terminally(
     assert (
         state_root / "sessions" / f"{invocation.idempotency_key}.json"
     ).is_file()
+
+    with pytest.raises(FactoryCodexBuildFailed) as caught:
+        await executor.reconcile_pending(
+            _dispatch(job, invocation),
+            invocation,
+            brief,
+        )
+
+    assert str(caught.value) == "Factory Codex build failed"
+    assert caught.value.reason == "runtime_failed"
+    assert caught.value.checkpoint_ref.sha256 == hashlib.sha256(
+        canonical_factory_codex_model(checkpoint)
+    ).hexdigest()
+    assert caught.value.terminal_receipt_ref.sha256 == checkpoint.terminal_receipt_sha256
+    assert len(caught.value.args) == 1
+
+    checkpoint_path = state_root / "checkpoints" / f"{invocation.invocation_id.hex}.json"
+    checkpoint_bytes = checkpoint_path.read_bytes()
+    receipt_path = state_root / "sessions" / f"{invocation.idempotency_key}.json"
+    receipt_bytes = receipt_path.read_bytes()
+    receipt_path.unlink()
+    with pytest.raises(FactoryDispatchError, match="receipt.*missing|missing.*receipt"):
+        await executor.reconcile_pending(_dispatch(job, invocation), invocation, brief)
+    assert checkpoint_path.read_bytes() == checkpoint_bytes
+
+    receipt_path.write_bytes(receipt_bytes)
+    journal_path = state_root / "journals" / f"{invocation.idempotency_key}.jsonl"
+    journal_bytes = journal_path.read_bytes()
+    journal_path.write_text('{"type":"tampered"}\n', encoding="utf-8")
+    with pytest.raises(FactoryDispatchError, match="journal.*digest|digest.*journal"):
+        await executor.reconcile_pending(_dispatch(job, invocation), invocation, brief)
+    assert checkpoint_path.read_bytes() == checkpoint_bytes
+    journal_path.write_bytes(journal_bytes)
 
 
 @pytest.mark.asyncio
@@ -3070,6 +3107,11 @@ async def test_authorized_resume_rejects_completion_after_authorization_expiry(
     assert failed is not None
     assert failed.phase == "implementation_failed"
     assert failed.implementation_failure_reason == "authority_expired"
+
+    with pytest.raises(FactoryCodexBuildFailed) as recovered:
+        await executor.reconcile_pending(authorized, invocation, brief)
+    assert recovered.value.reason == "authority_expired"
+    assert runner_count == 2
     assert failed.terminal_receipt_sha256 is not None
     assert (
         state_root / "sessions" / f"{invocation.idempotency_key}.json"
@@ -3913,6 +3955,14 @@ async def test_restart_reconciliation_terminalizes_durable_output_evidence_failu
     assert checkpoint.terminal_receipt_sha256 == hashlib.sha256(receipt).hexdigest()
     assert caught.value.process_cleanup_status == "verified_cancelled"
     assert caught.value.terminal_receipt_ref.sha256 == hashlib.sha256(receipt).hexdigest()
+    assert runner_calls() == 1
+
+    with pytest.raises(FactoryCodexBuildFailed) as recovered:
+        await executor.reconcile_pending(dispatch, invocation, brief)
+    assert recovered.value.reason == "evidence_failure"
+    assert recovered.value.terminal_receipt_ref.sha256 == hashlib.sha256(
+        receipt
+    ).hexdigest()
     assert runner_calls() == 1
 
 

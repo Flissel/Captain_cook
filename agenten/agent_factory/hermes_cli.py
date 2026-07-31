@@ -32,7 +32,10 @@ from agenten.agent_factory.codex_brief import (
     CodexBriefBuilder,
     CodexPromptArtifactStore,
 )
-from agenten.agent_factory.codex_build_execution import FactoryCodexBuildInterrupted
+from agenten.agent_factory.codex_build_execution import (
+    FactoryCodexBuildFailed,
+    FactoryCodexBuildInterrupted,
+)
 from agenten.agent_factory.evidence_store import FactoryEvidenceStore, FilesystemFactoryEvidenceStore
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError, HermesFactoryPort
 from agenten.agent_factory.skill_evaluation import (
@@ -507,6 +510,17 @@ class HermesCliFactory(HermesFactoryPort):
                 request.job,
                 artifact.model_dump_json(by_alias=True).encode("utf-8"),
             )
+        except FactoryCodexBuildFailed as exc:
+            try:
+                await self._replay_store.fail(
+                    pending,
+                    failure_kind=type(exc).__name__,
+                )
+            except Exception as replay_exc:
+                raise FactoryDispatchError(
+                    "factory skill failure reconciliation could not be persisted"
+                ) from replay_exc
+            raise
         except FactoryCodexBuildInterrupted as exc:
             try:
                 if exc.resume_ordinal == pending.resume_ordinal:

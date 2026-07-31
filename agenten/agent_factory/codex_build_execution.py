@@ -106,6 +106,14 @@ FactoryCodexBuildInterruptionReason = Literal[
     "resume_authorization_required",
 ]
 
+FactoryCodexBuildFailureReason = Literal[
+    "required_output_invalid",
+    "output_size_limit_exceeded",
+    "runtime_failed",
+    "authority_expired",
+    "evidence_failure",
+]
+
 FactoryCodexProcessState = Literal["active", "lost", "identity_mismatch"]
 
 
@@ -175,6 +183,30 @@ class FactoryCodexBuildInterrupted(FactoryDispatchError):
         self.terminal_receipt_ref = terminal_receipt_ref
         self.resume_ordinal = resume_ordinal
         self.authorization_binding = authorization_binding
+
+
+class FactoryCodexBuildFailed(FactoryDispatchError):
+    """Redacted terminal failure recovered from exact durable build evidence."""
+
+    def __init__(
+        self,
+        *,
+        reason: FactoryCodexBuildFailureReason,
+        checkpoint_ref: ArtifactRef,
+        terminal_receipt_ref: ArtifactRef,
+    ) -> None:
+        if reason not in {
+            "required_output_invalid",
+            "output_size_limit_exceeded",
+            "runtime_failed",
+            "authority_expired",
+            "evidence_failure",
+        }:
+            raise ValueError("Factory Codex failure reason is invalid")
+        super().__init__("Factory Codex build failed")
+        self.reason = reason
+        self.checkpoint_ref = checkpoint_ref
+        self.terminal_receipt_ref = terminal_receipt_ref
 
 
 class FactoryCodexOutputCaptureError(FactoryDispatchError):
@@ -960,7 +992,11 @@ class CodexCliFactoryBuildExecutor:
             prepared.root,
             checkpoint,
         )
-        if checkpoint.phase in {"implementation_running", "implementation_complete"}:
+        if checkpoint.phase in {
+            "implementation_running",
+            "implementation_complete",
+            "implementation_failed",
+        }:
             self._require_checkpoint_runtime_retry_authority(request, checkpoint)
         if checkpoint.phase == "sealed":
             raise FactoryDispatchError(
@@ -993,6 +1029,14 @@ class CodexCliFactoryBuildExecutor:
                 exit_code=int(receipt["exit_code"]),
                 **_interruption_details(request, invocation, checkpoint),
             )
+        if checkpoint.phase == "implementation_failed":
+            raise self._reconcile_failed(
+                request=request,
+                invocation=invocation,
+                brief=brief,
+                prepared=prepared,
+                checkpoint=checkpoint,
+            )
         if checkpoint.phase != "implementation_running":
             raise FactoryDispatchError(
                 "Factory Codex pending seal checkpoint is not reconcilable"
@@ -1023,6 +1067,87 @@ class CodexCliFactoryBuildExecutor:
                 **_interruption_details(request, invocation, checkpoint),
             )
         return self._seal_phase(invocation, prepared, checkpoint)
+
+    def _reconcile_failed(
+        self,
+        *,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+        prepared: PreparedFactoryWorkspace,
+        checkpoint: FactoryCodexBuildCheckpointV1,
+    ) -> FactoryCodexBuildFailed:
+        reason = checkpoint.implementation_failure_reason
+        receipt_sha256 = checkpoint.terminal_receipt_sha256
+        if reason is None or receipt_sha256 is None:
+            raise FactoryDispatchError(
+                "Factory Codex failed checkpoint evidence is incomplete"
+            )
+        terminal = self._load_terminal_evidence(
+            request=request,
+            invocation=invocation,
+            brief=brief,
+            prepared=prepared,
+            checkpoint=checkpoint,
+        )
+        if self._output_manifest_store.load_pending(invocation) is not None:
+            raise FactoryDispatchError(
+                "Factory Codex failed checkpoint conflicts with output capture"
+            )
+        authority_start = invocation.lease.issued_at
+        if checkpoint.resume_ordinal > 0:
+            authorization = request.runtime_retry_authorization
+            if authorization is None:
+                raise FactoryDispatchError(
+                    "Factory Codex failed reconciliation requires retry authority"
+                )
+            authority_start = authorization.issued_at
+        authority_deadline = self._authority_deadline(
+            request,
+            invocation,
+            authorized_resume=checkpoint.resume_ordinal > 0,
+        )
+        within_authority = (
+            authority_start <= terminal.completed_at < authority_deadline
+        )
+        status = terminal.payload["status"]
+        cleanup = terminal.payload["process_cleanup_status"]
+        shape_is_valid = {
+            "runtime_failed": status == "failed",
+            "authority_expired": (
+                status == "succeeded"
+                and terminal.completed_at >= authority_deadline
+            ),
+            "required_output_invalid": status == "succeeded" and within_authority,
+            "output_size_limit_exceeded": status == "succeeded" and within_authority,
+            "evidence_failure": (
+                status == "evidence_failed"
+                and cleanup in {"not_required", "verified_cancelled"}
+            ),
+        }[reason]
+        if not shape_is_valid:
+            raise FactoryDispatchError(
+                "Factory Codex failed checkpoint terminal evidence conflicts"
+            )
+        checkpoint_sha256 = hashlib.sha256(
+            canonical_factory_codex_model(checkpoint)
+        ).hexdigest()
+        return FactoryCodexBuildFailed(
+            reason=reason,
+            checkpoint_ref=ArtifactRef(
+                uri=f"artifact://factory/codex-checkpoint/{checkpoint_sha256}",
+                sha256=checkpoint_sha256,
+                media_type="application/json",
+            ),
+            terminal_receipt_ref=ArtifactRef(
+                uri=(
+                    "artifact://factory/codex-terminal-receipt/"
+                    f"{receipt_sha256}"
+                ),
+                sha256=receipt_sha256,
+                media_type="application/json",
+            ),
+        )
 
     async def _execute(
         self,
@@ -1870,6 +1995,8 @@ class CodexCliFactoryBuildExecutor:
             124: ("timed_out", {"not_required", "verified_cancelled", "unresolved"}),
             130: ("cancelled", {"not_required", "verified_cancelled", "unresolved"}),
         }.get(exit_code)
+        if expected_terminal is None and exit_code not in {0, 124, 130}:
+            expected_terminal = ("failed", {"not_required"})
         if (
             expected_terminal is None
             or status != expected_terminal[0]
