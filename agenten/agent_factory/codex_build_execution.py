@@ -37,6 +37,7 @@ from agenten.agent_factory.codex_build_recovery import (
     canonical_factory_codex_model,
 )
 from agenten.agent_factory.contracts import AgentFactoryJobV3
+from agenten.agent_factory.forge_contracts import CodexBuildReceiptV1
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
 from agenten.agent_factory.skill_sequence import (
     FactoryRuntimeRetryAuthorizationV1,
@@ -321,6 +322,13 @@ class CaptainCodexBuildExecutorPort(Protocol):
         completed: CompletedCodexBuild,
     ) -> None: ...
 
+    def validate_issued_receipt(
+        self,
+        invocation: FactorySkillInvocationV1,
+        completed: CompletedCodexBuild,
+        receipt: CodexBuildReceiptV1,
+    ) -> None: ...
+
     def persist_sealed(
         self,
         invocation: FactorySkillInvocationV1,
@@ -564,6 +572,7 @@ class CaptainCodexBuildSealer:
             test_evidence_paths=completed.test_evidence_paths,
             completed_at=completed.completed_at,
         )
+        self._executor.validate_issued_receipt(invocation, completed, receipt)
         receipt_ref = self._issuer.persist_receipt(receipt)
         workflow_receipt_ref = ArtifactRef.model_validate(
             receipt_ref.model_dump(mode="json")
@@ -1513,7 +1522,6 @@ class CodexCliFactoryBuildExecutor:
                 invocation=invocation,
                 manifest=manifest,
                 manifest_sha256=output_manifest_sha256,
-                workspace_root=prepared.root,
                 resume_ordinal=checkpoint.resume_ordinal,
                 terminal_receipt_sha256=receipt_sha256,
             )
@@ -1776,7 +1784,6 @@ class CodexCliFactoryBuildExecutor:
         output_snapshot_root = self._validate_output_manifest(
             invocation=invocation,
             checkpoint=checkpoint,
-            workspace_root=prepared.root,
         )
         try:
             receipt_payload = json.loads(session_receipt)
@@ -1809,7 +1816,6 @@ class CodexCliFactoryBuildExecutor:
             self._validate_output_manifest(
                 invocation=invocation,
                 checkpoint=checkpoint,
-                workspace_root=checkpoint.workspace_root,
             )
         evidence = self._sealed_evidence_store.load(invocation)
         if evidence is None:
@@ -1841,7 +1847,6 @@ class CodexCliFactoryBuildExecutor:
             self._validate_output_manifest(
                 invocation=invocation,
                 checkpoint=checkpoint,
-                workspace_root=checkpoint.workspace_root,
             )
         evidence = self._sealed_evidence_store.load(invocation)
         if (
@@ -1874,7 +1879,6 @@ class CodexCliFactoryBuildExecutor:
         output_snapshot_root = self._validate_output_manifest(
             invocation=invocation,
             checkpoint=checkpoint,
-            workspace_root=completed.workspace_root,
         )
         if (
             completed.output_snapshot_root is None
@@ -1883,6 +1887,22 @@ class CodexCliFactoryBuildExecutor:
             raise FactoryDispatchError(
                 "Factory Codex completed snapshot binding changed"
             )
+
+    def validate_issued_receipt(
+        self,
+        invocation: FactorySkillInvocationV1,
+        completed: CompletedCodexBuild,
+        receipt: CodexBuildReceiptV1,
+    ) -> None:
+        self.validate_completed_outputs(invocation, completed)
+        checkpoint = self._checkpoint_store.load(invocation)
+        if checkpoint is None or checkpoint.phase != "implementation_complete":
+            raise FactoryDispatchError("Factory Codex build is not ready to seal")
+        self._require_build_receipt_output_binding(
+            invocation,
+            checkpoint,
+            receipt,
+        )
 
     def persist_sealed(
         self,
@@ -1916,7 +1936,6 @@ class CodexCliFactoryBuildExecutor:
         self._validate_output_manifest(
             invocation=invocation,
             checkpoint=checkpoint,
-            workspace_root=checkpoint.workspace_root,
         )
         if (
             checkpoint.terminal_receipt_sha256
@@ -1988,7 +2007,6 @@ class CodexCliFactoryBuildExecutor:
         *,
         invocation: FactorySkillInvocationV1,
         checkpoint: FactoryCodexBuildCheckpointV1,
-        workspace_root: Path,
     ) -> Path:
         uri = checkpoint.output_manifest_uri
         digest = checkpoint.output_manifest_sha256
@@ -2005,7 +2023,6 @@ class CodexCliFactoryBuildExecutor:
             invocation=invocation,
             manifest=manifest,
             manifest_sha256=digest,
-            workspace_root=workspace_root,
             resume_ordinal=checkpoint.resume_ordinal,
             terminal_receipt_sha256=checkpoint.terminal_receipt_sha256,
         )
@@ -2036,7 +2053,6 @@ class CodexCliFactoryBuildExecutor:
         invocation: FactorySkillInvocationV1,
         manifest: FactoryCodexOutputManifestV1,
         manifest_sha256: str,
-        workspace_root: Path,
         resume_ordinal: int,
         terminal_receipt_sha256: str | None,
     ) -> Path:
@@ -2052,9 +2068,6 @@ class CodexCliFactoryBuildExecutor:
             raise FactoryDispatchError(
                 "Factory Codex output manifest checkpoint binding changed"
             )
-        current = self._scan_output_artifacts(workspace_root)
-        if current != manifest.artifacts:
-            raise FactoryDispatchError("Codex output artifact binding changed")
         snapshot_root = self._output_manifest_store.snapshot_root(
             manifest,
             sha256=manifest_sha256,
@@ -2228,6 +2241,18 @@ class CodexCliFactoryBuildExecutor:
         checkpoint: FactoryCodexBuildCheckpointV1,
         evidence: CodexBuildEvidenceV1,
     ) -> None:
+        self._require_build_receipt_output_binding(
+            invocation,
+            checkpoint,
+            evidence.build_receipt,
+        )
+
+    def _require_build_receipt_output_binding(
+        self,
+        invocation: FactorySkillInvocationV1,
+        checkpoint: FactoryCodexBuildCheckpointV1,
+        receipt: CodexBuildReceiptV1,
+    ) -> None:
         uri = checkpoint.output_manifest_uri
         digest = checkpoint.output_manifest_sha256
         if uri is None or digest is None:
@@ -2243,17 +2268,42 @@ class CodexCliFactoryBuildExecutor:
             item.relative_path: item.sha256
             for item in manifest.artifacts
         }
-        receipt = evidence.build_receipt
+        candidate_sha256 = by_path["factory-candidate.json"]
+        source_sha256 = by_path["candidate.zip"]
+        test_sha256 = by_path["test-evidence.json"]
         if (
-            receipt.candidate_manifest_ref.sha256
-            != by_path["factory-candidate.json"]
-            or receipt.source_archive_ref.sha256 != by_path["candidate.zip"]
-            or tuple(item.sha256 for item in receipt.test_evidence_refs)
-            != (by_path["test-evidence.json"],)
+            self._artifact_ref_binding(receipt.candidate_manifest_ref)
+            != (
+                "artifact://captain-codex-build/"
+                f"candidate-manifest/{candidate_sha256}",
+                candidate_sha256,
+                "application/json",
+            )
+            or self._artifact_ref_binding(receipt.source_archive_ref)
+            != (
+                f"artifact://captain-codex-build/codex-source/{source_sha256}",
+                source_sha256,
+                "application/zip",
+            )
+            or tuple(
+                self._artifact_ref_binding(item)
+                for item in receipt.test_evidence_refs
+            )
+            != (
+                (
+                    f"artifact://captain-codex-build/test-evidence/{test_sha256}",
+                    test_sha256,
+                    "application/json",
+                ),
+            )
         ):
             raise FactoryDispatchError(
                 "Factory Codex issued receipt output binding changed"
             )
+
+    @staticmethod
+    def _artifact_ref_binding(reference: ArtifactRef) -> tuple[str, str, str]:
+        return reference.uri, reference.sha256, reference.media_type
 
     def _scaffold_files(
         self,

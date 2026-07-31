@@ -86,6 +86,9 @@ class FakeBuildExecutor:
     def validate_completed_outputs(self, _invocation, _completed):
         return None
 
+    def validate_issued_receipt(self, _invocation, _completed, _receipt):
+        return None
+
     def persist_sealed(self, invocation, completed, evidence):
         self.sealed.append((invocation, completed, evidence))
         self.sealed_evidence = evidence
@@ -801,22 +804,33 @@ async def test_replay_rejects_changed_retry_authority_before_advancing_checkpoin
     )
 
     class MismatchedReceiptIssuer(CaptainCodexBuildReceiptIssuer):
+        def __init__(self, artifact_cas: CodexBuildArtifactCas) -> None:
+            super().__init__(artifact_cas)
+            self.persist_calls = 0
+
         def issue(self, **kwargs):
             receipt = super().issue(**kwargs)
             return receipt.model_copy(
                 update={
                     "source_archive_ref": receipt.source_archive_ref.model_copy(
                         update={
-                            "uri": f"artifact://codex-source/{'0' * 64}",
-                            "sha256": "0" * 64,
+                            "uri": (
+                                "artifact://attacker/codex-source/"
+                                f"{receipt.source_archive_ref.sha256}"
+                            ),
                         }
                     )
                 }
             )
 
+        def persist_receipt(self, receipt):
+            self.persist_calls += 1
+            return super().persist_receipt(receipt)
+
+    mismatched_issuer = MismatchedReceiptIssuer(cas)
     mismatch_sealer = CaptainCodexBuildSealer(
         executor=build_executor(checkpoint_store),
-        issuer=MismatchedReceiptIssuer(cas),
+        issuer=mismatched_issuer,
     )
     checkpoint_before_mismatch = checkpoint_store.load(invocation)
     with pytest.raises(
@@ -833,6 +847,8 @@ async def test_replay_rejects_changed_retry_authority_before_advancing_checkpoin
     assert not (
         state_root / "sealed-evidence" / f"{invocation.invocation_id.hex}.json"
     ).exists()
+    assert mismatched_issuer.persist_calls == 0
+    assert not (cas.root / "build-receipt").exists()
 
     crashing_sealer = CaptainCodexBuildSealer(
         executor=build_executor(CrashBeforeSealedCheckpointStore(checkpoint_root)),
@@ -1174,7 +1190,7 @@ async def test_cli_executor_fails_closed_when_codex_omits_required_outputs(
 
 
 @pytest.mark.asyncio
-async def test_implementation_complete_binds_exact_outputs_and_rejects_archive_replacement(
+async def test_implementation_complete_seals_snapshot_after_archive_replacement(
     tmp_path: Path,
 ) -> None:
     job, brief, artifact_reader = _executor_job_and_brief()
@@ -1250,39 +1266,25 @@ async def test_implementation_complete_binds_exact_outputs_and_rejects_archive_r
             uri=checkpoint.output_manifest_uri,
             sha256=checkpoint.output_manifest_sha256,
         )
-    checkpoint_bytes = (
-        state_root / "checkpoints" / f"{invocation.invocation_id.hex}.json"
-    ).read_bytes()
-
     (workspace / "candidate.zip").write_bytes(b"replacement archive")
-
-    class IssuerMustNotRun:
-        def issue(self, **_kwargs):
-            pytest.fail("output mutation must fail before the issuer")
-
+    cas = CodexBuildArtifactCas(tmp_path / "cas")
     sealer = CaptainCodexBuildSealer(
         executor=executor,
-        issuer=IssuerMustNotRun(),
+        issuer=CaptainCodexBuildReceiptIssuer(cas),
     )
-    with pytest.raises(
-        FactoryDispatchError,
-        match="Codex output artifact binding changed",
-    ):
-        sealer._seal_completed(
-            dispatch,
-            invocation,
-            brief,
-            completed,
-        )
-    with pytest.raises(
-        FactoryDispatchError,
-        match="Codex output artifact binding changed",
-    ):
-        await executor.reconcile_pending(dispatch, invocation, brief)
 
-    assert (
-        state_root / "checkpoints" / f"{invocation.invocation_id.hex}.json"
-    ).read_bytes() == checkpoint_bytes
+    evidence = sealer._seal_completed(
+        dispatch,
+        invocation,
+        brief,
+        completed,
+    )
+
+    by_path = {
+        item["relative_path"]: item["sha256"] for item in manifest["artifacts"]
+    }
+    assert evidence.build_receipt.source_archive_ref.sha256 == by_path["candidate.zip"]
+    assert checkpoint_store.load(invocation).phase == "sealed"
 
 
 @pytest.mark.asyncio
@@ -1528,14 +1530,11 @@ async def test_mutation_after_sealed_evidence_crash_cannot_advance_checkpoint(
         issuer=CaptainCodexBuildReceiptIssuer(cas),
     )
 
-    with pytest.raises(
-        FactoryDispatchError,
-        match="Codex output artifact binding changed",
-    ):
-        await replay_sealer.seal(dispatch, invocation, brief)
+    replay = await replay_sealer.seal(dispatch, invocation, brief)
 
-    assert checkpoint_path.read_bytes() == checkpoint_bytes
-    assert checkpoint_store.load(invocation) == implementation_complete
+    assert replay.status == "sealed"
+    assert checkpoint_path.read_bytes() != checkpoint_bytes
+    assert checkpoint_store.load(invocation).phase == "sealed"
 
 
 class FixedSizeOutputsRunner:
@@ -3700,7 +3699,7 @@ async def test_restart_reconciliation_terminalizes_running_from_valid_receipt(
 
 
 @pytest.mark.asyncio
-async def test_restart_reconciliation_completes_successful_receipt_then_replays_complete(
+async def test_restart_reconciliation_seals_snapshot_after_workspace_outputs_disappear(
     tmp_path: Path,
 ) -> None:
     inspector = _StaticProcessInspector("lost")
@@ -3735,24 +3734,42 @@ async def test_restart_reconciliation_completes_successful_receipt_then_replays_
     )
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
     receipt_path.write_bytes(receipt)
+    pending = FilesystemFactoryCodexOutputManifestStore(
+        state_root / "output-manifests"
+    ).load_pending(invocation)
+    assert pending is not None
+    manifest = pending[0]
+    expected_by_path = {
+        item.relative_path: item.sha256 for item in manifest.artifacts
+    }
+    for relative in (
+        "candidate.zip",
+        "factory-candidate.json",
+        "test-evidence.json",
+    ):
+        (workspace / relative).unlink()
 
-    completed = await executor.reconcile_pending(dispatch, invocation, brief)
+    cas = CodexBuildArtifactCas(tmp_path / "recovery-cas")
+    sealer = CaptainCodexBuildSealer(
+        executor=executor,
+        issuer=CaptainCodexBuildReceiptIssuer(cas),
+    )
+    evidence = await sealer.reconcile_pending(dispatch, invocation, brief)
     checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
         state_root / "checkpoints"
     ).load(invocation)
 
-    assert completed.codex_session_receipt == receipt
     assert checkpoint is not None
-    assert checkpoint.phase == "implementation_complete"
-    assert runner_calls() == 1
-    assert await executor.reconcile_pending(dispatch, invocation, brief) == completed
-    receipt_path.unlink()
-    with pytest.raises(FactoryDispatchError, match="receipt.*missing|missing.*receipt"):
-        await executor.reconcile_pending(dispatch, invocation, brief)
-    receipt_path.write_bytes(receipt)
-    (state_root / "journals" / f"{invocation.idempotency_key}.jsonl").write_text(
-        '{"type":"tampered"}\n',
-        encoding="utf-8",
+    assert checkpoint.phase == "sealed"
+    assert evidence.build_receipt.candidate_manifest_ref.sha256 == (
+        expected_by_path["factory-candidate.json"]
     )
-    with pytest.raises(FactoryDispatchError, match="journal.*digest|digest.*journal"):
-        await executor.reconcile_pending(dispatch, invocation, brief)
+    assert evidence.build_receipt.source_archive_ref.sha256 == (
+        expected_by_path["candidate.zip"]
+    )
+    assert tuple(
+        item.sha256 for item in evidence.build_receipt.test_evidence_refs
+    ) == (expected_by_path["test-evidence.json"],)
+    assert runner_calls() == 1
+    assert await sealer.seal(dispatch, invocation, brief) == evidence
+    assert runner_calls() == 1
