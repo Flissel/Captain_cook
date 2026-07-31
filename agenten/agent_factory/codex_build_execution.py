@@ -374,6 +374,13 @@ class CaptainCodexBuildExecutorPort(Protocol):
         brief: CodexBuildBriefV1,
     ) -> CompletedCodexBuild: ...
 
+    def reconcile_failed(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+    ) -> FactoryCodexBuildFailed: ...
+
     def replay_sealed(
         self,
         invocation: FactorySkillInvocationV1,
@@ -617,6 +624,23 @@ class CaptainCodexBuildSealer:
             brief,
         )
         return self._seal_completed(request, invocation, brief, completed)
+
+    def reconcile_failed(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+    ) -> FactoryCodexBuildFailed:
+        if not isinstance(request.job, AgentFactoryJobV3):
+            raise FactoryDispatchError(
+                "Codex failure reconciliation requires a V3 Factory job"
+            )
+        self._executor.validate_replay_authority(request, invocation)
+        if self._executor.replay_sealed(invocation) is not None:
+            raise FactoryDispatchError(
+                "Factory Codex sealed replay is not a terminal failure"
+            )
+        return self._executor.reconcile_failed(request, invocation, brief)
 
     def _seal_completed(
         self,
@@ -963,6 +987,45 @@ class CodexCliFactoryBuildExecutor:
                 "Factory Codex prior terminal evidence is not resumable"
             )
         return authorization
+
+    def reconcile_failed(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+    ) -> FactoryCodexBuildFailed:
+        """Validate only an already-terminal failure; never inspect or run work."""
+
+        if not isinstance(request.job, AgentFactoryJobV3):
+            raise FactoryDispatchError(
+                "Codex failure reconciliation requires a V3 Factory job"
+            )
+        checkpoint = self._checkpoint_store.load(invocation)
+        if checkpoint is None or checkpoint.phase != "implementation_failed":
+            raise FactoryDispatchError(
+                "Factory Codex checkpoint is not a terminal failure"
+            )
+        prepared = self._prepare_or_recover(
+            request,
+            invocation,
+            brief,
+            checkpoint,
+        )
+        self._validate_original_scaffold(
+            request,
+            invocation,
+            brief,
+            prepared.root,
+            checkpoint,
+        )
+        self._require_checkpoint_runtime_retry_authority(request, checkpoint)
+        return self._reconcile_failed(
+            request=request,
+            invocation=invocation,
+            brief=brief,
+            prepared=prepared,
+            checkpoint=checkpoint,
+        )
 
     async def reconcile_pending(
         self,

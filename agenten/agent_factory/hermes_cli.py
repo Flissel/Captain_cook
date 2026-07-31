@@ -163,6 +163,13 @@ class CaptainCodexBuildSealerPort(Protocol):
         brief: CodexBuildBriefV1,
     ) -> CodexBuildEvidenceV1: ...
 
+    def reconcile_failed(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+    ) -> FactoryCodexBuildFailed: ...
+
     def validate_runtime_retry(
         self,
         request: FactoryDispatch,
@@ -239,13 +246,26 @@ class HermesCliFactory(HermesFactoryPort):
         if self._released_skill_catalog is None:
             raise FactoryDispatchError("released factory skill catalog is not configured")
         now = self._clock()
-        authority_expires_at = _validate_factory_dispatch(request, now=now)
+        _validate_factory_dispatch_bindings(request, now=now)
         steps = self._sequence_policy.steps_for(
             role=request.role,
             attempt=request.action.attempt,
             require_codex_seal=isinstance(request.job, AgentFactoryJobV3),
         )
         improvement = _validated_improvement_authorization(request)
+        if (
+            now >= request.lease.expires_at
+            and request.runtime_retry_authorization is None
+            and isinstance(request.job, AgentFactoryJobV3)
+            and request.role is FactoryRole.TOOL_INTEGRATOR
+            and FactorySkillStep.SEAL_CODEX_BUILD in steps
+        ):
+            await self._reconcile_expired_pending_codex_failure(
+                request,
+                steps=steps,
+                improvement=improvement,
+            )
+        authority_expires_at = _validate_factory_dispatch(request, now=now)
         if now >= request.lease.expires_at:
             await self._require_runtime_recovery_replays(request, steps=steps)
 
@@ -610,6 +630,86 @@ class HermesCliFactory(HermesFactoryPort):
                 "Factory runtime recovery does not bind the original seal invocation"
             )
 
+    async def _reconcile_expired_pending_codex_failure(
+        self,
+        request: FactoryDispatch,
+        *,
+        steps: tuple[FactorySkillStep, ...],
+        improvement: FactoryImprovementAuthorizationV1 | None,
+    ) -> None:
+        """Terminalize exact durable failure evidence without execution authority."""
+
+        if self._codex_build_sealer is None:
+            raise FactoryDispatchError("Captain Codex build sealer is not configured")
+        assert self._released_skill_catalog is not None
+        if request.runtime_retry_authorization is not None:
+            raise FactoryDispatchError(
+                "original Factory failure reconciliation forbids retry authority"
+            )
+        input_ref = (
+            improvement.authorization_ref
+            if improvement is not None
+            else request.job.input_ref
+        )
+        brief: CodexBuildBriefV1 | None = None
+        for step in steps:
+            released_skill = self._released_skill_catalog.released_for(
+                request.job,
+                step,
+            )
+            expected_invocation = _factory_invocation(
+                request,
+                step=step,
+                released_skill=released_skill,
+                input_ref=input_ref,
+            )
+            if step is FactorySkillStep.SEAL_CODEX_BUILD:
+                if brief is None:
+                    raise FactoryDispatchError(
+                        "expired Factory failure reconciliation requires its brief"
+                    )
+                pending = await self._replay_store.pending(
+                    request.job,
+                    step=step,
+                    attempt=request.action.attempt,
+                )
+                if (
+                    pending.invocation != expected_invocation
+                    or pending.resume_ordinal != 0
+                ):
+                    raise FactoryDispatchError(
+                        "expired Factory failure replay binding conflicts"
+                    )
+                failure = self._codex_build_sealer.reconcile_failed(
+                    request,
+                    expected_invocation,
+                    brief,
+                )
+                await self._replay_store.fail(
+                    pending,
+                    failure_kind=type(failure).__name__,
+                )
+                raise failure
+            replay = await self._replay_store.completed(
+                request.job,
+                step=step,
+                attempt=request.action.attempt,
+            )
+            if replay.invocation != expected_invocation or replay.artifact is None:
+                raise FactoryDispatchError(
+                    "expired Factory predecessor replay binding conflicts"
+                )
+            if step is FactorySkillStep.BRIEF_CODEX:
+                if not isinstance(replay.artifact, CodexBuildBriefV1):
+                    raise FactoryDispatchError(
+                        "completed brief replay is not a Codex build brief"
+                    )
+                brief = replay.artifact
+            input_ref = replay.artifact.artifact_ref
+        raise FactoryDispatchError(
+            "expired Factory failure reconciliation has no seal step"
+        )
+
     def validate_dispatch_configuration(self, request: FactoryDispatch) -> None:
         """Fail before external setup when a released sequence cannot be resolved."""
 
@@ -620,8 +720,24 @@ class HermesCliFactory(HermesFactoryPort):
         if self._released_skill_catalog is None:
             raise FactoryDispatchError("released factory skill catalog is not configured")
         now = self._clock()
-        _validate_factory_dispatch(request, now=now)
+        _validate_factory_dispatch_bindings(request, now=now)
         _validated_improvement_authorization(request)
+        steps = self._sequence_policy.steps_for(
+            role=request.role,
+            attempt=request.action.attempt,
+            require_codex_seal=isinstance(request.job, AgentFactoryJobV3),
+        )
+        expired_failure_preflight = (
+            now >= request.lease.expires_at
+            and request.runtime_retry_authorization is None
+            and isinstance(request.job, AgentFactoryJobV3)
+            and request.role is FactoryRole.TOOL_INTEGRATOR
+            and self._codex_build_sealer is not None
+            and FactorySkillStep.SEAL_CODEX_BUILD in steps
+        )
+        if expired_failure_preflight:
+            return
+        _validate_factory_dispatch(request, now=now)
         if (
             isinstance(request.job, AgentFactoryJobV3)
             and
@@ -629,11 +745,7 @@ class HermesCliFactory(HermesFactoryPort):
             and self._codex_build_sealer is None
         ):
             raise FactoryDispatchError("Captain Codex build sealer is not configured")
-        for step in self._sequence_policy.steps_for(
-            role=request.role,
-            attempt=request.action.attempt,
-            require_codex_seal=isinstance(request.job, AgentFactoryJobV3),
-        ):
+        for step in steps:
             released_skill = self._released_skill_catalog.released_for(
                 request.job,
                 step,
@@ -958,6 +1070,14 @@ class FactorySkillReplayStore(Protocol):
         attempt: int,
     ) -> FactorySkillReplayRecord: ...
 
+    async def pending(
+        self,
+        job: FactoryJob,
+        *,
+        step: FactorySkillStep,
+        attempt: int,
+    ) -> FactorySkillReplayRecord: ...
+
     async def claim(
         self,
         invocation: FactorySkillInvocationV1,
@@ -1024,6 +1144,23 @@ class InMemoryFactorySkillReplayStore:
         async with self._lock:
             record = self._records.get(key)
         return _require_completed_prior_replay(
+            record,
+            job=job,
+            step=step,
+            attempt=attempt,
+        )
+
+    async def pending(
+        self,
+        job: FactoryJob,
+        *,
+        step: FactorySkillStep,
+        attempt: int,
+    ) -> FactorySkillReplayRecord:
+        key = _factory_step_idempotency_key(job, step=step, attempt=attempt)
+        async with self._lock:
+            record = self._records.get(key)
+        return _require_pending_prior_replay(
             record,
             job=job,
             step=step,
@@ -1160,6 +1297,29 @@ class FilesystemFactorySkillReplayStore:
             else:
                 raise
         return _require_completed_prior_replay(
+            record,
+            job=job,
+            step=step,
+            attempt=attempt,
+        )
+
+    async def pending(
+        self,
+        job: FactoryJob,
+        *,
+        step: FactorySkillStep,
+        attempt: int,
+    ) -> FactorySkillReplayRecord:
+        key = _factory_step_idempotency_key(job, step=step, attempt=attempt)
+        path = self._path_for(key)
+        try:
+            record = await asyncio.to_thread(self._read_record, path)
+        except FactoryDispatchError:
+            if not path.exists():
+                record = None
+            else:
+                raise
+        return _require_pending_prior_replay(
             record,
             job=job,
             step=step,
@@ -1657,6 +1817,35 @@ _STEP_RESULT_MODELS: dict[FactorySkillStep, type[BaseModel]] = {
 def _validate_factory_dispatch(
     request: FactoryDispatch, *, now: datetime
 ) -> datetime:
+    _validate_factory_dispatch_bindings(request, now=now)
+    assert request.role is not None
+    assert request.lease is not None
+    lease = request.lease
+    if now < lease.expires_at:
+        return lease.expires_at
+    authorization = request.runtime_retry_authorization
+    if (
+        request.role is not FactoryRole.TOOL_INTEGRATOR
+        or authorization is None
+        or authorization.job_id != request.job.job_id
+        or authorization.correlation_id != request.job.correlation_id
+        or authorization.subject_version != request.job.subject_version
+        or authorization.attempt != request.action.attempt
+        or authorization.lease_id != lease.lease_id
+        or authorization.workspace_ref != lease.workspace_ref
+        or now < authorization.issued_at
+        or now >= authorization.expires_at
+        or now >= request.job.deadline_at
+    ):
+        raise FactoryDispatchError(
+            "Hermes factory dispatch requires an active lease or Captain recovery authority"
+        )
+    return min(authorization.expires_at, request.job.deadline_at)
+
+
+def _validate_factory_dispatch_bindings(
+    request: FactoryDispatch, *, now: datetime
+) -> None:
     assert request.role is not None
     assert request.lease is not None
     lease = request.lease
@@ -1684,26 +1873,6 @@ def _validate_factory_dispatch(
         raise FactoryDispatchError(
             "Hermes factory dispatch requires an active lease or Captain recovery authority"
         )
-    if now < lease.expires_at:
-        return lease.expires_at
-    authorization = request.runtime_retry_authorization
-    if (
-        request.role is not FactoryRole.TOOL_INTEGRATOR
-        or authorization is None
-        or authorization.job_id != request.job.job_id
-        or authorization.correlation_id != request.job.correlation_id
-        or authorization.subject_version != request.job.subject_version
-        or authorization.attempt != request.action.attempt
-        or authorization.lease_id != lease.lease_id
-        or authorization.workspace_ref != lease.workspace_ref
-        or now < authorization.issued_at
-        or now >= authorization.expires_at
-        or now >= request.job.deadline_at
-    ):
-        raise FactoryDispatchError(
-            "Hermes factory dispatch requires an active lease or Captain recovery authority"
-        )
-    return min(authorization.expires_at, request.job.deadline_at)
 
 
 def _validated_improvement_authorization(
@@ -1907,6 +2076,37 @@ def _require_completed_prior_replay(
         or invocation.step is not step
     ):
         raise FactoryDispatchError("prior Factory replay does not match the Captain job")
+    return record
+
+
+def _require_pending_prior_replay(
+    record: FactorySkillReplayRecord | None,
+    *,
+    job: FactoryJob,
+    step: FactorySkillStep,
+    attempt: int,
+) -> FactorySkillReplayRecord:
+    if record is not None and record.state == "failed":
+        raise FactoryDispatchError("factory skill replay previously failed")
+    if record is not None and record.state == "interrupted":
+        raise FactoryDispatchError(
+            "Hermes factory dispatch requires an active lease or Captain recovery authority"
+        )
+    if record is None or record.state != "pending":
+        raise FactoryDispatchError(
+            f"pending {step.value} replay is required for failure reconciliation"
+        )
+    invocation = record.invocation
+    if (
+        invocation.idempotency_key
+        != _factory_step_idempotency_key(job, step=step, attempt=attempt)
+        or invocation.job_id != job.job_id
+        or invocation.correlation_id != job.correlation_id
+        or invocation.subject_version != job.subject_version
+        or invocation.attempt != attempt
+        or invocation.step is not step
+    ):
+        raise FactoryDispatchError("pending Factory replay does not match the Captain job")
     return record
 
 

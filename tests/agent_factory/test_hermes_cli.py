@@ -1768,9 +1768,11 @@ async def test_authorized_runtime_retry_resumes_only_seal_without_new_hermes_cal
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("after_job_deadline", [False, True])
 async def test_restart_reconciles_durable_codex_failure_to_failed_replay_without_effects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    after_job_deadline: bool,
 ) -> None:
     now = datetime(2026, 7, 19, 10, tzinfo=timezone.utc)
     factory_job = job_v3(mode="demo").model_copy(
@@ -1851,15 +1853,18 @@ async def test_restart_reconciles_durable_codex_failure_to_failed_replay_without
     class DurableFailureSealer:
         def __init__(self) -> None:
             self.seal_calls = 0
-            self.reconcile_calls = 0
+            self.failure_reconcile_calls = 0
 
         async def seal(self, *_args: object) -> CodexBuildEvidenceV1:
             self.seal_calls += 1
             raise durable_failure
 
+        def reconcile_failed(self, *_args: object) -> FactoryCodexBuildFailed:
+            self.failure_reconcile_calls += 1
+            return durable_failure
+
         async def reconcile_pending(self, *_args: object) -> CodexBuildEvidenceV1:
-            self.reconcile_calls += 1
-            raise durable_failure
+            raise AssertionError("expired failure recovery must not reconcile work")
 
     replay_root = tmp_path / "failed-replays"
 
@@ -1929,20 +1934,29 @@ async def test_restart_reconciles_durable_codex_failure_to_failed_replay_without
     ]
     assert len(pending) == 1
 
+    restart_now = (
+        factory_job.deadline_at + timedelta(seconds=1)
+        if after_job_deadline
+        else tool_lease.expires_at + timedelta(seconds=1)
+    )
+    assert restart_now >= tool_lease.expires_at
+    assert tool_request.runtime_retry_authorization is None
+
     restarted = HermesCliFactory(
         settings=settings,
         released_skill_catalog=catalog,
         replay_store=FilesystemFactorySkillReplayStore(replay_root),
         codex_build_sealer=sealer,
         codex_prompt_artifact_store=prompt_store,
-        clock=lambda: now,
+        clock=lambda: restart_now,
     )
+    restarted.validate_dispatch_configuration(tool_request)
     with pytest.raises(FactoryCodexBuildFailed) as recovered:
         await restarted.dispatch(tool_request)
 
     assert recovered.value.reason == "runtime_failed"
     assert sealer.seal_calls == 1
-    assert sealer.reconcile_calls == 1
+    assert sealer.failure_reconcile_calls == 1
     assert len(prompts) == 2
     failed = [
         json.loads(path.read_text(encoding="utf-8"))
@@ -1955,7 +1969,7 @@ async def test_restart_reconciles_durable_codex_failure_to_failed_replay_without
     with pytest.raises(FactoryDispatchError, match="previously failed"):
         await restarted.dispatch(tool_request)
     assert sealer.seal_calls == 1
-    assert sealer.reconcile_calls == 1
+    assert sealer.failure_reconcile_calls == 1
     assert len(prompts) == 2
 
 
