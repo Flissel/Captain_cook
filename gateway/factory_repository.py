@@ -10,11 +10,12 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import HTTPException
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from agenten.agent_factory.contracts import (
     AgentFactoryJobV3,
     FactoryEvidenceBlock,
+    FactoryPhase,
     FactoryJob,
     FactoryLease,
     FactoryRole,
@@ -36,6 +37,8 @@ from agenten.agent_factory.service import FactoryRepository, FactoryRepositoryEr
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import FactorySkillStep
+from agenten.agent_factory.skill_sequence import FactoryRuntimeRetryAuthorizationV1
+from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from gateway.store import GatewayStore
 from gateway.contracts import (
     FactoryBudgetReleaseRequest,
@@ -53,11 +56,27 @@ class FactorySkillAssignmentSource(Protocol):
     ) -> ReleasedHermesSkill: ...
 
 
+class FactoryRuntimeRetrySource(Protocol):
+    def active(
+        self,
+        job: FactoryJob,
+        action: FactoryAction,
+        projection: object,
+        now: datetime,
+    ) -> FactoryRuntimeRetryAuthorizationV1 | None: ...
+
+
 class GatewayFactoryRepository(FactoryRepository):
     """Use GatewayStore as the sole durable factory lifecycle authority."""
 
-    def __init__(self, store: GatewayStore) -> None:
+    def __init__(
+        self,
+        store: GatewayStore,
+        *,
+        runtime_retries: FactoryRuntimeRetrySource | None = None,
+    ) -> None:
         self._store = store
+        self._runtime_retries = runtime_retries
 
     def register(self, job: FactoryJob) -> None:
         self._translate(lambda: self._store.record_factory_job(job))
@@ -66,7 +85,31 @@ class GatewayFactoryRepository(FactoryRepository):
         return self._translate(lambda: self._store.factory_job(job_id).job)
 
     def append(self, block: FactoryEvidenceBlock) -> bool:
-        receipt = self._translate(lambda: self._store.record_factory_block(block))
+        runtime_retry = None
+        if (
+            self._runtime_retries is not None
+            and block.role is FactoryRole.TOOL_INTEGRATOR
+            and block.phase is FactoryPhase.AGENT_CODE_CREATED
+        ):
+            projection = self._translate(lambda: self._store.factory_job(block.job_id))
+            runtime_retry = self._runtime_retries.active(
+                projection.job,
+                FactoryAction(
+                    kind=FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,
+                    attempt=block.attempt,
+                ),
+                projection,
+                block.occurred_at.astimezone(timezone.utc),
+            )
+        if runtime_retry is None:
+            receipt = self._translate(lambda: self._store.record_factory_block(block))
+        else:
+            receipt = self._translate(
+                lambda: self._store.record_factory_block(
+                    block,
+                    runtime_retry_authorization=runtime_retry,
+                )
+            )
         return not receipt.replayed
 
     def blocks(self, job_id: UUID) -> tuple[FactoryEvidenceBlock, ...]:
@@ -208,8 +251,14 @@ class GatewayFactoryLeases(FactoryLeasePort):
 class GatewayFactoryBudgetLedger(FactoryBudgetPort):
     """Route budget authority through GatewayStore without database credentials."""
 
-    def __init__(self, store: GatewayStore) -> None:
+    def __init__(
+        self,
+        store: GatewayStore,
+        *,
+        runtime_retries: FactoryRuntimeRetrySource | None = None,
+    ) -> None:
         self._store = store
+        self._runtime_retries = runtime_retries
 
     def reserve(
         self,

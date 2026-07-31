@@ -301,7 +301,17 @@ def compose_business_demo_factory_operator(
         raise ValueError("Factory provider secret is not present in the process")
 
     store = GatewayStore(MariaDBStorage(settings.test_mariadb_dsn))
-    repository = GatewayFactoryRepository(store)
+    codex_state_root = (authority_root / "runtime-state" / "codex").resolve()
+    runtime_retry_authority = FilesystemFactoryRuntimeRetryAuthority(
+        authority_root=(
+            authority_root / "runtime-state" / "runtime-retry-authorizations"
+        ),
+        checkpoint_root=codex_state_root / "checkpoints",
+    )
+    repository = GatewayFactoryRepository(
+        store,
+        runtime_retries=runtime_retry_authority,
+    )
     creation_artifact_root = (
         workspace / ".captain-cook" / "minibook-creation-cas"
     ).resolve()
@@ -324,13 +334,6 @@ def compose_business_demo_factory_operator(
     codex_workspace_root = (
         workspace / ".captain-cook" / "private" / "codex-workspaces"
     ).resolve()
-    codex_state_root = (authority_root / "runtime-state" / "codex").resolve()
-    runtime_retry_authority = FilesystemFactoryRuntimeRetryAuthority(
-        authority_root=(
-            authority_root / "runtime-state" / "runtime-retry-authorizations"
-        ),
-        checkpoint_root=codex_state_root / "checkpoints",
-    )
     codex_executable = Path(
         _required(environment, "CAPTAIN_CODEX_EXECUTABLE")
     ).resolve(strict=True)

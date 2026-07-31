@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import contextmanager
+from datetime import timedelta
 from uuid import UUID
 
 import pytest
@@ -30,7 +31,10 @@ from agenten.agent_factory.skill_workflow_contracts import (
     FACTORY_SKILL_ID_BY_STEP,
     CodebaseInventoryV1,
     FactorySkillStep,
+    factory_runtime_retry_evidence_binding,
+    factory_runtime_retry_evidence_binding_sha256,
 )
+from agenten.agent_factory.skill_sequence import FactoryRuntimeRetryAuthorizationV1
 from agenten.agent_factory.state_machine import FactoryLifecycleStatus, FactoryProjection
 from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.contracts import (
@@ -146,6 +150,101 @@ def test_gateway_adapter_runs_coordinator_against_gateway_store_shape() -> None:
     coordinator.record(block(FactoryPhase.FORGE_REQUESTED))
 
     assert coordinator.projection(factory_job.job_id).phase is FactoryPhase.FORGE_REQUESTED
+
+
+def test_gateway_accepts_expired_tool_integrator_evidence_only_with_exact_retry(
+    job_v3,
+) -> None:
+    lease = issue_factory_lease(
+        job=job_v3,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/retry-ledger",
+        now=job_v3.occurred_at,
+    )
+    occurred_at = lease.expires_at + timedelta(seconds=1)
+    placeholder = ArtifactRef(
+        uri=f"artifact://factory/runtime-retry/{'0' * 64}",
+        sha256="0" * 64,
+        media_type="application/json",
+    )
+    authorization = FactoryRuntimeRetryAuthorizationV1(
+        schema="captain.factory-runtime-retry-authorization.v1",
+        authorization_ref=placeholder,
+        producer="captain",
+        status="succeeded",
+        job_id=job_v3.job_id,
+        correlation_id=job_v3.correlation_id,
+        subject_version=job_v3.subject_version,
+        attempt=1,
+        invocation_id=UUID("73000000-0000-0000-0000-000000000001"),
+        idempotency_key="a" * 64,
+        lease_id=lease.lease_id,
+        checkpoint_ref=ArtifactRef(
+            uri=f"artifact://factory/codex-checkpoint/{'b' * 64}",
+            sha256="b" * 64,
+            media_type="application/json",
+        ),
+        terminal_receipt_ref=ArtifactRef(
+            uri=f"artifact://factory/codex-terminal-receipt/{'c' * 64}",
+            sha256="c" * 64,
+            media_type="application/json",
+        ),
+        workspace_ref=lease.workspace_ref,
+        base_revision="d" * 40,
+        scaffold_manifest_sha256="e" * 64,
+        brief_sha256="f" * 64,
+        resume_ordinal=1,
+        maximum_runtime_seconds=60,
+        issued_at=lease.expires_at,
+        expires_at=lease.expires_at + timedelta(minutes=2),
+    )
+    digest = factory_runtime_retry_evidence_binding_sha256(
+        factory_runtime_retry_evidence_binding(authorization)
+    )
+    authorization = authorization.model_copy(
+        update={
+            "authorization_ref": ArtifactRef(
+                uri=f"artifact://factory/runtime-retry/{digest}",
+                sha256=digest,
+                media_type="application/json",
+            )
+        }
+    )
+    evidence = block(FactoryPhase.AGENT_CODE_CREATED).model_copy(
+        update={
+            "job_id": job_v3.job_id,
+            "correlation_id": job_v3.correlation_id,
+            "subject_version": job_v3.subject_version,
+            "attempt": 1,
+            "occurred_at": occurred_at,
+            "role": FactoryRole.TOOL_INTEGRATOR,
+            "lease_id": lease.lease_id,
+            "evidence_refs": (authorization.authorization_ref,),
+        }
+    )
+
+    GatewayStore._assert_evidence_lease(
+        evidence,
+        lease,
+        runtime_retry_authorization=authorization,
+    )
+
+    with pytest.raises(HTTPException, match="active lease"):
+        GatewayStore._assert_evidence_lease(evidence, lease)
+    changed = authorization.model_copy(
+        update={
+            "authorization_ref": authorization.authorization_ref.model_copy(
+                update={"sha256": "1" * 64}
+            )
+        }
+    )
+    with pytest.raises(HTTPException, match="active lease"):
+        GatewayStore._assert_evidence_lease(
+            evidence,
+            lease,
+            runtime_retry_authorization=changed,
+        )
 
 
 def test_gateway_leases_resolve_only_the_current_role_attempt() -> None:

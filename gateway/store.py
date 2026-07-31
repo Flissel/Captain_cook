@@ -67,7 +67,10 @@ from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillStep,
     TeamEvaluationV1,
     TeamExecutionEvidenceV1,
+    factory_runtime_retry_evidence_binding,
+    factory_runtime_retry_evidence_binding_sha256,
 )
+from agenten.agent_factory.skill_sequence import FactoryRuntimeRetryAuthorizationV1
 from agenten.agent_factory.state_machine import (
     FactoryActionKind,
     FactoryLifecycleError,
@@ -1827,7 +1830,12 @@ class GatewayStore:
             record_id=f"{publication.skill_id}:{publication.version}", replayed=False
         )
 
-    def record_factory_block(self, evidence: FactoryEvidenceBlock) -> FactoryWriteReceipt:
+    def record_factory_block(
+        self,
+        evidence: FactoryEvidenceBlock,
+        *,
+        runtime_retry_authorization: FactoryRuntimeRetryAuthorizationV1 | None = None,
+    ) -> FactoryWriteReceipt:
         canonical = evidence.model_dump(mode="json", by_alias=True)
         with self.storage.transaction() as connection:
             with connection.cursor() as cursor:
@@ -1935,7 +1943,11 @@ class GatewayStore:
                     )
                 except FactoryLifecycleError as exc:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
-                self._assert_evidence_lease(evidence, lease)
+                self._assert_evidence_lease(
+                    evidence,
+                    lease,
+                    runtime_retry_authorization=runtime_retry_authorization,
+                )
                 index = self._next_index(cursor)
                 block = self._new_block(
                     cursor,
@@ -3157,7 +3169,12 @@ class GatewayStore:
             raise HTTPException(status_code=409, detail="factory lease role is not the next authorized action")
 
     @staticmethod
-    def _assert_evidence_lease(evidence: FactoryEvidenceBlock, lease: FactoryLease | None) -> None:
+    def _assert_evidence_lease(
+        evidence: FactoryEvidenceBlock,
+        lease: FactoryLease | None,
+        *,
+        runtime_retry_authorization: FactoryRuntimeRetryAuthorizationV1 | None = None,
+    ) -> None:
         """Bind Hermes evidence to one previously persisted, active role lease."""
 
         if evidence.role is None:
@@ -3170,10 +3187,35 @@ class GatewayStore:
             or lease.subject_version != evidence.subject_version
             or lease.attempt != evidence.attempt
             or lease.role is not evidence.role
-            or lease.issued_at > evidence.occurred_at
-            or lease.expires_at <= evidence.occurred_at
         ):
             raise HTTPException(status_code=409, detail="factory evidence is outside its active lease")
+        if lease.issued_at <= evidence.occurred_at < lease.expires_at:
+            return
+        authorization = runtime_retry_authorization
+        if (
+            evidence.role is not FactoryRole.TOOL_INTEGRATOR
+            or evidence.phase is not FactoryPhase.AGENT_CODE_CREATED
+            or authorization is None
+            or authorization.producer != "captain"
+            or authorization.status != "succeeded"
+            or authorization.job_id != evidence.job_id
+            or authorization.correlation_id != evidence.correlation_id
+            or authorization.subject_version != evidence.subject_version
+            or authorization.attempt != evidence.attempt
+            or authorization.lease_id != evidence.lease_id
+            or not authorization.issued_at
+            <= evidence.occurred_at
+            < authorization.expires_at
+            or authorization.authorization_ref not in evidence.evidence_refs
+            or authorization.authorization_ref.sha256
+            != factory_runtime_retry_evidence_binding_sha256(
+                factory_runtime_retry_evidence_binding(authorization)
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="factory evidence is outside its active lease",
+            )
 
     def _runtime_grant_block(
         self,
