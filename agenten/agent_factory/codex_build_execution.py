@@ -9,7 +9,7 @@ import os
 import re
 import shutil
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1546,12 +1546,6 @@ class CodexCliFactoryBuildExecutor:
                 events.append(event)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
             raise FactoryDispatchError("Factory Codex JSONL journal is invalid") from None
-        thread_ids = {
-            value
-            for event in events
-            for value in (event.get("thread_id"),)
-            if isinstance(value, str) and value.strip()
-        }
         event_types = sorted(
             {
                 value
@@ -1560,15 +1554,10 @@ class CodexCliFactoryBuildExecutor:
                 if isinstance(value, str) and value.strip()
             }
         )
-        observed_thread_id = next(iter(thread_ids), None)
+        observed_thread_id = _canonical_codex_thread_id(events)
         expected_thread_id = checkpoint.parent_codex_thread_id or observed_thread_id
         if (
-            len(thread_ids) > 1
-            or (
-                observed_thread_id is not None
-                and _CODEX_THREAD_ID_PATTERN.fullmatch(observed_thread_id) is None
-            )
-            or receipt["event_count"] != len(events)
+            receipt["event_count"] != len(events)
             or receipt["event_types"] != event_types
             or receipt["codex_thread_id"] != expected_thread_id
             or (
@@ -2083,20 +2072,7 @@ def _session_receipt(
         events.append(value)
     if not events and result.terminal_status == "succeeded":
         raise FactoryDispatchError("Codex JSONL evidence is empty")
-    thread_ids = {
-        value
-        for event in events
-        for value in (event.get("thread_id"),)
-        if isinstance(value, str) and value.strip()
-    }
-    if len(thread_ids) > 1:
-        raise FactoryDispatchError("Codex JSONL contains conflicting thread IDs")
-    observed_thread_id = next(iter(thread_ids), None)
-    if (
-        observed_thread_id is not None
-        and _CODEX_THREAD_ID_PATTERN.fullmatch(observed_thread_id) is None
-    ):
-        raise FactoryDispatchError("Codex thread ID is invalid")
+    observed_thread_id = _canonical_codex_thread_id(events)
     if isinstance(resume_ordinal, bool) or not 0 <= resume_ordinal <= 2:
         raise FactoryDispatchError("Codex resume ordinal is invalid")
     if resume_ordinal == 0 and parent_lineage is not None:
@@ -2164,6 +2140,29 @@ def _session_receipt(
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def _canonical_codex_thread_id(
+    events: Iterable[Mapping[str, object]],
+) -> str | None:
+    """Return the sole canonical Codex thread start, ignoring unrelated fields."""
+
+    starts = tuple(event for event in events if event.get("type") == "thread.started")
+    if not starts:
+        return None
+    if len(starts) != 1:
+        raise FactoryDispatchError(
+            "Codex JSONL must contain at most one thread.started event"
+        )
+    thread_id = starts[0].get("thread_id")
+    if (
+        not isinstance(thread_id, str)
+        or _CODEX_THREAD_ID_PATTERN.fullmatch(thread_id) is None
+    ):
+        raise FactoryDispatchError(
+            "Codex thread.started thread ID is invalid"
+        )
+    return thread_id
 
 
 def _validate_factory_codex_run_result(

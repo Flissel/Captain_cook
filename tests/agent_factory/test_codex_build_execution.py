@@ -983,7 +983,12 @@ async def test_cli_executor_fails_closed_when_codex_omits_required_outputs(
             self.journal_path = journal_path
 
         async def run(self, _authorized):
-            line = json.dumps({"type": "thread.started"})
+            line = json.dumps(
+                {
+                    "type": "thread.started",
+                    "thread_id": "incomplete-output-thread",
+                }
+            )
             journal = f"{line}\n".encode("utf-8")
             self.journal_path.parent.mkdir(parents=True, exist_ok=True)
             self.journal_path.write_bytes(journal)
@@ -1113,6 +1118,74 @@ def test_session_receipt_rejects_thread_id_that_could_become_a_cli_option(
             command=("codex", "exec", "--json", "bounded prompt"),
             completed_at=NOW,
         )
+
+
+@pytest.mark.parametrize(
+    "canonical_events",
+    (
+        (
+            {"type": "thread.started", "thread_id": "thread-123"},
+            {"type": "thread.started", "thread_id": "thread-123"},
+        ),
+        (
+            {"type": "thread.started", "thread_id": "thread-123"},
+            {"type": "thread.started", "thread_id": "thread-456"},
+        ),
+        ({"type": "thread.started"},),
+        ({"type": "thread.started", "thread_id": 7},),
+    ),
+)
+def test_session_receipt_rejects_duplicate_conflicting_or_malformed_thread_start(
+    tmp_path: Path,
+    canonical_events: tuple[dict[str, object], ...],
+) -> None:
+    lines = tuple(json.dumps(event) for event in canonical_events)
+    result = _run_result(
+        tmp_path,
+        exit_code=124,
+        terminal_status="timed_out",
+        jsonl_lines=lines,
+        process_cleanup_status="verified_cancelled",
+    )
+
+    with pytest.raises(FactoryDispatchError, match="thread.started"):
+        _session_receipt(
+            result=result,
+            session_id="factory-canonical-thread-test",
+            workspace_ref="workspace://factory/canonical-thread",
+            base_revision="a" * 40,
+            command=("codex", "exec", "--json", "bounded prompt"),
+            completed_at=NOW,
+        )
+
+
+def test_session_receipt_ignores_thread_id_on_noncanonical_event(
+    tmp_path: Path,
+) -> None:
+    lines = (
+        json.dumps({"type": "turn.started", "thread_id": "injected-thread"}),
+        json.dumps({"type": "turn.completed"}),
+    )
+    result = _run_result(
+        tmp_path,
+        exit_code=124,
+        terminal_status="timed_out",
+        jsonl_lines=lines,
+        process_cleanup_status="verified_cancelled",
+    )
+
+    receipt = json.loads(
+        _session_receipt(
+            result=result,
+            session_id="factory-no-canonical-thread-test",
+            workspace_ref="workspace://factory/no-canonical-thread",
+            base_revision="a" * 40,
+            command=("codex", "exec", "--json", "bounded prompt"),
+            completed_at=NOW,
+        )
+    )
+
+    assert receipt["codex_thread_id"] is None
 
 
 def test_session_receipt_reports_empty_succeeded_journal_truthfully(tmp_path: Path) -> None:
@@ -1806,6 +1879,7 @@ async def _resume_lineage_fixture(
     tmp_path: Path,
     *,
     prior_thread_id: str | None,
+    noncanonical_thread_id: str | None = None,
 ):
     job, brief, artifact_reader = _executor_job_and_brief()
     invocation = _seal_invocation(job, brief)
@@ -1824,18 +1898,22 @@ async def _resume_lineage_fixture(
             self.journal_path = journal_path
 
         async def run(self, _authorized) -> CodexRunResult:
-            lines = (
-                ()
-                if prior_thread_id is None
-                else (
-                    json.dumps(
-                        {
-                            "type": "thread.started",
-                            "thread_id": prior_thread_id,
-                        }
-                    ),
+            events: list[dict[str, object]] = []
+            if prior_thread_id is not None:
+                events.append(
+                    {
+                        "type": "thread.started",
+                        "thread_id": prior_thread_id,
+                    }
                 )
-            )
+            if noncanonical_thread_id is not None:
+                events.append(
+                    {
+                        "type": "turn.completed",
+                        "thread_id": noncanonical_thread_id,
+                    }
+                )
+            lines = tuple(json.dumps(event) for event in events)
             journal = b"".join(f"{line}\n".encode("utf-8") for line in lines)
             self.journal_path.parent.mkdir(parents=True, exist_ok=True)
             self.journal_path.write_bytes(journal)
@@ -2072,6 +2150,31 @@ async def test_authorized_resume_uses_prior_thread_and_persists_parent_lineage(
     )
     assert cas.read_bytes(build_receipt.codex_session_ref) == (
         completed.codex_session_receipt
+    )
+
+
+@pytest.mark.asyncio
+async def test_authorized_resume_uses_only_canonical_thread_started_event(
+    tmp_path: Path,
+) -> None:
+    fixture = await _resume_lineage_fixture(
+        tmp_path,
+        prior_thread_id="codex-thread-123",
+        noncanonical_thread_id="injected-thread",
+    )
+
+    await fixture["executor"].execute_authorized_resume(
+        fixture["authorized"],
+        fixture["invocation"],
+        fixture["brief"],
+    )
+
+    assert fixture["authorizer"].requests[1].command[:5] == (
+        "codex",
+        "exec",
+        "resume",
+        "--json",
+        "codex-thread-123",
     )
 
 
