@@ -56,7 +56,7 @@ from agenten.agent_factory.minibook_forge import (
     MinibookForgeSettings,
     MinibookSwarmForge,
 )
-from agenten.agent_factory.orchestration import FactoryDispatch
+from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
 from agenten.agent_factory.state_machine import FactoryActionKind
 from agenten.agent_factory.production_dispatch_runner import (
     ProductionFactoryDispatchResult,
@@ -207,12 +207,26 @@ class FactoryLiveOperatorSettings:
             raise ValueError("Factory live dispatch bound is invalid")
 
 
-class _ContentAddressedInputMaterializer:
-    def __init__(self, store: BusinessBenchmarkContentAddressedArtifactStore) -> None:
-        self._store = store
+class _FactoryInputMaterializer:
+    """Route only Captain-owned artifacts to their exact verified CAS."""
+
+    def __init__(
+        self,
+        *,
+        benchmark_artifacts: BusinessBenchmarkContentAddressedArtifactStore,
+        codex_build_artifacts: CodexBuildArtifactCas,
+    ) -> None:
+        self._benchmark_artifacts = benchmark_artifacts
+        self._codex_build_artifacts = codex_build_artifacts
 
     def materialize(self, reference: ArtifactRef) -> Path:
-        return self._store.local_path(reference)
+        if reference.uri.startswith("artifact://business-benchmark-production/"):
+            self._benchmark_artifacts.read_bytes(reference)
+            return self._benchmark_artifacts.local_path(reference)
+        if reference.uri.startswith("artifact://captain-codex-build/"):
+            self._codex_build_artifacts.read_bytes(reference)
+            return self._codex_build_artifacts.local_path(reference)
+        raise FactoryDispatchError("factory input artifact owner is unsupported")
 
 
 class _LazyProductionBenchmarkInputs:
@@ -346,6 +360,9 @@ def compose_business_demo_factory_operator(
             timeout_seconds=maximum_runtime_seconds,
         )
 
+    codex_build_cas = CodexBuildArtifactCas(
+        workspace / ".captain-cook" / "private" / "codex-build-cas"
+    )
     codex_sealer = CaptainCodexBuildSealer(
         executor=CodexCliFactoryBuildExecutor(
             settings=CodexCliFactoryBuildSettings(
@@ -377,14 +394,13 @@ def compose_business_demo_factory_operator(
             ),
             clock=current_time,
         ),
-        issuer=CaptainCodexBuildReceiptIssuer(
-            CodexBuildArtifactCas(
-                workspace / ".captain-cook" / "private" / "codex-build-cas"
-            )
-        ),
+        issuer=CaptainCodexBuildReceiptIssuer(codex_build_cas),
     )
     forge = MinibookSwarmForge(
-        materializer=_ContentAddressedInputMaterializer(benchmark_cas),
+        materializer=_FactoryInputMaterializer(
+            benchmark_artifacts=benchmark_cas,
+            codex_build_artifacts=codex_build_cas,
+        ),
         mapper=mapper,
         skill_receipts=mapper,
         settings=MinibookForgeSettings(

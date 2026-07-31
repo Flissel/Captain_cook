@@ -171,19 +171,30 @@
   `c36882f3-792a-528c-9c99-6dcbf2dfc9cb` and Renewal job
   `63cc1810-fd20-50cb-a110-d96d016066c2` to suite 21 and seed
   `business-benchmark-demo-2026-07-v21`; plan evidence explicitly records no
-  provider, live-service, provisioning, Gateway, or Minibook mutation.
+  provider, live-service, provisioning, Gateway, or Minibook mutation. The
+  first V21 Claims execution then completed Codex, produced all three output
+  artifacts, and reached Captain's sealed checkpoint, proving the pre-seal
+  manifest correction. It next failed closed before launching Minibook Forge:
+  the composition routed the new `captain-codex-build` source reference to the
+  benchmark-only materializer. Renewal, technical holdout execution, all 30
+  business cases, Gateway promotion, and Minibook projection did not run. The
+  local composition now routes benchmark and Codex-build references to their
+  exact owning CAS and verifies content digests before materialization. The
+  sealed V21 Claims replay remains immutable and is eligible for reuse only
+  through the same Captain lease/job binding.
 - [x] Enforce the operator's `1.00 EUR` marginal-cost ceiling per team before
   provider construction. The live demo reserves at most `0.30 USD` for one
   team's candidate/baseline benchmark and conservatively assigns the complete
   two-team Hermes ceiling of `0.06 USD` to either team. Codex is admitted only
   when `codex login status` proves ChatGPT subscription authentication, so its
-  metered API reserve is exactly zero. Captain rejects any composition whose
-  prior V20 Hermes attempt is additionally reserved at `0.06 USD` per team.
-  Captain rejects any composition whose cumulative worst-case `0.42 USD` per
+  metered API reserve is exactly zero. The prior V20 and first V21 attempts are
+  each additionally reserved at `0.06 USD` per team because their actual
+  Hermes usage was not materialized durably. Captain rejects any composition
+  whose cumulative worst-case `0.48 USD` per
   team exceeds the internal `0.50 USD` ceiling, any
   API-key-authenticated Codex session, or any missing/non-canonical cost field.
   The internal ceiling is intentionally far below the user ceiling rather than
   depending on a live exchange-rate lookup during dispatch. This guard was
-  verified without another provider call. Actual V20 Hermes spend was not
-  materialized as durable usage evidence, so the full configured reserve is
-  counted conservatively; this does not claim that V19 or V20 can resume.
+  verified without another provider call. Both prior configured reserves are
+  counted conservatively; this does not claim that V19 or V20 can resume or
+  that V21 has passed its technical holdout.

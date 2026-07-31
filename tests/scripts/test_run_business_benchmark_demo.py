@@ -26,7 +26,7 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "$maximumUsdPerTeam = '0.30'" in source
     assert "$maximumHermesUsd = '0.06'" in source
     assert "$maximumTotalUsdPerTeam = '0.50'" in source
-    assert "$priorAttemptReserveUsdPerTeam = '0.06'" in source
+    assert "$priorAttemptReserveUsdPerTeam = '0.12'" in source
     assert "$userMaximumEurPerTeam = '1.00'" in source
     assert "$environment['CAPTAIN_BENCHMARK_MAX_USD'] = '0.60'" in source
     assert "Assert-CodexUsesChatGptSubscription" in source

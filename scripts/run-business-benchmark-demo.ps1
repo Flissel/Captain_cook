@@ -127,7 +127,7 @@ $canonicalRenewalWorkflow = Join-Path $repositoryRoot 'examples/business_benchma
 $maximumUsdPerTeam = '0.30'
 $maximumHermesUsd = '0.06'
 $maximumTotalUsdPerTeam = '0.50'
-$priorAttemptReserveUsdPerTeam = '0.06'
+$priorAttemptReserveUsdPerTeam = '0.12'
 $userMaximumEurPerTeam = '1.00'
 $seedVersion = 'business-benchmark-demo-2026-07-v21'
 

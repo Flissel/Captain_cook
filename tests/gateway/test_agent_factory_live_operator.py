@@ -11,6 +11,10 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 
+from agenten.agent_factory.business_benchmark_production_ports import (
+    BusinessBenchmarkContentAddressedArtifactStore,
+)
+from agenten.agent_factory.codex_build_provenance import CodexBuildArtifactCas
 from agenten.agent_factory.contracts import (
     FactoryBlockStatus,
     FactoryEvidenceBlock,
@@ -25,6 +29,7 @@ from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.agent_factory_live_operator import (
     FactoryLiveOperatorSettings,
+    _FactoryInputMaterializer,
     _LazyProductionBenchmarkInputs,
     validate_factory_total_cost_envelope,
     run_business_demo_factory_jobs,
@@ -38,6 +43,44 @@ JOB_IDS = (
     UUID("71000000-0000-0000-0000-000000000001"),
     UUID("71000000-0000-0000-0000-000000000002"),
 )
+
+
+def test_factory_input_materializer_routes_and_verifies_each_owned_cas(
+    tmp_path: Path,
+) -> None:
+    benchmark = BusinessBenchmarkContentAddressedArtifactStore(
+        tmp_path / ".captain-cook" / "benchmark"
+    )
+    codex = CodexBuildArtifactCas(tmp_path / ".captain-cook" / "codex")
+    benchmark_ref = benchmark.put(
+        b"benchmark-input",
+        "application/json",
+        namespace="job-input",
+    )
+    codex_ref = codex.put_bytes(
+        b"sealed-source",
+        media_type="application/zip",
+        namespace="source-archive",
+    )
+    materializer = _FactoryInputMaterializer(
+        benchmark_artifacts=benchmark,
+        codex_build_artifacts=codex,
+    )
+
+    assert materializer.materialize(benchmark_ref).read_bytes() == b"benchmark-input"
+    assert materializer.materialize(codex_ref).read_bytes() == b"sealed-source"
+
+    codex.local_path(codex_ref).write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="digest"):
+        materializer.materialize(codex_ref)
+
+    unknown_ref = ArtifactRef(
+        uri=f"artifact://foreign/source/{'f' * 64}",
+        sha256="f" * 64,
+        media_type="application/zip",
+    )
+    with pytest.raises(FactoryDispatchError, match="owner"):
+        materializer.materialize(unknown_ref)
 
 
 class _ForgeRepository:
@@ -170,7 +213,7 @@ def test_total_cost_envelope_requires_subscription_codex_and_keeps_each_team_bel
         "CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM": "0.50",
         "CAPTAIN_FACTORY_CODEX_METERED_USD_PER_TEAM": "0",
         "CAPTAIN_FACTORY_HERMES_MAX_TOTAL_USD": "0.06",
-        "CAPTAIN_FACTORY_PRIOR_ATTEMPT_RESERVE_USD_PER_TEAM": "0.06",
+        "CAPTAIN_FACTORY_PRIOR_ATTEMPT_RESERVE_USD_PER_TEAM": "0.12",
     }
 
     validate_factory_total_cost_envelope(
@@ -187,7 +230,7 @@ def test_total_cost_envelope_requires_subscription_codex_and_keeps_each_team_bel
         validate_factory_total_cost_envelope(
             environment={
                 **environment,
-                "CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM": "0.41",
+                "CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM": "0.47",
             },
             benchmark_maximum_usd_per_team=(Decimal("0.30"), Decimal("0.30")),
         )
