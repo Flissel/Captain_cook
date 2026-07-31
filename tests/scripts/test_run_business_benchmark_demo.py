@@ -28,6 +28,8 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "$maximumTotalUsdPerTeam = '0.75'" in source
     assert "$priorAttemptReserveUsdPerTeam = '0.20'" in source
     assert "$userMaximumEurPerTeam = '1.00'" in source
+    assert "[ValidateSet('ClaimsFirst', 'RenewalFirst')]" in source
+    assert "[array]::Reverse($orderedFactoryJobIds)" in source
     assert "$environment['CAPTAIN_BENCHMARK_MAX_USD'] = '0.60'" in source
     assert "Assert-CodexUsesChatGptSubscription" in source
     assert "$environment['CAPTAIN_CODEX_AUTH_MODE'] = 'chatgpt_subscription'" in source

@@ -7,7 +7,10 @@ param(
 
     [string]$PythonPath = '',
 
-    [string]$HermesPythonPath = ''
+    [string]$HermesPythonPath = '',
+
+    [ValidateSet('ClaimsFirst', 'RenewalFirst')]
+    [string]$BuildOrder = 'ClaimsFirst'
 )
 
 Set-StrictMode -Version Latest
@@ -951,13 +954,20 @@ try {
     }
 
     if ($preflight.production_scope_resolvable -ne $true -or $Action -ceq 'BUILD') {
+        $orderedFactoryJobIds = @(
+            [string]$claims.job.job_id
+            [string]$renewal.job.job_id
+        )
+        if ($BuildOrder -ceq 'RenewalFirst') {
+            [array]::Reverse($orderedFactoryJobIds)
+        }
         $factoryArguments = @(
             $factoryRunner,
             '--workspace-root', $repositoryRoot,
             '--python-executable', $python,
             '--hermes-python-executable', $hermesPython,
-            '--job-id', [string]$claims.job.job_id,
-            '--job-id', [string]$renewal.job.job_id,
+            '--job-id', $orderedFactoryJobIds[0],
+            '--job-id', $orderedFactoryJobIds[1],
             '--hermes-provider', 'openai-api',
             '--hermes-model', $model,
             '--hermes-max-usd', $maximumHermesUsd,
