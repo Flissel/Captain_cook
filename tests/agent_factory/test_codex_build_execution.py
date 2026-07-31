@@ -643,12 +643,14 @@ async def test_replay_rejects_changed_retry_authority_before_advancing_checkpoin
             "runtime_retry_authorization_sha256": (
                 authorization.authorization_ref.sha256
             ),
-            "runtime_retry_authorization_binding_sha256": hashlib.sha256(
-                canonical_factory_codex_model(authorization)
-            ).hexdigest(),
-            "updated_at": NOW + timedelta(seconds=3),
-        }
-    )
+                "runtime_retry_authorization_binding_sha256": hashlib.sha256(
+                    canonical_factory_codex_model(authorization)
+                ).hexdigest(),
+                "parent_terminal_receipt_sha256": receipt_sha256,
+                "parent_journal_sha256": "e" * 64,
+                "updated_at": NOW + timedelta(seconds=3),
+            }
+        )
     checkpoint_store.advance(interrupted, resumed)
     implementation_complete = resumed.model_copy(
         update={
@@ -1090,6 +1092,29 @@ def test_session_receipt_retains_zero_or_partial_timeout_journal(
     assert "private prompt" not in json.dumps(receipt)
 
 
+def test_session_receipt_rejects_thread_id_that_could_become_a_cli_option(
+    tmp_path: Path,
+) -> None:
+    line = json.dumps({"type": "thread.started", "thread_id": "--last"})
+    result = _run_result(
+        tmp_path,
+        exit_code=124,
+        terminal_status="timed_out",
+        jsonl_lines=(line,),
+        process_cleanup_status="verified_cancelled",
+    )
+
+    with pytest.raises(FactoryDispatchError, match="thread ID"):
+        _session_receipt(
+            result=result,
+            session_id="factory-safe-thread-test",
+            workspace_ref="workspace://factory/safe-thread",
+            base_revision="a" * 40,
+            command=("codex", "exec", "--json", "bounded prompt"),
+            completed_at=NOW,
+        )
+
+
 def test_session_receipt_reports_empty_succeeded_journal_truthfully(tmp_path: Path) -> None:
     result = _run_result(
         tmp_path,
@@ -1305,7 +1330,7 @@ async def test_cli_executor_persists_unresolved_cleanup_but_never_makes_it_resum
     with pytest.raises(FactoryDispatchError, match="already running or unresolved"):
         await executor.execute(dispatch, invocation, brief)
     with pytest.raises(FactoryDispatchError, match="not interrupted"):
-        executor.validate_authorized_resume(dispatch, invocation)
+        executor.validate_authorized_resume(dispatch, invocation, brief)
     assert runner_calls == 1
 
 
@@ -1775,6 +1800,301 @@ async def test_authorized_resume_uses_next_ordinal_without_replacing_timeout_rec
             invocation,
             brief,
         )
+
+
+async def _resume_lineage_fixture(
+    tmp_path: Path,
+    *,
+    prior_thread_id: str | None,
+):
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+    current = NOW
+    runner_calls = 0
+
+    class RecoveringPreparer:
+        def prepare_or_recover(self, _request, _invocation, _brief, _checkpoint):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    class TimedOutRunner:
+        def __init__(self, journal_path: Path) -> None:
+            self.journal_path = journal_path
+
+        async def run(self, _authorized) -> CodexRunResult:
+            lines = (
+                ()
+                if prior_thread_id is None
+                else (
+                    json.dumps(
+                        {
+                            "type": "thread.started",
+                            "thread_id": prior_thread_id,
+                        }
+                    ),
+                )
+            )
+            journal = b"".join(f"{line}\n".encode("utf-8") for line in lines)
+            self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+            self.journal_path.write_bytes(journal)
+            return CodexRunResult(
+                exit_code=124,
+                terminal_status="timed_out",
+                process_cleanup_status="verified_cancelled",
+                journal_path=self.journal_path,
+                journal_sha256=hashlib.sha256(journal).hexdigest(),
+                artifact_references=(),
+                jsonl_lines=lines,
+            )
+
+    resume_runners: list[SuccessfulRunner] = []
+
+    def runner_factory(**kwargs):
+        nonlocal runner_calls
+        runner_calls += 1
+        if runner_calls == 1:
+            return TimedOutRunner(kwargs["journal_path"])
+        runner = SuccessfulRunner(workspace, kwargs["journal_path"])
+        resume_runners.append(runner)
+        return runner
+
+    authorizer = RecordingAuthorizer()
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=RecoveringPreparer(),
+        artifact_reader=artifact_reader,
+        authorizer=authorizer,
+        runner_factory=runner_factory,
+        resume_authorizer=CaptainFactoryCodexResumeAuthorizer(clock=lambda: current),
+        clock=lambda: current,
+    )
+    dispatch = _dispatch(job, invocation)
+    with pytest.raises(FactoryCodexBuildInterrupted):
+        await executor.execute(dispatch, invocation, brief)
+    checkpoint_store = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    )
+    checkpoint = checkpoint_store.load(invocation)
+    assert checkpoint is not None
+    current = invocation.lease.expires_at + timedelta(seconds=1)
+    authorized = _authorized_runtime_retry_dispatch(
+        dispatch,
+        invocation,
+        checkpoint,
+        issued_at=current,
+        expires_at=current + timedelta(minutes=2),
+    )
+    return {
+        "executor": executor,
+        "job": job,
+        "dispatch": dispatch,
+        "authorized": authorized,
+        "invocation": invocation,
+        "brief": brief,
+        "state_root": state_root,
+        "workspace": workspace,
+        "checkpoint_store": checkpoint_store,
+        "checkpoint": checkpoint,
+        "authorizer": authorizer,
+        "runner_calls": lambda: runner_calls,
+        "resume_runners": resume_runners,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tamper", ("missing_receipt", "journal_digest"))
+async def test_authorized_resume_revalidates_prior_terminal_evidence_before_process(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    fixture = await _resume_lineage_fixture(
+        tmp_path,
+        prior_thread_id="codex-thread-123",
+    )
+    state_root = fixture["state_root"]
+    invocation = fixture["invocation"]
+    receipt_path = (
+        state_root / "sessions" / f"{invocation.idempotency_key}.json"
+    )
+    journal_path = (
+        state_root / "journals" / f"{invocation.idempotency_key}.jsonl"
+    )
+    if tamper == "missing_receipt":
+        receipt_path.unlink()
+    else:
+        journal_path.write_text(
+            '{"type":"thread.started","thread_id":"tampered-thread"}\n',
+            encoding="utf-8",
+        )
+
+    with pytest.raises(FactoryDispatchError, match="receipt|journal"):
+        await fixture["executor"].execute_authorized_resume(
+            fixture["authorized"],
+            invocation,
+            fixture["brief"],
+        )
+
+    assert fixture["runner_calls"]() == 1
+    assert len(fixture["authorizer"].requests) == 1
+    assert fixture["checkpoint_store"].load(invocation) == fixture["checkpoint"]
+
+
+@pytest.mark.asyncio
+async def test_authorized_resume_rejects_prior_receipt_journal_thread_mismatch(
+    tmp_path: Path,
+) -> None:
+    fixture = await _resume_lineage_fixture(
+        tmp_path,
+        prior_thread_id="codex-thread-123",
+    )
+    state_root = fixture["state_root"]
+    invocation = fixture["invocation"]
+    receipt_path = (
+        state_root / "sessions" / f"{invocation.idempotency_key}.json"
+    )
+    journal_path = (
+        state_root / "journals" / f"{invocation.idempotency_key}.jsonl"
+    )
+    journal = (
+        b'{"type":"thread.started","thread_id":"different-thread"}\n'
+    )
+    journal_path.write_bytes(journal)
+    receipt = json.loads(receipt_path.read_bytes())
+    receipt["jsonl_sha256"] = hashlib.sha256(journal).hexdigest()
+    receipt["journal_sha256"] = hashlib.sha256(journal).hexdigest()
+    receipt_path.write_bytes(
+        json.dumps(
+            receipt,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    changed_checkpoint = fixture["checkpoint"].model_copy(
+        update={
+            "terminal_receipt_sha256": hashlib.sha256(
+                receipt_path.read_bytes()
+            ).hexdigest()
+        }
+    )
+    checkpoint_path = (
+        state_root
+        / "checkpoints"
+        / f"{invocation.invocation_id.hex}.json"
+    )
+    checkpoint_path.write_bytes(canonical_factory_codex_model(changed_checkpoint))
+    authorized = _authorized_runtime_retry_dispatch(
+        fixture["dispatch"],
+        invocation,
+        changed_checkpoint,
+        issued_at=fixture["authorized"].runtime_retry_authorization.issued_at,
+        expires_at=fixture["authorized"].runtime_retry_authorization.expires_at,
+    )
+
+    with pytest.raises(FactoryDispatchError, match="thread"):
+        await fixture["executor"].execute_authorized_resume(
+            authorized,
+            invocation,
+            fixture["brief"],
+        )
+
+    assert fixture["runner_calls"]() == 1
+    assert len(fixture["authorizer"].requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_authorized_resume_uses_prior_thread_and_persists_parent_lineage(
+    tmp_path: Path,
+) -> None:
+    fixture = await _resume_lineage_fixture(
+        tmp_path,
+        prior_thread_id="codex-thread-123",
+    )
+
+    completed = await fixture["executor"].execute_authorized_resume(
+        fixture["authorized"],
+        fixture["invocation"],
+        fixture["brief"],
+    )
+
+    assert fixture["runner_calls"]() == 2
+    resume_command = fixture["authorizer"].requests[1].command
+    assert resume_command[:5] == (
+        "codex",
+        "exec",
+        "resume",
+        "--json",
+        "codex-thread-123",
+    )
+    assert resume_command[-1] == fixture["authorizer"].requests[0].command[-1]
+    receipt = json.loads(completed.codex_session_receipt)
+    prior_receipt_path = (
+        fixture["state_root"]
+        / "sessions"
+        / f"{fixture['invocation'].idempotency_key}.json"
+    )
+    prior_journal_path = (
+        fixture["state_root"]
+        / "journals"
+        / f"{fixture['invocation'].idempotency_key}.jsonl"
+    )
+    assert receipt["resume_ordinal"] == 1
+    assert receipt["parent_terminal_receipt_sha256"] == hashlib.sha256(
+        prior_receipt_path.read_bytes()
+    ).hexdigest()
+    assert receipt["parent_journal_sha256"] == hashlib.sha256(
+        prior_journal_path.read_bytes()
+    ).hexdigest()
+    assert receipt["parent_codex_thread_id"] == "codex-thread-123"
+    checkpoint = fixture["checkpoint_store"].load(fixture["invocation"])
+    assert checkpoint is not None
+    assert checkpoint.parent_terminal_receipt_sha256 == (
+        receipt["parent_terminal_receipt_sha256"]
+    )
+    assert checkpoint.parent_journal_sha256 == receipt["parent_journal_sha256"]
+    assert checkpoint.parent_codex_thread_id == "codex-thread-123"
+    cas = CodexBuildArtifactCas(tmp_path / "lineage-cas")
+    build_receipt = CaptainCodexBuildReceiptIssuer(cas).issue(
+        job=fixture["job"],
+        build_brief=fixture["brief"],
+        workspace_root=fixture["workspace"],
+        codex_session_receipt=completed.codex_session_receipt,
+        seal_idempotency_key=fixture["invocation"].idempotency_key,
+        candidate_manifest_path=completed.candidate_manifest_path,
+        source_archive_path=completed.source_archive_path,
+        test_evidence_paths=completed.test_evidence_paths,
+        completed_at=completed.completed_at,
+    )
+    assert cas.read_bytes(build_receipt.codex_session_ref) == (
+        completed.codex_session_receipt
+    )
+
+
+@pytest.mark.asyncio
+async def test_authorized_resume_without_prior_thread_reuses_prompt_contract_and_ordinal(
+    tmp_path: Path,
+) -> None:
+    fixture = await _resume_lineage_fixture(tmp_path, prior_thread_id=None)
+
+    completed = await fixture["executor"].execute_authorized_resume(
+        fixture["authorized"],
+        fixture["invocation"],
+        fixture["brief"],
+    )
+
+    assert fixture["authorizer"].requests[1].command == (
+        fixture["authorizer"].requests[0].command
+    )
+    receipt = json.loads(completed.codex_session_receipt)
+    assert receipt["resume_ordinal"] == 1
+    assert receipt["parent_terminal_receipt_sha256"]
+    assert receipt["parent_journal_sha256"] == hashlib.sha256(b"").hexdigest()
+    assert receipt["parent_codex_thread_id"] is None
 
 
 @pytest.mark.asyncio

@@ -164,6 +164,7 @@ class CaptainCodexBuildSealerPort(Protocol):
         self,
         request: FactoryDispatch,
         invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
     ) -> FactoryRuntimeRetryAuthorizationV1: ...
 
 
@@ -311,6 +312,7 @@ class HermesCliFactory(HermesFactoryPort):
                 validated = self._codex_build_sealer.validate_runtime_retry(
                     request,
                     invocation,
+                    artifacts[-1],
                 )
                 if validated is not authorization:
                     raise FactoryDispatchError(

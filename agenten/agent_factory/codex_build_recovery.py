@@ -31,6 +31,7 @@ FactoryCodexBuildPhase = Literal[
 
 _DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _REVISION_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
+_CODEX_THREAD_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _TRANSITIONS: frozenset[tuple[FactoryCodexBuildPhase, FactoryCodexBuildPhase]] = (
     frozenset(
         {
@@ -61,6 +62,9 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
     phase: FactoryCodexBuildPhase
     resume_ordinal: int = Field(ge=0)
     terminal_receipt_sha256: str | None = None
+    parent_terminal_receipt_sha256: str | None = None
+    parent_journal_sha256: str | None = None
+    parent_codex_thread_id: str | None = None
     runtime_retry_authorization_uri: str | None = None
     runtime_retry_authorization_sha256: str | None = None
     runtime_retry_authorization_binding_sha256: str | None = None
@@ -90,6 +94,8 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
         "sealed_build_receipt_sha256",
         "runtime_retry_authorization_sha256",
         "runtime_retry_authorization_binding_sha256",
+        "parent_terminal_receipt_sha256",
+        "parent_journal_sha256",
     )
     @classmethod
     def _require_sha256(cls, value: str | None) -> str | None:
@@ -102,6 +108,13 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
     def _require_receipt_digest(cls, value: str | None) -> str | None:
         if value is not None and _DIGEST_PATTERN.fullmatch(value) is None:
             raise ValueError("terminal_receipt_sha256 must be a SHA-256 digest")
+        return value
+
+    @field_validator("parent_codex_thread_id")
+    @classmethod
+    def _require_safe_parent_thread_id(cls, value: str | None) -> str | None:
+        if value is not None and _CODEX_THREAD_ID_PATTERN.fullmatch(value) is None:
+            raise ValueError("parent Codex thread ID is invalid")
         return value
 
     @field_validator("updated_at")
@@ -143,6 +156,17 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
             raise ValueError("original runtime checkpoint cannot bind retry authority")
         if self.resume_ordinal > 0 and any(value is None for value in retry_values):
             raise ValueError("resumed runtime checkpoint requires retry authority")
+        parent_lineage = (
+            self.parent_terminal_receipt_sha256,
+            self.parent_journal_sha256,
+        )
+        if self.resume_ordinal == 0 and (
+            any(value is not None for value in parent_lineage)
+            or self.parent_codex_thread_id is not None
+        ):
+            raise ValueError("original checkpoint cannot bind parent lineage")
+        if self.resume_ordinal > 0 and any(value is None for value in parent_lineage):
+            raise ValueError("resumed checkpoint requires parent lineage")
         return self
 
 
@@ -556,6 +580,27 @@ def _require_transition(
         raise FactoryDispatchError(
             "Factory Codex checkpoint retry authority binding changed"
         )
+    previous_parent = (
+        previous.parent_terminal_receipt_sha256,
+        previous.parent_journal_sha256,
+        previous.parent_codex_thread_id,
+    )
+    next_parent = (
+        next_checkpoint.parent_terminal_receipt_sha256,
+        next_checkpoint.parent_journal_sha256,
+        next_checkpoint.parent_codex_thread_id,
+    )
+    if transition == ("implementation_interrupted", "implementation_running"):
+        if (
+            previous.terminal_receipt_sha256 is None
+            or next_checkpoint.parent_terminal_receipt_sha256
+            != previous.terminal_receipt_sha256
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex checkpoint parent lineage conflicts"
+            )
+    elif previous_parent != next_parent:
+        raise FactoryDispatchError("Factory Codex checkpoint parent lineage changed")
     if transition == ("implementation_complete", "sealed") and (
         next_checkpoint.terminal_receipt_sha256
         != previous.terminal_receipt_sha256

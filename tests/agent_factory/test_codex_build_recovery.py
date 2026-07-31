@@ -25,6 +25,9 @@ def _bound_checkpoint(
     phase: str = "scaffold_ready",
     resume_ordinal: int = 0,
     terminal_receipt_sha256: str | None = None,
+    parent_terminal_receipt_sha256: str | None = None,
+    parent_journal_sha256: str | None = None,
+    parent_codex_thread_id: str | None = None,
     updated_at: datetime = NOW,
 ) -> tuple[FactoryCodexBuildCheckpointV1, object]:
     job, brief, _artifact_reader = _executor_job_and_brief()
@@ -57,6 +60,9 @@ def _bound_checkpoint(
         phase=phase,
         resume_ordinal=resume_ordinal,
         terminal_receipt_sha256=terminal_receipt_sha256,
+        parent_terminal_receipt_sha256=parent_terminal_receipt_sha256,
+        parent_journal_sha256=parent_journal_sha256,
+        parent_codex_thread_id=parent_codex_thread_id,
         updated_at=updated_at,
         **sealed_bindings,
     )
@@ -70,6 +76,9 @@ def _next(
     seconds: int,
     resume_ordinal: int | None = None,
     terminal_receipt_sha256: str | None = None,
+    parent_terminal_receipt_sha256: str | None = None,
+    parent_journal_sha256: str | None = None,
+    parent_codex_thread_id: str | None = None,
 ) -> FactoryCodexBuildCheckpointV1:
     updates = {
             "phase": phase,
@@ -79,6 +88,21 @@ def _next(
                 else resume_ordinal
             ),
             "terminal_receipt_sha256": terminal_receipt_sha256,
+            "parent_terminal_receipt_sha256": (
+                checkpoint.parent_terminal_receipt_sha256
+                if parent_terminal_receipt_sha256 is None
+                else parent_terminal_receipt_sha256
+            ),
+            "parent_journal_sha256": (
+                checkpoint.parent_journal_sha256
+                if parent_journal_sha256 is None
+                else parent_journal_sha256
+            ),
+            "parent_codex_thread_id": (
+                checkpoint.parent_codex_thread_id
+                if parent_codex_thread_id is None
+                else parent_codex_thread_id
+            ),
             "updated_at": checkpoint.updated_at + timedelta(seconds=seconds),
         }
     effective_ordinal = updates["resume_ordinal"]
@@ -118,6 +142,9 @@ def test_checkpoint_store_advances_full_monotonic_lifecycle_and_replays_target(
         phase="implementation_running",
         seconds=1,
         resume_ordinal=1,
+        parent_terminal_receipt_sha256="b" * 64,
+        parent_journal_sha256="d" * 64,
+        parent_codex_thread_id="019f0000-0000-7000-8000-000000000001",
     )
     complete = _next(
         resumed,
@@ -141,6 +168,96 @@ def test_checkpoint_store_advances_full_monotonic_lifecycle_and_replays_target(
     assert store.advance(complete, sealed) == sealed
     assert store.advance(sealed, sealed) == sealed
     assert store.load(invocation) == sealed
+
+
+def test_resume_checkpoint_binds_exact_prior_receipt_journal_and_thread_lineage(
+    tmp_path: Path,
+) -> None:
+    store = FilesystemFactoryCodexBuildCheckpointStore(tmp_path / "checkpoints")
+    scaffold, _ = _bound_checkpoint(tmp_path)
+    running = _next(scaffold, phase="implementation_running", seconds=1)
+    interrupted = _next(
+        running,
+        phase="implementation_interrupted",
+        seconds=1,
+        terminal_receipt_sha256="b" * 64,
+    )
+    resumed = _next(
+        interrupted,
+        phase="implementation_running",
+        seconds=1,
+        resume_ordinal=1,
+        parent_terminal_receipt_sha256="b" * 64,
+        parent_journal_sha256="c" * 64,
+        parent_codex_thread_id="019f0000-0000-7000-8000-000000000001",
+    )
+    completed = _next(
+        resumed,
+        phase="implementation_complete",
+        seconds=1,
+        terminal_receipt_sha256="d" * 64,
+    )
+
+    store.advance(None, scaffold)
+    store.advance(scaffold, running)
+    store.advance(running, interrupted)
+    store.advance(interrupted, resumed)
+    store.advance(resumed, completed)
+
+    assert completed.parent_terminal_receipt_sha256 == "b" * 64
+    assert completed.parent_journal_sha256 == "c" * 64
+    assert (
+        completed.parent_codex_thread_id
+        == "019f0000-0000-7000-8000-000000000001"
+    )
+
+
+def test_resume_checkpoint_rejects_missing_or_changed_parent_lineage(
+    tmp_path: Path,
+) -> None:
+    store = FilesystemFactoryCodexBuildCheckpointStore(tmp_path / "checkpoints")
+    scaffold, _ = _bound_checkpoint(tmp_path)
+    running = _next(scaffold, phase="implementation_running", seconds=1)
+    interrupted = _next(
+        running,
+        phase="implementation_interrupted",
+        seconds=1,
+        terminal_receipt_sha256="b" * 64,
+    )
+    store.advance(None, scaffold)
+    store.advance(scaffold, running)
+    store.advance(running, interrupted)
+
+    missing = _next(
+        interrupted,
+        phase="implementation_running",
+        seconds=1,
+        resume_ordinal=1,
+    )
+    with pytest.raises(FactoryDispatchError, match="checkpoint.*invalid|parent.*lineage"):
+        store.advance(
+            interrupted,
+            missing,
+        )
+
+    resumed = _next(
+        interrupted,
+        phase="implementation_running",
+        seconds=1,
+        resume_ordinal=1,
+        parent_terminal_receipt_sha256="b" * 64,
+        parent_journal_sha256="c" * 64,
+    )
+    store.advance(interrupted, resumed)
+    changed = _next(
+        resumed,
+        phase="implementation_complete",
+        seconds=1,
+        terminal_receipt_sha256="d" * 64,
+    ).model_copy(update={"parent_journal_sha256": "e" * 64})
+
+    with pytest.raises(FactoryDispatchError, match="lineage"):
+        store.advance(resumed, changed)
 
 
 @pytest.mark.parametrize(

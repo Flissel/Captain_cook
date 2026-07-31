@@ -1624,12 +1624,19 @@ async def test_authorized_runtime_retry_resumes_only_seal_without_new_hermes_cal
                 tuple[FactoryDispatch, FactorySkillInvocationV1, CodexBuildBriefV1]
             ] = []
             self.success = CaptainBuildSealer()
+            self.reject_terminal_lineage = False
 
         def validate_runtime_retry(
             self,
             request: FactoryDispatch,
             invocation: FactorySkillInvocationV1,
+            brief: CodexBuildBriefV1,
         ) -> FactoryRuntimeRetryAuthorizationV1:
+            assert brief.build_assignment.workspace_ref == invocation.lease.workspace_ref
+            if self.reject_terminal_lineage:
+                raise FactoryDispatchError(
+                    "Factory Codex prior terminal evidence is invalid"
+                )
             assert request.runtime_retry_authorization is not None
             assert request.runtime_retry_authorization.invocation_id == invocation.invocation_id
             return request.runtime_retry_authorization
@@ -1741,6 +1748,11 @@ async def test_authorized_runtime_retry_resumes_only_seal_without_new_hermes_cal
         runtime_retry_authorization=authorization,
     )
 
+    sealer.reject_terminal_lineage = True
+    with pytest.raises(FactoryDispatchError, match="terminal evidence"):
+        await factory.dispatch(authorized_request)
+    assert len(sealer.calls) == 1
+    sealer.reject_terminal_lineage = False
     evidence = await factory.dispatch(authorized_request)
 
     assert evidence.phase is FactoryPhase.TOOL_CANDIDATE_TESTED

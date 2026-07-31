@@ -1089,6 +1089,70 @@ async def test_powershell_runner_sets_a_scoped_codex_home_for_the_child(
 
 
 @pytest.mark.asyncio
+async def test_powershell_runner_passes_resume_thread_and_prompt_as_distinct_arguments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class Process:
+        returncode = 0
+
+        def __init__(self) -> None:
+            self.stdout = asyncio.StreamReader()
+            self.stdout.feed_eof()
+            self.stderr = asyncio.StreamReader()
+            self.stderr.feed_eof()
+
+        async def wait(self) -> int:
+            return self.returncode
+
+    async def create_process(*args: object, **kwargs: object) -> Process:
+        captured["args"] = args
+        return Process()
+
+    monkeypatch.setattr(
+        "agenten.execution.codex_supervisor.asyncio.create_subprocess_exec",
+        create_process,
+    )
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    runner = PowerShellCodexRunner(
+        pwsh_path=Path(_pwsh()),
+        script_path=Path("scripts/codex-session.ps1").resolve(),
+        codex_path=Path(r"C:\Windows\System32\timeout.exe"),
+        session_id="runner-resume-1",
+        state_path=tmp_path / "runner-process.json",
+        journal_path=tmp_path / "runner.jsonl",
+        artifact_references=(),
+        codex_home=codex_home,
+        deadline_at=FUTURE_DEADLINE,
+    )
+    prompt = 'continue "exact"; $env:SHOULD_NOT_EXPAND'
+
+    await runner.run(
+        AuthorizedCodexRun(
+            workspace=tmp_path,
+            command=(
+                "codex",
+                "exec",
+                "resume",
+                "--json",
+                "codex-thread-123",
+                prompt,
+            ),
+            environment=FrozenEnvironment({"PATH": "safe-path"}),
+        )
+    )
+
+    arguments = captured["args"]
+    assert isinstance(arguments, tuple)
+    assert arguments[arguments.index("-ResumeThreadId") + 1] == "codex-thread-123"
+    assert arguments[arguments.index("-Prompt") + 1] == prompt
+    assert "codex-thread-123" not in prompt
+
+
+@pytest.mark.asyncio
 async def test_powershell_runner_timeout_cancels_recorded_child_tree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

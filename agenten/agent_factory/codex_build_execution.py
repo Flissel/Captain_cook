@@ -52,6 +52,7 @@ from agenten.execution.codex_supervisor import (
 
 
 _REVISION_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
+_CODEX_THREAD_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OUTPUT_PATHS = (
     "factory-candidate.json",
     "candidate.zip",
@@ -203,6 +204,23 @@ class PreparedFactoryWorkspace:
 
 
 @dataclass(frozen=True)
+class _CodexResumeLineage:
+    terminal_receipt_sha256: str
+    journal_sha256: str
+    codex_thread_id: str | None
+
+
+@dataclass(frozen=True)
+class _LoadedCodexTerminalEvidence:
+    content: bytes
+    payload: dict[str, object]
+    receipt_sha256: str
+    journal_sha256: str
+    codex_thread_id: str | None
+    completed_at: datetime
+
+
+@dataclass(frozen=True)
 class CodexCliFactoryBuildSettings:
     """Non-secret bounds for one Factory-specific Codex execution."""
 
@@ -226,6 +244,7 @@ class CaptainCodexBuildExecutorPort(Protocol):
         self,
         request: FactoryDispatch,
         invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
     ) -> FactoryRuntimeRetryAuthorizationV1: ...
 
     async def execute_authorized_resume(
@@ -422,8 +441,9 @@ class CaptainCodexBuildSealer:
         self,
         request: FactoryDispatch,
         invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
     ) -> FactoryRuntimeRetryAuthorizationV1:
-        return self._executor.validate_authorized_resume(request, invocation)
+        return self._executor.validate_authorized_resume(request, invocation, brief)
 
     async def seal(
         self,
@@ -729,7 +749,7 @@ class CodexCliFactoryBuildExecutor:
         invocation: FactorySkillInvocationV1,
         brief: CodexBuildBriefV1,
     ) -> CompletedCodexBuild:
-        authorization = self.validate_authorized_resume(request, invocation)
+        authorization = self.validate_authorized_resume(request, invocation, brief)
         resume_ordinal = authorization.resume_ordinal
         checkpoint = self._checkpoint_store.load(invocation)
         assert checkpoint is not None
@@ -752,6 +772,7 @@ class CodexCliFactoryBuildExecutor:
         self,
         request: FactoryDispatch,
         invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
     ) -> FactoryRuntimeRetryAuthorizationV1:
         if self._resume_authorizer is None:
             raise FactoryDispatchError(
@@ -773,6 +794,34 @@ class CodexCliFactoryBuildExecutor:
         if resume_ordinal != authorization.resume_ordinal:
             raise FactoryDispatchError(
                 "Factory Codex resume authorization decision is invalid"
+            )
+        prepared = self._prepare_or_recover(
+            request,
+            invocation,
+            brief,
+            checkpoint,
+        )
+        self._validate_original_scaffold(
+            request,
+            invocation,
+            brief,
+            prepared.root,
+            checkpoint,
+        )
+        prior = self._load_terminal_evidence(
+            request=request,
+            invocation=invocation,
+            brief=brief,
+            prepared=prepared,
+            checkpoint=checkpoint,
+        )
+        if (
+            prior.payload["status"] not in {"timed_out", "cancelled"}
+            or prior.payload["process_cleanup_status"] == "unresolved"
+            or prior.completed_at > checkpoint.updated_at
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex prior terminal evidence is not resumable"
             )
         return authorization
 
@@ -890,6 +939,7 @@ class CodexCliFactoryBuildExecutor:
             or remaining_seconds < 1
         ):
             raise FactoryDispatchError("Codex build lease is not active")
+        resume_lineage: _CodexResumeLineage | None = None
         checkpoint = self._checkpoint_store.load(invocation)
         if checkpoint is None:
             scaffold_files = self._scaffold_files(request, brief)
@@ -952,7 +1002,32 @@ class CodexCliFactoryBuildExecutor:
                         exit_code=None,
                         **_interruption_details(request, invocation, checkpoint),
                     )
-                run_request = self._run_request(request, invocation, brief, prepared)
+                prior = self._load_terminal_evidence(
+                    request=request,
+                    invocation=invocation,
+                    brief=brief,
+                    prepared=prepared,
+                    checkpoint=checkpoint,
+                )
+                if (
+                    prior.payload["status"] not in {"timed_out", "cancelled"}
+                    or prior.payload["process_cleanup_status"] == "unresolved"
+                ):
+                    raise FactoryDispatchError(
+                        "Factory Codex prior terminal evidence is not resumable"
+                    )
+                resume_lineage = _CodexResumeLineage(
+                    terminal_receipt_sha256=prior.receipt_sha256,
+                    journal_sha256=prior.journal_sha256,
+                    codex_thread_id=prior.codex_thread_id,
+                )
+                run_request = self._run_request(
+                    request,
+                    invocation,
+                    brief,
+                    prepared,
+                    resume_thread_id=resume_lineage.codex_thread_id,
+                )
                 authorized = self._authorizer.authorize(run_request)
             else:
                 run_request = self._run_request(request, invocation, brief, prepared)
@@ -966,6 +1041,7 @@ class CodexCliFactoryBuildExecutor:
             run_request=run_request,
             authorized=authorized,
             authorized_resume_ordinal=authorized_resume_ordinal,
+            resume_lineage=resume_lineage,
         )
         return self._seal_phase(invocation, prepared, checkpoint)
 
@@ -1043,9 +1119,16 @@ class CodexCliFactoryBuildExecutor:
         invocation: FactorySkillInvocationV1,
         brief: CodexBuildBriefV1,
         prepared: PreparedFactoryWorkspace,
+        *,
+        resume_thread_id: str | None = None,
     ) -> CodexRunRequest:
         session_id = f"factory-{invocation.invocation_id.hex[:24]}"
         prompt = _codex_prompt(request, invocation, brief)
+        command = (
+            ("codex", "exec", "resume", "--json", resume_thread_id, prompt)
+            if resume_thread_id is not None
+            else ("codex", "exec", "--json", prompt)
+        )
         return CodexRunRequest(
             run_id=invocation.invocation_id.hex,
             trace_id=request.job.correlation_id.hex,
@@ -1054,7 +1137,7 @@ class CodexCliFactoryBuildExecutor:
             session_id=session_id,
             claim_token=invocation.lease.lease_id,
             iteration=invocation.attempt,
-            command=("codex", "exec", "--json", prompt),
+            command=command,
             workspace=prepared.root,
             project_id=request.job.job_id.hex,
             claim_id=invocation.invocation_id.hex,
@@ -1073,6 +1156,7 @@ class CodexCliFactoryBuildExecutor:
         run_request: CodexRunRequest,
         authorized: AuthorizedCodexRun,
         authorized_resume_ordinal: int | None,
+        resume_lineage: _CodexResumeLineage | None,
     ) -> FactoryCodexBuildCheckpointV1:
         authority_deadline = self._authority_deadline(
             request,
@@ -1106,6 +1190,10 @@ class CodexCliFactoryBuildExecutor:
         if authorized_resume_ordinal is not None:
             authorization = request.runtime_retry_authorization
             assert authorization is not None
+            if resume_lineage is None:
+                raise FactoryDispatchError(
+                    "Factory Codex resume lineage is unavailable"
+                )
             runtime_seconds = min(
                 runtime_seconds,
                 authorization.maximum_runtime_seconds,
@@ -1145,6 +1233,7 @@ class CodexCliFactoryBuildExecutor:
                 resume_ordinal=next_ordinal,
                 terminal_receipt_sha256=None,
                 scaffold_manifest_sha256=checkpoint.scaffold_manifest_sha256,
+                resume_lineage=resume_lineage,
                 previous=checkpoint,
             ),
         )
@@ -1162,6 +1251,8 @@ class CodexCliFactoryBuildExecutor:
             base_revision=prepared.base_revision,
             command=run_request.command,
             completed_at=completed_at,
+            resume_ordinal=checkpoint.resume_ordinal,
+            parent_lineage=resume_lineage,
         )
         receipt_path = self._persist_session_receipt(
             invocation,
@@ -1185,6 +1276,7 @@ class CodexCliFactoryBuildExecutor:
                     resume_ordinal=checkpoint.resume_ordinal,
                     terminal_receipt_sha256=receipt_sha256,
                     scaffold_manifest_sha256=checkpoint.scaffold_manifest_sha256,
+                    resume_lineage=resume_lineage,
                     previous=checkpoint,
                 ),
             )
@@ -1217,6 +1309,7 @@ class CodexCliFactoryBuildExecutor:
                 resume_ordinal=checkpoint.resume_ordinal,
                 terminal_receipt_sha256=receipt_sha256,
                 scaffold_manifest_sha256=checkpoint.scaffold_manifest_sha256,
+                resume_lineage=resume_lineage,
                 previous=checkpoint,
             ),
         )
@@ -1302,6 +1395,44 @@ class CodexCliFactoryBuildExecutor:
         prepared: PreparedFactoryWorkspace,
         checkpoint: FactoryCodexBuildCheckpointV1,
     ) -> tuple[bytes, dict[str, object]]:
+        terminal = self._load_terminal_evidence(
+            request=request,
+            invocation=invocation,
+            brief=brief,
+            prepared=prepared,
+            checkpoint=checkpoint,
+        )
+        receipt = terminal.payload
+        completed_at = terminal.completed_at
+        authorized_resume = checkpoint.resume_ordinal > 0
+        authority_deadline = self._authority_deadline(
+            request,
+            invocation,
+            authorized_resume=authorized_resume,
+        )
+        authority_start = invocation.lease.issued_at
+        if authorized_resume:
+            authorization = request.runtime_retry_authorization
+            if authorization is None or authorization.resume_ordinal != checkpoint.resume_ordinal:
+                raise FactoryDispatchError(
+                    "Factory Codex reconciliation requires original retry authority"
+                )
+            authority_start = authorization.issued_at
+        if not authority_start <= completed_at < authority_deadline:
+            raise FactoryDispatchError(
+                "Factory Codex terminal receipt is outside Captain authority"
+            )
+        return terminal.content, receipt
+
+    def _load_terminal_evidence(
+        self,
+        *,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+        prepared: PreparedFactoryWorkspace,
+        checkpoint: FactoryCodexBuildCheckpointV1,
+    ) -> _LoadedCodexTerminalEvidence:
         receipt_path = self._session_receipt_path(
             invocation, checkpoint.resume_ordinal
         )
@@ -1336,9 +1467,23 @@ class CodexCliFactoryBuildExecutor:
             "journal_sha256",
             "event_count",
             "event_types",
+            "resume_ordinal",
+            "parent_terminal_receipt_sha256",
+            "parent_journal_sha256",
+            "parent_codex_thread_id",
             "completed_at",
         }
-        run_request = self._run_request(request, invocation, brief, prepared)
+        run_request = self._run_request(
+            request,
+            invocation,
+            brief,
+            prepared,
+            resume_thread_id=(
+                checkpoint.parent_codex_thread_id
+                if checkpoint.resume_ordinal > 0
+                else None
+            ),
+        )
         if (
             set(receipt) != expected_keys
             or receipt["schema"] != "captain.codex-session-receipt.v1"
@@ -1347,6 +1492,13 @@ class CodexCliFactoryBuildExecutor:
             != f"factory-{invocation.invocation_id.hex[:24]}"
             or receipt["workspace_ref"] != checkpoint.workspace_ref
             or receipt["base_revision"] != checkpoint.base_revision
+            or receipt["resume_ordinal"] != checkpoint.resume_ordinal
+            or receipt["parent_terminal_receipt_sha256"]
+            != checkpoint.parent_terminal_receipt_sha256
+            or receipt["parent_journal_sha256"]
+            != checkpoint.parent_journal_sha256
+            or receipt["parent_codex_thread_id"]
+            != checkpoint.parent_codex_thread_id
             or receipt["command_sha256"]
             != hashlib.sha256(
                 "\0".join(run_request.command).encode("utf-8")
@@ -1365,7 +1517,11 @@ class CodexCliFactoryBuildExecutor:
             124: ("timed_out", {"not_required", "verified_cancelled", "unresolved"}),
             130: ("cancelled", {"verified_cancelled", "unresolved"}),
         }.get(exit_code)
-        if expected_terminal is None or status != expected_terminal[0] or cleanup not in expected_terminal[1]:
+        if (
+            expected_terminal is None
+            or status != expected_terminal[0]
+            or cleanup not in expected_terminal[1]
+        ):
             raise FactoryDispatchError("Factory Codex terminal receipt is inconsistent")
 
         journal_path = self._journal_path(invocation, checkpoint.resume_ordinal)
@@ -1404,14 +1560,25 @@ class CodexCliFactoryBuildExecutor:
                 if isinstance(value, str) and value.strip()
             }
         )
+        observed_thread_id = next(iter(thread_ids), None)
+        expected_thread_id = checkpoint.parent_codex_thread_id or observed_thread_id
         if (
             len(thread_ids) > 1
+            or (
+                observed_thread_id is not None
+                and _CODEX_THREAD_ID_PATTERN.fullmatch(observed_thread_id) is None
+            )
             or receipt["event_count"] != len(events)
             or receipt["event_types"] != event_types
-            or receipt["codex_thread_id"] != next(iter(thread_ids), None)
+            or receipt["codex_thread_id"] != expected_thread_id
+            or (
+                checkpoint.parent_codex_thread_id is not None
+                and observed_thread_id is not None
+                and observed_thread_id != checkpoint.parent_codex_thread_id
+            )
             or (status == "succeeded" and not events)
         ):
-            raise FactoryDispatchError("Factory Codex JSONL journal receipt changed")
+            raise FactoryDispatchError("Factory Codex JSONL journal thread receipt changed")
         try:
             completed_at = datetime.fromisoformat(str(receipt["completed_at"]))
         except ValueError:
@@ -1425,24 +1592,6 @@ class CodexCliFactoryBuildExecutor:
             raise FactoryDispatchError(
                 "Factory Codex terminal receipt completion time is invalid"
             )
-        authorized_resume = checkpoint.resume_ordinal > 0
-        authority_deadline = self._authority_deadline(
-            request,
-            invocation,
-            authorized_resume=authorized_resume,
-        )
-        authority_start = invocation.lease.issued_at
-        if authorized_resume:
-            authorization = request.runtime_retry_authorization
-            if authorization is None or authorization.resume_ordinal != checkpoint.resume_ordinal:
-                raise FactoryDispatchError(
-                    "Factory Codex reconciliation requires original retry authority"
-                )
-            authority_start = authorization.issued_at
-        if not authority_start <= completed_at < authority_deadline:
-            raise FactoryDispatchError(
-                "Factory Codex terminal receipt is outside Captain authority"
-            )
         digest = hashlib.sha256(content).hexdigest()
         if (
             checkpoint.terminal_receipt_sha256 is not None
@@ -1451,7 +1600,21 @@ class CodexCliFactoryBuildExecutor:
             raise FactoryDispatchError(
                 "Factory Codex terminal session receipt digest changed"
             )
-        return content, receipt
+        if (
+            checkpoint.phase != "implementation_running"
+            and checkpoint.terminal_receipt_sha256 is None
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex terminal session receipt digest is missing"
+            )
+        return _LoadedCodexTerminalEvidence(
+            content=content,
+            payload=receipt,
+            receipt_sha256=digest,
+            journal_sha256=journal_sha256,
+            codex_thread_id=expected_thread_id,
+            completed_at=completed_at,
+        )
 
     def _seal_phase(
         self,
@@ -1723,6 +1886,7 @@ class CodexCliFactoryBuildExecutor:
         terminal_receipt_sha256: str | None,
         scaffold_manifest_sha256: str,
         previous: FactoryCodexBuildCheckpointV1 | None,
+        resume_lineage: _CodexResumeLineage | None = None,
     ) -> FactoryCodexBuildCheckpointV1:
         retry_uri, retry_sha256, retry_binding_sha256 = (
             self._runtime_retry_checkpoint_binding(
@@ -1746,6 +1910,33 @@ class CodexCliFactoryBuildExecutor:
             phase=phase,
             resume_ordinal=resume_ordinal,
             terminal_receipt_sha256=terminal_receipt_sha256,
+            parent_terminal_receipt_sha256=(
+                resume_lineage.terminal_receipt_sha256
+                if resume_lineage is not None
+                else (
+                    previous.parent_terminal_receipt_sha256
+                    if previous is not None
+                    else None
+                )
+            ),
+            parent_journal_sha256=(
+                resume_lineage.journal_sha256
+                if resume_lineage is not None
+                else (
+                    previous.parent_journal_sha256
+                    if previous is not None
+                    else None
+                )
+            ),
+            parent_codex_thread_id=(
+                resume_lineage.codex_thread_id
+                if resume_lineage is not None
+                else (
+                    previous.parent_codex_thread_id
+                    if previous is not None
+                    else None
+                )
+            ),
             runtime_retry_authorization_uri=retry_uri,
             runtime_retry_authorization_sha256=retry_sha256,
             runtime_retry_authorization_binding_sha256=retry_binding_sha256,
@@ -1859,6 +2050,8 @@ def _session_receipt(
     base_revision: str,
     command: tuple[str, ...],
     completed_at: datetime,
+    resume_ordinal: int = 0,
+    parent_lineage: _CodexResumeLineage | None = None,
 ) -> bytes:
     if completed_at.tzinfo is None or completed_at.utcoffset() != timezone.utc.utcoffset(
         completed_at
@@ -1898,11 +2091,36 @@ def _session_receipt(
     }
     if len(thread_ids) > 1:
         raise FactoryDispatchError("Codex JSONL contains conflicting thread IDs")
+    observed_thread_id = next(iter(thread_ids), None)
+    if (
+        observed_thread_id is not None
+        and _CODEX_THREAD_ID_PATTERN.fullmatch(observed_thread_id) is None
+    ):
+        raise FactoryDispatchError("Codex thread ID is invalid")
+    if isinstance(resume_ordinal, bool) or not 0 <= resume_ordinal <= 2:
+        raise FactoryDispatchError("Codex resume ordinal is invalid")
+    if resume_ordinal == 0 and parent_lineage is not None:
+        raise FactoryDispatchError("Original Codex receipt cannot bind parent lineage")
+    if resume_ordinal > 0 and parent_lineage is None:
+        raise FactoryDispatchError("Resumed Codex receipt requires parent lineage")
+    if (
+        parent_lineage is not None
+        and parent_lineage.codex_thread_id is not None
+        and observed_thread_id is not None
+        and observed_thread_id != parent_lineage.codex_thread_id
+    ):
+        raise FactoryDispatchError("Codex resumed thread ID changed")
+    effective_thread_id = (
+        parent_lineage.codex_thread_id
+        if parent_lineage is not None
+        and parent_lineage.codex_thread_id is not None
+        else observed_thread_id
+    )
     payload = {
         "schema": "captain.codex-session-receipt.v1",
         "provider": "codex-cli",
         "session_id": session_id,
-        "codex_thread_id": next(iter(thread_ids), None),
+        "codex_thread_id": effective_thread_id,
         "status": result.terminal_status,
         "exit_code": result.exit_code,
         "process_cleanup_status": result.process_cleanup_status,
@@ -1921,6 +2139,22 @@ def _session_receipt(
                 for event_type in (event.get("type"),)
                 if isinstance(event_type, str) and event_type.strip()
             }
+        ),
+        "resume_ordinal": resume_ordinal,
+        "parent_terminal_receipt_sha256": (
+            parent_lineage.terminal_receipt_sha256
+            if parent_lineage is not None
+            else None
+        ),
+        "parent_journal_sha256": (
+            parent_lineage.journal_sha256
+            if parent_lineage is not None
+            else None
+        ),
+        "parent_codex_thread_id": (
+            parent_lineage.codex_thread_id
+            if parent_lineage is not None
+            else None
         ),
         "completed_at": completed_at.isoformat(),
     }

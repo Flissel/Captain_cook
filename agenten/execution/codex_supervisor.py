@@ -150,8 +150,18 @@ class PowerShellCodexRunner:
         self._monotonic = monotonic or time.monotonic
 
     async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
-        if len(authorized.command) != 4:
-            raise ValueError("PowerShell Codex runner requires one prompt argument")
+        standard_command = (
+            len(authorized.command) == 4
+            and authorized.command[:3] == ("codex", "exec", "--json")
+        )
+        resume_command = (
+            len(authorized.command) == 6
+            and authorized.command[:4] == ("codex", "exec", "resume", "--json")
+        )
+        if not standard_command and not resume_command:
+            raise ValueError("PowerShell Codex runner command is invalid")
+        prompt = authorized.command[-1]
+        resume_thread_id = authorized.command[-2] if resume_command else None
         self._journal_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         journal_descriptor = os.open(
             self._journal_path,
@@ -172,7 +182,7 @@ class PowerShellCodexRunner:
             deadline_remaining_seconds,
         )
         wrapper_stop_at = self._monotonic() + wrapper_timeout_seconds
-        process = await asyncio.create_subprocess_exec(
+        launcher_arguments = [
             str(self._pwsh_path),
             "-NoProfile",
             "-File",
@@ -180,7 +190,7 @@ class PowerShellCodexRunner:
             "-Workspace",
             str(authorized.workspace),
             "-Prompt",
-            authorized.command[3],
+            prompt,
             "-CodexPath",
             str(self._codex_path),
             "-SessionId",
@@ -189,6 +199,11 @@ class PowerShellCodexRunner:
             str(self._state_path),
             "-DeadlineAt",
             self._deadline_at.isoformat(),
+        ]
+        if resume_thread_id is not None:
+            launcher_arguments.extend(("-ResumeThreadId", resume_thread_id))
+        process = await asyncio.create_subprocess_exec(
+            *launcher_arguments,
             cwd=authorized.workspace,
             env=child_environment,
             stdout=asyncio.subprocess.PIPE,

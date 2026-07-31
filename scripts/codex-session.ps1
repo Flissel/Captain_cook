@@ -21,6 +21,10 @@ param(
     [DateTimeOffset] $DeadlineAt,
 
     [Parameter(ParameterSetName = "Run")]
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$')]
+    [string] $ResumeThreadId,
+
+    [Parameter(ParameterSetName = "Run")]
     [ValidateSet("read-only", "workspace-write")]
     [string] $Sandbox = "workspace-write",
 
@@ -133,11 +137,24 @@ $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
 $startInfo.ArgumentList.Add("-a")
 $startInfo.ArgumentList.Add("never")
-$startInfo.ArgumentList.Add("exec")
-$startInfo.ArgumentList.Add("--sandbox")
-$startInfo.ArgumentList.Add($Sandbox)
-$startInfo.ArgumentList.Add("--json")
-$startInfo.ArgumentList.Add($Prompt)
+if ($ResumeThreadId) {
+    # `codex exec resume` inherits global sandbox policy. Every value is a
+    # distinct ArgumentList entry so neither thread names nor prompts cross a
+    # shell parsing boundary.
+    $startInfo.ArgumentList.Add("-s")
+    $startInfo.ArgumentList.Add($Sandbox)
+    $startInfo.ArgumentList.Add("exec")
+    $startInfo.ArgumentList.Add("resume")
+    $startInfo.ArgumentList.Add("--json")
+    $startInfo.ArgumentList.Add($ResumeThreadId)
+    $startInfo.ArgumentList.Add($Prompt)
+} else {
+    $startInfo.ArgumentList.Add("exec")
+    $startInfo.ArgumentList.Add("--sandbox")
+    $startInfo.ArgumentList.Add($Sandbox)
+    $startInfo.ArgumentList.Add("--json")
+    $startInfo.ArgumentList.Add($Prompt)
+}
 
 $process = [System.Diagnostics.Process]::new()
 $process.StartInfo = $startInfo

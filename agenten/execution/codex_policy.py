@@ -90,6 +90,10 @@ class CodexExecutionPolicy:
         }
     )
     _ALLOWED_COMMAND_PREFIX = ("codex", "exec", "--json")
+    _ALLOWED_RESUME_COMMAND_PREFIX = ("codex", "exec", "resume", "--json")
+    _CODEX_THREAD_ID_PATTERN = re.compile(
+        r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
     _MCP_LEASE_ENVIRONMENT_NAMES = frozenset({"N8N_MCP_TOKEN"})
     _FORBIDDEN_SECRET_PATH_PATTERNS = (
         re.compile(
@@ -186,11 +190,20 @@ class CodexExecutionPolicy:
 
     @classmethod
     def _require_allowed_command(cls, command: tuple[str, ...]) -> None:
-        if (
-            len(command) != len(cls._ALLOWED_COMMAND_PREFIX) + 1
-            or command[: len(cls._ALLOWED_COMMAND_PREFIX)] != cls._ALLOWED_COMMAND_PREFIX
-            or command[-1].lstrip().startswith("-")
-        ):
+        standard = (
+            len(command) == len(cls._ALLOWED_COMMAND_PREFIX) + 1
+            and command[: len(cls._ALLOWED_COMMAND_PREFIX)]
+            == cls._ALLOWED_COMMAND_PREFIX
+            and not command[-1].lstrip().startswith("-")
+        )
+        resumed = (
+            len(command) == len(cls._ALLOWED_RESUME_COMMAND_PREFIX) + 2
+            and command[: len(cls._ALLOWED_RESUME_COMMAND_PREFIX)]
+            == cls._ALLOWED_RESUME_COMMAND_PREFIX
+            and cls._CODEX_THREAD_ID_PATTERN.fullmatch(command[-2]) is not None
+            and not command[-1].lstrip().startswith("-")
+        )
+        if not standard and not resumed:
             raise CodexPolicyViolation("command is not in the Codex allowlist")
 
     @classmethod
