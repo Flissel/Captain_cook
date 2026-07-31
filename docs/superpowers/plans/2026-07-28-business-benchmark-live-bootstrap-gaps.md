@@ -96,7 +96,7 @@
   terminal exit cause, checkpoint/receipt references, and immutable Captain
   resume bindings without exposing workspace paths, journals, prompts, or
   stderr. This is local implementation evidence only, not a provider run.
-- [ ] Run the prepared immutable v19 two-profile Factory scope and 30-case
+- [ ] Run the prepared immutable v20 two-profile Factory scope and 30-case
   team/baseline benchmark after `OPENAI_API_KEY` is securely exported into the invoking
   process. Retain cost, latency, tool, handoff, recovery, Gateway decision, and
   Minibook projection evidence; do not call either team `ready_to_use` before
@@ -147,6 +147,15 @@
   the expected endpoint plus ledger DSN; a merely healthy foreign Gateway fails
   closed. This is infrastructure evidence only; it does not repair v19's
   missing Captain blocks or authorize a benchmark rerun.
+- [x] Retire v19 from further execution without rewriting its private evidence.
+  The dedicated persistent ledger has no v19 jobs, while the private Claims
+  replay remains bound to the lost v19 lease through discovery, Codex brief,
+  and sealed-build evidence. Re-provisioning v19 would therefore create a new
+  lease that correctly conflicts with the old immutable replay. Suite/seed v20
+  creates fresh Claims job `f5263d6f-5d91-5794-8a5d-8b8aa8b83643` and Renewal
+  job `9b710b88-41dd-59c9-a65b-063e29d422b0` under the same case, model, and
+  cost contracts. This is dry-run evidence only; v20 has not yet called a
+  provider or produced a candidate.
 - [x] Enforce the operator's `1.00 EUR` marginal-cost ceiling per team before
   provider construction. The live demo reserves at most `0.30 USD` for one
   team's candidate/baseline benchmark and conservatively assigns the complete

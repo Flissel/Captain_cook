@@ -128,7 +128,7 @@ $maximumUsdPerTeam = '0.30'
 $maximumHermesUsd = '0.06'
 $maximumTotalUsdPerTeam = '0.40'
 $userMaximumEurPerTeam = '1.00'
-$seedVersion = 'business-benchmark-demo-2026-07-v19'
+$seedVersion = 'business-benchmark-demo-2026-07-v20'
 
 $rootEnvAllowlist = @(
     'CAPTAIN_GATEWAY_TOKEN',
@@ -348,7 +348,7 @@ function New-DryRunPlan {
         mode = 'dry_run'
         database = 'captain_test'
         issued_at = $IssuedAt
-        suite_version = 19
+        suite_version = 20
         seed_version_id = $seedVersion
         maximum_usd_per_team = $maximumUsdPerTeam
         jobs = @(
@@ -562,7 +562,7 @@ try {
             '--issued-at', $issuedAt,
             '--model', 'gpt-4.1-mini',
             '--maximum-usd-per-team', $maximumUsdPerTeam,
-            '--suite-version', '19',
+            '--suite-version', '20',
             '--seed-version-id', $seedVersion
         )
         $rawPlanProvisioning = @(& $python @planArguments)
@@ -592,7 +592,7 @@ try {
             if (
                 [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
                 @($team.job.execution_policy.allowed_models) -notcontains 'gpt-4.1-mini' -or
-                [int]$team.suite.suite_version -ne 19
+                [int]$team.suite.suite_version -ne 20
             ) {
                 throw 'Dry-run team model or budget does not match the demo authority.'
             }
@@ -711,7 +711,7 @@ try {
         '--issued-at', $issuedAt,
         '--model', $model,
         '--maximum-usd-per-team', $maximumUsdPerTeam,
-        '--suite-version', '19',
+        '--suite-version', '20',
         '--seed-version-id', $seedVersion
     )
     if ($Action -in @('BUILD', 'RUN')) {
@@ -750,7 +750,7 @@ try {
         if (
             [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
             @($team.job.execution_policy.allowed_models) -notcontains $model -or
-            [int]$team.suite.suite_version -ne 19
+            [int]$team.suite.suite_version -ne 20
         ) {
             throw 'Provisioned team model or budget does not match the demo authority.'
         }
