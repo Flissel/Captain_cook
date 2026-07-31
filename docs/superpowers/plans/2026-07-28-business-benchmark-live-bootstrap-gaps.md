@@ -208,6 +208,14 @@
   and exact resume ordinal `1`; no new suite or Hermes call is required for the
   one authorized resume. All 30 business cases, promotion, and projection
   remain unproven.
+  Renewal Resume 1 subsequently completed in the original Codex thread,
+  retained streamed JSONL, produced the required artifacts, and reached the
+  sealed Captain checkpoint without a new Hermes call. Gateway then accepted
+  the recovery-bound tool-candidate block only after exact retry-reference,
+  lease, job, attempt, and evidence-time validation. The technical holdout
+  still failed `business_value` and `mandatory_handoff` while `safe_tool_use`
+  passed. Therefore both Claims and Renewal require explicit Captain
+  improvement authorization; neither candidate may enter the 30-case gate yet.
 - [x] Enforce the operator's `1.00 EUR` marginal-cost ceiling per team before
   provider construction. The live demo reserves at most `0.30 USD` for one
   team's candidate/baseline benchmark and conservatively assigns the complete

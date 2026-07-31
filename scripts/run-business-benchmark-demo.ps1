@@ -338,6 +338,39 @@ function New-CandidatesReady {
     }
 }
 
+function New-FactoryImprovementCheckpoint {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Teams,
+        [Parameter(Mandatory = $true)][object[]]$Results,
+        [Parameter(Mandatory = $true)][string]$IssuedAt
+    )
+    return [ordered]@{
+        schema = 'captain.business-benchmark-demo-run.v1'
+        status = 'factory_improvement_required'
+        database = 'captain_test'
+        issued_at = $IssuedAt
+        maximum_usd_per_team = $maximumUsdPerTeam
+        jobs = @(
+            foreach ($team in $Teams) {
+                $result = @($Results | Where-Object {
+                    [string]$_.job_id -ceq [string]$team.job.job_id
+                })
+                if ($result.Count -ne 1) {
+                    throw 'Factory result does not bind exactly one provisioned team.'
+                }
+                [ordered]@{
+                    profile = [string]$team.profile
+                    job_id = [string]$team.job.job_id
+                    candidate_id = [string]$team.candidate_id
+                    factory_status = [string]$result[0].status
+                    next_action = [string]$result[0].next_action.kind
+                }
+            }
+        )
+        instruction = 'Captain must evaluate the failed technical evidence and explicitly authorize each improvement attempt.'
+    }
+}
+
 function New-DryRunPlan {
     param(
         [Parameter(Mandatory = $true)][object[]]$Teams,
@@ -949,12 +982,28 @@ try {
         }
         if ($Action -ceq 'BUILD') {
             $invalidStops = @($factoryResult.results | Where-Object {
-                $_.status -cne 'stop_point_reached' -or
-                $_.next_action.kind -cne 'dispatch_quality_warden' -or
-                [string]$_.next_action.job_id -cne [string]$_.job_id
+                -not (
+                    (
+                        $_.status -ceq 'stop_point_reached' -and
+                        $_.next_action.kind -ceq 'dispatch_quality_warden'
+                    ) -or (
+                        $_.status -ceq 'captain_action_required' -and
+                        $_.next_action.kind -ceq 'append_improvement_requested'
+                    )
+                ) -or [string]$_.next_action.job_id -cne [string]$_.job_id
             })
             if ($invalidStops.Count -ne 0) {
-                throw 'Captain Factory Build did not stop both jobs before Quality Warden.'
+                throw 'Captain Factory Build did not reach a bounded technical checkpoint.'
+            }
+            if (@($factoryResult.results | Where-Object {
+                $_.status -ceq 'captain_action_required'
+            }).Count -ne 0) {
+                New-FactoryImprovementCheckpoint `
+                    -Teams $teams `
+                    -Results @($factoryResult.results) `
+                    -IssuedAt $issuedAt |
+                    ConvertTo-Json -Compress -Depth 20
+                exit 2
             }
         }
         elseif (@($factoryResult.results | Where-Object {

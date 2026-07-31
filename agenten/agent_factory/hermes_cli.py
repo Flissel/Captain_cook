@@ -271,8 +271,11 @@ class HermesCliFactory(HermesFactoryPort):
             )
         historical_completed_replay = False
         if now >= request.lease.expires_at:
-            await self._require_runtime_recovery_replays(request, steps=steps)
             authorization = request.runtime_retry_authorization
+            if authorization is None or now >= request.job.deadline_at:
+                _validate_factory_dispatch(request, now=now)
+            await self._require_runtime_recovery_replays(request, steps=steps)
+            assert authorization is not None
             if authorization is not None and now >= authorization.expires_at:
                 await self._require_completed_runtime_recovery_replay(
                     request,
