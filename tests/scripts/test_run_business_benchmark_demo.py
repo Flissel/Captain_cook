@@ -21,7 +21,7 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     source = SCRIPT.read_text(encoding="utf-8")
 
     assert source.startswith("#requires -Version 7")
-    assert "[ValidateSet('Plan', 'Run')]" in source
+    assert "[ValidateSet('Plan', 'Build', 'Run')]" in source
     assert "--maximum-usd-per-team', $maximumUsdPerTeam" in source
     assert "$maximumUsdPerTeam = '0.30'" in source
     assert "$maximumHermesUsd = '0.06'" in source
@@ -488,8 +488,7 @@ print(json.dumps({
     assert "OPENAI_API_KEY must already exist in the process" in provider_boundary.stderr
     assert not (repository / "provider-called").exists()
 
-    (scripts / "preflight-business-benchmark-demo.py").write_text(
-        r"""
+    factory_preflight = r"""
 import json
 from pathlib import Path
 
@@ -502,7 +501,9 @@ print(json.dumps({
     'production_scope_resolvable': resolvable,
     **({'jobs': []} if resolvable else {}),
 }))
-""".strip(),
+"""
+    (scripts / "preflight-business-benchmark-demo.py").write_text(
+        factory_preflight.strip(),
         encoding="utf-8",
     )
     (scripts / "run-agent-factory-business-demo.py").write_text(
@@ -611,6 +612,102 @@ Set-Content (Join-Path $root 'provider-called') 'yes'
 """.strip(),
         encoding="utf-8",
     )
+    built = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(scripts / SCRIPT.name),
+            "-Action",
+            "Build",
+            "-PythonPath",
+            sys.executable,
+            "-HermesPythonPath",
+            sys.executable,
+        ],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert built.returncode == 0, built.stderr
+    candidates_ready = json.loads(built.stdout)
+    assert candidates_ready == {
+        "schema": "captain.business-benchmark-demo-run.v1",
+        "status": "candidates_ready",
+        "database": "captain_test",
+        "issued_at": candidates_ready["issued_at"],
+        "maximum_usd_per_team": "0.30",
+        "jobs": [
+            {
+                "profile": "claims",
+                "job_id": "71000000-0000-0000-0000-000000000001",
+                "candidate_id": "claims-candidate",
+            },
+            {
+                "profile": "renewal",
+                "job_id": "71000000-0000-0000-0000-000000000002",
+                "candidate_id": "renewal-candidate",
+            },
+        ],
+        "renewal_batch_id": "renewal-batch",
+    }
+    assert candidates_ready["issued_at"].endswith("Z")
+    assert (repository / "service-called").is_file()
+    assert (repository / "factory-called").is_file()
+    assert not (repository / "provider-called").exists()
+    build_arguments = json.loads((repository / "provision-args.json").read_text("utf-8"))
+    assert "--apply" in build_arguments
+    build_factory_arguments = json.loads(
+        (repository / "factory-args.json").read_text("utf-8")
+    )
+    assert build_factory_arguments.count("--job-id") == 2
+    assert "process-only-demo-key" not in built.stdout + built.stderr
+
+    (scripts / "preflight-business-benchmark-demo.py").write_text(
+        r"""
+import json
+print(json.dumps({
+    'schema': 'captain.business-benchmark-default-preflight.v1',
+    'status': 'factory_dispatch_required',
+    'database': 'captain_test',
+    'production_scope_resolvable': False,
+}))
+""".strip(),
+        encoding="utf-8",
+    )
+    blocked_build = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(scripts / SCRIPT.name),
+            "-Action",
+            "Build",
+            "-PythonPath",
+            sys.executable,
+            "-HermesPythonPath",
+            sys.executable,
+        ],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert blocked_build.returncode == 2, blocked_build.stderr
+    assert json.loads(blocked_build.stdout)["status"] == "factory_dispatch_required"
+    assert not (repository / "provider-called").exists()
+    (scripts / "preflight-business-benchmark-demo.py").write_text(
+        factory_preflight.strip(),
+        encoding="utf-8",
+    )
+    (repository / "factory-called").unlink()
+
     successful = subprocess.run(
         [
             pwsh,

@@ -1,6 +1,9 @@
 #requires -Version 7
 [CmdletBinding()]
 param(
+    [ValidateSet('Build', 'Run')]
+    [string]$Action = 'Run',
+
     [string]$PythonPath = ''
 )
 
@@ -21,7 +24,7 @@ try {
         throw 'OPENAI_API_KEY must not be empty.'
     }
     [Environment]::SetEnvironmentVariable('OPENAI_API_KEY', $plainKey, 'Process')
-    & $demoRunner -Action Run -PythonPath $PythonPath
+    & $demoRunner -Action $Action -PythonPath $PythonPath
     $exitCode = $LASTEXITCODE
 }
 finally {

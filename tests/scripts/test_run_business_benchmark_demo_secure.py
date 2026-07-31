@@ -16,7 +16,9 @@ def test_secure_runner_prompts_masked_and_keeps_provider_key_process_only() -> N
     assert "SetEnvironmentVariable('OPENAI_API_KEY', $plainKey, 'Process')" in source
     assert "SetEnvironmentVariable('OPENAI_API_KEY', $nullString, 'Process')" in source
     assert "run-business-benchmark-demo.ps1" in source
-    assert "-Action Run" in source
+    assert "[ValidateSet('Build', 'Run')]" in source
+    assert "[string]$Action = 'Run'" in source
+    assert "-Action $Action" in source
     assert "Get-Content" not in source
     assert ".env" not in source
     assert "Write-Output $plainKey" not in source

@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Plan', 'Run')]
+    [ValidateSet('Plan', 'Build', 'Run')]
     [string]$Action,
 
     [string]$PythonPath = '',
@@ -261,6 +261,31 @@ function New-FactoryDispatchCheckpoint {
     }
 }
 
+function New-CandidatesReady {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Teams,
+        [Parameter(Mandatory = $true)][string]$IssuedAt,
+        [Parameter(Mandatory = $true)][string]$RenewalBatchId
+    )
+    return [ordered]@{
+        schema = 'captain.business-benchmark-demo-run.v1'
+        status = 'candidates_ready'
+        database = 'captain_test'
+        issued_at = $IssuedAt
+        maximum_usd_per_team = $maximumUsdPerTeam
+        jobs = @(
+            foreach ($team in $Teams) {
+                [ordered]@{
+                    profile = [string]$team.profile
+                    job_id = [string]$team.job.job_id
+                    candidate_id = [string]$team.candidate_id
+                }
+            }
+        )
+        renewal_batch_id = $RenewalBatchId
+    }
+}
+
 function New-DryRunPlan {
     param(
         [Parameter(Mandatory = $true)][object[]]$Teams,
@@ -494,7 +519,7 @@ try {
 
     $hermesPython = Resolve-HermesPython $HermesPythonPath
 
-    if ($Action -ceq 'Run') {
+    if ($Action -in @('Build', 'Run')) {
         try {
             & $serviceRunner benchmark-start *> $null
             if ($LASTEXITCODE -ne 0) {
@@ -587,7 +612,7 @@ try {
         '--suite-version', '19',
         '--seed-version-id', $seedVersion
     )
-    if ($Action -ceq 'Run') {
+    if ($Action -in @('Build', 'Run')) {
         $arguments += '--apply'
     }
     $rawProvisioning = @(& $python @arguments)
@@ -600,7 +625,7 @@ try {
     catch {
         throw 'Captain business benchmark provisioning returned invalid JSON.'
     }
-    $expectedMode = if ($Action -ceq 'Run') { 'applied' } else { 'dry_run' }
+    $expectedMode = if ($Action -in @('Build', 'Run')) { 'applied' } else { 'dry_run' }
     if (
         $provisioning.schema -cne 'captain.business-benchmark-demo-provisioning.v1' -or
         $provisioning.mode -cne $expectedMode -or
@@ -628,7 +653,7 @@ try {
             throw 'Provisioned team model or budget does not match the demo authority.'
         }
         if (
-            $Action -ceq 'Run' -and
+            $Action -in @('Build', 'Run') -and
             [decimal]$team.gateway_budget_remaining_usd -ne [decimal]$maximumUsdPerTeam
         ) {
             throw 'Applied team Gateway budget does not match the demo authority.'
@@ -689,7 +714,7 @@ try {
         exit 2
     }
 
-    if ([string]::IsNullOrWhiteSpace($processOpenAiKey)) {
+    if ($Action -ceq 'Run' -and [string]::IsNullOrWhiteSpace($processOpenAiKey)) {
         throw 'OPENAI_API_KEY must already exist in the process; demo env files are never read for it.'
     }
 
@@ -790,6 +815,15 @@ try {
                 ConvertTo-Json -Compress -Depth 20
             exit 2
         }
+    }
+
+    if ($Action -ceq 'Build') {
+        New-CandidatesReady `
+            -Teams $teams `
+            -IssuedAt $issuedAt `
+            -RenewalBatchId $renewalBatchId |
+            ConvertTo-Json -Compress -Depth 20
+        exit 0
     }
 
     $liveFailure = $null
