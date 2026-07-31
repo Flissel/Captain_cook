@@ -96,10 +96,15 @@ class Mapper:
         )
 
 
-def _workflow_evidence():
+def _workflow_evidence(*, attempt: int = 1, inventory_attempt: int | None = None):
     factory_job = job_v3(mode="demo")
+    inventory_attempt = attempt if inventory_attempt is None else inventory_attempt
 
-    def bind(payload: dict[str, object]) -> dict[str, object]:
+    def bind(
+        payload: dict[str, object],
+        *,
+        bound_attempt: int,
+    ) -> dict[str, object]:
         invocation = payload["invocation"]
         assert isinstance(invocation, dict)
         lease = invocation["lease"]
@@ -109,7 +114,7 @@ def _workflow_evidence():
                 "job_id": str(factory_job.job_id),
                 "correlation_id": str(factory_job.correlation_id),
                 "subject_version": factory_job.subject_version,
-                "attempt": 1,
+                "attempt": bound_attempt,
                 "input_ref": factory_job.input_ref.model_dump(mode="json"),
                 "input_sha256": factory_job.input_ref.sha256,
                 "acceptance_assertion_ids": list(factory_job.acceptance_assertion_ids),
@@ -120,7 +125,7 @@ def _workflow_evidence():
                 "job_id": str(factory_job.job_id),
                 "correlation_id": str(factory_job.correlation_id),
                 "subject_version": factory_job.subject_version,
-                "attempt": 1,
+                "attempt": bound_attempt,
             }
         )
         payload.update(
@@ -128,14 +133,16 @@ def _workflow_evidence():
                 "job_id": str(factory_job.job_id),
                 "correlation_id": str(factory_job.correlation_id),
                 "subject_version": factory_job.subject_version,
-                "attempt": 1,
+                "attempt": bound_attempt,
                 "acceptance_assertion_ids": list(factory_job.acceptance_assertion_ids),
             }
         )
         return payload
 
-    inventory = CodebaseInventoryV1.model_validate(bind(inventory_payload()))
-    brief_data = bind(brief_payload())
+    inventory = CodebaseInventoryV1.model_validate(
+        bind(inventory_payload(), bound_attempt=inventory_attempt)
+    )
+    brief_data = bind(brief_payload(), bound_attempt=attempt)
     brief_data["context_refs"] = [inventory.artifact_ref.model_dump(mode="json")]
     invocation = brief_data["invocation"]
     assert isinstance(invocation, dict)
@@ -145,7 +152,7 @@ def _workflow_evidence():
         {
             "correlation_id": str(factory_job.correlation_id),
             "subject_version": factory_job.subject_version,
-            "attempt": 1,
+            "attempt": attempt,
             "compiled_spec_ref": factory_job.compiled_spec_ref.model_dump(mode="json"),
             "dependency_graph_ref": factory_job.dependency_graph_ref.model_dump(mode="json"),
             "released_skill": {
@@ -171,7 +178,7 @@ def _workflow_evidence():
             "job_id": str(factory_job.job_id),
             "correlation_id": str(factory_job.correlation_id),
             "subject_version": factory_job.subject_version,
-            "attempt": 1,
+            "attempt": attempt,
             "input_ref": brief.artifact_ref.model_dump(mode="json"),
             "input_sha256": brief.artifact_ref.sha256,
             "acceptance_assertion_ids": list(factory_job.acceptance_assertion_ids),
@@ -182,7 +189,7 @@ def _workflow_evidence():
             "job_id": str(factory_job.job_id),
             "correlation_id": str(factory_job.correlation_id),
             "subject_version": factory_job.subject_version,
-            "attempt": 1,
+            "attempt": attempt,
             "workspace_ref": assignment["workspace_ref"],
         }
     )
@@ -194,7 +201,7 @@ def _workflow_evidence():
             "creation_job_id": assignment["creation_job_id"],
             "correlation_id": str(factory_job.correlation_id),
             "subject_version": factory_job.subject_version,
-            "attempt": 1,
+            "attempt": attempt,
             "assignment_id": assignment["assignment_id"],
             "idempotency_key": assignment["idempotency_key"],
             "seal_idempotency_key": build_invocation["idempotency_key"],
@@ -210,7 +217,7 @@ def _workflow_evidence():
             "job_id": str(factory_job.job_id),
             "correlation_id": str(factory_job.correlation_id),
             "subject_version": factory_job.subject_version,
-            "attempt": 1,
+            "attempt": attempt,
             "acceptance_assertion_ids": list(factory_job.acceptance_assertion_ids),
             "build_receipt_ref": sealed_ref,
             "evidence_refs": [sealed_ref],
@@ -282,6 +289,32 @@ def test_creation_job_mapper_uses_exact_captain_brief_and_is_deterministic() -> 
     assert any(
         ref.sha256 == build.build_receipt_ref.sha256 for ref in receipt.evidence_refs
     )
+
+
+def test_creation_job_mapper_retry_uses_brief_bound_baseline_inventory() -> None:
+    factory_job, inventory, brief, build = _workflow_evidence(
+        attempt=2,
+        inventory_attempt=1,
+    )
+    mapper = CaptainCreationJobMapper(
+        evidence=ForgeEvidence(inventory, brief, build)
+    )
+
+    creation_job = mapper.map(
+        FactoryDispatch(
+            job=factory_job,
+            action=FactoryAction(
+                kind=FactoryActionKind.SUBMIT_FORGE_JOB,
+                attempt=2,
+            ),
+            role=None,
+            lease=None,
+        )
+    )
+
+    assert creation_job.attempt == 2
+    assert inventory.attempt == 1
+    assert inventory.artifact_ref in brief.context_refs
 
 
 def test_creation_job_mapper_rejects_missing_blueprint_inventory_binding() -> None:

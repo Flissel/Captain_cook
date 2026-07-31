@@ -76,12 +76,6 @@ class CaptainCreationJobMapper:
         job = request.job
         attempt = request.action.attempt
         artifacts = self._evidence.workflow_artifacts(job.job_id)
-        inventories = tuple(
-            artifact
-            for artifact in artifacts
-            if isinstance(artifact, CodebaseInventoryV1)
-            and _matches_dispatch(artifact, job, attempt)
-        )
         briefs = tuple(
             artifact
             for artifact in artifacts
@@ -94,13 +88,25 @@ class CaptainCreationJobMapper:
             if isinstance(artifact, CodexBuildEvidenceV1)
             and _matches_dispatch(artifact, job, attempt)
         )
-        if len(inventories) != 1 or len(briefs) != 1 or len(builds) != 1:
+        if len(briefs) != 1 or len(builds) != 1:
+            raise FactoryDispatchError(
+                "creation job requires exactly one Captain inventory, Codex brief, and sealed build"
+            )
+        brief = briefs[0]
+        build = builds[0]
+        inventories = tuple(
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, CodebaseInventoryV1)
+            and _matches_job_identity(artifact, job)
+            and artifact.attempt <= attempt
+            and artifact.artifact_ref in brief.context_refs
+        )
+        if len(inventories) != 1:
             raise FactoryDispatchError(
                 "creation job requires exactly one Captain inventory, Codex brief, and sealed build"
             )
         inventory = inventories[0]
-        brief = briefs[0]
-        build = builds[0]
 
         if inventory.artifact_ref not in brief.context_refs:
             raise FactoryDispatchError("Codex brief is not bound to the Captain inventory")
@@ -244,12 +250,18 @@ def _same_artifact_ref(left: object, right: object) -> bool:
 
 def _matches_dispatch(artifact: object, job: object, attempt: int) -> bool:
     return (
+        _matches_job_identity(artifact, job)
+        and getattr(artifact, "attempt", None) == attempt
+    )
+
+
+def _matches_job_identity(artifact: object, job: object) -> bool:
+    return (
         getattr(artifact, "job_id", None) == getattr(job, "job_id", None)
         and getattr(artifact, "correlation_id", None)
         == getattr(job, "correlation_id", None)
         and getattr(artifact, "subject_version", None)
         == getattr(job, "subject_version", None)
-        and getattr(artifact, "attempt", None) == attempt
     )
 
 
