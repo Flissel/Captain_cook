@@ -575,7 +575,10 @@ class FactoryDispatcher:
             now = self._clock.now()
             improvement_authorization = None
             runtime_retry_authorization = None
-            if role is FactoryRole.TOOL_INTEGRATOR and action.attempt > 1:
+            if (
+                action.kind is FactoryActionKind.DISPATCH_TOOL_INTEGRATOR
+                and action.attempt > 1
+            ):
                 if self._improvements is None:
                     raise FactoryDispatchError(
                         "retry dispatch requires improvement authorization evidence"
@@ -586,7 +589,10 @@ class FactoryDispatcher:
                     projection,
                     now,
                 )
-            if role is FactoryRole.TOOL_INTEGRATOR and self._runtime_retries is not None:
+            if (
+                action.kind is FactoryActionKind.DISPATCH_TOOL_INTEGRATOR
+                and self._runtime_retries is not None
+            ):
                 runtime_retry_authorization = self._runtime_retries.active(
                     job,
                     action,

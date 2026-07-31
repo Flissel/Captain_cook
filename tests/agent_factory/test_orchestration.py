@@ -358,3 +358,65 @@ async def test_retry_dispatch_gets_typed_improvement_authorization_from_port() -
 
     assert action.kind is FactoryActionKind.DISPATCH_TOOL_INTEGRATOR
     assert hermes.requests[0].improvement_authorization == authorization
+
+
+@pytest.mark.asyncio
+async def test_retry_build_validator_does_not_reopen_improvement_authority() -> None:
+    coordinator = FactoryCoordinator(InMemoryFactoryRepository())
+    factory_job = job()
+    coordinator.register(factory_job)
+    for phase in (
+        FactoryPhase.FORGE_REQUESTED,
+        FactoryPhase.BLUEPRINT_CREATED,
+        FactoryPhase.TOOL_CANDIDATE_TESTED,
+        FactoryPhase.AGENT_CODE_CREATED,
+        FactoryPhase.BUILD_FAILED,
+        FactoryPhase.IMPROVEMENT_REQUESTED,
+    ):
+        coordinator.record(block(phase))
+    for event_id, phase in (
+        (
+            UUID("00000000-0000-0000-0000-000000000099"),
+            FactoryPhase.BLUEPRINT_CREATED,
+        ),
+        (
+            UUID("00000000-0000-0000-0000-000000000100"),
+            FactoryPhase.TOOL_CANDIDATE_TESTED,
+        ),
+        (
+            UUID("00000000-0000-0000-0000-000000000101"),
+            FactoryPhase.AGENT_CODE_CREATED,
+        ),
+    ):
+        coordinator.record(
+            block(phase, attempt=2).model_copy(update={"event_id": event_id})
+        )
+
+    class Improvements:
+        def active(self, *_args, **_kwargs):
+            raise AssertionError(
+                "build validation must not reopen improvement authority"
+            )
+
+    class RetryValidator(CandidateValidator):
+        async def dispatch(self, request: object):
+            self.requests.append(request)
+            return block(FactoryPhase.BUILD_PASSED, attempt=2).model_copy(
+                update={
+                    "event_id": UUID(
+                        "00000000-0000-0000-0000-000000000102"
+                    )
+                }
+            )
+
+    validator = RetryValidator()
+    action = await dispatcher(
+        coordinator,
+        Hermes(),
+        Forge(),
+        validator,
+        improvements=Improvements(),
+    ).dispatch_next(factory_job.job_id)
+
+    assert action.kind is FactoryActionKind.DISPATCH_BUILD_VALIDATOR
+    assert len(validator.requests) == 1
