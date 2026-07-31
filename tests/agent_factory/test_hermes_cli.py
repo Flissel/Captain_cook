@@ -26,6 +26,7 @@ from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.hermes_cli import (
     FactorySkillReplayPendingError,
     FactorySkillReplayClaim,
+    FactorySkillReplayRetryableFailureError,
     FilesystemFactorySkillReplayStore,
     FilesystemReleasedFactorySkillCatalog,
     HermesCliFactory,
@@ -1557,6 +1558,25 @@ async def test_runtime_retry_replay_requires_atomic_authorized_resume(
     assert resumed.record.claim_token != interrupted.claim_token
     with pytest.raises(FactoryDispatchError, match="interrupted"):
         await replay_store.resume(interrupted, authorization=authorization)
+
+    failed = await replay_store.fail(
+        resumed.record,
+        failure_kind="CodexPolicyViolation",
+    )
+    with pytest.raises(FactorySkillReplayRetryableFailureError) as retryable:
+        await replay_store.claim(invocation)
+    retried = await replay_store.retry_failed(
+        retryable.value.record,
+        authorization=authorization,
+    )
+    assert retried.acquired is True
+    assert retried.record.state == "pending"
+    assert retried.record.resume_ordinal == 1
+    assert retried.record.runtime_retry_authorization_ref == (
+        authorization.authorization_ref
+    )
+    with pytest.raises(FactoryDispatchError, match="failure changed"):
+        await replay_store.retry_failed(failed, authorization=authorization)
 
 
 @pytest.mark.asyncio

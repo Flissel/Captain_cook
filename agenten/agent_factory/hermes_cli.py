@@ -349,6 +349,29 @@ class HermesCliFactory(HermesFactoryPort):
                     interrupted.record,
                     authorization=validated,
                 )
+            except FactorySkillReplayRetryableFailureError as failed:
+                authorization = request.runtime_retry_authorization
+                if (
+                    step is not FactorySkillStep.SEAL_CODEX_BUILD
+                    or authorization is None
+                    or self._codex_build_sealer is None
+                    or not artifacts
+                    or not isinstance(artifacts[-1], CodexBuildBriefV1)
+                ):
+                    raise
+                validated = self._codex_build_sealer.validate_runtime_retry(
+                    request,
+                    invocation,
+                    artifacts[-1],
+                )
+                if validated is not authorization:
+                    raise FactoryDispatchError(
+                        "Captain Codex runtime retry validation changed authority"
+                    )
+                claim = await self._replay_store.retry_failed(
+                    failed.record,
+                    authorization=validated,
+                )
             if not claim.acquired:
                 accepted = claim.record
                 assert accepted.artifact is not None
@@ -1019,6 +1042,16 @@ class FactorySkillReplayInterruptedError(FactoryDispatchError):
         self.record = record
 
 
+class FactorySkillReplayRetryableFailureError(FactoryDispatchError):
+    """A pre-launch resume policy failure may reuse the same Captain authority."""
+
+    def __init__(self, record: "FactorySkillReplayRecord") -> None:
+        super().__init__(
+            "factory skill replay failed before launch and requires recovery"
+        )
+        self.record = record
+
+
 @dataclass(frozen=True)
 class FactorySkillReplayRecord:
     invocation: FactorySkillInvocationV1
@@ -1177,6 +1210,13 @@ class FactorySkillReplayStore(Protocol):
         authorization: FactoryRuntimeRetryAuthorizationV1,
     ) -> FactorySkillReplayClaim: ...
 
+    async def retry_failed(
+        self,
+        failed: FactorySkillReplayRecord,
+        *,
+        authorization: FactoryRuntimeRetryAuthorizationV1,
+    ) -> FactorySkillReplayClaim: ...
+
     async def abandon(self, pending: FactorySkillReplayRecord) -> None: ...
 
 
@@ -1306,6 +1346,23 @@ class InMemoryFactorySkillReplayStore:
             if existing != interrupted or existing.state != "interrupted":
                 raise FactoryDispatchError("factory skill replay is no longer interrupted")
             self._records[interrupted.invocation.idempotency_key] = resumed
+        return FactorySkillReplayClaim(record=resumed, acquired=True)
+
+    async def retry_failed(
+        self,
+        failed: FactorySkillReplayRecord,
+        *,
+        authorization: FactoryRuntimeRetryAuthorizationV1,
+    ) -> FactorySkillReplayClaim:
+        resumed = _retried_failed_replay_record(
+            failed,
+            authorization=authorization,
+        )
+        async with self._lock:
+            existing = self._records.get(failed.invocation.idempotency_key)
+            if existing != failed or existing.state != "failed":
+                raise FactoryDispatchError("factory skill replay failure changed")
+            self._records[failed.invocation.idempotency_key] = resumed
         return FactorySkillReplayClaim(record=resumed, acquired=True)
 
     async def abandon(self, pending: FactorySkillReplayRecord) -> None:
@@ -1473,6 +1530,25 @@ class FilesystemFactorySkillReplayStore:
         )
         return FactorySkillReplayClaim(record=resumed, acquired=True)
 
+    async def retry_failed(
+        self,
+        failed: FactorySkillReplayRecord,
+        *,
+        authorization: FactoryRuntimeRetryAuthorizationV1,
+    ) -> FactorySkillReplayClaim:
+        resumed = _retried_failed_replay_record(
+            failed,
+            authorization=authorization,
+        )
+        path = self._path_for(failed.invocation.idempotency_key)
+        await asyncio.to_thread(
+            self._replace_failed,
+            path,
+            failed,
+            resumed,
+        )
+        return FactorySkillReplayClaim(record=resumed, acquired=True)
+
     async def abandon(self, pending: FactorySkillReplayRecord) -> None:
         path = self._path_for(pending.invocation.idempotency_key)
         await asyncio.to_thread(self._remove_pending, path, pending)
@@ -1542,13 +1618,28 @@ class FilesystemFactorySkillReplayStore:
         )
 
     @classmethod
+    def _replace_failed(
+        cls,
+        path: Path,
+        failed: FactorySkillReplayRecord,
+        resumed: FactorySkillReplayRecord,
+    ) -> None:
+        cls._replace_exact(
+            path,
+            failed,
+            resumed,
+            expected_state="failed",
+            diagnostic="factory skill replay failure changed",
+        )
+
+    @classmethod
     def _replace_exact(
         cls,
         path: Path,
         expected: FactorySkillReplayRecord,
         outcome: FactorySkillReplayRecord,
         *,
-        expected_state: Literal["pending", "interrupted"],
+        expected_state: Literal["pending", "interrupted", "failed"],
         diagnostic: str,
     ) -> None:
         lock = cls._acquire_file_lock(path.with_suffix(".lock"))
@@ -1882,6 +1973,46 @@ def _resumed_replay_record(
     )
 
 
+def _retried_failed_replay_record(
+    failed: FactorySkillReplayRecord,
+    *,
+    authorization: FactoryRuntimeRetryAuthorizationV1,
+) -> FactorySkillReplayRecord:
+    invocation = failed.invocation
+    expected_authorization_digest = hashlib.sha256(
+        _canonical_json(
+            authorization.model_dump(mode="json", by_alias=True)
+        ).encode("utf-8")
+    ).hexdigest()
+    if (
+        failed.state != "failed"
+        or failed.failure_kind != "CodexPolicyViolation"
+        or failed.resume_ordinal != authorization.resume_ordinal
+        or failed.runtime_retry_authorization_ref != authorization.authorization_ref
+        or failed.runtime_retry_authorization_binding_sha256
+        != expected_authorization_digest
+        or authorization.job_id != invocation.job_id
+        or authorization.correlation_id != invocation.correlation_id
+        or authorization.subject_version != invocation.subject_version
+        or authorization.attempt != invocation.attempt
+        or authorization.invocation_id != invocation.invocation_id
+        or authorization.idempotency_key != invocation.idempotency_key
+        or authorization.lease_id != invocation.lease.lease_id
+    ):
+        raise FactoryDispatchError(
+            "factory skill replay pre-launch failure does not match retry authority"
+        )
+    return FactorySkillReplayRecord(
+        invocation=invocation,
+        invocation_sha256=failed.invocation_sha256,
+        claim_token=uuid4().hex,
+        state="pending",
+        resume_ordinal=authorization.resume_ordinal,
+        runtime_retry_authorization_ref=authorization.authorization_ref,
+        runtime_retry_authorization_binding_sha256=expected_authorization_digest,
+    )
+
+
 def _existing_replay_claim(
     existing: FactorySkillReplayRecord,
     invocation: FactorySkillInvocationV1,
@@ -1894,6 +2025,11 @@ def _existing_replay_claim(
     if existing.state == "pending":
         raise FactorySkillReplayPendingError(existing)
     if existing.state == "failed":
+        if (
+            existing.failure_kind == "CodexPolicyViolation"
+            and existing.runtime_retry_authorization_ref is not None
+        ):
+            raise FactorySkillReplayRetryableFailureError(existing)
         raise FactoryDispatchError("factory skill replay previously failed")
     if existing.state == "interrupted":
         raise FactorySkillReplayInterruptedError(existing)
