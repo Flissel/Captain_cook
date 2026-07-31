@@ -23,7 +23,10 @@ from agenten.agent_factory.codex_build_execution import (
 )
 from agenten.agent_factory.codex_build_recovery import (
     FactoryCodexBuildCheckpointV1,
+    FactoryCodexOutputArtifactV1,
+    FactoryCodexOutputManifestV1,
     FilesystemFactoryCodexBuildCheckpointStore,
+    FilesystemFactoryCodexOutputManifestStore,
     canonical_factory_codex_model,
 )
 from agenten.agent_factory.codex_build_provenance import (
@@ -77,6 +80,9 @@ class FakeBuildExecutor:
         return self.sealed_evidence
 
     def validate_replay_authority(self, _request, _invocation):
+        return None
+
+    def validate_completed_outputs(self, _invocation, _completed):
         return None
 
     def persist_sealed(self, invocation, completed, evidence):
@@ -652,10 +658,39 @@ async def test_replay_rejects_changed_retry_authority_before_advancing_checkpoin
             }
         )
     checkpoint_store.advance(interrupted, resumed)
+    output_manifest = FactoryCodexOutputManifestV1(
+        schema="captain.factory-codex-output-manifest.v1",
+        job_id=job.job_id,
+        correlation_id=job.correlation_id,
+        attempt=invocation.attempt,
+        invocation_id=invocation.invocation_id,
+        workspace_ref=invocation.lease.workspace_ref,
+        resume_ordinal=1,
+        terminal_receipt_sha256=receipt_sha256,
+        artifacts=tuple(
+            FactoryCodexOutputArtifactV1(
+                relative_path=relative,
+                sha256=hashlib.sha256((workspace / relative).read_bytes()).hexdigest(),
+                size=(workspace / relative).stat().st_size,
+            )
+            for relative in (
+                "candidate.zip",
+                "factory-candidate.json",
+                "test-evidence.json",
+            )
+        ),
+    )
+    output_manifest_uri, output_manifest_sha256 = (
+        FilesystemFactoryCodexOutputManifestStore(
+            state_root / "output-manifests"
+        ).persist(output_manifest)
+    )
     implementation_complete = resumed.model_copy(
         update={
             "phase": "implementation_complete",
             "terminal_receipt_sha256": receipt_sha256,
+            "output_manifest_uri": output_manifest_uri,
+            "output_manifest_sha256": output_manifest_sha256,
             "updated_at": NOW + timedelta(seconds=4),
         }
     )
@@ -1021,7 +1056,241 @@ async def test_cli_executor_fails_closed_when_codex_omits_required_outputs(
         tmp_path / "state" / "checkpoints"
     ).load(invocation)
     assert checkpoint is not None
+    assert checkpoint.phase == "implementation_running"
+    assert (
+        tmp_path
+        / "state"
+        / "sessions"
+        / f"{invocation.idempotency_key}.json"
+    ).is_file()
+    assert not (tmp_path / "state" / "output-manifests").exists()
+
+
+@pytest.mark.asyncio
+async def test_implementation_complete_binds_exact_outputs_and_rejects_archive_replacement(
+    tmp_path: Path,
+) -> None:
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+
+    class Preparer:
+        def prepare(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+        def prepare_or_recover(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=Preparer(),
+        artifact_reader=artifact_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=lambda **kwargs: SuccessfulRunner(
+            workspace,
+            kwargs["journal_path"],
+        ),
+        clock=lambda: NOW,
+    )
+    dispatch = _dispatch(job, invocation)
+
+    completed = await executor.execute(dispatch, invocation, brief)
+
+    checkpoint_store = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    )
+    checkpoint = checkpoint_store.load(invocation)
+    assert checkpoint is not None
     assert checkpoint.phase == "implementation_complete"
+    assert checkpoint.output_manifest_sha256 is not None
+    assert checkpoint.output_manifest_uri == (
+        "artifact://factory/codex-output-manifest/"
+        f"{checkpoint.output_manifest_sha256}"
+    )
+    manifest_path = (
+        state_root
+        / "output-manifests"
+        / f"{checkpoint.output_manifest_sha256}.json"
+    )
+    manifest = json.loads(manifest_path.read_bytes())
+    assert manifest["schema"] == "captain.factory-codex-output-manifest.v1"
+    assert [item["relative_path"] for item in manifest["artifacts"]] == [
+        "candidate.zip",
+        "factory-candidate.json",
+        "test-evidence.json",
+    ]
+    assert all(item["size"] > 0 for item in manifest["artifacts"])
+    assert str(workspace) not in json.dumps(manifest)
+    checkpoint_bytes = (
+        state_root / "checkpoints" / f"{invocation.invocation_id.hex}.json"
+    ).read_bytes()
+
+    (workspace / "candidate.zip").write_bytes(b"replacement archive")
+
+    class IssuerMustNotRun:
+        def issue(self, **_kwargs):
+            pytest.fail("output mutation must fail before the issuer")
+
+    sealer = CaptainCodexBuildSealer(
+        executor=executor,
+        issuer=IssuerMustNotRun(),
+    )
+    with pytest.raises(
+        FactoryDispatchError,
+        match="Codex output artifact binding changed",
+    ):
+        sealer._seal_completed(
+            dispatch,
+            invocation,
+            brief,
+            completed,
+        )
+    with pytest.raises(
+        FactoryDispatchError,
+        match="Codex output artifact binding changed",
+    ):
+        await executor.reconcile_pending(dispatch, invocation, brief)
+
+    assert (
+        state_root / "checkpoints" / f"{invocation.invocation_id.hex}.json"
+    ).read_bytes() == checkpoint_bytes
+
+
+@pytest.mark.asyncio
+async def test_output_manifest_ignores_unrequired_workspace_files(
+    tmp_path: Path,
+) -> None:
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+
+    class Preparer:
+        def prepare(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+        def prepare_or_recover(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=Preparer(),
+        artifact_reader=artifact_reader,
+        authorizer=RecordingAuthorizer(),
+        runner_factory=lambda **kwargs: SuccessfulRunner(
+            workspace,
+            kwargs["journal_path"],
+        ),
+        clock=lambda: NOW,
+    )
+    dispatch = _dispatch(job, invocation)
+    completed = await executor.execute(dispatch, invocation, brief)
+    (workspace / "unrelated-debug.txt").write_text("irrelevant", encoding="utf-8")
+
+    replay = await executor.reconcile_pending(dispatch, invocation, brief)
+
+    assert replay == completed
+
+
+@pytest.mark.asyncio
+async def test_mutation_after_sealed_evidence_crash_cannot_advance_checkpoint(
+    tmp_path: Path,
+) -> None:
+    cas = CodexBuildArtifactCas(tmp_path / "cas")
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+    checkpoint_root = state_root / "checkpoints"
+
+    class Preparer:
+        def prepare(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+        def prepare_or_recover(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    class CrashBeforeSealedCheckpointStore(FilesystemFactoryCodexBuildCheckpointStore):
+        def advance(
+            self,
+            previous: FactoryCodexBuildCheckpointV1 | None,
+            next_checkpoint: FactoryCodexBuildCheckpointV1,
+        ) -> FactoryCodexBuildCheckpointV1:
+            if (
+                previous is not None
+                and previous.phase == "implementation_complete"
+                and next_checkpoint.phase == "sealed"
+            ):
+                raise RuntimeError("simulated crash before checkpoint advance")
+            return super().advance(previous, next_checkpoint)
+
+    def build_executor(
+        checkpoint_store: FilesystemFactoryCodexBuildCheckpointStore,
+    ) -> CodexCliFactoryBuildExecutor:
+        return CodexCliFactoryBuildExecutor(
+            settings=CodexCliFactoryBuildSettings(
+                state_root=state_root,
+                maximum_runtime_seconds=120,
+            ),
+            workspace_preparer=Preparer(),
+            artifact_reader=artifact_reader,
+            authorizer=RecordingAuthorizer(),
+            runner_factory=lambda **kwargs: SuccessfulRunner(
+                workspace,
+                kwargs["journal_path"],
+            ),
+            checkpoint_store=checkpoint_store,
+            clock=lambda: NOW,
+        )
+
+    crashing_executor = build_executor(
+        CrashBeforeSealedCheckpointStore(checkpoint_root)
+    )
+    dispatch = _dispatch(job, invocation)
+    crashing_sealer = CaptainCodexBuildSealer(
+        executor=crashing_executor,
+        issuer=CaptainCodexBuildReceiptIssuer(cas),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await crashing_sealer.seal(dispatch, invocation, brief)
+
+    checkpoint_store = FilesystemFactoryCodexBuildCheckpointStore(checkpoint_root)
+    implementation_complete = checkpoint_store.load(invocation)
+    assert implementation_complete is not None
+    assert implementation_complete.phase == "implementation_complete"
+    checkpoint_path = checkpoint_root / f"{invocation.invocation_id.hex}.json"
+    checkpoint_bytes = checkpoint_path.read_bytes()
+    assert (
+        state_root / "sealed-evidence" / f"{invocation.invocation_id.hex}.json"
+    ).is_file()
+    (workspace / "test-evidence.json").write_text(
+        json.dumps({"status": "passed", "command_ids": ["replacement"]}),
+        encoding="utf-8",
+    )
+    replay_sealer = CaptainCodexBuildSealer(
+        executor=build_executor(checkpoint_store),
+        issuer=CaptainCodexBuildReceiptIssuer(cas),
+    )
+
+    with pytest.raises(
+        FactoryDispatchError,
+        match="Codex output artifact binding changed",
+    ):
+        await replay_sealer.seal(dispatch, invocation, brief)
+
+    assert checkpoint_path.read_bytes() == checkpoint_bytes
+    assert checkpoint_store.load(invocation) == implementation_complete
 
 
 def _run_result(
@@ -1829,6 +2098,19 @@ async def test_authorized_resume_uses_next_ordinal_without_replacing_timeout_rec
     assert checkpoint is not None
     assert checkpoint.phase == "implementation_complete"
     assert checkpoint.resume_ordinal == 1
+    assert checkpoint.output_manifest_sha256 is not None
+    resumed_manifest = json.loads(
+        (
+            state_root
+            / "output-manifests"
+            / f"{checkpoint.output_manifest_sha256}.json"
+        ).read_bytes()
+    )
+    assert resumed_manifest["resume_ordinal"] == 1
+    assert (
+        resumed_manifest["terminal_receipt_sha256"]
+        == checkpoint.terminal_receipt_sha256
+    )
     assert runner_count == 2
     assert observed_deadlines == [
         min(invocation.lease.expires_at, job.deadline_at),

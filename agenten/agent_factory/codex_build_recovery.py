@@ -32,6 +32,9 @@ FactoryCodexBuildPhase = Literal[
 _DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _REVISION_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
 _CODEX_THREAD_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_OUTPUT_MANIFEST_URI_PATTERN = re.compile(
+    r"^artifact://factory/codex-output-manifest/(?P<sha256>[0-9a-f]{64})$"
+)
 _TRANSITIONS: frozenset[tuple[FactoryCodexBuildPhase, FactoryCodexBuildPhase]] = (
     frozenset(
         {
@@ -68,6 +71,8 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
     runtime_retry_authorization_uri: str | None = None
     runtime_retry_authorization_sha256: str | None = None
     runtime_retry_authorization_binding_sha256: str | None = None
+    output_manifest_uri: str | None = None
+    output_manifest_sha256: str | None = None
     sealed_evidence_sha256: str | None = None
     sealed_build_receipt_uri: str | None = None
     sealed_build_receipt_sha256: str | None = None
@@ -94,6 +99,7 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
         "sealed_build_receipt_sha256",
         "runtime_retry_authorization_sha256",
         "runtime_retry_authorization_binding_sha256",
+        "output_manifest_sha256",
         "parent_terminal_receipt_sha256",
         "parent_journal_sha256",
     )
@@ -133,6 +139,26 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
         }
         if receipt_required != (self.terminal_receipt_sha256 is not None):
             raise ValueError("terminal receipt does not match checkpoint phase")
+        output_values = (
+            self.output_manifest_uri,
+            self.output_manifest_sha256,
+        )
+        output_required = self.phase in {"implementation_complete", "sealed"}
+        if output_required and any(value is None for value in output_values):
+            raise ValueError(
+                "completed checkpoint requires original output manifest binding"
+            )
+        if not output_required and any(value is not None for value in output_values):
+            raise ValueError(
+                "incomplete checkpoint cannot bind an output manifest"
+            )
+        if self.output_manifest_uri is not None:
+            match = _OUTPUT_MANIFEST_URI_PATTERN.fullmatch(self.output_manifest_uri)
+            if (
+                match is None
+                or match.group("sha256") != self.output_manifest_sha256
+            ):
+                raise ValueError("checkpoint output manifest reference is invalid")
         sealed_values = (
             self.sealed_evidence_sha256,
             self.sealed_build_receipt_uri,
@@ -206,6 +232,126 @@ class FactoryCodexScaffoldManifestV1(BaseModel):
         if names != tuple(sorted(names)) or len(names) != len(set(names)):
             raise ValueError("scaffold files must be sorted and unique")
         return value
+
+
+FactoryCodexOutputPath = Literal[
+    "candidate.zip",
+    "factory-candidate.json",
+    "test-evidence.json",
+]
+
+
+class FactoryCodexOutputArtifactV1(BaseModel):
+    """One required output captured at successful Codex termination."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    relative_path: FactoryCodexOutputPath
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size: int = Field(ge=0)
+
+
+class FactoryCodexOutputManifestV1(BaseModel):
+    """Immutable content bindings for the exact three seal inputs."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_name: Literal["captain.factory-codex-output-manifest.v1"] = Field(
+        default="captain.factory-codex-output-manifest.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    job_id: UUID
+    correlation_id: UUID
+    attempt: int = Field(ge=1)
+    invocation_id: UUID
+    workspace_ref: str = Field(min_length=1)
+    resume_ordinal: int = Field(ge=0)
+    terminal_receipt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    artifacts: tuple[FactoryCodexOutputArtifactV1, ...] = Field(min_length=3, max_length=3)
+
+    @field_validator("artifacts")
+    @classmethod
+    def _require_exact_sorted_artifacts(
+        cls,
+        value: tuple[FactoryCodexOutputArtifactV1, ...],
+    ) -> tuple[FactoryCodexOutputArtifactV1, ...]:
+        paths = tuple(item.relative_path for item in value)
+        if paths != (
+            "candidate.zip",
+            "factory-candidate.json",
+            "test-evidence.json",
+        ):
+            raise ValueError(
+                "output manifest must bind the exact sorted required artifacts"
+            )
+        return value
+
+
+class FilesystemFactoryCodexOutputManifestStore:
+    """Content-addressed, write-once output manifests in Captain private state."""
+
+    def __init__(self, root: Path) -> None:
+        self._root = root.resolve()
+
+    def persist(self, manifest: FactoryCodexOutputManifestV1) -> tuple[str, str]:
+        content = canonical_factory_codex_model(manifest)
+        digest = hashlib.sha256(content).hexdigest()
+        _atomic_write_once(
+            self._path(digest),
+            content,
+            conflict="Factory Codex output manifest conflicts",
+        )
+        return (
+            f"artifact://factory/codex-output-manifest/{digest}",
+            digest,
+        )
+
+    def load(
+        self,
+        invocation: FactorySkillInvocationV1,
+        *,
+        uri: str,
+        sha256: str,
+    ) -> FactoryCodexOutputManifestV1:
+        match = _OUTPUT_MANIFEST_URI_PATTERN.fullmatch(uri)
+        if (
+            match is None
+            or match.group("sha256") != sha256
+            or _DIGEST_PATTERN.fullmatch(sha256) is None
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex output manifest reference is invalid"
+            )
+        path = self._path(sha256)
+        try:
+            content = path.read_bytes()
+            manifest = FactoryCodexOutputManifestV1.model_validate_json(content)
+        except (OSError, ValidationError, ValueError):
+            raise FactoryDispatchError(
+                "Factory Codex output manifest is missing or invalid"
+            ) from None
+        if (
+            hashlib.sha256(content).hexdigest() != sha256
+            or content != canonical_factory_codex_model(manifest)
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex output manifest digest changed"
+            )
+        if (
+            manifest.invocation_id != invocation.invocation_id
+            or manifest.job_id != invocation.job_id
+            or manifest.correlation_id != invocation.correlation_id
+            or manifest.attempt != invocation.attempt
+            or manifest.workspace_ref != invocation.lease.workspace_ref
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex output manifest binding changed"
+            )
+        return manifest
+
+    def _path(self, sha256: str) -> Path:
+        return self._root / f"{sha256}.json"
 
 
 class FilesystemFactoryCodexScaffoldManifestStore:
@@ -601,6 +747,25 @@ def _require_transition(
             )
     elif previous_parent != next_parent:
         raise FactoryDispatchError("Factory Codex checkpoint parent lineage changed")
+    previous_output = (
+        previous.output_manifest_uri,
+        previous.output_manifest_sha256,
+    )
+    next_output = (
+        next_checkpoint.output_manifest_uri,
+        next_checkpoint.output_manifest_sha256,
+    )
+    if transition == ("implementation_running", "implementation_complete"):
+        if any(value is not None for value in previous_output) or any(
+            value is None for value in next_output
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex checkpoint output manifest binding conflicts"
+            )
+    elif previous_output != next_output:
+        raise FactoryDispatchError(
+            "Factory Codex checkpoint output manifest binding changed"
+        )
     if transition == ("implementation_complete", "sealed") and (
         next_checkpoint.terminal_receipt_sha256
         != previous.terminal_receipt_sha256
@@ -613,7 +778,10 @@ __all__ = [
     "FactoryCodexBuildPhase",
     "FactoryCodexScaffoldFileV1",
     "FactoryCodexScaffoldManifestV1",
+    "FactoryCodexOutputArtifactV1",
+    "FactoryCodexOutputManifestV1",
     "FilesystemFactoryCodexBuildCheckpointStore",
+    "FilesystemFactoryCodexOutputManifestStore",
     "FilesystemFactoryCodexScaffoldManifestStore",
     "FilesystemFactoryCodexSealedEvidenceStore",
     "canonical_factory_codex_model",

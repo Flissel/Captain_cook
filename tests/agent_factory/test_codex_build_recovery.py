@@ -47,6 +47,18 @@ def _bound_checkpoint(
         if phase == "sealed"
         else {}
     )
+    output_manifest_sha256 = "5" * 64
+    output_bindings = (
+        {
+            "output_manifest_uri": (
+                "artifact://factory/codex-output-manifest/"
+                f"{output_manifest_sha256}"
+            ),
+            "output_manifest_sha256": output_manifest_sha256,
+        }
+        if phase in {"implementation_complete", "sealed"}
+        else {}
+    )
     checkpoint = FactoryCodexBuildCheckpointV1(
         job_id=job.job_id,
         correlation_id=job.correlation_id,
@@ -64,6 +76,7 @@ def _bound_checkpoint(
         parent_journal_sha256=parent_journal_sha256,
         parent_codex_thread_id=parent_codex_thread_id,
         updated_at=updated_at,
+        **output_bindings,
         **sealed_bindings,
     )
     return checkpoint, invocation
@@ -120,6 +133,24 @@ def _next(
                 "sealed_evidence_sha256": "1" * 64,
                 "sealed_build_receipt_uri": "artifact://sealed/original",
                 "sealed_build_receipt_sha256": "2" * 64,
+            }
+        )
+    if phase in {"implementation_complete", "sealed"}:
+        digest = checkpoint.output_manifest_sha256 or "5" * 64
+        updates.update(
+            {
+                "output_manifest_uri": (
+                    "artifact://factory/codex-output-manifest/"
+                    f"{digest}"
+                ),
+                "output_manifest_sha256": digest,
+            }
+        )
+    else:
+        updates.update(
+            {
+                "output_manifest_uri": None,
+                "output_manifest_sha256": None,
             }
         )
     return checkpoint.model_copy(update=updates)

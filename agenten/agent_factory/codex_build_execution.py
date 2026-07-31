@@ -22,9 +22,12 @@ from agenten.agent_factory.codex_build_provenance import (
 from agenten.agent_factory.codex_build_recovery import (
     FactoryCodexBuildCheckpointV1,
     FactoryCodexBuildPhase,
+    FactoryCodexOutputArtifactV1,
+    FactoryCodexOutputManifestV1,
     FactoryCodexScaffoldFileV1,
     FactoryCodexScaffoldManifestV1,
     FilesystemFactoryCodexBuildCheckpointStore,
+    FilesystemFactoryCodexOutputManifestStore,
     FilesystemFactoryCodexScaffoldManifestStore,
     FilesystemFactoryCodexSealedEvidenceStore,
     canonical_factory_codex_model,
@@ -272,6 +275,12 @@ class CaptainCodexBuildExecutorPort(Protocol):
         invocation: FactorySkillInvocationV1,
     ) -> None: ...
 
+    def validate_completed_outputs(
+        self,
+        invocation: FactorySkillInvocationV1,
+        completed: CompletedCodexBuild,
+    ) -> None: ...
+
     def persist_sealed(
         self,
         invocation: FactorySkillInvocationV1,
@@ -499,6 +508,7 @@ class CaptainCodexBuildSealer:
         brief: CodexBuildBriefV1,
         completed: CompletedCodexBuild,
     ) -> CodexBuildEvidenceV1:
+        self._executor.validate_completed_outputs(invocation, completed)
         receipt = self._issuer.issue(
             job=request.job,
             build_brief=brief,
@@ -701,6 +711,7 @@ class CodexCliFactoryBuildExecutor:
         runner_factory: FactoryCodexRunnerFactory,
         checkpoint_store: FilesystemFactoryCodexBuildCheckpointStore | None = None,
         scaffold_manifest_store: FilesystemFactoryCodexScaffoldManifestStore | None = None,
+        output_manifest_store: FilesystemFactoryCodexOutputManifestStore | None = None,
         sealed_evidence_store: FilesystemFactoryCodexSealedEvidenceStore | None = None,
         resume_authorizer: FactoryCodexResumeAuthorizerPort | None = None,
         process_inspector: FactoryCodexProcessInspectorPort | None = None,
@@ -718,6 +729,12 @@ class CodexCliFactoryBuildExecutor:
             scaffold_manifest_store
             or FilesystemFactoryCodexScaffoldManifestStore(
                 settings.state_root.resolve() / "scaffold-manifests"
+            )
+        )
+        self._output_manifest_store = (
+            output_manifest_store
+            or FilesystemFactoryCodexOutputManifestStore(
+                settings.state_root.resolve() / "output-manifests"
             )
         )
         self._sealed_evidence_store = (
@@ -1298,6 +1315,12 @@ class CodexCliFactoryBuildExecutor:
             )
         if not invocation.lease.issued_at <= completed_at < authority_deadline:
             raise FactoryDispatchError("Codex build completed outside Captain authority")
+        output_manifest_uri, output_manifest_sha256 = self._persist_output_manifest(
+            invocation=invocation,
+            prepared=prepared,
+            resume_ordinal=checkpoint.resume_ordinal,
+            terminal_receipt_sha256=receipt_sha256,
+        )
         return self._checkpoint_store.advance(
             checkpoint,
             self._checkpoint(
@@ -1309,6 +1332,8 @@ class CodexCliFactoryBuildExecutor:
                 resume_ordinal=checkpoint.resume_ordinal,
                 terminal_receipt_sha256=receipt_sha256,
                 scaffold_manifest_sha256=checkpoint.scaffold_manifest_sha256,
+                output_manifest_uri=output_manifest_uri,
+                output_manifest_sha256=output_manifest_sha256,
                 resume_lineage=resume_lineage,
                 previous=checkpoint,
             ),
@@ -1365,8 +1390,16 @@ class CodexCliFactoryBuildExecutor:
         receipt_sha256 = hashlib.sha256(receipt_content).hexdigest()
         if receipt["status"] in {"timed_out", "cancelled"}:
             phase: FactoryCodexBuildPhase = "implementation_interrupted"
+            output_manifest_uri = None
+            output_manifest_sha256 = None
         elif receipt["status"] == "succeeded":
             phase = "implementation_complete"
+            output_manifest_uri, output_manifest_sha256 = self._persist_output_manifest(
+                invocation=invocation,
+                prepared=prepared,
+                resume_ordinal=checkpoint.resume_ordinal,
+                terminal_receipt_sha256=receipt_sha256,
+            )
         else:
             raise FactoryDispatchError(
                 "Factory Codex failed terminal receipt requires operator inspection"
@@ -1382,6 +1415,8 @@ class CodexCliFactoryBuildExecutor:
                 resume_ordinal=checkpoint.resume_ordinal,
                 terminal_receipt_sha256=receipt_sha256,
                 scaffold_manifest_sha256=checkpoint.scaffold_manifest_sha256,
+                output_manifest_uri=output_manifest_uri,
+                output_manifest_sha256=output_manifest_sha256,
                 previous=checkpoint,
             ),
         )
@@ -1620,12 +1655,11 @@ class CodexCliFactoryBuildExecutor:
             raise FactoryDispatchError("Codex terminal session receipt is missing") from exc
         if hashlib.sha256(session_receipt).hexdigest() != checkpoint.terminal_receipt_sha256:
             raise FactoryDispatchError("Codex terminal session receipt digest changed")
-        for relative in _OUTPUT_PATHS:
-            target = prepared.root / relative
-            if not target.is_file():
-                raise FactoryDispatchError(
-                    f"Codex omitted required build artifact: {relative}"
-                )
+        self._validate_output_manifest(
+            invocation=invocation,
+            checkpoint=checkpoint,
+            workspace_root=prepared.root,
+        )
         try:
             receipt_payload = json.loads(session_receipt)
             completed_at = datetime.fromisoformat(receipt_payload["completed_at"])
@@ -1645,13 +1679,20 @@ class CodexCliFactoryBuildExecutor:
         invocation: FactorySkillInvocationV1,
     ) -> CodexBuildEvidenceV1 | None:
         checkpoint = self._checkpoint_store.load(invocation)
-        evidence = self._sealed_evidence_store.load(invocation)
         if checkpoint is None:
+            evidence = self._sealed_evidence_store.load(invocation)
             if evidence is not None:
                 raise FactoryDispatchError(
                     "Factory Codex sealed evidence has no checkpoint"
                 )
             return None
+        if checkpoint.phase in {"implementation_complete", "sealed"}:
+            self._validate_output_manifest(
+                invocation=invocation,
+                checkpoint=checkpoint,
+                workspace_root=checkpoint.workspace_root,
+            )
+        evidence = self._sealed_evidence_store.load(invocation)
         if evidence is None:
             if checkpoint.phase == "sealed":
                 raise FactoryDispatchError(
@@ -1663,6 +1704,7 @@ class CodexCliFactoryBuildExecutor:
                 "Factory Codex sealed evidence appeared before implementation complete"
             )
         return self._bind_or_validate_sealed_checkpoint(
+            invocation,
             checkpoint,
             evidence,
         )
@@ -1673,6 +1715,15 @@ class CodexCliFactoryBuildExecutor:
         invocation: FactorySkillInvocationV1,
     ) -> None:
         checkpoint = self._checkpoint_store.load(invocation)
+        if checkpoint is not None and checkpoint.phase in {
+            "implementation_complete",
+            "sealed",
+        }:
+            self._validate_output_manifest(
+                invocation=invocation,
+                checkpoint=checkpoint,
+                workspace_root=checkpoint.workspace_root,
+            )
         evidence = self._sealed_evidence_store.load(invocation)
         if (
             checkpoint is None
@@ -1681,6 +1732,31 @@ class CodexCliFactoryBuildExecutor:
         ):
             return
         self._require_checkpoint_runtime_retry_authority(request, checkpoint)
+
+    def validate_completed_outputs(
+        self,
+        invocation: FactorySkillInvocationV1,
+        completed: CompletedCodexBuild,
+    ) -> None:
+        checkpoint = self._checkpoint_store.load(invocation)
+        if checkpoint is None or checkpoint.phase != "implementation_complete":
+            raise FactoryDispatchError("Factory Codex build is not ready to seal")
+        if (
+            completed.workspace_root.resolve() != checkpoint.workspace_root
+            or completed.candidate_manifest_path != _OUTPUT_PATHS[0]
+            or completed.source_archive_path != _OUTPUT_PATHS[1]
+            or completed.test_evidence_paths != (_OUTPUT_PATHS[2],)
+            or hashlib.sha256(completed.codex_session_receipt).hexdigest()
+            != checkpoint.terminal_receipt_sha256
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex completed output binding changed"
+            )
+        self._validate_output_manifest(
+            invocation=invocation,
+            checkpoint=checkpoint,
+            workspace_root=completed.workspace_root,
+        )
 
     def persist_sealed(
         self,
@@ -1696,14 +1772,25 @@ class CodexCliFactoryBuildExecutor:
             raise FactoryDispatchError("Factory Codex seal receipt binding changed")
         if evidence.build_receipt.codex_session_ref.sha256 != receipt_sha256:
             raise FactoryDispatchError("Factory Codex evidence session receipt changed")
+        self.validate_completed_outputs(invocation, completed)
         self._sealed_evidence_store.persist(evidence)
-        return self._bind_or_validate_sealed_checkpoint(checkpoint, evidence)
+        return self._bind_or_validate_sealed_checkpoint(
+            invocation,
+            checkpoint,
+            evidence,
+        )
 
     def _bind_or_validate_sealed_checkpoint(
         self,
+        invocation: FactorySkillInvocationV1,
         checkpoint: FactoryCodexBuildCheckpointV1,
         evidence: CodexBuildEvidenceV1,
     ) -> CodexBuildEvidenceV1:
+        self._validate_output_manifest(
+            invocation=invocation,
+            checkpoint=checkpoint,
+            workspace_root=checkpoint.workspace_root,
+        )
         if (
             checkpoint.terminal_receipt_sha256
             != evidence.build_receipt.codex_session_ref.sha256
@@ -1734,6 +1821,94 @@ class CodexCliFactoryBuildExecutor:
         )
         self._checkpoint_store.advance(checkpoint, target)
         return evidence
+
+    def _persist_output_manifest(
+        self,
+        *,
+        invocation: FactorySkillInvocationV1,
+        prepared: PreparedFactoryWorkspace,
+        resume_ordinal: int,
+        terminal_receipt_sha256: str,
+    ) -> tuple[str, str]:
+        manifest = FactoryCodexOutputManifestV1(
+            schema="captain.factory-codex-output-manifest.v1",
+            job_id=invocation.job_id,
+            correlation_id=invocation.correlation_id,
+            attempt=invocation.attempt,
+            invocation_id=invocation.invocation_id,
+            workspace_ref=invocation.lease.workspace_ref,
+            resume_ordinal=resume_ordinal,
+            terminal_receipt_sha256=terminal_receipt_sha256,
+            artifacts=self._read_output_artifacts(prepared.root),
+        )
+        return self._output_manifest_store.persist(manifest)
+
+    def _validate_output_manifest(
+        self,
+        *,
+        invocation: FactorySkillInvocationV1,
+        checkpoint: FactoryCodexBuildCheckpointV1,
+        workspace_root: Path,
+    ) -> None:
+        uri = checkpoint.output_manifest_uri
+        digest = checkpoint.output_manifest_sha256
+        if uri is None or digest is None:
+            raise FactoryDispatchError(
+                "Factory Codex original output manifest binding is missing"
+            )
+        manifest = self._output_manifest_store.load(
+            invocation,
+            uri=uri,
+            sha256=digest,
+        )
+        if (
+            manifest.resume_ordinal != checkpoint.resume_ordinal
+            or manifest.terminal_receipt_sha256
+            != checkpoint.terminal_receipt_sha256
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex output manifest checkpoint binding changed"
+            )
+        current = self._read_output_artifacts(workspace_root)
+        if current != manifest.artifacts:
+            raise FactoryDispatchError(
+                "Codex output artifact binding changed"
+            )
+
+    @staticmethod
+    def _read_output_artifacts(
+        workspace_root: Path,
+    ) -> tuple[FactoryCodexOutputArtifactV1, ...]:
+        try:
+            root = workspace_root.resolve(strict=True)
+        except OSError:
+            raise FactoryDispatchError(
+                "Codex output workspace is unavailable"
+            ) from None
+        artifacts: list[FactoryCodexOutputArtifactV1] = []
+        for relative in sorted(_OUTPUT_PATHS):
+            target = root / relative
+            try:
+                resolved = target.resolve(strict=True)
+                if (
+                    target.is_symlink()
+                    or not target.is_file()
+                    or resolved.parent != root
+                ):
+                    raise OSError
+                content = target.read_bytes()
+            except OSError:
+                raise FactoryDispatchError(
+                    f"Codex omitted required build artifact: {relative}"
+                ) from None
+            artifacts.append(
+                FactoryCodexOutputArtifactV1(
+                    relative_path=relative,
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    size=len(content),
+                )
+            )
+        return tuple(artifacts)
 
     def _scaffold_files(
         self,
@@ -1874,6 +2049,8 @@ class CodexCliFactoryBuildExecutor:
         resume_ordinal: int,
         terminal_receipt_sha256: str | None,
         scaffold_manifest_sha256: str,
+        output_manifest_uri: str | None = None,
+        output_manifest_sha256: str | None = None,
         previous: FactoryCodexBuildCheckpointV1 | None,
         resume_lineage: _CodexResumeLineage | None = None,
     ) -> FactoryCodexBuildCheckpointV1:
@@ -1896,6 +2073,8 @@ class CodexCliFactoryBuildExecutor:
                 canonical_factory_codex_model(brief)
             ).hexdigest(),
             scaffold_manifest_sha256=scaffold_manifest_sha256,
+            output_manifest_uri=output_manifest_uri,
+            output_manifest_sha256=output_manifest_sha256,
             phase=phase,
             resume_ordinal=resume_ordinal,
             terminal_receipt_sha256=terminal_receipt_sha256,
