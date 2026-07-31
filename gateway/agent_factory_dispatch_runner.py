@@ -147,7 +147,7 @@ class GatewayNextActionLeaseIssuer:
                 or authorization.lease_id != lease.lease_id
                 or authorization.workspace_ref != lease.workspace_ref
                 or now < authorization.issued_at
-                or now >= authorization.expires_at
+                or now >= job.deadline_at
             ):
                 raise FactoryLeaseDenied(
                     "Factory recovery lease authority is stale or mismatched"
@@ -194,7 +194,7 @@ class GatewayNextActionLeaseIssuer:
             or authorization.subject_version != job.subject_version
             or authorization.attempt != action.attempt
             or now < authorization.issued_at
-            or now >= authorization.expires_at
+            or now >= job.deadline_at
         ):
             raise FactoryLeaseDenied(
                 "Factory recovery authority does not match the next action"

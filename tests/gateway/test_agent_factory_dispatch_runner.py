@@ -393,6 +393,39 @@ def test_gateway_issuer_recovers_exact_expired_lease_under_successor_authority()
     assert store.recorded == []
 
 
+def test_gateway_issuer_can_handoff_historical_authority_for_effect_free_replay() -> None:
+    job = workflow_job(mode="demo")
+    action = _action(FactoryActionKind.DISPATCH_TOOL_INTEGRATOR)
+    original = issue_factory_lease(
+        job=job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/recovery/historical",
+        now=NOW - timedelta(minutes=16),
+    )
+    store = RecordingGatewayStore(job, leases=(original,))
+    authorization = _runtime_retry_authorization(job, original)
+    historical_now = authorization.expires_at + timedelta(seconds=1)
+    issuer = GatewayNextActionLeaseIssuer(
+        store=store,
+        workspace_namespace="business-benchmark-demo",
+    )
+
+    assert issuer.ensure_recovery_for(
+        job,
+        action,
+        FactoryRole.TOOL_INTEGRATOR,
+        historical_now,
+        authorization,
+    ) == original
+    assert issuer.active(
+        job,
+        FactoryRole.TOOL_INTEGRATOR,
+        1,
+        historical_now,
+    ) == original
+
+
 @pytest.mark.asyncio
 async def test_composed_runner_recovers_original_lease_after_expiry() -> None:
     job = workflow_job(mode="demo")
