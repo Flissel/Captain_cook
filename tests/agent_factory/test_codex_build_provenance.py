@@ -11,6 +11,7 @@ from zipfile import ZIP_BZIP2, ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
 
 import pytest
 
+import agenten.agent_factory.codex_build_provenance as codex_build_provenance
 from agenten.agent_factory.codex_build_provenance import (
     CaptainCodexBuildReceiptIssuer,
     CodexBuildArtifactCas,
@@ -61,6 +62,40 @@ def _deflated_zip_bytes(files: list[tuple[str, bytes | int]]) -> bytes:
                     piece = chunk[: min(remaining, len(chunk))]
                     target.write(piece)
                     remaining -= len(piece)
+    return output.getvalue()
+
+
+def _eocd_offset(archive: bytes | bytearray) -> int:
+    offset = archive.rfind(b"PK\x05\x06")
+    assert offset >= 0
+    return offset
+
+
+def _central_header_offset(archive: bytes | bytearray, filename: bytes) -> int:
+    filename_offset = archive.rfind(filename)
+    offset = archive.rfind(b"PK\x01\x02", 0, filename_offset)
+    assert offset >= 0
+    return offset
+
+
+def _local_header_offset(archive: bytes | bytearray, filename: str) -> int:
+    with ZipFile(BytesIO(bytes(archive))) as source:
+        return source.getinfo(filename).header_offset
+
+
+class _NonSeekableZipOutput(BytesIO):
+    def seekable(self) -> bool:
+        return False
+
+    def seek(self, *args: object, **kwargs: object) -> int:
+        raise OSError("fixture output is intentionally non-seekable")
+
+
+def _data_descriptor_zip_bytes(files: dict[str, bytes]) -> bytes:
+    output = _NonSeekableZipOutput()
+    with ZipFile(output, "w", compression=ZIP_DEFLATED) as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
     return output.getvalue()
 
 
@@ -440,6 +475,215 @@ def test_source_zip_rejects_inconsistent_stored_entry_sizes_before_read() -> Non
 
     with pytest.raises(CodexBuildProvenanceError, match="inconsistent.*metadata"):
         _require_safe_source_zip(bytes(archive))
+
+
+def test_source_zip_preflight_rejects_eocd_entry_count_over_limit() -> None:
+    archive = bytearray(_zip_bytes({"factory-candidate.json": b"{}"}))
+    eocd = _eocd_offset(archive)
+    struct.pack_into(
+        "<HH",
+        archive,
+        eocd + 8,
+        MAX_FACTORY_CODEX_SOURCE_ZIP_ENTRIES + 1,
+        MAX_FACTORY_CODEX_SOURCE_ZIP_ENTRIES + 1,
+    )
+
+    with pytest.raises(CodexBuildProvenanceError, match="entry count"):
+        _require_safe_source_zip(bytes(archive))
+
+
+def test_source_zip_preflight_rejects_eocd_and_actual_count_mismatch() -> None:
+    archive = bytearray(
+        _zip_bytes(
+            {
+                "factory-candidate.json": b"{}",
+                "src/team.py": b"safe",
+            }
+        )
+    )
+    eocd = _eocd_offset(archive)
+    struct.pack_into("<HH", archive, eocd + 8, 1, 1)
+
+    with pytest.raises(CodexBuildProvenanceError, match="central directory.*count"):
+        _require_safe_source_zip(bytes(archive))
+
+
+def test_source_zip_preflight_counts_4097_records_before_zipfile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = {"factory-candidate.json": b"{}"}
+    files.update({f"src/empty-{index:04d}.txt": b"" for index in range(4096)})
+    archive = bytearray(_zip_bytes(files))
+    eocd = _eocd_offset(archive)
+    struct.pack_into("<HH", archive, eocd + 8, 1, 1)
+
+    def unexpected_zipfile(*args: object, **kwargs: object) -> ZipFile:
+        raise AssertionError("ZipFile must not see an over-count central directory")
+
+    monkeypatch.setattr(codex_build_provenance, "ZipFile", unexpected_zipfile)
+    with pytest.raises(CodexBuildProvenanceError, match="entry count"):
+        _require_safe_source_zip(bytes(archive))
+
+
+def test_source_zip_preflight_rejects_zip64_sentinel_and_extra() -> None:
+    sentinel_archive = bytearray(_zip_bytes({"factory-candidate.json": b"{}"}))
+    eocd = _eocd_offset(sentinel_archive)
+    struct.pack_into("<HH", sentinel_archive, eocd + 8, 0xFFFF, 0xFFFF)
+    with pytest.raises(CodexBuildProvenanceError, match="ZIP64"):
+        _require_safe_source_zip(bytes(sentinel_archive))
+
+    output = BytesIO()
+    with ZipFile(output, "w", compression=ZIP_STORED) as archive:
+        manifest = ZipInfo("factory-candidate.json")
+        manifest.compress_type = ZIP_STORED
+        archive.writestr(manifest, b"{}")
+        source = ZipInfo("src/team.py")
+        source.compress_type = ZIP_STORED
+        source.extra = struct.pack("<HHQ", 0x0001, 8, 1)
+        archive.writestr(source, b"safe")
+    with pytest.raises(CodexBuildProvenanceError, match="ZIP64"):
+        _require_safe_source_zip(output.getvalue())
+
+
+@pytest.mark.parametrize("mutation", ["central_size", "central_signature"])
+def test_source_zip_preflight_rejects_invalid_central_directory_bounds(
+    mutation: str,
+) -> None:
+    archive = bytearray(_zip_bytes({"factory-candidate.json": b"{}"}))
+    eocd = _eocd_offset(archive)
+    if mutation == "central_size":
+        central_size = struct.unpack_from("<I", archive, eocd + 12)[0]
+        struct.pack_into("<I", archive, eocd + 12, central_size + 1)
+    else:
+        central_offset = struct.unpack_from("<I", archive, eocd + 16)[0]
+        struct.pack_into("<I", archive, central_offset, 0)
+
+    with pytest.raises(CodexBuildProvenanceError, match="central directory"):
+        _require_safe_source_zip(bytes(archive))
+
+
+@pytest.mark.parametrize(
+    "unsafe_names",
+    [
+        ("./factory-candidate.json", "factory-candidate.json"),
+        ("src//team.py",),
+        ("src/./team.py",),
+        ("src", "src/"),
+    ],
+)
+def test_source_zip_rejects_noncanonical_or_colliding_paths(
+    unsafe_names: tuple[str, ...],
+) -> None:
+    files = {"factory-candidate.json": b"{}"}
+    files.update({name: b"" if name.endswith("/") else b"{}" for name in unsafe_names})
+
+    with pytest.raises(CodexBuildProvenanceError, match="canonical path"):
+        _require_safe_source_zip(_zip_bytes(files))
+
+
+def test_source_zip_rejects_raw_backslash_path() -> None:
+    archive = _zip_bytes(
+        {
+            "factory-candidate.json": b"{}",
+            "src/team.py": b"safe",
+        }
+    ).replace(b"src/team.py", b"src\\team.py")
+
+    with pytest.raises(CodexBuildProvenanceError, match="canonical path"):
+        _require_safe_source_zip(archive)
+
+
+def test_source_zip_rejects_directory_entry_with_file_content() -> None:
+    archive = _zip_bytes(
+        {
+            "factory-candidate.json": b"{}",
+            "src/": b"not-a-directory-body",
+        }
+    )
+
+    with pytest.raises(CodexBuildProvenanceError, match="inconsistent.*metadata"):
+        _require_safe_source_zip(archive)
+
+
+def test_source_zip_rejects_forged_local_header_offset() -> None:
+    archive = bytearray(
+        _zip_bytes(
+            {
+                "factory-candidate.json": b"{}",
+                "src/team.py": b"safe",
+            }
+        )
+    )
+    source_central = _central_header_offset(archive, b"src/team.py")
+    manifest_local = _local_header_offset(archive, "factory-candidate.json")
+    struct.pack_into("<I", archive, source_central + 42, manifest_local)
+
+    with pytest.raises(CodexBuildProvenanceError, match="local header|overlap"):
+        _require_safe_source_zip(bytes(archive))
+
+
+@pytest.mark.parametrize(
+    ("unsafe_flag", "message"),
+    [
+        (0x0001, "encrypted"),
+        (0x0020, "unsupported ZIP flags"),
+        (0x0040, "unsupported ZIP flags"),
+        (0x2000, "unsupported ZIP flags"),
+    ],
+)
+def test_source_zip_rejects_unsafe_flags_before_streaming(
+    unsafe_flag: int,
+    message: str,
+) -> None:
+    archive = bytearray(
+        _zip_bytes(
+            {
+                "factory-candidate.json": b"{}",
+                "src/team.py": b"safe",
+            }
+        )
+    )
+    central = _central_header_offset(archive, b"src/team.py")
+    local = _local_header_offset(archive, "src/team.py")
+    central_flags = struct.unpack_from("<H", archive, central + 8)[0]
+    local_flags = struct.unpack_from("<H", archive, local + 6)[0]
+    struct.pack_into("<H", archive, central + 8, central_flags | unsafe_flag)
+    struct.pack_into("<H", archive, local + 6, local_flags | unsafe_flag)
+
+    with pytest.raises(CodexBuildProvenanceError, match=message):
+        _require_safe_source_zip(bytes(archive))
+
+
+def test_source_zip_streams_every_entry_and_rejects_bad_crc() -> None:
+    archive = bytearray(
+        _zip_bytes(
+            {
+                "factory-candidate.json": b"{}",
+                "src/team.py": b"safe",
+            }
+        )
+    )
+    central = _central_header_offset(archive, b"src/team.py")
+    local = _local_header_offset(archive, "src/team.py")
+    crc = struct.unpack_from("<I", archive, central + 16)[0]
+    forged_crc = crc ^ 0xFFFFFFFF
+    struct.pack_into("<I", archive, central + 16, forged_crc)
+    struct.pack_into("<I", archive, local + 14, forged_crc)
+
+    with pytest.raises(CodexBuildProvenanceError, match="not a valid ZIP"):
+        _require_safe_source_zip(bytes(archive))
+
+
+def test_source_zip_accepts_utf8_names_and_data_descriptors() -> None:
+    manifest = b'{"schema":"captain.factory-candidate.v1"}'
+    archive = _data_descriptor_zip_bytes(
+        {
+            "factory-candidate.json": manifest,
+            "src/über-team.py": b"TEAM = 'claims'\n",
+        }
+    )
+
+    assert _require_safe_source_zip(archive) == manifest
 
 
 def test_cas_is_content_addressed_write_once_and_detects_tampering(tmp_path: Path) -> None:

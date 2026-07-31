@@ -11,13 +11,23 @@ import hashlib
 import json
 import os
 import re
+import struct
+import zlib
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
-from zipfile import BadZipFile, ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
+from zipfile import (
+    BadZipFile,
+    LargeZipFile,
+    ZIP_DEFLATED,
+    ZIP_STORED,
+    ZipFile,
+    ZipInfo,
+)
 
 from agenten.agent_factory.contracts import AgentFactoryJobV3
 from agenten.agent_factory.forge_contracts import (
@@ -29,12 +39,26 @@ from agenten.agent_factory.skill_workflow_contracts import CodexBuildBriefV1
 
 _NAMESPACE_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 _WINDOWS_DRIVE_PATTERN = re.compile(r"^[A-Za-z]:")
+MAX_FACTORY_CODEX_SOURCE_ZIP_BYTES = 32 * 1024 * 1024
 MAX_FACTORY_CODEX_SOURCE_ZIP_ENTRIES = 4_096
 MAX_FACTORY_CODEX_SOURCE_ZIP_ENTRY_BYTES = 32 * 1024 * 1024
 MAX_FACTORY_CODEX_SOURCE_ZIP_TOTAL_BYTES = 128 * 1024 * 1024
 MAX_FACTORY_CODEX_SOURCE_ZIP_MANIFEST_BYTES = 2 * 1024 * 1024
 _SOURCE_ZIP_READ_CHUNK_BYTES = 64 * 1024
 _SUPPORTED_SOURCE_ZIP_COMPRESSION = frozenset({ZIP_STORED, ZIP_DEFLATED})
+_ZIP_DATA_DESCRIPTOR_FLAG = 0x0008
+_ZIP_UTF8_FLAG = 0x0800
+_ZIP_DEFLATE_OPTION_FLAGS = 0x0006
+_ZIP_EOCD_SIGNATURE = 0x06054B50
+_ZIP_CENTRAL_SIGNATURE = 0x02014B50
+_ZIP_LOCAL_SIGNATURE = 0x04034B50
+_ZIP_DATA_DESCRIPTOR_SIGNATURE = 0x08074B50
+_ZIP64_EXTRA_ID = 0x0001
+_ZIP_EOCD = struct.Struct("<I4H2IH")
+_ZIP_CENTRAL_HEADER = struct.Struct("<I6H3I5H2I")
+_ZIP_LOCAL_HEADER = struct.Struct("<I5H3I2H")
+_ZIP_EXTRA_HEADER = struct.Struct("<HH")
+_ZIP_DATA_DESCRIPTOR = struct.Struct("<III")
 _EXCLUDED_DIRECTORIES = frozenset(
     {
         ".captain-cook",
@@ -57,6 +81,25 @@ _EXCLUDED_DIRECTORIES = frozenset(
 
 class CodexBuildProvenanceError(ValueError):
     """The build cannot be sealed without weakening its provenance."""
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceZipCentralEntry:
+    filename: bytes
+    flags: int
+    compression: int
+    crc32: int
+    compressed_size: int
+    uncompressed_size: int
+    disk_number: int
+    external_attr: int
+    local_header_offset: int
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceZipLayout:
+    central_directory_offset: int
+    entries: tuple[_SourceZipCentralEntry, ...]
 
 
 class CodexBuildArtifactCas:
@@ -424,35 +467,35 @@ def _is_excluded(path: PurePosixPath, *, is_directory: bool) -> bool:
 
 def _require_safe_source_zip(content: bytes) -> bytes:
     try:
+        layout = _preflight_source_zip(content)
         with ZipFile(BytesIO(content)) as archive:
             items = archive.infolist()
-            if len(items) > MAX_FACTORY_CODEX_SOURCE_ZIP_ENTRIES:
+            if len(items) != len(layout.entries):
                 raise CodexBuildProvenanceError(
-                    "source archive exceeds the entry count limit"
+                    "source archive central directory count is inconsistent"
                 )
             names: set[str] = set()
-            total_uncompressed_size = 0
+            validated: list[tuple[ZipInfo, str]] = []
+            occupied_ranges: list[tuple[int, int]] = []
             candidate_manifest_info: ZipInfo | None = None
-            for item in items:
-                normalized = item.filename.replace("\\", "/")
-                path = PurePosixPath(normalized)
-                if (
-                    not normalized
-                    or path.is_absolute()
-                    or _WINDOWS_DRIVE_PATTERN.match(normalized)
-                    or ".." in path.parts
-                ):
+            for item, central in zip(items, layout.entries, strict=True):
+                _require_zipinfo_matches_central(item, central)
+                canonical, path = _require_canonical_source_zip_path(
+                    item.filename,
+                    is_directory=item.is_dir(),
+                )
+                if item.is_dir() and item.file_size != 0:
                     raise CodexBuildProvenanceError(
-                        "source archive contains path traversal"
+                        "source archive contains inconsistent directory metadata"
                     )
                 if _is_excluded(path, is_directory=item.is_dir()):
                     raise CodexBuildProvenanceError(
                         "source archive contains a forbidden private or cache path"
                     )
-                folded = normalized.casefold()
+                folded = canonical.casefold()
                 if folded in names:
                     raise CodexBuildProvenanceError(
-                        "source archive contains duplicate paths"
+                        "source archive contains a canonical path collision"
                     )
                 names.add(folded)
                 unix_type = (item.external_attr >> 16) & 0o170000
@@ -460,42 +503,15 @@ def _require_safe_source_zip(content: bytes) -> bytes:
                     raise CodexBuildProvenanceError(
                         "source archive contains a symbolic link"
                     )
-                if item.flag_bits & 0x1:
-                    raise CodexBuildProvenanceError(
-                        "source archive must not contain encrypted entries"
+                occupied_ranges.append(
+                    _require_safe_source_zip_local_record(
+                        memoryview(content),
+                        central,
+                        central_directory_offset=layout.central_directory_offset,
                     )
-                if item.compress_type not in _SUPPORTED_SOURCE_ZIP_COMPRESSION:
-                    raise CodexBuildProvenanceError(
-                        "source archive contains an unsupported compression method"
-                    )
-                if (
-                    not isinstance(item.file_size, int)
-                    or not isinstance(item.compress_size, int)
-                    or item.file_size < 0
-                    or item.compress_size < 0
-                    or item.header_offset < 0
-                    or not 0 <= item.CRC <= 0xFFFFFFFF
-                    or item.compress_size > len(content)
-                    or (item.file_size > 0 and item.compress_size == 0)
-                    or (
-                        item.compress_type == ZIP_STORED
-                        and item.file_size != item.compress_size
-                    )
-                    or (item.is_dir() and item.file_size != 0)
-                ):
-                    raise CodexBuildProvenanceError(
-                        "source archive contains inconsistent entry metadata"
-                    )
-                if item.file_size > MAX_FACTORY_CODEX_SOURCE_ZIP_ENTRY_BYTES:
-                    raise CodexBuildProvenanceError(
-                        "source archive entry exceeds the uncompressed size limit"
-                    )
-                total_uncompressed_size += item.file_size
-                if total_uncompressed_size > MAX_FACTORY_CODEX_SOURCE_ZIP_TOTAL_BYTES:
-                    raise CodexBuildProvenanceError(
-                        "source archive exceeds the aggregate uncompressed size limit"
-                    )
-                if normalized == "factory-candidate.json":
+                )
+                validated.append((item, canonical))
+                if canonical == "factory-candidate.json":
                     if item.is_dir() or candidate_manifest_info is not None:
                         raise CodexBuildProvenanceError(
                             "source archive candidate manifest is ambiguous"
@@ -505,50 +521,464 @@ def _require_safe_source_zip(content: bytes) -> bytes:
                             "source archive candidate manifest exceeds the size limit"
                         )
                     candidate_manifest_info = item
+            _require_nonoverlapping_source_zip_records(occupied_ranges)
             if candidate_manifest_info is None:
                 raise CodexBuildProvenanceError(
                     "source archive candidate manifest is missing"
                 )
-            candidate_manifest = _read_source_zip_entry_bounded(
+            candidate_manifest = _stream_source_zip_entries(
                 archive,
-                candidate_manifest_info,
-                maximum_bytes=MAX_FACTORY_CODEX_SOURCE_ZIP_MANIFEST_BYTES,
+                validated,
+                candidate_manifest_info=candidate_manifest_info,
             )
             _require_json_object(candidate_manifest, label="candidate manifest")
             return candidate_manifest
-    except BadZipFile as exc:
+    except CodexBuildProvenanceError:
+        raise
+    except (
+        BadZipFile,
+        LargeZipFile,
+        RuntimeError,
+        NotImplementedError,
+        EOFError,
+        OSError,
+        UnicodeDecodeError,
+        struct.error,
+        zlib.error,
+    ) as exc:
         raise CodexBuildProvenanceError("source archive is not a valid ZIP") from exc
 
 
-def _read_source_zip_entry_bounded(
-    archive: ZipFile,
-    item: ZipInfo,
-    *,
-    maximum_bytes: int,
-) -> bytes:
-    chunks: list[bytes] = []
-    observed_size = 0
-    with archive.open(item, "r") as stream:
-        while observed_size <= maximum_bytes:
-            chunk = stream.read(
-                min(
-                    _SOURCE_ZIP_READ_CHUNK_BYTES,
-                    maximum_bytes + 1 - observed_size,
-                )
-            )
-            if not chunk:
-                break
-            chunks.append(chunk)
-            observed_size += len(chunk)
-    if observed_size > maximum_bytes:
+def _preflight_source_zip(content: bytes) -> _SourceZipLayout:
+    """Parse bounded raw ZIP metadata before stdlib creates any ZipInfo objects."""
+
+    if len(content) > MAX_FACTORY_CODEX_SOURCE_ZIP_BYTES:
+        raise CodexBuildProvenanceError("source archive exceeds the raw size limit")
+    if len(content) < _ZIP_EOCD.size:
+        raise CodexBuildProvenanceError("source archive is not a valid ZIP")
+    view = memoryview(content)
+    eocd_offset = _find_source_zip_eocd(view)
+    (
+        signature,
+        disk_number,
+        central_disk_number,
+        entries_on_disk,
+        entry_count,
+        central_size,
+        central_offset,
+        _comment_length,
+    ) = _ZIP_EOCD.unpack_from(view, eocd_offset)
+    if signature != _ZIP_EOCD_SIGNATURE:
+        raise CodexBuildProvenanceError("source archive EOCD is inconsistent")
+    if (
+        entries_on_disk == 0xFFFF
+        or entry_count == 0xFFFF
+        or central_size == 0xFFFFFFFF
+        or central_offset == 0xFFFFFFFF
+    ):
+        raise CodexBuildProvenanceError("source archive uses unsupported ZIP64 metadata")
+    if disk_number != 0 or central_disk_number != 0 or entries_on_disk != entry_count:
+        raise CodexBuildProvenanceError("source archive must be a single-disk ZIP")
+    if entry_count > MAX_FACTORY_CODEX_SOURCE_ZIP_ENTRIES:
+        raise CodexBuildProvenanceError("source archive exceeds the entry count limit")
+    central_end = central_offset + central_size
+    if central_offset > eocd_offset or central_end != eocd_offset:
         raise CodexBuildProvenanceError(
-            "source archive candidate manifest exceeds the size limit"
+            "source archive central directory bounds are inconsistent"
         )
-    if observed_size != item.file_size:
+
+    entries: list[_SourceZipCentralEntry] = []
+    cursor = central_offset
+    aggregate_size = 0
+    while cursor < central_end:
+        if central_end - cursor < _ZIP_CENTRAL_HEADER.size:
+            raise CodexBuildProvenanceError(
+                "source archive central directory is truncated"
+            )
+        fields = _ZIP_CENTRAL_HEADER.unpack_from(view, cursor)
+        (
+            central_signature,
+            _version_made_by,
+            _version_needed,
+            flags,
+            compression,
+            _modified_time,
+            _modified_date,
+            crc32,
+            compressed_size,
+            uncompressed_size,
+            filename_length,
+            extra_length,
+            comment_length,
+            entry_disk_number,
+            _internal_attr,
+            external_attr,
+            local_header_offset,
+        ) = fields
+        if central_signature != _ZIP_CENTRAL_SIGNATURE:
+            raise CodexBuildProvenanceError(
+                "source archive central directory signature is invalid"
+            )
+        record_end = (
+            cursor
+            + _ZIP_CENTRAL_HEADER.size
+            + filename_length
+            + extra_length
+            + comment_length
+        )
+        if record_end > central_end:
+            raise CodexBuildProvenanceError(
+                "source archive central directory record is out of bounds"
+            )
+        if (
+            compressed_size == 0xFFFFFFFF
+            or uncompressed_size == 0xFFFFFFFF
+            or local_header_offset == 0xFFFFFFFF
+            or entry_disk_number == 0xFFFF
+        ):
+            raise CodexBuildProvenanceError(
+                "source archive uses unsupported ZIP64 metadata"
+            )
+        if entry_disk_number != 0:
+            raise CodexBuildProvenanceError("source archive must be a single-disk ZIP")
+        _require_safe_source_zip_flags(flags, compression)
+        _require_safe_source_zip_sizes(
+            compression=compression,
+            compressed_size=compressed_size,
+            uncompressed_size=uncompressed_size,
+            content_size=len(content),
+        )
+        aggregate_size += uncompressed_size
+        if aggregate_size > MAX_FACTORY_CODEX_SOURCE_ZIP_TOTAL_BYTES:
+            raise CodexBuildProvenanceError(
+                "source archive exceeds the aggregate uncompressed size limit"
+            )
+        filename_start = cursor + _ZIP_CENTRAL_HEADER.size
+        extra_start = filename_start + filename_length
+        filename = bytes(view[filename_start:extra_start])
+        filename_encoding = "utf-8" if flags & _ZIP_UTF8_FLAG else "cp437"
+        decoded_filename = filename.decode(filename_encoding)
+        _require_canonical_source_zip_path(
+            decoded_filename,
+            is_directory=decoded_filename.endswith("/"),
+        )
+        _require_no_zip64_extra(
+            view[extra_start : extra_start + extra_length],
+        )
+        if local_header_offset >= central_offset:
+            raise CodexBuildProvenanceError(
+                "source archive local header offset is out of bounds"
+            )
+        if len(entries) >= MAX_FACTORY_CODEX_SOURCE_ZIP_ENTRIES:
+            raise CodexBuildProvenanceError("source archive exceeds the entry count limit")
+        entries.append(
+            _SourceZipCentralEntry(
+                filename=filename,
+                flags=flags,
+                compression=compression,
+                crc32=crc32,
+                compressed_size=compressed_size,
+                uncompressed_size=uncompressed_size,
+                disk_number=entry_disk_number,
+                external_attr=external_attr,
+                local_header_offset=local_header_offset,
+            )
+        )
+        cursor = record_end
+    if cursor != central_end or len(entries) != entry_count:
+        raise CodexBuildProvenanceError(
+            "source archive central directory count is inconsistent"
+        )
+    return _SourceZipLayout(
+        central_directory_offset=central_offset,
+        entries=tuple(entries),
+    )
+
+
+def _find_source_zip_eocd(view: memoryview) -> int:
+    earliest = max(0, len(view) - _ZIP_EOCD.size - 0xFFFF)
+    matches: list[int] = []
+    for offset in range(len(view) - _ZIP_EOCD.size, earliest - 1, -1):
+        if struct.unpack_from("<I", view, offset)[0] != _ZIP_EOCD_SIGNATURE:
+            continue
+        comment_length = struct.unpack_from("<H", view, offset + 20)[0]
+        if offset + _ZIP_EOCD.size + comment_length == len(view):
+            matches.append(offset)
+            if len(matches) > 1:
+                break
+    if len(matches) != 1:
+        raise CodexBuildProvenanceError("source archive EOCD is missing or ambiguous")
+    return matches[0]
+
+
+def _require_no_zip64_extra(extra: memoryview) -> None:
+    cursor = 0
+    while cursor < len(extra):
+        if len(extra) - cursor < _ZIP_EXTRA_HEADER.size:
+            raise CodexBuildProvenanceError("source archive extra field is truncated")
+        extra_id, extra_size = _ZIP_EXTRA_HEADER.unpack_from(extra, cursor)
+        cursor += _ZIP_EXTRA_HEADER.size
+        end = cursor + extra_size
+        if end > len(extra):
+            raise CodexBuildProvenanceError("source archive extra field is out of bounds")
+        if extra_id == _ZIP64_EXTRA_ID:
+            raise CodexBuildProvenanceError(
+                "source archive uses unsupported ZIP64 metadata"
+            )
+        cursor = end
+
+
+def _require_safe_source_zip_flags(flags: int, compression: int) -> None:
+    if compression not in _SUPPORTED_SOURCE_ZIP_COMPRESSION:
+        raise CodexBuildProvenanceError(
+            "source archive contains an unsupported compression method"
+        )
+    allowed = _ZIP_DATA_DESCRIPTOR_FLAG | _ZIP_UTF8_FLAG
+    if compression == ZIP_DEFLATED:
+        allowed |= _ZIP_DEFLATE_OPTION_FLAGS
+    if flags & 0x0001:
+        raise CodexBuildProvenanceError(
+            "source archive must not contain encrypted entries"
+        )
+    if flags & ~allowed:
+        raise CodexBuildProvenanceError("source archive contains unsupported ZIP flags")
+
+
+def _require_safe_source_zip_sizes(
+    *,
+    compression: int,
+    compressed_size: int,
+    uncompressed_size: int,
+    content_size: int,
+) -> None:
+    if compression == ZIP_STORED and compressed_size != uncompressed_size:
         raise CodexBuildProvenanceError(
             "source archive contains inconsistent entry metadata"
         )
-    return b"".join(chunks)
+    if (
+        compressed_size < 0
+        or uncompressed_size < 0
+        or compressed_size > content_size
+        or (uncompressed_size > 0 and compressed_size == 0)
+    ):
+        raise CodexBuildProvenanceError(
+            "source archive contains inconsistent entry metadata"
+        )
+    if uncompressed_size > MAX_FACTORY_CODEX_SOURCE_ZIP_ENTRY_BYTES:
+        raise CodexBuildProvenanceError(
+            "source archive entry exceeds the uncompressed size limit"
+        )
+
+
+def _require_zipinfo_matches_central(
+    item: ZipInfo,
+    central: _SourceZipCentralEntry,
+) -> None:
+    encoding = "utf-8" if central.flags & _ZIP_UTF8_FLAG else "cp437"
+    decoded_filename = central.filename.decode(encoding)
+    if (
+        item.orig_filename != decoded_filename
+        or item.filename != decoded_filename
+        or item.flag_bits != central.flags
+        or item.compress_type != central.compression
+        or item.CRC != central.crc32
+        or item.compress_size != central.compressed_size
+        or item.file_size != central.uncompressed_size
+        or item.header_offset != central.local_header_offset
+        or item.external_attr != central.external_attr
+    ):
+        raise CodexBuildProvenanceError(
+            "source archive contains inconsistent entry metadata"
+        )
+
+
+def _require_canonical_source_zip_path(
+    filename: str,
+    *,
+    is_directory: bool,
+) -> tuple[str, PurePosixPath]:
+    if "\\" in filename:
+        raise CodexBuildProvenanceError(
+            "source archive contains a non-canonical path"
+        )
+    normalized = filename.replace("\\", "/")
+    parts = normalized.split("/")
+    if is_directory and parts and parts[-1] == "":
+        parts = parts[:-1]
+    if (
+        ".." in parts
+        or normalized.startswith("/")
+        or _WINDOWS_DRIVE_PATTERN.match(normalized)
+    ):
+        raise CodexBuildProvenanceError(
+            "source archive contains path traversal"
+        )
+    if (
+        not normalized
+        or not parts
+        or any(part in {"", "."} or "\x00" in part for part in parts)
+    ):
+        raise CodexBuildProvenanceError(
+            "source archive contains a non-canonical path"
+        )
+    canonical = "/".join(parts)
+    path = PurePosixPath(canonical)
+    if path.is_absolute() or path.as_posix() != canonical:
+        raise CodexBuildProvenanceError(
+            "source archive contains a non-canonical path"
+        )
+    return canonical, path
+
+
+def _require_safe_source_zip_local_record(
+    view: memoryview,
+    central: _SourceZipCentralEntry,
+    *,
+    central_directory_offset: int,
+) -> tuple[int, int]:
+    offset = central.local_header_offset
+    if offset < 0 or offset + _ZIP_LOCAL_HEADER.size > central_directory_offset:
+        raise CodexBuildProvenanceError(
+            "source archive local header offset is out of bounds"
+        )
+    (
+        signature,
+        _version_needed,
+        flags,
+        compression,
+        _modified_time,
+        _modified_date,
+        local_crc32,
+        local_compressed_size,
+        local_uncompressed_size,
+        filename_length,
+        extra_length,
+    ) = _ZIP_LOCAL_HEADER.unpack_from(view, offset)
+    if signature != _ZIP_LOCAL_SIGNATURE:
+        raise CodexBuildProvenanceError("source archive local header is invalid")
+    header_end = offset + _ZIP_LOCAL_HEADER.size + filename_length + extra_length
+    if header_end > central_directory_offset:
+        raise CodexBuildProvenanceError("source archive local header is out of bounds")
+    filename_start = offset + _ZIP_LOCAL_HEADER.size
+    extra_start = filename_start + filename_length
+    if bytes(view[filename_start:extra_start]) != central.filename:
+        raise CodexBuildProvenanceError(
+            "source archive local header filename is inconsistent"
+        )
+    _require_no_zip64_extra(view[extra_start:header_end])
+    if flags != central.flags or compression != central.compression:
+        raise CodexBuildProvenanceError(
+            "source archive contains inconsistent local header metadata"
+        )
+    uses_descriptor = bool(flags & _ZIP_DATA_DESCRIPTOR_FLAG)
+    if uses_descriptor:
+        if (
+            local_crc32 not in {0, central.crc32}
+            or local_compressed_size not in {0, central.compressed_size}
+            or local_uncompressed_size not in {0, central.uncompressed_size}
+        ):
+                raise CodexBuildProvenanceError(
+                    "source archive contains inconsistent local header metadata"
+            )
+    elif (
+        local_crc32 != central.crc32
+        or local_compressed_size != central.compressed_size
+        or local_uncompressed_size != central.uncompressed_size
+    ):
+        raise CodexBuildProvenanceError(
+            "source archive contains inconsistent local header metadata"
+        )
+    data_end = header_end + central.compressed_size
+    if data_end > central_directory_offset:
+        raise CodexBuildProvenanceError("source archive compressed data is out of bounds")
+    record_end = data_end
+    if uses_descriptor:
+        record_end = _require_source_zip_data_descriptor(
+            view,
+            data_end,
+            central,
+            central_directory_offset=central_directory_offset,
+        )
+    return offset, record_end
+
+
+def _require_source_zip_data_descriptor(
+    view: memoryview,
+    offset: int,
+    central: _SourceZipCentralEntry,
+    *,
+    central_directory_offset: int,
+) -> int:
+    if offset + _ZIP_DATA_DESCRIPTOR.size > central_directory_offset:
+        raise CodexBuildProvenanceError("source archive data descriptor is truncated")
+    signature_or_crc = struct.unpack_from("<I", view, offset)[0]
+    if signature_or_crc == _ZIP_DATA_DESCRIPTOR_SIGNATURE:
+        offset += 4
+    if offset + _ZIP_DATA_DESCRIPTOR.size > central_directory_offset:
+        raise CodexBuildProvenanceError("source archive data descriptor is truncated")
+    crc32, compressed_size, uncompressed_size = _ZIP_DATA_DESCRIPTOR.unpack_from(
+        view,
+        offset,
+    )
+    if (
+        crc32 != central.crc32
+        or compressed_size != central.compressed_size
+        or uncompressed_size != central.uncompressed_size
+    ):
+        raise CodexBuildProvenanceError(
+            "source archive data descriptor is inconsistent"
+        )
+    return offset + _ZIP_DATA_DESCRIPTOR.size
+
+
+def _require_nonoverlapping_source_zip_records(
+    ranges: Iterable[tuple[int, int]],
+) -> None:
+    previous_end = 0
+    for start, end in sorted(ranges):
+        if start < previous_end or end < start:
+            raise CodexBuildProvenanceError("source archive local records overlap")
+        previous_end = end
+
+
+def _stream_source_zip_entries(
+    archive: ZipFile,
+    entries: Iterable[tuple[ZipInfo, str]],
+    *,
+    candidate_manifest_info: ZipInfo,
+) -> bytes:
+    """Fully verify every member while retaining only the bounded manifest."""
+
+    manifest_chunks: list[bytes] = []
+    aggregate_size = 0
+    for item, _canonical in entries:
+        observed_size = 0
+        with archive.open(item, "r") as stream:
+            while True:
+                chunk = stream.read(_SOURCE_ZIP_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                observed_size += len(chunk)
+                aggregate_size += len(chunk)
+                if (
+                    observed_size > item.file_size
+                    or observed_size > MAX_FACTORY_CODEX_SOURCE_ZIP_ENTRY_BYTES
+                    or aggregate_size > MAX_FACTORY_CODEX_SOURCE_ZIP_TOTAL_BYTES
+                ):
+                    raise CodexBuildProvenanceError(
+                        "source archive expanded beyond its declared size"
+                    )
+                if item is candidate_manifest_info:
+                    if observed_size > MAX_FACTORY_CODEX_SOURCE_ZIP_MANIFEST_BYTES:
+                        raise CodexBuildProvenanceError(
+                            "source archive candidate manifest exceeds the size limit"
+                        )
+                    manifest_chunks.append(chunk)
+        if observed_size != item.file_size:
+            raise CodexBuildProvenanceError(
+                "source archive contains inconsistent entry metadata"
+            )
+    return b"".join(manifest_chunks)
 
 
 def _require_json_object(content: bytes, *, label: str) -> dict[str, Any]:
@@ -582,6 +1012,7 @@ __all__ = [
     "CaptainCodexBuildReceiptIssuer",
     "CodexBuildArtifactCas",
     "CodexBuildProvenanceError",
+    "MAX_FACTORY_CODEX_SOURCE_ZIP_BYTES",
     "MAX_FACTORY_CODEX_SOURCE_ZIP_ENTRIES",
     "MAX_FACTORY_CODEX_SOURCE_ZIP_ENTRY_BYTES",
     "MAX_FACTORY_CODEX_SOURCE_ZIP_MANIFEST_BYTES",
