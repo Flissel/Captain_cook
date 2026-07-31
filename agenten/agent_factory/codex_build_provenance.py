@@ -17,7 +17,7 @@ from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
-from zipfile import BadZipFile, ZIP_STORED, ZipFile, ZipInfo
+from zipfile import BadZipFile, ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
 
 from agenten.agent_factory.contracts import AgentFactoryJobV3
 from agenten.agent_factory.forge_contracts import (
@@ -29,6 +29,12 @@ from agenten.agent_factory.skill_workflow_contracts import CodexBuildBriefV1
 
 _NAMESPACE_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 _WINDOWS_DRIVE_PATTERN = re.compile(r"^[A-Za-z]:")
+MAX_FACTORY_CODEX_SOURCE_ZIP_ENTRIES = 4_096
+MAX_FACTORY_CODEX_SOURCE_ZIP_ENTRY_BYTES = 32 * 1024 * 1024
+MAX_FACTORY_CODEX_SOURCE_ZIP_TOTAL_BYTES = 128 * 1024 * 1024
+MAX_FACTORY_CODEX_SOURCE_ZIP_MANIFEST_BYTES = 2 * 1024 * 1024
+_SOURCE_ZIP_READ_CHUNK_BYTES = 64 * 1024
+_SUPPORTED_SOURCE_ZIP_COMPRESSION = frozenset({ZIP_STORED, ZIP_DEFLATED})
 _EXCLUDED_DIRECTORIES = frozenset(
     {
         ".captain-cook",
@@ -419,9 +425,15 @@ def _is_excluded(path: PurePosixPath, *, is_directory: bool) -> bool:
 def _require_safe_source_zip(content: bytes) -> bytes:
     try:
         with ZipFile(BytesIO(content)) as archive:
+            items = archive.infolist()
+            if len(items) > MAX_FACTORY_CODEX_SOURCE_ZIP_ENTRIES:
+                raise CodexBuildProvenanceError(
+                    "source archive exceeds the entry count limit"
+                )
             names: set[str] = set()
-            candidate_manifest: bytes | None = None
-            for item in archive.infolist():
+            total_uncompressed_size = 0
+            candidate_manifest_info: ZipInfo | None = None
+            for item in items:
                 normalized = item.filename.replace("\\", "/")
                 path = PurePosixPath(normalized)
                 if (
@@ -452,20 +464,91 @@ def _require_safe_source_zip(content: bytes) -> bytes:
                     raise CodexBuildProvenanceError(
                         "source archive must not contain encrypted entries"
                     )
+                if item.compress_type not in _SUPPORTED_SOURCE_ZIP_COMPRESSION:
+                    raise CodexBuildProvenanceError(
+                        "source archive contains an unsupported compression method"
+                    )
+                if (
+                    not isinstance(item.file_size, int)
+                    or not isinstance(item.compress_size, int)
+                    or item.file_size < 0
+                    or item.compress_size < 0
+                    or item.header_offset < 0
+                    or not 0 <= item.CRC <= 0xFFFFFFFF
+                    or item.compress_size > len(content)
+                    or (item.file_size > 0 and item.compress_size == 0)
+                    or (
+                        item.compress_type == ZIP_STORED
+                        and item.file_size != item.compress_size
+                    )
+                    or (item.is_dir() and item.file_size != 0)
+                ):
+                    raise CodexBuildProvenanceError(
+                        "source archive contains inconsistent entry metadata"
+                    )
+                if item.file_size > MAX_FACTORY_CODEX_SOURCE_ZIP_ENTRY_BYTES:
+                    raise CodexBuildProvenanceError(
+                        "source archive entry exceeds the uncompressed size limit"
+                    )
+                total_uncompressed_size += item.file_size
+                if total_uncompressed_size > MAX_FACTORY_CODEX_SOURCE_ZIP_TOTAL_BYTES:
+                    raise CodexBuildProvenanceError(
+                        "source archive exceeds the aggregate uncompressed size limit"
+                    )
                 if normalized == "factory-candidate.json":
-                    if item.is_dir() or candidate_manifest is not None:
+                    if item.is_dir() or candidate_manifest_info is not None:
                         raise CodexBuildProvenanceError(
                             "source archive candidate manifest is ambiguous"
                         )
-                    candidate_manifest = archive.read(item)
-            if candidate_manifest is None:
+                    if item.file_size > MAX_FACTORY_CODEX_SOURCE_ZIP_MANIFEST_BYTES:
+                        raise CodexBuildProvenanceError(
+                            "source archive candidate manifest exceeds the size limit"
+                        )
+                    candidate_manifest_info = item
+            if candidate_manifest_info is None:
                 raise CodexBuildProvenanceError(
                     "source archive candidate manifest is missing"
                 )
+            candidate_manifest = _read_source_zip_entry_bounded(
+                archive,
+                candidate_manifest_info,
+                maximum_bytes=MAX_FACTORY_CODEX_SOURCE_ZIP_MANIFEST_BYTES,
+            )
             _require_json_object(candidate_manifest, label="candidate manifest")
             return candidate_manifest
     except BadZipFile as exc:
         raise CodexBuildProvenanceError("source archive is not a valid ZIP") from exc
+
+
+def _read_source_zip_entry_bounded(
+    archive: ZipFile,
+    item: ZipInfo,
+    *,
+    maximum_bytes: int,
+) -> bytes:
+    chunks: list[bytes] = []
+    observed_size = 0
+    with archive.open(item, "r") as stream:
+        while observed_size <= maximum_bytes:
+            chunk = stream.read(
+                min(
+                    _SOURCE_ZIP_READ_CHUNK_BYTES,
+                    maximum_bytes + 1 - observed_size,
+                )
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            observed_size += len(chunk)
+    if observed_size > maximum_bytes:
+        raise CodexBuildProvenanceError(
+            "source archive candidate manifest exceeds the size limit"
+        )
+    if observed_size != item.file_size:
+        raise CodexBuildProvenanceError(
+            "source archive contains inconsistent entry metadata"
+        )
+    return b"".join(chunks)
 
 
 def _require_json_object(content: bytes, *, label: str) -> dict[str, Any]:
@@ -499,4 +582,8 @@ __all__ = [
     "CaptainCodexBuildReceiptIssuer",
     "CodexBuildArtifactCas",
     "CodexBuildProvenanceError",
+    "MAX_FACTORY_CODEX_SOURCE_ZIP_ENTRIES",
+    "MAX_FACTORY_CODEX_SOURCE_ZIP_ENTRY_BYTES",
+    "MAX_FACTORY_CODEX_SOURCE_ZIP_MANIFEST_BYTES",
+    "MAX_FACTORY_CODEX_SOURCE_ZIP_TOTAL_BYTES",
 ]
