@@ -1,10 +1,11 @@
 #requires -Version 7
 [CmdletBinding()]
 param(
-    [ValidateSet('Build', 'Run')]
-    [string]$Action = 'Run',
+    [Parameter(Position = 0)]
+    [string]$PythonPath = '',
 
-    [string]$PythonPath = ''
+    [ValidateSet('Build', 'Run')]
+    [string]$Action = 'Run'
 )
 
 Set-StrictMode -Version Latest

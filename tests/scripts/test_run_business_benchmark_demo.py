@@ -55,7 +55,7 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "OPENAI_API_KEY" not in source.split("$rootEnvAllowlist", 1)[1].split(
         ")", 1
     )[0]
-    assert "$Action -ceq 'Run' -and" in source
+    assert "$Action = $Action.ToUpperInvariant()" in source
     assert "Applied team Gateway budget does not match" in source
     assert "[decimal]$team.gateway_budget_remaining_usd" in source
     assert "docker compose down" not in source
@@ -458,7 +458,18 @@ print(json.dumps({
     'status': 'resolvable',
     'database': 'captain_test',
     'production_scope_resolvable': True,
-    'jobs': [],
+    'jobs': [
+        {
+            'job_id': '71000000-0000-0000-0000-000000000001',
+            'candidate_id': 'claims-candidate',
+            'attempt': 1,
+        },
+        {
+            'job_id': '71000000-0000-0000-0000-000000000002',
+            'candidate_id': 'renewal-candidate',
+            'attempt': 1,
+        },
+    ],
 }))
 """.strip(),
         encoding="utf-8",
@@ -499,7 +510,18 @@ print(json.dumps({
     'status': 'resolvable' if resolvable else 'factory_dispatch_required',
     'database': 'captain_test',
     'production_scope_resolvable': resolvable,
-    **({'jobs': []} if resolvable else {}),
+    **({'jobs': [
+        {
+            'job_id': '71000000-0000-0000-0000-000000000001',
+            'candidate_id': 'claims-candidate',
+            'attempt': 1,
+        },
+        {
+            'job_id': '71000000-0000-0000-0000-000000000002',
+            'candidate_id': 'renewal-candidate',
+            'attempt': 1,
+        },
+    ]} if resolvable else {}),
 }))
 """
     (scripts / "preflight-business-benchmark-demo.py").write_text(
@@ -619,7 +641,7 @@ Set-Content (Join-Path $root 'provider-called') 'yes'
             "-File",
             str(scripts / SCRIPT.name),
             "-Action",
-            "Build",
+            "build",
             "-PythonPath",
             sys.executable,
             "-HermesPythonPath",
@@ -666,6 +688,64 @@ Set-Content (Join-Path $root 'provider-called') 'yes'
     )
     assert build_factory_arguments.count("--job-id") == 2
     assert "process-only-demo-key" not in built.stdout + built.stderr
+
+    for invalid_jobs in (
+        [],
+        [
+            {
+                "job_id": "71000000-0000-0000-0000-000000000001",
+                "candidate_id": "wrong-claims-candidate",
+                "attempt": 1,
+            },
+            {
+                "job_id": "71000000-0000-0000-0000-000000000002",
+                "candidate_id": "renewal-candidate",
+                "attempt": 1,
+            },
+        ],
+    ):
+        (scripts / "preflight-business-benchmark-demo.py").write_text(
+            "\n".join(
+                (
+                    "import json",
+                    "print(json.dumps({",
+                    "    'schema': 'captain.business-benchmark-default-preflight.v1',",
+                    "    'status': 'resolvable',",
+                    "    'database': 'captain_test',",
+                    "    'production_scope_resolvable': True,",
+                    f"    'jobs': {invalid_jobs!r},",
+                    "}))",
+                )
+            ),
+            encoding="utf-8",
+        )
+        invalid_scope = subprocess.run(
+            [
+                pwsh,
+                "-NoProfile",
+                "-File",
+                str(scripts / SCRIPT.name),
+                "-Action",
+                "Build",
+                "-PythonPath",
+                sys.executable,
+                "-HermesPythonPath",
+                sys.executable,
+            ],
+            cwd=repository,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert invalid_scope.returncode != 0
+        assert "candidates_ready" not in invalid_scope.stdout
+        assert not (repository / "provider-called").exists()
+    (scripts / "preflight-business-benchmark-demo.py").write_text(
+        factory_preflight.strip(),
+        encoding="utf-8",
+    )
 
     (scripts / "preflight-business-benchmark-demo.py").write_text(
         r"""

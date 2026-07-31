@@ -12,6 +12,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$Action = $Action.ToUpperInvariant()
 
 function Test-NativeExecutableLaunch {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -318,6 +319,40 @@ function New-DryRunPlan {
     }
 }
 
+function Test-ResolvedPreflightBindings {
+    param(
+        [Parameter(Mandatory = $true)][object]$Preflight,
+        [Parameter(Mandatory = $true)][object[]]$Teams
+    )
+
+    if (
+        $Preflight.PSObject.Properties.Name -notcontains 'jobs' -or
+        @($Preflight.jobs).Count -ne 2
+    ) {
+        return $false
+    }
+    $expected = @(
+        foreach ($team in $Teams) {
+            "$([string]$team.job.job_id)|$([string]$team.candidate_id)"
+        }
+    ) | Sort-Object
+    $actual = @(
+        foreach ($scope in @($Preflight.jobs)) {
+            if (
+                $null -eq $scope -or
+                $scope.PSObject.Properties.Name -notcontains 'job_id' -or
+                $scope.PSObject.Properties.Name -notcontains 'candidate_id' -or
+                [string]::IsNullOrWhiteSpace([string]$scope.job_id) -or
+                [string]::IsNullOrWhiteSpace([string]$scope.candidate_id)
+            ) {
+                return $false
+            }
+            "$([string]$scope.job_id)|$([string]$scope.candidate_id)"
+        }
+    ) | Sort-Object
+    return ($expected -join ',') -ceq ($actual -join ',')
+}
+
 function Test-CodexBuildInterruptedCheckpoint {
     param([Parameter(Mandatory = $true)][object]$Checkpoint)
 
@@ -469,7 +504,7 @@ try {
     $python = Resolve-Python311 $PythonPath
     $issuedAt = [DateTimeOffset]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
 
-    if ($Action -ceq 'Plan') {
+    if ($Action -ceq 'PLAN') {
         $planArguments = @(
             $provisionScript,
             '--plan-only',
@@ -519,7 +554,7 @@ try {
 
     $hermesPython = Resolve-HermesPython $HermesPythonPath
 
-    if ($Action -in @('Build', 'Run')) {
+    if ($Action -in @('BUILD', 'RUN')) {
         try {
             & $serviceRunner benchmark-start *> $null
             if ($LASTEXITCODE -ne 0) {
@@ -612,7 +647,7 @@ try {
         '--suite-version', '19',
         '--seed-version-id', $seedVersion
     )
-    if ($Action -in @('Build', 'Run')) {
+    if ($Action -in @('BUILD', 'RUN')) {
         $arguments += '--apply'
     }
     $rawProvisioning = @(& $python @arguments)
@@ -625,7 +660,7 @@ try {
     catch {
         throw 'Captain business benchmark provisioning returned invalid JSON.'
     }
-    $expectedMode = if ($Action -in @('Build', 'Run')) { 'applied' } else { 'dry_run' }
+    $expectedMode = if ($Action -in @('BUILD', 'RUN')) { 'applied' } else { 'dry_run' }
     if (
         $provisioning.schema -cne 'captain.business-benchmark-demo-provisioning.v1' -or
         $provisioning.mode -cne $expectedMode -or
@@ -653,7 +688,7 @@ try {
             throw 'Provisioned team model or budget does not match the demo authority.'
         }
         if (
-            $Action -in @('Build', 'Run') -and
+            $Action -in @('BUILD', 'RUN') -and
             [decimal]$team.gateway_budget_remaining_usd -ne [decimal]$maximumUsdPerTeam
         ) {
             throw 'Applied team Gateway budget does not match the demo authority.'
@@ -700,6 +735,12 @@ try {
     ) {
         throw 'Captain business benchmark default composition preflight is not canonical.'
     }
+    if (
+        $preflight.production_scope_resolvable -eq $true -and
+        -not (Test-ResolvedPreflightBindings -Preflight $preflight -Teams $teams)
+    ) {
+        throw 'Captain business benchmark preflight scope does not bind the provisioned Claims and Renewal candidates.'
+    }
 
     $processOpenAiKey = [Environment]::GetEnvironmentVariable('OPENAI_API_KEY', 'Process')
     if (
@@ -714,7 +755,7 @@ try {
         exit 2
     }
 
-    if ($Action -ceq 'Run' -and [string]::IsNullOrWhiteSpace($processOpenAiKey)) {
+    if ($Action -ceq 'RUN' -and [string]::IsNullOrWhiteSpace($processOpenAiKey)) {
         throw 'OPENAI_API_KEY must already exist in the process; demo env files are never read for it.'
     }
 
@@ -807,6 +848,12 @@ try {
         ) {
             throw 'Captain business benchmark post-Factory preflight is not canonical.'
         }
+        if (
+            $preflight.production_scope_resolvable -eq $true -and
+            -not (Test-ResolvedPreflightBindings -Preflight $preflight -Teams $teams)
+        ) {
+            throw 'Captain business benchmark post-Factory scope does not bind the provisioned Claims and Renewal candidates.'
+        }
         if ($preflight.production_scope_resolvable -ne $true) {
             New-FactoryDispatchCheckpoint `
                 -Teams $teams `
@@ -817,7 +864,7 @@ try {
         }
     }
 
-    if ($Action -ceq 'Build') {
+    if ($Action -ceq 'BUILD') {
         New-CandidatesReady `
             -Teams $teams `
             -IssuedAt $issuedAt `
