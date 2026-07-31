@@ -1,4 +1,5 @@
 import os
+import socket
 import subprocess
 from pathlib import Path
 
@@ -8,6 +9,8 @@ PREFLIGHT = ROOT / "scripts" / "demo-preflight.ps1"
 RUNNER = ROOT / "scripts" / "run-live-demo.ps1"
 SERVICES = ROOT / "scripts" / "live-demo-services.ps1"
 MINIBOOK = ROOT / "scripts" / "minibook-demo.ps1"
+BENCHMARK_COMPOSE = ROOT / "docker-compose.benchmark.yml"
+MANAGED_PROCESS = ROOT / "scripts" / "managed-process-identity.ps1"
 
 
 def test_demo_preflight_contract_is_fail_closed_and_redacted() -> None:
@@ -101,9 +104,9 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "mariadb-test" in source
     assert "python" in source and "gateway.app" in source
     assert "gateway-demo.pid" in source
-    assert "Gateway port is occupied by a non-demo process" in source
-    assert "stale local Gateway process stopped" in source
-    assert "Get-CimInstance Win32_Process" in source
+    assert "Gateway port is occupied without the exact managed process and ledger identity" in source
+    assert "verified stale local Gateway process stopped" in source
+    assert "Get-ManagedProcessIdentity" in source
     assert ".env.captain-n8n" in source
     assert "CAPTAIN_N8N_API_KEY" in source
     assert "CAPTAIN_N8N_MCP_TOKEN" in source
@@ -133,6 +136,105 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "down -v" not in lowered
     assert "volume rm" not in lowered
     assert "vibemind" not in lowered
+
+
+def test_business_benchmark_uses_a_dedicated_persistent_database() -> None:
+    source = SERVICES.read_text(encoding="utf-8")
+    compose = BENCHMARK_COMPOSE.read_text(encoding="utf-8")
+
+    assert "docker-compose.benchmark.yml" in source
+    assert "captain-cook-business-benchmark" in source
+    assert "mariadb-benchmark" in source
+    assert "business-benchmark-runtime.env" in source
+    assert "MARIADB_BENCHMARK_PORT" in source
+    assert "CAPTAIN_BENCHMARK_GATEWAY_PORT" in source
+    assert BENCHMARK_COMPOSE.is_file()
+    assert "mariadb-benchmark:" in compose
+    assert "captain-benchmark-mariadb:/var/lib/mysql" in compose
+    assert "captain-benchmark-mariadb:" in compose
+    assert "tmpfs:" not in compose
+    assert "managed-process-identity.ps1" in source
+    assert "Get-ManagedProcessIdentity" in source
+    assert "Get-GatewayConfigurationSha256" in source
+
+
+def test_managed_process_identity_rejects_wrong_listener_and_configuration(
+    tmp_path: Path,
+) -> None:
+    identity = tmp_path / "gateway.pid"
+    harness = tmp_path / "verify.ps1"
+    harness.write_text(
+        "\n".join(
+            (
+                "$ErrorActionPreference = 'Stop'",
+                f". '{MANAGED_PROCESS.as_posix()}'",
+                "$process = Get-Process -Id $PID",
+                f"$path = '{identity.as_posix()}'",
+                "Write-ManagedProcessIdentity -Process $process -Path $path -ConfigurationSha256 ('a' * 64)",
+                "$matched = Get-ManagedProcessIdentity -Path $path -ListenerPid $PID -ConfigurationSha256 ('a' * 64)",
+                "if ($matched.Id -ne $PID) { throw 'identity mismatch' }",
+                "$wrongListenerRejected = $false",
+                "try { Get-ManagedProcessIdentity -Path $path -ListenerPid ($PID + 1) -ConfigurationSha256 ('a' * 64) } catch { $wrongListenerRejected = $true }",
+                "if (-not $wrongListenerRejected) { throw 'wrong listener accepted' }",
+                "$wrongConfigRejected = $false",
+                "try { Get-ManagedProcessIdentity -Path $path -ListenerPid $PID -ConfigurationSha256 ('b' * 64) } catch { $wrongConfigRejected = $true }",
+                "if (-not $wrongConfigRejected) { throw 'wrong config accepted' }",
+            )
+        ),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_managed_listener_identity_binds_a_real_listener_to_its_recorded_process(
+    tmp_path: Path,
+) -> None:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    identity = tmp_path / "listener.pid"
+    harness = tmp_path / "listener.ps1"
+    harness.write_text(
+        "\n".join(
+            (
+                "$ErrorActionPreference = 'Stop'",
+                f". '{MANAGED_PROCESS.as_posix()}'",
+                f"$listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, {port})",
+                "$listener.Start()",
+                "$other = Start-Process pwsh -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 20' -WindowStyle Hidden -PassThru",
+                "try {",
+                f"  Write-ManagedProcessIdentity -Process (Get-Process -Id $PID) -Path '{identity.as_posix()}' -ConfigurationSha256 ('a' * 64)",
+                f"  $matched = Get-ManagedListenerIdentity -Path '{identity.as_posix()}' -Port {port} -ConfigurationSha256 ('a' * 64)",
+                "  if ($matched.Id -ne $PID) { throw 'listener identity mismatch' }",
+                f"  Write-ManagedProcessIdentity -Process $other -Path '{identity.as_posix()}' -ConfigurationSha256 ('a' * 64)",
+                "  $wrongOwnerRejected = $false",
+                f"  try {{ Get-ManagedListenerIdentity -Path '{identity.as_posix()}' -Port {port} -ConfigurationSha256 ('a' * 64) }} catch {{ $wrongOwnerRejected = $true }}",
+                "  if (-not $wrongOwnerRejected) { throw 'foreign listener accepted' }",
+                "} finally {",
+                "  $listener.Stop()",
+                "  if (Get-Process -Id $other.Id -ErrorAction SilentlyContinue) { Stop-Process -Id $other.Id -Force }",
+                "}",
+            )
+        ),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_readme_documents_safe_recording_commands() -> None:

@@ -126,7 +126,24 @@
   paid retries were stopped until Codex output was streamed durably, timeout
   evidence retained its real terminal cause, and the build was split into
   resumable Captain-authored scaffold/test and Codex implementation phases.
-  Those local recovery changes are now complete. Suite/seed v19 is prepared
-  only through the no-apply `-Action Plan` contract; it has not been
-  provisioned, applied, or provider-executed. No run has yet reached a
-  benchmark, Gateway promotion, or Minibook projection.
+  Those local recovery changes are now complete. Suite/seed v19 was then
+  provisioned and provider-executed for candidate construction only. Claims
+  produced the exact inventory, Codex brief, and sealed build artifacts before
+  the first run failed closed at the Forge evidence mapping boundary. A later
+  resume proved that the shared disposable `captain_test` ledger had been
+  cleared while the private Hermes replay remained, so Captain rejected the
+  fresh-lease/replay mismatch. No business benchmark, Gateway promotion, or
+  Minibook projection ran. Actual provider cost was not materialized as a
+  readable usage receipt; configured ceilings remained `0.06` USD aggregate
+  for Hermes and `0.30` USD per team.
+- [x] Isolate provider-live benchmark state from ordinary MariaDB test cleanup.
+  `benchmark-start` now creates a dedicated `captain-cook-business-benchmark`
+  Compose project on its own port, uses a named persistent MariaDB volume, and
+  writes only an ignored runtime DSN contract for the benchmark runner. The
+  ordinary `captain_test` container remains disposable and cannot clear the
+  benchmark ledger. A controlled dedicated-container restart retained all 13
+  initialized schema tables. Gateway reuse and termination additionally require
+  the exact PID, start time, executable, listener PID, and a SHA-256 binding of
+  the expected endpoint plus ledger DSN; a merely healthy foreign Gateway fails
+  closed. This is infrastructure evidence only; it does not repair v19's
+  missing Captain blocks or authorize a benchmark rerun.

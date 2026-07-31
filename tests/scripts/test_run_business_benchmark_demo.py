@@ -40,6 +40,10 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "--apply" in source
     assert "preflight-business-benchmark-demo.py" in source
     assert "& $serviceRunner benchmark-start" in source
+    assert "business-benchmark-runtime.env" in source
+    assert "$benchmarkRuntimeAllowlist" in source
+    assert "MARIADB_BENCHMARK_PORT" in source
+    assert "CAPTAIN_BENCHMARK_GATEWAY_URL" in source
     assert "factory_dispatch_required" in source
     assert "infrastructure_required" in source
     assert source.index("preflight-business-benchmark-demo.py") < source.index(
@@ -322,17 +326,28 @@ param([string]$Action)
 if ($Action -cne 'benchmark-start') { throw 'only benchmark-start is accepted' }
 $root = Split-Path -Parent $PSScriptRoot
 Set-Content (Join-Path $root 'service-called') 'unsafe'
+$runtime = Join-Path $root '.captain-cook/private/business-benchmarks/business-benchmark-runtime.env'
+New-Item -ItemType Directory -Force (Split-Path $runtime -Parent) | Out-Null
+@(
+    'TEST_MARIADB_DSN=mariadb://captain_test:test-only@127.0.0.1:33316/captain_test',
+    'MARIADB_BENCHMARK_PORT=33316',
+    'CAPTAIN_BENCHMARK_GATEWAY_URL=http://127.0.0.1:8092'
+) | Set-Content $runtime
 """.strip(),
         encoding="utf-8",
     )
     (scripts / "provision-business-benchmark-demo.py").write_text(
         r"""
 import json
+import os
 from pathlib import Path
 import sys
 
 Path(__file__).resolve().parents[1].joinpath('provision-args.json').write_text(
     json.dumps(sys.argv[1:]), encoding='utf-8'
+)
+Path(__file__).resolve().parents[1].joinpath('selected-dsn.txt').write_text(
+    os.environ.get('TEST_MARIADB_DSN', ''), encoding='utf-8'
 )
 if '--apply' in sys.argv:
     Path(__file__).resolve().parents[1].joinpath('gateway-mutated').write_text(
@@ -418,6 +433,9 @@ print(json.dumps({
     )
     environment = dict(os.environ)
     environment.pop("OPENAI_API_KEY", None)
+    environment["TEST_MARIADB_DSN"] = (
+        "mariadb://hostile:hostile@127.0.0.1:39999/captain_test"
+    )
 
     planned = subprocess.run(
         [
@@ -781,6 +799,8 @@ Set-Content (Join-Path $root 'provider-called') 'yes'
     assert not (repository / "provider-called").exists()
     build_arguments = json.loads((repository / "provision-args.json").read_text("utf-8"))
     assert "--apply" in build_arguments
+    assert ":33316/captain_test" in (repository / "selected-dsn.txt").read_text("utf-8")
+    assert "39999" not in (repository / "selected-dsn.txt").read_text("utf-8")
     build_factory_arguments = json.loads(
         (repository / "factory-args.json").read_text("utf-8")
     )

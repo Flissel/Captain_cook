@@ -77,18 +77,21 @@ $preflightScript = Join-Path $PSScriptRoot 'preflight-business-benchmark-demo.py
 $factoryRunner = Join-Path $PSScriptRoot 'run-agent-factory-business-demo.py'
 $liveRunner = Join-Path $PSScriptRoot 'run-business-benchmark-live.ps1'
 $serviceRunner = Join-Path $PSScriptRoot 'live-demo-services.ps1'
+$benchmarkRuntimeEnvPath = Join-Path $repositoryRoot '.captain-cook/private/business-benchmarks/business-benchmark-runtime.env'
 $canonicalRenewalWorkflow = Join-Path $repositoryRoot 'examples/business_benchmark_candidates/customer_renewal_orchestration_team/workflows/renewal_context_read.json'
 $maximumUsdPerTeam = '0.30'
 $maximumHermesUsd = '0.06'
 $seedVersion = 'business-benchmark-demo-2026-07-v19'
 
 $rootEnvAllowlist = @(
-    'TEST_MARIADB_DSN',
-    'MARIADB_TEST_PORT',
-    'CAPTAIN_GATEWAY_URL',
     'CAPTAIN_GATEWAY_TOKEN',
     'WORKER_GATEWAY_TOKEN',
     'CAPTAIN_BENCHMARK_MODEL'
+)
+$benchmarkRuntimeAllowlist = @(
+    'TEST_MARIADB_DSN',
+    'MARIADB_BENCHMARK_PORT',
+    'CAPTAIN_BENCHMARK_GATEWAY_URL'
 )
 $captainN8nAllowlist = @(
     'CAPTAIN_N8N_PORT',
@@ -571,6 +574,15 @@ try {
     $environment = [ordered]@{}
     Merge-Environment $environment (Read-AllowlistedEnvironment $rootEnvPath $rootEnvAllowlist)
     Merge-Environment $environment (Read-AllowlistedEnvironment $captainN8nEnvPath $captainN8nAllowlist)
+    $benchmarkRuntime = Read-AllowlistedEnvironment $benchmarkRuntimeEnvPath $benchmarkRuntimeAllowlist
+    foreach ($required in $benchmarkRuntimeAllowlist) {
+        if (-not $benchmarkRuntime.Contains($required) -or [string]::IsNullOrWhiteSpace([string]$benchmarkRuntime[$required])) {
+            throw "Required dedicated benchmark runtime setting is missing: $required"
+        }
+    }
+    $environment['TEST_MARIADB_DSN'] = [string]$benchmarkRuntime['TEST_MARIADB_DSN']
+    $environment['MARIADB_TEST_PORT'] = [string]$benchmarkRuntime['MARIADB_BENCHMARK_PORT']
+    $environment['CAPTAIN_GATEWAY_URL'] = [string]$benchmarkRuntime['CAPTAIN_BENCHMARK_GATEWAY_URL']
     foreach ($required in @(
         'TEST_MARIADB_DSN',
         'MARIADB_TEST_PORT',
