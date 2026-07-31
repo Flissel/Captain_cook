@@ -330,7 +330,9 @@ def _allowed_next_phases(projection: FactoryProjection) -> frozenset[FactoryPhas
         FactoryPhase.TOOL_CANDIDATE_TESTED: frozenset({FactoryPhase.AGENT_CODE_CREATED}),
         FactoryPhase.AGENT_CODE_CREATED: frozenset({FactoryPhase.BUILD_PASSED, FactoryPhase.BUILD_FAILED}),
         FactoryPhase.BUILD_PASSED: frozenset({FactoryPhase.REAL_CASE_EVIDENCE}),
-        FactoryPhase.REAL_CASE_EVIDENCE: frozenset({FactoryPhase.QUALITY_REVIEWED}),
+        FactoryPhase.REAL_CASE_EVIDENCE: frozenset(
+            {FactoryPhase.QUALITY_REVIEWED, FactoryPhase.IMPROVEMENT_REQUESTED}
+        ),
         FactoryPhase.BUILD_FAILED: frozenset({FactoryPhase.IMPROVEMENT_REQUESTED, FactoryPhase.ESCALATED}),
         FactoryPhase.QUALITY_REVIEWED: frozenset(
             {FactoryPhase.IMPROVEMENT_REQUESTED, FactoryPhase.CAPABILITY_PROMOTED, FactoryPhase.ESCALATED}

@@ -78,6 +78,9 @@ from gateway.factory_forge_evidence import CaptainForgeEvidenceBridge
 from gateway.factory_runtime_retry_authority import (
     FilesystemFactoryRuntimeRetryAuthority,
 )
+from gateway.factory_improvement_authority import (
+    FilesystemFactoryImprovementAuthority,
+)
 from gateway.minibook_creation_artifacts import GatewayMinibookCreationArtifactStore
 from gateway.store import GatewayStore
 
@@ -308,6 +311,9 @@ def compose_business_demo_factory_operator(
         ),
         checkpoint_root=codex_state_root / "checkpoints",
     )
+    improvement_authority = FilesystemFactoryImprovementAuthority(
+        authority_root / "runtime-state" / "improvement-authorizations"
+    )
     repository = GatewayFactoryRepository(
         store,
         runtime_retries=runtime_retry_authority,
@@ -491,6 +497,7 @@ def compose_business_demo_factory_operator(
         codex_prompt_artifact_store=_BenchmarkCodexPromptArtifactStore(
             benchmark_cas
         ),
+        improvements=improvement_authority,
         runtime_retries=runtime_retry_authority,
     )
 

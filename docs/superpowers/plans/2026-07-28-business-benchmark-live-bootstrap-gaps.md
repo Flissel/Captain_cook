@@ -232,3 +232,20 @@
   verified without another provider call. Both prior configured reserves are
   counted conservatively; this does not claim that V19 or V20 can resume or
   that V21 has passed its technical holdout.
+- [x] Add a Captain-owned, content-addressed technical failure evaluation and
+  improvement authority before any paid business benchmark. Failed isolated
+  candidate execution marks every unproved Captain assertion failed; a real
+  AutoGen holdout retains only actually passed assertions as regression
+  guards. Both paths bind the exact job, attempt, source block, Forge candidate,
+  and immutable evidence. Captain can now transition directly from failed
+  `REAL_CASE_EVIDENCE` to `IMPROVEMENT_REQUESTED`, while the ordinary Quality
+  Warden path remains unchanged. The authority is stored only below the ignored
+  `.captain-cook` namespace, is accepted only after its request block appears in
+  the Gateway ledger, and is wired into the live operator for Attempt 2. The
+  `Authorize` action performs this ledger mutation without constructing Hermes,
+  Codex, AutoGen, n8n, or benchmark providers.
+- [ ] Issue the two V21 Attempt-2 authorizations against `captain_test`, rebuild
+  Claims and Renewal under the existing 1.00 EUR/team cost envelope, and repeat
+  the isolated technical gates. Do not run the 30 business cases until both
+  candidates produce executable AutoGen outcomes and pass every technical
+  assertion.

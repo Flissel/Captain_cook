@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Plan', 'Build', 'Run')]
+    [ValidateSet('Plan', 'Authorize', 'Build', 'Run')]
     [string]$Action,
 
     [string]$PythonPath = '',
@@ -120,6 +120,7 @@ $captainN8nEnvPath = Join-Path $repositoryRoot '.env.captain-n8n'
 $provisionScript = Join-Path $PSScriptRoot 'provision-business-benchmark-demo.py'
 $preflightScript = Join-Path $PSScriptRoot 'preflight-business-benchmark-demo.py'
 $factoryRunner = Join-Path $PSScriptRoot 'run-agent-factory-business-demo.py'
+$improvementIssuer = Join-Path $PSScriptRoot 'issue-factory-improvement.py'
 $liveRunner = Join-Path $PSScriptRoot 'run-business-benchmark-live.ps1'
 $serviceRunner = Join-Path $PSScriptRoot 'live-demo-services.ps1'
 $benchmarkRuntimeEnvPath = Join-Path $repositoryRoot '.captain-cook/private/business-benchmarks/business-benchmark-runtime.env'
@@ -681,7 +682,7 @@ try {
 
     $hermesPython = Resolve-HermesPython $HermesPythonPath
 
-    if ($Action -in @('BUILD', 'RUN')) {
+    if ($Action -in @('AUTHORIZE', 'BUILD', 'RUN')) {
         try {
             & $serviceRunner benchmark-start *> $null
             if ($LASTEXITCODE -ne 0) {
@@ -792,7 +793,7 @@ try {
         '--suite-version', '21',
         '--seed-version-id', $seedVersion
     )
-    if ($Action -in @('BUILD', 'RUN')) {
+    if ($Action -in @('AUTHORIZE', 'BUILD', 'RUN')) {
         $arguments += '--apply'
     }
     $rawProvisioning = @(& $python @arguments)
@@ -805,7 +806,7 @@ try {
     catch {
         throw 'Captain business benchmark provisioning returned invalid JSON.'
     }
-    $expectedMode = if ($Action -in @('BUILD', 'RUN')) { 'applied' } else { 'dry_run' }
+    $expectedMode = if ($Action -in @('AUTHORIZE', 'BUILD', 'RUN')) { 'applied' } else { 'dry_run' }
     if (
         $provisioning.schema -cne 'captain.business-benchmark-demo-provisioning.v1' -or
         $provisioning.mode -cne $expectedMode -or
@@ -833,7 +834,7 @@ try {
             throw 'Provisioned team model or budget does not match the demo authority.'
         }
         if (
-            $Action -in @('BUILD', 'RUN') -and
+            $Action -in @('AUTHORIZE', 'BUILD', 'RUN') -and
             [decimal]$team.gateway_budget_remaining_usd -ne [decimal]$maximumUsdPerTeam
         ) {
             throw 'Applied team Gateway budget does not match the demo authority.'
@@ -885,6 +886,51 @@ try {
         -not (Test-ResolvedPreflightBindings -Preflight $preflight -Teams $teams)
     ) {
         throw 'Captain business benchmark preflight scope does not bind the provisioned Claims and Renewal candidates.'
+    }
+
+    if ($Action -ceq 'AUTHORIZE') {
+        $rawAuthorization = @(
+            & $python $improvementIssuer `
+                --workspace-root $repositoryRoot `
+                --authority-root ([string]$environment['CAPTAIN_BENCHMARK_AUTHORITY_ROOT']) `
+                --job-id ([string]$claims.job.job_id) `
+                --job-id ([string]$renewal.job.job_id) `
+                --issued-at $issuedAt
+        )
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Captain improvement issuance failed closed.'
+        }
+        try {
+            $authorization = ($rawAuthorization -join [Environment]::NewLine) |
+                ConvertFrom-Json -Depth 30
+        }
+        catch {
+            throw 'Captain improvement issuance returned invalid JSON.'
+        }
+        $expectedAuthorizationJobIds = @(
+            [string]$claims.job.job_id,
+            [string]$renewal.job.job_id
+        ) | Sort-Object
+        $actualAuthorizationJobIds = @(
+            $authorization.authorizations | ForEach-Object { [string]$_.job_id }
+        ) | Sort-Object
+        if (
+            $authorization.schema -cne 'captain.factory-improvement-issuance.v1' -or
+            $authorization.database -cne 'captain_test' -or
+            $authorization.status -cne 'authorized' -or
+            @($authorization.authorizations).Count -ne 2 -or
+            ($expectedAuthorizationJobIds -join ',') -cne ($actualAuthorizationJobIds -join ',') -or
+            @($authorization.authorizations | Where-Object {
+                [int]$_.failed_attempt -ne 1 -or
+                [int]$_.authorized_attempt -ne 2 -or
+                [string]::IsNullOrWhiteSpace([string]$_.request_block_id) -or
+                [string]::IsNullOrWhiteSpace([string]$_.authorization_ref.sha256)
+            }).Count -ne 0
+        ) {
+            throw 'Captain improvement issuance result is not canonical.'
+        }
+        $authorization | ConvertTo-Json -Compress -Depth 30
+        exit 0
     }
 
     $processOpenAiKey = [Environment]::GetEnvironmentVariable('OPENAI_API_KEY', 'Process')

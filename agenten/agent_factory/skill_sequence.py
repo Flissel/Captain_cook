@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
+import json
 import re
 from typing import Literal
 from uuid import UUID
@@ -22,6 +24,10 @@ from agenten.agent_factory.skill_workflow_contracts import (
     TeamEvaluationV1,
     factory_runtime_retry_evidence_binding,
     factory_runtime_retry_evidence_binding_sha256,
+)
+from agenten.agent_factory.technical_improvement_contracts import (
+    CaptainTechnicalFailureEvaluationV1,
+    validate_captain_technical_failure_evaluation,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
 
@@ -214,7 +220,7 @@ class FactoryImprovementAuthorizationV1(BaseModel):
     authorization_ref: ArtifactRef
     authorized_attempt: int = Field(ge=2, le=5, strict=True)
     request_block: FactoryEvidenceBlock
-    failed_evaluation: TeamEvaluationV1
+    failed_evaluation: TeamEvaluationV1 | CaptainTechnicalFailureEvaluationV1
     prior_candidate_ref: ArtifactRef
     prior_green_assertion_ids: tuple[str, ...]
     prior_green_benchmark_metric_ids: tuple[BusinessBenchmarkMetricId, ...] = ()
@@ -242,6 +248,8 @@ class FactoryImprovementAuthorizationV1(BaseModel):
     def require_exact_failed_attempt_binding(self) -> "FactoryImprovementAuthorizationV1":
         request = self.request_block
         evaluation = self.failed_evaluation
+        if isinstance(evaluation, CaptainTechnicalFailureEvaluationV1):
+            validate_captain_technical_failure_evaluation(evaluation)
         if (
             request.phase is not FactoryPhase.IMPROVEMENT_REQUESTED
             or request.producer != "captain"
@@ -289,6 +297,85 @@ class FactoryImprovementAuthorizationV1(BaseModel):
         ):
             raise ValueError("failed benchmark metrics cannot be prior-green guards")
         return self
+
+
+def build_factory_improvement_authorization(
+    *,
+    request_block: FactoryEvidenceBlock,
+    failed_evaluation: TeamEvaluationV1 | CaptainTechnicalFailureEvaluationV1,
+    prior_candidate_ref: ArtifactRef,
+) -> FactoryImprovementAuthorizationV1:
+    """Build one content-addressed Captain authority for the next attempt."""
+
+    placeholder = ArtifactRef(
+        uri=f"artifact://factory/improvement-authorization/{'0' * 64}",
+        sha256="0" * 64,
+        media_type="application/json",
+    )
+    authorization = FactoryImprovementAuthorizationV1(
+        schema_name="captain.factory-improvement-authorization.v1",
+        authorization_ref=placeholder,
+        authorized_attempt=request_block.attempt + 1,
+        request_block=request_block,
+        failed_evaluation=failed_evaluation,
+        prior_candidate_ref=prior_candidate_ref,
+        prior_green_assertion_ids=failed_evaluation.prior_green_regression_ids,
+        prior_green_benchmark_metric_ids=(
+            failed_evaluation.prior_green_benchmark_metric_ids
+        ),
+    )
+    digest = factory_improvement_authorization_sha256(authorization)
+    return authorization.model_copy(
+        update={
+            "authorization_ref": ArtifactRef(
+                uri=f"artifact://factory/improvement-authorization/{digest}",
+                sha256=digest,
+                media_type="application/json",
+            )
+        }
+    )
+
+
+def factory_improvement_authorization_binding(
+    authorization: FactoryImprovementAuthorizationV1,
+) -> dict[str, object]:
+    return authorization.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude={"authorization_ref"},
+    )
+
+
+def factory_improvement_authorization_sha256(
+    authorization: FactoryImprovementAuthorizationV1,
+) -> str:
+    content = json.dumps(
+        factory_improvement_authorization_binding(authorization),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(content).hexdigest()
+
+
+def validate_factory_improvement_authorization(
+    authorization: FactoryImprovementAuthorizationV1,
+) -> FactoryImprovementAuthorizationV1:
+    if isinstance(
+        authorization.failed_evaluation,
+        CaptainTechnicalFailureEvaluationV1,
+    ):
+        validate_captain_technical_failure_evaluation(
+            authorization.failed_evaluation
+        )
+    digest = factory_improvement_authorization_sha256(authorization)
+    if authorization.authorization_ref != ArtifactRef(
+        uri=f"artifact://factory/improvement-authorization/{digest}",
+        sha256=digest,
+        media_type="application/json",
+    ):
+        raise ValueError("improvement authorization content binding does not match")
+    return authorization
 
 
 class SkillSequencePolicy:

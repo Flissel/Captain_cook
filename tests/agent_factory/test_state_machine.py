@@ -338,6 +338,27 @@ def test_missing_assertion_requests_improvement_not_promotion() -> None:
     assert next_action(state).kind is FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED
 
 
+def test_captain_can_request_improvement_directly_from_failed_technical_run() -> None:
+    state = FactoryProjection.from_job(job())
+    for event in (
+        block(FactoryPhase.FORGE_REQUESTED),
+        block(FactoryPhase.BLUEPRINT_CREATED),
+        block(FactoryPhase.TOOL_CANDIDATE_TESTED),
+        block(FactoryPhase.AGENT_CODE_CREATED),
+        block(FactoryPhase.BUILD_PASSED),
+        block(FactoryPhase.REAL_CASE_EVIDENCE),
+    ):
+        state = apply_block(state, event)
+
+    requested = apply_block(
+        state,
+        block(FactoryPhase.IMPROVEMENT_REQUESTED, assertions=("schema_valid",)),
+    )
+
+    assert requested.phase is FactoryPhase.IMPROVEMENT_REQUESTED
+    assert requested.attempt == 2
+
+
 def test_fifth_behavioral_failure_escalates() -> None:
     state = FactoryProjection.from_job(job()).model_copy(update={"attempt": 5})
     for phase in (
