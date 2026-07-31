@@ -53,6 +53,8 @@ from agenten.agent_factory.skill_workflow_contracts import (
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.execution.codex_policy import AuthorizedCodexRun
 from agenten.execution.codex_supervisor import (
+    DEFAULT_MAX_CODEX_JOURNAL_BYTES,
+    CodexOutputEvidenceError,
     CodexRunResult,
     CodexRunRequest,
     CodexRunner,
@@ -172,6 +174,24 @@ class FactoryCodexOutputCaptureError(FactoryDispatchError):
     ) -> None:
         super().__init__(message)
         self.reason = reason
+
+
+class FactoryCodexEvidenceFailure(FactoryDispatchError):
+    """A redacted durable Factory failure for untrustworthy Codex output."""
+
+    def __init__(
+        self,
+        *,
+        process_cleanup_status: Literal[
+            "not_required", "verified_cancelled", "unresolved"
+        ],
+        checkpoint_ref: ArtifactRef,
+        terminal_receipt_ref: ArtifactRef,
+    ) -> None:
+        super().__init__("Factory Codex output evidence failed")
+        self.process_cleanup_status = process_cleanup_status
+        self.checkpoint_ref = checkpoint_ref
+        self.terminal_receipt_ref = terminal_receipt_ref
 
 
 def _interruption_references(
@@ -1307,7 +1327,21 @@ class CodexCliFactoryBuildExecutor:
                 previous=checkpoint,
             ),
         )
-        result = await runner.run(authorized)
+        try:
+            result = await runner.run(authorized)
+        except CodexOutputEvidenceError as exc:
+            self._raise_persisted_evidence_failure(
+                error=exc,
+                request=request,
+                invocation=invocation,
+                brief=brief,
+                prepared=prepared,
+                checkpoint=checkpoint,
+                command=run_request.command,
+                session_id=session_id,
+                resume_lineage=resume_lineage,
+            )
+            raise AssertionError("unreachable")
         _validate_factory_codex_run_result(
             result=result,
             expected_journal_path=journal_path,
@@ -1444,6 +1478,88 @@ class CodexCliFactoryBuildExecutor:
                 previous=checkpoint,
             ),
         )
+
+    def _raise_persisted_evidence_failure(
+        self,
+        *,
+        error: CodexOutputEvidenceError,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+        prepared: PreparedFactoryWorkspace,
+        checkpoint: FactoryCodexBuildCheckpointV1,
+        command: tuple[str, ...],
+        session_id: str,
+        resume_lineage: _CodexResumeLineage | None,
+    ) -> None:
+        if (
+            error.process_cleanup_status is None
+            or error.journal_path is None
+            or error.journal_sha256 is None
+            or error.journal_byte_count is None
+            or error.event_count is None
+            or error.event_types is None
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex output failure evidence is incomplete"
+            ) from None
+        expected_journal = self._journal_path(invocation, checkpoint.resume_ordinal)
+        if error.journal_path != expected_journal:
+            raise FactoryDispatchError(
+                "Factory Codex output failure journal binding changed"
+            ) from None
+        completed_at = self._clock()
+        receipt = _evidence_failure_receipt(
+            error=error,
+            session_id=session_id,
+            workspace_ref=brief.build_assignment.workspace_ref,
+            base_revision=prepared.base_revision,
+            command=command,
+            completed_at=completed_at,
+            resume_ordinal=checkpoint.resume_ordinal,
+        )
+        receipt_sha256 = hashlib.sha256(receipt).hexdigest()
+        self._persist_session_receipt(
+            invocation,
+            receipt,
+            checkpoint.resume_ordinal,
+        )
+        terminal_checkpoint = checkpoint
+        if error.process_cleanup_status in {
+            "not_required",
+            "verified_cancelled",
+        }:
+            terminal_checkpoint = self._checkpoint_store.advance(
+                checkpoint,
+                self._checkpoint(
+                    request,
+                    invocation,
+                    brief,
+                    prepared,
+                    phase="implementation_failed",
+                    resume_ordinal=checkpoint.resume_ordinal,
+                    terminal_receipt_sha256=receipt_sha256,
+                    scaffold_manifest_sha256=checkpoint.scaffold_manifest_sha256,
+                    implementation_failure_reason="evidence_failure",
+                    resume_lineage=resume_lineage,
+                    previous=checkpoint,
+                ),
+            )
+        checkpoint_bytes = canonical_factory_codex_model(terminal_checkpoint)
+        checkpoint_sha256 = hashlib.sha256(checkpoint_bytes).hexdigest()
+        raise FactoryCodexEvidenceFailure(
+            process_cleanup_status=error.process_cleanup_status,
+            checkpoint_ref=ArtifactRef(
+                uri=f"artifact://factory/codex-checkpoint/{checkpoint_sha256}",
+                sha256=checkpoint_sha256,
+                media_type="application/json",
+            ),
+            terminal_receipt_ref=ArtifactRef(
+                uri=f"artifact://factory/codex-terminal-receipt/{receipt_sha256}",
+                sha256=receipt_sha256,
+                media_type="application/json",
+            ),
+        ) from None
 
     async def _reconcile_running(
         self,
@@ -1687,7 +1803,7 @@ class CodexCliFactoryBuildExecutor:
 
         journal_path = self._journal_path(invocation, checkpoint.resume_ordinal)
         try:
-            journal = journal_path.read_bytes()
+            journal = _read_bounded_codex_journal(journal_path)
         except OSError:
             raise FactoryDispatchError("Factory Codex JSONL journal is missing") from None
         journal_sha256 = hashlib.sha256(journal).hexdigest()
@@ -2451,6 +2567,7 @@ class CodexCliFactoryBuildExecutor:
             "output_size_limit_exceeded",
             "runtime_failed",
             "authority_expired",
+            "evidence_failure",
         ] | None = None,
         previous: FactoryCodexBuildCheckpointV1 | None,
         resume_lineage: _CodexResumeLineage | None = None,
@@ -2629,7 +2746,7 @@ def _session_receipt(
         raise FactoryDispatchError("Codex completion timestamp must be UTC")
     try:
         journal_path = result.journal_path.resolve(strict=True)
-        journal_bytes = journal_path.read_bytes()
+        journal_bytes = _read_bounded_codex_journal(journal_path)
     except OSError as exc:
         raise FactoryDispatchError("Codex JSONL journal is unavailable") from exc
     journal_sha256 = hashlib.sha256(journal_bytes).hexdigest()
@@ -2723,6 +2840,55 @@ def _session_receipt(
     ).encode("utf-8")
 
 
+def _evidence_failure_receipt(
+    *,
+    error: CodexOutputEvidenceError,
+    session_id: str,
+    workspace_ref: str,
+    base_revision: str,
+    command: tuple[str, ...],
+    completed_at: datetime,
+    resume_ordinal: int,
+) -> bytes:
+    if completed_at.tzinfo is None or completed_at.utcoffset() != timezone.utc.utcoffset(
+        completed_at
+    ):
+        raise FactoryDispatchError("Codex evidence failure timestamp must be UTC")
+    if (
+        error.process_cleanup_status is None
+        or error.journal_sha256 is None
+        or error.journal_byte_count is None
+        or error.event_count is None
+        or error.event_types is None
+    ):
+        raise FactoryDispatchError("Codex evidence failure metadata is incomplete")
+    payload = {
+        "schema": "captain.codex-session-error-receipt.v1",
+        "provider": "codex-cli",
+        "session_id": session_id,
+        "status": "evidence_failed",
+        "failure_kind": error.failure_kind,
+        "process_cleanup_status": error.process_cleanup_status,
+        "workspace_ref": workspace_ref,
+        "base_revision": base_revision,
+        "command_sha256": hashlib.sha256(
+            "\0".join(command).encode("utf-8")
+        ).hexdigest(),
+        "journal_sha256": error.journal_sha256,
+        "journal_byte_count": error.journal_byte_count,
+        "event_count": error.event_count,
+        "event_types": list(error.event_types),
+        "resume_ordinal": resume_ordinal,
+        "completed_at": completed_at.isoformat(),
+    }
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 def _canonical_codex_thread_id(
     events: Iterable[Mapping[str, object]],
 ) -> str | None:
@@ -2791,6 +2957,29 @@ def _validate_factory_codex_run_result(
         )
 
 
+def _read_bounded_codex_journal(path: Path) -> bytes:
+    try:
+        with path.open("rb") as journal:
+            size_before = os.fstat(journal.fileno()).st_size
+            if size_before > DEFAULT_MAX_CODEX_JOURNAL_BYTES:
+                raise FactoryDispatchError(
+                    "Codex JSONL journal exceeds the Factory size limit"
+                )
+            content = journal.read(DEFAULT_MAX_CODEX_JOURNAL_BYTES + 1)
+            size_after = os.fstat(journal.fileno()).st_size
+    except OSError as exc:
+        raise FactoryDispatchError("Codex JSONL journal is unavailable") from exc
+    if (
+        len(content) > DEFAULT_MAX_CODEX_JOURNAL_BYTES
+        or size_before != size_after
+        or len(content) != size_after
+    ):
+        raise FactoryDispatchError(
+            "Codex JSONL journal snapshot changed or exceeds the Factory size limit"
+        )
+    return content
+
+
 def _write_once(target: Path, content: bytes) -> None:
     try:
         descriptor = os.open(
@@ -2831,6 +3020,7 @@ __all__ = [
     "CodexCliFactoryBuildSettings",
     "CompletedCodexBuild",
     "FactoryCodexBuildInterrupted",
+    "FactoryCodexEvidenceFailure",
     "FactoryCodexProcessInspectorPort",
     "FactoryCodexProcessState",
     "FactoryBuildArtifactReaderPort",

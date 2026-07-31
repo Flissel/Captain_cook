@@ -182,7 +182,10 @@ try {
     )
     Move-Item -LiteralPath $temporaryStatePath -Destination $resolvedStatePath -Force
 
-    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $stderrTask = $process.StandardError.BaseStream.CopyToAsync(
+        [IO.Stream]::Null,
+        65536
+    )
     while (($line = $process.StandardOutput.ReadLine()) -ne $null) {
         [Console]::Out.WriteLine($line)
         [Console]::Out.Flush()

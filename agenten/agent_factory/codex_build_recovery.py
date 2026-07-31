@@ -88,6 +88,7 @@ class FactoryCodexBuildCheckpointV1(BaseModel):
         "output_size_limit_exceeded",
         "runtime_failed",
         "authority_expired",
+        "evidence_failure",
     ] | None = None
     sealed_evidence_sha256: str | None = None
     sealed_build_receipt_uri: str | None = None

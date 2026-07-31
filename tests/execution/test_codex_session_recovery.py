@@ -416,6 +416,38 @@ def _compile_streaming_fixture(
     return executable
 
 
+def _compile_large_stderr_fixture(tmp_path: Path) -> Path:
+    executable = tmp_path / f"large-stderr-fixture-{uuid4().hex}.exe"
+    source_path = executable.with_suffix(".cs")
+    source_path.write_text(
+        (
+            "using System;using System.IO;"
+            "public static class Program {"
+            "public static int Main(string[] args) {"
+            "byte[] chunk = new byte[65536];"
+            "Stream stderr = Console.OpenStandardError();"
+            "for (int i = 0; i < 1024; i++) { stderr.Write(chunk, 0, chunk.Length); }"
+            "stderr.Flush();"
+            'Console.Out.WriteLine("{\\\"type\\\":\\\"turn.started\\\"}");'
+            "Console.Out.Flush();return 0;"
+            "}}"
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe",
+            "/nologo",
+            f"/out:{executable}",
+            str(source_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return executable
+
+
 def _compile_marker_fixture(tmp_path: Path, marker_path: Path) -> Path:
     executable = tmp_path / f"marker-fixture-{uuid4().hex}.exe"
     escaped_marker = marker_path.as_posix().replace('"', '""')
@@ -670,6 +702,41 @@ async def test_powershell_launcher_streams_complete_line_before_child_exit(
         if process.returncode is None:
             process.kill()
         await process.wait()
+
+
+@pytest.mark.asyncio
+async def test_powershell_launcher_drains_large_stderr_without_retaining_it(
+    tmp_path: Path,
+) -> None:
+    fixture = _compile_large_stderr_fixture(tmp_path)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    runner = PowerShellCodexRunner(
+        pwsh_path=Path(_pwsh()),
+        script_path=Path("scripts/codex-session.ps1").resolve(),
+        codex_path=fixture,
+        session_id="large-stderr-1",
+        state_path=tmp_path / "large-stderr-process.json",
+        journal_path=tmp_path / "private" / "large-stderr.jsonl",
+        artifact_references=(),
+        codex_home=codex_home,
+        deadline_at=FUTURE_DEADLINE,
+        timeout_seconds=15,
+    )
+
+    result = await runner.run(
+        AuthorizedCodexRun(
+            workspace=tmp_path,
+            command=("codex", "exec", "--json", "harmless stderr test"),
+            environment=FrozenEnvironment({"PATH": os.environ["PATH"]}),
+        )
+    )
+
+    launcher = Path("scripts/codex-session.ps1").read_text(encoding="utf-8")
+    assert "ReadToEndAsync" not in launcher
+    assert "StandardError.BaseStream.CopyToAsync" in launcher
+    assert result.terminal_status == "succeeded"
+    assert result.jsonl_lines == ('{"type":"turn.started"}',)
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -110,11 +111,18 @@ class _FailingJournal:
     def fileno(self) -> int:
         return self._journal.fileno()
 
+    def seek(self, offset: int) -> int:
+        return self._journal.seek(offset)
+
+    def read(self, size: int) -> bytes:
+        return self._journal.read(size)
+
 
 def _runner(
     tmp_path: Path,
     *,
     max_jsonl_record_bytes: int | None = None,
+    max_journal_bytes: int | None = None,
 ) -> PowerShellCodexRunner:
     pwsh = shutil.which("pwsh")
     assert pwsh is not None
@@ -123,6 +131,8 @@ def _runner(
     kwargs: dict[str, object] = {}
     if max_jsonl_record_bytes is not None:
         kwargs["max_jsonl_record_bytes"] = max_jsonl_record_bytes
+    if max_journal_bytes is not None:
+        kwargs["max_journal_bytes"] = max_journal_bytes
     return PowerShellCodexRunner(
         pwsh_path=Path(pwsh),
         script_path=Path("scripts/codex-session.ps1").resolve(),
@@ -289,6 +299,94 @@ async def test_runner_rejects_unsafe_or_unterminated_record_fail_closed(
 
 
 @pytest.mark.asyncio
+async def test_runner_cancels_when_valid_records_exceed_total_journal_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records = tuple(
+        json.dumps({"type": "item.completed", "ordinal": ordinal}).encode()
+        for ordinal in range(4)
+    )
+    stream = asyncio.StreamReader()
+    stream.feed_data(b"".join(record + b"\n" for record in records))
+    process = _RunningProcess(stream)
+    cancellation_calls = 0
+
+    async def create_process(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        return process
+
+    async def cancel_for_evidence_failure() -> bool:
+        nonlocal cancellation_calls
+        cancellation_calls += 1
+        process.stop()
+        return True
+
+    monkeypatch.setattr(
+        codex_supervisor.asyncio, "create_subprocess_exec", create_process
+    )
+    runner = _runner(tmp_path, max_journal_bytes=len(records[0]) * 2 + 2)
+    monkeypatch.setattr(
+        runner,
+        "_attempt_verified_evidence_failure_cancellation",
+        cancel_for_evidence_failure,
+    )
+    error_type = getattr(codex_supervisor, "CodexJournalSizeLimitError")
+
+    with pytest.raises(error_type) as caught:
+        await runner.run(_authorized(tmp_path))
+
+    assert cancellation_calls == 1
+    assert process.alive is False
+    assert caught.value.process_cleanup_status == "verified_cancelled"
+    assert caught.value.journal_path == runner._journal_path
+    assert caught.value.journal_byte_count <= len(records[0]) * 2 + 2
+    assert caught.value.event_count <= 2
+    assert caught.value.event_types == ("item.completed",)
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_oversized_final_snapshot_without_unbounded_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = b'{"type":"turn.started"}'
+    runner = _runner(tmp_path, max_journal_bytes=64)
+
+    class AppendBeforeEof:
+        def __init__(self) -> None:
+            self._calls = 0
+
+        async def read(self, size: int) -> bytes:
+            del size
+            self._calls += 1
+            if self._calls == 1:
+                return record + b"\n"
+            with runner._journal_path.open("ab") as external:
+                external.write(b"x" * 128)
+            return b""
+
+    process = _CompletedProcess(stdout=AppendBeforeEof())
+
+    async def create_process(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        return process
+
+    monkeypatch.setattr(
+        codex_supervisor.asyncio, "create_subprocess_exec", create_process
+    )
+    error_type = getattr(codex_supervisor, "CodexJournalSizeLimitError")
+
+    with pytest.raises(error_type) as caught:
+        await runner.run(_authorized(tmp_path))
+
+    assert caught.value.process_cleanup_status == "not_required"
+    assert caught.value.journal_byte_count == len(record) + 1
+    assert caught.value.event_count == 1
+    assert caught.value.event_types == ("turn.started",)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ("read", "write", "fsync"))
 async def test_reader_or_journal_failure_cancels_running_process_and_leaks_no_tasks(
     tmp_path: Path,
@@ -343,7 +441,7 @@ async def test_reader_or_journal_failure_cancels_running_process_and_leaks_no_ta
         ) -> BinaryIO | _FailingJournal:
             journal = original_open(path, *args, **kwargs)
             mode = args[0] if args else kwargs.get("mode", "r")
-            if path.resolve() == journal_path and mode == "ab":
+            if path.resolve() == journal_path and mode == "a+b":
                 return _FailingJournal(journal)
             return journal
 
@@ -372,3 +470,40 @@ async def test_reader_or_journal_failure_cancels_running_process_and_leaks_no_ta
         )
     }
     assert leaked == set()
+
+
+@pytest.mark.asyncio
+async def test_reader_failure_reports_unresolved_when_cancellation_is_not_verified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _RunningProcess(_FailingReadStream())
+
+    async def create_process(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        return process
+
+    async def unverified_cancellation() -> bool:
+        process.stop()
+        return False
+
+    monkeypatch.setattr(
+        codex_supervisor.asyncio, "create_subprocess_exec", create_process
+    )
+    runner = _runner(tmp_path)
+    monkeypatch.setattr(
+        runner,
+        "_attempt_verified_evidence_failure_cancellation",
+        unverified_cancellation,
+    )
+
+    with pytest.raises(codex_supervisor.CodexOutputReadError) as caught:
+        await runner.run(_authorized(tmp_path))
+
+    assert caught.value.process_cleanup_status == "unresolved"
+    assert caught.value.journal_sha256 == hashlib.sha256(b"").hexdigest()
+    assert caught.value.journal_byte_count == 0
+    assert caught.value.event_count == 0
+    assert caught.value.event_types == ()
+    assert process.alive is False
+    assert process.active_waiters == 0
