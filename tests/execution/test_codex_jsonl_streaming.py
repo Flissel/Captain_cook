@@ -439,7 +439,7 @@ async def test_runner_cancels_at_tiny_record_count_limit_plus_one(
     assert caught.value.process_cleanup_status == "verified_cancelled"
     assert caught.value.journal_byte_count == 9
     assert caught.value.event_count == 3
-    assert caught.value.event_types == ()
+    assert caught.value.event_types == ("unknown",)
 
 
 @pytest.mark.asyncio

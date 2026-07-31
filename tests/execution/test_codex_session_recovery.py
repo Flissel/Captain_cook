@@ -865,9 +865,9 @@ class _PendingJsonlProcess:
         (("[]",), b"", ()),
         (("42",), b"", ()),
         (
-            ('{"type":"thread.started","thread_id":"valid-thread"}', "null"),
-            b'{"type":"thread.started","thread_id":"valid-thread"}\n',
-            ("thread.started",),
+            ('{"type":"SENSITIVE_MARKER"}', "null"),
+            b'{"type":"SENSITIVE_MARKER"}\n',
+            ("unknown",),
         ),
     ),
     ids=("malformed-first", "array-first", "scalar-first", "malformed-after-valid"),

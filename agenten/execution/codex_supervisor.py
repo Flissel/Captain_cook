@@ -38,6 +38,31 @@ DEFAULT_MAX_CODEX_JSONL_RECORD_BYTES = 1024 * 1024
 CODEX_JSONL_READ_CHUNK_BYTES = 64 * 1024
 DEFAULT_MAX_CODEX_JOURNAL_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_CODEX_JOURNAL_RECORDS = 65_536
+CODEX_RECEIPT_EVENT_TYPES = frozenset(
+    {
+        "error",
+        "item.completed",
+        "item.started",
+        "item.updated",
+        "thread.started",
+        "turn.completed",
+        "turn.started",
+    }
+)
+
+
+def canonical_codex_event_type(value: object) -> str:
+    """Return a bounded receipt-safe type without retaining provider text."""
+
+    if isinstance(value, str) and value in CODEX_RECEIPT_EVENT_TYPES:
+        return value
+    return "unknown"
+
+
+def canonical_codex_event_types(values: tuple[object, ...]) -> tuple[str, ...]:
+    """Deduplicate and sort the finite receipt-safe event vocabulary."""
+
+    return tuple(sorted({canonical_codex_event_type(value) for value in values}))
 
 
 CodexOutputFailureKind = Literal[
@@ -86,17 +111,14 @@ class CodexOutputEvidenceError(RuntimeError):
             raise ValueError("Codex output failure journal digest is invalid")
         if not 0 <= journal_byte_count <= DEFAULT_MAX_CODEX_JOURNAL_BYTES:
             raise ValueError("Codex output failure journal size is invalid")
-        if (
-            not 0 <= event_count <= DEFAULT_MAX_CODEX_JOURNAL_RECORDS
-            or tuple(sorted(set(event_types))) != event_types
-        ):
+        if not 0 <= event_count <= DEFAULT_MAX_CODEX_JOURNAL_RECORDS:
             raise ValueError("Codex output failure event metadata is invalid")
         self.process_cleanup_status = process_cleanup_status
         self.journal_path = resolved
         self.journal_sha256 = journal_sha256
         self.journal_byte_count = journal_byte_count
         self.event_count = event_count
-        self.event_types = event_types
+        self.event_types = canonical_codex_event_types(event_types)
 
 
 class CodexJournalPersistenceError(CodexOutputEvidenceError):
@@ -648,9 +670,7 @@ class PowerShellCodexRunner:
                 )
             event = self._require_json_object(record)
             records.append(record.decode("utf-8"))
-            event_type = event.get("type")
-            if isinstance(event_type, str) and event_type.strip():
-                event_types.add(event_type)
+            event_types.add(canonical_codex_event_type(event.get("type")))
         return tuple(records), tuple(sorted(event_types))
 
     @staticmethod

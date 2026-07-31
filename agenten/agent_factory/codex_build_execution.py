@@ -62,6 +62,8 @@ from agenten.execution.codex_supervisor import (
     CodexRunResult,
     CodexRunRequest,
     CodexRunner,
+    canonical_codex_event_type,
+    canonical_codex_event_types,
 )
 
 
@@ -1897,13 +1899,10 @@ class CodexCliFactoryBuildExecutor:
                 events.append(event)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
             raise FactoryDispatchError("Factory Codex JSONL journal is invalid") from None
-        event_types = sorted(
-            {
-                value
-                for event in events
-                for value in (event.get("type"),)
-                if isinstance(value, str) and value.strip()
-            }
+        event_types = list(
+            canonical_codex_event_types(
+                tuple(event.get("type") for event in events)
+            )
         )
         observed_thread_id = _canonical_codex_thread_id(events)
         expected_thread_id = checkpoint.parent_codex_thread_id or observed_thread_id
@@ -2037,13 +2036,10 @@ class CodexCliFactoryBuildExecutor:
             if not isinstance(value, dict):
                 break
             events.append(value)
-        event_types = sorted(
-            {
-                value
-                for event in events
-                for value in (event.get("type"),)
-                if isinstance(value, str) and value.strip()
-            }
+        event_types = list(
+            canonical_codex_event_types(
+                tuple(event.get("type") for event in events)
+            )
         )
         event_count = receipt.get("event_count")
         if (
@@ -3009,13 +3005,10 @@ def _session_receipt(
         "jsonl_sha256": journal_sha256,
         "journal_sha256": journal_sha256,
         "event_count": len(events),
-        "event_types": sorted(
-            {
-                event_type
-                for event in events
-                for event_type in (event.get("type"),)
-                if isinstance(event_type, str) and event_type.strip()
-            }
+        "event_types": list(
+            canonical_codex_event_types(
+                tuple(event.get("type") for event in events)
+            )
         ),
         "resume_ordinal": resume_ordinal,
         "parent_terminal_receipt_sha256": (
@@ -3077,9 +3070,7 @@ def _factory_codex_jsonl_evidence_error(
             )
             return error
         event_count += 1
-        event_type = event.get("type")
-        if isinstance(event_type, str) and event_type.strip():
-            event_types.add(event_type)
+        event_types.add(canonical_codex_event_type(event.get("type")))
     return None
 
 
@@ -3120,7 +3111,7 @@ def _evidence_failure_receipt(
         "journal_sha256": error.journal_sha256,
         "journal_byte_count": error.journal_byte_count,
         "event_count": error.event_count,
-        "event_types": list(error.event_types),
+        "event_types": list(canonical_codex_event_types(error.event_types)),
         "resume_ordinal": resume_ordinal,
         "completed_at": completed_at.isoformat(),
     }

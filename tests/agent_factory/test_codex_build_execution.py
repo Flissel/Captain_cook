@@ -1946,6 +1946,35 @@ def test_session_receipt_reports_empty_succeeded_journal_truthfully(tmp_path: Pa
         )
 
 
+def test_session_receipt_normalizes_untrusted_event_types_without_inflation(
+    tmp_path: Path,
+) -> None:
+    marker = "SENSITIVE_MARKER"
+    lines = tuple(
+        json.dumps({"type": f"{marker}_{index}"}) for index in range(128)
+    )
+    result = _run_result(
+        tmp_path,
+        jsonl_lines=lines,
+        exit_code=1,
+        terminal_status="failed",
+    )
+
+    receipt = _session_receipt(
+        result=result,
+        session_id="session-untrusted-types",
+        workspace_ref="workspace://factory/demo",
+        base_revision="a" * 40,
+        command=("codex", "exec", "--json", "safe"),
+        completed_at=NOW,
+    )
+    payload = json.loads(receipt)
+
+    assert payload["event_count"] == 128
+    assert payload["event_types"] == ["unknown"]
+    assert marker.encode("utf-8") not in receipt
+
+
 @pytest.mark.parametrize("exit_code", (0, 1, 124))
 def test_factory_interruption_rejects_noncanonical_cancellation_exit_code(
     exit_code: int,
@@ -3774,7 +3803,7 @@ async def test_cli_executor_terminalizes_malformed_injected_runner_output(
             self.journal_path = journal_path
 
         async def run(self, _authorized: AuthorizedCodexRun) -> CodexRunResult:
-            valid = '{"type":"thread.started","thread_id":"partial-thread"}'
+            valid = '{"type":"SENSITIVE_MARKER"}'
             journal = f"{valid}\n[]\n".encode("utf-8")
             self.journal_path.parent.mkdir(parents=True, exist_ok=True)
             self.journal_path.write_bytes(journal)
@@ -3810,7 +3839,8 @@ async def test_cli_executor_terminalizes_malformed_injected_runner_output(
     assert receipt["failure_kind"] == "invalid_json_object"
     assert receipt["process_cleanup_status"] == "not_required"
     assert receipt["event_count"] == 1
-    assert receipt["event_types"] == ["thread.started"]
+    assert receipt["event_types"] == ["unknown"]
+    assert b"SENSITIVE_MARKER" not in receipt_path.read_bytes()
     checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
         state_root / "checkpoints"
     ).load(invocation)
