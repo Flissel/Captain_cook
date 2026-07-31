@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -137,7 +136,8 @@ class FilesystemFactoryHermesRetryAuthority:
     @staticmethod
     def _read(path: Path) -> FactoryHermesReplayRetryAuthorizationV1:
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-            return FactoryHermesReplayRetryAuthorizationV1.model_validate(value)
-        except (OSError, json.JSONDecodeError, TypeError, ValueError, ValidationError) as exc:
+            return FactoryHermesReplayRetryAuthorizationV1.model_validate_json(
+                path.read_bytes()
+            )
+        except (OSError, TypeError, ValueError, ValidationError) as exc:
             raise FactoryDispatchError("Hermes retry authority is unavailable") from exc
