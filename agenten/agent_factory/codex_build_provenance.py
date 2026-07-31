@@ -102,6 +102,14 @@ class _SourceZipLayout:
     entries: tuple[_SourceZipCentralEntry, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _SourceZipLocalRecord:
+    record_start: int
+    record_end: int
+    data_start: int
+    data_end: int
+
+
 class CodexBuildArtifactCas:
     """Small write-once filesystem CAS for private Captain build evidence."""
 
@@ -475,7 +483,9 @@ def _require_safe_source_zip(content: bytes) -> bytes:
                     "source archive central directory count is inconsistent"
                 )
             names: set[str] = set()
-            validated: list[tuple[ZipInfo, str]] = []
+            validated: list[
+                tuple[ZipInfo, str, _SourceZipCentralEntry, _SourceZipLocalRecord]
+            ] = []
             occupied_ranges: list[tuple[int, int]] = []
             candidate_manifest_info: ZipInfo | None = None
             for item, central in zip(items, layout.entries, strict=True):
@@ -503,14 +513,15 @@ def _require_safe_source_zip(content: bytes) -> bytes:
                     raise CodexBuildProvenanceError(
                         "source archive contains a symbolic link"
                     )
-                occupied_ranges.append(
-                    _require_safe_source_zip_local_record(
-                        memoryview(content),
-                        central,
-                        central_directory_offset=layout.central_directory_offset,
-                    )
+                local_record = _require_safe_source_zip_local_record(
+                    memoryview(content),
+                    central,
+                    central_directory_offset=layout.central_directory_offset,
                 )
-                validated.append((item, canonical))
+                occupied_ranges.append(
+                    (local_record.record_start, local_record.record_end)
+                )
+                validated.append((item, canonical, central, local_record))
                 if canonical == "factory-candidate.json":
                     if item.is_dir() or candidate_manifest_info is not None:
                         raise CodexBuildProvenanceError(
@@ -527,7 +538,7 @@ def _require_safe_source_zip(content: bytes) -> bytes:
                     "source archive candidate manifest is missing"
                 )
             candidate_manifest = _stream_source_zip_entries(
-                archive,
+                memoryview(content),
                 validated,
                 candidate_manifest_info=candidate_manifest_info,
             )
@@ -835,7 +846,7 @@ def _require_safe_source_zip_local_record(
     central: _SourceZipCentralEntry,
     *,
     central_directory_offset: int,
-) -> tuple[int, int]:
+) -> _SourceZipLocalRecord:
     offset = central.local_header_offset
     if offset < 0 or offset + _ZIP_LOCAL_HEADER.size > central_directory_offset:
         raise CodexBuildProvenanceError(
@@ -899,7 +910,12 @@ def _require_safe_source_zip_local_record(
             central,
             central_directory_offset=central_directory_offset,
         )
-    return offset, record_end
+    return _SourceZipLocalRecord(
+        record_start=offset,
+        record_end=record_end,
+        data_start=header_end,
+        data_end=data_end,
+    )
 
 
 def _require_source_zip_data_descriptor(
@@ -911,24 +927,32 @@ def _require_source_zip_data_descriptor(
 ) -> int:
     if offset + _ZIP_DATA_DESCRIPTOR.size > central_directory_offset:
         raise CodexBuildProvenanceError("source archive data descriptor is truncated")
-    signature_or_crc = struct.unpack_from("<I", view, offset)[0]
-    if signature_or_crc == _ZIP_DATA_DESCRIPTOR_SIGNATURE:
-        offset += 4
-    if offset + _ZIP_DATA_DESCRIPTOR.size > central_directory_offset:
-        raise CodexBuildProvenanceError("source archive data descriptor is truncated")
-    crc32, compressed_size, uncompressed_size = _ZIP_DATA_DESCRIPTOR.unpack_from(
-        view,
-        offset,
+    expected = (
+        central.crc32,
+        central.compressed_size,
+        central.uncompressed_size,
     )
+    unsigned = _ZIP_DATA_DESCRIPTOR.unpack_from(view, offset)
+    unsigned_matches = unsigned == expected
+    signed_matches = False
     if (
-        crc32 != central.crc32
-        or compressed_size != central.compressed_size
-        or uncompressed_size != central.uncompressed_size
+        unsigned[0] == _ZIP_DATA_DESCRIPTOR_SIGNATURE
+        and offset + 4 + _ZIP_DATA_DESCRIPTOR.size <= central_directory_offset
     ):
-        raise CodexBuildProvenanceError(
-            "source archive data descriptor is inconsistent"
+        signed_matches = (
+            _ZIP_DATA_DESCRIPTOR.unpack_from(view, offset + 4) == expected
         )
-    return offset + _ZIP_DATA_DESCRIPTOR.size
+    if unsigned_matches and signed_matches:
+        raise CodexBuildProvenanceError(
+            "source archive data descriptor layout is ambiguous"
+        )
+    if signed_matches:
+        return offset + 4 + _ZIP_DATA_DESCRIPTOR.size
+    if unsigned_matches:
+        return offset + _ZIP_DATA_DESCRIPTOR.size
+    raise CodexBuildProvenanceError(
+        "source archive data descriptor is inconsistent"
+    )
 
 
 def _require_nonoverlapping_source_zip_records(
@@ -942,43 +966,97 @@ def _require_nonoverlapping_source_zip_records(
 
 
 def _stream_source_zip_entries(
-    archive: ZipFile,
-    entries: Iterable[tuple[ZipInfo, str]],
+    view: memoryview,
+    entries: Iterable[
+        tuple[ZipInfo, str, _SourceZipCentralEntry, _SourceZipLocalRecord]
+    ],
     *,
     candidate_manifest_info: ZipInfo,
 ) -> bytes:
-    """Fully verify every member while retaining only the bounded manifest."""
+    """Verify exact raw member streams while retaining only the bounded manifest."""
 
     manifest_chunks: list[bytes] = []
     aggregate_size = 0
-    for item, _canonical in entries:
+    for item, _canonical, central, local_record in entries:
         observed_size = 0
-        with archive.open(item, "r") as stream:
-            while True:
-                chunk = stream.read(_SOURCE_ZIP_READ_CHUNK_BYTES)
-                if not chunk:
-                    break
-                observed_size += len(chunk)
-                aggregate_size += len(chunk)
-                if (
-                    observed_size > item.file_size
-                    or observed_size > MAX_FACTORY_CODEX_SOURCE_ZIP_ENTRY_BYTES
-                    or aggregate_size > MAX_FACTORY_CODEX_SOURCE_ZIP_TOTAL_BYTES
-                ):
+        observed_crc32 = 0
+        for chunk in _iter_source_zip_member_output(view, central, local_record):
+            observed_size += len(chunk)
+            aggregate_size += len(chunk)
+            if (
+                observed_size > central.uncompressed_size
+                or observed_size > MAX_FACTORY_CODEX_SOURCE_ZIP_ENTRY_BYTES
+                or aggregate_size > MAX_FACTORY_CODEX_SOURCE_ZIP_TOTAL_BYTES
+            ):
+                raise CodexBuildProvenanceError(
+                    "source archive expanded beyond its declared size"
+                )
+            observed_crc32 = zlib.crc32(chunk, observed_crc32)
+            if item is candidate_manifest_info:
+                if observed_size > MAX_FACTORY_CODEX_SOURCE_ZIP_MANIFEST_BYTES:
                     raise CodexBuildProvenanceError(
-                        "source archive expanded beyond its declared size"
+                        "source archive candidate manifest exceeds the size limit"
                     )
-                if item is candidate_manifest_info:
-                    if observed_size > MAX_FACTORY_CODEX_SOURCE_ZIP_MANIFEST_BYTES:
-                        raise CodexBuildProvenanceError(
-                            "source archive candidate manifest exceeds the size limit"
-                        )
-                    manifest_chunks.append(chunk)
-        if observed_size != item.file_size:
+                manifest_chunks.append(chunk)
+        if (
+            observed_size != central.uncompressed_size
+            or observed_crc32 & 0xFFFFFFFF != central.crc32
+        ):
             raise CodexBuildProvenanceError(
                 "source archive contains inconsistent entry metadata"
             )
     return b"".join(manifest_chunks)
+
+
+def _iter_source_zip_member_output(
+    view: memoryview,
+    central: _SourceZipCentralEntry,
+    local_record: _SourceZipLocalRecord,
+) -> Iterable[bytes]:
+    if central.compression == ZIP_STORED:
+        cursor = local_record.data_start
+        while cursor < local_record.data_end:
+            end = min(cursor + _SOURCE_ZIP_READ_CHUNK_BYTES, local_record.data_end)
+            yield bytes(view[cursor:end])
+            cursor = end
+        return
+
+    decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+    cursor = local_record.data_start
+    while cursor < local_record.data_end:
+        end = min(cursor + _SOURCE_ZIP_READ_CHUNK_BYTES, local_record.data_end)
+        pending: bytes | memoryview = view[cursor:end]
+        cursor = end
+        while pending:
+            pending_size = len(pending)
+            output = decompressor.decompress(
+                pending,
+                _SOURCE_ZIP_READ_CHUNK_BYTES,
+            )
+            pending = decompressor.unconsumed_tail
+            if decompressor.unused_data:
+                raise CodexBuildProvenanceError(
+                    "source archive DEFLATE member contains trailing stream data"
+                )
+            if output:
+                yield output
+            if pending and not output and len(pending) >= pending_size:
+                raise CodexBuildProvenanceError(
+                    "source archive DEFLATE member made no bounded progress"
+                )
+    while True:
+        output = decompressor.decompress(b"", _SOURCE_ZIP_READ_CHUNK_BYTES)
+        if not output:
+            break
+        yield output
+    if (
+        not decompressor.eof
+        or decompressor.unused_data
+        or decompressor.unconsumed_tail
+    ):
+        raise CodexBuildProvenanceError(
+            "source archive DEFLATE member is truncated or inconsistent"
+        )
 
 
 def _require_json_object(content: bytes, *, label: str) -> dict[str, Any]:

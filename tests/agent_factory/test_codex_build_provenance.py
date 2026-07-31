@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import struct
+import zlib
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -670,8 +671,139 @@ def test_source_zip_streams_every_entry_and_rejects_bad_crc() -> None:
     struct.pack_into("<I", archive, central + 16, forged_crc)
     struct.pack_into("<I", archive, local + 14, forged_crc)
 
-    with pytest.raises(CodexBuildProvenanceError, match="not a valid ZIP"):
+    with pytest.raises(
+        CodexBuildProvenanceError,
+        match="not a valid ZIP|inconsistent entry metadata",
+    ):
         _require_safe_source_zip(bytes(archive))
+
+
+def test_source_zip_rejects_deflate_output_beyond_declared_prefix() -> None:
+    full_content = b"accepted-prefix" + b"hidden-suffix" * 128
+    declared_content = b"accepted-prefix"
+    archive = bytearray(
+        _deflated_zip_bytes(
+            [
+                ("factory-candidate.json", b"{}"),
+                ("src/team.bin", full_content),
+            ]
+        )
+    )
+    central = _central_header_offset(archive, b"src/team.bin")
+    local = _local_header_offset(archive, "src/team.bin")
+    declared_crc = zlib.crc32(declared_content) & 0xFFFFFFFF
+    struct.pack_into("<I", archive, central + 16, declared_crc)
+    struct.pack_into("<I", archive, central + 24, len(declared_content))
+    struct.pack_into("<I", archive, local + 14, declared_crc)
+    struct.pack_into("<I", archive, local + 22, len(declared_content))
+
+    with pytest.raises(CodexBuildProvenanceError, match="expanded|DEFLATE|valid ZIP"):
+        _require_safe_source_zip(bytes(archive))
+
+
+def test_source_zip_rejects_concatenated_deflate_stream() -> None:
+    archive = bytearray(
+        _deflated_zip_bytes(
+            [
+                ("factory-candidate.json", b"{}"),
+                ("src/team.bin", b"accepted-content"),
+            ]
+        )
+    )
+    source_central = _central_header_offset(archive, b"src/team.bin")
+    source_local = _local_header_offset(archive, "src/team.bin")
+    compressed_size = struct.unpack_from("<I", archive, source_central + 20)[0]
+    filename_length = struct.unpack_from("<H", archive, source_local + 26)[0]
+    extra_length = struct.unpack_from("<H", archive, source_local + 28)[0]
+    data_start = source_local + 30 + filename_length + extra_length
+    data_end = data_start + compressed_size
+    compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    trailing_stream = compressor.compress(b"hidden-stream") + compressor.flush()
+    archive[data_end:data_end] = trailing_stream
+
+    shifted_central = source_central + len(trailing_stream)
+    shifted_eocd = _eocd_offset(archive)
+    struct.pack_into(
+        "<I",
+        archive,
+        source_local + 18,
+        compressed_size + len(trailing_stream),
+    )
+    struct.pack_into(
+        "<I",
+        archive,
+        shifted_central + 20,
+        compressed_size + len(trailing_stream),
+    )
+    central_offset = struct.unpack_from("<I", archive, shifted_eocd + 16)[0]
+    struct.pack_into(
+        "<I",
+        archive,
+        shifted_eocd + 16,
+        central_offset + len(trailing_stream),
+    )
+
+    with pytest.raises(CodexBuildProvenanceError, match="DEFLATE|valid ZIP"):
+        _require_safe_source_zip(bytes(archive))
+
+
+def test_source_zip_rejects_truncated_deflate_stream() -> None:
+    archive = bytearray(
+        _deflated_zip_bytes(
+            [
+                ("factory-candidate.json", b"{}"),
+                ("src/team.bin", b"complete-content"),
+            ]
+        )
+    )
+    source_central = _central_header_offset(archive, b"src/team.bin")
+    source_local = _local_header_offset(archive, "src/team.bin")
+    compressed_size = struct.unpack_from("<I", archive, source_central + 20)[0]
+    filename_length = struct.unpack_from("<H", archive, source_local + 26)[0]
+    extra_length = struct.unpack_from("<H", archive, source_local + 28)[0]
+    data_start = source_local + 30 + filename_length + extra_length
+    del archive[data_start + compressed_size - 1]
+
+    shifted_central = source_central - 1
+    shifted_eocd = _eocd_offset(archive)
+    struct.pack_into("<I", archive, source_local + 18, compressed_size - 1)
+    struct.pack_into("<I", archive, shifted_central + 20, compressed_size - 1)
+    central_offset = struct.unpack_from("<I", archive, shifted_eocd + 16)[0]
+    struct.pack_into("<I", archive, shifted_eocd + 16, central_offset - 1)
+
+    with pytest.raises(CodexBuildProvenanceError, match="DEFLATE"):
+        _require_safe_source_zip(bytes(archive))
+
+
+def test_source_zip_accepts_signatureless_descriptor_when_crc_equals_signature() -> None:
+    manifest = b'{"schema":"captain.factory-candidate.v1"}'
+    crc_equals_descriptor_signature = bytes.fromhex("ac0a7ad5")
+    assert (
+        zlib.crc32(crc_equals_descriptor_signature) & 0xFFFFFFFF
+        == 0x08074B50
+    )
+    archive = bytearray(
+        _data_descriptor_zip_bytes(
+            {
+                "factory-candidate.json": manifest,
+                "src/crc.bin": crc_equals_descriptor_signature,
+            }
+        )
+    )
+    source_central = _central_header_offset(archive, b"src/crc.bin")
+    source_local = _local_header_offset(archive, "src/crc.bin")
+    compressed_size = struct.unpack_from("<I", archive, source_central + 20)[0]
+    filename_length = struct.unpack_from("<H", archive, source_local + 26)[0]
+    extra_length = struct.unpack_from("<H", archive, source_local + 28)[0]
+    data_start = source_local + 30 + filename_length + extra_length
+    descriptor_start = data_start + compressed_size
+    assert struct.unpack_from("<I", archive, descriptor_start)[0] == 0x08074B50
+    del archive[descriptor_start : descriptor_start + 4]
+    eocd = _eocd_offset(archive)
+    central_offset = struct.unpack_from("<I", archive, eocd + 16)[0]
+    struct.pack_into("<I", archive, eocd + 16, central_offset - 4)
+
+    assert _require_safe_source_zip(bytes(archive)) == manifest
 
 
 def test_source_zip_accepts_utf8_names_and_data_descriptors() -> None:
