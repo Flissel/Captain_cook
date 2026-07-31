@@ -31,6 +31,7 @@ from agenten.execution.codex_events import CodexParseWarning, CodexProcessEvent
 from agenten.execution.codex_policy import AuthorizedCodexRun, FrozenEnvironment
 from agenten.execution.codex_supervisor import (
     CodexJournalPersistenceError,
+    CodexOutputEvidenceError,
     CodexRunRequest,
     CodexRunResult,
     CodexRunTerminalStatus,
@@ -380,6 +381,8 @@ def _compile_streaming_fixture(
     tmp_path: Path,
     *,
     jsonl_line: str | None,
+    sleep_milliseconds: int = 60_000,
+    exit_code: int = 0,
 ) -> Path:
     executable = tmp_path / f"streaming-fixture-{uuid4().hex}.exe"
     write_line = ""
@@ -397,7 +400,7 @@ def _compile_streaming_fixture(
             "using System;using System.Threading;"
             "public static class Program {"
             "public static int Main(string[] args) {"
-            f"{write_line}Thread.Sleep(60000);return 0;"
+            f"{write_line}Thread.Sleep({sleep_milliseconds});return {exit_code};"
             "}}"
         ),
         encoding="utf-8",
@@ -816,8 +819,9 @@ class _UnverifiedTimeoutProcess:
 
 
 class _CompletedStreamingProcess:
-    def __init__(self, line: str) -> None:
+    def __init__(self, line: str, *, exit_code: int = 0) -> None:
         self.returncode: int | None = None
+        self._exit_code = exit_code
         self.stdout = asyncio.StreamReader()
         self.stdout.feed_data(f"{line}\n".encode())
         self.stdout.feed_eof()
@@ -825,8 +829,189 @@ class _CompletedStreamingProcess:
         self.stderr.feed_eof()
 
     async def wait(self) -> int:
-        self.returncode = 0
+        self.returncode = self._exit_code
         return self.returncode
+
+
+class _PendingJsonlProcess:
+    def __init__(self, lines: tuple[str, ...]) -> None:
+        self.returncode: int | None = None
+        self.stdout = asyncio.StreamReader()
+        for line in lines:
+            self.stdout.feed_data(f"{line}\n".encode("utf-8"))
+        self.stderr = asyncio.StreamReader()
+        self._wait_calls = 0
+
+    async def wait(self) -> int:
+        self._wait_calls += 1
+        if self._wait_calls == 1:
+            await asyncio.Future()
+        self.returncode = 1
+        self.stdout.feed_eof()
+        self.stderr.feed_eof()
+        return self.returncode
+
+    def kill(self) -> None:
+        self.returncode = -9
+        self.stdout.feed_eof()
+        self.stderr.feed_eof()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lines", "expected_journal", "expected_event_types"),
+    (
+        (("not-json",), b"", ()),
+        (("[]",), b"", ()),
+        (("42",), b"", ()),
+        (
+            ('{"type":"thread.started","thread_id":"valid-thread"}', "null"),
+            b'{"type":"thread.started","thread_id":"valid-thread"}\n',
+            ("thread.started",),
+        ),
+    ),
+    ids=("malformed-first", "array-first", "scalar-first", "malformed-after-valid"),
+)
+async def test_powershell_runner_rejects_every_non_object_jsonl_record_with_partial_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lines: tuple[str, ...],
+    expected_journal: bytes,
+    expected_event_types: tuple[str, ...],
+) -> None:
+    process = _PendingJsonlProcess(lines)
+    cancellation_calls = 0
+
+    async def create_process(*args: object, **kwargs: object) -> object:
+        return process
+
+    async def verified_cancel() -> bool:
+        nonlocal cancellation_calls
+        cancellation_calls += 1
+        return True
+
+    monkeypatch.setattr(
+        "agenten.execution.codex_supervisor.asyncio.create_subprocess_exec",
+        create_process,
+    )
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    journal_path = tmp_path / "private" / "invalid.jsonl"
+    runner = PowerShellCodexRunner(
+        pwsh_path=Path(_pwsh()),
+        script_path=Path("scripts/codex-session.ps1").resolve(),
+        codex_path=Path(r"C:\Windows\System32\timeout.exe"),
+        session_id="runner-invalid-jsonl",
+        state_path=tmp_path / "process-state.json",
+        journal_path=journal_path,
+        artifact_references=(),
+        codex_home=codex_home,
+        deadline_at=FUTURE_DEADLINE,
+        timeout_seconds=0.1,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_cancel_evidence_failure_process",
+        verified_cancel,
+    )
+
+    with pytest.raises(CodexOutputEvidenceError) as caught:
+        await runner.run(
+            AuthorizedCodexRun(
+                workspace=tmp_path,
+                command=("codex", "exec", "--json", "harmless invalid output"),
+                environment=FrozenEnvironment({"PATH": "safe"}),
+            )
+        )
+
+    error = caught.value
+    assert error.failure_kind == "invalid_json_object"
+    assert error.process_cleanup_status == "verified_cancelled"
+    assert error.journal_path == journal_path.resolve()
+    assert error.journal_byte_count == len(expected_journal)
+    assert error.journal_sha256 == hashlib.sha256(expected_journal).hexdigest()
+    assert error.event_count == len(expected_journal.splitlines())
+    assert error.event_types == expected_event_types
+    assert journal_path.read_bytes() == expected_journal
+    assert cancellation_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_powershell_runner_classifies_completed_exit_130_as_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _CompletedStreamingProcess('{"type":"turn.started"}', exit_code=130)
+
+    async def create_process(*args: object, **kwargs: object) -> object:
+        return process
+
+    monkeypatch.setattr(
+        "agenten.execution.codex_supervisor.asyncio.create_subprocess_exec",
+        create_process,
+    )
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    runner = PowerShellCodexRunner(
+        pwsh_path=Path(_pwsh()),
+        script_path=Path("scripts/codex-session.ps1").resolve(),
+        codex_path=Path(r"C:\Windows\System32\timeout.exe"),
+        session_id="runner-exit-130",
+        state_path=tmp_path / "process-state.json",
+        journal_path=tmp_path / "private" / "cancelled.jsonl",
+        artifact_references=(),
+        codex_home=codex_home,
+        deadline_at=FUTURE_DEADLINE,
+    )
+
+    result = await runner.run(
+        AuthorizedCodexRun(
+            workspace=tmp_path,
+            command=("codex", "exec", "--json", "harmless cancellation"),
+            environment=FrozenEnvironment({"PATH": "safe"}),
+        )
+    )
+
+    assert result.exit_code == 130
+    assert result.terminal_status == "cancelled"
+    assert result.process_cleanup_status == "not_required"
+
+
+@pytest.mark.asyncio
+async def test_real_powershell_runner_preserves_exit_130_cancellation_contract(
+    tmp_path: Path,
+) -> None:
+    fixture = _compile_streaming_fixture(
+        tmp_path,
+        jsonl_line='{"type":"turn.started"}',
+        sleep_milliseconds=0,
+        exit_code=130,
+    )
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    runner = PowerShellCodexRunner(
+        pwsh_path=Path(_pwsh()),
+        script_path=Path("scripts/codex-session.ps1").resolve(),
+        codex_path=fixture,
+        session_id="runner-real-exit-130",
+        state_path=tmp_path / "process-state.json",
+        journal_path=tmp_path / "private" / "cancelled.jsonl",
+        artifact_references=(),
+        codex_home=codex_home,
+        deadline_at=FUTURE_DEADLINE,
+    )
+
+    result = await runner.run(
+        AuthorizedCodexRun(
+            workspace=tmp_path,
+            command=("codex", "exec", "--json", "harmless cancellation"),
+            environment=FrozenEnvironment({"PATH": os.environ["PATH"]}),
+        )
+    )
+
+    assert result.exit_code == 130
+    assert result.terminal_status == "cancelled"
+    assert result.process_cleanup_status == "not_required"
 
 
 @pytest.mark.asyncio

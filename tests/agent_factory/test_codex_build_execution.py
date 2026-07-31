@@ -18,9 +18,11 @@ from agenten.agent_factory.codex_build_execution import (
     CodexCliFactoryBuildSettings,
     CompletedCodexBuild,
     FactoryCodexBuildInterrupted,
+    FactoryCodexEvidenceFailure,
     FactoryCodexProcessState,
     GitDetachedFactoryWorkspacePreparer,
     PreparedFactoryWorkspace,
+    _evidence_failure_receipt,
     _session_receipt,
 )
 from agenten.agent_factory.codex_build_recovery import (
@@ -2168,7 +2170,7 @@ async def test_cli_executor_makes_verified_controlled_cancellation_resumable(
             return CodexRunResult(
                 exit_code=130,
                 terminal_status="cancelled",
-                process_cleanup_status="verified_cancelled",
+                process_cleanup_status="not_required",
                 journal_path=self.journal_path,
                 journal_sha256=hashlib.sha256(b"").hexdigest(),
                 artifact_references=(),
@@ -2195,7 +2197,7 @@ async def test_cli_executor_makes_verified_controlled_cancellation_resumable(
     receipt_path = state_root / "sessions" / f"{invocation.idempotency_key}.json"
     receipt = json.loads(receipt_path.read_bytes())
     assert receipt["status"] == "cancelled"
-    assert receipt["process_cleanup_status"] == "verified_cancelled"
+    assert receipt["process_cleanup_status"] == "not_required"
     checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
         state_root / "checkpoints"
     ).load(invocation)
@@ -3658,6 +3660,8 @@ async def test_cli_executor_persists_output_evidence_failure_before_raising(
         def prepare(self, *_args):
             return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
 
+        prepare_or_recover = prepare
+
     class EvidenceFailureRunner:
         def __init__(self, journal_path: Path) -> None:
             self.journal_path = journal_path
@@ -3740,6 +3744,83 @@ async def test_cli_executor_persists_output_evidence_failure_before_raising(
     assert cleanup_status not in str(caught.value)
     assert private_detail not in str(caught.value)
     assert private_detail.encode() not in receipt_bytes
+    if cleanup_status == "unresolved":
+        with pytest.raises(
+            FactoryDispatchError,
+            match="cleanup is unresolved|output evidence.*unresolved",
+        ):
+            await executor.reconcile_pending(
+                _dispatch(job, invocation), invocation, brief
+            )
+
+
+@pytest.mark.asyncio
+async def test_cli_executor_terminalizes_malformed_injected_runner_output(
+    tmp_path: Path,
+) -> None:
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+    authorizer = RecordingAuthorizer()
+
+    class Preparer:
+        def prepare(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    class MalformedRunner:
+        def __init__(self, journal_path: Path) -> None:
+            self.journal_path = journal_path
+
+        async def run(self, _authorized: AuthorizedCodexRun) -> CodexRunResult:
+            valid = '{"type":"thread.started","thread_id":"partial-thread"}'
+            journal = f"{valid}\n[]\n".encode("utf-8")
+            self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+            self.journal_path.write_bytes(journal)
+            return CodexRunResult(
+                exit_code=0,
+                terminal_status="succeeded",
+                process_cleanup_status="not_required",
+                journal_path=self.journal_path,
+                journal_sha256=hashlib.sha256(journal).hexdigest(),
+                artifact_references=(),
+                jsonl_lines=(valid, "[]"),
+            )
+
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=Preparer(),
+        artifact_reader=artifact_reader,
+        authorizer=authorizer,
+        runner_factory=lambda **kwargs: MalformedRunner(kwargs["journal_path"]),
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FactoryCodexEvidenceFailure) as caught:
+        await executor.execute(_dispatch(job, invocation), invocation, brief)
+
+    receipt_path = state_root / "sessions" / f"{invocation.idempotency_key}.json"
+    receipt = json.loads(receipt_path.read_bytes())
+    assert receipt["schema"] == "captain.codex-session-error-receipt.v1"
+    assert receipt["status"] == "evidence_failed"
+    assert receipt["failure_kind"] == "invalid_json_object"
+    assert receipt["process_cleanup_status"] == "not_required"
+    assert receipt["event_count"] == 1
+    assert receipt["event_types"] == ["thread.started"]
+    checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert checkpoint is not None
+    assert checkpoint.phase == "implementation_failed"
+    assert checkpoint.implementation_failure_reason == "evidence_failure"
+    assert checkpoint.terminal_receipt_sha256 == hashlib.sha256(
+        receipt_path.read_bytes()
+    ).hexdigest()
+    assert caught.value.process_cleanup_status == "not_required"
 
 
 @pytest.mark.asyncio
@@ -3756,6 +3837,53 @@ async def test_restart_reconciliation_never_duplicates_an_active_running_process
 
     assert runner_calls() == 1
     assert len(inspector.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_reconciliation_terminalizes_durable_output_evidence_failure(
+    tmp_path: Path,
+) -> None:
+    inspector = _StaticProcessInspector("lost")
+    executor, dispatch, invocation, brief, _, state_root, authorizer, runner_calls = (
+        await _running_crash_fixture(tmp_path, inspector=inspector)
+    )
+    journal_path = state_root / "journals" / f"{invocation.idempotency_key}.jsonl"
+    journal = journal_path.read_bytes()
+    error = codex_supervisor.CodexOutputReadError("private restart detail")
+    error.bind_terminal_evidence(
+        process_cleanup_status="verified_cancelled",
+        journal_path=journal_path,
+        journal_sha256=hashlib.sha256(journal).hexdigest(),
+        journal_byte_count=len(journal),
+        event_count=1,
+        event_types=("thread.started",),
+    )
+    receipt = _evidence_failure_receipt(
+        error=error,
+        session_id=f"factory-{invocation.invocation_id.hex[:24]}",
+        workspace_ref=brief.build_assignment.workspace_ref,
+        base_revision="a" * 40,
+        command=authorizer.requests[0].command,
+        completed_at=NOW,
+        resume_ordinal=0,
+    )
+    receipt_path = state_root / "sessions" / f"{invocation.idempotency_key}.json"
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    receipt_path.write_bytes(receipt)
+
+    with pytest.raises(FactoryCodexEvidenceFailure) as caught:
+        await executor.reconcile_pending(dispatch, invocation, brief)
+
+    checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert checkpoint is not None
+    assert checkpoint.phase == "implementation_failed"
+    assert checkpoint.implementation_failure_reason == "evidence_failure"
+    assert checkpoint.terminal_receipt_sha256 == hashlib.sha256(receipt).hexdigest()
+    assert caught.value.process_cleanup_status == "verified_cancelled"
+    assert caught.value.terminal_receipt_ref.sha256 == hashlib.sha256(receipt).hexdigest()
+    assert runner_calls() == 1
 
 
 @pytest.mark.asyncio

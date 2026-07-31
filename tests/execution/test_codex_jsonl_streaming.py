@@ -253,7 +253,7 @@ async def test_runner_accepts_exact_record_limit_with_crlf_terminator(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    record = b"x" * 32
+    record = b'{"v":"' + (b"x" * 24) + b'"}'
     process = _CompletedProcess((record + b"\r\n",))
 
     async def create_process(*args: object, **kwargs: object) -> object:

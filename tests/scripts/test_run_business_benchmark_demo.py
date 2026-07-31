@@ -837,7 +837,7 @@ def test_interruption_validator_rejects_noncanonical_recovery_payloads(
     assert validate(factory_workspace).returncode == 0
     cancelled = json.loads(json.dumps(checkpoint))
     cancelled["reason"] = "runtime_cancelled"
-    cancelled["exit_code"] = 1
+    cancelled["exit_code"] = 130
     assert validate(cancelled).returncode == 0
     invalid_payloads = []
     host_path = json.loads(json.dumps(checkpoint))
@@ -859,7 +859,7 @@ def test_interruption_validator_rejects_noncanonical_recovery_payloads(
     invalid_payloads.append(malformed_uuid_and_identifier)
     invalid_reason_exit = json.loads(json.dumps(checkpoint))
     invalid_reason_exit["reason"] = "runtime_cancelled"
-    invalid_reason_exit["exit_code"] = 0
+    invalid_reason_exit["exit_code"] = 1
     invalid_payloads.append(invalid_reason_exit)
     invalid_resume = json.loads(json.dumps(checkpoint))
     invalid_resume["next_resume_ordinal"] = 3

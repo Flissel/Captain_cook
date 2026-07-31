@@ -57,6 +57,7 @@ from agenten.execution.codex_supervisor import (
     DEFAULT_MAX_CODEX_JOURNAL_BYTES,
     DEFAULT_MAX_CODEX_JOURNAL_RECORDS,
     DEFAULT_MAX_CODEX_JSONL_RECORD_BYTES,
+    CodexJsonlInvalidObjectError,
     CodexOutputEvidenceError,
     CodexRunResult,
     CodexRunRequest,
@@ -70,6 +71,17 @@ _OUTPUT_PATHS = (
     "factory-candidate.json",
     "candidate.zip",
     "test-evidence.json",
+)
+_CODEX_OUTPUT_FAILURE_KINDS = frozenset(
+    {
+        "journal_persistence_failed",
+        "output_read_failed",
+        "invalid_json_object",
+        "record_size_limit_exceeded",
+        "unterminated_record",
+        "journal_size_limit_exceeded",
+        "journal_record_count_exceeded",
+    }
 )
 
 
@@ -1350,6 +1362,20 @@ class CodexCliFactoryBuildExecutor:
             expected_journal_path=journal_path,
             journals_root=self._settings.state_root.resolve() / "journals",
         )
+        malformed_output = _factory_codex_jsonl_evidence_error(result)
+        if malformed_output is not None:
+            self._raise_persisted_evidence_failure(
+                error=malformed_output,
+                request=request,
+                invocation=invocation,
+                brief=brief,
+                prepared=prepared,
+                checkpoint=checkpoint,
+                command=run_request.command,
+                session_id=session_id,
+                resume_lineage=resume_lineage,
+            )
+            raise AssertionError("unreachable")
         completed_at = self._clock()
         session_receipt = _session_receipt(
             result=result,
@@ -1613,6 +1639,41 @@ class CodexCliFactoryBuildExecutor:
             )
 
         receipt_sha256 = hashlib.sha256(receipt_content).hexdigest()
+        if receipt["status"] == "evidence_failed":
+            failed = self._checkpoint_store.advance(
+                checkpoint,
+                self._checkpoint(
+                    request,
+                    invocation,
+                    brief,
+                    prepared,
+                    phase="implementation_failed",
+                    resume_ordinal=checkpoint.resume_ordinal,
+                    terminal_receipt_sha256=receipt_sha256,
+                    scaffold_manifest_sha256=checkpoint.scaffold_manifest_sha256,
+                    implementation_failure_reason="evidence_failure",
+                    previous=checkpoint,
+                ),
+            )
+            checkpoint_sha256 = hashlib.sha256(
+                canonical_factory_codex_model(failed)
+            ).hexdigest()
+            raise FactoryCodexEvidenceFailure(
+                process_cleanup_status=cleanup_status,
+                checkpoint_ref=ArtifactRef(
+                    uri=f"artifact://factory/codex-checkpoint/{checkpoint_sha256}",
+                    sha256=checkpoint_sha256,
+                    media_type="application/json",
+                ),
+                terminal_receipt_ref=ArtifactRef(
+                    uri=(
+                        "artifact://factory/codex-terminal-receipt/"
+                        f"{receipt_sha256}"
+                    ),
+                    sha256=receipt_sha256,
+                    media_type="application/json",
+                ),
+            )
         if receipt["status"] in {"timed_out", "cancelled"}:
             phase: FactoryCodexBuildPhase = "implementation_interrupted"
             output_manifest_uri = None
@@ -1732,6 +1793,16 @@ class CodexCliFactoryBuildExecutor:
             raise FactoryDispatchError(
                 "Factory Codex terminal session receipt is not canonical"
             )
+        if receipt.get("schema") == "captain.codex-session-error-receipt.v1":
+            return self._load_error_terminal_evidence(
+                request=request,
+                invocation=invocation,
+                brief=brief,
+                prepared=prepared,
+                checkpoint=checkpoint,
+                content=content,
+                receipt=receipt,
+            )
         expected_keys = {
             "schema",
             "provider",
@@ -1795,7 +1866,7 @@ class CodexCliFactoryBuildExecutor:
         expected_terminal = {
             0: ("succeeded", {"not_required"}),
             124: ("timed_out", {"not_required", "verified_cancelled", "unresolved"}),
-            130: ("cancelled", {"verified_cancelled", "unresolved"}),
+            130: ("cancelled", {"not_required", "verified_cancelled", "unresolved"}),
         }.get(exit_code)
         if (
             expected_terminal is None
@@ -1882,6 +1953,139 @@ class CodexCliFactoryBuildExecutor:
             receipt_sha256=digest,
             journal_sha256=journal_sha256,
             codex_thread_id=expected_thread_id,
+            completed_at=completed_at,
+        )
+
+    def _load_error_terminal_evidence(
+        self,
+        *,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+        prepared: PreparedFactoryWorkspace,
+        checkpoint: FactoryCodexBuildCheckpointV1,
+        content: bytes,
+        receipt: dict[str, object],
+    ) -> _LoadedCodexTerminalEvidence:
+        expected_keys = {
+            "schema",
+            "provider",
+            "session_id",
+            "status",
+            "failure_kind",
+            "process_cleanup_status",
+            "workspace_ref",
+            "base_revision",
+            "command_sha256",
+            "journal_sha256",
+            "journal_byte_count",
+            "event_count",
+            "event_types",
+            "resume_ordinal",
+            "completed_at",
+        }
+        run_request = self._run_request(
+            request,
+            invocation,
+            brief,
+            prepared,
+            resume_thread_id=(
+                checkpoint.parent_codex_thread_id
+                if checkpoint.resume_ordinal > 0
+                else None
+            ),
+        )
+        cleanup = receipt.get("process_cleanup_status")
+        if (
+            set(receipt) != expected_keys
+            or receipt.get("provider") != "codex-cli"
+            or receipt.get("session_id")
+            != f"factory-{invocation.invocation_id.hex[:24]}"
+            or receipt.get("status") != "evidence_failed"
+            or receipt.get("failure_kind") not in _CODEX_OUTPUT_FAILURE_KINDS
+            or cleanup not in {"not_required", "verified_cancelled", "unresolved"}
+            or receipt.get("workspace_ref") != checkpoint.workspace_ref
+            or receipt.get("base_revision") != checkpoint.base_revision
+            or receipt.get("resume_ordinal") != checkpoint.resume_ordinal
+            or receipt.get("command_sha256")
+            != hashlib.sha256(
+                "\0".join(run_request.command).encode("utf-8")
+            ).hexdigest()
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex error receipt binding changed"
+            )
+        journal_path = self._journal_path(invocation, checkpoint.resume_ordinal)
+        journal = _read_bounded_codex_journal(journal_path)
+        journal_sha256 = hashlib.sha256(journal).hexdigest()
+        if (
+            receipt.get("journal_sha256") != journal_sha256
+            or isinstance(receipt.get("journal_byte_count"), bool)
+            or receipt.get("journal_byte_count") != len(journal)
+        ):
+            raise FactoryDispatchError("Factory Codex error journal binding changed")
+        try:
+            lines = _bounded_codex_journal_lines(journal)
+        except UnicodeDecodeError:
+            raise FactoryDispatchError("Factory Codex error journal is invalid") from None
+        events: list[dict[str, object]] = []
+        for line in lines:
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                break
+            if not isinstance(value, dict):
+                break
+            events.append(value)
+        event_types = sorted(
+            {
+                value
+                for event in events
+                for value in (event.get("type"),)
+                if isinstance(value, str) and value.strip()
+            }
+        )
+        event_count = receipt.get("event_count")
+        if (
+            isinstance(event_count, bool)
+            or event_count != len(events)
+            or receipt.get("event_types") != event_types
+        ):
+            raise FactoryDispatchError("Factory Codex error event metadata changed")
+        try:
+            completed_at = datetime.fromisoformat(str(receipt.get("completed_at")))
+        except ValueError:
+            raise FactoryDispatchError(
+                "Factory Codex terminal receipt completion time is invalid"
+            ) from None
+        if (
+            completed_at.tzinfo is None
+            or completed_at.utcoffset() != timezone.utc.utcoffset(completed_at)
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex terminal receipt completion time is invalid"
+            )
+        digest = hashlib.sha256(content).hexdigest()
+        if (
+            checkpoint.terminal_receipt_sha256 is not None
+            and checkpoint.terminal_receipt_sha256 != digest
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex terminal session receipt digest changed"
+            )
+        if (
+            checkpoint.phase != "implementation_running"
+            and checkpoint.terminal_receipt_sha256 is None
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex terminal session receipt digest is missing"
+            )
+        return _LoadedCodexTerminalEvidence(
+            content=content,
+            payload=receipt,
+            receipt_sha256=digest,
+            journal_sha256=journal_sha256,
+            codex_thread_id=None,
             completed_at=completed_at,
         )
 
@@ -2839,6 +3043,46 @@ def _session_receipt(
     ).encode("utf-8")
 
 
+def _factory_codex_jsonl_evidence_error(
+    result: CodexRunResult,
+) -> CodexJsonlInvalidObjectError | None:
+    """Classify invalid runner JSONL before normal receipt construction."""
+
+    journal_path = result.journal_path.resolve(strict=True)
+    journal_bytes = _read_bounded_codex_journal(journal_path)
+    journal_sha256 = hashlib.sha256(journal_bytes).hexdigest()
+    if journal_sha256 != result.journal_sha256:
+        raise FactoryDispatchError("Codex JSONL journal digest does not match result")
+    journal_lines = _bounded_codex_journal_lines(journal_bytes)
+    if journal_lines != result.jsonl_lines:
+        raise FactoryDispatchError("Codex JSONL journal snapshot does not match result")
+    event_types: set[str] = set()
+    event_count = 0
+    for line in journal_lines:
+        try:
+            event = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            event = None
+        if not isinstance(event, dict):
+            error = CodexJsonlInvalidObjectError(
+                "Codex JSONL record is not a valid JSON object"
+            )
+            error.bind_terminal_evidence(
+                process_cleanup_status=result.process_cleanup_status,
+                journal_path=journal_path,
+                journal_sha256=journal_sha256,
+                journal_byte_count=len(journal_bytes),
+                event_count=event_count,
+                event_types=tuple(sorted(event_types)),
+            )
+            return error
+        event_count += 1
+        event_type = event.get("type")
+        if isinstance(event_type, str) and event_type.strip():
+            event_types.add(event_type)
+    return None
+
+
 def _evidence_failure_receipt(
     *,
     error: CodexOutputEvidenceError,
@@ -2944,6 +3188,7 @@ def _validate_factory_codex_run_result(
     elif result.exit_code == 130:
         expected_status = "cancelled"
         cleanup_is_valid = result.process_cleanup_status in {
+            "not_required",
             "verified_cancelled",
             "unresolved",
         }

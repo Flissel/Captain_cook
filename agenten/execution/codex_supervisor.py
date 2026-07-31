@@ -43,6 +43,7 @@ DEFAULT_MAX_CODEX_JOURNAL_RECORDS = 65_536
 CodexOutputFailureKind = Literal[
     "journal_persistence_failed",
     "output_read_failed",
+    "invalid_json_object",
     "record_size_limit_exceeded",
     "unterminated_record",
     "journal_size_limit_exceeded",
@@ -108,6 +109,12 @@ class CodexOutputReadError(CodexOutputEvidenceError):
     """The Codex process output stream could not be read."""
 
     failure_kind: CodexOutputFailureKind = "output_read_failed"
+
+
+class CodexJsonlInvalidObjectError(CodexOutputEvidenceError):
+    """One complete Codex JSONL record was not a valid JSON object."""
+
+    failure_kind: CodexOutputFailureKind = "invalid_json_object"
 
 
 class CodexJsonlRecordTooLargeError(CodexOutputEvidenceError):
@@ -441,6 +448,8 @@ class PowerShellCodexRunner:
         terminal_status: CodexRunTerminalStatus
         if timed_out or exit_code == 124:
             terminal_status = "timed_out"
+        elif exit_code == 130:
+            terminal_status = "cancelled"
         elif exit_code == 0:
             terminal_status = "succeeded"
         else:
@@ -513,6 +522,7 @@ class PowerShellCodexRunner:
                 if record.endswith(b"\r"):
                     record = record[:-1]
                 if record.strip():
+                    self._require_json_object(record)
                     self._persist_jsonl_record(journal, record, state)
                 cursor = newline + 1
                 if cursor == len(chunk):
@@ -636,17 +646,26 @@ class PowerShellCodexRunner:
                 raise CodexJournalRecordCountLimitError(
                     "Codex JSONL journal exceeds configured record count limit"
                 )
-            decoded = record.decode("utf-8", errors="replace")
-            records.append(decoded)
-            try:
-                event = json.loads(record)
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            if isinstance(event, dict):
-                event_type = event.get("type")
-                if isinstance(event_type, str) and event_type.strip():
-                    event_types.add(event_type)
+            event = self._require_json_object(record)
+            records.append(record.decode("utf-8"))
+            event_type = event.get("type")
+            if isinstance(event_type, str) and event_type.strip():
+                event_types.add(event_type)
         return tuple(records), tuple(sorted(event_types))
+
+    @staticmethod
+    def _require_json_object(record: bytes) -> dict[str, object]:
+        try:
+            event = json.loads(record)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise CodexJsonlInvalidObjectError(
+                "Codex JSONL record is not a valid JSON object"
+            ) from None
+        if not isinstance(event, dict):
+            raise CodexJsonlInvalidObjectError(
+                "Codex JSONL record is not a valid JSON object"
+            )
+        return event
 
     @staticmethod
     async def _drain_stderr(stderr: asyncio.StreamReader) -> None:

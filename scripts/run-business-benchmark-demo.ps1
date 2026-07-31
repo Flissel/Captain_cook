@@ -316,7 +316,7 @@ function Test-CodexBuildInterruptedCheckpoint {
     }
     if (
         ($Checkpoint.reason -ceq 'codex_timed_out' -and -not (Test-StrictInteger -Value $Checkpoint.exit_code -Expected 124)) -or
-        ($Checkpoint.reason -ceq 'runtime_cancelled' -and -not (Test-StrictNonzeroInteger -Value $Checkpoint.exit_code)) -or
+        ($Checkpoint.reason -ceq 'runtime_cancelled' -and -not (Test-StrictInteger -Value $Checkpoint.exit_code -Expected 130)) -or
         ($Checkpoint.reason -ceq 'resume_authorization_required' -and $null -ne $Checkpoint.exit_code) -or
         ($null -ne $Checkpoint.next_resume_ordinal -and [string]$Checkpoint.next_resume_ordinal -notmatch '^[12]$')
     ) {
