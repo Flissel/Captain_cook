@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from collections.abc import Iterator
 
 from pydantic import (
+    AliasChoices,
     BaseModel,
     ConfigDict,
     Field,
@@ -199,7 +200,11 @@ class FactoryAutoGenTeamManifestV1(_FrozenModel):
 class FactoryCandidateManifest(_FrozenModel):
     """The only executable input accepted by the factory evaluator."""
 
-    schema_name: Literal["captain.factory-candidate.v1"] = "captain.factory-candidate.v1"
+    schema_name: Literal["captain.factory-candidate.v1"] = Field(
+        default="captain.factory-candidate.v1",
+        validation_alias=AliasChoices("schema", "schema_name"),
+        serialization_alias="schema",
+    )
     candidate_id: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
     source_archive_ref: ArtifactRef
     team_manifest: FactoryCandidateArtifact

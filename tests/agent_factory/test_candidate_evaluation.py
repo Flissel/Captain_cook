@@ -207,6 +207,18 @@ def _candidate_manifest_payload() -> dict[str, object]:
     return payload
 
 
+def test_candidate_manifest_accepts_and_serializes_canonical_schema_alias() -> None:
+    payload = _candidate_manifest_payload()
+    payload["schema"] = "captain.factory-candidate.v1"
+
+    manifest = FactoryCandidateManifest.model_validate(payload)
+
+    assert manifest.schema_name == "captain.factory-candidate.v1"
+    serialized = manifest.model_dump(mode="json", by_alias=True)
+    assert serialized["schema"] == "captain.factory-candidate.v1"
+    assert "schema_name" not in serialized
+
+
 def test_candidate_manifest_allows_exactly_empty_n8n_artifacts_for_tool_free_team() -> None:
     payload = _candidate_manifest_payload()
     payload.update(

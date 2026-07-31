@@ -189,7 +189,12 @@
   canonical-digest verified, bound to the exact job/attempt/source, and bound
   to the unique `factory-candidate.json` inside the sealed source archive.
   Legacy V1 remains supported. This is locally verified adapter evidence;
-  Renewal, technical holdout execution, all 30 business cases, promotion, and
+  the next replay reached the external candidate and failed on the canonical
+  JSON `schema` field because `FactoryCandidateManifest` previously accepted
+  only its internal `schema_name`. The contract now reads both spellings for
+  backward compatibility and serializes only canonical `schema`; the actual
+  V21 Claims candidate parses under that corrected contract. Renewal,
+  technical holdout execution, all 30 business cases, promotion, and
   projection remain unproven.
 - [x] Enforce the operator's `1.00 EUR` marginal-cost ceiling per team before
   provider construction. The live demo reserves at most `0.30 USD` for one
