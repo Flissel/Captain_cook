@@ -2896,6 +2896,7 @@ class CodexCliFactoryBuildExecutor:
             ("job-input.md", request.job.input_ref),
             ("compiled-spec.json", request.job.compiled_spec_ref),
             ("dependency-graph.json", request.job.dependency_graph_ref),
+            ("codex-build-instructions.md", brief.prompt_ref),
         )
         files: dict[str, bytes] = {}
         for name, reference in bindings:
@@ -3187,7 +3188,9 @@ def _codex_prompt(
     return (
         "Implement the Captain-authorized AutoGen agent team in this isolated "
         "worktree. Read .captain-inputs/job-input.md, compiled-spec.json, "
-        "dependency-graph.json, and codex-build-brief.json. Reuse the repository "
+        "dependency-graph.json, codex-build-brief.json, and "
+        "codex-build-instructions.md. Treat codex-build-instructions.md as the "
+        "authoritative bounded implementation and retry guidance. Reuse the repository "
         "architecture and released skills. Do not read secrets, write outside "
         "this worktree, push Git changes, activate workflows, or weaken assertions. "
         "Use n8n only when the integration contract below requires it. Build-time "

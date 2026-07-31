@@ -180,10 +180,14 @@ class StaticArtifactReader:
 
 def _executor_job_and_brief():
     job, brief = _bound_job_and_brief()
+    build_instructions = (
+        b"Follow the bounded Captain repair diagnostics and real-case contract."
+    )
     content_by_name = {
         "input": b'{"input":"claims team"}',
         "compiled": b'{"spec":"compiled"}',
         "graph": b'{"nodes":["build"]}',
+        "instructions": build_instructions,
     }
     references = {
         name: ArtifactRef(
@@ -211,6 +215,12 @@ def _executor_job_and_brief():
         }
     )
     brief = brief.model_copy(update={"build_assignment": assignment})
+    brief = brief.model_copy(
+        update={
+            "artifact_ref": references["instructions"],
+            "prompt_ref": references["instructions"],
+        }
+    )
     contents = {
         hashlib.sha256(content).hexdigest(): content
         for content in content_by_name.values()
@@ -962,9 +972,15 @@ async def test_cli_executor_authorizes_before_materializing_and_records_redacted
     assert "pytest.live.demo is deferred to Captain" in prompt
     assert "MUST omit source_archive_ref" in prompt
     assert "Captain adds source_archive_ref only after sealing candidate.zip" in prompt
+    assert "codex-build-instructions.md" in prompt
     assert (workspace / ".captain-inputs" / "job-input.md").is_file()
     assert (workspace / ".captain-inputs" / "compiled-spec.json").is_file()
     assert (workspace / ".captain-inputs" / "dependency-graph.json").is_file()
+    assert (
+        workspace / ".captain-inputs" / "codex-build-instructions.md"
+    ).read_bytes() == (
+        b"Follow the bounded Captain repair diagnostics and real-case contract."
+    )
     session = json.loads(completed.codex_session_receipt)
     assert session["status"] == "succeeded"
     assert session["codex_thread_id"] == "codex-thread-123"
