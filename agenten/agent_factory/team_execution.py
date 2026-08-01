@@ -1809,23 +1809,61 @@ class HostAutoGenSessionExecutor:
                 separators=(",", ":"),
             ).encode("utf-8"),
         )
-        handoffs = tuple(
-            FactoryHandoffEvidenceV1(
-                from_agent=message.source,
-                to_agent=message.target,
-                evidence_ref=observation_ref,
+        handoffs: list[FactoryHandoffEvidenceV1] = []
+        for ordinal, message in enumerate(handoff_messages, start=1):
+            handoff_ref = await self._evidence_store.persist(
+                job,
+                json.dumps(
+                    {
+                        "schema": "captain.factory-autogen-handoff.v1",
+                        "invocation_id": str(identity.invocation_id),
+                        "runtime_session_id": identity.runtime_session_id,
+                        "ordinal": ordinal,
+                        "from_agent": message.source,
+                        "to_agent": message.target,
+                        "observation_ref": observation_ref.model_dump(mode="json"),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
             )
-            for message in handoff_messages
-        )
-        tool_executions = tuple(
-            FactoryToolExecutionEvidenceV1(
-                agent_name=event.source,
-                tool_name=execution.name,
-                status="failed" if execution.is_error else "succeeded",
-                evidence_ref=observation_ref,
+            handoffs.append(
+                FactoryHandoffEvidenceV1(
+                    from_agent=message.source,
+                    to_agent=message.target,
+                    evidence_ref=handoff_ref,
+                )
             )
-            for event, execution in tool_event_executions
-        )
+        tool_executions: list[FactoryToolExecutionEvidenceV1] = []
+        for ordinal, (event, execution) in enumerate(tool_event_executions, start=1):
+            status: Literal["succeeded", "failed"] = (
+                "failed" if execution.is_error else "succeeded"
+            )
+            tool_ref = await self._evidence_store.persist(
+                job,
+                json.dumps(
+                    {
+                        "schema": "captain.factory-autogen-tool-execution.v1",
+                        "invocation_id": str(identity.invocation_id),
+                        "runtime_session_id": identity.runtime_session_id,
+                        "ordinal": ordinal,
+                        "agent_name": event.source,
+                        "tool_name": execution.name,
+                        "status": status,
+                        "observation_ref": observation_ref.model_dump(mode="json"),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+            )
+            tool_executions.append(
+                FactoryToolExecutionEvidenceV1(
+                    agent_name=event.source,
+                    tool_name=execution.name,
+                    status=status,
+                    evidence_ref=tool_ref,
+                )
+            )
         all_n8n_evidence = (
             self._n8n_adapter.observed_evidence()
             if self._n8n_adapter is not None
@@ -1872,8 +1910,8 @@ class HostAutoGenSessionExecutor:
             task_result=result,
             runtime_evidence_ref=observation_ref,
             usage_receipts=usage_receipts,
-            handoffs=handoffs,
-            tool_executions=tool_executions,
+            handoffs=tuple(handoffs),
+            tool_executions=tuple(tool_executions),
             n8n_executions=n8n_executions,
             workflow_evidence_refs=n8n_refs,
             conversation_pattern=conversation_pattern,

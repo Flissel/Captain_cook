@@ -150,6 +150,101 @@ async def test_budgeted_client_scopes_parallel_tool_calls_to_requests_with_tools
 
 
 @pytest.mark.asyncio
+async def test_host_observation_persists_distinct_evidence_for_each_handoff(
+    tmp_path: Path,
+) -> None:
+    job = _job_v3()
+    invocation = _invocation(job)
+    store = FilesystemFactoryEvidenceStore(tmp_path / "host-evidence")
+    client = BudgetedChatCompletionClient(
+        job=job,
+        invocation=invocation,
+        attempt=1,
+        delegate=build_replay_model_client(["unused"]),
+        budget=InMemoryFactoryBudgetLedger(),
+        evidence_store=store,
+        provider="deterministic-replay",
+        model="approved-model-id",
+        max_cost_per_call=Decimal("0.50"),
+        paid_effect_authority=_PaidEffectAuthority(),
+        pricing_authority=_PricingAuthority(_pricing_quote(job)),
+        clock=lambda: NOW,
+    )
+    identity = HostAutoGenSessionIdentityV1.for_factory_execution(
+        job=job,
+        invocation=invocation,
+        case_ref=job.private_holdout_refs[0],
+        subject_id="three_agent_swarm",
+        variant="candidate",
+        request_id=UUID("77000000-0000-0000-0000-000000000010"),
+        runtime_session_id="three-agent-handoff-session",
+        effect_id="7" * 64,
+        claim_id=UUID("78000000-0000-0000-0000-000000000010"),
+        fence=1,
+        model="approved-model-id",
+    )
+    executor = HostAutoGenSessionExecutor(
+        model_client=client,
+        evidence_store=store,
+        holdouts=object(),  # type: ignore[arg-type]
+        tools={},
+        clock=lambda: NOW,
+    )
+    result = TaskResult(
+        messages=[
+            HandoffMessage(source="intake", target="coverage", content="transfer"),
+            HandoffMessage(source="coverage", target="escalation", content="transfer"),
+            TextMessage(
+                source="escalation",
+                content='{"schema":"captain.business-benchmark-terminal.v1"}',
+            ),
+        ],
+        stop_reason="task_completed",
+    )
+
+    observed = await executor._observe(
+        job=job,
+        identity=identity,
+        model_client=client,
+        result=result,
+        receipt_offset=0,
+        dispatch_offset=0,
+        unresolved_before=frozenset(),
+        conversation_pattern="swarm",
+        max_messages=10,
+        max_handoffs=2,
+        max_tool_calls=0,
+        termination_conditions=("task_completed", "max_messages", "max_handoffs"),
+        handoff_tool_names=(
+            "transfer_to_coverage",
+            "transfer_to_escalation",
+        ),
+        n8n_tools={},
+        n8n_evidence_offset=0,
+    )
+
+    assert [item.from_agent for item in observed.handoffs] == ["intake", "coverage"]
+    assert [item.to_agent for item in observed.handoffs] == ["coverage", "escalation"]
+    assert len({item.evidence_ref for item in observed.handoffs}) == 2
+    persisted = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (tmp_path / "host-evidence").rglob("*.json")
+    ]
+    handoff_evidence = [
+        item
+        for item in persisted
+        if item.get("schema") == "captain.factory-autogen-handoff.v1"
+    ]
+    assert sorted(
+        (item["ordinal"], item["from_agent"], item["to_agent"])
+        for item in handoff_evidence
+    ) == [
+        (1, "intake", "coverage"),
+        (2, "coverage", "escalation"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_activity_ceiling_allows_exact_configured_handoff_and_tool_call() -> None:
     termination = _FactoryActivityCeilingTermination(
         max_handoffs=1,
