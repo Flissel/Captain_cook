@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import replace
@@ -4098,6 +4099,42 @@ async def test_restart_reconciliation_never_duplicates_an_active_running_process
     with pytest.raises(FactoryDispatchError, match="active.*inspection|inspection.*active"):
         await executor.reconcile_pending(dispatch, invocation, brief)
 
+    assert runner_calls() == 1
+    assert len(inspector.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_reconciliation_materializes_cancelled_receipt_for_lost_process(
+    tmp_path: Path,
+) -> None:
+    inspector = _StaticProcessInspector("lost")
+    executor, dispatch, invocation, brief, _, state_root, _, runner_calls = (
+        await _running_crash_fixture(tmp_path, inspector=inspector)
+    )
+    journal_path = state_root / "journals" / f"{invocation.idempotency_key}.jsonl"
+    os.utime(journal_path, (NOW.timestamp(), NOW.timestamp()))
+    receipt_path = state_root / "sessions" / f"{invocation.idempotency_key}.json"
+    assert not receipt_path.exists()
+
+    with pytest.raises(FactoryCodexBuildInterrupted) as caught:
+        await executor.reconcile_pending(dispatch, invocation, brief)
+
+    assert caught.value.reason == "runtime_cancelled"
+    assert caught.value.exit_code == 130
+    receipt = json.loads(receipt_path.read_bytes())
+    assert receipt["schema"] == "captain.codex-session-receipt.v1"
+    assert receipt["status"] == "cancelled"
+    assert receipt["exit_code"] == 130
+    assert receipt["process_cleanup_status"] == "not_required"
+    assert receipt["completed_at"] == NOW.isoformat()
+    checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert checkpoint is not None
+    assert checkpoint.phase == "implementation_interrupted"
+    assert checkpoint.terminal_receipt_sha256 == hashlib.sha256(
+        receipt_path.read_bytes()
+    ).hexdigest()
     assert runner_calls() == 1
     assert len(inspector.calls) == 1
 

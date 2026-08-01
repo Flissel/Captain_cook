@@ -1951,6 +1951,17 @@ class CodexCliFactoryBuildExecutor:
                 raise FactoryDispatchError(
                     "Factory Codex process identity is unresolved; inspection is required"
                 )
+        receipt_path = self._session_receipt_path(
+            invocation, checkpoint.resume_ordinal
+        )
+        if inspected_state == "lost" and not receipt_path.is_file():
+            self._persist_lost_process_interruption_receipt(
+                request=request,
+                invocation=invocation,
+                brief=brief,
+                prepared=prepared,
+                checkpoint=checkpoint,
+            )
         receipt_content, receipt = self._load_reconciliation_receipt(
             request=request,
             invocation=invocation,
@@ -2058,6 +2069,80 @@ class CodexCliFactoryBuildExecutor:
                 output_manifest_sha256=output_manifest_sha256,
                 previous=checkpoint,
             ),
+        )
+
+    def _persist_lost_process_interruption_receipt(
+        self,
+        *,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+        prepared: PreparedFactoryWorkspace,
+        checkpoint: FactoryCodexBuildCheckpointV1,
+    ) -> None:
+        """Materialize a bounded cancellation receipt after exact process loss."""
+
+        journal_path = self._journal_path(invocation, checkpoint.resume_ordinal)
+        try:
+            journal = _read_bounded_codex_journal(journal_path)
+            journal_lines = _bounded_codex_journal_lines(journal)
+            completed_at = datetime.fromtimestamp(
+                journal_path.stat().st_mtime,
+                tz=timezone.utc,
+            )
+        except (OSError, UnicodeDecodeError) as exc:
+            raise FactoryDispatchError(
+                "Factory Codex lost process journal is unavailable"
+            ) from exc
+        run_request = self._run_request(
+            request,
+            invocation,
+            brief,
+            prepared,
+            resume_thread_id=(
+                checkpoint.parent_codex_thread_id
+                if checkpoint.resume_ordinal > 0
+                else None
+            ),
+        )
+        parent_lineage: _CodexResumeLineage | None = None
+        if checkpoint.resume_ordinal > 0:
+            if (
+                checkpoint.parent_terminal_receipt_sha256 is None
+                or checkpoint.parent_journal_sha256 is None
+            ):
+                raise FactoryDispatchError(
+                    "Factory Codex lost resumed process lineage is incomplete"
+                )
+            parent_lineage = _CodexResumeLineage(
+                terminal_receipt_sha256=(
+                    checkpoint.parent_terminal_receipt_sha256
+                ),
+                journal_sha256=checkpoint.parent_journal_sha256,
+                codex_thread_id=checkpoint.parent_codex_thread_id,
+            )
+        receipt = _session_receipt(
+            result=CodexRunResult(
+                exit_code=130,
+                terminal_status="cancelled",
+                process_cleanup_status="not_required",
+                journal_path=journal_path,
+                journal_sha256=hashlib.sha256(journal).hexdigest(),
+                artifact_references=(),
+                jsonl_lines=journal_lines,
+            ),
+            session_id=f"factory-{invocation.invocation_id.hex[:24]}",
+            workspace_ref=brief.build_assignment.workspace_ref,
+            base_revision=prepared.base_revision,
+            command=run_request.command,
+            completed_at=completed_at,
+            resume_ordinal=checkpoint.resume_ordinal,
+            parent_lineage=parent_lineage,
+        )
+        self._persist_session_receipt(
+            invocation,
+            receipt,
+            checkpoint.resume_ordinal,
         )
 
     def _load_reconciliation_receipt(
