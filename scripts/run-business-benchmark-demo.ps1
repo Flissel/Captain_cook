@@ -129,12 +129,12 @@ $serviceRunner = Join-Path $PSScriptRoot 'live-demo-services.ps1'
 $benchmarkRuntimeEnvPath = Join-Path $repositoryRoot '.captain-cook/private/business-benchmarks/business-benchmark-runtime.env'
 $canonicalRenewalWorkflow = Join-Path $repositoryRoot 'examples/business_benchmark_candidates/customer_renewal_orchestration_team/workflows/renewal_context_read.json'
 $maximumUsdPerTeam = '0.20'
-$maximumHermesUsd = '0.10'
+$maximumHermesUsd = '0.15'
 $maximumTotalUsdPerTeam = '0.75'
-$priorAttemptReserveUsdPerTeam = '0.45'
+$priorAttemptReserveUsdPerTeam = '0.40'
 $userMaximumEurPerTeam = '1.00'
 $budgetEurPerUsd = '1.25'
-$seedVersion = 'business-benchmark-demo-2026-07-v25'
+$seedVersion = 'business-benchmark-demo-2026-07-v26'
 
 $rootEnvAllowlist = @(
     'CAPTAIN_GATEWAY_TOKEN',
@@ -387,7 +387,7 @@ function New-DryRunPlan {
         mode = 'dry_run'
         database = 'captain_test'
         issued_at = $IssuedAt
-        suite_version = 25
+        suite_version = 26
         seed_version_id = $seedVersion
         maximum_usd_per_team = $maximumUsdPerTeam
         jobs = @(
@@ -678,7 +678,7 @@ try {
             '--issued-at', $issuedAt,
             '--model', 'gpt-4.1-mini',
             '--maximum-usd-per-team', $maximumUsdPerTeam,
-            '--suite-version', '25',
+            '--suite-version', '26',
             '--seed-version-id', $seedVersion
         )
         $rawPlanProvisioning = @(& $python @planArguments)
@@ -708,7 +708,7 @@ try {
             if (
                 [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
                 @($team.job.execution_policy.allowed_models) -notcontains 'gpt-4.1-mini' -or
-                [int]$team.suite.suite_version -ne 25
+                [int]$team.suite.suite_version -ne 26
             ) {
                 throw 'Dry-run team model or budget does not match the demo authority.'
             }
@@ -829,7 +829,7 @@ try {
         '--issued-at', $issuedAt,
         '--model', $model,
         '--maximum-usd-per-team', $maximumUsdPerTeam,
-        '--suite-version', '25',
+        '--suite-version', '26',
         '--seed-version-id', $seedVersion
     )
     if ($Action -in @('AUTHORIZE', 'BUILD', 'RUN')) {
@@ -868,7 +868,7 @@ try {
         if (
             [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
             @($team.job.execution_policy.allowed_models) -notcontains $model -or
-            [int]$team.suite.suite_version -ne 25
+            [int]$team.suite.suite_version -ne 26
         ) {
             throw 'Provisioned team model or budget does not match the demo authority.'
         }
