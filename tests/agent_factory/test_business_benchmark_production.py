@@ -53,6 +53,7 @@ from agenten.agent_factory.execution_policy import (
 )
 from agenten.agent_factory.factory_feedback import FactoryFeedbackBuilder
 from agenten.agent_factory.leases import issue_factory_lease
+from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillInvocationV1,
@@ -256,7 +257,7 @@ class Gateway:
 
 class SuiteAuthority:
     def __init__(self, job: AgentFactoryJobV3, private_suite: BusinessBenchmarkSuiteV1) -> None:
-        self.reference = job.private_holdout_refs[0]
+        self.reference = job.private_holdout_refs[-1]
         self.private_suite = private_suite
 
     def canonical_suite(self, *, profile_id: str, suite_version: int):
@@ -328,7 +329,21 @@ def settings(job: AgentFactoryJobV3, candidate_id: str) -> LiveBusinessBenchmark
 
 
 def authorities(tmp_path: Path):
-    job = live_job()
+    base_job = live_job()
+    technical_digest = hashlib.sha256(b"technical-holdout").hexdigest()
+    technical_ref = PrivateHoldoutRef(
+        holdout_id=f"holdout-{technical_digest[:12]}",
+        uri=f"holdout://holdout-{technical_digest[:12]}",
+        sha256=technical_digest,
+    )
+    job = base_job.model_copy(
+        update={
+            "private_holdout_refs": (
+                technical_ref,
+                *base_job.private_holdout_refs,
+            )
+        }
+    )
     store = BusinessBenchmarkContentAddressedArtifactStore(
         tmp_path / ".captain-cook" / "benchmark-cas"
     )
@@ -563,7 +578,7 @@ def run_receipt(
         correlation_id=job.correlation_id,
         subject_version=job.subject_version,
         attempt=1,
-        suite_ref=job.private_holdout_refs[0],
+        suite_ref=job.private_holdout_refs[-1],
         suite_id=suite().suite_id,
         case_id=benchmark_case.case_id,
         case_sha256=case_sha256,
@@ -607,7 +622,7 @@ class FactoryComposition:
             subject_version=job.subject_version,
             attempt=1,
             candidate_ref=candidate_ref.model_dump(mode="json"),
-            suite_ref=job.private_holdout_refs[0].model_dump(mode="json"),
+            suite_ref=job.private_holdout_refs[-1].model_dump(mode="json"),
             suite_id=suite().suite_id,
         )
         self.candidate_receipts = tuple(
@@ -732,7 +747,7 @@ async def test_production_composition_runs_one_isolated_team_and_returns_exact_e
     assert factory.calls[0]["executor"] is executor
     assert factory.calls[0]["replay_store"] is replay
     assert factory.calls[0]["technical_executions"]
-    assert factory.calls[0]["expected_suite_ref"] == job.private_holdout_refs[0]
+    assert factory.calls[0]["expected_suite_ref"] == job.private_holdout_refs[-1]
     assert factory.calls[0]["expected_suite"] == suite()
     report = factory.calls[0]["report_invocation_factory"](
         factory.last_result.evaluation

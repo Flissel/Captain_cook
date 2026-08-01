@@ -284,12 +284,21 @@ class ProductionBusinessBenchmarkScopeResolver:
                 job=job,
                 attempt=selection.attempt,
             )
+            technical_holdout_ref = runtime_invocation.execution_scope_ref
+            if (
+                not isinstance(technical_holdout_ref, PrivateHoldoutRef)
+                or technical_holdout_ref not in job.private_holdout_refs
+                or technical_holdout_ref == suite_ref
+            ):
+                raise ValueError(
+                    "technical execution scope is unavailable, stale, or mixed"
+                )
             self._require_invocation(
                 runtime_invocation,
                 job=job,
                 attempt=selection.attempt,
                 step=FactorySkillStep.EXECUTE_TEAM,
-                suite_ref=suite_ref,
+                suite_ref=technical_holdout_ref,
             )
             self._require_invocation(
                 evaluation_invocation,
@@ -311,7 +320,7 @@ class ProductionBusinessBenchmarkScopeResolver:
                 job=job,
                 attempt=selection.attempt,
                 candidate_ref=candidate_ref,
-                suite_ref=suite_ref,
+                holdout_ref=technical_holdout_ref,
                 runtime_invocation=runtime_invocation,
             )
             budget = self._gateway.budget_projection(job.job_id)
@@ -440,7 +449,7 @@ class ProductionBusinessBenchmarkScopeResolver:
         job: AgentFactoryJobV3,
         attempt: int,
         candidate_ref: ArtifactRef,
-        suite_ref: PrivateHoldoutRef,
+        holdout_ref: PrivateHoldoutRef,
         runtime_invocation: FactorySkillInvocationV1,
     ) -> None:
         required_runs = job.execution_policy.required_live_runs
@@ -459,7 +468,7 @@ class ProductionBusinessBenchmarkScopeResolver:
             or item.subject_version != job.subject_version
             or item.attempt != attempt
             or item.candidate_ref != candidate_ref
-            or item.holdout_ref != suite_ref
+            or item.holdout_ref != holdout_ref
             or item.invocation_id != runtime_invocation.invocation_id
             or item.invocation != runtime_invocation
             or item.status != "succeeded"
