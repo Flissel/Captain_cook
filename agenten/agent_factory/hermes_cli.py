@@ -378,10 +378,10 @@ class HermesCliFactory(HermesFactoryPort):
                 (authority_expires_at - now).total_seconds(),
             )
         )
-        input_ref = (
-            improvement.authorization_ref
-            if improvement is not None
-            else request.job.input_ref
+        input_ref = await self._initial_workflow_input_ref(
+            request,
+            steps=steps,
+            improvement=improvement,
         )
         artifacts: list[_FactoryWorkflowArtifact] = []
         transcript_refs: list[ArtifactRef] = []
@@ -871,10 +871,10 @@ class HermesCliFactory(HermesFactoryPort):
             raise FactoryDispatchError(
                 "original Factory failure reconciliation forbids retry authority"
             )
-        input_ref = (
-            improvement.authorization_ref
-            if improvement is not None
-            else request.job.input_ref
+        input_ref = await self._initial_workflow_input_ref(
+            request,
+            steps=steps,
+            improvement=improvement,
         )
         brief: CodexBuildBriefV1 | None = None
         for step in steps:
@@ -955,6 +955,33 @@ class HermesCliFactory(HermesFactoryPort):
         raise FactoryDispatchError(
             "expired Factory failure reconciliation has no seal step"
         )
+
+    async def _initial_workflow_input_ref(
+        self,
+        request: FactoryDispatch,
+        *,
+        steps: tuple[FactorySkillStep, ...],
+        improvement: FactoryImprovementAuthorizationV1 | None,
+    ) -> ArtifactRef:
+        if improvement is not None:
+            return improvement.authorization_ref
+        if (
+            isinstance(request.job, AgentFactoryJobV3)
+            and request.action.attempt == 1
+            and steps
+            and steps[0] is FactorySkillStep.BRIEF_CODEX
+        ):
+            discovery = await self._replay_store.completed(
+                request.job,
+                step=FactorySkillStep.DISCOVER,
+                attempt=1,
+            )
+            if not isinstance(discovery.artifact, CodebaseInventoryV1):
+                raise FactoryDispatchError(
+                    "completed discovery replay is not a codebase inventory"
+                )
+            return discovery.artifact.artifact_ref
+        return request.job.input_ref
 
     def validate_dispatch_configuration(self, request: FactoryDispatch) -> None:
         """Fail before external setup when a released sequence cannot be resolved."""

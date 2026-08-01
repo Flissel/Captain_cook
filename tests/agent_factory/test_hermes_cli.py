@@ -566,6 +566,13 @@ async def test_v3_brief_reuses_discovery_and_accepts_only_digest_attestation(
     assert len(prompt_store.content) == 1
     assert len(sealer.calls) == 1
     brief = sealer.calls[0][2]
+    discovery = await replay_store.completed(
+        factory_job,
+        step=FactorySkillStep.DISCOVER,
+        attempt=1,
+    )
+    assert discovery.artifact is not None
+    assert brief.invocation.input_ref == discovery.artifact.artifact_ref
     assert brief.prompt_ref.uri in prompt_store.content
     assert brief.build_assignment.compiled_spec_ref.model_dump(mode="json") == (
         factory_job.compiled_spec_ref.model_dump(mode="json")
