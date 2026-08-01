@@ -392,7 +392,11 @@ def _allowed_next_phases(projection: FactoryProjection) -> frozenset[FactoryPhas
             {FactoryPhase.REAL_CASE_REVALIDATED}
         ),
         FactoryPhase.REAL_CASE_REVALIDATED: frozenset(
-            {FactoryPhase.QUALITY_REVIEWED, FactoryPhase.IMPROVEMENT_REQUESTED}
+            {
+                FactoryPhase.QUALITY_REVIEWED,
+                FactoryPhase.IMPROVEMENT_REQUESTED,
+                FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED,
+            }
         ),
         FactoryPhase.BUILD_FAILED: frozenset({FactoryPhase.IMPROVEMENT_REQUESTED, FactoryPhase.ESCALATED}),
         FactoryPhase.QUALITY_REVIEWED: frozenset(

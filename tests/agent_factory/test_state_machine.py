@@ -412,6 +412,65 @@ def test_captain_can_revalidate_same_attempt_after_host_runtime_fix() -> None:
     assert next_action(revalidated).kind is FactoryActionKind.DISPATCH_QUALITY_WARDEN
 
 
+def test_captain_can_reauthorize_failed_technical_revalidation_same_attempt() -> None:
+    state = FactoryProjection.from_job(job())
+    for event in (
+        block(FactoryPhase.FORGE_REQUESTED),
+        block(FactoryPhase.BLUEPRINT_CREATED),
+        block(FactoryPhase.TOOL_CANDIDATE_TESTED),
+        block(FactoryPhase.AGENT_CODE_CREATED),
+        block(FactoryPhase.BUILD_PASSED),
+        block(FactoryPhase.REAL_CASE_EVIDENCE, status=FactoryBlockStatus.FAILED),
+    ):
+        state = apply_block(state, event)
+
+    superseded_ref = ArtifactRef(
+        uri=f"artifact://factory/team-execution/{'c' * 64}",
+        sha256="c" * 64,
+        media_type="application/json",
+    )
+    first_authorization = ArtifactRef(
+        uri=f"artifact://factory/technical-revalidation/{'b' * 64}",
+        sha256="b" * 64,
+        media_type="application/json",
+    )
+    state = apply_block(
+        state,
+        block(FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED).model_copy(
+            update={
+                "artifact_refs": (superseded_ref,),
+                "evidence_refs": (first_authorization,),
+            }
+        ),
+    )
+    state = apply_block(
+        state,
+        block(
+            FactoryPhase.REAL_CASE_REVALIDATED,
+            status=FactoryBlockStatus.FAILED,
+        ),
+    )
+
+    second_authorization = ArtifactRef(
+        uri=f"artifact://factory/technical-revalidation/{'d' * 64}",
+        sha256="d" * 64,
+        media_type="application/json",
+    )
+    requested = apply_block(
+        state,
+        block(FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED).model_copy(
+            update={
+                "event_id": UUID("00000000-0000-0000-0000-000000000099"),
+                "artifact_refs": (superseded_ref,),
+                "evidence_refs": (second_authorization,),
+            }
+        ),
+    )
+
+    assert requested.attempt == 1
+    assert next_action(requested).authorization_ref == second_authorization
+
+
 def test_fifth_behavioral_failure_escalates() -> None:
     state = FactoryProjection.from_job(job()).model_copy(update={"attempt": 5})
     for phase in (
