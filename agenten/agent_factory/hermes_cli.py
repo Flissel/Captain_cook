@@ -3090,10 +3090,14 @@ def _factory_skill_prompt(
             _STEP_RESULT_MODELS[invocation.step].model_json_schema(by_alias=True)
         )
     lines = []
-    if any(
-        seed is not None
-        for seed in (discovery_seed, codex_brief_seed, improvement_seed)
-    ):
+    if improvement_seed is not None:
+        lines.append(
+            "Return one JSON object with every exact binding from "
+            "captain_required_output_bindings. Add a non-empty "
+            '"changed_components" array containing only concrete repair targets '
+            "selected from captain_improvement_seed.permitted_changed_components."
+        )
+    elif discovery_seed is not None or codex_brief_seed is not None:
         lines.append(
             "Return this exact JSON as your first and only response: "
             + _canonical_json(required_bindings)
