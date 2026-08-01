@@ -32,7 +32,9 @@ from agenten.agent_factory.hermes_cli import (
     FilesystemReleasedFactorySkillCatalog,
     HermesCliFactory,
     HermesCliSettings,
+    _codex_brief_seed_sha256,
     _discovery_seed_sha256,
+    _parse_codex_brief_attestation,
     _parse_discovery_attestation,
     factory_skill_replay_failure_ref,
     _captain_discovery_seed,
@@ -370,6 +372,56 @@ def test_discovery_attestation_rejects_wrong_digest_with_extra_suffix() -> None:
             stdout,
             invocation=invocation,
             discovery_seed=discovery_seed,
+        )
+
+
+def test_codex_brief_attestation_accepts_one_redundant_invocation_typo() -> None:
+    brief = CodexBuildBriefV1.model_validate(brief_payload())
+    invocation = brief.invocation
+    expected_invocation_id = str(invocation.invocation_id)
+    typo_invocation_id = expected_invocation_id[:-1] + (
+        "0" if expected_invocation_id[-1] != "0" else "1"
+    )
+    stdout = json.dumps(
+        {
+            "schema": "hermes.factory-codex-brief-attestation.v1",
+            "invocation_id": typo_invocation_id,
+            "seed_sha256": _codex_brief_seed_sha256(brief),
+            "accepted": True,
+        }
+    ).encode("utf-8")
+
+    observed = _parse_codex_brief_attestation(
+        stdout,
+        invocation=invocation,
+        codex_brief_seed=brief,
+    )
+
+    assert observed.invocation_id == invocation.invocation_id
+
+
+def test_codex_brief_attestation_rejects_two_invocation_typos() -> None:
+    brief = CodexBuildBriefV1.model_validate(brief_payload())
+    invocation = brief.invocation
+    expected_invocation_id = str(invocation.invocation_id)
+    typo_invocation_id = "11" + expected_invocation_id[2:]
+    stdout = json.dumps(
+        {
+            "schema": "hermes.factory-codex-brief-attestation.v1",
+            "invocation_id": typo_invocation_id,
+            "seed_sha256": _codex_brief_seed_sha256(brief),
+            "accepted": True,
+        }
+    ).encode("utf-8")
+
+    with pytest.raises(
+        FactoryDispatchError,
+        match="does not match Captain's seed",
+    ):
+        _parse_codex_brief_attestation(
+            stdout,
+            invocation=invocation,
+            codex_brief_seed=brief,
         )
 
 

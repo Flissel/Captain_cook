@@ -3224,10 +3224,12 @@ def _seed_attestation_payload(
     stdout: bytes,
     *,
     expected_seed_sha256: str,
+    expected_invocation_id: UUID,
 ) -> object:
     payload = _parse_evidence_payload(stdout)
     if not isinstance(payload, dict):
         return payload
+    normalized = dict(payload)
     observed_seed_sha256 = payload.get("seed_sha256")
     if (
         isinstance(observed_seed_sha256, str)
@@ -3235,8 +3237,26 @@ def _seed_attestation_payload(
         and observed_seed_sha256[:64] == expected_seed_sha256
         and re.fullmatch(r"[0-9a-f]{65}", observed_seed_sha256) is not None
     ):
-        return {**payload, "seed_sha256": expected_seed_sha256}
-    return payload
+        normalized["seed_sha256"] = expected_seed_sha256
+    expected_invocation = str(expected_invocation_id)
+    observed_invocation = normalized.get("invocation_id")
+    if (
+        normalized.get("seed_sha256") == expected_seed_sha256
+        and isinstance(observed_invocation, str)
+        and len(observed_invocation) == len(expected_invocation)
+        and re.fullmatch(r"[0-9a-f-]{36}", observed_invocation) is not None
+        and sum(
+            observed != expected
+            for observed, expected in zip(
+                observed_invocation,
+                expected_invocation,
+                strict=True,
+            )
+        )
+        == 1
+    ):
+        normalized["invocation_id"] = expected_invocation
+    return normalized
 
 
 def _parse_improvement_attestation(
@@ -3251,6 +3271,7 @@ def _parse_improvement_attestation(
             _seed_attestation_payload(
                 stdout,
                 expected_seed_sha256=expected_seed_sha256,
+                expected_invocation_id=invocation.invocation_id,
             )
         )
     except (TypeError, ValueError, ValidationError) as exc:
@@ -3382,6 +3403,7 @@ def _parse_discovery_attestation(
             _seed_attestation_payload(
                 stdout,
                 expected_seed_sha256=expected_seed_sha256,
+                expected_invocation_id=invocation.invocation_id,
             )
         )
     except (TypeError, ValueError, ValidationError) as exc:
@@ -3410,6 +3432,7 @@ def _parse_codex_brief_attestation(
             _seed_attestation_payload(
                 stdout,
                 expected_seed_sha256=expected_seed_sha256,
+                expected_invocation_id=invocation.invocation_id,
             )
         )
     except (TypeError, ValueError, ValidationError) as exc:
