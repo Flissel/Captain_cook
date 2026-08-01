@@ -1307,6 +1307,11 @@ async def test_authorized_resume_repairs_missing_required_outputs_in_same_thread
         "--json",
         "codex-thread-123",
     )
+    assert "CAPTAIN RESUME REPAIR" in authorizer.requests[1].command[5]
+    assert "Do not repeat broad repository inspection" in (
+        authorizer.requests[1].command[5]
+    )
+    assert "Do not finish with a blocked report" in authorizer.requests[1].command[5]
     checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
         state_root / "checkpoints"
     ).load(invocation)
@@ -3061,7 +3066,10 @@ async def test_authorized_resume_uses_prior_thread_and_persists_parent_lineage(
         "--json",
         "codex-thread-123",
     )
-    assert resume_command[-1] == fixture["authorizer"].requests[0].command[-1]
+    assert resume_command[-1].startswith(
+        fixture["authorizer"].requests[0].command[-1]
+    )
+    assert "CAPTAIN RESUME REPAIR" in resume_command[-1]
     receipt = json.loads(completed.codex_session_receipt)
     prior_receipt_path = (
         fixture["state_root"]

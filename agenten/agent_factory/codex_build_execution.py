@@ -1586,6 +1586,18 @@ class CodexCliFactoryBuildExecutor:
     ) -> CodexRunRequest:
         session_id = f"factory-{invocation.invocation_id.hex[:24]}"
         prompt = _codex_prompt(request, invocation, brief)
+        if resume_thread_id is not None:
+            prompt += (
+                "\n\nCAPTAIN RESUME REPAIR:\n"
+                "Continue from the existing workspace and thread. Do not repeat broad "
+                "repository inspection. Shell startup may be delayed on Windows; wait for "
+                "each bounded command to finish and retry a transient shell probe before "
+                "declaring infrastructure failure. Inspect which required output artifacts "
+                "are missing, complete the candidate-scoped implementation and tests, then "
+                "regenerate all three final artifacts. Do not finish with a blocked report "
+                "while bounded shell commands eventually complete or required artifacts "
+                "remain absent."
+            )
         command = (
             ("codex", "exec", "resume", "--json", resume_thread_id, prompt)
             if resume_thread_id is not None
