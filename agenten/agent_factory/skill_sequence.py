@@ -164,9 +164,9 @@ class FactoryHermesReplayRetryAuthorizationV1(BaseModel):
     ) -> "FactoryHermesReplayRetryAuthorizationV1":
         if self.expires_at <= self.issued_at:
             raise ValueError("Hermes retry authority expiry must follow issuance")
-        if self.internal_total_cap_usd > Decimal("0.80"):
+        if self.internal_total_cap_usd > Decimal("4.80"):
             raise ValueError("Hermes retry internal team cap exceeds policy")
-        if self.user_total_cap_eur > Decimal("1.00"):
+        if self.user_total_cap_eur > Decimal("6.00"):
             raise ValueError("Hermes retry user team cap exceeds policy")
         allocated = (
             self.maximum_additional_cost_usd

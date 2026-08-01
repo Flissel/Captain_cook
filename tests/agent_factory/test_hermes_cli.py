@@ -2063,7 +2063,7 @@ async def test_failed_improve_replay_requires_exact_budget_bound_captain_retry(
             failed_replay_ref=failure_ref,
             issued_at=invocation.lease.issued_at,
             expires_at=invocation.lease.issued_at + timedelta(minutes=5),
-            user_total_cap_eur=Decimal("1.01"),
+            user_total_cap_eur=Decimal("6.01"),
         )
     authorization = build_factory_hermes_replay_retry_authorization(
         job_id=invocation.job_id,
