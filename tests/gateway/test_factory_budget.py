@@ -25,7 +25,11 @@ from agenten.agent_factory.execution_budget import (
 from agenten.agent_factory.contracts import FactoryPhase
 from agenten.agent_factory.contracts import FactoryRole
 from agenten.agent_factory.leases import issue_factory_lease
-from agenten.agent_factory.skill_workflow_contracts import CodebaseInventoryV1
+from agenten.agent_factory.skill_workflow_contracts import (
+    CandidateRevisionV1,
+    CodebaseInventoryV1,
+    CodexBuildBriefV1,
+)
 from agenten.agent_factory.state_machine import FactoryLifecycleStatus, FactoryProjection
 from gateway.contracts import FactoryBudgetReservationWriteReceipt
 from gateway.contracts import FactoryUsageSubmissionV2
@@ -38,7 +42,11 @@ from blockchain.mariadb_storage import MariaDBStorage
 from tests.agent_factory.test_execution_budget import job_v3, usage_payload
 from tests.agent_factory.test_state_machine import block, job
 from tests.agent_factory.test_capability_resolution import job as job_v2
-from tests.agent_factory.test_skill_workflow_contracts import inventory_payload
+from tests.agent_factory.test_skill_workflow_contracts import (
+    brief_payload,
+    inventory_payload,
+    revision_payload,
+)
 from tests.support.mariadb import assert_isolated_test_database
 
 
@@ -49,6 +57,28 @@ TEST_DSN = os.getenv("TEST_MARIADB_DSN")
 class Mirror:
     def enqueue_nowait(self, _: dict[str, object]) -> None:
         return None
+
+
+def test_improvement_brief_can_follow_revision_before_phase_transition(job_v3) -> None:
+    projection = FactoryProjection.from_job(job_v3).model_copy(
+        update={"phase": FactoryPhase.IMPROVEMENT_REQUESTED, "attempt": 2}
+    )
+    revision = CandidateRevisionV1.model_validate(revision_payload())
+    revision = revision.model_copy(
+        update={
+            "attempt": 2,
+            "invocation": revision.invocation.model_copy(update={"attempt": 2}),
+        }
+    )
+    brief = CodexBuildBriefV1.model_validate(brief_payload())
+    brief = brief.model_copy(
+        update={
+            "attempt": 2,
+            "invocation": brief.invocation.model_copy(update={"attempt": 2}),
+        }
+    )
+
+    GatewayStore._assert_workflow_sequence(projection, brief, (revision,))
 
 
 def validation_only_app(actor: GatewayRole):

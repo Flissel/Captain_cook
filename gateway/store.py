@@ -2273,6 +2273,19 @@ class GatewayStore:
             FactorySkillStep.EVALUATE_TEAM: {FactoryPhase.REAL_CASE_EVIDENCE},
             FactorySkillStep.REPORT_CAPTAIN: {FactoryPhase.REAL_CASE_EVIDENCE},
         }[step]
+        if (
+            step is FactorySkillStep.BRIEF_CODEX
+            and artifact.attempt > 1
+            and any(
+                isinstance(candidate, CandidateRevisionV1)
+                and candidate.attempt == artifact.attempt
+                for candidate in prior_artifacts
+            )
+        ):
+            required_phase = {
+                *required_phase,
+                FactoryPhase.IMPROVEMENT_REQUESTED,
+            }
         if projection.phase not in required_phase:
             raise HTTPException(
                 status_code=409,
