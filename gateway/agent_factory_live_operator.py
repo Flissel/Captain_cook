@@ -133,7 +133,7 @@ def validate_factory_total_cost_envelope(
     if (
         environment.get("CAPTAIN_FACTORY_HERMES_PROVIDER", "").strip() != "custom"
         or environment.get("CAPTAIN_FACTORY_HERMES_MODEL", "").strip()
-        != "llama3.1:8b"
+        != "captain-hermes:8b"
         or environment.get("CUSTOM_BASE_URL", "").strip()
         != "http://127.0.0.1:11434/v1"
     ):
@@ -196,7 +196,7 @@ def validate_factory_total_cost_envelope(
         or total_maximum_usd > Decimal("0.80")
         or total_maximum_usd * budget_eur_per_usd > user_maximum_eur
         or codex_metered_usd != 0
-        or hermes_incremental_usd != 0
+        or hermes_incremental_usd != Decimal("0.003148")
         or len(benchmark_maximum_usd_per_team) != 2
         or any(
             benchmark_usd
@@ -249,7 +249,7 @@ class FactoryLiveOperatorSettings:
             or not self.hermes_model.strip()
             or (
                 self.hermes_provider == "custom"
-                and self.hermes_model != "llama3.1:8b"
+                and self.hermes_model != "captain-hermes:8b"
             )
             or not self.hermes_maximum_total_cost_usd.is_finite()
             or self.hermes_maximum_total_cost_usd <= 0

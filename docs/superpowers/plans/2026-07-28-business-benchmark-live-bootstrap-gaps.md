@@ -266,10 +266,14 @@
   spend. At the conservative fixed `1.25 EUR/USD` guard this caps Claims at
   `0.881115 EUR` and Renewal at `0.97699 EUR`; any larger composition fails
   before provider construction.
-- [x] Verify a local Hermes call through loopback Ollama with `llama3.1:8b`:
-  one typed call, `estimated_cost_usd=0`, no cloud credential required. Keep the
-  historical Hermes paid-effect ledger capped at `0.25 USD`; new v29 skill
-  calls use the local provider and add no marginal provider spend.
+- [x] Verify local Hermes through loopback Ollama and pin the Factory runner to
+  `captain-hermes:8b`, a machine-local `llama3.1:8b` derivative with a 65,536
+  token context and temperature zero. The exact public discovery prompt
+  returned naked typed JSON with 5,620 input tokens, one API call,
+  `estimated_cost_usd=0`, and no cloud credential. Keep the historical Hermes
+  paid-effect ledger capped at `0.25 USD`; reserve its remaining `0.003148 USD`
+  in the formal retry authority even though the verified local call reports
+  zero marginal provider spend.
 - [x] Embed one normative public build contract in both v29 job input and
   compiled spec. It contains the exact three-agent topology, handoffs, tool
   allocation, canonical public system prompts, conversation ceilings, strict
@@ -283,3 +287,5 @@
   Hermes plus ChatGPT-subscription Codex. Run the isolated technical holdout
   for each exact candidate. Do not start the 15-case paired benchmark for a
   team until every technical assertion is green.
+  The cumulative worst-case guards, including the remaining Hermes retry
+  reserve, are `0.88505 EUR` for Claims and `0.980925 EUR` for Renewal.

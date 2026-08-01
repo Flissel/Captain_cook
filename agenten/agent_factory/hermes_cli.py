@@ -3028,12 +3028,23 @@ def _factory_skill_prompt(
         output_schema = _canonical_json(
             _STEP_RESULT_MODELS[invocation.step].model_json_schema(by_alias=True)
         )
-    lines = [
+    lines = []
+    if any(
+        seed is not None
+        for seed in (discovery_seed, codex_brief_seed, improvement_seed)
+    ):
+        lines.append(
+            "Return this exact JSON as your first and only response: "
+            + _canonical_json(required_bindings)
+        )
+    lines.extend(
+        (
             f"Use /{skill_name} and no other skill.",
             f"captain_invocation_json={_canonical_json(invocation_payload)}",
             f"captain_required_output_bindings={_canonical_json(required_bindings)}",
             f"captain_output_json_schema={output_schema}",
-    ]
+        )
+    )
     if invocation.step is FactorySkillStep.BRIEF_CODEX:
         if job is None or not isinstance(job, AgentFactoryJobV3):
             raise FactoryDispatchError(

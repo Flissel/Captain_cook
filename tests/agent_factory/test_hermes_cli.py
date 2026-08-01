@@ -525,6 +525,10 @@ async def test_dispatch_uses_oneshot_mode_for_parseable_evidence(
     assert "captain_discovery_seed=" in observed[-1]
     assert "captain_discovery_seed_sha256=" in observed[-1]
     assert "do not call tools" in observed[-1]
+    first_line = observed[-1].splitlines()[0]
+    assert first_line.startswith(
+        "Return this exact JSON as your first and only response: "
+    )
     assert len(recorded_workflow_artifacts) == 1
     assert isinstance(recorded_workflow_artifacts[0], CodebaseInventoryV1)
     binding_prefix = "captain_required_output_bindings="
@@ -532,6 +536,7 @@ async def test_dispatch_uses_oneshot_mode_for_parseable_evidence(
         line for line in observed[-1].splitlines() if line.startswith(binding_prefix)
     )
     bindings = json.loads(binding_line.removeprefix(binding_prefix))
+    assert json.loads(first_line.split(": ", 1)[1]) == bindings
     assert bindings["schema"] == "hermes.factory-discovery-attestation.v1"
     assert bindings["invocation_id"] == _invocation_from_prompt(observed[-1])["invocation_id"]
     assert bindings["seed_sha256"]

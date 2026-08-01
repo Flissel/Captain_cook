@@ -132,7 +132,7 @@ $maximumUsdPerTeam = '0.32'
 $maximumHermesUsd = '0.25'
 # V29 uses the exact local loopback Ollama provider. Its verified usage receipt
 # reports zero marginal USD; the historical paid Hermes ledger remains capped.
-$maximumIncrementalHermesUsd = '0.00'
+$maximumIncrementalHermesUsd = '0.003148'
 $maximumTotalUsdPerTeam = '0.80'
 # Immutable V28 evidence, conservatively assigning all shared Hermes spend to
 # each team. These values are carried forward rather than resetting the cap.
@@ -825,7 +825,7 @@ try {
     $environment['CAPTAIN_FACTORY_CODEX_METERED_USD_PER_TEAM'] = '0'
     $environment['CAPTAIN_FACTORY_HERMES_INCREMENTAL_MAX_USD'] = $maximumIncrementalHermesUsd
     $environment['CAPTAIN_FACTORY_HERMES_PROVIDER'] = 'custom'
-    $environment['CAPTAIN_FACTORY_HERMES_MODEL'] = 'llama3.1:8b'
+    $environment['CAPTAIN_FACTORY_HERMES_MODEL'] = 'captain-hermes:8b'
     $environment['CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_CLAIMS'] = $priorActualUsdClaims
     $environment['CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_RENEWAL'] = $priorActualUsdRenewal
     $environment['CUSTOM_BASE_URL'] = 'http://127.0.0.1:11434/v1'
@@ -1046,7 +1046,7 @@ try {
             '--job-id', $orderedFactoryJobIds[0],
             '--job-id', $orderedFactoryJobIds[1],
             '--hermes-provider', 'custom',
-            '--hermes-model', 'llama3.1:8b',
+            '--hermes-model', 'captain-hermes:8b',
             '--hermes-max-usd', $maximumHermesUsd,
             '--maximum-dispatches', '12'
         )
