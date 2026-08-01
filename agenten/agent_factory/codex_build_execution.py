@@ -247,7 +247,11 @@ def _interruption_references(
     checkpoint: FactoryCodexBuildCheckpointV1,
 ) -> dict[str, object]:
     receipt_sha256 = checkpoint.terminal_receipt_sha256
-    if checkpoint.phase != "implementation_interrupted" or receipt_sha256 is None:
+    resumable_phase = checkpoint.phase == "implementation_interrupted" or (
+        checkpoint.phase == "implementation_failed"
+        and checkpoint.implementation_failure_reason == "evidence_failure"
+    )
+    if not resumable_phase or receipt_sha256 is None:
         raise FactoryDispatchError("Factory Codex interruption checkpoint is invalid")
     checkpoint_sha256 = hashlib.sha256(
         canonical_factory_codex_model(checkpoint)
@@ -991,8 +995,18 @@ class CodexCliFactoryBuildExecutor:
             raise FactoryDispatchError(
                 "Factory Codex resume authorization validator is not configured"
             )
-        if checkpoint is None or checkpoint.phase != "implementation_interrupted":
-            raise FactoryDispatchError("Factory Codex build is not interrupted")
+        if checkpoint is None or checkpoint.phase not in {
+            "implementation_interrupted",
+            "implementation_failed",
+        }:
+            raise FactoryDispatchError(
+                "Factory Codex build is not interrupted or resumable"
+            )
+        if (
+            checkpoint.phase == "implementation_failed"
+            and checkpoint.implementation_failure_reason != "evidence_failure"
+        ):
+            raise FactoryDispatchError("Factory Codex build failure is not resumable")
         resume_ordinal = self._resume_authorizer.authorize_resume(
             request,
             invocation,
@@ -1026,8 +1040,17 @@ class CodexCliFactoryBuildExecutor:
             prepared=prepared,
             checkpoint=checkpoint,
         )
+        interruption_is_resumable = (
+            checkpoint.phase == "implementation_interrupted"
+            and prior.payload["status"] in {"timed_out", "cancelled"}
+        )
+        evidence_failure_is_resumable = (
+            checkpoint.phase == "implementation_failed"
+            and prior.payload["status"] == "evidence_failed"
+            and prior.payload.get("failure_kind") == "record_size_limit_exceeded"
+        )
         if (
-            prior.payload["status"] not in {"timed_out", "cancelled"}
+            not (interruption_is_resumable or evidence_failure_is_resumable)
             or prior.payload["process_cleanup_status"] == "unresolved"
             or prior.completed_at > checkpoint.updated_at
         ):
@@ -1361,12 +1384,19 @@ class CodexCliFactoryBuildExecutor:
                 raise FactoryDispatchError(
                     "Factory Codex implementation is already running or unresolved"
                 )
-            if checkpoint.phase == "implementation_interrupted":
+            if checkpoint.phase in {
+                "implementation_interrupted",
+                "implementation_failed",
+            }:
                 if authorized_resume_ordinal is None:
-                    raise FactoryCodexBuildInterrupted(
-                        reason="resume_authorization_required",
-                        exit_code=None,
-                        **_interruption_details(request, invocation, checkpoint),
+                    if checkpoint.phase == "implementation_interrupted":
+                        raise FactoryCodexBuildInterrupted(
+                            reason="resume_authorization_required",
+                            exit_code=None,
+                            **_interruption_details(request, invocation, checkpoint),
+                        )
+                    raise FactoryDispatchError(
+                        "Factory Codex evidence failure requires runtime retry authority"
                     )
                 prior = self._load_terminal_evidence(
                     request=request,
@@ -1375,8 +1405,19 @@ class CodexCliFactoryBuildExecutor:
                     prepared=prepared,
                     checkpoint=checkpoint,
                 )
+                interruption_is_resumable = (
+                    checkpoint.phase == "implementation_interrupted"
+                    and prior.payload["status"] in {"timed_out", "cancelled"}
+                )
+                evidence_failure_is_resumable = (
+                    checkpoint.phase == "implementation_failed"
+                    and checkpoint.implementation_failure_reason == "evidence_failure"
+                    and prior.payload["status"] == "evidence_failed"
+                    and prior.payload.get("failure_kind")
+                    == "record_size_limit_exceeded"
+                )
                 if (
-                    prior.payload["status"] not in {"timed_out", "cancelled"}
+                    not (interruption_is_resumable or evidence_failure_is_resumable)
                     or prior.payload["process_cleanup_status"] == "unresolved"
                 ):
                     raise FactoryDispatchError(
@@ -2373,7 +2414,7 @@ class CodexCliFactoryBuildExecutor:
             payload=receipt,
             receipt_sha256=digest,
             journal_sha256=journal_sha256,
-            codex_thread_id=None,
+            codex_thread_id=_canonical_codex_thread_id(events),
             completed_at=completed_at,
         )
 
@@ -3227,6 +3268,10 @@ def _codex_prompt(
         "generated-candidate` for python.compileall and `python -m pytest -q "
         "--no-cov generated-candidate/tests` for pytest.not-live. Do not run the "
         "repository-wide test suite. pytest.live.demo is deferred to Captain's "
+        "Keep every shell command's combined output well below 256 KiB. Never dump "
+        "whole directories or documents, and never use broad recursive `rg -A` or "
+        "`rg -B` searches across multiple trees. Inspect with targeted `rg -n` queries "
+        "and small bounded slices such as `Select-Object -First`. "
         "sealed holdout gate; record it as deferred, never as passed. Finish only "
         "after creating: "
         "factory-candidate.json (the complete candidate manifest), candidate.zip "

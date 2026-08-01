@@ -30,7 +30,7 @@ from agenten.agent_runtime.contracts import ArtifactRef
 
 
 class CaptainRuntimeRetryAuthorizationIssuer:
-    """Mint one bounded retry only from verified interrupted local evidence."""
+    """Mint one bounded retry only from verified resumable local evidence."""
 
     def __init__(self, *, authority_root: Path, codex_state_root: Path) -> None:
         self._authority_root = _private_root(authority_root)
@@ -65,7 +65,7 @@ class CaptainRuntimeRetryAuthorizationIssuer:
             label="terminal receipt",
         )
         checkpoint = _read_checkpoint(checkpoint_file)
-        _require_interruption_binding(
+        _require_resumable_binding(
             checkpoint=checkpoint,
             binding=binding,
             checkpoint_ref=checkpoint_ref,
@@ -190,10 +190,17 @@ class FilesystemFactoryRuntimeRetryAuthority:
                     authorization.resume_ordinal == checkpoint.resume_ordinal + 1
                     and authorization.issued_at <= now < authorization.expires_at
                 )
+            elif (
+                checkpoint.phase == "implementation_failed"
+                and checkpoint.implementation_failure_reason == "evidence_failure"
+            ):
+                eligible = (
+                    authorization.resume_ordinal == checkpoint.resume_ordinal + 1
+                    and authorization.issued_at <= now < authorization.expires_at
+                )
             elif checkpoint.phase in {
                 "implementation_running",
                 "implementation_complete",
-                "implementation_failed",
                 "sealed",
             }:
                 eligible = authorization.resume_ordinal == checkpoint.resume_ordinal
@@ -210,7 +217,7 @@ class FilesystemFactoryRuntimeRetryAuthority:
         return selected[0]
 
 
-def _require_interruption_binding(
+def _require_resumable_binding(
     *,
     checkpoint: FactoryCodexBuildCheckpointV1,
     binding: FactoryCodexBuildInterruptionBindings,
@@ -223,7 +230,11 @@ def _require_interruption_binding(
         canonical_factory_codex_model(checkpoint)
     ).hexdigest()
     if (
-        checkpoint.phase != "implementation_interrupted"
+        checkpoint.phase not in {"implementation_interrupted", "implementation_failed"}
+        or (
+            checkpoint.phase == "implementation_failed"
+            and checkpoint.implementation_failure_reason != "evidence_failure"
+        )
         or checkpoint.job_id != binding.job_id
         or checkpoint.correlation_id != binding.correlation_id
         or checkpoint.attempt != binding.attempt
@@ -253,13 +264,21 @@ def _require_interruption_binding(
         terminal = json.loads(terminal_bytes)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("runtime retry terminal receipt is invalid") from exc
+    interrupted_terminal = (
+        terminal.get("schema") == "captain.codex-session-receipt.v1"
+        and terminal.get("status") in {"timed_out", "cancelled"}
+        and terminal.get("exit_code") in {124, 130}
+    )
+    evidence_failure_terminal = (
+        terminal.get("schema") == "captain.codex-session-error-receipt.v1"
+        and terminal.get("status") == "evidence_failed"
+        and terminal.get("failure_kind") == "record_size_limit_exceeded"
+    )
     if (
         checkpoint.terminal_receipt_sha256 != terminal_sha
         or terminal_receipt_ref != expected_terminal
         or not isinstance(terminal, dict)
-        or terminal.get("schema") != "captain.codex-session-receipt.v1"
-        or terminal.get("status") not in {"timed_out", "cancelled"}
-        or terminal.get("exit_code") not in {124, 130}
+        or not (interrupted_terminal or evidence_failure_terminal)
         or terminal.get("resume_ordinal") != checkpoint.resume_ordinal
         or terminal.get("process_cleanup_status") == "unresolved"
         or terminal.get("workspace_ref") != checkpoint.workspace_ref

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -15,6 +16,12 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from agenten.agent_factory.codex_build_execution import (
     FactoryCodexBuildInterruptionBindings,
 )
+from agenten.agent_factory.codex_build_recovery import (
+    FactoryCodexBuildCheckpointV1,
+    canonical_factory_codex_model,
+)
+from agenten.agent_factory.hermes_cli import load_factory_skill_replay_record
+from agenten.agent_factory.skill_workflow_contracts import FactorySkillStep
 from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.factory_runtime_retry_authority import (
     CaptainRuntimeRetryAuthorizationIssuer,
@@ -25,12 +32,14 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Issue one Captain-owned Codex retry from a canonical interruption "
-            "checkpoint read from stdin."
+            "checkpoint read from stdin or an exact durable record-size failure."
         )
     )
     parser.add_argument("--workspace-root", type=Path, required=True)
     parser.add_argument("--maximum-runtime-seconds", type=int, default=600)
     parser.add_argument("--authorization-window-seconds", type=int, default=1200)
+    parser.add_argument("--evidence-failure-job-id", type=UUID)
+    parser.add_argument("--attempt", type=int)
     return parser
 
 
@@ -151,6 +160,95 @@ def _revision(value: object) -> str:
     return text
 
 
+def _load_evidence_failure(
+    workspace: Path,
+    *,
+    job_id: UUID,
+    attempt: int,
+) -> tuple[
+    FactoryCodexBuildInterruptionBindings,
+    ArtifactRef,
+    ArtifactRef,
+    int,
+]:
+    if isinstance(attempt, bool) or attempt < 1 or attempt > 5:
+        raise ValueError("evidence failure attempt is invalid")
+    state_root = (
+        workspace
+        / ".captain-cook"
+        / "private"
+        / "business-benchmarks"
+        / "runtime-state"
+    ).resolve()
+    replay_root = state_root / "hermes-evidence" / "skill-replays"
+    matches = []
+    for path in replay_root.glob("*.json"):
+        replay = load_factory_skill_replay_record(path)
+        if (
+            replay.invocation.job_id == job_id
+            and replay.invocation.attempt == attempt
+            and replay.invocation.step is FactorySkillStep.SEAL_CODEX_BUILD
+            and replay.state == "failed"
+            and replay.failure_kind == "FactoryCodexEvidenceFailure"
+        ):
+            matches.append(replay)
+    if len(matches) != 1:
+        raise ValueError("exactly one durable Codex evidence failure is required")
+    replay = matches[0]
+    invocation = replay.invocation
+    checkpoint_path = (
+        state_root
+        / "codex"
+        / "checkpoints"
+        / f"{invocation.invocation_id.hex}.json"
+    )
+    try:
+        checkpoint_bytes = checkpoint_path.read_bytes()
+        checkpoint = FactoryCodexBuildCheckpointV1.model_validate_json(
+            checkpoint_bytes
+        )
+    except (OSError, ValueError) as exc:
+        raise ValueError("Codex evidence failure checkpoint is unavailable") from exc
+    checkpoint_sha = hashlib.sha256(
+        canonical_factory_codex_model(checkpoint)
+    ).hexdigest()
+    terminal_sha = checkpoint.terminal_receipt_sha256
+    if (
+        checkpoint.phase != "implementation_failed"
+        or checkpoint.implementation_failure_reason != "evidence_failure"
+        or checkpoint.resume_ordinal != replay.resume_ordinal
+        or terminal_sha is None
+    ):
+        raise ValueError("Codex evidence failure checkpoint is not resumable")
+    binding = FactoryCodexBuildInterruptionBindings(
+        job_id=invocation.job_id,
+        correlation_id=invocation.correlation_id,
+        subject_version=invocation.subject_version,
+        attempt=invocation.attempt,
+        invocation_id=invocation.invocation_id,
+        idempotency_key=invocation.idempotency_key,
+        lease_id=invocation.lease.lease_id,
+        workspace_ref=checkpoint.workspace_ref,
+        base_revision=checkpoint.base_revision,
+        scaffold_manifest_sha256=checkpoint.scaffold_manifest_sha256,
+        brief_sha256=checkpoint.brief_sha256,
+    )
+    return (
+        binding,
+        ArtifactRef(
+            uri=f"artifact://factory/codex-checkpoint/{checkpoint_sha}",
+            sha256=checkpoint_sha,
+            media_type="application/json",
+        ),
+        ArtifactRef(
+            uri=f"artifact://factory/codex-terminal-receipt/{terminal_sha}",
+            sha256=terminal_sha,
+            media_type="application/json",
+        ),
+        checkpoint.resume_ordinal + 1,
+    )
+
+
 def main() -> int:
     args = _parser().parse_args()
     if (
@@ -160,10 +258,24 @@ def main() -> int:
         or args.authorization_window_seconds > 3600
     ):
         raise SystemExit("retry runtime or authorization window is invalid")
-    binding, checkpoint_ref, terminal_ref, resume_ordinal = _load_interruption(
-        sys.stdin.read()
-    )
     workspace = args.workspace_root.resolve(strict=True)
+    evidence_mode = args.evidence_failure_job_id is not None or args.attempt is not None
+    if evidence_mode:
+        if args.evidence_failure_job_id is None or args.attempt is None:
+            raise SystemExit(
+                "--evidence-failure-job-id and --attempt must be provided together"
+            )
+        binding, checkpoint_ref, terminal_ref, resume_ordinal = (
+            _load_evidence_failure(
+                workspace,
+                job_id=args.evidence_failure_job_id,
+                attempt=args.attempt,
+            )
+        )
+    else:
+        binding, checkpoint_ref, terminal_ref, resume_ordinal = _load_interruption(
+            sys.stdin.read()
+        )
     authority_root = (
         workspace
         / ".captain-cook"

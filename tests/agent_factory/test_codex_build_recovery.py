@@ -256,6 +256,64 @@ def test_resume_checkpoint_binds_exact_prior_receipt_journal_and_thread_lineage(
     )
 
 
+def test_evidence_failure_retry_advances_with_new_authority_and_lineage(
+    tmp_path: Path,
+) -> None:
+    store = FilesystemFactoryCodexBuildCheckpointStore(tmp_path / "checkpoints")
+    scaffold, invocation = _bound_checkpoint(tmp_path)
+    running = _next(scaffold, phase="implementation_running", seconds=1)
+    failed = _next(
+        running,
+        phase="implementation_failed",
+        seconds=1,
+        terminal_receipt_sha256="b" * 64,
+    )
+    failed = failed.model_copy(
+        update={"implementation_failure_reason": "evidence_failure"}
+    )
+    resumed = _next(
+        failed,
+        phase="implementation_running",
+        seconds=1,
+        resume_ordinal=1,
+        parent_terminal_receipt_sha256="b" * 64,
+        parent_journal_sha256="d" * 64,
+        parent_codex_thread_id="019f0000-0000-7000-8000-000000000002",
+    )
+
+    assert store.advance(None, scaffold) == scaffold
+    assert store.advance(scaffold, running) == running
+    assert store.advance(running, failed) == failed
+    assert store.advance(failed, resumed) == resumed
+    assert store.load(invocation) == resumed
+
+
+def test_non_evidence_failure_remains_terminal(tmp_path: Path) -> None:
+    store = FilesystemFactoryCodexBuildCheckpointStore(tmp_path / "checkpoints")
+    scaffold, _ = _bound_checkpoint(tmp_path)
+    running = _next(scaffold, phase="implementation_running", seconds=1)
+    failed = _next(
+        running,
+        phase="implementation_failed",
+        seconds=1,
+        terminal_receipt_sha256="b" * 64,
+    )
+    resumed = _next(
+        failed,
+        phase="implementation_running",
+        seconds=1,
+        resume_ordinal=1,
+        parent_terminal_receipt_sha256="b" * 64,
+        parent_journal_sha256="d" * 64,
+    )
+
+    store.advance(None, scaffold)
+    store.advance(scaffold, running)
+    store.advance(running, failed)
+    with pytest.raises(FactoryDispatchError, match="evidence failure"):
+        store.advance(failed, resumed)
+
+
 def test_resume_checkpoint_rejects_missing_or_changed_parent_lineage(
     tmp_path: Path,
 ) -> None:

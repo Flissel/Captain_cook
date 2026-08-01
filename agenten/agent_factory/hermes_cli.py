@@ -2445,14 +2445,28 @@ def _retried_failed_replay_record(
             authorization.model_dump(mode="json", by_alias=True)
         ).encode("utf-8")
     ).hexdigest()
+    evidence_retry = failed.failure_kind == "FactoryCodexEvidenceFailure"
     if (
         failed.state != "failed"
-        or failed.failure_kind
-        not in {"CodexPolicyViolation", "CodexBuildProvenanceError"}
-        or failed.resume_ordinal != authorization.resume_ordinal
-        or failed.runtime_retry_authorization_ref != authorization.authorization_ref
-        or failed.runtime_retry_authorization_binding_sha256
-        != expected_authorization_digest
+        or failed.failure_kind not in {
+            "CodexPolicyViolation",
+            "CodexBuildProvenanceError",
+            "FactoryCodexEvidenceFailure",
+        }
+        or (
+            evidence_retry
+            and authorization.resume_ordinal != failed.resume_ordinal + 1
+        )
+        or (
+            not evidence_retry
+            and (
+                failed.resume_ordinal != authorization.resume_ordinal
+                or failed.runtime_retry_authorization_ref
+                != authorization.authorization_ref
+                or failed.runtime_retry_authorization_binding_sha256
+                != expected_authorization_digest
+            )
+        )
         or authorization.job_id != invocation.job_id
         or authorization.correlation_id != invocation.correlation_id
         or authorization.subject_version != invocation.subject_version
@@ -2573,9 +2587,10 @@ def _hermes_retry_exceeds_authority(
 
 
 def _is_codex_retryable_failure(replay: FactorySkillReplayRecord) -> bool:
+    if replay.failure_kind == "FactoryCodexEvidenceFailure":
+        return replay.resume_ordinal < 2
     return (
-        replay.failure_kind
-        in {"CodexPolicyViolation", "CodexBuildProvenanceError"}
+        replay.failure_kind in {"CodexPolicyViolation", "CodexBuildProvenanceError"}
         and replay.runtime_retry_authorization_ref is not None
     )
 

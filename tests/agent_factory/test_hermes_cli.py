@@ -1846,6 +1846,75 @@ async def test_runtime_retry_replay_requires_atomic_authorized_resume(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("durable", [False, True])
+async def test_evidence_failure_replay_requires_new_runtime_retry_authority(
+    tmp_path: Path,
+    durable: bool,
+) -> None:
+    replay_store = (
+        FilesystemFactorySkillReplayStore(tmp_path / "runtime-replays")
+        if durable
+        else InMemoryFactorySkillReplayStore()
+    )
+    invocation = FactorySkillInvocationV1.model_validate(seal_invocation_payload())
+    claimed = await replay_store.claim(invocation)
+    failed = await replay_store.fail(
+        claimed.record,
+        failure_kind="FactoryCodexEvidenceFailure",
+    )
+    with pytest.raises(FactorySkillReplayRetryableFailureError) as retryable:
+        await replay_store.claim(invocation)
+    authorization = FactoryRuntimeRetryAuthorizationV1(
+        schema_name="captain.factory-runtime-retry-authorization.v1",
+        authorization_ref=ArtifactRef(
+            uri=f"artifact://factory/runtime-retry/{'a' * 64}",
+            sha256="a" * 64,
+            media_type="application/json",
+        ),
+        producer="captain",
+        status="succeeded",
+        job_id=invocation.job_id,
+        correlation_id=invocation.correlation_id,
+        subject_version=invocation.subject_version,
+        attempt=invocation.attempt,
+        invocation_id=invocation.invocation_id,
+        idempotency_key=invocation.idempotency_key,
+        lease_id=invocation.lease.lease_id,
+        checkpoint_ref=ArtifactRef(
+            uri=f"artifact://factory/codex-checkpoint/{'c' * 64}",
+            sha256="c" * 64,
+            media_type="application/json",
+        ),
+        terminal_receipt_ref=ArtifactRef(
+            uri=f"artifact://factory/codex-terminal-receipt/{'d' * 64}",
+            sha256="d" * 64,
+            media_type="application/json",
+        ),
+        workspace_ref=invocation.lease.workspace_ref,
+        base_revision="e" * 40,
+        scaffold_manifest_sha256="f" * 64,
+        brief_sha256="1" * 64,
+        resume_ordinal=1,
+        maximum_runtime_seconds=60,
+        issued_at=invocation.lease.issued_at,
+        expires_at=invocation.lease.issued_at + timedelta(minutes=1),
+    )
+
+    retried = await replay_store.retry_failed(
+        retryable.value.record,
+        authorization=authorization,
+    )
+
+    assert retried.record.state == "pending"
+    assert retried.record.resume_ordinal == 1
+    assert retried.record.runtime_retry_authorization_ref == (
+        authorization.authorization_ref
+    )
+    with pytest.raises(FactoryDispatchError, match="failure changed"):
+        await replay_store.retry_failed(failed, authorization=authorization)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("durable", [False, True])
 @pytest.mark.parametrize(
     "step",
     ["improve_team", "brief_codex"],

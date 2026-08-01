@@ -969,6 +969,8 @@ async def test_cli_executor_authorizes_before_materializing_and_records_redacted
     assert "python -m compileall -q generated-candidate" in prompt
     assert "python -m pytest -q --no-cov generated-candidate/tests" in prompt
     assert "Do not run the repository-wide test suite" in prompt
+    assert "combined output well below 256 KiB" in prompt
+    assert "never use broad recursive `rg -A` or `rg -B`" in prompt
     assert "pytest.live.demo is deferred to Captain" in prompt
     assert "on Windows do not use Compress-Archive" in prompt
     assert "MUST omit source_archive_ref" in prompt

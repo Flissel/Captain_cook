@@ -105,6 +105,63 @@ def _interrupted_fixture(tmp_path: Path):
     )
 
 
+def _evidence_failure_fixture(tmp_path: Path):
+    (
+        job,
+        state_root,
+        checkpoint_path,
+        terminal_path,
+        binding,
+        _,
+        _,
+    ) = _interrupted_fixture(tmp_path)
+    terminal_bytes = json.dumps(
+        {
+            "schema": "captain.codex-session-error-receipt.v1",
+            "status": "evidence_failed",
+            "failure_kind": "record_size_limit_exceeded",
+            "resume_ordinal": 0,
+            "process_cleanup_status": "verified_cancelled",
+            "workspace_ref": binding.workspace_ref,
+            "base_revision": binding.base_revision,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    terminal_sha = hashlib.sha256(terminal_bytes).hexdigest()
+    checkpoint = FactoryCodexBuildCheckpointV1.model_validate_json(
+        checkpoint_path.read_bytes()
+    ).model_copy(
+        update={
+            "phase": "implementation_failed",
+            "terminal_receipt_sha256": terminal_sha,
+            "implementation_failure_reason": "evidence_failure",
+        }
+    )
+    checkpoint_path.write_bytes(canonical_factory_codex_model(checkpoint))
+    terminal_path.write_bytes(terminal_bytes)
+    checkpoint_sha = hashlib.sha256(
+        canonical_factory_codex_model(checkpoint)
+    ).hexdigest()
+    return (
+        job,
+        state_root,
+        checkpoint_path,
+        terminal_path,
+        binding,
+        ArtifactRef(
+            uri=f"artifact://factory/codex-checkpoint/{checkpoint_sha}",
+            sha256=checkpoint_sha,
+            media_type="application/json",
+        ),
+        ArtifactRef(
+            uri=f"artifact://factory/codex-terminal-receipt/{terminal_sha}",
+            sha256=terminal_sha,
+            media_type="application/json",
+        ),
+    )
+
+
 def test_captain_issues_and_loads_exact_interrupted_runtime_retry(
     tmp_path: Path,
 ) -> None:
@@ -146,6 +203,96 @@ def test_captain_issues_and_loads_exact_interrupted_runtime_retry(
         NOW + timedelta(seconds=1),
     ) == issued
     assert issued.authorization_ref.uri.endswith(issued.authorization_ref.sha256)
+
+
+def test_captain_issues_exact_record_limit_evidence_retry(tmp_path: Path) -> None:
+    (
+        job,
+        state_root,
+        checkpoint_path,
+        terminal_path,
+        binding,
+        checkpoint_ref,
+        terminal_ref,
+    ) = _evidence_failure_fixture(tmp_path)
+    authority_root = tmp_path / ".captain-cook" / "runtime-retries"
+    issuer = CaptainRuntimeRetryAuthorizationIssuer(
+        authority_root=authority_root,
+        codex_state_root=state_root,
+    )
+
+    issued = issuer.issue(
+        checkpoint_path=checkpoint_path,
+        terminal_receipt_path=terminal_path,
+        binding=binding,
+        checkpoint_ref=checkpoint_ref,
+        terminal_receipt_ref=terminal_ref,
+        resume_ordinal=1,
+        maximum_runtime_seconds=600,
+        issued_at=NOW,
+        expires_at=NOW + timedelta(minutes=20),
+    )
+    authority = FilesystemFactoryRuntimeRetryAuthority(
+        authority_root=authority_root,
+        checkpoint_root=state_root / "checkpoints",
+    )
+
+    assert authority.active(
+        job,
+        FactoryAction(kind=FactoryActionKind.DISPATCH_TOOL_INTEGRATOR, attempt=1),
+        SimpleNamespace(job=job),
+        NOW + timedelta(seconds=1),
+    ) == issued
+
+
+def test_captain_rejects_other_evidence_failure_kind(tmp_path: Path) -> None:
+    (
+        _,
+        state_root,
+        checkpoint_path,
+        terminal_path,
+        binding,
+        checkpoint_ref,
+        _,
+    ) = _evidence_failure_fixture(tmp_path)
+    payload = json.loads(terminal_path.read_bytes())
+    payload["failure_kind"] = "invalid_json_object"
+    changed = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    terminal_path.write_bytes(changed)
+    checkpoint = FactoryCodexBuildCheckpointV1.model_validate_json(
+        checkpoint_path.read_bytes()
+    ).model_copy(
+        update={"terminal_receipt_sha256": hashlib.sha256(changed).hexdigest()}
+    )
+    checkpoint_path.write_bytes(canonical_factory_codex_model(checkpoint))
+    checkpoint_sha = hashlib.sha256(
+        canonical_factory_codex_model(checkpoint)
+    ).hexdigest()
+    issuer = CaptainRuntimeRetryAuthorizationIssuer(
+        authority_root=tmp_path / ".captain-cook" / "runtime-retries",
+        codex_state_root=state_root,
+    )
+
+    with pytest.raises(ValueError, match="terminal receipt"):
+        issuer.issue(
+            checkpoint_path=checkpoint_path,
+            terminal_receipt_path=terminal_path,
+            binding=binding,
+            checkpoint_ref=ArtifactRef(
+                uri=f"artifact://factory/codex-checkpoint/{checkpoint_sha}",
+                sha256=checkpoint_sha,
+                media_type="application/json",
+            ),
+            terminal_receipt_ref=ArtifactRef(
+                uri=("artifact://factory/codex-terminal-receipt/" + hashlib.sha256(changed).hexdigest()),
+                sha256=hashlib.sha256(changed).hexdigest(),
+                media_type="application/json",
+            ),
+            resume_ordinal=1,
+            maximum_runtime_seconds=600,
+            issued_at=NOW,
+            expires_at=NOW + timedelta(minutes=20),
+        )
 
 
 def test_retry_issuer_rejects_changed_terminal_or_checkpoint_binding(

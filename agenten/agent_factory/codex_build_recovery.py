@@ -52,6 +52,7 @@ _TRANSITIONS: frozenset[tuple[FactoryCodexBuildPhase, FactoryCodexBuildPhase]] =
             ("implementation_running", "implementation_complete"),
             ("implementation_running", "implementation_failed"),
             ("implementation_interrupted", "implementation_running"),
+            ("implementation_failed", "implementation_running"),
             ("implementation_complete", "sealed"),
         }
     )
@@ -955,9 +956,11 @@ def _require_transition(
         raise FactoryDispatchError("Factory Codex checkpoint phase transition is invalid")
     if next_checkpoint.updated_at <= previous.updated_at:
         raise FactoryDispatchError("Factory Codex checkpoint timestamp is not monotonic")
-    expected_ordinal = previous.resume_ordinal + (
-        1 if transition == ("implementation_interrupted", "implementation_running") else 0
-    )
+    resume_transition = transition in {
+        ("implementation_interrupted", "implementation_running"),
+        ("implementation_failed", "implementation_running"),
+    }
+    expected_ordinal = previous.resume_ordinal + (1 if resume_transition else 0)
     if next_checkpoint.resume_ordinal != expected_ordinal:
         raise FactoryDispatchError("Factory Codex checkpoint resume ordinal is invalid")
     previous_retry = (
@@ -970,9 +973,7 @@ def _require_transition(
         next_checkpoint.runtime_retry_authorization_sha256,
         next_checkpoint.runtime_retry_authorization_binding_sha256,
     )
-    if transition != ("implementation_interrupted", "implementation_running") and (
-        previous_retry != next_retry
-    ):
+    if not resume_transition and previous_retry != next_retry:
         raise FactoryDispatchError(
             "Factory Codex checkpoint retry authority binding changed"
         )
@@ -986,7 +987,7 @@ def _require_transition(
         next_checkpoint.parent_journal_sha256,
         next_checkpoint.parent_codex_thread_id,
     )
-    if transition == ("implementation_interrupted", "implementation_running"):
+    if resume_transition:
         if (
             previous.terminal_receipt_sha256 is None
             or next_checkpoint.parent_terminal_receipt_sha256
@@ -1023,6 +1024,14 @@ def _require_transition(
         ):
             raise FactoryDispatchError(
                 "Factory Codex implementation failure binding conflicts"
+            )
+    elif transition == ("implementation_failed", "implementation_running"):
+        if (
+            previous.implementation_failure_reason != "evidence_failure"
+            or next_checkpoint.implementation_failure_reason is not None
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex evidence failure retry binding conflicts"
             )
     elif (
         previous.implementation_failure_reason
