@@ -213,9 +213,9 @@ def test_total_cost_envelope_requires_subscription_codex_and_keeps_each_team_bel
         "CAPTAIN_CODEX_AUTH_MODE": "chatgpt_subscription",
         "CAPTAIN_FACTORY_USER_MAX_EUR_PER_TEAM": "1.00",
         "CAPTAIN_FACTORY_BUDGET_EUR_PER_USD": "1.25",
-        "CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM": "0.79",
+        "CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM": "0.80",
         "CAPTAIN_FACTORY_CODEX_METERED_USD_PER_TEAM": "0",
-        "CAPTAIN_FACTORY_HERMES_MAX_TOTAL_USD": "0.19",
+        "CAPTAIN_FACTORY_HERMES_MAX_TOTAL_USD": "0.20",
         "CAPTAIN_FACTORY_PRIOR_ATTEMPT_RESERVE_USD_PER_TEAM": "0.20",
     }
 

@@ -24,8 +24,8 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "[ValidateSet('Plan', 'Authorize', 'Build', 'Run')]" in source
     assert "--maximum-usd-per-team', $maximumUsdPerTeam" in source
     assert "$maximumUsdPerTeam = '0.40'" in source
-    assert "$maximumHermesUsd = '0.19'" in source
-    assert "$maximumTotalUsdPerTeam = '0.79'" in source
+    assert "$maximumHermesUsd = '0.20'" in source
+    assert "$maximumTotalUsdPerTeam = '0.80'" in source
     assert "$priorAttemptReserveUsdPerTeam = '0.20'" in source
     assert "$userMaximumEurPerTeam = '1.00'" in source
     assert "$budgetEurPerUsd = '1.25'" in source
@@ -982,7 +982,7 @@ print(json.dumps({
     factory_arguments = json.loads(
         (repository / "factory-args.json").read_text("utf-8")
     )
-    assert factory_arguments[factory_arguments.index("--hermes-max-usd") + 1] == "0.19"
+    assert factory_arguments[factory_arguments.index("--hermes-max-usd") + 1] == "0.20"
     assert factory_arguments[
         factory_arguments.index("--hermes-python-executable") + 1
     ] == sys.executable
