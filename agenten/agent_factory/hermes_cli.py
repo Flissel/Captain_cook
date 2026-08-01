@@ -2635,12 +2635,38 @@ def _same_or_valid_successor_lease(left: FactoryLease, right: FactoryLease) -> b
         return False
     expected_left_suffix = left.issued_at.strftime("%Y%m%dT%H%M%S%fZ")
     expected_right_suffix = right.issued_at.strftime("%Y%m%dT%H%M%S%fZ")
+    same_workspace_lineage = (
+        left_prefix == right_prefix
+        and left_suffix == expected_left_suffix
+        and right_suffix == expected_right_suffix
+    )
+    expected_profile = {
+        IntegrationIntent.NONE: "claims",
+        IntegrationIntent.N8N: "renewal",
+    }.get(left.integration_intent)
+    bootstrap_to_runtime = (
+        left.role is FactoryRole.AGENT_ARCHITECT
+        and expected_profile is not None
+        and re.fullmatch(
+            (
+                r"workspace://business-benchmark-demo/"
+                + expected_profile
+                + r"/epoch-[0-9a-f]{16}"
+            ),
+            left_workspace,
+        )
+        is not None
+        and right_workspace
+        == (
+            "workspace://business-benchmark-factory-v3/"
+            f"{left.job_id}/dispatch_agent_architect/{left.attempt}/"
+            f"{expected_right_suffix}"
+        )
+    )
     return (
         left_payload == right_payload
         and right_issued >= left_expires
-        and left_prefix == right_prefix
-        and left_suffix == expected_left_suffix
-        and right_suffix == expected_right_suffix
+        and (same_workspace_lineage or bootstrap_to_runtime)
     )
 
 

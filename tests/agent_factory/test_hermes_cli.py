@@ -37,6 +37,7 @@ from agenten.agent_factory.hermes_cli import (
     _hermes_retry_exceeds_authority,
     _parse_codex_brief_attestation,
     _parse_discovery_attestation,
+    _same_or_valid_successor_lease,
     factory_skill_replay_failure_ref,
     _captain_discovery_seed,
     _require_improvement_artifact_binding,
@@ -387,6 +388,44 @@ def test_discovery_attestation_rejects_wrong_digest_with_extra_suffix() -> None:
             invocation=invocation,
             discovery_seed=discovery_seed,
         )
+
+
+def test_demo_bootstrap_lease_accepts_exact_gateway_runtime_successor() -> None:
+    payload = invocation_payload("discover")
+    lease_payload = payload["lease"]
+    assert isinstance(lease_payload, dict)
+    lease_payload["workspace_ref"] = (
+        "workspace://business-benchmark-demo/claims/epoch-"
+        + "a" * 16
+    )
+    invocation = FactorySkillInvocationV1.model_validate(payload)
+    bootstrap = invocation.lease
+    successor = bootstrap.model_copy(
+        update={
+            "lease_id": "factory-runtime-successor",
+            "issued_at": bootstrap.expires_at,
+            "expires_at": bootstrap.expires_at + timedelta(minutes=15),
+            "workspace_ref": (
+                "workspace://business-benchmark-factory-v3/"
+                f"{bootstrap.job_id}/dispatch_agent_architect/"
+                f"{bootstrap.attempt}/"
+                + bootstrap.expires_at.strftime("%Y%m%dT%H%M%S%fZ")
+            ),
+        }
+    )
+
+    assert _same_or_valid_successor_lease(bootstrap, successor)
+    assert not _same_or_valid_successor_lease(
+        bootstrap,
+        successor.model_copy(
+            update={
+                "workspace_ref": successor.workspace_ref.replace(
+                    str(bootstrap.job_id),
+                    "00000000-0000-0000-0000-000000000000",
+                )
+            }
+        ),
+    )
 
 
 def test_codex_brief_attestation_accepts_one_redundant_invocation_typo() -> None:
