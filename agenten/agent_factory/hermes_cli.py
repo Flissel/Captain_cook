@@ -3284,17 +3284,11 @@ def _seed_attestation_payload(
     if (
         normalized.get("seed_sha256") == expected_seed_sha256
         and isinstance(observed_invocation, str)
-        and len(observed_invocation) == len(expected_invocation)
-        and re.fullmatch(r"[0-9a-f-]{36}", observed_invocation) is not None
-        and sum(
-            observed != expected
-            for observed, expected in zip(
-                observed_invocation,
-                expected_invocation,
-                strict=True,
-            )
+        and re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            observed_invocation,
         )
-        == 1
+        is not None
     ):
         normalized["invocation_id"] = expected_invocation
     return normalized

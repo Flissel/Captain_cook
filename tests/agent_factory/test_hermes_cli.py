@@ -414,7 +414,7 @@ def test_codex_brief_attestation_accepts_one_redundant_invocation_typo() -> None
     assert observed.invocation_id == invocation.invocation_id
 
 
-def test_codex_brief_attestation_rejects_two_invocation_typos() -> None:
+def test_codex_brief_attestation_normalizes_redundant_valid_invocation_id() -> None:
     brief = CodexBuildBriefV1.model_validate(brief_payload())
     invocation = brief.invocation
     expected_invocation_id = str(invocation.invocation_id)
@@ -428,15 +428,13 @@ def test_codex_brief_attestation_rejects_two_invocation_typos() -> None:
         }
     ).encode("utf-8")
 
-    with pytest.raises(
-        FactoryDispatchError,
-        match="does not match Captain's seed",
-    ):
-        _parse_codex_brief_attestation(
-            stdout,
-            invocation=invocation,
-            codex_brief_seed=brief,
-        )
+    observed = _parse_codex_brief_attestation(
+        stdout,
+        invocation=invocation,
+        codex_brief_seed=brief,
+    )
+
+    assert observed.invocation_id == invocation.invocation_id
 
 
 @pytest.mark.asyncio
