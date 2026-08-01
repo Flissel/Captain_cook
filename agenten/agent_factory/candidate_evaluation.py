@@ -192,6 +192,11 @@ class FactoryAutoGenTeamManifestV1(_FrozenModel):
                 raise ValueError(f"unknown tool: {sorted(unknown_tools)[0]}")
         if self.conversation_pattern == "single_agent" and len(self.agents) != 1:
             raise ValueError("single_agent conversation requires exactly one agent")
+        if (
+            self.conversation_pattern != "swarm"
+            and any(agent.handoffs for agent in self.agents)
+        ):
+            raise ValueError("handoff topology requires swarm conversation pattern")
         if any(agent.handoffs for agent in self.agents) and self.max_handoffs == 0:
             raise ValueError("handoff topology requires a positive max_handoffs ceiling")
         return self

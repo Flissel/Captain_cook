@@ -1,6 +1,6 @@
 {
   "candidate_id": "customer_renewal_orchestration_team_v1",
-  "conversation_pattern": "selector_group_chat",
+  "conversation_pattern": "swarm",
   "max_messages": 12,
   "max_handoffs": 2,
   "max_tool_calls": 1,

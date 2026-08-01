@@ -109,6 +109,46 @@ def test_autogen_manifest_defaults_to_swarm_for_specialist_handoffs() -> None:
     assert manifest.conversation_pattern == "swarm"
 
 
+def test_autogen_manifest_rejects_non_swarm_pattern_for_handoff_topology() -> None:
+    with pytest.raises(ValueError, match="handoff topology requires swarm"):
+        FactoryAutoGenTeamManifestV1.model_validate(
+            {
+                "schema": "autogen-team.v1",
+                "name": "renewal_team",
+                "conversation_pattern": "selector_group_chat",
+                "agents": [
+                    {
+                        "name": "renewal",
+                        "tools": [],
+                        "system_prompt_ref": _ref(
+                            "artifact://factory/prompts/renewal",
+                            b"renewal",
+                            "text/plain",
+                        ),
+                        "handoffs": ["commercial"],
+                    },
+                    {
+                        "name": "commercial",
+                        "tools": [],
+                        "system_prompt_ref": _ref(
+                            "artifact://factory/prompts/commercial",
+                            b"commercial",
+                            "text/plain",
+                        ),
+                        "handoffs": [],
+                    },
+                ],
+                "memory_policy": "buffered",
+                "max_messages": 10,
+                "max_handoffs": 1,
+                "max_tool_calls": 0,
+                "termination_conditions": ["task_completed", "max_messages"],
+                "entrypoint_command": ["python", "run_team.py"],
+            },
+            context={"allowed_tools": set()},
+        )
+
+
 def test_evaluator_requires_explicit_autogen_transfer_tool_in_handoff_prompt(
     tmp_path: Path,
 ) -> None:

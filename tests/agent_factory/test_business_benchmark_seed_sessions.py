@@ -6,7 +6,13 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
-from autogen_core.models import ModelFamily, ModelInfo
+from autogen_core.models import (
+    CreateResult,
+    ModelFamily,
+    ModelInfo,
+    RequestUsage,
+)
+from autogen_core import FunctionCall
 from autogen_core.tools import FunctionTool
 from autogen_ext.models.replay import ReplayChatCompletionClient
 
@@ -46,14 +52,48 @@ TERMINAL = (
 @pytest.mark.parametrize(
     ("profile_id", "responses"),
     [
-        (CLAIMS_SEED_PROFILE, (TERMINAL,)),
-        (RENEWAL_SEED_PROFILE, ("renewal_analyst", TERMINAL)),
+        (
+            CLAIMS_SEED_PROFILE,
+            (
+                CreateResult(
+                    finish_reason="function_calls",
+                    content=[
+                        FunctionCall(
+                            id="claims-handoff-1",
+                            name="transfer_to_coverage_specialist",
+                            arguments="{}",
+                        )
+                    ],
+                    usage=RequestUsage(prompt_tokens=1, completion_tokens=1),
+                    cached=False,
+                ),
+                TERMINAL,
+            ),
+        ),
+        (
+            RENEWAL_SEED_PROFILE,
+            (
+                CreateResult(
+                    finish_reason="function_calls",
+                    content=[
+                        FunctionCall(
+                            id="renewal-handoff-1",
+                            name="transfer_to_commercial_advisor",
+                            arguments="{}",
+                        )
+                    ],
+                    usage=RequestUsage(prompt_tokens=1, completion_tokens=1),
+                    cached=False,
+                ),
+                TERMINAL,
+            ),
+        ),
     ],
 )
 async def test_seed_candidate_runs_through_real_host_autogen_session(
     tmp_path: Path,
     profile_id: str,
-    responses: tuple[str, ...],
+    responses: tuple[CreateResult | str, ...],
 ) -> None:
     case_body = b"Synthetic redacted business case with complete input."
     job = _job_v3(holdout_body=case_body)
@@ -176,6 +216,8 @@ async def test_seed_candidate_runs_through_real_host_autogen_session(
     assert result.provider_started is True
     assert result.provider_usage_unresolved is False
     assert result.message_count >= 2
+    assert result.handoff_count == 1
+    assert result.tool_call_count == 0
     assert result.termination_reason == "task_completed"
     assert TERMINAL in tuple(
         message.content

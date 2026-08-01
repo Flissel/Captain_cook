@@ -16,8 +16,8 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 from autogen_agentchat.agents import AssistantAgent
-from autogen_agentchat.base import TaskResult, TerminationCondition
-from autogen_agentchat.conditions import MaxMessageTermination, TextMentionTermination
+from autogen_agentchat.base import TaskResult, TerminatedException, TerminationCondition
+from autogen_agentchat.conditions import MaxMessageTermination
 from autogen_agentchat.messages import (
     BaseAgentEvent,
     BaseChatMessage,
@@ -862,9 +862,16 @@ class FactoryTeamRunResult(BaseModel):
 
 
 class _FactoryActivityCeilingTermination(TerminationCondition):
-    def __init__(self, *, max_handoffs: int, max_tool_calls: int) -> None:
+    def __init__(
+        self,
+        *,
+        max_handoffs: int,
+        max_tool_calls: int,
+        handoff_tool_names: Sequence[str] = (),
+    ) -> None:
         self._max_handoffs = max_handoffs
         self._max_tool_calls = max_tool_calls
+        self._handoff_tool_names = frozenset(handoff_tool_names)
         self._handoffs = 0
         self._tool_calls = 0
         self._terminated = False
@@ -879,14 +886,17 @@ class _FactoryActivityCeilingTermination(TerminationCondition):
     ) -> StopMessage | None:
         self._handoffs += sum(isinstance(item, HandoffMessage) for item in messages)
         self._tool_calls += sum(
-            len(item.content)
+            sum(
+                execution.name not in self._handoff_tool_names
+                for execution in item.content
+            )
             for item in messages
             if isinstance(item, ToolCallExecutionEvent)
         )
         reason = None
-        if self._handoffs >= self._max_handoffs and self._max_handoffs > 0:
+        if self._handoffs > self._max_handoffs and self._max_handoffs > 0:
             reason = "max_handoffs"
-        if self._tool_calls >= self._max_tool_calls and self._max_tool_calls > 0:
+        if self._tool_calls > self._max_tool_calls and self._max_tool_calls > 0:
             reason = "max_tool_calls"
         if reason is None:
             return None
@@ -896,6 +906,46 @@ class _FactoryActivityCeilingTermination(TerminationCondition):
     async def reset(self) -> None:
         self._handoffs = 0
         self._tool_calls = 0
+        self._terminated = False
+
+
+class _FactoryTaskCompletedTermination(TerminationCondition):
+    _TERMINAL_MARKERS = (
+        "TERMINATE",
+        "captain.business-benchmark-terminal.v1",
+    )
+
+    def __init__(self, *, require_handoff: bool) -> None:
+        self._require_handoff = require_handoff
+        self._handoff_targets: set[str] = set()
+        self._terminated = False
+
+    @property
+    def terminated(self) -> bool:
+        return self._terminated
+
+    async def __call__(
+        self,
+        messages: Sequence[BaseAgentEvent | BaseChatMessage],
+    ) -> StopMessage | None:
+        if self._terminated:
+            raise TerminatedException("Termination condition has already been reached")
+        self._handoff_targets.update(
+            item.target for item in messages if isinstance(item, HandoffMessage)
+        )
+        for message in messages:
+            if isinstance(message, HandoffMessage):
+                continue
+            if self._require_handoff and message.source not in self._handoff_targets:
+                continue
+            content = message.to_text()
+            if any(marker in content for marker in self._TERMINAL_MARKERS):
+                self._terminated = True
+                return StopMessage(source="factory_host", content="task_completed")
+        return None
+
+    async def reset(self) -> None:
+        self._handoff_targets.clear()
         self._terminated = False
 
 
@@ -1376,6 +1426,7 @@ class HostAutoGenSessionExecutor:
             max_handoffs=0,
             max_tool_calls=policy.max_tool_calls,
             termination_conditions=("task_completed", "max_messages", "max_tool_calls"),
+            handoff_tool_names=(),
             n8n_tools={
                 name: self._baseline_n8n_tools[name]
                 for name in policy.allowed_tools
@@ -1499,6 +1550,11 @@ class HostAutoGenSessionExecutor:
             )
             for agent in manifest.agents
         ]
+        handoff_tool_names = tuple(
+            f"transfer_to_{target}"
+            for agent in manifest.agents
+            for target in agent.handoffs
+        )
         termination: TerminationCondition = MaxMessageTermination(
             manifest.max_messages,
             include_agent_event=True,
@@ -1506,11 +1562,13 @@ class HostAutoGenSessionExecutor:
         termination = termination | _FactoryActivityCeilingTermination(
             max_handoffs=manifest.max_handoffs,
             max_tool_calls=manifest.max_tool_calls,
+            handoff_tool_names=handoff_tool_names,
         )
         if "task_completed" in manifest.termination_conditions:
             termination = (
-                TextMentionTermination("TERMINATE")
-                | TextMentionTermination("captain.business-benchmark-terminal.v1")
+                _FactoryTaskCompletedTermination(
+                    require_handoff=any(agent.handoffs for agent in manifest.agents)
+                )
                 | termination
             )
         team: Swarm | SelectorGroupChat | RoundRobinGroupChat | None = None
@@ -1591,6 +1649,7 @@ class HostAutoGenSessionExecutor:
             max_handoffs=manifest.max_handoffs,
             max_tool_calls=manifest.max_tool_calls,
             termination_conditions=manifest.termination_conditions,
+            handoff_tool_names=handoff_tool_names,
             n8n_tools=n8n_tools,
             n8n_evidence_offset=n8n_evidence_offset,
         )
@@ -1684,6 +1743,7 @@ class HostAutoGenSessionExecutor:
         max_handoffs: int,
         max_tool_calls: int,
         termination_conditions: tuple[str, ...],
+        handoff_tool_names: tuple[str, ...],
         n8n_tools: Mapping[str, OpaqueN8nToolReference],
         n8n_evidence_offset: int,
     ) -> HostAutoGenSessionResult:
@@ -1695,7 +1755,14 @@ class HostAutoGenSessionExecutor:
             for message in result.messages
             if isinstance(message, ToolCallExecutionEvent)
         )
-        tool_call_count = sum(len(event.content) for event in tool_events)
+        handoff_tool_name_set = frozenset(handoff_tool_names)
+        tool_event_executions = tuple(
+            (event, execution)
+            for event in tool_events
+            for execution in event.content
+            if execution.name not in handoff_tool_name_set
+        )
+        tool_call_count = len(tool_event_executions)
         if len(result.messages) > max_messages:
             raise ValueError("AutoGen team exceeded the message ceiling")
         if len(handoff_messages) > max_handoffs:
@@ -1747,8 +1814,7 @@ class HostAutoGenSessionExecutor:
                 status="failed" if execution.is_error else "succeeded",
                 evidence_ref=observation_ref,
             )
-            for event in tool_events
-            for execution in event.content
+            for event, execution in tool_event_executions
         )
         all_n8n_evidence = (
             self._n8n_adapter.observed_evidence()

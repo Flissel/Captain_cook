@@ -26,7 +26,7 @@ from agenten.agent_factory.candidate_evaluation import FactoryCandidateEvaluator
         (
             RENEWAL_SEED_PROFILE,
             "customer_renewal_orchestration_team_v1",
-            "selector_group_chat",
+            "swarm",
             ("renewal_analyst", "commercial_advisor", "human_review_coordinator"),
         ),
     ],
@@ -112,7 +112,7 @@ def test_renewal_seed_has_one_read_only_idempotent_n8n_workflow(
 ) -> None:
     resolved = package_business_benchmark_seed(RENEWAL_SEED_PROFILE, tmp_path)
     with FactoryCandidateEvaluator().verified_team_workspace(resolved) as (_, team):
-        assert team.conversation_pattern == "selector_group_chat"
+        assert team.conversation_pattern == "swarm"
 
     assert tuple(tool.name for tool in resolved.candidate.n8n_tools) == (
         "renewal_context_read",

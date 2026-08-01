@@ -62,6 +62,8 @@ from agenten.agent_factory.team_execution import (
     SealedSingleAgentPolicyV1,
     ResolvedFactoryHoldoutCase,
     TeamExecutionService,
+    _FactoryActivityCeilingTermination,
+    _FactoryTaskCompletedTermination,
     compose_live_team_execution,
 )
 from agenten.agent_runtime.contracts import (
@@ -82,6 +84,7 @@ from agenten.agent_runtime.capabilities import PROFILE_CAPABILITIES
 from agenten.llm.model_client import build_replay_model_client
 from autogen_core.models import (
     CreateResult,
+    FunctionExecutionResult,
     ModelFamily,
     ModelInfo,
     RequestUsage,
@@ -93,10 +96,87 @@ from autogen_ext.models.replay import ReplayChatCompletionClient
 from autogen_agentchat.teams import Swarm
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.base import TaskResult
-from autogen_agentchat.messages import TextMessage
+from autogen_agentchat.messages import HandoffMessage, TextMessage, ToolCallExecutionEvent
 
 
 NOW = datetime(2026, 7, 21, 13, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_activity_ceiling_allows_exact_configured_handoff_and_tool_call() -> None:
+    termination = _FactoryActivityCeilingTermination(
+        max_handoffs=1,
+        max_tool_calls=1,
+    )
+
+    assert await termination(
+        [
+            HandoffMessage(
+                source="intake",
+                target="specialist",
+                content="transfer",
+            )
+        ]
+    ) is None
+    assert await termination(
+        [
+            ToolCallExecutionEvent(
+                source="specialist",
+                content=[
+                    FunctionExecutionResult(
+                        content="ok",
+                        name="lookup",
+                        call_id="call-1",
+                    )
+                ],
+            )
+        ]
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_activity_ceiling_stops_only_after_handoff_limit_is_exceeded() -> None:
+    termination = _FactoryActivityCeilingTermination(
+        max_handoffs=1,
+        max_tool_calls=0,
+    )
+    handoff = HandoffMessage(
+        source="intake",
+        target="specialist",
+        content="transfer",
+    )
+
+    assert await termination([handoff]) is None
+    stop = await termination([handoff])
+
+    assert stop is not None
+    assert stop.content == "max_handoffs"
+
+
+@pytest.mark.asyncio
+async def test_task_completed_requires_observed_handoff_when_topology_has_handoffs() -> None:
+    termination = _FactoryTaskCompletedTermination(require_handoff=True)
+    terminal = TextMessage(
+        source="intake",
+        content='{"schema":"captain.business-benchmark-terminal.v1"}',
+    )
+
+    assert await termination([terminal]) is None
+    assert await termination(
+        [
+            HandoffMessage(
+                source="intake",
+                target="specialist",
+                content="transfer",
+            )
+        ]
+    ) is None
+    stop = await termination(
+        [TextMessage(source="specialist", content="TERMINATE")]
+    )
+
+    assert stop is not None
+    assert stop.content == "task_completed"
 
 
 def _policy_digest(job: AgentFactoryJobV3) -> str:
@@ -1986,7 +2066,21 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
         invocation=invocation,
         attempt=1,
         delegate=ReplayChatCompletionClient(
-            [benchmark_terminal],
+            [
+                CreateResult(
+                    finish_reason="function_calls",
+                    content=[
+                        FunctionCall(
+                            id="support-handoff-1",
+                            name="transfer_to_resolver",
+                            arguments="{}",
+                        )
+                    ],
+                    usage=RequestUsage(prompt_tokens=1, completion_tokens=1),
+                    cached=False,
+                ),
+                benchmark_terminal,
+            ],
             model_info=ModelInfo(
                 vision=False,
                 function_calling=True,
@@ -2130,7 +2224,21 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
         invocation=invocation,
         attempt=1,
         delegate=ReplayChatCompletionClient(
-            [benchmark_terminal],
+            [
+                CreateResult(
+                    finish_reason="function_calls",
+                    content=[
+                        FunctionCall(
+                            id="support-handoff-2",
+                            name="transfer_to_resolver",
+                            arguments="{}",
+                        )
+                    ],
+                    usage=RequestUsage(prompt_tokens=1, completion_tokens=1),
+                    cached=False,
+                ),
+                benchmark_terminal,
+            ],
             model_info=ModelInfo(
                 vision=False,
                 function_calling=True,
@@ -2224,7 +2332,8 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
     )
 
     assert result.status == "succeeded"
-    assert len(result.usage_receipts) == 1
+    assert len(result.usage_receipts) == 2
+    assert result.handoff_count == 1
     assert result.termination_reason == "task_completed"
     assert result.conversation_pattern == "swarm"
     assert captured_tokens[0] is not None
