@@ -131,13 +131,16 @@ def validate_factory_total_cost_envelope(
     ):
         raise ValueError("Factory Codex must use ChatGPT subscription authentication")
     if (
-        environment.get("CAPTAIN_FACTORY_HERMES_PROVIDER", "").strip() != "custom"
+        environment.get("CAPTAIN_FACTORY_HERMES_PROVIDER", "").strip()
+        != "openai-api"
         or environment.get("CAPTAIN_FACTORY_HERMES_MODEL", "").strip()
-        != "captain-hermes:8b"
-        or environment.get("CUSTOM_BASE_URL", "").strip()
-        != "http://127.0.0.1:11434/v1"
+        != "gpt-5.6-terra"
+        or environment.get(
+            "CAPTAIN_FACTORY_HERMES_REASONING_EFFORT", ""
+        ).strip()
+        != "high"
     ):
-        raise ValueError("Factory local Hermes route is invalid")
+        raise ValueError("Factory cloud Hermes route is invalid")
     try:
         user_maximum_eur = Decimal(
             _required(environment, "CAPTAIN_FACTORY_USER_MAX_EUR_PER_TEAM")
@@ -190,13 +193,13 @@ def validate_factory_total_cost_envelope(
     )
     if (
         any(not value.is_finite() or value < 0 for value in values)
-        or user_maximum_eur != Decimal("1.00")
+        or user_maximum_eur != Decimal("6.00")
         or budget_eur_per_usd < Decimal("1.00")
         or total_maximum_usd <= 0
-        or total_maximum_usd > Decimal("0.80")
+        or total_maximum_usd > Decimal("4.80")
         or total_maximum_usd * budget_eur_per_usd > user_maximum_eur
         or codex_metered_usd != 0
-        or hermes_incremental_usd != Decimal("0.003148")
+        or hermes_incremental_usd != Decimal("0.25")
         or len(benchmark_maximum_usd_per_team) != 2
         or any(
             benchmark_usd
@@ -224,6 +227,7 @@ class FactoryLiveOperatorSettings:
     hermes_provider: str
     hermes_model: str
     hermes_maximum_total_cost_usd: Decimal
+    hermes_reasoning_effort: str = "high"
     maximum_dispatches: int = 12
     stop_before_quality_warden: bool = False
 
@@ -247,6 +251,7 @@ class FactoryLiveOperatorSettings:
         if (
             self.hermes_provider not in {"openai-api", "custom"}
             or not self.hermes_model.strip()
+            or self.hermes_reasoning_effort != "high"
             or (
                 self.hermes_provider == "custom"
                 and self.hermes_model != "captain-hermes:8b"
@@ -567,6 +572,7 @@ def compose_business_demo_factory_operator(
             working_directory=workspace,
             provider=settings.hermes_provider,
             model=settings.hermes_model,
+            reasoning_effort=settings.hermes_reasoning_effort,
             maximum_total_cost_usd=settings.hermes_maximum_total_cost_usd,
         ),
         clock=current_time,

@@ -130,15 +130,15 @@ $benchmarkRuntimeEnvPath = Join-Path $repositoryRoot '.captain-cook/private/busi
 $canonicalRenewalWorkflow = Join-Path $repositoryRoot 'examples/business_benchmark_candidates/customer_renewal_orchestration_team/workflows/renewal_context_read.json'
 $maximumUsdPerTeam = '0.32'
 $maximumHermesUsd = '0.25'
-# V29 uses the exact local loopback Ollama provider. Its verified usage receipt
-# reports zero marginal USD; the historical paid Hermes ledger remains capped.
-$maximumIncrementalHermesUsd = '0.003148'
-$maximumTotalUsdPerTeam = '0.80'
+# Hermes uses the pinned OpenAI cloud route. The incremental reserve and the
+# benchmark reserve both remain inside the user-owned per-team total envelope.
+$maximumIncrementalHermesUsd = '0.25'
+$maximumTotalUsdPerTeam = '4.80'
 # Immutable V28 evidence, conservatively assigning all shared Hermes spend to
 # each team. These values are carried forward rather than resetting the cap.
 $priorActualUsdClaims = '0.384892'
 $priorActualUsdRenewal = '0.461592'
-$userMaximumEurPerTeam = '1.00'
+$userMaximumEurPerTeam = '6.00'
 $budgetEurPerUsd = '1.25'
 $seedVersion = 'business-benchmark-demo-2026-07-v29'
 
@@ -824,11 +824,11 @@ try {
     $environment['CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM'] = $maximumTotalUsdPerTeam
     $environment['CAPTAIN_FACTORY_CODEX_METERED_USD_PER_TEAM'] = '0'
     $environment['CAPTAIN_FACTORY_HERMES_INCREMENTAL_MAX_USD'] = $maximumIncrementalHermesUsd
-    $environment['CAPTAIN_FACTORY_HERMES_PROVIDER'] = 'custom'
-    $environment['CAPTAIN_FACTORY_HERMES_MODEL'] = 'captain-hermes:8b'
+    $environment['CAPTAIN_FACTORY_HERMES_PROVIDER'] = 'openai-api'
+    $environment['CAPTAIN_FACTORY_HERMES_MODEL'] = 'gpt-5.6-terra'
+    $environment['CAPTAIN_FACTORY_HERMES_REASONING_EFFORT'] = 'high'
     $environment['CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_CLAIMS'] = $priorActualUsdClaims
     $environment['CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_RENEWAL'] = $priorActualUsdRenewal
-    $environment['CUSTOM_BASE_URL'] = 'http://127.0.0.1:11434/v1'
     $environment['N8N_MODE'] = 'captain-builder'
     $environment['CAPTAIN_N8N_URL'] = "http://127.0.0.1:$($environment['CAPTAIN_N8N_PORT'])"
     Set-ProcessEnvironment $environment
@@ -1045,8 +1045,9 @@ try {
             '--hermes-python-executable', $hermesPython,
             '--job-id', $orderedFactoryJobIds[0],
             '--job-id', $orderedFactoryJobIds[1],
-            '--hermes-provider', 'custom',
-            '--hermes-model', 'captain-hermes:8b',
+            '--hermes-provider', 'openai-api',
+            '--hermes-model', 'gpt-5.6-terra',
+            '--hermes-reasoning-effort', 'high',
             '--hermes-max-usd', $maximumHermesUsd,
             '--maximum-dispatches', '12'
         )

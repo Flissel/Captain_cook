@@ -811,6 +811,7 @@ async def test_module_root_runs_only_the_checkout_cli_with_bound_cwd_and_pythonp
             working_directory=workspace_root,
             evidence_root=tmp_path / "evidence",
             maximum_output_tokens=1536,
+            reasoning_effort="high",
         )
     )._run_skill_prompt("sealed prompt", max_seconds=30)
 
@@ -830,6 +831,7 @@ async def test_module_root_runs_only_the_checkout_cli_with_bound_cwd_and_pythonp
     assert environment["PYTHONPATH"] != "global-hermes-location"
     assert environment["HERMES_MAX_ITERATIONS"] == "16"
     assert environment["HERMES_MAX_TOKENS"] == "1536"
+    assert environment["HERMES_REASONING_EFFORT"] == "high"
 
 
 def test_hermes_output_token_bound_is_strict() -> None:

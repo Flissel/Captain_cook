@@ -25,11 +25,11 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "--maximum-usd-per-team', $maximumUsdPerTeam" in source
     assert "$maximumUsdPerTeam = '0.32'" in source
     assert "$maximumHermesUsd = '0.25'" in source
-    assert "$maximumIncrementalHermesUsd = '0.003148'" in source
-    assert "$maximumTotalUsdPerTeam = '0.80'" in source
+    assert "$maximumIncrementalHermesUsd = '0.25'" in source
+    assert "$maximumTotalUsdPerTeam = '4.80'" in source
     assert "$priorActualUsdClaims = '0.384892'" in source
     assert "$priorActualUsdRenewal = '0.461592'" in source
-    assert "$userMaximumEurPerTeam = '1.00'" in source
+    assert "$userMaximumEurPerTeam = '6.00'" in source
     assert "$budgetEurPerUsd = '1.25'" in source
     assert "[ValidateSet('ClaimsFirst', 'RenewalFirst')]" in source
     assert "[array]::Reverse($orderedFactoryJobIds)" in source
@@ -42,9 +42,10 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "$environment['CAPTAIN_FACTORY_BUDGET_EUR_PER_USD']" in source
     assert "$environment['CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_CLAIMS']" in source
     assert "$environment['CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_RENEWAL']" in source
-    assert "$environment['CUSTOM_BASE_URL'] = 'http://127.0.0.1:11434/v1'" in source
-    assert "'--hermes-provider', 'custom'" in source
-    assert "'--hermes-model', 'captain-hermes:8b'" in source
+    assert "CUSTOM_BASE_URL" not in source
+    assert "'--hermes-provider', 'openai-api'" in source
+    assert "'--hermes-model', 'gpt-5.6-terra'" in source
+    assert "'--hermes-reasoning-effort', 'high'" in source
     assert "$seedVersion = 'business-benchmark-demo-2026-07-v29'" in source
     assert "'--suite-version', '29'" in source
     assert "New-DryRunPlan" in source
@@ -196,7 +197,9 @@ def test_factory_operator_cli_emits_only_redacted_codex_interruption(
             "--job-id",
             "71000000-0000-0000-0000-000000000002",
             "--hermes-model",
-            "gpt-4.1-mini",
+                "gpt-5.6-terra",
+                "--hermes-reasoning-effort",
+                "high",
         ],
     )
 
@@ -314,7 +317,9 @@ def test_factory_operator_cli_threads_stop_flag_and_emits_typed_results(
             "--job-id",
             "71000000-0000-0000-0000-000000000002",
             "--hermes-model",
-            "gpt-4.1-mini",
+                "gpt-5.6-terra",
+                "--hermes-reasoning-effort",
+                "high",
             "--stop-before-quality-warden",
         ],
     )
@@ -994,9 +999,18 @@ print(json.dumps({
     ] == sys.executable
     assert (
         factory_arguments[factory_arguments.index("--hermes-model") + 1]
-        == "captain-hermes:8b"
+        == "gpt-5.6-terra"
     )
-    assert factory_arguments[factory_arguments.index("--hermes-provider") + 1] == "custom"
+    assert (
+        factory_arguments[
+            factory_arguments.index("--hermes-reasoning-effort") + 1
+        ]
+        == "high"
+    )
+    assert (
+        factory_arguments[factory_arguments.index("--hermes-provider") + 1]
+        == "openai-api"
+    )
     assert factory_arguments.count("--job-id") == 2
     assert "--stop-before-quality-warden" not in factory_arguments
     assert "process-only-demo-key" not in successful.stdout + successful.stderr

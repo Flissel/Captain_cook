@@ -31,6 +31,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--maximum-dispatches", type=int, default=12)
     parser.add_argument("--hermes-provider", default="openai-api")
     parser.add_argument("--hermes-model", required=True)
+    parser.add_argument("--hermes-reasoning-effort", required=True)
     parser.add_argument("--hermes-max-usd", default="0.10")
     parser.add_argument("--stop-before-quality-warden", action="store_true")
     return parser
@@ -48,6 +49,7 @@ def main() -> int:
         job_ids=(args.job_id[0], args.job_id[1]),
         hermes_provider=args.hermes_provider,
         hermes_model=args.hermes_model,
+        hermes_reasoning_effort=args.hermes_reasoning_effort,
         hermes_maximum_total_cost_usd=Decimal(args.hermes_max_usd),
         maximum_dispatches=args.maximum_dispatches,
         stop_before_quality_warden=args.stop_before_quality_warden,

@@ -92,6 +92,7 @@ class HermesCliSettings:
     working_directory: Path | None = None
     provider: str | None = None
     model: str | None = None
+    reasoning_effort: str | None = None
     maximum_total_cost_usd: Decimal | None = None
     maximum_iterations: int = 16
     maximum_output_tokens: int = 2048
@@ -105,6 +106,18 @@ class HermesCliSettings:
                 or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", value) is None
             ):
                 raise ValueError(f"Hermes {label} is invalid")
+        if self.reasoning_effort not in {
+            None,
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra",
+        }:
+            raise ValueError("Hermes reasoning effort is invalid")
         maximum = self.maximum_total_cost_usd
         if maximum is not None and (
             isinstance(maximum, (bool, float))
@@ -1134,6 +1147,10 @@ class HermesCliFactory(HermesFactoryPort):
         environment["HERMES_MAX_TOKENS"] = str(
             self._settings.maximum_output_tokens
         )
+        if self._settings.reasoning_effort is not None:
+            environment["HERMES_REASONING_EFFORT"] = (
+                self._settings.reasoning_effort
+            )
         process_options["env"] = environment
         working_directory = self._settings.working_directory
         if working_directory is not None:
