@@ -142,6 +142,60 @@ async def test_technical_evaluator_scores_business_tools_and_required_handoff_pr
 
 
 @pytest.mark.asyncio
+async def test_technical_evaluator_does_not_treat_observed_handoff_as_external_tool(
+    tmp_path: Path,
+) -> None:
+    root, suite, technical = _private_pair(tmp_path)
+    hidden_case = next(item for item in suite.cases if item.case_id == technical.case_id)
+    evaluator = CaptainTechnicalBusinessHoldoutEvaluator(
+        root / "technical-holdouts",
+        candidate_ref=ArtifactRef(
+            uri="artifact://candidate/team.tar.gz",
+            sha256="e" * 64,
+            media_type="application/gzip",
+        ),
+        allowed_tools=(),
+        clock=lambda: NOW,
+    )
+    terminal = json.dumps(
+        {
+            "schema": "captain.business-benchmark-terminal.v1",
+            "observed_decision": hidden_case.expected_decision,
+            "observed_rationale_fact_ids": list(hidden_case.required_rationale_fact_ids),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    target = "escalation_specialist"
+    result = TaskResult(
+        messages=[
+            ToolCallExecutionEvent(
+                source="claims_specialist",
+                content=[
+                    FunctionExecutionResult(
+                        content="handoff",
+                        name=f"transfer_to_{target}",
+                        call_id="call-handoff",
+                        is_error=False,
+                    )
+                ],
+            ),
+            HandoffMessage(
+                source="claims_specialist",
+                target=target,
+                content="Captain review required",
+            ),
+            TextMessage(source=target, content=terminal),
+        ],
+        stop_reason="task_completed",
+    )
+
+    receipt = await evaluator.evaluate(technical.holdout_ref, result, ASSERTION_IDS)
+
+    assert all(item.passed for item in receipt.decisions)
+
+
+@pytest.mark.asyncio
 async def test_technical_evaluator_fails_closed_without_leaking_expected_answer(
     tmp_path: Path,
 ) -> None:

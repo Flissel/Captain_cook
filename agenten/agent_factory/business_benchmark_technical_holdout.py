@@ -197,11 +197,17 @@ class CaptainTechnicalBusinessHoldoutEvaluator:
             raise ValueError("technical holdout assertion contract does not match")
         record = self._load(reference)
         terminal = _terminal_output(result)
+        observed_handoff_tool_names = {
+            f"transfer_to_{message.target}"
+            for message in result.messages
+            if isinstance(message, HandoffMessage)
+        }
         observed_tools = {
             execution.name
             for message in result.messages
             if isinstance(message, ToolCallExecutionEvent)
             for execution in message.content
+            if execution.name not in observed_handoff_tool_names
         }
         handoff_observed = any(
             isinstance(message, HandoffMessage)

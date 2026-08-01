@@ -1569,7 +1569,7 @@ class HostAutoGenSessionExecutor:
         )
         termination: TerminationCondition = MaxMessageTermination(
             manifest.max_messages,
-            include_agent_event=True,
+            include_agent_event=False,
         )
         termination = termination | _FactoryActivityCeilingTermination(
             max_handoffs=manifest.max_handoffs,
@@ -1775,7 +1775,10 @@ class HostAutoGenSessionExecutor:
             if execution.name not in handoff_tool_name_set
         )
         tool_call_count = len(tool_event_executions)
-        if len(result.messages) > max_messages:
+        message_count = sum(
+            isinstance(message, BaseChatMessage) for message in result.messages
+        )
+        if message_count > max_messages:
             raise ValueError("AutoGen team exceeded the message ceiling")
         if len(handoff_messages) > max_handoffs:
             raise ValueError("AutoGen team exceeded the handoff ceiling")
@@ -1802,7 +1805,7 @@ class HostAutoGenSessionExecutor:
                     "schema": "captain.factory-autogen-observation.v2",
                     "identity": identity.model_dump(mode="json"),
                     "conversation_pattern": conversation_pattern,
-                    "message_count": len(result.messages),
+                    "message_count": message_count,
                     "handoff_count": len(handoff_messages),
                     "tool_call_count": tool_call_count,
                     "termination_reason": termination_reason,
@@ -1917,7 +1920,7 @@ class HostAutoGenSessionExecutor:
             n8n_executions=n8n_executions,
             workflow_evidence_refs=n8n_refs,
             conversation_pattern=conversation_pattern,
-            message_count=len(result.messages),
+            message_count=message_count,
             handoff_count=len(handoffs),
             tool_call_count=tool_call_count,
             termination_reason=termination_reason,
@@ -2992,7 +2995,10 @@ def _session_termination_reason(
         return "max_handoffs"
     if "max_tool_calls" in stop_reason:
         return "max_tool_calls"
-    if len(result.messages) >= max_messages or "Maximum number" in stop_reason:
+    message_count = sum(
+        isinstance(message, BaseChatMessage) for message in result.messages
+    )
+    if message_count >= max_messages or "Maximum number" in stop_reason:
         return "max_messages"
     if "task_completed" in termination_conditions:
         return "task_completed"

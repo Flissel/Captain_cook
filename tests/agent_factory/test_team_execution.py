@@ -65,6 +65,7 @@ from agenten.agent_factory.team_execution import (
     _holdout_scoped_invocation,
     _FactoryActivityCeilingTermination,
     _FactoryTaskCompletedTermination,
+    _session_termination_reason,
     compose_live_team_execution,
 )
 from gateway.factory_hermes_retry_authority import (
@@ -323,6 +324,35 @@ async def test_task_completed_requires_observed_handoff_when_topology_has_handof
 
     assert stop is not None
     assert stop.content == "task_completed"
+
+
+def test_message_ceiling_ignores_internal_agent_events() -> None:
+    tool_events = [
+        ToolCallExecutionEvent(
+            source="intake",
+            content=[
+                FunctionExecutionResult(
+                    content="handoff",
+                    name="transfer_to_specialist",
+                    call_id=f"handoff-{number}",
+                )
+            ],
+        )
+        for number in range(3)
+    ]
+    result = TaskResult(
+        messages=[
+            *tool_events,
+            TextMessage(source="specialist", content="TERMINATE"),
+        ],
+        stop_reason="task_completed",
+    )
+
+    assert _session_termination_reason(
+        result,
+        termination_conditions=("task_completed", "max_messages"),
+        max_messages=2,
+    ) == "task_completed"
 
 
 def _policy_digest(job: AgentFactoryJobV3) -> str:
