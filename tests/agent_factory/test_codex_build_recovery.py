@@ -298,6 +298,9 @@ def test_non_evidence_failure_remains_terminal(tmp_path: Path) -> None:
         seconds=1,
         terminal_receipt_sha256="b" * 64,
     )
+    failed = failed.model_copy(
+        update={"implementation_failure_reason": "runtime_failed"}
+    )
     resumed = _next(
         failed,
         phase="implementation_running",
@@ -310,7 +313,7 @@ def test_non_evidence_failure_remains_terminal(tmp_path: Path) -> None:
     store.advance(None, scaffold)
     store.advance(scaffold, running)
     store.advance(running, failed)
-    with pytest.raises(FactoryDispatchError, match="evidence failure"):
+    with pytest.raises(FactoryDispatchError, match="failure retry"):
         store.advance(failed, resumed)
 
 

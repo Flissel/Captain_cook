@@ -249,7 +249,8 @@ def _interruption_references(
     receipt_sha256 = checkpoint.terminal_receipt_sha256
     resumable_phase = checkpoint.phase == "implementation_interrupted" or (
         checkpoint.phase == "implementation_failed"
-        and checkpoint.implementation_failure_reason == "evidence_failure"
+        and checkpoint.implementation_failure_reason
+        in {"evidence_failure", "required_output_invalid"}
     )
     if not resumable_phase or receipt_sha256 is None:
         raise FactoryDispatchError("Factory Codex interruption checkpoint is invalid")
@@ -1004,7 +1005,8 @@ class CodexCliFactoryBuildExecutor:
             )
         if (
             checkpoint.phase == "implementation_failed"
-            and checkpoint.implementation_failure_reason != "evidence_failure"
+            and checkpoint.implementation_failure_reason
+            not in {"evidence_failure", "required_output_invalid"}
         ):
             raise FactoryDispatchError("Factory Codex build failure is not resumable")
         resume_ordinal = self._resume_authorizer.authorize_resume(
@@ -1049,8 +1051,19 @@ class CodexCliFactoryBuildExecutor:
             and prior.payload["status"] == "evidence_failed"
             and prior.payload.get("failure_kind") == "record_size_limit_exceeded"
         )
+        required_output_failure_is_resumable = (
+            checkpoint.phase == "implementation_failed"
+            and checkpoint.implementation_failure_reason
+            == "required_output_invalid"
+            and prior.payload["status"] == "succeeded"
+            and prior.payload.get("exit_code") == 0
+        )
         if (
-            not (interruption_is_resumable or evidence_failure_is_resumable)
+            not (
+                interruption_is_resumable
+                or evidence_failure_is_resumable
+                or required_output_failure_is_resumable
+            )
             or prior.payload["process_cleanup_status"] == "unresolved"
             or prior.completed_at > checkpoint.updated_at
         ):
@@ -1416,8 +1429,19 @@ class CodexCliFactoryBuildExecutor:
                     and prior.payload.get("failure_kind")
                     == "record_size_limit_exceeded"
                 )
+                required_output_failure_is_resumable = (
+                    checkpoint.phase == "implementation_failed"
+                    and checkpoint.implementation_failure_reason
+                    == "required_output_invalid"
+                    and prior.payload["status"] == "succeeded"
+                    and prior.payload.get("exit_code") == 0
+                )
                 if (
-                    not (interruption_is_resumable or evidence_failure_is_resumable)
+                    not (
+                        interruption_is_resumable
+                        or evidence_failure_is_resumable
+                        or required_output_failure_is_resumable
+                    )
                     or prior.payload["process_cleanup_status"] == "unresolved"
                 ):
                     raise FactoryDispatchError(

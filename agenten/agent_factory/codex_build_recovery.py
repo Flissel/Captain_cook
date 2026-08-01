@@ -1027,11 +1027,12 @@ def _require_transition(
             )
     elif transition == ("implementation_failed", "implementation_running"):
         if (
-            previous.implementation_failure_reason != "evidence_failure"
+            previous.implementation_failure_reason
+            not in {"evidence_failure", "required_output_invalid"}
             or next_checkpoint.implementation_failure_reason is not None
         ):
             raise FactoryDispatchError(
-                "Factory Codex evidence failure retry binding conflicts"
+                "Factory Codex failure retry binding conflicts"
             )
     elif (
         previous.implementation_failure_reason

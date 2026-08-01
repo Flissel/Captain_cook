@@ -1219,6 +1219,103 @@ async def test_cli_executor_fails_closed_when_codex_omits_required_outputs(
 
 
 @pytest.mark.asyncio
+async def test_authorized_resume_repairs_missing_required_outputs_in_same_thread(
+    tmp_path: Path,
+) -> None:
+    job, brief, artifact_reader = _executor_job_and_brief()
+    invocation = _seal_invocation(job, brief)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+
+    class Preparer:
+        def prepare(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+        def prepare_or_recover(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    class IncompleteRunner:
+        def __init__(self, journal_path: Path) -> None:
+            self.journal_path = journal_path
+
+        async def run(self, _authorized):
+            line = json.dumps(
+                {
+                    "type": "thread.started",
+                    "thread_id": "codex-thread-123",
+                }
+            )
+            journal = f"{line}\n".encode("utf-8")
+            self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+            self.journal_path.write_bytes(journal)
+            return CodexRunResult(
+                exit_code=0,
+                terminal_status="succeeded",
+                process_cleanup_status="not_required",
+                journal_path=self.journal_path,
+                journal_sha256=hashlib.sha256(journal).hexdigest(),
+                artifact_references=(),
+                jsonl_lines=(line,),
+            )
+
+    runner_calls = 0
+
+    def runner_factory(**kwargs):
+        nonlocal runner_calls
+        runner_calls += 1
+        if runner_calls == 1:
+            return IncompleteRunner(kwargs["journal_path"])
+        return SuccessfulRunner(workspace, kwargs["journal_path"])
+
+    authorizer = RecordingAuthorizer()
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=state_root,
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=Preparer(),
+        artifact_reader=artifact_reader,
+        authorizer=authorizer,
+        runner_factory=runner_factory,
+        resume_authorizer=CaptainFactoryCodexResumeAuthorizer(clock=lambda: NOW),
+        clock=lambda: NOW,
+    )
+    dispatch = _dispatch(job, invocation)
+
+    with pytest.raises(FactoryDispatchError, match="required build artifact"):
+        await executor.execute(dispatch, invocation, brief)
+    failed = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert failed is not None
+    assert failed.implementation_failure_reason == "required_output_invalid"
+    authorized = _authorized_runtime_retry_dispatch(dispatch, invocation, failed)
+
+    completed = await executor.execute_authorized_resume(
+        authorized,
+        invocation,
+        brief,
+    )
+
+    assert completed.source_archive_path == "candidate.zip"
+    assert runner_calls == 2
+    assert authorizer.requests[1].command[:5] == (
+        "codex",
+        "exec",
+        "resume",
+        "--json",
+        "codex-thread-123",
+    )
+    checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert checkpoint is not None
+    assert checkpoint.phase == "implementation_complete"
+    assert checkpoint.resume_ordinal == 1
+
+
+@pytest.mark.asyncio
 async def test_implementation_complete_seals_snapshot_after_archive_replacement(
     tmp_path: Path,
 ) -> None:
