@@ -790,9 +790,10 @@ def _require_zipinfo_matches_central(
 ) -> None:
     encoding = "utf-8" if central.flags & _ZIP_UTF8_FLAG else "cp437"
     decoded_filename = central.filename.decode(encoding)
+    normalized_filename = decoded_filename.replace("\\", "/")
     if (
         item.orig_filename != decoded_filename
-        or item.filename != decoded_filename
+        or item.filename != normalized_filename
         or item.flag_bits != central.flags
         or item.compress_type != central.compression
         or item.CRC != central.crc32
@@ -811,10 +812,6 @@ def _require_canonical_source_zip_path(
     *,
     is_directory: bool,
 ) -> tuple[str, PurePosixPath]:
-    if "\\" in filename:
-        raise CodexBuildProvenanceError(
-            "source archive contains a non-canonical path"
-        )
     normalized = filename.replace("\\", "/")
     parts = normalized.split("/")
     if is_directory and parts and parts[-1] == "":

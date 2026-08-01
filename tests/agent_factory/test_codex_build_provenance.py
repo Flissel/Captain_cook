@@ -582,7 +582,7 @@ def test_source_zip_rejects_noncanonical_or_colliding_paths(
         _require_safe_source_zip(_zip_bytes(files))
 
 
-def test_source_zip_rejects_raw_backslash_path() -> None:
+def test_source_zip_accepts_safe_windows_backslash_path() -> None:
     archive = _zip_bytes(
         {
             "factory-candidate.json": b"{}",
@@ -590,7 +590,18 @@ def test_source_zip_rejects_raw_backslash_path() -> None:
         }
     ).replace(b"src/team.py", b"src\\team.py")
 
-    with pytest.raises(CodexBuildProvenanceError, match="canonical path"):
+    assert _require_safe_source_zip(archive) == b"{}"
+
+
+def test_source_zip_rejects_windows_backslash_traversal() -> None:
+    archive = _zip_bytes(
+        {
+            "factory-candidate.json": b"{}",
+            "..\\evil.py": b"unsafe",
+        }
+    )
+
+    with pytest.raises(CodexBuildProvenanceError, match="path traversal"):
         _require_safe_source_zip(archive)
 
 

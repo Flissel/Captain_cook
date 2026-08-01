@@ -1712,9 +1712,14 @@ async def test_dispatch_replay_uses_identical_invocation_and_idempotency_key(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("durable", [False, True])
+@pytest.mark.parametrize(
+    "retryable_failure",
+    ["CodexPolicyViolation", "CodexBuildProvenanceError"],
+)
 async def test_runtime_retry_replay_requires_atomic_authorized_resume(
     tmp_path: Path,
     durable: bool,
+    retryable_failure: str,
 ) -> None:
     replay_store = (
         FilesystemFactorySkillReplayStore(tmp_path / "runtime-replays")
@@ -1820,7 +1825,7 @@ async def test_runtime_retry_replay_requires_atomic_authorized_resume(
 
     failed = await replay_store.fail(
         resumed.record,
-        failure_kind="CodexPolicyViolation",
+        failure_kind=retryable_failure,
     )
     with pytest.raises(FactorySkillReplayRetryableFailureError) as retryable:
         await replay_store.claim(invocation)

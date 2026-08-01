@@ -935,10 +935,15 @@ class CodexCliFactoryBuildExecutor:
         resume_ordinal = authorization.resume_ordinal
         checkpoint = self._checkpoint_store.load(invocation)
         assert checkpoint is not None
+        expected_resume_ordinal = (
+            checkpoint.resume_ordinal
+            if checkpoint.phase == "implementation_complete"
+            else checkpoint.resume_ordinal + 1
+        )
         if (
             not isinstance(resume_ordinal, int)
             or isinstance(resume_ordinal, bool)
-            or resume_ordinal != checkpoint.resume_ordinal + 1
+            or resume_ordinal != expected_resume_ordinal
         ):
             raise FactoryDispatchError(
                 "Factory Codex resume authorization decision is invalid"
@@ -956,11 +961,36 @@ class CodexCliFactoryBuildExecutor:
         invocation: FactorySkillInvocationV1,
         brief: CodexBuildBriefV1,
     ) -> FactoryRuntimeRetryAuthorizationV1:
+        checkpoint = self._checkpoint_store.load(invocation)
+        authorization = request.runtime_retry_authorization
+        if checkpoint is not None and checkpoint.phase == "implementation_complete":
+            if authorization is None:
+                raise FactoryDispatchError(
+                    "Factory Codex completed seal retry requires Captain runtime retry authority"
+                )
+            self._require_checkpoint_runtime_retry_authority(request, checkpoint)
+            if authorization.resume_ordinal != checkpoint.resume_ordinal:
+                raise FactoryDispatchError(
+                    "Factory Codex completed seal retry ordinal changed"
+                )
+            prepared = self._prepare_or_recover(
+                request,
+                invocation,
+                brief,
+                checkpoint,
+            )
+            self._validate_original_scaffold(
+                request,
+                invocation,
+                brief,
+                prepared.root,
+                checkpoint,
+            )
+            return authorization
         if self._resume_authorizer is None:
             raise FactoryDispatchError(
                 "Factory Codex resume authorization validator is not configured"
             )
-        checkpoint = self._checkpoint_store.load(invocation)
         if checkpoint is None or checkpoint.phase != "implementation_interrupted":
             raise FactoryDispatchError("Factory Codex build is not interrupted")
         resume_ordinal = self._resume_authorizer.authorize_resume(
@@ -968,7 +998,6 @@ class CodexCliFactoryBuildExecutor:
             invocation,
             checkpoint,
         )
-        authorization = request.runtime_retry_authorization
         if authorization is None:
             raise FactoryDispatchError(
                 "Factory Codex resume requires Captain runtime retry authority"
@@ -3204,7 +3233,9 @@ def _codex_prompt(
         "(the runnable source with factory-candidate.json at archive root and byte-"
         "identical to the external manifest), and test-evidence.json (JSON object "
         "listing commands, exit codes, assertion IDs, and status). Do not place "
-        "candidate.zip inside itself. factory-candidate.json MUST omit "
+        "candidate.zip inside itself. Write candidate.zip with canonical POSIX `/` "
+        "entry separators on every platform; on Windows do not use Compress-Archive. "
+        "factory-candidate.json MUST omit "
         "source_archive_ref; Captain adds source_archive_ref only after sealing "
         "candidate.zip, because a pre-seal archive digest would be self-referential. "
         "Keep generated source separate from "

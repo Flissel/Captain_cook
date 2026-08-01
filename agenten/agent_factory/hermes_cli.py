@@ -2447,7 +2447,8 @@ def _retried_failed_replay_record(
     ).hexdigest()
     if (
         failed.state != "failed"
-        or failed.failure_kind != "CodexPolicyViolation"
+        or failed.failure_kind
+        not in {"CodexPolicyViolation", "CodexBuildProvenanceError"}
         or failed.resume_ordinal != authorization.resume_ordinal
         or failed.runtime_retry_authorization_ref != authorization.authorization_ref
         or failed.runtime_retry_authorization_binding_sha256
@@ -2543,10 +2544,7 @@ def _existing_replay_claim(
     if existing.state == "pending":
         raise FactorySkillReplayPendingError(existing)
     if existing.state == "failed":
-        if (
-            existing.failure_kind == "CodexPolicyViolation"
-            and existing.runtime_retry_authorization_ref is not None
-        ):
+        if _is_codex_retryable_failure(existing):
             raise FactorySkillReplayRetryableFailureError(existing)
         if (
             _is_hermes_retryable_failure(existing)
@@ -2572,6 +2570,14 @@ def _hermes_retry_exceeds_authority(
         return True
     remaining_cost_usd = maximum_total_cost_usd - observed_cost_usd
     return remaining_cost_usd <= 0 or remaining_cost_usd > maximum_additional_cost_usd
+
+
+def _is_codex_retryable_failure(replay: FactorySkillReplayRecord) -> bool:
+    return (
+        replay.failure_kind
+        in {"CodexPolicyViolation", "CodexBuildProvenanceError"}
+        and replay.runtime_retry_authorization_ref is not None
+    )
 
 
 def _is_hermes_retryable_failure(

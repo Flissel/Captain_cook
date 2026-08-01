@@ -970,6 +970,7 @@ async def test_cli_executor_authorizes_before_materializing_and_records_redacted
     assert "python -m pytest -q --no-cov generated-candidate/tests" in prompt
     assert "Do not run the repository-wide test suite" in prompt
     assert "pytest.live.demo is deferred to Captain" in prompt
+    assert "on Windows do not use Compress-Archive" in prompt
     assert "MUST omit source_archive_ref" in prompt
     assert "Captain adds source_archive_ref only after sealing candidate.zip" in prompt
     assert "codex-build-instructions.md" in prompt
@@ -2654,6 +2655,11 @@ async def test_authorized_resume_uses_next_ordinal_without_replacing_timeout_rec
         invocation,
         brief,
     )
+    seal_retry = await executor.execute_authorized_resume(
+        authorized_dispatch,
+        invocation,
+        brief,
+    )
 
     checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
         state_root / "checkpoints"
@@ -2662,6 +2668,7 @@ async def test_authorized_resume_uses_next_ordinal_without_replacing_timeout_rec
     assert checkpoint.phase == "implementation_complete"
     assert checkpoint.resume_ordinal == 1
     assert checkpoint.output_manifest_sha256 is not None
+    assert seal_retry == completed
     resumed_manifest = json.loads(
         (
             state_root
