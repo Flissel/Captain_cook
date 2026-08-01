@@ -2328,6 +2328,16 @@ class CodexCliFactoryBuildExecutor:
             ),
         )
         cleanup = receipt.get("process_cleanup_status")
+        command_sha256 = receipt.get("command_sha256")
+        command_binding_is_valid = (
+            command_sha256
+            == hashlib.sha256(
+                "\0".join(run_request.command).encode("utf-8")
+            ).hexdigest()
+            if checkpoint.terminal_receipt_sha256 is None
+            else isinstance(command_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", command_sha256) is not None
+        )
         if (
             set(receipt) != expected_keys
             or receipt.get("provider") != "codex-cli"
@@ -2339,10 +2349,7 @@ class CodexCliFactoryBuildExecutor:
             or receipt.get("workspace_ref") != checkpoint.workspace_ref
             or receipt.get("base_revision") != checkpoint.base_revision
             or receipt.get("resume_ordinal") != checkpoint.resume_ordinal
-            or receipt.get("command_sha256")
-            != hashlib.sha256(
-                "\0".join(run_request.command).encode("utf-8")
-            ).hexdigest()
+            or not command_binding_is_valid
         ):
             raise FactoryDispatchError(
                 "Factory Codex error receipt binding changed"
