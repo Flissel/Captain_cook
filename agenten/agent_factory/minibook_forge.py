@@ -119,7 +119,7 @@ class CaptainCreationJobMapper:
                 raise FactoryDispatchError(
                     "initial creation job must not contain retry revision evidence"
                 )
-            expected_brief_input = job.input_ref
+            expected_brief_input = inventory.artifact_ref
         else:
             if len(revisions) != 1:
                 raise FactoryDispatchError(

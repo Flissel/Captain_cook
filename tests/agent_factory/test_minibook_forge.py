@@ -148,6 +148,8 @@ def _workflow_evidence(*, attempt: int = 1, inventory_attempt: int | None = None
     brief_data["context_refs"] = [inventory.artifact_ref.model_dump(mode="json")]
     invocation = brief_data["invocation"]
     assert isinstance(invocation, dict)
+    invocation["input_ref"] = inventory.artifact_ref.model_dump(mode="json")
+    invocation["input_sha256"] = inventory.artifact_ref.sha256
     assignment = brief_data["build_assignment"]
     assert isinstance(assignment, dict)
     assignment.update(
@@ -393,7 +395,7 @@ def test_creation_job_mapper_rejects_missing_blueprint_inventory_binding() -> No
 def test_creation_job_mapper_rejects_brief_for_different_input() -> None:
     factory_job, inventory, brief, build = _workflow_evidence()
     changed_invocation = brief.invocation.model_copy(
-        update={"input_ref": inventory.artifact_ref}
+        update={"input_ref": factory_job.input_ref}
     )
     changed = brief.model_copy(update={"invocation": changed_invocation})
     mapper = CaptainCreationJobMapper(evidence=ForgeEvidence(inventory, changed, build))
