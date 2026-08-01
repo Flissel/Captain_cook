@@ -294,7 +294,13 @@ def main() -> int:
             codex_state_root / "checkpoints" / f"{binding.invocation_id.hex}.json"
         ),
         terminal_receipt_path=(
-            codex_state_root / "sessions" / f"{binding.idempotency_key}.json"
+            codex_state_root
+            / "sessions"
+            / (
+                f"{binding.idempotency_key}.json"
+                if resume_ordinal == 1
+                else f"{binding.idempotency_key}.resume-{resume_ordinal - 1}.json"
+            )
         ),
         binding=binding,
         checkpoint_ref=checkpoint_ref,

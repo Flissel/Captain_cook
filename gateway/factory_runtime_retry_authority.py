@@ -58,13 +58,18 @@ class CaptainRuntimeRetryAuthorizationIssuer:
             expected_name=f"{binding.invocation_id.hex}.json",
             label="checkpoint",
         )
+        checkpoint = _read_checkpoint(checkpoint_file)
+        receipt_suffix = (
+            ""
+            if checkpoint.resume_ordinal == 0
+            else f".resume-{checkpoint.resume_ordinal}"
+        )
         session_file = _exact_file(
             terminal_receipt_path,
             root=self._session_root,
-            expected_name=f"{binding.idempotency_key}.json",
+            expected_name=f"{binding.idempotency_key}{receipt_suffix}.json",
             label="terminal receipt",
         )
-        checkpoint = _read_checkpoint(checkpoint_file)
         _require_resumable_binding(
             checkpoint=checkpoint,
             binding=binding,

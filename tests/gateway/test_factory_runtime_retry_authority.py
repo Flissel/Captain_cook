@@ -28,7 +28,7 @@ from tests.agent_factory.test_state_machine import job_v3
 NOW = datetime(2026, 7, 31, 20, 10, tzinfo=timezone.utc)
 
 
-def _interrupted_fixture(tmp_path: Path):
+def _interrupted_fixture(tmp_path: Path, *, resume_ordinal: int = 0):
     job = job_v3(mode="demo").model_copy(
         update={"deadline_at": NOW + timedelta(hours=2)}
     )
@@ -39,7 +39,7 @@ def _interrupted_fixture(tmp_path: Path):
             "schema": "captain.codex-session-receipt.v1",
             "status": "timed_out",
             "exit_code": 124,
-            "resume_ordinal": 0,
+            "resume_ordinal": resume_ordinal,
             "process_cleanup_status": "verified_cancelled",
             "workspace_ref": "workspace://factory/retry/test",
             "base_revision": "a" * 40,
@@ -59,13 +59,35 @@ def _interrupted_fixture(tmp_path: Path):
         brief_sha256="b" * 64,
         scaffold_manifest_sha256="c" * 64,
         phase="implementation_interrupted",
-        resume_ordinal=0,
+        resume_ordinal=resume_ordinal,
         terminal_receipt_sha256=terminal_sha,
+        parent_terminal_receipt_sha256=("1" * 64 if resume_ordinal > 0 else None),
+        parent_journal_sha256=("2" * 64 if resume_ordinal > 0 else None),
+        runtime_retry_authorization_uri=(
+            "artifact://factory/runtime-retry/prior"
+            if resume_ordinal > 0
+            else None
+        ),
+        runtime_retry_authorization_sha256=(
+            "3" * 64 if resume_ordinal > 0 else None
+        ),
+        runtime_retry_authorization_binding_sha256=(
+            "4" * 64 if resume_ordinal > 0 else None
+        ),
+        runtime_retry_authorization_issued_at=(
+            NOW - timedelta(minutes=5) if resume_ordinal > 0 else None
+        ),
+        runtime_retry_authorization_expires_at=(
+            NOW + timedelta(minutes=5) if resume_ordinal > 0 else None
+        ),
         updated_at=NOW - timedelta(minutes=1),
     )
     state_root = tmp_path / ".captain-cook" / "codex"
     checkpoint_path = state_root / "checkpoints" / f"{invocation_id.hex}.json"
-    terminal_path = state_root / "sessions" / f"{idempotency_key}.json"
+    receipt_suffix = "" if resume_ordinal == 0 else f".resume-{resume_ordinal}"
+    terminal_path = (
+        state_root / "sessions" / f"{idempotency_key}{receipt_suffix}.json"
+    )
     checkpoint_path.parent.mkdir(parents=True)
     terminal_path.parent.mkdir(parents=True)
     checkpoint_path.write_bytes(canonical_factory_codex_model(checkpoint))
@@ -203,6 +225,46 @@ def test_captain_issues_and_loads_exact_interrupted_runtime_retry(
         NOW + timedelta(seconds=1),
     ) == issued
     assert issued.authorization_ref.uri.endswith(issued.authorization_ref.sha256)
+
+
+def test_captain_issues_second_retry_from_resume_receipt(tmp_path: Path) -> None:
+    (
+        job,
+        state_root,
+        checkpoint_path,
+        terminal_path,
+        binding,
+        checkpoint_ref,
+        terminal_ref,
+    ) = _interrupted_fixture(tmp_path, resume_ordinal=1)
+    authority_root = tmp_path / ".captain-cook" / "runtime-retries"
+    issuer = CaptainRuntimeRetryAuthorizationIssuer(
+        authority_root=authority_root,
+        codex_state_root=state_root,
+    )
+
+    issued = issuer.issue(
+        checkpoint_path=checkpoint_path,
+        terminal_receipt_path=terminal_path,
+        binding=binding,
+        checkpoint_ref=checkpoint_ref,
+        terminal_receipt_ref=terminal_ref,
+        resume_ordinal=2,
+        maximum_runtime_seconds=600,
+        issued_at=NOW,
+        expires_at=NOW + timedelta(minutes=20),
+    )
+    authority = FilesystemFactoryRuntimeRetryAuthority(
+        authority_root=authority_root,
+        checkpoint_root=state_root / "checkpoints",
+    )
+
+    assert authority.active(
+        job,
+        FactoryAction(kind=FactoryActionKind.DISPATCH_TOOL_INTEGRATOR, attempt=1),
+        SimpleNamespace(job=job),
+        NOW + timedelta(seconds=1),
+    ) == issued
 
 
 def test_captain_issues_exact_record_limit_evidence_retry(tmp_path: Path) -> None:
