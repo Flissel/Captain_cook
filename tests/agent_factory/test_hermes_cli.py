@@ -34,6 +34,7 @@ from agenten.agent_factory.hermes_cli import (
     HermesCliSettings,
     _codex_brief_seed_sha256,
     _discovery_seed_sha256,
+    _hermes_retry_exceeds_authority,
     _parse_codex_brief_attestation,
     _parse_discovery_attestation,
     factory_skill_replay_failure_ref,
@@ -87,6 +88,19 @@ from tests.agent_factory.test_codex_build_provenance_contracts import (
     receipt_ref as codex_build_receipt_ref,
     seal_invocation_payload,
 )
+
+
+def test_hermes_retry_authority_limits_remaining_not_global_budget() -> None:
+    assert not _hermes_retry_exceeds_authority(
+        maximum_total_cost_usd=Decimal("0.20"),
+        observed_cost_usd=Decimal("0.1904096"),
+        maximum_additional_cost_usd=Decimal("0.01"),
+    )
+    assert _hermes_retry_exceeds_authority(
+        maximum_total_cost_usd=Decimal("0.20"),
+        observed_cost_usd=Decimal("0.18"),
+        maximum_additional_cost_usd=Decimal("0.01"),
+    )
 
 
 _STEP_SKILL_NAMES = {

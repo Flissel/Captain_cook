@@ -482,10 +482,12 @@ class HermesCliFactory(HermesFactoryPort):
                     requested_invocation=failed.requested_invocation,
                     now=self._clock(),
                 )
-                if (
-                    self._settings.maximum_total_cost_usd is None
-                    or self._settings.maximum_total_cost_usd
-                    > authorization.maximum_additional_cost_usd
+                if _hermes_retry_exceeds_authority(
+                    maximum_total_cost_usd=self._settings.maximum_total_cost_usd,
+                    observed_cost_usd=self._observed_cost_usd,
+                    maximum_additional_cost_usd=(
+                        authorization.maximum_additional_cost_usd
+                    ),
                 ):
                     raise FactoryDispatchError(
                         "Hermes retry settings exceed Captain recovery budget"
@@ -2558,6 +2560,18 @@ def _existing_replay_claim(
     if existing.state == "interrupted":
         raise FactorySkillReplayInterruptedError(existing)
     return FactorySkillReplayClaim(record=existing, acquired=False)
+
+
+def _hermes_retry_exceeds_authority(
+    *,
+    maximum_total_cost_usd: Decimal | None,
+    observed_cost_usd: Decimal,
+    maximum_additional_cost_usd: Decimal,
+) -> bool:
+    if maximum_total_cost_usd is None:
+        return True
+    remaining_cost_usd = maximum_total_cost_usd - observed_cost_usd
+    return remaining_cost_usd <= 0 or remaining_cost_usd > maximum_additional_cost_usd
 
 
 def _is_hermes_retryable_failure(
