@@ -131,12 +131,15 @@ class FactoryBudgetProjection(_FrozenContract):
     remaining_usd: Decimal
     active_reservation_ids: tuple[UUID, ...] = ()
 
-    @field_validator(
-        "limit_usd", "consumed_usd", "reserved_usd", "remaining_usd", mode="before"
-    )
+    @field_validator("limit_usd", "reserved_usd", mode="before")
     @classmethod
-    def require_canonical_amount(cls, value: object) -> Decimal:
+    def require_canonical_reserved_amount(cls, value: object) -> Decimal:
         return _parse_usd(value, "projection amount")
+
+    @field_validator("consumed_usd", "remaining_usd", mode="before")
+    @classmethod
+    def require_canonical_usage_amount(cls, value: object) -> Decimal:
+        return _parse_usage_usd(value, "projection amount")
 
     @model_validator(mode="after")
     def require_consistent_totals(self) -> "FactoryBudgetProjection":

@@ -27,6 +27,7 @@ from agenten.agent_runtime.contracts import (
 )
 from agenten.agent_factory.contracts import (
     AgentFactoryJobV3,
+    FactoryBlockStatus,
     FactoryEvidenceBlock,
     FactoryJob,
     FactoryLease,
