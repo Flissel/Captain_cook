@@ -257,18 +257,28 @@ class CodexBriefBuilder:
             )
             else list(failed_evaluation.technical_diagnostic_codes)
         )
-        technical_retry_contract = (
-            []
-            if not technical_diagnostic_codes
-            else [
+        technical_retry_contract: list[str] = []
+        if any(code.startswith("real_case_") for code in technical_diagnostic_codes):
+            technical_retry_contract.extend(
+                [
                 "The real-case command receives no stdin.",
                 "Read CAPTAIN_TRACE_ID from the process environment.",
                 "Emit exactly one JSON object on stdout and no prose.",
                 "Set trace_id to CAPTAIN_TRACE_ID.",
                 "Set assertion_ids to exactly the Captain acceptance assertion IDs.",
                 "Exit zero only after the deterministic real-case fixture is evaluated.",
-            ]
-        )
+                ]
+            )
+        if "mandatory_handoff_failed" in technical_diagnostic_codes:
+            technical_retry_contract.append(
+                "Require at least one meaningful configured agent handoff before terminal completion; "
+                "the initial agent must not complete the task before specialist collaboration."
+            )
+        if "business_value_failed" in technical_diagnostic_codes:
+            technical_retry_contract.append(
+                "Produce an evidence-grounded business decision and rationale after specialist "
+                "collaboration, matching the public output contract."
+            )
         document = {
             "Goal": (
                 "Implement the dependency-ready node described by "

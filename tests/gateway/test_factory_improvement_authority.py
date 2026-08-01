@@ -205,6 +205,61 @@ def test_captain_retains_only_passed_technical_assertions_as_regression_guards()
     ) == ("real_case_green",)
 
 
+def test_captain_classifies_public_business_and_handoff_failures() -> None:
+    job = _job().model_copy(
+        update={
+            "acceptance_assertion_ids": (
+                "business_value",
+                "safe_tool_use",
+                "mandatory_handoff",
+            )
+        }
+    )
+    payload = execution_payload(status="unresolved")
+    invocation = payload["invocation"]
+    assert isinstance(invocation, dict)
+    invocation["acceptance_assertion_ids"] = list(job.acceptance_assertion_ids)
+    payload["acceptance_assertion_ids"] = list(job.acceptance_assertion_ids)
+    execution_outcome = payload["execution_outcome"]
+    assert isinstance(execution_outcome, dict)
+    execution_outcome["assertion_outcomes"] = [
+        {
+            "assertion_id": "business_value",
+            "status": "failed",
+            "evidence_refs": [_ref("business", "1" * 64).model_dump(mode="json")],
+        },
+        {
+            "assertion_id": "safe_tool_use",
+            "status": "passed",
+            "evidence_refs": [_ref("safe", "2" * 64).model_dump(mode="json")],
+        },
+        {
+            "assertion_id": "mandatory_handoff",
+            "status": "failed",
+            "evidence_refs": [_ref("handoff", "3" * 64).model_dump(mode="json")],
+        },
+    ]
+    execution_outcome["status"] = "failed"
+    execution = TeamExecutionEvidenceV1.model_validate(payload)
+    source = _source_block(
+        FactoryPhase.REAL_CASE_EVIDENCE,
+        execution.artifact_ref,
+    ).model_copy(update={"artifact_refs": (execution.artifact_ref,)})
+
+    evaluation = CaptainTechnicalFailureEvaluator().from_team_execution(
+        job=job,
+        source_block=source,
+        candidate_ref=execution.candidate_ref,
+        execution=execution,
+        occurred_at=NOW,
+    )
+
+    assert evaluation.technical_diagnostic_codes == (
+        "business_value_failed",
+        "mandatory_handoff_failed",
+    )
+
+
 def test_issuer_recovers_team_execution_from_block_referenced_evidence(
     tmp_path: Path,
 ) -> None:

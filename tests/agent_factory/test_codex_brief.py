@@ -18,6 +18,7 @@ from agenten.agent_factory.execution_policy import (
 from agenten.agent_factory.forge_contracts import FactoryBuildAssignmentV1
 from agenten.agent_factory.skill_sequence import FactoryImprovementAuthorizationV1
 from agenten.agent_factory.technical_improvement_contracts import (
+    TechnicalFailureDiagnosticCode,
     build_captain_technical_failure_evaluation,
 )
 from agenten.agent_factory.outcome_contracts import AssertionOutcome
@@ -122,7 +123,11 @@ def retry_authorization() -> FactoryImprovementAuthorizationV1:
     )
 
 
-def technical_retry_authorization() -> FactoryImprovementAuthorizationV1:
+def technical_retry_authorization(
+    diagnostic_codes: tuple[TechnicalFailureDiagnosticCode, ...] = (
+        "real_case_trace_id_mismatch",
+    ),
+) -> FactoryImprovementAuthorizationV1:
     evidence_ref = ArtifactRef(
         uri="artifact://factory/candidate-evaluation/" + "7" * 64,
         sha256="7" * 64,
@@ -160,7 +165,7 @@ def technical_retry_authorization() -> FactoryImprovementAuthorizationV1:
             ),
         ),
         evidence_refs=(evidence_ref,),
-        technical_diagnostic_codes=("real_case_trace_id_mismatch",),
+        technical_diagnostic_codes=diagnostic_codes,
         failure_class="test_regression",
         recommendation=FactoryFeedbackRecommendation.RETRY_BUILD,
     )
@@ -358,3 +363,37 @@ def test_technical_retry_brief_explains_exact_real_case_runner_contract() -> Non
     assert "receives no stdin" in rendered
     assert "CAPTAIN_TRACE_ID" in rendered
     assert "exactly one JSON object" in rendered
+
+
+def test_behavioral_retry_brief_requires_specialist_handoff_before_completion() -> None:
+    authorization = technical_retry_authorization(
+        ("business_value_failed", "mandatory_handoff_failed")
+    )
+    invocation_data = invocation_payload(
+        "brief_codex",
+        attempt=2,
+        input_ref=authorization.authorization_ref.model_dump(mode="json"),
+        input_sha256=authorization.authorization_ref.sha256,
+        lease=lease_payload(
+            "tool_integrator",
+            "factory-tool-integrator",
+            attempt=2,
+        ),
+    )
+    assignment_data = build_assignment_payload()
+    assignment_data["attempt"] = 2
+    store = PromptArtifactStore()
+
+    brief = CodexBriefBuilder(artifact_store=store).build(
+        FactorySkillInvocationV1.model_validate(invocation_data),
+        FactoryBuildAssignmentV1.model_validate(assignment_data),
+        CodebaseInventoryV1.model_validate(inventory_payload()),
+        policy(),
+        improvement_authorization=authorization,
+    )
+
+    rendered = store.read(brief.prompt_ref)
+    assert "meaningful configured agent handoff" in rendered
+    assert "before terminal completion" in rendered
+    assert "evidence-grounded business decision" in rendered
+    assert "receives no stdin" not in rendered

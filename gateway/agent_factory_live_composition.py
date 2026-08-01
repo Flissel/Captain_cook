@@ -484,6 +484,7 @@ def compose_agent_factory_live(
         provider=cast(FactoryCandidateProvider, candidate_bindings),
         evidence_store=evidence_store,
         team_execution=team_execution,
+        workflow_artifacts=repository,
     )
     benchmark_composition = BusinessBenchmarkFactoryComposition(
         private_repository=business_benchmark_repository,

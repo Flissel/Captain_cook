@@ -161,6 +161,18 @@ class CaptainTechnicalFailureEvaluator:
             outcome.model_copy(update={"evidence_refs": evidence_refs})
             for outcome in outcomes
         )
+        diagnostic_codes = tuple(
+            code
+            for assertion_id, code in (
+                ("business_value", "business_value_failed"),
+                ("mandatory_handoff", "mandatory_handoff_failed"),
+            )
+            if any(
+                outcome.assertion_id == assertion_id
+                and outcome.status == "failed"
+                for outcome in outcomes
+            )
+        )
         return build_captain_technical_failure_evaluation(
             job_id=job.job_id,
             correlation_id=job.correlation_id,
@@ -173,6 +185,7 @@ class CaptainTechnicalFailureEvaluator:
             acceptance_assertion_ids=job.acceptance_assertion_ids,
             assertion_outcomes=normalized,
             evidence_refs=evidence_refs,
+            technical_diagnostic_codes=diagnostic_codes,
             failure_class="behavioral_failure",
             recommendation=FactoryFeedbackRecommendation.RETRY_BUILD,
         )

@@ -103,6 +103,7 @@ def test_composes_real_factory_runner_without_provider_effects(tmp_path: Path) -
     assert isinstance(composition.hermes, HermesCliFactory)
     assert isinstance(composition.team_execution, ProductionFactoryTeamExecutionPort)
     assert isinstance(composition.candidate_validator, CandidateEvaluationFactory)
+    assert composition.candidate_validator._workflow_artifacts is composition.repository
     assert isinstance(composition.business_benchmark, BusinessBenchmarkDispatchService)
     assert isinstance(composition.dispatcher, FactoryDispatcher)
     assert isinstance(composition.runner, ProductionFactoryDispatchRunner)

@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+import agenten.agent_factory.candidate_evaluation as candidate_evaluation_module
+
 from agenten.agent_factory.candidate_evaluation import (
     FactoryAutoGenTeamManifestV1,
     CandidateEvaluationFactory,
@@ -939,6 +941,110 @@ async def test_validator_rejects_agent_code_evidence_without_exact_forge_result(
                 lease=lease,
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_real_case_records_validated_team_execution_in_captain_workflow_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "candidate.zip"
+    team_ref, workflow_ref, input_ref, output_ref, source_ref = _write_candidate_archive(
+        archive_path
+    )
+    candidate = FactoryCandidateManifest(
+        candidate_id="support_triage_v1",
+        source_archive_ref=source_ref,
+        team_manifest={"reference": team_ref, "relative_path": "team_manifest.json"},
+        workflow_artifacts=(
+            {
+                "reference": workflow_ref,
+                "relative_path": "workflows/support_triage.json",
+            },
+        ),
+        tool_schema_artifacts=(
+            {
+                "reference": input_ref,
+                "relative_path": "schemas/support_triage.input.json",
+            },
+            {
+                "reference": output_ref,
+                "relative_path": "schemas/support_triage.output.json",
+            },
+        ),
+        n8n_tools=(
+            TypedN8nTool(
+                name="support_triage",
+                description="Route support.",
+                input_schema_ref=input_ref.uri,
+                output_schema_ref=output_ref.uri,
+            ),
+        ),
+        build_command=("python", "-m", "compileall", "-q", "."),
+        real_case_command=("python", "run_case.py"),
+        timeout_seconds=10,
+    )
+    factory_job = job()
+    lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.REAL_CASE_TESTER,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage",
+        now=factory_job.occurred_at,
+    )
+    request = FactoryDispatch(
+        job=factory_job,
+        action=FactoryAction(
+            kind=FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
+            attempt=1,
+        ),
+        role=FactoryRole.REAL_CASE_TESTER,
+        lease=lease,
+    )
+    team_evidence = SimpleNamespace(
+        model_dump_json=lambda **_kwargs: '{"schema":"test-team-evidence"}'
+    )
+    expected_block = object()
+    monkeypatch.setattr(
+        candidate_evaluation_module,
+        "_team_execution_block",
+        lambda *_args, **_kwargs: expected_block,
+    )
+
+    class TeamExecution:
+        def invocation_for(self, _request: FactoryDispatch) -> object:
+            return object()
+
+        async def execute(
+            self,
+            _request: FactoryDispatch,
+            _resolved: ResolvedFactoryCandidate,
+        ) -> object:
+            return team_evidence
+
+    recorded: list[object] = []
+
+    class WorkflowArtifacts:
+        def record_workflow_artifact(self, artifact: object) -> bool:
+            recorded.append(artifact)
+            return True
+
+    validator = CandidateEvaluationFactory(
+        provider=StaticFactoryCandidateProvider(
+            {
+                factory_job.job_id: ResolvedFactoryCandidate(
+                    candidate=candidate,
+                    source_archive=archive_path,
+                )
+            }
+        ),
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
+        team_execution=TeamExecution(),  # type: ignore[arg-type]
+        workflow_artifacts=WorkflowArtifacts(),  # type: ignore[arg-type]
+    )
+
+    assert await validator.dispatch(request) is expected_block
+    assert recorded == [team_evidence]
 
 
 @pytest.mark.asyncio

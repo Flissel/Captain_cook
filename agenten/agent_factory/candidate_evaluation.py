@@ -1210,6 +1210,15 @@ class FactoryTeamExecutionPort(Protocol):
     ) -> TeamExecutionEvidenceV1: ...
 
 
+class FactoryTeamExecutionArtifactSink(Protocol):
+    """Captain-owned append-only sink for validated team execution evidence."""
+
+    def record_workflow_artifact(
+        self,
+        artifact: TeamExecutionEvidenceV1,
+    ) -> bool: ...
+
+
 class CandidateEvaluationFactory:
     """Emit leased Hermes lifecycle blocks from independently persisted evaluation evidence."""
 
@@ -1220,11 +1229,13 @@ class CandidateEvaluationFactory:
         evidence_store: FactoryEvidenceStore,
         evaluator: FactoryCandidateEvaluator | None = None,
         team_execution: FactoryTeamExecutionPort | None = None,
+        workflow_artifacts: FactoryTeamExecutionArtifactSink | None = None,
     ) -> None:
         self._provider = provider
         self._evidence_store = evidence_store
         self._evaluator = evaluator or FactoryCandidateEvaluator()
         self._team_execution = team_execution
+        self._workflow_artifacts = workflow_artifacts
 
     async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
         if request.action.kind is FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE:
@@ -1258,13 +1269,16 @@ class CandidateEvaluationFactory:
                         by_alias=True, exclude_none=True
                     ).encode("utf-8"),
                 )
-                return _team_execution_block(
+                block = _team_execution_block(
                     request,
                     resolved,
                     team_evidence,
                     sealed,
                     expected_invocation=expected_invocation,
                 )
+                if self._workflow_artifacts is not None:
+                    self._workflow_artifacts.record_workflow_artifact(team_evidence)
+                return block
             result = self._evaluator.evaluate(
                 job=request.job,
                 candidate=resolved.candidate,
