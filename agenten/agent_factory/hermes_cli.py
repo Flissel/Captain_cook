@@ -2644,18 +2644,27 @@ def _same_or_valid_successor_lease(left: FactoryLease, right: FactoryLease) -> b
         IntegrationIntent.NONE: "claims",
         IntegrationIntent.N8N: "renewal",
     }.get(left.integration_intent)
+    bootstrap_workspace_pattern = (
+        None
+        if expected_profile is None
+        else (
+            r"workspace://business-benchmark-demo/"
+            + expected_profile
+            + r"/epoch-[0-9a-f]{16}"
+        )
+    )
+    left_is_bootstrap = (
+        bootstrap_workspace_pattern is not None
+        and re.fullmatch(bootstrap_workspace_pattern, left_workspace) is not None
+    )
+    bootstrap_to_bootstrap = (
+        left.role is FactoryRole.AGENT_ARCHITECT
+        and left_is_bootstrap
+        and re.fullmatch(bootstrap_workspace_pattern, right_workspace) is not None
+    )
     bootstrap_to_runtime = (
         left.role is FactoryRole.AGENT_ARCHITECT
-        and expected_profile is not None
-        and re.fullmatch(
-            (
-                r"workspace://business-benchmark-demo/"
-                + expected_profile
-                + r"/epoch-[0-9a-f]{16}"
-            ),
-            left_workspace,
-        )
-        is not None
+        and left_is_bootstrap
         and right_workspace
         == (
             "workspace://business-benchmark-factory-v3/"
@@ -2666,7 +2675,11 @@ def _same_or_valid_successor_lease(left: FactoryLease, right: FactoryLease) -> b
     return (
         left_payload == right_payload
         and right_issued >= left_expires
-        and (same_workspace_lineage or bootstrap_to_runtime)
+        and (
+            same_workspace_lineage
+            or bootstrap_to_bootstrap
+            or bootstrap_to_runtime
+        )
     )
 
 
