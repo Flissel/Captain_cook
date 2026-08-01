@@ -3163,6 +3163,116 @@ async def test_filesystem_replay_exposes_pending_claim_after_restart(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("durable", [False, True])
+async def test_completed_replay_accepts_exact_successor_lease_without_new_effect(
+    tmp_path: Path,
+    durable: bool,
+) -> None:
+    store = (
+        FilesystemFactorySkillReplayStore(tmp_path / "replays")
+        if durable
+        else InMemoryFactorySkillReplayStore()
+    )
+    invocation = FactorySkillInvocationV1.model_validate(invocation_payload("discover"))
+    invocation = invocation.model_copy(
+        update={
+            "lease": invocation.lease.model_copy(
+                update={
+                    "workspace_ref": (
+                        "workspace://factory/workflow/"
+                        + invocation.lease.issued_at.strftime("%Y%m%dT%H%M%S%fZ")
+                    )
+                }
+            )
+        }
+    )
+    claimed = await store.claim(invocation)
+    inventory = CodebaseInventoryV1.model_validate(inventory_payload()).model_copy(
+        update={"invocation": invocation}
+    )
+    completed = await store.complete(
+        claimed.record,
+        artifact=inventory,
+        transcript_ref=ArtifactRef(
+            uri="artifact://factory-evidence/successor-replay",
+            sha256="e" * 64,
+            media_type="application/json",
+        ),
+    )
+    successor = invocation.model_copy(
+        update={
+            "lease": invocation.lease.model_copy(
+                update={
+                    "lease_id": "factory-successor-replay",
+                    "issued_at": invocation.lease.expires_at,
+                    "expires_at": invocation.lease.expires_at + timedelta(minutes=15),
+                    "workspace_ref": (
+                        invocation.lease.workspace_ref.rsplit("/", 1)[0]
+                        + "/"
+                        + invocation.lease.expires_at.strftime("%Y%m%dT%H%M%S%fZ")
+                    ),
+                }
+            )
+        }
+    )
+
+    replay = await store.claim(successor)
+
+    assert replay.acquired is False
+    assert replay.record == completed
+    assert replay.record.invocation.lease == invocation.lease
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("durable", [False, True])
+async def test_pending_replay_exposes_original_claim_to_exact_successor_lease(
+    tmp_path: Path,
+    durable: bool,
+) -> None:
+    store = (
+        FilesystemFactorySkillReplayStore(tmp_path / "replays")
+        if durable
+        else InMemoryFactorySkillReplayStore()
+    )
+    invocation = FactorySkillInvocationV1.model_validate(seal_invocation_payload())
+    invocation = invocation.model_copy(
+        update={
+            "lease": invocation.lease.model_copy(
+                update={
+                    "workspace_ref": (
+                        "workspace://factory/workflow/"
+                        + invocation.lease.issued_at.strftime("%Y%m%dT%H%M%S%fZ")
+                    )
+                }
+            )
+        }
+    )
+    claimed = await store.claim(invocation)
+    successor = invocation.model_copy(
+        update={
+            "lease": invocation.lease.model_copy(
+                update={
+                    "lease_id": "factory-successor-pending",
+                    "issued_at": invocation.lease.expires_at,
+                    "expires_at": invocation.lease.expires_at + timedelta(minutes=15),
+                    "workspace_ref": (
+                        invocation.lease.workspace_ref.rsplit("/", 1)[0]
+                        + "/"
+                        + invocation.lease.expires_at.strftime("%Y%m%dT%H%M%S%fZ")
+                    ),
+                }
+            )
+        }
+    )
+
+    with pytest.raises(FactorySkillReplayPendingError) as caught:
+        await store.claim(successor)
+
+    assert caught.value.record == claimed.record
+    assert caught.value.record.invocation.lease == invocation.lease
+
+
+@pytest.mark.asyncio
 async def test_resume_claim_restart_restores_only_the_exact_prior_interruption(
     tmp_path: Path,
 ) -> None:

@@ -415,7 +415,7 @@ class HermesCliFactory(HermesFactoryPort):
                     raise
                 accepted = await self._reconcile_pending_codex_seal(
                     request,
-                    invocation,
+                    pending.record.invocation,
                     artifacts[-1],
                     pending.record,
                 )
@@ -438,7 +438,7 @@ class HermesCliFactory(HermesFactoryPort):
                     raise
                 validated = self._codex_build_sealer.validate_runtime_retry(
                     request,
-                    invocation,
+                    interrupted.record.invocation,
                     artifacts[-1],
                 )
                 if validated is not authorization:
@@ -461,7 +461,7 @@ class HermesCliFactory(HermesFactoryPort):
                     raise
                 validated = self._codex_build_sealer.validate_runtime_retry(
                     request,
-                    invocation,
+                    failed.record.invocation,
                     artifacts[-1],
                 )
                 if validated is not authorization:
@@ -2544,6 +2544,28 @@ def _existing_replay_claim(
         existing.invocation_sha256 != _factory_invocation_digest(invocation)
         or existing.invocation != invocation
     ):
+        valid_successor = (
+            _same_invocation_except_lease(existing.invocation, invocation)
+            and _same_or_valid_successor_lease(
+                existing.invocation.lease,
+                invocation.lease,
+            )
+        )
+        if valid_successor:
+            if existing.state == "pending":
+                raise FactorySkillReplayPendingError(existing)
+            if existing.state == "interrupted":
+                raise FactorySkillReplayInterruptedError(existing)
+            if existing.state == "failed":
+                if _is_codex_retryable_failure(existing):
+                    raise FactorySkillReplayRetryableFailureError(existing)
+                if _is_hermes_retryable_failure(existing) and existing.resume_ordinal < 3:
+                    raise FactorySkillReplayHermesRetryableFailureError(
+                        existing,
+                        invocation,
+                    )
+                raise FactoryDispatchError("factory skill replay previously failed")
+            return FactorySkillReplayClaim(record=existing, acquired=False)
         if (
             existing.state == "failed"
             and _is_hermes_retryable_failure(existing)
