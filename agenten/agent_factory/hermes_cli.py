@@ -2529,8 +2529,7 @@ def _existing_replay_claim(
     ):
         if (
             existing.state == "failed"
-            and existing.invocation.step is not FactorySkillStep.SEAL_CODEX_BUILD
-            and existing.failure_kind == "FactoryDispatchError"
+            and _is_hermes_retryable_failure(existing)
             and existing.resume_ordinal < 3
             and _same_invocation_except_lease(existing.invocation, invocation)
         ):
@@ -2548,10 +2547,9 @@ def _existing_replay_claim(
         ):
             raise FactorySkillReplayRetryableFailureError(existing)
         if (
-                existing.invocation.step is not FactorySkillStep.SEAL_CODEX_BUILD
-                and existing.failure_kind == "FactoryDispatchError"
-                and existing.resume_ordinal < 3
-            ):
+            _is_hermes_retryable_failure(existing)
+            and existing.resume_ordinal < 3
+        ):
             raise FactorySkillReplayHermesRetryableFailureError(
                 existing,
                 invocation,
@@ -2560,6 +2558,17 @@ def _existing_replay_claim(
     if existing.state == "interrupted":
         raise FactorySkillReplayInterruptedError(existing)
     return FactorySkillReplayClaim(record=existing, acquired=False)
+
+
+def _is_hermes_retryable_failure(
+    replay: FactorySkillReplayRecord,
+) -> bool:
+    if replay.failure_kind == "FactoryDispatchError":
+        return replay.invocation.step is not FactorySkillStep.SEAL_CODEX_BUILD
+    return (
+        replay.failure_kind == "evidence_binding_failed"
+        and replay.invocation.step is FactorySkillStep.EXECUTE_TEAM
+    )
 
 
 def _same_invocation_except_lease(

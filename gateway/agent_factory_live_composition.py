@@ -346,10 +346,14 @@ class ProductionFactoryTeamExecutionPort(FactoryTeamExecutionPort):
         evidence_store: FilesystemFactoryEvidenceStore,
         ports_for: FactoryLiveTeamExecutionPortsProvider,
         holdout_selector: Callable[[AgentFactoryJobV3], PrivateHoldoutRef] | None,
+        replay_retry_authority: (
+            CaptainHermesReplayRetryAuthorizationPort | None
+        ) = None,
     ) -> None:
         self._evidence_store = evidence_store
         self._ports_for = ports_for
         self._holdout_selector = holdout_selector
+        self._replay_retry_authority = replay_retry_authority
         self._adapters: dict[
             tuple[UUID, int, str], TeamExecutionCandidateAdapter
         ] = {}
@@ -388,6 +392,7 @@ class ProductionFactoryTeamExecutionPort(FactoryTeamExecutionPort):
             evidence_store=self._evidence_store,
             ports=ports,
             holdout_selector=self._holdout_selector,
+            replay_retry_authority=self._replay_retry_authority,
         )
         self._adapters[key] = adapter
         return adapter
@@ -480,6 +485,7 @@ def compose_agent_factory_live(
         evidence_store=evidence_store,
         ports_for=team_execution_ports_for,
         holdout_selector=holdout_selector,
+        replay_retry_authority=hermes_retry_authority,
     )
     candidate_validator = CandidateEvaluationFactory(
         provider=cast(FactoryCandidateProvider, candidate_bindings),

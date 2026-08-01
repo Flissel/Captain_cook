@@ -55,6 +55,8 @@ from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.leases import validate_factory_lease
 from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference
 from agenten.agent_factory.hermes_cli import (
+    CaptainHermesReplayRetryAuthorizationPort,
+    FactorySkillReplayHermesRetryableFailureError,
     FactorySkillReplayRecord,
     FactorySkillReplayStore,
     ReleasedFactorySkillCatalog,
@@ -2218,6 +2220,9 @@ class TeamExecutionService:
         runner: FactoryTeamRunner,
         evidence_store: FactoryEvidenceStore,
         replay_store: FactorySkillReplayStore | None = None,
+        replay_retry_authority: (
+            CaptainHermesReplayRetryAuthorizationPort | None
+        ) = None,
         clock: Callable[[], datetime],
     ) -> None:
         self._job = job
@@ -2225,6 +2230,7 @@ class TeamExecutionService:
         self._runner = runner
         self._evidence_store = evidence_store
         self._replay_store = replay_store
+        self._replay_retry_authority = replay_retry_authority
         self._clock = clock
 
     async def execute(
@@ -2255,7 +2261,21 @@ class TeamExecutionService:
             raise ValueError("offline factory policy forbids paid team execution")
         if self._replay_store is None:
             raise ValueError("paid team execution requires an atomic replay store")
-        replay = await self._replay_store.claim(invocation)
+        try:
+            replay = await self._replay_store.claim(invocation)
+        except FactorySkillReplayHermesRetryableFailureError as exc:
+            if self._replay_retry_authority is None:
+                raise
+            authorization = self._replay_retry_authority.active(
+                exc.record,
+                requested_invocation=invocation,
+                now=now,
+            )
+            replay = await self._replay_store.retry_failed_hermes(
+                exc.record,
+                requested_invocation=invocation,
+                authorization=authorization,
+            )
         if not replay.acquired:
             if not isinstance(replay.record.artifact, TeamExecutionEvidenceV1):
                 raise ValueError("team execution replay is missing completed evidence")
@@ -2762,6 +2782,9 @@ def compose_live_team_execution(
     holdout_selector: (
         Callable[[AgentFactoryJobV3], PrivateHoldoutRef] | None
     ) = None,
+    replay_retry_authority: (
+        CaptainHermesReplayRetryAuthorizationPort | None
+    ) = None,
 ) -> TeamExecutionCandidateAdapter:
     """Compose only the host AutoGen runner; generated runners are never accepted."""
 
@@ -2897,6 +2920,7 @@ def compose_live_team_execution(
             runner=runner,
             evidence_store=evidence_store,
             replay_store=ports.replay_store,
+            replay_retry_authority=replay_retry_authority,
             clock=ports.clock,
         )
 

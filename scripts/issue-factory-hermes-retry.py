@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 import sys
 from uuid import UUID
@@ -37,6 +38,21 @@ def _parser() -> argparse.ArgumentParser:
         ),
         default=FactorySkillStep.IMPROVE_TEAM.value,
     )
+    parser.add_argument(
+        "--maximum-additional-cost-usd", type=Decimal, default=Decimal("0.03")
+    )
+    parser.add_argument(
+        "--prior-attempt-reserve-usd", type=Decimal, default=Decimal("0.40")
+    )
+    parser.add_argument(
+        "--benchmark-reserve-usd", type=Decimal, default=Decimal("0.20")
+    )
+    parser.add_argument(
+        "--internal-total-cap-usd", type=Decimal, default=Decimal("0.79")
+    )
+    parser.add_argument(
+        "--user-total-cap-eur", type=Decimal, default=Decimal("1.00")
+    )
     return parser
 
 
@@ -60,7 +76,15 @@ def main() -> int:
         )
     authority = FilesystemFactoryHermesRetryAuthority(
         args.authority_root
-    ).issue(matches[0], now=datetime.now(timezone.utc))
+    ).issue(
+        matches[0],
+        now=datetime.now(timezone.utc),
+        maximum_additional_cost_usd=args.maximum_additional_cost_usd,
+        prior_attempt_reserve_usd=args.prior_attempt_reserve_usd,
+        benchmark_reserve_usd=args.benchmark_reserve_usd,
+        internal_total_cap_usd=args.internal_total_cap_usd,
+        user_total_cap_eur=args.user_total_cap_eur,
+    )
     print(
         json.dumps(
             {

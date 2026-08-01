@@ -45,9 +45,16 @@ class FilesystemFactoryHermesRetryAuthority:
     ) -> FactoryHermesReplayRetryAuthorizationV1:
         invocation = failed.invocation
         retry_ordinal = failed.resume_ordinal + 1
+        evidence_repair = (
+            failed.failure_kind == "evidence_binding_failed"
+            and invocation.step is FactorySkillStep.EXECUTE_TEAM
+        )
         if (
             failed.state != "failed"
-            or failed.failure_kind != "FactoryDispatchError"
+            or (
+                failed.failure_kind != "FactoryDispatchError"
+                and not evidence_repair
+            )
             or not 1 <= retry_ordinal <= 3
             or invocation.step is FactorySkillStep.SEAL_CODEX_BUILD
         ):
@@ -63,6 +70,12 @@ class FilesystemFactoryHermesRetryAuthority:
             idempotency_key=invocation.idempotency_key,
             lease_id=invocation.lease.lease_id,
             step=invocation.step,
+            reason=(
+                "evidence_binding_repaired"
+                if evidence_repair
+                else "cost_ceiling_reconfigured"
+            ),
+            failure_kind=failed.failure_kind,
             retry_ordinal=retry_ordinal,
             failed_replay_ref=factory_skill_replay_failure_ref(failed),
             issued_at=now,

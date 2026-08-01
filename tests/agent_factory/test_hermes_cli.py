@@ -1965,6 +1965,65 @@ async def test_failed_improve_replay_requires_exact_budget_bound_captain_retry(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("durable", [False, True])
+async def test_failed_execute_team_evidence_replay_is_captain_retryable(
+    tmp_path: Path,
+    durable: bool,
+) -> None:
+    replay_store = (
+        FilesystemFactorySkillReplayStore(tmp_path / "team-replays")
+        if durable
+        else InMemoryFactorySkillReplayStore()
+    )
+    payload = invocation_payload("execute_team", attempt=3)
+    lease_payload = payload["lease"]
+    assert isinstance(lease_payload, dict)
+    lease_payload["attempt"] = 3
+    invocation = FactorySkillInvocationV1.model_validate(payload)
+    claimed = await replay_store.claim(invocation)
+    failed = await replay_store.fail(
+        claimed.record,
+        failure_kind="evidence_binding_failed",
+    )
+
+    with pytest.raises(FactorySkillReplayHermesRetryableFailureError):
+        await replay_store.claim(invocation)
+
+    authorization = build_factory_hermes_replay_retry_authorization(
+        job_id=invocation.job_id,
+        correlation_id=invocation.correlation_id,
+        subject_version=invocation.subject_version,
+        attempt=invocation.attempt,
+        invocation_id=invocation.invocation_id,
+        idempotency_key=invocation.idempotency_key,
+        lease_id=invocation.lease.lease_id,
+        step=invocation.step,
+        reason="evidence_binding_repaired",
+        failure_kind="evidence_binding_failed",
+        failed_replay_ref=factory_skill_replay_failure_ref(failed),
+        retry_ordinal=1,
+        issued_at=invocation.lease.issued_at,
+        expires_at=invocation.lease.issued_at + timedelta(minutes=5),
+        maximum_additional_cost_usd=Decimal("0.03"),
+        prior_attempt_reserve_usd=Decimal("0.40"),
+        benchmark_reserve_usd=Decimal("0.20"),
+        internal_total_cap_usd=Decimal("0.79"),
+    )
+    retried = await replay_store.retry_failed_hermes(
+        failed,
+        requested_invocation=invocation,
+        authorization=authorization,
+    )
+
+    assert retried.acquired is True
+    assert retried.record.state == "pending"
+    assert retried.record.resume_ordinal == 1
+    assert retried.record.prior_failure_ref == factory_skill_replay_failure_ref(
+        failed
+    )
+
+
+@pytest.mark.asyncio
 async def test_authorized_runtime_retry_resumes_only_seal_without_new_hermes_call(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

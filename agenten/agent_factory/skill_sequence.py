@@ -131,7 +131,7 @@ class FactoryHermesReplayRetryAuthorizationV1(BaseModel):
     authorization_ref: ArtifactRef
     producer: Literal["captain"]
     status: Literal["succeeded"]
-    reason: Literal["cost_ceiling_reconfigured"]
+    reason: Literal["cost_ceiling_reconfigured", "evidence_binding_repaired"]
     job_id: UUID
     correlation_id: UUID
     subject_version: int = Field(ge=1, strict=True)
@@ -140,7 +140,7 @@ class FactoryHermesReplayRetryAuthorizationV1(BaseModel):
     idempotency_key: str = Field(pattern=r"^[0-9a-f]{64}$")
     lease_id: str = Field(min_length=1, max_length=200)
     step: FactorySkillStep
-    failure_kind: Literal["FactoryDispatchError"]
+    failure_kind: Literal["FactoryDispatchError", "evidence_binding_failed"]
     failed_replay_ref: ArtifactRef
     retry_ordinal: int = Field(ge=1, le=3, strict=True)
     maximum_additional_cost_usd: Decimal = Field(gt=Decimal("0"))
@@ -164,7 +164,7 @@ class FactoryHermesReplayRetryAuthorizationV1(BaseModel):
     ) -> "FactoryHermesReplayRetryAuthorizationV1":
         if self.expires_at <= self.issued_at:
             raise ValueError("Hermes retry authority expiry must follow issuance")
-        if self.internal_total_cap_usd > Decimal("0.75"):
+        if self.internal_total_cap_usd > Decimal("0.80"):
             raise ValueError("Hermes retry internal team cap exceeds policy")
         if self.user_total_cap_eur > Decimal("1.00"):
             raise ValueError("Hermes retry user team cap exceeds policy")
@@ -193,6 +193,12 @@ def build_factory_hermes_replay_retry_authorization(
     issued_at: datetime,
     expires_at: datetime,
     step: FactorySkillStep = FactorySkillStep.IMPROVE_TEAM,
+    reason: Literal[
+        "cost_ceiling_reconfigured", "evidence_binding_repaired"
+    ] = "cost_ceiling_reconfigured",
+    failure_kind: Literal[
+        "FactoryDispatchError", "evidence_binding_failed"
+    ] = "FactoryDispatchError",
     retry_ordinal: int = 1,
     maximum_additional_cost_usd: Decimal = Decimal("0.25"),
     prior_attempt_reserve_usd: Decimal = Decimal("0.20"),
@@ -212,7 +218,7 @@ def build_factory_hermes_replay_retry_authorization(
         authorization_ref=placeholder,
         producer="captain",
         status="succeeded",
-        reason="cost_ceiling_reconfigured",
+        reason=reason,
         job_id=job_id,
         correlation_id=correlation_id,
         subject_version=subject_version,
@@ -221,7 +227,7 @@ def build_factory_hermes_replay_retry_authorization(
         idempotency_key=idempotency_key,
         lease_id=lease_id,
         step=step,
-        failure_kind="FactoryDispatchError",
+        failure_kind=failure_kind,
         failed_replay_ref=failed_replay_ref,
         retry_ordinal=retry_ordinal,
         maximum_additional_cost_usd=maximum_additional_cost_usd,

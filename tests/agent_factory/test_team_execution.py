@@ -62,9 +62,13 @@ from agenten.agent_factory.team_execution import (
     SealedSingleAgentPolicyV1,
     ResolvedFactoryHoldoutCase,
     TeamExecutionService,
+    _holdout_scoped_invocation,
     _FactoryActivityCeilingTermination,
     _FactoryTaskCompletedTermination,
     compose_live_team_execution,
+)
+from gateway.factory_hermes_retry_authority import (
+    FilesystemFactoryHermesRetryAuthority,
 )
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
@@ -2912,6 +2916,53 @@ async def test_pre_effect_host_configuration_failure_abandons_replay_claim(
                 job.private_holdout_refs[0],
             )
     assert runner.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_captain_authority_reopens_exact_failed_team_evidence_replay(
+    tmp_path: Path,
+) -> None:
+    job = _job_v3()
+    invocation = _invocation(job)
+    holdout = job.private_holdout_refs[0]
+    scoped_invocation = _holdout_scoped_invocation(invocation, holdout)
+    replay_store = InMemoryFactorySkillReplayStore()
+    claimed = await replay_store.claim(scoped_invocation)
+    failed = await replay_store.fail(
+        claimed.record,
+        failure_kind="evidence_binding_failed",
+    )
+    authority = FilesystemFactoryHermesRetryAuthority(tmp_path / "authorities")
+    authority.issue(
+        failed,
+        now=NOW,
+        maximum_additional_cost_usd=Decimal("0.03"),
+        prior_attempt_reserve_usd=Decimal("0.40"),
+        benchmark_reserve_usd=Decimal("0.20"),
+        internal_total_cap_usd=Decimal("0.79"),
+    )
+
+    class Runner:
+        calls = 0
+
+        async def run(self, **_: object) -> FactoryTeamRunResult:
+            self.calls += 1
+            raise RuntimeError("controlled provider failure after authorized retry")
+
+    runner = Runner()
+    evidence = await TeamExecutionService(
+        job=job,
+        preflight=_SuccessfulPreflight(),
+        runner=runner,
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
+        replay_store=replay_store,
+        replay_retry_authority=authority,
+        clock=lambda: NOW,
+    ).execute(invocation, _candidate(tmp_path), holdout)
+
+    assert runner.calls == 1
+    assert evidence.status == "unresolved"
+    assert evidence.termination_reason == "provider_cost_unresolved"
 
 
 @pytest.mark.asyncio

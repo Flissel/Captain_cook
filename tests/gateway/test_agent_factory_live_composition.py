@@ -84,6 +84,7 @@ def test_composes_real_factory_runner_without_provider_effects(tmp_path: Path) -
     codex_build_sealer = object()
     codex_prompt_artifact_store = object()
     runtime_retries = object()
+    hermes_retry_authority = object()
 
     composition = _compose(
         tmp_path,
@@ -96,6 +97,7 @@ def test_composes_real_factory_runner_without_provider_effects(tmp_path: Path) -
         codex_build_sealer=codex_build_sealer,
         codex_prompt_artifact_store=codex_prompt_artifact_store,
         runtime_retries=runtime_retries,
+        hermes_retry_authority=hermes_retry_authority,
     )
 
     assert isinstance(composition.repository, GatewayFactoryRepository)
@@ -114,6 +116,11 @@ def test_composes_real_factory_runner_without_provider_effects(tmp_path: Path) -
     )
     assert composition.hermes._workflow_artifacts is composition.repository
     assert composition.repository._runtime_retries is runtime_retries
+    assert composition.hermes._hermes_retry_authority is hermes_retry_authority
+    assert (
+        composition.team_execution._replay_retry_authority
+        is hermes_retry_authority
+    )
     assert composition.dispatcher.lease_authority is composition.lease_issuer
     assert all(
         port.calls == 0
