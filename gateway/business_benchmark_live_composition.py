@@ -35,6 +35,7 @@ from agenten.agent_factory.business_benchmark_live import (
     ProductionBusinessBenchmarkCompositionPort,
 )
 from agenten.agent_factory.business_benchmark_production import (
+    BusinessBenchmarkCandidateAuthorityPort,
     ProductionBusinessBenchmarkScope,
 )
 from agenten.agent_factory.business_benchmark_production_ports import (
@@ -47,6 +48,7 @@ from agenten.agent_factory.business_benchmark_runtime import (
     BusinessBenchmarkSessionRequestV1,
 )
 from agenten.agent_factory.contracts import AgentFactoryJobV3
+from agenten.agent_factory.candidate_evaluation import ResolvedFactoryCandidate
 from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference
 from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillInvocationV1,
@@ -77,6 +79,35 @@ from gateway.business_benchmark_composition import (
     GatewayBusinessBenchmarkCompositionAuthority,
 )
 from gateway.contracts import RuntimeOperationProjection, RuntimeWriteReceipt
+
+
+class GatewayForgeCandidateResolverPort(Protocol):
+    def candidate_for(self, job: AgentFactoryJobV3) -> ResolvedFactoryCandidate: ...
+
+
+class GatewayForgeBusinessBenchmarkCandidateAuthority:
+    """Use the exact SHA-verified Forge candidate recorded by Gateway."""
+
+    def __init__(self, candidates: GatewayForgeCandidateResolverPort) -> None:
+        self._candidates = candidates
+
+    def resolve(
+        self,
+        *,
+        job: AgentFactoryJobV3,
+        expected_candidate_id: str,
+        expected_candidate_ref: ArtifactRef,
+    ) -> ResolvedFactoryCandidate:
+        candidate = self._candidates.candidate_for(job)
+        if (
+            not isinstance(candidate, ResolvedFactoryCandidate)
+            or candidate.candidate.candidate_id != expected_candidate_id
+            or candidate.candidate.source_archive_ref != expected_candidate_ref
+        ):
+            raise ValueError(
+                "current Forge candidate does not match Gateway benchmark evidence"
+            )
+        return candidate
 
 
 _POWERSHELL_CANONICAL_SHA256 = r"""
@@ -513,10 +544,12 @@ class GatewayBusinessBenchmarkLiveCompositionLoader:
         environment: Mapping[str, str],
         n8n_client: httpx.AsyncClient,
         clock: Callable[[], datetime],
+        candidate_authority: BusinessBenchmarkCandidateAuthorityPort | None = None,
     ) -> None:
         self._environment = dict(environment)
         self._n8n_client = n8n_client
         self._clock = clock
+        self._candidate_authority = candidate_authority
 
     def __call__(
         self, settings: LiveBusinessBenchmarkSettings
@@ -667,6 +700,7 @@ class GatewayBusinessBenchmarkLiveCompositionLoader:
             executor_builder=executor_builder,
             execution_policy_builder=policy_builder,
             clock=self._clock,
+            candidate_authority=self._candidate_authority,
         )
 
     def __repr__(self) -> str:

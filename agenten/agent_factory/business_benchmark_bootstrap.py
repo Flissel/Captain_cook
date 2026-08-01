@@ -79,6 +79,7 @@ from agenten.agent_factory.business_benchmark_human_review import (
     CaptainHumanReviewStore,
 )
 from agenten.agent_factory.business_benchmark_production import (
+    BusinessBenchmarkCandidateAuthorityPort,
     BusinessBenchmarkCasePolicyPort,
     CaptainBusinessBenchmarkPolicyBindingV1,
     ProductionBusinessBenchmarkComposition,
@@ -315,6 +316,7 @@ class ProductionBusinessBenchmarkBootstrapPorts:
     executor_builder: CaptainBusinessBenchmarkExecutorBuilderPort
     execution_policy_builder: CaptainBusinessBenchmarkExecutionPolicyBuilderPort
     clock: Callable[[], datetime]
+    candidate_authority: BusinessBenchmarkCandidateAuthorityPort | None = None
 
 
 @dataclass(frozen=True)
@@ -1400,7 +1402,11 @@ def compose_production_business_benchmark_composition(
     resolver = ProductionBusinessBenchmarkScopeResolver(
         gateway=gateway,
         suites=suite_authority,
-        candidates=BusinessBenchmarkCandidateAuthority(artifacts),
+        candidates=(
+            ports.candidate_authority
+            if ports.candidate_authority is not None
+            else BusinessBenchmarkCandidateAuthority(artifacts)
+        ),
         invocations=invocations,
     )
     factory = BusinessBenchmarkFactoryComposition(

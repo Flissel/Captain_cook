@@ -71,6 +71,7 @@ from gateway.agent_factory_live_composition import (
     select_technical_business_holdout,
 )
 from gateway.business_benchmark_live_composition import (
+    GatewayForgeBusinessBenchmarkCandidateAuthority,
     GatewayBusinessBenchmarkLiveCompositionLoader,
 )
 from gateway.factory_repository import GatewayFactoryRepository
@@ -453,6 +454,9 @@ def compose_business_demo_factory_operator(
         environment=environment,
         n8n_client=n8n_client,
         clock=current_time,
+        candidate_authority=GatewayForgeBusinessBenchmarkCandidateAuthority(
+            candidate_bindings
+        ),
     )
     benchmark_settings = {
         item.job_id: aggregate.for_selection(item)

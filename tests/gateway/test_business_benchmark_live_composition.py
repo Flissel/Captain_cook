@@ -13,6 +13,10 @@ import pytest
 from fastapi import HTTPException
 
 from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference
+from agenten.agent_factory.business_benchmark_candidate_seeds import (
+    CLAIMS_SEED_PROFILE,
+    package_business_benchmark_seed,
+)
 from agenten.agent_factory.business_benchmark_live import (
     BusinessBenchmarkTeamSelectionV1,
     LiveBusinessBenchmarkSettings,
@@ -28,6 +32,7 @@ from agenten.validation.contracts import (
 )
 from gateway.contracts import RuntimeOperationProjection, RuntimeWriteReceipt
 from gateway.business_benchmark_live_composition import (
+    GatewayForgeBusinessBenchmarkCandidateAuthority,
     GatewayBusinessBenchmarkLiveCompositionLoader,
     GatewayProfiledBusinessBenchmarkExecutorBuilder,
     GatewayRenewalN8nDeploymentBinding,
@@ -45,6 +50,37 @@ NOW = datetime(2026, 7, 28, 20, 0, tzinfo=timezone.utc)
 JOB_ID = UUID("71000000-0000-0000-0000-000000000001")
 CORRELATION_ID = UUID("71000000-0000-0000-0000-000000000002")
 INVOCATION_ID = UUID("71000000-0000-0000-0000-000000000003")
+
+
+def test_gateway_forge_candidate_authority_requires_exact_current_reference(
+    tmp_path: Path,
+) -> None:
+    candidate = package_business_benchmark_seed(
+        CLAIMS_SEED_PROFILE,
+        tmp_path / "candidate",
+    )
+
+    class ForgeCandidates:
+        def candidate_for(self, job: object):
+            assert job is expected_job
+            return candidate
+
+    expected_job = SimpleNamespace(job_id=JOB_ID)
+    authority = GatewayForgeBusinessBenchmarkCandidateAuthority(ForgeCandidates())
+
+    assert authority.resolve(
+        job=expected_job,
+        expected_candidate_id=candidate.candidate.candidate_id,
+        expected_candidate_ref=candidate.candidate.source_archive_ref,
+    ) == candidate
+    with pytest.raises(ValueError, match="current Forge candidate"):
+        authority.resolve(
+            job=expected_job,
+            expected_candidate_id=candidate.candidate.candidate_id,
+            expected_candidate_ref=candidate.candidate.source_archive_ref.model_copy(
+                update={"sha256": "f" * 64}
+            ),
+        )
 
 
 def _batch() -> WorkBatch:
@@ -530,10 +566,12 @@ def test_gateway_live_loader_composes_claims_without_n8n_or_secret_projection(
     environment = _environment(tmp_path)
     client = httpx.AsyncClient()
     try:
+        candidate_authority = SimpleNamespace(resolve=lambda **_: None)
         loader = GatewayBusinessBenchmarkLiveCompositionLoader(
             environment=environment,
             n8n_client=client,
             clock=lambda: NOW,
+            candidate_authority=candidate_authority,
         )
 
         result = loader(_live_settings(tmp_path, "claims"))
@@ -548,6 +586,7 @@ def test_gateway_live_loader_composes_claims_without_n8n_or_secret_projection(
         GatewayProfiledBusinessBenchmarkExecutorBuilder,
     )
     assert captured["executor_builder"].profiles == ("claims",)
+    assert captured["candidate_authority"] is candidate_authority
     serialized = f"{loader!r}|{captured['executor_builder']!r}"
     assert environment["OPENAI_API_KEY"] not in serialized
     assert "private-password" not in serialized

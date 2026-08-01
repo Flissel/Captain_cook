@@ -22,6 +22,9 @@ from agenten.agent_factory.business_benchmark_live import (
     LiveBusinessBenchmarkSettings,
     ProductionBusinessBenchmarkCompositionPort,
 )
+from agenten.agent_factory.business_benchmark_production import (
+    BusinessBenchmarkCandidateAuthorityPort,
+)
 from gateway.factory_repository import (
     GatewayFactoryBudgetLedger,
     GatewayFactoryLeases,
@@ -68,6 +71,7 @@ class GatewayBusinessBenchmarkCompositionAuthority:
         executor_builder: CaptainBusinessBenchmarkExecutorBuilderPort,
         execution_policy_builder: CaptainBusinessBenchmarkExecutionPolicyBuilderPort,
         clock: Callable[[], datetime],
+        candidate_authority: BusinessBenchmarkCandidateAuthorityPort | None = None,
     ) -> ProductionBusinessBenchmarkCompositionPort:
         """Inject one store-backed authority graph into the pure composition."""
 
@@ -81,6 +85,7 @@ class GatewayBusinessBenchmarkCompositionAuthority:
                 executor_builder=executor_builder,
                 execution_policy_builder=execution_policy_builder,
                 clock=clock,
+                candidate_authority=candidate_authority,
             ),
         )
 
