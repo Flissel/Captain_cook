@@ -921,17 +921,20 @@ try {
         throw 'Captain business benchmark default composition preflight is not canonical.'
     }
     if (
-        $preflight.production_scope_resolvable -eq $true -and
-        -not (Test-ResolvedPreflightBindings -Preflight $preflight -Teams $teams)
+        $preflight.PSObject.Properties.Name -contains 'jobs' -and
+        @($preflight.jobs).Count -gt 0
     ) {
-        throw 'Captain business benchmark preflight scope does not bind the provisioned Claims and Renewal candidates.'
-    }
-    if ($preflight.production_scope_resolvable -eq $true) {
         Set-ResolvedPreflightAttempts `
             -Environment $environment `
             -Preflight $preflight `
             -Teams $teams
         Set-ProcessEnvironment $environment
+    }
+    if (
+        $preflight.production_scope_resolvable -eq $true -and
+        -not (Test-ResolvedPreflightBindings -Preflight $preflight -Teams $teams)
+    ) {
+        throw 'Captain business benchmark preflight scope does not bind the provisioned Claims and Renewal candidates.'
     }
 
     if ($Action -ceq 'AUTHORIZE') {
@@ -1135,17 +1138,20 @@ try {
                 throw 'Captain business benchmark post-Factory preflight is not canonical.'
             }
             if (
-                $preflight.production_scope_resolvable -eq $true -and
-                -not (Test-ResolvedPreflightBindings -Preflight $preflight -Teams $teams)
+                $preflight.PSObject.Properties.Name -contains 'jobs' -and
+                @($preflight.jobs).Count -gt 0
             ) {
-                throw 'Captain business benchmark post-Factory scope does not bind the provisioned Claims and Renewal candidates.'
-            }
-            if ($preflight.production_scope_resolvable -eq $true) {
                 Set-ResolvedPreflightAttempts `
                     -Environment $environment `
                     -Preflight $preflight `
                     -Teams $teams
                 Set-ProcessEnvironment $environment
+            }
+            if (
+                $preflight.production_scope_resolvable -eq $true -and
+                -not (Test-ResolvedPreflightBindings -Preflight $preflight -Teams $teams)
+            ) {
+                throw 'Captain business benchmark post-Factory scope does not bind the provisioned Claims and Renewal candidates.'
             }
             if ($preflight.production_scope_resolvable -ne $true) {
                 New-FactoryDispatchCheckpoint `

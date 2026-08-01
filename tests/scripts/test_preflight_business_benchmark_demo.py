@@ -89,10 +89,18 @@ def test_preflight_maps_only_typed_scope_failure_to_factory_checkpoint(
     module = _load_module()
     closed = False
 
+    selections = (
+        SimpleNamespace(
+            job_id=UUID("71000000-0000-0000-0000-000000000001"),
+            candidate_id="candidate-a",
+            attempt=4,
+        ),
+    )
+
     class Settings:
         @classmethod
         def from_environment(cls, environment, *, repository_root):
-            return object()
+            return SimpleNamespace(selections=selections)
 
     class Composition:
         async def preflight(self, settings, environment, *, repository_root):
@@ -116,6 +124,13 @@ def test_preflight_maps_only_typed_scope_failure_to_factory_checkpoint(
         "status": "factory_dispatch_required",
         "database": "captain_test",
         "production_scope_resolvable": False,
+        "jobs": [
+            {
+                "job_id": "71000000-0000-0000-0000-000000000001",
+                "candidate_id": "candidate-a",
+                "attempt": 4,
+            }
+        ],
     }
     assert "private diagnostic" not in str(result)
     assert closed is True

@@ -75,6 +75,14 @@ async def preflight(
         settings,
         environment=resolved_environment,
     )
+    selected_jobs = [
+        {
+            "job_id": str(selection.job_id),
+            "candidate_id": selection.candidate_id,
+            "attempt": selection.attempt,
+        }
+        for selection in getattr(settings, "selections", ())
+    ]
     try:
         try:
             scopes = await composition.preflight(
@@ -88,6 +96,7 @@ async def preflight(
                 "status": "factory_dispatch_required",
                 "database": "captain_test",
                 "production_scope_resolvable": False,
+                "jobs": selected_jobs,
             }
         return {
             "schema": "captain.business-benchmark-default-preflight.v1",
