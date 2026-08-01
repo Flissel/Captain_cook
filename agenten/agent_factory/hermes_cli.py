@@ -94,6 +94,7 @@ class HermesCliSettings:
     model: str | None = None
     reasoning_effort: str | None = None
     maximum_total_cost_usd: Decimal | None = None
+    unresolved_effect_reserve_usd: Decimal | None = None
     maximum_iterations: int = 16
     maximum_output_tokens: int = 2048
 
@@ -128,6 +129,16 @@ class HermesCliSettings:
         ):
             raise ValueError(
                 "Hermes cost ceiling requires a positive Decimal and pinned model"
+            )
+        unresolved_reserve = self.unresolved_effect_reserve_usd
+        if unresolved_reserve is not None and (
+            maximum is None
+            or not unresolved_reserve.is_finite()
+            or unresolved_reserve <= 0
+            or unresolved_reserve > maximum
+        ):
+            raise ValueError(
+                "Hermes unresolved effect reserve requires available cost ceiling"
             )
         if (
             isinstance(self.maximum_iterations, bool)
@@ -320,7 +331,10 @@ class HermesCliFactory(HermesFactoryPort):
             provider_effect_store
             if provider_effect_store is not None
             else FilesystemHermesProviderEffectStore(
-                settings.evidence_root / "provider-effects"
+                settings.evidence_root / "provider-effects",
+                unresolved_effect_reserve_usd=(
+                    settings.unresolved_effect_reserve_usd
+                ),
             )
         )
         self._replay_store = (

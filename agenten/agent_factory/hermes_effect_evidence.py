@@ -79,8 +79,19 @@ def parse_hermes_usage(
 class FilesystemHermesProviderEffectStore:
     """Persist output and usage before typed artifact parsing can fail."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        unresolved_effect_reserve_usd: Decimal | None = None,
+    ) -> None:
         self._root = root.resolve()
+        if unresolved_effect_reserve_usd is not None and (
+            not unresolved_effect_reserve_usd.is_finite()
+            or unresolved_effect_reserve_usd <= 0
+        ):
+            raise ValueError("unresolved Hermes effect reserve is invalid")
+        self._unresolved_effect_reserve_usd = unresolved_effect_reserve_usd
 
     def total_estimated_cost_usd(self) -> Decimal:
         """Reconstruct the paid-effect reserve across process restarts."""
@@ -100,8 +111,11 @@ class FilesystemHermesProviderEffectStore:
                     raise ValueError
                 raw_cost = payload["estimated_cost_usd"]
                 if raw_cost is None:
-                    raise ValueError
-                cost = Decimal(str(raw_cost))
+                    if self._unresolved_effect_reserve_usd is None:
+                        raise ValueError
+                    cost = self._unresolved_effect_reserve_usd
+                else:
+                    cost = Decimal(str(raw_cost))
             except (
                 KeyError,
                 TypeError,

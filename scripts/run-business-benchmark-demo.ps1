@@ -129,10 +129,11 @@ $serviceRunner = Join-Path $PSScriptRoot 'live-demo-services.ps1'
 $benchmarkRuntimeEnvPath = Join-Path $repositoryRoot '.captain-cook/private/business-benchmarks/business-benchmark-runtime.env'
 $canonicalRenewalWorkflow = Join-Path $repositoryRoot 'examples/business_benchmark_candidates/customer_renewal_orchestration_team/workflows/renewal_context_read.json'
 $maximumUsdPerTeam = '0.32'
-$maximumHermesUsd = '0.25'
+$maximumHermesUsd = '1.00'
 # Hermes uses the pinned OpenAI cloud route. The incremental reserve and the
 # benchmark reserve both remain inside the user-owned per-team total envelope.
-$maximumIncrementalHermesUsd = '0.25'
+$maximumIncrementalHermesUsd = '1.00'
+$unresolvedHermesEffectReserveUsd = '0.25'
 $maximumTotalUsdPerTeam = '4.80'
 # Immutable V28 evidence, conservatively assigning all shared Hermes spend to
 # each team. These values are carried forward rather than resetting the cap.
@@ -824,6 +825,7 @@ try {
     $environment['CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM'] = $maximumTotalUsdPerTeam
     $environment['CAPTAIN_FACTORY_CODEX_METERED_USD_PER_TEAM'] = '0'
     $environment['CAPTAIN_FACTORY_HERMES_INCREMENTAL_MAX_USD'] = $maximumIncrementalHermesUsd
+    $environment['CAPTAIN_FACTORY_HERMES_UNRESOLVED_EFFECT_RESERVE_USD'] = $unresolvedHermesEffectReserveUsd
     $environment['CAPTAIN_FACTORY_HERMES_PROVIDER'] = 'openai-api'
     $environment['CAPTAIN_FACTORY_HERMES_MODEL'] = 'gpt-5.6-terra'
     $environment['CAPTAIN_FACTORY_HERMES_REASONING_EFFORT'] = 'high'

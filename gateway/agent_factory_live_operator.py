@@ -166,6 +166,12 @@ def validate_factory_total_cost_envelope(
                 "CAPTAIN_FACTORY_HERMES_INCREMENTAL_MAX_USD",
             )
         )
+        unresolved_hermes_effect_reserve_usd = Decimal(
+            _required(
+                environment,
+                "CAPTAIN_FACTORY_HERMES_UNRESOLVED_EFFECT_RESERVE_USD",
+            )
+        )
         prior_actual_usd = (
             Decimal(
                 _required(
@@ -188,6 +194,7 @@ def validate_factory_total_cost_envelope(
         total_maximum_usd,
         codex_metered_usd,
         hermes_incremental_usd,
+        unresolved_hermes_effect_reserve_usd,
         *prior_actual_usd,
         *benchmark_maximum_usd_per_team,
     )
@@ -199,7 +206,8 @@ def validate_factory_total_cost_envelope(
         or total_maximum_usd > Decimal("4.80")
         or total_maximum_usd * budget_eur_per_usd > user_maximum_eur
         or codex_metered_usd != 0
-        or hermes_incremental_usd != Decimal("0.25")
+        or hermes_incremental_usd != Decimal("1.00")
+        or unresolved_hermes_effect_reserve_usd != Decimal("0.25")
         or len(benchmark_maximum_usd_per_team) != 2
         or any(
             benchmark_usd
@@ -258,7 +266,7 @@ class FactoryLiveOperatorSettings:
             )
             or not self.hermes_maximum_total_cost_usd.is_finite()
             or self.hermes_maximum_total_cost_usd <= 0
-            or self.hermes_maximum_total_cost_usd > Decimal("0.25")
+            or self.hermes_maximum_total_cost_usd > Decimal("1.00")
         ):
             raise ValueError("Factory Hermes pin or cost allocation is invalid")
         if self.maximum_dispatches < 1 or self.maximum_dispatches > 24:
@@ -574,6 +582,12 @@ def compose_business_demo_factory_operator(
             model=settings.hermes_model,
             reasoning_effort=settings.hermes_reasoning_effort,
             maximum_total_cost_usd=settings.hermes_maximum_total_cost_usd,
+            unresolved_effect_reserve_usd=Decimal(
+                _required(
+                    environment,
+                    "CAPTAIN_FACTORY_HERMES_UNRESOLVED_EFFECT_RESERVE_USD",
+                )
+            ),
         ),
         clock=current_time,
         n8n_work_batches={
