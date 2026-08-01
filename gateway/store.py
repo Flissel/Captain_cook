@@ -2236,6 +2236,16 @@ class GatewayStore:
             if candidate.attempt == artifact.attempt
         )
         step = artifact.invocation.step
+        if step is FactorySkillStep.IMPROVE_TEAM:
+            requests = tuple(
+                reference
+                for reference in artifact.evidence_refs
+                if reference.uri.startswith(
+                    "artifact://factory/improvement-request/"
+                )
+            )
+            if len(requests) == 1:
+                return requests[0]
         if step is FactorySkillStep.REPORT_CAPTAIN:
             evaluations = tuple(
                 candidate
@@ -2249,10 +2259,15 @@ class GatewayStore:
                 )
             return evaluations[0].artifact_ref
         if step is FactorySkillStep.BRIEF_CODEX:
+            predecessor_type = (
+                CandidateRevisionV1
+                if artifact.attempt > 1
+                else CodebaseInventoryV1
+            )
             predecessors = tuple(
                 candidate
                 for candidate in current
-                if isinstance(candidate, (CodebaseInventoryV1, CandidateRevisionV1))
+                if isinstance(candidate, predecessor_type)
             )
             if len(predecessors) == 1:
                 return predecessors[0].artifact_ref
@@ -2273,6 +2288,28 @@ class GatewayStore:
             FactorySkillStep.EVALUATE_TEAM: {FactoryPhase.REAL_CASE_EVIDENCE},
             FactorySkillStep.REPORT_CAPTAIN: {FactoryPhase.REAL_CASE_EVIDENCE},
         }[step]
+        current_artifacts = tuple(
+            candidate
+            for candidate in prior_artifacts
+            if candidate.attempt == artifact.attempt
+        )
+        if step is FactorySkillStep.DISCOVER and artifact.attempt > 1:
+            required_phase = {
+                *required_phase,
+                FactoryPhase.IMPROVEMENT_REQUESTED,
+            }
+        if (
+            step is FactorySkillStep.IMPROVE_TEAM
+            and artifact.attempt > 1
+            and any(
+                isinstance(candidate, CodebaseInventoryV1)
+                for candidate in current_artifacts
+            )
+        ):
+            required_phase = {
+                *required_phase,
+                FactoryPhase.BLUEPRINT_CREATED,
+            }
         if (
             step is FactorySkillStep.BRIEF_CODEX
             and artifact.attempt > 1
@@ -2301,23 +2338,44 @@ class GatewayStore:
                 status_code=409,
                 detail="improve_team is allowed only on a later attempt",
             )
-        if step is FactorySkillStep.IMPROVE_TEAM and not any(
+        prior_failed_workflow_evaluation = any(
             isinstance(candidate, TeamEvaluationV1)
             and candidate.attempt == artifact.attempt - 1
             and candidate.failure_class is not None
             and candidate.recommendation
             == FactoryFeedbackRecommendation.RETRY_BUILD
             for candidate in prior_artifacts
+        )
+        bound_technical_failure = (
+            isinstance(artifact, CandidateRevisionV1)
+            and bool(artifact.failed_assertion_ids)
+            and any(
+                reference.uri.startswith(
+                    "artifact://factory/technical-failure-evaluation/"
+                )
+                for reference in artifact.evidence_refs
+            )
+        )
+        if (
+            step is FactorySkillStep.IMPROVE_TEAM
+            and not prior_failed_workflow_evaluation
+            and not bound_technical_failure
         ):
             raise HTTPException(
                 status_code=409,
                 detail="improve_team requires the prior attempt failed evaluation",
             )
         prefix = (
-            FactorySkillStep.IMPROVE_TEAM
+            (
+                FactorySkillStep.DISCOVER,
+                FactorySkillStep.IMPROVE_TEAM,
+                FactorySkillStep.BRIEF_CODEX,
+            )
             if artifact.attempt > 1
-            else FactorySkillStep.DISCOVER,
-            FactorySkillStep.BRIEF_CODEX,
+            else (
+                FactorySkillStep.DISCOVER,
+                FactorySkillStep.BRIEF_CODEX,
+            )
         )
         prior_steps = tuple(
             candidate.invocation.step
@@ -2325,16 +2383,18 @@ class GatewayStore:
             if candidate.attempt == artifact.attempt
         )
         sequence_valid = False
-        if step is prefix[0]:
+        if step is FactorySkillStep.DISCOVER:
             sequence_valid = not prior_steps
-        elif step is FactorySkillStep.BRIEF_CODEX:
+        elif step is FactorySkillStep.IMPROVE_TEAM:
             sequence_valid = prior_steps == prefix[:1]
+        elif step is FactorySkillStep.BRIEF_CODEX:
+            sequence_valid = prior_steps == prefix[:-1]
         elif step is FactorySkillStep.EXECUTE_TEAM:
             sequence_valid = (
-                prior_steps[:2] == prefix
+                prior_steps[: len(prefix)] == prefix
                 and all(
                     prior_step is FactorySkillStep.EXECUTE_TEAM
-                    for prior_step in prior_steps[2:]
+                    for prior_step in prior_steps[len(prefix) :]
                 )
             )
             executions = tuple(
@@ -2359,20 +2419,20 @@ class GatewayStore:
                 )
         elif step is FactorySkillStep.EVALUATE_TEAM:
             sequence_valid = (
-                prior_steps[:2] == prefix
-                and bool(prior_steps[2:])
+                prior_steps[: len(prefix)] == prefix
+                and bool(prior_steps[len(prefix) :])
                 and all(
                     prior_step is FactorySkillStep.EXECUTE_TEAM
-                    for prior_step in prior_steps[2:]
+                    for prior_step in prior_steps[len(prefix) :]
                 )
             )
         elif step is FactorySkillStep.REPORT_CAPTAIN:
             sequence_valid = (
-                prior_steps[:2] == prefix
-                and len(prior_steps) >= 4
+                prior_steps[: len(prefix)] == prefix
+                and len(prior_steps) >= len(prefix) + 2
                 and all(
                     prior_step is FactorySkillStep.EXECUTE_TEAM
-                    for prior_step in prior_steps[2:-1]
+                    for prior_step in prior_steps[len(prefix) : -1]
                 )
                 and prior_steps[-1] is FactorySkillStep.EVALUATE_TEAM
             )

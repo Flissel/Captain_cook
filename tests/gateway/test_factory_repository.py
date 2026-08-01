@@ -983,16 +983,22 @@ def test_gateway_workflow_sequence_rejects_improvement_on_first_attempt() -> Non
             ),
         }
     )
-    with pytest.raises(HTTPException, match="current factory phase"):
-        GatewayStore._assert_workflow_sequence(
-            retry_projection, retry_discovery, (failed_evaluation,)
-        )
-    with pytest.raises(HTTPException, match="failed evaluation"):
-        GatewayStore._assert_workflow_sequence(retry_projection, revision, ())
     GatewayStore._assert_workflow_sequence(
-        retry_projection,
+        retry_projection, retry_discovery, (failed_evaluation,)
+    )
+    with pytest.raises(HTTPException, match="prior workflow artifact sequence"):
+        GatewayStore._assert_workflow_sequence(
+            retry_projection,
+            revision,
+            (failed_evaluation,),
+        )
+    retry_blueprint = retry_projection.model_copy(
+        update={"phase": FactoryPhase.BLUEPRINT_CREATED}
+    )
+    GatewayStore._assert_workflow_sequence(
+        retry_blueprint,
         revision,
-        (failed_evaluation,),
+        (failed_evaluation, retry_discovery),
     )
 
     brief = parse_factory_workflow_artifact(brief_payload())
@@ -1001,9 +1007,9 @@ def test_gateway_workflow_sequence_rejects_improvement_on_first_attempt() -> Non
         update={"attempt": 2, "invocation": brief_invocation}
     )
     GatewayStore._assert_workflow_sequence(
-        retry_projection.model_copy(update={"phase": FactoryPhase.BLUEPRINT_CREATED}),
+        retry_blueprint,
         brief,
-        (failed_evaluation, revision),
+        (failed_evaluation, retry_discovery, revision),
     )
 
 

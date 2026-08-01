@@ -60,14 +60,46 @@ class Mirror:
 
 
 def test_improvement_brief_can_follow_revision_before_phase_transition(job_v3) -> None:
-    projection = FactoryProjection.from_job(job_v3).model_copy(
+    improvement_requested = FactoryProjection.from_job(job_v3).model_copy(
         update={"phase": FactoryPhase.IMPROVEMENT_REQUESTED, "attempt": 2}
     )
+    blueprint_created = improvement_requested.model_copy(
+        update={"phase": FactoryPhase.BLUEPRINT_CREATED}
+    )
+    inventory = CodebaseInventoryV1.model_validate(inventory_payload())
+    inventory = inventory.model_copy(
+        update={
+            "attempt": 2,
+            "invocation": inventory.invocation.model_copy(update={"attempt": 2}),
+        }
+    )
     revision = CandidateRevisionV1.model_validate(revision_payload())
+    technical_failure_ref = revision.evidence_refs[0].model_copy(
+        update={
+            "uri": (
+                "artifact://factory/technical-failure-evaluation/"
+                f"{revision.evidence_refs[0].sha256}"
+            )
+        }
+    )
+    improvement_request_ref = revision.codex_session_ref.model_copy(
+        update={
+            "uri": (
+                "artifact://factory/improvement-request/"
+                f"{revision.codex_session_ref.sha256}"
+            )
+        }
+    )
     revision = revision.model_copy(
         update={
             "attempt": 2,
-            "invocation": revision.invocation.model_copy(update={"attempt": 2}),
+            "invocation": revision.invocation.model_copy(
+                update={"attempt": 2, "input_ref": improvement_request_ref}
+            ),
+            "evidence_refs": (
+                technical_failure_ref,
+                improvement_request_ref,
+            ),
         }
     )
     brief = CodexBuildBriefV1.model_validate(brief_payload())
@@ -78,7 +110,25 @@ def test_improvement_brief_can_follow_revision_before_phase_transition(job_v3) -
         }
     )
 
-    GatewayStore._assert_workflow_sequence(projection, brief, (revision,))
+    GatewayStore._assert_workflow_sequence(improvement_requested, inventory, ())
+    GatewayStore._assert_workflow_sequence(
+        blueprint_created,
+        revision,
+        (inventory,),
+    )
+    GatewayStore._assert_workflow_sequence(
+        blueprint_created,
+        brief,
+        (inventory, revision),
+    )
+    assert GatewayStore._workflow_input_ref(job_v3, revision, (inventory,)) == (
+        improvement_request_ref
+    )
+    assert GatewayStore._workflow_input_ref(
+        job_v3,
+        brief,
+        (inventory, revision),
+    ) == revision.artifact_ref
 
 
 def validation_only_app(actor: GatewayRole):
