@@ -265,6 +265,12 @@ class CodexBriefBuilder:
                 "Set assertion_ids to exactly the Captain acceptance assertion IDs.",
                 "Exit zero only after the deterministic real-case fixture is evaluated.",
         ]
+        if "candidate_build_command_failed" in technical_diagnostic_codes:
+            technical_retry_contract.append(
+                "Run the candidate build command to a zero exit code, fix its tests "
+                "without weakening assertions, then regenerate candidate.zip from "
+                "the verified source tree."
+            )
         if (
             "mandatory_handoff" in invocation.acceptance_assertion_ids
             or "mandatory_handoff_failed" in technical_diagnostic_codes

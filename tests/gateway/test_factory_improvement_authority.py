@@ -140,6 +140,47 @@ def test_captain_converts_failed_build_preflight_to_fail_closed_assertions() -> 
     )
 
 
+def test_captain_converts_candidate_pytest_failure_to_retry_evidence() -> None:
+    job = _job()
+    evidence_ref = _ref("candidate-evaluation", "9" * 64)
+    source = _source_block(FactoryPhase.BUILD_FAILED, evidence_ref)
+    candidate_ref = _ref("candidate", "a" * 64)
+    result = FactoryCandidateEvaluationResult(
+        status="failed",
+        trace_id="trace-build-failed",
+        assertion_ids=(),
+        tool_names=(),
+        checks=(
+            FactoryEvaluationCheck(
+                name="source_archive", status="passed", detail="sha256 verified"
+            ),
+            FactoryEvaluationCheck(
+                name="build",
+                status="failed",
+                detail="candidate command failed: pytest exited 1",
+            ),
+        ),
+    )
+
+    evaluation = CaptainTechnicalFailureEvaluator().from_build_failure(
+        job=job,
+        source_block=source,
+        candidate_ref=candidate_ref,
+        result=result,
+        evidence_ref=evidence_ref,
+        occurred_at=NOW,
+    )
+
+    assert evaluation.failure_class == "test_regression"
+    assert evaluation.technical_diagnostic_codes == (
+        "candidate_build_command_failed",
+    )
+    assert tuple(item.status for item in evaluation.assertion_outcomes) == (
+        "failed",
+        "failed",
+    )
+
+
 def test_captain_classifies_missing_trace_without_copying_raw_failure_text() -> None:
     job = _job()
     evidence_ref = _ref("candidate-evaluation", "7" * 64)

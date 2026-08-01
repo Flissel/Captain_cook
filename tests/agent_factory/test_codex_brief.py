@@ -398,6 +398,39 @@ def test_technical_retry_brief_explains_exact_real_case_runner_contract() -> Non
     assert "exactly one JSON object" in rendered
 
 
+def test_build_failure_retry_brief_requires_candidate_tests_before_packaging() -> None:
+    authorization = technical_retry_authorization(
+        ("candidate_build_command_failed",)
+    )
+    invocation_data = invocation_payload(
+        "brief_codex",
+        attempt=2,
+        input_ref=authorization.authorization_ref.model_dump(mode="json"),
+        input_sha256=authorization.authorization_ref.sha256,
+        lease=lease_payload(
+            "tool_integrator",
+            "factory-tool-integrator",
+            attempt=2,
+        ),
+    )
+    assignment_data = build_assignment_payload()
+    assignment_data["attempt"] = 2
+    store = PromptArtifactStore()
+
+    brief = CodexBriefBuilder(artifact_store=store).build(
+        FactorySkillInvocationV1.model_validate(invocation_data),
+        FactoryBuildAssignmentV1.model_validate(assignment_data),
+        CodebaseInventoryV1.model_validate(inventory_payload()),
+        policy(),
+        improvement_authorization=authorization,
+    )
+
+    rendered = store.read(brief.prompt_ref)
+    assert "candidate_build_command_failed" in rendered
+    assert "Run the candidate build command to a zero exit code" in rendered
+    assert "regenerate candidate.zip" in rendered
+
+
 def test_behavioral_retry_brief_requires_specialist_handoff_before_completion() -> None:
     authorization = technical_retry_authorization(
         ("business_value_failed", "mandatory_handoff_failed")

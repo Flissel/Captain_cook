@@ -90,7 +90,10 @@ class CaptainTechnicalFailureEvaluator:
             or evidence_ref not in source_block.evidence_refs
             or result.status != "failed"
             or any(check.status == "infrastructure_failed" for check in result.checks)
-            or not any(check.name == "real_case" for check in failed_checks)
+            or not any(
+                check.name in {"build", "real_case"}
+                for check in failed_checks
+            )
         ):
             raise ValueError("build failure evidence is not retry-eligible")
         if (
@@ -201,6 +204,11 @@ def _technical_diagnostic_codes(
 ) -> tuple[TechnicalFailureDiagnosticCode, ...]:
     """Map public evaluator messages to a bounded, prompt-safe repair vocabulary."""
 
+    if any(
+        check.name == "build" and check.status == "failed"
+        for check in result.checks
+    ):
+        return ("candidate_build_command_failed",)
     failed = tuple(
         check
         for check in result.checks

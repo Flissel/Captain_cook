@@ -26,6 +26,7 @@ _TECHNICAL_FAILURE_PHASES = {
 
 TechnicalFailureDiagnosticCode = Literal[
     "business_value_failed",
+    "candidate_build_command_failed",
     "mandatory_handoff_failed",
     "real_case_command_failed",
     "real_case_contract_failed",
