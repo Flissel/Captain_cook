@@ -2289,6 +2289,16 @@ class CodexCliFactoryBuildExecutor:
                 else None
             ),
         )
+        command_sha256 = receipt.get("command_sha256")
+        command_binding_is_valid = (
+            command_sha256
+            == hashlib.sha256(
+                "\0".join(run_request.command).encode("utf-8")
+            ).hexdigest()
+            if checkpoint.terminal_receipt_sha256 is None
+            else isinstance(command_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", command_sha256) is not None
+        )
         if (
             set(receipt) != expected_keys
             or receipt["schema"] != "captain.codex-session-receipt.v1"
@@ -2304,10 +2314,7 @@ class CodexCliFactoryBuildExecutor:
             != checkpoint.parent_journal_sha256
             or receipt["parent_codex_thread_id"]
             != checkpoint.parent_codex_thread_id
-            or receipt["command_sha256"]
-            != hashlib.sha256(
-                "\0".join(run_request.command).encode("utf-8")
-            ).hexdigest()
+            or not command_binding_is_valid
         ):
             raise FactoryDispatchError(
                 "Factory Codex terminal session receipt binding changed"
