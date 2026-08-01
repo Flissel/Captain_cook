@@ -349,6 +349,7 @@ async def test_dispatch_uses_oneshot_mode_for_parseable_evidence(
         lease=lease,
     )
     observed: tuple[str, ...] = ()
+    recorded_workflow_artifacts: list[object] = []
     catalog = _catalog_for(tmp_path, FactorySkillStep.DISCOVER)
 
     class EvidenceStore:
@@ -358,6 +359,11 @@ async def test_dispatch_uses_oneshot_mode_for_parseable_evidence(
                 sha256="a" * 64,
                 media_type="application/json",
             )
+
+    class WorkflowArtifacts:
+        def record_workflow_artifact(self, artifact: object) -> bool:
+            recorded_workflow_artifacts.append(artifact)
+            return True
 
     class Process:
         returncode = 0
@@ -382,6 +388,7 @@ async def test_dispatch_uses_oneshot_mode_for_parseable_evidence(
             evidence_root=tmp_path / "evidence",
         ),
         evidence_store=EvidenceStore(),
+        workflow_artifacts=WorkflowArtifacts(),  # type: ignore[arg-type]
         released_skill_catalog=catalog,
         clock=lambda: lease.issued_at,
     ).dispatch(request)
@@ -406,6 +413,8 @@ async def test_dispatch_uses_oneshot_mode_for_parseable_evidence(
     assert "captain_discovery_seed=" in observed[-1]
     assert "captain_discovery_seed_sha256=" in observed[-1]
     assert "do not call tools" in observed[-1]
+    assert len(recorded_workflow_artifacts) == 1
+    assert isinstance(recorded_workflow_artifacts[0], CodebaseInventoryV1)
     binding_prefix = "captain_required_output_bindings="
     binding_line = next(
         line for line in observed[-1].splitlines() if line.startswith(binding_prefix)

@@ -112,6 +112,7 @@ def test_composes_real_factory_runner_without_provider_effects(tmp_path: Path) -
         composition.hermes._codex_prompt_artifact_store
         is codex_prompt_artifact_store
     )
+    assert composition.hermes._workflow_artifacts is composition.repository
     assert composition.repository._runtime_retries is runtime_retries
     assert composition.dispatcher.lease_authority is composition.lease_issuer
     assert all(

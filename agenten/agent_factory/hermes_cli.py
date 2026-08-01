@@ -234,6 +234,22 @@ class CaptainHermesReplayRetryAuthorizationPort(Protocol):
     ) -> FactoryHermesReplayRetryAuthorizationV1: ...
 
 
+class CaptainFactoryWorkflowArtifactPort(Protocol):
+    """Captain-owned append-only sink for governed Hermes workflow artifacts."""
+
+    def record_workflow_artifact(
+        self,
+        artifact: (
+            CodebaseInventoryV1
+            | CodexBuildBriefV1
+            | TeamExecutionEvidenceV1
+            | TeamEvaluationV1
+            | CandidateRevisionV1
+            | FactoryFeedbackV1
+        ),
+    ) -> bool: ...
+
+
 class FilesystemReleasedFactorySkillCatalog:
     """Load Captain release envelopes from an exact job/step catalog path."""
 
@@ -275,6 +291,7 @@ class HermesCliFactory(HermesFactoryPort):
         codex_build_sealer: CaptainCodexBuildSealerPort | None = None,
         codex_prompt_artifact_store: CodexPromptArtifactStore | None = None,
         hermes_retry_authority: CaptainHermesReplayRetryAuthorizationPort | None = None,
+        workflow_artifacts: CaptainFactoryWorkflowArtifactPort | None = None,
         provider_effect_store: FilesystemHermesProviderEffectStore | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -285,6 +302,7 @@ class HermesCliFactory(HermesFactoryPort):
         self._codex_build_sealer = codex_build_sealer
         self._codex_prompt_artifact_store = codex_prompt_artifact_store
         self._hermes_retry_authority = hermes_retry_authority
+        self._workflow_artifacts = workflow_artifacts
         self._provider_effect_store = (
             provider_effect_store
             if provider_effect_store is not None
@@ -403,6 +421,7 @@ class HermesCliFactory(HermesFactoryPort):
                 )
                 assert accepted.artifact is not None
                 assert accepted.transcript_ref is not None
+                self._record_workflow_artifact(accepted.artifact)
                 artifacts.append(accepted.artifact)
                 transcript_refs.append(accepted.transcript_ref)
                 input_ref = accepted.artifact.artifact_ref
@@ -480,6 +499,7 @@ class HermesCliFactory(HermesFactoryPort):
                 accepted = claim.record
                 assert accepted.artifact is not None
                 assert accepted.transcript_ref is not None
+                self._record_workflow_artifact(accepted.artifact)
                 artifacts.append(accepted.artifact)
                 transcript_refs.append(accepted.transcript_ref)
                 input_ref = accepted.artifact.artifact_ref
@@ -658,6 +678,7 @@ class HermesCliFactory(HermesFactoryPort):
             assert accepted.transcript_ref is not None
             transcript_refs.append(accepted.transcript_ref)
             artifact = accepted.artifact
+            self._record_workflow_artifact(artifact)
             artifacts.append(artifact)
             input_ref = artifact.artifact_ref
             if not _may_continue_after(artifact):
@@ -667,6 +688,17 @@ class HermesCliFactory(HermesFactoryPort):
             artifacts=tuple(artifacts),
             transcript_refs=tuple(transcript_refs),
         )
+
+    def _record_workflow_artifact(
+        self,
+        artifact: _FactoryWorkflowArtifact,
+    ) -> None:
+        if self._workflow_artifacts is None or isinstance(
+            artifact,
+            CodexBuildEvidenceV1,
+        ):
+            return
+        self._workflow_artifacts.record_workflow_artifact(artifact)
 
     async def _reconcile_pending_codex_seal(
         self,

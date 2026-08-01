@@ -473,6 +473,7 @@ def compose_agent_factory_live(
         codex_build_sealer=codex_build_sealer,
         codex_prompt_artifact_store=codex_prompt_artifact_store,
         hermes_retry_authority=hermes_retry_authority,
+        workflow_artifacts=repository,
         clock=clock,
     )
     team_execution = ProductionFactoryTeamExecutionPort(
