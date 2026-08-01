@@ -824,6 +824,8 @@ try {
     $environment['CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM'] = $maximumTotalUsdPerTeam
     $environment['CAPTAIN_FACTORY_CODEX_METERED_USD_PER_TEAM'] = '0'
     $environment['CAPTAIN_FACTORY_HERMES_INCREMENTAL_MAX_USD'] = $maximumIncrementalHermesUsd
+    $environment['CAPTAIN_FACTORY_HERMES_PROVIDER'] = 'custom'
+    $environment['CAPTAIN_FACTORY_HERMES_MODEL'] = 'llama3.1:8b'
     $environment['CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_CLAIMS'] = $priorActualUsdClaims
     $environment['CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_RENEWAL'] = $priorActualUsdRenewal
     $environment['CUSTOM_BASE_URL'] = 'http://127.0.0.1:11434/v1'

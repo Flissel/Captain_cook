@@ -208,9 +208,30 @@ def test_operator_settings_enforce_isolated_database_two_jobs_and_cost_allocatio
         )
 
 
+def test_operator_settings_accept_zero_cost_local_hermes_route(tmp_path: Path) -> None:
+    _write_hermes_runtime(tmp_path)
+
+    settings = FactoryLiveOperatorSettings(
+        workspace_root=tmp_path,
+        python_executable=Path(sys.executable),
+        hermes_python_executable=Path(sys.executable),
+        test_mariadb_dsn=LOCAL_DSN,
+        job_ids=JOB_IDS,
+        hermes_provider="custom",
+        hermes_model="llama3.1:8b",
+        hermes_maximum_total_cost_usd=Decimal("0.25"),
+    )
+
+    assert settings.hermes_provider == "custom"
+    assert settings.hermes_model == "llama3.1:8b"
+
+
 def test_total_cost_envelope_requires_subscription_codex_and_keeps_each_team_below_cap() -> None:
     environment = {
         "CAPTAIN_CODEX_AUTH_MODE": "chatgpt_subscription",
+        "CAPTAIN_FACTORY_HERMES_PROVIDER": "custom",
+        "CAPTAIN_FACTORY_HERMES_MODEL": "llama3.1:8b",
+        "CUSTOM_BASE_URL": "http://127.0.0.1:11434/v1",
         "CAPTAIN_FACTORY_USER_MAX_EUR_PER_TEAM": "1.00",
         "CAPTAIN_FACTORY_BUDGET_EUR_PER_USD": "1.25",
         "CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM": "0.80",
@@ -252,6 +273,28 @@ def test_total_cost_envelope_requires_subscription_codex_and_keeps_each_team_bel
                 **environment,
                 "CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_RENEWAL": "0.49",
             },
+            benchmark_maximum_usd_per_team=(Decimal("0.32"), Decimal("0.32")),
+        )
+
+
+def test_total_cost_envelope_rejects_remote_custom_hermes() -> None:
+    environment = {
+        "CAPTAIN_CODEX_AUTH_MODE": "chatgpt_subscription",
+        "CAPTAIN_FACTORY_HERMES_PROVIDER": "custom",
+        "CAPTAIN_FACTORY_HERMES_MODEL": "llama3.1:8b",
+        "CUSTOM_BASE_URL": "https://remote.example/v1",
+        "CAPTAIN_FACTORY_USER_MAX_EUR_PER_TEAM": "1.00",
+        "CAPTAIN_FACTORY_BUDGET_EUR_PER_USD": "1.25",
+        "CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM": "0.80",
+        "CAPTAIN_FACTORY_CODEX_METERED_USD_PER_TEAM": "0",
+        "CAPTAIN_FACTORY_HERMES_INCREMENTAL_MAX_USD": "0.00",
+        "CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_CLAIMS": "0.384892",
+        "CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_RENEWAL": "0.461592",
+    }
+
+    with pytest.raises(ValueError, match="local Hermes route"):
+        validate_factory_total_cost_envelope(
+            environment=environment,
             benchmark_maximum_usd_per_team=(Decimal("0.32"), Decimal("0.32")),
         )
 

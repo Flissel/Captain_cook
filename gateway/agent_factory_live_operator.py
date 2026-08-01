@@ -130,6 +130,14 @@ def validate_factory_total_cost_envelope(
         "chatgpt_subscription"
     ):
         raise ValueError("Factory Codex must use ChatGPT subscription authentication")
+    if (
+        environment.get("CAPTAIN_FACTORY_HERMES_PROVIDER", "").strip() != "custom"
+        or environment.get("CAPTAIN_FACTORY_HERMES_MODEL", "").strip()
+        != "llama3.1:8b"
+        or environment.get("CUSTOM_BASE_URL", "").strip()
+        != "http://127.0.0.1:11434/v1"
+    ):
+        raise ValueError("Factory local Hermes route is invalid")
     try:
         user_maximum_eur = Decimal(
             _required(environment, "CAPTAIN_FACTORY_USER_MAX_EUR_PER_TEAM")
@@ -188,6 +196,7 @@ def validate_factory_total_cost_envelope(
         or total_maximum_usd > Decimal("0.80")
         or total_maximum_usd * budget_eur_per_usd > user_maximum_eur
         or codex_metered_usd != 0
+        or hermes_incremental_usd != 0
         or len(benchmark_maximum_usd_per_team) != 2
         or any(
             benchmark_usd
@@ -236,8 +245,12 @@ class FactoryLiveOperatorSettings:
         if len(set(self.job_ids)) != 2:
             raise ValueError("Factory live operator requires two distinct jobs")
         if (
-            self.hermes_provider != "openai-api"
+            self.hermes_provider not in {"openai-api", "custom"}
             or not self.hermes_model.strip()
+            or (
+                self.hermes_provider == "custom"
+                and self.hermes_model != "llama3.1:8b"
+            )
             or not self.hermes_maximum_total_cost_usd.is_finite()
             or self.hermes_maximum_total_cost_usd <= 0
             or self.hermes_maximum_total_cost_usd > Decimal("0.25")
@@ -326,8 +339,13 @@ def compose_business_demo_factory_operator(
         item.job_id for item in aggregate.selections
     } != set(settings.job_ids):
         raise ValueError("Factory operator selections do not match the requested jobs")
-    if aggregate.model != settings.hermes_model:
-        raise ValueError("Hermes and AutoGen must use the same Captain-allowed model")
+    if (
+        environment.get("CAPTAIN_FACTORY_HERMES_PROVIDER")
+        != settings.hermes_provider
+        or environment.get("CAPTAIN_FACTORY_HERMES_MODEL")
+        != settings.hermes_model
+    ):
+        raise ValueError("Factory Hermes route does not match operator settings")
     validate_factory_total_cost_envelope(
         environment=environment,
         benchmark_maximum_usd_per_team=tuple(
