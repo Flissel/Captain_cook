@@ -865,6 +865,11 @@ try {
     foreach ($team in $teams) {
         $null = Require-NonEmpty $team.job.job_id "$($team.profile).job.job_id"
         $null = Require-NonEmpty $team.candidate_id "$($team.profile).candidate_id"
+        $gatewayBudgetRemaining = [decimal](
+            Require-NonEmpty `
+                $team.gateway_budget_remaining_usd `
+                "$($team.profile).gateway_budget_remaining_usd"
+        )
         if (
             [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
             @($team.job.execution_policy.allowed_models) -notcontains $model -or
@@ -874,7 +879,10 @@ try {
         }
         if (
             $Action -in @('AUTHORIZE', 'BUILD', 'RUN') -and
-            [decimal]$team.gateway_budget_remaining_usd -ne [decimal]$maximumUsdPerTeam
+            (
+                $gatewayBudgetRemaining -lt 0 -or
+                $gatewayBudgetRemaining -gt [decimal]$maximumUsdPerTeam
+            )
         ) {
             throw 'Applied team Gateway budget does not match the demo authority.'
         }

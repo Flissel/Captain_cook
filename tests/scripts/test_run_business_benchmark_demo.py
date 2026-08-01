@@ -81,7 +81,8 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     )[0]
     assert "$Action = $Action.ToUpperInvariant()" in source
     assert "Applied team Gateway budget does not match" in source
-    assert "[decimal]$team.gateway_budget_remaining_usd" in source
+    assert "$gatewayBudgetRemaining -lt 0" in source
+    assert "$gatewayBudgetRemaining -gt [decimal]$maximumUsdPerTeam" in source
     assert "docker compose down" not in source
     assert "VibeMind" not in source
     assert PREFLIGHT.is_file()
@@ -386,7 +387,7 @@ def team(profile, job_id, candidate_id, batch=None):
         },
         'suite': {'suite_version': suite_version},
         'candidate_id': candidate_id,
-        'gateway_budget_remaining_usd': '0.20',
+        'gateway_budget_remaining_usd': '0.19',
         'work_batch': None if batch is None else {'batch_id': batch},
         'production_scope_resolvable': True,
         'missing_gateway_evidence': ['team_execution_evidence'],
