@@ -1336,7 +1336,7 @@ class FactorySkillReplayRecord:
             raise FactoryDispatchError("factory skill replay invocation digest conflicts")
         if not self.claim_token:
             raise FactoryDispatchError("factory skill replay claim token is missing")
-        if isinstance(self.resume_ordinal, bool) or not 0 <= self.resume_ordinal <= 2:
+        if isinstance(self.resume_ordinal, bool) or not 0 <= self.resume_ordinal <= 3:
             raise FactoryDispatchError("factory skill replay resume ordinal is invalid")
         retry_binding = (
             self.runtime_retry_authorization_ref,
