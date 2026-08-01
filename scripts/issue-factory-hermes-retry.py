@@ -56,9 +56,24 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _canonical_authority_root(replay_root: Path, authority_root: Path) -> Path:
+    resolved_replay_root = replay_root.resolve()
+    expected = (
+        resolved_replay_root.parent.parent / "hermes-retry-authorizations"
+    ).resolve()
+    resolved_authority_root = authority_root.resolve()
+    if resolved_authority_root != expected:
+        raise FactoryDispatchError(
+            "Hermes retry authority root must be the canonical sibling of "
+            "hermes-evidence"
+        )
+    return resolved_authority_root
+
+
 def main() -> int:
     args = _parser().parse_args()
     replay_root = args.replay_root.resolve()
+    authority_root = _canonical_authority_root(replay_root, args.authority_root)
     selected_step = FactorySkillStep(args.step)
     matches = []
     for path in sorted(replay_root.glob("*.json")):
@@ -75,7 +90,7 @@ def main() -> int:
             "exactly one failed replay for the requested attempt and step is required"
         )
     authority = FilesystemFactoryHermesRetryAuthority(
-        args.authority_root
+        authority_root
     ).issue(
         matches[0],
         now=datetime.now(timezone.utc),
