@@ -44,14 +44,15 @@ class FilesystemFactoryHermesRetryAuthority:
         user_total_cap_eur: Decimal = Decimal("1.00"),
     ) -> FactoryHermesReplayRetryAuthorizationV1:
         invocation = failed.invocation
+        retry_ordinal = failed.resume_ordinal + 1
         if (
             failed.state != "failed"
             or failed.failure_kind != "FactoryDispatchError"
-            or failed.resume_ordinal != 0
+            or not 1 <= retry_ordinal <= 3
             or invocation.step is FactorySkillStep.SEAL_CODEX_BUILD
         ):
             raise FactoryDispatchError(
-                "only an original failed Hermes replay can be authorized"
+                "failed Hermes replay is not retry-eligible"
             )
         authorization = build_factory_hermes_replay_retry_authorization(
             job_id=invocation.job_id,
@@ -62,6 +63,7 @@ class FilesystemFactoryHermesRetryAuthority:
             idempotency_key=invocation.idempotency_key,
             lease_id=invocation.lease.lease_id,
             step=invocation.step,
+            retry_ordinal=retry_ordinal,
             failed_replay_ref=factory_skill_replay_failure_ref(failed),
             issued_at=now,
             expires_at=now + validity,
@@ -71,7 +73,10 @@ class FilesystemFactoryHermesRetryAuthority:
             internal_total_cap_usd=internal_total_cap_usd,
             user_total_cap_eur=user_total_cap_eur,
         )
-        path = self._path_for(invocation.idempotency_key)
+        path = self._path_for(
+            invocation.idempotency_key,
+            retry_ordinal=retry_ordinal,
+        )
         content = authorization.model_dump_json(by_alias=True).encode("utf-8")
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -95,7 +100,10 @@ class FilesystemFactoryHermesRetryAuthority:
         now: datetime,
     ) -> FactoryHermesReplayRetryAuthorizationV1:
         authorization = self._read(
-            self._path_for(failed.invocation.idempotency_key)
+            self._path_for(
+                failed.invocation.idempotency_key,
+                retry_ordinal=failed.resume_ordinal + 1,
+            )
         )
         try:
             validate_factory_hermes_replay_retry_authorization(
@@ -117,6 +125,7 @@ class FilesystemFactoryHermesRetryAuthority:
             or authorization.failure_kind != failed.failure_kind
             or authorization.failed_replay_ref
             != factory_skill_replay_failure_ref(failed)
+            or authorization.retry_ordinal != failed.resume_ordinal + 1
             or requested_invocation.idempotency_key != invocation.idempotency_key
         ):
             raise FactoryDispatchError(
@@ -124,8 +133,13 @@ class FilesystemFactoryHermesRetryAuthority:
             )
         return authorization
 
-    def _path_for(self, idempotency_key: str) -> Path:
-        path = (self._root / f"{idempotency_key}.json").resolve()
+    def _path_for(self, idempotency_key: str, *, retry_ordinal: int) -> Path:
+        filename = (
+            f"{idempotency_key}.json"
+            if retry_ordinal == 1
+            else f"{idempotency_key}.retry-{retry_ordinal}.json"
+        )
+        path = (self._root / filename).resolve()
         try:
             path.relative_to(self._root)
         except ValueError as exc:

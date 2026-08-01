@@ -142,7 +142,7 @@ class FactoryHermesReplayRetryAuthorizationV1(BaseModel):
     step: FactorySkillStep
     failure_kind: Literal["FactoryDispatchError"]
     failed_replay_ref: ArtifactRef
-    retry_ordinal: Literal[1]
+    retry_ordinal: int = Field(ge=1, le=3, strict=True)
     maximum_additional_cost_usd: Decimal = Field(gt=Decimal("0"))
     prior_attempt_reserve_usd: Decimal = Field(ge=Decimal("0"))
     benchmark_reserve_usd: Decimal = Field(ge=Decimal("0"))
@@ -193,6 +193,7 @@ def build_factory_hermes_replay_retry_authorization(
     issued_at: datetime,
     expires_at: datetime,
     step: FactorySkillStep = FactorySkillStep.IMPROVE_TEAM,
+    retry_ordinal: int = 1,
     maximum_additional_cost_usd: Decimal = Decimal("0.25"),
     prior_attempt_reserve_usd: Decimal = Decimal("0.20"),
     benchmark_reserve_usd: Decimal = Decimal("0.30"),
@@ -222,7 +223,7 @@ def build_factory_hermes_replay_retry_authorization(
         step=step,
         failure_kind="FactoryDispatchError",
         failed_replay_ref=failed_replay_ref,
-        retry_ordinal=1,
+        retry_ordinal=retry_ordinal,
         maximum_additional_cost_usd=maximum_additional_cost_usd,
         prior_attempt_reserve_usd=prior_attempt_reserve_usd,
         benchmark_reserve_usd=benchmark_reserve_usd,

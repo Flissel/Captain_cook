@@ -41,6 +41,29 @@ async def test_filesystem_authority_round_trips_strict_json_and_exact_failure(
     assert loaded.maximum_additional_cost_usd + loaded.prior_attempt_reserve_usd + loaded.benchmark_reserve_usd == loaded.internal_total_cap_usd
     assert loaded.user_total_cap_eur == 1
 
+    retried = await replay_store.retry_failed_hermes(
+        failed,
+        requested_invocation=invocation,
+        authorization=issued,
+    )
+    failed_again = await replay_store.fail(
+        retried.record,
+        failure_kind="FactoryDispatchError",
+    )
+
+    issued_again = authority.issue(
+        failed_again,
+        now=invocation.lease.issued_at + timedelta(seconds=2),
+    )
+    loaded_again = authority.active(
+        failed_again,
+        requested_invocation=invocation,
+        now=invocation.lease.issued_at + timedelta(seconds=3),
+    )
+
+    assert issued_again.retry_ordinal == 2
+    assert loaded_again == issued_again
+
 
 @pytest.mark.asyncio
 async def test_filesystem_authority_accepts_failed_brief_attestation(

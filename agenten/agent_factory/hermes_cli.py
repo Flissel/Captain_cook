@@ -2486,11 +2486,10 @@ def _retried_failed_hermes_replay_record(
     if (
         failed.state != "failed"
         or failed.failure_kind != authorization.failure_kind
-        or failed.resume_ordinal != 0
-        or failed.hermes_retry_authorization_ref is not None
+        or not 1 <= authorization.retry_ordinal <= 3
+        or authorization.retry_ordinal != failed.resume_ordinal + 1
         or invocation.step is FactorySkillStep.SEAL_CODEX_BUILD
         or authorization.step is not invocation.step
-        or authorization.retry_ordinal != 1
         or authorization.failed_replay_ref != failed_ref
         or authorization.job_id != invocation.job_id
         or authorization.correlation_id != invocation.correlation_id
@@ -2532,8 +2531,7 @@ def _existing_replay_claim(
             existing.state == "failed"
             and existing.invocation.step is not FactorySkillStep.SEAL_CODEX_BUILD
             and existing.failure_kind == "FactoryDispatchError"
-            and existing.resume_ordinal == 0
-            and existing.hermes_retry_authorization_ref is None
+            and existing.resume_ordinal < 3
             and _same_invocation_except_lease(existing.invocation, invocation)
         ):
             raise FactorySkillReplayHermesRetryableFailureError(
@@ -2550,11 +2548,10 @@ def _existing_replay_claim(
         ):
             raise FactorySkillReplayRetryableFailureError(existing)
         if (
-            existing.invocation.step is not FactorySkillStep.SEAL_CODEX_BUILD
-            and existing.failure_kind == "FactoryDispatchError"
-            and existing.resume_ordinal == 0
-            and existing.hermes_retry_authorization_ref is None
-        ):
+                existing.invocation.step is not FactorySkillStep.SEAL_CODEX_BUILD
+                and existing.failure_kind == "FactoryDispatchError"
+                and existing.resume_ordinal < 3
+            ):
             raise FactorySkillReplayHermesRetryableFailureError(
                 existing,
                 invocation,

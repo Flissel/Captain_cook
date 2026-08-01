@@ -1926,6 +1926,36 @@ async def test_failed_improve_replay_requires_exact_budget_bound_captain_retry(
         assert factory_skill_replay_failure_ref(
             FilesystemFactorySkillReplayStore._read_record(archive)
         ) == failure_ref
+    failed_again = await replay_store.fail(
+        retried.record,
+        failure_kind="FactoryDispatchError",
+    )
+    with pytest.raises(FactorySkillReplayHermesRetryableFailureError):
+        await replay_store.claim(successor_invocation)
+    failed_again_ref = factory_skill_replay_failure_ref(failed_again)
+    second_authorization = build_factory_hermes_replay_retry_authorization(
+        job_id=successor_invocation.job_id,
+        correlation_id=successor_invocation.correlation_id,
+        subject_version=successor_invocation.subject_version,
+        attempt=successor_invocation.attempt,
+        invocation_id=successor_invocation.invocation_id,
+        idempotency_key=successor_invocation.idempotency_key,
+        lease_id=successor_invocation.lease.lease_id,
+        step=successor_invocation.step,
+        failed_replay_ref=failed_again_ref,
+        retry_ordinal=2,
+        issued_at=successor_invocation.lease.issued_at,
+        expires_at=successor_invocation.lease.issued_at + timedelta(minutes=5),
+    )
+    retried_again = await replay_store.retry_failed_hermes(
+        failed_again,
+        requested_invocation=successor_invocation,
+        authorization=second_authorization,
+    )
+
+    assert retried_again.acquired is True
+    assert retried_again.record.resume_ordinal == 2
+    assert retried_again.record.prior_failure_ref == failed_again_ref
     with pytest.raises(FactoryDispatchError, match="failure changed"):
         await replay_store.retry_failed_hermes(
             failed,
