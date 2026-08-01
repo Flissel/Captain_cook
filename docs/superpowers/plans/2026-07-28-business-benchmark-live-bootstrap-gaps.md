@@ -257,3 +257,29 @@
   the isolated technical gates. Do not run the 30 business cases until both
   candidates produce executable AutoGen outcomes and pass every technical
   assertion.
+
+## V29 bounded recovery
+
+- [x] Carry the immutable V28 actual cost forward per team instead of resetting
+  the user cap: Claims `0.384892 USD`, Renewal `0.461592 USD`. Reserve at most
+  `0.32 USD` of new benchmark spend per team and zero incremental Hermes API
+  spend. At the conservative fixed `1.25 EUR/USD` guard this caps Claims at
+  `0.881115 EUR` and Renewal at `0.97699 EUR`; any larger composition fails
+  before provider construction.
+- [x] Verify a local Hermes call through loopback Ollama with `llama3.1:8b`:
+  one typed call, `estimated_cost_usd=0`, no cloud credential required. Keep the
+  historical Hermes paid-effect ledger capped at `0.25 USD`; new v29 skill
+  calls use the local provider and add no marginal provider spend.
+- [x] Embed one normative public build contract in both v29 job input and
+  compiled spec. It contains the exact three-agent topology, handoffs, tool
+  allocation, canonical public system prompts, conversation ceilings, strict
+  terminal JSON contract, and all five public acceptance categories. Captain
+  rejects any drifted topology or prompt digest before a provider-backed team
+  run.
+- [x] Emit non-leaking technical provenance codes that distinguish an invalid
+  terminal, wrong observed decision, incomplete rationale, unapproved tool,
+  and missing required handoff. Expected private answers remain absent.
+- [ ] Authorize and build the two fresh v29 jobs in `captain_test`, using local
+  Hermes plus ChatGPT-subscription Codex. Run the isolated technical holdout
+  for each exact candidate. Do not start the 15-case paired benchmark for a
+  team until every technical assertion is green.

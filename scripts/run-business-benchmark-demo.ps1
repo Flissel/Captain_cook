@@ -128,13 +128,19 @@ $liveRunner = Join-Path $PSScriptRoot 'run-business-benchmark-live.ps1'
 $serviceRunner = Join-Path $PSScriptRoot 'live-demo-services.ps1'
 $benchmarkRuntimeEnvPath = Join-Path $repositoryRoot '.captain-cook/private/business-benchmarks/business-benchmark-runtime.env'
 $canonicalRenewalWorkflow = Join-Path $repositoryRoot 'examples/business_benchmark_candidates/customer_renewal_orchestration_team/workflows/renewal_context_read.json'
-$maximumUsdPerTeam = '0.40'
+$maximumUsdPerTeam = '0.32'
 $maximumHermesUsd = '0.25'
+# V29 uses the exact local loopback Ollama provider. Its verified usage receipt
+# reports zero marginal USD; the historical paid Hermes ledger remains capped.
+$maximumIncrementalHermesUsd = '0.00'
 $maximumTotalUsdPerTeam = '0.80'
-$priorAttemptReserveUsdPerTeam = '0.19'
+# Immutable V28 evidence, conservatively assigning all shared Hermes spend to
+# each team. These values are carried forward rather than resetting the cap.
+$priorActualUsdClaims = '0.384892'
+$priorActualUsdRenewal = '0.461592'
 $userMaximumEurPerTeam = '1.00'
 $budgetEurPerUsd = '1.25'
-$seedVersion = 'business-benchmark-demo-2026-07-v28'
+$seedVersion = 'business-benchmark-demo-2026-07-v29'
 
 $rootEnvAllowlist = @(
     'CAPTAIN_GATEWAY_TOKEN',
@@ -387,7 +393,7 @@ function New-DryRunPlan {
         mode = 'dry_run'
         database = 'captain_test'
         issued_at = $IssuedAt
-        suite_version = 28
+        suite_version = 29
         seed_version_id = $seedVersion
         maximum_usd_per_team = $maximumUsdPerTeam
         jobs = @(
@@ -678,7 +684,7 @@ try {
             '--issued-at', $issuedAt,
             '--model', 'gpt-4.1-mini',
             '--maximum-usd-per-team', $maximumUsdPerTeam,
-            '--suite-version', '28',
+            '--suite-version', '29',
             '--seed-version-id', $seedVersion
         )
         $rawPlanProvisioning = @(& $python @planArguments)
@@ -708,7 +714,7 @@ try {
             if (
                 [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
                 @($team.job.execution_policy.allowed_models) -notcontains 'gpt-4.1-mini' -or
-                [int]$team.suite.suite_version -ne 28
+                [int]$team.suite.suite_version -ne 29
             ) {
                 throw 'Dry-run team model or budget does not match the demo authority.'
             }
@@ -817,8 +823,10 @@ try {
     $environment['CAPTAIN_FACTORY_BUDGET_EUR_PER_USD'] = $budgetEurPerUsd
     $environment['CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM'] = $maximumTotalUsdPerTeam
     $environment['CAPTAIN_FACTORY_CODEX_METERED_USD_PER_TEAM'] = '0'
-    $environment['CAPTAIN_FACTORY_HERMES_MAX_TOTAL_USD'] = $maximumHermesUsd
-    $environment['CAPTAIN_FACTORY_PRIOR_ATTEMPT_RESERVE_USD_PER_TEAM'] = $priorAttemptReserveUsdPerTeam
+    $environment['CAPTAIN_FACTORY_HERMES_INCREMENTAL_MAX_USD'] = $maximumIncrementalHermesUsd
+    $environment['CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_CLAIMS'] = $priorActualUsdClaims
+    $environment['CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_RENEWAL'] = $priorActualUsdRenewal
+    $environment['CUSTOM_BASE_URL'] = 'http://127.0.0.1:11434/v1'
     $environment['N8N_MODE'] = 'captain-builder'
     $environment['CAPTAIN_N8N_URL'] = "http://127.0.0.1:$($environment['CAPTAIN_N8N_PORT'])"
     Set-ProcessEnvironment $environment
@@ -829,7 +837,7 @@ try {
         '--issued-at', $issuedAt,
         '--model', $model,
         '--maximum-usd-per-team', $maximumUsdPerTeam,
-        '--suite-version', '28',
+        '--suite-version', '29',
         '--seed-version-id', $seedVersion
     )
     if ($Action -in @('AUTHORIZE', 'BUILD', 'RUN')) {
@@ -873,7 +881,7 @@ try {
         if (
             [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
             @($team.job.execution_policy.allowed_models) -notcontains $model -or
-            [int]$team.suite.suite_version -ne 28
+            [int]$team.suite.suite_version -ne 29
         ) {
             throw 'Provisioned team model or budget does not match the demo authority.'
         }
@@ -1035,8 +1043,8 @@ try {
             '--hermes-python-executable', $hermesPython,
             '--job-id', $orderedFactoryJobIds[0],
             '--job-id', $orderedFactoryJobIds[1],
-            '--hermes-provider', 'openai-api',
-            '--hermes-model', $model,
+            '--hermes-provider', 'custom',
+            '--hermes-model', 'llama3.1:8b',
             '--hermes-max-usd', $maximumHermesUsd,
             '--maximum-dispatches', '12'
         )

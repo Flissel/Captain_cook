@@ -285,6 +285,11 @@ class CodexBriefBuilder:
                 "Produce an evidence-grounded business decision and rationale after specialist "
                 "collaboration, matching the public output contract."
             )
+            technical_retry_contract.append(
+                "Treat public_team_build_contract in compiled-spec.json as normative: preserve "
+                "its exact agent names, handoff graph, tool allocation, system prompts, limits, "
+                "terminal JSON contract, and all five public acceptance categories."
+            )
         document = {
             "Goal": (
                 "Implement the dependency-ready node described by "

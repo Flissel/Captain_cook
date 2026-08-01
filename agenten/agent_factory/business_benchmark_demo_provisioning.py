@@ -26,6 +26,7 @@ from agenten.agent_factory.business_benchmark_candidate_seeds import (
     CLAIMS_SEED_PROFILE,
     RENEWAL_SEED_PROFILE,
     package_business_benchmark_seed,
+    public_business_benchmark_build_contract,
 )
 from agenten.agent_factory.business_benchmark_contracts import (
     BusinessBenchmarkPolicyV1,
@@ -901,6 +902,9 @@ def _prepare_job(
             "profile_id": profile_id,
             "candidate_id": candidate.candidate_id,
             "suite_version": settings.suite_version,
+            "public_team_build_contract": public_business_benchmark_build_contract(
+                profile_id
+            ),
         }
     )
     compiled = _canonical_json(
@@ -910,6 +914,9 @@ def _prepare_job(
             "required_capability": _CAPABILITY,
             "assertion_ids": _ASSERTION_IDS,
             "candidate_sha256": candidate.source_archive_ref.sha256,
+            "public_team_build_contract": public_business_benchmark_build_contract(
+                profile_id
+            ),
         }
     )
     graph = _canonical_json(

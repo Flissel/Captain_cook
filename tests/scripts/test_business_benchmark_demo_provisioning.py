@@ -393,6 +393,38 @@ def test_apply_persists_only_legal_initial_gateway_authority_and_is_idempotent(
     } == snapshot
 
 
+def test_compiled_specs_embed_normative_public_team_contracts_without_holdouts(
+    tmp_path: Path,
+) -> None:
+    gateway = RecordingGateway()
+    applied = BusinessBenchmarkDemoProvisioner(
+        settings(tmp_path),
+        gateway=gateway,
+        clock=lambda: ISSUED_AT + timedelta(minutes=1),
+    ).apply()
+    cas = BusinessBenchmarkContentAddressedArtifactStore(
+        tmp_path
+        / ".captain-cook"
+        / "private"
+        / "business-benchmarks"
+        / "cas"
+    )
+
+    for team in applied.teams:
+        compiled = json.loads(cas.read_bytes(team.job.compiled_spec_ref))
+        contract = compiled["public_team_build_contract"]
+        encoded = json.dumps(contract, sort_keys=True)
+        assert contract["profile_id"] == team.profile_id
+        assert contract["conversation_pattern"] == "swarm"
+        assert len(contract["agents"]) == 3
+        assert contract["terminal_output"]["schema"] == (
+            "captain.business-benchmark-terminal.v1"
+        )
+        assert "expected_decision" not in encoded
+        assert "required_rationale_fact_ids" not in encoded
+        assert "case_id" not in encoded
+
+
 def test_apply_resumes_stable_jobs_with_fresh_epoch_and_renews_active_leases(
     tmp_path: Path,
 ) -> None:

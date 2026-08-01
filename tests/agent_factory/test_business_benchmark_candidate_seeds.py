@@ -10,8 +10,13 @@ from agenten.agent_factory.business_benchmark_candidate_seeds import (
     CLAIMS_SEED_PROFILE,
     RENEWAL_SEED_PROFILE,
     package_business_benchmark_seed,
+    public_business_benchmark_build_contract,
+    validate_public_business_benchmark_candidate,
 )
-from agenten.agent_factory.candidate_evaluation import FactoryCandidateEvaluator
+from agenten.agent_factory.candidate_evaluation import (
+    FactoryAutoGenTeamManifestV1,
+    FactoryCandidateEvaluator,
+)
 
 
 @pytest.mark.parametrize(
@@ -53,6 +58,61 @@ def test_seed_candidate_is_reproducible_and_evaluator_verified(
     topology = result.team_execution_manifest
     assert topology.conversation_pattern == pattern
     assert tuple(agent.name for agent in topology.agents) == agent_names
+    validate_public_business_benchmark_candidate(profile_id, first, topology)
+
+
+@pytest.mark.parametrize("profile_id", [CLAIMS_SEED_PROFILE, RENEWAL_SEED_PROFILE])
+def test_public_build_contract_is_normative_complete_and_holdout_free(
+    profile_id: str,
+) -> None:
+    contract = public_business_benchmark_build_contract(profile_id)
+    encoded = json.dumps(contract, sort_keys=True)
+
+    assert contract["schema"] == "captain.business-benchmark-public-build-contract.v1"
+    assert contract["profile_id"] == profile_id
+    assert contract["conversation_pattern"] == "swarm"
+    assert len(contract["agents"]) == 3
+    assert contract["terminal_output"]["schema"] == (
+        "captain.business-benchmark-terminal.v1"
+    )
+    assert len(contract["public_acceptance_categories"]) == 5
+    assert "expected_decision" not in encoded
+    assert "required_rationale_fact_ids" not in encoded
+    assert "case_id" not in encoded
+
+
+def test_public_candidate_guard_rejects_claims_team_without_escalation_agent(
+    tmp_path: Path,
+) -> None:
+    resolved = package_business_benchmark_seed(CLAIMS_SEED_PROFILE, tmp_path)
+    result = FactoryCandidateEvaluator().validate(resolved, max_seconds=10)
+    assert result.team_execution_manifest is not None
+    manifest = result.team_execution_manifest
+    invalid = FactoryAutoGenTeamManifestV1.model_validate(
+        {
+            **manifest.model_dump(mode="json", by_alias=True),
+            "agents": [
+                {
+                    **manifest.agents[0].model_dump(mode="json"),
+                    "handoffs": ["coverage_specialist"],
+                },
+                {
+                    **manifest.agents[1].model_dump(mode="json"),
+                    "handoffs": [],
+                },
+            ],
+            "max_messages": 2,
+            "max_handoffs": 1,
+        },
+        context={"allowed_tools": set()},
+    )
+
+    with pytest.raises(ValueError, match="public build contract"):
+        validate_public_business_benchmark_candidate(
+            CLAIMS_SEED_PROFILE,
+            resolved,
+            invalid,
+        )
 
 
 def test_claims_seed_is_a_tool_free_swarm_with_sealed_business_rules(

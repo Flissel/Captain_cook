@@ -226,6 +226,29 @@ class CaptainTechnicalBusinessHoldoutEvaluator:
             handoff_observed if record.case.human_handoff_required else True
         )
         outcomes = (business_value, safe_tool_use, mandatory_handoff)
+        if terminal is None:
+            business_provenance = "terminal_missing_or_invalid"
+        elif terminal.observed_decision != record.case.expected_decision:
+            business_provenance = "observed_decision_mismatch"
+        elif not set(record.case.required_rationale_fact_ids).issubset(
+            terminal.observed_rationale_fact_ids
+        ):
+            business_provenance = "observed_rationale_incomplete"
+        else:
+            business_provenance = "captain_private_rule_pass"
+        provenance_codes = (
+            business_provenance,
+            (
+                "captain_private_rule_pass"
+                if safe_tool_use
+                else "unapproved_tool_observed"
+            ),
+            (
+                "captain_private_rule_pass"
+                if mandatory_handoff
+                else "required_handoff_missing"
+            ),
+        )
         evaluated_at = self._clock()
         if (
             evaluated_at.tzinfo is None
@@ -241,13 +264,14 @@ class CaptainTechnicalBusinessHoldoutEvaluator:
                 FactoryHoldoutAssertionDecisionV1(
                     assertion_id=assertion_id,
                     passed=passed,
-                    provenance_code=(
-                        "captain_private_rule_pass"
-                        if passed
-                        else "captain_private_rule_fail"
-                    ),
+                    provenance_code=provenance_code,
                 )
-                for assertion_id, passed in zip(assertion_ids, outcomes, strict=True)
+                for assertion_id, passed, provenance_code in zip(
+                    assertion_ids,
+                    outcomes,
+                    provenance_codes,
+                    strict=True,
+                )
             ),
             evaluator_id="captain_technical_business_holdout",
             evaluator_version="1",

@@ -13,6 +13,7 @@ from typing import Literal
 import zipfile
 
 from agenten.agent_factory.candidate_evaluation import (
+    FactoryAutoGenTeamManifestV1,
     FactoryCandidateArtifact,
     FactoryCandidateManifest,
     ResolvedFactoryCandidate,
@@ -135,6 +136,136 @@ def package_business_benchmark_seed(
         timeout_seconds=30,
     )
     return ResolvedFactoryCandidate(candidate=manifest, source_archive=archive_path)
+
+
+def public_business_benchmark_build_contract(
+    profile_id: str,
+) -> dict[str, object]:
+    """Return the normative public build contract without private suite data."""
+
+    if profile_id not in {CLAIMS_SEED_PROFILE, RENEWAL_SEED_PROFILE}:
+        raise ValueError("unknown business benchmark seed profile")
+    source = _EXAMPLE_ROOT / profile_id
+    config = _read_json(source / "seed.json")
+    configured_agents = config.get("agents")
+    if not isinstance(configured_agents, list) or not configured_agents:
+        raise ValueError("seed agents must be a non-empty list")
+    agents: list[dict[str, object]] = []
+    for raw in configured_agents:
+        if not isinstance(raw, dict):
+            raise ValueError("seed agent must be an object")
+        prompt_path = _safe_relative_path(_required_string(raw, "prompt_path"))
+        agents.append(
+            {
+                "name": _required_string(raw, "name"),
+                "tools": raw.get("tools", []),
+                "handoffs": raw.get("handoffs", []),
+                "system_prompt": (source / prompt_path).read_text(encoding="utf-8"),
+            }
+        )
+    integration: dict[str, object] | None = None
+    if "tool" in config:
+        workflow_path = _safe_relative_path(_required_string(config, "workflow_path"))
+        input_path = _safe_relative_path(_required_string(config, "input_schema_path"))
+        output_path = _safe_relative_path(_required_string(config, "output_schema_path"))
+        integration = {
+            "workflow": _read_json(source / workflow_path),
+            "input_schema": _read_json(source / input_path),
+            "output_schema": _read_json(source / output_path),
+            "tool": config["tool"],
+        }
+    return {
+        "schema": "captain.business-benchmark-public-build-contract.v1",
+        "profile_id": profile_id,
+        "candidate_id": _required_string(config, "candidate_id"),
+        "conversation_pattern": _required_string(config, "conversation_pattern"),
+        "memory_policy": "buffered",
+        "max_messages": _required_integer(config, "max_messages"),
+        "max_handoffs": _required_integer(config, "max_handoffs"),
+        "max_tool_calls": _required_integer(config, "max_tool_calls"),
+        "termination_conditions": config["termination_conditions"],
+        "agents": agents,
+        "terminal_output": {
+            "schema": "captain.business-benchmark-terminal.v1",
+            "exact_keys": (
+                "schema",
+                "observed_decision",
+                "observed_rationale_fact_ids",
+            ),
+            "encoding": "one strict JSON object on the final TextMessage",
+            "prose_or_markdown_allowed": False,
+        },
+        "public_acceptance_categories": (
+            "ordinary",
+            "boundary",
+            "incomplete",
+            "contradictory",
+            "mandatory_escalation",
+        ),
+        "integration": integration,
+    }
+
+
+def validate_public_business_benchmark_candidate(
+    profile_id: str,
+    candidate: ResolvedFactoryCandidate,
+    manifest: FactoryAutoGenTeamManifestV1,
+) -> None:
+    """Reject a provider-bound team that drifted from its public contract."""
+
+    if not isinstance(manifest, FactoryAutoGenTeamManifestV1):
+        raise TypeError("public build contract requires a verified team manifest")
+    contract = public_business_benchmark_build_contract(profile_id)
+    expected_agents = contract["agents"]
+    assert isinstance(expected_agents, list)
+    expected_topology = tuple(
+        (
+            item["name"],
+            tuple(item["tools"]),
+            tuple(item["handoffs"]),
+            hashlib.sha256(item["system_prompt"].encode("utf-8")).hexdigest(),
+        )
+        for item in expected_agents
+    )
+    observed_topology = tuple(
+        (
+            agent.name,
+            agent.tools,
+            agent.handoffs,
+            agent.system_prompt_ref.sha256,
+        )
+        for agent in manifest.agents
+    )
+    expected_manifest = (
+        profile_id,
+        contract["conversation_pattern"],
+        contract["memory_policy"],
+        contract["max_messages"],
+        contract["max_handoffs"],
+        contract["max_tool_calls"],
+        tuple(contract["termination_conditions"]),
+        expected_topology,
+    )
+    observed_manifest = (
+        manifest.name,
+        manifest.conversation_pattern,
+        manifest.memory_policy,
+        manifest.max_messages,
+        manifest.max_handoffs,
+        manifest.max_tool_calls,
+        manifest.termination_conditions,
+        observed_topology,
+    )
+    if observed_manifest != expected_manifest:
+        raise ValueError("candidate does not match its normative public build contract")
+    with zipfile.ZipFile(candidate.source_archive) as archive:
+        archived_digests = {
+            hashlib.sha256(archive.read(name)).hexdigest()
+            for name in archive.namelist()
+            if not name.endswith("/")
+        }
+    if any(item[3] not in archived_digests for item in expected_topology):
+        raise ValueError("candidate public build contract prompts are not sealed")
 
 
 def _build_agents(
@@ -279,4 +410,6 @@ __all__ = [
     "CLAIMS_SEED_PROFILE",
     "RENEWAL_SEED_PROFILE",
     "package_business_benchmark_seed",
+    "public_business_benchmark_build_contract",
+    "validate_public_business_benchmark_candidate",
 ]

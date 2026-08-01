@@ -235,6 +235,11 @@ async def test_technical_evaluator_fails_closed_without_leaking_expected_answer(
     )
 
     assert [item.passed for item in receipt.decisions] == [False, False, False]
+    assert [item.provenance_code for item in receipt.decisions] == [
+        "terminal_missing_or_invalid",
+        "unapproved_tool_observed",
+        "required_handoff_missing",
+    ]
     assert all("expected" not in item.provenance_code for item in receipt.decisions)
 
 

@@ -149,14 +149,25 @@ def validate_factory_total_cost_envelope(
                 "CAPTAIN_FACTORY_CODEX_METERED_USD_PER_TEAM",
             )
         )
-        hermes_total_usd = Decimal(
-            _required(environment, "CAPTAIN_FACTORY_HERMES_MAX_TOTAL_USD")
-        )
-        prior_attempt_usd = Decimal(
+        hermes_incremental_usd = Decimal(
             _required(
                 environment,
-                "CAPTAIN_FACTORY_PRIOR_ATTEMPT_RESERVE_USD_PER_TEAM",
+                "CAPTAIN_FACTORY_HERMES_INCREMENTAL_MAX_USD",
             )
+        )
+        prior_actual_usd = (
+            Decimal(
+                _required(
+                    environment,
+                    "CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_CLAIMS",
+                )
+            ),
+            Decimal(
+                _required(
+                    environment,
+                    "CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_RENEWAL",
+                )
+            ),
         )
     except ArithmeticError as exc:
         raise ValueError("Factory total cost envelope is invalid") from exc
@@ -165,8 +176,8 @@ def validate_factory_total_cost_envelope(
         budget_eur_per_usd,
         total_maximum_usd,
         codex_metered_usd,
-        hermes_total_usd,
-        prior_attempt_usd,
+        hermes_incremental_usd,
+        *prior_actual_usd,
         *benchmark_maximum_usd_per_team,
     )
     if (
@@ -180,11 +191,15 @@ def validate_factory_total_cost_envelope(
         or len(benchmark_maximum_usd_per_team) != 2
         or any(
             benchmark_usd
-            + hermes_total_usd
-            + prior_attempt_usd
+            + hermes_incremental_usd
+            + prior_usd
             + codex_metered_usd
             > total_maximum_usd
-            for benchmark_usd in benchmark_maximum_usd_per_team
+            for benchmark_usd, prior_usd in zip(
+                benchmark_maximum_usd_per_team,
+                prior_actual_usd,
+                strict=True,
+            )
         )
     ):
         raise ValueError("Factory total cost envelope is invalid")

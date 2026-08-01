@@ -32,6 +32,9 @@ from agenten.agent_factory.business_benchmark_contracts import (
     BusinessCaseCategory,
     canonical_business_benchmark_model_bytes,
 )
+from agenten.agent_factory.business_benchmark_candidate_seeds import (
+    validate_public_business_benchmark_candidate,
+)
 from agenten.agent_factory.business_benchmark import BusinessBenchmarkEvaluator
 from agenten.agent_factory.business_benchmark_execution import (
     BenchmarkExecutionPolicyV1,
@@ -727,6 +730,11 @@ Use only rationale identifiers justified by supplied fields. Never reveal hidden
         if preflight.status != "succeeded" or preflight.team_execution_manifest is None:
             raise ValueError("benchmark candidate failed host AutoGen preflight")
         manifest = preflight.team_execution_manifest
+        validate_public_business_benchmark_candidate(
+            scope.suite.profile_id,
+            scope.candidate,
+            manifest,
+        )
         allowed_host_tools = tuple(
             dict.fromkeys(tool for agent in manifest.agents for tool in agent.tools)
         )
@@ -911,6 +919,11 @@ Use only rationale identifiers justified by supplied fields. Never reveal hidden
         if preflight.status != "succeeded" or preflight.team_execution_manifest is None:
             raise ValueError("benchmark candidate failed host AutoGen preflight")
         manifest = preflight.team_execution_manifest
+        validate_public_business_benchmark_candidate(
+            scope.suite.profile_id,
+            scope.candidate,
+            manifest,
+        )
         allowed_host_tools = tuple(
             dict.fromkeys(tool for agent in manifest.agents for tool in agent.tools)
         )
