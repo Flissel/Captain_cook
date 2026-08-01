@@ -21,6 +21,7 @@ from agenten.agent_runtime.contracts import ArtifactRef
 _TECHNICAL_FAILURE_PHASES = {
     FactoryPhase.BUILD_FAILED,
     FactoryPhase.REAL_CASE_EVIDENCE,
+    FactoryPhase.REAL_CASE_REVALIDATED,
 }
 
 TechnicalFailureDiagnosticCode = Literal[

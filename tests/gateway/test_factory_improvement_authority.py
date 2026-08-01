@@ -174,7 +174,13 @@ def test_captain_classifies_missing_trace_without_copying_raw_failure_text() -> 
     assert "detail" not in evaluation.model_dump(mode="json")
 
 
-def test_captain_retains_only_passed_technical_assertions_as_regression_guards() -> None:
+@pytest.mark.parametrize(
+    "source_phase",
+    (FactoryPhase.REAL_CASE_EVIDENCE, FactoryPhase.REAL_CASE_REVALIDATED),
+)
+def test_captain_retains_only_passed_technical_assertions_as_regression_guards(
+    source_phase: FactoryPhase,
+) -> None:
     job = _job()
     payload = execution_payload(status="unresolved")
     outcomes = payload["execution_outcome"]
@@ -185,7 +191,7 @@ def test_captain_retains_only_passed_technical_assertions_as_regression_guards()
     assertion_outcomes[1]["status"] = "failed"
     execution = TeamExecutionEvidenceV1.model_validate(payload)
     source = _source_block(
-        FactoryPhase.REAL_CASE_EVIDENCE,
+        source_phase,
         execution.artifact_ref,
     ).model_copy(update={"artifact_refs": (execution.artifact_ref,)})
 
@@ -203,6 +209,7 @@ def test_captain_retains_only_passed_technical_assertions_as_regression_guards()
         for outcome in evaluation.assertion_outcomes
         if outcome.status == "failed"
     ) == ("real_case_green",)
+    assert evaluation.source_phase is source_phase
 
 
 def test_captain_classifies_public_business_and_handoff_failures() -> None:

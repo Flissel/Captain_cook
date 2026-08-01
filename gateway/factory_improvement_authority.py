@@ -132,10 +132,15 @@ class CaptainTechnicalFailureEvaluator:
         execution: TeamExecutionEvidenceV1,
         occurred_at: datetime,
     ) -> CaptainTechnicalFailureEvaluationV1:
+        if source_block.phase not in {
+            FactoryPhase.REAL_CASE_EVIDENCE,
+            FactoryPhase.REAL_CASE_REVALIDATED,
+        }:
+            raise ValueError("technical execution source phase is not retry-eligible")
         _require_source(
             job=job,
             source_block=source_block,
-            source_phase=FactoryPhase.REAL_CASE_EVIDENCE,
+            source_phase=source_block.phase,
             occurred_at=occurred_at,
         )
         outcomes = execution.execution_outcome.assertion_outcomes
@@ -313,6 +318,7 @@ class CaptainTechnicalImprovementIssuer:
         if projection.phase not in {
             FactoryPhase.BUILD_FAILED,
             FactoryPhase.REAL_CASE_EVIDENCE,
+            FactoryPhase.REAL_CASE_REVALIDATED,
         }:
             raise ValueError("current Factory phase is not retry-eligible")
         source_blocks = tuple(
@@ -320,9 +326,9 @@ class CaptainTechnicalImprovementIssuer:
             for block in self._repository.blocks(job_id)
             if block.phase is projection.phase and block.attempt == projection.attempt
         )
-        if len(source_blocks) != 1:
-            raise ValueError("technical failure source block is ambiguous")
-        source_block = source_blocks[0]
+        if not source_blocks or source_blocks[-1].status is not FactoryBlockStatus.FAILED:
+            raise ValueError("latest technical failure source block is unavailable")
+        source_block = source_blocks[-1]
         candidate_ref = self._candidates.current_candidate_ref(
             job,
             projection.attempt,
