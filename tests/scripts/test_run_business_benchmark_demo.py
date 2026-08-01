@@ -23,10 +23,10 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert source.startswith("#requires -Version 7")
     assert "[ValidateSet('Plan', 'Authorize', 'Build', 'Run')]" in source
     assert "--maximum-usd-per-team', $maximumUsdPerTeam" in source
-    assert "$maximumUsdPerTeam = '0.20'" in source
+    assert "$maximumUsdPerTeam = '0.40'" in source
     assert "$maximumHermesUsd = '0.19'" in source
     assert "$maximumTotalUsdPerTeam = '0.79'" in source
-    assert "$priorAttemptReserveUsdPerTeam = '0.40'" in source
+    assert "$priorAttemptReserveUsdPerTeam = '0.20'" in source
     assert "$userMaximumEurPerTeam = '1.00'" in source
     assert "$budgetEurPerUsd = '1.25'" in source
     assert "[ValidateSet('ClaimsFirst', 'RenewalFirst')]" in source
@@ -39,8 +39,8 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "$environment['CAPTAIN_FACTORY_USER_MAX_EUR_PER_TEAM']" in source
     assert "$environment['CAPTAIN_FACTORY_BUDGET_EUR_PER_USD']" in source
     assert "$environment['CAPTAIN_FACTORY_PRIOR_ATTEMPT_RESERVE_USD_PER_TEAM']" in source
-    assert "$seedVersion = 'business-benchmark-demo-2026-07-v27'" in source
-    assert "'--suite-version', '27'" in source
+    assert "$seedVersion = 'business-benchmark-demo-2026-07-v28'" in source
+    assert "'--suite-version', '28'" in source
     assert "New-DryRunPlan" in source
     assert "provider_calls = $false" in source
     assert "gateway_mutation = $false" in source
@@ -383,7 +383,7 @@ def team(profile, job_id, candidate_id, batch=None):
             'job_id': job_id,
             'execution_policy': {
                 'allowed_models': ['gpt-4.1-mini'],
-                'max_cost_usd': '0.20',
+                'max_cost_usd': '0.40',
             },
         },
         'suite': {'suite_version': suite_version},
@@ -488,9 +488,9 @@ print(json.dumps({
         "mode": "dry_run",
         "database": "captain_test",
         "issued_at": plan["issued_at"],
-        "suite_version": 27,
-        "seed_version_id": "business-benchmark-demo-2026-07-v27",
-        "maximum_usd_per_team": "0.20",
+        "suite_version": 28,
+        "seed_version_id": "business-benchmark-demo-2026-07-v28",
+        "maximum_usd_per_team": "0.40",
         "jobs": [
             {"profile": "claims", "job_id": "71000000-0000-0000-0000-000000000001"},
             {"profile": "renewal", "job_id": "71000000-0000-0000-0000-000000000002"},
@@ -506,7 +506,7 @@ print(json.dumps({
     assert plan["issued_at"].endswith("Z")
     plan_arguments = json.loads((repository / "provision-args.json").read_text("utf-8"))
     assert "--apply" not in plan_arguments
-    assert plan_arguments[plan_arguments.index("--suite-version") + 1] == "27"
+    assert plan_arguments[plan_arguments.index("--suite-version") + 1] == "28"
     assert not (repository / "service-called").exists()
     assert not (repository / "preflight-called").exists()
     assert not (repository / "provider-called").exists()
@@ -540,7 +540,7 @@ print(json.dumps({
         "status": "factory_dispatch_required",
         "database": "captain_test",
         "issued_at": checkpoint["issued_at"],
-        "maximum_usd_per_team": "0.20",
+        "maximum_usd_per_team": "0.40",
         "jobs": [
             {
                 "profile": "claims",
@@ -566,8 +566,8 @@ print(json.dumps({
     assert not (repository / "provider-called").exists()
     arguments = json.loads((repository / "provision-args.json").read_text("utf-8"))
     assert "--apply" in arguments
-    assert arguments[arguments.index("--maximum-usd-per-team") + 1] == "0.20"
-    assert arguments[arguments.index("--suite-version") + 1] == "27"
+    assert arguments[arguments.index("--maximum-usd-per-team") + 1] == "0.40"
+    assert arguments[arguments.index("--suite-version") + 1] == "28"
     issued_at = arguments[arguments.index("--issued-at") + 1]
     assert issued_at.endswith("Z")
     combined = completed.stdout + completed.stderr
@@ -800,7 +800,7 @@ Set-Content (Join-Path $root 'provider-called') 'yes'
         "status": "candidates_ready",
         "database": "captain_test",
         "issued_at": candidates_ready["issued_at"],
-        "maximum_usd_per_team": "0.20",
+        "maximum_usd_per_team": "0.40",
         "jobs": [
             {
                 "profile": "claims",
@@ -1059,8 +1059,8 @@ print(json.dumps({
     'mode': 'dry_run',
     'database': 'captain_test',
     'teams': [
-        {'profile': 'claims', 'job': {'job_id': '71000000-0000-0000-0000-000000000001', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.20'}}, 'suite': {'suite_version': 27}, 'candidate_id': 'claims-candidate'},
-        {'profile': 'renewal', 'job': {'job_id': '71000000-0000-0000-0000-000000000002', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.20'}}, 'suite': {'suite_version': 27}, 'candidate_id': 'renewal-candidate'},
+        {'profile': 'claims', 'job': {'job_id': '71000000-0000-0000-0000-000000000001', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.40'}}, 'suite': {'suite_version': 28}, 'candidate_id': 'claims-candidate'},
+        {'profile': 'renewal', 'job': {'job_id': '71000000-0000-0000-0000-000000000002', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.40'}}, 'suite': {'suite_version': 28}, 'candidate_id': 'renewal-candidate'},
     ],
 }))
 """.strip(),
