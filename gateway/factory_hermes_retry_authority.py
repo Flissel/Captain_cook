@@ -48,10 +48,10 @@ class FilesystemFactoryHermesRetryAuthority:
             failed.state != "failed"
             or failed.failure_kind != "FactoryDispatchError"
             or failed.resume_ordinal != 0
-            or invocation.step is not FactorySkillStep.IMPROVE_TEAM
+            or invocation.step is FactorySkillStep.SEAL_CODEX_BUILD
         ):
             raise FactoryDispatchError(
-                "only an original failed improve_team replay can be authorized"
+                "only an original failed Hermes replay can be authorized"
             )
         authorization = build_factory_hermes_replay_retry_authorization(
             job_id=invocation.job_id,
@@ -61,6 +61,7 @@ class FilesystemFactoryHermesRetryAuthority:
             invocation_id=invocation.invocation_id,
             idempotency_key=invocation.idempotency_key,
             lease_id=invocation.lease.lease_id,
+            step=invocation.step,
             failed_replay_ref=factory_skill_replay_failure_ref(failed),
             issued_at=now,
             expires_at=now + validity,

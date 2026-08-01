@@ -135,11 +135,11 @@ class FactoryHermesReplayRetryAuthorizationV1(BaseModel):
     job_id: UUID
     correlation_id: UUID
     subject_version: int = Field(ge=1, strict=True)
-    attempt: int = Field(ge=2, le=5, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
     invocation_id: UUID
     idempotency_key: str = Field(pattern=r"^[0-9a-f]{64}$")
     lease_id: str = Field(min_length=1, max_length=200)
-    step: Literal[FactorySkillStep.IMPROVE_TEAM]
+    step: FactorySkillStep
     failure_kind: Literal["FactoryDispatchError"]
     failed_replay_ref: ArtifactRef
     retry_ordinal: Literal[1]
@@ -175,6 +175,8 @@ class FactoryHermesReplayRetryAuthorizationV1(BaseModel):
         )
         if allocated > self.internal_total_cap_usd:
             raise ValueError("Hermes retry allocations exceed internal team cap")
+        if self.step is FactorySkillStep.SEAL_CODEX_BUILD:
+            raise ValueError("Codex seal failures require runtime retry authority")
         return self
 
 
@@ -190,6 +192,7 @@ def build_factory_hermes_replay_retry_authorization(
     failed_replay_ref: ArtifactRef,
     issued_at: datetime,
     expires_at: datetime,
+    step: FactorySkillStep = FactorySkillStep.IMPROVE_TEAM,
     maximum_additional_cost_usd: Decimal = Decimal("0.25"),
     prior_attempt_reserve_usd: Decimal = Decimal("0.20"),
     benchmark_reserve_usd: Decimal = Decimal("0.30"),
@@ -216,7 +219,7 @@ def build_factory_hermes_replay_retry_authorization(
         invocation_id=invocation_id,
         idempotency_key=idempotency_key,
         lease_id=lease_id,
-        step=FactorySkillStep.IMPROVE_TEAM,
+        step=step,
         failure_kind="FactoryDispatchError",
         failed_replay_ref=failed_replay_ref,
         retry_ordinal=1,

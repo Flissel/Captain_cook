@@ -1710,9 +1710,14 @@ async def test_runtime_retry_replay_requires_atomic_authorized_resume(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("durable", [False, True])
+@pytest.mark.parametrize(
+    "step",
+    ["improve_team", "brief_codex"],
+)
 async def test_failed_improve_replay_requires_exact_budget_bound_captain_retry(
     tmp_path: Path,
     durable: bool,
+    step: str,
 ) -> None:
     replay_root = tmp_path / "hermes-replays"
     replay_store = (
@@ -1720,7 +1725,7 @@ async def test_failed_improve_replay_requires_exact_budget_bound_captain_retry(
         if durable
         else InMemoryFactorySkillReplayStore()
     )
-    payload = invocation_payload("improve_team", attempt=2)
+    payload = invocation_payload(step, attempt=2)
     lease_payload = payload["lease"]
     assert isinstance(lease_payload, dict)
     lease_payload["attempt"] = 2
@@ -1765,6 +1770,7 @@ async def test_failed_improve_replay_requires_exact_budget_bound_captain_retry(
             invocation_id=invocation.invocation_id,
             idempotency_key=invocation.idempotency_key,
             lease_id=invocation.lease.lease_id,
+            step=invocation.step,
             failed_replay_ref=failure_ref,
             issued_at=invocation.lease.issued_at,
             expires_at=invocation.lease.issued_at + timedelta(minutes=5),
@@ -1778,6 +1784,7 @@ async def test_failed_improve_replay_requires_exact_budget_bound_captain_retry(
         invocation_id=invocation.invocation_id,
         idempotency_key=invocation.idempotency_key,
         lease_id=invocation.lease.lease_id,
+        step=invocation.step,
         failed_replay_ref=failure_ref,
         issued_at=invocation.lease.issued_at,
         expires_at=invocation.lease.issued_at + timedelta(minutes=5),
@@ -3019,7 +3026,7 @@ async def test_failed_effect_is_durable_and_never_respawned_after_restart(
     assert failed_record["state"] == "failed"
     assert failed_record["failure_kind"] == "FactoryDispatchError"
 
-    with pytest.raises(FactoryDispatchError, match="previously failed"):
+    with pytest.raises(FactoryDispatchError, match="recovery authority"):
         await HermesCliFactory(
             settings=settings,
             released_skill_catalog=catalog,

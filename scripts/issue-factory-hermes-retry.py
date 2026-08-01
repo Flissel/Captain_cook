@@ -27,25 +27,36 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--replay-root", type=Path, required=True)
     parser.add_argument("--authority-root", type=Path, required=True)
     parser.add_argument("--job-id", type=UUID, required=True)
+    parser.add_argument("--attempt", type=int, choices=range(1, 6), default=2)
+    parser.add_argument(
+        "--step",
+        choices=tuple(
+            step.value
+            for step in FactorySkillStep
+            if step is not FactorySkillStep.SEAL_CODEX_BUILD
+        ),
+        default=FactorySkillStep.IMPROVE_TEAM.value,
+    )
     return parser
 
 
 def main() -> int:
     args = _parser().parse_args()
     replay_root = args.replay_root.resolve()
+    selected_step = FactorySkillStep(args.step)
     matches = []
     for path in sorted(replay_root.glob("*.json")):
         record = load_factory_skill_replay_record(path)
         if (
             record.invocation.job_id == args.job_id
-            and record.invocation.attempt == 2
-            and record.invocation.step is FactorySkillStep.IMPROVE_TEAM
+            and record.invocation.attempt == args.attempt
+            and record.invocation.step is selected_step
             and record.state == "failed"
         ):
             matches.append(record)
     if len(matches) != 1:
         raise FactoryDispatchError(
-            "exactly one failed attempt-2 improve_team replay is required"
+            "exactly one failed replay for the requested attempt and step is required"
         )
     authority = FilesystemFactoryHermesRetryAuthority(
         args.authority_root

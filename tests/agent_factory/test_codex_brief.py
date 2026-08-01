@@ -223,6 +223,8 @@ def test_codex_brief_contains_goal_gates_and_only_opaque_refs() -> None:
     assert assignment.compiled_spec_ref.uri in rendered
     assert inventory.reusable_component_ids[0] in rendered
     assert invocation.lease.capabilities[0] in rendered
+    assert "receives no stdin" in rendered
+    assert "CAPTAIN_TRACE_ID" in rendered
     assert assignment.workspace_ref in rendered
     assert "C:\\Users" not in rendered
     assert "OPENAI_API_KEY" not in rendered
@@ -233,6 +235,33 @@ def test_codex_brief_contains_goal_gates_and_only_opaque_refs() -> None:
         "pytest.live.demo",
     )
     assert brief.required_test_command_ids != invocation.lease.capabilities
+
+
+def test_initial_business_brief_requires_specialist_handoff_before_completion() -> None:
+    assertion_ids = ["business_value", "safe_tool_use", "mandatory_handoff"]
+    invocation_data = invocation_payload(
+        "brief_codex",
+        acceptance_assertion_ids=assertion_ids,
+    )
+    assignment_data = build_assignment_payload()
+    assignment_data["public_assertion_ids"] = assertion_ids
+    inventory_data = inventory_payload(acceptance_assertion_ids=assertion_ids)
+    inventory_invocation = inventory_data["invocation"]
+    assert isinstance(inventory_invocation, dict)
+    inventory_invocation["acceptance_assertion_ids"] = assertion_ids
+    store = PromptArtifactStore()
+
+    brief = CodexBriefBuilder(artifact_store=store).build(
+        FactorySkillInvocationV1.model_validate(invocation_data),
+        FactoryBuildAssignmentV1.model_validate(assignment_data),
+        CodebaseInventoryV1.model_validate(inventory_data),
+        policy(),
+    )
+
+    rendered = store.read(brief.prompt_ref)
+    assert "meaningful configured agent handoff" in rendered
+    assert "before terminal completion" in rendered
+    assert "evidence-grounded business decision" in rendered
 
 
 def test_codex_brief_is_deterministic_and_keeps_context_opaque() -> None:
@@ -396,4 +425,4 @@ def test_behavioral_retry_brief_requires_specialist_handoff_before_completion() 
     assert "meaningful configured agent handoff" in rendered
     assert "before terminal completion" in rendered
     assert "evidence-grounded business decision" in rendered
-    assert "receives no stdin" not in rendered
+    assert "receives no stdin" in rendered

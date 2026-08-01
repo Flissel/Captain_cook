@@ -2429,7 +2429,7 @@ def _retried_failed_hermes_replay_record(
         or failed.failure_kind != authorization.failure_kind
         or failed.resume_ordinal != 0
         or failed.hermes_retry_authorization_ref is not None
-        or invocation.step is not FactorySkillStep.IMPROVE_TEAM
+        or invocation.step is FactorySkillStep.SEAL_CODEX_BUILD
         or authorization.step is not invocation.step
         or authorization.retry_ordinal != 1
         or authorization.failed_replay_ref != failed_ref
@@ -2471,7 +2471,7 @@ def _existing_replay_claim(
     ):
         if (
             existing.state == "failed"
-            and existing.invocation.step is FactorySkillStep.IMPROVE_TEAM
+            and existing.invocation.step is not FactorySkillStep.SEAL_CODEX_BUILD
             and existing.failure_kind == "FactoryDispatchError"
             and existing.resume_ordinal == 0
             and existing.hermes_retry_authorization_ref is None
@@ -2491,7 +2491,7 @@ def _existing_replay_claim(
         ):
             raise FactorySkillReplayRetryableFailureError(existing)
         if (
-            existing.invocation.step is FactorySkillStep.IMPROVE_TEAM
+            existing.invocation.step is not FactorySkillStep.SEAL_CODEX_BUILD
             and existing.failure_kind == "FactoryDispatchError"
             and existing.resume_ordinal == 0
             and existing.hermes_retry_authorization_ref is None
