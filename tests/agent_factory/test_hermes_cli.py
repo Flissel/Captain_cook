@@ -32,6 +32,8 @@ from agenten.agent_factory.hermes_cli import (
     FilesystemReleasedFactorySkillCatalog,
     HermesCliFactory,
     HermesCliSettings,
+    _discovery_seed_sha256,
+    _parse_discovery_attestation,
     factory_skill_replay_failure_ref,
     _captain_discovery_seed,
     _require_improvement_artifact_binding,
@@ -323,6 +325,52 @@ def test_captain_discovery_seed_is_typed_and_content_addressed() -> None:
     assert parsed.test_refs
     assert parsed.schema_refs
     assert parsed.artifact_ref.uri.endswith(parsed.artifact_ref.sha256)
+
+
+def test_discovery_attestation_accepts_one_extra_digest_suffix_character() -> None:
+    invocation = FactorySkillInvocationV1.model_validate(invocation_payload("discover"))
+    discovery_seed = {"schema": "captain.test-discovery-seed.v1"}
+    expected_digest = _discovery_seed_sha256(discovery_seed)
+    stdout = json.dumps(
+        {
+            "schema": "hermes.factory-discovery-attestation.v1",
+            "invocation_id": str(invocation.invocation_id),
+            "seed_sha256": expected_digest + "d",
+            "accepted": True,
+        }
+    ).encode("utf-8")
+
+    observed = _parse_discovery_attestation(
+        stdout,
+        invocation=invocation,
+        discovery_seed=discovery_seed,
+    )
+
+    assert observed.seed_sha256 == expected_digest
+
+
+def test_discovery_attestation_rejects_wrong_digest_with_extra_suffix() -> None:
+    invocation = FactorySkillInvocationV1.model_validate(invocation_payload("discover"))
+    discovery_seed = {"schema": "captain.test-discovery-seed.v1"}
+    expected_digest = _discovery_seed_sha256(discovery_seed)
+    stdout = json.dumps(
+        {
+            "schema": "hermes.factory-discovery-attestation.v1",
+            "invocation_id": str(invocation.invocation_id),
+            "seed_sha256": "0" + expected_digest[1:] + "d",
+            "accepted": True,
+        }
+    ).encode("utf-8")
+
+    with pytest.raises(
+        FactoryDispatchError,
+        match="exactly one typed discovery attestation",
+    ):
+        _parse_discovery_attestation(
+            stdout,
+            invocation=invocation,
+            discovery_seed=discovery_seed,
+        )
 
 
 @pytest.mark.asyncio

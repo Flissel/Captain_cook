@@ -3220,15 +3220,38 @@ def _improvement_seed_sha256(seed: dict[str, object]) -> str:
     return hashlib.sha256(_canonical_json(seed).encode("utf-8")).hexdigest()
 
 
+def _seed_attestation_payload(
+    stdout: bytes,
+    *,
+    expected_seed_sha256: str,
+) -> object:
+    payload = _parse_evidence_payload(stdout)
+    if not isinstance(payload, dict):
+        return payload
+    observed_seed_sha256 = payload.get("seed_sha256")
+    if (
+        isinstance(observed_seed_sha256, str)
+        and len(observed_seed_sha256) == 65
+        and observed_seed_sha256[:64] == expected_seed_sha256
+        and re.fullmatch(r"[0-9a-f]{65}", observed_seed_sha256) is not None
+    ):
+        return {**payload, "seed_sha256": expected_seed_sha256}
+    return payload
+
+
 def _parse_improvement_attestation(
     stdout: bytes,
     *,
     invocation: FactorySkillInvocationV1,
     improvement_seed: dict[str, object],
 ) -> _HermesImprovementAttestationV1:
+    expected_seed_sha256 = _improvement_seed_sha256(improvement_seed)
     try:
         attestation = _HermesImprovementAttestationV1.model_validate(
-            _parse_evidence_payload(stdout)
+            _seed_attestation_payload(
+                stdout,
+                expected_seed_sha256=expected_seed_sha256,
+            )
         )
     except (TypeError, ValueError, ValidationError) as exc:
         raise FactoryDispatchError(
@@ -3236,7 +3259,7 @@ def _parse_improvement_attestation(
         ) from exc
     if (
         attestation.invocation_id != invocation.invocation_id
-        or attestation.seed_sha256 != _improvement_seed_sha256(improvement_seed)
+        or attestation.seed_sha256 != expected_seed_sha256
     ):
         raise FactoryDispatchError(
             "Hermes improvement attestation does not match Captain's seed"
@@ -3353,9 +3376,13 @@ def _parse_discovery_attestation(
     invocation: FactorySkillInvocationV1,
     discovery_seed: dict[str, object],
 ) -> _HermesDiscoveryAttestationV1:
+    expected_seed_sha256 = _discovery_seed_sha256(discovery_seed)
     try:
         attestation = _HermesDiscoveryAttestationV1.model_validate(
-            _parse_evidence_payload(stdout)
+            _seed_attestation_payload(
+                stdout,
+                expected_seed_sha256=expected_seed_sha256,
+            )
         )
     except (TypeError, ValueError, ValidationError) as exc:
         raise FactoryDispatchError(
@@ -3363,7 +3390,7 @@ def _parse_discovery_attestation(
         ) from exc
     if (
         attestation.invocation_id != invocation.invocation_id
-        or attestation.seed_sha256 != _discovery_seed_sha256(discovery_seed)
+        or attestation.seed_sha256 != expected_seed_sha256
     ):
         raise FactoryDispatchError(
             "Hermes discovery attestation does not match Captain's seed"
@@ -3377,9 +3404,13 @@ def _parse_codex_brief_attestation(
     invocation: FactorySkillInvocationV1,
     codex_brief_seed: CodexBuildBriefV1,
 ) -> _HermesCodexBriefAttestationV1:
+    expected_seed_sha256 = _codex_brief_seed_sha256(codex_brief_seed)
     try:
         attestation = _HermesCodexBriefAttestationV1.model_validate(
-            _parse_evidence_payload(stdout)
+            _seed_attestation_payload(
+                stdout,
+                expected_seed_sha256=expected_seed_sha256,
+            )
         )
     except (TypeError, ValueError, ValidationError) as exc:
         raise FactoryDispatchError(
@@ -3387,7 +3418,7 @@ def _parse_codex_brief_attestation(
         ) from exc
     if (
         attestation.invocation_id != invocation.invocation_id
-        or attestation.seed_sha256 != _codex_brief_seed_sha256(codex_brief_seed)
+        or attestation.seed_sha256 != expected_seed_sha256
     ):
         raise FactoryDispatchError(
             "Hermes Codex brief attestation does not match Captain's seed"
