@@ -148,7 +148,30 @@ class GatewayBusinessBenchmarkDemoAuthority:
             ) from exc
 
 
+def resolve_current_factory_attempts(
+    dsn: str,
+    job_ids: tuple[UUID, ...],
+) -> dict[UUID, int]:
+    """Read current Captain attempts through the Gateway-owned DB boundary."""
+
+    if not job_ids or len(job_ids) != len(set(job_ids)):
+        raise GatewayBusinessBenchmarkDemoError(
+            "benchmark attempt job IDs must be non-empty and unique"
+        )
+    authority = GatewayBusinessBenchmarkDemoAuthority(dsn)
+    resolved: dict[UUID, int] = {}
+    for job_id in job_ids:
+        state = authority.resume_state(job_id)
+        if state is None or not 1 <= state.attempt <= 5:
+            raise GatewayBusinessBenchmarkDemoError(
+                "current Captain Factory attempt is unavailable"
+            )
+        resolved[job_id] = state.attempt
+    return resolved
+
+
 __all__ = [
     "GatewayBusinessBenchmarkDemoAuthority",
     "GatewayBusinessBenchmarkDemoError",
+    "resolve_current_factory_attempts",
 ]

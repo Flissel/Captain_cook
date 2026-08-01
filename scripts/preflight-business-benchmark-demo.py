@@ -8,6 +8,7 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 import sys
+from uuid import UUID
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,41 @@ from agenten.agent_factory.business_benchmark_live import (  # noqa: E402
     LiveBusinessBenchmarkSettings,
     load_production_business_benchmark_composition,
 )
+from agenten.agent_factory.business_benchmark_demo_provisioning import (  # noqa: E402
+    assert_local_captain_test_dsn,
+)
+from gateway.business_benchmark_demo import (  # noqa: E402
+    resolve_current_factory_attempts,
+)
+
+
+def _with_current_factory_attempts(
+    environment: Mapping[str, str],
+) -> dict[str, str]:
+    """Bind preflight to Captain's current attempts without executing effects."""
+
+    resolved = dict(environment)
+    profiles = ("CLAIMS", "RENEWAL")
+    required = (
+        "TEST_MARIADB_DSN",
+        *(f"CAPTAIN_BENCHMARK_{profile}_JOB_ID" for profile in profiles),
+    )
+    if any(not resolved.get(name, "").strip() for name in required):
+        return resolved
+    dsn = resolved["TEST_MARIADB_DSN"].strip()
+    assert_local_captain_test_dsn(dsn)
+    job_ids = tuple(
+        UUID(resolved[f"CAPTAIN_BENCHMARK_{profile}_JOB_ID"])
+        for profile in profiles
+    )
+    current_attempts = resolve_current_factory_attempts(dsn, job_ids)
+    for profile in profiles:
+        job_id = UUID(resolved[f"CAPTAIN_BENCHMARK_{profile}_JOB_ID"])
+        attempt = current_attempts[job_id]
+        if isinstance(attempt, bool) or not 1 <= attempt <= 5:
+            raise ValueError("current Captain Factory attempt is invalid")
+        resolved[f"CAPTAIN_BENCHMARK_{profile}_ATTEMPT"] = str(attempt)
+    return resolved
 from agenten.agent_factory.business_benchmark_production import (  # noqa: E402
     BusinessBenchmarkProductionScopeError,
 )
@@ -30,19 +66,20 @@ async def preflight(
 ) -> dict[str, object]:
     """Build and preflight the default composition, never its effectful run method."""
 
+    resolved_environment = _with_current_factory_attempts(environment)
     settings = LiveBusinessBenchmarkSettings.from_environment(
-        environment,
+        resolved_environment,
         repository_root=repository_root,
     )
     composition = load_production_business_benchmark_composition(
         settings,
-        environment=environment,
+        environment=resolved_environment,
     )
     try:
         try:
             scopes = await composition.preflight(
                 settings,
-                environment,
+                resolved_environment,
                 repository_root=repository_root,
             )
         except BusinessBenchmarkProductionScopeError:

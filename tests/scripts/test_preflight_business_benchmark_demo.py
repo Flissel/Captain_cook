@@ -119,3 +119,34 @@ def test_preflight_maps_only_typed_scope_failure_to_factory_checkpoint(
     }
     assert "private diagnostic" not in str(result)
     assert closed is True
+
+
+def test_preflight_resolves_current_captain_attempts_before_composition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module()
+    claims = UUID("71000000-0000-0000-0000-000000000001")
+    renewal = UUID("71000000-0000-0000-0000-000000000002")
+    observed: list[tuple[str, tuple[UUID, ...]]] = []
+
+    def resolve(dsn: str, job_ids: tuple[UUID, ...]) -> dict[UUID, int]:
+        observed.append((dsn, job_ids))
+        return {claims: 4, renewal: 3}
+
+    monkeypatch.setattr(module, "resolve_current_factory_attempts", resolve)
+    environment = {
+        "TEST_MARIADB_DSN": "mariadb://captain:test@127.0.0.1:33316/captain_test",
+        "CAPTAIN_BENCHMARK_CLAIMS_JOB_ID": str(claims),
+        "CAPTAIN_BENCHMARK_CLAIMS_ATTEMPT": "1",
+        "CAPTAIN_BENCHMARK_RENEWAL_JOB_ID": str(renewal),
+        "CAPTAIN_BENCHMARK_RENEWAL_ATTEMPT": "1",
+    }
+
+    resolved = module._with_current_factory_attempts(environment)
+
+    assert resolved["CAPTAIN_BENCHMARK_CLAIMS_ATTEMPT"] == "4"
+    assert resolved["CAPTAIN_BENCHMARK_RENEWAL_ATTEMPT"] == "3"
+    assert environment["CAPTAIN_BENCHMARK_CLAIMS_ATTEMPT"] == "1"
+    assert observed == [
+        (environment["TEST_MARIADB_DSN"], (claims, renewal))
+    ]

@@ -431,8 +431,12 @@ function Test-ResolvedPreflightBindings {
                 $null -eq $scope -or
                 $scope.PSObject.Properties.Name -notcontains 'job_id' -or
                 $scope.PSObject.Properties.Name -notcontains 'candidate_id' -or
+                $scope.PSObject.Properties.Name -notcontains 'attempt' -or
                 [string]::IsNullOrWhiteSpace([string]$scope.job_id) -or
-                [string]::IsNullOrWhiteSpace([string]$scope.candidate_id)
+                [string]::IsNullOrWhiteSpace([string]$scope.candidate_id) -or
+                -not ($scope.attempt -is [int] -or $scope.attempt -is [long]) -or
+                [int]$scope.attempt -lt 1 -or
+                [int]$scope.attempt -gt 5
             ) {
                 return $false
             }
@@ -440,6 +444,36 @@ function Test-ResolvedPreflightBindings {
         }
     ) | Sort-Object
     return ($expected -join ',') -ceq ($actual -join ',')
+}
+
+function Set-ResolvedPreflightAttempts {
+    param(
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Environment,
+        [Parameter(Mandatory = $true)][object]$Preflight,
+        [Parameter(Mandatory = $true)][object[]]$Teams
+    )
+
+    foreach ($team in $Teams) {
+        $profile = ([string]$team.profile).ToUpperInvariant()
+        if ($profile -notin @('CLAIMS', 'RENEWAL')) {
+            throw 'Resolved benchmark profile is invalid.'
+        }
+        $scopes = @($Preflight.jobs | Where-Object {
+            [string]$_.job_id -ceq [string]$team.job.job_id
+        })
+        if ($scopes.Count -ne 1) {
+            throw 'Resolved benchmark attempt binding is ambiguous.'
+        }
+        $attempt = $scopes[0].attempt
+        if (
+            -not ($attempt -is [int] -or $attempt -is [long]) -or
+            [int]$attempt -lt 1 -or
+            [int]$attempt -gt 5
+        ) {
+            throw 'Resolved benchmark attempt is invalid.'
+        }
+        $Environment["CAPTAIN_BENCHMARK_${profile}_ATTEMPT"] = [string]$attempt
+    }
 }
 
 function Test-CodexBuildInterruptedCheckpoint {
@@ -892,6 +926,13 @@ try {
     ) {
         throw 'Captain business benchmark preflight scope does not bind the provisioned Claims and Renewal candidates.'
     }
+    if ($preflight.production_scope_resolvable -eq $true) {
+        Set-ResolvedPreflightAttempts `
+            -Environment $environment `
+            -Preflight $preflight `
+            -Teams $teams
+        Set-ProcessEnvironment $environment
+    }
 
     if ($Action -ceq 'AUTHORIZE') {
         $rawAuthorization = @(
@@ -1098,6 +1139,13 @@ try {
                 -not (Test-ResolvedPreflightBindings -Preflight $preflight -Teams $teams)
             ) {
                 throw 'Captain business benchmark post-Factory scope does not bind the provisioned Claims and Renewal candidates.'
+            }
+            if ($preflight.production_scope_resolvable -eq $true) {
+                Set-ResolvedPreflightAttempts `
+                    -Environment $environment `
+                    -Preflight $preflight `
+                    -Teams $teams
+                Set-ProcessEnvironment $environment
             }
             if ($preflight.production_scope_resolvable -ne $true) {
                 New-FactoryDispatchCheckpoint `

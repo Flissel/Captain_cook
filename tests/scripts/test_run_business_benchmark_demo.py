@@ -64,6 +64,7 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "factory_dispatch_required" in source
     assert "factory_improvement_required" in source
     assert "append_improvement_requested" in source
+    assert "Set-ResolvedPreflightAttempts" in source
     assert "infrastructure_required" in source
     assert source.index("preflight-business-benchmark-demo.py") < source.index(
         "$null = @(& $liveRunner"
