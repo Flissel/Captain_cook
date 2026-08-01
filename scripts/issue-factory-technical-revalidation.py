@@ -14,7 +14,6 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from blockchain.mariadb_storage import MariaDBStorage
 from agenten.agent_factory.business_benchmark_demo_provisioning import (
     assert_local_captain_test_dsn,
 )
@@ -24,7 +23,6 @@ from agenten.agent_factory.contracts import (
     FactoryEvidenceBlock,
     FactoryPhase,
 )
-from agenten.agent_factory.service import FactoryCoordinator
 from agenten.agent_factory.skill_workflow_contracts import TeamExecutionEvidenceV1
 from agenten.agent_factory.technical_revalidation import (
     FilesystemFactoryTechnicalRevalidationAuthority,
@@ -33,8 +31,9 @@ from agenten.agent_factory.technical_revalidation import (
     build_technical_revalidation_authorization,
     technical_revalidation_runtime_sha256,
 )
-from gateway.factory_repository import GatewayFactoryRepository
-from gateway.store import GatewayStore
+from gateway.factory_technical_revalidation_composition import (
+    compose_factory_technical_revalidation,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -82,9 +81,10 @@ def main() -> int:
     if authority_root != expected_root:
         raise ValueError("technical revalidation authority root does not match")
 
-    store = GatewayStore(MariaDBStorage(dsn))
-    repository = GatewayFactoryRepository(store)
-    coordinator = FactoryCoordinator(repository)
+    composition = compose_factory_technical_revalidation(dsn)
+    store = composition.store
+    repository = composition.repository
+    coordinator = composition.coordinator
     stored = store.factory_job(args.job_id)
     job = stored.job
     if not isinstance(job, AgentFactoryJobV3):
