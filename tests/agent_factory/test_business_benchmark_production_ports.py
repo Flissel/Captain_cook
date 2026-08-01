@@ -280,6 +280,28 @@ def test_openai_builder_is_job_bound_and_keeps_secret_out_of_repr() -> None:
     assert "test-secret-never-log" not in repr(builder)
 
 
+def test_openai_client_does_not_apply_tool_only_arguments_globally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agenten.agent_factory.business_benchmark_production_ports as ports
+
+    observed: dict[str, object] = {}
+
+    def capture(**kwargs: object) -> object:
+        observed.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(ports, "OpenAIChatCompletionClient", capture)
+
+    ports._build_openai_client(api_key="test-secret", model="approved-model-id")
+
+    assert observed == {
+        "api_key": "test-secret",
+        "model": "approved-model-id",
+        "max_retries": 0,
+    }
+
+
 def test_openai_builder_rejects_wrong_provider_and_non_live_job() -> None:
     from agenten.agent_factory.business_benchmark_production_ports import (
         OpenAIBusinessBenchmarkModelClientBuilder,

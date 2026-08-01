@@ -103,6 +103,53 @@ NOW = datetime(2026, 7, 21, 13, tzinfo=timezone.utc)
 
 
 @pytest.mark.asyncio
+async def test_budgeted_client_scopes_parallel_tool_calls_to_requests_with_tools(
+    tmp_path: Path,
+) -> None:
+    job = _job_v3()
+    observed_create_args: list[dict[str, object]] = []
+
+    class CapturingReplayClient(ReplayChatCompletionClient):
+        async def create(self, *args: object, **kwargs: object) -> CreateResult:
+            observed_create_args.append(dict(kwargs.get("extra_create_args", {})))
+            return await super().create(*args, **kwargs)  # type: ignore[arg-type]
+
+    delegate = CapturingReplayClient(
+        ["tool response", "terminal response"],
+        model_info=ModelInfo(
+            vision=False,
+            function_calling=True,
+            json_output=True,
+            family=ModelFamily.UNKNOWN,
+            structured_output=True,
+        ),
+    )
+    client = BudgetedChatCompletionClient(
+        job=job,
+        invocation=_invocation(job),
+        attempt=1,
+        delegate=delegate,
+        budget=InMemoryFactoryBudgetLedger(),
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "provider-evidence"),
+        provider="deterministic-replay",
+        model="approved-model-id",
+        max_cost_per_call=Decimal("0.50"),
+        paid_effect_authority=_PaidEffectAuthority(),
+        pricing_authority=_PricingAuthority(_pricing_quote(job)),
+        clock=lambda: NOW,
+    )
+
+    async def lookup(ticket: str) -> str:
+        return ticket
+
+    tool = FunctionTool(lookup, name="lookup", description="Lookup a ticket")
+    await client.create([UserMessage(content="use tool", source="user")], tools=[tool])
+    await client.create([UserMessage(content="finish", source="user")], tools=[])
+
+    assert observed_create_args == [{"parallel_tool_calls": False}, {}]
+
+
+@pytest.mark.asyncio
 async def test_activity_ceiling_allows_exact_configured_handoff_and_tool_call() -> None:
     termination = _FactoryActivityCeilingTermination(
         max_handoffs=1,

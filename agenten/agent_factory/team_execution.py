@@ -343,6 +343,11 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
         cancellation_token: CancellationToken | None = None,
     ) -> CreateResult:
         reservation, pricing_quote = self._reserve()
+        scoped_create_args = dict(extra_create_args)
+        if tools:
+            scoped_create_args["parallel_tool_calls"] = False
+        else:
+            scoped_create_args.pop("parallel_tool_calls", None)
         try:
             self._provider_dispatched = True
             self._provider_dispatch_count += 1
@@ -352,7 +357,7 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
                 tools=tools,
                 tool_choice=tool_choice,
                 json_output=json_output,
-                extra_create_args=extra_create_args,
+                extra_create_args=scoped_create_args,
                 cancellation_token=cancellation_token,
             )
         except asyncio.CancelledError:
@@ -373,6 +378,11 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
         cancellation_token: CancellationToken | None = None,
     ) -> AsyncGenerator[str | CreateResult, None]:
         reservation, pricing_quote = self._reserve()
+        scoped_create_args = dict(extra_create_args)
+        if tools:
+            scoped_create_args["parallel_tool_calls"] = False
+        else:
+            scoped_create_args.pop("parallel_tool_calls", None)
         finalized = False
         try:
             self._provider_dispatched = True
@@ -383,7 +393,7 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
                 tools=tools,
                 tool_choice=tool_choice,
                 json_output=json_output,
-                extra_create_args=extra_create_args,
+                extra_create_args=scoped_create_args,
                 cancellation_token=cancellation_token,
             ):
                 if isinstance(item, CreateResult):
