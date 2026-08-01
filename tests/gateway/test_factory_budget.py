@@ -185,6 +185,43 @@ def test_gateway_accepts_only_exact_captain_bound_technical_revalidation() -> No
             (inventory, brief, prior),
         )
 
+    second_authorization_ref = authorization_ref.model_copy(
+        update={
+            "sha256": "f" * 64,
+            "uri": f"artifact://factory/technical-revalidation/{'f' * 64}",
+        }
+    )
+    failed_revalidation = revalidated.model_copy(update={"status": "unresolved"})
+    second_projection = projection.model_copy(
+        update={
+            "technical_revalidation_authorization_ref": second_authorization_ref,
+            "technical_revalidation_supersedes_ref": failed_revalidation.artifact_ref,
+        }
+    )
+    second_invocation = failed_revalidation.invocation.model_copy(
+        update={
+            "invocation_id": UUID("00000000-0000-0000-0000-000000000997"),
+            "idempotency_key": "8" * 64,
+        }
+    )
+    second_revalidation = failed_revalidation.model_copy(
+        update={
+            "invocation": second_invocation,
+            "invocation_id": second_invocation.invocation_id,
+            "evidence_refs": (
+                *failed_revalidation.evidence_refs,
+                second_authorization_ref,
+                failed_revalidation.artifact_ref,
+            ),
+        }
+    )
+
+    GatewayStore._assert_workflow_sequence(
+        second_projection,
+        second_revalidation,
+        (inventory, brief, prior, failed_revalidation),
+    )
+
 
 def validation_only_app(actor: GatewayRole):
     app = create_app(

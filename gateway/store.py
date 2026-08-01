@@ -2463,9 +2463,9 @@ class GatewayStore:
                     and projection.technical_revalidation_authorization_ref
                     is not None
                     and projection.technical_revalidation_supersedes_ref is not None
-                    and len(executions) == 1
+                    and bool(executions)
                 ):
-                    prior = executions[0]
+                    prior = executions[-1]
                     authorized_revalidation = (
                         prior.status != "succeeded"
                         and artifact.run_number == prior.run_number

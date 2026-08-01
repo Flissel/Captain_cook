@@ -470,6 +470,25 @@ def test_captain_can_reauthorize_failed_technical_revalidation_same_attempt() ->
     assert requested.attempt == 1
     assert next_action(requested).authorization_ref == second_authorization
 
+    replacement_authorization = ArtifactRef(
+        uri=f"artifact://factory/technical-revalidation/{'e' * 64}",
+        sha256="e" * 64,
+        media_type="application/json",
+    )
+    replaced = apply_block(
+        requested,
+        block(FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED).model_copy(
+            update={
+                "event_id": UUID("00000000-0000-0000-0000-000000000098"),
+                "artifact_refs": (superseded_ref,),
+                "evidence_refs": (replacement_authorization,),
+            }
+        ),
+    )
+
+    assert replaced.attempt == 1
+    assert next_action(replaced).authorization_ref == replacement_authorization
+
 
 def test_fifth_behavioral_failure_escalates() -> None:
     state = FactoryProjection.from_job(job()).model_copy(update={"attempt": 5})

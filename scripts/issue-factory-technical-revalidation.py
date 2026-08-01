@@ -93,6 +93,7 @@ def main() -> int:
     if projection.phase not in {
         FactoryPhase.REAL_CASE_EVIDENCE,
         FactoryPhase.REAL_CASE_REVALIDATED,
+        FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED,
     }:
         raise ValueError("Factory job is not at a technical evidence checkpoint")
     technical_blocks = tuple(
