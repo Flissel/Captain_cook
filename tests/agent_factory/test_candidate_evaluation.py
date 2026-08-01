@@ -109,6 +109,54 @@ def test_autogen_manifest_defaults_to_swarm_for_specialist_handoffs() -> None:
     assert manifest.conversation_pattern == "swarm"
 
 
+def test_evaluator_requires_explicit_autogen_transfer_tool_in_handoff_prompt(
+    tmp_path: Path,
+) -> None:
+    intake_prompt = b"Always hand off to the coverage specialist."
+    coverage_prompt = b"Produce the final decision."
+    (tmp_path / "intake.txt").write_bytes(intake_prompt)
+    (tmp_path / "coverage.txt").write_bytes(coverage_prompt)
+    manifest = FactoryAutoGenTeamManifestV1.model_validate(
+        {
+            "schema": "autogen-team.v1",
+            "name": "claims_team",
+            "conversation_pattern": "swarm",
+            "agents": [
+                {
+                    "name": "intake_specialist",
+                    "tools": [],
+                    "system_prompt_ref": _ref(
+                        "artifact://factory/prompts/intake",
+                        intake_prompt,
+                        "text/plain",
+                    ),
+                    "handoffs": ["coverage_specialist"],
+                },
+                {
+                    "name": "coverage_specialist",
+                    "tools": [],
+                    "system_prompt_ref": _ref(
+                        "artifact://factory/prompts/coverage",
+                        coverage_prompt,
+                        "text/plain",
+                    ),
+                    "handoffs": [],
+                },
+            ],
+            "memory_policy": "buffered",
+            "max_messages": 10,
+            "max_handoffs": 2,
+            "max_tool_calls": 0,
+            "termination_conditions": ["task_completed", "max_messages"],
+            "entrypoint_command": ["python", "run_team.py"],
+        },
+        context={"allowed_tools": set()},
+    )
+
+    with pytest.raises(ValueError, match="transfer_to_coverage_specialist"):
+        FactoryCandidateEvaluator._verify_system_prompts(manifest, tmp_path)
+
+
 @pytest.mark.parametrize(
     ("agents", "message"),
     [

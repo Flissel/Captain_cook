@@ -273,6 +273,10 @@ class CodexBriefBuilder:
                 "Require at least one meaningful configured agent handoff before terminal completion; "
                 "the initial agent must not complete the task before specialist collaboration."
             )
+            technical_retry_contract.append(
+                "Every agent with an outgoing AutoGen handoff must explicitly name and call "
+                "the generated transfer_to_<target_agent> tool in its sealed system prompt."
+            )
         if (
             "business_value" in invocation.acceptance_assertion_ids
             or "business_value_failed" in technical_diagnostic_codes

@@ -626,16 +626,30 @@ class FactoryCandidateEvaluator:
         manifest: FactoryAutoGenTeamManifestV1,
         workspace: Path,
     ) -> None:
-        digests = {
-            hashlib.sha256(path.read_bytes()).hexdigest()
+        content_by_digest = {
+            hashlib.sha256(content).hexdigest(): content
             for path in workspace.rglob("*")
             if path.is_file()
+            for content in (path.read_bytes(),)
         }
         if any(
-            agent.system_prompt_ref.sha256 not in digests
+            agent.system_prompt_ref.sha256 not in content_by_digest
             for agent in manifest.agents
         ):
             raise ValueError("system prompt ref is not sealed in the candidate archive")
+        for agent in manifest.agents:
+            try:
+                prompt = content_by_digest[agent.system_prompt_ref.sha256].decode(
+                    "utf-8"
+                )
+            except UnicodeDecodeError as exc:
+                raise ValueError("system prompt must be valid UTF-8") from exc
+            for target in agent.handoffs:
+                transfer_tool = f"transfer_to_{target}"
+                if transfer_tool not in prompt:
+                    raise ValueError(
+                        f"handoff prompt must explicitly call {transfer_tool}"
+                    )
 
     @staticmethod
     def _require_json(path: Path) -> None:

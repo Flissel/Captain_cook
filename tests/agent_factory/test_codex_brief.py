@@ -262,6 +262,7 @@ def test_initial_business_brief_requires_specialist_handoff_before_completion() 
     assert "meaningful configured agent handoff" in rendered
     assert "before terminal completion" in rendered
     assert "evidence-grounded business decision" in rendered
+    assert "transfer_to_<target_agent>" in rendered
 
 
 def test_codex_brief_is_deterministic_and_keeps_context_opaque() -> None:

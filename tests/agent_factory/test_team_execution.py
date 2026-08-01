@@ -306,7 +306,9 @@ def _candidate(tmp_path: Path) -> ResolvedFactoryCandidate:
 
 def _sealed_team_candidate(tmp_path: Path) -> ResolvedFactoryCandidate:
     source = tmp_path / "sealed-team.zip"
-    first_prompt = b"Triage the case and hand off when needed."
+    first_prompt = (
+        b"Triage the case and call transfer_to_resolver when a handoff is needed."
+    )
     second_prompt = b"Resolve the typed support case."
     workflow = b"{}"
     input_schema = b'{"type":"object"}'
