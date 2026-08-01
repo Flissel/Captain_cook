@@ -2482,6 +2482,12 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
     assert result.handoff_count == 1
     assert result.termination_reason == "task_completed"
     assert result.conversation_pattern == "swarm"
+    activity_refs = {
+        *result.handoff_evidence_refs,
+        *result.tool_evidence_refs,
+    }
+    assert activity_refs.issubset(set(result.runtime_result.evidence_refs))
+    assert activity_refs.issubset(set(result.execution_outcome.evidence_refs))
     assert captured_tokens[0] is not None
     persisted = [
         path.read_text(encoding="utf-8")

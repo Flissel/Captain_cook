@@ -2140,6 +2140,10 @@ class HostAutoGenTeamRunner:
         tool_executions = session.tool_executions
         n8n_executions = session.n8n_executions
         n8n_refs = session.workflow_evidence_refs
+        activity_refs = (
+            *(item.evidence_ref for item in handoffs),
+            *(item.evidence_ref for item in tool_executions),
+        )
         command_id = uuid5(
             NAMESPACE_URL,
             f"factory-autogen-command|{invocation.invocation_id}",
@@ -2169,7 +2173,12 @@ class HostAutoGenTeamRunner:
             status=(RuntimeStatus.SUCCEEDED if succeeded else RuntimeStatus.FAILED),
             session_id=runtime_session_id,
             artifact_refs=(observation_ref,),
-            evidence_refs=(observation_ref, decision_ref, *n8n_refs),
+            evidence_refs=(
+                observation_ref,
+                decision_ref,
+                *activity_refs,
+                *n8n_refs,
+            ),
             error=None if succeeded else "Captain holdout assertions unresolved",
         )
         outcome = ExecutionOutcomeV1(
@@ -2185,7 +2194,12 @@ class HostAutoGenTeamRunner:
             tool_versions=tuple(
                 sorted({f"{item.tool_name}@1" for item in tool_executions})
             ),
-            evidence_refs=(observation_ref, decision_ref, *n8n_refs),
+            evidence_refs=(
+                observation_ref,
+                decision_ref,
+                *activity_refs,
+                *n8n_refs,
+            ),
             status="succeeded" if succeeded else "failed",
         )
         return FactoryTeamRunResult(
