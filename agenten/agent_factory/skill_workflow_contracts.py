@@ -645,6 +645,35 @@ class TeamEvaluationV1(_WorkflowArtifactBase):
         return self
 
 
+def effective_team_execution_evidence(
+    evidence: tuple[TeamExecutionEvidenceV1, ...],
+) -> tuple[TeamExecutionEvidenceV1, ...]:
+    """Project the latest explicitly authorized evidence for each run scope."""
+
+    effective: dict[int, TeamExecutionEvidenceV1] = {}
+    for item in evidence:
+        prior = effective.get(item.run_number)
+        if prior is None:
+            effective[item.run_number] = item
+            continue
+        authorized = tuple(
+            reference
+            for reference in item.evidence_refs
+            if reference.uri.startswith(
+                "artifact://factory/technical-revalidation/"
+            )
+        )
+        if (
+            prior.status == "succeeded"
+            or item.candidate_ref != prior.candidate_ref
+            or item.holdout_ref != prior.holdout_ref
+            or len(authorized) != 1
+        ):
+            raise ValueError("team execution revalidation is stale, mixed, or unauthorized")
+        effective[item.run_number] = item
+    return tuple(effective[number] for number in sorted(effective))
+
+
 class CandidateRevisionV1(_WorkflowArtifactBase):
     schema_name: Literal["hermes.factory-candidate-revision.v1"] = Field(
         alias="schema", serialization_alias="schema"

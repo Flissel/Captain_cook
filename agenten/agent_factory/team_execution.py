@@ -143,8 +143,14 @@ class FactoryPricingQuoteV1(BaseModel):
             Decimal(usage.prompt_tokens) * self.input_cost_per_million
             + Decimal(usage.completion_tokens) * self.output_cost_per_million
         ) / Decimal("1000000")
+        # Gateway budgets and usage receipts are defined at micro-dollar
+        # precision.  Rounding every provider call up to a whole cent can
+        # exhaust a small, Captain-approved benchmark budget long before the
+        # provider cost does (for example, 30 low-token calls become $0.30).
+        # Keep the conservative ceiling, but apply it at the ledger's native
+        # precision.
         return max(calculated, self.minimum_cost_usd).quantize(
-            Decimal("0.01"), rounding=ROUND_CEILING
+            Decimal("0.000001"), rounding=ROUND_CEILING
         )
 
 
@@ -2874,6 +2880,17 @@ def compose_live_team_execution(
                 "released_skill_id": released.skill_id,
                 "released_skill_version": released.version,
                 "released_skill_sha256": released.content_sha256,
+                "factory_action": request.action.kind.value,
+                "technical_revalidation_authorization_sha256": (
+                    request.action.authorization_ref.sha256
+                    if request.action.authorization_ref is not None
+                    else None
+                ),
+                "technical_revalidation_supersedes_sha256": (
+                    request.action.supersedes_ref.sha256
+                    if request.action.supersedes_ref is not None
+                    else None
+                ),
             },
             sort_keys=True,
             separators=(",", ":"),

@@ -35,6 +35,7 @@ from agenten.agent_factory.skill_workflow_contracts import (
     FactoryFeedbackV1,
     TeamEvaluationV1,
     TeamExecutionEvidenceV1,
+    effective_team_execution_evidence,
 )
 from agenten.agent_factory.state_machine import (
     FactoryAction,
@@ -372,19 +373,27 @@ class FactoryCoordinator:
         projection = self.projection(job_id)
         if (
             isinstance(projection.job, AgentFactoryJobV3)
-            and projection.phase is FactoryPhase.REAL_CASE_EVIDENCE
+            and projection.phase
+            in {
+                FactoryPhase.REAL_CASE_EVIDENCE,
+                FactoryPhase.REAL_CASE_REVALIDATED,
+            }
         ):
             technical_blocks = tuple(
                 block
                 for block in self._repository.blocks(job_id)
-                if block.phase is FactoryPhase.REAL_CASE_EVIDENCE
+                if block.phase
+                in {
+                    FactoryPhase.REAL_CASE_EVIDENCE,
+                    FactoryPhase.REAL_CASE_REVALIDATED,
+                }
                 and block.attempt == projection.attempt
             )
-            if len(technical_blocks) != 1:
+            if not technical_blocks:
                 raise FactoryLifecycleError(
-                    "current technical evidence block is ambiguous"
+                    "current technical evidence block is unavailable"
                 )
-            if technical_blocks[0].status is FactoryBlockStatus.FAILED:
+            if technical_blocks[-1].status is FactoryBlockStatus.FAILED:
                 return FactoryAction(
                     kind=FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED,
                     attempt=projection.attempt,
@@ -478,11 +487,13 @@ class FactoryCoordinator:
     ) -> FactoryReleaseDecision | None:
         if evaluation is None:
             return None
-        executions = tuple(
-            artifact
-            for artifact in self.workflow_artifacts(job.job_id)
-            if isinstance(artifact, TeamExecutionEvidenceV1)
-            and artifact.attempt == attempt
+        executions = effective_team_execution_evidence(
+            tuple(
+                artifact
+                for artifact in self.workflow_artifacts(job.job_id)
+                if isinstance(artifact, TeamExecutionEvidenceV1)
+                and artifact.attempt == attempt
+            )
         )
         return evaluate_factory_workflow_release(
             job,

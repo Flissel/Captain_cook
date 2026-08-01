@@ -41,6 +41,7 @@ from gateway.store import GatewayStore
 from blockchain.mariadb_storage import MariaDBStorage
 from tests.agent_factory.test_execution_budget import job_v3, usage_payload
 from tests.agent_factory.test_state_machine import block, job
+from tests.agent_factory.test_release_gate import workflow_job, workflow_run
 from tests.agent_factory.test_capability_resolution import job as job_v2
 from tests.agent_factory.test_skill_workflow_contracts import (
     brief_payload,
@@ -131,6 +132,60 @@ def test_improvement_brief_can_follow_revision_before_phase_transition(job_v3) -
     ) == revision.artifact_ref
 
 
+def test_gateway_accepts_only_exact_captain_bound_technical_revalidation() -> None:
+    factory_job = workflow_job(mode="demo")
+    inventory = CodebaseInventoryV1.model_validate(inventory_payload())
+    brief = CodexBuildBriefV1.model_validate(brief_payload())
+    prior = workflow_run(1).model_copy(update={"status": "unresolved"})
+    authorization_ref = prior.artifact_ref.model_copy(
+        update={
+            "uri": (
+                "artifact://factory/technical-revalidation/"
+                f"{prior.artifact_ref.sha256}"
+            )
+        }
+    )
+    source_ref = prior.artifact_ref.model_copy(
+        update={
+            "uri": f"artifact://factory/team-execution/{prior.artifact_ref.sha256}"
+        }
+    )
+    projection = FactoryProjection.from_job(factory_job).model_copy(
+        update={
+            "status": FactoryLifecycleStatus.RUNNING,
+            "phase": FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED,
+            "technical_revalidation_authorization_ref": authorization_ref,
+            "technical_revalidation_supersedes_ref": source_ref,
+        }
+    )
+    revalidated_invocation = prior.invocation.model_copy(
+        update={
+            "invocation_id": UUID("00000000-0000-0000-0000-000000000998"),
+            "idempotency_key": "9" * 64,
+        }
+    )
+    revalidated = prior.model_copy(
+        update={
+            "invocation": revalidated_invocation,
+            "invocation_id": revalidated_invocation.invocation_id,
+            "status": "succeeded",
+            "evidence_refs": (*prior.evidence_refs, authorization_ref, source_ref),
+        }
+    )
+
+    GatewayStore._assert_workflow_sequence(
+        projection,
+        revalidated,
+        (inventory, brief, prior),
+    )
+    with pytest.raises(HTTPException, match="exact prior workflow artifact sequence"):
+        GatewayStore._assert_workflow_sequence(
+            projection,
+            revalidated.model_copy(update={"evidence_refs": prior.evidence_refs}),
+            (inventory, brief, prior),
+        )
+
+
 def validation_only_app(actor: GatewayRole):
     app = create_app(
         mirror=Mirror(),
@@ -163,6 +218,7 @@ class BudgetStore:
             workspace_ref="workspace://factory/budget-test",
             now=factory_job.occurred_at,
         )
+        self.leases = (self.lease,)
 
     def reserve_factory_budget(self, request):
         self.reservation_request = request
@@ -195,7 +251,7 @@ class BudgetStore:
         )
 
     def factory_job(self, _job_id):
-        return type("Factory", (), {"leases": (self.lease,)})()
+        return type("Factory", (), {"leases": self.leases})()
 
     def release_factory_budget(self, request):
         self.release_request = request
@@ -251,6 +307,32 @@ def test_gateway_budget_adapter_binds_job_and_round_trips_port_calls(job_v3) -> 
     assert usage_write.replayed is False
     assert release_write.replayed is False
     assert ledger.projection(job_v3.job_id).remaining_usd == Decimal("5.00")
+
+
+def test_gateway_budget_usage_binds_latest_same_role_revalidation_lease(job_v3) -> None:
+    store = BudgetStore(job_v3)
+    latest = store.lease.model_copy(
+        update={
+            "lease_id": "lease-real-case-revalidation",
+            "workspace_ref": "workspace://factory/technical-revalidation",
+            "issued_at": store.lease.issued_at + timedelta(seconds=1),
+        }
+    )
+    store.leases = (store.lease, latest)
+    ledger = GatewayFactoryBudgetLedger(store)
+    reservation = ledger.reserve(
+        job_v3,
+        attempt=2,
+        requested_usd=Decimal("0.12"),
+        now=NOW + timedelta(seconds=2),
+    )
+    receipt = FactoryUsageReceiptV1.model_validate(
+        usage_payload(reservation, cost_usd="0.01")
+    )
+
+    ledger.record_usage(job_v3, reservation, receipt)
+
+    assert store.usage_submission.lease_id == latest.lease_id
 
 
 @pytest.mark.parametrize(

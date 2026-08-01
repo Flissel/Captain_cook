@@ -349,11 +349,15 @@ class ProductionFactoryTeamExecutionPort(FactoryTeamExecutionPort):
         replay_retry_authority: (
             CaptainHermesReplayRetryAuthorizationPort | None
         ) = None,
+        technical_revalidation_validator: (
+            Callable[[FactoryDispatch], None] | None
+        ) = None,
     ) -> None:
         self._evidence_store = evidence_store
         self._ports_for = ports_for
         self._holdout_selector = holdout_selector
         self._replay_retry_authority = replay_retry_authority
+        self._technical_revalidation_validator = technical_revalidation_validator
         self._adapters: dict[
             tuple[UUID, int, str], TeamExecutionCandidateAdapter
         ] = {}
@@ -374,6 +378,15 @@ class ProductionFactoryTeamExecutionPort(FactoryTeamExecutionPort):
     def _adapter(self, request: FactoryDispatch) -> TeamExecutionCandidateAdapter:
         if not isinstance(request.job, AgentFactoryJobV3) or request.lease is None:
             raise FactoryDispatchError("live team execution requires a V3 job")
+        if (
+            request.action.kind
+            is FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION
+        ):
+            if self._technical_revalidation_validator is None:
+                raise FactoryDispatchError(
+                    "technical revalidation requires Captain authorization validation"
+                )
+            self._technical_revalidation_validator(request)
         key = (
             request.job.job_id,
             request.action.attempt,
@@ -446,6 +459,7 @@ def compose_agent_factory_live(
     hermes_retry_authority: CaptainHermesReplayRetryAuthorizationPort | None = None,
     codex_build_sealer: CaptainCodexBuildSealerPort | None = None,
     codex_prompt_artifact_store: CodexPromptArtifactStore | None = None,
+    technical_revalidation_validator: Callable[[FactoryDispatch], None] | None = None,
 ) -> AgentFactoryLiveComposition:
     """Wire production ports without executing Hermes, providers, n8n, or Forge."""
 
@@ -486,6 +500,7 @@ def compose_agent_factory_live(
         ports_for=team_execution_ports_for,
         holdout_selector=holdout_selector,
         replay_retry_authority=hermes_retry_authority,
+        technical_revalidation_validator=technical_revalidation_validator,
     )
     candidate_validator = CandidateEvaluationFactory(
         provider=cast(FactoryCandidateProvider, candidate_bindings),

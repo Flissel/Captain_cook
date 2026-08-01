@@ -158,6 +158,7 @@ def block(
         FactoryPhase.BUILD_PASSED: FactoryRole.TOOL_INTEGRATOR,
         FactoryPhase.BUILD_FAILED: FactoryRole.TOOL_INTEGRATOR,
         FactoryPhase.REAL_CASE_EVIDENCE: FactoryRole.REAL_CASE_TESTER,
+        FactoryPhase.REAL_CASE_REVALIDATED: FactoryRole.REAL_CASE_TESTER,
         FactoryPhase.QUALITY_REVIEWED: FactoryRole.QUALITY_WARDEN,
     }.get(phase)
     effective_role = role if role is not None else role_for_phase
@@ -357,6 +358,58 @@ def test_captain_can_request_improvement_directly_from_failed_technical_run() ->
 
     assert requested.phase is FactoryPhase.IMPROVEMENT_REQUESTED
     assert requested.attempt == 2
+
+
+def test_captain_can_revalidate_same_attempt_after_host_runtime_fix() -> None:
+    state = FactoryProjection.from_job(job())
+    for event in (
+        block(FactoryPhase.FORGE_REQUESTED),
+        block(FactoryPhase.BLUEPRINT_CREATED),
+        block(FactoryPhase.TOOL_CANDIDATE_TESTED),
+        block(FactoryPhase.AGENT_CODE_CREATED),
+        block(FactoryPhase.BUILD_PASSED),
+        block(
+            FactoryPhase.REAL_CASE_EVIDENCE,
+            status=FactoryBlockStatus.FAILED,
+        ),
+    ):
+        state = apply_block(state, event)
+
+    authorization_ref = ArtifactRef(
+        uri=f"artifact://factory/technical-revalidation/{'b' * 64}",
+        sha256="b" * 64,
+        media_type="application/json",
+    )
+    superseded_ref = ArtifactRef(
+        uri=f"artifact://factory/team-execution/{'c' * 64}",
+        sha256="c" * 64,
+        media_type="application/json",
+    )
+    requested = apply_block(
+        state,
+        block(FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED).model_copy(
+            update={
+                "artifact_refs": (superseded_ref,),
+                "evidence_refs": (authorization_ref,),
+            }
+        ),
+    )
+
+    action = next_action(requested)
+    assert action.kind is FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION
+    assert action.attempt == 1
+    assert action.authorization_ref == authorization_ref
+    assert action.supersedes_ref == superseded_ref
+
+    revalidated = apply_block(
+        requested,
+        block(
+            FactoryPhase.REAL_CASE_REVALIDATED,
+            assertions=job().acceptance_assertion_ids,
+        ),
+    )
+    assert revalidated.attempt == 1
+    assert next_action(revalidated).kind is FactoryActionKind.DISPATCH_QUALITY_WARDEN
 
 
 def test_fifth_behavioral_failure_escalates() -> None:

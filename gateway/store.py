@@ -1931,6 +1931,30 @@ class GatewayStore:
                         cursor,
                         evidence.job_id,
                     )
+                if evidence.phase is FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED:
+                    technical_blocks = tuple(
+                        block
+                        for block in self._factory_blocks(cursor, evidence.job_id)
+                        if block.attempt == evidence.attempt
+                        and block.phase
+                        in {
+                            FactoryPhase.REAL_CASE_EVIDENCE,
+                            FactoryPhase.REAL_CASE_REVALIDATED,
+                        }
+                    )
+                    if (
+                        not technical_blocks
+                        or technical_blocks[-1].status is not FactoryBlockStatus.FAILED
+                        or evidence.artifact_refs[0]
+                        not in technical_blocks[-1].evidence_refs
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "technical revalidation must supersede the latest "
+                                "failed technical evidence"
+                            ),
+                        )
                 try:
                     apply_block(
                         projection,
@@ -2284,9 +2308,18 @@ class GatewayStore:
             FactorySkillStep.DISCOVER: {FactoryPhase.FORGE_REQUESTED},
             FactorySkillStep.IMPROVE_TEAM: {FactoryPhase.IMPROVEMENT_REQUESTED},
             FactorySkillStep.BRIEF_CODEX: {FactoryPhase.BLUEPRINT_CREATED},
-            FactorySkillStep.EXECUTE_TEAM: {FactoryPhase.BUILD_PASSED},
-            FactorySkillStep.EVALUATE_TEAM: {FactoryPhase.REAL_CASE_EVIDENCE},
-            FactorySkillStep.REPORT_CAPTAIN: {FactoryPhase.REAL_CASE_EVIDENCE},
+            FactorySkillStep.EXECUTE_TEAM: {
+                FactoryPhase.BUILD_PASSED,
+                FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED,
+            },
+            FactorySkillStep.EVALUATE_TEAM: {
+                FactoryPhase.REAL_CASE_EVIDENCE,
+                FactoryPhase.REAL_CASE_REVALIDATED,
+            },
+            FactorySkillStep.REPORT_CAPTAIN: {
+                FactoryPhase.REAL_CASE_EVIDENCE,
+                FactoryPhase.REAL_CASE_REVALIDATED,
+            },
         }[step]
         current_artifacts = tuple(
             candidate
@@ -2405,17 +2438,47 @@ class GatewayStore:
             )
             if isinstance(artifact, TeamExecutionEvidenceV1):
                 all_executions = (*executions, artifact)
-                sequence_valid = sequence_valid and all(
+                identities_unique = all(
                     len(values) == len(set(values))
                     for values in (
-                        tuple(item.run_number for item in all_executions),
                         tuple(item.invocation_id for item in all_executions),
                         tuple(
                             item.invocation.idempotency_key
                             for item in all_executions
                         ),
+                    )
+                )
+                run_scope_unique = all(
+                    len(values) == len(set(values))
+                    for values in (
+                        tuple(item.run_number for item in all_executions),
                         tuple(item.holdout_ref for item in all_executions),
                     )
+                )
+                authorized_revalidation = False
+                if (
+                    projection.phase
+                    is FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED
+                    and projection.technical_revalidation_authorization_ref
+                    is not None
+                    and projection.technical_revalidation_supersedes_ref is not None
+                    and len(executions) == 1
+                ):
+                    prior = executions[0]
+                    authorized_revalidation = (
+                        prior.status != "succeeded"
+                        and artifact.run_number == prior.run_number
+                        and artifact.holdout_ref == prior.holdout_ref
+                        and artifact.candidate_ref == prior.candidate_ref
+                        and projection.technical_revalidation_authorization_ref
+                        in artifact.evidence_refs
+                        and projection.technical_revalidation_supersedes_ref
+                        in artifact.evidence_refs
+                    )
+                sequence_valid = (
+                    sequence_valid
+                    and identities_unique
+                    and (run_scope_unique or authorized_revalidation)
                 )
         elif step is FactorySkillStep.EVALUATE_TEAM:
             sequence_valid = (
@@ -3235,7 +3298,12 @@ class GatewayStore:
                     FactoryActionKind.DISPATCH_BUILD_VALIDATOR,
                 }
             ),
-            FactoryRole.REAL_CASE_TESTER: frozenset({FactoryActionKind.DISPATCH_REAL_CASE_TESTER}),
+            FactoryRole.REAL_CASE_TESTER: frozenset(
+                {
+                    FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
+                    FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION,
+                }
+            ),
             FactoryRole.QUALITY_WARDEN: frozenset({FactoryActionKind.DISPATCH_QUALITY_WARDEN}),
         }
         if action.kind not in role_actions[lease.role]:

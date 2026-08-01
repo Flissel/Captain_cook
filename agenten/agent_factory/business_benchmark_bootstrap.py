@@ -123,6 +123,7 @@ from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillStep,
     TeamEvaluationV1,
     TeamExecutionEvidenceV1,
+    effective_team_execution_evidence,
 )
 from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent
 from agenten.agent_runtime.n8n_endpoint import N8nEndpoint
@@ -1049,11 +1050,13 @@ class GatewayBusinessBenchmarkAuthority:
     def team_execution_evidence(
         self, job_id: UUID, attempt: int
     ) -> tuple[TeamExecutionEvidenceV1, ...]:
-        return tuple(
-            item
-            for item in self._repository.workflow_artifacts(job_id)
-            if isinstance(item, TeamExecutionEvidenceV1)
-            and item.attempt == attempt
+        return effective_team_execution_evidence(
+            tuple(
+                item
+                for item in self._repository.workflow_artifacts(job_id)
+                if isinstance(item, TeamExecutionEvidenceV1)
+                and item.attempt == attempt
+            )
         )
 
     def budget_projection(self, job_id: UUID) -> FactoryBudgetProjection | None:
@@ -1211,10 +1214,15 @@ class GatewayBenchmarkInvocationAuthority:
     ) -> FactorySkillInvocationV1:
         observed = tuple(
             item.invocation
-            for item in self._repository.workflow_artifacts(job.job_id)
-            if isinstance(item, TeamExecutionEvidenceV1)
-            and item.attempt == attempt
-            and item.invocation.step is FactorySkillStep.EXECUTE_TEAM
+            for item in effective_team_execution_evidence(
+                tuple(
+                    item
+                    for item in self._repository.workflow_artifacts(job.job_id)
+                    if isinstance(item, TeamExecutionEvidenceV1)
+                    and item.attempt == attempt
+                    and item.invocation.step is FactorySkillStep.EXECUTE_TEAM
+                )
+            )
         )
         invocations = tuple(
             invocation

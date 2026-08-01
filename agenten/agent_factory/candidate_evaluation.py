@@ -1271,17 +1271,42 @@ class CandidateEvaluationFactory:
             attempt=request.action.attempt,
             now=request.lease.issued_at,
         )
-        if request.action.kind is FactoryActionKind.DISPATCH_REAL_CASE_TESTER:
+        if request.action.kind in {
+            FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
+            FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION,
+        }:
             if self._team_execution is None:
                 raise FactoryDispatchError(
                     "real-case dispatch requires a configured TeamExecutionService"
                 )
         try:
             resolved = self._provider.candidate_for(request.job)
-            if request.action.kind is FactoryActionKind.DISPATCH_REAL_CASE_TESTER:
+            if request.action.kind in {
+                FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
+                FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION,
+            }:
                 assert self._team_execution is not None
                 expected_invocation = self._team_execution.invocation_for(request)
                 team_evidence = await self._team_execution.execute(request, resolved)
+                if (
+                    request.action.kind
+                    is FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION
+                ):
+                    assert request.action.authorization_ref is not None
+                    assert request.action.supersedes_ref is not None
+                    team_evidence = team_evidence.model_copy(
+                        update={
+                            "evidence_refs": tuple(
+                                dict.fromkeys(
+                                    (
+                                        *team_evidence.evidence_refs,
+                                        request.action.authorization_ref,
+                                        request.action.supersedes_ref,
+                                    )
+                                )
+                            )
+                        }
+                    )
                 sealed = await self._evidence_store.persist(
                     request.job,
                     team_evidence.model_dump_json(
@@ -1438,6 +1463,7 @@ def _validation_phase(action: FactoryActionKind) -> tuple[FactoryPhase, FactoryR
         FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE: (FactoryPhase.AGENT_CODE_CREATED, FactoryRole.TOOL_INTEGRATOR),
         FactoryActionKind.DISPATCH_BUILD_VALIDATOR: (FactoryPhase.BUILD_PASSED, FactoryRole.TOOL_INTEGRATOR),
         FactoryActionKind.DISPATCH_REAL_CASE_TESTER: (FactoryPhase.REAL_CASE_EVIDENCE, FactoryRole.REAL_CASE_TESTER),
+        FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION: (FactoryPhase.REAL_CASE_REVALIDATED, FactoryRole.REAL_CASE_TESTER),
         FactoryActionKind.DISPATCH_QUALITY_WARDEN: (FactoryPhase.QUALITY_REVIEWED, FactoryRole.QUALITY_WARDEN),
     }
     try:
@@ -1497,7 +1523,12 @@ def _team_execution_block(
         producer="hermes",
         subject_version=request.job.subject_version,
         attempt=request.action.attempt,
-        phase=FactoryPhase.REAL_CASE_EVIDENCE,
+        phase=(
+            FactoryPhase.REAL_CASE_REVALIDATED
+            if request.action.kind
+            is FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION
+            else FactoryPhase.REAL_CASE_EVIDENCE
+        ),
         role=FactoryRole.REAL_CASE_TESTER,
         status=status,
         artifact_refs=(

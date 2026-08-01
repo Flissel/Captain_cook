@@ -26,6 +26,7 @@ _ACTION_ROLES: dict[FactoryActionKind, FactoryRole] = {
     FactoryActionKind.SUBMIT_FORGE_JOB: FactoryRole.TOOL_INTEGRATOR,
     FactoryActionKind.DISPATCH_BUILD_VALIDATOR: FactoryRole.TOOL_INTEGRATOR,
     FactoryActionKind.DISPATCH_REAL_CASE_TESTER: FactoryRole.REAL_CASE_TESTER,
+    FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION: FactoryRole.REAL_CASE_TESTER,
     FactoryActionKind.DISPATCH_QUALITY_WARDEN: FactoryRole.QUALITY_WARDEN,
 }
 

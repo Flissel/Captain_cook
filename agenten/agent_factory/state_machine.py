@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .contracts import AgentFactoryJobV3, FactoryEvidenceBlock, FactoryJob, FactoryPhase
 from .release_gate import (
@@ -49,6 +49,10 @@ class FactoryActionKind(str, Enum):
     EMIT_AGENT_CODE_EVIDENCE = "emit_agent_code_evidence"
     DISPATCH_BUILD_VALIDATOR = "dispatch_build_validator"
     DISPATCH_REAL_CASE_TESTER = "dispatch_real_case_tester"
+    APPEND_TECHNICAL_REVALIDATION_REQUESTED = (
+        "append_technical_revalidation_requested"
+    )
+    DISPATCH_TECHNICAL_REVALIDATION = "dispatch_technical_revalidation"
     DISPATCH_QUALITY_WARDEN = "dispatch_quality_warden"
     APPEND_IMPROVEMENT_REQUESTED = "append_improvement_requested"
     VALIDATE_FOR_PROMOTION = "validate_for_promotion"
@@ -63,6 +67,19 @@ class FactoryAction(BaseModel):
     kind: FactoryActionKind
     attempt: int = Field(ge=1, le=5)
     job_id: UUID | None = None
+    authorization_ref: ArtifactRef | None = None
+    supersedes_ref: ArtifactRef | None = None
+
+    @model_validator(mode="after")
+    def require_revalidation_bindings(self) -> "FactoryAction":
+        bound = self.kind is FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION
+        has_any = self.authorization_ref is not None or self.supersedes_ref is not None
+        has_both = self.authorization_ref is not None and self.supersedes_ref is not None
+        if (bound and not has_both) or (not bound and has_any):
+            raise ValueError(
+                "technical revalidation action requires exact authorization and source refs"
+            )
+        return self
 
 
 class FactoryProjection(BaseModel):
@@ -82,6 +99,8 @@ class FactoryProjection(BaseModel):
     feedback_ref: ArtifactRef | None = None
     feedback_recommendation: FactoryFeedbackRecommendation | None = None
     tool_gaps: tuple[ToolGapMarker, ...] = ()
+    technical_revalidation_authorization_ref: ArtifactRef | None = None
+    technical_revalidation_supersedes_ref: ArtifactRef | None = None
 
     @classmethod
     def from_job(cls, job: FactoryJob) -> "FactoryProjection":
@@ -136,6 +155,22 @@ def apply_block(
         if projection.attempt >= projection.job.max_behavioral_iterations:
             raise FactoryLifecycleError("behavioral iteration ceiling reached")
         attempt += 1
+    elif block.phase is FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED:
+        authorization_refs = tuple(
+            reference
+            for reference in block.evidence_refs
+            if reference.uri.startswith(
+                "artifact://factory/technical-revalidation/"
+            )
+        )
+        if len(authorization_refs) != 1 or len(block.artifact_refs) != 1:
+            raise FactoryLifecycleError(
+                "technical revalidation requires one authorization and one superseded execution ref"
+            )
+        evaluation_update = {
+            "technical_revalidation_authorization_ref": authorization_refs[0],
+            "technical_revalidation_supersedes_ref": block.artifact_refs[0],
+        }
     elif block.phase is FactoryPhase.CAPABILITY_PROMOTED:
         required = set(projection.job.acceptance_assertion_ids)
         if not required.issubset(assertions):
@@ -251,7 +286,23 @@ def next_action(
         return FactoryAction(kind=FactoryActionKind.DISPATCH_BUILD_VALIDATOR, attempt=projection.attempt)
     if phase is FactoryPhase.BUILD_PASSED:
         return FactoryAction(kind=FactoryActionKind.DISPATCH_REAL_CASE_TESTER, attempt=projection.attempt)
+    if phase is FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED:
+        if (
+            projection.technical_revalidation_authorization_ref is None
+            or projection.technical_revalidation_supersedes_ref is None
+        ):
+            raise FactoryLifecycleError(
+                "technical revalidation projection is missing Captain bindings"
+            )
+        return FactoryAction(
+            kind=FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION,
+            attempt=projection.attempt,
+            authorization_ref=projection.technical_revalidation_authorization_ref,
+            supersedes_ref=projection.technical_revalidation_supersedes_ref,
+        )
     if phase is FactoryPhase.REAL_CASE_EVIDENCE:
+        return FactoryAction(kind=FactoryActionKind.DISPATCH_QUALITY_WARDEN, attempt=projection.attempt)
+    if phase is FactoryPhase.REAL_CASE_REVALIDATED:
         return FactoryAction(kind=FactoryActionKind.DISPATCH_QUALITY_WARDEN, attempt=projection.attempt)
     if phase in {FactoryPhase.BUILD_FAILED, FactoryPhase.QUALITY_REVIEWED}:
         if (
@@ -331,6 +382,16 @@ def _allowed_next_phases(projection: FactoryProjection) -> frozenset[FactoryPhas
         FactoryPhase.AGENT_CODE_CREATED: frozenset({FactoryPhase.BUILD_PASSED, FactoryPhase.BUILD_FAILED}),
         FactoryPhase.BUILD_PASSED: frozenset({FactoryPhase.REAL_CASE_EVIDENCE}),
         FactoryPhase.REAL_CASE_EVIDENCE: frozenset(
+            {
+                FactoryPhase.QUALITY_REVIEWED,
+                FactoryPhase.IMPROVEMENT_REQUESTED,
+                FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED,
+            }
+        ),
+        FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED: frozenset(
+            {FactoryPhase.REAL_CASE_REVALIDATED}
+        ),
+        FactoryPhase.REAL_CASE_REVALIDATED: frozenset(
             {FactoryPhase.QUALITY_REVIEWED, FactoryPhase.IMPROVEMENT_REQUESTED}
         ),
         FactoryPhase.BUILD_FAILED: frozenset({FactoryPhase.IMPROVEMENT_REQUESTED, FactoryPhase.ESCALATED}),

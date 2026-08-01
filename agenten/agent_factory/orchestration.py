@@ -530,6 +530,7 @@ _ROLE_ACTIONS: dict[FactoryActionKind, FactoryRole] = {
     FactoryActionKind.DISPATCH_TOOL_INTEGRATOR: FactoryRole.TOOL_INTEGRATOR,
     FactoryActionKind.DISPATCH_BUILD_VALIDATOR: FactoryRole.TOOL_INTEGRATOR,
     FactoryActionKind.DISPATCH_REAL_CASE_TESTER: FactoryRole.REAL_CASE_TESTER,
+    FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION: FactoryRole.REAL_CASE_TESTER,
     FactoryActionKind.DISPATCH_QUALITY_WARDEN: FactoryRole.QUALITY_WARDEN,
 }
 
@@ -624,6 +625,7 @@ class FactoryDispatcher:
                 action.kind
                 in {
                     FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
+                    FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION,
                     FactoryActionKind.DISPATCH_QUALITY_WARDEN,
                 }
                 and self._candidate_validator is not None

@@ -31,7 +31,11 @@ from agenten.agent_factory.business_benchmark_live import (
 from agenten.agent_factory.business_benchmark_production_ports import (
     BusinessBenchmarkContentAddressedArtifactStore,
 )
-from agenten.agent_factory.candidate_evaluation import GatewayForgeCandidateProvider
+from agenten.agent_factory.candidate_evaluation import (
+    GatewayForgeCandidateProvider,
+    ResolvedFactoryCandidate,
+)
+from agenten.agent_factory.contracts import AgentFactoryJobV3
 from agenten.agent_factory.codex_build_execution import (
     CaptainCodexBuildSealer,
     CaptainFactoryCodexResumeAuthorizer,
@@ -57,6 +61,11 @@ from agenten.agent_factory.minibook_forge import (
     MinibookSwarmForge,
 )
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
+from agenten.agent_factory.technical_revalidation import (
+    FilesystemFactoryTechnicalRevalidationAuthority,
+    TECHNICAL_REVALIDATION_EVALUATOR_PATHS,
+    TECHNICAL_REVALIDATION_RUNTIME_PATHS,
+)
 from agenten.agent_factory.state_machine import FactoryActionKind
 from agenten.agent_factory.production_dispatch_runner import (
     ProductionFactoryDispatchResult,
@@ -74,7 +83,7 @@ from gateway.business_benchmark_live_composition import (
     GatewayForgeBusinessBenchmarkCandidateAuthority,
     GatewayBusinessBenchmarkLiveCompositionLoader,
 )
-from gateway.factory_repository import GatewayFactoryRepository
+from gateway.factory_repository import GatewayFactoryBudgetLedger, GatewayFactoryRepository
 from gateway.factory_forge_evidence import CaptainForgeEvidenceBridge
 from gateway.factory_runtime_retry_authority import (
     FilesystemFactoryRuntimeRetryAuthority,
@@ -314,6 +323,7 @@ def compose_business_demo_factory_operator(
         raise ValueError("Factory provider secret is not present in the process")
 
     store = GatewayStore(MariaDBStorage(settings.test_mariadb_dsn))
+    budget_ledger = GatewayFactoryBudgetLedger(store)
     codex_state_root = (authority_root / "runtime-state" / "codex").resolve()
     runtime_retry_authority = FilesystemFactoryRuntimeRetryAuthority(
         authority_root=(
@@ -338,6 +348,31 @@ def compose_business_demo_factory_operator(
         repository=repository,
         artifacts=GatewayMinibookCreationArtifactStore(creation_artifact_root),
     )
+    technical_revalidation_authority = (
+        FilesystemFactoryTechnicalRevalidationAuthority(
+            authority_root
+            / "runtime-state"
+            / "technical-revalidation-authorizations",
+            repository_root=workspace,
+            runtime_paths=TECHNICAL_REVALIDATION_RUNTIME_PATHS,
+            evaluator_paths=TECHNICAL_REVALIDATION_EVALUATOR_PATHS,
+        )
+    )
+    def validate_technical_revalidation(request: FactoryDispatch) -> None:
+        if not isinstance(request.job, AgentFactoryJobV3):
+            raise FactoryDispatchError("technical revalidation requires a V3 job")
+        resolved = candidate_bindings.candidate_for(request.job)
+        if not isinstance(resolved, ResolvedFactoryCandidate):
+            raise FactoryDispatchError("technical revalidation candidate is unavailable")
+        technical_revalidation_authority.active(
+            job=request.job,
+            action=request.action,
+            budget=budget_ledger.projection(request.job.job_id),
+            now=current_time(),
+            code_revision=_git_revision(workspace),
+            candidate_ref=resolved.candidate.source_archive_ref,
+            holdout_ref=select_technical_business_holdout(request.job),
+        )
     factory_evidence_root = (
         authority_root / "runtime-state" / "factory-evidence"
     ).resolve()
@@ -516,6 +551,7 @@ def compose_business_demo_factory_operator(
         improvements=improvement_authority,
         runtime_retries=runtime_retry_authority,
         hermes_retry_authority=hermes_retry_authority,
+        technical_revalidation_validator=validate_technical_revalidation,
     )
 
 
@@ -553,6 +589,23 @@ def _required(environment: Mapping[str, str], name: str) -> str:
     if not value:
         raise ValueError(f"required Factory operator setting is missing: {name}")
     return value
+
+
+def _git_revision(workspace: Path) -> str:
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    revision = completed.stdout.strip().lower()
+    if completed.returncode != 0 or len(revision) != 40 or any(
+        character not in "0123456789abcdef" for character in revision
+    ):
+        raise ValueError("Factory operator Git revision is unavailable")
+    return revision
 
 
 def _assert_hermes_python_runtime(

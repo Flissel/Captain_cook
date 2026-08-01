@@ -326,6 +326,11 @@ class GatewayFactoryBudgetLedger(FactoryBudgetPort):
             and lease.issued_at <= receipt.started_at
             and receipt.ended_at < lease.expires_at
         )
+        if candidates:
+            latest_issued_at = max(lease.issued_at for lease in candidates)
+            candidates = tuple(
+                lease for lease in candidates if lease.issued_at == latest_issued_at
+            )
         if len(candidates) != 1:
             raise ValueError("usage requires one exact active factory lease")
         submission = FactoryUsageSubmissionV2(

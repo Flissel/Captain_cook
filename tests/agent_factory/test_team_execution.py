@@ -663,6 +663,21 @@ def _sealed_team_candidate(tmp_path: Path) -> ResolvedFactoryCandidate:
     )
 
 
+def test_pricing_quote_accounts_at_micro_dollar_precision() -> None:
+    job = _job_v3()
+    quote = _pricing_quote(job).model_copy(
+        update={
+            "input_cost_per_million": Decimal("0.40"),
+            "output_cost_per_million": Decimal("1.60"),
+            "minimum_cost_usd": Decimal("0"),
+        }
+    )
+
+    assert quote.cost(RequestUsage(prompt_tokens=1_000, completion_tokens=250)) == (
+        Decimal("0.000800")
+    )
+
+
 def _invocation(job: AgentFactoryJobV3) -> FactorySkillInvocationV1:
     lease = issue_factory_lease(
         job=job,
