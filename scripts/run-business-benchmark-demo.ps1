@@ -890,8 +890,8 @@ try {
     $renewalBatchId = Require-NonEmpty $renewal.work_batch.batch_id 'renewal.work_batch.batch_id'
 
     $environment['CAPTAIN_BENCHMARK_PROFILE'] = 'all'
-    $environment['CAPTAIN_BENCHMARK_MAX_USD'] = '0.40'
     $environment['CAPTAIN_JOB_ALLOWED_MODELS'] = $model
+    [decimal]$aggregateRemainingUsd = 0
     foreach ($binding in @(
         @('CLAIMS', $claims),
         @('RENEWAL', $renewal)
@@ -902,9 +902,19 @@ try {
         $environment["${prefix}_CANDIDATE_ID"] = [string]$team.candidate_id
         $environment["${prefix}_JOB_ID"] = [string]$team.job.job_id
         $environment["${prefix}_ATTEMPT"] = '1'
-        $environment["${prefix}_MAX_USD"] = $maximumUsdPerTeam
-        $environment["${prefix}_REMAINING_USD"] = [string]$team.gateway_budget_remaining_usd
+        $teamRemainingUsd = [decimal]$team.gateway_budget_remaining_usd
+        $teamRemainingText = $teamRemainingUsd.ToString(
+            '0.00######',
+            [Globalization.CultureInfo]::InvariantCulture
+        )
+        $environment["${prefix}_MAX_USD"] = $teamRemainingText
+        $environment["${prefix}_REMAINING_USD"] = $teamRemainingText
+        $aggregateRemainingUsd += $teamRemainingUsd
     }
+    $environment['CAPTAIN_BENCHMARK_MAX_USD'] = $aggregateRemainingUsd.ToString(
+        '0.00######',
+        [Globalization.CultureInfo]::InvariantCulture
+    )
     $environment['CAPTAIN_BENCHMARK_RENEWAL_BATCH_ID'] = $renewalBatchId
     $environment['CAPTAIN_BENCHMARK_RENEWAL_WORKSPACE_REF'] = "workspace://business-benchmark-renewal/$renewalBatchId"
     $environment['CAPTAIN_BENCHMARK_EVIDENCE_ROOT'] = Join-Path $repositoryRoot '.captain-cook/evidence/business-benchmarks/preflight'
