@@ -1930,9 +1930,14 @@ async def test_runtime_retry_replay_requires_atomic_authorized_resume(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("durable", [False, True])
+@pytest.mark.parametrize(
+    "failure_kind",
+    ["FactoryCodexEvidenceFailure", "FactoryCodexOutputCaptureError"],
+)
 async def test_evidence_failure_replay_requires_new_runtime_retry_authority(
     tmp_path: Path,
     durable: bool,
+    failure_kind: str,
 ) -> None:
     replay_store = (
         FilesystemFactorySkillReplayStore(tmp_path / "runtime-replays")
@@ -1943,7 +1948,7 @@ async def test_evidence_failure_replay_requires_new_runtime_retry_authority(
     claimed = await replay_store.claim(invocation)
     failed = await replay_store.fail(
         claimed.record,
-        failure_kind="FactoryCodexEvidenceFailure",
+        failure_kind=failure_kind,
     )
     with pytest.raises(FactorySkillReplayRetryableFailureError) as retryable:
         await replay_store.claim(invocation)

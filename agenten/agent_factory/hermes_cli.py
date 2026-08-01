@@ -2476,13 +2476,17 @@ def _retried_failed_replay_record(
             authorization.model_dump(mode="json", by_alias=True)
         ).encode("utf-8")
     ).hexdigest()
-    evidence_retry = failed.failure_kind == "FactoryCodexEvidenceFailure"
+    evidence_retry = failed.failure_kind in {
+        "FactoryCodexEvidenceFailure",
+        "FactoryCodexOutputCaptureError",
+    }
     if (
         failed.state != "failed"
         or failed.failure_kind not in {
             "CodexPolicyViolation",
             "CodexBuildProvenanceError",
             "FactoryCodexEvidenceFailure",
+            "FactoryCodexOutputCaptureError",
         }
         or (
             evidence_retry
@@ -2640,7 +2644,10 @@ def _hermes_retry_exceeds_authority(
 
 
 def _is_codex_retryable_failure(replay: FactorySkillReplayRecord) -> bool:
-    if replay.failure_kind == "FactoryCodexEvidenceFailure":
+    if replay.failure_kind in {
+        "FactoryCodexEvidenceFailure",
+        "FactoryCodexOutputCaptureError",
+    }:
         return replay.resume_ordinal < 2
     return (
         replay.failure_kind in {"CodexPolicyViolation", "CodexBuildProvenanceError"}
