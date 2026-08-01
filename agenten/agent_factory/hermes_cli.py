@@ -3090,7 +3090,7 @@ def _factory_skill_prompt(
                 "captain_improvement_seed="
                 + _canonical_json(improvement_seed),
                 f"captain_improvement_seed_sha256={seed_sha256}",
-                "Select only the bounded changed_components required by the supplied failed evidence, then return its digest-bound attestation; do not call tools or invent artifact references.",
+                "Select changed_components only from captain_improvement_seed.permitted_changed_components. failed_assertion_ids such as business_value are diagnostic inputs and are never changed_components. For a business_value failure caused by max_messages, select only concrete repair targets such as system_prompt, user_prompt, termination, handoffs, and tests. Return the digest-bound attestation; do not call tools or invent artifact references.",
             )
         )
     lines.extend(

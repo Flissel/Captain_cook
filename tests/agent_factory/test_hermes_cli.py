@@ -1607,6 +1607,7 @@ async def test_authorized_retry_runs_improve_before_brief_codex(
     assert authorization.prior_candidate_ref.uri in improve_prompt
     assert authorization.failed_evaluation.artifact_ref.uri in improve_prompt
     assert "Return exactly one hermes.factory-improvement-attestation.v1" in improve_prompt
+    assert "business_value are diagnostic inputs and are never changed_components" in improve_prompt
     assert "--no-tools" in commands[0]
     assert "--no-tools" in commands[1]
     assert "--no-tools" in commands[2]
