@@ -8,7 +8,7 @@ from agenten.agent_factory.service import (
     InMemoryFactoryRepository,
 )
 from agenten.agent_factory.state_machine import FactoryActionKind, FactoryLifecycleError
-from agenten.agent_factory.contracts import FactoryPhase
+from agenten.agent_factory.contracts import FactoryBlockStatus, FactoryPhase
 from agenten.agent_factory.factory_feedback import FactoryFeedbackBuilder
 from tests.agent_factory.test_factory_feedback import (
     _budget as workflow_budget,
@@ -92,6 +92,31 @@ def test_repository_rebuilds_state_and_returns_next_captain_action() -> None:
     assert action.kind is FactoryActionKind.DISPATCH_AGENT_ARCHITECT
     assert action.job_id == factory_job.job_id
     assert coordinator.blocks(factory_job.job_id) == (block(FactoryPhase.FORGE_REQUESTED),)
+
+
+def test_failed_v3_technical_evidence_requires_captain_improvement_before_benchmark() -> None:
+    repository = InMemoryFactoryRepository()
+    coordinator = FactoryCoordinator(repository)
+    factory_job = job_v3()
+    coordinator.register(factory_job)
+    for phase in (
+        FactoryPhase.FORGE_REQUESTED,
+        FactoryPhase.BLUEPRINT_CREATED,
+        FactoryPhase.TOOL_CANDIDATE_TESTED,
+        FactoryPhase.AGENT_CODE_CREATED,
+        FactoryPhase.BUILD_PASSED,
+    ):
+        coordinator.record(workflow_block(phase))
+    coordinator.record(
+        workflow_block(FactoryPhase.REAL_CASE_EVIDENCE).model_copy(
+            update={"status": FactoryBlockStatus.FAILED}
+        )
+    )
+
+    action = coordinator.next_action(factory_job.job_id)
+
+    assert action.kind is FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED
+    assert action.attempt == 1
 
 
 def test_duplicate_evidence_is_idempotent_but_conflicting_event_id_is_rejected() -> None:

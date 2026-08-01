@@ -14,8 +14,10 @@ from agenten.agent_runtime.contracts import ArtifactRef
 
 from agenten.agent_factory.contracts import (
     AgentFactoryJobV3,
+    FactoryBlockStatus,
     FactoryEvidenceBlock,
     FactoryJob,
+    FactoryPhase,
 )
 from agenten.agent_factory.execution_budget import (
     FactoryBudgetProjection,
@@ -36,6 +38,7 @@ from agenten.agent_factory.skill_workflow_contracts import (
 )
 from agenten.agent_factory.state_machine import (
     FactoryAction,
+    FactoryActionKind,
     FactoryLifecycleError,
     FactoryProjection,
     apply_block,
@@ -367,6 +370,26 @@ class FactoryCoordinator:
 
     def next_action(self, job_id: UUID) -> FactoryAction:
         projection = self.projection(job_id)
+        if (
+            isinstance(projection.job, AgentFactoryJobV3)
+            and projection.phase is FactoryPhase.REAL_CASE_EVIDENCE
+        ):
+            technical_blocks = tuple(
+                block
+                for block in self._repository.blocks(job_id)
+                if block.phase is FactoryPhase.REAL_CASE_EVIDENCE
+                and block.attempt == projection.attempt
+            )
+            if len(technical_blocks) != 1:
+                raise FactoryLifecycleError(
+                    "current technical evidence block is ambiguous"
+                )
+            if technical_blocks[0].status is FactoryBlockStatus.FAILED:
+                return FactoryAction(
+                    kind=FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED,
+                    attempt=projection.attempt,
+                    job_id=job_id,
+                )
         evaluation = (
             self.evaluation_for_job(job_id)
             if projection.phase is not None and projection.phase.value == "quality_reviewed"
