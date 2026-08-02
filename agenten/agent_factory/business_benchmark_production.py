@@ -31,6 +31,7 @@ from agenten.agent_factory.business_benchmark_contracts import (
 from agenten.agent_factory.business_benchmark_execution import (
     BenchmarkExecutionPolicyV1,
     BusinessBenchmarkExecutorPort,
+    PairedBusinessBenchmarkCoordinator,
 )
 from agenten.agent_factory.business_benchmark_dispatch import (
     BusinessBenchmarkDispatchInputs,
@@ -852,6 +853,12 @@ class ProductionBusinessBenchmarkComposition:
         policy_binding = self._captain_policy(scope)
         executor = self._executor_factory(scope)
         replay_store = self._replay_store_factory(scope)
+        self._validate_outstanding_policy_budget(
+            scope,
+            case_policies,
+            executor=executor,
+            replay_store=replay_store,
+        )
         prepared = _PreparedProductionBusinessBenchmarkScope(
             scope=scope,
             executor=executor,
@@ -906,16 +913,49 @@ class ProductionBusinessBenchmarkComposition:
                 )
             policies[benchmark_case.case_id] = policy
 
+        return policies
+
+    @staticmethod
+    def _validate_outstanding_policy_budget(
+        scope: ProductionBusinessBenchmarkScope,
+        policies: Mapping[str, BenchmarkExecutionPolicyV1],
+        *,
+        executor: BusinessBenchmarkExecutorPort,
+        replay_store: BusinessBenchmarkReplayStore,
+    ) -> None:
+
         maximum_cost_micro_usd = int(scope.selection.maximum_usd * 1_000_000)
         remaining_cost_micro_usd = int(
             scope.budget_projection.remaining_usd * 1_000_000
         )
-        total_cost_micro_usd = 2 * sum(
-            policy.maximum_cost_micro_usd for policy in policies.values()
+        coordinator = PairedBusinessBenchmarkCoordinator(
+            job_id=scope.job.job_id,
+            correlation_id=scope.job.correlation_id,
+            subject_version=scope.job.subject_version,
+            attempt=scope.selection.attempt,
+            suite_id=scope.suite.suite_id,
+            executor=executor,
+            replay_store=replay_store,
         )
-        total_latency_ms = 2 * sum(
-            policy.maximum_latency_ms for policy in policies.values()
-        )
+        snapshot_for = getattr(replay_store, "snapshot", None)
+        total_cost_micro_usd = 0
+        total_latency_ms = 0
+        for benchmark_case in scope.suite.cases:
+            policy = policies[benchmark_case.case_id]
+            envelopes = coordinator.envelopes_for_case(
+                case=benchmark_case,
+                suite_ref=scope.suite_ref,
+                candidate_ref=scope.candidate_ref,
+                execution_policy=policy,
+            )
+            for envelope in envelopes:
+                receipt = None
+                if callable(snapshot_for):
+                    snapshot = snapshot_for(coordinator.effect_identity(envelope))
+                    receipt = getattr(snapshot, "receipt", None)
+                if receipt is None:
+                    total_cost_micro_usd += policy.maximum_cost_micro_usd
+                    total_latency_ms += policy.maximum_latency_ms
         if (
             total_cost_micro_usd > maximum_cost_micro_usd
             or total_cost_micro_usd > remaining_cost_micro_usd
@@ -927,7 +967,6 @@ class ProductionBusinessBenchmarkComposition:
             raise BusinessBenchmarkProductionScopeError(
                 "benchmark execution policy exceeds the job latency budget"
             )
-        return policies
 
     def _captain_policy(
         self, scope: ProductionBusinessBenchmarkScope

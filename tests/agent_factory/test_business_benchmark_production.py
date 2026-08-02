@@ -905,6 +905,67 @@ async def test_production_preflight_materializes_and_reuses_real_scope_adapters(
 
 
 @pytest.mark.asyncio
+async def test_production_preflight_charges_only_effects_missing_from_replay(
+    tmp_path: Path,
+) -> None:
+    job, manifest, gateway, invocations, resolver = authorities(tmp_path)
+    factory = FactoryComposition(job, manifest.source_archive_ref)
+    policy = BenchmarkExecutionPolicyV1(
+        schema="captain.business-benchmark-execution-policy.v1",
+        model_version="approved-model-id",
+        baseline_system_policy_version="baseline-v1",
+        maximum_cost_micro_usd=30_000,
+        maximum_latency_ms=1000,
+        redaction_policy_version="redaction-v1",
+    )
+    completed_case_ids = frozenset(case.case_id for case in suite().cases[:11])
+
+    class FirstPairCompletedReplay:
+        @staticmethod
+        def snapshot(identity):
+            return SimpleNamespace(
+                receipt=object() if identity.case_id in completed_case_ids else None
+            )
+
+    gateway.budget = FactoryBudgetProjection(
+        job_id=job.job_id,
+        limit_usd="5.00",
+        consumed_usd="4.72",
+        reserved_usd="0",
+        remaining_usd="0.28",
+    )
+    selected = settings(job, manifest.candidate_id)
+    selection = selected.selections[0].model_copy(
+        update={
+            "maximum_usd": Decimal("0.28"),
+            "captain_remaining_usd": Decimal("0.28"),
+        }
+    )
+    selected = selected.model_copy(
+        update={"selections": (selection,), "maximum_usd": Decimal("0.28")}
+    )
+    composition = ProductionBusinessBenchmarkComposition(
+        resolver=resolver,
+        factory_composition=factory,
+        invocation_authority=invocations,
+        executor_factory=lambda scope: object(),
+        replay_store_factory=lambda scope: FirstPairCompletedReplay(),
+        execution_policy_factory=lambda scope: (lambda case: policy),
+        benchmark_policy_authority=PolicyAuthority(job),
+        receipt_finalizer=Finalizer(),
+        clock=lambda: NOW,
+    )
+
+    prepared = await composition.preflight(
+        selected,
+        {"OPENAI_API_KEY": "present-for-deterministic-test-only"},
+        repository_root=tmp_path,
+    )
+
+    assert prepared == composition.expected_scopes
+
+
+@pytest.mark.asyncio
 async def test_production_composition_rejects_aggregate_settings_before_effects(
     tmp_path: Path,
 ) -> None:
@@ -1043,7 +1104,11 @@ async def test_all_case_and_captain_policies_are_materialized_before_effect_fact
     with pytest.raises(BusinessBenchmarkProductionScopeError, match="policy"):
         await composition.run(settings(job, manifest.candidate_id))
 
-    assert created == []
+    assert created == (
+        ["executor", "replay"]
+        if invalid_policy in {"cost", "latency"}
+        else []
+    )
     assert factory.calls == []
 
 

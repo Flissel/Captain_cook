@@ -199,6 +199,30 @@ class PairedBusinessBenchmarkCoordinator:
         candidate_ref: ArtifactRef,
         execution_policy: BenchmarkExecutionPolicyV1,
     ) -> tuple[BusinessBenchmarkRunReceiptV1, BusinessBenchmarkRunReceiptV1]:
+        candidate, baseline = self.envelopes_for_case(
+            case=case,
+            suite_ref=suite_ref,
+            candidate_ref=candidate_ref,
+            execution_policy=execution_policy,
+        )
+        candidate_receipt = await self._run_variant(candidate)
+        baseline_receipt = await self._run_variant(baseline)
+        self._validate_pair(candidate_receipt, baseline_receipt)
+        return candidate_receipt, baseline_receipt
+
+    def envelopes_for_case(
+        self,
+        *,
+        case: BusinessBenchmarkCaseV1,
+        suite_ref: PrivateHoldoutRef,
+        candidate_ref: ArtifactRef,
+        execution_policy: BenchmarkExecutionPolicyV1,
+    ) -> tuple[
+        BusinessBenchmarkExecutionEnvelopeV1,
+        BusinessBenchmarkExecutionEnvelopeV1,
+    ]:
+        """Return the canonical pair identities without executing an effect."""
+
         if execution_policy.allowed_tool_intents != case.allowed_tool_intents:
             raise BusinessBenchmarkExecutionError(
                 "execution policy tool intents must exactly match case tool intents"
@@ -217,15 +241,13 @@ class PairedBusinessBenchmarkCoordinator:
             candidate_ref=None,
             execution_policy=execution_policy,
         )
-        candidate_receipt = await self._run_variant(candidate)
-        baseline_receipt = await self._run_variant(baseline)
-        self._validate_pair(candidate_receipt, baseline_receipt)
-        return candidate_receipt, baseline_receipt
+        return candidate, baseline
 
-    async def _run_variant(
-        self, envelope: BusinessBenchmarkExecutionEnvelopeV1
-    ) -> BusinessBenchmarkRunReceiptV1:
-        identity = BusinessBenchmarkEffectIdentityV1.create(
+    @staticmethod
+    def effect_identity(
+        envelope: BusinessBenchmarkExecutionEnvelopeV1,
+    ) -> BusinessBenchmarkEffectIdentityV1:
+        return BusinessBenchmarkEffectIdentityV1.create(
             request_id=envelope.request_id,
             job_id=envelope.job_id,
             correlation_id=envelope.correlation_id,
@@ -238,6 +260,11 @@ class PairedBusinessBenchmarkCoordinator:
             execution_policy_sha256=envelope.execution_policy_sha256,
             variant_policy_sha256=envelope.variant_policy_sha256,
         )
+
+    async def _run_variant(
+        self, envelope: BusinessBenchmarkExecutionEnvelopeV1
+    ) -> BusinessBenchmarkRunReceiptV1:
+        identity = self.effect_identity(envelope)
         snapshot = self._replay_store.snapshot(identity)
         if snapshot.receipt is not None:
             self._validate_receipt(snapshot.receipt, envelope)
