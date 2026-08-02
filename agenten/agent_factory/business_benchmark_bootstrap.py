@@ -432,7 +432,9 @@ class _RequestBoundBenchmarkHoldoutResolver:
         expected_sha = hashlib.sha256(self._body).hexdigest()
         if (
             reference.sha256 != expected_sha
-            or reference != self._request.identity.case_ref
+            or reference != self._request.case_ref
+            or reference.holdout_id != self._request.identity.case_id
+            or reference.sha256 != self._request.identity.case_sha256
         ):
             raise ValueError("host session requested a different redacted benchmark task")
         return ResolvedFactoryHoldoutCase(reference=reference, body=self._body)

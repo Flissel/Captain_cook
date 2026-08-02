@@ -651,7 +651,8 @@ def test_claims_baseline_prompt_has_equal_public_policy_without_private_labels()
     assert not any(item in prompt for item in forbidden)
 
 
-def test_renewal_builder_wires_equal_request_scoped_n8n_authority(
+@pytest.mark.asyncio
+async def test_renewal_builder_wires_equal_request_scoped_n8n_authority(
     tmp_path: Path,
 ) -> None:
     import httpx
@@ -890,6 +891,7 @@ def test_renewal_builder_wires_equal_request_scoped_n8n_authority(
         )
         return BusinessBenchmarkSessionRequestV1(
             identity=identity,
+            case_ref=case_ref,
             benchmark_case_sha256="c" * 64,
             redacted_case_task=task,
             allowed_host_tools=allowed_tools,
@@ -897,13 +899,12 @@ def test_renewal_builder_wires_equal_request_scoped_n8n_authority(
             maximum_latency_ms=2500,
         )
 
-    candidate_session = session_factory.create(
-        request(
-            "candidate",
-            (tool_ref.tool_name, "captain_business_decision"),
-            1,
-        )
+    candidate_request = request(
+        "candidate",
+        (tool_ref.tool_name, "captain_business_decision"),
+        1,
     )
+    candidate_session = session_factory.create(candidate_request)
     baseline_session = session_factory.create(
         request(
             "single_agent_baseline",
@@ -935,6 +936,10 @@ def test_renewal_builder_wires_equal_request_scoped_n8n_authority(
     assert sensitive_baseline_session._n8n_adapter is None
     assert sensitive_baseline_session._baseline_n8n_tools == {}
     assert len(authorization_port.calls) == 2
+    resolved_case = await candidate_session._holdouts.resolve(
+        candidate_request.case_ref
+    )
+    assert resolved_case.reference == candidate_request.case_ref
 
     different_authorization, _ = _baseline_n8n_contract(
         job, tool_ref, suffix="8"

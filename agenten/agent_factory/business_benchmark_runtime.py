@@ -212,6 +212,7 @@ class BusinessBenchmarkTeamRuntimeScopeV1:
 @dataclass(frozen=True)
 class BusinessBenchmarkSessionRequestV1:
     identity: HostAutoGenSessionIdentityV1
+    case_ref: PrivateHoldoutRef
     benchmark_case_sha256: str
     redacted_case_task: str = field(repr=False)
     allowed_host_tools: tuple[str, ...]
@@ -397,6 +398,7 @@ class BusinessBenchmarkProviderRuntimeBridge:
         )
         request = BusinessBenchmarkSessionRequestV1(
             identity=identity,
+            case_ref=case_ref,
             benchmark_case_sha256=envelope.case_sha256,
             redacted_case_task=redacted_case_task,
             allowed_host_tools=candidate_allowed_tools,
