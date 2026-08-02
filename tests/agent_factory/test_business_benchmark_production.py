@@ -904,6 +904,25 @@ async def test_production_preflight_materializes_and_reuses_real_scope_adapters(
     assert factory.calls[0]["replay_store"] is replays[0]
 
 
+def test_scope_refreshes_gateway_budget_after_factory_build(
+    tmp_path: Path,
+) -> None:
+    job, manifest, gateway, _, resolver = authorities(tmp_path)
+    gateway.budget = FactoryBudgetProjection(
+        job_id=job.job_id,
+        limit_usd="5.00",
+        consumed_usd="4.72",
+        reserved_usd="0",
+        remaining_usd="0.28",
+    )
+
+    scope = resolver.resolve(settings(job, manifest.candidate_id))
+
+    assert scope.selection.captain_remaining_usd == Decimal("0.28")
+    assert scope.selection.maximum_usd == Decimal("0.28")
+    assert scope.budget_projection == gateway.budget
+
+
 @pytest.mark.asyncio
 async def test_production_preflight_charges_only_effects_missing_from_replay(
     tmp_path: Path,

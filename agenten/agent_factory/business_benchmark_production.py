@@ -367,12 +367,23 @@ class ProductionBusinessBenchmarkScopeResolver:
                 runtime_invocation=technical_runtime_invocation,
             )
             budget = self._gateway.budget_projection(job.job_id)
-            self._require_budget(
+            if isinstance(budget, FactoryBudgetProjection):
+                budget = FactoryBudgetProjection.model_validate(
+                    budget.model_dump(mode="python")
+                )
+            selection = self._refresh_budget_selection(
                 budget,
                 job=job,
                 selection=selection,
             )
             assert budget is not None
+            canonical_settings = LiveBusinessBenchmarkSettings.model_validate(
+                canonical_settings.model_dump(mode="python")
+                | {
+                    "selections": (selection,),
+                    "maximum_usd": selection.maximum_usd,
+                }
+            )
 
             expected_suite = BusinessBenchmarkExpectedSuiteV1(
                 profile=selection.profile,
@@ -520,20 +531,27 @@ class ProductionBusinessBenchmarkScopeResolver:
             raise ValueError("team execution evidence is stale or mixed")
 
     @staticmethod
-    def _require_budget(
+    def _refresh_budget_selection(
         budget: FactoryBudgetProjection | None,
         *,
         job: AgentFactoryJobV3,
         selection: BusinessBenchmarkTeamSelectionV1,
-    ) -> None:
+    ) -> BusinessBenchmarkTeamSelectionV1:
         if (
             not isinstance(budget, FactoryBudgetProjection)
             or budget.job_id != job.job_id
             or budget.limit_usd != job.execution_policy.max_cost_usd
-            or budget.remaining_usd != selection.captain_remaining_usd
-            or selection.maximum_usd > budget.remaining_usd
+            or budget.remaining_usd <= 0
         ):
             raise ValueError("Gateway budget projection is missing or stale")
+        maximum_usd = min(selection.maximum_usd, budget.remaining_usd)
+        return BusinessBenchmarkTeamSelectionV1.model_validate(
+            selection.model_dump(mode="python")
+            | {
+                "maximum_usd": maximum_usd,
+                "captain_remaining_usd": budget.remaining_usd,
+            }
+        )
 
 
 class BusinessBenchmarkExecutorFactoryPort(Protocol):
