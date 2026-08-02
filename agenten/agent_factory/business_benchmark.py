@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from typing import Callable
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from agenten.agent_factory.business_benchmark_contracts import (
     BenchmarkDisposition,
@@ -72,7 +72,7 @@ class BusinessBenchmarkEvaluator:
         self,
         *,
         clock: Callable[[], datetime] | None = None,
-        uuid_factory: Callable[[], UUID] = uuid4,
+        uuid_factory: Callable[[], UUID] | None = None,
     ) -> None:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._uuid_factory = uuid_factory
@@ -86,10 +86,25 @@ class BusinessBenchmarkEvaluator:
         self._require_case_pair(case, candidate, baseline)
         candidate_scores = _score(case, candidate)
         baseline_scores = _score(case, baseline)
+        case_ref = _private_case_ref(case)
+        receipt_id = (
+            self._uuid_factory()
+            if self._uuid_factory is not None
+            else uuid5(
+                NAMESPACE_URL,
+                "captain.business-benchmark-case-receipt:"
+                f"{case_ref.sha256}:{candidate.run_id}:{baseline.run_id}",
+            )
+        )
+        evaluated_at = (
+            _utc_now(self._clock)
+            if self._uuid_factory is not None
+            else max(candidate.completed_at, baseline.completed_at)
+        )
         return BusinessBenchmarkReceiptV1(
             schema="captain.business-benchmark-receipt.v1",
-            receipt_id=self._uuid_factory(),
-            case_ref=_private_case_ref(case),
+            receipt_id=receipt_id,
+            case_ref=case_ref,
             candidate=candidate,
             baseline=baseline,
             candidate_decision_correct=candidate_scores.decision_correct,
@@ -103,7 +118,7 @@ class BusinessBenchmarkEvaluator:
             human_handoff_required=case.human_handoff_required,
             candidate_mandatory_handoff_missed=candidate_scores.mandatory_handoff_missed,
             baseline_mandatory_handoff_missed=baseline_scores.mandatory_handoff_missed,
-            evaluated_at=_utc_now(self._clock),
+            evaluated_at=evaluated_at,
         )
 
     def summarize(
@@ -123,9 +138,37 @@ class BusinessBenchmarkEvaluator:
         passed_metric_ids, failed_metric_ids = business_benchmark_metric_partition(
             reason_codes
         )
+        summary_identity = {
+            "job_id": str(effective_binding.job_id),
+            "correlation_id": str(effective_binding.correlation_id),
+            "subject_version": effective_binding.subject_version,
+            "attempt": effective_binding.attempt,
+            "candidate_ref_sha256": effective_binding.candidate_ref.sha256,
+            "suite_ref_sha256": effective_binding.suite_ref.sha256,
+            "suite_id": suite.suite_id,
+            "policy": policy.model_dump(mode="json", by_alias=True),
+            "receipt_ids": [str(receipt.receipt_id) for receipt in ordered],
+        }
+        summary_id = (
+            self._uuid_factory()
+            if self._uuid_factory is not None
+            else uuid5(
+                NAMESPACE_URL,
+                "captain.business-benchmark-summary:"
+                f"{_digest_value(summary_identity)}",
+            )
+        )
+        evaluated_at = (
+            _utc_now(self._clock)
+            if self._uuid_factory is not None
+            else max(
+                (receipt.evaluated_at for receipt in ordered),
+                default=suite.created_at,
+            )
+        )
         payload: dict[str, object] = {
             "schema": "captain.business-benchmark-summary.v1",
-            "summary_id": str(self._uuid_factory()),
+            "summary_id": str(summary_id),
             "job_id": str(effective_binding.job_id),
             "correlation_id": str(effective_binding.correlation_id),
             "subject_version": effective_binding.subject_version,
@@ -158,7 +201,7 @@ class BusinessBenchmarkEvaluator:
             "reason_codes": list(reason_codes),
             "passed_metric_ids": list(passed_metric_ids),
             "failed_metric_ids": list(failed_metric_ids),
-            "evaluated_at": _utc_now(self._clock).isoformat().replace("+00:00", "Z"),
+            "evaluated_at": evaluated_at.isoformat().replace("+00:00", "Z"),
         }
         digest = _digest_value(payload)
         payload["artifact_ref"] = ArtifactRef(

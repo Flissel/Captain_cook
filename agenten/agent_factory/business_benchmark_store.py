@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import tempfile
@@ -59,6 +60,10 @@ class BusinessBenchmarkRepository(Protocol):
     def record_summary(self, summary: BusinessBenchmarkSummaryV1) -> ArtifactRef: ...
 
     def summary(self, summary_id: UUID) -> BusinessBenchmarkSummaryV1 | None: ...
+
+    def canonical_summary(
+        self, proposed: BusinessBenchmarkSummaryV1
+    ) -> BusinessBenchmarkSummaryV1 | None: ...
 
 
 class PrivateBusinessBenchmarkStore:
@@ -169,6 +174,14 @@ class InMemoryBusinessBenchmarkRepository:
         stored = self._summaries.get(summary_id)
         return None if stored is None else stored[0]
 
+    def canonical_summary(
+        self, proposed: BusinessBenchmarkSummaryV1
+    ) -> BusinessBenchmarkSummaryV1 | None:
+        return _canonical_existing_summary(
+            proposed,
+            tuple(summary for summary, _ in self._summaries.values()),
+        )
+
     @staticmethod
     def _append(
         records: dict[UUID, tuple[_BenchmarkModel, ArtifactRef]],
@@ -212,6 +225,16 @@ class FilesystemBusinessBenchmarkEvidenceStore:
         if not path.exists():
             return None
         return BusinessBenchmarkSummaryV1.model_validate_json(path.read_bytes())
+
+    def canonical_summary(
+        self, proposed: BusinessBenchmarkSummaryV1
+    ) -> BusinessBenchmarkSummaryV1 | None:
+        root = self._root / "summaries"
+        existing = tuple(
+            BusinessBenchmarkSummaryV1.model_validate_json(path.read_bytes())
+            for path in sorted(root.glob("*.json"))
+        ) if root.exists() else ()
+        return _canonical_existing_summary(proposed, existing)
 
     def path_for(self, reference: ArtifactRef) -> Path:
         if not reference.uri.startswith(_EVIDENCE_URI_PREFIX):
@@ -289,6 +312,45 @@ def record_summary(
 
 
 _BenchmarkModel = BusinessBenchmarkRunReceiptV1 | BusinessBenchmarkReceiptV1 | BusinessBenchmarkSummaryV1
+
+
+def _canonical_existing_summary(
+    proposed: BusinessBenchmarkSummaryV1,
+    existing: tuple[BusinessBenchmarkSummaryV1, ...],
+) -> BusinessBenchmarkSummaryV1 | None:
+    canonical = _canonical_summary(proposed)
+    binding = _summary_binding(canonical)
+    matches = tuple(item for item in existing if _summary_binding(item) == binding)
+    if not matches:
+        return None
+    expected = _summary_semantics(canonical)
+    if any(_summary_semantics(item) != expected for item in matches):
+        raise BusinessBenchmarkConflictError(
+            "business benchmark summary binding already has different metrics"
+        )
+    return min(matches, key=lambda item: (item.evaluated_at, str(item.summary_id)))
+
+
+def _summary_binding(summary: BusinessBenchmarkSummaryV1) -> tuple[object, ...]:
+    return (
+        summary.job_id,
+        summary.correlation_id,
+        summary.subject_version,
+        summary.attempt,
+        summary.candidate_ref,
+    )
+
+
+def _summary_semantics(summary: BusinessBenchmarkSummaryV1) -> bytes:
+    payload = summary.model_dump(mode="json", by_alias=True)
+    for field in ("summary_id", "artifact_ref", "evaluated_at"):
+        payload.pop(field)
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def _canonical_json(model: BaseModel) -> bytes:

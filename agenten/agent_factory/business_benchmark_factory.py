@@ -86,6 +86,11 @@ class PrivateFilesystemBusinessBenchmarkRepository:
     def summary(self, summary_id: UUID) -> BusinessBenchmarkSummaryV1 | None:
         return self.evidence.summary(summary_id)
 
+    def canonical_summary(
+        self, proposed: BusinessBenchmarkSummaryV1
+    ) -> BusinessBenchmarkSummaryV1 | None:
+        return self.evidence.canonical_summary(proposed)
+
 
 @dataclass(frozen=True)
 class BusinessBenchmarkFactoryResult:
@@ -213,9 +218,13 @@ class BusinessBenchmarkFactoryComposition:
                 suite_ref=suite_ref,
             ),
         )
-        # Ordering is authoritative: evaluation can resolve only an already
-        # committed immutable summary artifact.
-        self._private_repository.record_summary(summary)
+        existing_summary = self._private_repository.canonical_summary(summary)
+        if existing_summary is not None:
+            summary = existing_summary
+        else:
+            # Ordering is authoritative: evaluation can resolve only an already
+            # committed immutable summary artifact.
+            self._private_repository.record_summary(summary)
         self._gateway_repository.record_business_benchmark_summary(summary)
 
         evaluation = self._team_evaluator.evaluate(

@@ -325,6 +325,32 @@ def test_case_receipts_and_summaries_are_idempotent_and_queryable(tmp_path: Path
     assert store.summary(UUID("00000000-0000-0000-0000-000000000106")).artifact_ref == summary().artifact_ref
 
 
+def test_store_resolves_legacy_equivalent_summary_for_replay(tmp_path: Path) -> None:
+    store = FilesystemBusinessBenchmarkEvidenceStore(tmp_path)
+    legacy = summary()
+    store.record_summary(legacy)
+    payload = legacy.model_dump(mode="json", by_alias=True)
+    payload["summary_id"] = "00000000-0000-0000-0000-000000000206"
+    payload["evaluated_at"] = "2026-07-26T11:00:00Z"
+    payload.pop("artifact_ref")
+    digest = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    payload["artifact_ref"] = {
+        "uri": f"artifact://business-benchmark-summary/{digest}",
+        "sha256": digest,
+        "media_type": "application/json",
+    }
+    replay = BusinessBenchmarkSummaryV1.model_validate(payload)
+
+    assert store.canonical_summary(replay) == legacy
+
+
 @pytest.mark.parametrize(
     ("field_name", "value"),
     [

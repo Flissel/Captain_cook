@@ -192,6 +192,32 @@ def binding() -> BusinessBenchmarkEvaluationBinding:
     )
 
 
+def test_default_evaluator_is_replay_deterministic() -> None:
+    benchmark_suite = suite()
+
+    def evaluate(clock_value: datetime):
+        target = BusinessBenchmarkEvaluator(clock=lambda: clock_value)
+        case_receipts = tuple(
+            target.evaluate_case(
+                case,
+                run_receipt(case, "candidate"),
+                run_receipt(case, "single_agent_baseline"),
+            )
+            for case in benchmark_suite.cases
+        )
+        return case_receipts, target.summarize(
+            benchmark_suite,
+            case_receipts,
+            policy(),
+            binding=binding(),
+        )
+
+    first = evaluate(NOW)
+    replay = evaluate(NOW.replace(hour=NOW.hour + 1))
+
+    assert replay == first
+
+
 def policy() -> BusinessBenchmarkPolicyV1:
     return BusinessBenchmarkPolicyV1(schema="captain.business-benchmark-policy.v1")
 

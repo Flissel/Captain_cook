@@ -1242,6 +1242,11 @@ class CaptainCanonicalSuiteRepository:
     def summary(self, summary_id: UUID) -> BusinessBenchmarkSummaryV1 | None:
         return self._evidence_store().summary(summary_id)
 
+    def canonical_summary(
+        self, proposed: BusinessBenchmarkSummaryV1
+    ) -> BusinessBenchmarkSummaryV1 | None:
+        return self._evidence_store().canonical_summary(proposed)
+
     def _evidence_store(self) -> FilesystemBusinessBenchmarkEvidenceStore:
         if self._evidence is None:
             raise ValueError("canonical suite repository has no evidence store")
