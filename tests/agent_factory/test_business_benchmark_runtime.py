@@ -935,7 +935,9 @@ async def test_prepare_rejects_expired_real_case_lease(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_prepare_requires_candidate_source_from_the_injected_cas(tmp_path: Path) -> None:
+async def test_prepare_accepts_digest_verified_candidate_from_external_cas(
+    tmp_path: Path,
+) -> None:
     from agenten.agent_factory.business_benchmark_runtime import (
         BusinessBenchmarkProviderRuntimeBridge,
     )
@@ -943,13 +945,13 @@ async def test_prepare_requires_candidate_source_from_the_injected_cas(tmp_path:
     store, scope, state, factory, review, _, _ = runtime_parts(tmp_path)
     external = tmp_path / "outside-cas.zip"
     external.write_bytes(store.read_bytes(scope.candidate_ref))
-    forged_candidate = ResolvedFactoryCandidate(
+    external_candidate = ResolvedFactoryCandidate(
         candidate=scope.resolved_candidate.candidate,
         source_archive=external,
     )
-    forged_scope = replace(scope, resolved_candidate=forged_candidate)
+    external_scope = replace(scope, resolved_candidate=external_candidate)
     runtime = BusinessBenchmarkProviderRuntimeBridge(
-        scopes={scope.job.job_id: forged_scope},
+        scopes={scope.job.job_id: external_scope},
         session_factory=factory,
         artifacts=store,
         provider_state=state,
@@ -957,7 +959,35 @@ async def test_prepare_requires_candidate_source_from_the_injected_cas(tmp_path:
         clock=lambda: NOW + timedelta(minutes=2),
     )
 
-    with pytest.raises(ValueError, match="CAS|artifact"):
+    prepared = await runtime.prepare(envelope(scope.job, scope.candidate_ref))
+
+    assert prepared.runtime_session_id.startswith("benchmark-session-candidate-")
+
+
+@pytest.mark.asyncio
+async def test_prepare_rejects_external_candidate_with_wrong_digest(tmp_path: Path) -> None:
+    from agenten.agent_factory.business_benchmark_runtime import (
+        BusinessBenchmarkProviderRuntimeBridge,
+    )
+
+    store, scope, state, factory, review, _, _ = runtime_parts(tmp_path)
+    external = tmp_path / "tampered-candidate.zip"
+    external.write_bytes(b"tampered candidate archive")
+    tampered_candidate = ResolvedFactoryCandidate(
+        candidate=scope.resolved_candidate.candidate,
+        source_archive=external,
+    )
+    tampered_scope = replace(scope, resolved_candidate=tampered_candidate)
+    runtime = BusinessBenchmarkProviderRuntimeBridge(
+        scopes={scope.job.job_id: tampered_scope},
+        session_factory=factory,
+        artifacts=store,
+        provider_state=state,
+        human_review=review,
+        clock=lambda: NOW + timedelta(minutes=2),
+    )
+
+    with pytest.raises(ValueError, match="digest|artifact"):
         await runtime.prepare(envelope(scope.job, scope.candidate_ref))
 
 

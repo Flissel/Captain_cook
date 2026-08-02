@@ -557,13 +557,10 @@ class BusinessBenchmarkProviderRuntimeBridge:
             )
         except FactoryLeaseDenied as exc:
             raise ValueError("runtime REAL_CASE_TESTER lease is not active") from exc
-        try:
-            self._artifacts.read_bytes(scope.candidate_ref)
-            canonical_candidate_path = self._artifacts.local_path(scope.candidate_ref)
-        except ValueError as exc:
-            raise ValueError("runtime candidate is not available from the CAS") from exc
-        if scope.resolved_candidate.source_archive.resolve() != canonical_candidate_path.resolve():
-            raise ValueError("runtime candidate source path is outside the CAS authority")
+        _verify_candidate_archive(
+            scope.resolved_candidate.source_archive,
+            scope.candidate_ref,
+        )
         return scope
 
     @staticmethod
@@ -936,6 +933,19 @@ def _digest_json(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def _verify_candidate_archive(source_archive: Path, reference: ArtifactRef) -> None:
+    try:
+        resolved = source_archive.resolve(strict=True)
+        if not resolved.is_file():
+            raise ValueError("runtime candidate artifact is not a file")
+        with resolved.open("rb") as stream:
+            actual_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+    except (OSError, ValueError) as exc:
+        raise ValueError("runtime candidate artifact is unavailable") from exc
+    if actual_sha256 != reference.sha256:
+        raise ValueError("runtime candidate artifact digest does not match its authority")
 
 
 def _envelope_idempotency_key(
