@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
@@ -20,6 +21,10 @@ from agenten.agent_factory.business_benchmark_candidate_seeds import (
     CLAIMS_SEED_PROFILE,
     RENEWAL_SEED_PROFILE,
     package_business_benchmark_seed,
+)
+from agenten.agent_factory.business_decision_tool import (
+    TOOL_NAME as BUSINESS_DECISION_TOOL,
+    bind_captain_business_decision,
 )
 from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
 from agenten.agent_factory.execution_budget import InMemoryFactoryBudgetLedger
@@ -41,19 +46,61 @@ from tests.agent_factory.test_team_execution import (
 )
 
 
-TERMINAL = (
+CLAIMS_TASK = json.dumps(
+    {
+        "schema": "captain.business-benchmark-redacted-task.v1",
+        "case_id": "claims-seed-session-case",
+        "profile_id": CLAIMS_SEED_PROFILE,
+        "redacted_input": {
+            "coverage_state": "active",
+            "documentation_state": "complete",
+            "loss_band": "ordinary",
+            "reported_delay_band": "on_time",
+        },
+        "allowed_tool_intents": ["none"],
+        "allowed_tools": [BUSINESS_DECISION_TOOL],
+        "required_output_schema": "captain.business-benchmark-terminal.v1",
+    },
+    sort_keys=True,
+    separators=(",", ":"),
+)
+RENEWAL_TASK = json.dumps(
+    {
+        "schema": "captain.business-benchmark-redacted-task.v1",
+        "case_id": "renewal-seed-session-case",
+        "profile_id": RENEWAL_SEED_PROFILE,
+        "redacted_input": {
+            "renewal_window": "open",
+            "engagement_band": "stable",
+            "commercial_evidence_state": "complete",
+            "consent_state": "verified",
+        },
+        "allowed_tool_intents": ["n8n"],
+        "allowed_tools": ["renewal_context_read", BUSINESS_DECISION_TOOL],
+        "required_output_schema": "captain.business-benchmark-terminal.v1",
+    },
+    sort_keys=True,
+    separators=(",", ":"),
+)
+CLAIMS_TERMINAL = (
     '{"schema":"captain.business-benchmark-terminal.v1",'
     '"observed_decision":"route_standard_review",'
-    '"observed_rationale_fact_ids":["fact_input_complete"]}'
+    '"observed_rationale_fact_ids":["coverage_state_verified","evidence_complete"]}'
+)
+RENEWAL_TERMINAL = (
+    '{"schema":"captain.business-benchmark-terminal.v1",'
+    '"observed_decision":"propose_next_best_action",'
+    '"observed_rationale_fact_ids":["renewal_window_verified","next_action_supported"]}'
 )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("profile_id", "responses"),
+    ("profile_id", "task", "responses", "terminal"),
     [
         (
             CLAIMS_SEED_PROFILE,
+            CLAIMS_TASK,
             (
                 CreateResult(
                     finish_reason="function_calls",
@@ -67,11 +114,25 @@ TERMINAL = (
                     usage=RequestUsage(prompt_tokens=1, completion_tokens=1),
                     cached=False,
                 ),
-                TERMINAL,
+                CreateResult(
+                    finish_reason="function_calls",
+                    content=[
+                        FunctionCall(
+                            id="claims-decision-1",
+                            name=BUSINESS_DECISION_TOOL,
+                            arguments=json.dumps({"task_json": CLAIMS_TASK}),
+                        )
+                    ],
+                    usage=RequestUsage(prompt_tokens=1, completion_tokens=1),
+                    cached=False,
+                ),
+                CLAIMS_TERMINAL,
             ),
+            CLAIMS_TERMINAL,
         ),
         (
             RENEWAL_SEED_PROFILE,
+            RENEWAL_TASK,
             (
                 CreateResult(
                     finish_reason="function_calls",
@@ -85,17 +146,32 @@ TERMINAL = (
                     usage=RequestUsage(prompt_tokens=1, completion_tokens=1),
                     cached=False,
                 ),
-                TERMINAL,
+                CreateResult(
+                    finish_reason="function_calls",
+                    content=[
+                        FunctionCall(
+                            id="renewal-decision-1",
+                            name=BUSINESS_DECISION_TOOL,
+                            arguments=json.dumps({"task_json": RENEWAL_TASK}),
+                        )
+                    ],
+                    usage=RequestUsage(prompt_tokens=1, completion_tokens=1),
+                    cached=False,
+                ),
+                RENEWAL_TERMINAL,
             ),
+            RENEWAL_TERMINAL,
         ),
     ],
 )
 async def test_seed_candidate_runs_through_real_host_autogen_session(
     tmp_path: Path,
     profile_id: str,
+    task: str,
     responses: tuple[CreateResult | str, ...],
+    terminal: str,
 ) -> None:
-    case_body = b"Synthetic redacted business case with complete input."
+    case_body = task.encode("utf-8")
     job = _job_v3(holdout_body=case_body)
     invocation = _invocation(job)
     candidate = package_business_benchmark_seed(profile_id, tmp_path / "candidate")
@@ -175,7 +251,9 @@ async def test_seed_candidate_runs_through_real_host_autogen_session(
         model_client_factory=model_client_for,
         evidence_store=evidence,
         holdouts=Holdouts(),  # type: ignore[arg-type]
-        tools={},
+        tools={
+            BUSINESS_DECISION_TOOL: bind_captain_business_decision(task),
+        },
         n8n_adapter=N8nAdapter(),  # type: ignore[arg-type]
         n8n_authority=object(),  # type: ignore[arg-type]
         clock=lambda: NOW,
@@ -217,9 +295,9 @@ async def test_seed_candidate_runs_through_real_host_autogen_session(
     assert result.provider_usage_unresolved is False
     assert result.message_count >= 2
     assert result.handoff_count == 1
-    assert result.tool_call_count == 0
+    assert result.tool_call_count == 1
     assert result.termination_reason == "task_completed"
-    assert TERMINAL in tuple(
+    assert terminal in tuple(
         message.content
         for message in result.task_result.messages
         if isinstance(message.content, str)
