@@ -185,6 +185,10 @@ class FactoryCodexBuildInterrupted(FactoryDispatchError):
         self.authorization_binding = authorization_binding
 
 
+class FactoryCodexCleanupUnresolved(FactoryDispatchError):
+    """A provisional runtime state that must keep the seal replay pending."""
+
+
 class FactoryCodexBuildFailed(FactoryDispatchError):
     """Redacted terminal failure recovered from exact durable build evidence."""
 
@@ -1089,6 +1093,11 @@ class CodexCliFactoryBuildExecutor:
                 "Codex failure reconciliation requires a V3 Factory job"
             )
         checkpoint = self._checkpoint_store.load(invocation)
+        if checkpoint is not None and checkpoint.phase == "implementation_running":
+            raise FactoryCodexCleanupUnresolved(
+                "Factory Codex checkpoint is not a terminal failure; pending "
+                "reconciliation is required"
+            )
         if checkpoint is None or checkpoint.phase != "implementation_failed":
             raise FactoryDispatchError(
                 "Factory Codex checkpoint is not a terminal failure"
@@ -1763,7 +1772,7 @@ class CodexCliFactoryBuildExecutor:
             checkpoint.resume_ordinal,
         )
         if result.process_cleanup_status == "unresolved":
-            raise FactoryDispatchError(
+            raise FactoryCodexCleanupUnresolved(
                 "Codex process cleanup is unresolved; runtime resume is denied"
             )
         if result.terminal_status in {"timed_out", "cancelled"}:
@@ -2017,7 +2026,7 @@ class CodexCliFactoryBuildExecutor:
             )
             cleanup_status = receipt["process_cleanup_status"]
         if cleanup_status == "unresolved":
-            raise FactoryDispatchError(
+            raise FactoryCodexCleanupUnresolved(
                 "Factory Codex process cleanup is unresolved; inspection is required"
             )
         if inspected_state is None and not (
@@ -3900,6 +3909,7 @@ __all__ = [
     "CodexCliFactoryBuildSettings",
     "CompletedCodexBuild",
     "FactoryCodexBuildInterrupted",
+    "FactoryCodexCleanupUnresolved",
     "FactoryCodexEvidenceFailure",
     "FactoryCodexProcessInspectorPort",
     "FactoryCodexProcessState",

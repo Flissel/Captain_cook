@@ -46,6 +46,7 @@ from agenten.agent_factory.hermes_cli import (
 from agenten.agent_factory.codex_build_execution import (
     FactoryCodexBuildFailed,
     FactoryCodexBuildInterrupted,
+    FactoryCodexCleanupUnresolved,
 )
 from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
@@ -2227,6 +2228,177 @@ async def test_failed_execute_team_evidence_replay_is_captain_retryable(
     assert retried.record.prior_failure_ref == factory_skill_replay_failure_ref(
         failed
     )
+
+
+@pytest.mark.asyncio
+async def test_unresolved_codex_cleanup_keeps_seal_replay_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 7, 19, 10, tzinfo=timezone.utc)
+    factory_job = job_v3(mode="demo").model_copy(
+        update={"deadline_at": now + timedelta(minutes=30)}
+    )
+    architect_lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.AGENT_ARCHITECT,
+        attempt=1,
+        workspace_ref="workspace://factory/cleanup-pending/discovery",
+        now=now,
+    )
+    tool_lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/cleanup-pending/build",
+        now=now,
+    )
+
+    class PromptStore:
+        def persist(self, job_id: UUID, content: bytes) -> ArtifactRef:
+            digest = hashlib.sha256(content).hexdigest()
+            return ArtifactRef(
+                uri=f"artifact://factory-prompts/{job_id}/{digest}",
+                sha256=digest,
+                media_type="application/json",
+            )
+
+    class Process:
+        returncode = 0
+
+        def __init__(self, prompt: str) -> None:
+            self.prompt = prompt
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            digest_prefix = "captain_codex_brief_seed_sha256="
+            if digest_prefix in self.prompt:
+                digest = next(
+                    line.removeprefix(digest_prefix)
+                    for line in self.prompt.splitlines()
+                    if line.startswith(digest_prefix)
+                )
+                return json.dumps(
+                    {
+                        "schema": "hermes.factory-codex-brief-attestation.v1",
+                        "invocation_id": _invocation_from_prompt(self.prompt)[
+                            "invocation_id"
+                        ],
+                        "seed_sha256": digest,
+                        "accepted": True,
+                    }
+                ).encode(), b""
+            return json.dumps(_typed_payload(self.prompt)).encode(), b""
+
+    async def create_process(*command: str, **__: object) -> Process:
+        return Process(command[-1])
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    class CleanupUnresolvedSealer:
+        async def reconcile_pending(
+            self,
+            *_args: object,
+        ) -> CodexBuildEvidenceV1:
+            raise FactoryCodexBuildInterrupted(
+                reason="codex_timed_out",
+                exit_code=124,
+                checkpoint_ref=ArtifactRef(
+                    uri=f"artifact://factory/codex-checkpoint/{'c' * 64}",
+                    sha256="c" * 64,
+                    media_type="application/json",
+                ),
+                terminal_receipt_ref=ArtifactRef(
+                    uri=f"artifact://factory/codex-terminal-receipt/{'d' * 64}",
+                    sha256="d" * 64,
+                    media_type="application/json",
+                ),
+                resume_ordinal=0,
+            )
+
+        def reconcile_failed(self, *_args: object, **_kwargs: object) -> None:
+            raise FactoryCodexCleanupUnresolved(
+                "Factory Codex running checkpoint requires pending reconciliation"
+            )
+
+        async def seal(self, *_args: object) -> CodexBuildEvidenceV1:
+            raise FactoryCodexCleanupUnresolved(
+                "Codex process cleanup is unresolved; runtime resume is denied"
+            )
+
+    replay_store = FilesystemFactorySkillReplayStore(tmp_path / "runtime-replays")
+    factory = HermesCliFactory(
+        settings=HermesCliSettings(
+            skill_root=tmp_path,
+            working_directory=_CAPTAIN_WORKSPACE_ROOT,
+            evidence_root=tmp_path / "evidence",
+        ),
+        released_skill_catalog=_catalog_for(
+            tmp_path,
+            FactorySkillStep.DISCOVER,
+            FactorySkillStep.BRIEF_CODEX,
+            FactorySkillStep.SEAL_CODEX_BUILD,
+        ),
+        replay_store=replay_store,
+        codex_build_sealer=CleanupUnresolvedSealer(),
+        codex_prompt_artifact_store=PromptStore(),
+        clock=lambda: now,
+    )
+    await factory.dispatch(
+        FactoryDispatch(
+            job=factory_job,
+            action=FactoryAction(
+                kind=FactoryActionKind.DISPATCH_AGENT_ARCHITECT,
+                attempt=1,
+                job_id=factory_job.job_id,
+            ),
+            role=FactoryRole.AGENT_ARCHITECT,
+            lease=architect_lease,
+        )
+    )
+
+    with pytest.raises(FactoryCodexCleanupUnresolved):
+        await factory.dispatch(
+            FactoryDispatch(
+                job=factory_job,
+                action=FactoryAction(
+                    kind=FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,
+                    attempt=1,
+                    job_id=factory_job.job_id,
+                ),
+                role=FactoryRole.TOOL_INTEGRATOR,
+                lease=tool_lease,
+            )
+        )
+
+    pending = await replay_store.pending(
+        factory_job,
+        step=FactorySkillStep.SEAL_CODEX_BUILD,
+        attempt=1,
+    )
+    assert pending.state == "pending"
+    assert pending.failure_kind is None
+
+    now = tool_lease.expires_at + timedelta(seconds=1)
+    with pytest.raises(FactoryCodexBuildInterrupted):
+        await factory.dispatch(
+            FactoryDispatch(
+                job=factory_job,
+                action=FactoryAction(
+                    kind=FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,
+                    attempt=1,
+                    job_id=factory_job.job_id,
+                ),
+                role=FactoryRole.TOOL_INTEGRATOR,
+                lease=tool_lease,
+            )
+        )
+
+    replay_payload = json.loads(
+        (tmp_path / "runtime-replays" / f"{pending.invocation.idempotency_key}.json")
+        .read_bytes()
+    )
+    assert replay_payload["state"] == "interrupted"
+    assert replay_payload["resume_ordinal"] == 0
 
 
 @pytest.mark.asyncio

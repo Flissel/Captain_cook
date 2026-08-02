@@ -20,6 +20,7 @@ from agenten.agent_factory.codex_build_execution import (
     CompletedCodexBuild,
     FactoryCodexBuildFailed,
     FactoryCodexBuildInterrupted,
+    FactoryCodexCleanupUnresolved,
     FactoryCodexEvidenceFailure,
     FactoryCodexProcessState,
     GitDetachedFactoryWorkspacePreparer,
@@ -2546,7 +2547,7 @@ async def test_cli_executor_persists_unresolved_cleanup_but_never_makes_it_resum
     )
     dispatch = _dispatch(job, invocation)
 
-    with pytest.raises(FactoryDispatchError, match="cleanup is unresolved"):
+    with pytest.raises(FactoryCodexCleanupUnresolved, match="cleanup is unresolved"):
         await executor.execute(dispatch, invocation, brief)
 
     receipt_path = state_root / "sessions" / f"{invocation.idempotency_key}.json"

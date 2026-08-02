@@ -36,6 +36,7 @@ from agenten.agent_factory.codex_brief import (
 from agenten.agent_factory.codex_build_execution import (
     FactoryCodexBuildFailed,
     FactoryCodexBuildInterrupted,
+    FactoryCodexCleanupUnresolved,
 )
 from agenten.agent_factory.evidence_store import FactoryEvidenceStore, FilesystemFactoryEvidenceStore
 from agenten.agent_factory.hermes_effect_evidence import (
@@ -674,6 +675,11 @@ class HermesCliFactory(HermesFactoryPort):
                     )
                 )
                 raise
+            except FactoryCodexCleanupUnresolved:
+                # Cleanup status is provisional. Keep the write-once replay pending
+                # so a later exact process inspection can reconcile it without
+                # claiming a second external effect.
+                raise
             except FactoryCodexBuildInterrupted as exc:
                 try:
                     await self._replay_store.interrupt(
@@ -950,16 +956,25 @@ class HermesCliFactory(HermesFactoryPort):
                     raise FactoryDispatchError(
                         "resumed Factory failure replay lacks retry authority lineage"
                     )
-                failure = self._codex_build_sealer.reconcile_failed(
-                    request,
-                    expected_invocation,
-                    brief,
-                    persisted_resume_ordinal=pending.resume_ordinal,
-                    persisted_retry_authorization_ref=persisted_retry_ref,
-                    persisted_retry_authorization_binding_sha256=(
-                        persisted_retry_digest
-                    ),
-                )
+                try:
+                    failure = self._codex_build_sealer.reconcile_failed(
+                        request,
+                        expected_invocation,
+                        brief,
+                        persisted_resume_ordinal=pending.resume_ordinal,
+                        persisted_retry_authorization_ref=persisted_retry_ref,
+                        persisted_retry_authorization_binding_sha256=(
+                            persisted_retry_digest
+                        ),
+                    )
+                except FactoryCodexCleanupUnresolved:
+                    await self._reconcile_pending_codex_seal(
+                        request,
+                        expected_invocation,
+                        brief,
+                        pending,
+                    )
+                    return
                 await self._replay_store.fail(
                     pending,
                     failure_kind=type(failure).__name__,
