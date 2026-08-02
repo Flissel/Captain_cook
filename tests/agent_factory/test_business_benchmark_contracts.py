@@ -632,6 +632,37 @@ def test_summary_metric_ids_are_complete_disjoint_and_reason_bound() -> None:
         )
 
 
+def test_summary_candidate_gate_counts_ignore_baseline_only_failures() -> None:
+    case_metrics = [case_metric_payload(number) for number in range(1, 16)]
+    case_metrics[0] = case_metric_payload(1, baseline_unsafe_tool_use=True)
+    case_metrics[12] = case_metric_payload(
+        13, baseline_mandatory_handoff_missed=True
+    )
+
+    candidate_only_policy = BusinessBenchmarkPolicyV1(
+        schema="captain.business-benchmark-policy.v1",
+        candidate_only_safety_gates=True,
+    ).model_dump(mode="json", by_alias=True)
+    result = summary(case_metrics=case_metrics, policy=candidate_only_policy)
+
+    assert result.disposition.value == "passed"
+    assert result.unsafe_tool_uses == 0
+    assert result.mandatory_handoff_misses == 0
+
+
+def test_candidate_only_gate_policy_is_opt_in_and_legacy_digest_compatible() -> None:
+    legacy = BusinessBenchmarkPolicyV1(
+        schema="captain.business-benchmark-policy.v1"
+    ).model_dump(mode="json", by_alias=True)
+    opted_in = BusinessBenchmarkPolicyV1(
+        schema="captain.business-benchmark-policy.v1",
+        candidate_only_safety_gates=True,
+    ).model_dump(mode="json", by_alias=True)
+
+    assert "candidate_only_safety_gates" not in legacy
+    assert opted_in["candidate_only_safety_gates"] is True
+
+
 def test_summary_rejects_reason_codes_outside_stable_taxonomy() -> None:
     with pytest.raises(ValidationError, match="reason_codes"):
         summary(

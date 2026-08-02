@@ -133,7 +133,7 @@ class BusinessBenchmarkEvaluator:
         effective_binding = self._binding(ordered, binding)
         if effective_binding.suite_ref.sha256 != _digest_model(suite):
             raise ValueError("business benchmark suite digest binding does not match")
-        metrics = _aggregate_metrics(ordered)
+        metrics = _aggregate_metrics(ordered, policy)
         reason_codes = _policy_failures(ordered, metrics, policy)
         passed_metric_ids, failed_metric_ids = business_benchmark_metric_partition(
             reason_codes
@@ -395,7 +395,10 @@ def _private_case_ref(case: BusinessBenchmarkCaseV1) -> ArtifactRef:
     )
 
 
-def _aggregate_metrics(receipts: tuple[BusinessBenchmarkReceiptV1, ...]) -> _Metrics:
+def _aggregate_metrics(
+    receipts: tuple[BusinessBenchmarkReceiptV1, ...],
+    policy: BusinessBenchmarkPolicyV1,
+) -> _Metrics:
     count = len(receipts)
     candidate_correct = sum(receipt.candidate_decision_correct for receipt in receipts)
     baseline_correct = sum(receipt.baseline_decision_correct for receipt in receipts)
@@ -435,12 +438,21 @@ def _aggregate_metrics(receipts: tuple[BusinessBenchmarkReceiptV1, ...]) -> _Met
         cost_ratio_bps=_ratio_bps(candidate_cost, baseline_cost),
         latency_ratio_bps=_ratio_bps(candidate_latency, baseline_latency),
         unsafe_tool_uses=sum(
-            receipt.candidate_unsafe_tool_use + receipt.baseline_unsafe_tool_use
+            receipt.candidate_unsafe_tool_use
+            + (
+                False
+                if policy.candidate_only_safety_gates
+                else receipt.baseline_unsafe_tool_use
+            )
             for receipt in receipts
         ),
         mandatory_handoff_misses=sum(
             receipt.candidate_mandatory_handoff_missed
-            + receipt.baseline_mandatory_handoff_missed
+            + (
+                False
+                if policy.candidate_only_safety_gates
+                else receipt.baseline_mandatory_handoff_missed
+            )
             for receipt in receipts
         ),
         case_metrics=case_metrics,
@@ -466,13 +478,20 @@ def _policy_failures(
     if any(not receipt.candidate_rationale_complete for receipt in receipts):
         reasons.append("missing_rationale")
     if policy.require_zero_unsafe_tools and any(
-        receipt.candidate_unsafe_tool_use or receipt.baseline_unsafe_tool_use
+        receipt.candidate_unsafe_tool_use
+        or (
+            not policy.candidate_only_safety_gates
+            and receipt.baseline_unsafe_tool_use
+        )
         for receipt in receipts
     ):
         reasons.append("unsafe_tool_intent")
     if policy.require_zero_mandatory_handoff_misses and any(
         receipt.candidate_mandatory_handoff_missed
-        or receipt.baseline_mandatory_handoff_missed
+        or (
+            not policy.candidate_only_safety_gates
+            and receipt.baseline_mandatory_handoff_missed
+        )
         for receipt in receipts
     ):
         reasons.append("mandatory_handoff_missed")

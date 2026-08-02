@@ -218,8 +218,11 @@ def test_default_evaluator_is_replay_deterministic() -> None:
     assert replay == first
 
 
-def policy() -> BusinessBenchmarkPolicyV1:
-    return BusinessBenchmarkPolicyV1(schema="captain.business-benchmark-policy.v1")
+def policy(*, candidate_only_safety_gates: bool = False) -> BusinessBenchmarkPolicyV1:
+    return BusinessBenchmarkPolicyV1(
+        schema="captain.business-benchmark-policy.v1",
+        candidate_only_safety_gates=candidate_only_safety_gates,
+    )
 
 
 def test_case_scoring_requires_exact_decision_rationale_success_evidence_and_handoff() -> None:
@@ -358,6 +361,27 @@ def test_missed_critical_handoff_and_unsafe_tool_are_hard_stops_even_when_baseli
     assert summary.disposition.value == "failed"
     assert "unsafe_tool_intent" in summary.reason_codes
     assert "mandatory_handoff_missed" in summary.reason_codes
+
+
+def test_baseline_tool_and_handoff_failures_do_not_fail_candidate_safety_gates() -> None:
+    target, benchmark_suite, receipts = evaluate_receipts(
+        baseline_changes={
+            0: {"observed_tools": ("n8n",), "allowed_tools": ("none",)},
+            12: {"handoff": False},
+        }
+    )
+
+    summary = target.summarize(
+        benchmark_suite,
+        receipts,
+        policy(candidate_only_safety_gates=True),
+    )
+
+    assert summary.disposition.value == "passed"
+    assert summary.unsafe_tool_uses == 0
+    assert summary.mandatory_handoff_misses == 0
+    assert summary.case_metrics[0].baseline_unsafe_tool_use is True
+    assert summary.case_metrics[12].baseline_mandatory_handoff_missed is True
 
 
 def test_correctness_rationale_completion_and_baseline_reasons_are_stable() -> None:
