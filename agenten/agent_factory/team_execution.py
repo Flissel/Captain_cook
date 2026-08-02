@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Mapping, Sequence
 from typing import Any, Callable, Literal, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -268,6 +268,7 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
         paid_effect_authority: FactoryPaidEffectAuthorityPort,
         pricing_authority: FactoryPricingAuthorityPort,
         clock: Callable[[], datetime],
+        before_provider_dispatch: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         if max_cost_per_call <= 0:
             raise ValueError("model call maximum cost must be positive")
@@ -299,6 +300,8 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
         self._paid_effect_authority = paid_effect_authority
         self._pricing_authority = pricing_authority
         self._clock = clock
+        self._before_provider_dispatch = before_provider_dispatch
+        self._provider_boundary_started = False
         self._usage_receipts: list[FactoryUsageReceiptV1] = []
         self._provider_dispatched = False
         self._provider_dispatch_count = 0
@@ -356,6 +359,7 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
             scoped_create_args["parallel_tool_calls"] = False
         else:
             scoped_create_args.pop("parallel_tool_calls", None)
+        await self._enter_provider_boundary()
         try:
             self._provider_dispatched = True
             self._provider_dispatch_count += 1
@@ -391,6 +395,7 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
             scoped_create_args["parallel_tool_calls"] = False
         else:
             scoped_create_args.pop("parallel_tool_calls", None)
+        await self._enter_provider_boundary()
         finalized = False
         try:
             self._provider_dispatched = True
@@ -413,6 +418,13 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
         except asyncio.CancelledError:
             # A started stream may already have incurred provider cost.
             raise
+
+    async def _enter_provider_boundary(self) -> None:
+        if self._provider_boundary_started:
+            return
+        if self._before_provider_dispatch is not None:
+            await self._before_provider_dispatch()
+        self._provider_boundary_started = True
 
     def _reserve(self) -> tuple[FactoryBudgetReservationV1, FactoryPricingQuoteV1]:
         now = self._clock()

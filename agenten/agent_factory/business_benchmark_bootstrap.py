@@ -510,6 +510,7 @@ class CaptainBusinessBenchmarkHostSessionFactory:
                 paid_effect_authority=self._paid_effect_authority,
                 pricing_authority=self._pricing_authority,
                 clock=self._clock,
+                before_provider_dispatch=request.before_provider_dispatch,
             )
 
         return HostAutoGenSessionExecutor(
@@ -599,6 +600,7 @@ class CaptainRenewalBusinessBenchmarkHostSessionFactory:
                 paid_effect_authority=self._paid_effect_authority,
                 pricing_authority=self._pricing_authority,
                 clock=self._clock,
+                before_provider_dispatch=request.before_provider_dispatch,
             )
 
         adapter = None

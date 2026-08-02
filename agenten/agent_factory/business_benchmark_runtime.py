@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import Callable, Literal, Mapping, Protocol
+from typing import Awaitable, Callable, Literal, Mapping, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from autogen_agentchat.messages import TextMessage
@@ -218,6 +218,10 @@ class BusinessBenchmarkSessionRequestV1:
     allowed_host_tools: tuple[str, ...]
     maximum_cost_micro_usd: int
     maximum_latency_ms: int
+    before_provider_dispatch: Callable[[], Awaitable[None]] | None = field(
+        default=None,
+        repr=False,
+    )
 
 
 class BusinessBenchmarkSessionFactoryPort(Protocol):
@@ -330,6 +334,7 @@ class BusinessBenchmarkProviderRuntimeBridge:
         fence_receipt: BusinessBenchmarkFenceReceiptV1,
         *,
         baseline_policy: BaselineAssistantPolicyV1 | None,
+        before_provider_dispatch: Callable[[], Awaitable[None]] | None = None,
     ) -> ProviderBenchmarkExecutionV1:
         scope = self._scope_for(envelope)
         if (
@@ -404,6 +409,7 @@ class BusinessBenchmarkProviderRuntimeBridge:
             allowed_host_tools=candidate_allowed_tools,
             maximum_cost_micro_usd=envelope.maximum_cost_micro_usd,
             maximum_latency_ms=envelope.maximum_latency_ms,
+            before_provider_dispatch=before_provider_dispatch,
         )
         session = self._session_factory.create(request)
         try:

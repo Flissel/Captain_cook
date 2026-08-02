@@ -282,6 +282,7 @@ class ProductionBusinessBenchmarkRuntimeBundlePort(Protocol):
         fence_receipt: BusinessBenchmarkFenceReceiptV1,
         *,
         baseline_policy: BaselineAssistantPolicyV1 | None,
+        before_provider_dispatch: Callable[[], Awaitable[None]],
     ) -> ProviderBenchmarkExecutionV1: ...
 
     async def recover(
@@ -340,7 +341,15 @@ class BusinessBenchmarkLiveAdapter:
         if prepared.runtime_session_id != envelope.runtime_session_id:
             raise ValueError("claimed runtime session does not match benchmark envelope")
         await self._fence_store.assert_current(prepared, claim, fence_receipt)
-        await self._fence_store.begin_dispatch(prepared, claim, fence_receipt)
+
+        provider_boundary_started = False
+
+        async def before_provider_dispatch() -> None:
+            nonlocal provider_boundary_started
+            if provider_boundary_started:
+                return
+            await self._fence_store.begin_dispatch(prepared, claim, fence_receipt)
+            provider_boundary_started = True
 
         baseline_policy = (
             self._baseline_policy(envelope)
@@ -353,7 +362,10 @@ class BusinessBenchmarkLiveAdapter:
             claim,
             fence_receipt,
             baseline_policy=baseline_policy,
+            before_provider_dispatch=before_provider_dispatch,
         )
+        if not provider_boundary_started:
+            raise ValueError("provider runtime returned without entering its paid boundary")
         latency_ms = math.ceil((self._monotonic_clock() - started) * 1_000)
         if latency_ms < 0:
             raise ValueError("monotonic benchmark latency moved backwards")

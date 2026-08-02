@@ -226,9 +226,18 @@ class RuntimeBundle:
             runtime_session_id=env.runtime_session_id,
         )
 
-    async def execute(self, env, effect_claim, fence_receipt, *, baseline_policy):
+    async def execute(
+        self,
+        env,
+        effect_claim,
+        fence_receipt,
+        *,
+        baseline_policy,
+        before_provider_dispatch,
+    ):
         self.policies.append(baseline_policy)
         assert effect_claim.prepared_effect.runtime_session_id == env.runtime_session_id
+        await before_provider_dispatch()
         assert self.result is not None
         return self.result
 
@@ -434,6 +443,39 @@ async def test_provider_result_must_bind_exact_case_budget_redaction_and_candida
     assert fence_store.finalized_receipt is None
     assert "begin_dispatch" in fence_store.calls
     assert "record_provider_terminal" not in fence_store.calls
+
+
+@pytest.mark.asyncio
+async def test_local_runtime_failure_does_not_mark_provider_dispatch_started() -> None:
+    class LocalFailureRuntime(RuntimeBundle):
+        async def execute(
+            self,
+            env,
+            effect_claim,
+            fence_receipt,
+            *,
+            baseline_policy,
+            before_provider_dispatch,
+        ):
+            del env, effect_claim, fence_receipt, baseline_policy, before_provider_dispatch
+            raise ValueError("local pre-provider validation failed")
+
+    env = envelope()
+    fence_store = DurableFenceStore()
+    adapter = BusinessBenchmarkLiveAdapter(
+        runtime_bundle=LocalFailureRuntime(),
+        fence_store=fence_store,
+        trusted_tool_intents={},
+        monotonic_clock=iter((0.0, 0.1)).__next__,
+        clock=lambda: NOW,
+    )
+    effect_claim = claim(env)
+    fence = await adapter.register_fence(effect_claim.prepared_effect, effect_claim)
+
+    with pytest.raises(ValueError, match="local pre-provider"):
+        await adapter.execute(env, effect_claim, fence)
+
+    assert "begin_dispatch" not in fence_store.calls
 
 
 @pytest.mark.asyncio
