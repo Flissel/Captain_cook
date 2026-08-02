@@ -3163,8 +3163,12 @@ class CodexCliFactoryBuildExecutor:
             instructions = json.loads(files["codex-build-instructions.md"])
         except (UnicodeDecodeError, json.JSONDecodeError):
             instructions = None
-        if isinstance(instructions, dict) and "prior candidate ref" in instructions:
-            prior_uri = instructions["prior candidate ref"]
+        prior_uri = (
+            instructions.get("prior candidate ref")
+            if isinstance(instructions, dict)
+            else None
+        )
+        if prior_uri is not None:
             matching = tuple(
                 reference
                 for reference in brief.context_refs

@@ -1070,6 +1070,60 @@ async def test_improvement_scaffold_materializes_digest_bound_prior_candidate(
 
 
 @pytest.mark.asyncio
+async def test_initial_scaffold_ignores_explicit_null_prior_candidate(
+    tmp_path: Path,
+) -> None:
+    job, brief, artifact_reader = _executor_job_and_brief()
+    instructions = json.dumps(
+        {"prior candidate ref": None},
+        sort_keys=True,
+    ).encode("utf-8")
+    instructions_sha256 = hashlib.sha256(instructions).hexdigest()
+    instructions_ref = ArtifactRef(
+        uri=f"artifact://test/{instructions_sha256}",
+        sha256=instructions_sha256,
+        media_type="application/json",
+    )
+    brief = brief.model_copy(
+        update={
+            "artifact_ref": instructions_ref,
+            "prompt_ref": instructions_ref,
+        }
+    )
+    invocation = _seal_invocation(job, brief)
+    contents = dict(artifact_reader._contents)
+    contents[instructions_sha256] = instructions
+    artifact_reader = StaticArtifactReader(contents)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    class Preparer:
+        def prepare(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    authorizer = RecordingAuthorizer()
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=tmp_path / "state",
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=Preparer(),
+        artifact_reader=artifact_reader,
+        authorizer=authorizer,
+        runner_factory=lambda **kwargs: SuccessfulRunner(
+            workspace,
+            kwargs["journal_path"],
+        ),
+        clock=lambda: NOW,
+    )
+
+    await executor.execute(_dispatch(job, invocation), invocation, brief)
+
+    assert not (workspace / ".captain-inputs" / "prior-candidate.zip").exists()
+    assert "prior-candidate.zip" not in authorizer.requests[0].command[3]
+
+
+@pytest.mark.asyncio
 async def test_authorization_failure_retries_same_uncheckpointed_detached_workspace(
     tmp_path: Path,
 ) -> None:
