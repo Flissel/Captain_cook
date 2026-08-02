@@ -119,6 +119,26 @@ class _BenchmarkCodexPromptArtifactStore:
         )
 
 
+class _FactoryCodexArtifactReader:
+    """Route immutable inputs to their owning CAS and reject foreign refs."""
+
+    def __init__(
+        self,
+        *,
+        benchmark_artifacts: BusinessBenchmarkContentAddressedArtifactStore,
+        minibook_creation_artifacts: GatewayMinibookCreationArtifactStore,
+    ) -> None:
+        self._benchmark_artifacts = benchmark_artifacts
+        self._minibook_creation_artifacts = minibook_creation_artifacts
+
+    def read_bytes(self, reference: ArtifactRef) -> bytes:
+        if reference.uri.startswith("artifact://business-benchmark-production/"):
+            return self._benchmark_artifacts.read_bytes(reference)
+        if reference.uri.startswith("artifact://minibook-creation/"):
+            return self._minibook_creation_artifacts.read_bytes(reference)
+        raise ValueError("artifact reference has no recognized Factory owner")
+
+
 def validate_factory_total_cost_envelope(
     *,
     environment: Mapping[str, str],
@@ -390,9 +410,12 @@ def compose_business_demo_factory_operator(
     creation_artifact_root = (
         workspace / ".captain-cook" / "minibook-creation-cas"
     ).resolve()
+    creation_artifacts = GatewayMinibookCreationArtifactStore(
+        creation_artifact_root
+    )
     candidate_bindings = GatewayForgeCandidateProvider(
         repository=repository,
-        artifacts=GatewayMinibookCreationArtifactStore(creation_artifact_root),
+        artifacts=creation_artifacts,
     )
     technical_revalidation_authority = (
         FilesystemFactoryTechnicalRevalidationAuthority(
@@ -485,7 +508,10 @@ def compose_business_demo_factory_operator(
                 repository_root=workspace,
                 workspaces_root=codex_workspace_root,
             ),
-            artifact_reader=benchmark_cas,
+            artifact_reader=_FactoryCodexArtifactReader(
+                benchmark_artifacts=benchmark_cas,
+                minibook_creation_artifacts=creation_artifacts,
+            ),
             authorizer=codex_authorizer,
             runner_factory=codex_runner_factory,
             checkpoint_store=FilesystemFactoryCodexBuildCheckpointStore(

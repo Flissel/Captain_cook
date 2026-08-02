@@ -29,6 +29,7 @@ from agenten.agent_factory.skill_workflow_contracts import CandidateRevisionV1
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.agent_factory_live_operator import (
+    _FactoryCodexArtifactReader,
     FactoryLiveOperatorSettings,
     _FactoryInputMaterializer,
     _LazyProductionBenchmarkInputs,
@@ -36,6 +37,8 @@ from gateway.agent_factory_live_operator import (
     run_business_demo_factory_jobs,
 )
 from gateway.factory_forge_evidence import CaptainForgeEvidenceBridge
+from gateway.minibook_creation_artifacts import GatewayMinibookCreationArtifactStore
+from minibook.swarm.artifact_store import FilesystemCreationArtifactStore
 from tests.agent_factory.test_minibook_forge import _workflow_evidence
 from tests.agent_factory.test_skill_workflow_contracts import revision_payload
 
@@ -45,6 +48,45 @@ JOB_IDS = (
     UUID("71000000-0000-0000-0000-000000000001"),
     UUID("71000000-0000-0000-0000-000000000002"),
 )
+
+
+def test_factory_codex_artifact_reader_routes_only_owned_cas_refs(
+    tmp_path: Path,
+) -> None:
+    benchmark = BusinessBenchmarkContentAddressedArtifactStore(
+        tmp_path / ".captain-cook" / "benchmark"
+    )
+    creation_root = tmp_path / ".captain-cook" / "minibook-creation"
+    creation = FilesystemCreationArtifactStore(creation_root)
+    benchmark_ref = benchmark.put(
+        b"benchmark-input",
+        "application/json",
+        namespace="job-input",
+    )
+    minibook_ref = ArtifactRef.model_validate(
+        creation.put(
+            b"candidate-zip",
+            "application/zip",
+            namespace="forge-source",
+        ).model_dump(mode="json")
+    )
+    reader = _FactoryCodexArtifactReader(
+        benchmark_artifacts=benchmark,
+        minibook_creation_artifacts=GatewayMinibookCreationArtifactStore(
+            creation_root
+        ),
+    )
+
+    assert reader.read_bytes(benchmark_ref) == b"benchmark-input"
+    assert reader.read_bytes(minibook_ref) == b"candidate-zip"
+
+    foreign_ref = ArtifactRef(
+        uri=f"artifact://foreign/source/{'f' * 64}",
+        sha256="f" * 64,
+        media_type="application/zip",
+    )
+    with pytest.raises(ValueError, match="owner"):
+        reader.read_bytes(foreign_ref)
 
 
 def test_factory_input_materializer_routes_and_verifies_each_owned_cas(
