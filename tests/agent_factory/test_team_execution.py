@@ -65,6 +65,7 @@ from agenten.agent_factory.team_execution import (
     _holdout_scoped_invocation,
     _FactoryActivityCeilingTermination,
     _FactoryTaskCompletedTermination,
+    _n8n_tool_failure_category,
     _session_termination_reason,
     compose_live_team_execution,
 )
@@ -105,6 +106,21 @@ from autogen_agentchat.messages import HandoffMessage, TextMessage, ToolCallExec
 
 
 NOW = datetime(2026, 7, 21, 13, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("2 validation errors for renewal_context_read: Field required", "invalid_arguments"),
+        ("Captain n8n renewal read failed closed", "provider_rejected"),
+        ("arbitrary provider prose that must not escape", "unknown"),
+    ],
+)
+def test_n8n_tool_failure_category_is_bounded_and_sanitized(
+    content: str,
+    expected: str,
+) -> None:
+    assert _n8n_tool_failure_category(content) == expected
 
 
 @pytest.mark.asyncio

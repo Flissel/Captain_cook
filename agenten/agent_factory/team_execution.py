@@ -1927,6 +1927,20 @@ class HostAutoGenSessionExecutor:
             observed.tool_name != evidence.tool_name
             for observed, evidence in zip(observed_n8n_calls, n8n_executions)
         ):
+            failed_categories = tuple(
+                sorted(
+                    {
+                        _n8n_tool_failure_category(execution.content)
+                        for _, execution in tool_event_executions
+                        if execution.name in n8n_tools and execution.is_error
+                    }
+                )
+            )
+            if failed_categories:
+                raise ValueError(
+                    "n8n tool execution failed before host-owned evidence: "
+                    + ",".join(failed_categories)
+                )
             raise ValueError("n8n tool call is missing host-owned execution evidence")
         n8n_refs = _unique_refs(
             tuple(
@@ -3038,6 +3052,19 @@ def _session_termination_reason(
     if "task_completed" in termination_conditions:
         return "task_completed"
     raise ValueError("AutoGen stopped without a declared termination condition")
+
+
+def _n8n_tool_failure_category(content: str) -> str:
+    """Map provider/tool errors to a bounded public-safe diagnostic category."""
+
+    normalized = content.casefold()
+    if "validation error" in normalized or "field required" in normalized:
+        return "invalid_arguments"
+    if "captain n8n renewal read failed closed" in normalized:
+        return "provider_rejected"
+    if "cancelled" in normalized or "canceled" in normalized:
+        return "cancelled"
+    return "unknown"
 
 
 def _holdout_scoped_invocation(
