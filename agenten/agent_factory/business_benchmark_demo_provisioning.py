@@ -359,6 +359,23 @@ class BusinessBenchmarkDemoProvisioner:
         applied: list[BusinessBenchmarkDemoTeamPlanV1] = []
         for item in prepared:
             if item.checkpoint:
+                policy_bytes = _canonical_json(
+                    item.policy_binding.model_dump(mode="json", by_alias=True)
+                )
+                policy_ref = cas.put(
+                    policy_bytes,
+                    "application/json",
+                    namespace="benchmark-policy",
+                )
+                if policy_ref != item.plan.policy_binding_ref:
+                    raise ValueError(
+                        "resumed benchmark policy artifact changed after planning"
+                    )
+                cas.bind(
+                    "benchmark-policy",
+                    f"{item.plan.job.job_id}:{item.policy_binding.attempt}",
+                    policy_ref,
+                )
                 budget = gateway.budget_projection(item.plan.job.job_id)
                 applied.append(
                     item.plan.model_copy(
@@ -519,10 +536,24 @@ class BusinessBenchmarkDemoProvisioner:
         if existing_binding != planned_binding:
             raise ValueError("immutable stable demo job binding changed")
         if state.phase not in {None, FactoryPhase.FORGE_REQUESTED} or state.attempt != 1:
+            policy_binding = CaptainBusinessBenchmarkPolicyBindingV1.create(
+                job=existing,
+                attempt=state.attempt,
+                policy=item.policy_binding.policy,
+            )
+            policy_bytes = _canonical_json(
+                policy_binding.model_dump(mode="json", by_alias=True)
+            )
+            policy_ref = _predicted_ref(
+                policy_bytes,
+                "application/json",
+                "benchmark-policy",
+            )
             return _PreparedTeam(
                 plan=item.plan.model_copy(
                     update={
                         "job": existing,
+                        "policy_binding_ref": policy_ref,
                         "initial_lease": None,
                         "next_action": "continue_existing_lifecycle",
                         "next_dispatch": None,
@@ -534,12 +565,10 @@ class BusinessBenchmarkDemoProvisioner:
                     }
                 ),
                 candidate_manifest=item.candidate_manifest,
-                artifacts=item.artifacts,
-                policy_binding=CaptainBusinessBenchmarkPolicyBindingV1.create(
-                    job=existing,
-                    attempt=1,
-                    policy=item.policy_binding.policy,
+                artifacts=_deduplicate_artifacts(
+                    (*item.artifacts, (policy_ref, policy_bytes))
                 ),
+                policy_binding=policy_binding,
                 forge_requested=_forge_requested(
                     existing,
                     candidate_ref=item.plan.candidate_ref,

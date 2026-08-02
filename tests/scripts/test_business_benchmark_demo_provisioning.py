@@ -35,6 +35,9 @@ from agenten.agent_factory.business_benchmark_production_ports import (
     BusinessBenchmarkCandidateAuthority,
     BusinessBenchmarkContentAddressedArtifactStore,
 )
+from agenten.agent_factory.business_benchmark_production import (
+    CaptainBusinessBenchmarkPolicyBindingV1,
+)
 from agenten.agent_factory.business_benchmark_provisioning import (
     CaptainPrivateBusinessBenchmarkSuiteLoader,
 )
@@ -520,7 +523,7 @@ def test_apply_reports_later_projection_without_rewinding_or_renewing_lease(
         gateway.resume_overrides[team.job.job_id] = BusinessBenchmarkDemoResumeStateV1(
             job=team.job,
             phase=FactoryPhase.BLUEPRINT_CREATED,
-            attempt=1,
+            attempt=3,
         )
     snapshot = (
         dict(gateway.jobs),
@@ -542,6 +545,22 @@ def test_apply_reports_later_projection_without_rewinding_or_renewing_lease(
     assert all(team.next_action == "continue_existing_lifecycle" for team in resumed.teams)
     assert all(team.next_dispatch is None for team in resumed.teams)
     assert all(team.initial_lease is None for team in resumed.teams)
+    cas = BusinessBenchmarkContentAddressedArtifactStore(
+        tmp_path
+        / ".captain-cook"
+        / "private"
+        / "business-benchmarks"
+        / "cas"
+    )
+    for team in resumed.teams:
+        assert cas.binding(
+            "benchmark-policy",
+            f"{team.job.job_id}:3",
+        ) == team.policy_binding_ref
+        binding = CaptainBusinessBenchmarkPolicyBindingV1.model_validate_json(
+            cas.read_bytes(team.policy_binding_ref)
+        )
+        assert binding.attempt == 3
     assert (
         gateway.jobs,
         gateway.blocks,
