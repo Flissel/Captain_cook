@@ -181,10 +181,7 @@ async def test_execute_calls_exact_production_webhook_and_builds_bound_response(
         assert webhook["headers"] == {}
         assert webhook["query"] == {}
         assert webhook["body"]["operation"] == "read_renewal_context"
-        assert webhook["body"]["captain"]["correlation_id"] == str(
-            current.correlation_id
-        )
-        assert webhook["body"]["captain"]["artifact_digest"] == WORKFLOW_DIGEST
+        assert "captain" not in webhook["body"]
         return httpx.Response(200, json=rpc(body["id"], provider_payload(current)))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -241,6 +238,33 @@ async def test_sse_execute_response_polls_get_execution_until_success() -> None:
 
     assert tools == ["execute_workflow", "get_execution", "get_execution"]
     assert result.execution.execution_id == "execution-101"
+
+
+@pytest.mark.asyncio
+async def test_bound_idempotency_is_sufficient_when_execution_omits_captain_echo() -> None:
+    current = request_value()
+    tools: list[str] = []
+
+    async def handler(raw: httpx.Request) -> httpx.Response:
+        body = json.loads(raw.content)
+        name = body["params"]["name"]
+        tools.append(name)
+        value = {
+            "workflowId": WORKFLOW_ID,
+            "executionId": "execution-101",
+            "status": "running" if name == "execute_workflow" else "success",
+        }
+        if name == "get_execution":
+            value["output"] = output_value(current)
+        return httpx.Response(200, json=rpc(body["id"], value))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await transport(client).execute(
+            endpoint=endpoint(), request=current, timeout_seconds=1
+        )
+
+    assert tools == ["execute_workflow", "get_execution"]
+    assert result.output.idempotency_key == current.input_payload.idempotency_key
 
 
 @pytest.mark.asyncio
