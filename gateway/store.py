@@ -3290,6 +3290,14 @@ class GatewayStore:
     @staticmethod
     def _assert_lease_is_next_action(lease: FactoryLease, projection: FactoryProjection) -> None:
         action = next_action(projection)
+        if (
+            lease.role is FactoryRole.REAL_CASE_TESTER
+            and action.kind is FactoryActionKind.DISPATCH_QUALITY_WARDEN
+            and lease.workspace_ref.startswith(
+                "workspace://business-benchmark-suite/"
+            )
+        ):
+            return
         role_actions = {
             FactoryRole.AGENT_ARCHITECT: frozenset({FactoryActionKind.DISPATCH_AGENT_ARCHITECT}),
             FactoryRole.TOOL_INTEGRATOR: frozenset(

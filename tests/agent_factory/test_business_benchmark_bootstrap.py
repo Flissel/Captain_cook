@@ -1153,6 +1153,9 @@ def test_gateway_invocation_authority_builds_quality_chain_from_active_captain_d
             }[step]
 
     class Leases:
+        def __init__(self) -> None:
+            self.recorded = []
+
         def active(self, current_job, role, attempt, now):
             assert current_job == job
             assert role is FactoryRole.QUALITY_WARDEN
@@ -1160,15 +1163,20 @@ def test_gateway_invocation_authority_builds_quality_chain_from_active_captain_d
             assert now == NOW
             return evaluation.lease
 
+        def record(self, lease):
+            self.recorded.append(lease)
+            return lease
+
     repository = SimpleNamespace(
         workflow_artifacts=lambda _: (
             production_execution(job, _ref("candidate"), runtime),
         )
     )
+    leases = Leases()
     authority = GatewayBenchmarkInvocationAuthority(
         repository=repository,
         released_skills=Catalog(),
-        leases=Leases(),
+        leases=leases,
         clock=lambda: NOW,
     )
 
@@ -1187,6 +1195,7 @@ def test_gateway_invocation_authority_builds_quality_chain_from_active_captain_d
     assert benchmark.lease.workspace_ref.startswith(
         "workspace://business-benchmark-suite/"
     )
+    assert leases.recorded == [benchmark.lease]
     quality = authority.evaluation_invocation(job=job, attempt=1)
     assert quality.step is FactorySkillStep.EVALUATE_TEAM
     assert quality.input_ref == job.input_ref

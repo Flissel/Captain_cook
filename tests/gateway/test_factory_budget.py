@@ -372,6 +372,37 @@ def test_gateway_budget_usage_binds_latest_same_role_revalidation_lease(job_v3) 
     assert store.usage_submission.lease_id == latest.lease_id
 
 
+def test_gateway_budget_usage_accepts_exact_benchmark_sublease(job_v3) -> None:
+    store = BudgetStore(job_v3)
+    benchmark_sublease = issue_factory_lease(
+        job=job_v3,
+        role=FactoryRole.REAL_CASE_TESTER,
+        attempt=2,
+        workspace_ref="workspace://factory/business-benchmark-suite",
+        now=job_v3.occurred_at,
+    )
+    store.leases = ()
+    ledger = GatewayFactoryBudgetLedger(store)
+    reservation = ledger.reserve(
+        job_v3,
+        attempt=2,
+        requested_usd=Decimal("0.12"),
+        now=NOW,
+    )
+    receipt = FactoryUsageReceiptV1.model_validate(
+        usage_payload(reservation, cost_usd="0.01")
+    )
+
+    ledger.record_usage(
+        job_v3,
+        reservation,
+        receipt,
+        lease=benchmark_sublease,
+    )
+
+    assert store.usage_submission.lease_id == benchmark_sublease.lease_id
+
+
 @pytest.mark.parametrize(
     ("path", "actor"),
     (

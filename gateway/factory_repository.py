@@ -247,6 +247,13 @@ class GatewayFactoryLeases(FactoryLeasePort):
             candidates[0], job=job, role=role, attempt=attempt, now=now
         )
 
+    def record(self, lease: FactoryLease) -> FactoryLease:
+        try:
+            self._store.record_factory_lease(lease)
+        except HTTPException as exc:
+            raise FactoryLeaseDenied(str(exc.detail)) from exc
+        return lease
+
 
 class GatewayFactoryBudgetLedger(FactoryBudgetPort):
     """Route budget authority through GatewayStore without database credentials."""
@@ -303,6 +310,8 @@ class GatewayFactoryBudgetLedger(FactoryBudgetPort):
         job: AgentFactoryJobV3,
         reservation: FactoryBudgetReservationV1,
         receipt: FactoryUsageReceiptV1,
+        *,
+        lease: FactoryLease | None = None,
     ) -> FactoryBudgetWriteReceipt:
         if (
             receipt.reservation_id != reservation.reservation_id
@@ -311,26 +320,44 @@ class GatewayFactoryBudgetLedger(FactoryBudgetPort):
             or receipt.attempt != reservation.attempt
         ):
             raise ValueError("factory usage receipt binding mismatch")
-        leases = self._translate_budget(
-            lambda: self._store.factory_job(job.job_id).leases
-        )
-        candidates = tuple(
-            lease
-            for lease in leases
-            if lease.job_id == job.job_id
-            and lease.correlation_id == job.correlation_id
-            and lease.subject_version == job.subject_version
-            and lease.attempt == receipt.attempt
-            and lease.role is FactoryRole.REAL_CASE_TESTER
-            and "model.invoke" in lease.capabilities
-            and lease.issued_at <= receipt.started_at
-            and receipt.ended_at < lease.expires_at
-        )
-        if candidates:
-            latest_issued_at = max(lease.issued_at for lease in candidates)
-            candidates = tuple(
-                lease for lease in candidates if lease.issued_at == latest_issued_at
+        if lease is not None:
+            try:
+                validate_factory_lease(
+                    lease,
+                    job=job,
+                    role=FactoryRole.REAL_CASE_TESTER,
+                    attempt=receipt.attempt,
+                    now=receipt.started_at,
+                )
+            except FactoryLeaseDenied as exc:
+                raise ValueError("usage Factory lease is invalid") from exc
+            candidates = (
+                (lease,)
+                if "model.invoke" in lease.capabilities
+                and receipt.ended_at < lease.expires_at
+                else ()
             )
+        else:
+            leases = self._translate_budget(
+                lambda: self._store.factory_job(job.job_id).leases
+            )
+            candidates = tuple(
+                item
+                for item in leases
+                if item.job_id == job.job_id
+                and item.correlation_id == job.correlation_id
+                and item.subject_version == job.subject_version
+                and item.attempt == receipt.attempt
+                and item.role is FactoryRole.REAL_CASE_TESTER
+                and "model.invoke" in item.capabilities
+                and item.issued_at <= receipt.started_at
+                and receipt.ended_at < item.expires_at
+            )
+            if candidates:
+                latest_issued_at = max(item.issued_at for item in candidates)
+                candidates = tuple(
+                    item for item in candidates if item.issued_at == latest_issued_at
+                )
         if len(candidates) != 1:
             raise ValueError("usage requires one exact active factory lease")
         submission = FactoryUsageSubmissionV2(

@@ -511,7 +511,12 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
             ended_at=ended_at,
             evidence_ref=evidence_ref,
         )
-        self._budget.record_usage(self._job, reservation, receipt)
+        self._budget.record_usage(
+            self._job,
+            reservation,
+            receipt,
+            lease=self._invocation.lease,
+        )
         self._usage_receipts.append(receipt)
         self._provider_effects_with_unknown_usage.discard(reservation.reservation_id)
 

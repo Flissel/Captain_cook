@@ -1232,6 +1232,8 @@ class ActiveFactoryLeasePort(Protocol):
         now: datetime,
     ) -> FactoryLease: ...
 
+    def record(self, lease: FactoryLease) -> FactoryLease: ...
+
 
 class GatewayBenchmarkInvocationAuthority:
     """Reconstruct quality invocations only from Gateway skills and leases."""
@@ -1306,17 +1308,20 @@ class GatewayBenchmarkInvocationAuthority:
             ).encode("utf-8")
         ).hexdigest()
         now = self._utc_now()
+        lease_epoch = now.replace(second=0, microsecond=0)
         benchmark_lease = issue_factory_lease(
             job=job,
             role=FactoryRole.REAL_CASE_TESTER,
             attempt=attempt,
             workspace_ref=(
                 "workspace://business-benchmark-suite/"
-                f"{job.job_id}/{attempt}/{suite_ref.sha256}"
+                f"{job.job_id}/{attempt}/{suite_ref.sha256}/"
+                f"{lease_epoch.strftime('%Y%m%dT%H%MZ')}"
             ),
-            now=now,
+            now=lease_epoch,
             integration_intent=technical.lease.integration_intent,
         )
+        benchmark_lease = self._leases.record(benchmark_lease)
         return technical.model_copy(
             update={
                 "invocation_id": uuid5(

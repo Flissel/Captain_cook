@@ -20,7 +20,7 @@ from pydantic import (
     model_validator,
 )
 
-from agenten.agent_factory.contracts import AgentFactoryJobV3
+from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryLease
 from agenten.agent_factory.execution_policy import FactoryExecutionPolicyV1
 from agenten.agent_runtime.contracts import ArtifactRef, SHA256_PATTERN
 
@@ -166,6 +166,8 @@ class FactoryBudgetPort(Protocol):
         job: AgentFactoryJobV3,
         reservation: FactoryBudgetReservationV1,
         receipt: FactoryUsageReceiptV1,
+        *,
+        lease: FactoryLease | None = None,
     ) -> FactoryBudgetWriteReceipt: ...
 
     def release(
@@ -276,7 +278,10 @@ class InMemoryFactoryBudgetLedger:
         job: AgentFactoryJobV3,
         reservation: FactoryBudgetReservationV1,
         receipt: FactoryUsageReceiptV1,
+        *,
+        lease: FactoryLease | None = None,
     ) -> FactoryBudgetWriteReceipt:
+        del lease
         with self._lock:
             stored = self._require_reservation(job, reservation)
             self._require_receipt_bindings(job, stored, receipt)
