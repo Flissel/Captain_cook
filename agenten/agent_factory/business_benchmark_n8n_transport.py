@@ -465,11 +465,7 @@ def _decode_nested_json(value: object) -> object:
 
 
 def _required_execution_id(value: object) -> str:
-    identifiers = _unique_strings(value, ("executionId", "execution_id"))
-    if not identifiers and isinstance(value, dict):
-        candidate = value.get("id")
-        if isinstance(candidate, (str, int)) and str(candidate).strip():
-            identifiers = {str(candidate).strip()}
+    identifiers = _execution_ids(value)
     if len(identifiers) != 1:
         raise RenewalContextMcpProviderError(
             "Captain n8n execution ID is missing or ambiguous"
@@ -485,13 +481,7 @@ def _require_execution_identity(
     allow_missing_workflow: bool,
 ) -> None:
     workflow_ids = _unique_strings(value, ("workflowId", "workflow_id"))
-    execution_ids = _unique_strings(value, ("executionId", "execution_id"))
-    if not execution_ids and isinstance(value, dict):
-        candidate = value.get("id")
-        if isinstance(candidate, (str, int)) and not isinstance(candidate, bool):
-            text = str(candidate).strip()
-            if text:
-                execution_ids = {text}
+    execution_ids = _execution_ids(value)
     if (
         (workflow_ids and workflow_ids != {workflow_id})
         or (not workflow_ids and not allow_missing_workflow)
@@ -622,6 +612,23 @@ def _execution_statuses(value: object) -> set[str]:
             statuses.update(_execution_statuses(nested))
         return statuses
     return set()
+
+
+def _execution_ids(value: object) -> set[str]:
+    identifiers = _unique_strings(value, ("executionId", "execution_id"))
+    if identifiers or not isinstance(value, dict):
+        return identifiers
+    candidates: list[object] = [value.get("id")]
+    execution = value.get("execution")
+    if isinstance(execution, dict):
+        candidates.append(execution.get("id"))
+    return {
+        str(candidate).strip()
+        for candidate in candidates
+        if isinstance(candidate, (str, int))
+        and not isinstance(candidate, bool)
+        and str(candidate).strip()
+    }
 
 
 def _unique_strings(value: object, keys: tuple[str, ...]) -> set[str]:

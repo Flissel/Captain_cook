@@ -255,7 +255,28 @@ async def test_bound_idempotency_is_sufficient_when_execution_omits_captain_echo
             "status": "running" if name == "execute_workflow" else "success",
         }
         if name == "get_execution":
-            value["output"] = output_value(current)
+            value = {
+                "execution": {
+                    "id": "execution-101",
+                    "workflowId": WORKFLOW_ID,
+                    "status": "success",
+                },
+                "data": {
+                    "resultData": {
+                        "runData": {
+                            "Read Synthetic Renewal Context": [
+                                {
+                                    "data": {
+                                        "main": [
+                                            [[{"json": output_value(current)}]]
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                },
+            }
         return httpx.Response(200, json=rpc(body["id"], value))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
