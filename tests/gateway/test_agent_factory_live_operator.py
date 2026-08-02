@@ -30,6 +30,7 @@ from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.agent_factory_live_operator import (
     _FactoryCodexArtifactReader,
+    _canonical_business_benchmark_repository,
     FactoryLiveOperatorSettings,
     _FactoryInputMaterializer,
     _LazyProductionBenchmarkInputs,
@@ -48,6 +49,26 @@ JOB_IDS = (
     UUID("71000000-0000-0000-0000-000000000001"),
     UUID("71000000-0000-0000-0000-000000000002"),
 )
+
+
+def test_operator_canonical_benchmark_repository_has_stable_receipt_store(
+    tmp_path: Path,
+) -> None:
+    repository = _canonical_business_benchmark_repository(
+        authority_root=tmp_path / ".captain-cook" / "private" / "business-benchmarks",
+        seed_version_id="operator-receipt-test-v1",
+    )
+
+    evidence = repository._evidence_store()
+
+    assert evidence._root == (
+        tmp_path
+        / ".captain-cook"
+        / "private"
+        / "business-benchmarks"
+        / "runtime-state"
+        / "benchmark-receipts"
+    )
 
 
 def test_factory_codex_artifact_reader_routes_only_owned_cas_refs(

@@ -31,6 +31,9 @@ from agenten.agent_factory.business_benchmark_live import (
 from agenten.agent_factory.business_benchmark_production_ports import (
     BusinessBenchmarkContentAddressedArtifactStore,
 )
+from agenten.agent_factory.business_benchmark_store import (
+    FilesystemBusinessBenchmarkEvidenceStore,
+)
 from agenten.agent_factory.candidate_evaluation import (
     GatewayForgeCandidateProvider,
     ResolvedFactoryCandidate,
@@ -345,6 +348,22 @@ class _LazyProductionBenchmarkInputs:
         return composition.dispatch_inputs(selected, request)
 
 
+def _canonical_business_benchmark_repository(
+    *,
+    authority_root: Path,
+    seed_version_id: str,
+) -> CaptainCanonicalSuiteRepository:
+    return CaptainCanonicalSuiteRepository(
+        CaptainCanonicalSuiteAuthority(
+            root=authority_root / "suites",
+            seed_version_id=seed_version_id,
+        ),
+        FilesystemBusinessBenchmarkEvidenceStore(
+            authority_root / "runtime-state" / "benchmark-receipts"
+        ),
+    )
+
+
 def compose_business_demo_factory_operator(
     settings: FactoryLiveOperatorSettings,
     *,
@@ -573,14 +592,12 @@ def compose_business_demo_factory_operator(
         settings=benchmark_settings,
         loader=benchmark_loader,
     )
-    suite_repository = CaptainCanonicalSuiteRepository(
-        CaptainCanonicalSuiteAuthority(
-            root=authority_root / "suites",
-            seed_version_id=_required(
-                environment,
-                "CAPTAIN_BENCHMARK_SEED_VERSION_ID",
-            ),
-        )
+    suite_repository = _canonical_business_benchmark_repository(
+        authority_root=authority_root,
+        seed_version_id=_required(
+            environment,
+            "CAPTAIN_BENCHMARK_SEED_VERSION_ID",
+        ),
     )
     renewal = next(
         item for item in aggregate.selections if item.profile == "renewal"
