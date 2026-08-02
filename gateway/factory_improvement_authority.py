@@ -171,16 +171,20 @@ class CaptainTechnicalFailureEvaluator:
             outcome.model_copy(update={"evidence_refs": evidence_refs})
             for outcome in outcomes
         )
-        diagnostic_codes = tuple(
-            code
-            for assertion_id, code in (
-                ("business_value", "business_value_failed"),
-                ("mandatory_handoff", "mandatory_handoff_failed"),
-            )
-            if any(
-                outcome.assertion_id == assertion_id
-                and outcome.status == "failed"
-                for outcome in outcomes
+        diagnostic_codes = (
+            ("real_case_contract_failed",)
+            if execution.termination_reason == "preflight_failed"
+            else tuple(
+                code
+                for assertion_id, code in (
+                    ("business_value", "business_value_failed"),
+                    ("mandatory_handoff", "mandatory_handoff_failed"),
+                )
+                if any(
+                    outcome.assertion_id == assertion_id
+                    and outcome.status == "failed"
+                    for outcome in outcomes
+                )
             )
         )
         if holdout_receipt is not None:

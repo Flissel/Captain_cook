@@ -433,6 +433,33 @@ def test_build_failure_retry_brief_requires_candidate_tests_before_packaging() -
     assert "regenerate candidate.zip" in rendered
 
 
+def test_preflight_contract_retry_brief_requires_strict_executable_manifest() -> None:
+    authorization = technical_retry_authorization(("real_case_contract_failed",))
+    invocation_data = invocation_payload(
+        "brief_codex",
+        attempt=2,
+        input_ref=authorization.authorization_ref.model_dump(mode="json"),
+        input_sha256=authorization.authorization_ref.sha256,
+        lease=lease_payload("tool_integrator", "factory-tool-integrator", attempt=2),
+    )
+    assignment_data = build_assignment_payload()
+    assignment_data["attempt"] = 2
+    store = PromptArtifactStore()
+
+    brief = CodexBriefBuilder(artifact_store=store).build(
+        FactorySkillInvocationV1.model_validate(invocation_data),
+        FactoryBuildAssignmentV1.model_validate(assignment_data),
+        CodebaseInventoryV1.model_validate(inventory_payload()),
+        policy(),
+        improvement_authorization=authorization,
+    )
+
+    rendered = store.read(brief.prompt_ref)
+    assert "FactoryAutoGenTeamManifestV1" in rendered
+    assert "system_prompt_ref" in rendered
+    assert "host_tools belongs only in factory-candidate.json" in rendered
+
+
 def test_behavioral_retry_brief_requires_specialist_handoff_before_completion() -> None:
     authorization = technical_retry_authorization(
         (

@@ -343,6 +343,37 @@ def test_captain_classifies_public_business_and_handoff_failures() -> None:
     )
 
 
+def test_captain_classifies_preflight_failure_as_candidate_contract_failure() -> None:
+    job = _job()
+    payload = execution_payload(status="failed")
+    payload["termination_reason"] = "preflight_failed"
+    outcome = payload["execution_outcome"]
+    assert isinstance(outcome, dict)
+    assertions = outcome["assertion_outcomes"]
+    assert isinstance(assertions, list)
+    for assertion in assertions:
+        assert isinstance(assertion, dict)
+        assertion["status"] = "failed"
+    outcome["status"] = "failed"
+    execution = TeamExecutionEvidenceV1.model_validate(payload)
+    source = _source_block(
+        FactoryPhase.REAL_CASE_EVIDENCE,
+        execution.artifact_ref,
+    ).model_copy(update={"artifact_refs": (execution.artifact_ref,)})
+
+    evaluation = CaptainTechnicalFailureEvaluator().from_team_execution(
+        job=job,
+        source_block=source,
+        candidate_ref=execution.candidate_ref,
+        execution=execution,
+        occurred_at=NOW,
+    )
+
+    assert evaluation.technical_diagnostic_codes == (
+        "real_case_contract_failed",
+    )
+
+
 def test_issuer_recovers_team_execution_from_block_referenced_evidence(
     tmp_path: Path,
 ) -> None:

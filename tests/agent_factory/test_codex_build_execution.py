@@ -977,6 +977,9 @@ async def test_cli_executor_authorizes_before_materializing_and_records_redacted
     assert "on Windows do not use Compress-Archive" in prompt
     assert "MUST omit source_archive_ref" in prompt
     assert "Captain adds source_archive_ref only after sealing candidate.zip" in prompt
+    assert "FactoryAutoGenTeamManifestV1" in prompt
+    assert "system_prompt_ref" in prompt
+    assert "host_tools only in factory-candidate.json" in prompt
     assert "codex-build-instructions.md" in prompt
     assert (workspace / ".captain-inputs" / "job-input.md").is_file()
     assert (workspace / ".captain-inputs" / "compiled-spec.json").is_file()

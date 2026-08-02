@@ -271,6 +271,13 @@ class CodexBriefBuilder:
                 "without weakening assertions, then regenerate candidate.zip from "
                 "the verified source tree."
             )
+        if "real_case_contract_failed" in technical_diagnostic_codes:
+            technical_retry_contract.append(
+                "Validate generated-candidate/team_manifest.json against "
+                "FactoryAutoGenTeamManifestV1 before packaging: each agent must use a "
+                "content-addressed system_prompt_ref, never inline system_prompt, and "
+                "host_tools belongs only in factory-candidate.json."
+            )
         if (
             "mandatory_handoff" in invocation.acceptance_assertion_ids
             or "mandatory_handoff_failed" in technical_diagnostic_codes
