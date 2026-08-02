@@ -367,6 +367,42 @@ def test_configured_case_policy_preserves_each_canonical_tool_intent() -> None:
     )
 
 
+def test_configured_case_policy_reserves_stable_budget_for_every_retry() -> None:
+    from agenten.agent_factory.business_benchmark_bootstrap import (
+        ConfiguredBusinessBenchmarkExecutionPolicyBuilder,
+        _effective_provider_call_maximum,
+    )
+
+    job = live_job().model_copy(
+        update={
+            "execution_policy": live_job().execution_policy.model_copy(
+                update={"max_cost_usd": Decimal("0.32")}
+            ),
+            "max_behavioral_iterations": 5,
+        }
+    )
+    configured = _settings(job)
+    benchmark_suite = suite()
+    builder = ConfiguredBusinessBenchmarkExecutionPolicyBuilder(
+        model=configured.model,
+        redaction_policy_version="benchmark-redaction-v1",
+        maximum_cost_micro_usd=10_000,
+        maximum_latency_ms=30_000,
+    )
+
+    policy_for = builder(
+        SimpleNamespace(settings=configured, job=job, suite=benchmark_suite)
+    )
+
+    expected = 320_000 // (len(benchmark_suite.cases) * 2 * 5)
+    policies = tuple(policy_for(case) for case in benchmark_suite.cases)
+    assert {policy.maximum_cost_micro_usd for policy in policies} == {expected}
+    assert _effective_provider_call_maximum(
+        configured=Decimal("0.01"),
+        policies=policies,
+    ) == Decimal("0.01")
+
+
 def _complete_bootstrap_environment(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -570,7 +606,7 @@ def test_claims_executor_builder_creates_durable_host_runtime_without_provider_c
         policy_builder=policy_builder,
         provider="openai",
         model=configured.model,
-        max_cost_per_call=Decimal("0.001"),
+        max_cost_per_call=Decimal("0.01"),
         clock=lambda: now,
     )
 
@@ -830,7 +866,7 @@ async def test_renewal_builder_wires_equal_request_scoped_n8n_authority(
         policy_builder=policy_builder,
         provider="openai",
         model=configured.model,
-        max_cost_per_call=Decimal("0.001"),
+        max_cost_per_call=Decimal("0.01"),
         n8n=n8n_ports,
         clock=lambda: now,
     )

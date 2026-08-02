@@ -449,7 +449,7 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
             or pricing_quote.provider != self._provider
             or pricing_quote.model != self._model
             or pricing_quote.effective_at > now
-            or pricing_quote.max_cost_per_call != self._max_cost_per_call
+            or pricing_quote.max_cost_per_call < self._max_cost_per_call
         ):
             raise ValueError("Captain pricing quote does not match this paid model effect")
         reservation = self._budget.reserve(

@@ -1715,6 +1715,57 @@ async def test_budgeted_model_client_reserves_before_every_provider_call(
 
 
 @pytest.mark.asyncio
+async def test_budgeted_model_client_may_reserve_below_pricing_ceiling(
+    tmp_path: Path,
+) -> None:
+    job = _job_v3()
+    budget = InMemoryFactoryBudgetLedger()
+    client = BudgetedChatCompletionClient(
+        job=job,
+        invocation=_invocation(job),
+        attempt=1,
+        delegate=build_replay_model_client(["bounded"]),
+        budget=budget,
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "bounded-provider"),
+        provider="deterministic-replay",
+        model="approved-model-id",
+        max_cost_per_call=Decimal("0.25"),
+        paid_effect_authority=_PaidEffectAuthority(),
+        pricing_authority=_PricingAuthority(_pricing_quote(job)),
+        clock=lambda: NOW,
+    )
+
+    await client.create([UserMessage(content="bounded", source="user")])
+
+    assert budget.projection(job.job_id).consumed_usd == Decimal("0.10")
+    assert budget.projection(job.job_id).reserved_usd == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_budgeted_model_client_rejects_reservation_above_pricing_ceiling(
+    tmp_path: Path,
+) -> None:
+    job = _job_v3()
+    client = BudgetedChatCompletionClient(
+        job=job,
+        invocation=_invocation(job),
+        attempt=1,
+        delegate=build_replay_model_client(["unused"]),
+        budget=InMemoryFactoryBudgetLedger(),
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "overpriced-provider"),
+        provider="deterministic-replay",
+        model="approved-model-id",
+        max_cost_per_call=Decimal("0.51"),
+        paid_effect_authority=_PaidEffectAuthority(),
+        pricing_authority=_PricingAuthority(_pricing_quote(job)),
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(ValueError, match="pricing quote"):
+        await client.create([UserMessage(content="reject", source="user")])
+
+
+@pytest.mark.asyncio
 async def test_dispatched_provider_failure_keeps_unknown_cost_reservation_active(
     tmp_path: Path,
 ) -> None:

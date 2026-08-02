@@ -441,6 +441,23 @@ class ConfiguredBusinessBenchmarkExecutionPolicyBuilder:
     ) -> BusinessBenchmarkCasePolicyPort:
         if scope.settings.model != self.model:
             raise ValueError("benchmark policy model does not match the resolved scope")
+        maximum_cost_micro_usd = self.maximum_cost_micro_usd
+        suite = getattr(scope, "suite", None)
+        job = getattr(scope, "job", None)
+        cases = getattr(suite, "cases", ())
+        iterations = getattr(job, "max_behavioral_iterations", None)
+        job_policy = getattr(job, "execution_policy", None)
+        job_maximum_usd = getattr(job_policy, "max_cost_usd", None)
+        if cases and isinstance(iterations, int) and iterations > 0 and job_maximum_usd:
+            effect_slots = len(cases) * 2 * iterations
+            job_maximum_micro_usd = int(Decimal(job_maximum_usd) * 1_000_000)
+            stable_effect_maximum = job_maximum_micro_usd // effect_slots
+            if stable_effect_maximum < 1:
+                raise ValueError("benchmark job budget cannot fund every retry effect")
+            maximum_cost_micro_usd = min(
+                maximum_cost_micro_usd,
+                stable_effect_maximum,
+            )
 
         def for_case(
             benchmark_case: BusinessBenchmarkCaseV1,
@@ -449,13 +466,34 @@ class ConfiguredBusinessBenchmarkExecutionPolicyBuilder:
                 schema="captain.business-benchmark-execution-policy.v1",
                 model_version=self.model,
                 allowed_tool_intents=benchmark_case.allowed_tool_intents,
-                maximum_cost_micro_usd=self.maximum_cost_micro_usd,
+                maximum_cost_micro_usd=maximum_cost_micro_usd,
                 maximum_latency_ms=self.maximum_latency_ms,
                 redaction_policy_version=self.redaction_policy_version,
                 baseline_system_policy_version=self.baseline_system_policy_version,
             )
 
         return for_case
+
+
+def _effective_provider_call_maximum(
+    *,
+    configured: Decimal,
+    policies: tuple[BenchmarkExecutionPolicyV1, ...],
+) -> Decimal:
+    configured_micro_usd = configured * Decimal(1_000_000)
+    if (
+        not configured.is_finite()
+        or configured <= 0
+        or configured_micro_usd != configured_micro_usd.to_integral_value()
+        or configured * Decimal(100) != (configured * Decimal(100)).to_integral_value()
+        or not policies
+        or any(policy.maximum_cost_micro_usd < 1 for policy in policies)
+    ):
+        raise ValueError("provider per-call maximum is invalid")
+    # Gateway reservations use cents, while the immutable case envelope uses
+    # micro-USD. Keep the cent-denominated reservation ceiling and let the
+    # terminal receipt enforce the tighter case-policy maximum.
+    return configured
 
 
 class _RequestBoundBenchmarkHoldoutResolver:
@@ -813,17 +851,10 @@ Use only rationale identifiers justified by supplied fields. Never reveal hidden
             ): case_policy(item)
             for item in scope.suite.cases
         }
-        configured_call_micro_usd = self._max_cost_per_call * Decimal(1_000_000)
-        if (
-            configured_call_micro_usd != configured_call_micro_usd.to_integral_value()
-            or any(
-                configured_call_micro_usd > policy.maximum_cost_micro_usd
-                for policy in policies.values()
-            )
-        ):
-            raise ValueError(
-                "provider per-call maximum exceeds the benchmark case maximum"
-            )
+        effective_max_cost_per_call = _effective_provider_call_maximum(
+            configured=self._max_cost_per_call,
+            policies=tuple(policies.values()),
+        )
         baseline_ref = authorities.artifacts.put(
             self._BASELINE_PROMPT,
             "text/plain",
@@ -868,7 +899,7 @@ Use only rationale identifiers justified by supplied fields. Never reveal hidden
             evidence_store=self._evidence_store,
             provider=self._provider,
             model=self._model,
-            max_cost_per_call=self._max_cost_per_call,
+            max_cost_per_call=effective_max_cost_per_call,
             clock=self._clock,
         )
         runtime = BusinessBenchmarkProviderRuntimeBridge(
@@ -1037,17 +1068,10 @@ Use only rationale identifiers justified by supplied fields. Never reveal hidden
             ): case_policy(item)
             for item in scope.suite.cases
         }
-        configured_call_micro_usd = self._max_cost_per_call * Decimal(1_000_000)
-        if (
-            configured_call_micro_usd != configured_call_micro_usd.to_integral_value()
-            or any(
-                configured_call_micro_usd > policy.maximum_cost_micro_usd
-                for policy in policies.values()
-            )
-        ):
-            raise ValueError(
-                "provider per-call maximum exceeds the benchmark case maximum"
-            )
+        effective_max_cost_per_call = _effective_provider_call_maximum(
+            configured=self._max_cost_per_call,
+            policies=tuple(policies.values()),
+        )
         baseline_ref = authorities.artifacts.put(
             self._BASELINE_PROMPT,
             "text/plain",
@@ -1090,7 +1114,7 @@ Use only rationale identifiers justified by supplied fields. Never reveal hidden
             evidence_store=self._evidence_store,
             provider=self._provider,
             model=self._model,
-            max_cost_per_call=self._max_cost_per_call,
+            max_cost_per_call=effective_max_cost_per_call,
             tool_reference=tool_reference,
             n8n=self._n8n,
             clock=self._clock,
