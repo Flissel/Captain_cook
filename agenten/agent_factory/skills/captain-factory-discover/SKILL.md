@@ -26,7 +26,12 @@ assertions, expose secrets, or claim ready_to_use.
    Use builtin `codebase-inspection` only for metrics, never as semantic
    inspection.
 2. Read Context7 AutoGen documentation when the installed version affects a
-   decision. Read n8n documentation only for a declared integration.
+   decision. For a declared n8n integration, use the pinned official
+   `n8n-io/skills` source: load `using-n8n-skills-official`, route to the
+   applicable capability skill, and ground discovery through the official
+   instance-level MCP. Do not use remembered node parameters or a separate
+   custom n8n skill pack. For work without declared n8n intent, load neither
+   n8n skills nor n8n documentation.
 3. Map reusable components, assertion coverage, uncertainty, conflicts, and
    missing capabilities. Do not change code or create artifacts outside the
    declared output.

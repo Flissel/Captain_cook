@@ -600,6 +600,10 @@ def test_runbook_documents_setup_verification_and_scoped_rollback() -> None:
 
     for phrase in (
         "configure-hermes-factory-skills.ps1",
+        "configure-official-n8n-skills.ps1",
+        "n8n-skills@n8n-io",
+        "using-n8n-skills-official",
+        "codex mcp get n8n --json",
         "hermes skills list --enabled-only",
         "hermes bundles show captain-agent-factory-loop",
         "-Remove",

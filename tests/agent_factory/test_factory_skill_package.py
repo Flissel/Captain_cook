@@ -175,6 +175,29 @@ def test_factory_skill_is_digestible_and_contains_release_boundaries() -> None:
         "ready_to_use",
     ):
         assert phrase.lower() in text.lower()
+
+
+@pytest.mark.parametrize(
+    "skill_name",
+    (
+        "captain-factory-discover",
+        "captain-factory-brief-codex",
+        "captain-factory-improve-team",
+    ),
+)
+def test_n8n_factory_steps_delegate_technical_build_rules_to_official_skills(
+    skill_name: str,
+) -> None:
+    text = (
+        Path("agenten/agent_factory/skills") / skill_name / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+    for phrase in (
+        "n8n-io/skills",
+        "using-n8n-skills-official",
+        "instance-level mcp",
+    ):
+        assert phrase.lower() in text.lower()
     assert "api_key=" not in text.lower()
     assert "bearer " not in text.lower()
 

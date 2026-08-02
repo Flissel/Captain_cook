@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import UUID
@@ -520,3 +521,67 @@ def test_behavioral_retry_brief_requires_specialist_handoff_before_completion() 
     assert "Preserve every evidence-grounded rationale fact" in rendered
     assert "terminal rationale_fact_ids" in rendered
     assert "receives no stdin" in rendered
+
+
+def test_n8n_codex_brief_requires_official_skills_and_instance_mcp_protocol() -> None:
+    invocation_data = invocation_payload("brief_codex")
+    invocation_data["lease"] = lease_payload(
+        "tool_integrator",
+        "n8n-builder",
+        integration_intent="n8n",
+        capabilities=["n8n.workflow.manage"],
+    )
+    assignment_data = build_assignment_payload()
+    assignment_data["integrations"] = [
+        {
+            "integration_id": "support_workflow",
+            "kind": "n8n",
+            "severity": "required",
+            "input_contract_ref": artifact("n8n-input"),
+            "output_contract_ref": artifact("n8n-output"),
+        }
+    ]
+    store = PromptArtifactStore()
+
+    brief = CodexBriefBuilder(artifact_store=store).build(
+        FactorySkillInvocationV1.model_validate(invocation_data),
+        FactoryBuildAssignmentV1.model_validate(assignment_data),
+        CodebaseInventoryV1.model_validate(inventory_payload()),
+        policy(),
+    )
+
+    rendered = json.loads(store.read(brief.prompt_ref))
+    protocol = rendered["official n8n build protocol"]
+    assert protocol["source"] == "n8n-io/skills"
+    assert protocol["commit"] == "046c330c9308bbfc54ceab1adbe3d8fc6bebc8fa"
+    assert protocol["meta_skill"] == "using-n8n-skills-official"
+    assert protocol["required_skills"] == [
+        "using-n8n-skills-official",
+        "n8n-workflow-lifecycle-official",
+        "n8n-node-configuration-official",
+        "n8n-agents-official",
+        "n8n-error-handling-official",
+        "n8n-credentials-and-security-official",
+    ]
+    assert protocol["mcp_sequence"] == [
+        "get_sdk_reference",
+        "get_node_types",
+        "validate_workflow",
+        "create_workflow_from_code or update_workflow",
+        "get_workflow_details",
+    ]
+    assert protocol["report_skills_used"] is True
+
+
+def test_non_n8n_codex_brief_omits_official_n8n_protocol() -> None:
+    store = PromptArtifactStore()
+
+    brief = CodexBriefBuilder(artifact_store=store).build(
+        FactorySkillInvocationV1.model_validate(invocation_payload("brief_codex")),
+        FactoryBuildAssignmentV1.model_validate(build_assignment_payload()),
+        CodebaseInventoryV1.model_validate(inventory_payload()),
+        policy(),
+    )
+
+    rendered = json.loads(store.read(brief.prompt_ref))
+    assert "official n8n build protocol" not in rendered

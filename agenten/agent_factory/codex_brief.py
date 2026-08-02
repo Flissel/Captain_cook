@@ -9,6 +9,7 @@ from uuid import UUID
 
 from agenten.agent_factory.execution_policy import FactoryExecutionPolicyV1
 from agenten.agent_factory.forge_contracts import FactoryBuildAssignmentV1
+from agenten.agent_factory.n8n_official_skills import official_n8n_build_protocol
 from agenten.agent_factory.skill_workflow_contracts import (
     CodebaseInventoryV1,
     CodexBuildBriefV1,
@@ -408,6 +409,8 @@ class CodexBriefBuilder:
             ],
             "forbidden effects": list(cls._FORBIDDEN_EFFECT_IDS),
         }
+        if any(item.kind == "n8n" for item in assignment.integrations):
+            document["official n8n build protocol"] = official_n8n_build_protocol()
         reject_sensitive_data(document, "Codex build brief")
         return json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
 

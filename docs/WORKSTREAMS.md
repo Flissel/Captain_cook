@@ -27,7 +27,10 @@ may retain a private candidate, but it cannot publish or promote. Required
 Minibook receives only the resulting read-only projection. The `hermes-agent/`
 submodule never writes the shared registry. n8n capabilities are limited to a
 Captain-issued `integration_intent=n8n` tool-integrator lease and opaque MCP
-references.
+references. Inside that lease, official commit-pinned `n8n-io/skills` own the
+technical workflow build/debug instructions and the approved instance-level
+MCP interaction sequence; Captain still owns budget, evidence, retry, and
+promotion authority.
 
 ### Business benchmark gate ownership
 

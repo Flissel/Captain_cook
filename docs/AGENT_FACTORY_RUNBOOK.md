@@ -13,7 +13,7 @@ presence:
 $env:TEST_MARIADB_DSN -ne $null
 $env:N8N_API_KEY -ne $null
 $env:N8N_MCP_TOKEN -ne $null
-codex mcp get n8n-mcp
+codex mcp get n8n --json
 ```
 
 The n8n MCP endpoint must answer a non-destructive workflow-list call before a
@@ -55,6 +55,37 @@ pwsh -NoProfile -File scripts/configure-hermes-factory-skills.ps1 `
 
 The rollback does not reset builtin skills or delete other external skill
 directories. It does not open or print `.env`.
+
+## Official n8n build skills
+
+Install the official `n8n-io/skills` plugin at Captain's reviewed commit pin:
+
+```powershell
+pwsh -NoProfile -File scripts/configure-official-n8n-skills.ps1
+```
+
+The installer adds `n8n-skills@n8n-io`, verifies the exact marketplace commit
+and plugin version, registers that pinned skill directory with Hermes, and
+validates the existing instance-level MCP registration without exposing its
+token. It fails closed if `n8n` points anywhere except Captain's approved local
+endpoint or uses a token source other than `N8N_MCP_TOKEN`. If the installed
+Hermes CLI cannot round-trip multiple external skill directories, the installer
+refuses to mutate the user configuration.
+
+Verify the installation, then restart Codex so the newly installed skills and
+hooks are loaded:
+
+```powershell
+codex plugin list
+codex mcp get n8n --json
+hermes skills inspect using-n8n-skills-official
+```
+
+For declared n8n integrations, Hermes and Codex begin with
+`using-n8n-skills-official` and use the official lifecycle, node configuration,
+agent, debugging, and credential skills. They use the instance-level MCP to
+inspect node types, validate the workflow, create or update it, and read it back.
+Captain's lease, budget, evidence, retry, and promotion rules remain authoritative.
 
 ## Offline contract gate
 

@@ -22,7 +22,11 @@ assertions, expose secrets, or claim ready_to_use.
    short-lived `n8n-builder` profile and `n8n-mcp` lease when the compiled
    specification declares `integration_intent=n8n`. Limit changes to an isolated
    draft; never allow activation, production adoption, service administration,
-   or volume management.
+   or volume management. For an n8n-implicated failure, use the pinned official
+   `n8n-io/skills` source: load `using-n8n-skills-official`, route through
+   `n8n-debugging-official` and the affected capability skill, and verify the
+   repair through the official instance-level MCP. Do not duplicate or override
+   upstream n8n node and workflow rules inside this Captain skill.
 3. Select only the smallest evidence-implicated `changed_components` enum set.
    Do not invent artifact references, lifecycle identity, timestamps, candidate
    IDs, Codex sessions, or test results. Captain materializes `CandidateRevisionV1`

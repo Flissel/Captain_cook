@@ -47,6 +47,14 @@ missing/failed replay, changed digest, stale lease, or malformed attestation
 stops before Codex. Hermes never authors Captain lifecycle identity or release
 evidence.
 
+When the typed assignment declares an n8n integration, the technical workflow
+construction protocol comes from the commit-pinned official `n8n-io/skills`
+plugin. Hermes and Codex start with `using-n8n-skills-official` and use the
+approved instance-level MCP for SDK inspection, node discovery, validation,
+write, and read-back. Those skills replace locally duplicated n8n build advice;
+they do not grant a lease, increase a budget, validate evidence, authorize a
+retry, or promote a candidate. All of those decisions remain Captain-owned.
+
 ### Business benchmark release validation
 
 Every V3 Factory candidate must pass a Captain-owned paired business benchmark

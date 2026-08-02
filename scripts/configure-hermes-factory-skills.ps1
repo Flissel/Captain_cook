@@ -31,11 +31,11 @@ $textAssetExtensions = @(
 # SHA-256 of every file in that skill directory. Known text assets normalize
 # CRLF and standalone CR to LF before hashing; binary files remain byte-exact.
 $releasedSkillDigests = @{
-    'captain-factory-discover' = 'b3490d5ef05f18f5ca38464c59d546196cdc3ed8b0d058da9fe7fd2df5f859fa'
-    'captain-factory-brief-codex' = '9cae3f24d43e9d4660803025a13c72bc9e5a73940a2cd11c2de9e4e691c1c67f'
+    'captain-factory-discover' = '0ffb6398ab1f220210e6fc2d251f3aebb2a394a7836c4ec94f071eb93d9009a6'
+    'captain-factory-brief-codex' = '7dfbfcac855a9f1baaae7f88b705b89441239a16f37096669be92a5e39d69e3e'
     'captain-factory-execute-team' = '5e885c4ab70985d7b4f41a1129b4e3d62e815e201da58e0d695b7caf35305897'
     'captain-factory-evaluate-team' = '468f49b870d19554812216eefd82542b51fd09e3563cfde3dc9d0332704157c7'
-    'captain-factory-improve-team' = '4c1bd1a3981832d9ddd6051fd35a3885621f898c305cf99eb8f11b71ced0d35f'
+    'captain-factory-improve-team' = 'b4f578003d30df824e4310f0fefd1e821a00f963e9e67e1e17630483ab7d3bc9'
     'captain-factory-report-captain' = '077dd7671601707aeb07aca32c1f84ed6d2ef34c90129e950c96a92c2d5d3827'
 }
 

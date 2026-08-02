@@ -30,7 +30,13 @@ assertions, expose secrets, or claim ready_to_use.
    and `n8n-mcp` lease when the compiled specification declares
    `integration_intent=n8n`. Limit the assignment to an isolated draft; never
    allow activation, production adoption, service administration, or volume
-   management.
+   management. Require the Captain-authored brief to delegate technical n8n
+   construction to the pinned official `n8n-io/skills` source. Codex must load
+   `using-n8n-skills-official`, then the routed lifecycle, node, agent, error,
+   and credential skills, and use the official instance-level MCP sequence:
+   SDK reference, exact node types, validation, create/update, and read-back
+   verification. Custom Captain skills retain lease/evidence authority but do
+   not replace upstream n8n build guidance.
 5. Require the brief to demand code, tests, manifests, digests, and command
    evidence; candidate inputs and outputs remain subject to Captain's seal. Do
    not grant an approval bypass.
