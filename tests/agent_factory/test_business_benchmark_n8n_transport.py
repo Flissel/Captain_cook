@@ -252,7 +252,7 @@ async def test_bound_idempotency_is_sufficient_when_execution_omits_captain_echo
         value = {
             "workflowId": WORKFLOW_ID,
             "executionId": "execution-101",
-            "status": "running" if name == "execute_workflow" else "success",
+            "status": "started" if name == "execute_workflow" else "success",
         }
         if name == "get_execution":
             value = {

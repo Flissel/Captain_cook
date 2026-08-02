@@ -39,7 +39,7 @@ from agenten.targets.n8n import N8nExecutionEvidence
 _MAX_MCP_RESPONSE_BYTES = 2 * 1024 * 1024
 _SUCCESS_STATUSES = frozenset({"success", "succeeded", "completed"})
 _PENDING_STATUSES = frozenset(
-    {"new", "created", "queued", "pending", "running", "waiting"}
+    {"new", "created", "queued", "pending", "started", "running", "waiting"}
 )
 _FAILED_STATUSES = frozenset(
     {"failed", "error", "cancelled", "canceled", "crashed"}
