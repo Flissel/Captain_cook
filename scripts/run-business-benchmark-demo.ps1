@@ -142,6 +142,7 @@ $priorActualUsdClaims = '1.448531'
 $priorActualUsdRenewal = '1.525231'
 $userMaximumEurPerTeam = '6.00'
 $budgetEurPerUsd = '1.25'
+$humanReviewTimeoutSeconds = '120'
 $seedVersion = 'business-benchmark-demo-2026-08-v34'
 
 $rootEnvAllowlist = @(
@@ -814,7 +815,7 @@ try {
     $environment['CAPTAIN_BENCHMARK_SEED_VERSION_ID'] = $seedVersion
     $environment['CAPTAIN_BENCHMARK_AUTHORITY_ROOT'] = Join-Path $repositoryRoot '.captain-cook/private/business-benchmarks'
     $environment['CAPTAIN_BENCHMARK_SKILL_ROOT'] = Join-Path $repositoryRoot 'agenten/agent_factory/skills'
-    $environment['CAPTAIN_BENCHMARK_HUMAN_REVIEW_TIMEOUT_SECONDS'] = '0'
+    $environment['CAPTAIN_BENCHMARK_HUMAN_REVIEW_TIMEOUT_SECONDS'] = $humanReviewTimeoutSeconds
     $environment['CAPTAIN_BENCHMARK_RENEWAL_N8N_EVIDENCE_ROOT'] = Join-Path $repositoryRoot '.captain-cook/business-benchmark'
     $environment['CAPTAIN_BENCHMARK_RENEWAL_WORKFLOW_PATH'] = $canonicalRenewalWorkflow
     $environment['CAPTAIN_CODEX_EXECUTABLE'] = $codexCommand

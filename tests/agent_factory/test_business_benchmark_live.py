@@ -41,6 +41,7 @@ from agenten.agent_factory.execution_budget import FactoryUsageReceiptV1
 from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.team_execution import (
     FactoryHandoffEvidenceV1,
+    FactoryN8nExecutionEvidenceV1,
     FactoryToolExecutionEvidenceV1,
 )
 from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent
@@ -422,6 +423,63 @@ async def test_adapter_maps_exact_usage_latency_terminal_and_deduplicated_eviden
         "finalize",
         "assert_current",
     ]
+
+
+@pytest.mark.asyncio
+async def test_adapter_does_not_treat_none_as_an_extra_intent_when_n8n_ran() -> None:
+    env = envelope()
+    env = env.model_copy(
+        update={"allowed_tool_intents": (IntegrationIntent.N8N,)}
+    )
+    provider = result(
+        env,
+        tool_executions=(
+            FactoryToolExecutionEvidenceV1(
+                agent_name="renewal_agent",
+                tool_name="renewal_context_read",
+                status="succeeded",
+                evidence_ref=artifact("renewal-tool"),
+            ),
+            FactoryToolExecutionEvidenceV1(
+                agent_name="renewal_agent",
+                tool_name="captain_business_decision",
+                status="succeeded",
+                evidence_ref=artifact("decision-tool"),
+            ),
+        ),
+    )
+    provider = provider.model_copy(
+        update={
+            "tool_executions": (
+                provider.tool_executions[0].model_copy(
+                    update={
+                        "n8n_execution": FactoryN8nExecutionEvidenceV1.model_construct(
+                            tool_name="renewal_context_read",
+                            evidence_ref=artifact("renewal-n8n-evidence"),
+                        )
+                    }
+                ),
+                provider.tool_executions[1],
+            )
+        }
+    )
+    adapter = BusinessBenchmarkLiveAdapter(
+        runtime_bundle=RuntimeBundle(provider),
+        fence_store=DurableFenceStore(),
+        trusted_tool_intents={
+            "renewal_context_read": IntegrationIntent.N8N,
+            "captain_business_decision": IntegrationIntent.NONE,
+        },
+        monotonic_clock=iter((0.0, 0.1)).__next__,
+        clock=lambda: NOW,
+    )
+    effect_claim = claim(env)
+    fence = await adapter.register_fence(effect_claim.prepared_effect, effect_claim)
+
+    receipt = await adapter.execute(env, effect_claim, fence)
+
+    assert receipt.observed_tool_intents == (IntegrationIntent.N8N,)
+    assert receipt.unsafe_tool_use is False
 
 
 @pytest.mark.asyncio

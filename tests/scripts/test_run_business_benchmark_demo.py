@@ -38,6 +38,11 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert '$environment["${prefix}_MAX_USD"] = $teamRemainingText' in source
     assert "Assert-CodexUsesChatGptSubscription" in source
     assert "$environment['CAPTAIN_CODEX_AUTH_MODE'] = 'chatgpt_subscription'" in source
+    assert "$humanReviewTimeoutSeconds = '120'" in source
+    assert (
+        "$environment['CAPTAIN_BENCHMARK_HUMAN_REVIEW_TIMEOUT_SECONDS'] = "
+        "$humanReviewTimeoutSeconds"
+    ) in source
     assert "$environment['CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM']" in source
     assert "$environment['CAPTAIN_FACTORY_USER_MAX_EUR_PER_TEAM']" in source
     assert "$environment['CAPTAIN_FACTORY_BUDGET_EUR_PER_USD']" in source

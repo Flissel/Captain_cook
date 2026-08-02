@@ -518,6 +518,14 @@ class BusinessBenchmarkLiveAdapter:
                 )
             if intent not in observed:
                 observed.append(intent)
+        # NONE is the explicit absence of an external integration.  Reserved
+        # Captain host tools use that binding, but it must not become a second
+        # integration intent when a substantive integration (for example n8n)
+        # also ran in the same candidate session.
+        if any(intent is not IntegrationIntent.NONE for intent in observed):
+            observed = [
+                intent for intent in observed if intent is not IntegrationIntent.NONE
+            ]
         return tuple(observed)
 
     @staticmethod

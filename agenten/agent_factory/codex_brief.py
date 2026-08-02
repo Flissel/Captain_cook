@@ -323,6 +323,27 @@ class CodexBriefBuilder:
             technical_retry_contract.append(
                 "Always emit the exact structured terminal output contract after collaboration."
             )
+        if improvement_authorization is not None:
+            technical_retry_contract.append(
+                "System prompts may be tuned to fix only the enumerated failed metrics while "
+                "preserving the public business policy, agent identities, handoff graph, tool "
+                "allocation, limits, terminal contract, and acceptance categories; never inspect "
+                "or infer private holdout cases."
+            )
+            technical_retry_contract.append(
+                "A failed mandatory_handoff benchmark metric requires explicit Captain operator "
+                "review evidence; never fabricate, simulate, or claim that external completion "
+                "inside candidate code."
+            )
+        if {
+            "cost_efficiency",
+            "latency_efficiency",
+        } & set(failed_benchmark_metric_ids):
+            technical_retry_contract.append(
+                "For cost or latency failures, reduce model turns, prompt tokens, and serial "
+                "handoffs on each public path without removing required specialist collaboration "
+                "or weakening any prior-green metric."
+            )
         document = {
             "Goal": (
                 "Implement the dependency-ready node described by "

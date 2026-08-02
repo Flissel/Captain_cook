@@ -72,14 +72,18 @@ def policy() -> FactoryExecutionPolicyV1:
     )
 
 
-def retry_authorization() -> FactoryImprovementAuthorizationV1:
+def retry_authorization(
+    *,
+    benchmark_reason_codes: tuple[str, ...] = ("unsafe_tool_intent",),
+    failed_benchmark_metric_ids: tuple[str, ...] = ("tool_safety",),
+) -> FactoryImprovementAuthorizationV1:
     evaluation_data = evaluation_payload(
         failure_class="behavioral_failure",
         recommendation="RETRY_BUILD",
         prior_green_regression_ids=["schema_valid"],
         benchmark_disposition="failed",
-        benchmark_reason_codes=["unsafe_tool_intent"],
-        failed_benchmark_metric_ids=["tool_safety"],
+        benchmark_reason_codes=list(benchmark_reason_codes),
+        failed_benchmark_metric_ids=list(failed_benchmark_metric_ids),
     )
     outcomes = evaluation_data["assertion_outcomes"]
     assert isinstance(outcomes, list)
@@ -329,7 +333,18 @@ def test_codex_brief_requires_compiled_n8n_intent_and_separate_authority(
 
 
 def test_retry_brief_binds_failed_evaluation_candidate_and_prior_green() -> None:
-    authorization = retry_authorization()
+    authorization = retry_authorization(
+        benchmark_reason_codes=(
+            "unsafe_tool_intent",
+            "cost_ratio_exceeded",
+            "latency_ratio_exceeded",
+        ),
+        failed_benchmark_metric_ids=(
+            "tool_safety",
+            "cost_efficiency",
+            "latency_efficiency",
+        ),
+    )
     invocation_data = invocation_payload(
         "brief_codex",
         attempt=2,
@@ -363,7 +378,14 @@ def test_retry_brief_binds_failed_evaluation_candidate_and_prior_green() -> None
     assert '"prior green benchmark metrics": [\n      "coverage"' in rendered
     assert '"failed benchmark metric IDs": [\n      "tool_safety"' in rendered
     assert '"benchmark reason codes": [\n      "unsafe_tool_intent"' in rendered
-    assert brief.failed_benchmark_metric_ids == ("tool_safety",)
+    assert "System prompts may be tuned" in rendered
+    assert "reduce model turns, prompt tokens, and serial handoffs" in rendered
+    assert "Captain operator review" in rendered
+    assert brief.failed_benchmark_metric_ids == (
+        "tool_safety",
+        "cost_efficiency",
+        "latency_efficiency",
+    )
     assert brief.regression_benchmark_metric_ids == ("coverage",)
     assert authorization.prior_candidate_ref.uri in rendered
 
