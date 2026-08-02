@@ -15,6 +15,7 @@ import math
 import os
 import re
 import time
+import zipfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -104,7 +105,11 @@ from agenten.agent_factory.business_benchmark_production_ports import (
     OpenAIBusinessBenchmarkModelClientBuilder,
     factory_execution_policy_sha256,
 )
-from agenten.agent_factory.candidate_evaluation import FactoryCandidateEvaluator
+from agenten.agent_factory.candidate_evaluation import (
+    FactoryCandidateArtifact,
+    FactoryCandidateEvaluator,
+    ResolvedFactoryCandidate,
+)
 from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
 from agenten.agent_factory.factory_feedback import FactoryFeedbackBuilder
 from agenten.agent_factory.team_evaluation import TeamEvaluationService
@@ -284,6 +289,7 @@ class CaptainRenewalBusinessBenchmarkN8nPorts:
     client: httpx.AsyncClient
     workflow_id: str
     workflow_ref: ArtifactRef
+    canonical_payload_sha256: str
     authorization_port: CaptainRenewalN8nAuthorizationPort
     grant_authority: FactoryN8nGrantAuthorityPort
     broker_token_issuer: Callable[[RenewalContextN8nProviderRequestV1], str]
@@ -299,12 +305,41 @@ class CaptainRenewalBusinessBenchmarkN8nPorts:
             or not isinstance(self.client, httpx.AsyncClient)
             or not self.workflow_id.strip()
             or self.workflow_ref.media_type != "application/json"
+            or re.fullmatch(r"[0-9a-f]{64}", self.canonical_payload_sha256)
+            is None
             or not callable(getattr(self.authorization_port, "authorization_for", None))
             or not callable(getattr(self.grant_authority, "authorize_command", None))
             or not callable(getattr(self.grant_authority, "authorize", None))
             or not callable(self.broker_token_issuer)
         ):
             raise ValueError("Renewal n8n bootstrap ports are incomplete or unscoped")
+
+
+def _candidate_workflow_canonical_payload_sha256(
+    candidate: ResolvedFactoryCandidate,
+    artifact: FactoryCandidateArtifact,
+) -> str:
+    """Bind formatting-independent candidate JSON to the deployed workflow body."""
+
+    try:
+        with zipfile.ZipFile(candidate.source_archive) as archive:
+            content = archive.read(artifact.relative_path.replace("\\", "/"))
+        if hashlib.sha256(content).hexdigest() != artifact.reference.sha256:
+            raise ValueError("candidate workflow artifact digest changed")
+        payload = json.loads(content.decode("utf-8"))
+    except (KeyError, OSError, UnicodeError, json.JSONDecodeError, zipfile.BadZipFile) as exc:
+        raise ValueError("candidate workflow artifact is unavailable or invalid") from exc
+    publish_fields = ("name", "nodes", "connections", "settings")
+    if not isinstance(payload, dict) or any(field not in payload for field in publish_fields):
+        raise ValueError("candidate workflow artifact is unavailable or invalid")
+    published_payload = {field: payload[field] for field in publish_fields}
+    encoded = json.dumps(
+        published_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -965,7 +1000,11 @@ Use only rationale identifiers justified by supplied fields. Never reveal hidden
             or candidate_tools[0].name != "renewal_context_read"
             or scope.candidate.candidate.host_tools != (BUSINESS_DECISION_TOOL,)
             or len(candidate_workflows) != 1
-            or candidate_workflows[0].reference != self._n8n.workflow_ref
+            or _candidate_workflow_canonical_payload_sha256(
+                scope.candidate,
+                candidate_workflows[0],
+            )
+            != self._n8n.canonical_payload_sha256
         ):
             raise ValueError(
                 "Renewal candidate must match the one Captain-authorized workflow tool"

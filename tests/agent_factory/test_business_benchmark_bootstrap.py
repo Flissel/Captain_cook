@@ -666,6 +666,7 @@ async def test_renewal_builder_wires_equal_request_scoped_n8n_authority(
         CaptainCanonicalSuiteAuthority,
         ConfiguredBusinessBenchmarkExecutionPolicyBuilder,
         ProductionBusinessBenchmarkRuntimeAuthorities,
+        _candidate_workflow_canonical_payload_sha256,
     )
     from agenten.agent_factory.business_benchmark_candidate_seeds import (
         RENEWAL_SEED_PROFILE,
@@ -798,13 +799,22 @@ async def test_renewal_builder_wires_equal_request_scoped_n8n_authority(
         mcp_broker_url="http://localhost:5680",
     )
     client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(500)))
-    workflow_ref = candidate.candidate.workflow_artifacts[0].reference
+    workflow_ref = ArtifactRef(
+        uri=f"artifact://deployed-renewal-workflow/{'f' * 64}",
+        sha256="f" * 64,
+        media_type="application/json",
+    )
+    canonical_payload_sha256 = _candidate_workflow_canonical_payload_sha256(
+        candidate,
+        candidate.candidate.workflow_artifacts[0],
+    )
     n8n_ports = CaptainRenewalBusinessBenchmarkN8nPorts(
         endpoint=endpoint,
         allowed_endpoint_urls=frozenset({"http://localhost:5679"}),
         client=client,
         workflow_id="renewal-context-workflow",
         workflow_ref=workflow_ref,
+        canonical_payload_sha256=canonical_payload_sha256,
         authorization_port=authorization_port,  # type: ignore[arg-type]
         grant_authority=GrantAuthority(),  # type: ignore[arg-type]
         broker_token_issuer=lambda _: "request-bound-test-token",

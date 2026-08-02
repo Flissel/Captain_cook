@@ -162,6 +162,7 @@ class GatewayRenewalN8nDeploymentBinding:
     workflow_id: str
     workflow_ref: ArtifactRef
     published_sha256: str
+    canonical_payload_sha256: str
 
     @classmethod
     def from_evidence_root(
@@ -264,6 +265,14 @@ class GatewayRenewalN8nDeploymentBinding:
                         media_type="application/json",
                     ),
                     published_sha256=published_sha256,
+                    canonical_payload_sha256=hashlib.sha256(
+                        json.dumps(
+                            expected_published_payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest(),
                 )
             )
         if len(matches) != 1:
@@ -673,6 +682,7 @@ class GatewayBusinessBenchmarkLiveCompositionLoader:
                 client=self._n8n_client,
                 workflow_id=deployment.workflow_id,
                 workflow_ref=deployment.workflow_ref,
+                canonical_payload_sha256=deployment.canonical_payload_sha256,
                 authorization_port=runtime_authority,
                 grant_authority=CaptainN8nGrantAuthority(runtime_authority),
                 broker_token_issuer=runtime_authority.broker_token_for,
