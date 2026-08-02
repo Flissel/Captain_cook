@@ -27,7 +27,9 @@ import httpx
 
 from agenten.agent_factory.business_benchmark_contracts import (
     BusinessBenchmarkCaseV1,
+    BusinessBenchmarkReceiptV1,
     BusinessBenchmarkRunReceiptV1,
+    BusinessBenchmarkSummaryV1,
     BusinessBenchmarkSuiteV1,
     BusinessCaseCategory,
     canonical_business_benchmark_model_bytes,
@@ -1197,8 +1199,13 @@ class CaptainCanonicalSuiteAuthority:
 class CaptainCanonicalSuiteRepository:
     """Expose the same canonical suite authority to the Factory composition."""
 
-    def __init__(self, authority: CaptainCanonicalSuiteAuthority) -> None:
+    def __init__(
+        self,
+        authority: CaptainCanonicalSuiteAuthority,
+        evidence: FilesystemBusinessBenchmarkEvidenceStore | None = None,
+    ) -> None:
         self._authority = authority
+        self._evidence = evidence
         self._by_reference: dict[PrivateHoldoutRef, BusinessBenchmarkSuiteV1] = {}
 
     def suite_ref(self, profile_id: str, suite_version: int) -> PrivateHoldoutRef:
@@ -1220,6 +1227,25 @@ class CaptainCanonicalSuiteRepository:
             raise ValueError(
                 "canonical benchmark suite must be resolved before its private body"
             ) from exc
+
+    def record_run_receipt(
+        self, receipt: BusinessBenchmarkRunReceiptV1
+    ) -> ArtifactRef:
+        return self._evidence_store().record_run_receipt(receipt)
+
+    def record_case_receipt(self, receipt: BusinessBenchmarkReceiptV1) -> ArtifactRef:
+        return self._evidence_store().record_case_receipt(receipt)
+
+    def record_summary(self, summary: BusinessBenchmarkSummaryV1) -> ArtifactRef:
+        return self._evidence_store().record_summary(summary)
+
+    def summary(self, summary_id: UUID) -> BusinessBenchmarkSummaryV1 | None:
+        return self._evidence_store().summary(summary_id)
+
+    def _evidence_store(self) -> FilesystemBusinessBenchmarkEvidenceStore:
+        if self._evidence is None:
+            raise ValueError("canonical suite repository has no evidence store")
+        return self._evidence
 
 
 class ReleasedSkillCatalogPort(Protocol):
@@ -1503,7 +1529,13 @@ def compose_production_business_benchmark_composition(
         root=config.private_suite_root,
         seed_version_id=config.seed_version_id,
     )
-    private_repository = CaptainCanonicalSuiteRepository(suite_authority)
+    evidence = FilesystemBusinessBenchmarkEvidenceStore(
+        config.evidence_store_root
+    )
+    private_repository = CaptainCanonicalSuiteRepository(
+        suite_authority,
+        evidence,
+    )
     gateway = GatewayBusinessBenchmarkAuthority(ports.gateway_repository)
     invocations = GatewayBenchmarkInvocationAuthority(
         repository=ports.gateway_repository,
@@ -1528,10 +1560,6 @@ def compose_production_business_benchmark_composition(
         team_evaluator=TeamEvaluationService(clock=ports.clock),
         feedback_builder=FactoryFeedbackBuilder(clock=ports.clock),
     )
-    evidence = FilesystemBusinessBenchmarkEvidenceStore(
-        config.evidence_store_root
-    )
-
     return ProductionBusinessBenchmarkComposition(
         resolver=resolver,
         factory_composition=factory,

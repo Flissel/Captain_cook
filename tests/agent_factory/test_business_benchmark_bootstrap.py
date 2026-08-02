@@ -1127,6 +1127,39 @@ def test_canonical_suite_authority_provisions_and_reloads_digest_bound_suite(
     assert len(first.cases) == 15
 
 
+def test_canonical_suite_repository_persists_run_receipts(tmp_path: Path) -> None:
+    from agenten.agent_factory.business_benchmark_bootstrap import (
+        CaptainCanonicalSuiteAuthority,
+        CaptainCanonicalSuiteRepository,
+    )
+    from agenten.agent_factory.business_benchmark_store import (
+        FilesystemBusinessBenchmarkEvidenceStore,
+    )
+
+    repository = CaptainCanonicalSuiteRepository(
+        CaptainCanonicalSuiteAuthority(
+            root=tmp_path / ".captain-cook" / "private-suites",
+            seed_version_id="repository-receipt-test-v1",
+        ),
+        FilesystemBusinessBenchmarkEvidenceStore(
+            tmp_path / ".captain-cook" / "receipts"
+        ),
+    )
+    current_job = live_job()
+    benchmark_case = suite().cases[0]
+    receipt = run_receipt(
+        job=current_job,
+        candidate_ref=_ref("candidate"),
+        benchmark_case=benchmark_case,
+        variant="candidate",
+    )
+
+    first = repository.record_run_receipt(receipt)
+    replay = repository.record_run_receipt(receipt)
+
+    assert replay == first
+
+
 def test_gateway_invocation_authority_builds_quality_chain_from_active_captain_data() -> None:
     from agenten.agent_factory.business_benchmark_bootstrap import (
         GatewayBenchmarkInvocationAuthority,
