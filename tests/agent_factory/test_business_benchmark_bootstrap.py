@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -577,7 +578,7 @@ def test_claims_executor_builder_creates_durable_host_runtime_without_provider_c
     assert isinstance(executor, BusinessBenchmarkLiveAdapter)
     runtime_scope = executor._runtime_bundle._scopes[job.job_id]
     assert runtime_scope.team_manifest.conversation_pattern == "swarm"
-    assert runtime_scope.allowed_host_tools == ()
+    assert runtime_scope.allowed_host_tools == ("captain_business_decision",)
     assert runtime_scope.baseline_policy.allowed_tools == ()
     assert runtime_scope.candidate_workspace == artifacts.root
     assert _sealed_text(
@@ -823,7 +824,10 @@ def test_renewal_builder_wires_equal_request_scoped_n8n_authority(
 
     assert isinstance(executor, BusinessBenchmarkLiveAdapter)
     runtime_scope = executor._runtime_bundle._scopes[job.job_id]
-    assert runtime_scope.allowed_host_tools == (tool_ref.tool_name,)
+    assert runtime_scope.allowed_host_tools == (
+        tool_ref.tool_name,
+        "captain_business_decision",
+    )
     assert runtime_scope.baseline_policy.allowed_tools == (tool_ref.tool_name,)
     assert runtime_scope.tool_intents == {tool_ref.tool_name: IntegrationIntent.N8N}
     assert tuple(
@@ -839,7 +843,26 @@ def test_renewal_builder_wires_equal_request_scoped_n8n_authority(
     session_factory = executor._runtime_bundle._session_factory
 
     def request(variant: str, allowed_tools: tuple[str, ...], ordinal: int):
-        task = f'Renewal case {ordinal}: {{"evidence_partition":"ordinary"}}'
+        task = json.dumps(
+            {
+                "schema": "captain.business-benchmark-redacted-task.v1",
+                "case_id": f"renewal-public-{ordinal:02d}",
+                "profile_id": "customer_renewal_orchestration_team",
+                "redacted_input": {
+                    "renewal_window": "open",
+                    "engagement_band": "stable",
+                    "commercial_evidence_state": "complete",
+                    "consent_state": "verified",
+                },
+                "allowed_tool_intents": [
+                    "n8n" if tool_ref.tool_name in allowed_tools else "none"
+                ],
+                "allowed_tools": list(allowed_tools),
+                "required_output_schema": "captain.business-benchmark-terminal.v1",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         case_ref = job.private_holdout_refs[0].model_copy(
             update={
                 "holdout_id": f"redacted-renewal-{ordinal:02d}",
@@ -874,14 +897,24 @@ def test_renewal_builder_wires_equal_request_scoped_n8n_authority(
         )
 
     candidate_session = session_factory.create(
-        request("candidate", (tool_ref.tool_name,), 1)
+        request(
+            "candidate",
+            (tool_ref.tool_name, "captain_business_decision"),
+            1,
+        )
     )
     baseline_session = session_factory.create(
-        request("single_agent_baseline", (tool_ref.tool_name,), 2)
+        request(
+            "single_agent_baseline",
+            (tool_ref.tool_name, "captain_business_decision"),
+            2,
+        )
     )
-    sensitive_session = session_factory.create(request("candidate", (), 3))
+    sensitive_session = session_factory.create(
+        request("candidate", ("captain_business_decision",), 3)
+    )
     sensitive_baseline_session = session_factory.create(
-        request("single_agent_baseline", (), 5)
+        request("single_agent_baseline", ("captain_business_decision",), 5)
     )
 
     assert isinstance(candidate_session._n8n_adapter, CaptainRenewalContextN8nAdapter)
@@ -908,7 +941,11 @@ def test_renewal_builder_wires_equal_request_scoped_n8n_authority(
     authorization_to_return["value"] = different_authorization
     with pytest.raises(ValueError, match="exact same command/grant"):
         session_factory.create(
-            request("single_agent_baseline", (tool_ref.tool_name,), 4)
+            request(
+                "single_agent_baseline",
+                (tool_ref.tool_name, "captain_business_decision"),
+                4,
+            )
         )
 
 

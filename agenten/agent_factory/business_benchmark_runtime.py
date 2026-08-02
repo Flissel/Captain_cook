@@ -165,18 +165,22 @@ class BusinessBenchmarkTeamRuntimeScopeV1:
             != self.resolved_candidate.candidate.team_manifest.reference
         ):
             raise ValueError("runtime candidate, model, or baseline scope is stale")
+        manifest_tools = {
+            tool_name
+            for agent in self.team_manifest.agents
+            for tool_name in agent.tools
+        }
+        n8n_tools = {
+            tool.name for tool in self.resolved_candidate.candidate.n8n_tools
+        }
+        reserved_host_tools = set(self.resolved_candidate.candidate.host_tools)
+        baseline_tools = set(self.baseline_policy.allowed_tools)
         if (
             len(self.allowed_host_tools) != len(set(self.allowed_host_tools))
-            or set(self.allowed_host_tools) != set(self.tool_intents)
-            or set(self.allowed_host_tools)
-            != {
-                tool_name
-                for agent in self.team_manifest.agents
-                for tool_name in agent.tools
-            }
-            or set(self.allowed_host_tools)
-            - {tool.name for tool in self.resolved_candidate.candidate.n8n_tools}
-            or set(self.allowed_host_tools) != set(self.baseline_policy.allowed_tools)
+            or set(self.allowed_host_tools) != manifest_tools
+            or set(self.allowed_host_tools) != n8n_tools | reserved_host_tools
+            or set(self.tool_intents) != n8n_tools
+            or baseline_tools != n8n_tools
             or any(
                 not isinstance(intent, IntegrationIntent)
                 for intent in self.tool_intents.values()
@@ -347,12 +351,32 @@ class BusinessBenchmarkProviderRuntimeBridge:
         if envelope.variant == "single_agent_baseline" and baseline_policy is None:
             raise ValueError("baseline execution requires its sealed host policy")
 
-        allowed_tools = tuple(
+        integration_tools = tuple(
             name
             for name in scope.allowed_host_tools
-            if scope.tool_intents[name] in envelope.allowed_tool_intents
+            if name in scope.tool_intents
+            and scope.tool_intents[name] in envelope.allowed_tool_intents
         )
-        redacted_case_task = self._redacted_case_task(envelope, allowed_tools)
+        candidate_allowed_tools = tuple(
+            name
+            for name in scope.allowed_host_tools
+            if name in scope.resolved_candidate.candidate.host_tools
+            or name in integration_tools
+        )
+        baseline_allowed_tools = tuple(
+            name
+            for name in scope.baseline_policy.allowed_tools
+            if name in integration_tools
+        )
+        execution_allowed_tools = (
+            candidate_allowed_tools
+            if envelope.variant == "candidate"
+            else baseline_allowed_tools
+        )
+        redacted_case_task = self._redacted_case_task(
+            envelope,
+            candidate_allowed_tools,
+        )
         case_ref = self._case_reference(redacted_case_task)
         identity = HostAutoGenSessionIdentityV1.for_factory_execution(
             job=scope.job,
@@ -375,7 +399,7 @@ class BusinessBenchmarkProviderRuntimeBridge:
             identity=identity,
             benchmark_case_sha256=envelope.case_sha256,
             redacted_case_task=redacted_case_task,
-            allowed_host_tools=allowed_tools,
+            allowed_host_tools=candidate_allowed_tools,
             maximum_cost_micro_usd=envelope.maximum_cost_micro_usd,
             maximum_latency_ms=envelope.maximum_latency_ms,
         )
@@ -389,7 +413,7 @@ class BusinessBenchmarkProviderRuntimeBridge:
                     identity=identity,
                     candidate=scope.resolved_candidate,
                     manifest=scope.team_manifest,
-                    allowed_tools=allowed_tools,
+                    allowed_tools=execution_allowed_tools,
                     allowed_models=(scope.model,),
                     max_seconds=envelope.maximum_latency_ms / 1_000,
                 )
@@ -405,7 +429,7 @@ class BusinessBenchmarkProviderRuntimeBridge:
                     system_prompt_ref=scope.baseline_policy.system_prompt_ref,
                     execution_policy_sha256=scope.baseline_policy.execution_policy_sha256,
                     model=scope.model,
-                    allowed_tools=allowed_tools,
+                    allowed_tools=execution_allowed_tools,
                     max_messages=scope.baseline_policy.max_messages,
                     max_tool_calls=scope.baseline_policy.max_tool_calls,
                 )

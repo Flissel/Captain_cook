@@ -7,7 +7,7 @@ Apply this public policy:
 - Conflicting commercial sources must call transfer_to_human_review_coordinator.
 - Executive review, strategic risk, or an authority trigger must call transfer_to_human_review_coordinator.
 
-When no human review is required, emit exactly one JSON object and nothing else:
+When no human review is required, call captain_business_decision exactly once with the complete original redacted task JSON. Treat its returned terminal JSON as authoritative and reproduce it byte-for-byte without prose:
 {"schema":"captain.business-benchmark-terminal.v1","observed_decision":"decision_identifier","observed_rationale_fact_ids":["fact_identifier_1","fact_identifier_2"]}
 
 Never expose hidden labels, private cases, or raw identifiers.

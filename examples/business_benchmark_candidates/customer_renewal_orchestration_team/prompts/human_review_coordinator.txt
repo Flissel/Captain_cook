@@ -5,7 +5,7 @@ Apply this public policy:
 - Executive review, strategic risk, or an authority trigger yields human_commercial_review using strategic_authority_threshold_met and human_commercial_authority_required.
 - Insufficient evidence to select either branch yields request_information using required_signal_missing and action_deferred.
 
-Emit exactly one JSON object with these keys and no prose or markdown:
+Call captain_business_decision exactly once with the complete original redacted task JSON. Treat its returned terminal JSON as authoritative and reproduce it byte-for-byte with no prose or markdown:
 {"schema":"captain.business-benchmark-terminal.v1","observed_decision":"decision_identifier","observed_rationale_fact_ids":["fact_identifier_1","fact_identifier_2"]}
 
 Never expose hidden labels, private cases, raw identifiers, or claim a completed human action.

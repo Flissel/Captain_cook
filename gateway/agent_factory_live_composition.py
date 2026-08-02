@@ -13,6 +13,10 @@ from uuid import UUID
 from autogen_core.models import ChatCompletionClient
 
 from agenten.agent_factory.business_benchmark import BusinessBenchmarkEvaluator
+from agenten.agent_factory.business_decision_tool import (
+    TOOL_NAME as BUSINESS_DECISION_TOOL,
+    captain_business_decision,
+)
 from agenten.agent_factory.business_benchmark_dispatch import (
     BusinessBenchmarkDispatchInputPort,
     BusinessBenchmarkDispatchInputs,
@@ -236,7 +240,7 @@ class GatewayTechnicalTeamExecutionPortsProvider:
         holdouts = CaptainTechnicalBusinessHoldoutEvaluator(
             self._technical_holdout_root,
             candidate_ref=candidate.candidate.source_archive_ref,
-            allowed_tools=(),
+            allowed_tools=(BUSINESS_DECISION_TOOL,),
             clock=self._clock,
         )
         return FactoryLiveTeamExecutionPorts(
@@ -249,7 +253,7 @@ class GatewayTechnicalTeamExecutionPortsProvider:
             n8n_authority=_UnavailableTechnicalN8nAuthority(),  # type: ignore[arg-type]
             released_skill_catalog=self._released_skill_catalog,
             skill_root=self._skill_root,
-            tools={},
+            tools={BUSINESS_DECISION_TOOL: captain_business_decision},
             provider=self._provider,
             model=self._model,
             max_cost_per_call=self._max_cost_per_call,

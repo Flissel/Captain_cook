@@ -76,6 +76,7 @@ def test_public_build_contract_is_normative_complete_and_holdout_free(
         "captain.business-benchmark-terminal.v1"
     )
     assert len(contract["public_acceptance_categories"]) == 5
+    assert contract["host_tools"] == ["captain_business_decision"]
     assert "expected_decision" not in encoded
     assert "required_rationale_fact_ids" not in encoded
     assert "case_id" not in encoded
@@ -104,7 +105,7 @@ def test_public_candidate_guard_rejects_claims_team_without_escalation_agent(
             "max_messages": 2,
             "max_handoffs": 1,
         },
-        context={"allowed_tools": set()},
+        context={"allowed_tools": {"captain_business_decision"}},
     )
 
     with pytest.raises(ValueError, match="public build contract"):
@@ -115,7 +116,7 @@ def test_public_candidate_guard_rejects_claims_team_without_escalation_agent(
         )
 
 
-def test_claims_seed_is_a_tool_free_swarm_with_sealed_business_rules(
+def test_claims_seed_uses_only_captain_decision_tool_with_sealed_business_rules(
     tmp_path: Path,
 ) -> None:
     resolved = package_business_benchmark_seed(CLAIMS_SEED_PROFILE, tmp_path)
@@ -124,7 +125,11 @@ def test_claims_seed_is_a_tool_free_swarm_with_sealed_business_rules(
     team = result.team_execution_manifest
 
     assert team.conversation_pattern == "swarm"
-    assert all(agent.tools == () for agent in team.agents)
+    assert tuple(agent.tools for agent in team.agents) == (
+        (),
+        ("captain_business_decision",),
+        ("captain_business_decision",),
+    )
     assert team.agents[0].handoffs == ("coverage_specialist",)
     assert team.agents[1].handoffs == ("escalation_specialist",)
     assert team.agents[2].handoffs == ()
@@ -132,6 +137,7 @@ def test_claims_seed_is_a_tool_free_swarm_with_sealed_business_rules(
     assert resolved.candidate.tool_schema_artifacts == ()
     assert resolved.candidate.n8n_tools == ()
     assert resolved.candidate.n8n_tool_references == ()
+    assert resolved.candidate.host_tools == ("captain_business_decision",)
 
     with zipfile.ZipFile(resolved.source_archive) as archive:
         archived_names = set(archive.namelist())
@@ -179,9 +185,10 @@ def test_renewal_seed_has_one_read_only_idempotent_n8n_workflow(
     )
     assert tuple(agent.tools for agent in team.agents) == (
         ("renewal_context_read",),
-        (),
-        (),
+        ("captain_business_decision",),
+        ("captain_business_decision",),
     )
+    assert resolved.candidate.host_tools == ("captain_business_decision",)
     assert len(resolved.candidate.workflow_artifacts) == 1
     assert len(resolved.candidate.tool_schema_artifacts) == 2
     assert len(resolved.candidate.n8n_tool_references) == 1
@@ -248,6 +255,7 @@ def test_renewal_seed_has_one_read_only_idempotent_n8n_workflow(
     assert "ordinary or boundary" in prompts
     assert "Never call it" in prompts
     assert "captain.business-benchmark-terminal.v1" in prompts
+    assert "call captain_business_decision exactly once" in prompts.lower()
     assert "expected_decision" not in prompts
     assert "required_rationale_fact_ids" not in prompts
     assert "case_id" not in prompts

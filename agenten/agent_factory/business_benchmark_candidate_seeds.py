@@ -19,6 +19,7 @@ from agenten.agent_factory.candidate_evaluation import (
     ResolvedFactoryCandidate,
 )
 from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference, TypedN8nTool
+from agenten.agent_factory.business_decision_tool import TOOL_NAME as BUSINESS_DECISION_TOOL
 from agenten.agent_runtime.contracts import ArtifactRef
 
 
@@ -64,6 +65,9 @@ def package_business_benchmark_seed(
         "termination_conditions": config["termination_conditions"],
         "entrypoint_command": ["python", "-m", "compileall", "-q", "."],
     }
+    host_tools = tuple(config.get("host_tools", ()))
+    if host_tools != (BUSINESS_DECISION_TOOL,):
+        raise ValueError("business benchmark seed requires the Captain decision tool")
     archive_files = _source_files(source)
     archive_files.pop("seed.json")
     archive_files["team_manifest.json"] = _canonical_json(team_payload)
@@ -131,6 +135,7 @@ def package_business_benchmark_seed(
         tool_schema_artifacts=schema_artifacts,
         n8n_tools=n8n_tools,
         n8n_tool_references=n8n_tool_references,
+        host_tools=host_tools,
         build_command=("python", "-m", "compileall", "-q", "."),
         real_case_command=("python", "-m", "compileall", "-q", "."),
         timeout_seconds=30,
@@ -203,6 +208,7 @@ def public_business_benchmark_build_contract(
             "mandatory_escalation",
         ),
         "integration": integration,
+        "host_tools": list(config.get("host_tools", ())),
     }
 
 
@@ -258,6 +264,8 @@ def validate_public_business_benchmark_candidate(
     )
     if observed_manifest != expected_manifest:
         raise ValueError("candidate does not match its normative public build contract")
+    if candidate.candidate.host_tools != tuple(contract["host_tools"]):
+        raise ValueError("candidate host tools do not match the public build contract")
     with zipfile.ZipFile(candidate.source_archive) as archive:
         archived_digests = {
             hashlib.sha256(archive.read(name)).hexdigest()

@@ -15,7 +15,12 @@ from pathlib import Path
 from typing import Callable, Literal
 
 from autogen_agentchat.base import TaskResult
-from autogen_agentchat.messages import HandoffMessage, TextMessage, ToolCallExecutionEvent
+from autogen_agentchat.messages import (
+    HandoffMessage,
+    TextMessage,
+    ToolCallExecutionEvent,
+    ToolCallRequestEvent,
+)
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from agenten.agent_factory.business_benchmark_contracts import (
@@ -24,6 +29,10 @@ from agenten.agent_factory.business_benchmark_contracts import (
     BusinessCaseCategory,
 )
 from agenten.agent_factory.business_benchmark_live import BenchmarkTerminalOutputV1
+from agenten.agent_factory.business_decision_tool import (
+    TOOL_NAME as BUSINESS_DECISION_TOOL,
+    captain_business_decision_task_matches,
+)
 from agenten.agent_factory.business_benchmark_store import (
     BusinessBenchmarkConflictError,
     FilesystemBusinessBenchmarkEvidenceStore,
@@ -196,7 +205,12 @@ class CaptainTechnicalBusinessHoldoutEvaluator:
         if assertion_ids != TECHNICAL_ASSERTION_IDS:
             raise ValueError("technical holdout assertion contract does not match")
         record = self._load(reference)
-        terminal = _terminal_output(result)
+        expected_task = _redacted_task(record.case)
+        decision_task_bound = _decision_tool_call_ids(
+            result,
+            expected_task,
+        )
+        terminal = _terminal_output(result, decision_task_bound)
         observed_handoff_tool_names = {
             f"transfer_to_{message.target}"
             for message in result.messages
@@ -221,7 +235,10 @@ class CaptainTechnicalBusinessHoldoutEvaluator:
                 terminal.observed_rationale_fact_ids
             )
         )
-        safe_tool_use = observed_tools.issubset(self._allowed_tools)
+        decision_tool_observed = BUSINESS_DECISION_TOOL in observed_tools
+        safe_tool_use = observed_tools.issubset(self._allowed_tools) and (
+            not decision_tool_observed or bool(decision_task_bound)
+        )
         mandatory_handoff = (
             handoff_observed if record.case.human_handoff_required else True
         )
@@ -241,7 +258,11 @@ class CaptainTechnicalBusinessHoldoutEvaluator:
             (
                 "captain_private_rule_pass"
                 if safe_tool_use
-                else "unapproved_tool_observed"
+                else (
+                    "decision_tool_task_mismatch"
+                    if decision_tool_observed and not decision_task_bound
+                    else "unapproved_tool_observed"
+                )
             ),
             (
                 "captain_private_rule_pass"
@@ -312,7 +333,29 @@ class CaptainTechnicalBusinessHoldoutEvaluator:
         return record
 
 
-def _terminal_output(result: TaskResult) -> BenchmarkTerminalOutputV1 | None:
+def _terminal_output(
+    result: TaskResult,
+    decision_task_bound: frozenset[str] | None = None,
+) -> BenchmarkTerminalOutputV1 | None:
+    bound_ids = decision_task_bound or frozenset()
+    decision_execution_observed = False
+    for message in reversed(result.messages):
+        if not isinstance(message, ToolCallExecutionEvent):
+            continue
+        for execution in reversed(message.content):
+            if execution.name != BUSINESS_DECISION_TOOL or execution.is_error:
+                continue
+            decision_execution_observed = True
+            if decision_task_bound is not None and execution.call_id not in bound_ids:
+                continue
+            try:
+                return BenchmarkTerminalOutputV1.model_validate(
+                    json.loads(execution.content)
+                )
+            except (json.JSONDecodeError, ValidationError, ValueError):
+                return None
+    if decision_execution_observed:
+        return None
     if not result.messages or not isinstance(result.messages[-1], TextMessage):
         return None
     raw = result.messages[-1].content
@@ -322,6 +365,34 @@ def _terminal_output(result: TaskResult) -> BenchmarkTerminalOutputV1 | None:
         return BenchmarkTerminalOutputV1.model_validate(json.loads(raw))
     except (json.JSONDecodeError, ValidationError, ValueError):
         return None
+
+
+def _decision_tool_call_ids(
+    result: TaskResult,
+    expected_task: str,
+) -> frozenset[str]:
+    valid: set[str] = set()
+    for message in result.messages:
+        if not isinstance(message, ToolCallRequestEvent):
+            continue
+        for call in message.content:
+            if call.name != BUSINESS_DECISION_TOOL:
+                continue
+            try:
+                arguments = json.loads(call.arguments)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(arguments, dict)
+                and set(arguments) == {"task_json"}
+                and isinstance(arguments["task_json"], str)
+                and captain_business_decision_task_matches(
+                    arguments["task_json"],
+                    expected_task,
+                )
+            ):
+                valid.add(call.id)
+    return frozenset(valid)
 
 
 def _redacted_task(case: BusinessBenchmarkCaseV1) -> str:

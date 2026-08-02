@@ -414,6 +414,39 @@ def create_scope(tmp_path: Path):
     return store, scope
 
 
+def with_reserved_decision_tool(
+    scope: BusinessBenchmarkTeamRuntimeScopeV1,
+) -> BusinessBenchmarkTeamRuntimeScopeV1:
+    manifest_payload = scope.team_manifest.model_dump(mode="json", by_alias=True)
+    manifest_payload["agents"][0]["tools"] = [
+        "claims_lookup",
+        "captain_business_decision",
+    ]
+    manifest = FactoryAutoGenTeamManifestV1.model_validate(
+        manifest_payload,
+        context={
+            "allowed_tools": {
+                "claims_lookup",
+                "captain_business_decision",
+            }
+        },
+    )
+    candidate_manifest = scope.resolved_candidate.candidate.model_copy(
+        update={"host_tools": ("captain_business_decision",)}
+    )
+    candidate = ResolvedFactoryCandidate(
+        candidate=candidate_manifest,
+        source_archive=scope.resolved_candidate.source_archive,
+    )
+    return replace(
+        scope,
+        resolved_candidate=candidate,
+        team_manifest=manifest,
+        allowed_host_tools=("claims_lookup", "captain_business_decision"),
+        tool_intents={"claims_lookup": IntegrationIntent.N8N},
+    )
+
+
 def usage(env: BusinessBenchmarkExecutionEnvelopeV1, ref: ArtifactRef) -> FactoryUsageReceiptV1:
     return FactoryUsageReceiptV1(
         schema="captain.factory-usage-receipt.v1",
@@ -935,6 +968,87 @@ def test_runtime_scope_rejects_tools_outside_the_verified_candidate_manifest(
 
     with pytest.raises(ValueError, match="tools|manifest"):
         replace(scope, allowed_host_tools=(), tool_intents={})
+
+
+def test_runtime_scope_accepts_reserved_candidate_tool_without_giving_it_to_baseline(
+    tmp_path: Path,
+) -> None:
+    _, scope = create_scope(tmp_path)
+
+    scoped = with_reserved_decision_tool(scope)
+
+    assert scoped.allowed_host_tools == (
+        "claims_lookup",
+        "captain_business_decision",
+    )
+    assert scoped.baseline_policy.allowed_tools == ("claims_lookup",)
+    assert scoped.tool_intents == {"claims_lookup": IntegrationIntent.N8N}
+
+
+@pytest.mark.asyncio
+async def test_reserved_decision_tool_is_candidate_only_while_redacted_task_stays_paired(
+    tmp_path: Path,
+) -> None:
+    from agenten.agent_factory.business_benchmark_runtime import (
+        BusinessBenchmarkDurableFenceAdapter,
+        BusinessBenchmarkProviderRuntimeBridge,
+    )
+
+    store, base_scope = create_scope(tmp_path)
+    scope = with_reserved_decision_tool(base_scope)
+    state = BusinessBenchmarkProviderStateStore(
+        tmp_path / ".captain-cook" / "provider-state-host-tool"
+    )
+    factory = RecordingSessionFactory(store)
+    review = ReviewPort(store, "completed")
+    runtime = BusinessBenchmarkProviderRuntimeBridge(
+        scopes={scope.job.job_id: scope},
+        session_factory=factory,
+        artifacts=store,
+        provider_state=state,
+        human_review=review,
+        clock=lambda: NOW + timedelta(minutes=2),
+    )
+    fence = BusinessBenchmarkDurableFenceAdapter(
+        provider_state=state,
+        artifacts=store,
+        preparation_for_effect=runtime.preparation_binding_for,
+        clock=lambda: NOW + timedelta(minutes=2),
+    )
+    candidate_env = envelope(scope.job, scope.candidate_ref)
+    baseline_env = envelope(
+        scope.job,
+        scope.candidate_ref,
+        variant="single_agent_baseline",
+        case=candidate_env.case,
+    )
+
+    for env in (candidate_env, baseline_env):
+        await runtime.prepare(env)
+        effect_claim = claimed(env)
+        receipt = await fence.register_fence(effect_claim.prepared_effect, effect_claim)
+        await runtime.execute(
+            env,
+            effect_claim,
+            receipt,
+            baseline_policy=(
+                BaselineAssistantPolicyV1(
+                    schema="captain.business-benchmark-baseline-assistant-policy.v1",
+                    agent_name="baseline_claim_case_01",
+                )
+                if env.variant == "single_agent_baseline"
+                else None
+            ),
+        )
+
+    assert factory.requests[0].redacted_case_task == factory.requests[1].redacted_case_task
+    assert factory.executors[0].calls[0][1]["allowed_tools"] == (
+        "claims_lookup",
+        "captain_business_decision",
+    )
+    assert factory.executors[1].calls[0][1]["policy"].allowed_tools == (
+        "claims_lookup",
+    )
 
 
 @pytest.mark.asyncio

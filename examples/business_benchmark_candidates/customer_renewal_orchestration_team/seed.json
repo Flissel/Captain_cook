@@ -3,7 +3,8 @@
   "conversation_pattern": "swarm",
   "max_messages": 12,
   "max_handoffs": 2,
-  "max_tool_calls": 1,
+  "max_tool_calls": 2,
+  "host_tools": ["captain_business_decision"],
   "termination_conditions": ["task_completed", "max_messages", "max_handoffs", "max_tool_calls"],
   "agents": [
     {
@@ -15,13 +16,13 @@
     {
       "name": "commercial_advisor",
       "prompt_path": "prompts/commercial_advisor.txt",
-      "tools": [],
+      "tools": ["captain_business_decision"],
       "handoffs": ["human_review_coordinator"]
     },
     {
       "name": "human_review_coordinator",
       "prompt_path": "prompts/human_review_coordinator.txt",
-      "tools": [],
+      "tools": ["captain_business_decision"],
       "handoffs": []
     }
   ],

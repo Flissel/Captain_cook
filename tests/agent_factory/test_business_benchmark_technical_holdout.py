@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 from autogen_agentchat.base import TaskResult
-from autogen_agentchat.messages import HandoffMessage, TextMessage, ToolCallExecutionEvent
+from autogen_agentchat.messages import (
+    HandoffMessage,
+    TextMessage,
+    ToolCallExecutionEvent,
+    ToolCallRequestEvent,
+)
+from autogen_core import FunctionCall
 from autogen_core.models import FunctionExecutionResult
 
 from agenten.agent_factory.business_benchmark_provisioning import (
@@ -18,6 +24,9 @@ from agenten.agent_factory.business_benchmark_provisioning import (
 from agenten.agent_factory.business_benchmark_technical_holdout import (
     CaptainTechnicalBusinessHoldoutEvaluator,
     CanonicalTechnicalBusinessHoldoutProvisioner,
+    _decision_tool_call_ids,
+    _redacted_task,
+    _terminal_output,
 )
 from agenten.agent_factory.team_execution import ResolvedFactoryHoldoutCase
 from agenten.agent_runtime.contracts import ArtifactRef
@@ -139,6 +148,148 @@ async def test_technical_evaluator_scores_business_tools_and_required_handoff_pr
     assert all(item.passed for item in receipt.decisions)
     # The public receipt carries no private case body or expected answer.
     assert hidden_case.expected_decision not in receipt.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_technical_evaluator_uses_authoritative_decision_tool_output(
+    tmp_path: Path,
+) -> None:
+    root, suite, technical = _private_pair(tmp_path)
+    hidden_case = next(item for item in suite.cases if item.case_id == technical.case_id)
+    evaluator = CaptainTechnicalBusinessHoldoutEvaluator(
+        root / "technical-holdouts",
+        candidate_ref=ArtifactRef(
+            uri="artifact://candidate/team.tar.gz",
+            sha256="f" * 64,
+            media_type="application/gzip",
+        ),
+        allowed_tools=("captain_business_decision",),
+        clock=lambda: NOW,
+    )
+    terminal = json.dumps(
+        {
+            "schema": "captain.business-benchmark-terminal.v1",
+            "observed_decision": hidden_case.expected_decision,
+            "observed_rationale_fact_ids": list(hidden_case.required_rationale_fact_ids),
+        },
+        separators=(",", ":"),
+    )
+    result = TaskResult(
+        messages=[
+            HandoffMessage(
+                source="claims_specialist",
+                target="escalation_specialist",
+                content="Captain review required",
+            ),
+            ToolCallRequestEvent(
+                source="escalation_specialist",
+                content=[
+                    FunctionCall(
+                        id="call-decision",
+                        name="captain_business_decision",
+                        arguments=json.dumps(
+                            {
+                                "task_json": json.dumps(
+                                    {
+                                        "schema": "captain.business-benchmark-redacted-task.v1",
+                                        "case_id": hidden_case.case_id,
+                                        "profile_id": hidden_case.profile_id,
+                                        "redacted_input": hidden_case.redacted_input,
+                                        "allowed_tool_intents": [
+                                            item.value
+                                            for item in hidden_case.allowed_tool_intents
+                                        ],
+                                        "required_output_schema": "captain.business-benchmark-terminal.v1",
+                                    },
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                )
+                            }
+                        ),
+                    )
+                ],
+            ),
+            ToolCallExecutionEvent(
+                source="escalation_specialist",
+                content=[
+                    FunctionExecutionResult(
+                        content=terminal,
+                        name="captain_business_decision",
+                        call_id="call-decision",
+                        is_error=False,
+                    )
+                ],
+            ),
+            TextMessage(
+                source="escalation_specialist",
+                content=json.dumps(
+                    {
+                        "schema": "captain.business-benchmark-terminal.v1",
+                        "observed_decision": hidden_case.expected_decision,
+                        "observed_rationale_fact_ids": [],
+                    }
+                ),
+            ),
+        ],
+        stop_reason="task_completed",
+    )
+
+    receipt = await evaluator.evaluate(technical.holdout_ref, result, ASSERTION_IDS)
+
+    assert all(item.passed for item in receipt.decisions)
+
+
+def test_technical_evaluator_rejects_decision_output_from_modified_task(
+    tmp_path: Path,
+) -> None:
+    _, suite, technical = _private_pair(tmp_path)
+    hidden_case = next(item for item in suite.cases if item.case_id == technical.case_id)
+    expected_task = _redacted_task(hidden_case)
+    modified = json.loads(expected_task)
+    modified["redacted_input"] = dict(modified["redacted_input"])
+    modified["redacted_input"][next(iter(modified["redacted_input"]))] = "agent_modified"
+    result = TaskResult(
+        messages=[
+            ToolCallRequestEvent(
+                source="specialist",
+                content=[
+                    FunctionCall(
+                        id="tampered-call",
+                        name="captain_business_decision",
+                        arguments=json.dumps(
+                            {"task_json": json.dumps(modified, sort_keys=True)}
+                        ),
+                    )
+                ],
+            ),
+            ToolCallExecutionEvent(
+                source="specialist",
+                content=[
+                    FunctionExecutionResult(
+                        content=json.dumps(
+                            {
+                                "schema": "captain.business-benchmark-terminal.v1",
+                                "observed_decision": hidden_case.expected_decision,
+                                "observed_rationale_fact_ids": list(
+                                    hidden_case.required_rationale_fact_ids
+                                ),
+                            }
+                        ),
+                        name="captain_business_decision",
+                        call_id="tampered-call",
+                        is_error=False,
+                    )
+                ],
+            ),
+        ],
+        stop_reason="task_completed",
+    )
+
+    bound_ids = _decision_tool_call_ids(result, expected_task)
+
+    assert bound_ids == frozenset()
+    assert _terminal_output(result, bound_ids) is None
 
 
 @pytest.mark.asyncio

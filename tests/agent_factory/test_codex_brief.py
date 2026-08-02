@@ -266,6 +266,8 @@ def test_initial_business_brief_requires_specialist_handoff_before_completion() 
     assert "public_team_build_contract" in rendered
     assert "normative" in rendered
     assert "all five public acceptance categories" in rendered
+    assert "captain_business_decision" in rendered
+    assert "authoritative" in rendered
 
 
 def test_codex_brief_is_deterministic_and_keeps_context_opaque() -> None:

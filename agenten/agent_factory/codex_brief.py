@@ -296,6 +296,12 @@ class CodexBriefBuilder:
                 "its exact agent names, handoff graph, tool allocation, system prompts, limits, "
                 "terminal JSON contract, and all five public acceptance categories."
             )
+            technical_retry_contract.append(
+                "When public_team_build_contract declares captain_business_decision, preserve it "
+                "as a reserved host tool on exactly the declared terminal agents, call it once "
+                "with the complete original redacted task JSON, and treat its returned terminal "
+                "JSON as authoritative."
+            )
         if "observed_rationale_incomplete" in technical_diagnostic_codes:
             technical_retry_contract.append(
                 "Preserve every evidence-grounded rationale fact from specialist messages in "

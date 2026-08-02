@@ -32,6 +32,10 @@ from agenten.agent_factory.business_benchmark_contracts import (
     BusinessCaseCategory,
     canonical_business_benchmark_model_bytes,
 )
+from agenten.agent_factory.business_decision_tool import (
+    TOOL_NAME as BUSINESS_DECISION_TOOL,
+    bind_captain_business_decision,
+)
 from agenten.agent_factory.business_benchmark_candidate_seeds import (
     validate_public_business_benchmark_candidate,
 )
@@ -510,7 +514,11 @@ class CaptainBusinessBenchmarkHostSessionFactory:
             model_client_factory=model_client_for,
             evidence_store=self._evidence_store,
             holdouts=_RequestBoundBenchmarkHoldoutResolver(request),
-            tools={},
+            tools={
+                BUSINESS_DECISION_TOOL: bind_captain_business_decision(
+                    request.redacted_case_task
+                )
+            },
             baseline_tools={},
             clock=self._clock,
         )
@@ -563,7 +571,10 @@ class CaptainRenewalBusinessBenchmarkHostSessionFactory:
         ):
             raise ValueError("host session request is outside the resolved benchmark scope")
         allowed = request.allowed_host_tools
-        if allowed not in {(), (self._tool_reference.tool_name,)}:
+        if allowed not in {
+            (BUSINESS_DECISION_TOOL,),
+            (self._tool_reference.tool_name, BUSINESS_DECISION_TOOL),
+        }:
             raise ValueError("Renewal request contains an unauthorized host tool subset")
 
         def model_client_for(identity):
@@ -590,7 +601,7 @@ class CaptainRenewalBusinessBenchmarkHostSessionFactory:
 
         adapter = None
         baseline_n8n_tools: dict[str, OpaqueN8nToolReference] = {}
-        if allowed:
+        if self._tool_reference.tool_name in allowed:
             raw_authorization = self._n8n.authorization_port.authorization_for(
                 job=self._scope.job,
                 invocation=self._scope.runtime_invocation,
@@ -640,7 +651,11 @@ class CaptainRenewalBusinessBenchmarkHostSessionFactory:
             model_client_factory=model_client_for,
             evidence_store=self._evidence_store,
             holdouts=_RequestBoundBenchmarkHoldoutResolver(request),
-            tools={},
+            tools={
+                BUSINESS_DECISION_TOOL: bind_captain_business_decision(
+                    request.redacted_case_task
+                )
+            },
             baseline_tools={},
             baseline_n8n_tools=baseline_n8n_tools,
             n8n_adapter=adapter,
@@ -738,8 +753,14 @@ Use only rationale identifiers justified by supplied fields. Never reveal hidden
         allowed_host_tools = tuple(
             dict.fromkeys(tool for agent in manifest.agents for tool in agent.tools)
         )
-        if allowed_host_tools:
-            raise ValueError("Claims benchmark candidate must not request integration tools")
+        if (
+            allowed_host_tools != (BUSINESS_DECISION_TOOL,)
+            or scope.candidate.candidate.n8n_tools
+            or scope.candidate.candidate.host_tools != (BUSINESS_DECISION_TOOL,)
+        ):
+            raise ValueError(
+                "Claims benchmark candidate must request only the Captain decision tool"
+            )
 
         case_policy = self._policy_builder(scope)
         policies = {
@@ -791,7 +812,7 @@ Use only rationale identifiers justified by supplied fields. Never reveal hidden
             benchmark_policies=policies,
             baseline_policy=baseline,
             baseline_system_policy_version="single-agent-baseline-v1",
-            allowed_host_tools=(),
+            allowed_host_tools=allowed_host_tools,
             tool_intents={},
         )
         state = BusinessBenchmarkProviderStateStore(
@@ -930,9 +951,11 @@ Use only rationale identifiers justified by supplied fields. Never reveal hidden
         candidate_tools = scope.candidate.candidate.n8n_tools
         candidate_workflows = scope.candidate.candidate.workflow_artifacts
         if (
-            allowed_host_tools != ("renewal_context_read",)
+            allowed_host_tools
+            != ("renewal_context_read", BUSINESS_DECISION_TOOL)
             or len(candidate_tools) != 1
-            or candidate_tools[0].name != allowed_host_tools[0]
+            or candidate_tools[0].name != "renewal_context_read"
+            or scope.candidate.candidate.host_tools != (BUSINESS_DECISION_TOOL,)
             or len(candidate_workflows) != 1
             or candidate_workflows[0].reference != self._n8n.workflow_ref
         ):
@@ -988,7 +1011,7 @@ Use only rationale identifiers justified by supplied fields. Never reveal hidden
             system_prompt_ref=baseline_ref,
             execution_policy_sha256=factory_execution_policy_sha256(scope.job),
             model=self._model,
-            allowed_tools=allowed_host_tools,
+            allowed_tools=(candidate_tools[0].name,),
             max_messages=manifest.max_messages,
             max_tool_calls=manifest.max_tool_calls,
         )
@@ -1008,7 +1031,7 @@ Use only rationale identifiers justified by supplied fields. Never reveal hidden
             baseline_policy=baseline,
             baseline_system_policy_version="single-agent-baseline-v1",
             allowed_host_tools=allowed_host_tools,
-            tool_intents={allowed_host_tools[0]: IntegrationIntent.N8N},
+            tool_intents={candidate_tools[0].name: IntegrationIntent.N8N},
         )
         state = BusinessBenchmarkProviderStateStore(authorities.provider_state_root)
         session_factory = CaptainRenewalBusinessBenchmarkHostSessionFactory(
@@ -1042,7 +1065,7 @@ Use only rationale identifiers justified by supplied fields. Never reveal hidden
         return BusinessBenchmarkLiveAdapter(
             runtime_bundle=runtime,
             fence_store=fence,
-            trusted_tool_intents={allowed_host_tools[0]: IntegrationIntent.N8N},
+            trusted_tool_intents={candidate_tools[0].name: IntegrationIntent.N8N},
             monotonic_clock=time.monotonic,
             clock=self._clock,
         )

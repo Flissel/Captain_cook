@@ -207,7 +207,9 @@ def test_gateway_technical_ports_bind_candidate_private_holdout_and_no_tools(
     assert selected == team.technical_holdout.holdout_ref
     assert resolved.reference == selected
     assert ports.allowed_tools_for is not None
-    assert ports.allowed_tools_for(selected, candidate) == ()
+    assert ports.allowed_tools_for(selected, candidate) == (
+        "captain_business_decision",
+    )
     with pytest.raises(ValueError, match="not available"):
         ports.n8n_adapter.authorization("renewal_context_read")
 

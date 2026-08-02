@@ -197,6 +197,42 @@ def test_evaluator_requires_explicit_autogen_transfer_tool_in_handoff_prompt(
         FactoryCandidateEvaluator._verify_system_prompts(manifest, tmp_path)
 
 
+def test_evaluator_requires_each_declared_host_tool_in_its_agent_prompt(
+    tmp_path: Path,
+) -> None:
+    prompt = b"Produce the final decision without naming the registered tool."
+    (tmp_path / "decision.txt").write_bytes(prompt)
+    manifest = FactoryAutoGenTeamManifestV1.model_validate(
+        {
+            "schema": "autogen-team.v1",
+            "name": "claims_team",
+            "conversation_pattern": "single_agent",
+            "agents": [
+                {
+                    "name": "coverage_specialist",
+                    "tools": ["captain_business_decision"],
+                    "system_prompt_ref": _ref(
+                        "artifact://factory/prompts/decision",
+                        prompt,
+                        "text/plain",
+                    ),
+                    "handoffs": [],
+                }
+            ],
+            "memory_policy": "buffered",
+            "max_messages": 10,
+            "max_handoffs": 0,
+            "max_tool_calls": 1,
+            "termination_conditions": ["task_completed", "max_messages"],
+            "entrypoint_command": ["python", "run_team.py"],
+        },
+        context={"allowed_tools": {"captain_business_decision"}},
+    )
+
+    with pytest.raises(ValueError, match="captain_business_decision"):
+        FactoryCandidateEvaluator._verify_system_prompts(manifest, tmp_path)
+
+
 @pytest.mark.parametrize(
     ("agents", "message"),
     [
@@ -324,6 +360,19 @@ def test_candidate_manifest_allows_exactly_empty_n8n_artifacts_for_tool_free_tea
     assert manifest.tool_schema_artifacts == ()
     assert manifest.n8n_tools == ()
     assert manifest.n8n_tool_references == ()
+
+
+def test_candidate_manifest_allows_only_reserved_host_decision_tool() -> None:
+    payload = _candidate_manifest_payload()
+    payload["host_tools"] = ("captain_business_decision",)
+
+    manifest = FactoryCandidateManifest.model_validate(payload)
+
+    assert manifest.host_tools == ("captain_business_decision",)
+
+    payload["host_tools"] = ("untrusted_host_tool",)
+    with pytest.raises(ValueError, match="host tool"):
+        FactoryCandidateManifest.model_validate(payload)
 
 
 @pytest.mark.parametrize(

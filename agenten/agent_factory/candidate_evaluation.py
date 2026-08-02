@@ -47,6 +47,7 @@ from agenten.agent_factory.forge_contracts import (
 )
 from agenten.agent_factory.leases import validate_factory_lease
 from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference, TypedN8nTool
+from agenten.agent_factory.business_decision_tool import TOOL_NAME as BUSINESS_DECISION_TOOL
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
 from agenten.agent_factory.skill_evaluation import (
     HermesSkillEvaluationRequest,
@@ -217,9 +218,17 @@ class FactoryCandidateManifest(_FrozenModel):
     tool_schema_artifacts: tuple[FactoryCandidateArtifact, ...] = ()
     n8n_tools: tuple[TypedN8nTool, ...] = ()
     n8n_tool_references: tuple[OpaqueN8nToolReference, ...] = ()
+    host_tools: tuple[str, ...] = ()
     build_command: tuple[str, ...] = Field(min_length=1)
     real_case_command: tuple[str, ...] = Field(min_length=1)
     timeout_seconds: int = Field(ge=1, le=300)
+
+    @field_validator("host_tools")
+    @classmethod
+    def require_reserved_host_tools(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)) or set(value) - {BUSINESS_DECISION_TOOL}:
+            raise ValueError("candidate host tool is not Captain-reserved")
+        return value
 
     @field_validator("build_command", "real_case_command")
     @classmethod
@@ -302,7 +311,10 @@ class FactoryCandidateEvaluator:
             raise ValueError("candidate evaluation requires positive remaining lease time")
         deadline = time.monotonic() + max_seconds
         manifest = candidate.candidate
-        tool_names = tuple(tool.name for tool in manifest.n8n_tools)
+        tool_names = (
+            *(tool.name for tool in manifest.n8n_tools),
+            *manifest.host_tools,
+        )
         checks: list[FactoryEvaluationCheck] = []
         topology: FactoryAutoGenTeamManifestV1 | None = None
         try:
@@ -472,7 +484,10 @@ class FactoryCandidateEvaluator:
         if max_seconds is not None and max_seconds <= 0:
             raise ValueError("candidate evaluation requires positive remaining lease time")
         deadline = None if max_seconds is None else time.monotonic() + max_seconds
-        tool_names = tuple(tool.name for tool in candidate.n8n_tools)
+        tool_names = (
+            *(tool.name for tool in candidate.n8n_tools),
+            *candidate.host_tools,
+        )
         checks: list[FactoryEvaluationCheck] = []
         try:
             self._verify_source_archive(candidate.source_archive_ref, source_archive)
@@ -623,7 +638,12 @@ class FactoryCandidateEvaluator:
             raise ValueError("team manifest must be valid UTF-8 JSON") from exc
         return FactoryAutoGenTeamManifestV1.model_validate(
             payload,
-            context={"allowed_tools": {tool.name for tool in candidate.n8n_tools}},
+            context={
+                "allowed_tools": {
+                    *(tool.name for tool in candidate.n8n_tools),
+                    *candidate.host_tools,
+                }
+            },
         )
 
     @staticmethod
@@ -649,6 +669,11 @@ class FactoryCandidateEvaluator:
                 )
             except UnicodeDecodeError as exc:
                 raise ValueError("system prompt must be valid UTF-8") from exc
+            for tool_name in agent.tools:
+                if tool_name == BUSINESS_DECISION_TOOL and tool_name not in prompt:
+                    raise ValueError(
+                        f"system prompt must explicitly name declared tool {tool_name}"
+                    )
             for target in agent.handoffs:
                 transfer_tool = f"transfer_to_{target}"
                 if transfer_tool not in prompt:
