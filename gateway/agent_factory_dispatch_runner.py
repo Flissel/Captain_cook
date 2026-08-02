@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Protocol
 from uuid import UUID
 
@@ -29,6 +29,8 @@ _ACTION_ROLES: dict[FactoryActionKind, FactoryRole] = {
     FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION: FactoryRole.REAL_CASE_TESTER,
     FactoryActionKind.DISPATCH_QUALITY_WARDEN: FactoryRole.QUALITY_WARDEN,
 }
+
+_QUALITY_WARDEN_MINIMUM_REMAINING = timedelta(minutes=10)
 
 
 class GatewayFactoryLeaseStorePort(Protocol):
@@ -266,6 +268,12 @@ class GatewayNextActionLeaseIssuer:
                 workspace_matches
                 and candidate.integration_intent is integration_intent
             ):
+                if (
+                    role is FactoryRole.QUALITY_WARDEN
+                    and candidate.expires_at - now
+                    < _QUALITY_WARDEN_MINIMUM_REMAINING
+                ):
+                    continue
                 matches.append(candidate)
         if not matches:
             return None

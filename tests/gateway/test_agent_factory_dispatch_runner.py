@@ -363,6 +363,38 @@ def test_expired_action_lease_is_renewed_with_a_unique_lease_id() -> None:
     assert store.recorded == [renewed]
 
 
+def test_quality_warden_lease_is_renewed_before_long_benchmark_dispatch() -> None:
+    job = workflow_job(mode="demo")
+    action = _action(FactoryActionKind.DISPATCH_QUALITY_WARDEN)
+    workspace_prefix = (
+        f"workspace://business-benchmark-demo/{job.job_id}/"
+        "dispatch_quality_warden/1/"
+    )
+    near_expiry = issue_factory_lease(
+        job=job,
+        role=FactoryRole.QUALITY_WARDEN,
+        attempt=1,
+        workspace_ref=workspace_prefix + "existing",
+        now=NOW - timedelta(minutes=6),
+    )
+    store = RecordingGatewayStore(job, leases=(near_expiry,))
+
+    renewed = GatewayNextActionLeaseIssuer(
+        store=store,
+        workspace_namespace="business-benchmark-demo",
+    ).ensure_for(
+        job,
+        action,
+        FactoryRole.QUALITY_WARDEN,
+        NOW,
+    )
+
+    assert renewed.lease_id != near_expiry.lease_id
+    assert renewed.issued_at == NOW
+    assert renewed.expires_at - NOW == timedelta(minutes=15)
+    assert store.recorded == [renewed]
+
+
 def test_gateway_issuer_recovers_exact_expired_lease_under_successor_authority() -> None:
     job = workflow_job(mode="demo")
     action = _action(FactoryActionKind.DISPATCH_TOOL_INTEGRATOR)
