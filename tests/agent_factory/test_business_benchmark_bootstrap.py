@@ -40,7 +40,7 @@ from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillInvocationV1,
     FactorySkillStep,
 )
-from agenten.agent_runtime.contracts import ArtifactRef
+from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent
 
 from tests.agent_factory.test_business_benchmark_production_ports import live_job
 from tests.agent_factory.test_business_benchmark_production import (
@@ -577,6 +577,9 @@ def test_claims_executor_builder_creates_durable_host_runtime_without_provider_c
     executor = builder(scope, runtime_authorities)
 
     assert isinstance(executor, BusinessBenchmarkLiveAdapter)
+    assert executor._trusted_tool_intents == {
+        "captain_business_decision": IntegrationIntent.NONE
+    }
     runtime_scope = executor._runtime_bundle._scopes[job.job_id]
     assert runtime_scope.team_manifest.conversation_pattern == "swarm"
     assert runtime_scope.allowed_host_tools == ("captain_business_decision",)
@@ -825,6 +828,10 @@ async def test_renewal_builder_wires_equal_request_scoped_n8n_authority(
     executor = builder(scope, runtime_authorities)
 
     assert isinstance(executor, BusinessBenchmarkLiveAdapter)
+    assert executor._trusted_tool_intents == {
+        tool_ref.tool_name: IntegrationIntent.N8N,
+        "captain_business_decision": IntegrationIntent.NONE,
+    }
     runtime_scope = executor._runtime_bundle._scopes[job.job_id]
     assert runtime_scope.allowed_host_tools == (
         tool_ref.tool_name,

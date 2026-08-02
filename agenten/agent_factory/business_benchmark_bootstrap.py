@@ -851,7 +851,9 @@ Use only rationale identifiers justified by supplied fields. Never reveal hidden
         return BusinessBenchmarkLiveAdapter(
             runtime_bundle=runtime,
             fence_store=fence,
-            trusted_tool_intents={},
+            trusted_tool_intents={
+                BUSINESS_DECISION_TOOL: IntegrationIntent.NONE,
+            },
             monotonic_clock=time.monotonic,
             clock=self._clock,
         )
@@ -1069,7 +1071,10 @@ Use only rationale identifiers justified by supplied fields. Never reveal hidden
         return BusinessBenchmarkLiveAdapter(
             runtime_bundle=runtime,
             fence_store=fence,
-            trusted_tool_intents={candidate_tools[0].name: IntegrationIntent.N8N},
+            trusted_tool_intents={
+                candidate_tools[0].name: IntegrationIntent.N8N,
+                BUSINESS_DECISION_TOOL: IntegrationIntent.NONE,
+            },
             monotonic_clock=time.monotonic,
             clock=self._clock,
         )
