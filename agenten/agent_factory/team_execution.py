@@ -23,6 +23,7 @@ from autogen_agentchat.messages import (
     BaseChatMessage,
     HandoffMessage,
     StopMessage,
+    TextMessage,
     ToolCallExecutionEvent,
 )
 from autogen_agentchat.teams import RoundRobinGroupChat, SelectorGroupChat, Swarm
@@ -969,7 +970,7 @@ class _FactoryTaskCompletedTermination(TerminationCondition):
             item.target for item in messages if isinstance(item, HandoffMessage)
         )
         for message in messages:
-            if isinstance(message, HandoffMessage):
+            if not isinstance(message, TextMessage):
                 continue
             if self._require_handoff and message.source not in self._handoff_targets:
                 continue

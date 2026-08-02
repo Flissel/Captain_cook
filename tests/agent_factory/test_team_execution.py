@@ -326,6 +326,34 @@ async def test_task_completed_requires_observed_handoff_when_topology_has_handof
     assert stop.content == "task_completed"
 
 
+@pytest.mark.asyncio
+async def test_task_completed_ignores_terminal_marker_inside_tool_result() -> None:
+    termination = _FactoryTaskCompletedTermination(require_handoff=False)
+    tool_result = ToolCallExecutionEvent(
+        source="specialist",
+        content=[
+            FunctionExecutionResult(
+                content='{"schema":"captain.business-benchmark-terminal.v1"}',
+                name="captain_business_decision",
+                call_id="call-terminal-decision",
+            )
+        ],
+    )
+
+    assert await termination([tool_result]) is None
+    stop = await termination(
+        [
+            TextMessage(
+                source="specialist",
+                content='{"schema":"captain.business-benchmark-terminal.v1"}',
+            )
+        ]
+    )
+
+    assert stop is not None
+    assert stop.content == "task_completed"
+
+
 def test_message_ceiling_ignores_internal_agent_events() -> None:
     tool_events = [
         ToolCallExecutionEvent(
