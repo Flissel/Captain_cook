@@ -24,12 +24,12 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "[ValidateSet('Plan', 'Authorize', 'Build', 'Run')]" in source
     assert "--maximum-usd-per-team', $maximumUsdPerTeam" in source
     assert "$maximumUsdPerTeam = '0.32'" in source
-    assert "$maximumHermesUsd = '1.10'" in source
-    assert "$maximumIncrementalHermesUsd = '1.10'" in source
+    assert "$maximumHermesUsd = '1.50'" in source
+    assert "$maximumIncrementalHermesUsd = '1.50'" in source
     assert "$unresolvedHermesEffectReserveUsd = '0.25'" in source
     assert "$maximumTotalUsdPerTeam = '4.80'" in source
-    assert "$priorActualUsdClaims = '1.159682'" in source
-    assert "$priorActualUsdRenewal = '1.236382'" in source
+    assert "$priorActualUsdClaims = '1.448531'" in source
+    assert "$priorActualUsdRenewal = '1.525231'" in source
     assert "$userMaximumEurPerTeam = '6.00'" in source
     assert "$budgetEurPerUsd = '1.25'" in source
     assert "[ValidateSet('ClaimsFirst', 'RenewalFirst')]" in source
@@ -47,8 +47,8 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "'--hermes-provider', 'openai-api'" in source
     assert "'--hermes-model', 'gpt-5.6-terra'" in source
     assert "'--hermes-reasoning-effort', 'high'" in source
-    assert "$seedVersion = 'business-benchmark-demo-2026-08-v33'" in source
-    assert "'--suite-version', '33'" in source
+    assert "$seedVersion = 'business-benchmark-demo-2026-08-v34'" in source
+    assert "'--suite-version', '34'" in source
     assert "New-DryRunPlan" in source
     assert "provider_calls = $false" in source
     assert "gateway_mutation = $false" in source
@@ -500,8 +500,8 @@ print(json.dumps({
         "mode": "dry_run",
         "database": "captain_test",
         "issued_at": plan["issued_at"],
-            "suite_version": 33,
-        "seed_version_id": "business-benchmark-demo-2026-08-v33",
+            "suite_version": 34,
+        "seed_version_id": "business-benchmark-demo-2026-08-v34",
         "maximum_usd_per_team": "0.32",
         "jobs": [
             {"profile": "claims", "job_id": "71000000-0000-0000-0000-000000000001"},
@@ -518,7 +518,7 @@ print(json.dumps({
     assert plan["issued_at"].endswith("Z")
     plan_arguments = json.loads((repository / "provision-args.json").read_text("utf-8"))
     assert "--apply" not in plan_arguments
-    assert plan_arguments[plan_arguments.index("--suite-version") + 1] == "33"
+    assert plan_arguments[plan_arguments.index("--suite-version") + 1] == "34"
     assert not (repository / "service-called").exists()
     assert not (repository / "preflight-called").exists()
     assert not (repository / "provider-called").exists()
@@ -579,7 +579,7 @@ print(json.dumps({
     arguments = json.loads((repository / "provision-args.json").read_text("utf-8"))
     assert "--apply" in arguments
     assert arguments[arguments.index("--maximum-usd-per-team") + 1] == "0.32"
-    assert arguments[arguments.index("--suite-version") + 1] == "33"
+    assert arguments[arguments.index("--suite-version") + 1] == "34"
     issued_at = arguments[arguments.index("--issued-at") + 1]
     assert issued_at.endswith("Z")
     combined = completed.stdout + completed.stderr
@@ -994,7 +994,7 @@ print(json.dumps({
     factory_arguments = json.loads(
         (repository / "factory-args.json").read_text("utf-8")
     )
-    assert factory_arguments[factory_arguments.index("--hermes-max-usd") + 1] == "1.10"
+    assert factory_arguments[factory_arguments.index("--hermes-max-usd") + 1] == "1.50"
     assert factory_arguments[
         factory_arguments.index("--hermes-python-executable") + 1
     ] == sys.executable
@@ -1084,8 +1084,8 @@ print(json.dumps({
     'mode': 'dry_run',
     'database': 'captain_test',
     'teams': [
-        {'profile': 'claims', 'job': {'job_id': '71000000-0000-0000-0000-000000000001', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.32'}}, 'suite': {'suite_version': 33}, 'candidate_id': 'claims-candidate'},
-        {'profile': 'renewal', 'job': {'job_id': '71000000-0000-0000-0000-000000000002', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.32'}}, 'suite': {'suite_version': 33}, 'candidate_id': 'renewal-candidate'},
+        {'profile': 'claims', 'job': {'job_id': '71000000-0000-0000-0000-000000000001', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.32'}}, 'suite': {'suite_version': 34}, 'candidate_id': 'claims-candidate'},
+        {'profile': 'renewal', 'job': {'job_id': '71000000-0000-0000-0000-000000000002', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.32'}}, 'suite': {'suite_version': 34}, 'candidate_id': 'renewal-candidate'},
     ],
 }))
 """.strip(),

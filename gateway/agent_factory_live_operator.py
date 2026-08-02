@@ -226,7 +226,7 @@ def validate_factory_total_cost_envelope(
         or total_maximum_usd > Decimal("4.80")
         or total_maximum_usd * budget_eur_per_usd > user_maximum_eur
         or codex_metered_usd != 0
-        or hermes_incremental_usd != Decimal("1.10")
+        or hermes_incremental_usd != Decimal("1.50")
         or unresolved_hermes_effect_reserve_usd != Decimal("0.25")
         or len(benchmark_maximum_usd_per_team) != 2
         or any(
@@ -286,7 +286,7 @@ class FactoryLiveOperatorSettings:
             )
             or not self.hermes_maximum_total_cost_usd.is_finite()
             or self.hermes_maximum_total_cost_usd <= 0
-            or self.hermes_maximum_total_cost_usd > Decimal("1.10")
+            or self.hermes_maximum_total_cost_usd > Decimal("1.50")
         ):
             raise ValueError("Factory Hermes pin or cost allocation is invalid")
         if self.maximum_dispatches < 1 or self.maximum_dispatches > 24:

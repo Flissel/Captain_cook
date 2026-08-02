@@ -220,7 +220,7 @@ def test_operator_settings_enforce_isolated_database_two_jobs_and_cost_allocatio
         hermes_provider="openai-api",
         hermes_model="gpt-5.6-terra",
         hermes_reasoning_effort="high",
-        hermes_maximum_total_cost_usd=Decimal("1.10"),
+        hermes_maximum_total_cost_usd=Decimal("1.50"),
         stop_before_quality_warden=True,
     )
 
@@ -237,7 +237,7 @@ def test_operator_settings_enforce_isolated_database_two_jobs_and_cost_allocatio
             hermes_provider="openai-api",
             hermes_model="gpt-5.6-terra",
             hermes_reasoning_effort="high",
-            hermes_maximum_total_cost_usd=Decimal("1.11"),
+            hermes_maximum_total_cost_usd=Decimal("1.51"),
         )
     with pytest.raises(ValueError, match="distinct jobs"):
         FactoryLiveOperatorSettings(
@@ -281,10 +281,10 @@ def test_total_cost_envelope_requires_subscription_codex_and_keeps_each_team_bel
         "CAPTAIN_FACTORY_BUDGET_EUR_PER_USD": "1.25",
         "CAPTAIN_FACTORY_MAX_TOTAL_COST_USD_PER_TEAM": "4.80",
         "CAPTAIN_FACTORY_CODEX_METERED_USD_PER_TEAM": "0",
-        "CAPTAIN_FACTORY_HERMES_INCREMENTAL_MAX_USD": "1.10",
+        "CAPTAIN_FACTORY_HERMES_INCREMENTAL_MAX_USD": "1.50",
         "CAPTAIN_FACTORY_HERMES_UNRESOLVED_EFFECT_RESERVE_USD": "0.25",
-        "CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_CLAIMS": "0.384892",
-        "CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_RENEWAL": "0.461592",
+        "CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_CLAIMS": "1.448531",
+        "CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_RENEWAL": "1.525231",
     }
 
     validate_factory_total_cost_envelope(

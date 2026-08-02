@@ -129,20 +129,20 @@ $serviceRunner = Join-Path $PSScriptRoot 'live-demo-services.ps1'
 $benchmarkRuntimeEnvPath = Join-Path $repositoryRoot '.captain-cook/private/business-benchmarks/business-benchmark-runtime.env'
 $canonicalRenewalWorkflow = Join-Path $repositoryRoot 'examples/business_benchmark_candidates/customer_renewal_orchestration_team/workflows/renewal_context_read.json'
 $maximumUsdPerTeam = '0.32'
-$maximumHermesUsd = '1.10'
+$maximumHermesUsd = '1.50'
 # Hermes uses the pinned OpenAI cloud route. The incremental reserve and the
 # benchmark reserve both remain inside the user-owned per-team total envelope.
-$maximumIncrementalHermesUsd = '1.10'
+$maximumIncrementalHermesUsd = '1.50'
 $unresolvedHermesEffectReserveUsd = '0.25'
 $maximumTotalUsdPerTeam = '4.80'
 # Carry the immutable team evidence forward and charge the complete shared
-# Hermes effect ledger through V32 to each team, rounded upward to micro-USD.
+# Hermes effect ledger through V33 to each team, rounded upward to micro-USD.
 # This double-counts shared effects across teams and therefore stays conservative.
-$priorActualUsdClaims = '1.159682'
-$priorActualUsdRenewal = '1.236382'
+$priorActualUsdClaims = '1.448531'
+$priorActualUsdRenewal = '1.525231'
 $userMaximumEurPerTeam = '6.00'
 $budgetEurPerUsd = '1.25'
-$seedVersion = 'business-benchmark-demo-2026-08-v33'
+$seedVersion = 'business-benchmark-demo-2026-08-v34'
 
 $rootEnvAllowlist = @(
     'CAPTAIN_GATEWAY_TOKEN',
@@ -395,7 +395,7 @@ function New-DryRunPlan {
         mode = 'dry_run'
         database = 'captain_test'
         issued_at = $IssuedAt
-        suite_version = 33
+        suite_version = 34
         seed_version_id = $seedVersion
         maximum_usd_per_team = $maximumUsdPerTeam
         jobs = @(
@@ -686,7 +686,7 @@ try {
             '--issued-at', $issuedAt,
             '--model', 'gpt-4.1-mini',
             '--maximum-usd-per-team', $maximumUsdPerTeam,
-            '--suite-version', '33',
+            '--suite-version', '34',
             '--seed-version-id', $seedVersion
         )
         $rawPlanProvisioning = @(& $python @planArguments)
@@ -716,7 +716,7 @@ try {
             if (
                 [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
                 @($team.job.execution_policy.allowed_models) -notcontains 'gpt-4.1-mini' -or
-                [int]$team.suite.suite_version -ne 33
+                [int]$team.suite.suite_version -ne 34
             ) {
                 throw 'Dry-run team model or budget does not match the demo authority.'
             }
@@ -842,7 +842,7 @@ try {
         '--issued-at', $issuedAt,
         '--model', $model,
         '--maximum-usd-per-team', $maximumUsdPerTeam,
-        '--suite-version', '33',
+        '--suite-version', '34',
         '--seed-version-id', $seedVersion
     )
     if ($Action -in @('AUTHORIZE', 'BUILD', 'RUN')) {
@@ -886,7 +886,7 @@ try {
         if (
             [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
             @($team.job.execution_policy.allowed_models) -notcontains $model -or
-            [int]$team.suite.suite_version -ne 33
+            [int]$team.suite.suite_version -ne 34
         ) {
             throw 'Provisioned team model or budget does not match the demo authority.'
         }
