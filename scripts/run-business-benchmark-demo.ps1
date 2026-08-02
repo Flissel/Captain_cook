@@ -129,10 +129,10 @@ $serviceRunner = Join-Path $PSScriptRoot 'live-demo-services.ps1'
 $benchmarkRuntimeEnvPath = Join-Path $repositoryRoot '.captain-cook/private/business-benchmarks/business-benchmark-runtime.env'
 $canonicalRenewalWorkflow = Join-Path $repositoryRoot 'examples/business_benchmark_candidates/customer_renewal_orchestration_team/workflows/renewal_context_read.json'
 $maximumUsdPerTeam = '0.32'
-$maximumHermesUsd = '1.00'
+$maximumHermesUsd = '1.10'
 # Hermes uses the pinned OpenAI cloud route. The incremental reserve and the
 # benchmark reserve both remain inside the user-owned per-team total envelope.
-$maximumIncrementalHermesUsd = '1.00'
+$maximumIncrementalHermesUsd = '1.10'
 $unresolvedHermesEffectReserveUsd = '0.25'
 $maximumTotalUsdPerTeam = '4.80'
 # Carry the immutable team evidence forward and charge the complete shared

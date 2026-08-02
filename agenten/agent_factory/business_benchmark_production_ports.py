@@ -251,6 +251,7 @@ def _build_openai_client(*, api_key: str, model: str) -> ChatCompletionClient:
         api_key=api_key,
         model=model,
         max_retries=0,
+        temperature=0,
     )
 
 

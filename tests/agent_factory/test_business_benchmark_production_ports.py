@@ -299,6 +299,7 @@ def test_openai_client_does_not_apply_tool_only_arguments_globally(
         "api_key": "test-secret",
         "model": "approved-model-id",
         "max_retries": 0,
+        "temperature": 0,
     }
 
 
