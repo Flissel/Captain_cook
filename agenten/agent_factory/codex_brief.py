@@ -296,6 +296,20 @@ class CodexBriefBuilder:
                 "its exact agent names, handoff graph, tool allocation, system prompts, limits, "
                 "terminal JSON contract, and all five public acceptance categories."
             )
+        if "observed_rationale_incomplete" in technical_diagnostic_codes:
+            technical_retry_contract.append(
+                "Preserve every evidence-grounded rationale fact from specialist messages in "
+                "the terminal rationale_fact_ids output; do not omit facts used for the decision."
+            )
+        if "observed_decision_mismatch" in technical_diagnostic_codes:
+            technical_retry_contract.append(
+                "Reconcile specialist evidence before emitting the terminal decision; the decision "
+                "must follow the candidate's documented deterministic business rules."
+            )
+        if "terminal_missing_or_invalid" in technical_diagnostic_codes:
+            technical_retry_contract.append(
+                "Always emit the exact structured terminal output contract after collaboration."
+            )
         document = {
             "Goal": (
                 "Implement the dependency-ready node described by "

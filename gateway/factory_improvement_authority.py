@@ -29,6 +29,7 @@ from agenten.agent_factory.skill_workflow_contracts import (
     FactoryFeedbackRecommendation,
     TeamExecutionEvidenceV1,
 )
+from agenten.agent_factory.team_execution import FactoryHoldoutEvaluationReceiptV1
 from agenten.agent_factory.service import FactoryCoordinator
 from agenten.agent_factory.state_machine import (
     FactoryAction,
@@ -133,6 +134,7 @@ class CaptainTechnicalFailureEvaluator:
         source_block: FactoryEvidenceBlock,
         candidate_ref: ArtifactRef,
         execution: TeamExecutionEvidenceV1,
+        holdout_receipt: FactoryHoldoutEvaluationReceiptV1 | None = None,
         occurred_at: datetime,
     ) -> CaptainTechnicalFailureEvaluationV1:
         if source_block.phase not in {
@@ -181,6 +183,31 @@ class CaptainTechnicalFailureEvaluator:
                 for outcome in outcomes
             )
         )
+        if holdout_receipt is not None:
+            if (
+                holdout_receipt.holdout_ref != execution.holdout_ref
+                or holdout_receipt.candidate_ref != candidate_ref
+                or holdout_receipt.assertion_ids != job.acceptance_assertion_ids
+                or tuple(item.assertion_id for item in holdout_receipt.decisions)
+                != job.acceptance_assertion_ids
+                or tuple(item.passed for item in holdout_receipt.decisions)
+                != tuple(item.status == "passed" for item in outcomes)
+            ):
+                raise ValueError("technical holdout receipt does not match execution")
+            public_provenance_codes = tuple(
+                item.provenance_code
+                for item in holdout_receipt.decisions
+                if not item.passed
+                and item.provenance_code
+                in {
+                    "observed_decision_mismatch",
+                    "observed_rationale_incomplete",
+                    "terminal_missing_or_invalid",
+                }
+            )
+            diagnostic_codes = tuple(
+                dict.fromkeys((*diagnostic_codes[:1], *public_provenance_codes, *diagnostic_codes[1:]))
+            )
         return build_captain_technical_failure_evaluation(
             job_id=job.job_id,
             correlation_id=job.correlation_id,
@@ -456,11 +483,23 @@ class CaptainTechnicalImprovementIssuer:
         )
         if len(executions) != 1:
             raise ValueError("technical execution evidence is ambiguous")
+        receipts: list[FactoryHoldoutEvaluationReceiptV1] = []
+        for reference in executions[0].evidence_refs:
+            try:
+                receipt = FactoryHoldoutEvaluationReceiptV1.model_validate_json(
+                    self._evidence.read_verified(reference, job_id=job.job_id)
+                )
+            except (OSError, ValueError):
+                continue
+            receipts.append(receipt)
+        if len(receipts) > 1:
+            raise ValueError("technical holdout receipt is ambiguous")
         return self._evaluator.from_team_execution(
             job=job,
             source_block=source_block,
             candidate_ref=candidate_ref,
             execution=executions[0],
+            holdout_receipt=receipts[0] if receipts else None,
             occurred_at=occurred_at,
         )
 

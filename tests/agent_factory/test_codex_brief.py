@@ -433,7 +433,11 @@ def test_build_failure_retry_brief_requires_candidate_tests_before_packaging() -
 
 def test_behavioral_retry_brief_requires_specialist_handoff_before_completion() -> None:
     authorization = technical_retry_authorization(
-        ("business_value_failed", "mandatory_handoff_failed")
+        (
+            "business_value_failed",
+            "observed_rationale_incomplete",
+            "mandatory_handoff_failed",
+        )
     )
     invocation_data = invocation_payload(
         "brief_codex",
@@ -462,4 +466,6 @@ def test_behavioral_retry_brief_requires_specialist_handoff_before_completion() 
     assert "meaningful configured agent handoff" in rendered
     assert "before terminal completion" in rendered
     assert "evidence-grounded business decision" in rendered
+    assert "Preserve every evidence-grounded rationale fact" in rendered
+    assert "terminal rationale_fact_ids" in rendered
     assert "receives no stdin" in rendered

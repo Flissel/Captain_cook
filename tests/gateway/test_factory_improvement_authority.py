@@ -20,6 +20,10 @@ from agenten.agent_factory.skill_sequence import (
 from agenten.agent_factory.service import FactoryCoordinator, InMemoryFactoryRepository
 from agenten.agent_factory.skill_workflow_contracts import TeamExecutionEvidenceV1
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
+from agenten.agent_factory.team_execution import (
+    FactoryHoldoutAssertionDecisionV1,
+    FactoryHoldoutEvaluationReceiptV1,
+)
 from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.factory_improvement_authority import (
     CaptainFactoryImprovementAuthorizationStore,
@@ -289,6 +293,32 @@ def test_captain_classifies_public_business_and_handoff_failures() -> None:
     ]
     execution_outcome["status"] = "failed"
     execution = TeamExecutionEvidenceV1.model_validate(payload)
+    holdout_receipt = FactoryHoldoutEvaluationReceiptV1(
+        schema="captain.factory-holdout-evaluation-receipt.v1",
+        holdout_ref=execution.holdout_ref,
+        candidate_ref=execution.candidate_ref,
+        assertion_ids=job.acceptance_assertion_ids,
+        decisions=(
+            FactoryHoldoutAssertionDecisionV1(
+                assertion_id="business_value",
+                passed=False,
+                provenance_code="observed_rationale_incomplete",
+            ),
+            FactoryHoldoutAssertionDecisionV1(
+                assertion_id="safe_tool_use",
+                passed=True,
+                provenance_code="captain_private_rule_pass",
+            ),
+            FactoryHoldoutAssertionDecisionV1(
+                assertion_id="mandatory_handoff",
+                passed=False,
+                provenance_code="terminal_missing_or_invalid",
+            ),
+        ),
+        evaluator_id="captain_technical_business_holdout",
+        evaluator_version="1",
+        evaluated_at=NOW,
+    )
     source = _source_block(
         FactoryPhase.REAL_CASE_EVIDENCE,
         execution.artifact_ref,
@@ -299,11 +329,14 @@ def test_captain_classifies_public_business_and_handoff_failures() -> None:
         source_block=source,
         candidate_ref=execution.candidate_ref,
         execution=execution,
+        holdout_receipt=holdout_receipt,
         occurred_at=NOW,
     )
 
     assert evaluation.technical_diagnostic_codes == (
         "business_value_failed",
+        "observed_rationale_incomplete",
+        "terminal_missing_or_invalid",
         "mandatory_handoff_failed",
     )
 
