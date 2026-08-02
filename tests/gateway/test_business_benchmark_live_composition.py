@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -133,6 +133,43 @@ class RecordingRuntimeStore:
         return RuntimeWriteReceipt(operation_id=grant.command_id, replayed=replayed)
 
 
+class RenewingRuntimeStore:
+    def __init__(self, batch: WorkBatch) -> None:
+        self.batch = batch
+        self.commands: dict[UUID, object] = {}
+        self.grants: dict[UUID, object] = {}
+
+    def bundle(self, batch_id: str) -> dict[str, object]:
+        assert batch_id == self.batch.batch_id
+        return self.batch.model_dump(mode="json")
+
+    def runtime_operation(self, operation_id: UUID) -> RuntimeOperationProjection:
+        command = self.commands.get(operation_id)
+        if command is None:
+            raise HTTPException(status_code=404, detail="runtime operation not found")
+        return RuntimeOperationProjection(
+            operation_id=operation_id,
+            command=command,
+            grant=self.grants.get(operation_id),
+        )
+
+    def accept_runtime_command(self, command) -> RuntimeWriteReceipt:
+        existing = self.commands.setdefault(command.event_id, command)
+        assert existing == command
+        return RuntimeWriteReceipt(
+            operation_id=command.event_id,
+            replayed=existing is not command,
+        )
+
+    def record_capability_grant(self, grant) -> RuntimeWriteReceipt:
+        existing = self.grants.setdefault(grant.command_id, grant)
+        assert existing == grant
+        return RuntimeWriteReceipt(
+            operation_id=grant.command_id,
+            replayed=existing is not grant,
+        )
+
+
 def test_renewal_runtime_authority_requires_a_real_released_work_batch() -> None:
     store = SimpleNamespace(bundle=lambda _batch_id: (_ for _ in ()).throw(KeyError()))
 
@@ -246,7 +283,7 @@ def test_renewal_runtime_authority_persists_one_paired_command_and_issues_broker
         correlation_id=CORRELATION_ID,
         subject_version=1,
         invocation_id=INVOCATION_ID,
-        case_sha256="b" * 64,
+        case_sha256="a" * 64,
         tool=tool,
         workspace_ref="workspace://factory/renewal-benchmark",
     )
@@ -256,6 +293,76 @@ def test_renewal_runtime_authority_persists_one_paired_command_and_issues_broker
     assert claim.command_id == candidate.runtime_command.event_id
     assert claim.grant_id == candidate.capability_grant.grant_id
     assert claim.endpoint_identity == "http://127.0.0.1:5680"
+
+
+def test_renewal_runtime_authority_appends_a_successor_after_grant_expiry() -> None:
+    store = RenewingRuntimeStore(_batch())
+    current = {"now": NOW}
+    authority = GatewayRenewalN8nRuntimeAuthority.from_gateway_store(
+        store=store,
+        batch_id=store.batch.batch_id,
+        workspace_ref="workspace://factory/renewal-benchmark",
+        endpoint_identity="http://127.0.0.1:5680",
+        broker_signing_secret="test-only-signing-secret",
+        clock=lambda: current["now"],
+    )
+    job = SimpleNamespace(
+        job_id=JOB_ID,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+    )
+    invocation = SimpleNamespace(
+        invocation_id=INVOCATION_ID,
+        job_id=JOB_ID,
+        correlation_id=CORRELATION_ID,
+        subject_version=1,
+        attempt=1,
+        step=FactorySkillStep.EXECUTE_TEAM,
+    )
+    tool = OpaqueN8nToolReference(
+        schema="captain.n8n-mcp-tool-reference.v1",
+        tool_name="renewal_context_read",
+        input_schema_ref="artifact://benchmark/renewal-input",
+        output_schema_ref="artifact://benchmark/renewal-output",
+    )
+    request = SimpleNamespace(
+        identity=SimpleNamespace(
+            job_id=JOB_ID,
+            correlation_id=CORRELATION_ID,
+            subject_version=1,
+            attempt=1,
+            invocation_id=INVOCATION_ID,
+            variant="candidate",
+            case_id="holdout-333333333333",
+            case_sha256="c" * 64,
+        ),
+        case_ref=SimpleNamespace(
+            holdout_id="holdout-333333333333",
+            sha256="c" * 64,
+        ),
+        benchmark_case_sha256="d" * 64,
+        maximum_latency_ms=2500,
+    )
+
+    first = authority.authorization_for(
+        job=job,
+        invocation=invocation,
+        request=request,
+        tool_reference=tool,
+    )
+    current["now"] = first.capability_grant.expires_at + timedelta(seconds=1)
+    renewed = authority.authorization_for(
+        job=job,
+        invocation=invocation,
+        request=request,
+        tool_reference=tool,
+    )
+
+    assert renewed.runtime_command.event_id != first.runtime_command.event_id
+    assert renewed.capability_grant.command_id == renewed.runtime_command.event_id
+    assert renewed.capability_grant.issued_at == current["now"]
+    assert len(store.commands) == 2
+    assert len(store.grants) == 2
 
 
 @pytest.mark.asyncio

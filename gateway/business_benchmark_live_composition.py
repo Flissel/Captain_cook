@@ -366,12 +366,28 @@ class GatewayRenewalN8nRuntimeAuthority:
             case_sha256=request.benchmark_case_sha256,
             tool_reference=tool_reference,
         )
-        try:
-            operation = self._store.runtime_operation(command_id)
-        except HTTPException as exc:
-            if exc.status_code != 404:
-                raise ValueError("Captain Renewal runtime state is unavailable") from exc
-            operation = None
+        operation = None
+        for _ in range(16):
+            operation = self._runtime_operation_or_none(command_id)
+            if operation is None:
+                break
+            if operation.grant is None:
+                raise ValueError("Captain Renewal runtime grant is missing")
+            if operation.revocation is None and operation.grant.expires_at > now:
+                return self._authorization_from_operation(
+                    operation,
+                    job=job,
+                    invocation=invocation,
+                    request=request,
+                    tool_reference=tool_reference,
+                    now=now,
+                )
+            command_id = _renewed_runtime_command_id(
+                command_id=command_id,
+                grant_id=operation.grant.grant_id,
+            )
+        else:
+            raise ValueError("Captain Renewal runtime renewal chain is exhausted")
         if operation is None:
             tool_sha256 = _tool_reference_sha256(tool_reference)
             command = AgentRuntimeCommand(
@@ -428,21 +444,18 @@ class GatewayRenewalN8nRuntimeAuthority:
         command = operation.command
         grant = operation.grant
         tool = getattr(request, "tool")
-        expected_id = _runtime_command_id(
-            job_id=getattr(request, "job_id"),
-            invocation_id=getattr(request, "invocation_id"),
-            case_sha256=getattr(request, "case_sha256"),
-            tool_reference=tool,
-        )
         if (
             grant is None
-            or command.event_id != expected_id
             or command.event_id != command_id
+            or command.subject_id != tool.tool_name
             or command.payload.project_id != str(getattr(request, "job_id"))
+            or command.payload.subtask_id != tool.tool_name
+            or command.payload.prompt_ref.sha256 != _tool_reference_sha256(tool)
             or command.causation_id != getattr(request, "invocation_id")
             or command.correlation_id != getattr(request, "correlation_id")
             or command.subject_version != getattr(request, "subject_version")
             or command.payload.workspace_ref != getattr(request, "workspace_ref")
+            or grant.command_id != command.event_id
             or grant.grant_id != getattr(request, "grant_id")
         ):
             raise ValueError("Renewal MCP lease request is not Gateway-authorized")
@@ -745,6 +758,19 @@ def _runtime_command_id(
                 str(invocation_id),
                 case_sha256,
                 _tool_reference_sha256(tool_reference),
+            )
+        ),
+    )
+
+
+def _renewed_runtime_command_id(*, command_id: UUID, grant_id: str) -> UUID:
+    return uuid5(
+        NAMESPACE_URL,
+        "|".join(
+            (
+                "captain.business-benchmark-renewal-n8n-command-renewal.v1",
+                str(command_id),
+                grant_id,
             )
         ),
     )
