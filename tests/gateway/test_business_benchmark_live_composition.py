@@ -207,9 +207,14 @@ def test_renewal_runtime_authority_persists_one_paired_command_and_issues_broker
                 attempt=1,
                 invocation_id=INVOCATION_ID,
                 variant=variant,
+                case_id="holdout-111111111111",
                 case_sha256="a" * 64,
             ),
-            benchmark_case_sha256="a" * 64,
+            case_ref=SimpleNamespace(
+                holdout_id="holdout-111111111111",
+                sha256="a" * 64,
+            ),
+            benchmark_case_sha256="b" * 64,
             maximum_latency_ms=2500,
         )
 
@@ -241,7 +246,7 @@ def test_renewal_runtime_authority_persists_one_paired_command_and_issues_broker
         correlation_id=CORRELATION_ID,
         subject_version=1,
         invocation_id=INVOCATION_ID,
-        case_sha256="a" * 64,
+        case_sha256="b" * 64,
         tool=tool,
         workspace_ref="workspace://factory/renewal-benchmark",
     )
@@ -291,9 +296,14 @@ async def test_gateway_grant_state_drives_the_real_captain_n8n_authority() -> No
             attempt=1,
             invocation_id=INVOCATION_ID,
             variant="candidate",
+            case_id="holdout-222222222222",
             case_sha256="b" * 64,
         ),
-        benchmark_case_sha256="b" * 64,
+        case_ref=SimpleNamespace(
+            holdout_id="holdout-222222222222",
+            sha256="b" * 64,
+        ),
+        benchmark_case_sha256="c" * 64,
         maximum_latency_ms=2500,
     )
     authorization = authority.authorization_for(

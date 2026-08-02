@@ -354,7 +354,8 @@ class GatewayRenewalN8nRuntimeAuthority:
             or identity.subject_version != job.subject_version
             or identity.attempt != invocation.attempt
             or identity.invocation_id != invocation.invocation_id
-            or request.benchmark_case_sha256 != identity.case_sha256
+            or request.case_ref.holdout_id != identity.case_id
+            or request.case_ref.sha256 != identity.case_sha256
             or tool_reference.tool_name not in self._batch.subtask_ids
         ):
             raise ValueError("Renewal n8n request is outside Captain authority")
@@ -505,7 +506,8 @@ class GatewayRenewalN8nRuntimeAuthority:
             or command.payload.prompt_ref.sha256
             != _tool_reference_sha256(tool_reference)
             or grant.expires_at <= now
-            or request.benchmark_case_sha256 != request.identity.case_sha256
+            or request.case_ref.holdout_id != request.identity.case_id
+            or request.case_ref.sha256 != request.identity.case_sha256
         ):
             raise ValueError("Captain Renewal runtime operation is not canonical")
         return claim
