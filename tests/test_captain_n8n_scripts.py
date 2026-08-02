@@ -15,6 +15,13 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_broker_start_always_recreates_gateway_bound_security_proxy() -> None:
+    source = (ROOT / "scripts" / "captain-n8n.ps1").read_text(encoding="utf-8")
+
+    broker_start = source[source.index("function Invoke-BrokerStart"):]
+    assert "--force-recreate" in broker_start
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))

@@ -838,7 +838,7 @@ function Invoke-BrokerStart {
     }
     # Rebuilds only when the broker context changed; never leaves a stale
     # security proxy running after its authorization code was updated.
-    & docker compose -p captain-n8n-builder --env-file $EnvFile --profile mcp-broker -f $ComposeFile up -d --build mcp-broker
+    & docker compose -p captain-n8n-builder --env-file $EnvFile --profile mcp-broker -f $ComposeFile up -d --build --force-recreate mcp-broker
     if ($LASTEXITCODE -ne 0) {
         throw "Captain MCP broker start failed."
     }

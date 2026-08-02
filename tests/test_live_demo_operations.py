@@ -142,6 +142,12 @@ def test_business_benchmark_uses_a_dedicated_persistent_database() -> None:
     source = SERVICES.read_text(encoding="utf-8")
     compose = BENCHMARK_COMPOSE.read_text(encoding="utf-8")
 
+    benchmark_start = source[source.index("function Invoke-BenchmarkStart"):]
+    assert "Start-CaptainN8nBroker $benchmarkValues" in benchmark_start
+    assert benchmark_start.index("Start-Gateway $benchmarkValues") < benchmark_start.index(
+        "Start-CaptainN8nBroker $benchmarkValues"
+    )
+
     assert "docker-compose.benchmark.yml" in source
     assert "captain-cook-business-benchmark" in source
     assert "mariadb-benchmark" in source

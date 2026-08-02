@@ -189,6 +189,24 @@ function Initialize-CaptainN8n($Values, [switch]$Recover, [string]$SourceEnv) {
     }
     Sync-CaptainN8nEnvironment $Values
 }
+function Start-CaptainN8nBroker($Values) {
+    $n8n = Join-Path $PSScriptRoot 'captain-n8n.ps1'
+    $gatewayUri = [Uri][string]$Values['CAPTAIN_GATEWAY_URL']
+    $brokerValues = [ordered]@{}
+    foreach ($item in $Values.GetEnumerator()) { $brokerValues[$item.Key] = $item.Value }
+    $brokerValues['CAPTAIN_GATEWAY_URL'] = "http://host.docker.internal:$($gatewayUri.Port)"
+    Set-ProcessEnvironment $brokerValues
+    try {
+        & $n8n broker-start *> $null
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Captain n8n MCP broker could not bind to the selected Gateway.'
+        }
+    }
+    finally {
+        Set-ProcessEnvironment $Values
+    }
+    Write-Host '[ready] Captain n8n MCP broker bound to the selected Gateway (values redacted)'
+}
 function Stop-CaptainN8nContainers {
     $containers = @(& docker ps --filter 'label=com.docker.compose.project=captain-n8n-builder' --format '{{.ID}}')
     if ($LASTEXITCODE -ne 0) { throw 'Could not inspect Captain n8n containers.' }
@@ -327,6 +345,7 @@ function Invoke-StartServices([switch]$RecoverDemoCredentials, [string]$SourceEn
     docker compose --project-name $project --env-file $rootEnv --file $testCompose up -d --wait mariadb-test
     if ($LASTEXITCODE -ne 0) { throw 'Isolated captain_test MariaDB failed to start.' }
     Start-Gateway $values
+    Start-CaptainN8nBroker $values
     Start-Runtime $values
     docker compose --env-file $rootEnv up -d --wait mailpit
     if ($LASTEXITCODE -ne 0) { throw 'Captain Mailpit failed to start.' }
@@ -348,6 +367,7 @@ function Invoke-BenchmarkStart([switch]$RecoverDemoCredentials, [string]$SourceE
     docker compose --project-name $benchmarkProject --env-file $rootEnv --file $benchmarkCompose up -d --wait mariadb-benchmark
     if ($LASTEXITCODE -ne 0) { throw 'Dedicated persistent business benchmark MariaDB failed to start.' }
     Start-Gateway $benchmarkValues -PidPath $benchmarkGatewayPid
+    Start-CaptainN8nBroker $benchmarkValues
     $runtimeValues = [ordered]@{
         TEST_MARIADB_DSN=[string]$benchmarkValues['TEST_MARIADB_DSN']
         MARIADB_BENCHMARK_PORT=[string]$benchmarkValues['MARIADB_TEST_PORT']
