@@ -55,8 +55,10 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "minibook_mutation = $false" in source
     assert "run-agent-factory-business-demo.py" in source
     assert "issue-factory-improvement.py" in source
+    assert "--eligible-only" in source
     assert "captain.factory-improvement-issuance.v1" in source
     assert "$authorizedAttempt -ne ($failedAttempt + 1)" in source
+    assert "@($authorization.authorizations).Count -lt 1" in source
     assert "Resolve-HermesPython" in source
     assert "'--hermes-python-executable', $hermesPython" in source
     assert "factory-operator-stderr.log" in source

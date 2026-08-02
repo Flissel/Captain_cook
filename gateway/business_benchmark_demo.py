@@ -23,7 +23,7 @@ from agenten.agent_factory.contracts import (
 from agenten.agent_factory.execution_budget import FactoryBudgetProjection
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import FactorySkillStep
-from agenten.agent_factory.service import FactoryRepositoryError
+from agenten.agent_factory.service import FactoryCoordinator, FactoryRepositoryError
 from agenten.validation.contracts import WorkBatch
 from gateway.factory_repository import GatewayFactoryRepository
 from gateway.store import GatewayStore
@@ -134,6 +134,13 @@ class GatewayBusinessBenchmarkDemoAuthority:
             lambda: self._repository.workflow_budget_projection(job_id)
         )
 
+    def current_action(self, job_id: UUID):
+        """Resolve Captain's current lifecycle action without executing it."""
+
+        return self._translate(
+            lambda: FactoryCoordinator(self._repository).next_action(job_id)
+        )
+
     @staticmethod
     def _translate(operation: Callable[[], _T]) -> _T:
         try:
@@ -170,8 +177,26 @@ def resolve_current_factory_attempts(
     return resolved
 
 
+def resolve_current_factory_actions(
+    dsn: str,
+    job_ids: tuple[UUID, ...],
+) -> dict[UUID, str]:
+    """Read current Captain action kinds for an exact, unique job set."""
+
+    if not job_ids or len(job_ids) != len(set(job_ids)):
+        raise GatewayBusinessBenchmarkDemoError(
+            "benchmark action job IDs must be non-empty and unique"
+        )
+    authority = GatewayBusinessBenchmarkDemoAuthority(dsn)
+    return {
+        job_id: authority.current_action(job_id).kind.value
+        for job_id in job_ids
+    }
+
+
 __all__ = [
     "GatewayBusinessBenchmarkDemoAuthority",
     "GatewayBusinessBenchmarkDemoError",
+    "resolve_current_factory_actions",
     "resolve_current_factory_attempts",
 ]

@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from gateway.business_benchmark_demo import (
     GatewayBusinessBenchmarkDemoAuthority,
     GatewayBusinessBenchmarkDemoError,
+    resolve_current_factory_actions,
     resolve_current_factory_attempts,
 )
 from tests.scripts.test_business_benchmark_demo_provisioning import (
@@ -128,6 +129,34 @@ def test_gateway_resolves_current_attempts_for_exact_jobs(
     )
 
     assert resolve_current_factory_attempts(
+        "mariadb://captain:test@127.0.0.1:33316/captain_test",
+        tuple(expected),
+    ) == expected
+
+
+def test_gateway_resolves_current_actions_for_exact_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    teams = BusinessBenchmarkDemoProvisioner(settings(tmp_path)).plan().teams
+    expected = {
+        teams[0].job.job_id: "dispatch_quality_warden",
+        teams[1].job.job_id: "append_improvement_requested",
+    }
+
+    class Authority:
+        def __init__(self, dsn: str) -> None:
+            assert dsn == "mariadb://captain:test@127.0.0.1:33316/captain_test"
+
+        def current_action(self, job_id):
+            return SimpleNamespace(kind=SimpleNamespace(value=expected[job_id]))
+
+    monkeypatch.setattr(
+        "gateway.business_benchmark_demo.GatewayBusinessBenchmarkDemoAuthority",
+        Authority,
+    )
+
+    assert resolve_current_factory_actions(
         "mariadb://captain:test@127.0.0.1:33316/captain_test",
         tuple(expected),
     ) == expected

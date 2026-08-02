@@ -223,11 +223,13 @@ def test_captain_classifies_missing_trace_without_copying_raw_failure_text() -> 
     "source_phase",
     (FactoryPhase.REAL_CASE_EVIDENCE, FactoryPhase.REAL_CASE_REVALIDATED),
 )
+@pytest.mark.parametrize("execution_status", ("failed", "unresolved"))
 def test_captain_retains_only_passed_technical_assertions_as_regression_guards(
     source_phase: FactoryPhase,
+    execution_status: str,
 ) -> None:
     job = _job()
-    payload = execution_payload(status="unresolved")
+    payload = execution_payload(status=execution_status)
     outcomes = payload["execution_outcome"]
     assert isinstance(outcomes, dict)
     assertion_outcomes = outcomes["assertion_outcomes"]

@@ -158,7 +158,7 @@ class CaptainTechnicalFailureEvaluator:
             or execution.acceptance_assertion_ids != job.acceptance_assertion_ids
             or tuple(item.assertion_id for item in outcomes)
             != job.acceptance_assertion_ids
-            or execution.status != "unresolved"
+            or execution.status not in {"failed", "unresolved"}
             or not any(item.status == "failed" for item in outcomes)
             or execution.artifact_ref
             not in (*source_block.artifact_refs, *source_block.evidence_refs)

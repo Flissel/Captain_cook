@@ -975,7 +975,8 @@ try {
                 --authority-root ([string]$environment['CAPTAIN_BENCHMARK_AUTHORITY_ROOT']) `
                 --job-id ([string]$claims.job.job_id) `
                 --job-id ([string]$renewal.job.job_id) `
-                --issued-at $issuedAt
+                --issued-at $issuedAt `
+                --eligible-only
         )
         if ($LASTEXITCODE -ne 0) {
             throw 'Captain improvement issuance failed closed.'
@@ -994,12 +995,23 @@ try {
         $actualAuthorizationJobIds = @(
             $authorization.authorizations | ForEach-Object { [string]$_.job_id }
         ) | Sort-Object
+        $skippedAuthorizationJobIds = @(
+            $authorization.skipped_job_ids | ForEach-Object { [string]$_ }
+        ) | Sort-Object
+        $coveredAuthorizationJobIds = @(
+            $actualAuthorizationJobIds
+            $skippedAuthorizationJobIds
+        ) | Sort-Object
         if (
             $authorization.schema -cne 'captain.factory-improvement-issuance.v1' -or
             $authorization.database -cne 'captain_test' -or
             $authorization.status -cne 'authorized' -or
-            @($authorization.authorizations).Count -ne 2 -or
-            ($expectedAuthorizationJobIds -join ',') -cne ($actualAuthorizationJobIds -join ',') -or
+            @($authorization.authorizations).Count -lt 1 -or
+            @($authorization.requested_job_ids).Count -ne 2 -or
+            ($expectedAuthorizationJobIds -join ',') -cne ($coveredAuthorizationJobIds -join ',') -or
+            @($actualAuthorizationJobIds | Where-Object {
+                $skippedAuthorizationJobIds -contains $_
+            }).Count -ne 0 -or
             @($authorization.authorizations | Where-Object {
                 $failedAttempt = [int]$_.failed_attempt
                 $authorizedAttempt = [int]$_.authorized_attempt

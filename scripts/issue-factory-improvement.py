@@ -16,6 +16,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from gateway.factory_improvement_operator import (
     issue_captain_technical_improvements,
 )
+from gateway.business_benchmark_demo import resolve_current_factory_actions
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -28,6 +29,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--authority-root", type=Path, required=True)
     parser.add_argument("--job-id", type=UUID, action="append", required=True)
     parser.add_argument("--issued-at", required=True)
+    parser.add_argument(
+        "--eligible-only",
+        action="store_true",
+        help="Issue only jobs whose current Captain action requests improvement.",
+    )
     return parser
 
 
@@ -45,11 +51,27 @@ def main() -> int:
     ):
         raise SystemExit("improvement issuance time must be UTC")
 
+    requested_job_ids = tuple(args.job_id)
+    selected_job_ids = requested_job_ids
+    skipped_job_ids: tuple[UUID, ...] = ()
+    if args.eligible_only:
+        actions = resolve_current_factory_actions(dsn, requested_job_ids)
+        selected_job_ids = tuple(
+            job_id
+            for job_id in requested_job_ids
+            if actions[job_id] == "append_improvement_requested"
+        )
+        skipped_job_ids = tuple(
+            job_id for job_id in requested_job_ids if job_id not in selected_job_ids
+        )
+        if not selected_job_ids:
+            raise SystemExit("no Captain Factory job currently requests improvement")
+
     issued = issue_captain_technical_improvements(
         workspace=args.workspace_root,
         authority_root=args.authority_root,
         test_mariadb_dsn=dsn,
-        job_ids=tuple(args.job_id),
+        job_ids=selected_job_ids,
         clock=lambda: issued_at,
     )
     print(
@@ -59,6 +81,14 @@ def main() -> int:
                 "database": "captain_test",
                 "status": "authorized",
                 "issued_at": issued_at.isoformat().replace("+00:00", "Z"),
+                **(
+                    {
+                        "requested_job_ids": [str(item) for item in requested_job_ids],
+                        "skipped_job_ids": [str(item) for item in skipped_job_ids],
+                    }
+                    if args.eligible_only
+                    else {}
+                ),
                 "authorizations": [
                     {
                         "job_id": str(item.request_block.job_id),
