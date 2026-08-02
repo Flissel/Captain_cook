@@ -136,13 +136,13 @@ $maximumIncrementalHermesUsd = '1.00'
 $unresolvedHermesEffectReserveUsd = '0.25'
 $maximumTotalUsdPerTeam = '4.80'
 # Carry the immutable prior evidence forward and conservatively charge the full
-# V29 Hermes allowance to each team. This may overstate spend but can never
+# V29 and V30 Hermes allowances to each team. This may overstate spend but can never
 # reset or understate the user-owned cumulative cap.
-$priorActualUsdClaims = '1.384892'
-$priorActualUsdRenewal = '1.461592'
+$priorActualUsdClaims = '2.384892'
+$priorActualUsdRenewal = '2.461592'
 $userMaximumEurPerTeam = '6.00'
 $budgetEurPerUsd = '1.25'
-$seedVersion = 'business-benchmark-demo-2026-08-v30'
+$seedVersion = 'business-benchmark-demo-2026-08-v31'
 
 $rootEnvAllowlist = @(
     'CAPTAIN_GATEWAY_TOKEN',
@@ -395,7 +395,7 @@ function New-DryRunPlan {
         mode = 'dry_run'
         database = 'captain_test'
         issued_at = $IssuedAt
-        suite_version = 30
+        suite_version = 31
         seed_version_id = $seedVersion
         maximum_usd_per_team = $maximumUsdPerTeam
         jobs = @(
@@ -686,7 +686,7 @@ try {
             '--issued-at', $issuedAt,
             '--model', 'gpt-4.1-mini',
             '--maximum-usd-per-team', $maximumUsdPerTeam,
-            '--suite-version', '30',
+            '--suite-version', '31',
             '--seed-version-id', $seedVersion
         )
         $rawPlanProvisioning = @(& $python @planArguments)
@@ -716,7 +716,7 @@ try {
             if (
                 [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
                 @($team.job.execution_policy.allowed_models) -notcontains 'gpt-4.1-mini' -or
-                [int]$team.suite.suite_version -ne 30
+                [int]$team.suite.suite_version -ne 31
             ) {
                 throw 'Dry-run team model or budget does not match the demo authority.'
             }
@@ -842,7 +842,7 @@ try {
         '--issued-at', $issuedAt,
         '--model', $model,
         '--maximum-usd-per-team', $maximumUsdPerTeam,
-        '--suite-version', '30',
+        '--suite-version', '31',
         '--seed-version-id', $seedVersion
     )
     if ($Action -in @('AUTHORIZE', 'BUILD', 'RUN')) {
@@ -886,7 +886,7 @@ try {
         if (
             [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
             @($team.job.execution_policy.allowed_models) -notcontains $model -or
-            [int]$team.suite.suite_version -ne 30
+            [int]$team.suite.suite_version -ne 31
         ) {
             throw 'Provisioned team model or budget does not match the demo authority.'
         }
