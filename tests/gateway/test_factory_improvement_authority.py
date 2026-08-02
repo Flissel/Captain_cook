@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
@@ -18,7 +19,10 @@ from agenten.agent_factory.skill_sequence import (
     build_factory_improvement_authorization,
 )
 from agenten.agent_factory.service import FactoryCoordinator, InMemoryFactoryRepository
-from agenten.agent_factory.skill_workflow_contracts import TeamExecutionEvidenceV1
+from agenten.agent_factory.skill_workflow_contracts import (
+    TeamEvaluationV1,
+    TeamExecutionEvidenceV1,
+)
 from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from agenten.agent_factory.team_execution import (
     FactoryHoldoutAssertionDecisionV1,
@@ -31,7 +35,12 @@ from gateway.factory_improvement_authority import (
     CaptainTechnicalFailureEvaluator,
     FilesystemFactoryImprovementAuthority,
 )
-from tests.agent_factory.test_skill_workflow_contracts import execution_payload
+from tests.agent_factory.test_skill_workflow_contracts import (
+    CORRELATION_ID,
+    JOB_ID,
+    evaluation_payload,
+    execution_payload,
+)
 from tests.agent_factory.test_state_machine import job_v3
 
 
@@ -628,3 +637,105 @@ def test_issuer_appends_attempt_two_request_from_current_build_failure(
             if block.phase is FactoryPhase.IMPROVEMENT_REQUESTED
         )
     ) == 1
+
+
+def test_issuer_appends_retry_from_failed_quality_benchmark(
+    tmp_path: Path,
+) -> None:
+    job = _job().model_copy(
+        update={
+            "job_id": UUID(JOB_ID),
+            "correlation_id": UUID(CORRELATION_ID),
+            "acceptance_assertion_ids": ("schema_valid", "real_case_green"),
+        }
+    )
+    candidate_ref = _ref("candidate", "7" * 64)
+    payload = evaluation_payload(
+        benchmark_disposition="failed",
+        benchmark_reason_codes=["mandatory_handoff_missed"],
+        failed_benchmark_metric_ids=["mandatory_handoff"],
+        prior_green_benchmark_metric_ids=["coverage"],
+        failure_class="behavioral_failure",
+        recommendation="RETRY_BUILD",
+    )
+    evaluation = TeamEvaluationV1.model_validate(payload)
+
+    class Evidence:
+        def read_verified(self, reference, *, job_id=None):
+            raise AssertionError("quality retry must use the stored typed evaluation")
+
+    class Candidates:
+        def current_candidate_ref(self, selected_job, attempt):
+            assert selected_job == job
+            assert attempt == 1
+            return candidate_ref
+
+    source = FactoryEvidenceBlock.model_validate(
+        {
+            "schema": "captain.agent-factory-block.v1",
+            "event_id": "00000000-0000-0000-0000-000000000607",
+            "job_id": str(job.job_id),
+            "correlation_id": str(job.correlation_id),
+            "causation_id": str(job.event_id),
+            "occurred_at": NOW - timedelta(minutes=1),
+            "producer": "hermes",
+            "subject_version": job.subject_version,
+            "attempt": 1,
+            "phase": FactoryPhase.QUALITY_REVIEWED.value,
+            "role": "quality_warden",
+            "status": FactoryBlockStatus.SUCCEEDED.value,
+            "artifact_refs": [evaluation.artifact_ref.model_dump(mode="json")],
+            "evidence_refs": [evaluation.artifact_ref.model_dump(mode="json")],
+            "assertion_ids": list(job.acceptance_assertion_ids),
+            "lease_id": "quality-lease",
+        }
+    )
+
+    class Repository:
+        def blocks(self, selected_job_id):
+            assert selected_job_id == job.job_id
+            return (source,)
+
+        def workflow_artifacts(self, selected_job_id):
+            assert selected_job_id == job.job_id
+            return (evaluation,)
+
+    class Coordinator:
+        recorded = None
+
+        def projection(self, selected_job_id):
+            assert selected_job_id == job.job_id
+            return type(
+                "Projection",
+                (),
+                {
+                    "job": job,
+                    "phase": FactoryPhase.QUALITY_REVIEWED,
+                    "attempt": 1,
+                    "block_ids": (source.event_id,),
+                },
+            )()
+
+        def record(self, block):
+            self.recorded = block
+
+    coordinator = Coordinator()
+
+    issuer = CaptainTechnicalImprovementIssuer(
+        repository=Repository(),  # type: ignore[arg-type]
+        coordinator=coordinator,  # type: ignore[arg-type]
+        candidates=Candidates(),
+        evidence=Evidence(),
+        authorizations=CaptainFactoryImprovementAuthorizationStore(
+            tmp_path / ".captain-cook" / "improvements"
+        ),
+        clock=lambda: NOW,
+    )
+
+    authorization = issuer.issue(job.job_id)
+
+    assert authorization.failed_evaluation == evaluation
+    assert authorization.prior_green_benchmark_metric_ids == ("coverage",)
+    assert coordinator.recorded == authorization.request_block
+    assert authorization.request_block.phase is FactoryPhase.IMPROVEMENT_REQUESTED
+    assert authorization.authorized_attempt == 2

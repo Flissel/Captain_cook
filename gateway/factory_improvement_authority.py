@@ -27,6 +27,7 @@ from agenten.agent_factory.skill_sequence import (
 )
 from agenten.agent_factory.skill_workflow_contracts import (
     FactoryFeedbackRecommendation,
+    TeamEvaluationV1,
     TeamExecutionEvidenceV1,
 )
 from agenten.agent_factory.team_execution import FactoryHoldoutEvaluationReceiptV1
@@ -279,8 +280,11 @@ class CaptainFactoryImprovementAuthorizationStore:
     ) -> FactoryImprovementAuthorizationV1:
         validated = validate_factory_improvement_authorization(authorization)
         evaluation = validated.failed_evaluation
-        if not isinstance(evaluation, CaptainTechnicalFailureEvaluationV1):
-            raise ValueError("technical improvement store requires Captain evaluation")
+        if not isinstance(
+            evaluation,
+            (CaptainTechnicalFailureEvaluationV1, TeamEvaluationV1),
+        ):
+            raise ValueError("improvement store requires a typed failed evaluation")
         evaluation_path = (
             self._root
             / "evaluations"
@@ -358,6 +362,7 @@ class CaptainTechnicalImprovementIssuer:
             FactoryPhase.BUILD_FAILED,
             FactoryPhase.REAL_CASE_EVIDENCE,
             FactoryPhase.REAL_CASE_REVALIDATED,
+            FactoryPhase.QUALITY_REVIEWED,
         }:
             raise ValueError("current Factory phase is not retry-eligible")
         source_blocks = tuple(
@@ -365,8 +370,13 @@ class CaptainTechnicalImprovementIssuer:
             for block in self._repository.blocks(job_id)
             if block.phase is projection.phase and block.attempt == projection.attempt
         )
-        if not source_blocks or source_blocks[-1].status is not FactoryBlockStatus.FAILED:
-            raise ValueError("latest technical failure source block is unavailable")
+        expected_source_status = (
+            FactoryBlockStatus.SUCCEEDED
+            if projection.phase is FactoryPhase.QUALITY_REVIEWED
+            else FactoryBlockStatus.FAILED
+        )
+        if not source_blocks or source_blocks[-1].status is not expected_source_status:
+            raise ValueError("latest failed-candidate source block is unavailable")
         source_block = source_blocks[-1]
         candidate_ref = self._candidates.current_candidate_ref(
             job,
@@ -381,8 +391,18 @@ class CaptainTechnicalImprovementIssuer:
                 candidate_ref=candidate_ref,
                 occurred_at=now,
             )
-        else:
+        elif projection.phase in {
+            FactoryPhase.REAL_CASE_EVIDENCE,
+            FactoryPhase.REAL_CASE_REVALIDATED,
+        }:
             evaluation = self._evaluate_execution(
+                job=job,
+                source_block=source_block,
+                candidate_ref=candidate_ref,
+                occurred_at=now,
+            )
+        else:
+            evaluation = self._evaluate_quality(
                 job=job,
                 source_block=source_block,
                 candidate_ref=candidate_ref,
@@ -506,6 +526,55 @@ class CaptainTechnicalImprovementIssuer:
             holdout_receipt=receipts[0] if receipts else None,
             occurred_at=occurred_at,
         )
+
+    def _evaluate_quality(
+        self,
+        *,
+        job: FactoryJob,
+        source_block: FactoryEvidenceBlock,
+        candidate_ref: ArtifactRef,
+        occurred_at: datetime,
+    ) -> TeamEvaluationV1:
+        _require_source(
+            job=job,
+            source_block=source_block,
+            source_phase=FactoryPhase.QUALITY_REVIEWED,
+            occurred_at=occurred_at,
+        )
+        referenced = (*source_block.artifact_refs, *source_block.evidence_refs)
+        evaluations = tuple(
+            artifact
+            for artifact in self._repository.workflow_artifacts(job.job_id)
+            if isinstance(artifact, TeamEvaluationV1)
+            and artifact.job_id == job.job_id
+            and artifact.correlation_id == job.correlation_id
+            and artifact.subject_version == job.subject_version
+            and artifact.attempt == source_block.attempt
+            and artifact.acceptance_assertion_ids == job.acceptance_assertion_ids
+            and artifact.artifact_ref in referenced
+        )
+        if len(evaluations) != 1:
+            raise ValueError("failed quality evaluation evidence is ambiguous")
+        evaluation = evaluations[0]
+        has_failed_assertion = any(
+            outcome.status == "failed" for outcome in evaluation.assertion_outcomes
+        )
+        if (
+            source_block.status is not FactoryBlockStatus.SUCCEEDED
+            or evaluation.recommendation
+            is not FactoryFeedbackRecommendation.RETRY_BUILD
+            or evaluation.failure_class
+            not in {"behavioral_failure", "test_regression"}
+            or not (has_failed_assertion or evaluation.failed_benchmark_metric_ids)
+            or evaluation.occurred_at > occurred_at
+        ):
+            raise ValueError("quality evaluation is not retry-eligible")
+        if evaluation.benchmark_summary_ref is not None and (
+            evaluation.benchmark_disposition != "failed"
+            or evaluation.benchmark_summary_ref not in evaluation.evidence_refs
+        ):
+            raise ValueError("quality benchmark evidence is not retry-eligible")
+        return evaluation
 
 
 def _add_exact_execution(
