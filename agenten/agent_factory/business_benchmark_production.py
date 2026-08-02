@@ -159,6 +159,14 @@ class BusinessBenchmarkInvocationAuthorityPort(Protocol):
         self, *, job: AgentFactoryJobV3, attempt: int
     ) -> FactorySkillInvocationV1: ...
 
+    def benchmark_invocation(
+        self,
+        *,
+        job: AgentFactoryJobV3,
+        attempt: int,
+        suite_ref: PrivateHoldoutRef,
+    ) -> FactorySkillInvocationV1: ...
+
     def evaluation_invocation(
         self, *, job: AgentFactoryJobV3, attempt: int
     ) -> FactorySkillInvocationV1: ...
@@ -276,15 +284,20 @@ class ProductionBusinessBenchmarkScopeResolver:
             if candidate_ref != expected_candidate_ref:
                 raise ValueError("candidate authority returned a different reference")
 
-            runtime_invocation = self._invocations.runtime_invocation(
+            technical_runtime_invocation = self._invocations.runtime_invocation(
                 job=job,
                 attempt=selection.attempt,
+            )
+            runtime_invocation = self._invocations.benchmark_invocation(
+                job=job,
+                attempt=selection.attempt,
+                suite_ref=suite_ref,
             )
             evaluation_invocation = self._invocations.evaluation_invocation(
                 job=job,
                 attempt=selection.attempt,
             )
-            technical_holdout_ref = runtime_invocation.execution_scope_ref
+            technical_holdout_ref = technical_runtime_invocation.execution_scope_ref
             if (
                 not isinstance(technical_holdout_ref, PrivateHoldoutRef)
                 or technical_holdout_ref not in job.private_holdout_refs
@@ -294,12 +307,33 @@ class ProductionBusinessBenchmarkScopeResolver:
                     "technical execution scope is unavailable, stale, or mixed"
                 )
             self._require_invocation(
-                runtime_invocation,
+                technical_runtime_invocation,
                 job=job,
                 attempt=selection.attempt,
                 step=FactorySkillStep.EXECUTE_TEAM,
                 suite_ref=technical_holdout_ref,
             )
+            self._require_invocation(
+                runtime_invocation,
+                job=job,
+                attempt=selection.attempt,
+                step=FactorySkillStep.EXECUTE_TEAM,
+                suite_ref=suite_ref,
+            )
+            if (
+                runtime_invocation.invocation_id
+                == technical_runtime_invocation.invocation_id
+                or runtime_invocation.idempotency_key
+                == technical_runtime_invocation.idempotency_key
+                or runtime_invocation.lease != technical_runtime_invocation.lease
+                or runtime_invocation.released_skill
+                != technical_runtime_invocation.released_skill
+                or runtime_invocation.input_ref
+                != technical_runtime_invocation.input_ref
+            ):
+                raise ValueError(
+                    "benchmark invocation is not derived from technical authority"
+                )
             self._require_invocation(
                 evaluation_invocation,
                 job=job,
@@ -321,7 +355,7 @@ class ProductionBusinessBenchmarkScopeResolver:
                 attempt=selection.attempt,
                 candidate_ref=candidate_ref,
                 holdout_ref=technical_holdout_ref,
-                runtime_invocation=runtime_invocation,
+                runtime_invocation=technical_runtime_invocation,
             )
             budget = self._gateway.budget_projection(job.job_id)
             self._require_budget(

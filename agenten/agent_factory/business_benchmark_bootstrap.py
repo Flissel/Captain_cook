@@ -1271,6 +1271,47 @@ class GatewayBenchmarkInvocationAuthority:
             )
         return invocations[0]
 
+    def benchmark_invocation(
+        self,
+        *,
+        job: AgentFactoryJobV3,
+        attempt: int,
+        suite_ref: PrivateHoldoutRef,
+    ) -> FactorySkillInvocationV1:
+        """Derive one immutable suite-scoped invocation from technical authority."""
+
+        technical = self.runtime_invocation(job=job, attempt=attempt)
+        if (
+            suite_ref not in job.private_holdout_refs
+            or suite_ref == technical.execution_scope_ref
+        ):
+            raise ValueError("benchmark suite invocation scope is stale or mixed")
+        payload = {
+            "job_id": str(job.job_id),
+            "subject_version": job.subject_version,
+            "attempt": attempt,
+            "technical_invocation_id": str(technical.invocation_id),
+            "technical_idempotency_key": technical.idempotency_key,
+            "suite_ref_sha256": suite_ref.sha256,
+        }
+        idempotency_key = hashlib.sha256(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return technical.model_copy(
+            update={
+                "invocation_id": uuid5(
+                    NAMESPACE_URL,
+                    f"captain.business-benchmark:{idempotency_key}",
+                ),
+                "idempotency_key": idempotency_key,
+                "execution_scope_ref": suite_ref,
+            }
+        )
+
     def evaluation_invocation(
         self, *, job: AgentFactoryJobV3, attempt: int
     ) -> FactorySkillInvocationV1:

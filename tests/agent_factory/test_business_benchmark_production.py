@@ -290,6 +290,30 @@ class InvocationAuthority:
     def runtime_invocation(self, *, job: AgentFactoryJobV3, attempt: int):
         return invocation(job, FactorySkillStep.EXECUTE_TEAM)
 
+    def benchmark_invocation(
+        self,
+        *,
+        job: AgentFactoryJobV3,
+        attempt: int,
+        suite_ref: PrivateHoldoutRef,
+    ):
+        technical = self.runtime_invocation(job=job, attempt=attempt)
+        idempotency_key = hashlib.sha256(
+            (
+                f"benchmark:{technical.invocation_id}:{suite_ref.sha256}"
+            ).encode("utf-8")
+        ).hexdigest()
+        return technical.model_copy(
+            update={
+                "invocation_id": uuid5(
+                    NAMESPACE_URL,
+                    f"captain.business-benchmark:{idempotency_key}",
+                ),
+                "idempotency_key": idempotency_key,
+                "execution_scope_ref": suite_ref,
+            }
+        )
+
     def evaluation_invocation(self, *, job: AgentFactoryJobV3, attempt: int):
         return invocation(job, FactorySkillStep.EVALUATE_TEAM)
 
@@ -407,6 +431,11 @@ def test_scope_resolver_builds_digest_only_scope_from_exact_captain_authorities(
     assert scope.job == job
     assert scope.candidate_ref == manifest.source_archive_ref
     assert scope.runtime_invocation.step is FactorySkillStep.EXECUTE_TEAM
+    assert scope.runtime_invocation.execution_scope_ref == scope.suite_ref
+    assert (
+        scope.runtime_invocation.invocation_id
+        != scope.technical_executions[0].invocation_id
+    )
     assert scope.evaluation_invocation.step is FactorySkillStep.EVALUATE_TEAM
     assert scope.technical_executions == gateway.executions
     assert scope.budget_projection == gateway.budget

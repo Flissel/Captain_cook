@@ -34,6 +34,7 @@ from agenten.agent_factory.business_benchmark_production_ports import (
 from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryRole
 from agenten.agent_factory.execution_budget import FactoryBudgetProjection
 from agenten.agent_factory.leases import issue_factory_lease
+from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillInvocationV1,
@@ -1119,7 +1120,21 @@ def test_gateway_invocation_authority_builds_quality_chain_from_active_captain_d
         GatewayBenchmarkInvocationAuthority,
     )
 
-    job = live_job()
+    base_job = live_job()
+    technical_sha256 = hashlib.sha256(b"technical-suite").hexdigest()
+    technical_ref = PrivateHoldoutRef(
+        holdout_id=f"holdout-{technical_sha256[:12]}",
+        uri=f"holdout://holdout-{technical_sha256[:12]}",
+        sha256=technical_sha256,
+    )
+    job = base_job.model_copy(
+        update={
+            "private_holdout_refs": (
+                technical_ref,
+                *base_job.private_holdout_refs,
+            )
+        }
+    )
     runtime = _invocation(job, FactorySkillStep.EXECUTE_TEAM)
     evaluation = _invocation(job, FactorySkillStep.EVALUATE_TEAM)
     report = _invocation(job, FactorySkillStep.REPORT_CAPTAIN, input_ref=_ref("evaluation"))
@@ -1153,6 +1168,15 @@ def test_gateway_invocation_authority_builds_quality_chain_from_active_captain_d
     )
 
     assert authority.runtime_invocation(job=job, attempt=1) == runtime
+    benchmark = authority.benchmark_invocation(
+        job=job,
+        attempt=1,
+        suite_ref=job.private_holdout_refs[-1],
+    )
+    assert benchmark.execution_scope_ref == job.private_holdout_refs[-1]
+    assert benchmark.invocation_id != runtime.invocation_id
+    assert benchmark.idempotency_key != runtime.idempotency_key
+    assert benchmark.lease == runtime.lease
     quality = authority.evaluation_invocation(job=job, attempt=1)
     assert quality.step is FactorySkillStep.EVALUATE_TEAM
     assert quality.input_ref == job.input_ref
