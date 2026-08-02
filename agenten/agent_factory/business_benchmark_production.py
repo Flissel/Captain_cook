@@ -325,7 +325,15 @@ class ProductionBusinessBenchmarkScopeResolver:
                 == technical_runtime_invocation.invocation_id
                 or runtime_invocation.idempotency_key
                 == technical_runtime_invocation.idempotency_key
-                or runtime_invocation.lease != technical_runtime_invocation.lease
+                or runtime_invocation.lease.role
+                is not technical_runtime_invocation.lease.role
+                or runtime_invocation.lease.integration_intent
+                is not technical_runtime_invocation.lease.integration_intent
+                or runtime_invocation.lease.capabilities
+                != technical_runtime_invocation.lease.capabilities
+                or not runtime_invocation.lease.workspace_ref.startswith(
+                    "workspace://business-benchmark-suite/"
+                )
                 or runtime_invocation.released_skill
                 != technical_runtime_invocation.released_skill
                 or runtime_invocation.input_ref

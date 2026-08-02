@@ -298,6 +298,17 @@ class InvocationAuthority:
         suite_ref: PrivateHoldoutRef,
     ):
         technical = self.runtime_invocation(job=job, attempt=attempt)
+        benchmark_lease = issue_factory_lease(
+            job=job,
+            role=FactoryRole.REAL_CASE_TESTER,
+            attempt=attempt,
+            workspace_ref=(
+                "workspace://business-benchmark-suite/"
+                f"{job.job_id}/{attempt}/{suite_ref.sha256}"
+            ),
+            now=NOW,
+            integration_intent=technical.lease.integration_intent,
+        )
         idempotency_key = hashlib.sha256(
             (
                 f"benchmark:{technical.invocation_id}:{suite_ref.sha256}"
@@ -311,6 +322,7 @@ class InvocationAuthority:
                 ),
                 "idempotency_key": idempotency_key,
                 "execution_scope_ref": suite_ref,
+                "lease": benchmark_lease,
             }
         )
 

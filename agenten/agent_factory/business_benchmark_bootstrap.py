@@ -122,7 +122,7 @@ from agenten.agent_factory.execution_budget import (
     FactoryBudgetPort,
     FactoryBudgetProjection,
 )
-from agenten.agent_factory.leases import validate_factory_lease
+from agenten.agent_factory.leases import issue_factory_lease, validate_factory_lease
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import (
     FACTORY_SKILL_ID_BY_STEP,
@@ -1301,6 +1301,18 @@ class GatewayBenchmarkInvocationAuthority:
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
+        now = self._utc_now()
+        benchmark_lease = issue_factory_lease(
+            job=job,
+            role=FactoryRole.REAL_CASE_TESTER,
+            attempt=attempt,
+            workspace_ref=(
+                "workspace://business-benchmark-suite/"
+                f"{job.job_id}/{attempt}/{suite_ref.sha256}"
+            ),
+            now=now,
+            integration_intent=technical.lease.integration_intent,
+        )
         return technical.model_copy(
             update={
                 "invocation_id": uuid5(
@@ -1309,6 +1321,7 @@ class GatewayBenchmarkInvocationAuthority:
                 ),
                 "idempotency_key": idempotency_key,
                 "execution_scope_ref": suite_ref,
+                "lease": benchmark_lease,
             }
         )
 

@@ -1176,7 +1176,12 @@ def test_gateway_invocation_authority_builds_quality_chain_from_active_captain_d
     assert benchmark.execution_scope_ref == job.private_holdout_refs[-1]
     assert benchmark.invocation_id != runtime.invocation_id
     assert benchmark.idempotency_key != runtime.idempotency_key
-    assert benchmark.lease == runtime.lease
+    assert benchmark.lease != runtime.lease
+    assert benchmark.lease.role is FactoryRole.REAL_CASE_TESTER
+    assert benchmark.lease.integration_intent is runtime.lease.integration_intent
+    assert benchmark.lease.workspace_ref.startswith(
+        "workspace://business-benchmark-suite/"
+    )
     quality = authority.evaluation_invocation(job=job, attempt=1)
     assert quality.step is FactorySkillStep.EVALUATE_TEAM
     assert quality.input_ref == job.input_ref
