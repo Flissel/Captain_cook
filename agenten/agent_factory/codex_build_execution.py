@@ -2006,6 +2006,16 @@ class CodexCliFactoryBuildExecutor:
             checkpoint=checkpoint,
         )
         cleanup_status = receipt["process_cleanup_status"]
+        if cleanup_status == "unresolved" and inspected_state == "lost":
+            receipt_content, receipt = (
+                self._persist_verified_cleanup_session_receipt(
+                    invocation=invocation,
+                    checkpoint=checkpoint,
+                    original_content=receipt_content,
+                    original_receipt=receipt,
+                )
+            )
+            cleanup_status = receipt["process_cleanup_status"]
         if cleanup_status == "unresolved":
             raise FactoryDispatchError(
                 "Factory Codex process cleanup is unresolved; inspection is required"
@@ -2181,6 +2191,45 @@ class CodexCliFactoryBuildExecutor:
             checkpoint.resume_ordinal,
         )
 
+    def _persist_verified_cleanup_session_receipt(
+        self,
+        *,
+        invocation: FactorySkillInvocationV1,
+        checkpoint: FactoryCodexBuildCheckpointV1,
+        original_content: bytes,
+        original_receipt: dict[str, object],
+    ) -> tuple[bytes, dict[str, object]]:
+        if (
+            original_receipt.get("process_cleanup_status") != "unresolved"
+            or original_receipt.get("status") not in {"timed_out", "cancelled"}
+            or checkpoint.terminal_receipt_sha256 is not None
+            or hashlib.sha256(original_content).hexdigest()
+            != hashlib.sha256(
+                self._session_receipt_path(
+                    invocation,
+                    checkpoint.resume_ordinal,
+                ).read_bytes()
+            ).hexdigest()
+        ):
+            raise FactoryDispatchError(
+                "Factory Codex cleanup verification source is invalid"
+            )
+        verified_receipt = dict(original_receipt)
+        verified_receipt["process_cleanup_status"] = "verified_cancelled"
+        content = json.dumps(
+            verified_receipt,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        target = self._verified_session_receipt_path(
+            invocation,
+            checkpoint.resume_ordinal,
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _write_once(target, content)
+        return content, verified_receipt
+
     def _load_reconciliation_receipt(
         self,
         *,
@@ -2228,8 +2277,9 @@ class CodexCliFactoryBuildExecutor:
         prepared: PreparedFactoryWorkspace,
         checkpoint: FactoryCodexBuildCheckpointV1,
     ) -> _LoadedCodexTerminalEvidence:
-        receipt_path = self._session_receipt_path(
-            invocation, checkpoint.resume_ordinal
+        receipt_path = self._terminal_receipt_path(
+            invocation,
+            checkpoint,
         )
         try:
             content = receipt_path.read_bytes()
@@ -3109,6 +3159,29 @@ class CodexCliFactoryBuildExecutor:
             if hashlib.sha256(content).hexdigest() != reference.sha256:
                 raise FactoryDispatchError("Factory build input digest changed")
             files[name] = content
+        try:
+            instructions = json.loads(files["codex-build-instructions.md"])
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            instructions = None
+        if isinstance(instructions, dict) and "prior candidate ref" in instructions:
+            prior_uri = instructions["prior candidate ref"]
+            matching = tuple(
+                reference
+                for reference in brief.context_refs
+                if reference.uri == prior_uri
+                and reference.media_type == "application/zip"
+                and reference.uri.startswith(
+                    "artifact://minibook-creation/forge-source/"
+                )
+            )
+            if len(matching) != 1:
+                raise FactoryDispatchError(
+                    "Factory prior candidate reference is not uniquely bound"
+                )
+            prior_content = self._artifact_reader.read_bytes(matching[0])
+            if hashlib.sha256(prior_content).hexdigest() != matching[0].sha256:
+                raise FactoryDispatchError("Factory prior candidate digest changed")
+            files["prior-candidate.zip"] = prior_content
         files["codex-build-brief.json"] = canonical_factory_codex_model(brief)
         return files
 
@@ -3347,6 +3420,43 @@ class CodexCliFactoryBuildExecutor:
             f"{invocation.idempotency_key}{ordinal_suffix}.json"
         )
 
+    def _verified_session_receipt_path(
+        self,
+        invocation: FactorySkillInvocationV1,
+        resume_ordinal: int,
+    ) -> Path:
+        ordinal_suffix = (
+            "" if resume_ordinal == 0 else f".resume-{resume_ordinal}"
+        )
+        return self._settings.state_root.resolve() / "sessions" / (
+            f"{invocation.idempotency_key}{ordinal_suffix}.cleanup-verified.json"
+        )
+
+    def _terminal_receipt_path(
+        self,
+        invocation: FactorySkillInvocationV1,
+        checkpoint: FactoryCodexBuildCheckpointV1,
+    ) -> Path:
+        primary = self._session_receipt_path(
+            invocation,
+            checkpoint.resume_ordinal,
+        )
+        expected_sha256 = checkpoint.terminal_receipt_sha256
+        if expected_sha256 is None:
+            return primary
+        verified = self._verified_session_receipt_path(
+            invocation,
+            checkpoint.resume_ordinal,
+        )
+        for candidate in (primary, verified):
+            try:
+                content = candidate.read_bytes()
+            except OSError:
+                continue
+            if hashlib.sha256(content).hexdigest() == expected_sha256:
+                return candidate
+        return primary
+
     def _process_state_path(
         self,
         invocation: FactorySkillInvocationV1,
@@ -3390,13 +3500,27 @@ def _codex_prompt(
             for item in brief.build_assignment.integrations
         ],
     }
+    prior_candidate_guidance = (
+        "Start from .captain-inputs/prior-candidate.zip: extract it into "
+        "generated-candidate before editing, and do not search the repository for "
+        "an older candidate. "
+        if any(
+            reference.media_type == "application/zip"
+            and reference.uri.startswith(
+                "artifact://minibook-creation/forge-source/"
+            )
+            for reference in brief.context_refs
+        )
+        else ""
+    )
     return (
         "Implement the Captain-authorized AutoGen agent team in this isolated "
         "worktree. Read .captain-inputs/job-input.md, compiled-spec.json, "
         "dependency-graph.json, codex-build-brief.json, and "
         "codex-build-instructions.md. Treat codex-build-instructions.md as the "
         "authoritative bounded implementation and retry guidance. Reuse the repository "
-        "architecture and released skills. Do not read secrets, write outside "
+        + prior_candidate_guidance
+        + "architecture and released skills. Do not read secrets, write outside "
         "this worktree, push Git changes, activate workflows, or weaken assertions. "
         "Use n8n only when the integration contract below requires it. Build-time "
         "verification is candidate-scoped: use `python -m compileall -q "

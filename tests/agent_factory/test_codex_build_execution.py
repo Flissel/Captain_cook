@@ -1003,6 +1003,73 @@ async def test_cli_executor_authorizes_before_materializing_and_records_redacted
 
 
 @pytest.mark.asyncio
+async def test_improvement_scaffold_materializes_digest_bound_prior_candidate(
+    tmp_path: Path,
+) -> None:
+    job, brief, artifact_reader = _executor_job_and_brief()
+    prior_candidate = b"PK\x03\x04bounded prior candidate bytes"
+    prior_sha256 = hashlib.sha256(prior_candidate).hexdigest()
+    prior_ref = ArtifactRef(
+        uri=f"artifact://minibook-creation/forge-source/{prior_sha256}",
+        sha256=prior_sha256,
+        media_type="application/zip",
+    )
+    instructions = json.dumps(
+        {"prior candidate ref": prior_ref.uri},
+        sort_keys=True,
+    ).encode("utf-8")
+    instructions_sha256 = hashlib.sha256(instructions).hexdigest()
+    instructions_ref = ArtifactRef(
+        uri=f"artifact://test/{instructions_sha256}",
+        sha256=instructions_sha256,
+        media_type="application/json",
+    )
+    brief = brief.model_copy(
+        update={
+            "artifact_ref": instructions_ref,
+            "prompt_ref": instructions_ref,
+            "context_refs": (*brief.context_refs, prior_ref),
+        }
+    )
+    invocation = _seal_invocation(job, brief)
+    contents = dict(artifact_reader._contents)
+    contents[instructions_sha256] = instructions
+    contents[prior_sha256] = prior_candidate
+    artifact_reader = StaticArtifactReader(contents)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    class Preparer:
+        def prepare(self, *_args):
+            return PreparedFactoryWorkspace(root=workspace, base_revision="a" * 40)
+
+    authorizer = RecordingAuthorizer()
+    executor = CodexCliFactoryBuildExecutor(
+        settings=CodexCliFactoryBuildSettings(
+            state_root=tmp_path / "state",
+            maximum_runtime_seconds=120,
+        ),
+        workspace_preparer=Preparer(),
+        artifact_reader=artifact_reader,
+        authorizer=authorizer,
+        runner_factory=lambda **kwargs: SuccessfulRunner(
+            workspace,
+            kwargs["journal_path"],
+        ),
+        clock=lambda: NOW,
+    )
+
+    await executor.execute(_dispatch(job, invocation), invocation, brief)
+
+    assert (
+        workspace / ".captain-inputs" / "prior-candidate.zip"
+    ).read_bytes() == prior_candidate
+    assert "Start from .captain-inputs/prior-candidate.zip" in (
+        authorizer.requests[0].command[3]
+    )
+
+
+@pytest.mark.asyncio
 async def test_authorization_failure_retries_same_uncheckpointed_detached_workspace(
     tmp_path: Path,
 ) -> None:
@@ -4471,6 +4538,62 @@ async def test_restart_reconciliation_terminalizes_running_from_valid_receipt(
     journal_path = state_root / "journals" / f"{invocation.idempotency_key}.jsonl"
     journal_path.write_text('{"type":"tampered"}\n', encoding="utf-8")
     with pytest.raises(FactoryDispatchError, match="journal.*digest|digest.*journal"):
+        await executor.reconcile_pending(dispatch, invocation, brief)
+
+
+@pytest.mark.asyncio
+async def test_restart_reconciliation_verifies_lost_unresolved_cleanup_append_only(
+    tmp_path: Path,
+) -> None:
+    inspector = _StaticProcessInspector("lost")
+    executor, dispatch, invocation, brief, _, state_root, authorizer, runner_calls = (
+        await _running_crash_fixture(tmp_path, inspector=inspector)
+    )
+    original = _persist_crash_receipt(
+        state_root=state_root,
+        invocation=invocation,
+        brief=brief,
+        command=authorizer.requests[0].command,
+        exit_code=124,
+        terminal_status="timed_out",
+        process_cleanup_status="unresolved",
+    )
+
+    with pytest.raises(FactoryCodexBuildInterrupted) as caught:
+        await executor.reconcile_pending(dispatch, invocation, brief)
+
+    assert caught.value.reason == "codex_timed_out"
+    primary = state_root / "sessions" / f"{invocation.idempotency_key}.json"
+    verified = (
+        state_root
+        / "sessions"
+        / f"{invocation.idempotency_key}.cleanup-verified.json"
+    )
+    assert primary.read_bytes() == original
+    verified_bytes = verified.read_bytes()
+    verified_payload = json.loads(verified_bytes)
+    assert verified_payload["status"] == "timed_out"
+    assert verified_payload["exit_code"] == 124
+    assert verified_payload["process_cleanup_status"] == "verified_cancelled"
+    checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
+        state_root / "checkpoints"
+    ).load(invocation)
+    assert checkpoint is not None
+    assert checkpoint.phase == "implementation_interrupted"
+    assert checkpoint.terminal_receipt_sha256 == hashlib.sha256(
+        verified_bytes
+    ).hexdigest()
+    assert caught.value.terminal_receipt_ref.sha256 == (
+        checkpoint.terminal_receipt_sha256
+    )
+    assert runner_calls() == 1
+    with pytest.raises(FactoryCodexBuildInterrupted) as replayed:
+        await executor.reconcile_pending(dispatch, invocation, brief)
+    assert replayed.value.terminal_receipt_ref.sha256 == (
+        checkpoint.terminal_receipt_sha256
+    )
+    verified.write_text('{"tampered":true}', encoding="utf-8")
+    with pytest.raises(FactoryDispatchError, match="receipt.*digest|digest.*receipt"):
         await executor.reconcile_pending(dispatch, invocation, brief)
 
 
