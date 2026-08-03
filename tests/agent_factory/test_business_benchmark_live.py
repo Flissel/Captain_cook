@@ -426,6 +426,33 @@ async def test_adapter_maps_exact_usage_latency_terminal_and_deduplicated_eviden
 
 
 @pytest.mark.asyncio
+async def test_adapter_records_real_limit_overage_as_terminal_policy_failure() -> None:
+    env = envelope().model_copy(update={"maximum_latency_ms": 100})
+    fence_store = DurableFenceStore()
+    adapter = BusinessBenchmarkLiveAdapter(
+        runtime_bundle=RuntimeBundle(result(env)),
+        fence_store=fence_store,
+        trusted_tool_intents={},
+        monotonic_clock=iter((0.0, 0.101)).__next__,
+        clock=lambda: NOW,
+    )
+    effect_claim = claim(env)
+    fence = await adapter.register_fence(effect_claim.prepared_effect, effect_claim)
+
+    receipt = await adapter.execute(env, effect_claim, fence)
+
+    assert receipt.status == "policy_failed"
+    assert receipt.latency_ms == 101
+    assert receipt.observed_decision is None
+    assert receipt.observed_rationale_fact_ids == ()
+    assert receipt.human_handoff_completed is None
+    assert receipt.evidence_refs
+    assert fence_store.finalized_receipt == receipt
+    assert "record_provider_terminal" in fence_store.calls
+    assert "finalize" in fence_store.calls
+
+
+@pytest.mark.asyncio
 async def test_adapter_does_not_treat_none_as_an_extra_intent_when_n8n_ran() -> None:
     env = envelope()
     env = env.model_copy(

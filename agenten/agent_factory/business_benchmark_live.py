@@ -425,7 +425,12 @@ class BusinessBenchmarkLiveAdapter:
                 ),
             )
         )
-        succeeded = provider.status == "succeeded"
+        limit_exceeded = (
+            cost_micro_usd > envelope.maximum_cost_micro_usd
+            or latency_ms > envelope.maximum_latency_ms
+        )
+        receipt_status = "policy_failed" if limit_exceeded else provider.status
+        succeeded = receipt_status == "succeeded"
         receipt = BusinessBenchmarkRunReceiptV1(
             schema="captain.business-benchmark-run-receipt.v1",
             run_id=uuid5(NAMESPACE_URL, f"business-benchmark-run:{envelope.idempotency_key}"),
@@ -446,10 +451,12 @@ class BusinessBenchmarkLiveAdapter:
             allowed_tool_intents=envelope.allowed_tool_intents,
             maximum_cost_micro_usd=envelope.maximum_cost_micro_usd,
             maximum_latency_ms=envelope.maximum_latency_ms,
-            status=provider.status,
-            observed_decision=terminal.observed_decision if terminal else None,
+            status=receipt_status,
+            observed_decision=(
+                terminal.observed_decision if succeeded and terminal else None
+            ),
             observed_rationale_fact_ids=(
-                terminal.observed_rationale_fact_ids if terminal else ()
+                terminal.observed_rationale_fact_ids if succeeded and terminal else ()
             ),
             observed_tool_intents=observed_intents,
             unsafe_tool_use=bool(set(observed_intents) - set(envelope.allowed_tool_intents)),

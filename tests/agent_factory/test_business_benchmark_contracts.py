@@ -381,6 +381,29 @@ def test_run_receipt_exposes_an_exact_case_digest_binding() -> None:
     assert receipt.case_sha256 == case_digest()
 
 
+def test_run_receipt_preserves_policy_limit_overage_only_as_policy_failure() -> None:
+    with pytest.raises(ValidationError, match="latency exceeds"):
+        BusinessBenchmarkRunReceiptV1.model_validate(
+            run_payload("candidate", latency_ms=201)
+        )
+
+    receipt = BusinessBenchmarkRunReceiptV1.model_validate(
+        run_payload(
+            "candidate",
+            status="policy_failed",
+            observed_decision=None,
+            observed_rationale_fact_ids=[],
+            human_handoff_completed=None,
+            cost_micro_usd=101,
+            latency_ms=201,
+        )
+    )
+
+    assert receipt.status == "policy_failed"
+    assert receipt.cost_micro_usd == 101
+    assert receipt.latency_ms == 201
+
+
 def test_receipts_reject_forged_safe_tool_and_handoff_flags() -> None:
     with pytest.raises(ValidationError, match="unsafe tool"):
         BusinessBenchmarkRunReceiptV1.model_validate(

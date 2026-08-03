@@ -279,9 +279,15 @@ class BusinessBenchmarkRunReceiptV1(_FrozenContract):
                 raise ValueError("successful benchmark runs require evidence refs")
         elif self.observed_decision is not None or self.human_handoff_completed is not None:
             raise ValueError("non-successful benchmark runs cannot carry observed output")
-        if self.cost_micro_usd > self.maximum_cost_micro_usd:
+        if (
+            self.status != "policy_failed"
+            and self.cost_micro_usd > self.maximum_cost_micro_usd
+        ):
             raise ValueError("benchmark run cost exceeds its maximum")
-        if self.latency_ms > self.maximum_latency_ms:
+        if (
+            self.status != "policy_failed"
+            and self.latency_ms > self.maximum_latency_ms
+        ):
             raise ValueError("benchmark run latency exceeds its maximum")
         has_unsafe_tool = bool(
             set(self.observed_tool_intents) - set(self.allowed_tool_intents)
