@@ -145,6 +145,7 @@ if ($ResumeThreadId) {
     $startInfo.ArgumentList.Add($Sandbox)
     $startInfo.ArgumentList.Add("exec")
     $startInfo.ArgumentList.Add("--ignore-user-config")
+    $startInfo.ArgumentList.Add("--ignore-rules")
     $startInfo.ArgumentList.Add("resume")
     $startInfo.ArgumentList.Add("--json")
     $startInfo.ArgumentList.Add($ResumeThreadId)
@@ -152,6 +153,7 @@ if ($ResumeThreadId) {
 } else {
     $startInfo.ArgumentList.Add("exec")
     $startInfo.ArgumentList.Add("--ignore-user-config")
+    $startInfo.ArgumentList.Add("--ignore-rules")
     $startInfo.ArgumentList.Add("--sandbox")
     $startInfo.ArgumentList.Add($Sandbox)
     $startInfo.ArgumentList.Add("--json")
