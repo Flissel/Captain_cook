@@ -41,7 +41,12 @@ The v34 summary contract intentionally remains unchanged and audit-valid.
   available. Legacy policies omit the field and retain their original digest
   and semantics.
 
-## GAPS_TO_CLOSE for a fresh v35 benchmark
+## GAPS_TO_CLOSE for a fresh v36 benchmark
+
+The v35 Claims build remains immutable technical-failure evidence: inherited
+Codex plugins blocked the first process and its two bounded resumes never
+produced candidate artifacts. v36 keeps the same predeclared business-value
+policy but derives fresh job IDs and fresh Codex threads after plugin isolation.
 
 - [x] Define the business-value gate before creating new holdouts. Require a
   material correctness or completion uplift over the baseline, zero candidate
@@ -57,7 +62,8 @@ The v34 summary contract intentionally remains unchanged and audit-valid.
   never mutate or reinterpret the v34 summaries. Applying those jobs remains
   part of the paid run.
 - [ ] Run a fresh 15+15 paired benchmark for each team from a clean checkout.
-- [ ] Promote through Captain/Gateway only when the predeclared v35 policy is
+- [ ] Promote through Captain/Gateway only when the predeclared v35 policy on
+  the fresh v36 suite is
   green; otherwise retain the candidate as evaluated but not ready-to-use.
 
 ## Non-claims
