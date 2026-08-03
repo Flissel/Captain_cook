@@ -184,6 +184,23 @@ def test_codex_command_without_the_jsonl_allowlist_is_rejected(tmp_path: Path) -
         )
 
 
+def test_fresh_recovery_run_preserves_captain_validated_dirty_workspace(
+    tmp_path: Path,
+) -> None:
+    approved_root, project, workspace = _clean_project(tmp_path)
+    (project / ".captain-inputs").mkdir()
+    (project / ".captain-inputs" / "compiled-spec.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+
+    authorized = CodexExecutionPolicy(
+        workspace_root=approved_root,
+        environment={},
+    ).authorize(_request(project, workspace, recovery_run=True))
+
+    assert authorized.command[:3] == ("codex", "exec", "--json")
+
+
 def test_exact_codex_resume_thread_command_is_authorized(tmp_path: Path) -> None:
     approved_root, project, workspace = _clean_project(tmp_path)
     command = (

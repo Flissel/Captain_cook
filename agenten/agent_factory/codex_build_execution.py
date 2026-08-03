@@ -1649,6 +1649,7 @@ class CodexCliFactoryBuildExecutor:
             claim_id=invocation.invocation_id.hex,
             fencing_token=invocation.subject_version,
             project_root=prepared.root,
+            recovery_run=repair_context,
         )
 
     async def _implementation_phase(

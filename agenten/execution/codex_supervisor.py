@@ -199,6 +199,7 @@ class CodexRunRequest(BaseModel):
     )
     fencing_token: int | None = Field(default=None, ge=1)
     project_root: Path | None = None
+    recovery_run: bool = False
 
     @field_validator("command")
     @classmethod

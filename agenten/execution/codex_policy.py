@@ -139,7 +139,7 @@ class CodexExecutionPolicy:
             raise CodexPolicyViolation("project root is outside the approved root")
         self._require_allowed_command(request.command)
         self._reject_secret_paths(request.command)
-        if not self._is_resume_command(request.command):
+        if not self._is_resume_command(request.command) and not request.recovery_run:
             self._reject_dirty_project(project_root)
         return AuthorizedCodexRun(
             workspace=workspace,
