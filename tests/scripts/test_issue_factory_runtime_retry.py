@@ -91,3 +91,26 @@ def test_retry_issuer_input_rejects_malformed_captain_binding() -> None:
 
     with pytest.raises(ValueError, match="invalid"):
         module._load_interruption(json.dumps(payload))
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_reason"),
+    (
+        ("FactoryCodexEvidenceFailure", "evidence_failure"),
+        ("FactoryCodexOutputCaptureError", "required_output_invalid"),
+        ("FactoryDispatchError", "runtime_failed"),
+    ),
+)
+def test_retry_issuer_maps_only_bounded_terminal_failure_kinds(
+    failure_kind: str, expected_reason: str
+) -> None:
+    module = _module()
+
+    assert module._runtime_failure_reason(failure_kind) == expected_reason
+
+
+def test_retry_issuer_rejects_unrecognized_terminal_failure_kind() -> None:
+    module = _module()
+
+    with pytest.raises(ValueError, match="not retryable"):
+        module._runtime_failure_reason("UnexpectedFailure")

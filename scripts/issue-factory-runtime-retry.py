@@ -165,6 +165,18 @@ def _revision(value: object) -> str:
     return text
 
 
+def _runtime_failure_reason(failure_kind: str) -> str:
+    reasons = {
+        "FactoryCodexEvidenceFailure": "evidence_failure",
+        "FactoryCodexOutputCaptureError": "required_output_invalid",
+        "FactoryDispatchError": "runtime_failed",
+    }
+    try:
+        return reasons[failure_kind]
+    except KeyError:
+        raise ValueError("Codex terminal failure is not retryable") from None
+
+
 def _load_failed_attempt(
     workspace: Path,
     *,
@@ -195,7 +207,11 @@ def _load_failed_attempt(
             and replay.invocation.step is FactorySkillStep.SEAL_CODEX_BUILD
             and replay.state == "failed"
             and replay.failure_kind
-            in {"FactoryCodexEvidenceFailure", "FactoryDispatchError"}
+            in {
+                "FactoryCodexEvidenceFailure",
+                "FactoryCodexOutputCaptureError",
+                "FactoryDispatchError",
+            }
         ):
             matches.append(replay)
     if len(matches) != 1:
@@ -219,11 +235,7 @@ def _load_failed_attempt(
         canonical_factory_codex_model(checkpoint)
     ).hexdigest()
     terminal_sha = checkpoint.terminal_receipt_sha256
-    expected_reason = (
-        "evidence_failure"
-        if replay.failure_kind == "FactoryCodexEvidenceFailure"
-        else "runtime_failed"
-    )
+    expected_reason = _runtime_failure_reason(replay.failure_kind or "")
     if (
         checkpoint.phase != "implementation_failed"
         or checkpoint.implementation_failure_reason != expected_reason
