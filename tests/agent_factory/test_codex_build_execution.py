@@ -1344,7 +1344,7 @@ async def test_cli_executor_fails_closed_when_codex_omits_required_outputs(
 
 
 @pytest.mark.asyncio
-async def test_authorized_resume_repairs_missing_required_outputs_in_same_thread(
+async def test_authorized_resume_repairs_missing_outputs_in_fresh_policy_thread(
     tmp_path: Path,
 ) -> None:
     job, brief, artifact_reader = _executor_job_and_brief()
@@ -1425,18 +1425,16 @@ async def test_authorized_resume_repairs_missing_required_outputs_in_same_thread
 
     assert completed.source_archive_path == "candidate.zip"
     assert runner_calls == 2
-    assert authorizer.requests[1].command[:5] == (
+    assert authorizer.requests[1].command[:3] == (
         "codex",
         "exec",
-        "resume",
         "--json",
-        "codex-thread-123",
     )
-    assert "CAPTAIN RESUME REPAIR" in authorizer.requests[1].command[5]
+    assert "CAPTAIN RESUME REPAIR" in authorizer.requests[1].command[3]
     assert "Do not repeat broad repository inspection" in (
-        authorizer.requests[1].command[5]
+        authorizer.requests[1].command[3]
     )
-    assert "Do not finish with a blocked report" in authorizer.requests[1].command[5]
+    assert "Do not finish with a blocked report" in authorizer.requests[1].command[3]
     checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
         state_root / "checkpoints"
     ).load(invocation)

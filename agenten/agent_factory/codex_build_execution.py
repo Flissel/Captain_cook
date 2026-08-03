@@ -1483,7 +1483,12 @@ class CodexCliFactoryBuildExecutor:
                     invocation,
                     brief,
                     prepared,
-                    resume_thread_id=resume_lineage.codex_thread_id,
+                    resume_thread_id=(
+                        None
+                        if required_output_failure_is_resumable
+                        else resume_lineage.codex_thread_id
+                    ),
+                    repair_context=required_output_failure_is_resumable,
                 )
                 authorized = self._authorizer.authorize(run_request)
             else:
@@ -1609,13 +1614,14 @@ class CodexCliFactoryBuildExecutor:
         prepared: PreparedFactoryWorkspace,
         *,
         resume_thread_id: str | None = None,
+        repair_context: bool = False,
     ) -> CodexRunRequest:
         session_id = f"factory-{invocation.invocation_id.hex[:24]}"
         prompt = _codex_prompt(request, invocation, brief)
-        if resume_thread_id is not None:
+        if resume_thread_id is not None or repair_context:
             prompt += (
                 "\n\nCAPTAIN RESUME REPAIR:\n"
-                "Continue from the existing workspace and thread. Do not repeat broad "
+                "Continue from the existing workspace. Do not repeat broad "
                 "repository inspection. Shell startup may be delayed on Windows; wait for "
                 "each bounded command to finish and retry a transient shell probe before "
                 "declaring infrastructure failure. Inspect which required output artifacts "
