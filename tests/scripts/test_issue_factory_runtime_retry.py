@@ -114,3 +114,25 @@ def test_retry_issuer_rejects_unrecognized_terminal_failure_kind() -> None:
 
     with pytest.raises(ValueError, match="not retryable"):
         module._runtime_failure_reason("UnexpectedFailure")
+
+
+def test_retry_issuer_accepts_prelaunch_policy_failure_without_consuming_ordinal() -> None:
+    module = _module()
+
+    assert module._matches_failed_checkpoint(
+        failure_kind="CodexPolicyViolation",
+        checkpoint_reason="required_output_invalid",
+        replay_resume_ordinal=2,
+        checkpoint_resume_ordinal=1,
+    )
+
+
+def test_retry_issuer_rejects_policy_failure_after_checkpoint_advanced() -> None:
+    module = _module()
+
+    assert not module._matches_failed_checkpoint(
+        failure_kind="CodexPolicyViolation",
+        checkpoint_reason="required_output_invalid",
+        replay_resume_ordinal=2,
+        checkpoint_resume_ordinal=2,
+    )

@@ -177,6 +177,28 @@ def _runtime_failure_reason(failure_kind: str) -> str:
         raise ValueError("Codex terminal failure is not retryable") from None
 
 
+def _matches_failed_checkpoint(
+    *,
+    failure_kind: str,
+    checkpoint_reason: str | None,
+    replay_resume_ordinal: int,
+    checkpoint_resume_ordinal: int,
+) -> bool:
+    if failure_kind == "CodexPolicyViolation":
+        return (
+            checkpoint_reason == "required_output_invalid"
+            and replay_resume_ordinal == checkpoint_resume_ordinal + 1
+        )
+    try:
+        expected_reason = _runtime_failure_reason(failure_kind)
+    except ValueError:
+        return False
+    return (
+        checkpoint_reason == expected_reason
+        and replay_resume_ordinal == checkpoint_resume_ordinal
+    )
+
+
 def _load_failed_attempt(
     workspace: Path,
     *,
@@ -211,6 +233,7 @@ def _load_failed_attempt(
                 "FactoryCodexEvidenceFailure",
                 "FactoryCodexOutputCaptureError",
                 "FactoryDispatchError",
+                "CodexPolicyViolation",
             }
         ):
             matches.append(replay)
@@ -235,11 +258,14 @@ def _load_failed_attempt(
         canonical_factory_codex_model(checkpoint)
     ).hexdigest()
     terminal_sha = checkpoint.terminal_receipt_sha256
-    expected_reason = _runtime_failure_reason(replay.failure_kind or "")
     if (
         checkpoint.phase != "implementation_failed"
-        or checkpoint.implementation_failure_reason != expected_reason
-        or checkpoint.resume_ordinal != replay.resume_ordinal
+        or not _matches_failed_checkpoint(
+            failure_kind=replay.failure_kind or "",
+            checkpoint_reason=checkpoint.implementation_failure_reason,
+            replay_resume_ordinal=replay.resume_ordinal,
+            checkpoint_resume_ordinal=checkpoint.resume_ordinal,
+        )
         or terminal_sha is None
     ):
         raise ValueError("Codex runtime failure checkpoint is not resumable")
