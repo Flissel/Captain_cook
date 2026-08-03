@@ -21,6 +21,7 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     source = SCRIPT.read_text(encoding="utf-8")
 
     assert source.startswith("#requires -Version 7")
+    assert "$global:LASTEXITCODE = 0" in source
     assert "[ValidateSet('Plan', 'Authorize', 'Build', 'Run')]" in source
     assert "--maximum-usd-per-team', $maximumUsdPerTeam" in source
     assert "$maximumUsdPerTeam = '0.32'" in source

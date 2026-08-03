@@ -15,6 +15,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$global:LASTEXITCODE = 0
 $Action = $Action.ToUpperInvariant()
 
 function Test-NativeExecutableLaunch {
