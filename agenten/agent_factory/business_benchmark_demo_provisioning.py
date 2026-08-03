@@ -1025,9 +1025,9 @@ def _prepare_released_skills(
     for step in FactorySkillStep:
         skill_id = FACTORY_SKILL_ID_BY_STEP[step]
         release_version = {
-            FactorySkillStep.DISCOVER: 5,
-            FactorySkillStep.BRIEF_CODEX: 2,
-            FactorySkillStep.IMPROVE_TEAM: 2,
+            FactorySkillStep.DISCOVER: 6,
+            FactorySkillStep.BRIEF_CODEX: 3,
+            FactorySkillStep.IMPROVE_TEAM: 3,
         }.get(step, 1)
         directory = root / skill_id
         content = _directory_zip_bytes(directory)

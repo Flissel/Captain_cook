@@ -186,9 +186,9 @@ def test_dry_run_is_side_effect_free_and_contains_two_redacted_stable_plans(
         releases = dict(
             zip(team.released_workflow_steps, team.released_skills, strict=True)
         )
-        assert releases[FactorySkillStep.DISCOVER].version == 5
-        assert releases[FactorySkillStep.BRIEF_CODEX].version == 2
-        assert releases[FactorySkillStep.IMPROVE_TEAM].version == 2
+        assert releases[FactorySkillStep.DISCOVER].version == 6
+        assert releases[FactorySkillStep.BRIEF_CODEX].version == 3
+        assert releases[FactorySkillStep.IMPROVE_TEAM].version == 3
         assert all(
             release.version == 1
             for step, release in releases.items()
