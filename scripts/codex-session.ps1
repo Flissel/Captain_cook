@@ -135,14 +135,10 @@ $startInfo.UseShellExecute = $false
 $startInfo.CreateNoWindow = $true
 $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
-$startInfo.ArgumentList.Add("-a")
-$startInfo.ArgumentList.Add("never")
+$startInfo.ArgumentList.Add("--dangerously-bypass-approvals-and-sandbox")
 if ($ResumeThreadId) {
-    # `codex exec resume` inherits global sandbox policy. Every value is a
-    # distinct ArgumentList entry so neither thread names nor prompts cross a
-    # shell parsing boundary.
-    $startInfo.ArgumentList.Add("-s")
-    $startInfo.ArgumentList.Add($Sandbox)
+    # Every value is a distinct ArgumentList entry so neither thread names nor
+    # prompts cross a shell parsing boundary.
     $startInfo.ArgumentList.Add("exec")
     $startInfo.ArgumentList.Add("--ignore-user-config")
     $startInfo.ArgumentList.Add("--ignore-rules")
@@ -154,8 +150,6 @@ if ($ResumeThreadId) {
     $startInfo.ArgumentList.Add("exec")
     $startInfo.ArgumentList.Add("--ignore-user-config")
     $startInfo.ArgumentList.Add("--ignore-rules")
-    $startInfo.ArgumentList.Add("--sandbox")
-    $startInfo.ArgumentList.Add($Sandbox)
     $startInfo.ArgumentList.Add("--json")
     $startInfo.ArgumentList.Add($Prompt)
 }

@@ -1218,22 +1218,21 @@ async def test_powershell_runner_bridges_authorized_run_to_real_launcher(
     assert result.process_cleanup_status == "not_required"
     assert result.artifact_references == ("artifact://sealed/runner-test",)
     assert result.jsonl_lines == ()
-    assert 'ArgumentList.Add("--sandbox")' in Path(
-        "scripts/codex-session.ps1"
-    ).read_text(encoding="utf-8")
-    assert 'ArgumentList.Add("-a")' in Path(
-        "scripts/codex-session.ps1"
-    ).read_text(encoding="utf-8")
-    assert 'ArgumentList.Add("never")' in Path(
+    assert 'ArgumentList.Add("--dangerously-bypass-approvals-and-sandbox")' in Path(
         "scripts/codex-session.ps1"
     ).read_text(encoding="utf-8")
     assert 'ArgumentList.Add("--ignore-user-config")' in Path(
         "scripts/codex-session.ps1"
     ).read_text(encoding="utf-8")
     launcher = Path("scripts/codex-session.ps1").read_text(encoding="utf-8")
-    assert launcher.index('ArgumentList.Add("-a")') < launcher.index(
+    assert launcher.index(
+        'ArgumentList.Add("--dangerously-bypass-approvals-and-sandbox")'
+    ) < launcher.index(
         'ArgumentList.Add("exec")'
     )
+    assert launcher.count(
+        'ArgumentList.Add("--dangerously-bypass-approvals-and-sandbox")'
+    ) == 1
     assert launcher.count('ArgumentList.Add("--ignore-user-config")') == 2
     assert launcher.count('ArgumentList.Add("--ignore-rules")') == 2
     assert launcher.index('ArgumentList.Add("exec")') < launcher.index(

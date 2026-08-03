@@ -116,9 +116,16 @@ class RecordingAuthorizer:
 
 
 class SuccessfulRunner:
-    def __init__(self, workspace: Path, journal_path: Path) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        journal_path: Path,
+        *,
+        thread_id: str = "codex-thread-123",
+    ) -> None:
         self.workspace = workspace
         self.journal_path = journal_path
+        self.thread_id = thread_id
         self.calls: list[AuthorizedCodexRun] = []
 
     async def run(self, authorized: AuthorizedCodexRun) -> CodexRunResult:
@@ -153,7 +160,7 @@ class SuccessfulRunner:
             json.dumps(
                 {
                     "type": "thread.started",
-                    "thread_id": "codex-thread-123",
+                    "thread_id": self.thread_id,
                 }
             ),
             json.dumps({"type": "turn.completed"}),
@@ -1391,7 +1398,11 @@ async def test_authorized_resume_repairs_missing_outputs_in_fresh_policy_thread(
         runner_calls += 1
         if runner_calls == 1:
             return IncompleteRunner(kwargs["journal_path"])
-        return SuccessfulRunner(workspace, kwargs["journal_path"])
+        return SuccessfulRunner(
+            workspace,
+            kwargs["journal_path"],
+            thread_id="codex-thread-fresh",
+        )
 
     authorizer = RecordingAuthorizer()
     executor = CodexCliFactoryBuildExecutor(
@@ -1435,6 +1446,9 @@ async def test_authorized_resume_repairs_missing_outputs_in_fresh_policy_thread(
         authorizer.requests[1].command[3]
     )
     assert "Do not finish with a blocked report" in authorizer.requests[1].command[3]
+    receipt = json.loads(completed.codex_session_receipt)
+    assert receipt["codex_thread_id"] == "codex-thread-fresh"
+    assert receipt["parent_codex_thread_id"] == "codex-thread-123"
     checkpoint = FilesystemFactoryCodexBuildCheckpointStore(
         state_root / "checkpoints"
     ).load(invocation)

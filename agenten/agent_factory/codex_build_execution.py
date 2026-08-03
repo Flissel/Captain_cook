@@ -3635,7 +3635,10 @@ def _session_receipt(
         raise FactoryDispatchError("Original Codex receipt cannot bind parent lineage")
     if resume_ordinal > 0 and parent_lineage is None:
         raise FactoryDispatchError("Resumed Codex receipt requires parent lineage")
+    same_thread_resume = command[:3] == ("codex", "exec", "resume")
     if (
+        same_thread_resume
+        and
         parent_lineage is not None
         and parent_lineage.codex_thread_id is not None
         and observed_thread_id is not None
@@ -3644,7 +3647,8 @@ def _session_receipt(
         raise FactoryDispatchError("Codex resumed thread ID changed")
     effective_thread_id = (
         parent_lineage.codex_thread_id
-        if parent_lineage is not None
+        if same_thread_resume
+        and parent_lineage is not None
         and parent_lineage.codex_thread_id is not None
         else observed_thread_id
     )
