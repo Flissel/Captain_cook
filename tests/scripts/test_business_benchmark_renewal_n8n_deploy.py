@@ -326,11 +326,11 @@ try {{
 $global:remote.nodes[0].webhookId = '9ac8b6b8-63ee-4f6d-8a1e-b47f3914a8dd'
 $webhookIdError = $null
 try {{ $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)} }} catch {{ $webhookIdError = $_.Exception.Message }}
-$originalCode = $global:remote.nodes[1].parameters.jsCode
-$global:remote.nodes[1].parameters.jsCode = 'return [{{ json: {{ changed: true }} }}];'
+    $originalOutput = $global:remote.nodes[2].parameters.jsonOutput
+    $global:remote.nodes[2].parameters.jsonOutput = '={{ {{ changed: true }} }}'
 $canonicalChangeError = $null
 try {{ $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)} }} catch {{ $canonicalChangeError = $_.Exception.Message }}
-$global:remote.nodes[1].parameters.jsCode = $originalCode
+    $global:remote.nodes[2].parameters.jsonOutput = $originalOutput
 $global:remote.nodes[0] | Add-Member -NotePropertyName credentialToken -NotePropertyValue 'forbidden-provider-state'
 $sensitiveExtraError = $null
 try {{ $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)} }} catch {{ $sensitiveExtraError = $_.Exception.Message }}
@@ -685,12 +685,12 @@ $failed = $false
 $failure = $null
 try {{ $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)} }} catch {{ $failed = $true; $failure = $_.Exception.Message }}
 $putsBeforeRecovery = $global:puts
-$canonicalCode = $global:remote.nodes[1].parameters.jsCode
-$global:remote.nodes[1].parameters.jsCode = 'return [{{ json: {{ nearMatch: true }} }}];'
+    $canonicalOutput = $global:remote.nodes[2].parameters.jsonOutput
+    $global:remote.nodes[2].parameters.jsonOutput = '={{ {{ nearMatch: true }} }}'
 $nearMatchError = $null
 try {{ $null = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)} }} catch {{ $nearMatchError = $_.Exception.Message }}
 $putsAfterNearMatch = $global:puts
-$global:remote.nodes[1].parameters.jsCode = $canonicalCode
+    $global:remote.nodes[2].parameters.jsonOutput = $canonicalOutput
 $secondFailed = $false
 $secondFailure = $null
 try {{ $secondResult = & {_pwsh_literal(SCRIPT)} -Action Deploy -EvidenceDirectory {_pwsh_literal(evidence)} | ConvertFrom-Json }} catch {{ $secondFailed = $true; $secondFailure = $_.Exception.Message }}

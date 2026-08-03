@@ -24,19 +24,59 @@
       }
     },
     {
-      "id": "renewal-read",
-      "name": "Read Synthetic Renewal Context",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
+      "id": "renewal-validate",
+      "name": "Validate Renewal Read Contract",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
       "position": [260, 0],
       "parameters": {
-        "jsCode": "const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value); const envelope = $json; if (!isPlainObject(envelope) || !isPlainObject(envelope.body)) { throw new Error('read-only contract rejected'); } const input = envelope.body; const inputKeys = ['operation', 'idempotency_key', 'evidence_partition', 'synthetic_subject_id', 'commercial_snapshot']; const snapshotKeys = ['renewal_window', 'engagement_band', 'commercial_evidence_state', 'consent_state']; const allowed = ['ordinary', 'boundary']; if (Object.keys(input).length !== inputKeys.length || !inputKeys.every((key) => Object.prototype.hasOwnProperty.call(input, key)) || input.operation !== 'read_renewal_context' || typeof input.idempotency_key !== 'string' || input.idempotency_key.length < 16 || input.idempotency_key.length > 128 || !allowed.includes(input.evidence_partition) || typeof input.synthetic_subject_id !== 'string' || !/^subject-[a-z0-9]+$/.test(input.synthetic_subject_id) || !isPlainObject(input.commercial_snapshot) || Object.keys(input.commercial_snapshot).length !== snapshotKeys.length || !snapshotKeys.every((key) => Object.prototype.hasOwnProperty.call(input.commercial_snapshot, key) && typeof input.commercial_snapshot[key] === 'string')) { throw new Error('read-only contract rejected'); } const facts = snapshotKeys.map((key) => `${key}.${input.commercial_snapshot[key]}`); return [{ json: { operation: input.operation, idempotency_key: input.idempotency_key, status: 'read', facts } }];"
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+          "conditions": [
+            {
+              "leftValue": "={{ (() => { const i = $json.body; const s = i?.commercial_snapshot; const inputKeys = ['operation','idempotency_key','evidence_partition','synthetic_subject_id','commercial_snapshot']; const snapshotKeys = ['renewal_window','engagement_band','commercial_evidence_state','consent_state']; return i && typeof i === 'object' && !Array.isArray(i) && Object.keys(i).length === inputKeys.length && inputKeys.every((key) => Object.keys(i).includes(key)) && i.operation === 'read_renewal_context' && typeof i.idempotency_key === 'string' && i.idempotency_key.length >= 16 && i.idempotency_key.length <= 128 && ['ordinary','boundary'].includes(i.evidence_partition) && typeof i.synthetic_subject_id === 'string' && /^subject-[a-z0-9]+$/.test(i.synthetic_subject_id) && s && typeof s === 'object' && !Array.isArray(s) && Object.keys(s).length === snapshotKeys.length && snapshotKeys.every((key) => Object.keys(s).includes(key) && typeof s[key] === 'string') ? 'valid' : 'invalid'; })() }}",
+              "rightValue": "valid",
+              "operator": {"type": "string", "operation": "equals"}
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "renewal-read",
+      "name": "Read Synthetic Renewal Context",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [520, -100],
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={{ ({ operation: $json.body.operation, idempotency_key: $json.body.idempotency_key, status: 'read', facts: ['renewal_window.' + $json.body.commercial_snapshot.renewal_window, 'engagement_band.' + $json.body.commercial_snapshot.engagement_band, 'commercial_evidence_state.' + $json.body.commercial_snapshot.commercial_evidence_state, 'consent_state.' + $json.body.commercial_snapshot.consent_state] }) }}",
+        "includeOtherFields": false,
+        "options": {"dotNotation": true}
+      }
+    },
+    {
+      "id": "renewal-reject",
+      "name": "Reject Invalid Renewal Read",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [520, 100],
+      "parameters": {
+        "errorType": "errorMessage",
+        "errorMessage": "read-only contract rejected"
       }
     }
   ],
   "connections": {
     "Typed Renewal Input": {
-      "main": [[{"node": "Read Synthetic Renewal Context", "type": "main", "index": 0}]]
+      "main": [[{"node": "Validate Renewal Read Contract", "type": "main", "index": 0}]]
+    },
+    "Validate Renewal Read Contract": {
+      "main": [
+        [{"node": "Read Synthetic Renewal Context", "type": "main", "index": 0}],
+        [{"node": "Reject Invalid Renewal Read", "type": "main", "index": 0}]
+      ]
     }
   },
   "settings": {"availableInMCP": true, "executionOrder": "v1"}

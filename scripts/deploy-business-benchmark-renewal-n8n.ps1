@@ -184,11 +184,16 @@ function Read-AndValidateWorkflow {
     ) {
         throw "Canonical renewal workflow read-only contract is invalid."
     }
-    if (@($workflow.nodes).Count -ne 2) {
+    if (@($workflow.nodes).Count -ne 4) {
         throw "Canonical renewal workflow node inventory is invalid."
     }
     $nodeTypes = @($workflow.nodes | ForEach-Object { $_.type } | Sort-Object)
-    $expectedNodeTypes = @("n8n-nodes-base.code", "n8n-nodes-base.webhook")
+    $expectedNodeTypes = @(
+        "n8n-nodes-base.if",
+        "n8n-nodes-base.set",
+        "n8n-nodes-base.stopAndError",
+        "n8n-nodes-base.webhook"
+    )
     if (($nodeTypes -join "|") -cne ($expectedNodeTypes -join "|")) {
         throw "Canonical renewal workflow contains an unauthorized node type."
     }
