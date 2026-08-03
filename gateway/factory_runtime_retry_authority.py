@@ -279,7 +279,8 @@ def _require_resumable_binding(
     evidence_failure_terminal = (
         terminal.get("schema") == "captain.codex-session-error-receipt.v1"
         and terminal.get("status") == "evidence_failed"
-        and terminal.get("failure_kind") == "record_size_limit_exceeded"
+        and terminal.get("failure_kind")
+        in {"record_size_limit_exceeded", "output_read_failed"}
     )
     required_output_terminal = (
         checkpoint.implementation_failure_reason == "required_output_invalid"

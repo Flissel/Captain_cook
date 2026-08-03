@@ -127,7 +127,11 @@ def _interrupted_fixture(tmp_path: Path, *, resume_ordinal: int = 0):
     )
 
 
-def _evidence_failure_fixture(tmp_path: Path):
+def _evidence_failure_fixture(
+    tmp_path: Path,
+    *,
+    failure_kind: str = "record_size_limit_exceeded",
+):
     (
         job,
         state_root,
@@ -141,7 +145,7 @@ def _evidence_failure_fixture(tmp_path: Path):
         {
             "schema": "captain.codex-session-error-receipt.v1",
             "status": "evidence_failed",
-            "failure_kind": "record_size_limit_exceeded",
+            "failure_kind": failure_kind,
             "resume_ordinal": 0,
             "process_cleanup_status": "verified_cancelled",
             "workspace_ref": binding.workspace_ref,
@@ -324,7 +328,14 @@ def test_captain_issues_second_retry_from_resume_receipt(tmp_path: Path) -> None
     ) == issued
 
 
-def test_captain_issues_exact_record_limit_evidence_retry(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "failure_kind",
+    ("record_size_limit_exceeded", "output_read_failed"),
+)
+def test_captain_issues_exact_recoverable_evidence_retry(
+    tmp_path: Path,
+    failure_kind: str,
+) -> None:
     (
         job,
         state_root,
@@ -333,7 +344,7 @@ def test_captain_issues_exact_record_limit_evidence_retry(tmp_path: Path) -> Non
         binding,
         checkpoint_ref,
         terminal_ref,
-    ) = _evidence_failure_fixture(tmp_path)
+    ) = _evidence_failure_fixture(tmp_path, failure_kind=failure_kind)
     authority_root = tmp_path / ".captain-cook" / "runtime-retries"
     issuer = CaptainRuntimeRetryAuthorizationIssuer(
         authority_root=authority_root,

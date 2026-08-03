@@ -104,6 +104,9 @@ behavioral attempt.
   inspection or cancellation before continuation.
 - Missing or digest-conflicting checkpoint, journal, workspace, receipt, or
   authorization data fails closed.
+- A digest-bound `output_read_failed` receipt is resumable only when process
+  cleanup is resolved; malformed JSON and other semantic evidence failures
+  remain non-resumable.
 - Successful execution with missing artifacts is a failed seal, not a resumable
   provider timeout.
 - Seal is idempotent: identical completed evidence replays; conflicting bytes

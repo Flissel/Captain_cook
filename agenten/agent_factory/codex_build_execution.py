@@ -1053,7 +1053,8 @@ class CodexCliFactoryBuildExecutor:
         evidence_failure_is_resumable = (
             checkpoint.phase == "implementation_failed"
             and prior.payload["status"] == "evidence_failed"
-            and prior.payload.get("failure_kind") == "record_size_limit_exceeded"
+            and prior.payload.get("failure_kind")
+            in {"record_size_limit_exceeded", "output_read_failed"}
         )
         required_output_failure_is_resumable = (
             checkpoint.phase == "implementation_failed"
@@ -1436,7 +1437,7 @@ class CodexCliFactoryBuildExecutor:
                     and checkpoint.implementation_failure_reason == "evidence_failure"
                     and prior.payload["status"] == "evidence_failed"
                     and prior.payload.get("failure_kind")
-                    == "record_size_limit_exceeded"
+                    in {"record_size_limit_exceeded", "output_read_failed"}
                 )
                 required_output_failure_is_resumable = (
                     checkpoint.phase == "implementation_failed"
