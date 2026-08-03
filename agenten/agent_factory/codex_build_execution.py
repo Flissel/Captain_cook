@@ -254,7 +254,7 @@ def _interruption_references(
     resumable_phase = checkpoint.phase == "implementation_interrupted" or (
         checkpoint.phase == "implementation_failed"
         and checkpoint.implementation_failure_reason
-        in {"evidence_failure", "required_output_invalid"}
+        in {"evidence_failure", "required_output_invalid", "runtime_failed"}
     )
     if not resumable_phase or receipt_sha256 is None:
         raise FactoryDispatchError("Factory Codex interruption checkpoint is invalid")

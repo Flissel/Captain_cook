@@ -288,9 +288,9 @@ def test_evidence_failure_retry_advances_with_new_authority_and_lineage(
     assert store.load(invocation) == resumed
 
 
-def test_non_evidence_failure_remains_terminal(tmp_path: Path) -> None:
+def test_runtime_failure_can_resume_with_bound_parent_lineage(tmp_path: Path) -> None:
     store = FilesystemFactoryCodexBuildCheckpointStore(tmp_path / "checkpoints")
-    scaffold, _ = _bound_checkpoint(tmp_path)
+    scaffold, invocation = _bound_checkpoint(tmp_path)
     running = _next(scaffold, phase="implementation_running", seconds=1)
     failed = _next(
         running,
@@ -301,6 +301,39 @@ def test_non_evidence_failure_remains_terminal(tmp_path: Path) -> None:
     failed = failed.model_copy(
         update={"implementation_failure_reason": "runtime_failed"}
     )
+    resumed = _next(
+        failed,
+        phase="implementation_running",
+        seconds=1,
+        resume_ordinal=1,
+        parent_terminal_receipt_sha256="b" * 64,
+        parent_journal_sha256="d" * 64,
+    )
+
+    store.advance(None, scaffold)
+    store.advance(scaffold, running)
+    store.advance(running, failed)
+    assert store.advance(failed, resumed) == resumed
+    assert store.load(invocation) == resumed
+
+
+@pytest.mark.parametrize(
+    "failure_reason",
+    ("output_size_limit_exceeded", "authority_expired"),
+)
+def test_non_retryable_failure_remains_terminal(
+    tmp_path: Path,
+    failure_reason: str,
+) -> None:
+    store = FilesystemFactoryCodexBuildCheckpointStore(tmp_path / "checkpoints")
+    scaffold, _ = _bound_checkpoint(tmp_path)
+    running = _next(scaffold, phase="implementation_running", seconds=1)
+    failed = _next(
+        running,
+        phase="implementation_failed",
+        seconds=1,
+        terminal_receipt_sha256="b" * 64,
+    ).model_copy(update={"implementation_failure_reason": failure_reason})
     resumed = _next(
         failed,
         phase="implementation_running",

@@ -1028,7 +1028,7 @@ def _require_transition(
     elif transition == ("implementation_failed", "implementation_running"):
         if (
             previous.implementation_failure_reason
-            not in {"evidence_failure", "required_output_invalid"}
+            not in {"evidence_failure", "required_output_invalid", "runtime_failed"}
             or next_checkpoint.implementation_failure_reason is not None
         ):
             raise FactoryDispatchError(
