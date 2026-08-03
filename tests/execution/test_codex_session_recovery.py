@@ -1227,8 +1227,14 @@ async def test_powershell_runner_bridges_authorized_run_to_real_launcher(
     assert 'ArgumentList.Add("never")' in Path(
         "scripts/codex-session.ps1"
     ).read_text(encoding="utf-8")
+    assert 'ArgumentList.Add("--ignore-user-config")' in Path(
+        "scripts/codex-session.ps1"
+    ).read_text(encoding="utf-8")
     launcher = Path("scripts/codex-session.ps1").read_text(encoding="utf-8")
     assert launcher.index('ArgumentList.Add("-a")') < launcher.index(
+        'ArgumentList.Add("exec")'
+    )
+    assert launcher.index('ArgumentList.Add("--ignore-user-config")') < launcher.index(
         'ArgumentList.Add("exec")'
     )
     identity = json.loads(state_path.read_text(encoding="utf-8"))

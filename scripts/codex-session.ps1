@@ -137,6 +137,7 @@ $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
 $startInfo.ArgumentList.Add("-a")
 $startInfo.ArgumentList.Add("never")
+$startInfo.ArgumentList.Add("--ignore-user-config")
 if ($ResumeThreadId) {
     # `codex exec resume` inherits global sandbox policy. Every value is a
     # distinct ArgumentList entry so neither thread names nor prompts cross a
