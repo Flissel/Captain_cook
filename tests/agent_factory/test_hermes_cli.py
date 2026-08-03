@@ -1915,6 +1915,18 @@ async def test_runtime_retry_replay_requires_atomic_authorized_resume(
     )
     with pytest.raises(FactorySkillReplayRetryableFailureError) as retryable:
         await replay_store.claim(invocation)
+    if retryable_failure == "CodexPolicyViolation":
+        authorization = authorization.model_copy(
+            update={
+                "authorization_ref": ArtifactRef(
+                    uri=f"artifact://factory/runtime-retry/{'b' * 64}",
+                    sha256="b" * 64,
+                    media_type="application/json",
+                ),
+                "issued_at": authorization.issued_at + timedelta(seconds=1),
+                "expires_at": authorization.expires_at + timedelta(seconds=1),
+            }
+        )
     retried = await replay_store.retry_failed(
         retryable.value.record,
         authorization=authorization,

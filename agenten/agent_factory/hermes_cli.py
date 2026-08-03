@@ -2511,13 +2511,7 @@ def _retried_failed_replay_record(
         )
         or (
             not evidence_retry
-            and (
-                failed.resume_ordinal != authorization.resume_ordinal
-                or failed.runtime_retry_authorization_ref
-                != authorization.authorization_ref
-                or failed.runtime_retry_authorization_binding_sha256
-                != expected_authorization_digest
-            )
+            and failed.resume_ordinal != authorization.resume_ordinal
         )
         or authorization.job_id != invocation.job_id
         or authorization.correlation_id != invocation.correlation_id
