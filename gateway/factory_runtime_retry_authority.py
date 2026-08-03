@@ -198,7 +198,7 @@ class FilesystemFactoryRuntimeRetryAuthority:
             elif (
                 checkpoint.phase == "implementation_failed"
                 and checkpoint.implementation_failure_reason
-                in {"evidence_failure", "required_output_invalid"}
+                in {"evidence_failure", "required_output_invalid", "runtime_failed"}
             ):
                 eligible = (
                     authorization.resume_ordinal == checkpoint.resume_ordinal + 1
@@ -240,7 +240,7 @@ def _require_resumable_binding(
         or (
             checkpoint.phase == "implementation_failed"
             and checkpoint.implementation_failure_reason
-            not in {"evidence_failure", "required_output_invalid"}
+            not in {"evidence_failure", "required_output_invalid", "runtime_failed"}
         )
         or checkpoint.job_id != binding.job_id
         or checkpoint.correlation_id != binding.correlation_id
@@ -288,6 +288,13 @@ def _require_resumable_binding(
         and terminal.get("status") == "succeeded"
         and terminal.get("exit_code") == 0
     )
+    runtime_failure_terminal = (
+        checkpoint.implementation_failure_reason == "runtime_failed"
+        and terminal.get("schema") == "captain.codex-session-receipt.v1"
+        and terminal.get("status") == "failed"
+        and isinstance(terminal.get("exit_code"), int)
+        and terminal.get("exit_code") not in {0, 124, 130}
+    )
     if (
         checkpoint.terminal_receipt_sha256 != terminal_sha
         or terminal_receipt_ref != expected_terminal
@@ -296,6 +303,7 @@ def _require_resumable_binding(
             interrupted_terminal
             or evidence_failure_terminal
             or required_output_terminal
+            or runtime_failure_terminal
         )
         or terminal.get("resume_ordinal") != checkpoint.resume_ordinal
         or terminal.get("process_cleanup_status") == "unresolved"

@@ -32,13 +32,18 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Issue one Captain-owned Codex retry from a canonical interruption "
-            "checkpoint read from stdin or an exact durable record-size failure."
+            "checkpoint read from stdin or an exact durable runtime failure."
         )
     )
     parser.add_argument("--workspace-root", type=Path, required=True)
     parser.add_argument("--maximum-runtime-seconds", type=int, default=600)
     parser.add_argument("--authorization-window-seconds", type=int, default=1200)
-    parser.add_argument("--evidence-failure-job-id", type=UUID)
+    parser.add_argument(
+        "--failure-job-id",
+        "--evidence-failure-job-id",
+        dest="failure_job_id",
+        type=UUID,
+    )
     parser.add_argument("--attempt", type=int)
     return parser
 
@@ -160,7 +165,7 @@ def _revision(value: object) -> str:
     return text
 
 
-def _load_evidence_failure(
+def _load_failed_attempt(
     workspace: Path,
     *,
     job_id: UUID,
@@ -189,11 +194,12 @@ def _load_evidence_failure(
             and replay.invocation.attempt == attempt
             and replay.invocation.step is FactorySkillStep.SEAL_CODEX_BUILD
             and replay.state == "failed"
-            and replay.failure_kind == "FactoryCodexEvidenceFailure"
+            and replay.failure_kind
+            in {"FactoryCodexEvidenceFailure", "FactoryDispatchError"}
         ):
             matches.append(replay)
     if len(matches) != 1:
-        raise ValueError("exactly one durable Codex evidence failure is required")
+        raise ValueError("exactly one durable Codex runtime failure is required")
     replay = matches[0]
     invocation = replay.invocation
     checkpoint_path = (
@@ -208,18 +214,23 @@ def _load_evidence_failure(
             checkpoint_bytes
         )
     except (OSError, ValueError) as exc:
-        raise ValueError("Codex evidence failure checkpoint is unavailable") from exc
+        raise ValueError("Codex runtime failure checkpoint is unavailable") from exc
     checkpoint_sha = hashlib.sha256(
         canonical_factory_codex_model(checkpoint)
     ).hexdigest()
     terminal_sha = checkpoint.terminal_receipt_sha256
+    expected_reason = (
+        "evidence_failure"
+        if replay.failure_kind == "FactoryCodexEvidenceFailure"
+        else "runtime_failed"
+    )
     if (
         checkpoint.phase != "implementation_failed"
-        or checkpoint.implementation_failure_reason != "evidence_failure"
+        or checkpoint.implementation_failure_reason != expected_reason
         or checkpoint.resume_ordinal != replay.resume_ordinal
         or terminal_sha is None
     ):
-        raise ValueError("Codex evidence failure checkpoint is not resumable")
+        raise ValueError("Codex runtime failure checkpoint is not resumable")
     binding = FactoryCodexBuildInterruptionBindings(
         job_id=invocation.job_id,
         correlation_id=invocation.correlation_id,
@@ -259,16 +270,16 @@ def main() -> int:
     ):
         raise SystemExit("retry runtime or authorization window is invalid")
     workspace = args.workspace_root.resolve(strict=True)
-    evidence_mode = args.evidence_failure_job_id is not None or args.attempt is not None
-    if evidence_mode:
-        if args.evidence_failure_job_id is None or args.attempt is None:
+    failure_mode = args.failure_job_id is not None or args.attempt is not None
+    if failure_mode:
+        if args.failure_job_id is None or args.attempt is None:
             raise SystemExit(
-                "--evidence-failure-job-id and --attempt must be provided together"
+                "--failure-job-id and --attempt must be provided together"
             )
         binding, checkpoint_ref, terminal_ref, resume_ordinal = (
-            _load_evidence_failure(
+            _load_failed_attempt(
                 workspace,
-                job_id=args.evidence_failure_job_id,
+                job_id=args.failure_job_id,
                 attempt=args.attempt,
             )
         )

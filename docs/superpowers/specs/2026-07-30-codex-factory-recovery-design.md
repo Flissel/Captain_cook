@@ -107,6 +107,9 @@ behavioral attempt.
 - A digest-bound `output_read_failed` receipt is resumable only when process
   cleanup is resolved; malformed JSON and other semantic evidence failures
   remain non-resumable.
+- A terminal `runtime_failed` receipt with a non-interruption exit code may use
+  the next bounded resume ordinal; the same checkpoint, workspace, terminal
+  digest, and Captain authorization must still match exactly.
 - Successful execution with missing artifacts is a failed seal, not a resumable
   provider timeout.
 - Seal is idempotent: identical completed evidence replays; conflicting bytes

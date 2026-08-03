@@ -2494,6 +2494,7 @@ def _retried_failed_replay_record(
     evidence_retry = failed.failure_kind in {
         "FactoryCodexEvidenceFailure",
         "FactoryCodexOutputCaptureError",
+        "FactoryDispatchError",
     }
     if (
         failed.state != "failed"
@@ -2502,6 +2503,7 @@ def _retried_failed_replay_record(
             "CodexBuildProvenanceError",
             "FactoryCodexEvidenceFailure",
             "FactoryCodexOutputCaptureError",
+            "FactoryDispatchError",
         }
         or (
             evidence_retry
@@ -2663,6 +2665,11 @@ def _is_codex_retryable_failure(replay: FactorySkillReplayRecord) -> bool:
         "FactoryCodexEvidenceFailure",
         "FactoryCodexOutputCaptureError",
     }:
+        return replay.resume_ordinal < 2
+    if (
+        replay.failure_kind == "FactoryDispatchError"
+        and replay.invocation.step is FactorySkillStep.SEAL_CODEX_BUILD
+    ):
         return replay.resume_ordinal < 2
     return (
         replay.failure_kind in {"CodexPolicyViolation", "CodexBuildProvenanceError"}

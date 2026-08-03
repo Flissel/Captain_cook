@@ -245,6 +245,63 @@ def _required_output_failure_fixture(tmp_path: Path):
     )
 
 
+def _runtime_failure_fixture(tmp_path: Path):
+    (
+        job,
+        state_root,
+        checkpoint_path,
+        terminal_path,
+        binding,
+        _,
+        _,
+    ) = _interrupted_fixture(tmp_path, resume_ordinal=1)
+    terminal_bytes = json.dumps(
+        {
+            "schema": "captain.codex-session-receipt.v1",
+            "status": "failed",
+            "exit_code": 2,
+            "resume_ordinal": 1,
+            "process_cleanup_status": "not_required",
+            "workspace_ref": binding.workspace_ref,
+            "base_revision": binding.base_revision,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    terminal_sha = hashlib.sha256(terminal_bytes).hexdigest()
+    checkpoint = FactoryCodexBuildCheckpointV1.model_validate_json(
+        checkpoint_path.read_bytes()
+    ).model_copy(
+        update={
+            "phase": "implementation_failed",
+            "terminal_receipt_sha256": terminal_sha,
+            "implementation_failure_reason": "runtime_failed",
+        }
+    )
+    checkpoint_path.write_bytes(canonical_factory_codex_model(checkpoint))
+    terminal_path.write_bytes(terminal_bytes)
+    checkpoint_sha = hashlib.sha256(
+        canonical_factory_codex_model(checkpoint)
+    ).hexdigest()
+    return (
+        job,
+        state_root,
+        checkpoint_path,
+        terminal_path,
+        binding,
+        ArtifactRef(
+            uri=f"artifact://factory/codex-checkpoint/{checkpoint_sha}",
+            sha256=checkpoint_sha,
+            media_type="application/json",
+        ),
+        ArtifactRef(
+            uri=f"artifact://factory/codex-terminal-receipt/{terminal_sha}",
+            sha256=terminal_sha,
+            media_type="application/json",
+        ),
+    )
+
+
 def test_captain_issues_and_loads_exact_interrupted_runtime_retry(
     tmp_path: Path,
 ) -> None:
@@ -358,6 +415,46 @@ def test_captain_issues_exact_recoverable_evidence_retry(
         checkpoint_ref=checkpoint_ref,
         terminal_receipt_ref=terminal_ref,
         resume_ordinal=1,
+        maximum_runtime_seconds=600,
+        issued_at=NOW,
+        expires_at=NOW + timedelta(minutes=20),
+    )
+    authority = FilesystemFactoryRuntimeRetryAuthority(
+        authority_root=authority_root,
+        checkpoint_root=state_root / "checkpoints",
+    )
+
+    assert authority.active(
+        job,
+        FactoryAction(kind=FactoryActionKind.DISPATCH_TOOL_INTEGRATOR, attempt=1),
+        SimpleNamespace(job=job),
+        NOW + timedelta(seconds=1),
+    ) == issued
+
+
+def test_captain_issues_exact_runtime_failure_retry(tmp_path: Path) -> None:
+    (
+        job,
+        state_root,
+        checkpoint_path,
+        terminal_path,
+        binding,
+        checkpoint_ref,
+        terminal_ref,
+    ) = _runtime_failure_fixture(tmp_path)
+    authority_root = tmp_path / ".captain-cook" / "runtime-retries"
+    issuer = CaptainRuntimeRetryAuthorizationIssuer(
+        authority_root=authority_root,
+        codex_state_root=state_root,
+    )
+
+    issued = issuer.issue(
+        checkpoint_path=checkpoint_path,
+        terminal_receipt_path=terminal_path,
+        binding=binding,
+        checkpoint_ref=checkpoint_ref,
+        terminal_receipt_ref=terminal_ref,
+        resume_ordinal=2,
         maximum_runtime_seconds=600,
         issued_at=NOW,
         expires_at=NOW + timedelta(minutes=20),

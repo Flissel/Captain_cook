@@ -1933,9 +1933,13 @@ async def test_runtime_retry_replay_requires_atomic_authorized_resume(
 @pytest.mark.parametrize("durable", [False, True])
 @pytest.mark.parametrize(
     "failure_kind",
-    ["FactoryCodexEvidenceFailure", "FactoryCodexOutputCaptureError"],
+    [
+        "FactoryCodexEvidenceFailure",
+        "FactoryCodexOutputCaptureError",
+        "FactoryDispatchError",
+    ],
 )
-async def test_evidence_failure_replay_requires_new_runtime_retry_authority(
+async def test_codex_runtime_failure_replay_requires_new_runtime_retry_authority(
     tmp_path: Path,
     durable: bool,
     failure_kind: str,

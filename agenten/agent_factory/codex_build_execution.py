@@ -1063,11 +1063,19 @@ class CodexCliFactoryBuildExecutor:
             and prior.payload["status"] == "succeeded"
             and prior.payload.get("exit_code") == 0
         )
+        runtime_failure_is_resumable = (
+            checkpoint.phase == "implementation_failed"
+            and checkpoint.implementation_failure_reason == "runtime_failed"
+            and prior.payload["status"] == "failed"
+            and isinstance(prior.payload.get("exit_code"), int)
+            and prior.payload.get("exit_code") not in {0, 124, 130}
+        )
         if (
             not (
                 interruption_is_resumable
                 or evidence_failure_is_resumable
                 or required_output_failure_is_resumable
+                or runtime_failure_is_resumable
             )
             or prior.payload["process_cleanup_status"] == "unresolved"
             or prior.completed_at > checkpoint.updated_at
@@ -1446,11 +1454,19 @@ class CodexCliFactoryBuildExecutor:
                     and prior.payload["status"] == "succeeded"
                     and prior.payload.get("exit_code") == 0
                 )
+                runtime_failure_is_resumable = (
+                    checkpoint.phase == "implementation_failed"
+                    and checkpoint.implementation_failure_reason == "runtime_failed"
+                    and prior.payload["status"] == "failed"
+                    and isinstance(prior.payload.get("exit_code"), int)
+                    and prior.payload.get("exit_code") not in {0, 124, 130}
+                )
                 if (
                     not (
                         interruption_is_resumable
                         or evidence_failure_is_resumable
                         or required_output_failure_is_resumable
+                        or runtime_failure_is_resumable
                     )
                     or prior.payload["process_cleanup_status"] == "unresolved"
                 ):
