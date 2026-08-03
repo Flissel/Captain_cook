@@ -512,6 +512,59 @@ def test_captain_issues_exact_required_output_repair_retry(tmp_path: Path) -> No
     ) == issued
 
 
+def test_captain_selects_latest_identical_prelaunch_repair_authority(
+    tmp_path: Path,
+) -> None:
+    (
+        job,
+        state_root,
+        checkpoint_path,
+        terminal_path,
+        binding,
+        checkpoint_ref,
+        terminal_ref,
+    ) = _required_output_failure_fixture(tmp_path)
+    authority_root = tmp_path / ".captain-cook" / "runtime-retries"
+    issuer = CaptainRuntimeRetryAuthorizationIssuer(
+        authority_root=authority_root,
+        codex_state_root=state_root,
+    )
+    issuer.issue(
+        checkpoint_path=checkpoint_path,
+        terminal_receipt_path=terminal_path,
+        binding=binding,
+        checkpoint_ref=checkpoint_ref,
+        terminal_receipt_ref=terminal_ref,
+        resume_ordinal=1,
+        maximum_runtime_seconds=600,
+        issued_at=NOW,
+        expires_at=NOW + timedelta(minutes=20),
+    )
+    replacement = issuer.issue(
+        checkpoint_path=checkpoint_path,
+        terminal_receipt_path=terminal_path,
+        binding=binding,
+        checkpoint_ref=checkpoint_ref,
+        terminal_receipt_ref=terminal_ref,
+        resume_ordinal=1,
+        maximum_runtime_seconds=600,
+        issued_at=NOW + timedelta(seconds=2),
+        expires_at=NOW + timedelta(minutes=20, seconds=2),
+    )
+
+    active = FilesystemFactoryRuntimeRetryAuthority(
+        authority_root=authority_root,
+        checkpoint_root=state_root / "checkpoints",
+    ).active(
+        job,
+        FactoryAction(kind=FactoryActionKind.DISPATCH_TOOL_INTEGRATOR, attempt=1),
+        SimpleNamespace(job=job),
+        NOW + timedelta(seconds=3),
+    )
+
+    assert active == replacement
+
+
 def test_captain_rejects_other_evidence_failure_kind(tmp_path: Path) -> None:
     (
         _,

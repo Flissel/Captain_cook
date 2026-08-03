@@ -219,8 +219,41 @@ class FilesystemFactoryRuntimeRetryAuthority:
         highest = max(item.resume_ordinal for item in matching)
         selected = tuple(item for item in matching if item.resume_ordinal == highest)
         if len(selected) != 1:
-            raise ValueError("runtime retry authority is conflicting")
+            checkpoint = _read_checkpoint(
+                self._checkpoint_root / f"{selected[0].invocation_id.hex}.json"
+            )
+            bindings = {
+                _prelaunch_supersession_binding(item) for item in selected
+            }
+            latest_issued_at = max(item.issued_at for item in selected)
+            latest = tuple(
+                item for item in selected if item.issued_at == latest_issued_at
+            )
+            if (
+                checkpoint.phase != "implementation_failed"
+                or checkpoint.implementation_failure_reason
+                != "required_output_invalid"
+                or len(bindings) != 1
+                or len(latest) != 1
+            ):
+                raise ValueError("runtime retry authority is conflicting")
+            return latest[0]
         return selected[0]
+
+
+def _prelaunch_supersession_binding(
+    authorization: FactoryRuntimeRetryAuthorizationV1,
+) -> bytes:
+    payload = authorization.model_dump(
+        mode="json",
+        exclude={"authorization_ref", "issued_at", "expires_at"},
+    )
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def _require_resumable_binding(
