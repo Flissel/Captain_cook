@@ -1010,7 +1010,7 @@ class CodexCliFactoryBuildExecutor:
         if (
             checkpoint.phase == "implementation_failed"
             and checkpoint.implementation_failure_reason
-            not in {"evidence_failure", "required_output_invalid"}
+            not in {"evidence_failure", "required_output_invalid", "runtime_failed"}
         ):
             raise FactoryDispatchError("Factory Codex build failure is not resumable")
         resume_ordinal = self._resume_authorizer.authorize_resume(
