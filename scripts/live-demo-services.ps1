@@ -9,6 +9,7 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$global:LASTEXITCODE = 0
 $root = Split-Path -Parent $PSScriptRoot
 $rootEnv = Join-Path $root '.env'
 $n8nEnv = Join-Path $root '.env.captain-n8n'
