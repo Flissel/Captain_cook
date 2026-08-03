@@ -18,6 +18,7 @@ from agenten.agent_factory.business_benchmark_demo_provisioning import (
     BusinessBenchmarkDemoPlanSettings,
     BusinessBenchmarkDemoProvisioningSettings,
 )
+from agenten.agent_factory.business_benchmark_contracts import BusinessBenchmarkPolicyV1
 from gateway.business_benchmark_demo import GatewayBusinessBenchmarkDemoError
 
 
@@ -48,6 +49,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--seed-version-id",
         default="business-benchmark-demo-2026-07",
     )
+    parser.add_argument("--policy-id", default="captain-business-value-v1")
+    parser.add_argument("--candidate-only-safety-gates", action="store_true")
+    parser.add_argument("--relative-efficiency-diagnostics", action="store_true")
+    parser.add_argument("--minimum-correctness-uplift-bps", type=int, default=0)
+    parser.add_argument("--minimum-completion-uplift-bps", type=int, default=0)
     return parser.parse_args(argv)
 
 
@@ -74,6 +80,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             "maximum_usd_per_team": args.maximum_usd_per_team,
             "suite_version": args.suite_version,
             "seed_version_id": args.seed_version_id,
+            "benchmark_policy": BusinessBenchmarkPolicyV1(
+                schema="captain.business-benchmark-policy.v1",
+                policy_id=args.policy_id,
+                candidate_only_safety_gates=args.candidate_only_safety_gates,
+                enforce_relative_efficiency_gates=(
+                    not args.relative_efficiency_diagnostics
+                ),
+                minimum_correctness_uplift_bps=(
+                    args.minimum_correctness_uplift_bps
+                ),
+                minimum_completion_uplift_bps=(
+                    args.minimum_completion_uplift_bps
+                ),
+            ),
         }
         settings = (
             BusinessBenchmarkDemoProvisioningSettings(

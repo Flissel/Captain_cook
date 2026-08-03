@@ -143,7 +143,7 @@ $priorActualUsdRenewal = '1.525231'
 $userMaximumEurPerTeam = '6.00'
 $budgetEurPerUsd = '1.25'
 $humanReviewTimeoutSeconds = '120'
-$seedVersion = 'business-benchmark-demo-2026-08-v34'
+$seedVersion = 'business-benchmark-demo-2026-08-v35'
 
 $rootEnvAllowlist = @(
     'CAPTAIN_GATEWAY_TOKEN',
@@ -396,7 +396,7 @@ function New-DryRunPlan {
         mode = 'dry_run'
         database = 'captain_test'
         issued_at = $IssuedAt
-        suite_version = 34
+        suite_version = 35
         seed_version_id = $seedVersion
         maximum_usd_per_team = $maximumUsdPerTeam
         jobs = @(
@@ -687,8 +687,13 @@ try {
             '--issued-at', $issuedAt,
             '--model', 'gpt-4.1-mini',
             '--maximum-usd-per-team', $maximumUsdPerTeam,
-            '--suite-version', '34',
-            '--seed-version-id', $seedVersion
+            '--suite-version', '35',
+            '--seed-version-id', $seedVersion,
+            '--policy-id', 'captain-business-value-v35',
+            '--candidate-only-safety-gates',
+            '--relative-efficiency-diagnostics',
+            '--minimum-correctness-uplift-bps', '500',
+            '--minimum-completion-uplift-bps', '1000'
         )
         $rawPlanProvisioning = @(& $python @planArguments)
         if ($LASTEXITCODE -ne 0) {
@@ -717,7 +722,7 @@ try {
             if (
                 [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
                 @($team.job.execution_policy.allowed_models) -notcontains 'gpt-4.1-mini' -or
-                [int]$team.suite.suite_version -ne 34
+                [int]$team.suite.suite_version -ne 35
             ) {
                 throw 'Dry-run team model or budget does not match the demo authority.'
             }
@@ -843,8 +848,13 @@ try {
         '--issued-at', $issuedAt,
         '--model', $model,
         '--maximum-usd-per-team', $maximumUsdPerTeam,
-        '--suite-version', '34',
-        '--seed-version-id', $seedVersion
+        '--suite-version', '35',
+        '--seed-version-id', $seedVersion,
+        '--policy-id', 'captain-business-value-v35',
+        '--candidate-only-safety-gates',
+        '--relative-efficiency-diagnostics',
+        '--minimum-correctness-uplift-bps', '500',
+        '--minimum-completion-uplift-bps', '1000'
     )
     if ($Action -in @('AUTHORIZE', 'BUILD', 'RUN')) {
         $arguments += '--apply'
@@ -887,7 +897,7 @@ try {
         if (
             [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
             @($team.job.execution_policy.allowed_models) -notcontains $model -or
-            [int]$team.suite.suite_version -ne 34
+            [int]$team.suite.suite_version -ne 35
         ) {
             throw 'Provisioned team model or budget does not match the demo authority.'
         }

@@ -46,6 +46,7 @@ BusinessBenchmarkReasonCode = Literal[
     "below_minimum_correctness",
     "below_baseline_correctness",
     "below_baseline_completion",
+    "insufficient_business_value_uplift",
     "cost_ratio_exceeded",
     "latency_ratio_exceeded",
     "zero_baseline_cost_with_candidate_spend",
@@ -374,6 +375,47 @@ class BusinessBenchmarkPolicyV1(_FrozenContract):
         strict=True,
         exclude_if=lambda value: value is False,
     )
+    enforce_relative_efficiency_gates: bool = Field(
+        default=True,
+        strict=True,
+        exclude_if=lambda value: value is True,
+    )
+    minimum_correctness_uplift_bps: int = Field(
+        default=0,
+        ge=0,
+        le=10000,
+        strict=True,
+        exclude_if=lambda value: value == 0,
+    )
+    minimum_completion_uplift_bps: int = Field(
+        default=0,
+        ge=0,
+        le=10000,
+        strict=True,
+        exclude_if=lambda value: value == 0,
+    )
+
+    def material_uplift_satisfied(
+        self,
+        *,
+        candidate_correctness_bps: int,
+        baseline_correctness_bps: int,
+        candidate_completion_bps: int,
+        baseline_completion_bps: int,
+    ) -> bool:
+        correctness_required = self.minimum_correctness_uplift_bps > 0
+        completion_required = self.minimum_completion_uplift_bps > 0
+        if not correctness_required and not completion_required:
+            return True
+        correctness_satisfied = correctness_required and (
+            candidate_correctness_bps - baseline_correctness_bps
+            >= self.minimum_correctness_uplift_bps
+        )
+        completion_satisfied = completion_required and (
+            candidate_completion_bps - baseline_completion_bps
+            >= self.minimum_completion_uplift_bps
+        )
+        return correctness_satisfied or completion_satisfied
 
 
 class BusinessBenchmarkCaseMetricV1(_FrozenContract):
@@ -531,20 +573,32 @@ class BusinessBenchmarkSummaryV1(_FrozenContract):
                     and self.candidate_completion_bps
                     < self.baseline_completion_bps
                 ),
+                "insufficient_business_value_uplift": (
+                    not self.policy.material_uplift_satisfied(
+                        candidate_correctness_bps=self.candidate_correctness_bps,
+                        baseline_correctness_bps=self.baseline_correctness_bps,
+                        candidate_completion_bps=self.candidate_completion_bps,
+                        baseline_completion_bps=self.baseline_completion_bps,
+                    )
+                ),
                 "cost_ratio_exceeded": (
-                    self.baseline_cost_micro_usd > 0
+                    self.policy.enforce_relative_efficiency_gates
+                    and self.baseline_cost_micro_usd > 0
                     and self.cost_ratio_bps > self.policy.maximum_cost_ratio_bps
                 ),
                 "latency_ratio_exceeded": (
-                    self.baseline_latency_ms > 0
+                    self.policy.enforce_relative_efficiency_gates
+                    and self.baseline_latency_ms > 0
                     and self.latency_ratio_bps > self.policy.maximum_latency_ratio_bps
                 ),
                 "zero_baseline_cost_with_candidate_spend": (
-                    self.baseline_cost_micro_usd == 0
+                    self.policy.enforce_relative_efficiency_gates
+                    and self.baseline_cost_micro_usd == 0
                     and self.candidate_cost_micro_usd > 0
                 ),
                 "zero_baseline_latency_with_candidate_time": (
-                    self.baseline_latency_ms == 0
+                    self.policy.enforce_relative_efficiency_gates
+                    and self.baseline_latency_ms == 0
                     and self.candidate_latency_ms > 0
                 ),
             }
@@ -598,9 +652,22 @@ class BusinessBenchmarkSummaryV1(_FrozenContract):
             or self.candidate_completion_bps < self.baseline_completion_bps
         ):
             failures.append("below baseline")
-        if self.cost_ratio_bps > self.policy.maximum_cost_ratio_bps:
+        if not self.policy.material_uplift_satisfied(
+            candidate_correctness_bps=self.candidate_correctness_bps,
+            baseline_correctness_bps=self.baseline_correctness_bps,
+            candidate_completion_bps=self.candidate_completion_bps,
+            baseline_completion_bps=self.baseline_completion_bps,
+        ):
+            failures.append("business value uplift")
+        if (
+            self.policy.enforce_relative_efficiency_gates
+            and self.cost_ratio_bps > self.policy.maximum_cost_ratio_bps
+        ):
             failures.append("cost ratio")
-        if self.latency_ratio_bps > self.policy.maximum_latency_ratio_bps:
+        if (
+            self.policy.enforce_relative_efficiency_gates
+            and self.latency_ratio_bps > self.policy.maximum_latency_ratio_bps
+        ):
             failures.append("latency ratio")
         if self.disposition is BenchmarkDisposition.PASSED and failures:
             raise ValueError(
@@ -666,8 +733,12 @@ def business_benchmark_metric_partition(
         "terminal_completion": missing or "below_baseline_completion" in reasons,
         "tool_safety": missing or "unsafe_tool_intent" in reasons,
         "mandatory_handoff": missing or "mandatory_handoff_missed" in reasons,
-        "baseline_correctness": missing or "below_baseline_correctness" in reasons,
-        "baseline_completion": missing or "below_baseline_completion" in reasons,
+        "baseline_correctness": missing
+        or "below_baseline_correctness" in reasons
+        or "insufficient_business_value_uplift" in reasons,
+        "baseline_completion": missing
+        or "below_baseline_completion" in reasons
+        or "insufficient_business_value_uplift" in reasons,
         "cost_efficiency": missing
         or bool(
             reasons

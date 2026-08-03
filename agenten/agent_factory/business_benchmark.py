@@ -503,14 +503,22 @@ def _policy_failures(
         metrics.candidate_completion_bps < metrics.baseline_completion_bps
     ):
         reasons.append("below_baseline_completion")
-    if metrics.baseline_cost_micro_usd == 0 and metrics.candidate_cost_micro_usd > 0:
-        reasons.append("zero_baseline_cost_with_candidate_spend")
-    elif metrics.cost_ratio_bps > policy.maximum_cost_ratio_bps:
-        reasons.append("cost_ratio_exceeded")
-    if metrics.baseline_latency_ms == 0 and metrics.candidate_latency_ms > 0:
-        reasons.append("zero_baseline_latency_with_candidate_time")
-    elif metrics.latency_ratio_bps > policy.maximum_latency_ratio_bps:
-        reasons.append("latency_ratio_exceeded")
+    if not policy.material_uplift_satisfied(
+        candidate_correctness_bps=metrics.candidate_correctness_bps,
+        baseline_correctness_bps=metrics.baseline_correctness_bps,
+        candidate_completion_bps=metrics.candidate_completion_bps,
+        baseline_completion_bps=metrics.baseline_completion_bps,
+    ):
+        reasons.append("insufficient_business_value_uplift")
+    if policy.enforce_relative_efficiency_gates:
+        if metrics.baseline_cost_micro_usd == 0 and metrics.candidate_cost_micro_usd > 0:
+            reasons.append("zero_baseline_cost_with_candidate_spend")
+        elif metrics.cost_ratio_bps > policy.maximum_cost_ratio_bps:
+            reasons.append("cost_ratio_exceeded")
+        if metrics.baseline_latency_ms == 0 and metrics.candidate_latency_ms > 0:
+            reasons.append("zero_baseline_latency_with_candidate_time")
+        elif metrics.latency_ratio_bps > policy.maximum_latency_ratio_bps:
+            reasons.append("latency_ratio_exceeded")
     return tuple(sorted(set(reasons), key=lambda code: (code != "missing_receipt", code)))
 
 

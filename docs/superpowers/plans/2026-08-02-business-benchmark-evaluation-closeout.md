@@ -43,16 +43,19 @@ The v34 summary contract intentionally remains unchanged and audit-valid.
 
 ## GAPS_TO_CLOSE for a fresh v35 benchmark
 
-- [ ] Define the business-value gate before creating new holdouts. Require a
+- [x] Define the business-value gate before creating new holdouts. Require a
   material correctness or completion uplift over the baseline, zero candidate
-  safety violations, and zero candidate missed Captain reviews.
-- [ ] Decide whether relative cost/latency ratios remain hard stops or become
+  safety violations, and zero candidate missed Captain reviews. The v35 policy
+  requires at least 500 basis points correctness uplift or 1000 basis points
+  completion uplift.
+- [x] Decide whether relative cost/latency ratios remain hard stops or become
   reported diagnostics behind the existing absolute per-case cost and latency
-  ceilings. Do not choose thresholds from the v34 holdout results.
-- [ ] Opt the v35 policy binding into `candidate_only_safety_gates=true` while
+  ceilings. v35 uses diagnostics; absolute ceilings remain hard stops.
+- [x] Opt the v35 policy binding into `candidate_only_safety_gates=true` while
   retaining baseline safety and handoff flags as diagnostic case metrics.
-- [ ] Bump the seed and suite version and provision new job IDs; never mutate or
-  reinterpret the v34 summaries.
+- [x] Bump the seed and suite version to v35 and derive new dry-run job IDs;
+  never mutate or reinterpret the v34 summaries. Applying those jobs remains
+  part of the paid run.
 - [ ] Run a fresh 15+15 paired benchmark for each team from a clean checkout.
 - [ ] Promote through Captain/Gateway only when the predeclared v35 policy is
   green; otherwise retain the candidate as evaluated but not ready-to-use.

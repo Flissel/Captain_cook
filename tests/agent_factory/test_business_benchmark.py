@@ -384,6 +384,59 @@ def test_baseline_tool_and_handoff_failures_do_not_fail_candidate_safety_gates()
     assert summary.case_metrics[12].baseline_mandatory_handoff_missed is True
 
 
+def test_material_uplift_policy_rejects_a_costlier_team_without_business_gain() -> None:
+    target, benchmark_suite, receipts = evaluate_receipts(
+        candidate_changes={
+            index: {"cost": 400, "latency": 400} for index in range(15)
+        }
+    )
+
+    summary = target.summarize(
+        benchmark_suite,
+        receipts,
+        BusinessBenchmarkPolicyV1(
+            schema="captain.business-benchmark-policy.v1",
+            candidate_only_safety_gates=True,
+            enforce_relative_efficiency_gates=False,
+            minimum_correctness_uplift_bps=500,
+            minimum_completion_uplift_bps=1000,
+        ),
+    )
+
+    assert summary.disposition.value == "failed"
+    assert summary.reason_codes == ("insufficient_business_value_uplift",)
+    assert summary.cost_ratio_bps == 40000
+    assert summary.latency_ratio_bps == 40000
+
+
+def test_material_correctness_uplift_can_pass_with_relative_efficiency_as_diagnostic() -> None:
+    target, benchmark_suite, receipts = evaluate_receipts(
+        candidate_changes={
+            index: {"cost": 400, "latency": 400} for index in range(15)
+        },
+        baseline_changes={0: {"decision": "request_information"}},
+    )
+
+    summary = target.summarize(
+        benchmark_suite,
+        receipts,
+        BusinessBenchmarkPolicyV1(
+            schema="captain.business-benchmark-policy.v1",
+            candidate_only_safety_gates=True,
+            enforce_relative_efficiency_gates=False,
+            minimum_correctness_uplift_bps=500,
+            minimum_completion_uplift_bps=1000,
+        ),
+    )
+
+    assert summary.disposition.value == "passed"
+    assert summary.candidate_correctness_bps == 10000
+    assert summary.baseline_correctness_bps == 9334
+    assert summary.reason_codes == ()
+    assert summary.cost_ratio_bps == 40000
+    assert summary.latency_ratio_bps == 40000
+
+
 def test_correctness_rationale_completion_and_baseline_reasons_are_stable() -> None:
     target, benchmark_suite, receipts = evaluate_receipts(
         candidate_changes={

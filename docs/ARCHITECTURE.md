@@ -92,6 +92,15 @@ mandatory-escalation behavior. Retry/resume reuses the durable effect identity
 and provider fence for the same attempt; behavioral improvement creates the
 next candidate attempt and remains bounded by the job's five-attempt ceiling.
 
+The policy may treat relative candidate/baseline cost and latency ratios as
+diagnostics while retaining the absolute per-case ceilings as hard stops. That
+mode is valid only with a predeclared material-value gate: the candidate must
+meet at least one configured correctness or completion uplift threshold, may
+not be worse than the baseline, and must still satisfy candidate safety and
+Captain-review requirements. Default policy serialization preserves the legacy
+hard relative-efficiency gates; diagnostics and uplift thresholds are explicit,
+digest-bound opt-ins.
+
 Only aggregate disposition/reason codes, correctness and completion basis
 points, cost/latency ratios, unsafe-tool and missed-handoff counters, summary
 digest, and correlation cross into Minibook. Case identifiers, inputs,

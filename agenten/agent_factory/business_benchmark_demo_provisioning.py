@@ -132,6 +132,11 @@ class BusinessBenchmarkDemoPlanSettings(_FrozenModel):
     maximum_usd_per_team: Decimal
     suite_version: int = Field(ge=1, strict=True)
     seed_version_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+    benchmark_policy: BusinessBenchmarkPolicyV1 = Field(
+        default_factory=lambda: BusinessBenchmarkPolicyV1(
+            schema="captain.business-benchmark-policy.v1"
+        )
+    )
 
     @field_validator("issued_at")
     @classmethod
@@ -194,6 +199,7 @@ class BusinessBenchmarkDemoTeamPlanV1(_FrozenModel):
     candidate_manifest_ref: ArtifactRef
     team_manifest_ref: ArtifactRef
     policy_binding_ref: ArtifactRef
+    policy: BusinessBenchmarkPolicyV1
     released_skills: tuple[ReleasedHermesSkill, ...]
     initial_lease: FactoryLease | None
     blocker: ToolGapMarker
@@ -693,9 +699,7 @@ class BusinessBenchmarkDemoProvisioner:
                 policy = CaptainBusinessBenchmarkPolicyBindingV1.create(
                     job=job,
                     attempt=1,
-                    policy=BusinessBenchmarkPolicyV1(
-                        schema="captain.business-benchmark-policy.v1"
-                    ),
+                    policy=self._settings.benchmark_policy,
                 )
                 policy_bytes = _canonical_json(
                     policy.model_dump(mode="json", by_alias=True)
@@ -745,6 +749,7 @@ class BusinessBenchmarkDemoProvisioner:
                             candidate_manifest_ref=_manifest_ref(manifest),
                             team_manifest_ref=manifest.team_manifest.reference,
                             policy_binding_ref=policy_ref,
+                            policy=policy.policy,
                             released_skills=ordered_skills,
                             initial_lease=initial_lease,
                             blocker=blocker,

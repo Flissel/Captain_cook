@@ -228,6 +228,33 @@ def test_dry_run_is_side_effect_free_and_contains_two_redacted_stable_plans(
     assert not (tmp_path / ".captain-cook").exists()
 
 
+def test_dry_run_binds_the_explicit_v35_business_value_policy(tmp_path: Path) -> None:
+    from agenten.agent_factory.business_benchmark_contracts import (
+        BusinessBenchmarkPolicyV1,
+    )
+
+    v35_policy = BusinessBenchmarkPolicyV1(
+        schema="captain.business-benchmark-policy.v1",
+        policy_id="captain-business-value-v35",
+        candidate_only_safety_gates=True,
+        enforce_relative_efficiency_gates=False,
+        minimum_correctness_uplift_bps=500,
+        minimum_completion_uplift_bps=1000,
+    )
+
+    result = BusinessBenchmarkDemoProvisioner(
+        settings(
+            tmp_path,
+            suite_version=35,
+            seed_version_id="business-benchmark-demo-2026-08-v35",
+            benchmark_policy=v35_policy,
+        )
+    ).plan()
+
+    assert all(team.policy == v35_policy for team in result.teams)
+    assert len({team.policy_binding_ref.sha256 for team in result.teams}) == 2
+
+
 def test_dry_run_plans_one_job_bound_public_read_only_renewal_work_batch(
     tmp_path: Path,
 ) -> None:
