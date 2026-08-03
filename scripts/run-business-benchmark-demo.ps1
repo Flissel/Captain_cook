@@ -146,7 +146,7 @@ $budgetEurPerUsd = '1.25'
 # human completion that arrives later remains a handoff miss for this bounded
 # evaluation run instead of consuming the 30-second provider envelope.
 $humanReviewTimeoutSeconds = '1'
-$seedVersion = 'business-benchmark-demo-2026-08-v38'
+$seedVersion = 'business-benchmark-demo-2026-08-v39'
 
 $rootEnvAllowlist = @(
     'CAPTAIN_GATEWAY_TOKEN',
@@ -399,7 +399,7 @@ function New-DryRunPlan {
         mode = 'dry_run'
         database = 'captain_test'
         issued_at = $IssuedAt
-        suite_version = 38
+        suite_version = 39
         seed_version_id = $seedVersion
         maximum_usd_per_team = $maximumUsdPerTeam
         jobs = @(
@@ -690,7 +690,7 @@ try {
             '--issued-at', $issuedAt,
             '--model', 'gpt-4.1-mini',
             '--maximum-usd-per-team', $maximumUsdPerTeam,
-            '--suite-version', '38',
+            '--suite-version', '39',
             '--seed-version-id', $seedVersion,
             '--policy-id', 'captain-business-value-v35',
             '--candidate-only-safety-gates',
@@ -725,7 +725,7 @@ try {
             if (
                 [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
                 @($team.job.execution_policy.allowed_models) -notcontains 'gpt-4.1-mini' -or
-                [int]$team.suite.suite_version -ne 38
+                [int]$team.suite.suite_version -ne 39
             ) {
                 throw 'Dry-run team model or budget does not match the demo authority.'
             }
@@ -851,7 +851,7 @@ try {
         '--issued-at', $issuedAt,
         '--model', $model,
         '--maximum-usd-per-team', $maximumUsdPerTeam,
-        '--suite-version', '38',
+        '--suite-version', '39',
         '--seed-version-id', $seedVersion,
         '--policy-id', 'captain-business-value-v35',
         '--candidate-only-safety-gates',
@@ -900,7 +900,7 @@ try {
         if (
             [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
             @($team.job.execution_policy.allowed_models) -notcontains $model -or
-            [int]$team.suite.suite_version -ne 38
+            [int]$team.suite.suite_version -ne 39
         ) {
             throw 'Provisioned team model or budget does not match the demo authority.'
         }
