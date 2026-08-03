@@ -1234,8 +1234,9 @@ async def test_powershell_runner_bridges_authorized_run_to_real_launcher(
     assert launcher.index('ArgumentList.Add("-a")') < launcher.index(
         'ArgumentList.Add("exec")'
     )
-    assert launcher.index('ArgumentList.Add("--ignore-user-config")') < launcher.index(
-        'ArgumentList.Add("exec")'
+    assert launcher.count('ArgumentList.Add("--ignore-user-config")') == 2
+    assert launcher.index('ArgumentList.Add("exec")') < launcher.index(
+        'ArgumentList.Add("--ignore-user-config")'
     )
     identity = json.loads(state_path.read_text(encoding="utf-8"))
     assert identity["session_id"] == "runner-session-1"

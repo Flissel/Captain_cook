@@ -137,7 +137,6 @@ $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
 $startInfo.ArgumentList.Add("-a")
 $startInfo.ArgumentList.Add("never")
-$startInfo.ArgumentList.Add("--ignore-user-config")
 if ($ResumeThreadId) {
     # `codex exec resume` inherits global sandbox policy. Every value is a
     # distinct ArgumentList entry so neither thread names nor prompts cross a
@@ -145,12 +144,14 @@ if ($ResumeThreadId) {
     $startInfo.ArgumentList.Add("-s")
     $startInfo.ArgumentList.Add($Sandbox)
     $startInfo.ArgumentList.Add("exec")
+    $startInfo.ArgumentList.Add("--ignore-user-config")
     $startInfo.ArgumentList.Add("resume")
     $startInfo.ArgumentList.Add("--json")
     $startInfo.ArgumentList.Add($ResumeThreadId)
     $startInfo.ArgumentList.Add($Prompt)
 } else {
     $startInfo.ArgumentList.Add("exec")
+    $startInfo.ArgumentList.Add("--ignore-user-config")
     $startInfo.ArgumentList.Add("--sandbox")
     $startInfo.ArgumentList.Add($Sandbox)
     $startInfo.ArgumentList.Add("--json")
