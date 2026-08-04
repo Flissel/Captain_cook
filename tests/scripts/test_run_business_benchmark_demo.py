@@ -34,6 +34,14 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "$userMaximumEurPerTeam = '6.00'" in source
     assert "$budgetEurPerUsd = '1.25'" in source
     assert "[ValidateSet('ClaimsFirst', 'RenewalFirst')]" in source
+    assert "[ValidateSet('All', 'Claims', 'Renewal')]" in source
+    assert "[string]$TargetProfile = 'All'" in source
+    assert "$targetProfile = $TargetProfile.ToLowerInvariant()" in source
+    assert "$targetTeams = @($claims)" in source
+    assert "$targetTeams = @($renewal)" in source
+    assert "$humanReviewExpectedCompletions = if ($targetProfile -ceq 'claims')" in source
+    assert "$environment['CAPTAIN_BENCHMARK_PROFILE'] = $targetProfile" in source
+    assert "-Profile $targetProfile -PythonPath $python" in source
     assert "[array]::Reverse($orderedFactoryJobIds)" in source
     assert "$environment['CAPTAIN_BENCHMARK_MAX_USD'] = $aggregateRemainingUsd.ToString" in source
     assert '$environment["${prefix}_MAX_USD"] = $teamRemainingText' in source
@@ -1158,6 +1166,34 @@ print(json.dumps({
     plan_arguments = json.loads((repository / "provision-called").read_text("utf-8"))
     assert "--apply" not in plan_arguments
     assert "--plan-only" in plan_arguments
+
+    claims_only = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(scripts / SCRIPT.name),
+            "-Action",
+            "Plan",
+            "-TargetProfile",
+            "Claims",
+            "-PythonPath",
+            sys.executable,
+            "-HermesPythonPath",
+            str(repository / "absent-hermes-python.exe"),
+        ],
+        cwd=repository,
+        env={**os.environ, "PATH": ""},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert claims_only.returncode == 0, claims_only.stderr
+    assert json.loads(claims_only.stdout)["jobs"] == [
+        {"profile": "claims", "job_id": "71000000-0000-0000-0000-000000000001"}
+    ]
 
 
 def test_interruption_validator_rejects_noncanonical_recovery_payloads(

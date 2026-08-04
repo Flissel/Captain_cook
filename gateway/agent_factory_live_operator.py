@@ -146,7 +146,8 @@ class _FactoryCodexArtifactReader:
 def validate_factory_total_cost_envelope(
     *,
     environment: Mapping[str, str],
-    benchmark_maximum_usd_per_team: tuple[Decimal, Decimal],
+    benchmark_maximum_usd_per_team: tuple[Decimal, ...],
+    benchmark_profiles: tuple[str, ...] = ("claims", "renewal"),
 ) -> None:
     """Reject any demo composition that could exceed its total team reserve."""
 
@@ -196,20 +197,20 @@ def validate_factory_total_cost_envelope(
                 "CAPTAIN_FACTORY_HERMES_UNRESOLVED_EFFECT_RESERVE_USD",
             )
         )
-        prior_actual_usd = (
-            Decimal(
+        prior_actual_usd_by_profile = {
+            "claims": Decimal(
                 _required(
                     environment,
                     "CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_CLAIMS",
                 )
             ),
-            Decimal(
+            "renewal": Decimal(
                 _required(
                     environment,
                     "CAPTAIN_FACTORY_PRIOR_ACTUAL_USD_RENEWAL",
                 )
             ),
-        )
+        }
     except ArithmeticError as exc:
         raise ValueError("Factory total cost envelope is invalid") from exc
     values = (
@@ -219,8 +220,12 @@ def validate_factory_total_cost_envelope(
         codex_metered_usd,
         hermes_incremental_usd,
         unresolved_hermes_effect_reserve_usd,
-        *prior_actual_usd,
+        *prior_actual_usd_by_profile.values(),
         *benchmark_maximum_usd_per_team,
+    )
+    selected_prior_actual_usd = tuple(
+        prior_actual_usd_by_profile.get(profile, Decimal("NaN"))
+        for profile in benchmark_profiles
     )
     if (
         any(not value.is_finite() or value < 0 for value in values)
@@ -232,7 +237,10 @@ def validate_factory_total_cost_envelope(
         or codex_metered_usd != 0
         or hermes_incremental_usd != Decimal("1.50")
         or unresolved_hermes_effect_reserve_usd != Decimal("0.25")
-        or len(benchmark_maximum_usd_per_team) != 2
+        or len(benchmark_maximum_usd_per_team) not in {1, 2}
+        or len(benchmark_profiles) != len(benchmark_maximum_usd_per_team)
+        or len(set(benchmark_profiles)) != len(benchmark_profiles)
+        or any(profile not in prior_actual_usd_by_profile for profile in benchmark_profiles)
         or any(
             benchmark_usd
             + hermes_incremental_usd
@@ -241,7 +249,7 @@ def validate_factory_total_cost_envelope(
             > total_maximum_usd
             for benchmark_usd, prior_usd in zip(
                 benchmark_maximum_usd_per_team,
-                prior_actual_usd,
+                selected_prior_actual_usd,
                 strict=True,
             )
         )
@@ -255,7 +263,7 @@ class FactoryLiveOperatorSettings:
     python_executable: Path
     hermes_python_executable: Path
     test_mariadb_dsn: str
-    job_ids: tuple[UUID, UUID]
+    job_ids: tuple[UUID, ...]
     hermes_provider: str
     hermes_model: str
     hermes_maximum_total_cost_usd: Decimal
@@ -278,8 +286,10 @@ class FactoryLiveOperatorSettings:
             hermes_python,
             module_root=workspace / "hermes-agent",
         )
-        if len(set(self.job_ids)) != 2:
-            raise ValueError("Factory live operator requires two distinct jobs")
+        if len(self.job_ids) not in {1, 2}:
+            raise ValueError("Factory live operator requires one or two distinct jobs")
+        if len(set(self.job_ids)) != len(self.job_ids):
+            raise ValueError("Factory live operator requires distinct jobs")
         if (
             self.hermes_provider not in {"openai-api", "custom"}
             or not self.hermes_model.strip()
@@ -402,9 +412,7 @@ def compose_business_demo_factory_operator(
         environment,
         repository_root=workspace,
     )
-    if aggregate.profile != "all" or {
-        item.job_id for item in aggregate.selections
-    } != set(settings.job_ids):
+    if {item.job_id for item in aggregate.selections} != set(settings.job_ids):
         raise ValueError("Factory operator selections do not match the requested jobs")
     if (
         environment.get("CAPTAIN_FACTORY_HERMES_PROVIDER")
@@ -418,6 +426,7 @@ def compose_business_demo_factory_operator(
         benchmark_maximum_usd_per_team=tuple(
             item.maximum_usd for item in aggregate.selections
         ),
+        benchmark_profiles=tuple(item.profile for item in aggregate.selections),
     )
     if not environment.get("OPENAI_API_KEY", "").strip():
         raise ValueError("Factory provider secret is not present in the process")
@@ -615,9 +624,14 @@ def compose_business_demo_factory_operator(
         authority_root=authority_root,
         seed_version_id=seed_version_id,
     )
-    renewal = next(
-        item for item in aggregate.selections if item.profile == "renewal"
-    )
+    n8n_work_batches = {
+        item.job_id: _required(
+            environment,
+            "CAPTAIN_BENCHMARK_RENEWAL_BATCH_ID",
+        )
+        for item in aggregate.selections
+        if item.profile == "renewal"
+    }
     return compose_agent_factory_live(
         store=store,
         forge=forge,
@@ -652,12 +666,7 @@ def compose_business_demo_factory_operator(
             ),
         ),
         clock=current_time,
-        n8n_work_batches={
-            renewal.job_id: _required(
-                environment,
-                "CAPTAIN_BENCHMARK_RENEWAL_BATCH_ID",
-            )
-        },
+        n8n_work_batches=n8n_work_batches,
         holdout_selector=select_technical_business_holdout,
         codex_build_sealer=codex_sealer,
         codex_prompt_artifact_store=_BenchmarkCodexPromptArtifactStore(
@@ -674,7 +683,7 @@ async def run_business_demo_factory_jobs(
     settings: FactoryLiveOperatorSettings,
     *,
     environment: Mapping[str, str],
-) -> tuple[ProductionFactoryDispatchResult, ProductionFactoryDispatchResult]:
+) -> tuple[ProductionFactoryDispatchResult, ...]:
     stop_before_action = (
         FactoryActionKind.DISPATCH_QUALITY_WARDEN
         if settings.stop_before_quality_warden
@@ -696,7 +705,7 @@ async def run_business_demo_factory_jobs(
                 for job_id in settings.job_ids
             ]
         )
-    return results  # type: ignore[return-value]
+    return results
 
 
 def _required(environment: Mapping[str, str], name: str) -> str:

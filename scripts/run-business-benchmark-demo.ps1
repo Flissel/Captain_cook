@@ -12,6 +12,9 @@ param(
     [ValidateSet('ClaimsFirst', 'RenewalFirst')]
     [string]$BuildOrder = 'ClaimsFirst',
 
+    [ValidateSet('All', 'Claims', 'Renewal')]
+    [string]$TargetProfile = 'All',
+
     [string]$HumanReviewOperatorId = ''
 )
 
@@ -19,6 +22,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $global:LASTEXITCODE = 0
 $Action = $Action.ToUpperInvariant()
+$targetProfile = $TargetProfile.ToLowerInvariant()
 
 function Test-NativeExecutableLaunch {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -152,7 +156,15 @@ $humanReviewTimeoutSeconds = if (
     [string]::IsNullOrWhiteSpace($HumanReviewOperatorId)
 ) { '1' } else { '120' }
 $humanReviewAdapterTimeoutSeconds = '5400'
-$humanReviewExpectedCompletions = 9
+$humanReviewExpectedCompletions = if ($targetProfile -ceq 'claims') {
+    3
+}
+elseif ($targetProfile -ceq 'renewal') {
+    6
+}
+else {
+    9
+}
 $humanReviewDecisionCode = 'benchmark-escalation-acknowledged'
 $seedVersion = 'business-benchmark-demo-2026-08-v43'
 
@@ -436,7 +448,7 @@ function Test-ResolvedPreflightBindings {
 
     if (
         $Preflight.PSObject.Properties.Name -notcontains 'jobs' -or
-        @($Preflight.jobs).Count -ne 2
+        @($Preflight.jobs).Count -ne @($Teams).Count
     ) {
         return $false
     }
@@ -493,6 +505,9 @@ function Set-ResolvedPreflightAttempts {
             throw 'Resolved benchmark attempt is invalid.'
         }
         $Environment["CAPTAIN_BENCHMARK_${profile}_ATTEMPT"] = [string]$attempt
+        if (@($Teams).Count -eq 1) {
+            $Environment['CAPTAIN_BENCHMARK_ATTEMPT'] = [string]$attempt
+        }
     }
 }
 
@@ -796,7 +811,19 @@ try {
                 throw 'Dry-run team model or budget does not match the demo authority.'
             }
         }
-        New-DryRunPlan -Teams $planTeams -IssuedAt $issuedAt |
+        $planTargetTeams = if ($targetProfile -ceq 'claims') {
+            @($planTeams | Where-Object { $_.profile -ceq 'claims' })
+        }
+        elseif ($targetProfile -ceq 'renewal') {
+            @($planTeams | Where-Object { $_.profile -ceq 'renewal' })
+        }
+        else {
+            $planTeams
+        }
+        if ($planTargetTeams.Count -notin @(1, 2)) {
+            throw 'Target benchmark profile did not resolve exactly.'
+        }
+        New-DryRunPlan -Teams $planTargetTeams -IssuedAt $issuedAt |
             ConvertTo-Json -Compress -Depth 10
         exit 0
     }
@@ -955,6 +982,15 @@ try {
     }
     $claims = $claims[0]
     $renewal = $renewal[0]
+    if ($targetProfile -ceq 'claims') {
+        $targetTeams = @($claims)
+    }
+    elseif ($targetProfile -ceq 'renewal') {
+        $targetTeams = @($renewal)
+    }
+    else {
+        $targetTeams = $teams
+    }
     foreach ($team in $teams) {
         $null = Require-NonEmpty $team.job.job_id "$($team.profile).job.job_id"
         $null = Require-NonEmpty $team.candidate_id "$($team.profile).candidate_id"
@@ -982,7 +1018,7 @@ try {
     }
     $renewalBatchId = Require-NonEmpty $renewal.work_batch.batch_id 'renewal.work_batch.batch_id'
 
-    $environment['CAPTAIN_BENCHMARK_PROFILE'] = 'all'
+    $environment['CAPTAIN_BENCHMARK_PROFILE'] = $targetProfile
     $environment['CAPTAIN_JOB_ALLOWED_MODELS'] = $model
     [decimal]$aggregateRemainingUsd = 0
     foreach ($binding in @(
@@ -1002,7 +1038,21 @@ try {
         )
         $environment["${prefix}_MAX_USD"] = $teamRemainingText
         $environment["${prefix}_REMAINING_USD"] = $teamRemainingText
-        $aggregateRemainingUsd += $teamRemainingUsd
+        if (
+            $targetProfile -ceq 'all' -or
+            [string]$team.profile -ceq $targetProfile
+        ) {
+            $aggregateRemainingUsd += $teamRemainingUsd
+        }
+    }
+    if ($targetTeams.Count -eq 1) {
+        $selectedTeam = $targetTeams[0]
+        $selectedProfile = ([string]$selectedTeam.profile).ToUpperInvariant()
+        $environment['CAPTAIN_BENCHMARK_SUITE_VERSION'] = [string]$selectedTeam.suite.suite_version
+        $environment['CAPTAIN_BENCHMARK_CANDIDATE_ID'] = [string]$selectedTeam.candidate_id
+        $environment['CAPTAIN_BENCHMARK_JOB_ID'] = [string]$selectedTeam.job.job_id
+        $environment['CAPTAIN_BENCHMARK_ATTEMPT'] = '1'
+        $environment['CAPTAIN_JOB_REMAINING_USD'] = [string]$environment["CAPTAIN_BENCHMARK_${selectedProfile}_REMAINING_USD"]
     }
     $environment['CAPTAIN_BENCHMARK_MAX_USD'] = $aggregateRemainingUsd.ToString(
         '0.00######',
@@ -1038,25 +1088,28 @@ try {
         Set-ResolvedPreflightAttempts `
             -Environment $environment `
             -Preflight $preflight `
-            -Teams $teams
+            -Teams $targetTeams
         Set-ProcessEnvironment $environment
     }
     if (
         $preflight.production_scope_resolvable -eq $true -and
-        -not (Test-ResolvedPreflightBindings -Preflight $preflight -Teams $teams)
+        -not (Test-ResolvedPreflightBindings -Preflight $preflight -Teams $targetTeams)
     ) {
         throw 'Captain business benchmark preflight scope does not bind the provisioned Claims and Renewal candidates.'
     }
 
     if ($Action -ceq 'AUTHORIZE') {
+        $authorizationArguments = @(
+            $improvementIssuer,
+            '--workspace-root', $repositoryRoot,
+            '--authority-root', ([string]$environment['CAPTAIN_BENCHMARK_AUTHORITY_ROOT'])
+        )
+        foreach ($team in $targetTeams) {
+            $authorizationArguments += @('--job-id', [string]$team.job.job_id)
+        }
+        $authorizationArguments += @('--issued-at', $issuedAt, '--eligible-only')
         $rawAuthorization = @(
-            & $python $improvementIssuer `
-                --workspace-root $repositoryRoot `
-                --authority-root ([string]$environment['CAPTAIN_BENCHMARK_AUTHORITY_ROOT']) `
-                --job-id ([string]$claims.job.job_id) `
-                --job-id ([string]$renewal.job.job_id) `
-                --issued-at $issuedAt `
-                --eligible-only
+            & $python @authorizationArguments
         )
         if ($LASTEXITCODE -ne 0) {
             throw 'Captain improvement issuance failed closed.'
@@ -1069,8 +1122,7 @@ try {
             throw 'Captain improvement issuance returned invalid JSON.'
         }
         $expectedAuthorizationJobIds = @(
-            [string]$claims.job.job_id,
-            [string]$renewal.job.job_id
+            $targetTeams | ForEach-Object { [string]$_.job.job_id }
         ) | Sort-Object
         $actualAuthorizationJobIds = @(
             $authorization.authorizations | ForEach-Object { [string]$_.job_id }
@@ -1087,7 +1139,7 @@ try {
             $authorization.database -cne 'captain_test' -or
             $authorization.status -cne 'authorized' -or
             @($authorization.authorizations).Count -lt 1 -or
-            @($authorization.requested_job_ids).Count -ne 2 -or
+            @($authorization.requested_job_ids).Count -ne $targetTeams.Count -or
             ($expectedAuthorizationJobIds -join ',') -cne ($coveredAuthorizationJobIds -join ',') -or
             @($actualAuthorizationJobIds | Where-Object {
                 $skippedAuthorizationJobIds -contains $_
@@ -1114,7 +1166,7 @@ try {
         [string]::IsNullOrWhiteSpace($processOpenAiKey)
     ) {
         New-FactoryDispatchCheckpoint `
-            -Teams $teams `
+            -Teams $targetTeams `
             -IssuedAt $issuedAt `
             -RenewalBatchId $renewalBatchId |
             ConvertTo-Json -Compress -Depth 20
@@ -1135,7 +1187,7 @@ try {
         $humanReviewAdapter = Start-HumanReviewCompletionAdapter `
             -Python $python `
             -Root $humanReviewRoot `
-            -JobIds @([string]$claims.job.job_id, [string]$renewal.job.job_id) `
+            -JobIds @($targetTeams | ForEach-Object { [string]$_.job.job_id }) `
             -OperatorId $HumanReviewOperatorId `
             -ExpectedCompletions $humanReviewExpectedCompletions `
             -DecisionCode $humanReviewDecisionCode `
@@ -1144,10 +1196,9 @@ try {
 
     if ($preflight.production_scope_resolvable -ne $true -or $Action -ceq 'BUILD') {
         $orderedFactoryJobIds = @(
-            [string]$claims.job.job_id
-            [string]$renewal.job.job_id
+            $targetTeams | ForEach-Object { [string]$_.job.job_id }
         )
-        if ($BuildOrder -ceq 'RenewalFirst') {
+        if ($orderedFactoryJobIds.Count -eq 2 -and $BuildOrder -ceq 'RenewalFirst') {
             [array]::Reverse($orderedFactoryJobIds)
         }
         $factoryArguments = @(
@@ -1155,14 +1206,15 @@ try {
             '--workspace-root', $repositoryRoot,
             '--python-executable', $python,
             '--hermes-python-executable', $hermesPython,
-            '--job-id', $orderedFactoryJobIds[0],
-            '--job-id', $orderedFactoryJobIds[1],
             '--hermes-provider', 'openai-api',
             '--hermes-model', 'gpt-5.6-terra',
             '--hermes-reasoning-effort', 'high',
             '--hermes-max-usd', $maximumHermesUsd,
             '--maximum-dispatches', '12'
         )
+        foreach ($jobId in $orderedFactoryJobIds) {
+            $factoryArguments += @('--job-id', $jobId)
+        }
         if ($Action -ceq 'BUILD') {
             $factoryArguments += '--stop-before-quality-warden'
         }
@@ -1202,16 +1254,13 @@ try {
         catch {
             throw 'Captain Factory live operator returned invalid JSON.'
         }
-        $expectedJobIds = @(
-            [string]$claims.job.job_id,
-            [string]$renewal.job.job_id
-        ) | Sort-Object
+        $expectedJobIds = @($orderedFactoryJobIds) | Sort-Object
         $actualJobIds = @($factoryResult.results | ForEach-Object { [string]$_.job_id }) |
             Sort-Object
         if (
             $factoryResult.schema -cne 'captain.business-demo-factory-operator.v1' -or
             $factoryResult.database -cne 'captain_test' -or
-            @($factoryResult.results).Count -ne 2 -or
+            @($factoryResult.results).Count -ne $targetTeams.Count -or
             ($expectedJobIds -join ',') -cne ($actualJobIds -join ',') -or
             @($factoryResult.results | Where-Object {
                 $_.schema -cne 'captain.factory-dispatch-run-result.v1' -or
@@ -1245,7 +1294,7 @@ try {
                 $_.status -ceq 'captain_action_required'
             }).Count -ne 0) {
                 New-FactoryImprovementCheckpoint `
-                    -Teams $teams `
+                    -Teams $targetTeams `
                     -Results @($factoryResult.results) `
                     -IssuedAt $issuedAt |
                     ConvertTo-Json -Compress -Depth 20
@@ -1285,18 +1334,18 @@ try {
                 Set-ResolvedPreflightAttempts `
                     -Environment $environment `
                     -Preflight $preflight `
-                    -Teams $teams
+                    -Teams $targetTeams
                 Set-ProcessEnvironment $environment
             }
             if (
                 $preflight.production_scope_resolvable -eq $true -and
-                -not (Test-ResolvedPreflightBindings -Preflight $preflight -Teams $teams)
+                -not (Test-ResolvedPreflightBindings -Preflight $preflight -Teams $targetTeams)
             ) {
                 throw 'Captain business benchmark post-Factory scope does not bind the provisioned Claims and Renewal candidates.'
             }
             if ($preflight.production_scope_resolvable -ne $true) {
                 New-FactoryDispatchCheckpoint `
-                    -Teams $teams `
+                    -Teams $targetTeams `
                     -IssuedAt $issuedAt `
                     -RenewalBatchId $renewalBatchId |
                     ConvertTo-Json -Compress -Depth 20
@@ -1307,7 +1356,7 @@ try {
 
     if ($Action -ceq 'BUILD') {
         New-CandidatesReady `
-            -Teams $teams `
+            -Teams $targetTeams `
             -IssuedAt $issuedAt `
             -RenewalBatchId $renewalBatchId |
             ConvertTo-Json -Compress -Depth 20
@@ -1316,7 +1365,7 @@ try {
 
     $liveFailure = $null
     try {
-        $null = @(& $liveRunner -Profile all -PythonPath $python)
+        $null = @(& $liveRunner -Profile $targetProfile -PythonPath $python)
         if ($LASTEXITCODE -ne 0) {
             $liveFailure = 'provider runner returned a non-zero exit code'
         }

@@ -276,9 +276,14 @@ def _write_hermes_runtime(root: Path, *, include_logging: bool = True) -> None:
     (package / "__init__.py").write_text("", encoding="utf-8")
     if include_logging:
         (module_root / "concurrent_log_handler.py").write_text("", encoding="utf-8")
+    else:
+        (module_root / "concurrent_log_handler.py").write_text(
+            "raise ImportError('incomplete test runtime')\n",
+            encoding="utf-8",
+        )
 
 
-def test_operator_settings_enforce_isolated_database_two_jobs_and_cost_allocation(
+def test_operator_settings_enforce_isolated_database_bounded_jobs_and_cost_allocation(
     tmp_path: Path,
 ) -> None:
     _write_hermes_runtime(tmp_path)
@@ -299,6 +304,18 @@ def test_operator_settings_enforce_isolated_database_two_jobs_and_cost_allocatio
     assert settings.job_ids == JOB_IDS
     assert settings.hermes_python_executable == hermes_python
     assert settings.stop_before_quality_warden is True
+    single = FactoryLiveOperatorSettings(
+        workspace_root=tmp_path,
+        python_executable=Path(sys.executable),
+        hermes_python_executable=hermes_python,
+        test_mariadb_dsn=LOCAL_DSN,
+        job_ids=(JOB_IDS[0],),
+        hermes_provider="openai-api",
+        hermes_model="gpt-5.6-terra",
+        hermes_reasoning_effort="high",
+        hermes_maximum_total_cost_usd=Decimal("1.50"),
+    )
+    assert single.job_ids == (JOB_IDS[0],)
     with pytest.raises(ValueError, match="cost allocation"):
         FactoryLiveOperatorSettings(
             workspace_root=tmp_path,
@@ -318,6 +335,18 @@ def test_operator_settings_enforce_isolated_database_two_jobs_and_cost_allocatio
             hermes_python_executable=hermes_python,
             test_mariadb_dsn=LOCAL_DSN,
             job_ids=(JOB_IDS[0], JOB_IDS[0]),
+            hermes_provider="openai-api",
+            hermes_model="gpt-5.6-terra",
+            hermes_reasoning_effort="high",
+            hermes_maximum_total_cost_usd=Decimal("0.10"),
+        )
+    with pytest.raises(ValueError, match="one or two distinct jobs"):
+        FactoryLiveOperatorSettings(
+            workspace_root=tmp_path,
+            python_executable=Path(sys.executable),
+            hermes_python_executable=hermes_python,
+            test_mariadb_dsn=LOCAL_DSN,
+            job_ids=(),
             hermes_provider="openai-api",
             hermes_model="gpt-5.6-terra",
             hermes_reasoning_effort="high",
@@ -468,6 +497,50 @@ async def test_operator_threads_quality_warden_stop_to_both_jobs(
         (JOB_IDS[0], 9, FactoryActionKind.DISPATCH_QUALITY_WARDEN),
         (JOB_IDS[1], 9, FactoryActionKind.DISPATCH_QUALITY_WARDEN),
     ]
+
+
+@pytest.mark.asyncio
+async def test_operator_dispatches_only_the_selected_single_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[UUID] = []
+
+    class FakeAsyncClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def __aenter__(self) -> object:
+            return object()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class Composition:
+        async def run(self, job_id: UUID, **_kwargs: object) -> object:
+            calls.append(job_id)
+            return SimpleNamespace(job_id=job_id)
+
+    monkeypatch.setattr(
+        "gateway.agent_factory_live_operator.httpx.AsyncClient",
+        FakeAsyncClient,
+    )
+    monkeypatch.setattr(
+        "gateway.agent_factory_live_operator.compose_business_demo_factory_operator",
+        lambda *_args, **_kwargs: Composition(),
+    )
+    settings = SimpleNamespace(
+        job_ids=(JOB_IDS[0],),
+        maximum_dispatches=9,
+        stop_before_quality_warden=False,
+    )
+
+    results = await run_business_demo_factory_jobs(
+        settings,  # type: ignore[arg-type]
+        environment={},
+    )
+
+    assert tuple(result.job_id for result in results) == (JOB_IDS[0],)
+    assert calls == [JOB_IDS[0]]
 
 
 def test_operator_settings_reject_incomplete_hermes_runtime(tmp_path: Path) -> None:

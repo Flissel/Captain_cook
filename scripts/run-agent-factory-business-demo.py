@@ -22,7 +22,7 @@ from agenten.agent_factory.codex_build_execution import FactoryCodexBuildInterru
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Resume two Captain business-demo Factory jobs.",
+        description="Resume one or two Captain business-demo Factory jobs.",
     )
     parser.add_argument("--workspace-root", type=Path, required=True)
     parser.add_argument("--python-executable", type=Path, required=True)
@@ -39,14 +39,14 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _parser().parse_args()
-    if len(args.job_id) != 2:
-        raise SystemExit("exactly two --job-id values are required")
+    if len(args.job_id) not in {1, 2}:
+        raise SystemExit("one or two --job-id values are required")
     settings = FactoryLiveOperatorSettings(
         workspace_root=args.workspace_root,
         python_executable=args.python_executable,
         hermes_python_executable=args.hermes_python_executable,
         test_mariadb_dsn=os.environ.get("TEST_MARIADB_DSN", ""),
-        job_ids=(args.job_id[0], args.job_id[1]),
+        job_ids=tuple(args.job_id),
         hermes_provider=args.hermes_provider,
         hermes_model=args.hermes_model,
         hermes_reasoning_effort=args.hermes_reasoning_effort,
