@@ -40,6 +40,7 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "Assert-CodexUsesChatGptSubscription" in source
     assert "$environment['CAPTAIN_CODEX_AUTH_MODE'] = 'chatgpt_subscription'" in source
     assert "$humanReviewTimeoutSeconds = if (" in source
+    assert "$humanReviewAdapterTimeoutSeconds = '5400'" in source
     assert "[string]$HumanReviewOperatorId = ''" in source
     assert "Start-HumanReviewCompletionAdapter" in source
     assert source.count("$humanReviewAdapter = Start-HumanReviewCompletionAdapter") == 1
@@ -47,6 +48,8 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
         "$humanReviewAdapter = Start-HumanReviewCompletionAdapter"
     ) < source.index("$rawFactory = @(& $python @factoryArguments")
     assert "business_benchmark_human_review_cli" in source
+    assert "[string]$TimeoutSeconds" in source
+    assert "-TimeoutSeconds ([int]$humanReviewAdapterTimeoutSeconds)" in source
     assert (
         "$environment['CAPTAIN_BENCHMARK_HUMAN_REVIEW_TIMEOUT_SECONDS'] = "
         "$humanReviewTimeoutSeconds"

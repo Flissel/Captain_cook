@@ -151,6 +151,7 @@ $budgetEurPerUsd = '1.25'
 $humanReviewTimeoutSeconds = if (
     [string]::IsNullOrWhiteSpace($HumanReviewOperatorId)
 ) { '1' } else { '120' }
+$humanReviewAdapterTimeoutSeconds = '5400'
 $humanReviewExpectedCompletions = 9
 $humanReviewDecisionCode = 'benchmark-escalation-acknowledged'
 $seedVersion = 'business-benchmark-demo-2026-08-v43'
@@ -691,7 +692,8 @@ function Start-HumanReviewCompletionAdapter {
         [Parameter(Mandatory = $true)][string[]]$JobIds,
         [Parameter(Mandatory = $true)][string]$OperatorId,
         [Parameter(Mandatory = $true)][int]$ExpectedCompletions,
-        [Parameter(Mandatory = $true)][string]$DecisionCode
+        [Parameter(Mandatory = $true)][string]$DecisionCode,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
     )
     $stateRoot = Join-Path $repositoryRoot '.captain-cook/private/business-benchmarks/runtime-state'
     $null = New-Item -ItemType Directory -Force -Path $stateRoot
@@ -720,7 +722,7 @@ function Start-HumanReviewCompletionAdapter {
         '--expected-completions',
         [string]$ExpectedCompletions,
         '--timeout-seconds',
-        '300'
+        [string]$TimeoutSeconds
     )) {
         $arguments.Add($value)
     }
@@ -1136,7 +1138,8 @@ try {
             -JobIds @([string]$claims.job.job_id, [string]$renewal.job.job_id) `
             -OperatorId $HumanReviewOperatorId `
             -ExpectedCompletions $humanReviewExpectedCompletions `
-            -DecisionCode $humanReviewDecisionCode
+            -DecisionCode $humanReviewDecisionCode `
+            -TimeoutSeconds ([int]$humanReviewAdapterTimeoutSeconds)
     }
 
     if ($preflight.production_scope_resolvable -ne $true -or $Action -ceq 'BUILD') {
