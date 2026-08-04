@@ -39,6 +39,10 @@ from tests.agent_factory.test_factory_feedback import (
     _report_invocation,
 )
 from agenten.agent_factory.factory_feedback import FactoryFeedbackBuilder
+from agenten.agent_factory.skill_workflow_contracts import (
+    FactoryFeedbackRecommendation,
+)
+from gateway.contracts import FactoryJobProjection
 from tests.agent_factory.test_team_evaluation import _benchmark as workflow_benchmark
 from tests.agent_factory.test_skill_evaluation_contracts import evidence_payload
 
@@ -716,6 +720,117 @@ def test_v3_promotion_uses_only_the_workflow_release_decision() -> None:
     )
 
     assert promoted.status is FactoryLifecycleStatus.READY_TO_USE
+
+
+def _promotion_snapshot(
+    *, mode: str = "release"
+) -> tuple[FactoryJobProjection, object, object, FactoryEvidenceBlock]:
+    factory_job = job_v3(mode=mode)
+    evaluation = workflow_evaluation()
+    feedback = FactoryFeedbackBuilder(clock=lambda: evaluation.occurred_at).build(
+        invocation=_report_invocation(evaluation),
+        candidate_ref=workflow_candidate(),
+        evaluation=evaluation,
+        budget_projection=workflow_budget(),
+    )
+    quality = workflow_block(
+        FactoryPhase.QUALITY_REVIEWED,
+        assertions=factory_job.acceptance_assertion_ids,
+    ).model_copy(
+        update={
+            "job_id": factory_job.job_id,
+            "correlation_id": factory_job.correlation_id,
+            "artifact_refs": (evaluation.artifact_ref, feedback.artifact_ref),
+        }
+    )
+    projection = FactoryProjection.from_job(factory_job).model_copy(
+        update={
+            "status": FactoryLifecycleStatus.RUNNING,
+            "phase": FactoryPhase.QUALITY_REVIEWED,
+            "attempt": 1,
+            "observed_assertion_ids": factory_job.acceptance_assertion_ids,
+            "block_ids": (quality.event_id,),
+            "workflow_evaluation_ref": evaluation.artifact_ref,
+            "feedback_ref": feedback.artifact_ref,
+            "feedback_recommendation": feedback.recommendation,
+        }
+    )
+    snapshot = FactoryJobProjection(
+        job=factory_job,
+        blocks=(quality,),
+        leases=(),
+        projection=projection,
+    )
+    return snapshot, evaluation, feedback, quality
+
+
+def test_release_promotion_builder_emits_one_exact_captain_block() -> None:
+    from agenten.agent_factory.workflow_promotion import (
+        build_release_workflow_promotion,
+    )
+
+    snapshot, evaluation, feedback, quality = _promotion_snapshot()
+    factory_job = snapshot.job
+
+    promotion = build_release_workflow_promotion(snapshot, occurred_at=NOW)
+
+    assert promotion.phase is FactoryPhase.CAPABILITY_PROMOTED
+    assert promotion.producer == "captain"
+    assert promotion.status is FactoryBlockStatus.SUCCEEDED
+    assert promotion.causation_id == quality.event_id
+    assert promotion.artifact_refs == (evaluation.artifact_ref, feedback.artifact_ref)
+    assert promotion.evidence_refs == quality.evidence_refs
+    assert promotion.assertion_ids == factory_job.acceptance_assertion_ids
+    assert build_release_workflow_promotion(snapshot, occurred_at=NOW) == promotion
+
+
+def test_release_promotion_builder_rejects_demo_job() -> None:
+    from agenten.agent_factory.workflow_promotion import (
+        build_release_workflow_promotion,
+    )
+
+    snapshot, _, _, _ = _promotion_snapshot(mode="demo")
+
+    with pytest.raises(ValueError, match="release execution mode"):
+        build_release_workflow_promotion(snapshot, occurred_at=NOW)
+
+
+def test_release_promotion_builder_rejects_non_promotable_quality_review() -> None:
+    from agenten.agent_factory.workflow_promotion import (
+        build_release_workflow_promotion,
+    )
+
+    snapshot, _, _, _ = _promotion_snapshot()
+    snapshot = snapshot.model_copy(
+        update={
+            "projection": snapshot.projection.model_copy(
+                update={
+                    "feedback_recommendation": FactoryFeedbackRecommendation.RETRY_BUILD,
+                }
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="promotable quality review"):
+        build_release_workflow_promotion(snapshot, occurred_at=NOW)
+
+
+def test_release_promotion_builder_rejects_incomplete_quality_evidence() -> None:
+    from agenten.agent_factory.workflow_promotion import (
+        build_release_workflow_promotion,
+    )
+
+    snapshot, _, _, _ = _promotion_snapshot()
+    snapshot = snapshot.model_copy(
+        update={
+            "projection": snapshot.projection.model_copy(
+                update={"feedback_ref": None}
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="complete quality evidence"):
+        build_release_workflow_promotion(snapshot, occurred_at=NOW)
 
 
 def test_v3_quality_feedback_rejects_a_summary_for_another_suite() -> None:

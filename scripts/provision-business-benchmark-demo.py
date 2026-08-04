@@ -44,6 +44,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--model", default="gpt-4.1-mini")
     parser.add_argument("--maximum-usd-per-team", default="5.00")
+    parser.add_argument(
+        "--execution-mode",
+        choices=("demo", "release"),
+        default="demo",
+    )
     parser.add_argument("--suite-version", type=int, default=1)
     parser.add_argument(
         "--seed-version-id",
@@ -78,6 +83,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "issued_at": _issued_at(args.issued_at),
             "model": args.model,
             "maximum_usd_per_team": args.maximum_usd_per_team,
+            "execution_mode": args.execution_mode,
             "suite_version": args.suite_version,
             "seed_version_id": args.seed_version_id,
             "benchmark_policy": BusinessBenchmarkPolicyV1(

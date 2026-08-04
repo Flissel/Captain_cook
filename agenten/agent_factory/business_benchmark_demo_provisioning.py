@@ -130,6 +130,7 @@ class BusinessBenchmarkDemoPlanSettings(_FrozenModel):
     issued_at: datetime
     model: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
     maximum_usd_per_team: Decimal
+    execution_mode: FactoryExecutionMode = FactoryExecutionMode.DEMO
     suite_version: int = Field(ge=1, strict=True)
     seed_version_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
     benchmark_policy: BusinessBenchmarkPolicyV1 = Field(
@@ -963,9 +964,14 @@ def _prepare_job(
     input_ref = _predicted_ref(public_input, "application/json", "demo-input")
     compiled_ref = _predicted_ref(compiled, "application/json", "demo-spec")
     graph_ref = _predicted_ref(graph, "application/json", "demo-graph")
+    identity_prefix = (
+        "business-benchmark-demo-job-v1"
+        if settings.execution_mode is FactoryExecutionMode.DEMO
+        else "business-benchmark-release-job-v1"
+    )
     identity = "|".join(
         (
-            "business-benchmark-demo-job-v1",
+            identity_prefix,
             profile_id,
             str(settings.suite_version),
             settings.seed_version_id,
@@ -976,11 +982,13 @@ def _prepare_job(
     event_id = uuid5(_JOB_NAMESPACE, f"event|{identity}")
     policy = FactoryExecutionPolicyV1(
         schema="captain.factory-execution-policy.v1",
-        mode=FactoryExecutionMode.DEMO,
+        mode=settings.execution_mode,
         live_execution=True,
         max_cost_usd=settings.maximum_usd_per_team,
         max_runtime_seconds=86400,
-        required_live_runs=1,
+        required_live_runs=(
+            1 if settings.execution_mode is FactoryExecutionMode.DEMO else 3
+        ),
         allowed_models=(settings.model,),
         live_capabilities=(
             FactoryLiveCapability.MODEL_INVOKE,

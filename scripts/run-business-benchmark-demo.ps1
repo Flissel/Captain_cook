@@ -15,6 +15,12 @@ param(
     [ValidateSet('All', 'Claims', 'Renewal')]
     [string]$TargetProfile = 'All',
 
+    [ValidateSet('Demo', 'Release')]
+    [string]$ExecutionMode = 'Demo',
+
+    [ValidateRange(1, 999)]
+    [int]$SuiteVersion = 44,
+
     [string]$HumanReviewOperatorId = ''
 )
 
@@ -23,6 +29,7 @@ $ErrorActionPreference = 'Stop'
 $global:LASTEXITCODE = 0
 $Action = $Action.ToUpperInvariant()
 $targetProfile = $TargetProfile.ToLowerInvariant()
+$executionMode = $ExecutionMode.ToLowerInvariant()
 
 function Test-NativeExecutableLaunch {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -166,8 +173,7 @@ else {
     9
 }
 $humanReviewDecisionCode = 'benchmark-escalation-acknowledged'
-$suiteVersion = 44
-$seedVersion = 'business-benchmark-demo-2026-08-v44'
+$seedVersion = "business-benchmark-demo-2026-08-v${SuiteVersion}"
 
 $rootEnvAllowlist = @(
     'CAPTAIN_GATEWAY_TOKEN',
@@ -779,6 +785,7 @@ try {
             '--issued-at', $issuedAt,
             '--model', 'gpt-4.1-mini',
             '--maximum-usd-per-team', $maximumUsdPerTeam,
+            '--execution-mode', $executionMode,
             '--suite-version', [string]$suiteVersion,
             '--seed-version-id', $seedVersion,
             '--policy-id', 'captain-business-value-v35',
@@ -813,6 +820,10 @@ try {
             $null = Require-NonEmpty $team.job.job_id "$($team.profile).job.job_id"
             if (
                 [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
+                [string]$team.job.execution_policy.mode -cne $executionMode -or
+                [int]$team.job.execution_policy.required_live_runs -ne $(
+                    if ($executionMode -ceq 'demo') { 1 } else { 3 }
+                ) -or
                 @($team.job.execution_policy.allowed_models) -notcontains 'gpt-4.1-mini' -or
                 [int]$team.suite.suite_version -ne $suiteVersion
             ) {
@@ -952,6 +963,7 @@ try {
         '--issued-at', $issuedAt,
         '--model', $model,
         '--maximum-usd-per-team', $maximumUsdPerTeam,
+        '--execution-mode', $executionMode,
         '--suite-version', [string]$suiteVersion,
         '--seed-version-id', $seedVersion,
         '--policy-id', 'captain-business-value-v35',
@@ -1009,6 +1021,10 @@ try {
         )
         if (
             [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
+            [string]$team.job.execution_policy.mode -cne $executionMode -or
+            [int]$team.job.execution_policy.required_live_runs -ne $(
+                if ($executionMode -ceq 'demo') { 1 } else { 3 }
+            ) -or
             @($team.job.execution_policy.allowed_models) -notcontains $model -or
             [int]$team.suite.suite_version -ne $suiteVersion
         ) {

@@ -74,7 +74,7 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "'--hermes-provider', 'openai-api'" in source
     assert "'--hermes-model', 'gpt-5.6-terra'" in source
     assert "'--hermes-reasoning-effort', 'high'" in source
-    assert "$seedVersion = 'business-benchmark-demo-2026-08-v44'" in source
+    assert '$seedVersion = "business-benchmark-demo-2026-08-v${SuiteVersion}"' in source
     assert "'--suite-version', [string]$suiteVersion" in source
     assert "New-DryRunPlan" in source
     assert "provider_calls = $false" in source
@@ -417,13 +417,16 @@ if '--apply' in sys.argv:
         'unsafe', encoding='utf-8'
     )
 suite_version = int(sys.argv[sys.argv.index('--suite-version') + 1])
+execution_mode = sys.argv[sys.argv.index('--execution-mode') + 1]
 def team(profile, job_id, candidate_id, batch=None):
     return {
         'profile': profile,
         'job': {
             'job_id': job_id,
-            'execution_policy': {
-                'allowed_models': ['gpt-4.1-mini'],
+                'execution_policy': {
+                    'mode': execution_mode,
+                    'required_live_runs': 1 if execution_mode == 'demo' else 3,
+                    'allowed_models': ['gpt-4.1-mini'],
                 'max_cost_usd': '0.32',
             },
         },
@@ -560,6 +563,44 @@ print(json.dumps({
     assert not (repository / "preflight-called").exists()
     assert not (repository / "provider-called").exists()
     assert not (repository / "gateway-mutated").exists()
+
+    release_plan = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(scripts / SCRIPT.name),
+            "-Action",
+            "Plan",
+            "-TargetProfile",
+            "Claims",
+            "-ExecutionMode",
+            "Release",
+            "-SuiteVersion",
+            "45",
+            "-PythonPath",
+            sys.executable,
+            "-HermesPythonPath",
+            sys.executable,
+        ],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert release_plan.returncode == 0, release_plan.stderr
+    release_payload = json.loads(release_plan.stdout)
+    assert release_payload["suite_version"] == 45
+    assert release_payload["seed_version_id"] == "business-benchmark-demo-2026-08-v45"
+    assert [item["profile"] for item in release_payload["jobs"]] == ["claims"]
+    release_arguments = json.loads(
+        (repository / "provision-args.json").read_text("utf-8")
+    )
+    assert release_arguments[release_arguments.index("--execution-mode") + 1] == "release"
+    assert release_arguments[release_arguments.index("--suite-version") + 1] == "45"
 
     completed = subprocess.run(
         [
@@ -1157,8 +1198,8 @@ print(json.dumps({
     'mode': 'dry_run',
     'database': 'captain_test',
     'teams': [
-        {'profile': 'claims', 'job': {'job_id': '71000000-0000-0000-0000-000000000001', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.32'}}, 'suite': {'suite_version': 44}, 'candidate_id': 'claims-candidate'},
-        {'profile': 'renewal', 'job': {'job_id': '71000000-0000-0000-0000-000000000002', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.32'}}, 'suite': {'suite_version': 44}, 'candidate_id': 'renewal-candidate'},
+        {'profile': 'claims', 'job': {'job_id': '71000000-0000-0000-0000-000000000001', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.32', 'mode': 'demo', 'required_live_runs': 1}}, 'suite': {'suite_version': 44}, 'candidate_id': 'claims-candidate'},
+        {'profile': 'renewal', 'job': {'job_id': '71000000-0000-0000-0000-000000000002', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.32', 'mode': 'demo', 'required_live_runs': 1}}, 'suite': {'suite_version': 44}, 'candidate_id': 'renewal-candidate'},
     ],
 }))
 """.strip(),

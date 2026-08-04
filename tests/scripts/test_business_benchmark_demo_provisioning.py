@@ -228,6 +228,23 @@ def test_dry_run_is_side_effect_free_and_contains_two_redacted_stable_plans(
     assert not (tmp_path / ".captain-cook").exists()
 
 
+def test_release_plan_uses_three_runs_and_a_distinct_job_identity(
+    tmp_path: Path,
+) -> None:
+    demo = BusinessBenchmarkDemoProvisioner(settings(tmp_path)).plan()
+    release = BusinessBenchmarkDemoProvisioner(
+        settings(tmp_path, execution_mode="release")
+    ).plan()
+
+    assert tuple(
+        (team.job.execution_policy.mode.value, team.job.execution_policy.required_live_runs)
+        for team in release.teams
+    ) == (("release", 3), ("release", 3))
+    assert tuple(team.job.job_id for team in release.teams) != tuple(
+        team.job.job_id for team in demo.teams
+    )
+
+
 def test_dry_run_binds_the_explicit_v35_business_value_policy(tmp_path: Path) -> None:
     from agenten.agent_factory.business_benchmark_contracts import (
         BusinessBenchmarkPolicyV1,
@@ -836,6 +853,40 @@ def test_cli_defaults_to_dry_run_and_never_echoes_the_dsn(tmp_path: Path) -> Non
     assert payload["database"] == "captain_test"
     assert LOCAL_DSN not in completed.stdout
     assert not (tmp_path / ".captain-cook").exists()
+
+
+def test_cli_plans_release_mode_with_three_live_runs(tmp_path: Path) -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/provision-business-benchmark-demo.py",
+            "--plan-only",
+            "--workspace-root",
+            str(tmp_path),
+            "--issued-at",
+            ISSUED_AT.isoformat(),
+            "--model",
+            "gpt-4.1-mini",
+            "--maximum-usd-per-team",
+            "5.00",
+            "--execution-mode",
+            "release",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert tuple(
+        (
+            team["job"]["execution_policy"]["mode"],
+            team["job"]["execution_policy"]["required_live_runs"],
+        )
+        for team in payload["teams"]
+    ) == (("release", 3), ("release", 3))
 
 
 def test_plan_only_cli_needs_no_dsn_or_credential_environment(tmp_path: Path) -> None:
