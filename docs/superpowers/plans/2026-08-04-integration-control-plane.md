@@ -37,6 +37,8 @@ credential metadata and issues execution authority only after a safe probe.
 - [x] Add explicit rotation/revocation transitions, project binding, expiry,
   workflow-artifact digest fencing, stale-evidence rejection, and runtime
   expiry checks.
+- [x] Seal only matching n8n deployment/execution/correlation evidence into a
+  project- and workflow-bound, secret-free Gateway verification receipt.
 - [ ] Prove the new MariaDB tables and feed across a real Gateway restart.
 - [ ] Prove one real API-key/Bearer integration and one OAuth integration.
 - [ ] Run clean-checkout, architecture, security-audit, and live evidence gates.
