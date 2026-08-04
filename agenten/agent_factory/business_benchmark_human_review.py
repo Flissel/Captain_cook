@@ -605,8 +605,8 @@ def run_captain_human_review_completion_adapter(
     is not an approval of the underlying insurance or commercial decision.
     """
 
-    if not math.isfinite(timeout_seconds) or timeout_seconds < 0 or timeout_seconds > 600:
-        raise ValueError("completion adapter timeout must be between 0 and 600 seconds")
+    if not math.isfinite(timeout_seconds) or timeout_seconds < 0 or timeout_seconds > 5400:
+        raise ValueError("completion adapter timeout must be between 0 and 5400 seconds")
     if (
         not math.isfinite(poll_interval_seconds)
         or poll_interval_seconds <= 0

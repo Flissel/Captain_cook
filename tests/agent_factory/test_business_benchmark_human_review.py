@@ -456,7 +456,7 @@ async def test_completion_adapter_is_explicit_job_scoped_and_restart_safe(
         operator_id="codex-delegate",
         decision_code="benchmark-escalation-acknowledged",
         expected_completions=1,
-        timeout_seconds=0,
+        timeout_seconds=5400,
         completed_at=lambda: NOW + timedelta(minutes=5),
     )
 
