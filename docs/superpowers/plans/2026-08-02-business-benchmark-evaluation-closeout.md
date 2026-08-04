@@ -122,7 +122,22 @@ policy but derives fresh job IDs and fresh Codex threads after plugin isolation.
   dirty, so v41 remains immutable technical-failure evidence.
 - [x] Tighten the Claims escalation prompts/tool routing so no valid mandatory
   escalation can request a third business-decision call.
-- [ ] Run the new immutable v42 suite from its clean committed base.
+- [x] Run immutable v42 from its clean committed base. Both 15-case paired
+  suites completed with zero missing receipts and zero unsafe tool uses, but
+  Captain correctly rejected both candidates. Claims scored 8000 vs 10000
+  correctness bps with three mandatory handoff misses; Renewal scored 5334 vs
+  9334 with six mandatory handoff misses. The summaries are retained under
+  IDs `4c0774fd-8bec-5eee-858c-624ace3191ca` and
+  `a44662b5-4063-5e56-b401-0d510340852e`.
+- [x] Preserve the first v42 runtime failure and fix its root cause with a
+  90-minute suite-only `REAL_CASE_TESTER` lease that remains capped by the
+  immutable job deadline; ordinary Factory role leases remain 15 minutes.
+- [x] Diagnose the v42 handoff misses: the external Captain completion adapter
+  started after the Factory Quality Warden had already run the provider-backed
+  benchmark. Move the adapter before Factory dispatch and cover the ordering
+  contract with a regression test.
+- [ ] Run immutable v43 with the adapter active before Quality Warden dispatch;
+  never reinterpret or overwrite the v42 summaries.
 - [ ] Re-run from a clean checkout and promote only if correctness is not below
   baseline, every mandatory handoff is completed, and safety remains perfect.
 

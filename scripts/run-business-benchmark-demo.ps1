@@ -153,7 +153,7 @@ $humanReviewTimeoutSeconds = if (
 ) { '1' } else { '120' }
 $humanReviewExpectedCompletions = 9
 $humanReviewDecisionCode = 'benchmark-escalation-acknowledged'
-$seedVersion = 'business-benchmark-demo-2026-08-v42'
+$seedVersion = 'business-benchmark-demo-2026-08-v43'
 
 $rootEnvAllowlist = @(
     'CAPTAIN_GATEWAY_TOKEN',
@@ -406,7 +406,7 @@ function New-DryRunPlan {
         mode = 'dry_run'
         database = 'captain_test'
         issued_at = $IssuedAt
-        suite_version = 42
+        suite_version = 43
         seed_version_id = $seedVersion
         maximum_usd_per_team = $maximumUsdPerTeam
         jobs = @(
@@ -695,8 +695,8 @@ function Start-HumanReviewCompletionAdapter {
     )
     $stateRoot = Join-Path $repositoryRoot '.captain-cook/private/business-benchmarks/runtime-state'
     $null = New-Item -ItemType Directory -Force -Path $stateRoot
-    $stdoutPath = Join-Path $stateRoot 'human-review-completion-adapter-v42.stdout.log'
-    $stderrPath = Join-Path $stateRoot 'human-review-completion-adapter-v42.stderr.log'
+    $stdoutPath = Join-Path $stateRoot 'human-review-completion-adapter-v43.stdout.log'
+    $stderrPath = Join-Path $stateRoot 'human-review-completion-adapter-v43.stderr.log'
     Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
     $arguments = [Collections.Generic.List[string]]::new()
     foreach ($value in @(
@@ -754,7 +754,7 @@ try {
             '--issued-at', $issuedAt,
             '--model', 'gpt-4.1-mini',
             '--maximum-usd-per-team', $maximumUsdPerTeam,
-            '--suite-version', '42',
+            '--suite-version', '43',
             '--seed-version-id', $seedVersion,
             '--policy-id', 'captain-business-value-v35',
             '--candidate-only-safety-gates',
@@ -789,7 +789,7 @@ try {
             if (
                 [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
                 @($team.job.execution_policy.allowed_models) -notcontains 'gpt-4.1-mini' -or
-                [int]$team.suite.suite_version -ne 42
+                [int]$team.suite.suite_version -ne 43
             ) {
                 throw 'Dry-run team model or budget does not match the demo authority.'
             }
@@ -915,7 +915,7 @@ try {
         '--issued-at', $issuedAt,
         '--model', $model,
         '--maximum-usd-per-team', $maximumUsdPerTeam,
-        '--suite-version', '42',
+        '--suite-version', '43',
         '--seed-version-id', $seedVersion,
         '--policy-id', 'captain-business-value-v35',
         '--candidate-only-safety-gates',
@@ -964,7 +964,7 @@ try {
         if (
             [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
             @($team.job.execution_policy.allowed_models) -notcontains $model -or
-            [int]$team.suite.suite_version -ne 42
+            [int]$team.suite.suite_version -ne 43
         ) {
             throw 'Provisioned team model or budget does not match the demo authority.'
         }
@@ -1121,6 +1121,22 @@ try {
 
     if ($Action -ceq 'RUN' -and [string]::IsNullOrWhiteSpace($processOpenAiKey)) {
         throw 'OPENAI_API_KEY must already exist in the process; demo env files are never read for it.'
+    }
+
+    if (
+        $Action -ceq 'RUN' -and
+        -not [string]::IsNullOrWhiteSpace($HumanReviewOperatorId)
+    ) {
+        $humanReviewRoot = Join-Path `
+            $repositoryRoot `
+            '.captain-cook/private/business-benchmarks/human-review'
+        $humanReviewAdapter = Start-HumanReviewCompletionAdapter `
+            -Python $python `
+            -Root $humanReviewRoot `
+            -JobIds @([string]$claims.job.job_id, [string]$renewal.job.job_id) `
+            -OperatorId $HumanReviewOperatorId `
+            -ExpectedCompletions $humanReviewExpectedCompletions `
+            -DecisionCode $humanReviewDecisionCode
     }
 
     if ($preflight.production_scope_resolvable -ne $true -or $Action -ceq 'BUILD') {
@@ -1293,22 +1309,6 @@ try {
             -RenewalBatchId $renewalBatchId |
             ConvertTo-Json -Compress -Depth 20
         exit 0
-    }
-
-    if (
-        $Action -ceq 'RUN' -and
-        -not [string]::IsNullOrWhiteSpace($HumanReviewOperatorId)
-    ) {
-        $humanReviewRoot = Join-Path `
-            $repositoryRoot `
-            '.captain-cook/private/business-benchmarks/human-review'
-        $humanReviewAdapter = Start-HumanReviewCompletionAdapter `
-            -Python $python `
-            -Root $humanReviewRoot `
-            -JobIds @([string]$claims.job.job_id, [string]$renewal.job.job_id) `
-            -OperatorId $HumanReviewOperatorId `
-            -ExpectedCompletions $humanReviewExpectedCompletions `
-            -DecisionCode $humanReviewDecisionCode
     }
 
     $liveFailure = $null
