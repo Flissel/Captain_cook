@@ -153,7 +153,7 @@ $humanReviewTimeoutSeconds = if (
 ) { '1' } else { '120' }
 $humanReviewExpectedCompletions = 9
 $humanReviewDecisionCode = 'benchmark-escalation-acknowledged'
-$seedVersion = 'business-benchmark-demo-2026-08-v41'
+$seedVersion = 'business-benchmark-demo-2026-08-v42'
 
 $rootEnvAllowlist = @(
     'CAPTAIN_GATEWAY_TOKEN',
@@ -406,7 +406,7 @@ function New-DryRunPlan {
         mode = 'dry_run'
         database = 'captain_test'
         issued_at = $IssuedAt
-        suite_version = 41
+        suite_version = 42
         seed_version_id = $seedVersion
         maximum_usd_per_team = $maximumUsdPerTeam
         jobs = @(
@@ -695,8 +695,8 @@ function Start-HumanReviewCompletionAdapter {
     )
     $stateRoot = Join-Path $repositoryRoot '.captain-cook/private/business-benchmarks/runtime-state'
     $null = New-Item -ItemType Directory -Force -Path $stateRoot
-    $stdoutPath = Join-Path $stateRoot 'human-review-completion-adapter-v41.stdout.log'
-    $stderrPath = Join-Path $stateRoot 'human-review-completion-adapter-v41.stderr.log'
+    $stdoutPath = Join-Path $stateRoot 'human-review-completion-adapter-v42.stdout.log'
+    $stderrPath = Join-Path $stateRoot 'human-review-completion-adapter-v42.stderr.log'
     Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
     $arguments = [Collections.Generic.List[string]]::new()
     foreach ($value in @(
@@ -754,7 +754,7 @@ try {
             '--issued-at', $issuedAt,
             '--model', 'gpt-4.1-mini',
             '--maximum-usd-per-team', $maximumUsdPerTeam,
-            '--suite-version', '41',
+            '--suite-version', '42',
             '--seed-version-id', $seedVersion,
             '--policy-id', 'captain-business-value-v35',
             '--candidate-only-safety-gates',
@@ -789,7 +789,7 @@ try {
             if (
                 [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
                 @($team.job.execution_policy.allowed_models) -notcontains 'gpt-4.1-mini' -or
-                [int]$team.suite.suite_version -ne 41
+                [int]$team.suite.suite_version -ne 42
             ) {
                 throw 'Dry-run team model or budget does not match the demo authority.'
             }
@@ -915,7 +915,7 @@ try {
         '--issued-at', $issuedAt,
         '--model', $model,
         '--maximum-usd-per-team', $maximumUsdPerTeam,
-        '--suite-version', '41',
+        '--suite-version', '42',
         '--seed-version-id', $seedVersion,
         '--policy-id', 'captain-business-value-v35',
         '--candidate-only-safety-gates',
@@ -964,7 +964,7 @@ try {
         if (
             [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
             @($team.job.execution_policy.allowed_models) -notcontains $model -or
-            [int]$team.suite.suite_version -ne 41
+            [int]$team.suite.suite_version -ne 42
         ) {
             throw 'Provisioned team model or budget does not match the demo authority.'
         }

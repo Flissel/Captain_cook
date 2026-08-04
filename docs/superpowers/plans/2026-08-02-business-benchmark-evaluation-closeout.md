@@ -117,11 +117,12 @@ policy but derives fresh job IDs and fresh Codex threads after plugin isolation.
 - [x] Apply the predeclared v35 policy to the fresh v40 suite and retain both
   failed candidates as evaluated but not ready-to-use.
 - [x] Implement a real Captain human-review completion adapter for the six
-  Renewal and three Claims escalation cases. The v41 dry-run is effect-free;
-  the provider evaluation remains pending.
+  Renewal and three Claims escalation cases. The v41 dry-run was effect-free;
+  its first Factory build then failed before Codex launch because the base was
+  dirty, so v41 remains immutable technical-failure evidence.
 - [x] Tighten the Claims escalation prompts/tool routing so no valid mandatory
   escalation can request a third business-decision call.
-- [ ] Run the new immutable v41 suite from its clean committed base.
+- [ ] Run the new immutable v42 suite from its clean committed base.
 - [ ] Re-run from a clean checkout and promote only if correctness is not below
   baseline, every mandatory handoff is completed, and safety remains perfect.
 
