@@ -53,8 +53,8 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "'--hermes-provider', 'openai-api'" in source
     assert "'--hermes-model', 'gpt-5.6-terra'" in source
     assert "'--hermes-reasoning-effort', 'high'" in source
-    assert "$seedVersion = 'business-benchmark-demo-2026-08-v39'" in source
-    assert "'--suite-version', '39'" in source
+    assert "$seedVersion = 'business-benchmark-demo-2026-08-v40'" in source
+    assert "'--suite-version', '40'" in source
     assert "New-DryRunPlan" in source
     assert "provider_calls = $false" in source
     assert "gateway_mutation = $false" in source
@@ -508,8 +508,8 @@ print(json.dumps({
         "mode": "dry_run",
         "database": "captain_test",
         "issued_at": plan["issued_at"],
-            "suite_version": 39,
-        "seed_version_id": "business-benchmark-demo-2026-08-v39",
+            "suite_version": 40,
+        "seed_version_id": "business-benchmark-demo-2026-08-v40",
         "maximum_usd_per_team": "0.32",
         "jobs": [
             {"profile": "claims", "job_id": "71000000-0000-0000-0000-000000000001"},
@@ -526,7 +526,7 @@ print(json.dumps({
     assert plan["issued_at"].endswith("Z")
     plan_arguments = json.loads((repository / "provision-args.json").read_text("utf-8"))
     assert "--apply" not in plan_arguments
-    assert plan_arguments[plan_arguments.index("--suite-version") + 1] == "39"
+    assert plan_arguments[plan_arguments.index("--suite-version") + 1] == "40"
     assert "--candidate-only-safety-gates" in plan_arguments
     assert "--relative-efficiency-diagnostics" in plan_arguments
     assert plan_arguments[
@@ -595,7 +595,7 @@ print(json.dumps({
     arguments = json.loads((repository / "provision-args.json").read_text("utf-8"))
     assert "--apply" in arguments
     assert arguments[arguments.index("--maximum-usd-per-team") + 1] == "0.32"
-    assert arguments[arguments.index("--suite-version") + 1] == "39"
+    assert arguments[arguments.index("--suite-version") + 1] == "40"
     issued_at = arguments[arguments.index("--issued-at") + 1]
     assert issued_at.endswith("Z")
     combined = completed.stdout + completed.stderr
@@ -1100,8 +1100,8 @@ print(json.dumps({
     'mode': 'dry_run',
     'database': 'captain_test',
     'teams': [
-        {'profile': 'claims', 'job': {'job_id': '71000000-0000-0000-0000-000000000001', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.32'}}, 'suite': {'suite_version': 39}, 'candidate_id': 'claims-candidate'},
-        {'profile': 'renewal', 'job': {'job_id': '71000000-0000-0000-0000-000000000002', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.32'}}, 'suite': {'suite_version': 39}, 'candidate_id': 'renewal-candidate'},
+        {'profile': 'claims', 'job': {'job_id': '71000000-0000-0000-0000-000000000001', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.32'}}, 'suite': {'suite_version': 40}, 'candidate_id': 'claims-candidate'},
+        {'profile': 'renewal', 'job': {'job_id': '71000000-0000-0000-0000-000000000002', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.32'}}, 'suite': {'suite_version': 40}, 'candidate_id': 'renewal-candidate'},
     ],
 }))
 """.strip(),

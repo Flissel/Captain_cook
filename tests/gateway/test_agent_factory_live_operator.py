@@ -99,7 +99,7 @@ def test_hermes_cost_ledger_is_isolated_by_benchmark_suite(tmp_path: Path) -> No
 
     current_root = scoped_root(
         authority_root=authority_root,
-        seed_version_id="business-benchmark-demo-2026-08-v39",
+        seed_version_id="business-benchmark-demo-2026-08-v40",
     )
     current_store = FilesystemHermesProviderEffectStore(
         current_root / "provider-effects",
@@ -114,11 +114,11 @@ def test_hermes_cost_ledger_is_isolated_by_benchmark_suite(tmp_path: Path) -> No
     )
     assert current_root == scoped_root(
         authority_root=authority_root,
-        seed_version_id="business-benchmark-demo-2026-08-v39",
+        seed_version_id="business-benchmark-demo-2026-08-v40",
     )
     assert current_root != scoped_root(
         authority_root=authority_root,
-        seed_version_id="business-benchmark-demo-2026-08-v40",
+        seed_version_id="business-benchmark-demo-2026-08-v39",
     )
 
 
