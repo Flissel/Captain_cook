@@ -61,6 +61,30 @@ def test_expired_or_cross_role_lease_is_denied() -> None:
         )
 
 
+def test_explicit_lease_duration_cannot_outlive_v3_job_deadline() -> None:
+    factory_job = v3_job(live=True)
+
+    lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.REAL_CASE_TESTER,
+        attempt=1,
+        workspace_ref="workspace://factory/bounded-live-suite",
+        now=NOW,
+        duration=timedelta(minutes=10),
+    )
+
+    assert lease.expires_at == NOW + timedelta(minutes=10)
+    with pytest.raises(FactoryLeaseDenied, match="job deadline"):
+        issue_factory_lease(
+            job=factory_job,
+            role=FactoryRole.REAL_CASE_TESTER,
+            attempt=1,
+            workspace_ref="workspace://factory/unbounded-live-suite",
+            now=NOW,
+            duration=timedelta(minutes=16),
+        )
+
+
 def v3_job(*, live: bool) -> AgentFactoryJobV3:
     v1 = job()
     policy = FactoryExecutionPolicyV1.model_validate(

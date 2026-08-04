@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
 from agenten.agent_factory.contracts import (
+    AgentFactoryJobV2,
     AgentFactoryJobV3,
     FactoryJob,
     FactoryLease,
@@ -46,8 +47,16 @@ def issue_factory_lease(
     workspace_ref: str,
     now: datetime,
     integration_intent: IntegrationIntent = IntegrationIntent.NONE,
+    duration: timedelta = FACTORY_LEASE_DURATION,
 ) -> FactoryLease:
     issued_at = _require_utc(now)
+    if duration <= timedelta(0):
+        raise FactoryLeaseDenied("factory lease duration must be positive")
+    if duration != FACTORY_LEASE_DURATION and not isinstance(job, AgentFactoryJobV2):
+        raise FactoryLeaseDenied("extended factory lease requires a job deadline")
+    expires_at = issued_at + duration
+    if isinstance(job, AgentFactoryJobV2) and expires_at > job.deadline_at:
+        raise FactoryLeaseDenied("factory lease cannot outlive the job deadline")
     _require_execution_intent(job, integration_intent)
     profile = _ROLE_PROFILES[role]
     if role is FactoryRole.TOOL_INTEGRATOR and integration_intent is IntegrationIntent.N8N:
@@ -75,7 +84,7 @@ def issue_factory_lease(
         capabilities=tuple(sorted(capabilities)),
         workspace_ref=workspace_ref,
         issued_at=issued_at,
-        expires_at=issued_at + FACTORY_LEASE_DURATION,
+        expires_at=expires_at,
     )
 
 

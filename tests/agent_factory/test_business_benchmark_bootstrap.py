@@ -1218,12 +1218,17 @@ def test_gateway_invocation_authority_builds_quality_chain_from_active_captain_d
         uri=f"holdout://holdout-{technical_sha256[:12]}",
         sha256=technical_sha256,
     )
+    extended_policy = base_job.execution_policy.model_copy(
+        update={"max_runtime_seconds": 7200}
+    )
     job = base_job.model_copy(
         update={
             "private_holdout_refs": (
                 technical_ref,
                 *base_job.private_holdout_refs,
-            )
+            ),
+            "execution_policy": extended_policy,
+            "deadline_at": base_job.occurred_at + timedelta(hours=2),
         }
     )
     runtime = _invocation(job, FactorySkillStep.EXECUTE_TEAM)
@@ -1280,6 +1285,9 @@ def test_gateway_invocation_authority_builds_quality_chain_from_active_captain_d
     assert benchmark.lease.integration_intent is runtime.lease.integration_intent
     assert benchmark.lease.workspace_ref.startswith(
         "workspace://business-benchmark-suite/"
+    )
+    assert benchmark.lease.expires_at - benchmark.lease.issued_at == timedelta(
+        minutes=90
     )
     assert leases.recorded == [benchmark.lease]
     quality = authority.evaluation_invocation(job=job, attempt=1)

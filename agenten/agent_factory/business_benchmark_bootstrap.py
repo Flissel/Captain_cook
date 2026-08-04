@@ -18,7 +18,7 @@ import time
 import zipfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal, Protocol
@@ -144,6 +144,7 @@ from agenten.agent_runtime.n8n_endpoint import N8nEndpoint
 from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference
 
 
+BUSINESS_BENCHMARK_LEASE_DURATION = timedelta(minutes=90)
 _SAFE_VERSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
@@ -1419,6 +1420,7 @@ class GatewayBenchmarkInvocationAuthority:
             ),
             now=lease_epoch,
             integration_intent=technical.lease.integration_intent,
+            duration=BUSINESS_BENCHMARK_LEASE_DURATION,
         )
         benchmark_lease = self._leases.record(benchmark_lease)
         return technical.model_copy(
