@@ -39,18 +39,22 @@ credential metadata and issues execution authority only after a safe probe.
   expiry checks.
 - [x] Seal only matching n8n deployment/execution/correlation evidence into a
   project- and workflow-bound, secret-free Gateway verification receipt.
-- [ ] Prove the new MariaDB tables and feed across a real Gateway restart.
+- [x] Prove the new MariaDB tables and feed across a real Gateway restart,
+  including digest-fenced mutation replay, rotation, and revoke.
+- [x] Prove a native Captain-n8n `list_credentials` metadata read through the
+  SSE-aware adapter without exposing credential content.
 - [ ] Prove one real API-key/Bearer integration and one OAuth integration.
 - [ ] Run clean-checkout, architecture, security-audit, and live evidence gates.
 
-The checked metadata adapter has deterministic HTTP/MCP boundary coverage but
-does not claim a successful live `list_credentials` call. On 2026-08-04 the
-native call, `/healthz`, and MCP initialize all timed out. Docker Desktop logs
-identified `DockerDesktop/Wsl/CommandTimedOut` while running
-`wsl.exe -l -v --all`; Docker restart and a forced stop/start did not recover
-the Windows WSL subsystem. No Captain or VibeMind container/volume was deleted
-or reconfigured. MariaDB restart/replay, Minibook rebuild, and the provider E2E
-gates therefore remain live non-claims until Windows/WSL is restarted.
+On 2026-08-05 WSL and Docker recovered without deleting or reconfiguring any
+Captain or VibeMind volume. Captain MariaDB's isolated `captain_test` compose
+service passed the authenticated Gateway API restart/replay, rotation, and
+revoke acceptance cases. Captain-n8n `/healthz`, authenticated workflow read,
+and native MCP `list_credentials` each returned HTTP 200; the production
+adapter correctly parsed the MCP SSE response. The local Captain-n8n instance
+currently has zero `httpBearerAuth` and zero `oAuth2Api` credential metadata
+entries, so the provider E2E gates remain explicitly blocked rather than
+simulated.
 
 ## Acceptance sequence
 

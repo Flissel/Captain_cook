@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
@@ -10,9 +10,16 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
+from agenten.agent_factory.integration_setup import IntegrationSetupPlanner
 from blockchain.mariadb_storage import MariaDBStorage
 from gateway.app import create_app
 from gateway.settings import GatewaySettings
+from tests.agent_factory.test_integration_setup import (
+    credential,
+    integration,
+    receipt,
+    requirement,
+)
 from tests.agent_factory.test_state_machine import job
 from tests.support.mariadb import assert_isolated_test_database
 
@@ -77,7 +84,7 @@ def setup_payload(
         "subject_version": factory_job.subject_version,
         "revision": revision,
         "previous_content_sha256": previous_sha256,
-        "occurred_at": NOW.isoformat().replace("+00:00", "Z"),
+        "occurred_at": (NOW + timedelta(seconds=revision - 1)).isoformat().replace("+00:00", "Z"),
         "change_kind": "observed",
         "plan": {
             "schema": "captain.integration-setup-plan.v1",
@@ -102,6 +109,17 @@ def setup_payload(
             ],
         },
     }
+
+
+def ready_setup_payload(factory_job) -> dict[str, Any]:
+    payload = setup_payload(factory_job)
+    payload["plan"] = IntegrationSetupPlanner().plan(
+        integrations=(integration(),),
+        requirements=(requirement(),),
+        credentials=(credential(),),
+        verification_receipts=(receipt(),),
+    ).model_dump(mode="json", by_alias=True)
+    return payload
 
 
 def test_setup_api_is_captain_only_restart_safe_and_idempotent(
@@ -248,3 +266,71 @@ def test_setup_submission_must_match_the_factory_job(storage: MariaDBStorage) ->
 
     assert response.status_code == 409
     assert response.json() == {"detail": "integration setup does not match its factory job"}
+
+
+def test_setup_rotation_and_revoke_persist_across_restart(
+    storage: MariaDBStorage,
+) -> None:
+    factory_job = job()
+    with TestClient(application(storage)) as client:
+        assert client.post(
+            "/v1/factory/jobs",
+            json=factory_job.model_dump(mode="json", by_alias=True),
+            headers=auth(CAPTAIN_TOKEN),
+        ).status_code == 202
+        created = client.post(
+            "/v1/factory/integration-setups",
+            json=ready_setup_payload(factory_job),
+            headers=auth(CAPTAIN_TOKEN),
+        )
+        assert created.status_code == 201
+
+        rotation = {
+            "schema": "captain.integration-setup-mutation.v1",
+            "event_id": "80000000-0000-0000-0000-000000000004",
+            "credential_alias": "CRM_API_KEY",
+            "expected_content_sha256": created.json()["content_sha256"],
+            "occurred_at": "2026-08-04T12:01:00Z",
+            "action": "rotation_requested",
+        }
+        rotated = client.post(
+            f"/v1/factory/jobs/{factory_job.job_id}/integration-setup/mutations",
+            json=rotation,
+            headers=auth(CAPTAIN_TOKEN),
+        )
+        assert rotated.status_code == 201
+        assert client.post(
+            f"/v1/factory/jobs/{factory_job.job_id}/integration-setup/mutations",
+            json=rotation,
+            headers=auth(CAPTAIN_TOKEN),
+        ).status_code == 200
+        assert client.post(
+            f"/v1/factory/jobs/{factory_job.job_id}/integration-setup/mutations",
+            json={**rotation, "credential_alias": "OTHER_CREDENTIAL"},
+            headers=auth(CAPTAIN_TOKEN),
+        ).status_code == 409
+
+        revocation = {
+            **rotation,
+            "event_id": "80000000-0000-0000-0000-000000000005",
+            "expected_content_sha256": rotated.json()["content_sha256"],
+            "occurred_at": "2026-08-04T12:02:00Z",
+            "action": "revoked",
+        }
+        revoked = client.post(
+            f"/v1/factory/jobs/{factory_job.job_id}/integration-setup/mutations",
+            json=revocation,
+            headers=auth(CAPTAIN_TOKEN),
+        )
+        assert revoked.status_code == 201
+
+    with TestClient(application(storage)) as restarted:
+        recovered = restarted.get(
+            f"/v1/factory/jobs/{factory_job.job_id}/integration-setup",
+            headers=auth(CAPTAIN_TOKEN),
+        )
+
+    assert recovered.status_code == 200
+    assert recovered.json()["submission"]["revision"] == 3
+    assert recovered.json()["submission"]["change_kind"] == "revoked"
+    assert recovered.json()["submission"]["plan"]["connections"][0]["status"] == "revoked"

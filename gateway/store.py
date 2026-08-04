@@ -540,6 +540,9 @@ class GatewayStore:
         job_id: UUID,
         mutation: IntegrationSetupMutationV1,
     ) -> IntegrationSetupWriteReceiptV1:
+        replay = self._integration_setup_mutation_replay(job_id, mutation)
+        if replay is not None:
+            return replay
         try:
             submission = apply_integration_setup_mutation(
                 self.integration_setup(job_id),
@@ -553,6 +556,80 @@ class GatewayStore:
         return self.record_integration_setup(
             submission,
             controlled_mutation=True,
+        )
+
+    def _integration_setup_mutation_replay(
+        self,
+        job_id: UUID,
+        mutation: IntegrationSetupMutationV1,
+    ) -> IntegrationSetupWriteReceiptV1 | None:
+        """Return only an exact persisted rotation/revoke mutation replay."""
+
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT job_id, revision, content_sha256, payload
+                       FROM factory_integration_setup_events
+                       WHERE event_id = %s FOR UPDATE""",
+                    (str(mutation.event_id),),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        stored = IntegrationSetupSubmissionV1.model_validate(
+            self._decode_json(row["payload"])
+        )
+        if (
+            str(row["job_id"]) != str(job_id)
+            or stored.change_kind != mutation.action
+            or stored.previous_content_sha256 != mutation.expected_content_sha256
+            or stored.occurred_at != mutation.occurred_at
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="integration setup mutation event already exists with different content",
+            )
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT payload
+                       FROM factory_integration_setup_events
+                       WHERE job_id = %s AND content_sha256 = %s
+                       FOR UPDATE""",
+                    (str(job_id), mutation.expected_content_sha256),
+                )
+                predecessor = cursor.fetchone()
+        if predecessor is None:
+            raise HTTPException(
+                status_code=409,
+                detail="integration setup mutation event already exists with different content",
+            )
+        try:
+            expected = apply_integration_setup_mutation(
+                PersistedIntegrationSetupV1(
+                    submission=IntegrationSetupSubmissionV1.model_validate(
+                        self._decode_json(predecessor["payload"])
+                    ),
+                    content_sha256=mutation.expected_content_sha256,
+                ),
+                mutation,
+            )
+        except ValueError:
+            raise HTTPException(
+                status_code=409,
+                detail="integration setup mutation event already exists with different content",
+            ) from None
+        if expected != stored:
+            raise HTTPException(
+                status_code=409,
+                detail="integration setup mutation event already exists with different content",
+            )
+        return IntegrationSetupWriteReceiptV1(
+            event_id=mutation.event_id,
+            job_id=job_id,
+            revision=int(row["revision"]),
+            content_sha256=str(row["content_sha256"]),
+            replayed=True,
         )
 
     def integration_setup(self, job_id: UUID) -> PersistedIntegrationSetupV1:
