@@ -8,6 +8,10 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from agenten.agent_factory.contracts import FactoryLease, FactoryRole
+from agenten.agent_factory.integration_setup import (
+    IntegrationSetupPlanV1,
+    IntegrationSetupStatus,
+)
 from agenten.agent_runtime.contracts import IntegrationIntent
 from agenten.agent_factory.skill_evaluation import ToolGapMarker, ToolImplementationOption
 from agenten.targets.n8n import N8nDeployment, N8nExecutionEvidence, ValidationCase
@@ -20,6 +24,11 @@ class TypedN8nTool(BaseModel):
     description: str = Field(min_length=1)
     input_schema_ref: str = Field(pattern=r"^artifact://")
     output_schema_ref: str = Field(pattern=r"^artifact://")
+    integration_key: str | None = Field(
+        default=None,
+        pattern=r"^[a-z0-9][a-z0-9-]{0,63}$",
+        exclude=True,
+    )
 
     def opaque_reference(self) -> "OpaqueN8nToolReference":
         """Return the only serializable reference for this approved typed tool."""
@@ -134,13 +143,33 @@ class TypedN8nCatalog:
         return tool.opaque_reference()
 
     async def invoke(
-        self, *, lease: FactoryLease, call: TypedN8nCall, mcp: N8nMcpPort
+        self,
+        *,
+        lease: FactoryLease,
+        call: TypedN8nCall,
+        mcp: N8nMcpPort,
+        integration_setup_plan: IntegrationSetupPlanV1 | None = None,
     ) -> dict[str, object]:
         _require_n8n_tool_lease(lease)
         try:
             tool = self._tools[call.tool_name]
         except KeyError as exc:
             raise PermissionError("n8n tool is not registered in Captain's typed catalog") from exc
+        if tool.integration_key is not None:
+            matching_connections = (
+                ()
+                if integration_setup_plan is None
+                else tuple(
+                    connection
+                    for connection in integration_setup_plan.connections
+                    if connection.requirement.integration_key == tool.integration_key
+                )
+            )
+            if not matching_connections or any(
+                connection.status is not IntegrationSetupStatus.READY
+                for connection in matching_connections
+            ):
+                raise PermissionError("integration connection is not ready")
         if isinstance(mcp, N8nDeploymentToolAdapter):
             return await mcp.call_with_context(call)
         return await mcp.call_typed_tool(tool, call.payload)
