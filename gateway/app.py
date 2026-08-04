@@ -29,6 +29,7 @@ from agenten.agent_factory.execution_budget import (
     FactoryBudgetReservationV1,
     FactoryBudgetWriteReceipt,
 )
+from agenten.delivery.minibook_events import MinibookProjectionAcknowledgementV1
 from agenten.agent_factory.business_benchmark_contracts import BusinessBenchmarkSummaryV1
 from agenten.agent_factory.skill_workflow_contracts import TeamEvaluationV1
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
@@ -559,6 +560,22 @@ def create_app(
             cursor=next_cursor,
             has_more=has_more,
         )
+
+    @app.post(
+        "/api/v1/projections/minibook/acknowledgements",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def acknowledge_minibook_projection(
+        acknowledgement: MinibookProjectionAcknowledgementV1,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> AppendResult:
+        result = get_store().record_minibook_projection_acknowledgement(
+            acknowledgement
+        )
+        if result.replayed:
+            response.status_code = status.HTTP_200_OK
+        return result
 
     @app.post("/v1/runtime/commands", status_code=status.HTTP_202_ACCEPTED)
     async def accept_runtime_command(

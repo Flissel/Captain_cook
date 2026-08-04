@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory, Position=0)]
-    [ValidateSet("start", "benchmark-start", "health", "stop")]
+    [ValidateSet("start", "benchmark-start", "benchmark-restart", "health", "stop")]
     [string]$Action,
     [switch]$RecoverDemoCredentials,
     [string]$CredentialSourceEnv
@@ -397,6 +397,10 @@ try {
             Invoke-StartServices -Recover:$RecoverDemoCredentials -SourceEnv $CredentialSourceEnv
         }
         benchmark-start {
+            Invoke-BenchmarkStart -Recover:$RecoverDemoCredentials -SourceEnv $CredentialSourceEnv
+        }
+        benchmark-restart {
+            Stop-ManagedGateway -PidPath $benchmarkGatewayPid
             Invoke-BenchmarkStart -Recover:$RecoverDemoCredentials -SourceEnv $CredentialSourceEnv
         }
         health { Invoke-Health }

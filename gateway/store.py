@@ -35,6 +35,7 @@ from agenten.agent_factory.contracts import (
     FactoryRole,
     parse_factory_job,
 )
+from agenten.delivery.minibook_events import MinibookProjectionAcknowledgementV1
 from agenten.agent_factory.execution_budget import (
     BudgetExhausted,
     FactoryBudgetProjection,
@@ -119,6 +120,7 @@ from gateway.contracts import (
     project_release,
 )
 from gateway.release_policy import ReleaseReadiness, evaluate_release_readiness
+from gateway.registry_feed import factory_registry_mirror_event
 
 
 CAPTAIN_BLOCK_TYPES = frozenset({"problem", "work_batch", "holdout"})
@@ -3036,6 +3038,92 @@ class GatewayStore:
                 (int(row["index"]), str(event["block_type"]), event["data"], parent)
             )
         return records, has_more
+
+    def record_minibook_projection_acknowledgement(
+        self,
+        acknowledgement: MinibookProjectionAcknowledgementV1,
+    ) -> AppendResult:
+        """Persist one exact Factory-to-Minibook acknowledgement as delivery evidence."""
+
+        source = self.factory_promotion_source(
+            acknowledgement.projection_event_id
+        )
+        if source is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Factory promotion projection event is unavailable",
+            )
+        block, job = source
+        benchmark_summary = None
+        if job.get("schema") == "captain.agent-factory-job.v3":
+            job_id = UUID(str(block["job_id"]))
+            attempt = int(block["attempt"])
+            evaluations = tuple(
+                artifact
+                for artifact in self.factory_workflow_artifacts(job_id)
+                if isinstance(artifact, TeamEvaluationV1)
+                and artifact.attempt == attempt
+            )
+            if (
+                len(evaluations) != 1
+                or evaluations[0].benchmark_summary_ref is None
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Factory promotion has no unambiguous business "
+                        "benchmark evaluation"
+                    ),
+                )
+            benchmark_summary = self.business_benchmark_summary_by_artifact(
+                evaluations[0].benchmark_summary_ref
+            )
+            if benchmark_summary is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Factory promotion business benchmark summary is unavailable",
+                )
+        try:
+            mirror = factory_registry_mirror_event(
+                acknowledgement,
+                block,
+                job,
+                benchmark_summary=benchmark_summary,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return self.append_delivery_event(mirror)
+
+    def factory_promotion_source(
+        self,
+        projection_event_id: UUID,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Resolve only a successful Factory promotion admitted to the feed."""
+
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT event.data AS event_data, parent.data AS parent_data
+                    FROM blocks AS event
+                    JOIN blocks AS parent ON parent.`index` = event.parent_index
+                    WHERE event.block_type = 'agent_factory_block'
+                      AND parent.block_type = 'agent_factory_job'
+                      AND JSON_UNQUOTE(JSON_EXTRACT(event.data, '$.event_id')) = %s
+                      AND JSON_UNQUOTE(JSON_EXTRACT(event.data, '$.phase')) = 'capability_promoted'
+                      AND JSON_UNQUOTE(JSON_EXTRACT(event.data, '$.status')) = 'succeeded'
+                    ORDER BY event.`index`
+                    LIMIT 1
+                    """,
+                    (str(projection_event_id),),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            return None
+        return (
+            self._decode_json(row["event_data"]),
+            self._decode_json(row["parent_data"]),
+        )
 
     def _factory_leases(self, cursor: Any, job_id: UUID) -> tuple[FactoryLease, ...]:
         cursor.execute(

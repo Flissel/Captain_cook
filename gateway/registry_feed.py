@@ -17,7 +17,12 @@ from agenten.agent_runtime.contracts import (
     RuntimeOperation,
     RuntimeStatus,
 )
-from agenten.delivery.minibook_events import MinibookProjectionEvent
+from agenten.delivery.minibook_events import (
+    MinibookProjectionAcknowledgementV1,
+    MinibookProjectionEvent,
+)
+from agenten.delivery.projector import MinibookProjector
+from gateway.contracts import DeliveryEventEnvelope
 
 
 class MinibookProjectionFeedPage(BaseModel):
@@ -82,6 +87,65 @@ def factory_promotion_projection(
             "subject_version": block["subject_version"],
             "event_type": "capability.promoted",
             "payload": payload,
+        }
+    )
+
+
+def factory_registry_mirror_event(
+    acknowledgement: MinibookProjectionAcknowledgementV1,
+    block: dict[str, Any],
+    job: dict[str, Any],
+    *,
+    benchmark_summary: BusinessBenchmarkSummaryV1 | None = None,
+) -> DeliveryEventEnvelope:
+    """Bind a Minibook acknowledgement to one exact Factory promotion."""
+
+    projection = factory_promotion_projection(
+        block,
+        job,
+        benchmark_summary=benchmark_summary,
+    )
+    rendered = MinibookProjector.render(projection)
+    expected_post_id = "captain-projection-" + hashlib.sha256(
+        str(projection.event_id).encode("utf-8")
+    ).hexdigest()[:32]
+    expected = {
+        "projection_event_id": projection.event_id,
+        "correlation_id": projection.correlation_id,
+        "subject_id": projection.subject_id,
+        "subject_version": projection.subject_version,
+        "project_id": MinibookProjector.PROJECTION_PROJECT_ID,
+        "post_id": expected_post_id,
+        "content_sha256": rendered.content_hash,
+        "outcome": "mirrored",
+    }
+    actual = acknowledgement.model_dump(
+        include=set(expected),
+    )
+    if actual != expected:
+        raise ValueError("Minibook acknowledgement does not match Factory promotion")
+
+    return DeliveryEventEnvelope.model_validate(
+        {
+            "event_id": acknowledgement.acknowledgement_id,
+            "event_type": "registry_mirror",
+            "occurred_at": acknowledgement.acknowledged_at,
+            "actor": "captain-gateway",
+            "trace": {
+                "project_id": f"factory:{block['job_id']}",
+                "run_id": f"attempt:{block['attempt']}",
+                "trace_id": f"minibook-projection:{projection.event_id}",
+                "artifact_id": acknowledgement.post_id,
+                "job_id": block["job_id"],
+                "correlation_id": projection.correlation_id,
+                "subject_version": projection.subject_version,
+            },
+            "payload": {
+                "event_type": "registry_mirror",
+                "capability_id": job["required_capability"],
+                "capability_version": str(projection.subject_version),
+                "outcome": "mirrored",
+            },
         }
     )
 

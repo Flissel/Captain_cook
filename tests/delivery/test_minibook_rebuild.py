@@ -13,7 +13,11 @@ import pytest
 import scripts.rebuild_minibook_projection as rebuild_script
 
 from agenten.delivery.minibook_client import MinibookClient
-from agenten.delivery.minibook_events import MinibookProjectionEvent
+from agenten.delivery.minibook_events import (
+    MinibookProjectionAcknowledgementV1,
+    MinibookProjectionEvent,
+    minibook_projection_acknowledgement_id,
+)
 from agenten.delivery.projection_cursor import ProjectionCursorStore
 from agenten.delivery.projector import MinibookProjector
 from agenten.delivery.projector import ConflictingProjectionEvent
@@ -113,9 +117,11 @@ def test_factory_promotion_rebuild_is_visible_and_idempotent_with_same_correlati
             "required_capability": "support_triage",
         },
     )
+    requests: list[httpx.Request] = []
     feed = _single_page_feed(
         [event.model_dump(mode="json", by_alias=True)],
         cursor="factory-promotion-1",
+        requests=requests,
     )
     store = ProjectionCursorStore(tmp_path / "factory-projection.db")
     projector = MinibookProjector(projection_api, store)
@@ -130,6 +136,12 @@ def test_factory_promotion_rebuild_is_visible_and_idempotent_with_same_correlati
     assert correlation_id in posts[0]["content"]
     assert f"captain-correlation:{correlation_id}" in posts[0]["tags"]
     assert "support_triage" not in str(posts[0])
+    acknowledgements = [request for request in requests if request.method == "POST"]
+    assert len(acknowledgements) == 2
+    assert all(
+        request.url.path == "/api/v1/projections/minibook/acknowledgements"
+        for request in acknowledgements
+    )
 
 
 def _seed_projection_post(
@@ -495,6 +507,18 @@ def _single_page_feed(
     def handler(request: httpx.Request) -> httpx.Response:
         if requests is not None:
             requests.append(request)
+        if request.method == "POST":
+            acknowledgement = json.loads(request.content)
+            return httpx.Response(
+                201,
+                json={
+                    "event": {
+                        "event_id": acknowledgement["acknowledgement_id"],
+                    },
+                    "replayed": False,
+                },
+                request=request,
+            )
         return httpx.Response(
             200,
             json={"events": documents, "cursor": cursor, "has_more": False},
@@ -503,6 +527,73 @@ def _single_page_feed(
 
     http = httpx.Client(transport=httpx.MockTransport(handler))
     return CaptainProjectionFeed("https://captain.test", token="test-only", client=http)
+
+
+def test_projection_feed_posts_exact_acknowledgement_with_captain_token() -> None:
+    projection_event_id = uuid4()
+    post_id = "captain-projection-" + hashlib.sha256(
+        str(projection_event_id).encode("utf-8")
+    ).hexdigest()[:32]
+    content_sha256 = "a" * 64
+    acknowledgement = MinibookProjectionAcknowledgementV1.model_validate(
+        {
+            "acknowledgement_id": str(
+                minibook_projection_acknowledgement_id(
+                    projection_event_id,
+                    post_id=post_id,
+                    content_sha256=content_sha256,
+                )
+            ),
+            "projection_event_id": str(projection_event_id),
+            "correlation_id": str(uuid4()),
+            "subject_id": f"subject:{uuid4()}",
+            "subject_version": 1,
+            "project_id": "captain-runtime-projection-v2",
+            "post_id": post_id,
+            "content_sha256": content_sha256,
+            "acknowledged_at": "2026-07-20T08:01:00Z",
+            "outcome": "mirrored",
+        }
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            201,
+            json={
+                "event": {"event_id": str(acknowledgement.acknowledgement_id)},
+                "replayed": False,
+            },
+            request=request,
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        feed = CaptainProjectionFeed(
+            "https://captain.test",
+            token="captain-token",
+            client=http,
+        )
+        receipt = feed.acknowledge(acknowledgement)
+
+    assert receipt["replayed"] is False
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.method == "POST"
+    assert request.url.path == "/api/v1/projections/minibook/acknowledgements"
+    assert request.headers["Authorization"] == "Bearer captain-token"
+    assert json.loads(request.content) == acknowledgement.model_dump(
+        mode="json",
+        by_alias=True,
+    )
+
+
+def test_projection_feed_allows_bounded_cold_gateway_reads() -> None:
+    feed = CaptainProjectionFeed("https://captain.test", token="test-only")
+    try:
+        assert feed._client.timeout.read == 60.0
+    finally:
+        feed.close()
 
 
 def test_incremental_restart_resumes_from_committed_page_cursor(
@@ -687,10 +778,16 @@ def test_default_cli_dry_run_reports_missing_without_creating_project(
 ) -> None:
     document = json.loads(FIXTURE.read_text(encoding="utf-8"))[0]
     feed = _single_page_feed([document], cursor="after-dry-run")
+    minibook_options: dict[str, object] = {}
+
+    def minibook_client(*_args, **kwargs):
+        minibook_options.update(kwargs)
+        return projection_api
+
     monkeypatch.setenv("CAPTAIN_GATEWAY_TOKEN", "test-only")
     monkeypatch.setenv("MINIBOOK_API_KEY", "test-only")
     monkeypatch.setattr(rebuild_script, "CaptainProjectionFeed", lambda *a, **k: feed)
-    monkeypatch.setattr(rebuild_script, "MinibookClient", lambda *a, **k: projection_api)
+    monkeypatch.setattr(rebuild_script, "MinibookClient", minibook_client)
 
     cursor_path = tmp_path / "absent" / "nested" / "cursor.db"
     assert not cursor_path.parent.exists()
@@ -710,6 +807,7 @@ def test_default_cli_dry_run_reports_missing_without_creating_project(
     assert exit_code == 0
     assert output["mode"] == "dry-run"
     assert output["missing_event_ids"] == [document["event_id"]]
+    assert minibook_options["timeout_seconds"] == 60.0
     assert projection_api.list_projects() == []
     assert not cursor_path.parent.exists()
 
@@ -743,6 +841,70 @@ def test_successful_apply_full_rebuild_checkpoints_terminal_feed_cursor(
 
     assert exit_code == 0
     assert ProjectionCursorStore(cursor_path).get_feed_cursor() == "after-full-rebuild"
+
+
+def test_full_rebuild_does_not_checkpoint_when_factory_ack_is_rejected(
+    tmp_path: Path,
+    projection_api: MinibookClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = factory_promotion_projection(
+        {
+            "event_id": "10000000-0000-4000-8000-000000000001",
+            "job_id": "20000000-0000-4000-8000-000000000001",
+            "phase": "capability_promoted",
+            "status": "succeeded",
+            "attempt": 2,
+            "subject_version": 1,
+            "occurred_at": "2026-07-20T12:00:00Z",
+        },
+        {
+            "correlation_id": "30000000-0000-4000-8000-000000000001",
+            "required_capability": "support_triage",
+        },
+    )
+    cursor_path = tmp_path / "cursor.db"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(503, request=request)
+        return httpx.Response(
+            200,
+            json={
+                "events": [event.model_dump(mode="json", by_alias=True)],
+                "cursor": "after-factory-promotion",
+                "has_more": False,
+            },
+            request=request,
+        )
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    feed = CaptainProjectionFeed(
+        "https://captain.test",
+        token="test-only",
+        client=http,
+    )
+    monkeypatch.setenv("CAPTAIN_GATEWAY_TOKEN", "test-only")
+    monkeypatch.setenv("MINIBOOK_API_KEY", "test-only")
+    monkeypatch.setenv("MINIBOOK_PROJECTION_API_KEY", PROJECTION_API_KEY)
+    monkeypatch.setattr(rebuild_script, "CaptainProjectionFeed", lambda *a, **k: feed)
+    monkeypatch.setattr(rebuild_script, "MinibookClient", lambda *a, **k: projection_api)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        rebuild_script.main(
+            [
+                "--captain-url",
+                "https://captain.test",
+                "--minibook-url",
+                "http://127.0.0.1",
+                "--cursor-db",
+                str(cursor_path),
+                "--apply",
+                "--full-rebuild",
+            ]
+        )
+
+    assert ProjectionCursorStore(cursor_path).get_feed_cursor() is None
 
 
 def test_incremental_requires_explicit_full_rebuild_for_unversioned_cursor(

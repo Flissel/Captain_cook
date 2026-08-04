@@ -16,6 +16,7 @@ import httpx
 
 from agenten.delivery.minibook_client import MinibookClient
 from agenten.delivery.minibook_events import MinibookProjectionEvent
+from agenten.delivery.minibook_events import minibook_projection_acknowledgement_id
 from agenten.delivery.projection_cursor import ProjectionCursorStore
 from agenten.delivery.projector import MinibookProjector
 
@@ -152,6 +153,20 @@ def test_mixed_promotion_and_runtime_result_replay_and_zero_rebuild_are_stable(
     ]
     original_posts = client.list_posts(projector.ensure_projection_project()["id"])
     assert projector.reconcile(mixed).total_changes == 0
+    acknowledgement = projector.acknowledgement(promotion)
+    assert acknowledgement.projection_event_id == promotion.event_id
+    assert acknowledgement.correlation_id == promotion.correlation_id
+    assert acknowledgement.subject_id == promotion.subject_id
+    assert acknowledgement.subject_version == promotion.subject_version
+    assert acknowledgement.project_id == projector.PROJECTION_PROJECT_ID
+    assert acknowledgement.outcome == "mirrored"
+    assert acknowledgement.acknowledgement_id == (
+        minibook_projection_acknowledgement_id(
+            promotion.event_id,
+            post_id=acknowledgement.post_id,
+            content_sha256=acknowledgement.content_sha256,
+        )
+    )
 
     cursor_path.unlink()
     rebuilt = MinibookProjector(client, ProjectionCursorStore(cursor_path))

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from datetime import timezone
 from typing import Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from pydantic import (
     AwareDatetime,
@@ -66,6 +67,69 @@ ArtifactDigest = Annotated[str, StringConstraints(pattern=r"^sha256:[0-9a-f]{64}
 BenchmarkReasonCode = Annotated[
     str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$")
 ]
+_PROJECTION_ACKNOWLEDGEMENT_NAMESPACE = UUID(
+    "cbd7e2c8-71b1-4b83-8d0c-1311590f4c50"
+)
+
+
+def minibook_projection_acknowledgement_id(
+    projection_event_id: UUID,
+    *,
+    post_id: str,
+    content_sha256: str,
+) -> UUID:
+    """Derive one replay-stable acknowledgement identity from canonical output."""
+
+    return uuid5(
+        _PROJECTION_ACKNOWLEDGEMENT_NAMESPACE,
+        f"{projection_event_id}|{post_id}|{content_sha256}",
+    )
+
+
+class MinibookProjectionAcknowledgementV1(BaseModel):
+    """Captain-owned proof that one canonical projection is durable in Minibook."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    schema_name: Literal[
+        "captain.minibook-projection-acknowledgement.v1"
+    ] = Field(
+        default="captain.minibook-projection-acknowledgement.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    acknowledgement_id: UUID
+    projection_event_id: UUID
+    correlation_id: UUID
+    subject_id: SubjectReference
+    subject_version: int = Field(ge=1, strict=True)
+    project_id: Literal["captain-runtime-projection-v2"]
+    post_id: str = Field(
+        pattern=r"^captain-projection-[0-9a-f]{32}$",
+    )
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    acknowledged_at: AwareDatetime
+    outcome: Literal["mirrored"]
+
+    @field_validator("acknowledged_at")
+    @classmethod
+    def require_utc_acknowledgement(cls, value: AwareDatetime) -> AwareDatetime:
+        if value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("acknowledged_at must be UTC")
+        return value.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def require_deterministic_acknowledgement_id(
+        self,
+    ) -> "MinibookProjectionAcknowledgementV1":
+        expected = minibook_projection_acknowledgement_id(
+            self.projection_event_id,
+            post_id=self.post_id,
+            content_sha256=self.content_sha256,
+        )
+        if self.acknowledgement_id != expected:
+            raise ValueError("acknowledgement_id does not match canonical projection")
+        return self
 
 _EVENT_CATALOG: dict[
     ProjectionEventType,

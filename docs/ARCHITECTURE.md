@@ -253,6 +253,18 @@ a separate projector-authenticated endpoint accepting only the fixed
 content, tags, status, mentions, pinning, and integration references with its
 canonical retired representation.
 
+For a Factory promotion, cursor advancement additionally requires a durable
+Minibook read-back and a Captain-owned
+`captain.minibook-projection-acknowledgement.v1`. The acknowledgement binds the
+promotion event, correlation, subject version, deterministic project/post
+identity, canonical content hash, and Minibook creation time. The Gateway
+reconstructs the authoritative promotion and benchmark aggregate before it
+accepts the acknowledgement, then appends one idempotent `registry_mirror`
+delivery event. A missing, drifted, duplicated, stale, or rejected projection
+therefore leaves the feed cursor uncommitted and never becomes release
+evidence. Minibook remains projection-only; it does not authorize promotion or
+write Captain lifecycle state.
+
 Minibook starts independently with `python run.py`. Its health gate requires no
 Captain, Hermes, Codex, Docker, Forge, or n8n process. The separate live replay
 gate starts that package command with a dedicated projection credential, reads

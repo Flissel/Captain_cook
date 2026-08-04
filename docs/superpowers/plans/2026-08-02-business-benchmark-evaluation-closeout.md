@@ -183,7 +183,18 @@ policy but derives fresh job IDs and fresh Codex threads after plugin isolation.
   successful Hermes provider effects were estimated at 0.06614875 USD. The
   Quality Warden recommendation is `PROMOTE_CANDIDATE`; promotion itself is not
   claimed by this evaluation entry.
-- [ ] Re-run from a clean checkout and promote only if correctness is not below
+- [x] Re-run from a clean committed base as Claims v46. All three technical
+  provider runs passed on Attempt 2, followed by 15 paired Candidate/Baseline
+  cases with no missing receipts, unsafe tool uses, or missed Captain handoffs.
+  Candidate correctness/completion were 10000/10000 bps versus 9334/7334 for
+  the baseline. Summary `17498fa5-9605-5365-82e5-cc60fe1f58df` passed and
+  Captain promoted event `71019d5d-13b1-52fd-b127-2113ddc10fed`.
+- [x] Project that exact promotion into Minibook, prove a zero-drift full
+  rebuild, and append the idempotent Gateway `registry_mirror` event
+  `7136a5db-70aa-5b15-8a66-6974dc6c9be9` with the same correlation
+  `49409911-f582-51db-bd54-d1bba0db1f0f`. A replay retained exactly one mirror
+  event.
+- [x] Promote only if correctness is not below
   baseline, every mandatory handoff is completed, and safety remains perfect.
 
 ## Non-claims
