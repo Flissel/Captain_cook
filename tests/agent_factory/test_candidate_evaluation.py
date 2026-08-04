@@ -40,7 +40,7 @@ from agenten.agent_factory.skill_evaluation import (
     ToolImplementationOption,
 )
 from agenten.agent_runtime.contracts import IntegrationIntent
-from tests.agent_factory.test_state_machine import job
+from tests.agent_factory.test_state_machine import job, job_v3
 from tests.agent_factory.test_skill_evaluation_contracts import request_payload
 
 
@@ -1182,6 +1182,233 @@ async def test_real_case_records_validated_team_execution_in_captain_workflow_st
 
     assert await validator.dispatch(request) is expected_block
     assert recorded == [team_evidence]
+
+
+@pytest.mark.asyncio
+async def test_release_real_case_records_all_three_required_live_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "candidate.zip"
+    team_ref, workflow_ref, input_ref, output_ref, source_ref = _write_candidate_archive(
+        archive_path
+    )
+    candidate = FactoryCandidateManifest(
+        candidate_id="support_triage_v1",
+        source_archive_ref=source_ref,
+        team_manifest={"reference": team_ref, "relative_path": "team_manifest.json"},
+        workflow_artifacts=(
+            {
+                "reference": workflow_ref,
+                "relative_path": "workflows/support_triage.json",
+            },
+        ),
+        tool_schema_artifacts=(
+            {
+                "reference": input_ref,
+                "relative_path": "schemas/support_triage.input.json",
+            },
+            {
+                "reference": output_ref,
+                "relative_path": "schemas/support_triage.output.json",
+            },
+        ),
+        n8n_tools=(
+            TypedN8nTool(
+                name="support_triage",
+                description="Route support.",
+                input_schema_ref=input_ref.uri,
+                output_schema_ref=output_ref.uri,
+            ),
+        ),
+        build_command=("python", "-m", "compileall", "-q", "."),
+        real_case_command=("python", "run_case.py"),
+        timeout_seconds=10,
+    )
+    factory_job = job_v3(mode="release")
+    lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.REAL_CASE_TESTER,
+        attempt=1,
+        workspace_ref="workspace://factory/release-runs",
+        now=factory_job.occurred_at,
+    )
+    request = FactoryDispatch(
+        job=factory_job,
+        action=FactoryAction(
+            kind=FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
+            attempt=1,
+        ),
+        role=FactoryRole.REAL_CASE_TESTER,
+        lease=lease,
+    )
+    invocations = tuple(object() for _ in range(3))
+    evidences = tuple(
+        SimpleNamespace(
+            run_number=run_number,
+            model_dump_json=lambda **_kwargs: '{"schema":"test-team-evidence"}',
+        )
+        for run_number in (1, 2, 3)
+    )
+    expected_block = object()
+    monkeypatch.setattr(
+        candidate_evaluation_module,
+        "_team_execution_bundle_block",
+        lambda *_args, **_kwargs: expected_block,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        candidate_evaluation_module,
+        "_team_execution_block",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    class TeamExecution:
+        def invocation_for(self, _request: FactoryDispatch) -> object:
+            raise AssertionError("release execution must not use the singular path")
+
+        async def execute(
+            self,
+            _request: FactoryDispatch,
+            _resolved: ResolvedFactoryCandidate,
+        ) -> object:
+            raise AssertionError("release execution must not use the singular path")
+
+        def invocations_for(self, _request: FactoryDispatch) -> tuple[object, ...]:
+            return invocations
+
+        async def execute_required(
+            self,
+            _request: FactoryDispatch,
+            _resolved: ResolvedFactoryCandidate,
+        ) -> tuple[object, ...]:
+            return evidences
+
+    recorded: list[object] = []
+
+    class WorkflowArtifacts:
+        def record_workflow_artifact(self, artifact: object) -> bool:
+            recorded.append(artifact)
+            return True
+
+    validator = CandidateEvaluationFactory(
+        provider=StaticFactoryCandidateProvider(
+            {
+                factory_job.job_id: ResolvedFactoryCandidate(
+                    candidate=candidate,
+                    source_archive=archive_path,
+                )
+            }
+        ),
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
+        team_execution=TeamExecution(),  # type: ignore[arg-type]
+        workflow_artifacts=WorkflowArtifacts(),  # type: ignore[arg-type]
+    )
+
+    assert await validator.dispatch(request) is expected_block
+    assert recorded == list(evidences)
+
+
+@pytest.mark.asyncio
+async def test_release_technical_revalidation_retries_only_one_authorized_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory_job = job_v3(mode="release")
+    authorization_ref = _ref(
+        "artifact://factory/technical-revalidation/authorization",
+        b"authorization",
+    )
+    supersedes_ref = _ref(
+        "artifact://factory/team-execution/failed-run",
+        b"failed-run",
+    )
+    lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.REAL_CASE_TESTER,
+        attempt=1,
+        workspace_ref="workspace://factory/revalidation",
+        now=factory_job.occurred_at,
+    )
+    request = FactoryDispatch(
+        job=factory_job,
+        action=FactoryAction(
+            kind=FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION,
+            attempt=1,
+            job_id=factory_job.job_id,
+            authorization_ref=authorization_ref,
+            supersedes_ref=supersedes_ref,
+        ),
+        role=FactoryRole.REAL_CASE_TESTER,
+        lease=lease,
+    )
+
+    class Evidence:
+        evidence_refs: tuple[ArtifactRef, ...] = ()
+
+        def model_copy(self, *, update: dict[str, object]) -> "Evidence":
+            self.evidence_refs = tuple(update["evidence_refs"])  # type: ignore[arg-type]
+            return self
+
+        def model_dump_json(self, **_kwargs: object) -> str:
+            return '{"schema":"test-team-evidence"}'
+
+    evidence = Evidence()
+    expected_invocation = object()
+    expected_block = object()
+
+    class TeamExecution:
+        def invocation_for(self, _request: FactoryDispatch) -> object:
+            return expected_invocation
+
+        async def execute(
+            self,
+            _request: FactoryDispatch,
+            _resolved: ResolvedFactoryCandidate,
+        ) -> Evidence:
+            return evidence
+
+        def invocations_for(self, _request: FactoryDispatch) -> tuple[object, ...]:
+            raise AssertionError("technical revalidation must remain a singular retry")
+
+        async def execute_required(
+            self,
+            _request: FactoryDispatch,
+            _resolved: ResolvedFactoryCandidate,
+        ) -> tuple[object, ...]:
+            raise AssertionError("technical revalidation must remain a singular retry")
+
+    monkeypatch.setattr(
+        candidate_evaluation_module,
+        "_team_execution_block",
+        lambda *_args, **_kwargs: expected_block,
+    )
+    recorded: list[object] = []
+
+    class WorkflowArtifacts:
+        def record_workflow_artifact(self, artifact: object) -> bool:
+            recorded.append(artifact)
+            return True
+
+    validator = CandidateEvaluationFactory(
+        provider=StaticFactoryCandidateProvider(
+            {
+                factory_job.job_id: ResolvedFactoryCandidate(
+                    candidate=FactoryCandidateManifest.model_validate(
+                        _candidate_manifest_payload()
+                    ),
+                    source_archive=tmp_path / "candidate.zip",
+                )
+            }
+        ),
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
+        team_execution=TeamExecution(),  # type: ignore[arg-type]
+        workflow_artifacts=WorkflowArtifacts(),  # type: ignore[arg-type]
+    )
+
+    assert await validator.dispatch(request) is expected_block
+    assert evidence.evidence_refs == (authorization_ref, supersedes_ref)
+    assert recorded == [evidence]
 
 
 @pytest.mark.asyncio

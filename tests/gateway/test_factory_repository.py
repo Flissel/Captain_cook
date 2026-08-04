@@ -815,6 +815,37 @@ def test_gateway_workflow_sequence_requires_current_phase_and_prior_artifact() -
         )
 
 
+def test_gateway_accepts_three_release_runs_for_one_canonical_holdout() -> None:
+    factory_job = workflow_job(mode="release")
+    inventory = parse_factory_workflow_artifact(inventory_payload())
+    brief = parse_factory_workflow_artifact(brief_payload())
+    runs = tuple(
+        run.model_copy(
+            update={
+                "invocation": run.invocation.model_copy(
+                    update={
+                        "input_ref": factory_job.input_ref,
+                        "input_sha256": factory_job.input_ref.sha256,
+                    }
+                )
+            }
+        )
+        for run in (workflow_run(number) for number in range(1, 4))
+    )
+    build_passed = FactoryProjection.from_job(factory_job).model_copy(
+        update={
+            "status": FactoryLifecycleStatus.RUNNING,
+            "phase": FactoryPhase.BUILD_PASSED,
+        }
+    )
+    prior = (inventory, brief)
+
+    for run in runs:
+        GatewayStore._assert_workflow_artifact(factory_job, run, prior)
+        GatewayStore._assert_workflow_sequence(build_passed, run, prior)
+        prior = (*prior, run)
+
+
 def test_gateway_workflow_input_binding_uses_the_exact_step_predecessor() -> None:
     inventory = parse_factory_workflow_artifact(inventory_payload())
     evaluation = parse_factory_workflow_artifact(evaluation_payload())

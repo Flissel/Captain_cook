@@ -345,3 +345,41 @@ def test_benchmark_inputs_preserve_exact_gateway_forge_candidate_reference() -> 
         match="do not match the current Forge candidate",
     ):
         guarded.resolve(request)
+
+
+def test_release_team_execution_port_materializes_every_required_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = ProductionFactoryTeamExecutionPort(
+        evidence_store=SimpleNamespace(),  # type: ignore[arg-type]
+        ports_for=lambda _job: SimpleNamespace(),  # type: ignore[arg-type]
+        holdout_selector=lambda job: job.private_holdout_refs[0],
+    )
+    request = SimpleNamespace(
+        job=SimpleNamespace(
+            execution_policy=SimpleNamespace(required_live_runs=3),
+        )
+    )
+
+    class Adapter:
+        def __init__(self, run_number: int) -> None:
+            self.run_number = run_number
+
+        def invocation_for(self, _request: object) -> str:
+            return f"invocation-{self.run_number}"
+
+        async def execute(self, _request: object, _candidate: object) -> int:
+            return self.run_number
+
+    monkeypatch.setattr(
+        port,
+        "_adapter",
+        lambda _request, run_number=1: Adapter(run_number),
+    )
+
+    assert port.invocations_for(request) == (
+        "invocation-1",
+        "invocation-2",
+        "invocation-3",
+    )
+    assert asyncio.run(port.execute_required(request, object())) == (1, 2, 3)

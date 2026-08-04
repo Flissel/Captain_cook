@@ -1373,11 +1373,34 @@ class GatewayBenchmarkInvocationAuthority:
             for index, invocation in enumerate(observed)
             if invocation not in observed[:index]
         )
-        if len(invocations) != 1:
+        if len(invocations) == 1:
+            return invocations[0]
+        if len(invocations) != job.execution_policy.required_live_runs:
             raise ValueError(
                 "Gateway requires one exact execute-team invocation for the attempt"
             )
-        return invocations[0]
+        canonical = invocations[0]
+        if any(
+            invocation.invocation_id
+            != uuid5(
+                NAMESPACE_URL,
+                f"captain.factory-team-live:{invocation.idempotency_key}",
+            )
+            for invocation in invocations[1:]
+        ) or any(
+            invocation.model_copy(
+                update={
+                    "invocation_id": canonical.invocation_id,
+                    "idempotency_key": canonical.idempotency_key,
+                }
+            )
+            != canonical
+            for invocation in invocations[1:]
+        ):
+            raise ValueError(
+                "Gateway release execute-team invocations are stale or mixed"
+            )
+        return canonical
 
     def benchmark_invocation(
         self,

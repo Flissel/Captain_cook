@@ -1325,6 +1325,56 @@ def test_gateway_invocation_authority_accepts_three_runs_of_same_invocation() ->
     assert authority.runtime_invocation(job=job, attempt=1) == runtime
 
 
+def test_gateway_invocation_authority_reduces_three_release_sibling_invocations() -> None:
+    from agenten.agent_factory.business_benchmark_bootstrap import (
+        GatewayBenchmarkInvocationAuthority,
+    )
+
+    base_job = live_job()
+    job = base_job.model_copy(
+        update={
+            "execution_policy": base_job.execution_policy.model_copy(
+                update={"mode": "release", "required_live_runs": 3}
+            )
+        }
+    )
+    runtime = _invocation(job, FactorySkillStep.EXECUTE_TEAM)
+    invocations = tuple(
+        runtime.model_copy(
+            update={
+                "invocation_id": uuid5(
+                    NAMESPACE_URL,
+                    "captain.factory-team-live:"
+                    + hashlib.sha256(
+                        f"release-run:{run_number}".encode()
+                    ).hexdigest(),
+                ),
+                "idempotency_key": hashlib.sha256(
+                    f"release-run:{run_number}".encode()
+                ).hexdigest(),
+            }
+        )
+        for run_number in (1, 2, 3)
+    )
+    executions = tuple(
+        production_execution(
+            job,
+            _ref("candidate"),
+            invocation,
+            run_number,
+        )
+        for run_number, invocation in enumerate(invocations, start=1)
+    )
+    authority = GatewayBenchmarkInvocationAuthority(
+        repository=SimpleNamespace(workflow_artifacts=lambda _: executions),
+        released_skills=SimpleNamespace(),
+        leases=SimpleNamespace(),
+        clock=lambda: NOW,
+    )
+
+    assert authority.runtime_invocation(job=job, attempt=1) == invocations[0]
+
+
 def test_filesystem_receipt_finalizer_returns_exact_immutable_reference(
     tmp_path: Path,
 ) -> None:

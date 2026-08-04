@@ -30,6 +30,7 @@ from pydantic import (
 
 from agenten.agent_factory.contracts import (
     AgentFactoryJob,
+    AgentFactoryJobV3,
     FactoryBlockStatus,
     FactoryEvidenceBlock,
     FactoryJob,
@@ -1311,6 +1312,67 @@ class CandidateEvaluationFactory:
                 FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION,
             }:
                 assert self._team_execution is not None
+                required_runs = (
+                    request.job.execution_policy.required_live_runs
+                    if isinstance(request.job, AgentFactoryJobV3)
+                    and request.action.kind
+                    is FactoryActionKind.DISPATCH_REAL_CASE_TESTER
+                    else 1
+                )
+                if required_runs > 1:
+                    invocations_for = getattr(
+                        self._team_execution,
+                        "invocations_for",
+                        None,
+                    )
+                    execute_required = getattr(
+                        self._team_execution,
+                        "execute_required",
+                        None,
+                    )
+                    if not callable(invocations_for) or not callable(execute_required):
+                        raise FactoryDispatchError(
+                            "release real-case dispatch requires the multi-run execution port"
+                        )
+                    expected_invocations = tuple(invocations_for(request))
+                    team_evidences = tuple(
+                        await execute_required(request, resolved)
+                    )
+                    if (
+                        len(expected_invocations) != required_runs
+                        or len(team_evidences) != required_runs
+                        or tuple(item.run_number for item in team_evidences)
+                        != tuple(range(1, required_runs + 1))
+                    ):
+                        raise FactoryDispatchError(
+                            "release real-case dispatch returned incomplete run evidence"
+                        )
+                    blocks: list[FactoryEvidenceBlock] = []
+                    for expected_invocation, team_evidence in zip(
+                        expected_invocations,
+                        team_evidences,
+                        strict=True,
+                    ):
+                        sealed = await self._evidence_store.persist(
+                            request.job,
+                            team_evidence.model_dump_json(
+                                by_alias=True, exclude_none=True
+                            ).encode("utf-8"),
+                        )
+                        blocks.append(
+                            _team_execution_block(
+                                request,
+                                resolved,
+                                team_evidence,
+                                sealed,
+                                expected_invocation=expected_invocation,
+                            )
+                        )
+                        if self._workflow_artifacts is not None:
+                            self._workflow_artifacts.record_workflow_artifact(
+                                team_evidence
+                            )
+                    return _team_execution_bundle_block(request, tuple(blocks))
                 expected_invocation = self._team_execution.invocation_for(request)
                 team_evidence = await self._team_execution.execute(request, resolved)
                 if (
@@ -1501,6 +1563,62 @@ def _result_phase(phase: FactoryPhase, status: str) -> FactoryPhase:
     if phase is FactoryPhase.BUILD_PASSED and status != "succeeded":
         return FactoryPhase.BUILD_FAILED
     return phase
+
+
+def _team_execution_bundle_block(
+    request: FactoryDispatch,
+    blocks: tuple[FactoryEvidenceBlock, ...],
+) -> FactoryEvidenceBlock:
+    """Collapse complete release-run evidence into one lifecycle transition."""
+
+    if (
+        not isinstance(request.job, AgentFactoryJobV3)
+        or len(blocks) != request.job.execution_policy.required_live_runs
+        or not blocks
+    ):
+        raise FactoryDispatchError("release team execution bundle is incomplete")
+    first = blocks[0]
+    if any(
+        block.job_id != first.job_id
+        or block.attempt != first.attempt
+        or block.phase is not first.phase
+        or block.lease_id != first.lease_id
+        for block in blocks
+    ):
+        raise FactoryDispatchError("release team execution bundle is stale or mixed")
+    succeeded = all(
+        block.status is FactoryBlockStatus.SUCCEEDED for block in blocks
+    )
+    artifact_refs = tuple(
+        dict.fromkeys(
+            reference for block in blocks for reference in block.artifact_refs
+        )
+    )
+    evidence_refs = tuple(
+        dict.fromkeys(
+            reference for block in blocks for reference in block.evidence_refs
+        )
+    )
+    identity = "|".join(str(block.event_id) for block in blocks)
+    return first.model_copy(
+        update={
+            "event_id": uuid5(
+                NAMESPACE_URL,
+                f"factory-team-execution-bundle|{identity}",
+            ),
+            "occurred_at": max(block.occurred_at for block in blocks),
+            "status": (
+                FactoryBlockStatus.SUCCEEDED
+                if succeeded
+                else FactoryBlockStatus.FAILED
+            ),
+            "artifact_refs": artifact_refs,
+            "evidence_refs": evidence_refs,
+            "assertion_ids": (
+                request.job.acceptance_assertion_ids if succeeded else ()
+            ),
+        }
+    )
 
 
 def _team_execution_block(

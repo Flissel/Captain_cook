@@ -487,12 +487,29 @@ def test_release_job_requires_exactly_three_ordered_gateway_run_numbers(
         execution(
             release_job,
             manifest.source_archive_ref,
-            runtime,
+            runtime.model_copy(
+                update={
+                    "invocation_id": uuid5(
+                        NAMESPACE_URL,
+                        "captain.factory-team-live:"
+                        + hashlib.sha256(
+                            f"release-technical-run:{run_number}".encode()
+                        ).hexdigest(),
+                    ),
+                    "idempotency_key": hashlib.sha256(
+                        f"release-technical-run:{run_number}".encode()
+                    ).hexdigest(),
+                }
+            ),
             run_number=run_number,
         )
         for run_number in (1, 2, 3)
     )
-    invocations = InvocationAuthority(release_job)
+    class ReleaseInvocationAuthority(InvocationAuthority):
+        def runtime_invocation(self, *, job: AgentFactoryJobV3, attempt: int):
+            return gateway.executions[0].invocation
+
+    invocations = ReleaseInvocationAuthority(release_job)
     resolver = ProductionBusinessBenchmarkScopeResolver(
         gateway=gateway,
         suites=SuiteAuthority(release_job, suite()),

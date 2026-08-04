@@ -2314,7 +2314,12 @@ class TeamExecutionService:
             CaptainHermesReplayRetryAuthorizationPort | None
         ) = None,
         clock: Callable[[], datetime],
+        run_number: int | None = None,
     ) -> None:
+        if run_number is not None and not (
+            1 <= run_number <= job.execution_policy.required_live_runs
+        ):
+            raise ValueError("team execution run number is not Captain-authorized")
         self._job = job
         self._preflight = preflight
         self._runner = runner
@@ -2322,6 +2327,7 @@ class TeamExecutionService:
         self._replay_store = replay_store
         self._replay_retry_authority = replay_retry_authority
         self._clock = clock
+        self._explicit_run_number = run_number
 
     async def execute(
         self,
@@ -2777,6 +2783,8 @@ class TeamExecutionService:
     def _run_number(self, case_ref: PrivateHoldoutRef) -> int:
         """Use the Captain-authorized holdout order as stable run identity."""
 
+        if self._explicit_run_number is not None:
+            return self._explicit_run_number
         try:
             return self._job.private_holdout_refs.index(case_ref) + 1
         except ValueError as exc:
@@ -2875,6 +2883,7 @@ def compose_live_team_execution(
     replay_retry_authority: (
         CaptainHermesReplayRetryAuthorizationPort | None
     ) = None,
+    run_number: int | None = None,
 ) -> TeamExecutionCandidateAdapter:
     """Compose only the host AutoGen runner; generated runners are never accepted."""
 
@@ -2948,6 +2957,7 @@ def compose_live_team_execution(
                 "released_skill_version": released.version,
                 "released_skill_sha256": released.content_sha256,
                 "factory_action": request.action.kind.value,
+                **({"run_number": run_number} if run_number is not None else {}),
                 "technical_revalidation_authorization_sha256": (
                     request.action.authorization_ref.sha256
                     if request.action.authorization_ref is not None
@@ -3023,6 +3033,7 @@ def compose_live_team_execution(
             replay_store=ports.replay_store,
             replay_retry_authority=replay_retry_authority,
             clock=ports.clock,
+            run_number=run_number,
         )
 
     return TeamExecutionCandidateAdapter(

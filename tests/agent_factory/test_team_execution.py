@@ -505,6 +505,29 @@ def _n8n_tool_command_ref(reference: OpaqueN8nToolReference) -> ArtifactRef:
     return _artifact("n8n-command", hashlib.sha256(encoded).hexdigest())
 
 
+def test_team_execution_service_uses_explicit_release_run_ordinal(
+    tmp_path: Path,
+) -> None:
+    base_job = _job_v3()
+    job = base_job.model_copy(
+        update={
+            "execution_policy": base_job.execution_policy.model_copy(
+                update={"mode": "release", "required_live_runs": 3}
+            )
+        }
+    )
+    service = TeamExecutionService(
+        job=job,
+        preflight=SimpleNamespace(),  # type: ignore[arg-type]
+        runner=SimpleNamespace(),  # type: ignore[arg-type]
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
+        clock=lambda: NOW,
+        run_number=3,
+    )
+
+    assert service._run_number(job.private_holdout_refs[0]) == 3
+
+
 def _job_v3(
     *,
     live_execution: bool = True,
@@ -1976,7 +1999,7 @@ def test_embedded_live_composition_is_available_and_fails_closed_without_a_port(
 
 
 @pytest.mark.asyncio
-async def test_live_composition_executes_each_explicit_authorized_holdout_scope(
+async def test_live_composition_executes_three_release_runs_on_canonical_holdout(
     tmp_path: Path,
 ) -> None:
     bodies = (
@@ -2136,9 +2159,10 @@ async def test_live_composition_executes_each_explicit_authorized_holdout_scope(
                 tmp_path / "composition"
             ),
             ports=ports,
-            holdout_selector=lambda _current_job, selected=holdout: selected,
+            holdout_selector=lambda _current_job: holdouts[0],
+            run_number=run_number,
         )
-        for holdout in holdouts
+        for run_number in (1, 2, 3)
     )
     dispatch = FactoryDispatch(
         job=job,
@@ -2162,6 +2186,7 @@ async def test_live_composition_executes_each_explicit_authorized_holdout_scope(
     )
 
     assert tuple(item.run_number for item in evidence) == (1, 2, 3)
+    assert {item.holdout_ref for item in evidence} == {holdouts[0]}
     assert len({item.invocation_id for item in evidence}) == 3
     assert len({item.invocation.idempotency_key for item in evidence}) == 3
 

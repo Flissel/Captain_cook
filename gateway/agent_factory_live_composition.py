@@ -363,7 +363,7 @@ class ProductionFactoryTeamExecutionPort(FactoryTeamExecutionPort):
         self._replay_retry_authority = replay_retry_authority
         self._technical_revalidation_validator = technical_revalidation_validator
         self._adapters: dict[
-            tuple[UUID, int, str], TeamExecutionCandidateAdapter
+            tuple[UUID, int, str, int | None], TeamExecutionCandidateAdapter
         ] = {}
 
     def invocation_for(
@@ -372,6 +372,18 @@ class ProductionFactoryTeamExecutionPort(FactoryTeamExecutionPort):
     ) -> FactorySkillInvocationV1:
         return self._adapter(request).invocation_for(request)
 
+    def invocations_for(
+        self,
+        request: FactoryDispatch,
+    ) -> tuple[FactorySkillInvocationV1, ...]:
+        return tuple(
+            self._adapter(request, run_number).invocation_for(request)
+            for run_number in range(
+                1,
+                request.job.execution_policy.required_live_runs + 1,
+            )
+        )
+
     async def execute(
         self,
         request: FactoryDispatch,
@@ -379,9 +391,35 @@ class ProductionFactoryTeamExecutionPort(FactoryTeamExecutionPort):
     ) -> TeamExecutionEvidenceV1:
         return await self._adapter(request).execute(request, candidate)
 
-    def _adapter(self, request: FactoryDispatch) -> TeamExecutionCandidateAdapter:
+    async def execute_required(
+        self,
+        request: FactoryDispatch,
+        candidate: ResolvedFactoryCandidate,
+    ) -> tuple[TeamExecutionEvidenceV1, ...]:
+        return tuple(
+            [
+                await self._adapter(request, run_number).execute(
+                    request,
+                    candidate,
+                )
+                for run_number in range(
+                    1,
+                    request.job.execution_policy.required_live_runs + 1,
+                )
+            ]
+        )
+
+    def _adapter(
+        self,
+        request: FactoryDispatch,
+        run_number: int | None = None,
+    ) -> TeamExecutionCandidateAdapter:
         if not isinstance(request.job, AgentFactoryJobV3) or request.lease is None:
             raise FactoryDispatchError("live team execution requires a V3 job")
+        if run_number is not None and not (
+            1 <= run_number <= request.job.execution_policy.required_live_runs
+        ):
+            raise FactoryDispatchError("live team execution run is not authorized")
         if (
             request.action.kind
             is FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION
@@ -395,6 +433,7 @@ class ProductionFactoryTeamExecutionPort(FactoryTeamExecutionPort):
             request.job.job_id,
             request.action.attempt,
             request.lease.lease_id,
+            run_number,
         )
         existing = self._adapters.get(key)
         if existing is not None:
@@ -410,6 +449,7 @@ class ProductionFactoryTeamExecutionPort(FactoryTeamExecutionPort):
             ports=ports,
             holdout_selector=self._holdout_selector,
             replay_retry_authority=self._replay_retry_authority,
+            run_number=run_number,
         )
         self._adapters[key] = adapter
         return adapter

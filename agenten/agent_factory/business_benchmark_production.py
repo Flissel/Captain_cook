@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Protocol
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -515,6 +515,27 @@ class ProductionBusinessBenchmarkScopeResolver:
             raise ValueError(
                 "required team execution evidence run numbers are incomplete"
             )
+        def invocation_is_authorized_sibling(
+            item: TeamExecutionEvidenceV1,
+        ) -> bool:
+            if item.invocation == runtime_invocation:
+                return item.invocation_id == item.invocation.invocation_id
+            identity_is_bound = item.invocation.invocation_id == uuid5(
+                NAMESPACE_URL,
+                f"captain.factory-team-live:{item.invocation.idempotency_key}",
+            )
+            normalized = item.invocation.model_copy(
+                update={
+                    "invocation_id": runtime_invocation.invocation_id,
+                    "idempotency_key": runtime_invocation.idempotency_key,
+                }
+            )
+            return (
+                item.invocation_id == item.invocation.invocation_id
+                and identity_is_bound
+                and normalized == runtime_invocation
+            )
+
         if any(
             not isinstance(item, TeamExecutionEvidenceV1)
             or item.job_id != job.job_id
@@ -523,8 +544,7 @@ class ProductionBusinessBenchmarkScopeResolver:
             or item.attempt != attempt
             or item.candidate_ref != candidate_ref
             or item.holdout_ref != holdout_ref
-            or item.invocation_id != runtime_invocation.invocation_id
-            or item.invocation != runtime_invocation
+            or not invocation_is_authorized_sibling(item)
             or item.status != "succeeded"
             for item in executions
         ):

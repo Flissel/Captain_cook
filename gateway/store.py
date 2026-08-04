@@ -2236,17 +2236,26 @@ class GatewayStore:
         if isinstance(job, AgentFactoryJobV3) and isinstance(
             artifact, TeamExecutionEvidenceV1
         ):
-            try:
-                run_number = job.private_holdout_refs.index(artifact.holdout_ref) + 1
-            except ValueError as exc:
+            if artifact.holdout_ref not in job.private_holdout_refs:
                 raise HTTPException(
                     status_code=409,
                     detail="workflow execution holdout is not authorized by the Factory job",
-                ) from exc
-            if artifact.run_number != run_number:
+                )
+            required_runs = job.execution_policy.required_live_runs
+            release_trace = required_runs > 1
+            if release_trace:
+                valid_run = (
+                    artifact.holdout_ref == job.private_holdout_refs[0]
+                    and 1 <= artifact.run_number <= required_runs
+                )
+            else:
+                valid_run = artifact.run_number == (
+                    job.private_holdout_refs.index(artifact.holdout_ref) + 1
+                )
+            if not valid_run:
                 raise HTTPException(
                     status_code=409,
-                    detail="workflow execution run number does not match the authorized holdout order",
+                    detail="workflow execution run number does not match Captain release authority",
                 )
 
     @staticmethod
@@ -2449,12 +2458,22 @@ class GatewayStore:
                         ),
                     )
                 )
-                run_scope_unique = all(
-                    len(values) == len(set(values))
-                    for values in (
-                        tuple(item.run_number for item in all_executions),
-                        tuple(item.holdout_ref for item in all_executions),
+                run_numbers_unique = len(all_executions) == len(
+                    {item.run_number for item in all_executions}
+                )
+                holdouts_unique = len(all_executions) == len(
+                    {item.holdout_ref for item in all_executions}
+                )
+                repeated_release_holdout = (
+                    isinstance(projection.job, AgentFactoryJobV3)
+                    and projection.job.execution_policy.required_live_runs > 1
+                    and all(
+                        item.holdout_ref == projection.job.private_holdout_refs[0]
+                        for item in all_executions
                     )
+                )
+                run_scope_valid = run_numbers_unique and (
+                    holdouts_unique or repeated_release_holdout
                 )
                 authorized_revalidation = False
                 if (
@@ -2479,7 +2498,7 @@ class GatewayStore:
                 sequence_valid = (
                     sequence_valid
                     and identities_unique
-                    and (run_scope_unique or authorized_revalidation)
+                    and (run_scope_valid or authorized_revalidation)
                 )
         elif step is FactorySkillStep.EVALUATE_TEAM:
             sequence_valid = (
