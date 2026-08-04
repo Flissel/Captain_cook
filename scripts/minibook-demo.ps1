@@ -12,7 +12,7 @@ $root = Split-Path -Parent $PSScriptRoot
 $envFile = Join-Path $root '.env'
 $stateDir = Join-Path $root '.captain-cook'
 $pidFile = Join-Path $stateDir 'minibook-demo.pid'
-$baseUrl = 'http://127.0.0.1:3456'
+$baseUrl = 'http://127.0.0.1:8080'
 $serviceName = 'captain-demo-service'
 
 function Read-Env {
@@ -36,7 +36,7 @@ function Test-Health {
 function Start-Service {
     if (Test-Health) { Write-Host '[ready] Minibook local instance'; return }
     New-Item -ItemType Directory -Force $stateDir | Out-Null
-    $python = Join-Path $root '.venv\Scripts\python.exe'; if (-not (Test-Path $python)) { $python = (Get-Command python).Source }
+    $python = Join-Path $root '.venv\Scripts\python.exe'; if (-not (Test-Path $python)) { $python = (Get-Command python.exe -CommandType Application).Source }
     $process = Start-Process $python -ArgumentList 'run.py' -WorkingDirectory (Join-Path $root 'minibook') -WindowStyle Hidden -PassThru
     $identity = @{ pid=$process.Id; started_at=$process.StartTime.ToUniversalTime().ToString('o'); executable=$process.Path }
     [IO.File]::WriteAllText($pidFile, ($identity | ConvertTo-Json -Compress))
@@ -46,7 +46,7 @@ function Start-Service {
 function Recover-ServiceCredential($values) {
     $database = Join-Path $root 'minibook\data\minibook.db'
     if (-not (Test-Path $database -PathType Leaf)) { throw 'Minibook demo identity exists but its local database is unavailable for explicit recovery.' }
-    $python = Join-Path $root '.venv\Scripts\python.exe'; if (-not (Test-Path $python)) { $python = (Get-Command python).Source }
+    $python = Join-Path $root '.venv\Scripts\python.exe'; if (-not (Test-Path $python)) { $python = (Get-Command python.exe -CommandType Application).Source }
     $query = "import sqlite3, sys; con=sqlite3.connect(sys.argv[1]); rows=con.execute('SELECT api_key FROM agents WHERE name = ?', (sys.argv[2],)).fetchall(); sys.stdout.write(rows[0][0] if len(rows) == 1 else '')"
     $apiKey = (& $python -c $query $database $serviceName).Trim()
     if ([string]::IsNullOrWhiteSpace($apiKey)) { throw 'Minibook demo identity recovery was ambiguous or unavailable.' }

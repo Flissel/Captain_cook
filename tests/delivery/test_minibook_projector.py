@@ -124,6 +124,17 @@ def test_mixed_promotion_and_runtime_result_replay_and_zero_rebuild_are_stable(
                 "template_id": "factory_capability_ready_to_use",
                 "status_id": "ready_to_use",
                 "actor_role_id": "captain_gateway",
+                "benchmark_disposition": "passed",
+                "benchmark_reason_codes": [],
+                "candidate_correctness_bps": 10000,
+                "baseline_correctness_bps": 9334,
+                "candidate_completion_bps": 10000,
+                "baseline_completion_bps": 7334,
+                "cost_ratio_bps": 48177,
+                "latency_ratio_bps": 16780,
+                "unsafe_tool_uses": 0,
+                "mandatory_handoff_misses": 0,
+                "benchmark_summary_digest": "sha256:" + "a" * 64,
             },
         }
     )
@@ -140,6 +151,7 @@ def test_mixed_promotion_and_runtime_result_replay_and_zero_rebuild_are_stable(
         "duplicate",
     ]
     original_posts = client.list_posts(projector.ensure_projection_project()["id"])
+    assert projector.reconcile(mixed).total_changes == 0
 
     cursor_path.unlink()
     rebuilt = MinibookProjector(client, ProjectionCursorStore(cursor_path))

@@ -87,6 +87,8 @@ def test_minibook_demo_bootstrap_is_local_reusable_and_redacted() -> None:
     assert "SELECT api_key FROM agents WHERE name" in source
     assert "Write-Output $apiKey" not in source
     assert "minibook-demo.pid" in source
+    assert "$baseUrl = 'http://127.0.0.1:8080'" in source
+    assert "Get-Command python.exe -CommandType Application" in source
 
 
 def test_live_demo_services_only_operates_captain_resources() -> None:

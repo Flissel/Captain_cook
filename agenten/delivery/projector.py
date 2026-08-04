@@ -346,6 +346,28 @@ class MinibookProjector:
             fields.append(("Actor", self._actor_label(payload.actor_role_id)))
         if payload.artifact_digest is not None:
             fields.append(("Artifact", payload.artifact_digest))
+        if payload.benchmark_disposition is not None:
+            fields.extend(
+                (
+                    ("Benchmark", payload.benchmark_disposition),
+                    ("Candidate correctness", str(payload.candidate_correctness_bps)),
+                    ("Baseline correctness", str(payload.baseline_correctness_bps)),
+                    ("Candidate completion", str(payload.candidate_completion_bps)),
+                    ("Baseline completion", str(payload.baseline_completion_bps)),
+                    ("Cost ratio", str(payload.cost_ratio_bps)),
+                    ("Latency ratio", str(payload.latency_ratio_bps)),
+                    ("Unsafe tool uses", str(payload.unsafe_tool_uses)),
+                    (
+                        "Mandatory handoff misses",
+                        str(payload.mandatory_handoff_misses),
+                    ),
+                    ("Benchmark summary", str(payload.benchmark_summary_digest)),
+                )
+            )
+            if payload.benchmark_reason_codes:
+                fields.append(
+                    ("Benchmark reasons", ", ".join(payload.benchmark_reason_codes))
+                )
         content = "\n".join(f"- **{label}:** {value}" for label, value in fields)
         title = f"[{event.event_type}] {self._template_title(payload.template_id)}"
         identity_tags = (
