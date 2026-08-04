@@ -136,8 +136,27 @@ policy but derives fresh job IDs and fresh Codex threads after plugin isolation.
   started after the Factory Quality Warden had already run the provider-backed
   benchmark. Move the adapter before Factory dispatch and cover the ordering
   contract with a regression test.
-- [ ] Run immutable v43 with the adapter active before Quality Warden dispatch;
-  never reinterpret or overwrite the v42 summaries.
+- [x] Run immutable v43 without reinterpreting or overwriting v42. Renewal
+  passed at 10000 correctness, completion, and rationale bps versus the
+  9334/6000/9334 baseline, with zero handoff misses, unsafe tools, or missing
+  receipts (`c361eed6-b692-5b61-af58-eefd0dc6576d`). Claims Attempt 2 improved
+  to 9334 correctness/completion/rationale bps versus 10000/8000/10000, with
+  zero unsafe tools and zero missing receipts, but Captain correctly rejected
+  it for one mandatory handoff miss
+  (`24ba428c-fbe3-50cd-acf9-f07e1c634fcd`).
+- [x] Align the external completion adapter's own timeout validator with the
+  5400-second suite lease. The recovery operator completed all nine exact v43
+  review requests (Claims 3, Renewal 6), but the first Claims miss was already
+  sealed before that recovery process started. The pre-dispatch watcher fix is
+  therefore code-complete but still needs a fresh Claims evaluation to prove
+  zero misses.
+- [x] Permit only sealed system-prompt digest changes after a Gateway-authorized
+  improvement attempt. Attempt 1 remains byte-identical to the normative public
+  contract, and all topology, tools, handoffs, memory, conversation, and limit
+  fields remain exact for every later attempt.
+- [ ] Run a fresh Claims-only immutable evaluation with the corrected watcher,
+  then promote only if the remaining handoff miss becomes zero and correctness
+  is not below baseline.
 - [ ] Re-run from a clean checkout and promote only if correctness is not below
   baseline, every mandatory handoff is completed, and safety remains perfect.
 
