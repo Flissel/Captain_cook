@@ -72,6 +72,7 @@ from agenten.agent_factory.team_execution import (
     HostAutoGenSessionCancelledError,
     HostAutoGenSessionExecutor,
     HostAutoGenSessionIdentityV1,
+    HostAutoGenSessionPolicyError,
     HostAutoGenSessionResult,
     HostAutoGenSessionTimeoutError,
     SealedSingleAgentPolicyV1,
@@ -455,6 +456,12 @@ class BusinessBenchmarkProviderRuntimeBridge:
             if exc.provider_usage_unresolved:
                 raise ValueError("provider usage is unresolved after session timeout") from exc
             return self._interrupted(envelope, claim, exc, status="failed")
+        except HostAutoGenSessionPolicyError as exc:
+            if exc.provider_usage_unresolved:
+                raise ValueError(
+                    "provider usage is unresolved after session policy failure"
+                ) from exc
+            return self._interrupted(envelope, claim, exc, status="policy_failed")
         except HostAutoGenSessionCancelledError:
             raise
 
@@ -758,7 +765,7 @@ class BusinessBenchmarkProviderRuntimeBridge:
         self,
         envelope: BusinessBenchmarkExecutionEnvelopeV1,
         claim: BusinessBenchmarkEffectClaimV1,
-        interruption: HostAutoGenSessionTimeoutError,
+        interruption: HostAutoGenSessionTimeoutError | HostAutoGenSessionPolicyError,
         *,
         status: str,
     ) -> ProviderBenchmarkExecutionV1:
@@ -767,6 +774,11 @@ class BusinessBenchmarkProviderRuntimeBridge:
                 {
                     "schema": "captain.business-benchmark-provider-interruption.v1",
                     "effect_id": claim.identity.effect_id,
+                    "reason_code": (
+                        interruption.reason_code
+                        if isinstance(interruption, HostAutoGenSessionPolicyError)
+                        else "timeout"
+                    ),
                     "provider_started": interruption.provider_started,
                     "usage_resolved": not interruption.provider_usage_unresolved,
                 },

@@ -1285,6 +1285,28 @@ class HostAutoGenSessionCancelledError(
         )
 
 
+class HostAutoGenSessionPolicyError(RuntimeError):
+    """Fail-closed session result that retains resolved paid-effect evidence."""
+
+    def __init__(
+        self,
+        *,
+        reason_code: str,
+        identity: HostAutoGenSessionIdentityV1,
+        provider_started: bool,
+        provider_usage_unresolved: bool,
+        usage_receipts: tuple[FactoryUsageReceiptV1, ...],
+    ) -> None:
+        if reason_code not in {"max_messages", "max_handoffs", "max_tool_calls"}:
+            raise ValueError("unsupported host AutoGen policy failure")
+        super().__init__(f"host AutoGen session policy failed: {reason_code}")
+        self.reason_code = reason_code
+        self.identity = identity
+        self.provider_started = provider_started
+        self.provider_usage_unresolved = provider_usage_unresolved
+        self.usage_receipts = usage_receipts
+
+
 @dataclass(frozen=True)
 class AuthorityFreeBaselineTool:
     """Explicitly non-authoritative callable available to the fair baseline."""
@@ -1802,12 +1824,25 @@ class HostAutoGenSessionExecutor:
         message_count = sum(
             isinstance(message, BaseChatMessage) for message in result.messages
         )
+        policy_failure_reason = None
         if message_count > max_messages:
-            raise ValueError("AutoGen team exceeded the message ceiling")
-        if len(handoff_messages) > max_handoffs:
-            raise ValueError("AutoGen team exceeded the handoff ceiling")
-        if tool_call_count > max_tool_calls:
-            raise ValueError("AutoGen team exceeded the tool-call ceiling")
+            policy_failure_reason = "max_messages"
+        elif len(handoff_messages) > max_handoffs:
+            policy_failure_reason = "max_handoffs"
+        elif tool_call_count > max_tool_calls:
+            policy_failure_reason = "max_tool_calls"
+        if policy_failure_reason is not None:
+            raise HostAutoGenSessionPolicyError(
+                reason_code=policy_failure_reason,
+                identity=identity,
+                provider_started=(
+                    model_client.provider_dispatch_count > dispatch_offset
+                ),
+                provider_usage_unresolved=bool(
+                    model_client.unresolved_reservation_ids - unresolved_before
+                ),
+                usage_receipts=model_client.usage_receipts[receipt_offset:],
+            )
         termination_reason = _session_termination_reason(
             result,
             termination_conditions=termination_conditions,

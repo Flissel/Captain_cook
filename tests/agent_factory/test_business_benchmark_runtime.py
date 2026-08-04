@@ -57,6 +57,7 @@ from agenten.agent_factory.team_execution import (
     FactoryHandoffEvidenceV1,
     FactoryN8nExecutionEvidenceV1,
     FactoryToolExecutionEvidenceV1,
+    HostAutoGenSessionPolicyError,
     HostAutoGenSessionResult,
     ResolvedFactoryHoldoutCase,
     SealedSingleAgentPolicyV1,
@@ -481,6 +482,7 @@ class RecordingSessionFactory:
             separators=(",", ":"),
         )
         self.trailing_message: StopMessage | None = None
+        self.policy_failure_reason: str | None = None
 
     def create(self, request):
         self.requests.append(request)
@@ -497,6 +499,14 @@ class RecordingSessionExecutor:
 
     async def run_candidate(self, **kwargs: object) -> HostAutoGenSessionResult:
         self.calls.append(("candidate", kwargs))
+        if self.owner.policy_failure_reason is not None:
+            raise HostAutoGenSessionPolicyError(
+                reason_code=self.owner.policy_failure_reason,
+                identity=kwargs["identity"],
+                provider_started=True,
+                provider_usage_unresolved=False,
+                usage_receipts=(),
+            )
         return self._result(kwargs)
 
     async def run_baseline(self, **kwargs: object) -> HostAutoGenSessionResult:
@@ -685,6 +695,32 @@ async def test_candidate_execution_uses_fresh_bound_session_and_strict_evidence(
     assert all(item.binding == expected_binding for item in result.usage_receipts)
     assert all(item.binding == expected_binding for item in result.handoffs)
     assert all(item.status == "observed" for item in result.handoffs)
+
+
+@pytest.mark.asyncio
+async def test_candidate_policy_violation_becomes_failed_provider_evidence(
+    tmp_path: Path,
+) -> None:
+    store, scope, _, factory, _, runtime, fence = runtime_parts(tmp_path)
+    factory.policy_failure_reason = "max_tool_calls"
+    env = envelope(scope.job, scope.candidate_ref)
+    await runtime.prepare(env)
+    effect_claim = claimed(env)
+    fence_receipt = await fence.register_fence(effect_claim.prepared_effect, effect_claim)
+
+    result = await runtime.execute(
+        env,
+        effect_claim,
+        fence_receipt,
+        baseline_policy=None,
+    )
+
+    assert result.status == "policy_failed"
+    assert result.terminal_output is None
+    evidence = json.loads(store.local_path(result.runtime_evidence_ref).read_text())
+    assert evidence["reason_code"] == "max_tool_calls"
+    assert evidence["provider_started"] is True
+    assert evidence["usage_resolved"] is True
 
 
 @pytest.mark.asyncio
