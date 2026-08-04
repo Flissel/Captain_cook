@@ -465,6 +465,41 @@ def test_demo_bootstrap_lease_accepts_same_profile_epoch_successor() -> None:
     )
 
 
+def test_renewal_bootstrap_lease_with_none_intent_accepts_renewal_successor() -> None:
+    payload = invocation_payload("discover")
+    lease_payload = payload["lease"]
+    assert isinstance(lease_payload, dict)
+    lease_payload["integration_intent"] = "none"
+    lease_payload["workspace_ref"] = (
+        "workspace://business-benchmark-demo/renewal/epoch-" + "a" * 16
+    )
+    invocation = FactorySkillInvocationV1.model_validate(payload)
+    bootstrap = invocation.lease
+    successor = bootstrap.model_copy(
+        update={
+            "lease_id": "factory-renewal-bootstrap-successor",
+            "issued_at": bootstrap.expires_at,
+            "expires_at": bootstrap.expires_at + timedelta(minutes=15),
+            "workspace_ref": (
+                "workspace://business-benchmark-demo/renewal/epoch-" + "b" * 16
+            ),
+        }
+    )
+
+    assert _same_or_valid_successor_lease(bootstrap, successor)
+    assert not _same_or_valid_successor_lease(
+        bootstrap,
+        successor.model_copy(
+            update={
+                "workspace_ref": successor.workspace_ref.replace(
+                    "/renewal/",
+                    "/claims/",
+                )
+            }
+        ),
+    )
+
+
 def test_codex_brief_attestation_accepts_one_redundant_invocation_typo() -> None:
     brief = CodexBuildBriefV1.model_validate(brief_payload())
     invocation = brief.invocation
