@@ -154,8 +154,27 @@ policy but derives fresh job IDs and fresh Codex threads after plugin isolation.
   improvement attempt. Attempt 1 remains byte-identical to the normative public
   contract, and all topology, tools, handoffs, memory, conversation, and limit
   fields remain exact for every later attempt.
+- [x] Preserve Claims Attempt 3 as immutable failed evaluation evidence. Its
+  summary `90ccd274-d3d6-5977-b752-f2519d780c62` scored the candidate
+  8000/8000/8000 correctness/completion/rationale bps versus
+  10000/8000/10000 for the baseline. All three mandatory escalations missed
+  Captain completion because the watcher counted old Attempt-2 receipts; no
+  unsafe tool use or missing run receipt occurred.
+- [x] Bind the external review watcher to exact `(job_id, attempt)` pairs so
+  completed reviews from an older immutable attempt cannot satisfy a newer
+  attempt.
+- [x] Preserve Claims Attempt 4 as a technical interruption, not a business
+  evaluation. Twenty-six provider effects finalized before the third mandatory
+  escalation candidate hit an OpenAI upstream reset before response headers;
+  the final effect remains durably `dispatching` with unresolved usage and no
+  summary. Captain correctly forbids automatic reexecution of that paid effect.
+- [x] Prevent the wrapper from dispatching the provider benchmark a second time
+  after Factory already dispatched Quality Warden. A completed failed
+  evaluation now returns the typed `factory_improvement_required` checkpoint
+  directly instead of a misleading post-Factory dispatch checkpoint.
 - [ ] Run a fresh Claims-only immutable evaluation with the corrected watcher,
-  then promote only if the remaining handoff miss becomes zero and correctness
+  using the fresh v44 suite/job identities after the unresolved Attempt-4
+  effect. Promote only if mandatory handoff misses become zero and correctness
   is not below baseline.
 - [ ] Re-run from a clean checkout and promote only if correctness is not below
   baseline, every mandatory handoff is completed, and safety remains perfect.

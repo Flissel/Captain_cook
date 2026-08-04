@@ -74,8 +74,8 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "'--hermes-provider', 'openai-api'" in source
     assert "'--hermes-model', 'gpt-5.6-terra'" in source
     assert "'--hermes-reasoning-effort', 'high'" in source
-    assert "$seedVersion = 'business-benchmark-demo-2026-08-v43'" in source
-    assert "'--suite-version', '43'" in source
+    assert "$seedVersion = 'business-benchmark-demo-2026-08-v44'" in source
+    assert "'--suite-version', [string]$suiteVersion" in source
     assert "New-DryRunPlan" in source
     assert "provider_calls = $false" in source
     assert "gateway_mutation = $false" in source
@@ -529,8 +529,8 @@ print(json.dumps({
         "mode": "dry_run",
         "database": "captain_test",
         "issued_at": plan["issued_at"],
-            "suite_version": 43,
-        "seed_version_id": "business-benchmark-demo-2026-08-v43",
+        "suite_version": 44,
+        "seed_version_id": "business-benchmark-demo-2026-08-v44",
         "maximum_usd_per_team": "0.32",
         "jobs": [
             {"profile": "claims", "job_id": "71000000-0000-0000-0000-000000000001"},
@@ -547,7 +547,7 @@ print(json.dumps({
     assert plan["issued_at"].endswith("Z")
     plan_arguments = json.loads((repository / "provision-args.json").read_text("utf-8"))
     assert "--apply" not in plan_arguments
-    assert plan_arguments[plan_arguments.index("--suite-version") + 1] == "43"
+    assert plan_arguments[plan_arguments.index("--suite-version") + 1] == "44"
     assert "--candidate-only-safety-gates" in plan_arguments
     assert "--relative-efficiency-diagnostics" in plan_arguments
     assert plan_arguments[
@@ -616,7 +616,7 @@ print(json.dumps({
     arguments = json.loads((repository / "provision-args.json").read_text("utf-8"))
     assert "--apply" in arguments
     assert arguments[arguments.index("--maximum-usd-per-team") + 1] == "0.32"
-    assert arguments[arguments.index("--suite-version") + 1] == "43"
+    assert arguments[arguments.index("--suite-version") + 1] == "44"
     issued_at = arguments[arguments.index("--issued-at") + 1]
     assert issued_at.endswith("Z")
     combined = completed.stdout + completed.stderr
@@ -800,7 +800,10 @@ print(json.dumps({
                 'attempt': 1,
                 'job_id': job_id,
             },
-            'dispatched_actions': ['dispatch_real_case_tester'],
+            'dispatched_actions': (
+                ['dispatch_real_case_tester'] if stop_before_warden else
+                ['dispatch_real_case_tester', 'dispatch_quality_warden']
+            ),
         }
         for job_id in job_ids
     ],
@@ -1027,7 +1030,7 @@ print(json.dumps({
     assert successful.returncode == 0, successful.stderr
     assert json.loads(successful.stdout)["status"] == "completed"
     assert (repository / "factory-called").is_file()
-    assert (repository / "provider-called").is_file()
+    assert not (repository / "provider-called").exists()
     factory_arguments = json.loads(
         (repository / "factory-args.json").read_text("utf-8")
     )
@@ -1052,6 +1055,39 @@ print(json.dumps({
     assert factory_arguments.count("--job-id") == 2
     assert "--stop-before-quality-warden" not in factory_arguments
     assert "process-only-demo-key" not in successful.stdout + successful.stderr
+
+    (scripts / "run-agent-factory-business-demo.py").write_text(
+        factory_runner_source.replace(
+            "'validate_for_promotion'",
+            "'append_improvement_requested'",
+        ),
+        encoding="utf-8",
+    )
+    (repository / "factory-called").unlink()
+    improvement = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-File",
+            str(scripts / SCRIPT.name),
+            "-Action",
+            "Run",
+            "-PythonPath",
+            sys.executable,
+            "-HermesPythonPath",
+            sys.executable,
+        ],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert improvement.returncode == 2, improvement.stderr
+    assert json.loads(improvement.stdout)["status"] == "factory_improvement_required"
+    assert not (repository / "provider-called").exists()
 
 
 def test_missing_provider_key_does_not_block_infrastructure_checkpoint(
@@ -1121,8 +1157,8 @@ print(json.dumps({
     'mode': 'dry_run',
     'database': 'captain_test',
     'teams': [
-        {'profile': 'claims', 'job': {'job_id': '71000000-0000-0000-0000-000000000001', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.32'}}, 'suite': {'suite_version': 43}, 'candidate_id': 'claims-candidate'},
-        {'profile': 'renewal', 'job': {'job_id': '71000000-0000-0000-0000-000000000002', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.32'}}, 'suite': {'suite_version': 43}, 'candidate_id': 'renewal-candidate'},
+        {'profile': 'claims', 'job': {'job_id': '71000000-0000-0000-0000-000000000001', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.32'}}, 'suite': {'suite_version': 44}, 'candidate_id': 'claims-candidate'},
+        {'profile': 'renewal', 'job': {'job_id': '71000000-0000-0000-0000-000000000002', 'execution_policy': {'allowed_models': ['gpt-4.1-mini'], 'max_cost_usd': '0.32'}}, 'suite': {'suite_version': 44}, 'candidate_id': 'renewal-candidate'},
     ],
 }))
 """.strip(),
