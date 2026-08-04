@@ -172,10 +172,17 @@ policy but derives fresh job IDs and fresh Codex threads after plugin isolation.
   after Factory already dispatched Quality Warden. A completed failed
   evaluation now returns the typed `factory_improvement_required` checkpoint
   directly instead of a misleading post-Factory dispatch checkpoint.
-- [ ] Run a fresh Claims-only immutable evaluation with the corrected watcher,
+- [x] Run a fresh Claims-only immutable evaluation with the corrected watcher,
   using the fresh v44 suite/job identities after the unresolved Attempt-4
-  effect. Promote only if mandatory handoff misses become zero and correctness
-  is not below baseline.
+  effect. Attempt 1 retained its technical failure and Captain authorized exact
+  Attempt 2. Summary `1fb953b9-18a7-585f-9dcd-f5cbea1243ef` passed with
+  10000/10000/10000 candidate correctness/completion/rationale bps versus
+  9334/7334/9334 for the baseline, zero mandatory handoff misses, zero unsafe
+  tool uses, and zero missing receipts. The exact Attempt-2 watcher completed
+  all three Captain reviews. Gateway benchmark usage was 0.024882 USD; five
+  successful Hermes provider effects were estimated at 0.06614875 USD. The
+  Quality Warden recommendation is `PROMOTE_CANDIDATE`; promotion itself is not
+  claimed by this evaluation entry.
 - [ ] Re-run from a clean checkout and promote only if correctness is not below
   baseline, every mandatory handoff is completed, and safety remains perfect.
 
