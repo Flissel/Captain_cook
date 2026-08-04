@@ -23,6 +23,7 @@ from agenten.delivery.minibook_events import (
 )
 from agenten.delivery.projector import MinibookProjector
 from gateway.contracts import DeliveryEventEnvelope
+from gateway.integration_setup_contracts import IntegrationSetupSubmissionV1
 
 
 class MinibookProjectionFeedPage(BaseModel):
@@ -87,6 +88,58 @@ def factory_promotion_projection(
             "subject_version": block["subject_version"],
             "event_type": "capability.promoted",
             "payload": payload,
+        }
+    )
+
+
+def integration_setup_projection(
+    submission: IntegrationSetupSubmissionV1,
+    job: dict[str, Any],
+) -> MinibookProjectionEvent:
+    """Expose only aggregate setup readiness; never credential metadata."""
+
+    if str(submission.correlation_id) != str(job.get("correlation_id")):
+        raise ValueError("integration setup does not match projection parent")
+    required = tuple(
+        connection
+        for connection in submission.plan.connections
+        if connection.requirement.required
+    )
+    ready_count = sum(connection.status.value == "ready" for connection in required)
+    priority = {
+        "revoked": 0,
+        "expired": 1,
+        "verification_failed": 2,
+        "missing": 3,
+        "selection_required": 4,
+        "verification_required": 5,
+        "ready": 6,
+    }
+    aggregate_status = (
+        min((item.status.value for item in required), key=priority.__getitem__)
+        if required
+        else "ready"
+    )
+    return MinibookProjectionEvent.model_validate(
+        {
+            "schema": "captain.minibook-projection.v2",
+            "event_id": submission.event_id,
+            "correlation_id": submission.correlation_id,
+            "causation_id": job.get("event_id"),
+            "occurred_at": submission.occurred_at,
+            "producer": "captain-gateway",
+            "subject_id": _factory_subject_reference(str(submission.job_id)),
+            "subject_version": submission.subject_version,
+            "event_type": "integration.setup",
+            "payload": {
+                "view": "validation",
+                "template_id": "integration_setup_status",
+                "status_id": "observed",
+                "actor_role_id": "captain_gateway",
+                "integration_status": aggregate_status,
+                "required_integration_count": len(required),
+                "ready_integration_count": ready_count,
+            },
         }
     )
 

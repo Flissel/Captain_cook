@@ -29,6 +29,8 @@ class IntegrationSetupStatus(str, Enum):
     VERIFICATION_REQUIRED = "verification_required"
     VERIFICATION_FAILED = "verification_failed"
     READY = "ready"
+    REVOKED = "revoked"
+    EXPIRED = "expired"
 
 
 class IntegrationCredentialRequirementV1(_FrozenContract):
@@ -81,10 +83,13 @@ class CredentialVerificationReceiptV1(_FrozenContract):
     credential_alias: str
     credential_id: str = Field(pattern=_CREDENTIAL_ID_PATTERN)
     credential_type: str = Field(pattern=_CREDENTIAL_TYPE_PATTERN)
+    project_id: str | None = Field(default=None, pattern=_CREDENTIAL_ID_PATTERN)
     status: Literal["passed", "failed"]
     occurred_at: datetime
     workflow_ref: ArtifactRef
+    workflow_content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     execution_ref: ArtifactRef
+    valid_until: datetime | None = None
 
     @field_validator("credential_alias")
     @classmethod
@@ -92,12 +97,22 @@ class CredentialVerificationReceiptV1(_FrozenContract):
         CredentialAlias(alias=value)
         return value
 
-    @field_validator("occurred_at")
+    @field_validator("occurred_at", "valid_until")
     @classmethod
     def require_utc_timestamp(cls, value: datetime) -> datetime:
+        if value is None:
+            return value
         if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
             raise ValueError("verification receipt timestamp must be UTC")
         return value
+
+    @model_validator(mode="after")
+    def require_digest_and_expiry_binding(self) -> "CredentialVerificationReceiptV1":
+        if self.workflow_content_sha256 != self.workflow_ref.sha256:
+            raise ValueError("verification receipt workflow digest mismatch")
+        if self.valid_until is not None and self.valid_until <= self.occurred_at:
+            raise ValueError("verification receipt validity must end after verification")
+        return self
 
 
 class IntegrationConnectionV1(_FrozenContract):
@@ -122,17 +137,26 @@ class IntegrationConnectionV1(_FrozenContract):
             IntegrationSetupStatus.VERIFICATION_REQUIRED,
             IntegrationSetupStatus.VERIFICATION_FAILED,
             IntegrationSetupStatus.READY,
+            IntegrationSetupStatus.EXPIRED,
         } and selected is None:
             raise ValueError("connection state requires a selected credential")
         if self.status is IntegrationSetupStatus.READY:
             if receipt is None or receipt.status != "passed":
                 raise ValueError("ready connection requires a passed verification receipt")
+        if self.status is IntegrationSetupStatus.EXPIRED:
+            if (
+                receipt is None
+                or receipt.status != "passed"
+                or receipt.valid_until is None
+            ):
+                raise ValueError("expired connection requires an expiring passed receipt")
         if receipt is not None and selected is not None:
             if (
                 receipt.integration_key != self.requirement.integration_key
                 or receipt.credential_alias != self.requirement.credential_alias
                 or receipt.credential_id != selected.credential_id
                 or receipt.credential_type != selected.credential_type
+                or receipt.project_id != selected.project_id
             ):
                 raise ValueError("verification receipt does not match selected credential")
         return self
@@ -158,6 +182,7 @@ class IntegrationSetupPlanner:
         credentials: tuple[N8nCredentialMetadataV1, ...],
         selected_credential_ids: Mapping[str, str] | None = None,
         verification_receipts: tuple[CredentialVerificationReceiptV1, ...] = (),
+        now: datetime | None = None,
     ) -> IntegrationSetupPlanV1:
         expected = {
             (integration.integration_key, alias): integration.required
@@ -201,6 +226,10 @@ class IntegrationSetupPlanner:
         } - known_aliases
         if unknown_receipts:
             raise ValueError("verification receipt names an unknown alias")
+        if now is not None:
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise ValueError("integration setup evaluation time must be timezone-aware")
+            now = now.astimezone(timezone.utc)
 
         connections = tuple(
             self._resolve_connection(
@@ -208,6 +237,7 @@ class IntegrationSetupPlanner:
                 credentials=credentials,
                 selected_credential_id=selections.get(requirement.credential_alias),
                 receipts=receipts_by_alias[requirement.credential_alias],
+                now=now,
             )
             for requirement in requirements
         )
@@ -220,6 +250,7 @@ class IntegrationSetupPlanner:
         credentials: tuple[N8nCredentialMetadataV1, ...],
         selected_credential_id: str | None,
         receipts: tuple[CredentialVerificationReceiptV1, ...],
+        now: datetime | None,
     ) -> IntegrationConnectionV1:
         candidates = tuple(
             sorted(
@@ -282,10 +313,16 @@ class IntegrationSetupPlanner:
             )
 
         receipt = selected_receipts[0]
+        if receipt.project_id != selected.project_id:
+            raise ValueError("verification receipt project does not match selected credential")
+        if receipt.valid_until is not None and now is None:
+            raise ValueError("expiring verification receipt requires an evaluation time")
         status = (
-            IntegrationSetupStatus.READY
-            if receipt.status == "passed"
-            else IntegrationSetupStatus.VERIFICATION_FAILED
+            IntegrationSetupStatus.VERIFICATION_FAILED
+            if receipt.status == "failed"
+            else IntegrationSetupStatus.EXPIRED
+            if receipt.valid_until is not None and now is not None and receipt.valid_until <= now
+            else IntegrationSetupStatus.READY
         )
         return IntegrationConnectionV1(
             requirement=requirement,

@@ -29,17 +29,26 @@ credential metadata and issues execution authority only after a safe probe.
   integrations to remain visible.
 - [x] Add the n8n metadata discovery adapter using `list_credentials`; never
   request or retain secret data.
-- [ ] Project setup requirements through the Captain API and Minibook feed.
-- [ ] Bind verified connections to typed n8n deployments and short-lived
+- [x] Persist versioned, digest-fenced setup snapshots through Captain-only
+  Gateway API routes, expose an authenticated n8n UI deep-link surface, and
+  emit aggregate-only Minibook projections.
+- [x] Bind verified connections to typed n8n deployments and short-lived
   Captain capability leases.
-- [ ] Add rotation, revocation, expiry, workflow-digest fencing, and restart
-  recovery.
+- [x] Add explicit rotation/revocation transitions, project binding, expiry,
+  workflow-artifact digest fencing, stale-evidence rejection, and runtime
+  expiry checks.
+- [ ] Prove the new MariaDB tables and feed across a real Gateway restart.
 - [ ] Prove one real API-key/Bearer integration and one OAuth integration.
 - [ ] Run clean-checkout, architecture, security-audit, and live evidence gates.
 
 The checked metadata adapter has deterministic HTTP/MCP boundary coverage but
-does not claim a successful live `list_credentials` call. The real MCP attempt
-timed out and remains an explicit live-gate item.
+does not claim a successful live `list_credentials` call. On 2026-08-04 the
+native call, `/healthz`, and MCP initialize all timed out. Docker Desktop logs
+identified `DockerDesktop/Wsl/CommandTimedOut` while running
+`wsl.exe -l -v --all`; Docker restart and a forced stop/start did not recover
+the Windows WSL subsystem. No Captain or VibeMind container/volume was deleted
+or reconfigured. MariaDB restart/replay, Minibook rebuild, and the provider E2E
+gates therefore remain live non-claims until Windows/WSL is restarted.
 
 ## Acceptance sequence
 

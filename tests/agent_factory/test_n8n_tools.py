@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -140,6 +140,7 @@ async def test_integration_bound_tool_requires_verified_connection() -> None:
             credential_alias="CRM_API_KEY",
             credential_id="cred-prod",
             credential_type="httpBearerAuth",
+            project_id="captain-production",
             status="passed",
             occurred_at=NOW,
             workflow_ref=ArtifactRef(
@@ -147,12 +148,15 @@ async def test_integration_bound_tool_requires_verified_connection() -> None:
                 sha256="a" * 64,
                 media_type="application/json",
             ),
+            workflow_content_sha256="a" * 64,
             execution_ref=ArtifactRef(
                 uri="artifact://n8n-execution/" + "b" * 64,
                 sha256="b" * 64,
                 media_type="application/json",
             ),
+            valid_until=NOW + timedelta(minutes=30),
         ),),
+        now=NOW,
     )
     call = TypedN8nCall(
         tool_name="crm_lookup",
@@ -168,11 +172,27 @@ async def test_integration_bound_tool_requires_verified_connection() -> None:
             mcp=Mcp(),
             integration_setup_plan=unverified,
         )
+    with pytest.raises(PermissionError, match="current evaluation time"):
+        await catalog.invoke(
+            lease=lease,
+            call=call,
+            mcp=Mcp(),
+            integration_setup_plan=verified,
+        )
+    with pytest.raises(PermissionError, match="expired"):
+        await catalog.invoke(
+            lease=lease,
+            call=call,
+            mcp=Mcp(),
+            integration_setup_plan=verified,
+            now=NOW + timedelta(hours=1),
+        )
     result = await catalog.invoke(
         lease=lease,
         call=call,
         mcp=Mcp(),
         integration_setup_plan=verified,
+        now=NOW,
     )
 
     assert result["tool"] == "crm_lookup"

@@ -68,10 +68,19 @@ from gateway.registry_feed import mirror_captain_projection
 from gateway.registry_feed import (
     MinibookProjectionFeedPage,
     factory_promotion_projection,
+    integration_setup_projection,
     runtime_result_projection,
 )
 from gateway.settings import GatewaySettings
 from gateway.store import AppendResult, GatewayStore
+from gateway.integration_setup_contracts import (
+    IntegrationSetupMutationV1,
+    IntegrationSetupSubmissionV1,
+    IntegrationSetupWriteReceiptV1,
+    PersistedIntegrationSetupV1,
+    IntegrationSetupSurfaceV1,
+    build_integration_setup_surface,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -334,6 +343,53 @@ def create_app(
     ) -> FactoryWriteReceipt:
         return get_store().record_factory_job(job)
 
+    @app.post(
+        "/v1/factory/integration-setups",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def record_integration_setup(
+        submission: IntegrationSetupSubmissionV1,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> IntegrationSetupWriteReceiptV1:
+        receipt = get_store().record_integration_setup(submission)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
+
+    @app.get("/v1/factory/jobs/{job_id}/integration-setup")
+    async def get_integration_setup(
+        job_id: UUID,
+        _: GatewayRole = Depends(require_captain),
+    ) -> PersistedIntegrationSetupV1:
+        return get_store().integration_setup(job_id)
+
+    @app.get("/v1/factory/jobs/{job_id}/integration-setup/surface")
+    async def get_integration_setup_surface(
+        job_id: UUID,
+        _: GatewayRole = Depends(require_captain),
+    ) -> IntegrationSetupSurfaceV1:
+        configured = load_gateway_settings(app)
+        return build_integration_setup_surface(
+            get_store().integration_setup(job_id),
+            n8n_ui_base_url=configured.captain_n8n_ui_url,
+        )
+
+    @app.post(
+        "/v1/factory/jobs/{job_id}/integration-setup/mutations",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def mutate_integration_setup(
+        job_id: UUID,
+        mutation: IntegrationSetupMutationV1,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> IntegrationSetupWriteReceiptV1:
+        receipt = get_store().mutate_integration_setup(job_id, mutation)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
+
     @app.post("/v1/factory/budget/reservations", status_code=status.HTTP_201_CREATED)
     async def reserve_factory_budget(
         reservation: FactoryBudgetReservationV1,
@@ -548,6 +604,11 @@ def create_app(
                     data,
                     parent,
                     benchmark_summary=benchmark_summary,
+                )
+            elif block_type == "factory_integration_setup" and parent is not None:
+                event = integration_setup_projection(
+                    IntegrationSetupSubmissionV1.model_validate(data),
+                    parent,
                 )
             else:
                 event = runtime_result_projection(data)

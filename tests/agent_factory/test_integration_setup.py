@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -62,12 +62,15 @@ def receipt(
     credential_id: str = "cred-prod",
     *,
     status: str = "passed",
+    project_id: str | None = "captain-production",
+    valid_until: datetime | None = None,
 ) -> CredentialVerificationReceiptV1:
     return CredentialVerificationReceiptV1(
         integration_key="crm",
         credential_alias="CRM_API_KEY",
         credential_id=credential_id,
         credential_type="httpBearerAuth",
+        project_id=project_id,
         status=status,
         occurred_at=NOW,
         workflow_ref=ArtifactRef(
@@ -75,11 +78,13 @@ def receipt(
             sha256="a" * 64,
             media_type="application/json",
         ),
+        workflow_content_sha256="a" * 64,
         execution_ref=ArtifactRef(
             uri="artifact://n8n-execution/" + "b" * 64,
             sha256="b" * 64,
             media_type="application/json",
         ),
+        valid_until=valid_until,
     )
 
 
@@ -195,4 +200,43 @@ def test_credential_metadata_rejects_secret_data() -> None:
     with pytest.raises(ValidationError):
         N8nCredentialMetadataV1.model_validate(
             credential().model_dump() | {"token": "must-not-enter-captain"}
+        )
+
+
+def test_verification_is_project_and_workflow_digest_bound() -> None:
+    with pytest.raises(ValueError, match="project"):
+        IntegrationSetupPlanner().plan(
+            integrations=(integration(),),
+            requirements=(requirement(),),
+            credentials=(credential(),),
+            verification_receipts=(receipt(project_id="foreign-project"),),
+        )
+
+    with pytest.raises(ValidationError, match="workflow digest"):
+        receipt().model_copy(
+            update={"workflow_content_sha256": "c" * 64}
+        ).__class__.model_validate(
+            receipt().model_dump() | {"workflow_content_sha256": "c" * 64}
+        )
+
+
+def test_expired_verification_blocks_readiness_fail_closed() -> None:
+    expired = IntegrationSetupPlanner().plan(
+        integrations=(integration(),),
+        requirements=(requirement(),),
+        credentials=(credential(),),
+        verification_receipts=(receipt(valid_until=NOW + timedelta(minutes=30)),),
+        now=NOW + timedelta(hours=1),
+    )
+
+    assert expired.connections[0].status is IntegrationSetupStatus.EXPIRED
+    with pytest.raises(PermissionError, match="expired"):
+        require_required_integrations_ready(expired)
+
+    with pytest.raises(ValueError, match="evaluation time"):
+        IntegrationSetupPlanner().plan(
+            integrations=(integration(),),
+            requirements=(requirement(),),
+            credentials=(credential(),),
+            verification_receipts=(receipt(valid_until=NOW + timedelta(hours=1)),),
         )

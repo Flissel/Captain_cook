@@ -6,6 +6,7 @@ import os
 import secrets
 from collections.abc import Mapping
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
@@ -34,6 +35,7 @@ class GatewaySettings(BaseModel):
     host: Literal["127.0.0.1"] = "127.0.0.1"
     port: int = Field(default=8090, ge=1, le=65535)
     claim_ttl_seconds: int = Field(default=5_400, ge=1, le=86_400)
+    captain_n8n_ui_url: str = "http://localhost:5679"
 
     @field_validator(
         "ledger_dsn",
@@ -45,6 +47,21 @@ class GatewaySettings(BaseModel):
         if not value.get_secret_value().strip():
             raise ValueError("secret settings must not be blank")
         return value
+
+    @field_validator("captain_n8n_ui_url")
+    @classmethod
+    def _n8n_url_must_be_safe(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("Captain n8n URL must be a safe HTTP URL")
+        return value.rstrip("/")
 
     @model_validator(mode="after")
     def _role_tokens_must_be_distinct(self) -> "GatewaySettings":
@@ -106,6 +123,10 @@ class GatewaySettings(BaseModel):
                 approval_enabled=approval_enabled,
                 port=port,
                 claim_ttl_seconds=claim_ttl_seconds,
+                captain_n8n_ui_url=source.get(
+                    "CAPTAIN_N8N_URL",
+                    "http://localhost:5679",
+                ),
             )
         except ValidationError:
             raise GatewayConfigurationError("invalid gateway configuration") from None

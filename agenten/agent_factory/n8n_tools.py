@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Literal, Protocol
 from uuid import UUID
 
@@ -149,6 +150,7 @@ class TypedN8nCatalog:
         call: TypedN8nCall,
         mcp: N8nMcpPort,
         integration_setup_plan: IntegrationSetupPlanV1 | None = None,
+        now: datetime | None = None,
     ) -> dict[str, object]:
         _require_n8n_tool_lease(lease)
         try:
@@ -170,6 +172,24 @@ class TypedN8nCatalog:
                 for connection in matching_connections
             ):
                 raise PermissionError("integration connection is not ready")
+            expiring_receipts = tuple(
+                connection.verification_receipt
+                for connection in matching_connections
+                if connection.verification_receipt is not None
+                and connection.verification_receipt.valid_until is not None
+            )
+            if expiring_receipts:
+                if now is None or now.tzinfo is None or now.utcoffset() is None:
+                    raise PermissionError(
+                        "expiring integration requires a current evaluation time"
+                    )
+                evaluated_at = now.astimezone(timezone.utc)
+                if any(
+                    receipt.valid_until is not None
+                    and receipt.valid_until <= evaluated_at
+                    for receipt in expiring_receipts
+                ):
+                    raise PermissionError("integration verification has expired")
         if isinstance(mcp, N8nDeploymentToolAdapter):
             return await mcp.call_with_context(call)
         return await mcp.call_typed_tool(tool, call.payload)

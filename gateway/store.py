@@ -121,6 +121,14 @@ from gateway.contracts import (
 )
 from gateway.release_policy import ReleaseReadiness, evaluate_release_readiness
 from gateway.registry_feed import factory_registry_mirror_event
+from gateway.integration_setup_contracts import (
+    IntegrationSetupMutationV1,
+    IntegrationSetupSubmissionV1,
+    IntegrationSetupWriteReceiptV1,
+    PersistedIntegrationSetupV1,
+    apply_integration_setup_mutation,
+    validate_integration_setup_transition,
+)
 
 
 CAPTAIN_BLOCK_TYPES = frozenset({"problem", "work_batch", "holdout"})
@@ -378,6 +386,194 @@ class GatewayStore:
                     ) ENGINE=InnoDB
                     """
                 )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS factory_integration_setup_events (
+                        event_id CHAR(36) NOT NULL PRIMARY KEY,
+                        job_id CHAR(36) NOT NULL,
+                        correlation_id CHAR(36) NOT NULL,
+                        subject_version INT NOT NULL,
+                        revision INT NOT NULL,
+                        content_sha256 CHAR(64) NOT NULL,
+                        previous_content_sha256 CHAR(64) NULL,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        UNIQUE KEY uq_factory_integration_setup_revision
+                            (job_id, correlation_id, subject_version, revision),
+                        INDEX idx_factory_integration_setup_latest
+                            (job_id, revision),
+                        CONSTRAINT fk_factory_integration_setup_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+
+    def record_integration_setup(
+        self,
+        submission: IntegrationSetupSubmissionV1,
+        *,
+        controlled_mutation: bool = False,
+    ) -> IntegrationSetupWriteReceiptV1:
+        if submission.change_kind != "observed" and not controlled_mutation:
+            raise HTTPException(
+                status_code=409,
+                detail="integration setup mutation requires its dedicated route",
+            )
+        canonical = submission.model_dump(mode="json", by_alias=True)
+        digest = self._canonical_model_sha256(submission)
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT payload, content_sha256, revision
+                       FROM factory_integration_setup_events
+                       WHERE event_id = %s FOR UPDATE""",
+                    (str(submission.event_id),),
+                )
+                replay = cursor.fetchone()
+                if replay is not None:
+                    if self._decode_json(replay["payload"]) != canonical:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="integration setup event already exists with different content",
+                        )
+                    return IntegrationSetupWriteReceiptV1(
+                        event_id=submission.event_id,
+                        job_id=submission.job_id,
+                        revision=int(replay["revision"]),
+                        content_sha256=str(replay["content_sha256"]),
+                        replayed=True,
+                    )
+
+                job_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_job",
+                    field="job_id",
+                    value=str(submission.job_id),
+                    for_update=True,
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job not found")
+                job = parse_factory_job(job_block["data"])
+                if (
+                    job.correlation_id != submission.correlation_id
+                    or job.subject_version != submission.subject_version
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="integration setup does not match its factory job",
+                    )
+
+                cursor.execute(
+                    """SELECT revision, content_sha256, payload
+                       FROM factory_integration_setup_events
+                       WHERE job_id = %s
+                       ORDER BY revision DESC LIMIT 1 FOR UPDATE""",
+                    (str(submission.job_id),),
+                )
+                previous = cursor.fetchone()
+                expected_revision = 1 if previous is None else int(previous["revision"]) + 1
+                expected_digest = None if previous is None else str(previous["content_sha256"])
+                if (
+                    submission.revision != expected_revision
+                    or submission.previous_content_sha256 != expected_digest
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="integration setup revision fence mismatch",
+                    )
+                if previous is not None:
+                    prior_submission = IntegrationSetupSubmissionV1.model_validate(
+                        self._decode_json(previous["payload"])
+                    )
+                    try:
+                        validate_integration_setup_transition(
+                            prior_submission,
+                            submission,
+                        )
+                    except ValueError:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="integration setup transition is not allowed",
+                        ) from None
+
+                index = self._next_index(cursor)
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="factory_integration_setup",
+                    data=canonical,
+                    status="accepted",
+                    parent_index=job_block["index"],
+                    metadata={
+                        "schema": submission.schema_name,
+                        "content_sha256": digest,
+                    },
+                )
+                self._insert(cursor, block)
+                cursor.execute(
+                    """INSERT INTO factory_integration_setup_events
+                       (event_id, job_id, correlation_id, subject_version, revision,
+                        content_sha256, previous_content_sha256, block_index, payload)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        str(submission.event_id),
+                        str(submission.job_id),
+                        str(submission.correlation_id),
+                        submission.subject_version,
+                        submission.revision,
+                        digest,
+                        submission.previous_content_sha256,
+                        index,
+                        json.dumps(canonical, sort_keys=True, separators=(",", ":")),
+                    ),
+                )
+        return IntegrationSetupWriteReceiptV1(
+            event_id=submission.event_id,
+            job_id=submission.job_id,
+            revision=submission.revision,
+            content_sha256=digest,
+            replayed=False,
+        )
+
+    def mutate_integration_setup(
+        self,
+        job_id: UUID,
+        mutation: IntegrationSetupMutationV1,
+    ) -> IntegrationSetupWriteReceiptV1:
+        try:
+            submission = apply_integration_setup_mutation(
+                self.integration_setup(job_id),
+                mutation,
+            )
+        except ValueError:
+            raise HTTPException(
+                status_code=409,
+                detail="integration setup mutation is not allowed",
+            ) from None
+        return self.record_integration_setup(
+            submission,
+            controlled_mutation=True,
+        )
+
+    def integration_setup(self, job_id: UUID) -> PersistedIntegrationSetupV1:
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT payload, content_sha256
+                       FROM factory_integration_setup_events
+                       WHERE job_id = %s
+                       ORDER BY revision DESC LIMIT 1""",
+                    (str(job_id),),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="integration setup not found")
+        return PersistedIntegrationSetupV1(
+            submission=IntegrationSetupSubmissionV1.model_validate(
+                self._decode_json(row["payload"])
+            ),
+            content_sha256=str(row["content_sha256"]),
+        )
 
     def append_delivery_event(
         self,
@@ -3015,6 +3211,10 @@ class GatewayStore:
                           AND parent.block_type = 'agent_factory_job'
                           AND JSON_UNQUOTE(JSON_EXTRACT(event.data, '$.phase')) = 'capability_promoted'
                           AND JSON_UNQUOTE(JSON_EXTRACT(event.data, '$.status')) = 'succeeded'
+                        )
+                        OR (
+                          event.block_type = 'factory_integration_setup'
+                          AND parent.block_type = 'agent_factory_job'
                         )
                       )
                     ORDER BY event.`index`

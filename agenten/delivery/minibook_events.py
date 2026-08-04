@@ -26,6 +26,7 @@ ProjectionEventType = Literal[
     "validation.recorded",
     "replanning.requested",
     "capability.promoted",
+    "integration.setup",
 ]
 ProjectionView = Literal["project", "plan", "blueprint", "build", "validation"]
 ProjectionTemplateId = Literal[
@@ -38,6 +39,7 @@ ProjectionTemplateId = Literal[
     "runtime_validation_recorded",
     "runtime_replanning_requested",
     "factory_capability_ready_to_use",
+    "integration_setup_status",
 ]
 ProjectionStatusId = Literal[
     "requested",
@@ -156,6 +158,11 @@ _EVENT_CATALOG: dict[
         "factory_capability_ready_to_use",
         "ready_to_use",
     ),
+    "integration.setup": (
+        "validation",
+        "integration_setup_status",
+        "observed",
+    ),
 }
 
 
@@ -204,6 +211,21 @@ class MinibookProjectionPayload(BaseModel):
     benchmark_summary_digest: ArtifactDigest | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    integration_status: Literal[
+        "missing",
+        "selection_required",
+        "verification_required",
+        "verification_failed",
+        "ready",
+        "revoked",
+        "expired",
+    ] | None = Field(default=None, exclude_if=lambda value: value is None)
+    required_integration_count: int | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
+    ready_integration_count: int | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
 
 
 def redact_projection_payload(payload: dict[str, object]) -> MinibookProjectionPayload:
@@ -251,6 +273,7 @@ class MinibookProjectionEvent(BaseModel):
         if actual != expected:
             raise ValueError("projection template/status does not match event type")
         _validate_benchmark_projection(self.event_type, self.payload)
+        _validate_integration_setup_projection(self.event_type, self.payload)
         return self
 
 
@@ -277,3 +300,25 @@ def _validate_benchmark_projection(
         raise ValueError("benchmark aggregates are allowed only on capability promotion")
     if payload.benchmark_disposition == "passed" and payload.benchmark_reason_codes:
         raise ValueError("passed benchmark projection cannot include failure reasons")
+
+
+def _validate_integration_setup_projection(
+    event_type: ProjectionEventType,
+    payload: MinibookProjectionPayload,
+) -> None:
+    values = (
+        payload.integration_status,
+        payload.required_integration_count,
+        payload.ready_integration_count,
+    )
+    present = tuple(value is not None for value in values)
+    if any(present) and not all(present):
+        raise ValueError("integration setup projection aggregates must be complete")
+    if any(present) != (event_type == "integration.setup"):
+        raise ValueError("integration setup aggregates require an integration setup event")
+    if (
+        payload.ready_integration_count is not None
+        and payload.required_integration_count is not None
+        and payload.ready_integration_count > payload.required_integration_count
+    ):
+        raise ValueError("ready integration count exceeds required integration count")
