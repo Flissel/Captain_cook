@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 import os
 from pathlib import Path
+import re
 import subprocess
 from typing import Protocol
 from uuid import UUID
@@ -364,6 +365,21 @@ def _canonical_business_benchmark_repository(
     )
 
 
+def _suite_scoped_hermes_evidence_root(
+    *,
+    authority_root: Path,
+    seed_version_id: str,
+) -> Path:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", seed_version_id) is None:
+        raise ValueError("Hermes evidence scope requires a safe suite identifier")
+    return (
+        authority_root.resolve()
+        / "runtime-state"
+        / "hermes-evidence"
+        / seed_version_id
+    )
+
+
 def compose_business_demo_factory_operator(
     settings: FactoryLiveOperatorSettings,
     *,
@@ -592,12 +608,13 @@ def compose_business_demo_factory_operator(
         settings=benchmark_settings,
         loader=benchmark_loader,
     )
+    seed_version_id = _required(
+        environment,
+        "CAPTAIN_BENCHMARK_SEED_VERSION_ID",
+    )
     suite_repository = _canonical_business_benchmark_repository(
         authority_root=authority_root,
-        seed_version_id=_required(
-            environment,
-            "CAPTAIN_BENCHMARK_SEED_VERSION_ID",
-        ),
+        seed_version_id=seed_version_id,
     )
     renewal = next(
         item for item in aggregate.selections if item.profile == "renewal"
@@ -615,7 +632,10 @@ def compose_business_demo_factory_operator(
             executable=str(settings.hermes_python_executable.resolve()),
             skill_root=workspace / "agenten" / "agent_factory" / "skills",
             timeout_seconds=900,
-            evidence_root=authority_root / "runtime-state" / "hermes-evidence",
+            evidence_root=_suite_scoped_hermes_evidence_root(
+                authority_root=authority_root,
+                seed_version_id=seed_version_id,
+            ),
             released_skill_root=(
                 workspace / "agenten" / "agent_factory" / "released-skills"
             ),

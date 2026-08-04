@@ -10,6 +10,7 @@ import sys
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
+import gateway.agent_factory_live_operator as live_operator
 
 from agenten.agent_factory.business_benchmark_production_ports import (
     BusinessBenchmarkContentAddressedArtifactStore,
@@ -22,6 +23,9 @@ from agenten.agent_factory.contracts import (
     FactoryRole,
 )
 from agenten.agent_factory.evidence_store import FilesystemFactoryEvidenceStore
+from agenten.agent_factory.hermes_effect_evidence import (
+    FilesystemHermesProviderEffectStore,
+)
 from agenten.agent_factory.minibook_forge import CaptainCreationJobMapper
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
 from agenten.agent_factory.skill_workflow_contracts import FactorySkillStep
@@ -68,6 +72,48 @@ def test_operator_canonical_benchmark_repository_has_stable_receipt_store(
         / "business-benchmarks"
         / "runtime-state"
         / "benchmark-receipts"
+    )
+
+
+def test_hermes_cost_ledger_is_isolated_by_benchmark_suite(tmp_path: Path) -> None:
+    scoped_root = getattr(live_operator, "_suite_scoped_hermes_evidence_root", None)
+    assert scoped_root is not None
+    authority_root = tmp_path / "authority"
+    legacy_effects = (
+        authority_root
+        / "runtime-state"
+        / "hermes-evidence"
+        / "provider-effects"
+        / "effects"
+    )
+    legacy_effects.mkdir(parents=True)
+    (legacy_effects / f"{'a' * 64}.json").write_text(
+        json.dumps(
+            {
+                "schema": "captain.hermes-provider-effect.v1",
+                "estimated_cost_usd": "1.49",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    current_root = scoped_root(
+        authority_root=authority_root,
+        seed_version_id="business-benchmark-demo-2026-08-v39",
+    )
+    current_store = FilesystemHermesProviderEffectStore(
+        current_root / "provider-effects",
+        unresolved_effect_reserve_usd=Decimal("0.25"),
+    )
+
+    assert current_store.total_estimated_cost_usd() == Decimal("0")
+    assert current_root == scoped_root(
+        authority_root=authority_root,
+        seed_version_id="business-benchmark-demo-2026-08-v39",
+    )
+    assert current_root != scoped_root(
+        authority_root=authority_root,
+        seed_version_id="business-benchmark-demo-2026-08-v40",
     )
 
 
