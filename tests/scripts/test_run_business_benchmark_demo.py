@@ -51,6 +51,9 @@ def test_runner_contract_is_opt_in_redacted_and_factory_gated() -> None:
     assert "$humanReviewAdapterTimeoutSeconds = '5400'" in source
     assert "[string]$HumanReviewOperatorId = ''" in source
     assert "Start-HumanReviewCompletionAdapter" in source
+    assert "[string[]]$JobAttempts" in source
+    assert "$arguments.Add('--job-attempt')" in source
+    assert "-JobAttempts @($targetTeams | ForEach-Object" in source
     assert source.count("$humanReviewAdapter = Start-HumanReviewCompletionAdapter") == 1
     assert source.index(
         "$humanReviewAdapter = Start-HumanReviewCompletionAdapter"

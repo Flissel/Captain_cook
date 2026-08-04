@@ -589,7 +589,7 @@ class CaptainHumanReviewStore:
 def run_captain_human_review_completion_adapter(
     root: Path,
     *,
-    job_ids: tuple[UUID, ...],
+    job_attempts: tuple[tuple[UUID, int], ...],
     operator_id: str,
     decision_code: str,
     expected_completions: int,
@@ -613,17 +613,26 @@ def run_captain_human_review_completion_adapter(
         or poll_interval_seconds > 10
     ):
         raise ValueError("completion adapter poll interval must be between 0 and 10 seconds")
+    if (
+        not job_attempts
+        or len({job_id for job_id, _attempt in job_attempts}) != len(job_attempts)
+        or any(
+            isinstance(attempt, bool) or not 1 <= attempt <= 5
+            for _job_id, attempt in job_attempts
+        )
+    ):
+        raise ValueError("completion adapter job attempts are invalid")
+    allowed_attempts = dict(job_attempts)
     scope = CaptainHumanReviewCompletionAdapterResultV1(
         schema="captain.business-benchmark-human-review-completion-adapter.v1",
         status="timed_out",
-        job_ids=job_ids,
+        job_ids=tuple(allowed_attempts),
         operator_id=operator_id,
         decision_code=decision_code,
         expected_completions=expected_completions,
         completed_count=0,
         completed_review_request_ids=(),
     )
-    allowed_jobs = frozenset(scope.job_ids)
     clock = completed_at or (lambda: datetime.now(timezone.utc))
     store = CaptainHumanReviewStore(Path(root))
     deadline = monotonic() + timeout_seconds
@@ -632,7 +641,7 @@ def run_captain_human_review_completion_adapter(
         completed = tuple(
             item
             for item in store.list_reviews(status="completed")
-            if item.job_id in allowed_jobs
+            if allowed_attempts.get(item.job_id) == item.attempt
             and item.reason_code == "mandatory_human_review"
         )
         if len(completed) > expected_completions:
@@ -643,7 +652,7 @@ def run_captain_human_review_completion_adapter(
         pending = tuple(
             item
             for item in store.list_reviews(status="pending")
-            if item.job_id in allowed_jobs
+            if allowed_attempts.get(item.job_id) == item.attempt
             and item.reason_code == "mandatory_human_review"
         )
         for item in pending[:remaining]:
@@ -659,7 +668,7 @@ def run_captain_human_review_completion_adapter(
                 (
                     item.review_request_id
                     for item in store.list_reviews(status="completed")
-                    if item.job_id in allowed_jobs
+                    if allowed_attempts.get(item.job_id) == item.attempt
                     and item.reason_code == "mandatory_human_review"
                 ),
                 key=str,

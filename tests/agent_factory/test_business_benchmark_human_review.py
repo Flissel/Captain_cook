@@ -452,7 +452,7 @@ async def test_completion_adapter_is_explicit_job_scoped_and_restart_safe(
 
     result = run_captain_human_review_completion_adapter(
         root,
-        job_ids=(JOB_ID,),
+        job_attempts=((JOB_ID, 2),),
         operator_id="codex-delegate",
         decision_code="benchmark-escalation-acknowledged",
         expected_completions=1,
@@ -479,6 +479,8 @@ async def test_completion_adapter_is_explicit_job_scoped_and_restart_safe(
             "watch",
             "--job-id",
             str(JOB_ID),
+            "--job-attempt",
+            f"{JOB_ID}=2",
             "--operator-id",
             "codex-delegate",
             "--decision-code",
@@ -493,6 +495,17 @@ async def test_completion_adapter_is_explicit_job_scoped_and_restart_safe(
     assert payload["status"] == "completed"
     assert payload["completed_count"] == 1
     assert payload["job_ids"] == [str(JOB_ID)]
+
+    stale_only = run_captain_human_review_completion_adapter(
+        root,
+        job_attempts=((JOB_ID, 3),),
+        operator_id="codex-delegate",
+        decision_code="benchmark-escalation-acknowledged",
+        expected_completions=1,
+        timeout_seconds=0,
+    )
+    assert stale_only.status == "timed_out"
+    assert stale_only.completed_count == 0
 
 
 @pytest.mark.asyncio

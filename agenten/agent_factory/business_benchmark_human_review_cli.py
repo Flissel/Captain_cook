@@ -40,9 +40,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             payload = receipt.model_dump(mode="json", by_alias=True)
         else:
+            job_ids = tuple(UUID(item) for item in args.job_id)
+            job_attempts = tuple(_job_attempt(item) for item in args.job_attempt)
+            if set(job_ids) != {job_id for job_id, _attempt in job_attempts}:
+                raise ValueError("completion adapter job-attempt scope does not match")
             result = run_captain_human_review_completion_adapter(
                 Path(args.root),
-                job_ids=tuple(UUID(item) for item in args.job_id),
+                job_attempts=job_attempts,
                 operator_id=args.operator_id,
                 decision_code=args.decision_code,
                 expected_completions=args.expected_completions,
@@ -101,12 +105,20 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     watch.add_argument("--job-id", action="append", required=True)
+    watch.add_argument("--job-attempt", action="append", required=True)
     watch.add_argument("--operator-id", required=True)
     watch.add_argument("--decision-code", required=True)
     watch.add_argument("--expected-completions", required=True, type=int)
     watch.add_argument("--timeout-seconds", required=True, type=float)
     watch.add_argument("--poll-interval-seconds", type=float, default=0.1)
     return parser
+
+
+def _job_attempt(value: str) -> tuple[UUID, int]:
+    raw_job_id, separator, raw_attempt = value.rpartition("=")
+    if not separator:
+        raise ValueError("completion adapter job attempt is malformed")
+    return UUID(raw_job_id), int(raw_attempt)
 
 
 if __name__ == "__main__":

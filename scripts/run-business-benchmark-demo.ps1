@@ -705,6 +705,7 @@ function Start-HumanReviewCompletionAdapter {
         [Parameter(Mandatory = $true)][string]$Python,
         [Parameter(Mandatory = $true)][string]$Root,
         [Parameter(Mandatory = $true)][string[]]$JobIds,
+        [Parameter(Mandatory = $true)][string[]]$JobAttempts,
         [Parameter(Mandatory = $true)][string]$OperatorId,
         [Parameter(Mandatory = $true)][int]$ExpectedCompletions,
         [Parameter(Mandatory = $true)][string]$DecisionCode,
@@ -728,6 +729,10 @@ function Start-HumanReviewCompletionAdapter {
     foreach ($jobId in $JobIds) {
         $arguments.Add('--job-id')
         $arguments.Add($jobId)
+    }
+    foreach ($jobAttempt in $JobAttempts) {
+        $arguments.Add('--job-attempt')
+        $arguments.Add($jobAttempt)
     }
     foreach ($value in @(
         '--operator-id',
@@ -1188,6 +1193,10 @@ try {
             -Python $python `
             -Root $humanReviewRoot `
             -JobIds @($targetTeams | ForEach-Object { [string]$_.job.job_id }) `
+            -JobAttempts @($targetTeams | ForEach-Object {
+                $profile = ([string]$_.profile).ToUpperInvariant()
+                "$([string]$_.job.job_id)=$([string]$environment["CAPTAIN_BENCHMARK_${profile}_ATTEMPT"])"
+            }) `
             -OperatorId $HumanReviewOperatorId `
             -ExpectedCompletions $humanReviewExpectedCompletions `
             -DecisionCode $humanReviewDecisionCode `
