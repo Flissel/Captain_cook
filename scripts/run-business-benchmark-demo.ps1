@@ -10,7 +10,9 @@ param(
     [string]$HermesPythonPath = '',
 
     [ValidateSet('ClaimsFirst', 'RenewalFirst')]
-    [string]$BuildOrder = 'ClaimsFirst'
+    [string]$BuildOrder = 'ClaimsFirst',
+
+    [string]$HumanReviewOperatorId = ''
 )
 
 Set-StrictMode -Version Latest
@@ -146,8 +148,12 @@ $budgetEurPerUsd = '1.25'
 # The benchmark observes Captain's durable review request asynchronously. A
 # human completion that arrives later remains a handoff miss for this bounded
 # evaluation run instead of consuming the 30-second provider envelope.
-$humanReviewTimeoutSeconds = '1'
-$seedVersion = 'business-benchmark-demo-2026-08-v40'
+$humanReviewTimeoutSeconds = if (
+    [string]::IsNullOrWhiteSpace($HumanReviewOperatorId)
+) { '1' } else { '120' }
+$humanReviewExpectedCompletions = 9
+$humanReviewDecisionCode = 'benchmark-escalation-acknowledged'
+$seedVersion = 'business-benchmark-demo-2026-08-v41'
 
 $rootEnvAllowlist = @(
     'CAPTAIN_GATEWAY_TOKEN',
@@ -400,7 +406,7 @@ function New-DryRunPlan {
         mode = 'dry_run'
         database = 'captain_test'
         issued_at = $IssuedAt
-        suite_version = 40
+        suite_version = 41
         seed_version_id = $seedVersion
         maximum_usd_per_team = $maximumUsdPerTeam
         jobs = @(
@@ -678,6 +684,63 @@ function Get-HumanReviewCheckpoint {
     }
 }
 
+function Start-HumanReviewCompletionAdapter {
+    param(
+        [Parameter(Mandatory = $true)][string]$Python,
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string[]]$JobIds,
+        [Parameter(Mandatory = $true)][string]$OperatorId,
+        [Parameter(Mandatory = $true)][int]$ExpectedCompletions,
+        [Parameter(Mandatory = $true)][string]$DecisionCode
+    )
+    $stateRoot = Join-Path $repositoryRoot '.captain-cook/private/business-benchmarks/runtime-state'
+    $null = New-Item -ItemType Directory -Force -Path $stateRoot
+    $stdoutPath = Join-Path $stateRoot 'human-review-completion-adapter-v41.stdout.log'
+    $stderrPath = Join-Path $stateRoot 'human-review-completion-adapter-v41.stderr.log'
+    Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+    $arguments = [Collections.Generic.List[string]]::new()
+    foreach ($value in @(
+        '-m',
+        'agenten.agent_factory.business_benchmark_human_review_cli',
+        '--root',
+        $Root,
+        'watch'
+    )) {
+        $arguments.Add($value)
+    }
+    foreach ($jobId in $JobIds) {
+        $arguments.Add('--job-id')
+        $arguments.Add($jobId)
+    }
+    foreach ($value in @(
+        '--operator-id',
+        $OperatorId,
+        '--decision-code',
+        $DecisionCode,
+        '--expected-completions',
+        [string]$ExpectedCompletions,
+        '--timeout-seconds',
+        '300'
+    )) {
+        $arguments.Add($value)
+    }
+    $process = Start-Process `
+        -FilePath $Python `
+        -ArgumentList $arguments.ToArray() `
+        -WorkingDirectory $repositoryRoot `
+        -RedirectStandardOutput $stdoutPath `
+        -RedirectStandardError $stderrPath `
+        -WindowStyle Hidden `
+        -PassThru
+    return [pscustomobject]@{
+        process = $process
+        stdout_path = $stdoutPath
+        stderr_path = $stderrPath
+        job_ids = @($JobIds | Sort-Object)
+    }
+}
+
+$humanReviewAdapter = $null
 Push-Location $repositoryRoot
 try {
     $python = Resolve-Python311 $PythonPath
@@ -691,7 +754,7 @@ try {
             '--issued-at', $issuedAt,
             '--model', 'gpt-4.1-mini',
             '--maximum-usd-per-team', $maximumUsdPerTeam,
-            '--suite-version', '40',
+            '--suite-version', '41',
             '--seed-version-id', $seedVersion,
             '--policy-id', 'captain-business-value-v35',
             '--candidate-only-safety-gates',
@@ -726,7 +789,7 @@ try {
             if (
                 [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
                 @($team.job.execution_policy.allowed_models) -notcontains 'gpt-4.1-mini' -or
-                [int]$team.suite.suite_version -ne 40
+                [int]$team.suite.suite_version -ne 41
             ) {
                 throw 'Dry-run team model or budget does not match the demo authority.'
             }
@@ -852,7 +915,7 @@ try {
         '--issued-at', $issuedAt,
         '--model', $model,
         '--maximum-usd-per-team', $maximumUsdPerTeam,
-        '--suite-version', '40',
+        '--suite-version', '41',
         '--seed-version-id', $seedVersion,
         '--policy-id', 'captain-business-value-v35',
         '--candidate-only-safety-gates',
@@ -901,7 +964,7 @@ try {
         if (
             [string]$team.job.execution_policy.max_cost_usd -cne $maximumUsdPerTeam -or
             @($team.job.execution_policy.allowed_models) -notcontains $model -or
-            [int]$team.suite.suite_version -ne 40
+            [int]$team.suite.suite_version -ne 41
         ) {
             throw 'Provisioned team model or budget does not match the demo authority.'
         }
@@ -1232,6 +1295,22 @@ try {
         exit 0
     }
 
+    if (
+        $Action -ceq 'RUN' -and
+        -not [string]::IsNullOrWhiteSpace($HumanReviewOperatorId)
+    ) {
+        $humanReviewRoot = Join-Path `
+            $repositoryRoot `
+            '.captain-cook/private/business-benchmarks/human-review'
+        $humanReviewAdapter = Start-HumanReviewCompletionAdapter `
+            -Python $python `
+            -Root $humanReviewRoot `
+            -JobIds @([string]$claims.job.job_id, [string]$renewal.job.job_id) `
+            -OperatorId $HumanReviewOperatorId `
+            -ExpectedCompletions $humanReviewExpectedCompletions `
+            -DecisionCode $humanReviewDecisionCode
+    }
+
     $liveFailure = $null
     try {
         $null = @(& $liveRunner -Profile all -PythonPath $python)
@@ -1241,6 +1320,41 @@ try {
     }
     catch {
         $liveFailure = 'provider runner failed'
+    }
+    if ($null -ne $humanReviewAdapter) {
+        $adapterProcess = $humanReviewAdapter.process
+        if (-not $adapterProcess.WaitForExit(15000)) {
+            $adapterProcess.Kill($true)
+            $adapterProcess.WaitForExit()
+            $liveFailure = 'Captain human-review completion adapter did not finish'
+        }
+        elseif ($adapterProcess.ExitCode -ne 0) {
+            $liveFailure = 'Captain human-review completion adapter failed closed'
+        }
+        else {
+            $adapterResult = $null
+            try {
+                $adapterResult = Get-Content `
+                    -LiteralPath $humanReviewAdapter.stdout_path `
+                    -Raw | ConvertFrom-Json -Depth 20
+            }
+            catch {
+                $liveFailure = 'Captain human-review completion adapter returned invalid JSON'
+            }
+            if ($null -ne $adapterResult) {
+                $actualAdapterJobIds = @($adapterResult.job_ids | ForEach-Object {
+                    [string]$_
+                }) | Sort-Object
+                if (
+                    $adapterResult.schema -cne 'captain.business-benchmark-human-review-completion-adapter.v1' -or
+                    $adapterResult.status -cne 'completed' -or
+                    [int]$adapterResult.completed_count -ne $humanReviewExpectedCompletions -or
+                    ($actualAdapterJobIds -join ',') -cne ($humanReviewAdapter.job_ids -join ',')
+                ) {
+                    $liveFailure = 'Captain human-review completion adapter evidence is not canonical'
+                }
+            }
+        }
     }
     if ($null -ne $liveFailure) {
         $review = Get-HumanReviewCheckpoint -Python $python -IssuedAt $issuedAt
@@ -1260,5 +1374,12 @@ try {
     } | ConvertTo-Json -Compress -Depth 10
 }
 finally {
+    if (
+        $null -ne $humanReviewAdapter -and
+        -not $humanReviewAdapter.process.HasExited
+    ) {
+        $humanReviewAdapter.process.Kill($true)
+        $humanReviewAdapter.process.WaitForExit()
+    }
     Pop-Location
 }

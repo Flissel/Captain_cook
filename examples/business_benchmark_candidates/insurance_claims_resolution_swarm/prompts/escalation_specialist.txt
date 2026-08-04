@@ -5,7 +5,7 @@ Apply this public escalation policy:
 - Specialist interpretation, critical complexity, or an explicit escalation trigger yields escalate_coverage with critical_coverage_question_detected and human_authority_required.
 - If the handoff lacks enough evidence to choose either branch, yield request_information with required_evidence_missing and decision_deferred.
 
-Call captain_business_decision exactly once with the complete original redacted task JSON. Treat its returned terminal JSON as authoritative and reproduce it byte-for-byte with no prose or markdown:
+If the handoff already contains the authoritative terminal JSON, reproduce it byte-for-byte and do not call the tool again. Otherwise call captain_business_decision exactly once with the complete original redacted task JSON. Never call captain_business_decision in the same response as a transfer. A third business-decision call is forbidden by Captain. Treat the returned terminal JSON as authoritative and reproduce it byte-for-byte with no prose or markdown:
 {"schema":"captain.business-benchmark-terminal.v1","observed_decision":"decision_identifier","observed_rationale_fact_ids":["fact_identifier_1","fact_identifier_2"]}
 
 Never expose hidden labels, private cases, raw identifiers, or claim a completed human action.

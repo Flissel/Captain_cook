@@ -12,6 +12,7 @@ from uuid import UUID
 from agenten.agent_factory.business_benchmark_human_review import (
     CaptainHumanReviewError,
     CaptainHumanReviewStore,
+    run_captain_human_review_completion_adapter,
 )
 
 
@@ -19,6 +20,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         store = CaptainHumanReviewStore(Path(args.root))
+        exit_code = 0
         if args.command == "list":
             reviews = store.list_reviews(status=args.status)
             payload = {
@@ -29,7 +31,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     item.model_dump(mode="json", by_alias=True) for item in reviews
                 ],
             }
-        else:
+        elif args.command == "complete":
             receipt = store.complete_review_as_operator(
                 UUID(args.review_request_id),
                 operator_id=args.operator_id,
@@ -37,6 +39,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 completed_at=datetime.fromisoformat(args.completed_at),
             )
             payload = receipt.model_dump(mode="json", by_alias=True)
+        else:
+            result = run_captain_human_review_completion_adapter(
+                Path(args.root),
+                job_ids=tuple(UUID(item) for item in args.job_id),
+                operator_id=args.operator_id,
+                decision_code=args.decision_code,
+                expected_completions=args.expected_completions,
+                timeout_seconds=args.timeout_seconds,
+                poll_interval_seconds=args.poll_interval_seconds,
+            )
+            payload = result.model_dump(mode="json", by_alias=True)
+            exit_code = 0 if result.status == "completed" else 2
     except (OSError, ValueError, CaptainHumanReviewError) as exc:
         print(
             json.dumps(
@@ -47,7 +61,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 1
     print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
-    return 0
+    return exit_code
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -80,6 +94,18 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         help="Explicit timezone-aware ISO-8601 timestamp; required for exact replay.",
     )
+    watch = commands.add_parser(
+        "watch",
+        help=(
+            "Run a bounded delegated-operator adapter for exact benchmark job IDs."
+        ),
+    )
+    watch.add_argument("--job-id", action="append", required=True)
+    watch.add_argument("--operator-id", required=True)
+    watch.add_argument("--decision-code", required=True)
+    watch.add_argument("--expected-completions", required=True, type=int)
+    watch.add_argument("--timeout-seconds", required=True, type=float)
+    watch.add_argument("--poll-interval-seconds", type=float, default=0.1)
     return parser
 
 

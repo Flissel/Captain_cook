@@ -3,7 +3,7 @@
   "conversation_pattern": "swarm",
   "max_messages": 10,
   "max_handoffs": 2,
-  "max_tool_calls": 1,
+  "max_tool_calls": 2,
   "host_tools": ["captain_business_decision"],
   "termination_conditions": ["task_completed", "max_messages", "max_handoffs"],
   "agents": [

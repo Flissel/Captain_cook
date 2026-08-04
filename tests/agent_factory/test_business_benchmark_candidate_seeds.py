@@ -125,6 +125,7 @@ def test_claims_seed_uses_only_captain_decision_tool_with_sealed_business_rules(
     team = result.team_execution_manifest
 
     assert team.conversation_pattern == "swarm"
+    assert team.max_tool_calls == 2
     assert tuple(agent.tools for agent in team.agents) == (
         (),
         ("captain_business_decision",),
@@ -153,6 +154,8 @@ def test_claims_seed_uses_only_captain_decision_tool_with_sealed_business_rules(
     assert "escalate_coverage" in prompt_text
     assert "coverage_state_verified" in prompt_text
     assert "critical_coverage_question_detected" in prompt_text
+    assert "Never call captain_business_decision in the same response as a transfer" in prompt_text
+    assert "A third business-decision call is forbidden" in prompt_text
     assert "expected_decision" not in prompt_text
     assert "required_rationale_fact_ids" not in prompt_text
     assert "case_id" not in prompt_text

@@ -17,6 +17,7 @@ from agenten.agent_factory.business_benchmark_human_review import (
     CaptainHumanReviewStore,
     CaptainHumanReviewStaleFenceError,
     default_captain_human_review_root,
+    run_captain_human_review_completion_adapter,
 )
 from agenten.agent_factory.business_benchmark_provider_state import (
     BusinessBenchmarkProviderBindingV1,
@@ -69,12 +70,13 @@ def request(
     selected_binding: BusinessBenchmarkProviderBindingV1 | None = None,
     review_request_id: UUID = REVIEW_ID,
     requested_at: datetime = NOW,
+    reason_code: str = "mandatory_human_review",
 ) -> CaptainHumanReviewRequestV1:
     return CaptainHumanReviewRequestV1(
         schema="captain.business-benchmark-human-review-request.v1",
         review_request_id=review_request_id,
         binding=selected_binding or binding(),
-        reason_code="mandatory-human-review",
+        reason_code=reason_code,
         requested_at=requested_at,
     )
 
@@ -417,6 +419,80 @@ async def test_operator_cli_lists_and_explicitly_completes_with_redacted_artifac
 
     assert operator_main(["--root", str(root), "list", "--status", "pending"]) == 0
     assert json.loads(capsys.readouterr().out)["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_completion_adapter_is_explicit_job_scoped_and_restart_safe(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from agenten.agent_factory.business_benchmark_human_review_cli import (
+        main as operator_main,
+    )
+
+    root = review_root(tmp_path)
+    store = CaptainHumanReviewStore(root)
+    allowed = request()
+    unrelated_job_id = UUID(int=JOB_ID.int + 100)
+    unrelated = request(
+        selected_binding=BusinessBenchmarkProviderBindingV1.model_validate(
+            {
+                **binding().model_dump(mode="json", by_alias=True),
+                "effect_id": "c" * 64,
+                "claim_id": str(UUID(int=CLAIM_ID.int + 100)),
+                "job_id": str(unrelated_job_id),
+                "correlation_id": str(UUID(int=CORRELATION_ID.int + 100)),
+                "request_id": str(UUID(int=REQUEST_ID.int + 100)),
+            }
+        ),
+        review_request_id=UUID(int=REVIEW_ID.int + 100),
+    )
+    await store.request_review(allowed)
+    await store.request_review(unrelated)
+
+    result = run_captain_human_review_completion_adapter(
+        root,
+        job_ids=(JOB_ID,),
+        operator_id="codex-delegate",
+        decision_code="benchmark-escalation-acknowledged",
+        expected_completions=1,
+        timeout_seconds=0,
+        completed_at=lambda: NOW + timedelta(minutes=5),
+    )
+
+    assert result.status == "completed"
+    assert result.completed_count == 1
+    assert result.completed_review_request_ids == (REVIEW_ID,)
+    assert CaptainHumanReviewStore(root).find_receipt(REVIEW_ID).status == "completed"
+    assert CaptainHumanReviewStore(root).find_receipt(
+        unrelated.review_request_id
+    ).status == "accepted"
+
+    # The process adapter exposes the same exact, bounded authority surface.
+    restarted_root = tmp_path / ".captain-cook" / "private" / "adapter-cli"
+    restarted_store = CaptainHumanReviewStore(restarted_root)
+    await restarted_store.request_review(allowed)
+    assert operator_main(
+        [
+            "--root",
+            str(restarted_root),
+            "watch",
+            "--job-id",
+            str(JOB_ID),
+            "--operator-id",
+            "codex-delegate",
+            "--decision-code",
+            "benchmark-escalation-acknowledged",
+            "--expected-completions",
+            "1",
+            "--timeout-seconds",
+            "0",
+        ]
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "completed"
+    assert payload["completed_count"] == 1
+    assert payload["job_ids"] == [str(JOB_ID)]
 
 
 @pytest.mark.asyncio

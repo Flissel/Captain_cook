@@ -80,6 +80,13 @@ The v34 summary contract intentionally remains unchanged and audit-valid.
 - AutoGen message, handoff, and tool-call ceiling violations now become
   evidence-bound `policy_failed` provider receipts. A bad case no longer
   destroys the remaining benchmark coverage.
+- The Captain review boundary now has an opt-in delegated-operator adapter.
+  It runs outside the provider port, is restricted to exact immutable job IDs
+  and an exact completion count, and records only redacted acknowledgement
+  evidence. Without an explicit operator ID, review completion remains closed.
+- The Claims seed now permits exactly two business-decision calls, makes the
+  ordinary and escalation routes mutually exclusive in both specialist
+  prompts, and explicitly forbids a third call.
 - Hermes paid-effect accounting is scoped to the benchmark suite while retry
   authority remains in its canonical sibling store.
 - The Renewal n8n integration uses the active official native-node workflow;
@@ -109,10 +116,12 @@ policy but derives fresh job IDs and fresh Codex threads after plugin isolation.
   worktree and isolated `captain_test` services.
 - [x] Apply the predeclared v35 policy to the fresh v40 suite and retain both
   failed candidates as evaluated but not ready-to-use.
-- [ ] Implement a real Captain human-review completion adapter for the six
-  Renewal and three Claims escalation cases, then run a new immutable suite.
-- [ ] Tighten the Claims escalation prompts/tool routing so no valid mandatory
+- [x] Implement a real Captain human-review completion adapter for the six
+  Renewal and three Claims escalation cases. The v41 dry-run is effect-free;
+  the provider evaluation remains pending.
+- [x] Tighten the Claims escalation prompts/tool routing so no valid mandatory
   escalation can request a third business-decision call.
+- [ ] Run the new immutable v41 suite from its clean committed base.
 - [ ] Re-run from a clean checkout and promote only if correctness is not below
   baseline, every mandatory handoff is completed, and safety remains perfect.
 

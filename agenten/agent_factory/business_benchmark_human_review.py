@@ -14,10 +14,10 @@ import os
 import tempfile
 import threading
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from time import monotonic
-from typing import Iterator, Literal
+from time import monotonic, sleep
+from typing import Callable, Iterator, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -85,6 +85,28 @@ class CaptainHumanReviewEvidenceV1(_FrozenContract):
     def require_timezone(cls, value: datetime) -> datetime:
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("human review completion timestamp must be timezone-aware")
+        return value
+
+
+class CaptainHumanReviewCompletionAdapterResultV1(_FrozenContract):
+    """Bounded redacted outcome of one explicit delegated-operator process."""
+
+    schema_name: Literal[
+        "captain.business-benchmark-human-review-completion-adapter.v1"
+    ] = Field(alias="schema", serialization_alias="schema")
+    status: Literal["completed", "timed_out"]
+    job_ids: tuple[UUID, ...]
+    operator_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    decision_code: str = Field(pattern=IDENTIFIER_PATTERN)
+    expected_completions: int = Field(ge=1, le=100, strict=True)
+    completed_count: int = Field(ge=0, le=100, strict=True)
+    completed_review_request_ids: tuple[UUID, ...]
+
+    @field_validator("job_ids")
+    @classmethod
+    def require_unique_jobs(cls, value: tuple[UUID, ...]) -> tuple[UUID, ...]:
+        if not value or len(set(value)) != len(value):
+            raise ValueError("completion adapter job IDs must be non-empty and unique")
         return value
 
 
@@ -564,6 +586,101 @@ class CaptainHumanReviewStore:
             temporary.unlink(missing_ok=True)
 
 
+def run_captain_human_review_completion_adapter(
+    root: Path,
+    *,
+    job_ids: tuple[UUID, ...],
+    operator_id: str,
+    decision_code: str,
+    expected_completions: int,
+    timeout_seconds: float,
+    poll_interval_seconds: float = 0.1,
+    completed_at: Callable[[], datetime] | None = None,
+) -> CaptainHumanReviewCompletionAdapterResultV1:
+    """Complete only explicitly scoped pending reviews in a separate process.
+
+    Calling this function is the operator action.  The provider runtime cannot
+    import it through ``CaptainHumanReviewPort`` and cannot widen its job scope.
+    The decision code acknowledges the synthetic benchmark escalation only; it
+    is not an approval of the underlying insurance or commercial decision.
+    """
+
+    if not math.isfinite(timeout_seconds) or timeout_seconds < 0 or timeout_seconds > 600:
+        raise ValueError("completion adapter timeout must be between 0 and 600 seconds")
+    if (
+        not math.isfinite(poll_interval_seconds)
+        or poll_interval_seconds <= 0
+        or poll_interval_seconds > 10
+    ):
+        raise ValueError("completion adapter poll interval must be between 0 and 10 seconds")
+    scope = CaptainHumanReviewCompletionAdapterResultV1(
+        schema="captain.business-benchmark-human-review-completion-adapter.v1",
+        status="timed_out",
+        job_ids=job_ids,
+        operator_id=operator_id,
+        decision_code=decision_code,
+        expected_completions=expected_completions,
+        completed_count=0,
+        completed_review_request_ids=(),
+    )
+    allowed_jobs = frozenset(scope.job_ids)
+    clock = completed_at or (lambda: datetime.now(timezone.utc))
+    store = CaptainHumanReviewStore(Path(root))
+    deadline = monotonic() + timeout_seconds
+
+    while True:
+        completed = tuple(
+            item
+            for item in store.list_reviews(status="completed")
+            if item.job_id in allowed_jobs
+            and item.reason_code == "mandatory_human_review"
+        )
+        if len(completed) > expected_completions:
+            raise CaptainHumanReviewConflictError(
+                "completion adapter scope contains excess completed reviews"
+            )
+        remaining = expected_completions - len(completed)
+        pending = tuple(
+            item
+            for item in store.list_reviews(status="pending")
+            if item.job_id in allowed_jobs
+            and item.reason_code == "mandatory_human_review"
+        )
+        for item in pending[:remaining]:
+            store.complete_review_as_operator(
+                item.review_request_id,
+                operator_id=scope.operator_id,
+                decision_code=scope.decision_code,
+                completed_at=clock(),
+            )
+
+        completed_ids = tuple(
+            sorted(
+                (
+                    item.review_request_id
+                    for item in store.list_reviews(status="completed")
+                    if item.job_id in allowed_jobs
+                    and item.reason_code == "mandatory_human_review"
+                ),
+                key=str,
+            )
+        )
+        if len(completed_ids) == expected_completions:
+            status: Literal["completed", "timed_out"] = "completed"
+        elif monotonic() >= deadline:
+            status = "timed_out"
+        else:
+            sleep(poll_interval_seconds)
+            continue
+        return scope.model_copy(
+            update={
+                "status": status,
+                "completed_count": len(completed_ids),
+                "completed_review_request_ids": completed_ids,
+            }
+        )
+
+
 def _canonical(model: BaseModel) -> bytes:
     payload = model.model_dump(mode="json", by_alias=True)
     _reject_unsafe_evidence(payload, "human review")
@@ -599,6 +716,7 @@ else:
 
 
 __all__ = [
+    "CaptainHumanReviewCompletionAdapterResultV1",
     "CaptainHumanReviewConflictError",
     "CaptainHumanReviewEvidenceV1",
     "CaptainHumanReviewError",
@@ -606,4 +724,5 @@ __all__ = [
     "CaptainHumanReviewStaleFenceError",
     "CaptainHumanReviewStore",
     "default_captain_human_review_root",
+    "run_captain_human_review_completion_adapter",
 ]
