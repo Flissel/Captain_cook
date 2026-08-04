@@ -43,6 +43,9 @@ credential metadata and issues execution authority only after a safe probe.
   including digest-fenced mutation replay, rotation, and revoke.
 - [x] Prove a native Captain-n8n `list_credentials` metadata read through the
   SSE-aware adapter without exposing credential content.
+- [x] Prove the independent Minibook v2 HTTP projection, restart, idempotent
+  replay, drift rebuild, and redaction canaries against a Captain-compatible
+  local feed.
 - [ ] Prove one real API-key/Bearer integration and one OAuth integration.
 - [ ] Run clean-checkout, architecture, security-audit, and live evidence gates.
 
@@ -54,7 +57,9 @@ and native MCP `list_credentials` each returned HTTP 200; the production
 adapter correctly parsed the MCP SSE response. The local Captain-n8n instance
 currently has zero `httpBearerAuth` and zero `oAuth2Api` credential metadata
 entries, so the provider E2E gates remain explicitly blocked rather than
-simulated.
+simulated. The separate Minibook live gate passes against a temporary local
+Minibook HTTP service and a Captain-compatible v2 feed; it is not a claim that
+a provider-backed Gateway promotion has already reached Minibook.
 
 ## Acceptance sequence
 
