@@ -375,8 +375,7 @@ def _suite_scoped_hermes_evidence_root(
     return (
         authority_root.resolve()
         / "runtime-state"
-        / "hermes-evidence"
-        / seed_version_id
+        / f"hermes-evidence-{seed_version_id}"
     )
 
 

@@ -107,6 +107,11 @@ def test_hermes_cost_ledger_is_isolated_by_benchmark_suite(tmp_path: Path) -> No
     )
 
     assert current_store.total_estimated_cost_usd() == Decimal("0")
+    assert (
+        current_root / "skill-replays"
+    ).parent.parent / "hermes-retry-authorizations" == (
+        authority_root / "runtime-state" / "hermes-retry-authorizations"
+    )
     assert current_root == scoped_root(
         authority_root=authority_root,
         seed_version_id="business-benchmark-demo-2026-08-v39",
