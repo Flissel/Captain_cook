@@ -442,6 +442,92 @@ def test_issuer_recovers_team_execution_from_block_referenced_evidence(
     assert evaluation.prior_green_regression_ids == ("schema_valid",)
 
 
+def test_issuer_aggregates_failed_release_runs_into_one_retry_evaluation(
+    tmp_path: Path,
+) -> None:
+    base_job = job_v3(mode="release")
+    job = base_job.model_copy(
+        update={"deadline_at": NOW + timedelta(hours=2)}
+    )
+    failed_payload = execution_payload(status="unresolved")
+    outcome = failed_payload["execution_outcome"]
+    assert isinstance(outcome, dict)
+    assertions = outcome["assertion_outcomes"]
+    assert isinstance(assertions, list)
+    assert isinstance(assertions[0], dict)
+    assertions[0]["status"] = "failed"
+    failed = TeamExecutionEvidenceV1.model_validate(failed_payload)
+    succeeded = TeamExecutionEvidenceV1.model_validate(execution_payload())
+
+    executions: list[TeamExecutionEvidenceV1] = []
+    for run_number, template in ((1, failed), (2, failed), (3, succeeded)):
+        invocation = template.invocation.model_copy(
+            update={
+                "invocation_id": UUID(int=run_number),
+                "idempotency_key": f"{run_number}" * 64,
+            }
+        )
+        executions.append(
+            template.model_copy(
+                update={
+                    "invocation": invocation,
+                    "invocation_id": invocation.invocation_id,
+                    "run_number": run_number,
+                    "artifact_ref": _ref(
+                        f"team-execution-{run_number}",
+                        f"{run_number + 3}" * 64,
+                    ),
+                }
+            )
+        )
+    source = _source_block(
+        FactoryPhase.REAL_CASE_EVIDENCE,
+        executions[0].artifact_ref,
+    ).model_copy(
+        update={
+            "status": FactoryBlockStatus.FAILED,
+            "artifact_refs": tuple(item.artifact_ref for item in executions),
+            "evidence_refs": tuple(item.artifact_ref for item in executions),
+        }
+    )
+
+    class Repository:
+        def workflow_artifacts(self, _job_id):
+            return tuple(executions)
+
+    class Evidence:
+        def read_verified(self, _reference, *, job_id=None):
+            assert job_id == job.job_id
+            return b"{}"
+
+    issuer = CaptainTechnicalImprovementIssuer(
+        repository=Repository(),  # type: ignore[arg-type]
+        coordinator=object(),  # type: ignore[arg-type]
+        candidates=object(),  # type: ignore[arg-type]
+        evidence=Evidence(),
+        authorizations=CaptainFactoryImprovementAuthorizationStore(
+            tmp_path / ".captain-cook" / "improvements"
+        ),
+        clock=lambda: NOW,
+    )
+
+    evaluation = issuer._evaluate_execution(
+        job=job,
+        source_block=source,
+        candidate_ref=failed.candidate_ref,
+        occurred_at=NOW,
+    )
+
+    assert tuple(
+        (item.assertion_id, item.status)
+        for item in evaluation.assertion_outcomes
+    ) == (("schema_valid", "failed"), ("real_case_green", "passed"))
+    assert evaluation.prior_green_regression_ids == ("real_case_green",)
+    assert executions[0].artifact_ref in evaluation.evidence_refs
+    assert executions[1].artifact_ref in evaluation.evidence_refs
+    assert executions[2].artifact_ref not in evaluation.evidence_refs
+
+
 def test_persisted_authority_is_returned_only_for_exact_attempt_and_request_block(
     tmp_path: Path,
 ) -> None:

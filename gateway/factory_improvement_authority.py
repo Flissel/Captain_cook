@@ -14,6 +14,7 @@ from agenten.agent_factory.candidate_evaluation import (
     FactoryCandidateEvaluationResult,
 )
 from agenten.agent_factory.contracts import (
+    AgentFactoryJobV3,
     FactoryBlockStatus,
     FactoryEvidenceBlock,
     FactoryJob,
@@ -229,6 +230,89 @@ class CaptainTechnicalFailureEvaluator:
             failure_class="behavioral_failure",
             recommendation=FactoryFeedbackRecommendation.RETRY_BUILD,
         )
+
+
+def _aggregate_execution_failures(
+    evaluations: tuple[CaptainTechnicalFailureEvaluationV1, ...],
+) -> CaptainTechnicalFailureEvaluationV1:
+    """Reduce all failed release runs to one fail-closed Captain retry input."""
+
+    if not evaluations:
+        raise ValueError("technical execution evidence is not retry-eligible")
+    if len(evaluations) == 1:
+        return evaluations[0]
+    first = evaluations[0]
+    if any(
+        evaluation.job_id != first.job_id
+        or evaluation.correlation_id != first.correlation_id
+        or evaluation.subject_version != first.subject_version
+        or evaluation.attempt != first.attempt
+        or evaluation.source_phase is not first.source_phase
+        or evaluation.source_block_id != first.source_block_id
+        or evaluation.occurred_at != first.occurred_at
+        or evaluation.candidate_ref != first.candidate_ref
+        or evaluation.acceptance_assertion_ids
+        != first.acceptance_assertion_ids
+        for evaluation in evaluations[1:]
+    ):
+        raise ValueError("technical execution evaluations are stale or mixed")
+    outcomes: list[AssertionOutcome] = []
+    for index, assertion_id in enumerate(first.acceptance_assertion_ids):
+        observed = tuple(
+            evaluation.assertion_outcomes[index]
+            for evaluation in evaluations
+        )
+        if (
+            any(outcome.assertion_id != assertion_id for outcome in observed)
+            or len({outcome.integration_intent for outcome in observed}) != 1
+        ):
+            raise ValueError("technical execution assertion evidence is ambiguous")
+        outcomes.append(
+            AssertionOutcome(
+                assertion_id=assertion_id,
+                status=(
+                    "failed"
+                    if any(outcome.status == "failed" for outcome in observed)
+                    else "passed"
+                ),
+                integration_intent=observed[0].integration_intent,
+                evidence_refs=tuple(
+                    dict.fromkeys(
+                        reference
+                        for outcome in observed
+                        for reference in outcome.evidence_refs
+                    )
+                ),
+            )
+        )
+    return build_captain_technical_failure_evaluation(
+        job_id=first.job_id,
+        correlation_id=first.correlation_id,
+        subject_version=first.subject_version,
+        attempt=first.attempt,
+        source_phase=first.source_phase,
+        source_block_id=first.source_block_id,
+        occurred_at=first.occurred_at,
+        candidate_ref=first.candidate_ref,
+        acceptance_assertion_ids=first.acceptance_assertion_ids,
+        assertion_outcomes=tuple(outcomes),
+        evidence_refs=tuple(
+            dict.fromkeys(
+                reference
+                for evaluation in evaluations
+                for reference in evaluation.evidence_refs
+            )
+        ),
+        technical_diagnostic_codes=tuple(
+            dict.fromkeys(
+                code
+                for evaluation in evaluations
+                for code in evaluation.technical_diagnostic_codes
+            )
+        ),
+        failure_class="behavioral_failure",
+        recommendation=FactoryFeedbackRecommendation.RETRY_BUILD,
+    )
 
 
 def _technical_diagnostic_codes(
@@ -505,27 +589,53 @@ class CaptainTechnicalImprovementIssuer:
             and artifact.artifact_ref
             in (*source_block.artifact_refs, *source_block.evidence_refs)
         )
-        if len(executions) != 1:
-            raise ValueError("technical execution evidence is ambiguous")
-        receipts: list[FactoryHoldoutEvaluationReceiptV1] = []
-        for reference in executions[0].evidence_refs:
-            try:
-                receipt = FactoryHoldoutEvaluationReceiptV1.model_validate_json(
-                    self._evidence.read_verified(reference, job_id=job.job_id)
-                )
-            except (OSError, ValueError):
-                continue
-            receipts.append(receipt)
-        if len(receipts) > 1:
-            raise ValueError("technical holdout receipt is ambiguous")
-        return self._evaluator.from_team_execution(
-            job=job,
-            source_block=source_block,
-            candidate_ref=candidate_ref,
-            execution=executions[0],
-            holdout_receipt=receipts[0] if receipts else None,
-            occurred_at=occurred_at,
+        required_runs = (
+            job.execution_policy.required_live_runs
+            if isinstance(job, AgentFactoryJobV3)
+            else 1
         )
+        ordered = tuple(sorted(executions, key=lambda item: item.run_number))
+        if (
+            len(ordered) != required_runs
+            or tuple(item.run_number for item in ordered)
+            != tuple(range(1, required_runs + 1))
+        ):
+            raise ValueError("technical execution evidence is ambiguous")
+        failed = tuple(
+            execution
+            for execution in ordered
+            if execution.status in {"failed", "unresolved"}
+            and any(
+                outcome.status == "failed"
+                for outcome in execution.execution_outcome.assertion_outcomes
+            )
+        )
+        if not failed:
+            raise ValueError("technical execution evidence is not retry-eligible")
+        evaluations: list[CaptainTechnicalFailureEvaluationV1] = []
+        for execution in failed:
+            receipts: list[FactoryHoldoutEvaluationReceiptV1] = []
+            for reference in execution.evidence_refs:
+                try:
+                    receipt = FactoryHoldoutEvaluationReceiptV1.model_validate_json(
+                        self._evidence.read_verified(reference, job_id=job.job_id)
+                    )
+                except (OSError, ValueError):
+                    continue
+                receipts.append(receipt)
+            if len(receipts) > 1:
+                raise ValueError("technical holdout receipt is ambiguous")
+            evaluations.append(
+                self._evaluator.from_team_execution(
+                    job=job,
+                    source_block=source_block,
+                    candidate_ref=candidate_ref,
+                    execution=execution,
+                    holdout_receipt=receipts[0] if receipts else None,
+                    occurred_at=occurred_at,
+                )
+            )
+        return _aggregate_execution_failures(tuple(evaluations))
 
     def _evaluate_quality(
         self,
