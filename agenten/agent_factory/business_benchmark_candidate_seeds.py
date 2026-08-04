@@ -216,11 +216,15 @@ def validate_public_business_benchmark_candidate(
     profile_id: str,
     candidate: ResolvedFactoryCandidate,
     manifest: FactoryAutoGenTeamManifestV1,
+    *,
+    attempt: int,
 ) -> None:
     """Reject a provider-bound team that drifted from its public contract."""
 
     if not isinstance(manifest, FactoryAutoGenTeamManifestV1):
         raise TypeError("public build contract requires a verified team manifest")
+    if isinstance(attempt, bool) or attempt < 1 or attempt > 5:
+        raise ValueError("public build contract requires a valid Factory attempt")
     contract = public_business_benchmark_build_contract(profile_id)
     expected_agents = contract["agents"]
     assert isinstance(expected_agents, list)
@@ -262,7 +266,19 @@ def validate_public_business_benchmark_candidate(
         manifest.termination_conditions,
         observed_topology,
     )
-    if observed_manifest != expected_manifest:
+    expected_static_manifest = (
+        *expected_manifest[:-1],
+        tuple(item[:3] for item in expected_topology),
+    )
+    observed_static_manifest = (
+        *observed_manifest[:-1],
+        tuple(item[:3] for item in observed_topology),
+    )
+    if (
+        attempt == 1 and observed_manifest != expected_manifest
+    ) or (
+        attempt > 1 and observed_static_manifest != expected_static_manifest
+    ):
         raise ValueError("candidate does not match its normative public build contract")
     if candidate.candidate.host_tools != tuple(contract["host_tools"]):
         raise ValueError("candidate host tools do not match the public build contract")
@@ -272,7 +288,12 @@ def validate_public_business_benchmark_candidate(
             for name in archive.namelist()
             if not name.endswith("/")
         }
-    if any(item[3] not in archived_digests for item in expected_topology):
+    required_prompt_digests = (
+        tuple(item[3] for item in expected_topology)
+        if attempt == 1
+        else tuple(item[3] for item in observed_topology)
+    )
+    if any(digest not in archived_digests for digest in required_prompt_digests):
         raise ValueError("candidate public build contract prompts are not sealed")
 
 

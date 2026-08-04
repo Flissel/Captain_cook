@@ -829,6 +829,7 @@ Use only rationale identifiers justified by supplied fields. Never reveal hidden
             scope.suite.profile_id,
             scope.candidate,
             manifest,
+            attempt=scope.selection.attempt,
         )
         allowed_host_tools = tuple(
             dict.fromkeys(tool for agent in manifest.agents for tool in agent.tools)
@@ -1019,6 +1020,7 @@ Use only rationale identifiers justified by supplied fields. Never reveal hidden
             scope.suite.profile_id,
             scope.candidate,
             manifest,
+            attempt=scope.selection.attempt,
         )
         allowed_host_tools = tuple(
             dict.fromkeys(tool for agent in manifest.agents for tool in agent.tools)

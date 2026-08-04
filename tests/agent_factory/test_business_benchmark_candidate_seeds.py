@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
+import shutil
 import zipfile
 
 import pytest
@@ -58,7 +60,9 @@ def test_seed_candidate_is_reproducible_and_evaluator_verified(
     topology = result.team_execution_manifest
     assert topology.conversation_pattern == pattern
     assert tuple(agent.name for agent in topology.agents) == agent_names
-    validate_public_business_benchmark_candidate(profile_id, first, topology)
+    validate_public_business_benchmark_candidate(
+        profile_id, first, topology, attempt=1
+    )
 
 
 @pytest.mark.parametrize("profile_id", [CLAIMS_SEED_PROFILE, RENEWAL_SEED_PROFILE])
@@ -113,7 +117,51 @@ def test_public_candidate_guard_rejects_claims_team_without_escalation_agent(
             CLAIMS_SEED_PROFILE,
             resolved,
             invalid,
+            attempt=1,
         )
+
+
+def test_public_candidate_guard_allows_only_sealed_prompt_drift_after_attempt_one(
+    tmp_path: Path,
+) -> None:
+    resolved = package_business_benchmark_seed(CLAIMS_SEED_PROFILE, tmp_path / "seed")
+    result = FactoryCandidateEvaluator().validate(resolved, max_seconds=10)
+    assert result.team_execution_manifest is not None
+    manifest = result.team_execution_manifest
+    improved_prompt = b"Authorized attempt-two rationale improvement."
+    improved_digest = hashlib.sha256(improved_prompt).hexdigest()
+    improved_archive = tmp_path / "improved.zip"
+    shutil.copy2(resolved.source_archive, improved_archive)
+    with zipfile.ZipFile(improved_archive, "a") as archive:
+        archive.writestr("prompts/authorized-attempt-two.txt", improved_prompt)
+    improved_agent = manifest.agents[0].model_copy(
+        update={
+            "system_prompt_ref": manifest.agents[0].system_prompt_ref.model_copy(
+                update={
+                    "uri": f"artifact://authorized-prompt/{improved_digest}",
+                    "sha256": improved_digest,
+                }
+            )
+        }
+    )
+    improved_manifest = manifest.model_copy(
+        update={"agents": (improved_agent, *manifest.agents[1:])}
+    )
+    improved_candidate = resolved.model_copy(update={"source_archive": improved_archive})
+
+    with pytest.raises(ValueError, match="public build contract"):
+        validate_public_business_benchmark_candidate(
+            CLAIMS_SEED_PROFILE,
+            improved_candidate,
+            improved_manifest,
+            attempt=1,
+        )
+    validate_public_business_benchmark_candidate(
+        CLAIMS_SEED_PROFILE,
+        improved_candidate,
+        improved_manifest,
+        attempt=2,
+    )
 
 
 def test_claims_seed_uses_only_captain_decision_tool_with_sealed_business_rules(
