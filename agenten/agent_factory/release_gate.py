@@ -215,9 +215,29 @@ def evaluate_factory_workflow_release(
             evaluation,
             "workflow usage receipts do not cover the Gateway budget projection",
         )
+    run_receipt_ref_set = set(run_receipt_refs)
+    benchmark_receipts = tuple(
+        receipt
+        for receipt in usage_receipts
+        if receipt.attempt == evaluation.attempt
+        and receipt.evidence_ref not in run_receipt_ref_set
+    )
+    benchmark_receipts_are_bound = not benchmark_receipts or (
+        benchmark_summary is not None
+        and sum(
+            (receipt.cost_usd for receipt in benchmark_receipts),
+            start=Decimal("0"),
+        )
+        == Decimal(
+            benchmark_summary.candidate_cost_micro_usd
+            + benchmark_summary.baseline_cost_micro_usd
+        )
+        / Decimal(1_000_000)
+    )
     if (
         len(run_receipt_refs) != len(set(run_receipt_refs))
-        or set(run_receipt_refs) != accepted_receipt_refs
+        or not run_receipt_ref_set.issubset(accepted_receipt_refs)
+        or not benchmark_receipts_are_bound
     ):
         return _workflow_blocked(
             job,

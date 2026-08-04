@@ -723,6 +723,35 @@ def test_workflow_release_accepts_disjoint_exact_receipt_union() -> None:
     assert decision.status == "ready"
 
 
+def test_workflow_release_accepts_exact_benchmark_usage_cost_beyond_run_receipts() -> None:
+    runs = tuple(workflow_run(number) for number in range(1, 4))
+    technical_receipts = workflow_receipts(runs)
+    benchmark_receipt = technical_receipts[0].model_copy(
+        update={
+            "receipt_id": UUID("00000000-0000-0000-0000-000000000497"),
+            "reservation_id": UUID("00000000-0000-0000-0000-000000000496"),
+            "cost_usd": Decimal("0.000225"),
+            "evidence_ref": ArtifactRef.model_validate(
+                workflow_artifact("benchmark-usage", "8" * 64)
+            ),
+        }
+    )
+
+    decision = evaluate_factory_workflow_release(
+        workflow_job(mode="release"),
+        runs,
+        workflow_evaluation(
+            runs,
+            budget=workflow_budget("0.750225"),
+        ),
+        benchmark_summary=workflow_benchmark(runs),
+        budget_projection=workflow_budget("0.750225"),
+        usage_receipts=(*technical_receipts, benchmark_receipt),
+    )
+
+    assert decision.status == "ready"
+
+
 def test_workflow_release_rejects_legacy_evaluation_without_business_benchmark() -> None:
     runs = tuple(workflow_run(number) for number in range(1, 4))
     evaluation = workflow_evaluation(runs).model_copy(
