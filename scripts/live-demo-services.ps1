@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory, Position=0)]
-    [ValidateSet("start", "portal-start", "benchmark-start", "benchmark-restart", "health", "stop")]
+    [ValidateSet("start", "portal-start", "gateway-restart", "benchmark-start", "benchmark-restart", "health", "stop")]
     [string]$Action,
     [switch]$RecoverDemoCredentials,
     [string]$CredentialSourceEnv
@@ -358,6 +358,21 @@ function Stop-ManagedGateway([string]$PidPath=$gatewayPid) {
     Remove-Item $PidPath -Force
     Write-Host '[ready] managed Gateway stopped'
 }
+function Restart-Gateway($Values, [string]$PidPath=$gatewayPid) {
+    $gatewayPort = [Uri]$Values['CAPTAIN_GATEWAY_URL'] | Select-Object -ExpandProperty Port
+    $configurationSha256 = Get-GatewayConfigurationSha256 $Values
+    $managed = Get-ManagedListenerIdentity `
+        -Path $PidPath `
+        -Port $gatewayPort `
+        -ConfigurationSha256 $configurationSha256
+    & taskkill.exe /PID $managed.Id /T /F *> $null
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Verified managed Gateway process tree could not be stopped for restart.'
+    }
+    Remove-Item -LiteralPath $PidPath -Force
+    Start-Gateway $Values -PidPath $PidPath
+    Write-Host '[ready] verified managed Gateway restarted without container or volume changes'
+}
 function Get-ManagedRuntimeProcess {
     if (-not (Test-Path $runtimePid)) { return $null }
     try { $identity = Get-Content $runtimePid -Raw | ConvertFrom-Json } catch { throw 'Invalid managed Runtime PID file.' }
@@ -503,6 +518,10 @@ try {
         }
         portal-start {
             Invoke-PortalStart -Recover:$RecoverDemoCredentials -SourceEnv $CredentialSourceEnv
+        }
+        gateway-restart {
+            $values = Initialize-LocalEnvironment
+            Restart-Gateway $values
         }
         benchmark-start {
             Invoke-BenchmarkStart -Recover:$RecoverDemoCredentials -SourceEnv $CredentialSourceEnv

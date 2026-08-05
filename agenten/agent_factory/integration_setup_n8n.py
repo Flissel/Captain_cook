@@ -78,7 +78,8 @@ class CaptainN8nCredentialMetadataClient:
         }
         try:
             async with asyncio.timeout(timeout_seconds):
-                response = await self._http.post(
+                async with self._http.stream(
+                    "POST",
                     f"{endpoint.api_base_url.rstrip('/')}/mcp-server/http",
                     headers={
                         "Authorization": f"Bearer {token}",
@@ -87,17 +88,16 @@ class CaptainN8nCredentialMetadataClient:
                     },
                     json=payload,
                     timeout=httpx.Timeout(timeout_seconds),
-                )
+                ) as response:
+                    if response.status_code < 200 or response.status_code >= 300:
+                        raise N8nCredentialDiscoveryError(
+                            "Captain n8n credential metadata request failed"
+                        )
+                    value = await _structured_result(response, call_id)
         except (TimeoutError, httpx.TimeoutException, httpx.RequestError):
             raise N8nCredentialDiscoveryError(
                 "Captain n8n credential metadata request failed"
             ) from None
-        if response.status_code < 200 or response.status_code >= 300:
-            raise N8nCredentialDiscoveryError(
-                "Captain n8n credential metadata request failed"
-            )
-
-        value = _structured_result(response, call_id)
         data = value.get("data")
         if not isinstance(data, list):
             raise N8nCredentialDiscoveryError(
@@ -160,8 +160,14 @@ def _call_id(
     return f"captain-credential-list-{digest[:48]}"
 
 
-def _structured_result(response: httpx.Response, call_id: str) -> dict[str, object]:
-    content = response.content
+async def _structured_result(
+    response: httpx.Response,
+    call_id: str,
+) -> dict[str, object]:
+    content_type = response.headers.get("content-type", "").lower()
+    if "text/event-stream" in content_type:
+        return await _streamed_sse_result(response, call_id)
+    content = await response.aread()
     if not content or len(content) > _MAX_RESPONSE_BYTES:
         raise N8nCredentialDiscoveryError(
             "Captain n8n credential metadata response is invalid"
@@ -177,17 +183,26 @@ def _structured_result(response: httpx.Response, call_id: str) -> dict[str, obje
         envelopes.append(json.loads(text))
     except json.JSONDecodeError:
         envelopes.extend(_sse_values(text))
-    matches = (
+    envelope_matches = tuple(
         item
         for item in envelopes
         if isinstance(item, dict) and item.get("id") == call_id
     )
-    envelope_matches = tuple(matches)
     if len(envelope_matches) != 1:
         raise N8nCredentialDiscoveryError(
             "Captain n8n credential metadata response is invalid"
         )
-    envelope = envelope_matches[0]
+    return _structured_envelope(envelope_matches[0], call_id)
+
+
+def _structured_envelope(
+    envelope: dict[str, object],
+    call_id: str,
+) -> dict[str, object]:
+    if envelope.get("id") != call_id:
+        raise N8nCredentialDiscoveryError(
+            "Captain n8n credential metadata response is invalid"
+        )
     if envelope.get("jsonrpc") != "2.0" or "error" in envelope:
         raise N8nCredentialDiscoveryError(
             "Captain n8n credential metadata response is invalid"
@@ -216,6 +231,43 @@ def _structured_result(response: httpx.Response, call_id: str) -> dict[str, obje
             "Captain n8n credential metadata response is invalid"
         )
     return structured
+
+
+async def _streamed_sse_result(
+    response: httpx.Response,
+    call_id: str,
+) -> dict[str, object]:
+    data_lines: list[str] = []
+    consumed = 0
+    async for line in response.aiter_lines():
+        consumed += len(line.encode("utf-8")) + 1
+        if consumed > _MAX_RESPONSE_BYTES:
+            raise N8nCredentialDiscoveryError(
+                "Captain n8n credential metadata response is invalid"
+            )
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+            continue
+        if line or not data_lines:
+            continue
+        try:
+            envelope = json.loads("\n".join(data_lines))
+        except json.JSONDecodeError:
+            data_lines = []
+            continue
+        data_lines = []
+        if isinstance(envelope, dict) and envelope.get("id") == call_id:
+            return _structured_envelope(envelope, call_id)
+    if data_lines:
+        try:
+            envelope = json.loads("\n".join(data_lines))
+        except json.JSONDecodeError:
+            envelope = None
+        if isinstance(envelope, dict) and envelope.get("id") == call_id:
+            return _structured_envelope(envelope, call_id)
+    raise N8nCredentialDiscoveryError(
+        "Captain n8n credential metadata response is invalid"
+    )
 
 
 def _sse_values(text: str) -> tuple[object, ...]:

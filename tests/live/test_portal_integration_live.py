@@ -229,8 +229,9 @@ def test_ticket_lifecycle_provider_traces_restart_and_release_evidence(
     ) == expected_trace_bindings
     assert len({trace.trace_id for trace in traces}) == 3
     oauth_trace = traces[1]
-    assert oauth_trace.consent_ref is not None
-    assert oauth_trace.callback_ref is not None
+    assert oauth_trace.oauth_grant_type == "client_credentials"
+    assert oauth_trace.oauth_exchange_id is not None
+    assert oauth_trace.oauth_exchange_ref is not None
 
     release = live_portal.release_evidence()
     assert release.correlation_id == live_config.correlation_id

@@ -16,6 +16,7 @@ from agenten.agent_factory.integration_setup import (
     IntegrationCredentialRequirementV1,
     IntegrationSetupStatus,
     N8nCredentialMetadataV1,
+    oauth_exchange_artifact_ref,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.delivery.minibook_events import (
@@ -92,6 +93,10 @@ def _setup_with_bearer_and_oauth(factory_job) -> IntegrationSetupSubmissionV1:
         credential_type="oAuth2Api",
         project_id="captain-production",
     )
+    oauth_trace_id = UUID("41000000-0000-4000-8000-000000000001")
+    oauth_probe_id = UUID("51000000-0000-4000-8000-000000000001")
+    oauth_exchange_id = UUID("61000000-0000-4000-8000-000000000001")
+    oauth_proof = "9" * 64
     oauth_receipt = CredentialVerificationReceiptV1(
         integration_key="crm",
         credential_alias="CRM_OAUTH",
@@ -106,8 +111,17 @@ def _setup_with_bearer_and_oauth(factory_job) -> IntegrationSetupSubmissionV1:
         workflow_ref=_ref("n8n-workflow", "c" * 64),
         workflow_content_sha256="c" * 64,
         execution_ref=_ref("n8n-execution", "d" * 64),
-        oauth_consent_ref=_ref("oauth-consent", "e" * 64),
-        oauth_callback_ref=_ref("oauth-callback", "f" * 64),
+        provider_trace_id=oauth_trace_id,
+        provider_proof_sha256=oauth_proof,
+        provider_kind="oauth2",
+        provider_probe_id=oauth_probe_id,
+        oauth_grant_type="client_credentials",
+        oauth_exchange_id=oauth_exchange_id,
+        oauth_exchange_ref=oauth_exchange_artifact_ref(
+            exchange_id=oauth_exchange_id,
+            provider_trace_id=oauth_trace_id,
+            provider_proof_sha256=oauth_proof,
+        ),
     )
     oauth_connection = IntegrationConnectionV1(
         requirement=oauth_requirement,
@@ -161,9 +175,16 @@ def test_finalization_is_atomic_and_evidence_query_is_read_only() -> None:
             occurred_at=NOW + timedelta(seconds=index),
         )
         release_kind = "oauth" if kind == "oauth2" else "bearer"
+        trace_id = UUID(f"40000000-0000-4000-8000-{index:012d}")
+        provider_proof = f"{index + 8:x}" * 64
+        oauth_exchange_id = (
+            UUID(f"60000000-0000-4000-8000-{index:012d}")
+            if kind == "oauth2"
+            else None
+        )
         completion = PortalProviderProbeCompletionV1(
             probe_request_id=request.probe_request_id,
-            trace_id=UUID(f"40000000-0000-4000-8000-{index:012d}"),
+            trace_id=trace_id,
             run_id=run_id,
             job_id=factory_job.job_id,
             correlation_id=factory_job.correlation_id,
@@ -176,10 +197,21 @@ def test_finalization_is_atomic_and_evidence_query_is_read_only() -> None:
             template_release=_release(release_kind, template_sha),
             deployed_workflow_ref=_ref("n8n-workflow", f"{index + 2:x}" * 64),
             execution_ref=_ref("n8n-execution", f"{index + 5:x}" * 64),
-            provider_proof_sha256=f"{index + 8:x}" * 64,
-            provider_probe_id=f"portal-verification-r{setup.revision}",
-            consent_ref=(None if kind == "bearer" else _ref("oauth-consent", "e" * 64)),
-            callback_ref=(None if kind == "bearer" else _ref("oauth-callback", "f" * 64)),
+            provider_proof_sha256=provider_proof,
+            provider_probe_id=UUID(
+                f"50000000-0000-4000-8000-{index:012d}"
+            ),
+            oauth_grant_type=(None if kind == "bearer" else "client_credentials"),
+            oauth_exchange_id=oauth_exchange_id,
+            oauth_exchange_ref=(
+                None
+                if oauth_exchange_id is None
+                else oauth_exchange_artifact_ref(
+                    exchange_id=oauth_exchange_id,
+                    provider_trace_id=trace_id,
+                    provider_proof_sha256=provider_proof,
+                )
+            ),
             status="passed",
             occurred_at=NOW + timedelta(seconds=index, microseconds=1),
         )

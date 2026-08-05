@@ -17,7 +17,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import jwt
 from fastapi import FastAPI, HTTPException, Request, status
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 Clock = Callable[[], datetime]
@@ -110,6 +110,7 @@ class ProbeReceiptV1(BaseModel):
     setup_content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     occurred_at: datetime
     proof_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    oauth_exchange_id: UUID | None = None
 
     @field_validator("occurred_at")
     @classmethod
@@ -117,6 +118,14 @@ class ProbeReceiptV1(BaseModel):
         if value.tzinfo is None or value.utcoffset() != timedelta(0):
             raise ValueError("provider receipt time must be UTC")
         return value.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def require_kind_specific_exchange(self) -> "ProbeReceiptV1":
+        if self.kind == "oauth2" and self.oauth_exchange_id is None:
+            raise ValueError("OAuth receipt requires a token exchange")
+        if self.kind == "bearer" and self.oauth_exchange_id is not None:
+            raise ValueError("Bearer receipt cannot contain a token exchange")
+        return self
 
 
 class ReceiptStore:
@@ -132,6 +141,15 @@ class ReceiptStore:
                        payload TEXT NOT NULL
                    )"""
             )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS oauth_token_exchanges (
+                       exchange_id TEXT PRIMARY KEY,
+                       client_id_sha256 TEXT NOT NULL,
+                       scope TEXT NOT NULL,
+                       issued_at TEXT NOT NULL,
+                       expires_at TEXT NOT NULL
+                   )"""
+            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._path, timeout=10)
@@ -144,6 +162,7 @@ class ReceiptStore:
         kind: Literal["bearer", "oauth2"],
         request: ProbeRequestV1,
         occurred_at: datetime,
+        oauth_exchange_id: UUID | None = None,
     ) -> ProbeReceiptV1:
         public_request = request.model_dump(mode="json")
         request_sha256 = _sha256(public_request)
@@ -156,6 +175,8 @@ class ReceiptStore:
             **public_request,
             "occurred_at": _require_utc(occurred_at).isoformat(),
         }
+        if oauth_exchange_id is not None:
+            unsigned["oauth_exchange_id"] = str(oauth_exchange_id)
         receipt = ProbeReceiptV1.model_validate(
             {**unsigned, "proof_sha256": _sha256(unsigned)}
         )
@@ -179,6 +200,62 @@ class ReceiptStore:
                 (str(trace_id), effect_key, request_sha256, payload),
             )
         return receipt
+
+    def record_oauth_exchange(
+        self,
+        *,
+        client_id: str,
+        scope: str,
+        issued_at: datetime,
+        expires_at: datetime,
+    ) -> UUID:
+        exchange_id = uuid4()
+        normalized_issued_at = _require_utc(issued_at)
+        normalized_expires_at = _require_utc(expires_at)
+        if normalized_expires_at <= normalized_issued_at:
+            raise ValueError("OAuth token exchange expiry must follow issuance")
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO oauth_token_exchanges "
+                "(exchange_id, client_id_sha256, scope, issued_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    str(exchange_id),
+                    hashlib.sha256(client_id.encode("utf-8")).hexdigest(),
+                    scope,
+                    normalized_issued_at.isoformat(),
+                    normalized_expires_at.isoformat(),
+                ),
+            )
+        return exchange_id
+
+    def require_oauth_exchange(
+        self,
+        *,
+        exchange_id: UUID,
+        client_id: str,
+        scope: str,
+        observed_at: datetime,
+    ) -> None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT client_id_sha256, scope, issued_at, expires_at "
+                "FROM oauth_token_exchanges WHERE exchange_id = ?",
+                (str(exchange_id),),
+            ).fetchone()
+        if (
+            row is None
+            or row["client_id_sha256"]
+            != hashlib.sha256(client_id.encode("utf-8")).hexdigest()
+            or row["scope"] != scope
+            or datetime.fromisoformat(row["issued_at"]) > _require_utc(observed_at)
+            or datetime.fromisoformat(row["expires_at"]) <= _require_utc(observed_at)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid OAuth token exchange",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
 
     def get(self, trace_id: UUID) -> ProbeReceiptV1:
         with self._connect() as connection:
@@ -275,14 +352,21 @@ def create_app(*, settings: ProviderSettings, clock: Clock | None = None) -> Fas
         ]:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid grant")
         issued_at = _require_utc(now())
+        expires_at = issued_at + timedelta(minutes=5)
+        exchange_id = store.record_oauth_exchange(
+            client_id=settings.oauth_client_id,
+            scope="probe:read",
+            issued_at=issued_at,
+            expires_at=expires_at,
+        )
         claims = {
             "iss": settings.issuer,
             "aud": settings.audience,
             "sub": settings.oauth_client_id,
             "scope": "probe:read",
             "iat": int(issued_at.timestamp()),
-            "exp": int((issued_at + timedelta(minutes=5)).timestamp()),
-            "jti": str(uuid4()),
+            "exp": int(expires_at.timestamp()),
+            "jti": str(exchange_id),
         }
         token = jwt.encode(claims, settings.oauth_signing_secret, algorithm="HS256")
         return {
@@ -315,13 +399,25 @@ def create_app(*, settings: ProviderSettings, clock: Clock | None = None) -> Fas
                 or claims["exp"] <= current
             ):
                 raise jwt.InvalidTokenError
-        except jwt.PyJWTError:
+            exchange_id = UUID(str(claims.get("jti")))
+            store.require_oauth_exchange(
+                exchange_id=exchange_id,
+                client_id=settings.oauth_client_id,
+                scope="probe:read",
+                observed_at=now(),
+            )
+        except (jwt.PyJWTError, ValueError):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="invalid OAuth access token",
                 headers={"WWW-Authenticate": "Bearer"},
             ) from None
-        return store.record(kind="oauth2", request=probe, occurred_at=now())
+        return store.record(
+            kind="oauth2",
+            request=probe,
+            occurred_at=now(),
+            oauth_exchange_id=exchange_id,
+        )
 
     @app.get("/v1/audit/traces/{trace_id}", response_model=ProbeReceiptV1)
     async def audit_trace(trace_id: UUID, request: Request) -> ProbeReceiptV1:

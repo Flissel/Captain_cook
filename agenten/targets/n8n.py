@@ -6,7 +6,7 @@ import re
 from typing import Any, Literal, Protocol
 from uuid import UUID
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agenten.agent_runtime.n8n_endpoint import N8nEndpoint
 
@@ -41,7 +41,16 @@ class N8nProviderEvidence(BaseModel):
     trace_id: UUID
     proof_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     kind: Literal["bearer", "oauth2"]
-    probe_id: str = Field(min_length=1, max_length=128)
+    probe_id: UUID
+    oauth_exchange_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def require_kind_specific_exchange(self) -> "N8nProviderEvidence":
+        if self.kind == "oauth2" and self.oauth_exchange_id is None:
+            raise ValueError("OAuth provider evidence requires a token exchange")
+        if self.kind == "bearer" and self.oauth_exchange_id is not None:
+            raise ValueError("Bearer provider evidence cannot contain a token exchange")
+        return self
 
 
 class N8nExecutionEvidence(BaseModel):
@@ -255,10 +264,13 @@ class N8nTarget:
                             proof_sha256=record.output["provider_proof_sha256"],
                             kind=record.output["provider_kind"],
                             probe_id=record.output["provider_probe_id"],
+                            oauth_exchange_id=record.output.get(
+                                "oauth_exchange_id"
+                            ),
                         )
                     except ValueError:
                         raise N8nEvidenceError("n8n returned invalid provider evidence") from None
-                    if provider.probe_id != case.case_id:
+                    if str(provider.probe_id) != case.case_id:
                         raise N8nEvidenceError("n8n returned unbound provider evidence")
                 return N8nExecutionEvidence(
                     execution_id=record.execution_id,

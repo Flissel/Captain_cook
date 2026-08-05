@@ -75,9 +75,9 @@ class StaticCredentialSource:
 
 
 class RecordingVerificationSource:
-    def __init__(self, workflow_digest: str = "d" * 64) -> None:
+    def __init__(self, template_digest: str = "d" * 64) -> None:
         self.calls: list[dict[str, object]] = []
-        self.workflow_digest = workflow_digest
+        self.template_digest = template_digest
 
     def verify_credential(self, **kwargs):
         self.calls.append(kwargs)
@@ -86,7 +86,12 @@ class RecordingVerificationSource:
         now = kwargs["now"]
         workflow = ArtifactRef(
             uri="artifact://portal-verification/workflow",
-            sha256=self.workflow_digest,
+            sha256="c" * 64,
+            media_type="application/json",
+        )
+        template = ArtifactRef(
+            uri="artifact://portal-verification/template",
+            sha256=self.template_digest,
             media_type="application/json",
         )
         return CredentialVerificationReceiptV1(
@@ -97,6 +102,8 @@ class RecordingVerificationSource:
             project_id=credential.project_id,
             status="passed",
             occurred_at=now,
+            template_ref=template,
+            template_content_sha256=template.sha256,
             workflow_ref=workflow,
             workflow_content_sha256=workflow.sha256,
             execution_ref=ArtifactRef(

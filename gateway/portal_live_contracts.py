@@ -9,6 +9,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agenten.agent_runtime.contracts import ArtifactRef, IDENTIFIER_PATTERN
+from agenten.agent_factory.integration_setup import oauth_exchange_artifact_ref
 from agenten.agent_factory.gitea_template_contracts import GiteaTemplateReleaseV1
 from agenten.delivery.minibook_events import MinibookProjectionRebuildReceiptV1
 
@@ -50,9 +51,10 @@ class PortalProviderProbeCompletionV1(_FrozenContract):
     deployed_workflow_ref: ArtifactRef
     execution_ref: ArtifactRef
     provider_proof_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    provider_probe_id: str = Field(min_length=1, max_length=128)
-    consent_ref: ArtifactRef | None = None
-    callback_ref: ArtifactRef | None = None
+    provider_probe_id: UUID
+    oauth_grant_type: Literal["client_credentials"] | None = None
+    oauth_exchange_id: UUID | None = None
+    oauth_exchange_ref: ArtifactRef | None = None
     status: Literal["passed"]
     occurred_at: datetime
 
@@ -67,10 +69,24 @@ class PortalProviderProbeCompletionV1(_FrozenContract):
     def require_kind_specific_evidence(self) -> "PortalProviderProbeCompletionV1":
         if self.template_release.sha256 != self.template_ref.sha256:
             raise ValueError("provider probe Gitea release digest mismatch")
-        oauth_refs = (self.consent_ref, self.callback_ref)
-        if self.integration_kind == "oauth2" and not all(oauth_refs):
-            raise ValueError("OAuth completion requires consent and callback evidence")
-        if self.integration_kind == "bearer" and any(oauth_refs):
+        oauth_evidence = (
+            self.oauth_grant_type,
+            self.oauth_exchange_id,
+            self.oauth_exchange_ref,
+        )
+        if self.integration_kind == "oauth2":
+            if not all(value is not None for value in oauth_evidence):
+                raise ValueError("OAuth completion requires token exchange evidence")
+            assert self.oauth_exchange_id is not None
+            if self.oauth_exchange_ref != oauth_exchange_artifact_ref(
+                exchange_id=self.oauth_exchange_id,
+                provider_trace_id=self.trace_id,
+                provider_proof_sha256=self.provider_proof_sha256,
+            ):
+                raise ValueError("OAuth token exchange evidence is not provider-bound")
+        if self.integration_kind == "bearer" and any(
+            value is not None for value in oauth_evidence
+        ):
             raise ValueError("Bearer completion cannot contain OAuth evidence")
         return self
 

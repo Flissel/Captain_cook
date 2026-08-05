@@ -344,8 +344,29 @@ class ProviderTraceEvidence(_WireModel):
     status: Literal["passed"]
     occurred_at: datetime
     execution_ref: str = Field(pattern=EVIDENCE_REFERENCE_PATTERN)
-    consent_ref: str | None = Field(default=None, pattern=EVIDENCE_REFERENCE_PATTERN)
-    callback_ref: str | None = Field(default=None, pattern=EVIDENCE_REFERENCE_PATTERN)
+    oauth_grant_type: Literal["client_credentials"] | None = None
+    oauth_exchange_id: UUID | None = None
+    oauth_exchange_ref: str | None = Field(
+        default=None,
+        pattern=EVIDENCE_REFERENCE_PATTERN,
+    )
+
+    @model_validator(mode="after")
+    def require_oauth_exchange(self) -> Self:
+        evidence = (
+            self.oauth_grant_type,
+            self.oauth_exchange_id,
+            self.oauth_exchange_ref,
+        )
+        if self.integration_kind == "oauth" and not all(
+            value is not None for value in evidence
+        ):
+            raise ValueError("OAuth trace requires client-credentials exchange evidence")
+        if self.integration_kind == "bearer" and any(
+            value is not None for value in evidence
+        ):
+            raise ValueError("Bearer trace cannot contain OAuth exchange evidence")
+        return self
 
 
 class RestartEvidence(_WireModel):

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 from typing import Protocol
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from agenten.agent_factory.contracts import FactoryJob, FactoryLease, FactoryRole
 from agenten.agent_factory.gitea_template_contracts import GiteaTemplateReleaseV1
@@ -204,6 +204,7 @@ class PortalN8nCredentialVerificationSource:
             self._verify(
                 requirement=requirement,
                 credential=credential,
+                job_id=job_id,
                 correlation_id=correlation_id,
                 expected_content_sha256=expected_content_sha256,
                 expected_revision=expected_revision,
@@ -216,6 +217,7 @@ class PortalN8nCredentialVerificationSource:
         *,
         requirement: IntegrationCredentialRequirementV1,
         credential: N8nCredentialMetadataV1,
+        job_id: UUID,
         correlation_id: UUID,
         expected_content_sha256: str,
         expected_revision: int,
@@ -230,11 +232,17 @@ class PortalN8nCredentialVerificationSource:
             credential=credential,
         )
         deployment = await self._target.deploy(bound.artifact)
-        probe_id = f"portal-verification-r{expected_revision}"
+        probe_id = uuid5(
+            NAMESPACE_URL,
+            (
+                "captain:portal-verification:"
+                f"{job_id}:{correlation_id}:{expected_revision}:{credential.credential_id}"
+            ),
+        )
         execution = await self._target.execute(
             deployment,
             ValidationCase(
-                case_id=probe_id,
+                case_id=str(probe_id),
                 correlation_id=str(correlation_id),
                 input_payload={
                     "setup_content_sha256": expected_content_sha256,

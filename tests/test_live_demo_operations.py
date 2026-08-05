@@ -94,7 +94,7 @@ def test_minibook_demo_bootstrap_is_local_reusable_and_redacted() -> None:
 def test_live_demo_services_only_operates_captain_resources() -> None:
     source = SERVICES.read_text(encoding="utf-8")
     assert "$global:LASTEXITCODE = 0" in source
-    assert 'ValidateSet("start", "portal-start", "benchmark-start"' in source
+    assert 'ValidateSet("start", "portal-start", "gateway-restart", "benchmark-start"' in source
     assert "captain-n8n.ps1" in source
     assert "minibook-demo.ps1" in source
     assert "docker compose" in source
@@ -201,6 +201,23 @@ def test_live_demo_services_can_restart_only_the_managed_benchmark_gateway() -> 
     assert "Invoke-BenchmarkStart" in restart_block
     assert "docker compose down" not in restart_block
     assert "Stop-CaptainN8nContainers" not in restart_block
+
+
+def test_live_demo_services_can_restart_only_the_verified_portal_gateway() -> None:
+    source = SERVICES.read_text(encoding="utf-8")
+
+    assert '"gateway-restart"' in source
+    restart_block = source.split("gateway-restart {", 1)[1].split("}", 1)[0]
+    assert "Initialize-LocalEnvironment" in restart_block
+    assert "Restart-Gateway $values" in restart_block
+    assert "docker compose" not in restart_block
+    assert "Stop-CaptainN8nContainers" not in restart_block
+    restart_function = source.split("function Restart-Gateway", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "Get-ManagedListenerIdentity" in restart_function
+    assert "taskkill.exe" in restart_function
+    assert "Start-Gateway $Values" in restart_function
 
 
 def test_managed_process_identity_rejects_wrong_listener_and_configuration(

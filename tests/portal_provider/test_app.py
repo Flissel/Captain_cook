@@ -99,7 +99,20 @@ def test_oauth_client_credentials_token_authorizes_probe(tmp_path: Path) -> None
     assert denied.status_code == 401
     assert accepted.status_code == 200
     assert accepted.json()["kind"] == "oauth2"
+    assert UUID(accepted.json()["oauth_exchange_id"]) == UUID(claims["jti"])
     assert access_token not in accepted.text
+
+    with TestClient(
+        create_app(settings=settings, clock=lambda: NOW + timedelta(seconds=1))
+    ) as restarted:
+        replay = restarted.post(
+            "/v1/oauth2/probes",
+            headers={"Authorization": f"Bearer {access_token}"},
+            json=_probe(),
+        )
+
+    assert replay.status_code == 200
+    assert replay.json() == accepted.json()
 
 
 def test_audit_receipt_survives_restart_and_requires_distinct_token(tmp_path: Path) -> None:

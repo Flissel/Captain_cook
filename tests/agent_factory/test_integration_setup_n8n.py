@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 
@@ -22,6 +23,19 @@ from tests.agent_factory.test_state_machine import job
 
 NOW = datetime(2026, 8, 4, 10, tzinfo=timezone.utc)
 MCP_TOKEN = "private-mcp-token-never-serialized"
+
+
+class OpenSseStream(httpx.AsyncByteStream):
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+        self.closed = False
+
+    async def __aiter__(self):
+        yield self.payload
+        await asyncio.Event().wait()
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 def requirement() -> IntegrationCredentialRequirementV1:
@@ -135,6 +149,55 @@ async def test_discovers_only_sanitized_exact_credential_metadata() -> None:
     serialized = result[0].model_dump_json()
     assert "token" not in serialized.lower()
     assert MCP_TOKEN not in serialized
+
+
+@pytest.mark.asyncio
+async def test_discovery_returns_after_matching_sse_event_without_waiting_for_close() -> None:
+    stream: OpenSseStream | None = None
+
+    async def handler(raw: httpx.Request) -> httpx.Response:
+        nonlocal stream
+        call_id = json.loads(raw.content)["id"]
+        event = {
+            "jsonrpc": "2.0",
+            "id": call_id,
+            "result": {
+                "isError": False,
+                "structuredContent": {
+                    "data": [
+                        {
+                            "id": "cred-prod",
+                            "name": "CRM production",
+                            "type": "httpBearerAuth",
+                            "homeProject": {
+                                "id": "captain-production",
+                                "name": "Captain production",
+                            },
+                        }
+                    ]
+                },
+            },
+        }
+        stream = OpenSseStream(
+            f"event: message\ndata: {json.dumps(event)}\n\n".encode("utf-8")
+        )
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            stream=stream,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await CaptainN8nCredentialMetadataClient(http=http).discover(
+            lease=lease(),
+            endpoint=endpoint(),
+            requirement=requirement(),
+            now=NOW,
+            timeout_seconds=0.2,
+        )
+
+    assert tuple(item.credential_id for item in result) == ("cred-prod",)
+    assert stream is not None and stream.closed is True
 
 
 @pytest.mark.asyncio

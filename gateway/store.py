@@ -1055,8 +1055,8 @@ class GatewayStore:
                 now=now.astimezone(timezone.utc),
             )
             receipt = CredentialVerificationReceiptV1.model_validate(returned)
-            if receipt.workflow_content_sha256 != expected_workflow_sha256:
-                raise ValueError("verification workflow digest mismatch")
+            if receipt.template_content_sha256 != expected_workflow_sha256:
+                raise ValueError("verification template digest mismatch")
             replacement = self._resolve_portal_connection(
                 target.requirement,
                 credentials=target.candidate_credentials,
@@ -1729,8 +1729,9 @@ class GatewayStore:
             execution_ref=receipt.execution_ref,
             provider_proof_sha256=receipt.provider_proof_sha256,
             provider_probe_id=receipt.provider_probe_id,
-            consent_ref=receipt.oauth_consent_ref,
-            callback_ref=receipt.oauth_callback_ref,
+            oauth_grant_type=receipt.oauth_grant_type,
+            oauth_exchange_id=receipt.oauth_exchange_id,
+            oauth_exchange_ref=receipt.oauth_exchange_ref,
             status="passed",
             occurred_at=receipt.occurred_at,
         )

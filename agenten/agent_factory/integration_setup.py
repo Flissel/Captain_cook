@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal, Mapping
@@ -104,9 +106,10 @@ class CredentialVerificationReceiptV1(_FrozenContract):
     provider_trace_id: UUID | None = None
     provider_proof_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     provider_kind: Literal["bearer", "oauth2"] | None = None
-    provider_probe_id: str | None = Field(default=None, min_length=1, max_length=128)
-    oauth_consent_ref: ArtifactRef | None = None
-    oauth_callback_ref: ArtifactRef | None = None
+    provider_probe_id: UUID | None = None
+    oauth_grant_type: Literal["client_credentials"] | None = None
+    oauth_exchange_id: UUID | None = None
+    oauth_exchange_ref: ArtifactRef | None = None
     valid_until: datetime | None = None
 
     @field_validator("credential_alias")
@@ -143,8 +146,6 @@ class CredentialVerificationReceiptV1(_FrozenContract):
             )
             if self.verification_release.sha256 != release_digest:
                 raise ValueError("verification receipt Gitea release digest mismatch")
-        if (self.oauth_consent_ref is None) != (self.oauth_callback_ref is None):
-            raise ValueError("OAuth verification evidence is incomplete")
         provider_evidence = (
             self.provider_trace_id,
             self.provider_proof_sha256,
@@ -155,9 +156,56 @@ class CredentialVerificationReceiptV1(_FrozenContract):
             value is not None for value in provider_evidence
         ):
             raise ValueError("provider verification evidence is incomplete")
+        oauth_evidence = (
+            self.oauth_grant_type,
+            self.oauth_exchange_id,
+            self.oauth_exchange_ref,
+        )
+        if self.provider_kind == "oauth2":
+            if not all(value is not None for value in oauth_evidence):
+                raise ValueError("OAuth verification requires token exchange evidence")
+            assert self.provider_trace_id is not None
+            assert self.provider_proof_sha256 is not None
+            assert self.oauth_exchange_id is not None
+            if self.oauth_exchange_ref != oauth_exchange_artifact_ref(
+                exchange_id=self.oauth_exchange_id,
+                provider_trace_id=self.provider_trace_id,
+                provider_proof_sha256=self.provider_proof_sha256,
+            ):
+                raise ValueError("OAuth token exchange evidence is not provider-bound")
+        elif any(value is not None for value in oauth_evidence):
+            raise ValueError("non-OAuth verification cannot contain OAuth evidence")
         if self.valid_until is not None and self.valid_until <= self.occurred_at:
             raise ValueError("verification receipt validity must end after verification")
         return self
+
+
+def oauth_exchange_artifact_ref(
+    *,
+    exchange_id: UUID,
+    provider_trace_id: UUID,
+    provider_proof_sha256: str,
+) -> ArtifactRef:
+    payload = {
+        "schema": "captain.oauth-token-exchange-evidence.v1",
+        "grant_type": "client_credentials",
+        "exchange_id": str(exchange_id),
+        "provider_trace_id": str(provider_trace_id),
+        "provider_proof_sha256": provider_proof_sha256,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return ArtifactRef(
+        uri=f"artifact://oauth-token-exchange/{exchange_id}",
+        sha256=digest,
+        media_type="application/json",
+    )
 
 
 class IntegrationConnectionV1(_FrozenContract):

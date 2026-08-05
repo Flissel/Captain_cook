@@ -5,11 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime
+from uuid import UUID
 
 from agenten.agent_factory.integration_setup import (
     CredentialVerificationReceiptV1,
     IntegrationCredentialRequirementV1,
     N8nCredentialMetadataV1,
+    oauth_exchange_artifact_ref,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.gitea_template_contracts import GiteaTemplateReleaseV1
@@ -30,7 +32,7 @@ def seal_provider_verification(
     deployment: N8nDeployment,
     execution: N8nExecutionEvidence,
     expected_correlation_id: str,
-    expected_probe_id: str,
+    expected_probe_id: UUID,
     occurred_at: datetime,
     valid_until: datetime | None = None,
 ) -> CredentialVerificationReceiptV1:
@@ -85,6 +87,16 @@ def seal_provider_verification(
         ).encode("utf-8")
     ).hexdigest()
     workflow_digest = workflow_artifact.artifact_digest
+    oauth_exchange_id = execution.provider.oauth_exchange_id
+    oauth_exchange_ref = (
+        oauth_exchange_artifact_ref(
+            exchange_id=oauth_exchange_id,
+            provider_trace_id=execution.provider.trace_id,
+            provider_proof_sha256=execution.provider.proof_sha256,
+        )
+        if execution.provider.kind == "oauth2" and oauth_exchange_id is not None
+        else None
+    )
     return CredentialVerificationReceiptV1(
         integration_key=requirement.integration_key,
         credential_alias=requirement.credential_alias,
@@ -111,5 +123,10 @@ def seal_provider_verification(
         provider_proof_sha256=execution.provider.proof_sha256,
         provider_kind=execution.provider.kind,
         provider_probe_id=execution.provider.probe_id,
+        oauth_grant_type=(
+            "client_credentials" if execution.provider.kind == "oauth2" else None
+        ),
+        oauth_exchange_id=oauth_exchange_id,
+        oauth_exchange_ref=oauth_exchange_ref,
         valid_until=valid_until,
     )

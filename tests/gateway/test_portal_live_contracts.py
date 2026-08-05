@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from pydantic import SecretStr
 
 from agenten.agent_runtime.contracts import ArtifactRef
+from agenten.agent_factory.integration_setup import oauth_exchange_artifact_ref
 from agenten.agent_factory.gitea_template_contracts import GiteaTemplateReleaseV1
 from gateway.portal_live_contracts import (
     PortalRestartReceiptV1,
@@ -69,7 +70,7 @@ def test_probe_request_is_exactly_idempotent_and_setup_fenced() -> None:
         )
 
 
-def test_oauth_completion_requires_consent_and_callback_evidence() -> None:
+def test_oauth_client_credentials_completion_requires_token_exchange_evidence() -> None:
     common = {
         "probe_request_id": UUID("30000000-0000-4000-8000-000000000002"),
         "trace_id": UUID("40000000-0000-4000-8000-000000000002"),
@@ -86,20 +87,35 @@ def test_oauth_completion_requires_consent_and_callback_evidence() -> None:
         "deployed_workflow_ref": _ref("n8n-workflow", "c" * 64),
         "execution_ref": _ref("n8n-execution", "d" * 64),
         "provider_proof_sha256": "1" * 64,
-        "provider_probe_id": "portal-verification-r7",
+        "provider_probe_id": UUID("50000000-0000-4000-8000-000000000007"),
         "status": "passed",
         "occurred_at": NOW,
     }
 
-    with pytest.raises(ValidationError, match="consent and callback"):
+    with pytest.raises(ValidationError, match="token exchange"):
         PortalProviderProbeCompletionV1(**common)
 
+    exchange_id = UUID("60000000-0000-4000-8000-000000000007")
+    exchange_ref = oauth_exchange_artifact_ref(
+        exchange_id=exchange_id,
+        provider_trace_id=common["trace_id"],
+        provider_proof_sha256=common["provider_proof_sha256"],
+    )
     completion = PortalProviderProbeCompletionV1(
         **common,
-        consent_ref=_ref("oauth-consent", "e" * 64),
-        callback_ref=_ref("oauth-callback", "f" * 64),
+        oauth_grant_type="client_credentials",
+        oauth_exchange_id=exchange_id,
+        oauth_exchange_ref=exchange_ref,
     )
     assert completion.status == "passed"
+
+    with pytest.raises(ValidationError, match="cannot contain OAuth"):
+        PortalProviderProbeCompletionV1(
+            **(common | {"integration_kind": "bearer"}),
+            oauth_grant_type="client_credentials",
+            oauth_exchange_id=exchange_id,
+            oauth_exchange_ref=exchange_ref,
+        )
 
 
 def test_control_plane_tokens_must_be_complete_and_pairwise_distinct() -> None:

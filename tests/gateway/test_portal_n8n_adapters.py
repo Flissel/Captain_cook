@@ -244,3 +244,5 @@ def test_verification_adapter_seals_template_and_bound_workflow_digests() -> Non
         "setup_content_sha256": "c" * 64,
         "setup_revision": 7,
     }
+    probe_id = UUID(target.case.case_id)
+    assert receipt.provider_probe_id == probe_id

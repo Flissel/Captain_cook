@@ -376,8 +376,6 @@ def test_release_evidence_rejects_duplicate_trace_ids(
         "status": "passed",
         "occurred_at": "2026-08-05T12:00:00Z",
         "execution_ref": "execution://trace-3",
-        "consent_ref": None,
-        "callback_ref": None,
     }
 
     def handler(_request: httpx.Request) -> httpx.Response:

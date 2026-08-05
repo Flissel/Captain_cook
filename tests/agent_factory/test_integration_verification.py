@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from uuid import UUID
 
 import pytest
 
@@ -20,7 +21,7 @@ from agenten.targets.n8n import (
 
 NOW = datetime(2026, 8, 5, 8, tzinfo=timezone.utc)
 CORRELATION_ID = "20000000-0000-4000-8000-000000000001"
-PROBE_ID = "portal-verification-r1"
+PROBE_ID = UUID("50000000-0000-4000-8000-000000000001")
 
 
 def requirement() -> IntegrationCredentialRequirementV1:
@@ -80,6 +81,24 @@ def evidence() -> N8nExecutionEvidence:
     )
 
 
+def test_provider_evidence_rejects_non_uuid_probe_identity() -> None:
+    with pytest.raises(ValueError):
+        N8nProviderEvidence(
+            trace_id="30000000-0000-4000-8000-000000000001",
+            proof_sha256="c" * 64,
+            kind="bearer",
+            probe_id="portal-verification-r1",
+        )
+
+    accepted = N8nProviderEvidence(
+        trace_id="30000000-0000-4000-8000-000000000001",
+        proof_sha256="c" * 64,
+        kind="bearer",
+        probe_id="50000000-0000-4000-8000-000000000001",
+    )
+    assert accepted.probe_id == UUID("50000000-0000-4000-8000-000000000001")
+
+
 def test_matching_provider_execution_seals_secret_free_gateway_receipt() -> None:
     receipt = seal_provider_verification(
         requirement=requirement(),
@@ -107,6 +126,46 @@ def test_matching_provider_execution_seals_secret_free_gateway_receipt() -> None
     assert receipt.provider_probe_id == PROBE_ID
     rendered = receipt.model_dump_json()
     for forbidden in ("token", "password", "authorization", "client_secret"):
+        assert forbidden not in rendered.lower()
+
+
+def test_oauth_client_credentials_seals_provider_bound_exchange_evidence() -> None:
+    exchange_id = UUID("60000000-0000-4000-8000-000000000001")
+    oauth_requirement = requirement().model_copy(
+        update={"credential_alias": "CRM_OAUTH", "credential_type": "oAuth2Api"}
+    )
+    oauth_credential = credential().model_copy(
+        update={"credential_id": "cred-oauth", "credential_type": "oAuth2Api"}
+    )
+    oauth_evidence = evidence().model_copy(
+        update={
+            "provider": N8nProviderEvidence(
+                trace_id="30000000-0000-4000-8000-000000000001",
+                proof_sha256="c" * 64,
+                kind="oauth2",
+                probe_id=PROBE_ID,
+                oauth_exchange_id=exchange_id,
+            )
+        }
+    )
+
+    receipt = seal_provider_verification(
+        requirement=oauth_requirement,
+        credential=oauth_credential,
+        workflow_artifact=artifact(),
+        deployment=deployment(),
+        execution=oauth_evidence,
+        expected_correlation_id=CORRELATION_ID,
+        expected_probe_id=PROBE_ID,
+        occurred_at=NOW,
+    )
+
+    assert receipt.oauth_grant_type == "client_credentials"
+    assert receipt.oauth_exchange_id == exchange_id
+    assert receipt.oauth_exchange_ref is not None
+    assert receipt.oauth_exchange_ref.uri == f"artifact://oauth-token-exchange/{exchange_id}"
+    rendered = receipt.model_dump_json()
+    for forbidden in ("access_token", "client_secret", "authorization"):
         assert forbidden not in rendered.lower()
 
 
@@ -210,12 +269,15 @@ def test_foreign_project_or_workflow_digest_cannot_be_sealed() -> None:
             proof_sha256="c" * 64,
             kind="oauth2",
             probe_id=PROBE_ID,
+            oauth_exchange_id=UUID(
+                "60000000-0000-4000-8000-000000000001"
+            ),
         ),
         N8nProviderEvidence(
             trace_id="30000000-0000-4000-8000-000000000001",
             proof_sha256="c" * 64,
             kind="bearer",
-            probe_id="foreign-probe",
+            probe_id=UUID("50000000-0000-4000-8000-000000000002"),
         ),
     ),
 )
