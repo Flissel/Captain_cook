@@ -71,6 +71,7 @@ from gateway.mirror import MirrorQueue
 from gateway.portal_auth import initialize_portal_auth, require_portal_principal
 from gateway.portal_control_auth import (
     PortalControlRole,
+    require_evidence_control,
     require_provider_control,
     require_restart_control,
 )
@@ -106,6 +107,10 @@ from gateway.integration_setup_contracts import (
     build_integration_setup_surface,
 )
 from gateway.portal_live_contracts import (
+    PortalLiveEvidenceQueryV1,
+    PortalLiveEvidenceV1,
+    PortalLiveRunDecisionV1,
+    PortalLiveRunFinalizationV1,
     PortalProviderAuditQueryV1,
     PortalProviderAuditV1,
     PortalProviderProbeCompletionV1,
@@ -410,6 +415,39 @@ def create_app(
         return await run_in_threadpool(
             get_store().record_portal_restart_receipt,
             receipt,
+        )
+
+    @app.post("/v1/control/portal-runs/{run_id}/decisions")
+    async def finalize_portal_live_run(
+        run_id: str,
+        request: PortalLiveRunFinalizationV1,
+        _: GatewayRole = Depends(require_captain),
+    ) -> PortalLiveRunDecisionV1:
+        if request.run_id != run_id:
+            raise HTTPException(status_code=409, detail="run_id must match route")
+        return await run_in_threadpool(
+            get_store().finalize_portal_live_run,
+            request,
+        )
+
+    @app.get("/v1/control/evidence/health")
+    async def evidence_control_health(
+        _: PortalControlRole = Depends(require_evidence_control),
+    ) -> dict[str, str]:
+        return {
+            "status": "ok",
+            "service_version": "captain.portal-evidence-control.v1",
+            "boot_id": portal_control_boot_id,
+        }
+
+    @app.post("/v1/control/evidence/query")
+    async def query_portal_live_evidence(
+        query: PortalLiveEvidenceQueryV1,
+        _: PortalControlRole = Depends(require_evidence_control),
+    ) -> PortalLiveEvidenceV1:
+        return await run_in_threadpool(
+            get_store().portal_live_evidence,
+            query,
         )
 
     @app.get("/batches")

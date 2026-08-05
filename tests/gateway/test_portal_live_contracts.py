@@ -11,6 +11,7 @@ from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.gitea_template_contracts import GiteaTemplateReleaseV1
 from gateway.portal_live_contracts import (
     PortalRestartReceiptV1,
+    PortalLiveRunFinalizationV1,
     PortalProviderProbeCompletionV1,
     PortalProviderProbeRequestV1,
 )
@@ -150,4 +151,38 @@ def test_restart_receipt_requires_exact_services_and_new_boot_identity() -> None
     with pytest.raises(ValidationError, match="boot identity must change"):
         PortalRestartReceiptV1(
             **common | {"new_gateway_boot_id": "boot-before"}
+        )
+
+
+def test_live_finalization_requires_exactly_three_unique_provider_traces() -> None:
+    common = {
+        "decision_request_id": UUID("80000000-0000-4000-8000-000000000001"),
+        "run_id": "portal-live-v1",
+        "job_id": JOB_ID,
+        "correlation_id": CORRELATION_ID,
+        "provider_trace_ids": (
+            UUID("40000000-0000-4000-8000-000000000001"),
+            UUID("40000000-0000-4000-8000-000000000002"),
+            UUID("40000000-0000-4000-8000-000000000003"),
+        ),
+        "restart_id": UUID("60000000-0000-4000-8000-000000000001"),
+        "minibook_rebuild_id": UUID("70000000-0000-4000-8000-000000000001"),
+        "policy_version": "portal-live-v1",
+        "occurred_at": NOW,
+    }
+    assert len(PortalLiveRunFinalizationV1(**common).provider_trace_ids) == 3
+    with pytest.raises(ValidationError, match="exactly three"):
+        PortalLiveRunFinalizationV1(
+            **common | {"provider_trace_ids": common["provider_trace_ids"][:2]}
+        )
+    with pytest.raises(ValidationError, match="unique"):
+        PortalLiveRunFinalizationV1(
+            **common
+            | {
+                "provider_trace_ids": (
+                    common["provider_trace_ids"][0],
+                    common["provider_trace_ids"][0],
+                    common["provider_trace_ids"][2],
+                )
+            }
         )

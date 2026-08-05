@@ -157,6 +157,10 @@ from gateway.portal_contracts import (
 )
 from gateway.portal_store import PortalTicketStore
 from gateway.portal_live_contracts import (
+    PortalLiveEvidenceQueryV1,
+    PortalLiveEvidenceV1,
+    PortalLiveRunDecisionV1,
+    PortalLiveRunFinalizationV1,
     PortalProviderAuditQueryV1,
     PortalProviderAuditV1,
     PortalProviderProbeCompletionV1,
@@ -548,6 +552,24 @@ class GatewayStore:
                         block_index BIGINT NOT NULL UNIQUE,
                         payload JSON NOT NULL,
                         CONSTRAINT fk_minibook_rebuild_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS portal_live_run_decisions (
+                        decision_id CHAR(36) NOT NULL PRIMARY KEY,
+                        decision_request_id CHAR(36) NOT NULL UNIQUE,
+                        run_id VARCHAR(128) NOT NULL,
+                        job_id CHAR(36) NOT NULL,
+                        correlation_id CHAR(36) NOT NULL,
+                        decision_sha256 CHAR(64) NOT NULL UNIQUE,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        UNIQUE KEY uq_portal_live_run
+                            (run_id, job_id, correlation_id),
+                        CONSTRAINT fk_portal_live_run_block
                             FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
                     ) ENGINE=InnoDB
                     """
@@ -1369,6 +1391,255 @@ class GatewayStore:
                     ),
                 )
         return receipt
+
+    def finalize_portal_live_run(
+        self,
+        request: PortalLiveRunFinalizationV1,
+    ) -> PortalLiveRunDecisionV1:
+        """Accept one fully fenced run after all immutable evidence exists."""
+
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT payload FROM portal_live_run_decisions
+                       WHERE decision_request_id = %s
+                          OR (run_id = %s AND job_id = %s AND correlation_id = %s)
+                       FOR UPDATE""",
+                    (
+                        str(request.decision_request_id),
+                        request.run_id,
+                        str(request.job_id),
+                        str(request.correlation_id),
+                    ),
+                )
+                replay = cursor.fetchone()
+                if replay is not None:
+                    decision = PortalLiveRunDecisionV1.model_validate(
+                        self._decode_json(replay["payload"])
+                    )
+                    if (
+                        decision.decision_request_id != request.decision_request_id
+                        or decision.run_id != request.run_id
+                        or decision.job_id != request.job_id
+                        or decision.correlation_id != request.correlation_id
+                        or tuple(trace.trace_id for trace in decision.provider_traces)
+                        != request.provider_trace_ids
+                        or decision.restart_receipt.restart_id != request.restart_id
+                        or decision.minibook_rebuild_receipt.rebuild_id
+                        != request.minibook_rebuild_id
+                        or decision.policy_version != request.policy_version
+                        or decision.occurred_at != request.occurred_at
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="portal live run already finalized with different content",
+                        )
+                    return decision
+
+                cursor.execute(
+                    """SELECT payload, content_sha256, revision
+                       FROM factory_integration_setup_events
+                       WHERE job_id = %s ORDER BY revision DESC LIMIT 1 FOR UPDATE""",
+                    (str(request.job_id),),
+                )
+                setup_row = cursor.fetchone()
+                if setup_row is None:
+                    raise HTTPException(status_code=409, detail="integration setup is unavailable")
+                setup = IntegrationSetupSubmissionV1.model_validate(
+                    self._decode_json(setup_row["payload"])
+                )
+                if setup.correlation_id != request.correlation_id:
+                    raise HTTPException(status_code=409, detail="live run setup fence mismatch")
+
+                cursor.execute(
+                    """SELECT trace_id FROM portal_provider_probe_completions
+                       WHERE run_id = %s AND job_id = %s AND correlation_id = %s
+                       ORDER BY block_index FOR UPDATE""",
+                    (request.run_id, str(request.job_id), str(request.correlation_id)),
+                )
+                stored_trace_ids = tuple(
+                    UUID(str(row["trace_id"])) for row in cursor.fetchall()
+                )
+                if (
+                    len(stored_trace_ids) != 3
+                    or set(stored_trace_ids) != set(request.provider_trace_ids)
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="live run requires exactly the three submitted provider traces",
+                    )
+
+                traces: list[PortalProviderProbeCompletionV1] = []
+                for trace_id in request.provider_trace_ids:
+                    cursor.execute(
+                        """SELECT payload FROM portal_provider_probe_completions
+                           WHERE trace_id = %s FOR UPDATE""",
+                        (str(trace_id),),
+                    )
+                    trace_row = cursor.fetchone()
+                    if trace_row is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="portal provider trace is unavailable",
+                        )
+                    traces.append(
+                        PortalProviderProbeCompletionV1.model_validate(
+                            self._decode_json(trace_row["payload"])
+                        )
+                    )
+
+                cursor.execute(
+                    "SELECT payload FROM portal_restart_receipts WHERE restart_id = %s FOR UPDATE",
+                    (str(request.restart_id),),
+                )
+                restart_row = cursor.fetchone()
+                if restart_row is None:
+                    raise HTTPException(status_code=409, detail="portal restart receipt is unavailable")
+                restart = PortalRestartReceiptV1.model_validate(
+                    self._decode_json(restart_row["payload"])
+                )
+
+                cursor.execute(
+                    """SELECT payload FROM minibook_projection_rebuild_receipts
+                       WHERE rebuild_id = %s FOR UPDATE""",
+                    (str(request.minibook_rebuild_id),),
+                )
+                rebuild_row = cursor.fetchone()
+                if rebuild_row is None:
+                    raise HTTPException(status_code=409, detail="Minibook rebuild receipt is unavailable")
+                rebuild = MinibookProjectionRebuildReceiptV1.model_validate(
+                    self._decode_json(rebuild_row["payload"])
+                )
+
+                execution_content = json.dumps(
+                    [trace.execution_ref.model_dump(mode="json") for trace in traces],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                execution_sha256 = hashlib.sha256(execution_content).hexdigest()
+                decision = PortalLiveRunDecisionV1(
+                    decision_id=uuid5(
+                        NAMESPACE_URL,
+                        f"captain:portal-live-decision:{request.decision_request_id}",
+                    ),
+                    decision_request_id=request.decision_request_id,
+                    run_id=request.run_id,
+                    job_id=request.job_id,
+                    correlation_id=request.correlation_id,
+                    setup_revision=int(setup_row["revision"]),
+                    setup_content_sha256=str(setup_row["content_sha256"]),
+                    provider_traces=tuple(traces),
+                    restart_receipt=restart,
+                    minibook_rebuild_receipt=rebuild,
+                    gateway_execution_ref=ArtifactRef(
+                        uri=f"artifact://gateway-execution/{execution_sha256}",
+                        sha256=execution_sha256,
+                        media_type="application/json",
+                    ),
+                    policy_version=request.policy_version,
+                    status="accepted",
+                    occurred_at=request.occurred_at,
+                )
+                canonical = decision.model_dump(mode="json", by_alias=True)
+                decision_sha256 = self._canonical_model_sha256(decision)
+                job_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_job",
+                    field="job_id",
+                    value=str(request.job_id),
+                    for_update=True,
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job is unavailable")
+                index = self._next_index(cursor)
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="portal_live_run_accepted",
+                    data=canonical,
+                    status="accepted",
+                    parent_index=job_block["index"],
+                    metadata={"schema": "captain.portal-live-run-decision.v1"},
+                )
+                self._insert(cursor, block)
+                cursor.execute(
+                    """INSERT INTO portal_live_run_decisions
+                       (decision_id, decision_request_id, run_id, job_id,
+                        correlation_id, decision_sha256, block_index, payload)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        str(decision.decision_id),
+                        str(decision.decision_request_id),
+                        decision.run_id,
+                        str(decision.job_id),
+                        str(decision.correlation_id),
+                        decision_sha256,
+                        index,
+                        json.dumps(canonical, sort_keys=True),
+                    ),
+                )
+        return decision
+
+    def portal_live_evidence(
+        self,
+        query: PortalLiveEvidenceQueryV1,
+    ) -> PortalLiveEvidenceV1:
+        """Return a deterministic aggregate without appending ledger state."""
+
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT decision_sha256, payload FROM portal_live_run_decisions
+                       WHERE run_id = %s AND job_id = %s AND correlation_id = %s""",
+                    (query.run_id, str(query.job_id), str(query.correlation_id)),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="portal live evidence is unavailable")
+        decision = PortalLiveRunDecisionV1.model_validate(
+            self._decode_json(row["payload"])
+        )
+
+        def reference(kind: str, value: object) -> ArtifactRef:
+            content = json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+            digest = hashlib.sha256(content).hexdigest()
+            return ArtifactRef(
+                uri=f"artifact://{kind}/{digest}",
+                sha256=digest,
+                media_type="application/json",
+            )
+
+        rebuild = decision.minibook_rebuild_receipt
+        return PortalLiveEvidenceV1(
+            **query.model_dump(),
+            provider_traces=decision.provider_traces,
+            gitea_release_sha256=tuple(
+                sorted({trace.template_release.sha256 for trace in decision.provider_traces})
+            ),
+            gateway_decision_ref=ArtifactRef(
+                uri=f"artifact://gateway-decision/{row['decision_sha256']}",
+                sha256=str(row["decision_sha256"]),
+                media_type="application/json",
+            ),
+            gateway_execution_ref=decision.gateway_execution_ref,
+            restart_ref=reference(
+                "portal-restart", decision.restart_receipt.model_dump(mode="json")
+            ),
+            minibook_projection_ref=reference(
+                "minibook-projection", str(rebuild.acknowledgement_id)
+            ),
+            minibook_rebuild_ref=reference(
+                "minibook-rebuild", rebuild.model_dump(mode="json")
+            ),
+            status="accepted",
+        )
 
     def run_portal_provider_probe(
         self,

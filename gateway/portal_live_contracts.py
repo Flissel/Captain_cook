@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from agenten.agent_runtime.contracts import ArtifactRef, IDENTIFIER_PATTERN
 from agenten.agent_factory.gitea_template_contracts import GiteaTemplateReleaseV1
+from agenten.delivery.minibook_events import MinibookProjectionRebuildReceiptV1
 
 
 class _FrozenContract(BaseModel):
@@ -141,3 +142,117 @@ class PortalRestartReceiptV1(_FrozenContract):
         if self.previous_gateway_boot_id == self.new_gateway_boot_id:
             raise ValueError("restart boot identity must change")
         return self
+
+
+class PortalLiveRunFinalizationV1(_FrozenContract):
+    decision_request_id: UUID
+    run_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    job_id: UUID
+    correlation_id: UUID
+    provider_trace_ids: tuple[UUID, ...]
+    restart_id: UUID
+    minibook_rebuild_id: UUID
+    policy_version: str = Field(pattern=IDENTIFIER_PATTERN)
+    occurred_at: datetime
+
+    @field_validator("occurred_at")
+    @classmethod
+    def require_decision_at_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("live decision timestamp must be UTC")
+        return value.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def require_three_unique_traces(self) -> "PortalLiveRunFinalizationV1":
+        if len(self.provider_trace_ids) != 3:
+            raise ValueError("live finalization requires exactly three provider traces")
+        if len(set(self.provider_trace_ids)) != 3:
+            raise ValueError("live finalization provider traces must be unique")
+        return self
+
+
+class PortalLiveRunDecisionV1(_FrozenContract):
+    decision_id: UUID
+    decision_request_id: UUID
+    run_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    job_id: UUID
+    correlation_id: UUID
+    setup_revision: int = Field(ge=1, strict=True)
+    setup_content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    provider_traces: tuple[PortalProviderProbeCompletionV1, ...]
+    restart_receipt: PortalRestartReceiptV1
+    minibook_rebuild_receipt: MinibookProjectionRebuildReceiptV1
+    gateway_execution_ref: ArtifactRef
+    policy_version: str = Field(pattern=IDENTIFIER_PATTERN)
+    status: Literal["accepted"]
+    occurred_at: datetime
+
+    @field_validator("occurred_at")
+    @classmethod
+    def require_accepted_at_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("live decision timestamp must be UTC")
+        return value.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def require_complete_evidence_fences(self) -> "PortalLiveRunDecisionV1":
+        if len(self.provider_traces) != 3 or len(
+            {trace.trace_id for trace in self.provider_traces}
+        ) != 3:
+            raise ValueError("accepted live decision requires three unique provider traces")
+        kinds = {trace.integration_kind for trace in self.provider_traces}
+        if kinds != {"bearer", "oauth2"}:
+            raise ValueError("accepted live decision requires Bearer and OAuth evidence")
+        bound = (
+            self.run_id,
+            self.job_id,
+            self.correlation_id,
+            self.setup_revision,
+            self.setup_content_sha256,
+        )
+        if any(
+            (
+                trace.run_id,
+                trace.job_id,
+                trace.correlation_id,
+                trace.setup_revision,
+                trace.setup_content_sha256,
+            )
+            != bound
+            for trace in self.provider_traces
+        ):
+            raise ValueError("provider trace does not match accepted live run")
+        restart = self.restart_receipt
+        rebuild = self.minibook_rebuild_receipt
+        if (
+            (restart.run_id, restart.job_id, restart.correlation_id,
+             restart.setup_revision, restart.setup_content_sha256) != bound
+            or (rebuild.run_id, rebuild.job_id, rebuild.correlation_id,
+                rebuild.setup_revision, rebuild.setup_content_sha256) != bound
+        ):
+            raise ValueError("restart or Minibook evidence does not match accepted live run")
+        evidence_times = (
+            *(trace.occurred_at for trace in self.provider_traces),
+            restart.occurred_at,
+            rebuild.occurred_at,
+        )
+        if any(value >= self.occurred_at for value in evidence_times):
+            raise ValueError("accepted live decision must follow all evidence")
+        return self
+
+
+class PortalLiveEvidenceQueryV1(_FrozenContract):
+    run_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    job_id: UUID
+    correlation_id: UUID
+
+
+class PortalLiveEvidenceV1(PortalLiveEvidenceQueryV1):
+    provider_traces: tuple[PortalProviderProbeCompletionV1, ...]
+    gitea_release_sha256: tuple[str, ...]
+    gateway_decision_ref: ArtifactRef
+    gateway_execution_ref: ArtifactRef
+    restart_ref: ArtifactRef
+    minibook_projection_ref: ArtifactRef
+    minibook_rebuild_ref: ArtifactRef
+    status: Literal["accepted"]
