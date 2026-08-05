@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory, Position=0)]
-    [ValidateSet("start", "benchmark-start", "benchmark-restart", "health", "stop")]
+    [ValidateSet("start", "portal-start", "benchmark-start", "benchmark-restart", "health", "stop")]
     [string]$Action,
     [switch]$RecoverDemoCredentials,
     [string]$CredentialSourceEnv
@@ -21,7 +21,7 @@ $benchmarkGatewayPid = Join-Path $stateDir 'gateway-business-benchmark.pid'
 $benchmarkRuntimeEnv = Join-Path $stateDir 'private/business-benchmarks/business-benchmark-runtime.env'
 $runtimePid = Join-Path $stateDir 'runtime-demo.pid'
 $evidence = Join-Path $stateDir 'evidence/live-demo-services.json'
-$project = 'captain-cook-live-demo'
+$project = 'captain-cook-test'
 $benchmarkProject = 'captain-cook-business-benchmark'
 . (Join-Path $PSScriptRoot 'managed-process-identity.ps1')
 
@@ -59,7 +59,16 @@ function Set-Missing($Values, [string]$Name, [scriptblock]$Factory) {
     if (-not $Values.Contains($Name) -or [string]::IsNullOrWhiteSpace([string]$Values[$Name])) { $Values[$Name] = & $Factory }
 }
 function Initialize-LocalEnvironment {
-    $allowed = @('MARIADB_PASSWORD','MARIADB_ROOT_PASSWORD','MARIADB_TEST_PASSWORD','MARIADB_TEST_ROOT_PASSWORD','CAPTAIN_GATEWAY_TOKEN','WORKER_GATEWAY_TOKEN','CAPTAIN_RUNTIME_TOKEN','MARIADB_TEST_PORT','MARIADB_BENCHMARK_PORT','GATEWAY_PORT','CAPTAIN_BENCHMARK_GATEWAY_PORT','CAPTAIN_RUNTIME_PORT','TEST_MARIADB_DSN','LEDGER_DSN','CAPTAIN_GATEWAY_URL','CAPTAIN_RUNTIME_URL','N8N_API_KEY','N8N_MCP_TOKEN','CAPTAIN_N8N_PORT','CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','CAPTAIN_N8N_MCP_BROKER_URL','CAPTAIN_N8N_URL')
+    $allowed = @(
+        'MARIADB_PASSWORD','MARIADB_ROOT_PASSWORD','MARIADB_TEST_PASSWORD','MARIADB_TEST_ROOT_PASSWORD',
+        'CAPTAIN_GATEWAY_TOKEN','WORKER_GATEWAY_TOKEN','CAPTAIN_RUNTIME_TOKEN',
+        'MARIADB_TEST_PORT','MARIADB_BENCHMARK_PORT','GATEWAY_PORT','CAPTAIN_BENCHMARK_GATEWAY_PORT','CAPTAIN_RUNTIME_PORT',
+        'TEST_MARIADB_DSN','LEDGER_DSN','CAPTAIN_GATEWAY_URL','CAPTAIN_RUNTIME_URL',
+        'N8N_API_KEY','N8N_MCP_TOKEN','CAPTAIN_N8N_PORT','CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN','CAPTAIN_N8N_MCP_BROKER_URL','CAPTAIN_N8N_URL',
+        'PORTAL_SUPABASE_ISSUER','PORTAL_SUPABASE_AUDIENCE','PORTAL_SUPABASE_JWKS_URL','PORTAL_ORGANIZATION_CLAIM',
+        'PORTAL_PROVIDER_CONTROL_TOKEN','PORTAL_EVIDENCE_TOKEN','PORTAL_RESTART_CONTROL_TOKEN','SSL_CERT_FILE',
+        'CAPTAIN_PORTAL_N8N_ADAPTERS_ENABLED','CAPTAIN_PORTAL_GITEA_ORIGIN','CAPTAIN_PORTAL_VERIFICATION_RELEASES_JSON'
+    )
     $values = Read-Env $rootEnv $allowed
     Set-Missing $values 'MARIADB_PASSWORD' { New-Secret }
     Set-Missing $values 'MARIADB_ROOT_PASSWORD' { New-Secret }
@@ -128,7 +137,20 @@ function Recover-CaptainN8nEnvironment($Values, [string]$SourceEnv) {
     Write-Host '[ready] Captain n8n demo credentials recovered after REST/MCP verification (values redacted)'
 }
 function Get-GatewayConfigurationSha256($Values) {
-    $payload = "captain.gateway.v1`n$([string]$Values['CAPTAIN_GATEWAY_URL'])`n$([string]$Values['LEDGER_DSN'])"
+    $configurationNames = @(
+        'CAPTAIN_GATEWAY_URL','LEDGER_DSN','CAPTAIN_GATEWAY_TOKEN','WORKER_GATEWAY_TOKEN',
+        'PORTAL_SUPABASE_ISSUER','PORTAL_SUPABASE_AUDIENCE','PORTAL_SUPABASE_JWKS_URL','PORTAL_ORGANIZATION_CLAIM',
+        'PORTAL_PROVIDER_CONTROL_TOKEN','PORTAL_EVIDENCE_TOKEN','PORTAL_RESTART_CONTROL_TOKEN','SSL_CERT_FILE',
+        'CAPTAIN_PORTAL_N8N_ADAPTERS_ENABLED','CAPTAIN_N8N_API_KEY','CAPTAIN_N8N_MCP_TOKEN',
+        'CAPTAIN_PORTAL_GITEA_ORIGIN','CAPTAIN_PORTAL_VERIFICATION_RELEASES_JSON'
+    )
+    $lines = [Collections.Generic.List[string]]::new()
+    $lines.Add('captain.gateway.configuration.v2')
+    foreach ($name in $configurationNames) {
+        $value = if ($Values.Contains($name)) { [string]$Values[$name] } else { '' }
+        $lines.Add("$name=$value")
+    }
+    $payload = $lines -join "`n"
     $sha = [Security.Cryptography.SHA256]::Create()
     try {
         $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
@@ -231,12 +253,31 @@ function Start-Gateway($Values, [string]$PidPath=$gatewayPid) {
         Remove-Item -LiteralPath $PidPath -Force
         Write-Host '[ready] verified stale local Gateway process stopped after failed health check'
     } elseif (Test-Path -LiteralPath $PidPath -PathType Leaf) {
-        $managed = Get-ManagedProcessIdentity -Path $PidPath -ConfigurationSha256 $configurationSha256 -AllowExited
+        $managed = $null
+        try {
+            $managed = Get-ManagedProcessIdentity -Path $PidPath -ConfigurationSha256 $configurationSha256 -AllowExited
+        }
+        catch {
+            try { $legacyIdentity = Get-Content -LiteralPath $PidPath -Raw | ConvertFrom-Json }
+            catch { throw 'Legacy Gateway identity is invalid; refusing cleanup.' }
+            $propertyNames = @($legacyIdentity.PSObject.Properties.Name)
+            if ($propertyNames -contains 'schema' -or $propertyNames -contains 'configuration_sha256' -or $propertyNames -notcontains 'pid') {
+                throw
+            }
+            $legacyProcess = Get-Process -Id ([int]$legacyIdentity.pid) -ErrorAction SilentlyContinue
+            if ($legacyProcess) {
+                throw 'legacy Gateway identity still refers to a running process; refusing cleanup.'
+            }
+            Remove-Item -LiteralPath $PidPath -Force
+            Write-Host '[ready] verified exited legacy Gateway identity removed'
+        }
         if ($managed) {
             & taskkill.exe /PID $managed.Id /T /F *> $null
             if ($LASTEXITCODE -ne 0) { throw 'Verified listenerless Gateway process could not be stopped.' }
         }
-        Remove-Item -LiteralPath $PidPath -Force
+        if (Test-Path -LiteralPath $PidPath -PathType Leaf) {
+            Remove-Item -LiteralPath $PidPath -Force
+        }
     }
     New-Item -ItemType Directory -Force $stateDir | Out-Null
     $python = Join-Path $root '.venv\Scripts\python.exe'
@@ -244,17 +285,34 @@ function Start-Gateway($Values, [string]$PidPath=$gatewayPid) {
     if (-not (Test-Path $python -PathType Leaf)) { throw 'A concrete Python 3.11 executable is required for the managed Gateway.' }
     Set-ProcessEnvironment $Values
     $process = Start-Process $python -ArgumentList '-m','gateway.app' -WorkingDirectory $root -WindowStyle Hidden -PassThru
-    Write-ManagedProcessIdentity -Process $process -Path $PidPath -ConfigurationSha256 $configurationSha256
     foreach ($attempt in 1..60) {
         $healthy = $false
         try { $healthy = (Invoke-WebRequest "$($Values['CAPTAIN_GATEWAY_URL'])/healthz" -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200 } catch {}
         if ($healthy) {
             try {
+                $listeners = @(
+                    Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $gatewayPort -State Listen -ErrorAction SilentlyContinue
+                )
+                if ($listeners.Count -ne 1) { throw 'Gateway requires exactly one listener.' }
+                $listenerProcess = Get-Process -Id $listeners[0].OwningProcess -ErrorAction Stop
+                $listenerMetadata = Get-CimInstance Win32_Process -Filter "ProcessId=$($listenerProcess.Id)"
+                if (
+                    [int]$listenerMetadata.ParentProcessId -ne $process.Id -or
+                    [string]$listenerMetadata.CommandLine -notmatch '(?:^|\s)-m\s+gateway\.app(?:\s|$)'
+                ) {
+                    throw 'Gateway listener process is not an exact child of the managed launcher.'
+                }
+                Write-ManagedProcessIdentity -Process $listenerProcess -Path $PidPath -ConfigurationSha256 $configurationSha256
                 $verified = Get-ManagedListenerIdentity -Path $PidPath -Port $gatewayPort -ConfigurationSha256 $configurationSha256
-                if ($verified.Id -ne $process.Id) { throw 'New Gateway process does not own the healthy listener.' }
+                if ($verified.Id -ne $listenerProcess.Id) { throw 'New Gateway process does not own the healthy listener.' }
             }
             catch {
-                Stop-ManagedGateway -PidPath $PidPath
+                if (Get-Process -Id $process.Id -ErrorAction SilentlyContinue) {
+                    & taskkill.exe /PID $process.Id /T /F *> $null
+                }
+                if (Test-Path -LiteralPath $PidPath -PathType Leaf) {
+                    Remove-Item -LiteralPath $PidPath -Force
+                }
                 throw 'Healthy Gateway listener does not match the newly managed process and ledger identity.'
             }
             Write-Host '[ready] Gateway database=captain_test with verified process and ledger identity'
@@ -262,7 +320,12 @@ function Start-Gateway($Values, [string]$PidPath=$gatewayPid) {
         }
         Start-Sleep -Milliseconds 500
     }
-    Stop-ManagedGateway -PidPath $PidPath
+    if (Get-Process -Id $process.Id -ErrorAction SilentlyContinue) {
+        & taskkill.exe /PID $process.Id /T /F *> $null
+    }
+    if (Test-Path -LiteralPath $PidPath -PathType Leaf) {
+        Remove-Item -LiteralPath $PidPath -Force
+    }
     throw 'Gateway did not become healthy against captain_test.'
 }
 function Stop-ManagedGateway([string]$PidPath=$gatewayPid) {
@@ -353,6 +416,31 @@ function Invoke-StartServices([switch]$RecoverDemoCredentials, [string]$SourceEn
     & (Join-Path $PSScriptRoot 'minibook-demo.ps1') bootstrap -RecoverDemoCredentials:$RecoverDemoCredentials
     Invoke-Health
 }
+function Invoke-PortalStart([switch]$RecoverDemoCredentials, [string]$SourceEnv) {
+    $values = Initialize-LocalEnvironment
+    Set-ProcessEnvironment $values
+    Initialize-CaptainN8n $values -Recover:$RecoverDemoCredentials -SourceEnv $SourceEnv
+    docker compose --project-name $project --env-file $rootEnv --file $testCompose up -d --wait mariadb-test
+    if ($LASTEXITCODE -ne 0) { throw 'Isolated captain_test MariaDB failed to start.' }
+    Start-Gateway $values
+    Start-CaptainN8nBroker $values
+    if ((Invoke-WebRequest "$($values['CAPTAIN_GATEWAY_URL'])/healthz" -UseBasicParsing -TimeoutSec 3).StatusCode -ne 200) {
+        throw 'Portal Gateway health check failed.'
+    }
+    $summary = [ordered]@{
+        schema='captain.portal-services.v1'
+        checked_at=(Get-Date).ToUniversalTime().ToString('o')
+        status='ready'
+        secrets='redacted'
+        database='captain_test'
+        services=@('gateway','captain-n8n-rest','captain-n8n-mcp')
+        non_claims=@('agent-runtime','minibook')
+    }
+    $portalEvidence = Join-Path $stateDir 'evidence/portal-services.json'
+    New-Item -ItemType Directory -Force (Split-Path $portalEvidence -Parent) | Out-Null
+    $summary | ConvertTo-Json -Depth 4 | Set-Content $portalEvidence -Encoding utf8
+    Write-Host '[ready] Portal control services started; Runtime and Minibook not claimed'
+}
 function Invoke-BenchmarkStart([switch]$RecoverDemoCredentials, [string]$SourceEnv) {
     $values = Initialize-LocalEnvironment
     Initialize-CaptainN8n $values -Recover:$RecoverDemoCredentials -SourceEnv $SourceEnv
@@ -395,6 +483,9 @@ try {
     switch ($Action) {
         start {
             Invoke-StartServices -Recover:$RecoverDemoCredentials -SourceEnv $CredentialSourceEnv
+        }
+        portal-start {
+            Invoke-PortalStart -Recover:$RecoverDemoCredentials -SourceEnv $CredentialSourceEnv
         }
         benchmark-start {
             Invoke-BenchmarkStart -Recover:$RecoverDemoCredentials -SourceEnv $CredentialSourceEnv

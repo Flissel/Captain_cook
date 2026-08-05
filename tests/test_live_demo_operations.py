@@ -94,10 +94,7 @@ def test_minibook_demo_bootstrap_is_local_reusable_and_redacted() -> None:
 def test_live_demo_services_only_operates_captain_resources() -> None:
     source = SERVICES.read_text(encoding="utf-8")
     assert "$global:LASTEXITCODE = 0" in source
-    assert (
-        'ValidateSet("start", "benchmark-start", "benchmark-restart", "health", "stop")'
-        in source
-    )
+    assert 'ValidateSet("start", "portal-start", "benchmark-start"' in source
     assert "captain-n8n.ps1" in source
     assert "minibook-demo.ps1" in source
     assert "docker compose" in source
@@ -106,12 +103,17 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "mailpit" in source
     assert "evidence/live-demo-services.json" in source
     assert "docker-compose.test.yml" in source
-    assert "captain-cook-live-demo" in source
+    assert "$project = 'captain-cook-test'" in source
+    assert "captain-cook-live-demo" not in source
     assert "mariadb-test" in source
     assert "python" in source and "gateway.app" in source
     assert "gateway-demo.pid" in source
     assert "Gateway port is occupied without the exact managed process and ledger identity" in source
     assert "verified stale local Gateway process stopped" in source
+    assert "verified exited legacy Gateway identity removed" in source
+    assert "legacy Gateway identity still refers to a running process" in source
+    assert "Gateway listener process is not an exact child of the managed launcher" in source
+    assert "Write-ManagedProcessIdentity -Process $listenerProcess" in source
     assert "Get-ManagedProcessIdentity" in source
     assert ".env.captain-n8n" in source
     assert "CAPTAIN_N8N_API_KEY" in source
@@ -120,6 +122,26 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "captain_test" in source
     assert "CAPTAIN_GATEWAY_TOKEN" in source
     assert "WORKER_GATEWAY_TOKEN" in source
+    for portal_name in (
+        "PORTAL_SUPABASE_ISSUER",
+        "PORTAL_SUPABASE_AUDIENCE",
+        "PORTAL_SUPABASE_JWKS_URL",
+        "PORTAL_ORGANIZATION_CLAIM",
+        "PORTAL_PROVIDER_CONTROL_TOKEN",
+        "PORTAL_EVIDENCE_TOKEN",
+        "PORTAL_RESTART_CONTROL_TOKEN",
+        "SSL_CERT_FILE",
+    ):
+        assert portal_name in source
+    assert "captain.gateway.configuration.v2" in source
+    assert "function Invoke-PortalStart" in source
+    portal_start = source.split("function Invoke-PortalStart", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "Start-Gateway $values" in portal_start
+    assert "Start-CaptainN8nBroker $values" in portal_start
+    assert "Assert-RuntimeConfiguration" not in portal_start
+    assert "Start-Runtime" not in portal_start
     assert "RandomNumberGenerator" in source
     assert "[switch]$RecoverDemoCredentials" in source
     assert "[string]$CredentialSourceEnv" in source
