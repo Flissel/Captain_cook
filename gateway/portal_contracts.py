@@ -70,6 +70,35 @@ class PortalSetupActionRequestV1(_FrozenContract):
     action: Literal["rotation_requested", "revoked"]
 
 
+PortalTicketAction = Literal[
+    "discover",
+    "select",
+    "rotation_requested",
+    "revoked",
+]
+
+
+class PortalSetupTicketIssueV1(_FrozenContract):
+    """Secret-free request for one exact portal operation ticket."""
+
+    credential_alias: str = Field(pattern=IDENTIFIER_PATTERN)
+    action: PortalTicketAction
+
+
+class PortalSetupTicketUseV1(_FrozenContract):
+    """Opaque ticket proof submitted to its single-purpose route."""
+
+    ticket_id: UUID
+    ticket: str = Field(min_length=1, max_length=256)
+    credential_alias: str = Field(pattern=IDENTIFIER_PATTERN)
+
+
+class PortalSetupSelectionRequestV1(PortalSetupTicketUseV1):
+    """Explicit secret-free selection of one discovered n8n credential ID."""
+
+    credential_id: str = Field(pattern=r"^\S{1,256}$")
+
+
 def _require_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
         raise ValueError("portal ticket timestamps must be UTC")

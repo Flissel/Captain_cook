@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Callable, Protocol, TypeVar
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ValidationError
@@ -129,6 +129,23 @@ from gateway.integration_setup_contracts import (
     apply_integration_setup_mutation,
     validate_integration_setup_transition,
 )
+from agenten.agent_factory.input_contracts import RequestedIntegration
+from agenten.agent_factory.integration_setup import (
+    CredentialVerificationReceiptV1,
+    IntegrationConnectionV1,
+    IntegrationCredentialRequirementV1,
+    IntegrationSetupPlanner,
+    N8nCredentialMetadataV1,
+)
+from gateway.portal_contracts import (
+    PortalPrincipalV1,
+    PortalSetupActionRequestV1,
+    PortalSetupSelectionRequestV1,
+    PortalSetupTicketUseV1,
+    PortalSetupTicketV1,
+    PortalTicketAction,
+)
+from gateway.portal_store import PortalTicketStore
 
 
 CAPTAIN_BLOCK_TYPES = frozenset({"problem", "work_batch", "holdout"})
@@ -154,6 +171,15 @@ class LegacyImportWrite(Protocol):
     batch_id: str
     record_type: str
     data: dict[str, Any]
+
+
+class PortalCredentialMetadataSource(Protocol):
+    """Injected n8n boundary that returns sanitized credential metadata only."""
+
+    def list_credentials(
+        self,
+        requirement: IntegrationCredentialRequirementV1,
+    ) -> tuple[N8nCredentialMetadataV1, ...]: ...
 
 
 class _IdempotentReplay(Exception):
@@ -184,6 +210,12 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _after(candidate: datetime, previous: datetime) -> datetime:
+    candidate_utc = candidate.astimezone(timezone.utc)
+    previous_utc = previous.astimezone(timezone.utc)
+    return max(candidate_utc, previous_utc + timedelta(microseconds=1))
+
+
 class GatewayStore:
     """Own all gateway queries and append-only ledger writes."""
 
@@ -192,12 +224,15 @@ class GatewayStore:
         storage: MariaDBStorage,
         *,
         claim_ttl: timedelta = timedelta(minutes=90),
+        portal_credential_source: PortalCredentialMetadataSource | None = None,
     ):
         if claim_ttl <= timedelta(0):
             raise ValueError("claim_ttl must be positive")
         self.storage = storage
         self._claim_ttl = claim_ttl
+        self._portal_credential_source = portal_credential_source
         self._ensure_schema()
+        self._portal_tickets = PortalTicketStore(storage)
 
     def _ensure_schema(self) -> None:
         with self.storage.transaction() as connection:
@@ -651,6 +686,232 @@ class GatewayStore:
             ),
             content_sha256=str(row["content_sha256"]),
         )
+
+    def portal_integration_setup(
+        self,
+        job_id: UUID,
+        organization_id: str,
+    ) -> PersistedIntegrationSetupV1:
+        if not self._portal_tickets.organization_owns_setup(job_id, organization_id):
+            raise HTTPException(status_code=404, detail="integration setup not found")
+        return self.integration_setup(job_id)
+
+    def issue_portal_ticket(
+        self,
+        *,
+        job_id: UUID,
+        principal: PortalPrincipalV1,
+        credential_alias: str,
+        action: PortalTicketAction,
+        now: datetime,
+    ) -> PortalSetupTicketV1:
+        persisted = self.integration_setup(job_id)
+        matches = tuple(
+            connection
+            for connection in persisted.submission.plan.connections
+            if connection.requirement.credential_alias == credential_alias
+        )
+        if len(matches) != 1:
+            raise HTTPException(status_code=404, detail="integration setup not found")
+        try:
+            return self._portal_tickets.issue(
+                job_id=job_id,
+                principal=principal,
+                credential_alias=credential_alias,
+                action=action,
+                now=now,
+            )
+        except LookupError:
+            raise HTTPException(status_code=404, detail="integration setup not found") from None
+
+    def portal_discover(
+        self,
+        *,
+        job_id: UUID,
+        principal: PortalPrincipalV1,
+        request: PortalSetupTicketUseV1,
+        now: datetime,
+    ) -> PersistedIntegrationSetupV1:
+        self._consume_portal_ticket(
+            job_id=job_id,
+            principal=principal,
+            request=request,
+            action="discover",
+            now=now,
+        )
+        if self._portal_credential_source is None:
+            raise HTTPException(status_code=503, detail="credential discovery unavailable")
+        persisted, target_index = self._portal_target(
+            job_id, principal.organization_id, request.credential_alias
+        )
+        target = persisted.submission.plan.connections[target_index]
+        credentials = self._portal_credential_source.list_credentials(target.requirement)
+        replacement = self._resolve_portal_connection(
+            target.requirement,
+            credentials=credentials,
+            selected_credential_id=None,
+            verification_receipt=target.verification_receipt,
+            now=now,
+        )
+        return self._record_portal_observation(persisted, target_index, replacement, now)
+
+    def portal_select(
+        self,
+        *,
+        job_id: UUID,
+        principal: PortalPrincipalV1,
+        request: PortalSetupSelectionRequestV1,
+        now: datetime,
+    ) -> PersistedIntegrationSetupV1:
+        self._consume_portal_ticket(
+            job_id=job_id,
+            principal=principal,
+            request=request,
+            action="select",
+            now=now,
+        )
+        persisted, target_index = self._portal_target(
+            job_id, principal.organization_id, request.credential_alias
+        )
+        target = persisted.submission.plan.connections[target_index]
+        try:
+            replacement = self._resolve_portal_connection(
+                target.requirement,
+                credentials=target.candidate_credentials,
+                selected_credential_id=request.credential_id,
+                verification_receipt=None,
+                now=now,
+            )
+        except ValueError:
+            raise HTTPException(status_code=409, detail="credential selection is not allowed") from None
+        return self._record_portal_observation(persisted, target_index, replacement, now)
+
+    def portal_mutate(
+        self,
+        *,
+        job_id: UUID,
+        principal: PortalPrincipalV1,
+        request: PortalSetupActionRequestV1,
+        now: datetime,
+    ) -> PersistedIntegrationSetupV1:
+        self._consume_portal_ticket(
+            job_id=job_id,
+            principal=principal,
+            request=request,
+            action=request.action,
+            now=now,
+        )
+        persisted = self.portal_integration_setup(job_id, principal.organization_id)
+        occurred_at = _after(now, persisted.submission.occurred_at)
+        self.mutate_integration_setup(
+            job_id,
+            IntegrationSetupMutationV1(
+                event_id=uuid4(),
+                credential_alias=request.credential_alias,
+                expected_content_sha256=persisted.content_sha256,
+                occurred_at=occurred_at,
+                action=request.action,
+            ),
+        )
+        return self.portal_integration_setup(job_id, principal.organization_id)
+
+    def _consume_portal_ticket(
+        self,
+        *,
+        job_id: UUID,
+        principal: PortalPrincipalV1,
+        request: PortalSetupTicketUseV1 | PortalSetupActionRequestV1,
+        action: PortalTicketAction,
+        now: datetime,
+    ) -> None:
+        try:
+            self._portal_tickets.consume(
+                job_id=job_id,
+                principal=principal,
+                ticket_id=request.ticket_id,
+                raw_ticket=request.ticket,
+                credential_alias=request.credential_alias,
+                action=action,
+                now=now,
+            )
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="invalid portal setup ticket") from None
+
+    def _portal_target(
+        self,
+        job_id: UUID,
+        organization_id: str,
+        credential_alias: str,
+    ) -> tuple[PersistedIntegrationSetupV1, int]:
+        persisted = self.portal_integration_setup(job_id, organization_id)
+        matches = tuple(
+            index
+            for index, connection in enumerate(persisted.submission.plan.connections)
+            if connection.requirement.credential_alias == credential_alias
+        )
+        if len(matches) != 1:
+            raise HTTPException(status_code=404, detail="integration setup not found")
+        return persisted, matches[0]
+
+    @staticmethod
+    def _resolve_portal_connection(
+        requirement: IntegrationCredentialRequirementV1,
+        *,
+        credentials: tuple[N8nCredentialMetadataV1, ...],
+        selected_credential_id: str | None,
+        verification_receipt: CredentialVerificationReceiptV1 | None,
+        now: datetime,
+    ) -> IntegrationConnectionV1:
+        integration = RequestedIntegration(
+            integration_key=requirement.integration_key,
+            purpose="portal credential setup",
+            trigger="portal request",
+            operation="credential metadata selection",
+            required=requirement.required,
+            credential_aliases=(requirement.credential_alias,),
+            success_behavior="credential metadata is selected",
+            failure_behavior="integration remains not ready",
+        )
+        receipts = () if verification_receipt is None else (verification_receipt,)
+        plan = IntegrationSetupPlanner().plan(
+            integrations=(integration,),
+            requirements=(requirement,),
+            credentials=credentials,
+            selected_credential_ids=(
+                None
+                if selected_credential_id is None
+                else {requirement.credential_alias: selected_credential_id}
+            ),
+            verification_receipts=receipts,
+            now=now,
+        )
+        return plan.connections[0]
+
+    def _record_portal_observation(
+        self,
+        persisted: PersistedIntegrationSetupV1,
+        target_index: int,
+        replacement: IntegrationConnectionV1,
+        now: datetime,
+    ) -> PersistedIntegrationSetupV1:
+        current = persisted.submission
+        connections = tuple(
+            replacement if index == target_index else connection
+            for index, connection in enumerate(current.plan.connections)
+        )
+        submission = IntegrationSetupSubmissionV1(
+            event_id=uuid4(),
+            job_id=current.job_id,
+            correlation_id=current.correlation_id,
+            subject_version=current.subject_version,
+            revision=current.revision + 1,
+            previous_content_sha256=persisted.content_sha256,
+            occurred_at=_after(now, current.occurred_at),
+            change_kind="observed",
+            plan=current.plan.model_copy(update={"connections": connections}),
+        )
+        self.record_integration_setup(submission)
+        return self.integration_setup(current.job_id)
 
     def append_delivery_event(
         self,

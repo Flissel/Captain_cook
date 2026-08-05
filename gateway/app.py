@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from threading import Lock
-from typing import Any, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request, Response, status
@@ -64,7 +64,15 @@ from gateway.contracts import (
     PublishedHermesSkill,
 )
 from gateway.mirror import MirrorQueue
-from gateway.portal_auth import initialize_portal_auth
+from gateway.portal_auth import initialize_portal_auth, require_portal_principal
+from gateway.portal_contracts import (
+    PortalPrincipalV1,
+    PortalSetupActionRequestV1,
+    PortalSetupSelectionRequestV1,
+    PortalSetupTicketIssueV1,
+    PortalSetupTicketUseV1,
+    PortalSetupTicketV1,
+)
 from gateway.registry_feed import mirror_captain_projection
 from gateway.registry_feed import (
     MinibookProjectionFeedPage,
@@ -73,7 +81,7 @@ from gateway.registry_feed import (
     runtime_result_projection,
 )
 from gateway.settings import GatewaySettings
-from gateway.store import AppendResult, GatewayStore
+from gateway.store import AppendResult, GatewayStore, PortalCredentialMetadataSource
 from gateway.integration_setup_contracts import (
     IntegrationSetupMutationV1,
     IntegrationSetupSubmissionV1,
@@ -230,19 +238,24 @@ def create_app(
     storage: MariaDBStorage | None = None,
     mirror: Mirror | None = None,
     settings: GatewaySettings | None = None,
+    gateway_store: GatewayStore | None = None,
+    portal_credential_source: PortalCredentialMetadataSource | None = None,
+    portal_clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
     mirror = mirror or MirrorQueue(mirror_captain_projection)
     store_lock = Lock()
-    store: GatewayStore | None = (
+    store: GatewayStore | None = gateway_store or (
         GatewayStore(
             storage,
             claim_ttl=timedelta(seconds=settings.claim_ttl_seconds),
+            portal_credential_source=portal_credential_source,
         )
         if storage and settings
         else GatewayStore(storage)
         if storage
         else None
     )
+    portal_clock = portal_clock or (lambda: datetime.now(timezone.utc))
     sink_calls: list[dict[str, Any]] = []
 
     @asynccontextmanager
@@ -276,6 +289,11 @@ def create_app(
         exc: RequestValidationError,
     ):
         path = request.url.path
+        if request.method == "POST" and path.startswith("/v1/portal/"):
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "invalid portal request"},
+            )
         if request.method == "POST" and path.startswith("/v1/factory/"):
             return JSONResponse(
                 status_code=422,
@@ -303,6 +321,7 @@ def create_app(
                     store = GatewayStore(
                         MariaDBStorage(dsn),
                         claim_ttl=timedelta(seconds=configured.claim_ttl_seconds),
+                        portal_credential_source=portal_credential_source,
                     )
         return store
 
@@ -391,6 +410,94 @@ def create_app(
         if receipt.replayed:
             response.status_code = status.HTTP_200_OK
         return receipt
+
+    def portal_surface(
+        job_id: UUID,
+        principal: PortalPrincipalV1,
+    ) -> IntegrationSetupSurfaceV1:
+        configured = load_gateway_settings(app)
+        return build_integration_setup_surface(
+            get_store().portal_integration_setup(job_id, principal.organization_id),
+            n8n_ui_base_url=configured.captain_n8n_ui_url,
+        )
+
+    @app.post(
+        "/v1/portal/integration-setups/{job_id}/tickets",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def issue_portal_setup_ticket(
+        job_id: UUID,
+        request: PortalSetupTicketIssueV1,
+        principal: PortalPrincipalV1 = Depends(require_portal_principal),
+    ) -> PortalSetupTicketV1:
+        return get_store().issue_portal_ticket(
+            job_id=job_id,
+            principal=principal,
+            credential_alias=request.credential_alias,
+            action=request.action,
+            now=portal_clock(),
+        )
+
+    @app.get("/v1/portal/integration-setups/{job_id}")
+    async def get_portal_integration_setup(
+        job_id: UUID,
+        principal: PortalPrincipalV1 = Depends(require_portal_principal),
+    ) -> IntegrationSetupSurfaceV1:
+        return portal_surface(job_id, principal)
+
+    @app.post("/v1/portal/integration-setups/{job_id}/discover")
+    async def discover_portal_credentials(
+        job_id: UUID,
+        request: PortalSetupTicketUseV1,
+        principal: PortalPrincipalV1 = Depends(require_portal_principal),
+    ) -> IntegrationSetupSurfaceV1:
+        persisted = get_store().portal_discover(
+            job_id=job_id,
+            principal=principal,
+            request=request,
+            now=portal_clock(),
+        )
+        configured = load_gateway_settings(app)
+        return build_integration_setup_surface(
+            persisted,
+            n8n_ui_base_url=configured.captain_n8n_ui_url,
+        )
+
+    @app.post("/v1/portal/integration-setups/{job_id}/select")
+    async def select_portal_credential(
+        job_id: UUID,
+        request: PortalSetupSelectionRequestV1,
+        principal: PortalPrincipalV1 = Depends(require_portal_principal),
+    ) -> IntegrationSetupSurfaceV1:
+        persisted = get_store().portal_select(
+            job_id=job_id,
+            principal=principal,
+            request=request,
+            now=portal_clock(),
+        )
+        configured = load_gateway_settings(app)
+        return build_integration_setup_surface(
+            persisted,
+            n8n_ui_base_url=configured.captain_n8n_ui_url,
+        )
+
+    @app.post("/v1/portal/integration-setups/{job_id}/actions")
+    async def mutate_portal_integration_setup(
+        job_id: UUID,
+        request: PortalSetupActionRequestV1,
+        principal: PortalPrincipalV1 = Depends(require_portal_principal),
+    ) -> IntegrationSetupSurfaceV1:
+        persisted = get_store().portal_mutate(
+            job_id=job_id,
+            principal=principal,
+            request=request,
+            now=portal_clock(),
+        )
+        configured = load_gateway_settings(app)
+        return build_integration_setup_surface(
+            persisted,
+            n8n_ui_base_url=configured.captain_n8n_ui_url,
+        )
 
     @app.post("/v1/factory/budget/reservations", status_code=status.HTTP_201_CREATED)
     async def reserve_factory_budget(

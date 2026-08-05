@@ -8,10 +8,42 @@ from pydantic import ValidationError
 
 from gateway.portal_contracts import (
     PortalPrincipalV1,
+    PortalSetupSelectionRequestV1,
+    PortalSetupTicketIssueV1,
+    PortalSetupTicketUseV1,
     PortalSetupActionRequestV1,
     PortalSetupTicketRequestV1,
     PortalSetupTicketV1,
 )
+
+
+def test_portal_operation_requests_reject_secret_shaped_fields() -> None:
+    issue = PortalSetupTicketIssueV1(
+        credential_alias="CRM_PRIMARY",
+        action="discover",
+    )
+    use = PortalSetupTicketUseV1(
+        ticket_id=UUID("10000000-0000-0000-0000-000000000010"),
+        ticket="opaque-ticket",
+        credential_alias="CRM_PRIMARY",
+    )
+    selection = PortalSetupSelectionRequestV1(
+        ticket_id=use.ticket_id,
+        ticket=use.ticket,
+        credential_alias=use.credential_alias,
+        credential_id="credential-1",
+    )
+
+    assert issue.action == "discover"
+    assert selection.credential_id == "credential-1"
+    with pytest.raises(ValidationError):
+        PortalSetupTicketIssueV1.model_validate(
+            {
+                "credential_alias": "CRM_PRIMARY",
+                "action": "discover",
+                "api_key": "must-not-enter",
+            }
+        )
 
 
 NOW = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
