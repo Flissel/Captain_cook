@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 DEPLOY_SCRIPT = ROOT / "scripts" / "deploy-portal-mini-pc.ps1"
 PREFLIGHT_SCRIPT = ROOT / "scripts" / "portal-preflight.ps1"
+PROVISION_SCRIPT = ROOT / "scripts" / "provision-portal-link-secrets.ps1"
 
 
 def _source(path: Path) -> str:
@@ -24,6 +25,44 @@ def test_portal_deploy_refuses_missing_env_and_requires_apply() -> None:
     assert "[switch]$Apply" in source
     assert "No changes applied" in source
     assert "[switch]$Rollback" in source
+
+
+def test_portal_link_secret_provision_is_dry_run_and_rotation_gated() -> None:
+    source = _source(PROVISION_SCRIPT)
+
+    assert "[switch]$Apply" in source
+    assert "[switch]$Rotate" in source
+    assert "portal-link secrets already exist" in source
+    assert "captain.portal-link-secret-provision.v1" in source
+    assert "No secrets created" in source
+    assert "PrivateKey" in source
+    assert "mini-pc-client.key" in source
+    assert "captain-server.key" in source
+    assert "ConvertTo-Json" in source
+
+    result = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(PROVISION_SCRIPT),
+            "-MiniPcEndpoint",
+            "192.168.178.65",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    first_line = result.stdout.splitlines()[0]
+    report = json.loads(first_line)
+    assert report["apply"] is False
+    assert report["mini_pc_endpoint"] == "192.168.178.65"
+    assert report["secret_file_count"] == 8
+    assert "PRIVATE" not in result.stdout.upper()
 
 
 def test_portal_deploy_validates_both_configs_before_bounded_up() -> None:

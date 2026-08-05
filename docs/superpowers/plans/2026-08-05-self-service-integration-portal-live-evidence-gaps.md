@@ -160,3 +160,27 @@ they are not a separate follow-up project:
   for the same run, job, and correlation.
 - [ ] Run the isolated Bearer and OAuth paths, controlled restart/resume,
   rotation/revoke, and three distinct provider traces before any live claim.
+
+## 2026-08-05 transport evidence checkpoint
+
+The Captain host and the existing `offload-vm` Mini-PC now run separate,
+digest-pinned `captain-portal-link` Compose projects. Local keys and the two
+independent certificate-authority chains were generated into the ignored
+`deploy/portal-link/.secrets/` tree with restricted file ACLs; no key entered
+Git, command output, an artifact, or Gateway state.
+
+Verified live, without provider or lifecycle claims:
+
+- both WireGuard containers were healthy and each reported one current peer
+  handshake;
+- ICMP crossed `10.77.0.1/30` and `10.77.0.2/30` in both directions;
+- both nginx mTLS proxies remained running with drop-all/minimal capabilities;
+- an HTTP request to the Mini-PC loopback proxy crossed mTLS and WireGuard and
+  returned the expected `404` from a temporary Captain HTTP upstream;
+- the three Gateway control tokens are complete, pairwise distinct and stored
+  only in the ignored `.env`.
+
+The Mini-PC's existing Supabase and Gitea containers were observed healthy and
+reachable on LAN HTTP ports. That is deliberately not claimed as production
+portal evidence: their HTTPS origins, Supabase JWT/JWKS configuration, portal
+deployment and real Gateway request still remain to be proven.
