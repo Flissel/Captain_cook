@@ -3,3 +3,4 @@
 *.sh text eol=lf
 deploy/portal-provider/templates/**/*.json text eol=lf
 examples/business_benchmark_candidates/**/*.json text eol=lf
+examples/business_benchmark_candidates/**/*.txt text eol=lf
