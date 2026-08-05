@@ -36,6 +36,10 @@ class GatewaySettings(BaseModel):
     port: int = Field(default=8090, ge=1, le=65535)
     claim_ttl_seconds: int = Field(default=5_400, ge=1, le=86_400)
     captain_n8n_ui_url: str = "http://localhost:5679"
+    portal_supabase_issuer: str | None = None
+    portal_supabase_audience: str | None = None
+    portal_supabase_jwks_url: str | None = None
+    portal_organization_claim: str = "organization_id"
 
     @field_validator(
         "ledger_dsn",
@@ -63,6 +67,24 @@ class GatewaySettings(BaseModel):
             raise ValueError("Captain n8n URL must be a safe HTTP URL")
         return value.rstrip("/")
 
+    @field_validator(
+        "portal_supabase_issuer",
+        "portal_supabase_audience",
+        "portal_supabase_jwks_url",
+    )
+    @classmethod
+    def _portal_setting_must_not_be_blank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("portal settings must not be blank")
+        return value
+
+    @field_validator("portal_organization_claim")
+    @classmethod
+    def _portal_organization_claim_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("portal organization claim must not be blank")
+        return value
+
     @model_validator(mode="after")
     def _role_tokens_must_be_distinct(self) -> "GatewaySettings":
         if secrets.compare_digest(
@@ -70,7 +92,27 @@ class GatewaySettings(BaseModel):
             self.worker_gateway_token.get_secret_value(),
         ):
             raise ValueError("gateway role tokens must be distinct")
+        portal_settings = (
+            self.portal_supabase_issuer,
+            self.portal_supabase_audience,
+            self.portal_supabase_jwks_url,
+        )
+        if any(value is not None for value in portal_settings) and not all(
+            value is not None for value in portal_settings
+        ):
+            raise ValueError("portal identity settings must be configured together")
         return self
+
+    @property
+    def portal_identity_configured(self) -> bool:
+        return all(
+            value is not None
+            for value in (
+                self.portal_supabase_issuer,
+                self.portal_supabase_audience,
+                self.portal_supabase_jwks_url,
+            )
+        )
 
     @classmethod
     def from_env(
@@ -126,6 +168,13 @@ class GatewaySettings(BaseModel):
                 captain_n8n_ui_url=source.get(
                     "CAPTAIN_N8N_URL",
                     "http://localhost:5679",
+                ),
+                portal_supabase_issuer=source.get("PORTAL_SUPABASE_ISSUER"),
+                portal_supabase_audience=source.get("PORTAL_SUPABASE_AUDIENCE"),
+                portal_supabase_jwks_url=source.get("PORTAL_SUPABASE_JWKS_URL"),
+                portal_organization_claim=source.get(
+                    "PORTAL_ORGANIZATION_CLAIM",
+                    "organization_id",
                 ),
             )
         except ValidationError:

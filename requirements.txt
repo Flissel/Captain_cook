@@ -14,6 +14,7 @@ autogen-ext[openai]==0.7.5
 # Existing agenten/ and blockchain/ dependencies (previously unpinned).
 pydantic==2.13.4
 fastapi==0.139.0
+PyJWT[crypto]==2.13.0
 httpx==0.28.1
 PyYAML==6.0.3
 python-dotenv==1.0.1
