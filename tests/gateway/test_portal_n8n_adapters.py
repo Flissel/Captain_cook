@@ -15,7 +15,11 @@ from agenten.agent_factory.gitea_templates import VerifiedTemplatePayload
 from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_runtime.contracts import IntegrationIntent
 from agenten.agent_runtime.contracts import ArtifactRef
-from agenten.targets.n8n import N8nDeployment, N8nExecutionEvidence
+from agenten.targets.n8n import (
+    N8nDeployment,
+    N8nExecutionEvidence,
+    N8nProviderEvidence,
+)
 from gateway.portal_n8n_adapters import (
     PortalN8nCredentialMetadataSource,
     PortalN8nCredentialVerificationSource,
@@ -157,6 +161,12 @@ class RecordingTarget:
             artifact_digest=deployment.artifact_digest,
             correlation_id=case.correlation_id,
             status="success",
+            provider=N8nProviderEvidence(
+                trace_id="40000000-0000-4000-8000-000000000001",
+                proof_sha256="f" * 64,
+                kind="bearer",
+                probe_id=case.case_id,
+            ),
         )
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal, Mapping
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -100,6 +101,10 @@ class CredentialVerificationReceiptV1(_FrozenContract):
     workflow_ref: ArtifactRef
     workflow_content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     execution_ref: ArtifactRef
+    provider_trace_id: UUID | None = None
+    provider_proof_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    provider_kind: Literal["bearer", "oauth2"] | None = None
+    provider_probe_id: str | None = Field(default=None, min_length=1, max_length=128)
     oauth_consent_ref: ArtifactRef | None = None
     oauth_callback_ref: ArtifactRef | None = None
     valid_until: datetime | None = None
@@ -140,6 +145,16 @@ class CredentialVerificationReceiptV1(_FrozenContract):
                 raise ValueError("verification receipt Gitea release digest mismatch")
         if (self.oauth_consent_ref is None) != (self.oauth_callback_ref is None):
             raise ValueError("OAuth verification evidence is incomplete")
+        provider_evidence = (
+            self.provider_trace_id,
+            self.provider_proof_sha256,
+            self.provider_kind,
+            self.provider_probe_id,
+        )
+        if any(value is not None for value in provider_evidence) and not all(
+            value is not None for value in provider_evidence
+        ):
+            raise ValueError("provider verification evidence is incomplete")
         if self.valid_until is not None and self.valid_until <= self.occurred_at:
             raise ValueError("verification receipt validity must end after verification")
         return self

@@ -176,6 +176,8 @@ def test_finalization_is_atomic_and_evidence_query_is_read_only() -> None:
             template_release=_release(release_kind, template_sha),
             deployed_workflow_ref=_ref("n8n-workflow", f"{index + 2:x}" * 64),
             execution_ref=_ref("n8n-execution", f"{index + 5:x}" * 64),
+            provider_proof_sha256=f"{index + 8:x}" * 64,
+            provider_probe_id=f"portal-verification-r{setup.revision}",
             consent_ref=(None if kind == "bearer" else _ref("oauth-consent", "e" * 64)),
             callback_ref=(None if kind == "bearer" else _ref("oauth-callback", "f" * 64)),
             status="passed",

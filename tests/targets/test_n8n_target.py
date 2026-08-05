@@ -15,7 +15,14 @@ class ProviderState:
         self.execution_id = "execution-1"
         self.workflow_id = "workflow-1"
         self.execution_status = "success"
-        self.execution_output = {"artifact_digest": "a" * 64, "correlation_id": "correlation-1"}
+        self.execution_output = {
+            "artifact_digest": "a" * 64,
+            "correlation_id": "correlation-1",
+            "provider_trace_id": "10000000-0000-4000-8000-000000000001",
+            "provider_proof_sha256": "b" * 64,
+            "provider_kind": "bearer",
+            "provider_probe_id": "case-1",
+        }
         self.execution_reads = 0
         self.missing_execution_evidence_reads = 0
         self.requests: list[tuple[str, str, dict[str, Any] | None]] = []
@@ -123,6 +130,11 @@ async def test_target_deploys_executes_and_fetches_matching_real_http_evidence(n
     assert evidence.workflow_id==deployment.workflow_id
     assert evidence.artifact_digest==artifact().artifact_digest
     assert evidence.correlation_id=="correlation-1"
+    assert evidence.provider is not None
+    assert str(evidence.provider.trace_id)=="10000000-0000-4000-8000-000000000001"
+    assert evidence.provider.proof_sha256=="b"*64
+    assert evidence.provider.kind=="bearer"
+    assert evidence.provider.probe_id=="case-1"
     create=next(item for item in state.requests if item[:2]==("POST","/api/v1/workflows"))
     assert create[2]=={"name":deployment.workflow_name,"nodes":artifact().workflow["nodes"],"connections":{},"settings":{}}
     webhook=next(item for item in state.requests if item[0]=="POST" and item[1].startswith("/webhook/"))
@@ -220,3 +232,44 @@ async def test_target_rejects_provider_success_without_matching_execution_eviden
         deployment=await target.deploy(artifact())
         with pytest.raises(N8nEvidenceError,match="matching execution evidence"):
             await target.execute(deployment,ValidationCase(case_id="case-1",correlation_id="correlation-1",input_payload={}))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    (
+        ("provider_trace_id", None),
+        ("provider_proof_sha256", "short"),
+        ("provider_kind", "unknown"),
+        ("provider_probe_id", "another-case"),
+    ),
+)
+async def test_target_rejects_incomplete_or_unbound_provider_evidence(
+    n8n_server,
+    field,
+    bad_value,
+):
+    base_url, state = n8n_server
+    if bad_value is None:
+        state.execution_output.pop(field)
+    else:
+        state.execution_output[field] = bad_value
+    async with httpx.AsyncClient() as http:
+        target = N8nTarget(
+            N8nHttpClient(
+                api_base_url=base_url,
+                webhook_base_url=base_url,
+                api_key="local-test-key",
+                http=http,
+            )
+        )
+        deployment = await target.deploy(artifact())
+        with pytest.raises(N8nEvidenceError, match="provider evidence"):
+            await target.execute(
+                deployment,
+                ValidationCase(
+                    case_id="case-1",
+                    correlation_id="correlation-1",
+                    input_payload={},
+                ),
+            )

@@ -230,10 +230,11 @@ class PortalN8nCredentialVerificationSource:
             credential=credential,
         )
         deployment = await self._target.deploy(bound.artifact)
+        probe_id = f"portal-verification-r{expected_revision}"
         execution = await self._target.execute(
             deployment,
             ValidationCase(
-                case_id=f"portal-verification-r{expected_revision}",
+                case_id=probe_id,
                 correlation_id=str(correlation_id),
                 input_payload={
                     "setup_content_sha256": expected_content_sha256,
@@ -250,5 +251,6 @@ class PortalN8nCredentialVerificationSource:
             deployment=deployment,
             execution=execution,
             expected_correlation_id=str(correlation_id),
+            expected_probe_id=probe_id,
             occurred_at=now,
         )

@@ -30,6 +30,7 @@ def seal_provider_verification(
     deployment: N8nDeployment,
     execution: N8nExecutionEvidence,
     expected_correlation_id: str,
+    expected_probe_id: str,
     occurred_at: datetime,
     valid_until: datetime | None = None,
 ) -> CredentialVerificationReceiptV1:
@@ -61,6 +62,18 @@ def seal_provider_verification(
         or execution.status != "success"
     ):
         raise ValueError("execution evidence does not match verified deployment")
+    expected_provider_kind = {
+        "httpBearerAuth": "bearer",
+        "oAuth2Api": "oauth2",
+    }.get(requirement.credential_type)
+    if expected_provider_kind is None:
+        raise ValueError("credential type has no provider verification contract")
+    if (
+        execution.provider is None
+        or execution.provider.kind != expected_provider_kind
+        or execution.provider.probe_id != expected_probe_id
+    ):
+        raise ValueError("provider evidence does not match verification request")
 
     execution_payload = execution.model_dump(mode="json")
     execution_digest = hashlib.sha256(
@@ -94,5 +107,9 @@ def seal_provider_verification(
             sha256=execution_digest,
             media_type="application/json",
         ),
+        provider_trace_id=execution.provider.trace_id,
+        provider_proof_sha256=execution.provider.proof_sha256,
+        provider_kind=execution.provider.kind,
+        provider_probe_id=execution.provider.probe_id,
         valid_until=valid_until,
     )

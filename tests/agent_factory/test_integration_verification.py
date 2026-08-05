@@ -13,12 +13,14 @@ from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.targets.n8n import (
     N8nDeployment,
     N8nExecutionEvidence,
+    N8nProviderEvidence,
     SealedArtifact,
 )
 
 
 NOW = datetime(2026, 8, 5, 8, tzinfo=timezone.utc)
 CORRELATION_ID = "20000000-0000-4000-8000-000000000001"
+PROBE_ID = "portal-verification-r1"
 
 
 def requirement() -> IntegrationCredentialRequirementV1:
@@ -69,6 +71,12 @@ def evidence() -> N8nExecutionEvidence:
         artifact_digest="a" * 64,
         correlation_id=CORRELATION_ID,
         status="success",
+        provider=N8nProviderEvidence(
+            trace_id="30000000-0000-4000-8000-000000000001",
+            proof_sha256="c" * 64,
+            kind="bearer",
+            probe_id=PROBE_ID,
+        ),
     )
 
 
@@ -80,6 +88,7 @@ def test_matching_provider_execution_seals_secret_free_gateway_receipt() -> None
         deployment=deployment(),
         execution=evidence(),
         expected_correlation_id=CORRELATION_ID,
+        expected_probe_id=PROBE_ID,
         occurred_at=NOW,
         valid_until=NOW + timedelta(hours=1),
     )
@@ -92,6 +101,10 @@ def test_matching_provider_execution_seals_secret_free_gateway_receipt() -> None
     assert receipt.workflow_ref.uri == "artifact://n8n-workflow/" + "a" * 64
     assert receipt.execution_ref.uri.startswith("artifact://n8n-execution/")
     assert receipt.status == "passed"
+    assert str(receipt.provider_trace_id) == "30000000-0000-4000-8000-000000000001"
+    assert receipt.provider_proof_sha256 == "c" * 64
+    assert receipt.provider_kind == "bearer"
+    assert receipt.provider_probe_id == PROBE_ID
     rendered = receipt.model_dump_json()
     for forbidden in ("token", "password", "authorization", "client_secret"):
         assert forbidden not in rendered.lower()
@@ -115,6 +128,7 @@ def test_bound_workflow_keeps_release_and_deployment_digests_distinct() -> None:
         deployment=bound_deployment,
         execution=bound_execution,
         expected_correlation_id=CORRELATION_ID,
+        expected_probe_id=PROBE_ID,
         occurred_at=NOW,
     )
 
@@ -143,6 +157,7 @@ def test_mismatched_provider_execution_cannot_be_sealed(
             deployment=deployment(),
             execution=evidence().model_copy(update=changed),
             expected_correlation_id=CORRELATION_ID,
+            expected_probe_id=PROBE_ID,
             occurred_at=NOW,
         )
 
@@ -156,6 +171,7 @@ def test_foreign_project_or_workflow_digest_cannot_be_sealed() -> None:
             deployment=deployment(),
             execution=evidence(),
             expected_correlation_id=CORRELATION_ID,
+            expected_probe_id=PROBE_ID,
             occurred_at=NOW,
         )
 
@@ -168,6 +184,7 @@ def test_foreign_project_or_workflow_digest_cannot_be_sealed() -> None:
             deployment=deployment().model_copy(update={"artifact_digest": "b" * 64}),
             execution=evidence().model_copy(update={"artifact_digest": "b" * 64}),
             expected_correlation_id=CORRELATION_ID,
+            expected_probe_id=PROBE_ID,
             occurred_at=NOW,
         )
 
@@ -179,5 +196,38 @@ def test_foreign_project_or_workflow_digest_cannot_be_sealed() -> None:
             deployment=deployment().model_copy(update={"artifact_digest": "b" * 64}),
             execution=evidence(),
             expected_correlation_id=CORRELATION_ID,
+            expected_probe_id=PROBE_ID,
+            occurred_at=NOW,
+        )
+
+
+@pytest.mark.parametrize(
+    "provider",
+    (
+        None,
+        N8nProviderEvidence(
+            trace_id="30000000-0000-4000-8000-000000000001",
+            proof_sha256="c" * 64,
+            kind="oauth2",
+            probe_id=PROBE_ID,
+        ),
+        N8nProviderEvidence(
+            trace_id="30000000-0000-4000-8000-000000000001",
+            proof_sha256="c" * 64,
+            kind="bearer",
+            probe_id="foreign-probe",
+        ),
+    ),
+)
+def test_provider_verification_requires_bound_provider_proof(provider) -> None:
+    with pytest.raises(ValueError, match="provider evidence"):
+        seal_provider_verification(
+            requirement=requirement(),
+            credential=credential(),
+            workflow_artifact=artifact(),
+            deployment=deployment(),
+            execution=evidence().model_copy(update={"provider": provider}),
+            expected_correlation_id=CORRELATION_ID,
+            expected_probe_id=PROBE_ID,
             occurred_at=NOW,
         )

@@ -77,6 +77,10 @@ class RecordingProviderSource:
             workflow_ref=_ref("n8n-workflow", "c" * 64),
             workflow_content_sha256="c" * 64,
             execution_ref=_ref("n8n-execution", "d" * 64),
+            provider_trace_id=UUID("40000000-0000-4000-8000-000000000099"),
+            provider_proof_sha256="e" * 64,
+            provider_kind="bearer",
+            provider_probe_id="portal-verification-r1",
         )
 
 
@@ -138,6 +142,8 @@ def test_probe_start_and_completion_are_append_only_idempotent_and_auditable() -
             template_release=_release("a" * 64),
             deployed_workflow_ref=_ref("n8n-workflow", "c" * 64),
             execution_ref=_ref("n8n-execution", "d" * 64),
+            provider_proof_sha256="e" * 64,
+            provider_probe_id="portal-verification-r1",
             status="passed",
             occurred_at=NOW + timedelta(seconds=1),
         )
@@ -197,6 +203,9 @@ def test_provider_probe_orchestration_never_repeats_a_completed_effect() -> None
         replay = store.run_portal_provider_probe(request, now=NOW + timedelta(seconds=2))
         assert first == replay
         assert provider.calls == 1
+        assert first.trace_id == UUID("40000000-0000-4000-8000-000000000099")
+        assert first.provider_proof_sha256 == "e" * 64
+        assert first.provider_probe_id == "portal-verification-r1"
     finally:
         storage.clear()
 

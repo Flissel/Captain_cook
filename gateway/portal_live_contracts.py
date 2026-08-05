@@ -49,6 +49,8 @@ class PortalProviderProbeCompletionV1(_FrozenContract):
     template_release: GiteaTemplateReleaseV1
     deployed_workflow_ref: ArtifactRef
     execution_ref: ArtifactRef
+    provider_proof_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    provider_probe_id: str = Field(min_length=1, max_length=128)
     consent_ref: ArtifactRef | None = None
     callback_ref: ArtifactRef | None = None
     status: Literal["passed"]

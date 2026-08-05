@@ -85,6 +85,8 @@ def test_oauth_completion_requires_consent_and_callback_evidence() -> None:
         "template_release": _release("b" * 64),
         "deployed_workflow_ref": _ref("n8n-workflow", "c" * 64),
         "execution_ref": _ref("n8n-execution", "d" * 64),
+        "provider_proof_sha256": "1" * 64,
+        "provider_probe_id": "portal-verification-r7",
         "status": "passed",
         "occurred_at": NOW,
     }

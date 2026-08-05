@@ -1696,6 +1696,13 @@ class GatewayStore:
                 now=probe_time,
             )
             receipt = CredentialVerificationReceiptV1.model_validate(returned)
+            if (
+                receipt.provider_trace_id is None
+                or receipt.provider_proof_sha256 is None
+                or receipt.provider_kind != request.integration_kind
+                or receipt.provider_probe_id is None
+            ):
+                raise ValueError("provider receipt is incomplete or mismatched")
             IntegrationConnectionV1.model_validate(
                 target.model_copy(update={"verification_receipt": receipt})
             )
@@ -1707,16 +1714,7 @@ class GatewayStore:
             raise HTTPException(status_code=502, detail="credential verification failed")
         completion = PortalProviderProbeCompletionV1(
             probe_request_id=request.probe_request_id,
-            trace_id=uuid5(
-                NAMESPACE_URL,
-                "|".join(
-                    (
-                        "captain-portal-provider-trace",
-                        str(request.probe_request_id),
-                        receipt.execution_ref.sha256,
-                    )
-                ),
-            ),
+            trace_id=receipt.provider_trace_id,
             run_id=request.run_id,
             job_id=request.job_id,
             correlation_id=request.correlation_id,
@@ -1729,6 +1727,8 @@ class GatewayStore:
             template_release=receipt.verification_release,
             deployed_workflow_ref=receipt.workflow_ref,
             execution_ref=receipt.execution_ref,
+            provider_proof_sha256=receipt.provider_proof_sha256,
+            provider_probe_id=receipt.provider_probe_id,
             consent_ref=receipt.oauth_consent_ref,
             callback_ref=receipt.oauth_callback_ref,
             status="passed",

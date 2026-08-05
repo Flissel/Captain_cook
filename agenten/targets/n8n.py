@@ -4,6 +4,7 @@ import asyncio
 import copy
 import re
 from typing import Any, Literal, Protocol
+from uuid import UUID
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -35,6 +36,14 @@ class N8nDeployment(BaseModel):
     webhook_path: str = Field(pattern=r"^[a-z0-9-]+$")
     artifact_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
 
+class N8nProviderEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    trace_id: UUID
+    proof_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    kind: Literal["bearer", "oauth2"]
+    probe_id: str = Field(min_length=1, max_length=128)
+
+
 class N8nExecutionEvidence(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     execution_id: str = Field(min_length=1)
@@ -42,6 +51,7 @@ class N8nExecutionEvidence(BaseModel):
     artifact_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     correlation_id: str = Field(min_length=1)
     status: Literal["success"]
+    provider: N8nProviderEvidence | None = None
 
 class N8nWorkflowRecord(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True)
@@ -228,12 +238,35 @@ class N8nTarget:
                 and record.output.get("artifact_digest") == deployment.artifact_digest
                 and record.output.get("correlation_id") == case.correlation_id
             ):
+                provider_keys = {
+                    "provider_trace_id",
+                    "provider_proof_sha256",
+                    "provider_kind",
+                    "provider_probe_id",
+                }
+                present_provider_keys = provider_keys.intersection(record.output)
+                provider: N8nProviderEvidence | None = None
+                if present_provider_keys:
+                    if present_provider_keys != provider_keys:
+                        raise N8nEvidenceError("n8n returned incomplete provider evidence")
+                    try:
+                        provider = N8nProviderEvidence(
+                            trace_id=record.output["provider_trace_id"],
+                            proof_sha256=record.output["provider_proof_sha256"],
+                            kind=record.output["provider_kind"],
+                            probe_id=record.output["provider_probe_id"],
+                        )
+                    except ValueError:
+                        raise N8nEvidenceError("n8n returned invalid provider evidence") from None
+                    if provider.probe_id != case.case_id:
+                        raise N8nEvidenceError("n8n returned unbound provider evidence")
                 return N8nExecutionEvidence(
                     execution_id=record.execution_id,
                     workflow_id=record.workflow_id,
                     artifact_digest=deployment.artifact_digest,
                     correlation_id=case.correlation_id,
                     status="success",
+                    provider=provider,
                 )
             if attempt + 1 < self._evidence_attempts:
                 await asyncio.sleep(self._evidence_delay_seconds)
