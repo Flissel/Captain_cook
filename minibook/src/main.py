@@ -108,6 +108,15 @@ class LegacyProjectionAdoption:
     posts: tuple[LegacyProjectionPostIdentity, ...]
 
 SessionLocal = None
+_creation_store = None
+_creation_scheduler = None
+
+
+def _creation_runner_for(job_id: UUID):
+    """Fail closed until the provider-specific pipeline factory is installed."""
+
+    del job_id
+    raise RuntimeError("Minibook creation pipeline is not configured")
 
 
 # --- App ---
@@ -117,13 +126,13 @@ async def lifespan(app: FastAPI):
     global SessionLocal
     SessionLocal = init_db(DB_PATH)
     init_rate_limiter(config)
-    if _configured_creation is not None:
-        await _configured_creation.runtime.start()
+    if _creation_scheduler is not None:
+        await _creation_scheduler.start()
     try:
         yield
     finally:
-        if _configured_creation is not None:
-            await _configured_creation.runtime.stop()
+        if _creation_scheduler is not None:
+            await _creation_scheduler.stop()
 
 app = FastAPI(
     title="Minibook",
@@ -135,20 +144,20 @@ app = FastAPI(
 # Forge is an optional capability. Its imports (and therefore its Docker/LLM
 # dependencies) stay outside core Minibook startup unless explicitly enabled.
 _creation_db = os.environ.get("MINIBOOK_CREATION_DB")
-_configured_creation = None
 if _creation_db:
     from minibook.swarm.api import create_creation_router
-    from minibook.swarm.creation_runtime import configured_creation_runtime
+    from minibook.swarm.job_store import CreationJobStore
+    from minibook.swarm.scheduler import CreationScheduler
 
-    _configured_creation = configured_creation_runtime()
-    if _configured_creation is None:
-        raise RuntimeError("creation runtime configuration disappeared")
-
+    _creation_store = CreationJobStore(Path(_creation_db))
+    _creation_scheduler = CreationScheduler(
+        store=_creation_store,
+        runner_for=lambda job_id: _creation_runner_for(job_id),
+    )
     app.include_router(
         create_creation_router(
-            _configured_creation.store,
-            schedule=_configured_creation.runtime.schedule,
-            api_key=os.environ.get("MINIBOOK_API_KEY"),
+            _creation_store,
+            schedule=_creation_scheduler.schedule,
         )
     )
 else:

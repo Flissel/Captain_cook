@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from collections.abc import Iterator
 
 from pydantic import (
+    AliasChoices,
     BaseModel,
     ConfigDict,
     Field,
@@ -29,16 +30,30 @@ from pydantic import (
 
 from agenten.agent_factory.contracts import (
     AgentFactoryJob,
+    AgentFactoryJobV3,
     FactoryBlockStatus,
     FactoryEvidenceBlock,
+    FactoryJob,
     FactoryPhase,
     FactoryRole,
 )
 from agenten.agent_factory.evidence_store import FactoryEvidenceStore
+from agenten.agent_factory.forge_contracts import (
+    CodexBuildReceiptV1,
+    CreationPackageManifestV1,
+    CreationPackageManifestV2,
+    CreationResultV1,
+    ForgeBuildSkillUsageReceiptV1,
+    codex_build_receipt_sha256,
+)
 from agenten.agent_factory.leases import validate_factory_lease
 from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference, TypedN8nTool
+from agenten.agent_factory.business_decision_tool import TOOL_NAME as BUSINESS_DECISION_TOOL
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError
-from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationRequest
+from agenten.agent_factory.skill_evaluation import (
+    HermesSkillEvaluationRequest,
+    ReleasedHermesSkill,
+)
 from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillInvocationV1,
     FactorySkillStep,
@@ -179,6 +194,11 @@ class FactoryAutoGenTeamManifestV1(_FrozenModel):
                 raise ValueError(f"unknown tool: {sorted(unknown_tools)[0]}")
         if self.conversation_pattern == "single_agent" and len(self.agents) != 1:
             raise ValueError("single_agent conversation requires exactly one agent")
+        if (
+            self.conversation_pattern != "swarm"
+            and any(agent.handoffs for agent in self.agents)
+        ):
+            raise ValueError("handoff topology requires swarm conversation pattern")
         if any(agent.handoffs for agent in self.agents) and self.max_handoffs == 0:
             raise ValueError("handoff topology requires a positive max_handoffs ceiling")
         return self
@@ -187,19 +207,29 @@ class FactoryAutoGenTeamManifestV1(_FrozenModel):
 class FactoryCandidateManifest(_FrozenModel):
     """The only executable input accepted by the factory evaluator."""
 
-    schema_name: Literal["captain.factory-candidate.v1"] = "captain.factory-candidate.v1"
+    schema_name: Literal["captain.factory-candidate.v1"] = Field(
+        default="captain.factory-candidate.v1",
+        validation_alias=AliasChoices("schema", "schema_name"),
+        serialization_alias="schema",
+    )
     candidate_id: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
     source_archive_ref: ArtifactRef
     team_manifest: FactoryCandidateArtifact
-    # Code-only teams have no n8n artifacts.  A non-empty tool set is
-    # validated where an integration is actually declared and granted.
     workflow_artifacts: tuple[FactoryCandidateArtifact, ...] = ()
     tool_schema_artifacts: tuple[FactoryCandidateArtifact, ...] = ()
     n8n_tools: tuple[TypedN8nTool, ...] = ()
     n8n_tool_references: tuple[OpaqueN8nToolReference, ...] = ()
+    host_tools: tuple[str, ...] = ()
     build_command: tuple[str, ...] = Field(min_length=1)
     real_case_command: tuple[str, ...] = Field(min_length=1)
     timeout_seconds: int = Field(ge=1, le=300)
+
+    @field_validator("host_tools")
+    @classmethod
+    def require_reserved_host_tools(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)) or set(value) - {BUSINESS_DECISION_TOOL}:
+            raise ValueError("candidate host tool is not Captain-reserved")
+        return value
 
     @field_validator("build_command", "real_case_command")
     @classmethod
@@ -212,12 +242,30 @@ class FactoryCandidateManifest(_FrozenModel):
 
     @model_validator(mode="after")
     def require_sealed_tool_schemas(self) -> "FactoryCandidateManifest":
+        if not self.n8n_tools:
+            if (
+                self.workflow_artifacts
+                or self.tool_schema_artifacts
+                or self.n8n_tool_references
+            ):
+                raise ValueError(
+                    "candidate cannot contain n8n artifacts without n8n tools"
+                )
+            return self
+        if not self.workflow_artifacts:
+            raise ValueError("candidate with n8n tools requires at least one workflow")
+        tool_names = tuple(tool.name for tool in self.n8n_tools)
+        if len(tool_names) != len(set(tool_names)):
+            raise ValueError("candidate n8n tool names must be unique")
         references = {item.reference.uri for item in self.tool_schema_artifacts}
-        expected = {
+        expected_sequence = tuple(
             reference
             for tool in self.n8n_tools
             for reference in (tool.input_schema_ref, tool.output_schema_ref)
-        }
+        )
+        expected = set(expected_sequence)
+        if len(expected) != len(expected_sequence):
+            raise ValueError("candidate n8n tools require unique input/output schemas")
         if references != expected:
             raise ValueError("each typed n8n input/output schema must be sealed in the candidate archive")
         if len(references) != len(self.tool_schema_artifacts):
@@ -264,7 +312,10 @@ class FactoryCandidateEvaluator:
             raise ValueError("candidate evaluation requires positive remaining lease time")
         deadline = time.monotonic() + max_seconds
         manifest = candidate.candidate
-        tool_names = tuple(tool.name for tool in manifest.n8n_tools)
+        tool_names = (
+            *(tool.name for tool in manifest.n8n_tools),
+            *manifest.host_tools,
+        )
         checks: list[FactoryEvaluationCheck] = []
         topology: FactoryAutoGenTeamManifestV1 | None = None
         try:
@@ -314,16 +365,12 @@ class FactoryCandidateEvaluator:
                         name="build", status="passed", detail="compile and build succeeded"
                     )
                 )
-            return FactoryCandidateEvaluationResult.model_validate(
-                {
-                    "status": "succeeded",
-                    "trace_id": manifest.candidate_id,
-                    "tool_names": tool_names,
-                    "checks": tuple(checks),
-                    "candidate_manifest": manifest,
-                    "team_execution_manifest": topology,
-                },
-                context={"allowed_tools": set(tool_names)},
+            return self._preflight_result(
+                status="succeeded",
+                manifest=manifest,
+                tool_names=tool_names,
+                checks=checks,
+                topology=topology,
             )
         except (FileNotFoundError, OSError, zipfile.BadZipFile) as exc:
             checks.append(
@@ -337,6 +384,25 @@ class FactoryCandidateEvaluator:
                 FactoryEvaluationCheck(name="validation", status="failed", detail=str(exc))
             )
             status = "failed"
+        return self._preflight_result(
+            status=status,
+            manifest=manifest,
+            tool_names=tool_names,
+            checks=checks,
+            topology=topology,
+        )
+
+    @staticmethod
+    def _preflight_result(
+        *,
+        status: Literal["succeeded", "failed", "infrastructure_failed"],
+        manifest: FactoryCandidateManifest,
+        tool_names: tuple[str, ...],
+        checks: list[FactoryEvaluationCheck],
+        topology: FactoryAutoGenTeamManifestV1 | None,
+    ) -> FactoryCandidateEvaluationResult:
+        """Preserve the sealed candidate tool authority during nested validation."""
+
         return FactoryCandidateEvaluationResult.model_validate(
             {
                 "status": status,
@@ -419,7 +485,10 @@ class FactoryCandidateEvaluator:
         if max_seconds is not None and max_seconds <= 0:
             raise ValueError("candidate evaluation requires positive remaining lease time")
         deadline = None if max_seconds is None else time.monotonic() + max_seconds
-        tool_names = tuple(tool.name for tool in candidate.n8n_tools)
+        tool_names = (
+            *(tool.name for tool in candidate.n8n_tools),
+            *candidate.host_tools,
+        )
         checks: list[FactoryEvaluationCheck] = []
         try:
             self._verify_source_archive(candidate.source_archive_ref, source_archive)
@@ -570,7 +639,12 @@ class FactoryCandidateEvaluator:
             raise ValueError("team manifest must be valid UTF-8 JSON") from exc
         return FactoryAutoGenTeamManifestV1.model_validate(
             payload,
-            context={"allowed_tools": {tool.name for tool in candidate.n8n_tools}},
+            context={
+                "allowed_tools": {
+                    *(tool.name for tool in candidate.n8n_tools),
+                    *candidate.host_tools,
+                }
+            },
         )
 
     @staticmethod
@@ -578,16 +652,35 @@ class FactoryCandidateEvaluator:
         manifest: FactoryAutoGenTeamManifestV1,
         workspace: Path,
     ) -> None:
-        digests = {
-            hashlib.sha256(path.read_bytes()).hexdigest()
+        content_by_digest = {
+            hashlib.sha256(content).hexdigest(): content
             for path in workspace.rglob("*")
             if path.is_file()
+            for content in (path.read_bytes(),)
         }
         if any(
-            agent.system_prompt_ref.sha256 not in digests
+            agent.system_prompt_ref.sha256 not in content_by_digest
             for agent in manifest.agents
         ):
             raise ValueError("system prompt ref is not sealed in the candidate archive")
+        for agent in manifest.agents:
+            try:
+                prompt = content_by_digest[agent.system_prompt_ref.sha256].decode(
+                    "utf-8"
+                )
+            except UnicodeDecodeError as exc:
+                raise ValueError("system prompt must be valid UTF-8") from exc
+            for tool_name in agent.tools:
+                if tool_name == BUSINESS_DECISION_TOOL and tool_name not in prompt:
+                    raise ValueError(
+                        f"system prompt must explicitly name declared tool {tool_name}"
+                    )
+            for target in agent.handoffs:
+                transfer_tool = f"transfer_to_{target}"
+                if transfer_tool not in prompt:
+                    raise ValueError(
+                        f"handoff prompt must explicitly call {transfer_tool}"
+                    )
 
     @staticmethod
     def _require_json(path: Path) -> None:
@@ -764,7 +857,14 @@ class ResolvedFactoryCandidate(_FrozenModel):
 class FactoryCandidateProvider:
     """Explicit candidate lookup; production wiring may resolve it from Minibook artifacts."""
 
-    def candidate_for(self, job: AgentFactoryJob) -> ResolvedFactoryCandidate:
+    def accept_creation_result(
+        self,
+        job: FactoryJob,
+        result: CreationResultV1,
+    ) -> ResolvedFactoryCandidate:
+        raise NotImplementedError
+
+    def candidate_for(self, job: FactoryJob) -> ResolvedFactoryCandidate:
         raise NotImplementedError
 
 
@@ -774,11 +874,370 @@ class StaticFactoryCandidateProvider(FactoryCandidateProvider):
     def __init__(self, candidates: dict[object, ResolvedFactoryCandidate]) -> None:
         self._candidates = dict(candidates)
 
-    def candidate_for(self, job: AgentFactoryJob) -> ResolvedFactoryCandidate:
+    def accept_creation_result(
+        self,
+        job: FactoryJob,
+        result: CreationResultV1,
+    ) -> ResolvedFactoryCandidate:
+        resolved = self.candidate_for(job)
+        source_refs = tuple(
+            ArtifactRef.model_validate(reference.model_dump(mode="json"))
+            for reference in result.artifact_refs
+        )
+        if resolved.candidate.source_archive_ref not in source_refs:
+            raise FactoryDispatchError(
+                "static candidate source is not bound by CreationResultV1"
+            )
+        return resolved
+
+    def candidate_for(self, job: FactoryJob) -> ResolvedFactoryCandidate:
         try:
             return self._candidates[job.job_id]
         except KeyError as exc:
             raise FileNotFoundError("no sealed candidate is registered for the factory job") from exc
+
+
+class ForgeCandidateArtifactStore(Protocol):
+    """Read verified immutable Forge bytes without granting write authority."""
+
+    def read_bytes(self, reference: ArtifactRef) -> bytes: ...
+
+    def local_path(self, reference: ArtifactRef) -> Path: ...
+
+
+class FactoryBlockSource(Protocol):
+    def blocks(self, job_id: object) -> tuple[FactoryEvidenceBlock, ...]: ...
+
+    def released_for(
+        self,
+        job: FactoryJob,
+        step: FactorySkillStep,
+    ) -> ReleasedHermesSkill: ...
+
+
+class GatewayForgeCandidateProvider(FactoryCandidateProvider):
+    """Resolve candidates only from SHA-verified Forge bytes and Gateway blocks."""
+
+    def __init__(
+        self,
+        *,
+        repository: FactoryBlockSource,
+        artifacts: ForgeCandidateArtifactStore,
+    ) -> None:
+        self._repository = repository
+        self._artifacts = artifacts
+
+    def accept_creation_result(
+        self,
+        job: FactoryJob,
+        result: CreationResultV1,
+    ) -> ResolvedFactoryCandidate:
+        if result.package_manifest_ref is None:
+            raise FactoryDispatchError("Forge package manifest reference is missing")
+        if result.skill_usage_receipt_ref is None:
+            raise FactoryDispatchError("Forge skill usage receipt reference is missing")
+        package_ref = _runtime_ref(result.package_manifest_ref)
+        skill_usage_receipt_ref = _runtime_ref(result.skill_usage_receipt_ref)
+        artifact_refs = tuple(_runtime_ref(reference) for reference in result.artifact_refs)
+        resolved, package = self._resolve(
+            job=job,
+            attempt=result.attempt,
+            package_ref=package_ref,
+            artifact_refs=artifact_refs,
+            skill_usage_receipt_ref=skill_usage_receipt_ref,
+        )
+        if (
+            package.creation_job_id != result.creation_job_id
+            or package.correlation_id != result.correlation_id
+            or package.subject_version != result.subject_version
+        ):
+            raise FactoryDispatchError(
+                "Forge package manifest does not match CreationResultV1"
+            )
+        return resolved
+
+    def candidate_for(self, job: FactoryJob) -> ResolvedFactoryCandidate:
+        block = self._authoritative_block(job)
+        resolved, _ = self._resolve_block(job, block)
+        return resolved
+
+    def current_candidate_ref(
+        self,
+        job: FactoryJob,
+        attempt: int,
+    ) -> ArtifactRef | None:
+        try:
+            block = self._authoritative_block(job, attempt=attempt)
+        except FileNotFoundError:
+            return None
+        resolved, _ = self._resolve_block(job, block)
+        return resolved.candidate.source_archive_ref
+
+    def _authoritative_block(
+        self,
+        job: FactoryJob,
+        *,
+        attempt: int | None = None,
+    ) -> FactoryEvidenceBlock:
+        candidates = tuple(
+            block
+            for block in self._repository.blocks(job.job_id)
+            if block.phase is FactoryPhase.AGENT_CODE_CREATED
+            and block.status is FactoryBlockStatus.SUCCEEDED
+            and block.job_id == job.job_id
+            and block.correlation_id == job.correlation_id
+            and block.subject_version == job.subject_version
+            and (attempt is None or block.attempt == attempt)
+        )
+        if not candidates:
+            raise FileNotFoundError("authoritative Gateway candidate reference is unavailable")
+        highest_attempt = max(block.attempt for block in candidates)
+        latest = tuple(block for block in candidates if block.attempt == highest_attempt)
+        package_refs = {
+            _artifact_identity(block.artifact_refs[0])
+            for block in latest
+            if block.artifact_refs
+        }
+        if len(package_refs) != 1 or any(not block.artifact_refs for block in latest):
+            raise FactoryDispatchError(
+                "authoritative Gateway candidate reference is conflicting"
+            )
+        return max(latest, key=lambda block: (block.occurred_at, str(block.event_id)))
+
+    def _resolve_block(
+        self,
+        job: FactoryJob,
+        block: FactoryEvidenceBlock,
+    ) -> tuple[
+        ResolvedFactoryCandidate,
+        CreationPackageManifestV1 | CreationPackageManifestV2,
+    ]:
+        return self._resolve(
+            job=job,
+            attempt=block.attempt,
+            package_ref=block.artifact_refs[0],
+            artifact_refs=block.artifact_refs[1:],
+            skill_usage_receipt_ref=(
+                block.evidence_refs[-1] if block.evidence_refs else None
+            ),
+        )
+
+    def _resolve(
+        self,
+        *,
+        job: FactoryJob,
+        attempt: int,
+        package_ref: ArtifactRef,
+        artifact_refs: tuple[ArtifactRef, ...],
+        skill_usage_receipt_ref: ArtifactRef | None,
+    ) -> tuple[
+        ResolvedFactoryCandidate,
+        CreationPackageManifestV1 | CreationPackageManifestV2,
+    ]:
+        if package_ref.media_type != "application/json":
+            raise FactoryDispatchError("Forge package manifest media type is invalid")
+        try:
+            package_payload = json.loads(self._artifacts.read_bytes(package_ref))
+            if not isinstance(package_payload, dict):
+                raise ValueError("package manifest must be an object")
+            package_type = (
+                CreationPackageManifestV2
+                if package_payload.get("schema")
+                == "minibook.creation-package-manifest.v2"
+                else CreationPackageManifestV1
+            )
+            package = package_type.model_validate(package_payload)
+        except (OSError, ValueError) as exc:
+            raise FactoryDispatchError(
+                "Forge package manifest bytes are unavailable or invalid"
+            ) from exc
+        if (
+            package.factory_job_id != job.job_id
+            or package.correlation_id != job.correlation_id
+            or package.subject_version != job.subject_version
+            or package.attempt != attempt
+        ):
+            raise FactoryDispatchError("Forge package manifest does not match factory job")
+        package_skill_ref = _runtime_ref(package.skill_usage_receipt_ref)
+        if (
+            skill_usage_receipt_ref is None
+            or _artifact_identity(package_skill_ref)
+            != _artifact_identity(skill_usage_receipt_ref)
+        ):
+            raise FactoryDispatchError(
+                "Forge skill usage receipt reference is not bound by agent-code evidence"
+            )
+        try:
+            skill_usage_receipt = ForgeBuildSkillUsageReceiptV1.model_validate_json(
+                self._artifacts.read_bytes(package_skill_ref)
+            )
+        except (OSError, ValueError) as exc:
+            raise FactoryDispatchError(
+                "Forge skill usage receipt bytes are unavailable or invalid"
+            ) from exc
+        self._require_skill_usage_receipt(
+            job=job,
+            attempt=attempt,
+            package=package,
+            receipt=skill_usage_receipt,
+        )
+
+        candidate_ref = _runtime_ref(package.candidate_manifest_ref)
+        source_ref = _runtime_ref(package.source_archive_ref)
+        bound = {_artifact_identity(reference) for reference in artifact_refs}
+        if {
+            _artifact_identity(candidate_ref),
+            _artifact_identity(source_ref),
+        } - bound:
+            raise FactoryDispatchError(
+                "Forge package manifest references are not bound by agent-code evidence"
+            )
+        codex_build_receipt: CodexBuildReceiptV1 | None = None
+        if isinstance(package, CreationPackageManifestV2):
+            codex_receipt_ref = _runtime_ref(package.codex_build_receipt_ref)
+            if _artifact_identity(codex_receipt_ref) not in bound:
+                raise FactoryDispatchError(
+                    "Forge Codex build receipt is not bound by agent-code evidence"
+                )
+            try:
+                codex_build_receipt = CodexBuildReceiptV1.model_validate_json(
+                    self._artifacts.read_bytes(codex_receipt_ref)
+                )
+            except (OSError, ValueError) as exc:
+                raise FactoryDispatchError(
+                    "Forge Codex build receipt bytes are unavailable or invalid"
+                ) from exc
+            if codex_build_receipt_sha256(codex_build_receipt) != (
+                codex_receipt_ref.sha256
+            ):
+                raise FactoryDispatchError(
+                    "Forge Codex build receipt canonical digest changed"
+                )
+        try:
+            candidate = FactoryCandidateManifest.model_validate_json(
+                self._artifacts.read_bytes(candidate_ref)
+            )
+            source_bytes = self._artifacts.read_bytes(source_ref)
+            source_path = self._artifacts.local_path(source_ref)
+            if (
+                not source_path.is_file()
+                or hashlib.sha256(source_path.read_bytes()).hexdigest()
+                != source_ref.sha256
+                or hashlib.sha256(source_bytes).hexdigest() != source_ref.sha256
+            ):
+                raise FactoryDispatchError(
+                    "Forge local source archive differs from verified CAS bytes"
+                )
+        except (OSError, ValueError) as exc:
+            raise FactoryDispatchError(
+                "Forge candidate bytes are unavailable or invalid"
+            ) from exc
+        if _artifact_identity(candidate.source_archive_ref) != _artifact_identity(source_ref):
+            raise FactoryDispatchError(
+                "Forge candidate manifest does not match source archive"
+            )
+        if codex_build_receipt is not None:
+            self._require_codex_build_receipt(
+                job=job,
+                attempt=attempt,
+                package=package,
+                receipt=codex_build_receipt,
+                source_archive=source_path,
+            )
+        return (
+            ResolvedFactoryCandidate(candidate=candidate, source_archive=source_path),
+            package,
+        )
+
+    @staticmethod
+    def _require_codex_build_receipt(
+        *,
+        job: FactoryJob,
+        attempt: int,
+        package: CreationPackageManifestV2,
+        receipt: CodexBuildReceiptV1,
+        source_archive: Path,
+    ) -> None:
+        if (
+            receipt.factory_job_id != job.job_id
+            or receipt.creation_job_id != package.creation_job_id
+            or receipt.correlation_id != job.correlation_id
+            or receipt.subject_version != job.subject_version
+            or receipt.attempt != attempt
+            or receipt.acceptance_assertion_ids != job.acceptance_assertion_ids
+            or receipt.source_archive_ref.sha256
+            != package.source_archive_ref.sha256
+            or receipt.source_archive_ref.media_type
+            != package.source_archive_ref.media_type
+        ):
+            raise FactoryDispatchError(
+                "Forge Codex build receipt does not match factory job or source"
+            )
+        try:
+            with zipfile.ZipFile(source_archive) as archive:
+                candidates = tuple(
+                    item
+                    for item in archive.infolist()
+                    if PurePosixPath(item.filename).as_posix()
+                    == "factory-candidate.json"
+                )
+                if len(candidates) != 1:
+                    raise ValueError
+                candidate_bytes = archive.read(candidates[0])
+        except (OSError, KeyError, ValueError, zipfile.BadZipFile) as exc:
+            raise FactoryDispatchError(
+                "Forge source archive lacks the unique Captain candidate manifest"
+            ) from exc
+        if (
+            receipt.candidate_manifest_ref.media_type != "application/json"
+            or hashlib.sha256(candidate_bytes).hexdigest()
+            != receipt.candidate_manifest_ref.sha256
+        ):
+            raise FactoryDispatchError(
+                "Forge source archive does not match the Captain candidate manifest"
+            )
+
+    def _require_skill_usage_receipt(
+        self,
+        *,
+        job: FactoryJob,
+        attempt: int,
+        package: CreationPackageManifestV1,
+        receipt: ForgeBuildSkillUsageReceiptV1,
+    ) -> None:
+        if (
+            receipt.creation_job_id != package.creation_job_id
+            or receipt.factory_job_id != job.job_id
+            or receipt.correlation_id != job.correlation_id
+            or receipt.subject_version != job.subject_version
+            or receipt.attempt != attempt
+            or receipt.public_assertion_ids != job.acceptance_assertion_ids
+        ):
+            raise FactoryDispatchError(
+                "Forge skill usage receipt does not match factory job"
+            )
+        released = self._repository.released_for(job, FactorySkillStep.BRIEF_CODEX)
+        if (
+            receipt.released_skill.skill_id != released.skill_id
+            or receipt.released_skill.version != released.version
+            or receipt.released_skill.content_sha256 != released.content_sha256
+            or _artifact_identity(_runtime_ref(receipt.released_skill.content_ref))
+            != _artifact_identity(released.content_ref)
+        ):
+            raise FactoryDispatchError(
+                "Forge skill usage receipt does not match Captain released skill"
+            )
+
+
+def _runtime_ref(reference: object) -> ArtifactRef:
+    dump = getattr(reference, "model_dump", None)
+    if not callable(dump):
+        raise FactoryDispatchError("Forge artifact reference is invalid")
+    return ArtifactRef.model_validate(dump(mode="json"))
+
+
+def _artifact_identity(reference: ArtifactRef) -> tuple[str, str, str]:
+    return reference.uri, reference.sha256, reference.media_type
 
 
 class FactoryTeamExecutionPort(Protocol):
@@ -796,6 +1255,15 @@ class FactoryTeamExecutionPort(Protocol):
     ) -> TeamExecutionEvidenceV1: ...
 
 
+class FactoryTeamExecutionArtifactSink(Protocol):
+    """Captain-owned append-only sink for validated team execution evidence."""
+
+    def record_workflow_artifact(
+        self,
+        artifact: TeamExecutionEvidenceV1,
+    ) -> bool: ...
+
+
 class CandidateEvaluationFactory:
     """Emit leased Hermes lifecycle blocks from independently persisted evaluation evidence."""
 
@@ -806,13 +1274,19 @@ class CandidateEvaluationFactory:
         evidence_store: FactoryEvidenceStore,
         evaluator: FactoryCandidateEvaluator | None = None,
         team_execution: FactoryTeamExecutionPort | None = None,
+        workflow_artifacts: FactoryTeamExecutionArtifactSink | None = None,
     ) -> None:
         self._provider = provider
         self._evidence_store = evidence_store
         self._evaluator = evaluator or FactoryCandidateEvaluator()
         self._team_execution = team_execution
+        self._workflow_artifacts = workflow_artifacts
 
     async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
+        if request.action.kind is FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE:
+            raise FactoryDispatchError(
+                "agent code evidence requires the exact Forge CreationResultV1"
+            )
         phase, role = _validation_phase(request.action.kind)
         if request.role is not role or request.lease is None or request.lease.role is not role:
             raise FactoryDispatchError("candidate validation requires the matching active factory lease")
@@ -823,30 +1297,119 @@ class CandidateEvaluationFactory:
             attempt=request.action.attempt,
             now=request.lease.issued_at,
         )
-        if request.action.kind is FactoryActionKind.DISPATCH_REAL_CASE_TESTER:
+        if request.action.kind in {
+            FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
+            FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION,
+        }:
             if self._team_execution is None:
                 raise FactoryDispatchError(
                     "real-case dispatch requires a configured TeamExecutionService"
                 )
         try:
             resolved = self._provider.candidate_for(request.job)
-            if request.action.kind is FactoryActionKind.DISPATCH_REAL_CASE_TESTER:
+            if request.action.kind in {
+                FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
+                FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION,
+            }:
                 assert self._team_execution is not None
+                required_runs = (
+                    request.job.execution_policy.required_live_runs
+                    if isinstance(request.job, AgentFactoryJobV3)
+                    and request.action.kind
+                    is FactoryActionKind.DISPATCH_REAL_CASE_TESTER
+                    else 1
+                )
+                if required_runs > 1:
+                    invocations_for = getattr(
+                        self._team_execution,
+                        "invocations_for",
+                        None,
+                    )
+                    execute_required = getattr(
+                        self._team_execution,
+                        "execute_required",
+                        None,
+                    )
+                    if not callable(invocations_for) or not callable(execute_required):
+                        raise FactoryDispatchError(
+                            "release real-case dispatch requires the multi-run execution port"
+                        )
+                    expected_invocations = tuple(invocations_for(request))
+                    team_evidences = tuple(
+                        await execute_required(request, resolved)
+                    )
+                    if (
+                        len(expected_invocations) != required_runs
+                        or len(team_evidences) != required_runs
+                        or tuple(item.run_number for item in team_evidences)
+                        != tuple(range(1, required_runs + 1))
+                    ):
+                        raise FactoryDispatchError(
+                            "release real-case dispatch returned incomplete run evidence"
+                        )
+                    blocks: list[FactoryEvidenceBlock] = []
+                    for expected_invocation, team_evidence in zip(
+                        expected_invocations,
+                        team_evidences,
+                        strict=True,
+                    ):
+                        sealed = await self._evidence_store.persist(
+                            request.job,
+                            team_evidence.model_dump_json(
+                                by_alias=True, exclude_none=True
+                            ).encode("utf-8"),
+                        )
+                        blocks.append(
+                            _team_execution_block(
+                                request,
+                                resolved,
+                                team_evidence,
+                                sealed,
+                                expected_invocation=expected_invocation,
+                            )
+                        )
+                        if self._workflow_artifacts is not None:
+                            self._workflow_artifacts.record_workflow_artifact(
+                                team_evidence
+                            )
+                    return _team_execution_bundle_block(request, tuple(blocks))
                 expected_invocation = self._team_execution.invocation_for(request)
                 team_evidence = await self._team_execution.execute(request, resolved)
+                if (
+                    request.action.kind
+                    is FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION
+                ):
+                    assert request.action.authorization_ref is not None
+                    assert request.action.supersedes_ref is not None
+                    team_evidence = team_evidence.model_copy(
+                        update={
+                            "evidence_refs": tuple(
+                                dict.fromkeys(
+                                    (
+                                        *team_evidence.evidence_refs,
+                                        request.action.authorization_ref,
+                                        request.action.supersedes_ref,
+                                    )
+                                )
+                            )
+                        }
+                    )
                 sealed = await self._evidence_store.persist(
                     request.job,
                     team_evidence.model_dump_json(
                         by_alias=True, exclude_none=True
                     ).encode("utf-8"),
                 )
-                return _team_execution_block(
+                block = _team_execution_block(
                     request,
                     resolved,
                     team_evidence,
                     sealed,
                     expected_invocation=expected_invocation,
                 )
+                if self._workflow_artifacts is not None:
+                    self._workflow_artifacts.record_workflow_artifact(team_evidence)
+                return block
             result = self._evaluator.evaluate(
                 job=request.job,
                 candidate=resolved.candidate,
@@ -898,12 +1461,96 @@ class CandidateEvaluationFactory:
             lease_id=request.lease.lease_id,
         )
 
+    async def record_creation_result(
+        self,
+        request: FactoryDispatch,
+        result: CreationResultV1,
+    ) -> FactoryEvidenceBlock:
+        if request.action.kind is not FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE:
+            raise FactoryDispatchError(
+                "CreationResultV1 may only produce agent code evidence"
+            )
+        role = FactoryRole.TOOL_INTEGRATOR
+        if request.role is not role or request.lease is None or request.lease.role is not role:
+            raise FactoryDispatchError(
+                "agent code evidence requires the matching active factory lease"
+            )
+        validate_factory_lease(
+            request.lease,
+            job=request.job,
+            role=role,
+            attempt=request.action.attempt,
+            now=request.lease.issued_at,
+        )
+        if (
+            result.correlation_id != request.job.correlation_id
+            or result.subject_version != request.job.subject_version
+            or result.attempt != request.action.attempt
+        ):
+            raise FactoryDispatchError(
+                "Minibook CreationResultV1 does not match the factory dispatch"
+            )
+        if result.status != "succeeded":
+            raise FactoryDispatchError(
+                "Minibook CreationResultV1 did not produce successful agent code"
+            )
+        if not result.artifact_refs:
+            raise FactoryDispatchError(
+                "successful Minibook CreationResultV1 has no generated code artifacts"
+            )
+        self._provider.accept_creation_result(request.job, result)
+        assert result.package_manifest_ref is not None
+        assert result.skill_usage_receipt_ref is not None
+        content = json.dumps(
+            result.model_dump(mode="json", by_alias=True, exclude_none=True),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        sealed = await self._evidence_store.persist(request.job, content)
+        package_manifest_ref = ArtifactRef.model_validate(
+            result.package_manifest_ref.model_dump(mode="json")
+        )
+        artifact_refs = tuple(
+            ArtifactRef.model_validate(reference.model_dump(mode="json"))
+            for reference in result.artifact_refs
+        )
+        forge_evidence_refs = tuple(
+            ArtifactRef.model_validate(reference.model_dump(mode="json"))
+            for reference in result.evidence_refs
+        )
+        skill_usage_receipt_ref = ArtifactRef.model_validate(
+            result.skill_usage_receipt_ref.model_dump(mode="json")
+        )
+        return FactoryEvidenceBlock(
+            schema_name="captain.agent-factory-block.v1",
+            event_id=uuid5(
+                NAMESPACE_URL,
+                f"factory-creation-result|{request.job.job_id}|{request.action.attempt}|{sealed.sha256}",
+            ),
+            job_id=request.job.job_id,
+            correlation_id=request.job.correlation_id,
+            causation_id=request.job.event_id,
+            occurred_at=request.lease.issued_at,
+            producer="hermes",
+            subject_version=request.job.subject_version,
+            attempt=request.action.attempt,
+            phase=FactoryPhase.AGENT_CODE_CREATED,
+            role=role,
+            status=FactoryBlockStatus.SUCCEEDED,
+            artifact_refs=(package_manifest_ref, *artifact_refs),
+            evidence_refs=(sealed, *forge_evidence_refs, skill_usage_receipt_ref),
+            assertion_ids=(),
+            lease_id=request.lease.lease_id,
+        )
+
 
 def _validation_phase(action: FactoryActionKind) -> tuple[FactoryPhase, FactoryRole]:
     phases = {
         FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE: (FactoryPhase.AGENT_CODE_CREATED, FactoryRole.TOOL_INTEGRATOR),
         FactoryActionKind.DISPATCH_BUILD_VALIDATOR: (FactoryPhase.BUILD_PASSED, FactoryRole.TOOL_INTEGRATOR),
         FactoryActionKind.DISPATCH_REAL_CASE_TESTER: (FactoryPhase.REAL_CASE_EVIDENCE, FactoryRole.REAL_CASE_TESTER),
+        FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION: (FactoryPhase.REAL_CASE_REVALIDATED, FactoryRole.REAL_CASE_TESTER),
         FactoryActionKind.DISPATCH_QUALITY_WARDEN: (FactoryPhase.QUALITY_REVIEWED, FactoryRole.QUALITY_WARDEN),
     }
     try:
@@ -916,6 +1563,62 @@ def _result_phase(phase: FactoryPhase, status: str) -> FactoryPhase:
     if phase is FactoryPhase.BUILD_PASSED and status != "succeeded":
         return FactoryPhase.BUILD_FAILED
     return phase
+
+
+def _team_execution_bundle_block(
+    request: FactoryDispatch,
+    blocks: tuple[FactoryEvidenceBlock, ...],
+) -> FactoryEvidenceBlock:
+    """Collapse complete release-run evidence into one lifecycle transition."""
+
+    if (
+        not isinstance(request.job, AgentFactoryJobV3)
+        or len(blocks) != request.job.execution_policy.required_live_runs
+        or not blocks
+    ):
+        raise FactoryDispatchError("release team execution bundle is incomplete")
+    first = blocks[0]
+    if any(
+        block.job_id != first.job_id
+        or block.attempt != first.attempt
+        or block.phase is not first.phase
+        or block.lease_id != first.lease_id
+        for block in blocks
+    ):
+        raise FactoryDispatchError("release team execution bundle is stale or mixed")
+    succeeded = all(
+        block.status is FactoryBlockStatus.SUCCEEDED for block in blocks
+    )
+    artifact_refs = tuple(
+        dict.fromkeys(
+            reference for block in blocks for reference in block.artifact_refs
+        )
+    )
+    evidence_refs = tuple(
+        dict.fromkeys(
+            reference for block in blocks for reference in block.evidence_refs
+        )
+    )
+    identity = "|".join(str(block.event_id) for block in blocks)
+    return first.model_copy(
+        update={
+            "event_id": uuid5(
+                NAMESPACE_URL,
+                f"factory-team-execution-bundle|{identity}",
+            ),
+            "occurred_at": max(block.occurred_at for block in blocks),
+            "status": (
+                FactoryBlockStatus.SUCCEEDED
+                if succeeded
+                else FactoryBlockStatus.FAILED
+            ),
+            "artifact_refs": artifact_refs,
+            "evidence_refs": evidence_refs,
+            "assertion_ids": (
+                request.job.acceptance_assertion_ids if succeeded else ()
+            ),
+        }
+    )
 
 
 def _team_execution_block(
@@ -963,7 +1666,12 @@ def _team_execution_block(
         producer="hermes",
         subject_version=request.job.subject_version,
         attempt=request.action.attempt,
-        phase=FactoryPhase.REAL_CASE_EVIDENCE,
+        phase=(
+            FactoryPhase.REAL_CASE_REVALIDATED
+            if request.action.kind
+            is FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION
+            else FactoryPhase.REAL_CASE_EVIDENCE
+        ),
         role=FactoryRole.REAL_CASE_TESTER,
         status=status,
         artifact_refs=(

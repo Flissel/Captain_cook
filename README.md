@@ -352,6 +352,37 @@ parent gitlink, or has local changes. Its redacted report lists only the pinned
 commit, required Captain-planner/MCP entrypoints, focused-test status, and the
 lease-scoped `n8n-mcp` server identity.
 
+### Mini-PC self-service portal
+
+The static portal uses Supabase user authentication and sends its bearer only
+to same-origin `/v1/portal/...`. On the Mini-PC that route traverses the
+loopback portal-link, mTLS and the fixed WireGuard peers (`10.77.0.2` to
+`10.77.0.1`); the browser never receives a Gateway URL or role token.
+The browser origin itself is HTTPS (default `https://mini-pc.local:8444`);
+plaintext port 8088 is loopback-only health checking and cannot serve the SPA.
+
+After installing the local certificates and WireGuard configuration described
+in [docs/OPERATIONS.md](docs/OPERATIONS.md), validate without changing services:
+
+```powershell
+pwsh -NoProfile -File scripts/deploy-portal-mini-pc.ps1
+pwsh -NoProfile -File scripts/portal-preflight.ps1
+```
+
+Deployment is explicit and manages only the portal and the two Mini-PC link
+services:
+
+```powershell
+pwsh -NoProfile -File scripts/deploy-portal-mini-pc.ps1 -Apply
+```
+
+Rollback is a separate fail-closed path and requires the exact accepted image
+digest in `CAPTAIN_PORTAL_ACCEPTED_IMAGE`; it never rebuilds or retags it:
+
+```powershell
+pwsh -NoProfile -File scripts/deploy-portal-mini-pc.ps1 -Rollback -Apply
+```
+
 ## How Codex and GPT-5.6 fit
 
 Codex is used to build, test, and document the Devpost-ready vertical slice; the implementation history is recorded in this repository's Devpost feature branch and [docs/codex-sessions.md](docs/codex-sessions.md) records the primary submission session ID once captured. The LLM-backed production path is intentionally separate from the offline demo; its target model is configured as GPT-5.6 before the Devpost run. The video must show the working demo and explain both uses, as scripted in [docs/VIDEO_SCRIPT.md](docs/VIDEO_SCRIPT.md).

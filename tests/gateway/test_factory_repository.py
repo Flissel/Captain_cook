@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
+from datetime import timedelta
 from uuid import UUID
 
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from pydantic import SecretStr
+from pymysql.err import IntegrityError, OperationalError
 
 import gateway.contracts as gateway_contracts
 
 from agenten.agent_factory.contracts import FactoryPhase
 from agenten.agent_factory.contracts import FactoryRole
+from agenten.agent_factory.business_benchmark_contracts import BusinessBenchmarkSummaryV1
 from agenten.agent_factory.leases import issue_factory_lease
 from agenten.agent_factory.execution_budget import FactoryBudgetProjection
 from agenten.agent_factory.release_gate import E2EKind, E2EOutcome, E2ERunEvidence
@@ -25,7 +31,10 @@ from agenten.agent_factory.skill_workflow_contracts import (
     FACTORY_SKILL_ID_BY_STEP,
     CodebaseInventoryV1,
     FactorySkillStep,
+    factory_runtime_retry_evidence_binding,
+    factory_runtime_retry_evidence_binding_sha256,
 )
+from agenten.agent_factory.skill_sequence import FactoryRuntimeRetryAuthorizationV1
 from agenten.agent_factory.state_machine import FactoryLifecycleStatus, FactoryProjection
 from agenten.agent_runtime.contracts import ArtifactRef
 from gateway.contracts import (
@@ -35,6 +44,10 @@ from gateway.contracts import (
 )
 from gateway.factory_repository import GatewayFactoryLeases, GatewayFactoryRepository
 from gateway.store import GatewayStore
+from gateway.app import CAPTAIN_SKILL_EVENT_TYPES, create_app, require_skill_event_writer
+from gateway.auth import GatewayRole
+from gateway.settings import GatewaySettings
+from agenten.agent_factory.business_benchmark_contracts import canonical_business_benchmark_model_bytes
 from tests.agent_factory.test_state_machine import (
     accepted_evaluation,
     accepted_release_decision,
@@ -45,6 +58,7 @@ from tests.agent_factory.test_state_machine import (
 from tests.agent_factory.test_execution_budget import job_v3
 from tests.agent_factory.test_release_gate import (
     workflow_budget,
+    workflow_benchmark,
     workflow_evaluation,
     workflow_job,
     workflow_receipts,
@@ -71,6 +85,7 @@ class Store:
         self.usage_receipts = {}
         self.released_skills = []
         self.skill_assignments = []
+        self.benchmark_summaries = {}
 
     def record_factory_job(self, factory_job):
         self.jobs.setdefault(factory_job.job_id, factory_job)
@@ -113,6 +128,19 @@ class Store:
             if assignment.job_id == job_id and assignment.step is step
         )
 
+    def record_business_benchmark_summary(self, summary):
+        self.benchmark_summaries[summary.summary_id] = summary
+        return type("Receipt", (), {"replayed": False})()
+
+    def business_benchmark_summary(self, summary_id):
+        return self.benchmark_summaries.get(summary_id)
+
+    def business_benchmark_summary_by_artifact(self, artifact_ref):
+        return next(
+            (item for item in self.benchmark_summaries.values() if item.artifact_ref == artifact_ref),
+            None,
+        )
+
 
 def test_gateway_adapter_runs_coordinator_against_gateway_store_shape() -> None:
     coordinator = FactoryCoordinator(GatewayFactoryRepository(Store()))
@@ -122,6 +150,101 @@ def test_gateway_adapter_runs_coordinator_against_gateway_store_shape() -> None:
     coordinator.record(block(FactoryPhase.FORGE_REQUESTED))
 
     assert coordinator.projection(factory_job.job_id).phase is FactoryPhase.FORGE_REQUESTED
+
+
+def test_gateway_accepts_expired_tool_integrator_evidence_only_with_exact_retry(
+    job_v3,
+) -> None:
+    lease = issue_factory_lease(
+        job=job_v3,
+        role=FactoryRole.TOOL_INTEGRATOR,
+        attempt=1,
+        workspace_ref="workspace://factory/retry-ledger",
+        now=job_v3.occurred_at,
+    )
+    occurred_at = lease.expires_at + timedelta(seconds=1)
+    placeholder = ArtifactRef(
+        uri=f"artifact://factory/runtime-retry/{'0' * 64}",
+        sha256="0" * 64,
+        media_type="application/json",
+    )
+    authorization = FactoryRuntimeRetryAuthorizationV1(
+        schema="captain.factory-runtime-retry-authorization.v1",
+        authorization_ref=placeholder,
+        producer="captain",
+        status="succeeded",
+        job_id=job_v3.job_id,
+        correlation_id=job_v3.correlation_id,
+        subject_version=job_v3.subject_version,
+        attempt=1,
+        invocation_id=UUID("73000000-0000-0000-0000-000000000001"),
+        idempotency_key="a" * 64,
+        lease_id=lease.lease_id,
+        checkpoint_ref=ArtifactRef(
+            uri=f"artifact://factory/codex-checkpoint/{'b' * 64}",
+            sha256="b" * 64,
+            media_type="application/json",
+        ),
+        terminal_receipt_ref=ArtifactRef(
+            uri=f"artifact://factory/codex-terminal-receipt/{'c' * 64}",
+            sha256="c" * 64,
+            media_type="application/json",
+        ),
+        workspace_ref=lease.workspace_ref,
+        base_revision="d" * 40,
+        scaffold_manifest_sha256="e" * 64,
+        brief_sha256="f" * 64,
+        resume_ordinal=1,
+        maximum_runtime_seconds=60,
+        issued_at=lease.expires_at,
+        expires_at=lease.expires_at + timedelta(minutes=2),
+    )
+    digest = factory_runtime_retry_evidence_binding_sha256(
+        factory_runtime_retry_evidence_binding(authorization)
+    )
+    authorization = authorization.model_copy(
+        update={
+            "authorization_ref": ArtifactRef(
+                uri=f"artifact://factory/runtime-retry/{digest}",
+                sha256=digest,
+                media_type="application/json",
+            )
+        }
+    )
+    evidence = block(FactoryPhase.TOOL_CANDIDATE_TESTED).model_copy(
+        update={
+            "job_id": job_v3.job_id,
+            "correlation_id": job_v3.correlation_id,
+            "subject_version": job_v3.subject_version,
+            "attempt": 1,
+            "occurred_at": occurred_at,
+            "role": FactoryRole.TOOL_INTEGRATOR,
+            "lease_id": lease.lease_id,
+            "evidence_refs": (authorization.authorization_ref,),
+        }
+    )
+
+    GatewayStore._assert_evidence_lease(
+        evidence,
+        lease,
+        runtime_retry_authorization=authorization,
+    )
+
+    with pytest.raises(HTTPException, match="active lease"):
+        GatewayStore._assert_evidence_lease(evidence, lease)
+    changed = authorization.model_copy(
+        update={
+            "authorization_ref": authorization.authorization_ref.model_copy(
+                update={"sha256": "1" * 64}
+            )
+        }
+    )
+    with pytest.raises(HTTPException, match="active lease"):
+        GatewayStore._assert_evidence_lease(
+            evidence,
+            lease,
+            runtime_retry_authorization=changed,
+        )
 
 
 def test_gateway_leases_resolve_only_the_current_role_attempt() -> None:
@@ -215,6 +338,255 @@ def test_gateway_repository_exposes_budget_and_usage_as_read_only_evidence(job_v
     assert repository.workflow_usage_receipts(job_v3.job_id) == ()
 
 
+def test_gateway_repository_records_and_resolves_business_benchmark_summary() -> None:
+    runs = (workflow_run(1),)
+    summary = workflow_benchmark(runs)
+    store = Store()
+    repository = GatewayFactoryRepository(store)
+
+    assert repository.record_business_benchmark_summary(summary) is True
+    assert repository.business_benchmark_summary(summary.summary_id) == summary
+    assert repository.business_benchmark_summary_by_artifact(summary.artifact_ref) == summary
+
+
+def test_gateway_repository_translates_benchmark_conflict() -> None:
+    class ConflictStore(Store):
+        def record_business_benchmark_summary(self, summary):
+            raise HTTPException(status_code=409, detail="benchmark conflict")
+
+    with pytest.raises(FactoryRepositoryError, match="benchmark conflict"):
+        GatewayFactoryRepository(ConflictStore()).record_business_benchmark_summary(
+            workflow_benchmark((workflow_run(1),))
+        )
+
+
+def test_business_benchmark_delivery_event_is_deterministic_and_captain_only() -> None:
+    summary = workflow_benchmark((workflow_run(1),))
+    content_sha256 = hashlib.sha256(
+        canonical_business_benchmark_model_bytes(summary)
+    ).hexdigest()
+
+    first = GatewayStore._business_benchmark_validated_event(summary, content_sha256)
+    replay = GatewayStore._business_benchmark_validated_event(summary, content_sha256)
+
+    assert first == replay
+    assert first.event_type in CAPTAIN_SKILL_EVENT_TYPES
+    require_skill_event_writer(first, GatewayRole.CAPTAIN)
+    with pytest.raises(HTTPException) as denied:
+        require_skill_event_writer(first, GatewayRole.WORKER)
+    assert denied.value.status_code == 403
+    assert "case_metrics" not in first.model_dump_json()
+
+
+class _BenchmarkConflictCursor:
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self.rows = rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def execute(self, _query, _parameters) -> None:
+        return None
+
+    def fetchall(self):
+        return self.rows
+
+
+class _BenchmarkConflictConnection:
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self.rows = rows
+
+    def cursor(self):
+        return _BenchmarkConflictCursor(self.rows)
+
+
+class _BenchmarkConflictStorage:
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self.rows = rows
+
+    @contextmanager
+    def transaction(self):
+        yield _BenchmarkConflictConnection(self.rows)
+
+
+@pytest.mark.parametrize(
+    "write_error, expected_attempts",
+    (
+        (IntegrityError(1062, "duplicate benchmark identity"), 1),
+        (OperationalError(1213, "deadlock found"), 3),
+    ),
+)
+def test_business_benchmark_write_contention_is_normalized_to_conflict(
+    write_error: Exception,
+    expected_attempts: int,
+) -> None:
+    summary = workflow_benchmark((workflow_run(1),))
+    other_job_id = UUID("00000000-0000-0000-0000-000000000991")
+    conflicting_payload = summary.model_dump(mode="json", by_alias=True)
+    conflicting_payload["job_id"] = str(other_job_id)
+    rows = [
+        {
+            "summary_id": str(summary.summary_id),
+            "job_id": str(other_job_id),
+            "correlation_id": str(summary.correlation_id),
+            "subject_version": summary.subject_version,
+            "attempt": summary.attempt,
+            "candidate_sha256": summary.candidate_ref.sha256,
+            "artifact_sha256": summary.artifact_ref.sha256,
+            "payload": json.dumps(conflicting_payload, sort_keys=True),
+        }
+    ]
+    store = GatewayStore.__new__(GatewayStore)
+    store.storage = _BenchmarkConflictStorage(rows)
+    attempts = 0
+
+    def fail_write(_summary):
+        nonlocal attempts
+        attempts += 1
+        raise write_error
+
+    store._record_business_benchmark_summary_once = fail_write  # type: ignore[method-assign]
+
+    with pytest.raises(HTTPException) as conflict:
+        store.record_business_benchmark_summary(summary)
+
+    assert attempts == expected_attempts
+    assert conflict.value.status_code == 409
+    assert conflict.value.detail == (
+        "business benchmark summary identity already exists with different content"
+    )
+
+
+def test_business_benchmark_duplicate_race_accepts_only_exact_replay() -> None:
+    summary = workflow_benchmark((workflow_run(1),))
+    canonical = summary.model_dump(mode="json", by_alias=True)
+    rows = [
+        {
+            "summary_id": str(summary.summary_id),
+            "job_id": str(summary.job_id),
+            "correlation_id": str(summary.correlation_id),
+            "subject_version": summary.subject_version,
+            "attempt": summary.attempt,
+            "candidate_sha256": summary.candidate_ref.sha256,
+            "artifact_sha256": summary.artifact_ref.sha256,
+            "payload": json.dumps(canonical, sort_keys=True),
+        }
+    ]
+    store = GatewayStore.__new__(GatewayStore)
+    store.storage = _BenchmarkConflictStorage(rows)
+
+    def lose_duplicate_race(_summary):
+        raise IntegrityError(1062, "duplicate benchmark identity")
+
+    store._record_business_benchmark_summary_once = lose_duplicate_race  # type: ignore[method-assign]
+
+    receipt = store.record_business_benchmark_summary(summary)
+
+    assert receipt.replayed is True
+    assert receipt.summary_id == summary.summary_id
+
+
+class _AtomicBenchmarkCursor:
+    def __init__(self, state: dict[str, object]) -> None:
+        self.state = state
+        self._rows: list[dict[str, object]] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def execute(self, query: str, parameters) -> None:
+        if "SELECT summary_id" in query:
+            self._rows = []
+        elif "INSERT INTO factory_business_benchmark_summaries" in query:
+            self.state["summary"] = parameters
+
+    def fetchall(self):
+        return self._rows
+
+
+class _AtomicBenchmarkConnection:
+    def __init__(self, state: dict[str, object]) -> None:
+        self.state = state
+
+    def cursor(self):
+        return _AtomicBenchmarkCursor(self.state)
+
+
+class _AtomicBenchmarkStorage:
+    def __init__(self) -> None:
+        self.committed: dict[str, object] = {}
+
+    @contextmanager
+    def transaction(self):
+        staged = dict(self.committed)
+        try:
+            yield _AtomicBenchmarkConnection(staged)
+        except Exception:
+            raise
+        else:
+            self.committed = staged
+
+
+def test_business_benchmark_event_failure_rolls_back_summary_transaction() -> None:
+    factory_job = workflow_job(mode="demo")
+    execution = workflow_run(1)
+    summary = workflow_benchmark((execution,))
+    storage = _AtomicBenchmarkStorage()
+    store = GatewayStore.__new__(GatewayStore)
+    store.storage = storage
+    store._runtime_block_by_json_value = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: {"index": 7, "data": factory_job.model_dump(mode="json", by_alias=True)}
+    )
+    store._factory_projection = (  # type: ignore[method-assign]
+        lambda _cursor, job: FactoryProjection.from_job(job)
+    )
+    store._factory_workflow_artifacts_for_job = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: (execution,)
+    )
+    indexes = iter((8, 9))
+    store._next_index = lambda _cursor: next(indexes)  # type: ignore[method-assign]
+    store._new_block = (  # type: ignore[method-assign]
+        lambda _cursor, **values: values
+    )
+
+    def fail_delivery_event(_cursor, block):
+        if block["block_type"] == "delivery_event":
+            raise RuntimeError("injected delivery event failure")
+        _cursor.state.setdefault("blocks", []).append(block)
+
+    store._insert = fail_delivery_event  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="injected delivery event failure"):
+        store._record_business_benchmark_summary_once(summary)
+
+    assert "summary" not in storage.committed
+    assert storage.committed.get("blocks", []) == []
+
+
+def test_business_benchmark_artifact_route_rejects_malformed_sha256() -> None:
+    app = create_app(
+        settings=GatewaySettings(
+            ledger_dsn=SecretStr("mysql://unused"),
+            captain_gateway_token=SecretStr("captain-test-token"),
+            worker_gateway_token=SecretStr("worker-test-token"),
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/factory/business-benchmarks/artifacts/NOT-A-DIGEST",
+            headers={"Authorization": "Bearer captain-test-token"},
+        )
+
+    assert response.status_code == 422
+
+
 def test_gateway_repository_seeds_all_six_exact_job_skill_assignments() -> None:
     factory_job = workflow_job(mode="release")
     base_skill = parse_factory_workflow_artifact(
@@ -266,7 +638,7 @@ def test_gateway_repository_seeds_all_six_exact_job_skill_assignments() -> None:
         repository.released_for(changed_envelope, FactorySkillStep.DISCOVER)
 
 
-def test_gateway_recomputes_v3_release_from_persisted_workflow_evidence() -> None:
+def test_gateway_release_fails_closed_until_task6_resolves_benchmark_summary() -> None:
     runs = tuple(workflow_run(number) for number in range(1, 4))
     evaluation = workflow_evaluation(runs)
     store = GatewayStore.__new__(GatewayStore)
@@ -279,6 +651,9 @@ def test_gateway_recomputes_v3_release_from_persisted_workflow_evidence() -> Non
     store._factory_usage_receipts_for_job = (  # type: ignore[method-assign]
         lambda _cursor, _job_id, *, for_update: workflow_receipts(runs)
     )
+    store._factory_business_benchmark_summary_by_artifact = (  # type: ignore[method-assign]
+        lambda _cursor, _artifact_ref, *, for_update: None
+    )
 
     decision = store._factory_workflow_release_decision(
         object(),
@@ -289,7 +664,10 @@ def test_gateway_recomputes_v3_release_from_persisted_workflow_evidence() -> Non
     )
 
     assert decision is not None
-    assert decision.status == "ready"
+    assert decision.status == "blocked"
+    assert decision.reasons == (
+        "missing authoritative business benchmark summary",
+    )
     assert decision.evaluation_ref == evaluation.artifact_ref
 
 
@@ -435,6 +813,37 @@ def test_gateway_workflow_sequence_requires_current_phase_and_prior_artifact() -
         GatewayStore._assert_workflow_sequence(
             blueprint_created, inventory, ()
         )
+
+
+def test_gateway_accepts_three_release_runs_for_one_canonical_holdout() -> None:
+    factory_job = workflow_job(mode="release")
+    inventory = parse_factory_workflow_artifact(inventory_payload())
+    brief = parse_factory_workflow_artifact(brief_payload())
+    runs = tuple(
+        run.model_copy(
+            update={
+                "invocation": run.invocation.model_copy(
+                    update={
+                        "input_ref": factory_job.input_ref,
+                        "input_sha256": factory_job.input_ref.sha256,
+                    }
+                )
+            }
+        )
+        for run in (workflow_run(number) for number in range(1, 4))
+    )
+    build_passed = FactoryProjection.from_job(factory_job).model_copy(
+        update={
+            "status": FactoryLifecycleStatus.RUNNING,
+            "phase": FactoryPhase.BUILD_PASSED,
+        }
+    )
+    prior = (inventory, brief)
+
+    for run in runs:
+        GatewayStore._assert_workflow_artifact(factory_job, run, prior)
+        GatewayStore._assert_workflow_sequence(build_passed, run, prior)
+        prior = (*prior, run)
 
 
 def test_gateway_workflow_input_binding_uses_the_exact_step_predecessor() -> None:
@@ -605,16 +1014,22 @@ def test_gateway_workflow_sequence_rejects_improvement_on_first_attempt() -> Non
             ),
         }
     )
-    with pytest.raises(HTTPException, match="current factory phase"):
-        GatewayStore._assert_workflow_sequence(
-            retry_projection, retry_discovery, (failed_evaluation,)
-        )
-    with pytest.raises(HTTPException, match="failed evaluation"):
-        GatewayStore._assert_workflow_sequence(retry_projection, revision, ())
     GatewayStore._assert_workflow_sequence(
-        retry_projection,
+        retry_projection, retry_discovery, (failed_evaluation,)
+    )
+    with pytest.raises(HTTPException, match="prior workflow artifact sequence"):
+        GatewayStore._assert_workflow_sequence(
+            retry_projection,
+            revision,
+            (failed_evaluation,),
+        )
+    retry_blueprint = retry_projection.model_copy(
+        update={"phase": FactoryPhase.BLUEPRINT_CREATED}
+    )
+    GatewayStore._assert_workflow_sequence(
+        retry_blueprint,
         revision,
-        (failed_evaluation,),
+        (failed_evaluation, retry_discovery),
     )
 
     brief = parse_factory_workflow_artifact(brief_payload())
@@ -623,9 +1038,9 @@ def test_gateway_workflow_sequence_rejects_improvement_on_first_attempt() -> Non
         update={"attempt": 2, "invocation": brief_invocation}
     )
     GatewayStore._assert_workflow_sequence(
-        retry_projection.model_copy(update={"phase": FactoryPhase.BLUEPRINT_CREATED}),
+        retry_blueprint,
         brief,
-        (failed_evaluation, revision),
+        (failed_evaluation, retry_discovery, revision),
     )
 
 

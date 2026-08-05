@@ -4,31 +4,38 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from threading import Lock
-from typing import Any, Literal, Protocol
-from uuid import UUID
+from typing import Any, Callable, Literal, Protocol
+from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request, Response, status
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 
 from blockchain.mariadb_storage import MariaDBStorage
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
     AgentRuntimeResult,
+    ArtifactRef,
     CapabilityGrant,
     CapabilityGrantRevocation,
 )
 from agenten.agent_factory.contracts import FactoryEvidenceBlock, FactoryJob, FactoryLease, FactoryPhase
-from agenten.agent_factory.outcome_contracts import FactoryTerminalDecision
 from agenten.agent_factory.execution_budget import (
     FactoryBudgetProjection,
     FactoryBudgetReservationV1,
     FactoryBudgetWriteReceipt,
 )
+from agenten.delivery.minibook_events import (
+    MinibookProjectionAcknowledgementV1,
+    MinibookProjectionRebuildReceiptV1,
+)
+from agenten.agent_factory.business_benchmark_contracts import BusinessBenchmarkSummaryV1
+from agenten.agent_factory.skill_workflow_contracts import TeamEvaluationV1
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from gateway.auth import (
     GatewayRole,
@@ -41,23 +48,18 @@ from gateway.auth import (
 from gateway.contracts import (
     ActiveCodexSession,
     BatchProjection,
-    CapabilityExecutionRecord,
-    CapabilityExecutionRequest,
-    CapabilityReleaseRequest,
-    CapabilityWriteReceipt,
     DeliveryEventEnvelope,
     ReleaseProjection,
     RecoveryDecisionEvent,
     ReviewDecisionEvent,
     RuntimeOperationProjection,
     RuntimeWriteReceipt,
-    RuntimeResultRecoveryObservation,
-    RuntimeResultRecoveryRequest,
     FactoryJobProjection,
     FactoryBudgetReleaseRequest,
     FactoryBudgetReservationWriteReceipt,
     FactoryWorkflowArtifact,
     FactoryWorkflowArtifactWriteReceipt,
+    BusinessBenchmarkSummaryWriteReceipt,
     FactoryUsageSubmissionV2,
     FactoryReleaseDecisionSubmission,
     FactoryWriteReceipt,
@@ -65,16 +67,57 @@ from gateway.contracts import (
     FactorySkillWriteReceipt,
     PublishedHermesSkill,
 )
-from gateway.capability_catalog import CapabilityCatalogRecord
 from gateway.mirror import MirrorQueue
+from gateway.portal_auth import initialize_portal_auth, require_portal_principal
+from gateway.portal_control_auth import (
+    PortalControlRole,
+    require_evidence_control,
+    require_provider_control,
+    require_restart_control,
+)
+from gateway.portal_n8n_composition import build_portal_n8n_adapter_bundle
+from gateway.portal_contracts import (
+    PortalPrincipalV1,
+    PortalSetupActionRequestV1,
+    PortalSetupSelectionRequestV1,
+    PortalSetupTicketIssueV1,
+    PortalSetupTicketUseV1,
+    PortalSetupTicketV1,
+    PortalTenantBindingV1,
+)
 from gateway.registry_feed import mirror_captain_projection
 from gateway.registry_feed import (
     MinibookProjectionFeedPage,
     factory_promotion_projection,
+    integration_setup_projection,
     runtime_result_projection,
 )
 from gateway.settings import GatewaySettings
-from gateway.store import AppendResult, GatewayStore
+from gateway.store import (
+    AppendResult,
+    GatewayStore,
+    PortalCredentialMetadataSource,
+    PortalCredentialVerificationSource,
+)
+from gateway.integration_setup_contracts import (
+    IntegrationSetupMutationV1,
+    IntegrationSetupSubmissionV1,
+    IntegrationSetupWriteReceiptV1,
+    PersistedIntegrationSetupV1,
+    IntegrationSetupSurfaceV1,
+    build_integration_setup_surface,
+)
+from gateway.portal_live_contracts import (
+    PortalLiveEvidenceQueryV1,
+    PortalLiveEvidenceV1,
+    PortalLiveRunDecisionV1,
+    PortalLiveRunFinalizationV1,
+    PortalProviderAuditQueryV1,
+    PortalProviderAuditV1,
+    PortalProviderProbeCompletionV1,
+    PortalProviderProbeRequestV1,
+    PortalRestartReceiptV1,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -132,6 +175,7 @@ CAPTAIN_SKILL_EVENT_TYPES = frozenset(
         "hermes_skill_evaluation_requested",
         "hermes_skill_published",
         "hermes_ready_to_use_validated",
+        "captain_business_benchmark_validated",
     }
 )
 HERMES_SKILL_EVENT_TYPES = frozenset(
@@ -188,25 +232,82 @@ def require_skill_event_writer(event: DeliveryEventEnvelope, actor: GatewayRole)
         )
 
 
+def _factory_promotion_benchmark_summary(
+    store: GatewayStore,
+    block: dict[str, Any],
+) -> BusinessBenchmarkSummaryV1:
+    """Resolve the exact persisted V3 summary; never derive public metrics."""
+
+    job_id = UUID(str(block["job_id"]))
+    attempt = int(block["attempt"])
+    evaluations = tuple(
+        artifact
+        for artifact in store.factory_workflow_artifacts(job_id)
+        if isinstance(artifact, TeamEvaluationV1) and artifact.attempt == attempt
+    )
+    if len(evaluations) != 1 or evaluations[0].benchmark_summary_ref is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="factory promotion has no unambiguous business benchmark evaluation",
+        )
+    summary = store.business_benchmark_summary_by_artifact(
+        evaluations[0].benchmark_summary_ref
+    )
+    if summary is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="factory promotion business benchmark summary is unavailable",
+        )
+    return summary
+
+
 def create_app(
     *,
     storage: MariaDBStorage | None = None,
-    gateway_store: GatewayStore | None = None,
     mirror: Mirror | None = None,
     settings: GatewaySettings | None = None,
+    gateway_store: GatewayStore | None = None,
+    portal_credential_source: PortalCredentialMetadataSource | None = None,
+    portal_verification_source: PortalCredentialVerificationSource | None = None,
+    portal_clock: Callable[[], datetime] | None = None,
 ) -> FastAPI:
     mirror = mirror or MirrorQueue(mirror_captain_projection)
     store_lock = Lock()
-    store: GatewayStore | None = gateway_store or (
-        GatewayStore(
-            storage,
-            claim_ttl=timedelta(seconds=settings.claim_ttl_seconds),
+    def configured_store(
+        target_storage: MariaDBStorage,
+        configured: GatewaySettings | None,
+    ) -> GatewayStore:
+        created = GatewayStore(
+            target_storage,
+            claim_ttl=(
+                timedelta(seconds=configured.claim_ttl_seconds)
+                if configured is not None
+                else timedelta(minutes=90)
+            ),
+            portal_credential_source=portal_credential_source,
+            portal_verification_source=portal_verification_source,
         )
-        if storage and settings
-        else GatewayStore(storage)
-        if storage
-        else None
+        if (
+            configured is not None
+            and configured.portal_n8n_adapters_configured
+            and portal_credential_source is None
+            and portal_verification_source is None
+        ):
+            bundle = build_portal_n8n_adapter_bundle(
+                reader=created,
+                settings=configured,
+            )
+            created.configure_portal_sources(
+                credential_source=bundle.credential_source,
+                verification_source=bundle.verification_source,
+            )
+        return created
+
+    store: GatewayStore | None = gateway_store or (
+        configured_store(storage, settings) if storage else None
     )
+    portal_clock = portal_clock or (lambda: datetime.now(timezone.utc))
+    portal_control_boot_id = str(uuid4())
     sink_calls: list[dict[str, Any]] = []
 
     @asynccontextmanager
@@ -232,6 +333,7 @@ def create_app(
     )
     app.state.gateway_settings = settings
     app.state.gateway_settings_lock = Lock()
+    initialize_portal_auth(app)
 
     @app.exception_handler(RequestValidationError)
     async def sanitized_review_validation_error(
@@ -239,6 +341,11 @@ def create_app(
         exc: RequestValidationError,
     ):
         path = request.url.path
+        if request.method == "POST" and path.startswith("/v1/portal/"):
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "invalid portal request"},
+            )
         if request.method == "POST" and path.startswith("/v1/factory/"):
             return JSONResponse(
                 status_code=422,
@@ -263,10 +370,7 @@ def create_app(
                 if store is None:
                     configured = load_gateway_settings(app)
                     dsn = configured.ledger_dsn.get_secret_value()
-                    store = GatewayStore(
-                        MariaDBStorage(dsn),
-                        claim_ttl=timedelta(seconds=configured.claim_ttl_seconds),
-                    )
+                    store = configured_store(MariaDBStorage(dsn), configured)
         return store
 
     @app.get("/healthz")
@@ -284,6 +388,94 @@ def create_app(
                 detail="gateway unavailable",
             ) from None
         return {"status": "ok", "database": "ready"}
+
+    @app.get("/v1/control/provider/health")
+    async def provider_control_health(
+        _: PortalControlRole = Depends(require_provider_control),
+    ) -> dict[str, str]:
+        return {
+            "status": "ok",
+            "service_version": "captain.portal-provider-control.v1",
+            "boot_id": portal_control_boot_id,
+        }
+
+    @app.post("/v1/control/provider/probes")
+    async def run_provider_control_probe(
+        request: PortalProviderProbeRequestV1,
+        _: PortalControlRole = Depends(require_provider_control),
+    ) -> PortalProviderProbeCompletionV1:
+        return await run_in_threadpool(
+            get_store().run_portal_provider_probe,
+            request,
+            now=portal_clock(),
+        )
+
+    @app.post("/v1/control/provider/audit")
+    async def query_provider_control_audit(
+        request: PortalProviderAuditQueryV1,
+        _: PortalControlRole = Depends(require_provider_control),
+    ) -> PortalProviderAuditV1:
+        return await run_in_threadpool(
+            get_store().portal_provider_audit,
+            request,
+            observed_at=portal_clock(),
+        )
+
+    @app.post("/v1/control/restarts/{restart_id}/receipts")
+    async def record_restart_control_receipt(
+        restart_id: UUID,
+        receipt: PortalRestartReceiptV1,
+        _: PortalControlRole = Depends(require_restart_control),
+    ) -> PortalRestartReceiptV1:
+        if receipt.restart_id != restart_id:
+            raise HTTPException(status_code=409, detail="restart_id must match route")
+        return await run_in_threadpool(
+            get_store().record_portal_restart_receipt,
+            receipt,
+        )
+
+    @app.get("/v1/control/restarts/health")
+    async def restart_control_health(
+        _: PortalControlRole = Depends(require_restart_control),
+    ) -> dict[str, str]:
+        return {
+            "status": "ok",
+            "service_version": "captain.portal-restart-control.v1",
+            "boot_id": portal_control_boot_id,
+        }
+
+    @app.post("/v1/control/portal-runs/{run_id}/decisions")
+    async def finalize_portal_live_run(
+        run_id: str,
+        request: PortalLiveRunFinalizationV1,
+        _: GatewayRole = Depends(require_captain),
+    ) -> PortalLiveRunDecisionV1:
+        if request.run_id != run_id:
+            raise HTTPException(status_code=409, detail="run_id must match route")
+        return await run_in_threadpool(
+            get_store().finalize_portal_live_run,
+            request,
+        )
+
+    @app.get("/v1/control/evidence/health")
+    async def evidence_control_health(
+        _: PortalControlRole = Depends(require_evidence_control),
+    ) -> dict[str, str]:
+        return {
+            "status": "ok",
+            "service_version": "captain.portal-evidence-control.v1",
+            "boot_id": portal_control_boot_id,
+        }
+
+    @app.post("/v1/control/evidence/query")
+    async def query_portal_live_evidence(
+        query: PortalLiveEvidenceQueryV1,
+        _: PortalControlRole = Depends(require_evidence_control),
+    ) -> PortalLiveEvidenceV1:
+        return await run_in_threadpool(
+            get_store().portal_live_evidence,
+            query,
+        )
 
     @app.get("/batches")
     async def list_batches(
@@ -307,6 +499,178 @@ def create_app(
         _: GatewayRole = Depends(require_captain),
     ) -> FactoryWriteReceipt:
         return get_store().record_factory_job(job)
+
+    @app.post(
+        "/v1/factory/integration-setups",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def record_integration_setup(
+        submission: IntegrationSetupSubmissionV1,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> IntegrationSetupWriteReceiptV1:
+        receipt = get_store().record_integration_setup(submission)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
+
+    @app.get("/v1/factory/jobs/{job_id}/integration-setup")
+    async def get_integration_setup(
+        job_id: UUID,
+        _: GatewayRole = Depends(require_captain),
+    ) -> PersistedIntegrationSetupV1:
+        return get_store().integration_setup(job_id)
+
+    @app.get("/v1/factory/jobs/{job_id}/integration-setup/surface")
+    async def get_integration_setup_surface(
+        job_id: UUID,
+        _: GatewayRole = Depends(require_captain),
+    ) -> IntegrationSetupSurfaceV1:
+        configured = load_gateway_settings(app)
+        return build_integration_setup_surface(
+            get_store().integration_setup(job_id),
+            n8n_ui_base_url=configured.captain_n8n_ui_url,
+        )
+
+    @app.post(
+        "/v1/factory/jobs/{job_id}/integration-setup/mutations",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def mutate_integration_setup(
+        job_id: UUID,
+        mutation: IntegrationSetupMutationV1,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> IntegrationSetupWriteReceiptV1:
+        receipt = get_store().mutate_integration_setup(job_id, mutation)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
+
+    def portal_surface(
+        job_id: UUID,
+        principal: PortalPrincipalV1,
+    ) -> IntegrationSetupSurfaceV1:
+        configured = load_gateway_settings(app)
+        return build_integration_setup_surface(
+            get_store().portal_integration_setup(job_id, principal.organization_id),
+            n8n_ui_base_url=configured.captain_n8n_ui_url,
+        )
+
+    @app.post(
+        "/v1/portal/integration-setups/{job_id}/tickets",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def issue_portal_setup_ticket(
+        job_id: UUID,
+        request: PortalSetupTicketIssueV1,
+        principal: PortalPrincipalV1 = Depends(require_portal_principal),
+    ) -> PortalSetupTicketV1:
+        return get_store().issue_portal_ticket(
+            job_id=job_id,
+            principal=principal,
+            credential_alias=request.credential_alias,
+            action=request.action,
+            now=portal_clock(),
+        )
+
+    @app.post(
+        "/v1/factory/integration-setups/{job_id}/portal-tenant-binding",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def provision_portal_tenant_binding(
+        job_id: UUID,
+        binding: PortalTenantBindingV1,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> PortalTenantBindingV1:
+        if binding.job_id != job_id:
+            raise HTTPException(status_code=409, detail="portal binding job_id must match route")
+        created = get_store().provision_portal_tenant(binding)
+        if not created:
+            response.status_code = status.HTTP_200_OK
+        return binding
+
+    @app.get("/v1/portal/integration-setups/{job_id}")
+    async def get_portal_integration_setup(
+        job_id: UUID,
+        principal: PortalPrincipalV1 = Depends(require_portal_principal),
+    ) -> IntegrationSetupSurfaceV1:
+        return portal_surface(job_id, principal)
+
+    @app.post("/v1/portal/integration-setups/{job_id}/discover")
+    async def discover_portal_credentials(
+        job_id: UUID,
+        request: PortalSetupTicketUseV1,
+        principal: PortalPrincipalV1 = Depends(require_portal_principal),
+    ) -> IntegrationSetupSurfaceV1:
+        persisted = await run_in_threadpool(
+            get_store().portal_discover,
+            job_id=job_id,
+            principal=principal,
+            request=request,
+            now=portal_clock(),
+        )
+        configured = load_gateway_settings(app)
+        return build_integration_setup_surface(
+            persisted,
+            n8n_ui_base_url=configured.captain_n8n_ui_url,
+        )
+
+    @app.post("/v1/portal/integration-setups/{job_id}/select")
+    async def select_portal_credential(
+        job_id: UUID,
+        request: PortalSetupSelectionRequestV1,
+        principal: PortalPrincipalV1 = Depends(require_portal_principal),
+    ) -> IntegrationSetupSurfaceV1:
+        persisted = get_store().portal_select(
+            job_id=job_id,
+            principal=principal,
+            request=request,
+            now=portal_clock(),
+        )
+        configured = load_gateway_settings(app)
+        return build_integration_setup_surface(
+            persisted,
+            n8n_ui_base_url=configured.captain_n8n_ui_url,
+        )
+
+    @app.post("/v1/portal/integration-setups/{job_id}/verify")
+    async def verify_portal_credential(
+        job_id: UUID,
+        request: PortalSetupTicketUseV1,
+        principal: PortalPrincipalV1 = Depends(require_portal_principal),
+    ) -> IntegrationSetupSurfaceV1:
+        persisted = await run_in_threadpool(
+            get_store().portal_verify,
+            job_id=job_id,
+            principal=principal,
+            request=request,
+            now=portal_clock(),
+        )
+        configured = load_gateway_settings(app)
+        return build_integration_setup_surface(
+            persisted,
+            n8n_ui_base_url=configured.captain_n8n_ui_url,
+        )
+
+    @app.post("/v1/portal/integration-setups/{job_id}/actions")
+    async def mutate_portal_integration_setup(
+        job_id: UUID,
+        request: PortalSetupActionRequestV1,
+        principal: PortalPrincipalV1 = Depends(require_portal_principal),
+    ) -> IntegrationSetupSurfaceV1:
+        persisted = get_store().portal_mutate(
+            job_id=job_id,
+            principal=principal,
+            request=request,
+            now=portal_clock(),
+        )
+        configured = load_gateway_settings(app)
+        return build_integration_setup_surface(
+            persisted,
+            n8n_ui_base_url=configured.captain_n8n_ui_url,
+        )
 
     @app.post("/v1/factory/budget/reservations", status_code=status.HTTP_201_CREATED)
     async def reserve_factory_budget(
@@ -365,6 +729,42 @@ def create_app(
         _: GatewayRole = Depends(require_reader),
     ) -> tuple[FactoryWorkflowArtifact, ...]:
         return get_store().factory_workflow_artifacts(job_id)
+
+    @app.post("/v1/factory/business-benchmarks", status_code=status.HTTP_201_CREATED)
+    async def record_business_benchmark_summary(
+        summary: BusinessBenchmarkSummaryV1,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> BusinessBenchmarkSummaryWriteReceipt:
+        receipt = get_store().record_business_benchmark_summary(summary)
+        if receipt.replayed:
+            response.status_code = status.HTTP_200_OK
+        return receipt
+
+    @app.get("/v1/factory/business-benchmarks/artifacts/{artifact_sha256}")
+    async def get_business_benchmark_summary_by_artifact(
+        artifact_sha256: str = Path(pattern=r"^[0-9a-f]{64}$"),
+        _: GatewayRole = Depends(require_reader),
+    ) -> BusinessBenchmarkSummaryV1:
+        artifact_ref = ArtifactRef(
+            uri=f"artifact://business-benchmark-summary/{artifact_sha256}",
+            sha256=artifact_sha256,
+            media_type="application/json",
+        )
+        summary = get_store().business_benchmark_summary_by_artifact(artifact_ref)
+        if summary is None:
+            raise HTTPException(status_code=404, detail="business benchmark summary not found")
+        return summary
+
+    @app.get("/v1/factory/business-benchmarks/{summary_id}")
+    async def get_business_benchmark_summary(
+        summary_id: UUID,
+        _: GatewayRole = Depends(require_reader),
+    ) -> BusinessBenchmarkSummaryV1:
+        summary = get_store().business_benchmark_summary(summary_id)
+        if summary is None:
+            raise HTTPException(status_code=404, detail="business benchmark summary not found")
+        return summary
 
     @app.post("/v1/factory/blocks", status_code=status.HTTP_201_CREATED)
     async def record_factory_block(
@@ -463,78 +863,6 @@ def create_app(
     ) -> FactoryJobProjection:
         return get_store().factory_job(job_id)
 
-    def publish_capability_release(
-        request: CapabilityReleaseRequest,
-        response: Response,
-    ) -> CapabilityWriteReceipt:
-        receipt = get_store().publish_capability_release(request)
-        if receipt.replayed:
-            response.status_code = status.HTTP_200_OK
-        return receipt
-
-    @app.post("/v1/factory/terminal-decisions", status_code=status.HTTP_201_CREATED)
-    async def record_factory_terminal_decision(
-        request: CapabilityReleaseRequest | FactoryTerminalDecision,
-        response: Response,
-        _: GatewayRole = Depends(require_captain),
-    ) -> CapabilityWriteReceipt:
-        if isinstance(request, CapabilityReleaseRequest):
-            return publish_capability_release(request, response)
-        receipt = get_store().record_factory_terminal_decision(request)
-        if receipt.replayed:
-            response.status_code = status.HTTP_200_OK
-        return receipt
-
-    @app.get("/v1/factory/terminal-decisions/{job_id}")
-    async def get_factory_terminal_decision(
-        job_id: UUID,
-        _: GatewayRole = Depends(require_reader),
-    ) -> Any:
-        decision = get_store().factory_terminal_decision(job_id)
-        if decision is None:
-            raise HTTPException(status_code=404, detail="factory terminal decision not found")
-        return decision
-
-    @app.post("/v1/capabilities", status_code=status.HTTP_201_CREATED)
-    async def record_capability_release(
-        request: CapabilityReleaseRequest,
-        response: Response,
-        _: GatewayRole = Depends(require_captain),
-    ) -> CapabilityWriteReceipt:
-        return publish_capability_release(request, response)
-
-    @app.get("/v1/capabilities/{capability_id}")
-    async def get_capability(
-        capability_id: str,
-        version: int | None = Query(default=None, ge=1),
-        _: GatewayRole = Depends(require_reader),
-    ) -> CapabilityCatalogRecord:
-        record = get_store().capability(capability_id, version=version)
-        if record is None:
-            raise HTTPException(status_code=404, detail="capability not found")
-        return record
-
-    @app.post("/v1/capability-executions", status_code=status.HTTP_201_CREATED)
-    async def record_capability_execution(
-        request: CapabilityExecutionRequest,
-        response: Response,
-        _: GatewayRole = Depends(require_captain),
-    ) -> CapabilityWriteReceipt:
-        receipt = get_store().record_capability_execution(request)
-        if receipt.replayed:
-            response.status_code = status.HTTP_200_OK
-        return receipt
-
-    @app.get("/v1/capability-executions/{command_id}")
-    async def get_capability_execution(
-        command_id: UUID,
-        _: GatewayRole = Depends(require_reader),
-    ) -> CapabilityExecutionRecord:
-        record = get_store().capability_execution(command_id)
-        if record is None:
-            raise HTTPException(status_code=404, detail="capability execution not found")
-        return record
-
     @app.get("/api/v1/projections/minibook/events")
     async def minibook_projection_feed(
         cursor: str | None = Query(default=None, pattern=r"^[0-9]+$"),
@@ -548,11 +876,24 @@ def create_app(
         )
         projected_events = []
         for _, block_type, data, parent in records:
-            event = (
-                factory_promotion_projection(data, parent)
-                if block_type == "agent_factory_block" and parent is not None
-                else runtime_result_projection(data)
-            )
+            if block_type == "agent_factory_block" and parent is not None:
+                benchmark_summary = (
+                    _factory_promotion_benchmark_summary(get_store(), data)
+                    if parent.get("schema") == "captain.agent-factory-job.v3"
+                    else None
+                )
+                event = factory_promotion_projection(
+                    data,
+                    parent,
+                    benchmark_summary=benchmark_summary,
+                )
+            elif block_type == "factory_integration_setup" and parent is not None:
+                event = integration_setup_projection(
+                    IntegrationSetupSubmissionV1.model_validate(data),
+                    parent,
+                )
+            else:
+                event = runtime_result_projection(data)
             if event is not None:
                 projected_events.append(event)
         events = tuple(projected_events)
@@ -561,6 +902,32 @@ def create_app(
             events=events,
             cursor=next_cursor,
             has_more=has_more,
+        )
+
+    @app.post(
+        "/api/v1/projections/minibook/acknowledgements",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def acknowledge_minibook_projection(
+        acknowledgement: MinibookProjectionAcknowledgementV1,
+        response: Response,
+        _: GatewayRole = Depends(require_captain),
+    ) -> AppendResult:
+        result = get_store().record_minibook_projection_acknowledgement(
+            acknowledgement
+        )
+        if result.replayed:
+            response.status_code = status.HTTP_200_OK
+        return result
+
+    @app.post("/api/v1/projections/minibook/rebuild-receipts")
+    async def record_minibook_projection_rebuild(
+        receipt: MinibookProjectionRebuildReceiptV1,
+        _: GatewayRole = Depends(require_captain),
+    ) -> MinibookProjectionRebuildReceiptV1:
+        return await run_in_threadpool(
+            get_store().record_minibook_projection_rebuild_receipt,
+            receipt,
         )
 
     @app.post("/v1/runtime/commands", status_code=status.HTTP_202_ACCEPTED)
@@ -638,51 +1005,9 @@ def create_app(
     async def record_runtime_result(
         result: AgentRuntimeResult,
         response: Response,
-        execution_owner_id: str | None = Header(
-            default=None,
-            alias="X-Runtime-Owner-ID",
-            min_length=1,
-        ),
-        execution_fencing_token: int | None = Header(
-            default=None,
-            alias="X-Runtime-Fencing-Token",
-            ge=1,
-        ),
-        execution_claim_credential: str | None = Header(
-            default=None,
-            alias="X-Runtime-Claim-Credential",
-            min_length=20,
-        ),
-        actor: GatewayRole = Depends(require_actor),
+        _: GatewayRole = Depends(require_actor),
     ) -> RuntimeWriteReceipt:
-        claim_values = (
-            execution_owner_id,
-            execution_fencing_token,
-            execution_claim_credential,
-        )
-        supplied = tuple(value is not None for value in claim_values)
-        if any(supplied) and not all(supplied):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="runtime execution claim headers must be supplied together",
-            )
-        if all(supplied):
-            if actor is not GatewayRole.CAPTAIN:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="insufficient gateway role",
-                )
-            assert execution_owner_id is not None
-            assert execution_fencing_token is not None
-            assert execution_claim_credential is not None
-            receipt = get_store().record_runtime_result(
-                result,
-                execution_owner_id=execution_owner_id,
-                execution_fencing_token=execution_fencing_token,
-                execution_claim_credential=execution_claim_credential,
-            )
-        else:
-            receipt = get_store().record_runtime_result(result)
+        receipt = get_store().record_runtime_result(result)
         if receipt.replayed:
             response.status_code = status.HTTP_200_OK
         else:
@@ -700,39 +1025,6 @@ def create_app(
                 }
             )
         return receipt
-
-    @app.post("/v1/runtime/result-recoveries", status_code=status.HTTP_201_CREATED)
-    async def recover_runtime_result(
-        request: RuntimeResultRecoveryRequest,
-        response: Response,
-        execution_owner_id: str = Header(alias="X-Runtime-Owner-ID", min_length=1),
-        execution_fencing_token: int = Header(
-            alias="X-Runtime-Fencing-Token", ge=1
-        ),
-        execution_claim_credential: str = Header(
-            alias="X-Runtime-Claim-Credential", min_length=20
-        ),
-        _: GatewayRole = Depends(require_captain),
-    ) -> RuntimeWriteReceipt:
-        receipt = get_store().recover_runtime_result(
-            request,
-            execution_owner_id=execution_owner_id,
-            execution_fencing_token=execution_fencing_token,
-            execution_claim_credential=execution_claim_credential,
-        )
-        if receipt.replayed:
-            response.status_code = status.HTTP_200_OK
-        return receipt
-
-    @app.get("/v1/runtime/result-recoveries/{operation_id}")
-    async def get_runtime_result_recovery(
-        operation_id: UUID,
-        _: GatewayRole = Depends(require_reader),
-    ) -> RuntimeResultRecoveryObservation:
-        observation = get_store().runtime_result_recovery(operation_id)
-        if observation is None:
-            raise HTTPException(status_code=404, detail="runtime result recovery not found")
-        return observation
 
     @app.get("/v1/runtime/operations/{operation_id}")
     async def get_runtime_operation(

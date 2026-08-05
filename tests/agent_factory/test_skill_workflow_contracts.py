@@ -103,6 +103,14 @@ def invocation_payload(step: str, **overrides: object) -> dict[str, object]:
     return payload
 
 
+def benchmark_summary_artifact(digest: str = "4" * 64) -> dict[str, str]:
+    return {
+        "uri": f"artifact://business-benchmark-summary/{digest}",
+        "sha256": digest,
+        "media_type": "application/json",
+    }
+
+
 def common_payload(step: str, **overrides: object) -> dict[str, object]:
     invocation = invocation_payload(step)
     payload: dict[str, object] = {
@@ -252,6 +260,16 @@ def evaluation_payload(**overrides: object) -> dict[str, object]:
         deterministic_check_refs=[artifact("deterministic-check", "e" * 64)],
         judge_ref=None,
         prior_green_regression_ids=["schema_valid"],
+        benchmark_summary_ref=benchmark_summary_artifact(),
+        benchmark_policy_id="captain-business-value-v1",
+        benchmark_disposition="passed",
+        benchmark_reason_codes=[],
+        failed_benchmark_metric_ids=[],
+        prior_green_benchmark_metric_ids=["coverage"],
+        evidence_refs=[
+            artifact("evaluate_team-evidence", "c" * 64),
+            benchmark_summary_artifact(),
+        ],
         cost_summary_ref=artifact("cost-summary", "f" * 64),
         latency_summary_ref=artifact("latency-summary", "1" * 64),
         failure_class=None,
@@ -268,12 +286,53 @@ def revision_payload(**overrides: object) -> dict[str, object]:
         parent_candidate_ref=artifact("parent-candidate", "d" * 64),
         candidate_ref=artifact("new-candidate", "e" * 64),
         failed_assertion_ids=["real_case_green"],
+        failed_benchmark_metric_ids=[],
         changed_components=["system_prompt"],
         regression_assertion_ids=["schema_valid"],
+        regression_benchmark_metric_ids=["coverage"],
         codex_session_ref=artifact("codex-session", "f" * 64),
     )
     payload.update(overrides)
     return payload
+
+
+def test_legacy_team_evaluation_remains_readable_without_passing_benchmark() -> None:
+    payload = evaluation_payload()
+    for field in (
+        "benchmark_summary_ref",
+        "benchmark_policy_id",
+        "benchmark_disposition",
+        "benchmark_reason_codes",
+        "failed_benchmark_metric_ids",
+        "prior_green_benchmark_metric_ids",
+    ):
+        payload.pop(field)
+
+    evaluation = TeamEvaluationV1.model_validate(payload)
+
+    assert evaluation.benchmark_summary_ref is None
+    assert evaluation.benchmark_disposition is None
+    assert evaluation.failed_benchmark_metric_ids == ()
+
+
+def test_bound_team_evaluation_requires_benchmark_summary_evidence() -> None:
+    payload = evaluation_payload(
+        evidence_refs=[artifact("evaluate_team-evidence", "c" * 64)]
+    )
+    with pytest.raises(ValidationError, match="benchmark summary ref"):
+        TeamEvaluationV1.model_validate(payload)
+
+
+def test_candidate_revision_accepts_benchmark_only_failure_namespace() -> None:
+    revision = CandidateRevisionV1.model_validate(
+        revision_payload(
+            failed_assertion_ids=[],
+            failed_benchmark_metric_ids=["tool_safety"],
+        )
+    )
+
+    assert revision.failed_assertion_ids == ()
+    assert revision.failed_benchmark_metric_ids == ("tool_safety",)
 
 
 def feedback_payload(**overrides: object) -> dict[str, object]:

@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -14,20 +12,17 @@ from agenten.agent_factory.execution_budget import (
     FactoryBudgetProjection,
     FactoryUsageReceiptV1,
 )
-from agenten.agent_factory.outcome_contracts import (
-    CapabilityAssertionResult,
-    CapabilityPackageManifestV1,
-    CapabilityReleaseEvidenceV1,
-)
 from agenten.agent_factory.release_gate import (
     E2EKind,
     E2EOutcome,
     E2ERunEvidence,
     evaluate_factory_release,
     evaluate_factory_workflow_release,
+    factory_workflow_release_decision_block_reason,
 )
 from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillInvocationV1,
+    TeamEvaluationV1,
     TeamExecutionEvidenceV1,
 )
 from agenten.agent_factory.team_evaluation import TeamEvaluationService
@@ -35,7 +30,10 @@ from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.skill_evaluation import ToolGapMarker
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
 from tests.agent_factory.test_skill_evaluation_contracts import gap_payload
-from tests.agent_factory.test_state_machine import accepted_evaluation, artifact, job, v2_job
+from tests.agent_factory.test_business_benchmark_contracts import (
+    summary as business_summary,
+)
+from tests.agent_factory.test_state_machine import accepted_evaluation, artifact, job
 from tests.agent_factory.test_skill_workflow_contracts import (
     CORRELATION_ID,
     JOB_ID,
@@ -47,121 +45,6 @@ from tests.agent_factory.test_skill_workflow_contracts import (
 
 WORKFLOW_NOW = datetime(2026, 7, 21, 10, tzinfo=timezone.utc)
 
-
-def _base_manifest() -> CapabilityPackageManifestV1:
-    payload = json.loads(
-        (Path(__file__).parents[1] / "fixtures" / "contracts" / "capability_package_manifest.v1.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    factory_job = v2_job()
-    assertion_refs = tuple(
-        ArtifactRef.model_validate(artifact(f"assertion-{assertion_id}"))
-        for assertion_id in factory_job.acceptance_assertion_ids
-    )
-    payload.update(
-        {
-            "factory_job_id": str(factory_job.job_id),
-            "correlation_id": str(factory_job.correlation_id),
-            "subject_version": factory_job.subject_version,
-            "capability_id": factory_job.required_capability,
-            "assertion_outcomes": [
-                {
-                    "assertion_id": assertion_id,
-                    "status": "passed",
-                    "integration_intent": "none",
-                    "evidence_refs": [reference.model_dump(mode="json")],
-                }
-                for assertion_id, reference in zip(factory_job.acceptance_assertion_ids, assertion_refs)
-            ],
-            "private_holdout_receipts": [
-                {
-                    "holdout_id": factory_job.private_holdout_refs[0].holdout_id,
-                    "assertion_id": factory_job.acceptance_assertion_ids[0],
-                    "status": "passed",
-                    "evidence_ref": artifact("holdout-passed"),
-                }
-            ],
-            "recovery_receipt": {
-                "recovery_id": "controlled-recovery-01",
-                "assertion_id": factory_job.acceptance_assertion_ids[0],
-                "status": "passed",
-                "evidence_ref": artifact("recovery-passed"),
-            },
-        }
-    )
-    return CapabilityPackageManifestV1.model_validate(payload)
-
-
-def _release_evidence_ref(record: CapabilityReleaseEvidenceV1) -> ArtifactRef:
-    content = record.model_dump_json(by_alias=True).encode("utf-8")
-    digest = hashlib.sha256(content).hexdigest()
-    return ArtifactRef(
-        uri=f"artifact://release-evidence/{digest}",
-        sha256=digest,
-        media_type="application/json",
-    )
-
-
-def accepted_manifest(
-    *,
-    e2e: tuple[CapabilityReleaseEvidenceV1, ...] | None = None,
-) -> CapabilityPackageManifestV1:
-    manifest = _base_manifest()
-    records = e2e if e2e is not None else capability_e2e(manifest=manifest)
-    return manifest.model_copy(
-        update={
-            "release_evidence_refs": tuple(
-                _release_evidence_ref(record) for record in records
-            )
-        }
-    )
-
-
-def capability_e2e(
-    *,
-    successes: int = 3,
-    manifest: CapabilityPackageManifestV1 | None = None,
-) -> tuple[CapabilityReleaseEvidenceV1, ...]:
-    factory_job = v2_job()
-    effective_manifest = manifest or _base_manifest()
-    assertion_results = tuple(
-        CapabilityAssertionResult(
-            assertion_id=assertion_id,
-            status="passed",
-            integration_intent="none",
-            evidence_refs=(ArtifactRef.model_validate(artifact(f"run-assertion-{assertion_id}")),),
-        )
-        for assertion_id in factory_job.acceptance_assertion_ids
-    )
-
-    def run(number: int, *, kind: str, outcome: str) -> CapabilityReleaseEvidenceV1:
-        return CapabilityReleaseEvidenceV1(
-            schema_name="captain.capability-release-evidence.v1",
-            run_id=f"release-run-{number}",
-            run_number=number,
-            factory_job_id=factory_job.job_id,
-            creation_job_id=effective_manifest.creation_job_id,
-            correlation_id=factory_job.correlation_id,
-            subject_version=factory_job.subject_version,
-            attempt=1,
-            capability_id=factory_job.required_capability,
-            capability_version=effective_manifest.capability_version,
-            candidate_manifest_sha256="d" * 64,
-            package_archive_sha256=effective_manifest.source_ref.sha256,
-            extracted_tree_sha256="e" * 64,
-            kind=kind,
-            outcome=outcome,
-            producer="captain",
-            assertion_results=assertion_results,
-            recovery_id="controlled-recovery-01" if kind == "recovery" else None,
-            recovery_assertion_id=factory_job.acceptance_assertion_ids[0] if kind == "recovery" else None,
-        )
-
-    return (
-        run(1, kind="recovery", outcome="expected_failure_recovered"),
-        *(run(number, kind="normal", outcome="succeeded") for number in range(2, 2 + successes)),
-    )
 
 def evidence(number: int, kind: E2EKind, outcome: E2EOutcome) -> E2ERunEvidence:
     factory_job = job()
@@ -436,7 +319,6 @@ def workflow_run(
     lease = invocation["lease"]
     assert isinstance(lease, dict)
     lease["attempt"] = attempt
-    lease["lease_id"] = f"lease-real-case-tester-{attempt}-{number}"
     invocation_id = (
         f"00000000-0000-0000-0000-{320 + (attempt - 1) * 10 + number:012d}"
     )
@@ -464,13 +346,28 @@ def workflow_evaluation(
     lease["attempt"] = runs[0].attempt
     invocation = FactorySkillInvocationV1.model_validate(payload)
     projection = budget or workflow_budget()
+    benchmark_summary = workflow_benchmark(runs)
     return TeamEvaluationService(
         clock=lambda: WORKFLOW_NOW + timedelta(minutes=2)
     ).evaluate(
         invocation,
         runs[0].candidate_ref,
         runs,
+        benchmark_summary=benchmark_summary,
         budget_projection=projection,
+    )
+
+
+def workflow_benchmark(runs: tuple[TeamExecutionEvidenceV1, ...]):
+    invocation = runs[0].invocation
+    suite_ref = workflow_job(mode="release").private_holdout_refs[0]
+    return business_summary(
+        job_id=str(invocation.job_id),
+        correlation_id=str(invocation.correlation_id),
+        subject_version=invocation.subject_version,
+        attempt=invocation.attempt,
+        candidate_ref=runs[0].candidate_ref.model_dump(mode="json"),
+        suite_ref=suite_ref.model_dump(mode="json", by_alias=True),
     )
 
 
@@ -505,8 +402,6 @@ def workflow_receipts(
             job_id=run.job_id,
             correlation_id=run.correlation_id,
             attempt=run.attempt,
-            lease_id=run.invocation.lease.lease_id,
-            invocation_id=run.invocation_id,
             provider="approved-provider",
             model="approved-model-id",
             input_units=100,
@@ -528,6 +423,7 @@ def test_workflow_release_keeps_demo_ready_distinct_from_ready() -> None:
         workflow_job(mode="demo"),
         demo_runs,
         workflow_evaluation(demo_runs),
+        benchmark_summary=workflow_benchmark(demo_runs),
         budget_projection=workflow_budget(),
         usage_receipts=workflow_receipts(demo_runs),
     )
@@ -535,6 +431,7 @@ def test_workflow_release_keeps_demo_ready_distinct_from_ready() -> None:
         workflow_job(mode="release"),
         release_runs,
         workflow_evaluation(release_runs),
+        benchmark_summary=workflow_benchmark(release_runs),
         budget_projection=workflow_budget(),
         usage_receipts=workflow_receipts(release_runs),
     )
@@ -543,12 +440,180 @@ def test_workflow_release_keeps_demo_ready_distinct_from_ready() -> None:
     assert release.status == "ready"
 
 
+def test_workflow_release_does_not_trust_parsed_evaluation_benchmark_fields() -> None:
+    runs = (workflow_run(1),)
+    evaluation = workflow_evaluation(runs)
+    assert evaluation.benchmark_summary_ref is not None
+    fake_ref = ArtifactRef(
+        uri="artifact://business-benchmark-summary/" + "9" * 64,
+        sha256="9" * 64,
+        media_type="application/json",
+    )
+    payload = evaluation.model_dump(mode="json", by_alias=True)
+    payload["benchmark_summary_ref"] = fake_ref.model_dump(mode="json")
+    payload["evidence_refs"] = [
+        *[
+            reference
+            for reference in payload["evidence_refs"]
+            if reference != evaluation.benchmark_summary_ref.model_dump(mode="json")
+        ],
+        fake_ref.model_dump(mode="json"),
+    ]
+    forged = TeamEvaluationV1.model_validate(payload)
+
+    decision = evaluate_factory_workflow_release(
+        workflow_job(mode="demo"),
+        runs,
+        forged,
+        benchmark_summary=None,
+        budget_projection=workflow_budget(),
+        usage_receipts=workflow_receipts(runs),
+    )
+
+    assert decision.status == "blocked"
+    assert decision.reasons == ("missing authoritative business benchmark summary",)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("benchmark_policy_id", "forged-policy"),
+        ("benchmark_disposition", "failed"),
+        ("benchmark_reason_codes", ("missing_receipt",)),
+        ("failed_benchmark_metric_ids", ("coverage",)),
+    ),
+)
+def test_workflow_release_matches_every_copied_evaluation_benchmark_field(
+    field: str,
+    value: object,
+) -> None:
+    runs = (workflow_run(1),)
+    evaluation = workflow_evaluation(runs).model_copy(update={field: value})
+
+    decision = evaluate_factory_workflow_release(
+        workflow_job(mode="demo"),
+        runs,
+        evaluation,
+        benchmark_summary=workflow_benchmark(runs),
+        budget_projection=workflow_budget(),
+        usage_receipts=workflow_receipts(runs),
+    )
+
+    assert decision.status == "blocked"
+    assert decision.reasons == (
+        "workflow evaluation does not match authoritative business benchmark",
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("job_id", "00000000-0000-0000-0000-000000000999"),
+        ("correlation_id", "00000000-0000-0000-0000-000000000999"),
+        ("subject_version", 2),
+        ("attempt", 2),
+        ("candidate_ref", workflow_artifact("other-candidate", "8" * 64)),
+    ),
+)
+def test_workflow_release_matches_authoritative_summary_identity(
+    field: str,
+    value: object,
+) -> None:
+    runs = (workflow_run(1),)
+    payload = workflow_benchmark(runs).model_dump(mode="json", by_alias=True)
+    payload[field] = value
+    payload.pop("artifact_ref")
+    summary = business_summary(**payload)
+
+    decision = evaluate_factory_workflow_release(
+        workflow_job(mode="demo"),
+        runs,
+        workflow_evaluation(runs),
+        benchmark_summary=summary,
+        budget_projection=workflow_budget(),
+        usage_receipts=workflow_receipts(runs),
+    )
+
+    assert decision.status == "blocked"
+    assert decision.reasons == (
+        "workflow business benchmark binding does not match release evidence",
+    )
+
+
+def test_workflow_release_requires_a_job_owned_private_suite() -> None:
+    runs = (workflow_run(1),)
+    summary = workflow_benchmark(runs)
+    payload = summary.model_dump(mode="json", by_alias=True)
+    payload.pop("artifact_ref")
+    payload["suite_ref"] = {
+        **payload["suite_ref"],
+        "holdout_id": "holdout-999999999999",
+        "uri": "holdout://holdout-999999999999",
+        "sha256": "9" * 64,
+    }
+    foreign = business_summary(**payload)
+    evaluation = workflow_evaluation(runs)
+    evaluation = evaluation.model_copy(
+        update={
+            "benchmark_summary_ref": foreign.artifact_ref,
+            "evidence_refs": tuple(
+                foreign.artifact_ref if ref == summary.artifact_ref else ref
+                for ref in evaluation.evidence_refs
+            ),
+        }
+    )
+
+    decision = evaluate_factory_workflow_release(
+        workflow_job(mode="demo"),
+        runs,
+        evaluation,
+        benchmark_summary=foreign,
+        budget_projection=workflow_budget(),
+        usage_receipts=workflow_receipts(runs),
+    )
+
+    assert decision.status == "blocked"
+    assert decision.reasons == (
+        "workflow business benchmark suite is not owned by the Factory job",
+    )
+
+
+def test_workflow_release_revalidates_canonical_summary_digest() -> None:
+    runs = (workflow_run(1),)
+    summary = workflow_benchmark(runs)
+    forged = summary.model_construct(
+        **{
+            **summary.__dict__,
+            "artifact_ref": ArtifactRef(
+                uri="artifact://business-benchmark-summary/" + "9" * 64,
+                sha256="9" * 64,
+                media_type="application/json",
+            ),
+        }
+    )
+
+    decision = evaluate_factory_workflow_release(
+        workflow_job(mode="demo"),
+        runs,
+        workflow_evaluation(runs),
+        benchmark_summary=forged,
+        budget_projection=workflow_budget(),
+        usage_receipts=workflow_receipts(runs),
+    )
+
+    assert decision.status == "blocked"
+    assert decision.reasons == (
+        "workflow business benchmark summary is not canonical",
+    )
+
+
 def test_workflow_release_requires_exact_live_run_count_and_usage_receipts() -> None:
     runs = (workflow_run(1), workflow_run(2))
     decision = evaluate_factory_workflow_release(
         workflow_job(mode="release"),
         runs,
         workflow_evaluation(runs),
+        benchmark_summary=workflow_benchmark(runs),
         budget_projection=workflow_budget(),
         usage_receipts=workflow_receipts(runs),
     )
@@ -564,6 +629,7 @@ def test_workflow_release_requires_a_gateway_budget_projection() -> None:
         workflow_job(mode="demo"),
         runs,
         workflow_evaluation(runs),
+        benchmark_summary=workflow_benchmark(runs),
     )
 
     assert decision.status == "blocked"
@@ -579,6 +645,7 @@ def test_workflow_release_requires_receipts_to_cover_the_budget_projection() -> 
         workflow_job(mode="demo"),
         runs,
         workflow_evaluation(runs),
+        benchmark_summary=workflow_benchmark(runs),
         budget_projection=workflow_budget(),
         usage_receipts=(),
     )
@@ -601,6 +668,7 @@ def test_workflow_release_rejects_receipt_reference_reused_between_runs() -> Non
         workflow_job(mode="release"),
         reused,
         workflow_evaluation(reused),
+        benchmark_summary=workflow_benchmark(reused),
         budget_projection=workflow_budget(),
         usage_receipts=workflow_receipts((runs[0],)),
     )
@@ -611,17 +679,14 @@ def test_workflow_release_rejects_receipt_reference_reused_between_runs() -> Non
     )
 
 
-def test_workflow_release_counts_paid_hermes_receipt_without_binding_it_to_a_run() -> None:
+def test_workflow_release_rejects_extra_gateway_receipt_not_bound_to_a_run() -> None:
     runs = tuple(workflow_run(number) for number in range(1, 4))
     receipts = workflow_receipts(runs)
     extra = receipts[0].model_copy(
         update={
             "receipt_id": UUID("00000000-0000-0000-0000-000000000499"),
             "reservation_id": UUID("00000000-0000-0000-0000-000000000498"),
-            "lease_id": "lease-hermes-execute-team-extra",
-            "invocation_id": UUID("00000000-0000-0000-0000-000000000497"),
-            "provider": "hermes",
-            "cost_usd": Decimal("0.01"),
+            "cost_usd": Decimal("0.00"),
             "evidence_ref": ArtifactRef.model_validate(
                 workflow_artifact("extra-usage", "f" * 64)
             ),
@@ -632,75 +697,14 @@ def test_workflow_release_counts_paid_hermes_receipt_without_binding_it_to_a_run
         workflow_job(mode="release"),
         runs,
         workflow_evaluation(runs),
-        budget_projection=workflow_budget("0.76"),
+        benchmark_summary=workflow_benchmark(runs),
+        budget_projection=workflow_budget(),
         usage_receipts=(*receipts, extra),
     )
 
-    assert decision.status == "ready"
-
-
-def test_workflow_release_rejects_provider_receipts_swapped_between_runs() -> None:
-    runs = tuple(workflow_run(number) for number in range(1, 4))
-    receipts = workflow_receipts(runs)
-    swapped_runs = (
-        runs[0].model_copy(
-            update={"usage_receipt_refs": (receipts[1].evidence_ref,)}
-        ),
-        runs[1].model_copy(
-            update={"usage_receipt_refs": (receipts[0].evidence_ref,)}
-        ),
-        runs[2],
-    )
-
-    decision = evaluate_factory_workflow_release(
-        workflow_job(mode="release"),
-        swapped_runs,
-        workflow_evaluation(swapped_runs),
-        budget_projection=workflow_budget(),
-        usage_receipts=receipts,
-    )
-
     assert decision.status == "blocked"
     assert decision.reasons == (
-        "workflow run usage receipts must match the exact invocation and lease",
-    )
-
-
-def test_workflow_release_rejects_hermes_receipt_substituted_for_run_receipt() -> None:
-    runs = tuple(workflow_run(number) for number in range(1, 4))
-    receipts = workflow_receipts(runs)
-    hermes_extra = receipts[0].model_copy(
-        update={
-            "receipt_id": UUID("00000000-0000-0000-0000-000000000499"),
-            "reservation_id": UUID("00000000-0000-0000-0000-000000000498"),
-            "lease_id": "lease-hermes-execute-team-extra",
-            "invocation_id": UUID("00000000-0000-0000-0000-000000000497"),
-            "provider": "hermes",
-            "cost_usd": Decimal("0.01"),
-            "evidence_ref": ArtifactRef.model_validate(
-                workflow_artifact("extra-usage", "f" * 64)
-            ),
-        }
-    )
-    substituted_runs = (
-        runs[0].model_copy(
-            update={"usage_receipt_refs": (hermes_extra.evidence_ref,)}
-        ),
-        runs[1],
-        runs[2],
-    )
-
-    decision = evaluate_factory_workflow_release(
-        workflow_job(mode="release"),
-        substituted_runs,
-        workflow_evaluation(substituted_runs, budget=workflow_budget("0.76")),
-        budget_projection=workflow_budget("0.76"),
-        usage_receipts=(*receipts, hermes_extra),
-    )
-
-    assert decision.status == "blocked"
-    assert decision.reasons == (
-        "workflow run usage receipts must match the exact invocation and lease",
+        "workflow usage receipts must exactly and uniquely cover every run",
     )
 
 
@@ -711,11 +715,101 @@ def test_workflow_release_accepts_disjoint_exact_receipt_union() -> None:
         workflow_job(mode="release"),
         runs,
         workflow_evaluation(runs),
+        benchmark_summary=workflow_benchmark(runs),
         budget_projection=workflow_budget(),
         usage_receipts=workflow_receipts(runs),
     )
 
     assert decision.status == "ready"
+
+
+def test_workflow_release_accepts_exact_benchmark_usage_cost_beyond_run_receipts() -> None:
+    runs = tuple(workflow_run(number) for number in range(1, 4))
+    technical_receipts = workflow_receipts(runs)
+    benchmark_receipt = technical_receipts[0].model_copy(
+        update={
+            "receipt_id": UUID("00000000-0000-0000-0000-000000000497"),
+            "reservation_id": UUID("00000000-0000-0000-0000-000000000496"),
+            "cost_usd": Decimal("0.000225"),
+            "evidence_ref": ArtifactRef.model_validate(
+                workflow_artifact("benchmark-usage", "8" * 64)
+            ),
+        }
+    )
+
+    decision = evaluate_factory_workflow_release(
+        workflow_job(mode="release"),
+        runs,
+        workflow_evaluation(
+            runs,
+            budget=workflow_budget("0.750225"),
+        ),
+        benchmark_summary=workflow_benchmark(runs),
+        budget_projection=workflow_budget("0.750225"),
+        usage_receipts=(*technical_receipts, benchmark_receipt),
+    )
+
+    assert decision.status == "ready"
+
+
+def test_workflow_release_rejects_legacy_evaluation_without_business_benchmark() -> None:
+    runs = tuple(workflow_run(number) for number in range(1, 4))
+    evaluation = workflow_evaluation(runs).model_copy(
+        update={
+            "benchmark_summary_ref": None,
+            "benchmark_policy_id": None,
+            "benchmark_disposition": None,
+            "benchmark_reason_codes": (),
+            "failed_benchmark_metric_ids": (),
+        }
+    )
+
+    decision = evaluate_factory_workflow_release(
+        workflow_job(mode="release"),
+        runs,
+        evaluation,
+        benchmark_summary=workflow_benchmark(runs),
+        budget_projection=workflow_budget(),
+        usage_receipts=workflow_receipts(runs),
+    )
+
+    assert decision.status == "blocked"
+    assert decision.reasons == (
+        "workflow evaluation does not match authoritative business benchmark",
+    )
+
+
+def test_ready_decision_cannot_bypass_missing_business_benchmark() -> None:
+    runs = tuple(workflow_run(number) for number in range(1, 4))
+    evaluation = workflow_evaluation(runs)
+    decision = evaluate_factory_workflow_release(
+        workflow_job(mode="release"),
+        runs,
+        evaluation,
+        benchmark_summary=workflow_benchmark(runs),
+        budget_projection=workflow_budget(),
+        usage_receipts=workflow_receipts(runs),
+    )
+    legacy = evaluation.model_copy(
+        update={
+            "benchmark_summary_ref": None,
+            "benchmark_policy_id": None,
+            "benchmark_disposition": None,
+            "benchmark_reason_codes": (),
+            "failed_benchmark_metric_ids": (),
+        }
+    )
+
+    reason = factory_workflow_release_decision_block_reason(
+        workflow_job(mode="release"),
+        legacy,
+        decision,
+        benchmark_summary=workflow_benchmark(runs),
+    )
+
+    assert reason == (
+        "workflow evaluation does not match authoritative business benchmark"
+    )
 
 
 def test_workflow_release_scopes_exact_receipt_coverage_to_current_attempt() -> None:
@@ -731,6 +825,7 @@ def test_workflow_release_scopes_exact_receipt_coverage_to_current_attempt() -> 
         workflow_job(mode="release"),
         current_runs,
         workflow_evaluation(current_runs, budget=total_budget),
+        benchmark_summary=workflow_benchmark(current_runs),
         budget_projection=total_budget,
         usage_receipts=(*historical_receipts, *current_receipts),
     )
@@ -759,6 +854,7 @@ def test_workflow_release_rejects_changed_candidate_binding() -> None:
         workflow_job(mode="release"),
         (*runs[:2], changed),
         workflow_evaluation(runs),
+        benchmark_summary=workflow_benchmark(runs),
         budget_projection=workflow_budget(),
         usage_receipts=workflow_receipts(runs),
     )

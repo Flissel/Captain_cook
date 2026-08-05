@@ -3,13 +3,13 @@ __pycache__/
 .coverage
 .env
 .env.captain-n8n
+.env.n8n-credentials
 blockchain.json
 .claude/worktrees/
 .worktrees/
 .captain-cook/
 artifacts/evaluations/
 artifacts/agent-factory/
-artifacts/capability-factory/
 config/swarm_agents.json
 output/
 .venv/

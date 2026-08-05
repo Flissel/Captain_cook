@@ -10,12 +10,20 @@ from uuid import UUID
 import aiohttp
 from pydantic import BaseModel, ConfigDict
 
+from agenten.agent_factory.business_benchmark_contracts import BusinessBenchmarkSummaryV1
+
 from agenten.agent_runtime.contracts import (
     AgentRuntimeResult,
     RuntimeOperation,
     RuntimeStatus,
 )
-from agenten.delivery.minibook_events import MinibookProjectionEvent
+from agenten.delivery.minibook_events import (
+    MinibookProjectionAcknowledgementV1,
+    MinibookProjectionEvent,
+)
+from agenten.delivery.projector import MinibookProjector
+from gateway.contracts import DeliveryEventEnvelope
+from gateway.integration_setup_contracts import IntegrationSetupSubmissionV1
 
 
 class MinibookProjectionFeedPage(BaseModel):
@@ -31,21 +39,42 @@ class MinibookProjectionFeedPage(BaseModel):
 def factory_promotion_projection(
     block: dict[str, Any],
     job: dict[str, Any],
+    *,
+    benchmark_summary: BusinessBenchmarkSummaryV1 | None = None,
 ) -> MinibookProjectionEvent:
     """Build the strict public view of one committed Factory promotion."""
 
-    raw_subject = UUID(str(block["job_id"]))
-    if raw_subject.version == 4:
-        subject = raw_subject
-    else:
-        digest = bytearray(
-            hashlib.sha256(
-                f"captain-factory-subject:{raw_subject}".encode("utf-8")
-            ).digest()[:16]
+    payload: dict[str, object] = {
+        "view": "validation",
+        "template_id": "factory_capability_ready_to_use",
+        "status_id": "ready_to_use",
+        "actor_role_id": "captain_gateway",
+    }
+    if benchmark_summary is not None:
+        if (
+            str(benchmark_summary.job_id) != str(block["job_id"])
+            or str(benchmark_summary.correlation_id) != str(job["correlation_id"])
+            or benchmark_summary.subject_version != block["subject_version"]
+            or benchmark_summary.attempt != block["attempt"]
+        ):
+            raise ValueError("benchmark summary does not match promoted capability")
+        if benchmark_summary.disposition.value != "passed":
+            raise ValueError("promoted capability requires a passed business benchmark")
+        payload.update(
+            {
+                "benchmark_disposition": benchmark_summary.disposition.value,
+                "benchmark_reason_codes": list(benchmark_summary.reason_codes),
+                "candidate_correctness_bps": benchmark_summary.candidate_correctness_bps,
+                "baseline_correctness_bps": benchmark_summary.baseline_correctness_bps,
+                "candidate_completion_bps": benchmark_summary.candidate_completion_bps,
+                "baseline_completion_bps": benchmark_summary.baseline_completion_bps,
+                "cost_ratio_bps": benchmark_summary.cost_ratio_bps,
+                "latency_ratio_bps": benchmark_summary.latency_ratio_bps,
+                "unsafe_tool_uses": benchmark_summary.unsafe_tool_uses,
+                "mandatory_handoff_misses": benchmark_summary.mandatory_handoff_misses,
+                "benchmark_summary_digest": f"sha256:{benchmark_summary.artifact_ref.sha256}",
+            }
         )
-        digest[6] = (digest[6] & 0x0F) | 0x40
-        digest[8] = (digest[8] & 0x3F) | 0x80
-        subject = UUID(bytes=bytes(digest))
 
     return MinibookProjectionEvent.model_validate(
         {
@@ -55,17 +84,186 @@ def factory_promotion_projection(
             "causation_id": job.get("event_id"),
             "occurred_at": block["occurred_at"],
             "producer": "captain-gateway",
-            "subject_id": f"subject:{subject}",
+            "subject_id": _factory_subject_reference(str(block["job_id"])),
             "subject_version": block["subject_version"],
             "event_type": "capability.promoted",
+            "payload": payload,
+        }
+    )
+
+
+def integration_setup_projection(
+    submission: IntegrationSetupSubmissionV1,
+    job: dict[str, Any],
+) -> MinibookProjectionEvent:
+    """Expose only aggregate setup readiness; never credential metadata."""
+
+    if str(submission.correlation_id) != str(job.get("correlation_id")):
+        raise ValueError("integration setup does not match projection parent")
+    required = tuple(
+        connection
+        for connection in submission.plan.connections
+        if connection.requirement.required
+    )
+    ready_count = sum(connection.status.value == "ready" for connection in required)
+    priority = {
+        "revoked": 0,
+        "expired": 1,
+        "verification_failed": 2,
+        "missing": 3,
+        "selection_required": 4,
+        "verification_required": 5,
+        "ready": 6,
+    }
+    aggregate_status = (
+        min((item.status.value for item in required), key=priority.__getitem__)
+        if required
+        else "ready"
+    )
+    return MinibookProjectionEvent.model_validate(
+        {
+            "schema": "captain.minibook-projection.v2",
+            "event_id": submission.event_id,
+            "correlation_id": submission.correlation_id,
+            "causation_id": job.get("event_id"),
+            "occurred_at": submission.occurred_at,
+            "producer": "captain-gateway",
+            "subject_id": _factory_subject_reference(str(submission.job_id)),
+            "subject_version": submission.revision,
+            "event_type": "integration.setup",
             "payload": {
                 "view": "validation",
-                "template_id": "factory_capability_ready_to_use",
-                "status_id": "ready_to_use",
+                "template_id": "integration_setup_status",
+                "status_id": "observed",
                 "actor_role_id": "captain_gateway",
+                "integration_status": aggregate_status,
+                "required_integration_count": len(required),
+                "ready_integration_count": ready_count,
             },
         }
     )
+
+
+def factory_registry_mirror_event(
+    acknowledgement: MinibookProjectionAcknowledgementV1,
+    block: dict[str, Any],
+    job: dict[str, Any],
+    *,
+    benchmark_summary: BusinessBenchmarkSummaryV1 | None = None,
+) -> DeliveryEventEnvelope:
+    """Bind a Minibook acknowledgement to one exact Factory promotion."""
+
+    projection = factory_promotion_projection(
+        block,
+        job,
+        benchmark_summary=benchmark_summary,
+    )
+    rendered = MinibookProjector.render(projection)
+    expected_post_id = "captain-projection-" + hashlib.sha256(
+        str(projection.event_id).encode("utf-8")
+    ).hexdigest()[:32]
+    expected = {
+        "projection_event_id": projection.event_id,
+        "correlation_id": projection.correlation_id,
+        "subject_id": projection.subject_id,
+        "subject_version": projection.subject_version,
+        "project_id": MinibookProjector.PROJECTION_PROJECT_ID,
+        "post_id": expected_post_id,
+        "content_sha256": rendered.content_hash,
+        "outcome": "mirrored",
+    }
+    actual = acknowledgement.model_dump(
+        include=set(expected),
+    )
+    if actual != expected:
+        raise ValueError("Minibook acknowledgement does not match Factory promotion")
+
+    return DeliveryEventEnvelope.model_validate(
+        {
+            "event_id": acknowledgement.acknowledgement_id,
+            "event_type": "registry_mirror",
+            "occurred_at": acknowledgement.acknowledged_at,
+            "actor": "captain-gateway",
+            "trace": {
+                "project_id": f"factory:{block['job_id']}",
+                "run_id": f"attempt:{block['attempt']}",
+                "trace_id": f"minibook-projection:{projection.event_id}",
+                "artifact_id": acknowledgement.post_id,
+                "job_id": block["job_id"],
+                "correlation_id": projection.correlation_id,
+                "subject_version": projection.subject_version,
+            },
+            "payload": {
+                "event_type": "registry_mirror",
+                "capability_id": job["required_capability"],
+                "capability_version": str(projection.subject_version),
+                "outcome": "mirrored",
+            },
+        }
+    )
+
+
+def integration_setup_registry_mirror_event(
+    acknowledgement: MinibookProjectionAcknowledgementV1,
+    submission: IntegrationSetupSubmissionV1,
+    job: dict[str, Any],
+) -> DeliveryEventEnvelope:
+    """Bind a Minibook acknowledgement to one exact setup projection."""
+
+    projection = integration_setup_projection(submission, job)
+    rendered = MinibookProjector.render(projection)
+    expected_post_id = "captain-projection-" + hashlib.sha256(
+        str(projection.event_id).encode("utf-8")
+    ).hexdigest()[:32]
+    expected = {
+        "projection_event_id": projection.event_id,
+        "correlation_id": projection.correlation_id,
+        "subject_id": projection.subject_id,
+        "subject_version": projection.subject_version,
+        "project_id": MinibookProjector.PROJECTION_PROJECT_ID,
+        "post_id": expected_post_id,
+        "content_sha256": rendered.content_hash,
+        "outcome": "mirrored",
+    }
+    if acknowledgement.model_dump(include=set(expected)) != expected:
+        raise ValueError("Minibook acknowledgement does not match integration setup")
+    return DeliveryEventEnvelope.model_validate(
+        {
+            "event_id": acknowledgement.acknowledgement_id,
+            "event_type": "registry_mirror",
+            "occurred_at": acknowledgement.acknowledged_at,
+            "actor": "captain-gateway",
+            "trace": {
+                "project_id": f"factory:{submission.job_id}",
+                "run_id": f"integration-setup:{submission.revision}",
+                "trace_id": f"minibook-projection:{projection.event_id}",
+                "artifact_id": acknowledgement.post_id,
+                "job_id": submission.job_id,
+                "correlation_id": projection.correlation_id,
+                "subject_version": projection.subject_version,
+            },
+            "payload": {
+                "event_type": "registry_mirror",
+                "capability_id": "integration_setup",
+                "capability_version": str(submission.revision),
+                "outcome": "mirrored",
+            },
+        }
+    )
+
+
+def _factory_subject_reference(job_id: str) -> str:
+    """Keep valid v4 job IDs stable and canonicalize all other UUIDs."""
+
+    parsed = UUID(job_id)
+    if parsed.version == 4:
+        return f"subject:{parsed}"
+    subject_digest = bytearray(
+        hashlib.sha256(f"captain-factory-subject:{parsed}".encode("utf-8")).digest()[:16]
+    )
+    subject_digest[6] = (subject_digest[6] & 0x0F) | 0x40
+    subject_digest[8] = (subject_digest[8] & 0x3F) | 0x80
+    return f"subject:{UUID(bytes=bytes(subject_digest))}"
 
 
 def runtime_result_projection(

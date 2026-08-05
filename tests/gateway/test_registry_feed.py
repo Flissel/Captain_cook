@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timezone
+import hashlib
 import json
 import sqlite3
 from uuid import UUID
@@ -8,10 +9,12 @@ from fastapi.testclient import TestClient
 import pytest
 from pydantic import SecretStr
 
+from agenten.delivery import minibook_events
+from agenten.delivery.projector import MinibookProjector
 from gateway import registry_feed
 from gateway.app import create_app
 from gateway.settings import GatewaySettings
-from gateway.store import GatewayStore
+from gateway.store import AppendResult, GatewayStore
 
 
 def test_successful_batch_is_mirrored_as_validated_without_forum_credentials(monkeypatch) -> None:
@@ -124,6 +127,229 @@ def test_factory_promotion_builds_redacted_v2_projection_with_correlation() -> N
     serialized = event.model_dump_json(by_alias=True)
     assert "support_triage" not in serialized
     assert "private" not in serialized
+
+
+def test_factory_projection_ack_builds_exact_registry_mirror_event() -> None:
+    acknowledgement_contract = getattr(
+        minibook_events,
+        "MinibookProjectionAcknowledgementV1",
+        None,
+    )
+    acknowledgement_id = getattr(
+        minibook_events,
+        "minibook_projection_acknowledgement_id",
+        None,
+    )
+    build_mirror = getattr(registry_feed, "factory_registry_mirror_event", None)
+    assert acknowledgement_contract is not None
+    assert callable(acknowledgement_id)
+    assert callable(build_mirror)
+
+    block = {
+        "event_id": "10000000-0000-4000-8000-000000000001",
+        "job_id": "20000000-0000-4000-8000-000000000001",
+        "phase": "capability_promoted",
+        "status": "succeeded",
+        "attempt": 2,
+        "subject_version": 7,
+        "occurred_at": "2026-07-20T08:00:00Z",
+    }
+    job = {
+        "correlation_id": "30000000-0000-4000-8000-000000000001",
+        "required_capability": "support_triage",
+    }
+    projection = registry_feed.factory_promotion_projection(block, job)
+    rendered = MinibookProjector.render(projection)
+    post_id = "captain-projection-" + hashlib.sha256(
+        str(projection.event_id).encode("utf-8")
+    ).hexdigest()[:32]
+    acknowledgement = acknowledgement_contract.model_validate(
+        {
+            "schema": "captain.minibook-projection-acknowledgement.v1",
+            "acknowledgement_id": str(
+                acknowledgement_id(
+                    projection.event_id,
+                    post_id=post_id,
+                    content_sha256=rendered.content_hash,
+                )
+            ),
+            "projection_event_id": str(projection.event_id),
+            "correlation_id": str(projection.correlation_id),
+            "subject_id": projection.subject_id,
+            "subject_version": projection.subject_version,
+            "project_id": MinibookProjector.PROJECTION_PROJECT_ID,
+            "post_id": post_id,
+            "content_sha256": rendered.content_hash,
+            "acknowledged_at": "2026-07-20T08:01:00Z",
+            "outcome": "mirrored",
+        }
+    )
+
+    mirror = build_mirror(acknowledgement, block, job)
+
+    assert mirror.event_id == acknowledgement.acknowledgement_id
+    assert mirror.event_type == "registry_mirror"
+    assert mirror.occurred_at == acknowledgement.acknowledged_at
+    assert mirror.actor == "captain-gateway"
+    assert mirror.trace.project_id == f"factory:{block['job_id']}"
+    assert mirror.trace.run_id == "attempt:2"
+    assert mirror.trace.job_id == UUID(block["job_id"])
+    assert mirror.trace.correlation_id == projection.correlation_id
+    assert mirror.trace.subject_version == 7
+    assert mirror.trace.artifact_id == post_id
+    assert mirror.payload.capability_id == "support_triage"
+    assert mirror.payload.capability_version == "7"
+    assert mirror.payload.outcome == "mirrored"
+
+
+def test_projection_ack_endpoint_is_captain_only_and_returns_durable_receipt(
+    monkeypatch,
+) -> None:
+    block = {
+        "event_id": "10000000-0000-4000-8000-000000000001",
+        "job_id": "20000000-0000-4000-8000-000000000001",
+        "phase": "capability_promoted",
+        "status": "succeeded",
+        "attempt": 2,
+        "subject_version": 7,
+        "occurred_at": "2026-07-20T08:00:00Z",
+    }
+    job = {
+        "correlation_id": "30000000-0000-4000-8000-000000000001",
+        "required_capability": "support_triage",
+    }
+    projection = registry_feed.factory_promotion_projection(block, job)
+    rendered = MinibookProjector.render(projection)
+    post_id = "captain-projection-" + hashlib.sha256(
+        str(projection.event_id).encode("utf-8")
+    ).hexdigest()[:32]
+    acknowledgement = minibook_events.MinibookProjectionAcknowledgementV1(
+        acknowledgement_id=minibook_events.minibook_projection_acknowledgement_id(
+            projection.event_id,
+            post_id=post_id,
+            content_sha256=rendered.content_hash,
+        ),
+        projection_event_id=projection.event_id,
+        correlation_id=projection.correlation_id,
+        subject_id=projection.subject_id,
+        subject_version=projection.subject_version,
+        project_id=MinibookProjector.PROJECTION_PROJECT_ID,
+        post_id=post_id,
+        content_sha256=rendered.content_hash,
+        acknowledged_at=datetime(2026, 7, 20, 8, 1, tzinfo=timezone.utc),
+        outcome="mirrored",
+    )
+    mirror = registry_feed.factory_registry_mirror_event(
+        acknowledgement,
+        block,
+        job,
+    )
+    calls = []
+
+    class Store:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def record_minibook_projection_acknowledgement(self, candidate):
+            calls.append(candidate)
+            return AppendResult(event=mirror, replayed=False)
+
+    class Mirror:
+        def enqueue_nowait(self, _payload) -> None:
+            pass
+
+    monkeypatch.setattr("gateway.app.GatewayStore", Store)
+    app = create_app(
+        storage=object(),
+        mirror=Mirror(),
+        settings=GatewaySettings(
+            ledger_dsn=SecretStr("mysql://unused/captain_test"),
+            captain_gateway_token=SecretStr("captain-token"),
+            worker_gateway_token=SecretStr("worker-token"),
+        ),
+    )
+    payload = acknowledgement.model_dump(mode="json", by_alias=True)
+    with TestClient(app) as client:
+        forbidden = client.post(
+            "/api/v1/projections/minibook/acknowledgements",
+            headers={"Authorization": "Bearer worker-token"},
+            json=payload,
+        )
+        created = client.post(
+            "/api/v1/projections/minibook/acknowledgements",
+            headers={"Authorization": "Bearer captain-token"},
+            json=payload,
+        )
+
+    assert forbidden.status_code == 403
+    assert created.status_code == 201
+    assert created.json()["event"]["event_id"] == str(
+        acknowledgement.acknowledgement_id
+    )
+    assert created.json()["replayed"] is False
+    assert calls == [acknowledgement]
+
+
+def test_gateway_store_binds_ack_to_authoritative_factory_promotion() -> None:
+    block = {
+        "event_id": "10000000-0000-4000-8000-000000000001",
+        "job_id": "20000000-0000-4000-8000-000000000001",
+        "phase": "capability_promoted",
+        "status": "succeeded",
+        "attempt": 2,
+        "subject_version": 7,
+        "occurred_at": "2026-07-20T08:00:00Z",
+    }
+    job = {
+        "correlation_id": "30000000-0000-4000-8000-000000000001",
+        "required_capability": "support_triage",
+    }
+    projection = registry_feed.factory_promotion_projection(block, job)
+    rendered = MinibookProjector.render(projection)
+    post_id = "captain-projection-" + hashlib.sha256(
+        str(projection.event_id).encode("utf-8")
+    ).hexdigest()[:32]
+    acknowledgement = minibook_events.MinibookProjectionAcknowledgementV1(
+        acknowledgement_id=minibook_events.minibook_projection_acknowledgement_id(
+            projection.event_id,
+            post_id=post_id,
+            content_sha256=rendered.content_hash,
+        ),
+        projection_event_id=projection.event_id,
+        correlation_id=projection.correlation_id,
+        subject_id=projection.subject_id,
+        subject_version=projection.subject_version,
+        project_id=MinibookProjector.PROJECTION_PROJECT_ID,
+        post_id=post_id,
+        content_sha256=rendered.content_hash,
+        acknowledged_at=datetime(2026, 7, 20, 8, 1, tzinfo=timezone.utc),
+        outcome="mirrored",
+    )
+    appended = []
+
+    class Store(GatewayStore):
+        def __init__(self) -> None:
+            pass
+
+        def factory_promotion_source(self, projection_event_id):
+            assert projection_event_id == projection.event_id
+            return block, job
+
+        def append_delivery_event(self, event, *, require_current_claim=False):
+            assert require_current_claim is False
+            appended.append(event)
+            return AppendResult(event=event, replayed=False)
+
+    result = Store().record_minibook_projection_acknowledgement(acknowledgement)
+
+    assert result.replayed is False
+    assert appended == [
+        registry_feed.factory_registry_mirror_event(
+            acknowledgement,
+            block,
+            job,
+        )
+    ]
 
 
 @pytest.mark.parametrize("operation", ("codex.run", "codex.resume"))
@@ -364,7 +590,10 @@ def test_projection_feed_is_captain_authenticated_and_globally_paginated(monkeyp
 def test_store_pages_admitted_mixed_records_by_one_global_ledger_cursor() -> None:
     promotion_job = {
         "correlation_id": "30000000-0000-4000-8000-000000000001",
+        "required_capability": "support_triage",
     }
+    promotion_event_id = UUID("10000000-0000-4000-8000-000000000001")
+    promotion_job_id = "20000000-0000-4000-8000-000000000001"
     database = sqlite3.connect(":memory:")
     database.row_factory = sqlite3.Row
     database.create_function("JSON_UNQUOTE", 1, lambda value: value)
@@ -406,7 +635,15 @@ def test_store_pages_admitted_mixed_records_by_one_global_ledger_cursor() -> Non
     insert(
         2,
         "agent_factory_block",
-        {"phase": "capability_promoted", "status": "succeeded"},
+        {
+            "event_id": str(promotion_event_id),
+            "job_id": promotion_job_id,
+            "phase": "capability_promoted",
+            "status": "succeeded",
+            "attempt": 2,
+            "subject_version": 7,
+            "occurred_at": "2026-07-20T08:00:00Z",
+        },
         parent_index=0,
     )
     insert(3, "unrelated_block", {"secret": "not-admitted"})
@@ -435,8 +672,11 @@ def test_store_pages_admitted_mixed_records_by_one_global_ledger_cursor() -> Non
         def __exit__(self, *_args):
             self.delegate.close()
 
-        def execute(self, sql: str, params: tuple[int, int]) -> None:
+        def execute(self, sql: str, params: tuple[object, ...]) -> None:
             self.delegate.execute(sql.replace("%s", "?"), params)
+
+        def fetchone(self):
+            return self.delegate.fetchone()
 
         def fetchall(self):
             return self.delegate.fetchall()
@@ -485,4 +725,19 @@ def test_store_pages_admitted_mixed_records_by_one_global_ledger_cursor() -> Non
         (4, "agent_runtime_result"),
         (5, "agent_factory_block"),
     ]
+    assert store.factory_promotion_source(promotion_event_id) == (
+        {
+            "event_id": str(promotion_event_id),
+            "job_id": promotion_job_id,
+            "phase": "capability_promoted",
+            "status": "succeeded",
+            "attempt": 2,
+            "subject_version": 7,
+            "occurred_at": "2026-07-20T08:00:00Z",
+        },
+        promotion_job,
+    )
+    assert store.factory_promotion_source(
+        UUID("10000000-0000-4000-8000-000000000099")
+    ) is None
     database.close()

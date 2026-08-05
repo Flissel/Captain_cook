@@ -22,6 +22,7 @@ from tests.agent_factory.test_skill_workflow_contracts import (
     invocation_payload,
     tool_gap_payload,
 )
+from tests.agent_factory.test_team_evaluation import _benchmark
 
 
 NOW = datetime(2026, 7, 21, 10, 3, tzinfo=timezone.utc)
@@ -31,7 +32,11 @@ def _candidate() -> ArtifactRef:
     return ArtifactRef.model_validate(artifact("candidate", "d" * 64))
 
 
-def _execution(*, failed: bool = False) -> TeamExecutionEvidenceV1:
+def _execution(
+    *,
+    failed: bool = False,
+    termination_reason: str = "task_completed",
+) -> TeamExecutionEvidenceV1:
     outcome = execution_outcome_payload(status="failed" if failed else "succeeded")
     if failed:
         outcomes = list(outcome["assertion_outcomes"])
@@ -41,6 +46,7 @@ def _execution(*, failed: bool = False) -> TeamExecutionEvidenceV1:
         execution_payload(
             execution_outcome=outcome,
             status="failed" if failed else "succeeded",
+            termination_reason=termination_reason,
         )
     )
 
@@ -59,11 +65,16 @@ def _evaluation_invocation() -> FactorySkillInvocationV1:
     return FactorySkillInvocationV1.model_validate(invocation_payload("evaluate_team"))
 
 
-def _evaluation(*, failed: bool = False) -> TeamEvaluationV1:
+def _evaluation(
+    *,
+    failed: bool = False,
+    benchmark_failure: str | None = None,
+) -> TeamEvaluationV1:
     return TeamEvaluationService(clock=lambda: NOW).evaluate(
         _evaluation_invocation(),
         _candidate(),
         _execution(failed=failed),
+        benchmark_summary=_benchmark(failure=benchmark_failure),
         budget_projection=_budget(),
     )
 
@@ -176,3 +187,73 @@ def test_feedback_rejects_a_candidate_not_bound_by_the_evaluation() -> None:
             evaluation=evaluation,
             budget_projection=_budget(),
         )
+
+
+def test_feedback_preserves_business_benchmark_reason_codes() -> None:
+    evaluation = _evaluation(benchmark_failure="unsafe_tool_intent")
+
+    feedback = FactoryFeedbackBuilder(clock=lambda: NOW).build(
+        invocation=_report_invocation(evaluation),
+        candidate_ref=_candidate(),
+        evaluation=evaluation,
+        budget_projection=_budget(),
+    )
+
+    assert feedback.recommendation is FactoryFeedbackRecommendation.RETRY_BUILD
+    assert "unsafe_tool_intent" in feedback.reason_codes
+    assert "candidate_retry_required" in feedback.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("termination_reason", "recommendation"),
+    (
+        (
+            "credential_required",
+            FactoryFeedbackRecommendation.BLOCKED_CREDENTIAL_REQUIRED,
+        ),
+        ("preflight_failed", FactoryFeedbackRecommendation.RETRY_BUILD),
+    ),
+)
+def test_feedback_preserves_execution_gate_over_missing_benchmark_receipt(
+    termination_reason: str,
+    recommendation: FactoryFeedbackRecommendation,
+) -> None:
+    evaluation = TeamEvaluationService(clock=lambda: NOW).evaluate(
+        _evaluation_invocation(),
+        _candidate(),
+        _execution(failed=True, termination_reason=termination_reason),
+        benchmark_summary=_benchmark(failure="missing_receipt"),
+        budget_projection=_budget(),
+    )
+
+    feedback = FactoryFeedbackBuilder(clock=lambda: NOW).build(
+        invocation=_report_invocation(evaluation),
+        candidate_ref=_candidate(),
+        evaluation=evaluation,
+        budget_projection=_budget(),
+    )
+
+    assert feedback.recommendation is recommendation
+    assert "missing_receipt" in feedback.reason_codes
+
+
+def test_feedback_never_promotes_legacy_evaluation_without_benchmark() -> None:
+    evaluation = _evaluation().model_copy(
+        update={
+            "benchmark_summary_ref": None,
+            "benchmark_policy_id": None,
+            "benchmark_disposition": None,
+            "benchmark_reason_codes": (),
+            "failed_benchmark_metric_ids": (),
+        }
+    )
+
+    feedback = FactoryFeedbackBuilder(clock=lambda: NOW).build(
+        invocation=_report_invocation(evaluation),
+        candidate_ref=_candidate(),
+        evaluation=evaluation,
+        budget_projection=_budget(),
+    )
+
+    assert feedback.recommendation is FactoryFeedbackRecommendation.MANUAL_DECISION_REQUIRED
+    assert feedback.reason_codes == ("business_benchmark_missing",)

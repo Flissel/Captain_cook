@@ -12,6 +12,5 @@
   "dependency_graph_ref": {"uri": "artifact://sha256/graph", "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "media_type": "application/json"},
   "released_skill": {"skill_id": "autogen-agent-factory", "version": 1, "content_ref": {"uri": "artifact://sha256/skill", "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "media_type": "text/markdown"}, "content_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},
   "public_assertion_ids": ["assertion.team-starts"],
-  "deadline_at": "2030-01-01T00:00:00Z",
-  "architect_lease_id": "captain-architect-lease-1"
+  "deadline_at": "2030-01-01T00:00:00Z"
 }

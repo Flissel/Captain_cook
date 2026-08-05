@@ -65,35 +65,24 @@ class CreationRunner:
         )
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
-    async def run_slice(
-        self,
-        job_id: UUID,
-        *,
-        persist_result: bool = True,
-        pause_after_architect: bool = False,
-    ) -> CreationResultV1 | None:
+    async def run_slice(self, job_id: UUID) -> CreationResultV1:
         existing = self.store.result(job_id)
         if existing is not None:
             return existing
         job = self.store.job(job_id)
         progress = self.store.progress(job_id)
         if progress.status == "cancelled":
-            result = self._terminal(
-                job,
-                "cancelled",
-                CreationFailure(code="cancelled", summary="creation cancelled"),
+            return self.store.finish(
+                self._terminal(job, "cancelled", CreationFailure(code="cancelled", summary="creation cancelled"))
             )
-            return self.store.finish(result) if persist_result else result
         if datetime.now(timezone.utc) >= job.deadline_at:
-            result = self._terminal(
-                job,
-                "blocked",
-                CreationFailure(
-                    code="deadline_expired",
-                    summary="creation deadline expired",
-                ),
+            return self.store.finish(
+                self._terminal(
+                    job,
+                    "blocked",
+                    CreationFailure(code="deadline_expired", summary="creation deadline expired"),
+                )
             )
-            return self.store.finish(result) if persist_result else result
         completed = self.store.completed_steps(job_id)
         snapshot = self.store.snapshot(job_id)
         for step in self.pipeline.steps:
@@ -112,10 +101,7 @@ class CreationRunner:
                 self.store.record_external_effect(job_id, effect_key, outcome.effect_receipt)
             self.store.complete_step(job_id, step, effect_key, outcome.snapshot)
             snapshot = outcome.snapshot
-            if pause_after_architect and step == "architect":
-                return None
-        result = self.pipeline.assemble_result(job, snapshot)
-        return self.store.finish(result) if persist_result else result
+        return self.store.finish(self.pipeline.assemble_result(job, snapshot))
 
     def cancel(self, job_id: UUID, expected_version: int):
         return self.store.cancel(job_id, expected_version)

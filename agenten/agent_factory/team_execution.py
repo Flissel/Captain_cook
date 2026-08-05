@@ -5,28 +5,25 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
-import re
-import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Mapping, Sequence
 from typing import Any, Callable, Literal, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 from autogen_agentchat.agents import AssistantAgent
-from autogen_agentchat.base import TaskResult, TerminationCondition
-from autogen_agentchat.conditions import MaxMessageTermination, TextMentionTermination
+from autogen_agentchat.base import TaskResult, TerminatedException, TerminationCondition
+from autogen_agentchat.conditions import MaxMessageTermination
 from autogen_agentchat.messages import (
     BaseAgentEvent,
     BaseChatMessage,
     HandoffMessage,
     StopMessage,
-    StructuredMessage,
+    TextMessage,
     ToolCallExecutionEvent,
 )
 from autogen_agentchat.teams import RoundRobinGroupChat, SelectorGroupChat, Swarm
@@ -59,6 +56,8 @@ from agenten.agent_factory.holdout_contracts import PrivateHoldoutRef
 from agenten.agent_factory.leases import validate_factory_lease
 from agenten.agent_factory.n8n_tools import OpaqueN8nToolReference
 from agenten.agent_factory.hermes_cli import (
+    CaptainHermesReplayRetryAuthorizationPort,
+    FactorySkillReplayHermesRetryableFailureError,
     FactorySkillReplayRecord,
     FactorySkillReplayStore,
     ReleasedFactorySkillCatalog,
@@ -82,43 +81,11 @@ from agenten.agent_runtime.contracts import (
     RuntimeOperation,
     RuntimeStatus,
 )
-
-
 from agenten.agent_runtime.capabilities import validate_grant
 from agenten.targets.n8n import N8nExecutionEvidence
 
 
-_SAFE_PROVIDER_DIAGNOSTIC = re.compile(r"^[A-Za-z0-9 _.,:;()/-]{1,180}$")
-
-
-class _FactoryTerminalAssertion(BaseModel):
-    """One provider-enforced observation item, normalized by Captain later."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    assertion_id: str = Field(pattern=r"^assert-[0-9a-f]{12}$")
-    passed: StrictBool
-    observable: str = Field(min_length=1)
-
-
-class _FactoryTerminalRecovery(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    stop_condition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-
-
-class _FactoryTerminalObservation(BaseModel):
-    """Strict provider response schema; maps are reconstructed by Captain."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
-
-    schema_name: Literal["captain.factory-observation.v1"] = Field(
-        alias="schema",
-        serialization_alias="schema",
-    )
-    assertions: list[_FactoryTerminalAssertion] = Field(min_length=1)
-    recovery: _FactoryTerminalRecovery
-    termination: Literal["TERMINATE"]
+_HOST_SESSION_RESOURCE_LOCKS: dict[tuple[str, int], asyncio.Lock] = {}
 
 
 class FactoryPricingQuoteV1(BaseModel):
@@ -177,8 +144,14 @@ class FactoryPricingQuoteV1(BaseModel):
             Decimal(usage.prompt_tokens) * self.input_cost_per_million
             + Decimal(usage.completion_tokens) * self.output_cost_per_million
         ) / Decimal("1000000")
+        # Gateway budgets and usage receipts are defined at micro-dollar
+        # precision.  Rounding every provider call up to a whole cent can
+        # exhaust a small, Captain-approved benchmark budget long before the
+        # provider cost does (for example, 30 low-token calls become $0.30).
+        # Keep the conservative ceiling, but apply it at the ledger's native
+        # precision.
         return max(calculated, self.minimum_cost_usd).quantize(
-            Decimal("0.01"), rounding=ROUND_CEILING
+            Decimal("0.000001"), rounding=ROUND_CEILING
         )
 
 
@@ -194,6 +167,18 @@ class FactoryPricingAuthorityPort(Protocol):
         model: str,
         now: datetime,
     ) -> FactoryPricingQuoteV1: ...
+
+
+class FactoryModelClientBindingV1(BaseModel):
+    """Immutable pre-effect identity of one host-owned budgeted model client."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, strict=True)
+    model: str = Field(min_length=1, max_length=128)
 
 
 class FactoryPaidEffectAuthorityPort(Protocol):
@@ -284,6 +269,7 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
         paid_effect_authority: FactoryPaidEffectAuthorityPort,
         pricing_authority: FactoryPricingAuthorityPort,
         clock: Callable[[], datetime],
+        before_provider_dispatch: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         if max_cost_per_call <= 0:
             raise ValueError("model call maximum cost must be positive")
@@ -297,6 +283,13 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
         if model not in job.execution_policy.allowed_models:
             raise ValueError("budgeted model is not allowed by the execution policy")
         self._job = job
+        self._binding = FactoryModelClientBindingV1(
+            job_id=job.job_id,
+            correlation_id=job.correlation_id,
+            subject_version=job.subject_version,
+            attempt=attempt,
+            model=model,
+        )
         self._invocation = invocation
         self._attempt = attempt
         self._delegate = delegate
@@ -308,8 +301,11 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
         self._paid_effect_authority = paid_effect_authority
         self._pricing_authority = pricing_authority
         self._clock = clock
+        self._before_provider_dispatch = before_provider_dispatch
+        self._provider_boundary_started = False
         self._usage_receipts: list[FactoryUsageReceiptV1] = []
         self._provider_dispatched = False
+        self._provider_dispatch_count = 0
         self._provider_effects_with_unknown_usage: set[UUID] = set()
 
     @property
@@ -319,6 +315,10 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
     @property
     def model(self) -> str:
         return self._model
+
+    @property
+    def binding(self) -> FactoryModelClientBindingV1:
+        return self._binding
 
     @property
     def provider_dispatched(self) -> bool:
@@ -336,6 +336,14 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
 
         return bool(self._provider_effects_with_unknown_usage)
 
+    @property
+    def provider_dispatch_count(self) -> int:
+        return self._provider_dispatch_count
+
+    @property
+    def unresolved_reservation_ids(self) -> frozenset[UUID]:
+        return frozenset(self._provider_effects_with_unknown_usage)
+
     async def create(
         self,
         messages: Sequence[LLMMessage],
@@ -347,15 +355,22 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
         cancellation_token: CancellationToken | None = None,
     ) -> CreateResult:
         reservation, pricing_quote = self._reserve()
+        scoped_create_args = dict(extra_create_args)
+        if tools:
+            scoped_create_args["parallel_tool_calls"] = False
+        else:
+            scoped_create_args.pop("parallel_tool_calls", None)
+        await self._enter_provider_boundary()
         try:
             self._provider_dispatched = True
+            self._provider_dispatch_count += 1
             self._provider_effects_with_unknown_usage.add(reservation.reservation_id)
             result = await self._delegate.create(
                 messages,
                 tools=tools,
                 tool_choice=tool_choice,
                 json_output=json_output,
-                extra_create_args=extra_create_args,
+                extra_create_args=scoped_create_args,
                 cancellation_token=cancellation_token,
             )
         except asyncio.CancelledError:
@@ -376,16 +391,23 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
         cancellation_token: CancellationToken | None = None,
     ) -> AsyncGenerator[str | CreateResult, None]:
         reservation, pricing_quote = self._reserve()
+        scoped_create_args = dict(extra_create_args)
+        if tools:
+            scoped_create_args["parallel_tool_calls"] = False
+        else:
+            scoped_create_args.pop("parallel_tool_calls", None)
+        await self._enter_provider_boundary()
         finalized = False
         try:
             self._provider_dispatched = True
+            self._provider_dispatch_count += 1
             self._provider_effects_with_unknown_usage.add(reservation.reservation_id)
             async for item in self._delegate.create_stream(
                 messages,
                 tools=tools,
                 tool_choice=tool_choice,
                 json_output=json_output,
-                extra_create_args=extra_create_args,
+                extra_create_args=scoped_create_args,
                 cancellation_token=cancellation_token,
             ):
                 if isinstance(item, CreateResult):
@@ -397,6 +419,13 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
         except asyncio.CancelledError:
             # A started stream may already have incurred provider cost.
             raise
+
+    async def _enter_provider_boundary(self) -> None:
+        if self._provider_boundary_started:
+            return
+        if self._before_provider_dispatch is not None:
+            await self._before_provider_dispatch()
+        self._provider_boundary_started = True
 
     def _reserve(self) -> tuple[FactoryBudgetReservationV1, FactoryPricingQuoteV1]:
         now = self._clock()
@@ -420,7 +449,7 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
             or pricing_quote.provider != self._provider
             or pricing_quote.model != self._model
             or pricing_quote.effective_at > now
-            or pricing_quote.max_cost_per_call != self._max_cost_per_call
+            or pricing_quote.max_cost_per_call < self._max_cost_per_call
         ):
             raise ValueError("Captain pricing quote does not match this paid model effect")
         reservation = self._budget.reserve(
@@ -428,7 +457,6 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
             attempt=self._attempt,
             requested_usd=self._max_cost_per_call,
             now=now,
-            invocation_id=self._invocation.invocation_id,
         )
         return reservation, pricing_quote
 
@@ -454,8 +482,6 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
                     "job_id": str(self._job.job_id),
                     "correlation_id": str(self._job.correlation_id),
                     "attempt": self._attempt,
-                    "lease_id": self._invocation.lease.lease_id,
-                    "invocation_id": str(self._invocation.invocation_id),
                     "execution_policy_sha256": pricing_quote.execution_policy_sha256,
                     "pricing_quote_id": pricing_quote.quote_id,
                     "pricing_version": pricing_quote.version,
@@ -477,8 +503,6 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
             job_id=self._job.job_id,
             correlation_id=self._job.correlation_id,
             attempt=self._attempt,
-            lease_id=self._invocation.lease.lease_id,
-            invocation_id=self._invocation.invocation_id,
             provider=self._provider,
             model=self._model,
             input_units=usage.prompt_tokens,
@@ -488,7 +512,12 @@ class BudgetedChatCompletionClient(ChatCompletionClient):
             ended_at=ended_at,
             evidence_ref=evidence_ref,
         )
-        self._budget.record_usage(self._job, reservation, receipt)
+        self._budget.record_usage(
+            self._job,
+            reservation,
+            receipt,
+            lease=self._invocation.lease,
+        )
         self._usage_receipts.append(receipt)
         self._provider_effects_with_unknown_usage.discard(reservation.reservation_id)
 
@@ -703,33 +732,6 @@ def _opaque_n8n_tool_reference_digest(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _redacted_transcript(
-    messages: Sequence[BaseAgentEvent | BaseChatMessage],
-) -> tuple[dict[str, str], ...]:
-    """Bind a run to its exact transcript without persisting private prose."""
-
-    return tuple(
-        {
-            "source": message.source,
-            "message_type": type(message).__name__,
-            "content_sha256": _canonical_json_digest(
-                message.model_dump(mode="json", by_alias=True).get("content")
-            ),
-        }
-        for message in messages
-    )
-
-
-def _canonical_json_digest(value: object) -> str:
-    encoded = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
 class FactoryN8nToolAdapterPort(Protocol):
     """Host-owned n8n tool plus a fresh authorization claim for every call."""
 
@@ -896,9 +898,16 @@ class FactoryTeamRunResult(BaseModel):
 
 
 class _FactoryActivityCeilingTermination(TerminationCondition):
-    def __init__(self, *, max_handoffs: int, max_tool_calls: int) -> None:
+    def __init__(
+        self,
+        *,
+        max_handoffs: int,
+        max_tool_calls: int,
+        handoff_tool_names: Sequence[str] = (),
+    ) -> None:
         self._max_handoffs = max_handoffs
         self._max_tool_calls = max_tool_calls
+        self._handoff_tool_names = frozenset(handoff_tool_names)
         self._handoffs = 0
         self._tool_calls = 0
         self._terminated = False
@@ -914,16 +923,16 @@ class _FactoryActivityCeilingTermination(TerminationCondition):
         self._handoffs += sum(isinstance(item, HandoffMessage) for item in messages)
         self._tool_calls += sum(
             sum(
-                not execution.name.startswith("transfer_to_")
+                execution.name not in self._handoff_tool_names
                 for execution in item.content
             )
             for item in messages
             if isinstance(item, ToolCallExecutionEvent)
         )
         reason = None
-        if self._handoffs >= self._max_handoffs and self._max_handoffs > 0:
+        if self._handoffs > self._max_handoffs and self._max_handoffs > 0:
             reason = "max_handoffs"
-        if self._tool_calls >= self._max_tool_calls and self._max_tool_calls > 0:
+        if self._tool_calls > self._max_tool_calls and self._max_tool_calls > 0:
             reason = "max_tool_calls"
         if reason is None:
             return None
@@ -933,6 +942,46 @@ class _FactoryActivityCeilingTermination(TerminationCondition):
     async def reset(self) -> None:
         self._handoffs = 0
         self._tool_calls = 0
+        self._terminated = False
+
+
+class _FactoryTaskCompletedTermination(TerminationCondition):
+    _TERMINAL_MARKERS = (
+        "TERMINATE",
+        "captain.business-benchmark-terminal.v1",
+    )
+
+    def __init__(self, *, require_handoff: bool) -> None:
+        self._require_handoff = require_handoff
+        self._handoff_targets: set[str] = set()
+        self._terminated = False
+
+    @property
+    def terminated(self) -> bool:
+        return self._terminated
+
+    async def __call__(
+        self,
+        messages: Sequence[BaseAgentEvent | BaseChatMessage],
+    ) -> StopMessage | None:
+        if self._terminated:
+            raise TerminatedException("Termination condition has already been reached")
+        self._handoff_targets.update(
+            item.target for item in messages if isinstance(item, HandoffMessage)
+        )
+        for message in messages:
+            if not isinstance(message, TextMessage):
+                continue
+            if self._require_handoff and message.source not in self._handoff_targets:
+                continue
+            content = message.to_text()
+            if any(marker in content for marker in self._TERMINAL_MARKERS):
+                self._terminated = True
+                return StopMessage(source="factory_host", content="task_completed")
+        return None
+
+    async def reset(self) -> None:
+        self._handoff_targets.clear()
         self._terminated = False
 
 
@@ -989,6 +1038,1022 @@ class FactoryTeamRunner(Protocol):
     ) -> FactoryTeamRunResult: ...
 
 
+class HostAutoGenSessionIdentityV1(BaseModel):
+    """Complete Captain identity bound to one provider-backed AutoGen session."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_name: Literal["captain.host-autogen-session-identity.v1"] = (
+        "captain.host-autogen-session-identity.v1"
+    )
+    job_id: UUID
+    correlation_id: UUID
+    subject_id: str = Field(min_length=1, max_length=128)
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, strict=True)
+    invocation_id: UUID
+    request_id: UUID
+    runtime_session_id: str = Field(
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"
+    )
+    case_id: str = Field(min_length=1, max_length=128)
+    case_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    variant: Literal["candidate", "single_agent_baseline"]
+    effect_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    claim_id: UUID
+    fence: int = Field(ge=1, strict=True)
+    model: str = Field(min_length=1, max_length=128)
+    execution_policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @classmethod
+    def for_factory_execution(
+        cls,
+        *,
+        job: AgentFactoryJobV3,
+        invocation: FactorySkillInvocationV1,
+        case_ref: PrivateHoldoutRef,
+        subject_id: str,
+        variant: Literal["candidate", "single_agent_baseline"],
+        request_id: UUID,
+        runtime_session_id: str,
+        effect_id: str,
+        claim_id: UUID,
+        fence: int,
+        model: str,
+    ) -> "HostAutoGenSessionIdentityV1":
+        return cls(
+            job_id=job.job_id,
+            correlation_id=job.correlation_id,
+            subject_id=subject_id,
+            subject_version=job.subject_version,
+            attempt=invocation.attempt,
+            invocation_id=invocation.invocation_id,
+            request_id=request_id,
+            runtime_session_id=runtime_session_id,
+            case_id=case_ref.holdout_id,
+            case_sha256=case_ref.sha256,
+            variant=variant,
+            effect_id=effect_id,
+            claim_id=claim_id,
+            fence=fence,
+            model=model,
+            execution_policy_sha256=_execution_policy_digest(job),
+        )
+
+
+class SealedSingleAgentPolicyV1(BaseModel):
+    """Digest-bound baseline policy with no team, routing, grant, or publish authority."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_name: Literal["captain.sealed-single-agent-policy.v1"] = (
+        "captain.sealed-single-agent-policy.v1"
+    )
+    agent_name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    system_prompt_ref: ArtifactRef
+    prompt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    execution_policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    model: str = Field(min_length=1, max_length=128)
+    allowed_tools: tuple[str, ...] = ()
+    max_messages: int = Field(ge=1, le=100, strict=True)
+    max_tool_calls: int = Field(ge=0, le=100, strict=True)
+    team_manifest_ref: None = None
+    routing_authority: Literal[False] = False
+    publication_authority: Literal[False] = False
+    grant_authority: Literal[False] = False
+    policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("allowed_tools")
+    @classmethod
+    def require_unique_tools(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)) or any(not item.strip() for item in value):
+            raise ValueError("baseline tools must be unique named entries")
+        return value
+
+    @model_validator(mode="after")
+    def require_digest_binding(self) -> "SealedSingleAgentPolicyV1":
+        if self.prompt_sha256 != self.system_prompt_ref.sha256:
+            raise ValueError("baseline prompt digest does not match its sealed reference")
+        if self.policy_sha256 != _single_agent_policy_digest(self):
+            raise ValueError("baseline policy digest does not match its sealed content")
+        return self
+
+    @classmethod
+    def seal(
+        cls,
+        *,
+        agent_name: str,
+        system_prompt_ref: ArtifactRef,
+        execution_policy_sha256: str,
+        model: str,
+        allowed_tools: tuple[str, ...],
+        max_messages: int,
+        max_tool_calls: int,
+    ) -> "SealedSingleAgentPolicyV1":
+        values: dict[str, object] = {
+            "schema_name": "captain.sealed-single-agent-policy.v1",
+            "agent_name": agent_name,
+            "system_prompt_ref": system_prompt_ref,
+            "prompt_sha256": system_prompt_ref.sha256,
+            "execution_policy_sha256": execution_policy_sha256,
+            "model": model,
+            "allowed_tools": allowed_tools,
+            "max_messages": max_messages,
+            "max_tool_calls": max_tool_calls,
+            "team_manifest_ref": None,
+            "routing_authority": False,
+            "publication_authority": False,
+            "grant_authority": False,
+        }
+        values["policy_sha256"] = _single_agent_policy_digest(values)
+        return cls.model_validate(values)
+
+
+class HostAutoGenSessionResult(BaseModel):
+    """Redacted host observation plus the in-process result for private evaluation."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        arbitrary_types_allowed=True,
+    )
+
+    task_result: TaskResult = Field(repr=False, exclude=True)
+    runtime_evidence_ref: ArtifactRef
+    usage_receipts: tuple[FactoryUsageReceiptV1, ...]
+    handoffs: tuple[FactoryHandoffEvidenceV1, ...] = ()
+    tool_executions: tuple[FactoryToolExecutionEvidenceV1, ...] = ()
+    n8n_executions: tuple[FactoryN8nExecutionEvidenceV1, ...] = ()
+    workflow_evidence_refs: tuple[ArtifactRef, ...] = ()
+    conversation_pattern: Literal[
+        "swarm",
+        "selector_group_chat",
+        "round_robin_group_chat",
+        "single_agent",
+    ]
+    message_count: int = Field(ge=0, strict=True)
+    handoff_count: int = Field(ge=0, strict=True)
+    tool_call_count: int = Field(ge=0, strict=True)
+    termination_reason: str = Field(min_length=1, max_length=200)
+    provider_started: StrictBool
+    provider_usage_unresolved: StrictBool
+    human_handoff_completed: Literal[False] = False
+
+    @model_validator(mode="after")
+    def require_redacted_evidence_consistency(self) -> "HostAutoGenSessionResult":
+        if self.handoff_count != len(self.handoffs):
+            raise ValueError("session handoff count does not match typed evidence")
+        if self.tool_call_count != len(self.tool_executions):
+            raise ValueError("session tool count does not match typed evidence")
+        if self.n8n_executions and not {
+            item.evidence_ref for item in self.n8n_executions
+        }.issubset(self.workflow_evidence_refs):
+            raise ValueError("session n8n evidence refs do not match")
+        return self
+
+
+class _HostAutoGenSessionInterruption:
+    identity: HostAutoGenSessionIdentityV1
+    provider_started: bool
+    provider_usage_unresolved: bool
+    usage_receipts: tuple[FactoryUsageReceiptV1, ...]
+
+    def _capture_session_state(
+        self,
+        *,
+        identity: HostAutoGenSessionIdentityV1,
+        model_client: BudgetedChatCompletionClient,
+        receipt_offset: int,
+        dispatch_offset: int,
+        unresolved_before: frozenset[UUID],
+    ) -> None:
+        self.identity = identity
+        self.provider_started = model_client.provider_dispatch_count > dispatch_offset
+        self.provider_usage_unresolved = bool(
+            model_client.unresolved_reservation_ids - unresolved_before
+        )
+        self.usage_receipts = model_client.usage_receipts[receipt_offset:]
+
+
+class HostAutoGenSessionTimeoutError(
+    _HostAutoGenSessionInterruption,
+    asyncio.TimeoutError,
+):
+    """Timed-out session retaining the exact paid-effect reconciliation state."""
+
+    def __init__(
+        self,
+        *,
+        identity: HostAutoGenSessionIdentityV1,
+        model_client: BudgetedChatCompletionClient,
+        receipt_offset: int,
+        dispatch_offset: int,
+        unresolved_before: frozenset[UUID],
+    ) -> None:
+        asyncio.TimeoutError.__init__(self, "host AutoGen session timed out")
+        self._capture_session_state(
+            identity=identity,
+            model_client=model_client,
+            receipt_offset=receipt_offset,
+            dispatch_offset=dispatch_offset,
+            unresolved_before=unresolved_before,
+        )
+
+
+class HostAutoGenSessionCancelledError(
+    _HostAutoGenSessionInterruption,
+    asyncio.CancelledError,
+):
+    """Cancelled session retaining the exact paid-effect reconciliation state."""
+
+    def __init__(
+        self,
+        *,
+        identity: HostAutoGenSessionIdentityV1,
+        model_client: BudgetedChatCompletionClient,
+        receipt_offset: int,
+        dispatch_offset: int,
+        unresolved_before: frozenset[UUID],
+    ) -> None:
+        asyncio.CancelledError.__init__(self, "host AutoGen session cancelled")
+        self._capture_session_state(
+            identity=identity,
+            model_client=model_client,
+            receipt_offset=receipt_offset,
+            dispatch_offset=dispatch_offset,
+            unresolved_before=unresolved_before,
+        )
+
+
+class HostAutoGenSessionPolicyError(RuntimeError):
+    """Fail-closed session result that retains resolved paid-effect evidence."""
+
+    def __init__(
+        self,
+        *,
+        reason_code: str,
+        identity: HostAutoGenSessionIdentityV1,
+        provider_started: bool,
+        provider_usage_unresolved: bool,
+        usage_receipts: tuple[FactoryUsageReceiptV1, ...],
+    ) -> None:
+        if reason_code not in {"max_messages", "max_handoffs", "max_tool_calls"}:
+            raise ValueError("unsupported host AutoGen policy failure")
+        super().__init__(f"host AutoGen session policy failed: {reason_code}")
+        self.reason_code = reason_code
+        self.identity = identity
+        self.provider_started = provider_started
+        self.provider_usage_unresolved = provider_usage_unresolved
+        self.usage_receipts = usage_receipts
+
+
+@dataclass(frozen=True)
+class AuthorityFreeBaselineTool:
+    """Explicitly non-authoritative callable available to the fair baseline."""
+
+    name: str
+    function: Callable[..., Any]
+    integration_intent: Literal[IntegrationIntent.NONE] = IntegrationIntent.NONE
+    mutates_external_state: Literal[False] = False
+    routing_authority: Literal[False] = False
+    publication_authority: Literal[False] = False
+    grant_authority: Literal[False] = False
+
+    def __post_init__(self) -> None:
+        if not self.name or not self.name.replace("_", "a").isalnum():
+            raise ValueError("authority-free baseline tool name is invalid")
+        if not callable(self.function):
+            raise ValueError("authority-free baseline tool must be callable")
+        if (
+            self.integration_intent is not IntegrationIntent.NONE
+            or self.mutates_external_state
+            or self.routing_authority
+            or self.publication_authority
+            or self.grant_authority
+        ):
+            raise ValueError("baseline tool must be authority-free")
+
+
+class HostAutoGenSessionExecutor:
+    """Execute candidate or authority-free baseline sessions under one host boundary."""
+
+    def __init__(
+        self,
+        *,
+        model_client: BudgetedChatCompletionClient | None = None,
+        model_client_factory: Callable[
+            [HostAutoGenSessionIdentityV1], BudgetedChatCompletionClient
+        ]
+        | None = None,
+        evidence_store: FactoryEvidenceStore,
+        holdouts: FactoryHoldoutEvaluatorPort,
+        tools: Mapping[str, Callable[..., Any]],
+        baseline_tools: Mapping[str, AuthorityFreeBaselineTool] | None = None,
+        baseline_n8n_tools: Mapping[str, OpaqueN8nToolReference] | None = None,
+        evaluator: FactoryCandidateEvaluator | None = None,
+        n8n_adapter: FactoryN8nToolAdapterPort | None = None,
+        n8n_authority: FactoryN8nGrantAuthorityPort | None = None,
+        clock: Callable[[], datetime],
+    ) -> None:
+        if (model_client is None) == (model_client_factory is None):
+            raise ValueError("provide exactly one fixed model client or session factory")
+        self._fixed_model_client = model_client
+        self._model_client_factory = model_client_factory
+        self._evidence_store = evidence_store
+        self._holdouts = holdouts
+        self._tools = dict(tools)
+        self._baseline_tools = {
+            name: tool.function for name, tool in (baseline_tools or {}).items()
+        }
+        if any(name != tool.name for name, tool in (baseline_tools or {}).items()):
+            raise ValueError("baseline tool registry key does not match sealed tool")
+        self._baseline_n8n_tools = dict(baseline_n8n_tools or {})
+        if any(
+            name != reference.tool_name
+            for name, reference in self._baseline_n8n_tools.items()
+        ):
+            raise ValueError("baseline n8n tool registry key does not match opaque ref")
+        if set(self._baseline_tools).intersection(self._baseline_n8n_tools):
+            raise ValueError("baseline tool cannot have ambiguous authority")
+        self._evaluator = evaluator or FactoryCandidateEvaluator()
+        self._n8n_adapter = n8n_adapter
+        self._n8n_authority = n8n_authority
+        self._clock = clock
+        lock_resources: set[tuple[str, int]] = set()
+        if n8n_adapter is not None:
+            lock_resources.add(("n8n_adapter", id(n8n_adapter)))
+        if model_client is not None:
+            lock_resources.add(("model_client", id(model_client)))
+        if not lock_resources:
+            lock_resources.add(("executor", id(self)))
+        self._session_locks = tuple(
+            _HOST_SESSION_RESOURCE_LOCKS.setdefault(resource, asyncio.Lock())
+            for resource in sorted(lock_resources)
+        )
+
+    async def run_baseline(
+        self,
+        *,
+        job: AgentFactoryJobV3,
+        invocation: FactorySkillInvocationV1,
+        case_ref: PrivateHoldoutRef,
+        identity: HostAutoGenSessionIdentityV1,
+        policy: SealedSingleAgentPolicyV1,
+        workspace: Path,
+        allowed_models: tuple[str, ...],
+        max_seconds: float,
+    ) -> HostAutoGenSessionResult:
+        self._validate_identity(
+            job=job,
+            invocation=invocation,
+            case_ref=case_ref,
+            identity=identity,
+            subject_id="single_agent_baseline",
+            variant="single_agent_baseline",
+        )
+        if self._model_client_factory is None:
+            raise ValueError("baseline execution requires a fresh model client factory")
+        model_client = self._client_for(identity)
+        if (
+            policy.execution_policy_sha256 != _execution_policy_digest(job)
+            or policy.model != identity.model
+            or policy.model != model_client.model
+            or policy.model not in allowed_models
+        ):
+            raise ValueError("baseline policy is not bound to the current execution policy")
+        resolved_tools = self._resolve_tools(
+            policy.allowed_tools,
+            maximum=policy.max_tool_calls,
+            n8n_tools=self._baseline_n8n_tools,
+            registry=self._baseline_tools,
+        )
+        agent = AssistantAgent(
+            name=policy.agent_name,
+            model_client=model_client,
+            tools=[resolved_tools[name] for name in policy.allowed_tools],
+            handoffs=[],
+            model_context=BufferedChatCompletionContext(
+                buffer_size=policy.max_messages
+            ),
+            system_message=_sealed_text(workspace, policy.system_prompt_ref),
+            max_tool_iterations=max(1, policy.max_tool_calls),
+        )
+        task = await self._resolve_task(case_ref)
+        cancellation_token = CancellationToken()
+        receipt_offset = len(model_client.usage_receipts)
+        dispatch_offset = model_client.provider_dispatch_count
+        unresolved_before = model_client.unresolved_reservation_ids
+        n8n_evidence_offset = (
+            len(self._n8n_adapter.observed_evidence())
+            if self._n8n_adapter is not None
+            else 0
+        )
+        try:
+            result = await asyncio.wait_for(
+                agent.run(task=task, cancellation_token=cancellation_token),
+                timeout=max_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            cancellation_token.cancel()
+            raise HostAutoGenSessionTimeoutError(
+                identity=identity,
+                model_client=model_client,
+                receipt_offset=receipt_offset,
+                dispatch_offset=dispatch_offset,
+                unresolved_before=unresolved_before,
+            ) from exc
+        except asyncio.CancelledError as exc:
+            cancellation_token.cancel()
+            raise HostAutoGenSessionCancelledError(
+                identity=identity,
+                model_client=model_client,
+                receipt_offset=receipt_offset,
+                dispatch_offset=dispatch_offset,
+                unresolved_before=unresolved_before,
+            ) from exc
+        return await self._observe(
+            job=job,
+            identity=identity,
+            model_client=model_client,
+            result=result,
+            receipt_offset=receipt_offset,
+            dispatch_offset=dispatch_offset,
+            unresolved_before=unresolved_before,
+            conversation_pattern="single_agent",
+            max_messages=policy.max_messages,
+            max_handoffs=0,
+            max_tool_calls=policy.max_tool_calls,
+            termination_conditions=("task_completed", "max_messages", "max_tool_calls"),
+            handoff_tool_names=(),
+            n8n_tools={
+                name: self._baseline_n8n_tools[name]
+                for name in policy.allowed_tools
+                if name in self._baseline_n8n_tools
+            },
+            n8n_evidence_offset=n8n_evidence_offset,
+        )
+
+    async def run_candidate(
+        self,
+        *,
+        job: AgentFactoryJobV3,
+        invocation: FactorySkillInvocationV1,
+        case_ref: PrivateHoldoutRef,
+        identity: HostAutoGenSessionIdentityV1,
+        candidate: ResolvedFactoryCandidate,
+        manifest: FactoryAutoGenTeamManifestV1 | None = None,
+        allowed_tools: tuple[str, ...] | None = None,
+        allowed_models: tuple[str, ...],
+        max_seconds: float,
+    ) -> HostAutoGenSessionResult:
+        expected_manifest = manifest
+        for lock in self._session_locks:
+            await lock.acquire()
+        try:
+            with self._evaluator.verified_team_workspace(candidate) as (
+                workspace,
+                verified_manifest,
+            ):
+                return await self._run_candidate_session(
+                    job=job,
+                    invocation=invocation,
+                    case_ref=case_ref,
+                    identity=identity,
+                    workspace=workspace,
+                    manifest=verified_manifest,
+                    expected_manifest=expected_manifest,
+                    candidate=candidate,
+                    allowed_tools=allowed_tools,
+                    allowed_models=allowed_models,
+                    max_seconds=max_seconds,
+                )
+        finally:
+            for lock in reversed(self._session_locks):
+                lock.release()
+
+    async def _run_candidate_session(
+        self,
+        *,
+        job: AgentFactoryJobV3,
+        invocation: FactorySkillInvocationV1,
+        case_ref: PrivateHoldoutRef,
+        identity: HostAutoGenSessionIdentityV1,
+        workspace: Path,
+        manifest: FactoryAutoGenTeamManifestV1,
+        expected_manifest: FactoryAutoGenTeamManifestV1 | None,
+        candidate: ResolvedFactoryCandidate,
+        allowed_tools: tuple[str, ...] | None,
+        allowed_models: tuple[str, ...],
+        max_seconds: float,
+    ) -> HostAutoGenSessionResult:
+        if expected_manifest is not None and manifest != expected_manifest:
+            raise ValueError("verified candidate manifest changed after runtime preflight")
+        self._validate_identity(
+            job=job,
+            invocation=invocation,
+            case_ref=case_ref,
+            identity=identity,
+            subject_id=candidate.candidate.candidate_id,
+            variant="candidate",
+        )
+        model_client = self._client_for(identity)
+        if model_client.model != identity.model or model_client.model not in allowed_models:
+            raise ValueError("host model client is not allowed by the factory job")
+        declared_tools = tuple(
+            dict.fromkeys(tool for agent in manifest.agents for tool in agent.tools)
+        )
+        if allowed_tools is None:
+            required_tools = declared_tools
+        else:
+            allowed_set = set(allowed_tools)
+            if (
+                len(allowed_tools) != len(allowed_set)
+                or allowed_set - set(declared_tools)
+            ):
+                raise ValueError(
+                    "allowed tools must be a subset of the sealed candidate manifest"
+                )
+            required_tools = tuple(
+                name for name in declared_tools if name in allowed_set
+            )
+        required_tool_names = set(required_tools)
+        n8n_tools = {
+            tool.name: tool.opaque_reference()
+            for tool in candidate.candidate.n8n_tools
+            if tool.name in required_tool_names
+        }
+        resolved_tools = self._resolve_tools(
+            required_tools,
+            maximum=manifest.max_tool_calls,
+            n8n_tools=n8n_tools,
+            registry=self._tools,
+        )
+        participants = [
+            AssistantAgent(
+                name=agent.name,
+                model_client=model_client,
+                tools=[
+                    resolved_tools[name]
+                    for name in agent.tools
+                    if name in required_tool_names
+                ],
+                handoffs=list(agent.handoffs),
+                model_context=(
+                    BufferedChatCompletionContext(buffer_size=manifest.max_messages)
+                    if manifest.memory_policy == "buffered"
+                    else None
+                ),
+                system_message=_sealed_text(workspace, agent.system_prompt_ref),
+                max_tool_iterations=max(1, manifest.max_tool_calls),
+            )
+            for agent in manifest.agents
+        ]
+        handoff_tool_names = tuple(
+            f"transfer_to_{target}"
+            for agent in manifest.agents
+            for target in agent.handoffs
+        )
+        termination: TerminationCondition = MaxMessageTermination(
+            manifest.max_messages,
+            include_agent_event=False,
+        )
+        termination = termination | _FactoryActivityCeilingTermination(
+            max_handoffs=manifest.max_handoffs,
+            max_tool_calls=manifest.max_tool_calls,
+            handoff_tool_names=handoff_tool_names,
+        )
+        if "task_completed" in manifest.termination_conditions:
+            termination = (
+                _FactoryTaskCompletedTermination(
+                    require_handoff=any(agent.handoffs for agent in manifest.agents)
+                )
+                | termination
+            )
+        team: Swarm | SelectorGroupChat | RoundRobinGroupChat | None = None
+        if manifest.conversation_pattern == "swarm":
+            team = Swarm(
+                participants,
+                termination_condition=termination,
+                max_turns=manifest.max_messages,
+            )
+        elif manifest.conversation_pattern == "selector_group_chat":
+            team = SelectorGroupChat(
+                participants,
+                model_client=model_client,
+                termination_condition=termination,
+                max_turns=manifest.max_messages,
+            )
+        elif manifest.conversation_pattern == "round_robin_group_chat":
+            team = RoundRobinGroupChat(
+                participants,
+                termination_condition=termination,
+                max_turns=manifest.max_messages,
+            )
+        task = await self._resolve_task(case_ref)
+        cancellation_token = CancellationToken()
+        receipt_offset = len(model_client.usage_receipts)
+        dispatch_offset = model_client.provider_dispatch_count
+        unresolved_before = model_client.unresolved_reservation_ids
+        n8n_evidence_offset = (
+            len(self._n8n_adapter.observed_evidence())
+            if self._n8n_adapter is not None
+            else 0
+        )
+        try:
+            if manifest.conversation_pattern == "single_agent":
+                if len(participants) != 1:
+                    raise ValueError("single-agent topology requires exactly one participant")
+                result = await asyncio.wait_for(
+                    participants[0].run(
+                        task=task,
+                        cancellation_token=cancellation_token,
+                    ),
+                    timeout=max_seconds,
+                )
+            else:
+                assert team is not None
+                result = await asyncio.wait_for(
+                    team.run(task=task, cancellation_token=cancellation_token),
+                    timeout=max_seconds,
+                )
+        except asyncio.TimeoutError as exc:
+            cancellation_token.cancel()
+            raise HostAutoGenSessionTimeoutError(
+                identity=identity,
+                model_client=model_client,
+                receipt_offset=receipt_offset,
+                dispatch_offset=dispatch_offset,
+                unresolved_before=unresolved_before,
+            ) from exc
+        except asyncio.CancelledError as exc:
+            cancellation_token.cancel()
+            raise HostAutoGenSessionCancelledError(
+                identity=identity,
+                model_client=model_client,
+                receipt_offset=receipt_offset,
+                dispatch_offset=dispatch_offset,
+                unresolved_before=unresolved_before,
+            ) from exc
+        return await self._observe(
+            job=job,
+            identity=identity,
+            model_client=model_client,
+            result=result,
+            receipt_offset=receipt_offset,
+            dispatch_offset=dispatch_offset,
+            unresolved_before=unresolved_before,
+            conversation_pattern=manifest.conversation_pattern,
+            max_messages=manifest.max_messages,
+            max_handoffs=manifest.max_handoffs,
+            max_tool_calls=manifest.max_tool_calls,
+            termination_conditions=manifest.termination_conditions,
+            handoff_tool_names=handoff_tool_names,
+            n8n_tools=n8n_tools,
+            n8n_evidence_offset=n8n_evidence_offset,
+        )
+
+    async def _resolve_task(self, case_ref: PrivateHoldoutRef) -> str:
+        private_case = await self._holdouts.resolve(case_ref)
+        if private_case.reference != case_ref:
+            raise ValueError("private holdout resolver returned a different reference")
+        try:
+            return private_case.body.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("private holdout body must be UTF-8") from exc
+
+    def _resolve_tools(
+        self,
+        required_tools: tuple[str, ...],
+        *,
+        maximum: int,
+        n8n_tools: Mapping[str, OpaqueN8nToolReference],
+        registry: Mapping[str, Callable[..., Any]],
+    ) -> dict[str, BaseTool[BaseModel, Any]]:
+        required_n8n_tools = set(required_tools).intersection(n8n_tools)
+        if required_n8n_tools and (
+            self._n8n_adapter is None or self._n8n_authority is None
+        ):
+            raise ValueError(
+                "n8n tools require trusted n8n adapter and grant authority"
+            )
+        resolved: dict[str, Callable[..., Any] | BaseTool[BaseModel, Any]] = dict(
+            registry
+        )
+        if self._n8n_adapter is not None:
+            assert self._n8n_authority is not None or not required_n8n_tools
+            for name in required_n8n_tools:
+                raw_claim = self._n8n_adapter.authorization(name)
+                claim = FactoryN8nToolAuthorizationV1.model_validate(
+                    raw_claim.model_dump(mode="python")
+                )
+                if (
+                    claim.tool_name != name
+                    or claim.approved_tool_ref != n8n_tools[name]
+                ):
+                    raise ValueError(
+                        "n8n authorization claim belongs to a different tool"
+                    )
+            resolved.update(
+                {
+                    name: CaptainAuthorizedN8nTool(
+                        name=name,
+                        approved_tool_ref=n8n_tools[name],
+                        adapter=self._n8n_adapter,
+                        authority=self._n8n_authority,
+                        clock=self._clock,
+                    )
+                    for name in required_n8n_tools
+                }
+            )
+        unknown_tools = set(required_tools) - set(resolved)
+        if unknown_tools:
+            raise ValueError(f"host tool is not registered: {sorted(unknown_tools)[0]}")
+        counter = _FactoryToolCallCounter(maximum)
+        capped: dict[str, BaseTool[BaseModel, Any]] = {}
+        for name in required_tools:
+            raw_tool = resolved[name]
+            delegate = (
+                raw_tool
+                if isinstance(raw_tool, BaseTool)
+                else FunctionTool(
+                    raw_tool,
+                    description=(raw_tool.__doc__ or f"Host tool {name}"),
+                    name=name,
+                )
+            )
+            capped[name] = _FactoryCappedTool(delegate, counter)
+        return capped
+
+    async def _observe(
+        self,
+        *,
+        job: AgentFactoryJobV3,
+        identity: HostAutoGenSessionIdentityV1,
+        model_client: BudgetedChatCompletionClient,
+        result: TaskResult,
+        receipt_offset: int,
+        dispatch_offset: int,
+        unresolved_before: frozenset[UUID],
+        conversation_pattern: Literal[
+            "swarm", "selector_group_chat", "round_robin_group_chat", "single_agent"
+        ],
+        max_messages: int,
+        max_handoffs: int,
+        max_tool_calls: int,
+        termination_conditions: tuple[str, ...],
+        handoff_tool_names: tuple[str, ...],
+        n8n_tools: Mapping[str, OpaqueN8nToolReference],
+        n8n_evidence_offset: int,
+    ) -> HostAutoGenSessionResult:
+        handoff_messages = tuple(
+            message for message in result.messages if isinstance(message, HandoffMessage)
+        )
+        tool_events = tuple(
+            message
+            for message in result.messages
+            if isinstance(message, ToolCallExecutionEvent)
+        )
+        handoff_tool_name_set = frozenset(handoff_tool_names)
+        tool_event_executions = tuple(
+            (event, execution)
+            for event in tool_events
+            for execution in event.content
+            if execution.name not in handoff_tool_name_set
+        )
+        tool_call_count = len(tool_event_executions)
+        message_count = sum(
+            isinstance(message, BaseChatMessage) for message in result.messages
+        )
+        policy_failure_reason = None
+        if message_count > max_messages:
+            policy_failure_reason = "max_messages"
+        elif len(handoff_messages) > max_handoffs:
+            policy_failure_reason = "max_handoffs"
+        elif tool_call_count > max_tool_calls:
+            policy_failure_reason = "max_tool_calls"
+        if policy_failure_reason is not None:
+            raise HostAutoGenSessionPolicyError(
+                reason_code=policy_failure_reason,
+                identity=identity,
+                provider_started=(
+                    model_client.provider_dispatch_count > dispatch_offset
+                ),
+                provider_usage_unresolved=bool(
+                    model_client.unresolved_reservation_ids - unresolved_before
+                ),
+                usage_receipts=model_client.usage_receipts[receipt_offset:],
+            )
+        termination_reason = _session_termination_reason(
+            result,
+            termination_conditions=termination_conditions,
+            max_messages=max_messages,
+        )
+        usage_receipts = model_client.usage_receipts[receipt_offset:]
+        if any(
+            receipt.job_id != identity.job_id
+            or receipt.correlation_id != identity.correlation_id
+            or receipt.attempt != identity.attempt
+            or receipt.model != identity.model
+            for receipt in usage_receipts
+        ):
+            raise ValueError("usage receipt does not match session identity")
+        observation_ref = await self._evidence_store.persist(
+            job,
+            json.dumps(
+                {
+                    "schema": "captain.factory-autogen-observation.v2",
+                    "identity": identity.model_dump(mode="json"),
+                    "conversation_pattern": conversation_pattern,
+                    "message_count": message_count,
+                    "handoff_count": len(handoff_messages),
+                    "tool_call_count": tool_call_count,
+                    "termination_reason": termination_reason,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+        )
+        handoffs: list[FactoryHandoffEvidenceV1] = []
+        for ordinal, message in enumerate(handoff_messages, start=1):
+            handoff_ref = await self._evidence_store.persist(
+                job,
+                json.dumps(
+                    {
+                        "schema": "captain.factory-autogen-handoff.v1",
+                        "invocation_id": str(identity.invocation_id),
+                        "runtime_session_id": identity.runtime_session_id,
+                        "ordinal": ordinal,
+                        "from_agent": message.source,
+                        "to_agent": message.target,
+                        "observation_ref": observation_ref.model_dump(mode="json"),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+            )
+            handoffs.append(
+                FactoryHandoffEvidenceV1(
+                    from_agent=message.source,
+                    to_agent=message.target,
+                    evidence_ref=handoff_ref,
+                )
+            )
+        tool_executions: list[FactoryToolExecutionEvidenceV1] = []
+        for ordinal, (event, execution) in enumerate(tool_event_executions, start=1):
+            status: Literal["succeeded", "failed"] = (
+                "failed" if execution.is_error else "succeeded"
+            )
+            tool_ref = await self._evidence_store.persist(
+                job,
+                json.dumps(
+                    {
+                        "schema": "captain.factory-autogen-tool-execution.v1",
+                        "invocation_id": str(identity.invocation_id),
+                        "runtime_session_id": identity.runtime_session_id,
+                        "ordinal": ordinal,
+                        "agent_name": event.source,
+                        "tool_name": execution.name,
+                        "status": status,
+                        "observation_ref": observation_ref.model_dump(mode="json"),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+            )
+            tool_executions.append(
+                FactoryToolExecutionEvidenceV1(
+                    agent_name=event.source,
+                    tool_name=execution.name,
+                    status=status,
+                    evidence_ref=tool_ref,
+                )
+            )
+        all_n8n_evidence = (
+            self._n8n_adapter.observed_evidence()
+            if self._n8n_adapter is not None
+            else ()
+        )
+        n8n_executions = all_n8n_evidence[n8n_evidence_offset:]
+        if n8n_executions and self._n8n_authority is None:
+            raise ValueError("n8n evidence requires trusted grant authority")
+        for n8n_execution in n8n_executions:
+            assert self._n8n_authority is not None
+            if (
+                n8n_execution.tool_name not in n8n_tools
+                or n8n_execution.approved_tool_ref
+                != n8n_tools.get(n8n_execution.tool_name)
+                or n8n_execution.runtime_command.correlation_id
+                != identity.correlation_id
+                or n8n_execution.runtime_command.subject_version
+                != identity.subject_version
+                or n8n_execution.runtime_result.correlation_id
+                != identity.correlation_id
+                or n8n_execution.runtime_result.subject_version
+                != identity.subject_version
+                or n8n_execution.execution.correlation_id
+                != str(identity.correlation_id)
+            ):
+                raise ValueError("n8n evidence does not match session identity")
+            await self._n8n_authority.authorize(n8n_execution, now=self._clock())
+        observed_n8n_calls = tuple(
+            item for item in tool_executions if item.tool_name in n8n_tools
+        )
+        if len(n8n_executions) != len(observed_n8n_calls) or any(
+            observed.tool_name != evidence.tool_name
+            for observed, evidence in zip(observed_n8n_calls, n8n_executions)
+        ):
+            failed_categories = tuple(
+                sorted(
+                    {
+                        _n8n_tool_failure_category(execution.content)
+                        for _, execution in tool_event_executions
+                        if execution.name in n8n_tools and execution.is_error
+                    }
+                )
+            )
+            if failed_categories:
+                raise ValueError(
+                    "n8n tool execution failed before host-owned evidence: "
+                    + ",".join(failed_categories)
+                )
+            raise ValueError("n8n tool call is missing host-owned execution evidence")
+        n8n_refs = _unique_refs(
+            tuple(
+                reference
+                for item in n8n_executions
+                for reference in (item.workflow_ref, item.evidence_ref)
+            )
+        )
+        return HostAutoGenSessionResult(
+            task_result=result,
+            runtime_evidence_ref=observation_ref,
+            usage_receipts=usage_receipts,
+            handoffs=tuple(handoffs),
+            tool_executions=tuple(tool_executions),
+            n8n_executions=n8n_executions,
+            workflow_evidence_refs=n8n_refs,
+            conversation_pattern=conversation_pattern,
+            message_count=message_count,
+            handoff_count=len(handoffs),
+            tool_call_count=tool_call_count,
+            termination_reason=termination_reason,
+            provider_started=(
+                model_client.provider_dispatch_count > dispatch_offset
+            ),
+            provider_usage_unresolved=bool(
+                model_client.unresolved_reservation_ids - unresolved_before
+            ),
+            human_handoff_completed=False,
+        )
+
+    def _client_for(
+        self, identity: HostAutoGenSessionIdentityV1
+    ) -> BudgetedChatCompletionClient:
+        if self._model_client_factory is not None:
+            client = self._model_client_factory(identity)
+        else:
+            assert self._fixed_model_client is not None
+            client = self._fixed_model_client
+        binding = client.binding
+        if (
+            binding.job_id != identity.job_id
+            or binding.correlation_id != identity.correlation_id
+            or binding.subject_version != identity.subject_version
+            or binding.attempt != identity.attempt
+            or binding.model != identity.model
+        ):
+            raise ValueError("model client does not match session identity")
+        return client
+
+    @staticmethod
+    def _validate_identity(
+        *,
+        job: AgentFactoryJobV3,
+        invocation: FactorySkillInvocationV1,
+        case_ref: PrivateHoldoutRef,
+        identity: HostAutoGenSessionIdentityV1,
+        subject_id: str,
+        variant: Literal["candidate", "single_agent_baseline"],
+    ) -> None:
+        expected = (
+            (invocation.job_id, job.job_id),
+            (invocation.correlation_id, job.correlation_id),
+            (invocation.subject_version, job.subject_version),
+            (identity.job_id, job.job_id),
+            (identity.correlation_id, job.correlation_id),
+            (identity.subject_id, subject_id),
+            (identity.subject_version, job.subject_version),
+            (identity.attempt, invocation.attempt),
+            (identity.invocation_id, invocation.invocation_id),
+            (identity.case_id, case_ref.holdout_id),
+            (identity.case_sha256, case_ref.sha256),
+            (identity.variant, variant),
+            (identity.execution_policy_sha256, _execution_policy_digest(job)),
+        )
+        if any(observed != required for observed, required in expected):
+            raise ValueError("AutoGen session identity does not match its execution")
+
+
 class HostAutoGenTeamRunner:
     """Instantiate AutoGen 0.7.5 teams from sealed data under host instrumentation."""
 
@@ -1002,6 +2067,12 @@ class HostAutoGenTeamRunner:
         tools: Mapping[str, Callable[..., Any]],
         n8n_adapter: FactoryN8nToolAdapterPort | None = None,
         n8n_authority: FactoryN8nGrantAuthorityPort | None = None,
+        session_executor: HostAutoGenSessionExecutor | None = None,
+        allowed_tools_for: Callable[
+            [PrivateHoldoutRef, ResolvedFactoryCandidate],
+            tuple[str, ...] | None,
+        ]
+        | None = None,
         clock: Callable[[], datetime],
     ) -> None:
         self._model_client = model_client
@@ -1011,7 +2082,18 @@ class HostAutoGenTeamRunner:
         self._tools = dict(tools)
         self._n8n_adapter = n8n_adapter
         self._n8n_authority = n8n_authority
+        self._allowed_tools_for = allowed_tools_for
         self._clock = clock
+        self._session_executor = session_executor or HostAutoGenSessionExecutor(
+            model_client=model_client,
+            evidence_store=evidence_store,
+            holdouts=holdouts,
+            tools=tools,
+            evaluator=self._evaluator,
+            n8n_adapter=n8n_adapter,
+            n8n_authority=n8n_authority,
+            clock=clock,
+        )
 
     @property
     def paid_effect_started(self) -> bool:
@@ -1048,356 +2130,173 @@ class HostAutoGenTeamRunner:
     ) -> FactoryTeamRunResult:
         if self._model_client.model not in allowed_models:
             raise ValueError("host model client is not allowed by the factory job")
-        receipt_offset = len(self._model_client.usage_receipts)
-        with self._evaluator.verified_team_workspace(candidate) as (
-            workspace,
-            manifest,
-        ):
-            private_case = await self._holdouts.resolve(case_ref)
-            if private_case.reference != case_ref:
-                raise ValueError("private holdout resolver returned a different reference")
-            task = build_private_holdout_task_envelope(
-                private_case.body,
-                invocation.acceptance_assertion_ids,
+        request_id = uuid5(
+            invocation.invocation_id,
+            f"factory-autogen-request:{case_ref.holdout_id}:{case_ref.sha256}",
+        )
+        runtime_session_id = (
+            f"autogen-team-{invocation.attempt}-{request_id.hex}"
+        )
+        identity_payload = "|".join(
+            (
+                str(job.job_id),
+                str(job.correlation_id),
+                candidate.candidate.candidate_id,
+                str(job.subject_version),
+                str(invocation.attempt),
+                str(invocation.invocation_id),
+                str(request_id),
+                case_ref.holdout_id,
+                case_ref.sha256,
+                self._model_client.model,
             )
-            try:
-                private_payload = json.loads(private_case.body.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                private_payload = None
-            structured_terminal = isinstance(private_payload, dict) and isinstance(
-                private_payload.get("assertion_expectations"), dict
-            )
-            n8n_tools = {
-                tool.name: tool.opaque_reference()
-                for tool in candidate.candidate.n8n_tools
-            }
-            n8n_tool_names = set(n8n_tools)
-            required_n8n_tools = {
-                tool
-                for agent in manifest.agents
-                for tool in agent.tools
-                if tool in n8n_tool_names
-            }
-            if required_n8n_tools and (
-                self._n8n_adapter is None or self._n8n_authority is None
-            ):
-                raise ValueError(
-                    "candidate n8n tools require trusted n8n adapter and grant authority"
-                )
-            resolved_tools = dict(self._tools)
-            if self._n8n_adapter is not None:
-                resolved_tools.update(
-                    {
-                        name: CaptainAuthorizedN8nTool(
-                            name=name,
-                            approved_tool_ref=n8n_tools[name],
-                            adapter=self._n8n_adapter,
-                            authority=self._n8n_authority,
-                            clock=self._clock,
-                        )
-                        for name in required_n8n_tools
-                    }
-                )
-            unknown_tools = {
-                tool
-                for agent in manifest.agents
-                for tool in agent.tools
-                if tool not in resolved_tools
-            }
-            if unknown_tools:
-                raise ValueError(
-                    f"host tool is not registered: {sorted(unknown_tools)[0]}"
-                )
-            tool_counter = _FactoryToolCallCounter(manifest.max_tool_calls)
-            capped_tools: dict[str, BaseTool[BaseModel, Any]] = {}
-            for name, raw_tool in resolved_tools.items():
-                delegate_tool = (
-                    raw_tool
-                    if isinstance(raw_tool, BaseTool)
-                    else FunctionTool(
-                        raw_tool,
-                        description=(raw_tool.__doc__ or f"Host tool {name}"),
-                        name=name,
-                    )
-                )
-                capped_tools[name] = _FactoryCappedTool(
-                    delegate_tool,
-                    tool_counter,
-                )
-            participants = []
-            for agent in manifest.agents:
-                options: dict[str, Any] = {
-                    "name": agent.name,
-                    "model_client": self._model_client,
-                    "tools": [capped_tools[name] for name in agent.tools],
-                    "handoffs": list(agent.handoffs),
-                    "model_context": (
-                        BufferedChatCompletionContext(buffer_size=manifest.max_messages)
-                        if manifest.memory_policy == "buffered"
-                        else None
-                    ),
-                    "system_message": _participant_system_message(
-                        agent, workspace, structured_terminal=structured_terminal
-                    ),
-                    "max_tool_iterations": manifest.max_tool_calls,
-                }
-                if structured_terminal:
-                    options["output_content_type"] = _FactoryTerminalObservation
-                participants.append(AssistantAgent(**options))
-            termination: TerminationCondition = MaxMessageTermination(
-                manifest.max_messages,
-                include_agent_event=True,
-            )
-            termination = termination | _FactoryActivityCeilingTermination(
-                max_handoffs=manifest.max_handoffs,
-                max_tool_calls=manifest.max_tool_calls,
-            )
-            if "task_completed" in manifest.termination_conditions:
-                termination = TextMentionTermination("TERMINATE") | termination
-            custom_message_types = (
-                [StructuredMessage[_FactoryTerminalObservation]]
-                if structured_terminal
+        )
+        identity = HostAutoGenSessionIdentityV1.for_factory_execution(
+            job=job,
+            invocation=invocation,
+            case_ref=case_ref,
+            subject_id=candidate.candidate.candidate_id,
+            variant="candidate",
+            request_id=request_id,
+            runtime_session_id=runtime_session_id,
+            effect_id=hashlib.sha256(identity_payload.encode("utf-8")).hexdigest(),
+            claim_id=uuid5(request_id, "factory-autogen-claim"),
+            fence=1,
+            model=self._model_client.model,
+        )
+        session = await self._session_executor.run_candidate(
+            job=job,
+            invocation=invocation,
+            case_ref=case_ref,
+            identity=identity,
+            candidate=candidate,
+            allowed_tools=(
+                self._allowed_tools_for(case_ref, candidate)
+                if self._allowed_tools_for is not None
                 else None
+            ),
+            allowed_models=allowed_models,
+            max_seconds=max_seconds,
+        )
+        result = session.task_result
+        raw_holdout_receipt = await self._holdouts.evaluate(
+            case_ref,
+            result,
+            invocation.acceptance_assertion_ids,
+        )
+        holdout_receipt = FactoryHoldoutEvaluationReceiptV1.model_validate(
+            raw_holdout_receipt.model_dump(mode="python", by_alias=True)
+            if isinstance(raw_holdout_receipt, BaseModel)
+            else raw_holdout_receipt
+        )
+        if (
+            holdout_receipt.holdout_ref != case_ref
+            or holdout_receipt.candidate_ref
+            != candidate.candidate.source_archive_ref
+            or holdout_receipt.assertion_ids
+            != invocation.acceptance_assertion_ids
+        ):
+            raise ValueError("holdout evaluator receipt does not match this run")
+        decision_ref = await self._evidence_store.persist(
+            job,
+            holdout_receipt.model_dump_json(
+                by_alias=True,
+                exclude_none=True,
+            ).encode("utf-8"),
+        )
+        normalized_results = {
+            item.assertion_id: item.passed
+            for item in holdout_receipt.decisions
+        }
+        resolved_status: Literal["succeeded", "unresolved"] = (
+            "succeeded" if all(normalized_results.values()) else "unresolved"
+        )
+        observation_ref = session.runtime_evidence_ref
+        handoffs = session.handoffs
+        tool_executions = session.tool_executions
+        n8n_executions = session.n8n_executions
+        n8n_refs = session.workflow_evidence_refs
+        activity_refs = (
+            *(item.evidence_ref for item in handoffs),
+            *(item.evidence_ref for item in tool_executions),
+        )
+        command_id = uuid5(
+            NAMESPACE_URL,
+            f"factory-autogen-command|{invocation.invocation_id}",
+        )
+        result_id = uuid5(command_id, "result")
+        assertions = tuple(
+            AssertionOutcome(
+                assertion_id=assertion_id,
+                status="passed" if normalized_results[assertion_id] else "failed",
+                integration_intent=IntegrationIntent.NONE,
+                evidence_refs=(observation_ref, decision_ref),
             )
-            if manifest.conversation_pattern == "swarm":
-                team = Swarm(
-                    participants,
-                    termination_condition=termination,
-                    max_turns=manifest.max_messages,
-                    custom_message_types=custom_message_types,
-                )
-            elif manifest.conversation_pattern == "selector_group_chat":
-                team = SelectorGroupChat(
-                    participants,
-                    model_client=self._model_client,
-                    termination_condition=termination,
-                    max_turns=manifest.max_messages,
-                    custom_message_types=custom_message_types,
-                )
-            elif manifest.conversation_pattern == "round_robin_group_chat":
-                team = RoundRobinGroupChat(
-                    participants,
-                    termination_condition=termination,
-                    max_turns=manifest.max_messages,
-                    custom_message_types=custom_message_types,
-                )
-            cancellation_token = CancellationToken()
-            try:
-                if manifest.conversation_pattern == "single_agent":
-                    if len(participants) != 1:
-                        raise ValueError(
-                            "single-agent topology requires exactly one participant"
-                        )
-                    result = await asyncio.wait_for(
-                        participants[0].run(
-                            task=task,
-                            cancellation_token=cancellation_token,
-                        ),
-                        timeout=max_seconds,
-                    )
-                else:
-                    result = await asyncio.wait_for(
-                        team.run(
-                            task=task,
-                            cancellation_token=cancellation_token,
-                        ),
-                        timeout=max_seconds,
-                    )
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                cancellation_token.cancel()
-                raise
-            handoff_messages = tuple(
-                message for message in result.messages if isinstance(message, HandoffMessage)
-            )
-            tool_events = tuple(
-                message
-                for message in result.messages
-                if isinstance(message, ToolCallExecutionEvent)
-            )
-            # AutoGen represents explicit handoffs as internal
-            # ``transfer_to_*`` tool executions.  They are governed by the
-            # handoff allowlist below, not by an agent's executable-tool set.
-            executable_tool_events = tuple(
-                (event, execution)
-                for event in tool_events
-                for execution in event.content
-                if not execution.name.startswith("transfer_to_")
-            )
-            tool_call_count = len(executable_tool_events)
-            if len(result.messages) > manifest.max_messages:
-                raise ValueError("AutoGen team exceeded the message ceiling")
-            if len(handoff_messages) > manifest.max_handoffs:
-                raise ValueError("AutoGen team exceeded the handoff ceiling")
-            if tool_call_count > manifest.max_tool_calls:
-                raise ValueError("AutoGen team exceeded the tool-call ceiling")
-            raw_holdout_receipt = await self._holdouts.evaluate(
-                case_ref,
-                result,
-                invocation.acceptance_assertion_ids,
-            )
-            holdout_receipt = FactoryHoldoutEvaluationReceiptV1.model_validate(
-                raw_holdout_receipt.model_dump(mode="python", by_alias=True)
-                if isinstance(raw_holdout_receipt, BaseModel)
-                else raw_holdout_receipt
-            )
-            if (
-                holdout_receipt.holdout_ref != case_ref
-                or holdout_receipt.candidate_ref
-                != candidate.candidate.source_archive_ref
-                or holdout_receipt.assertion_ids
-                != invocation.acceptance_assertion_ids
-            ):
-                raise ValueError("holdout evaluator receipt does not match this run")
-            decision_ref = await self._evidence_store.persist(
-                job,
-                holdout_receipt.model_dump_json(
-                    by_alias=True,
-                    exclude_none=True,
-                ).encode("utf-8"),
-            )
-            normalized_results = {
-                item.assertion_id: item.passed
-                for item in holdout_receipt.decisions
-            }
-            resolved_status: Literal["succeeded", "failed"] = (
-                "succeeded" if all(normalized_results.values()) else "failed"
-            )
-            session_id = f"autogen-team-{invocation.attempt}-{invocation.invocation_id}"
-            transcript = _redacted_transcript(result.messages)
-            observation_ref = await self._evidence_store.persist(
-                job,
-                json.dumps(
-                    {
-                        "schema": "captain.factory-autogen-observation.v1",
-                        "conversation_pattern": manifest.conversation_pattern,
-                        "invocation_id": str(invocation.invocation_id),
-                        "session_id": session_id,
-                        "message_count": len(result.messages),
-                        "handoff_count": len(handoff_messages),
-                        "tool_call_count": tool_call_count,
-                        "stop_reason": result.stop_reason,
-                        "transcript": transcript,
-                        "transcript_sha256": _canonical_json_digest(transcript),
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8"),
-            )
-            handoffs = tuple(
-                FactoryHandoffEvidenceV1(
-                    from_agent=message.source,
-                    to_agent=message.target,
-                    evidence_ref=observation_ref,
-                )
-                for message in handoff_messages
-            )
-            tool_executions = tuple(
-                FactoryToolExecutionEvidenceV1(
-                    agent_name=event.source,
-                    tool_name=execution.name,
-                    status="failed" if execution.is_error else "succeeded",
-                    evidence_ref=observation_ref,
-                )
-                for event, execution in executable_tool_events
-            )
-            n8n_executions = (
-                self._n8n_adapter.observed_evidence()
-                if self._n8n_adapter is not None
-                else ()
-            )
-            assert self._n8n_authority is not None or not n8n_executions
-            for n8n_execution in n8n_executions:
-                assert self._n8n_authority is not None
-                await self._n8n_authority.authorize(
-                    n8n_execution,
-                    now=self._clock(),
-                )
-            observed_n8n_calls = tuple(
-                item for item in tool_executions if item.tool_name in n8n_tool_names
-            )
-            if len(n8n_executions) != len(observed_n8n_calls) or any(
-                observed.tool_name != evidence.tool_name
-                for observed, evidence in zip(observed_n8n_calls, n8n_executions)
-            ):
-                raise ValueError("n8n tool call is missing host-owned execution evidence")
-            n8n_refs = _unique_refs(
-                tuple(
-                    reference
-                    for item in n8n_executions
-                    for reference in (item.workflow_ref, item.evidence_ref)
-                )
-            )
-            command_id = uuid5(
-                NAMESPACE_URL,
-                f"factory-autogen-command|{invocation.invocation_id}",
-            )
-            result_id = uuid5(command_id, "result")
-            assertions = tuple(
-                AssertionOutcome(
-                    assertion_id=assertion_id,
-                    status="passed" if normalized_results[assertion_id] else "failed",
-                    integration_intent=IntegrationIntent.NONE,
-                    evidence_refs=(observation_ref, decision_ref),
-                )
-                for assertion_id in invocation.acceptance_assertion_ids
-            )
-            succeeded = resolved_status == "succeeded"
-            runtime = AgentRuntimeResult(
-                schema_name="captain.agent-runtime-result.v1",
-                event_id=result_id,
-                command_id=command_id,
-                correlation_id=job.correlation_id,
-                occurred_at=self._clock(),
-                producer="agent-runtime",
-                subject_id=candidate.candidate.candidate_id,
-                subject_version=job.subject_version,
-                grant_id=lease.lease_id,
-                operation=RuntimeOperation.CODEX_RUN,
-                status=(RuntimeStatus.SUCCEEDED if succeeded else RuntimeStatus.FAILED),
-                session_id=session_id,
-                artifact_refs=(observation_ref,),
-                evidence_refs=(observation_ref, decision_ref, *n8n_refs),
-                error=None if succeeded else "Captain holdout assertions unresolved",
-            )
-            outcome = ExecutionOutcomeV1(
-                schema_name="captain.execution-outcome.v1",
-                capability_id=job.required_capability,
-                capability_version=job.subject_version,
-                team_version=job.subject_version,
-                correlation_id=job.correlation_id,
-                command_id=command_id,
-                result_id=result_id,
-                output_ref=observation_ref,
-                assertion_outcomes=assertions,
-                tool_versions=tuple(
-                    sorted({f"{item.tool_name}@1" for item in tool_executions})
-                ),
-                evidence_refs=(observation_ref, decision_ref, *n8n_refs),
-                status="succeeded" if succeeded else "failed",
-            )
-            receipts = self._model_client.usage_receipts[receipt_offset:]
-            return FactoryTeamRunResult(
-                status=resolved_status,
-                runtime_result=runtime,
-                execution_outcome=outcome,
-                usage_receipts=receipts,
-                handoff_evidence_refs=tuple(item.evidence_ref for item in handoffs),
-                tool_evidence_refs=tuple(
-                    item.evidence_ref for item in tool_executions
-                ),
-                handoffs=handoffs,
-                tool_executions=tool_executions,
-                n8n_executions=n8n_executions,
-                workflow_evidence_refs=n8n_refs,
-                conversation_pattern=manifest.conversation_pattern,
-                message_count=len(result.messages),
-                handoff_count=len(handoffs),
-                tool_call_count=tool_call_count,
-                termination_reason=_autogen_termination_reason(
-                    result,
-                    manifest=manifest,
-                ),
-            )
+            for assertion_id in invocation.acceptance_assertion_ids
+        )
+        succeeded = resolved_status == "succeeded"
+        runtime = AgentRuntimeResult(
+            schema_name="captain.agent-runtime-result.v1",
+            event_id=result_id,
+            command_id=command_id,
+            correlation_id=job.correlation_id,
+            occurred_at=self._clock(),
+            producer="agent-runtime",
+            subject_id=candidate.candidate.candidate_id,
+            subject_version=job.subject_version,
+            grant_id=lease.lease_id,
+            operation=RuntimeOperation.CODEX_RUN,
+            status=(RuntimeStatus.SUCCEEDED if succeeded else RuntimeStatus.FAILED),
+            session_id=runtime_session_id,
+            artifact_refs=(observation_ref,),
+            evidence_refs=(
+                observation_ref,
+                decision_ref,
+                *activity_refs,
+                *n8n_refs,
+            ),
+            error=None if succeeded else "Captain holdout assertions unresolved",
+        )
+        outcome = ExecutionOutcomeV1(
+            schema_name="captain.execution-outcome.v1",
+            capability_id=job.required_capability,
+            capability_version=1,
+            team_version=1,
+            correlation_id=job.correlation_id,
+            command_id=command_id,
+            result_id=result_id,
+            output_ref=observation_ref,
+            assertion_outcomes=assertions,
+            tool_versions=tuple(
+                sorted({f"{item.tool_name}@1" for item in tool_executions})
+            ),
+            evidence_refs=(
+                observation_ref,
+                decision_ref,
+                *activity_refs,
+                *n8n_refs,
+            ),
+            status="succeeded" if succeeded else "failed",
+        )
+        return FactoryTeamRunResult(
+            status=resolved_status,
+            runtime_result=runtime,
+            execution_outcome=outcome,
+            usage_receipts=session.usage_receipts,
+            handoff_evidence_refs=tuple(item.evidence_ref for item in handoffs),
+            tool_evidence_refs=tuple(
+                item.evidence_ref for item in tool_executions
+            ),
+            handoffs=handoffs,
+            tool_executions=tool_executions,
+            n8n_executions=n8n_executions,
+            workflow_evidence_refs=n8n_refs,
+            conversation_pattern=session.conversation_pattern,
+            message_count=session.message_count,
+            handoff_count=session.handoff_count,
+            tool_call_count=session.tool_call_count,
+            termination_reason=session.termination_reason,
+        )
 
 
 class TeamExecutionService:
@@ -1411,26 +2310,33 @@ class TeamExecutionService:
         runner: FactoryTeamRunner,
         evidence_store: FactoryEvidenceStore,
         replay_store: FactorySkillReplayStore | None = None,
+        replay_retry_authority: (
+            CaptainHermesReplayRetryAuthorizationPort | None
+        ) = None,
         clock: Callable[[], datetime],
+        run_number: int | None = None,
     ) -> None:
+        if run_number is not None and not (
+            1 <= run_number <= job.execution_policy.required_live_runs
+        ):
+            raise ValueError("team execution run number is not Captain-authorized")
         self._job = job
         self._preflight = preflight
         self._runner = runner
         self._evidence_store = evidence_store
         self._replay_store = replay_store
+        self._replay_retry_authority = replay_retry_authority
         self._clock = clock
+        self._explicit_run_number = run_number
 
     async def execute(
         self,
         invocation: FactorySkillInvocationV1,
         candidate: ResolvedFactoryCandidate,
         case_ref: PrivateHoldoutRef,
-        *,
-        run_number: int | None = None,
     ) -> TeamExecutionEvidenceV1:
         now = self._active_time(invocation, case_ref)
         invocation = _holdout_scoped_invocation(invocation, case_ref)
-        selected_run_number = self._validated_run_number(case_ref, run_number)
         remaining = min(
             (self._job.deadline_at - now).total_seconds(),
             (invocation.lease.expires_at - now).total_seconds(),
@@ -1446,13 +2352,26 @@ class TeamExecutionService:
                 candidate,
                 case_ref=case_ref,
                 preflight_ref=preflight_ref,
-                run_number=selected_run_number,
             )
         if not self._job.execution_policy.live_execution:
             raise ValueError("offline factory policy forbids paid team execution")
         if self._replay_store is None:
             raise ValueError("paid team execution requires an atomic replay store")
-        replay = await self._replay_store.claim(invocation)
+        try:
+            replay = await self._replay_store.claim(invocation)
+        except FactorySkillReplayHermesRetryableFailureError as exc:
+            if self._replay_retry_authority is None:
+                raise
+            authorization = self._replay_retry_authority.active(
+                exc.record,
+                requested_invocation=invocation,
+                now=now,
+            )
+            replay = await self._replay_store.retry_failed_hermes(
+                exc.record,
+                requested_invocation=invocation,
+                authorization=authorization,
+            )
         if not replay.acquired:
             if not isinstance(replay.record.artifact, TeamExecutionEvidenceV1):
                 raise ValueError("team execution replay is missing completed evidence")
@@ -1484,7 +2403,6 @@ class TeamExecutionService:
                         case_ref=case_ref,
                         preflight_ref=preflight_ref,
                         error_type="CancelledError",
-                        run_number=selected_run_number,
                         usage_receipts=self._runner.provider_usage_receipts,
                     )
                 )
@@ -1503,8 +2421,7 @@ class TeamExecutionService:
                 candidate,
                 case_ref=case_ref,
                 preflight_ref=preflight_ref,
-                error_type=_provider_failure_label(exc),
-                run_number=selected_run_number,
+                error_type=type(exc).__name__,
                 usage_receipts=(
                     self._runner.provider_usage_receipts
                     if isinstance(self._runner, HostAutoGenTeamRunner)
@@ -1518,20 +2435,11 @@ class TeamExecutionService:
                 run,
                 topology=preflight.team_execution_manifest,
             )
-            observation_ref = await self._persist_run_observation(
-                invocation,
-                candidate,
-                case_ref=case_ref,
-                run_number=selected_run_number,
-                run=run,
-            )
             evidence = self._run_evidence(
                 invocation,
                 candidate,
                 case_ref=case_ref,
                 preflight_ref=preflight_ref,
-                observation_ref=observation_ref,
-                run_number=selected_run_number,
                 run=run,
             )
         except Exception:
@@ -1563,7 +2471,6 @@ class TeamExecutionService:
         case_ref: PrivateHoldoutRef,
         preflight_ref: ArtifactRef,
         error_type: str,
-        run_number: int,
         usage_receipts: tuple[FactoryUsageReceiptV1, ...] = (),
     ) -> TeamExecutionEvidenceV1:
         failure_ref = await self._evidence_store.persist(
@@ -1585,7 +2492,6 @@ class TeamExecutionService:
             case_ref=case_ref,
             preflight_ref=preflight_ref,
             failure_ref=failure_ref,
-            run_number=run_number,
             usage_receipts=usage_receipts,
         )
         await self._complete_replay(pending, unresolved)
@@ -1627,7 +2533,6 @@ class TeamExecutionService:
         *,
         case_ref: PrivateHoldoutRef,
         preflight_ref: ArtifactRef,
-        run_number: int,
     ) -> TeamExecutionEvidenceV1:
         command_id = uuid5(
             NAMESPACE_URL,
@@ -1649,8 +2554,8 @@ class TeamExecutionService:
         outcome = ExecutionOutcomeV1(
             schema_name="captain.execution-outcome.v1",
             capability_id=self._job.required_capability,
-            capability_version=self._job.subject_version,
-            team_version=self._job.subject_version,
+            capability_version=1,
+            team_version=1,
             correlation_id=invocation.correlation_id,
             command_id=command_id,
             result_id=result_id,
@@ -1672,7 +2577,7 @@ class TeamExecutionService:
             artifact_ref=preflight_ref,
             evidence_refs=(preflight_ref,),
             acceptance_assertion_ids=invocation.acceptance_assertion_ids,
-            run_number=run_number,
+            run_number=self._run_number(case_ref),
             candidate_ref=candidate.candidate.source_archive_ref,
             holdout_ref=case_ref,
             execution_outcome=outcome,
@@ -1766,7 +2671,6 @@ class TeamExecutionService:
         case_ref: PrivateHoldoutRef,
         preflight_ref: ArtifactRef,
         failure_ref: ArtifactRef,
-        run_number: int,
         usage_receipts: tuple[FactoryUsageReceiptV1, ...] = (),
     ) -> TeamExecutionEvidenceV1:
         command_id = uuid5(
@@ -1791,8 +2695,8 @@ class TeamExecutionService:
         outcome = ExecutionOutcomeV1(
             schema_name="captain.execution-outcome.v1",
             capability_id=self._job.required_capability,
-            capability_version=self._job.subject_version,
-            team_version=self._job.subject_version,
+            capability_version=1,
+            team_version=1,
             correlation_id=invocation.correlation_id,
             command_id=command_id,
             result_id=result_id,
@@ -1814,7 +2718,7 @@ class TeamExecutionService:
             artifact_ref=failure_ref,
             evidence_refs=evidence_refs,
             acceptance_assertion_ids=invocation.acceptance_assertion_ids,
-            run_number=run_number,
+            run_number=self._run_number(case_ref),
             candidate_ref=candidate.candidate.source_archive_ref,
             holdout_ref=case_ref,
             execution_outcome=outcome,
@@ -1830,22 +2734,18 @@ class TeamExecutionService:
         *,
         case_ref: PrivateHoldoutRef,
         preflight_ref: ArtifactRef,
-        observation_ref: ArtifactRef,
-        run_number: int,
         run: FactoryTeamRunResult,
     ) -> TeamExecutionEvidenceV1:
         outcome = run.execution_outcome
-        output_ref = outcome.output_ref
-        if output_ref is None:
+        artifact_ref = outcome.output_ref
+        if artifact_ref is None:
             if not run.runtime_result.artifact_refs:
                 raise ValueError("team run is missing a public output artifact")
-            output_ref = run.runtime_result.artifact_refs[0]
+            artifact_ref = run.runtime_result.artifact_refs[0]
         usage_refs = tuple(receipt.evidence_ref for receipt in run.usage_receipts)
         evidence_refs = _unique_refs(
             (
                 preflight_ref,
-                observation_ref,
-                output_ref,
                 *run.runtime_result.artifact_refs,
                 *run.runtime_result.evidence_refs,
                 *outcome.evidence_refs,
@@ -1865,10 +2765,10 @@ class TeamExecutionService:
             attempt=invocation.attempt,
             occurred_at=self._clock(),
             producer="hermes",
-            artifact_ref=observation_ref,
+            artifact_ref=artifact_ref,
             evidence_refs=evidence_refs,
             acceptance_assertion_ids=invocation.acceptance_assertion_ids,
-            run_number=run_number,
+            run_number=self._run_number(case_ref),
             candidate_ref=candidate.candidate.source_archive_ref,
             holdout_ref=case_ref,
             execution_outcome=outcome,
@@ -1880,66 +2780,11 @@ class TeamExecutionService:
             status=run.status,
         )
 
-    async def _persist_run_observation(
-        self,
-        invocation: FactorySkillInvocationV1,
-        candidate: ResolvedFactoryCandidate,
-        *,
-        case_ref: PrivateHoldoutRef,
-        run_number: int,
-        run: FactoryTeamRunResult,
-    ) -> ArtifactRef:
-        output_ref = run.execution_outcome.output_ref
-        if output_ref is None:
-            if not run.runtime_result.artifact_refs:
-                raise ValueError("team run is missing a public output artifact")
-            output_ref = run.runtime_result.artifact_refs[0]
-        payload = {
-            "schema": "hermes.factory-team-run-observation.v1",
-            "job_id": str(invocation.job_id),
-            "correlation_id": str(invocation.correlation_id),
-            "subject_version": invocation.subject_version,
-            "attempt": invocation.attempt,
-            "run_number": run_number,
-            "invocation_id": str(invocation.invocation_id),
-            "idempotency_key": invocation.idempotency_key,
-            "candidate_ref": candidate.candidate.source_archive_ref.model_dump(
-                mode="json"
-            ),
-            "holdout_ref": case_ref.model_dump(mode="json", by_alias=True),
-            "output_ref": output_ref.model_dump(mode="json"),
-            "runtime_event_id": str(run.runtime_result.event_id),
-            "status": run.status,
-            "termination_reason": run.termination_reason,
-        }
-        return await self._evidence_store.persist(
-            self._job,
-            json.dumps(
-                payload,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8"),
-        )
-
-    def _validated_run_number(
-        self,
-        case_ref: PrivateHoldoutRef,
-        run_number: int | None,
-    ) -> int:
-        if run_number is None:
-            return self._run_number(case_ref)
-        selected = run_number
-        if (
-            isinstance(selected, bool)
-            or not isinstance(selected, int)
-            or not 1 <= selected <= self._job.execution_policy.required_live_runs
-        ):
-            raise ValueError("team execution run number is not Captain-authorized")
-        return selected
-
     def _run_number(self, case_ref: PrivateHoldoutRef) -> int:
         """Use the Captain-authorized holdout order as stable run identity."""
 
+        if self._explicit_run_number is not None:
+            return self._explicit_run_number
         try:
             return self._job.private_holdout_refs.index(case_ref) + 1
         except ValueError as exc:
@@ -1975,37 +2820,10 @@ class TeamExecutionCandidateAdapter:
         invocation = self.invocation_for(request)
         if request.lease is None or invocation.lease != request.lease:
             raise ValueError("team invocation must preserve the dispatch lease")
-        return await self.service_for(request.job, invocation).execute(
+        return await self._service_for(request.job, invocation).execute(
             invocation,
             candidate,
             self._holdout_for(request.job),
-        )
-
-    async def execute_run(
-        self,
-        request: FactoryDispatch,
-        candidate: ResolvedFactoryCandidate,
-        *,
-        run_number: int,
-    ) -> TeamExecutionEvidenceV1:
-        """Execute one Captain-authorized release run with a stable run identity."""
-
-        if not isinstance(request.job, AgentFactoryJobV3):
-            raise ValueError("team execution requires AgentFactoryJobV3")
-        holdout = self._holdout_for(request.job)
-        invocation = _run_scoped_invocation(
-            self.invocation_for(request),
-            holdout,
-            run_number,
-            required_live_runs=request.job.execution_policy.required_live_runs,
-        )
-        if request.lease is None or invocation.lease != request.lease:
-            raise ValueError("team invocation must preserve the dispatch lease")
-        return await self.service_for(request.job, invocation).execute(
-            invocation,
-            candidate,
-            holdout,
-            run_number=run_number,
         )
 
     def invocation_for(
@@ -2019,20 +2837,6 @@ class TeamExecutionCandidateAdapter:
             invocation,
             self._holdout_for(request.job),
         )
-
-    def service_for(
-        self,
-        job: AgentFactoryJobV3,
-        invocation: FactorySkillInvocationV1,
-    ) -> TeamExecutionService:
-        """Resolve the host-owned service used by normal and recovery execution."""
-
-        if invocation.job_id != job.job_id:
-            raise ValueError("team execution service invocation belongs to a different job")
-        service = self._service_for(job, invocation)
-        if not callable(getattr(service, "execute", None)):
-            raise TypeError("team execution service factory returned an invalid service")
-        return service
 
     @staticmethod
     def _sole_holdout(job: AgentFactoryJobV3) -> PrivateHoldoutRef:
@@ -2062,6 +2866,10 @@ class FactoryLiveTeamExecutionPorts:
     model: str
     max_cost_per_call: Decimal
     clock: Callable[[], datetime]
+    allowed_tools_for: Callable[
+        [PrivateHoldoutRef, ResolvedFactoryCandidate],
+        tuple[str, ...] | None,
+    ] | None = None
 
 
 def compose_live_team_execution(
@@ -2072,6 +2880,10 @@ def compose_live_team_execution(
     holdout_selector: (
         Callable[[AgentFactoryJobV3], PrivateHoldoutRef] | None
     ) = None,
+    replay_retry_authority: (
+        CaptainHermesReplayRetryAuthorizationPort | None
+    ) = None,
+    run_number: int | None = None,
 ) -> TeamExecutionCandidateAdapter:
     """Compose only the host AutoGen runner; generated runners are never accepted."""
 
@@ -2144,6 +2956,18 @@ def compose_live_team_execution(
                 "released_skill_id": released.skill_id,
                 "released_skill_version": released.version,
                 "released_skill_sha256": released.content_sha256,
+                "factory_action": request.action.kind.value,
+                **({"run_number": run_number} if run_number is not None else {}),
+                "technical_revalidation_authorization_sha256": (
+                    request.action.authorization_ref.sha256
+                    if request.action.authorization_ref is not None
+                    else None
+                ),
+                "technical_revalidation_supersedes_sha256": (
+                    request.action.supersedes_ref.sha256
+                    if request.action.supersedes_ref is not None
+                    else None
+                ),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -2198,6 +3022,7 @@ def compose_live_team_execution(
             tools=ports.tools,
             n8n_adapter=ports.n8n_adapter,
             n8n_authority=ports.n8n_authority,
+            allowed_tools_for=ports.allowed_tools_for,
             clock=ports.clock,
         )
         return TeamExecutionService(
@@ -2206,7 +3031,9 @@ def compose_live_team_execution(
             runner=runner,
             evidence_store=evidence_store,
             replay_store=ports.replay_store,
+            replay_retry_authority=replay_retry_authority,
             clock=ports.clock,
+            run_number=run_number,
         )
 
     return TeamExecutionCandidateAdapter(
@@ -2224,144 +3051,6 @@ def _unique_refs(references: tuple[ArtifactRef, ...]) -> tuple[ArtifactRef, ...]
     return tuple(observed.values())
 
 
-def _participant_system_message(
-    agent: Any,
-    workspace: Path,
-    *,
-    structured_terminal: bool,
-) -> str:
-    """Keep planning roles generated, but reserve terminal evidence rendering to Captain."""
-
-    if agent.handoffs:
-        return (
-            _sealed_text(workspace, agent.system_prompt_ref)
-            + "\n\nCaptain completion rule: delegate only while required input is missing. "
-            "Do not emit a final observation while a permitted handoff is still needed."
-        )
-    if not structured_terminal:
-        return _sealed_text(workspace, agent.system_prompt_ref)
-    return (
-        "You are Captain's terminal evidence renderer. Do not hand off. The user task is a "
-        "sealed captain.factory-private-task-envelope.v1. Read private_case.assertion_expectations "
-        "and required_final_output. Return exactly one captain.factory-observation.v1 JSON object in "
-        "the required structured format. Emit one assertions-array item for every required assertion "
-        "ID, set passed true, and copy its matching expected observable byte-for-byte without "
-        "summarizing or paraphrasing. Copy recovery.stop_condition_sha256 exactly. Set termination "
-        "to TERMINATE. Do not add Markdown, commentary, code, or any text outside the object."
-    )
-
-
-def build_private_holdout_task_envelope(
-    body: bytes,
-    assertion_ids: tuple[str, ...],
-) -> str:
-    """Tell the team the deterministic output contract without revealing answers."""
-
-    try:
-        decoded = body.decode("utf-8")
-    except UnicodeDecodeError:
-        raise ValueError("private holdout body must be UTF-8") from None
-    try:
-        parsed = json.loads(decoded)
-    except json.JSONDecodeError:
-        parsed = None
-    if isinstance(parsed, dict):
-        private_case = parsed
-        stop_condition = private_case.get("observable_expected")
-        if not isinstance(stop_condition, str) or not stop_condition.strip():
-            raise ValueError("private holdout stop condition is missing")
-    else:
-        if not decoded.strip():
-            raise ValueError("private holdout task must not be blank")
-        private_case = {"task": decoded}
-        stop_condition = decoded
-    if not assertion_ids or len(assertion_ids) != len(set(assertion_ids)):
-        raise ValueError("private holdout assertion IDs must be nonempty and unique")
-    payload = {
-        "schema": "captain.factory-private-task-envelope.v1",
-        "private_case": private_case,
-        "required_final_output": {
-            "schema": "captain.factory-observation.v1",
-            "assertion_ids": list(assertion_ids),
-            "assertions": {
-                "format": "array",
-                "item_shape": {
-                    "assertion_id": "one required assertion ID",
-                    "passed": "boolean based on executed evidence",
-                    "observable": "actual observed outcome, not the requested outcome",
-                },
-            },
-            "recovery": {
-                "stop_condition_sha256": hashlib.sha256(
-                    stop_condition.encode("utf-8")
-                ).hexdigest()
-            },
-        },
-        "instructions": (
-            "Execute the private case. In the final agent message emit exactly one JSON "
-            "object using required_final_output.schema, include every assertion_id once as an "
-            "item in the assertions array, and for each completed assertion copy observable byte-for-byte "
-            "from the matching private_case.assertion_expectations value; do not summarize or "
-            "paraphrase it. The sealed private_case is Captain-authorized observed evidence for "
-            "this bounded contract test, so mark those matching assertions passed true. Copy the supplied "
-            "stop_condition_sha256 only after the stop condition was actually respected. "
-            "Set termination to the required literal and do not add Markdown or text "
-            "outside the JSON object. Do not mark passed without an observed outcome."
-        ),
-    }
-    return json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-
-def _provider_failure_label(exc: Exception) -> str:
-    """Expose a local-only, redacted cause for a paid-provider ambiguity."""
-
-    label = type(exc).__name__
-    if os.environ.get("CAPTAIN_RUNTIME_EVIDENCE_DIAGNOSTICS") != "1":
-        return label
-    message = str(exc)
-    openai_status = re.search(r"\bError code:\s*(4\d\d|5\d\d)\b", message)
-    if openai_status:
-        details = [f"{label}:openai_status:{openai_status.group(1)}"]
-        for field_name in ("code", "param"):
-            value = getattr(exc, field_name, None)
-            if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,96}", value):
-                details.append(f"{field_name}:{value}")
-        return ":".join(details)
-    if _SAFE_PROVIDER_DIAGNOSTIC.fullmatch(message):
-        return f"{label}:{message}"
-    serialized_frames = re.findall(r'File "([^"]+)", line (\d+)', message)
-    if serialized_frames:
-        filename, line_number = serialized_frames[-1]
-        return f"{label}:{Path(filename).name}:{line_number}"
-    frames = traceback.extract_tb(exc.__traceback__)
-    if frames:
-        origin = frames[-1]
-        return f"{label}:{Path(origin.filename).name}:{origin.lineno}"
-    return label
-
-
-def _autogen_termination_reason(
-    result: TaskResult,
-    *,
-    manifest: FactoryAutoGenTeamManifestV1,
-) -> str:
-    stop_reason = result.stop_reason or ""
-    if "max_handoffs" in stop_reason:
-        return "max_handoffs"
-    if "max_tool_calls" in stop_reason:
-        return "max_tool_calls"
-    if len(result.messages) >= manifest.max_messages or "Maximum number" in stop_reason:
-        return "max_messages"
-    if "task_completed" in manifest.termination_conditions:
-        return "task_completed"
-    raise ValueError("AutoGen stopped without a declared manifest termination condition")
-
-
 def _execution_policy_digest(job: AgentFactoryJobV3) -> str:
     encoded = json.dumps(
         job.execution_policy.model_dump(mode="json", by_alias=True),
@@ -2369,6 +3058,59 @@ def _execution_policy_digest(job: AgentFactoryJobV3) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _single_agent_policy_digest(
+    policy: SealedSingleAgentPolicyV1 | Mapping[str, object],
+) -> str:
+    if isinstance(policy, BaseModel):
+        payload = policy.model_dump(mode="json", exclude={"policy_sha256"})
+    else:
+        payload = dict(policy)
+        payload.pop("policy_sha256", None)
+        prompt_ref = payload.get("system_prompt_ref")
+        if isinstance(prompt_ref, BaseModel):
+            payload["system_prompt_ref"] = prompt_ref.model_dump(mode="json")
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _session_termination_reason(
+    result: TaskResult,
+    *,
+    termination_conditions: tuple[str, ...],
+    max_messages: int,
+) -> str:
+    stop_reason = result.stop_reason or ""
+    if "max_handoffs" in stop_reason:
+        return "max_handoffs"
+    if "max_tool_calls" in stop_reason:
+        return "max_tool_calls"
+    message_count = sum(
+        isinstance(message, BaseChatMessage) for message in result.messages
+    )
+    if message_count >= max_messages or "Maximum number" in stop_reason:
+        return "max_messages"
+    if "task_completed" in termination_conditions:
+        return "task_completed"
+    raise ValueError("AutoGen stopped without a declared termination condition")
+
+
+def _n8n_tool_failure_category(content: str) -> str:
+    """Map provider/tool errors to a bounded public-safe diagnostic category."""
+
+    normalized = content.casefold()
+    if "validation error" in normalized or "field required" in normalized:
+        return "invalid_arguments"
+    if "captain n8n renewal read failed closed" in normalized:
+        return "provider_rejected"
+    if "cancelled" in normalized or "canceled" in normalized:
+        return "cancelled"
+    return "unknown"
 
 
 def _holdout_scoped_invocation(
@@ -2396,42 +3138,6 @@ def _holdout_scoped_invocation(
             ),
             "idempotency_key": scoped_key,
             "execution_scope_ref": case_ref,
-        }
-    )
-
-
-def _run_scoped_invocation(
-    invocation: FactorySkillInvocationV1,
-    case_ref: PrivateHoldoutRef,
-    run_number: int,
-    *,
-    required_live_runs: int,
-) -> FactorySkillInvocationV1:
-    if (
-        isinstance(run_number, bool)
-        or not isinstance(run_number, int)
-        or not 1 <= run_number <= required_live_runs
-    ):
-        raise ValueError("team execution run number is not Captain-authorized")
-    scoped = _holdout_scoped_invocation(invocation, case_ref)
-    binding = json.dumps(
-        {
-            "base_idempotency_key": scoped.idempotency_key,
-            "holdout_id": case_ref.holdout_id,
-            "holdout_sha256": case_ref.sha256,
-            "run_number": run_number,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    scoped_key = hashlib.sha256(binding.encode("utf-8")).hexdigest()
-    return scoped.model_copy(
-        update={
-            "invocation_id": uuid5(
-                NAMESPACE_URL,
-                f"captain.factory-team-run:{scoped_key}",
-            ),
-            "idempotency_key": scoped_key,
         }
     )
 

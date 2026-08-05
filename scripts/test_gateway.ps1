@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [switch]$IncludeMcpBrokerLive
+    [switch]$IncludeMcpBrokerLive,
+    [string]$PythonPath = ''
 )
 
 Set-StrictMode -Version Latest
@@ -51,6 +52,48 @@ function Test-PythonCanImportPytest {
 
     & $Python -c "import pytest" 2>$null
     return $LASTEXITCODE -eq 0
+}
+
+function Test-Python311 {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Python
+    )
+
+    & $Python -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 11) else 1)" 2>$null
+    return $LASTEXITCODE -eq 0
+}
+
+function Resolve-GatewayPython {
+    param(
+        [AllowEmptyString()]
+        [string]$PythonPath,
+        [Parameter(Mandatory)]
+        [string]$localPython
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($PythonPath)) {
+        if (-not [System.IO.Path]::IsPathFullyQualified($PythonPath)) {
+            throw "Explicit -PythonPath must be fully qualified"
+        }
+        if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
+            throw "Explicit -PythonPath must reference an existing file"
+        }
+
+        $resolvedPython = [System.IO.Path]::GetFullPath($PythonPath)
+        if (-not (Test-Python311 -Python $resolvedPython)) {
+            throw "Explicit -PythonPath must be Python 3.11"
+        }
+        if (-not (Test-PythonCanImportPytest -Python $resolvedPython)) {
+            throw "Explicit -PythonPath must import pytest"
+        }
+        return $resolvedPython
+    }
+
+    if ((Test-Path -LiteralPath $localPython) -and (Test-PythonCanImportPytest -Python $localPython)) {
+        return [System.IO.Path]::GetFullPath($localPython)
+    }
+    return (Get-Command python -ErrorAction Stop).Source
 }
 
 function Invoke-Pytest {
@@ -123,18 +166,15 @@ function Assert-SelectedPytestSummary {
 
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $composeFile = [System.IO.Path]::GetFullPath((Join-Path $repoRoot "docker-compose.test.yml"))
-$dockerCommand = (Get-Command docker -ErrorAction Stop).Source
 $isWindowsPlatform = $env:OS -eq "Windows_NT"
 $localPython = if ($isWindowsPlatform) {
     Join-Path $repoRoot ".venv/Scripts/python.exe"
 } else {
     Join-Path $repoRoot ".venv/bin/python"
 }
-$pythonCommand = if ((Test-Path -LiteralPath $localPython) -and (Test-PythonCanImportPytest -Python $localPython)) {
-    [System.IO.Path]::GetFullPath($localPython)
-} else {
-    (Get-Command python -ErrorAction Stop).Source
-}
+$pythonCommand = Resolve-GatewayPython -PythonPath $PythonPath -LocalPython $localPython
+Write-Host "Gateway test interpreter: $pythonCommand"
+$dockerCommand = (Get-Command docker -ErrorAction Stop).Source
 
 $environmentNames = @(
     "MARIADB_TEST_PASSWORD",
@@ -198,9 +238,8 @@ try {
         Assert-SelectedPytestSummary -SelectedOutput $liveOutput -MinimumPassed 1 | Out-Null
     }
 
-    # The root coverage configuration includes the Hermes submodule, so this
-    # integration runner verifies behavior without turning external source
-    # coverage into a false failure.
+    # This integration runner verifies behavior without mixing service-process
+    # execution into the parent unit-test coverage gate.
     $fullArguments = @("-m", "pytest", "-q", "--no-cov", "-rs", "-m", "not live")
     $fullOutput = Invoke-Pytest -Python $pythonCommand -Arguments $fullArguments -Label "Full non-live suite"
     $AllowedFullSuiteSkipPatterns = @(

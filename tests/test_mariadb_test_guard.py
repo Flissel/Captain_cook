@@ -4,6 +4,7 @@ import ast
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 
@@ -175,6 +176,107 @@ def test_gate_falls_back_when_the_local_venv_cannot_import_pytest() -> None:
     assert "-c" in source
     assert '"import pytest"' in source
     assert "Test-PythonCanImportPytest -Python $localPython" in source
+
+
+def _gateway_python_resolver_source(source: str) -> str:
+    start = source.index("function Test-PythonCanImportPytest")
+    end = source.index("function Invoke-Pytest", start)
+    return source[start:end]
+
+
+def _pwsh_literal(value: Path) -> str:
+    return str(value).replace("'", "''")
+
+
+def test_gate_explicit_pythonpath_wins_over_auto_resolution(tmp_path: Path) -> None:
+    source = (ROOT / "scripts/test_gateway.ps1").read_text(encoding="utf-8")
+
+    assert "function Resolve-GatewayPython" in source
+    resolver = _gateway_python_resolver_source(source)
+    supplied_python = Path(sys.executable).resolve()
+    absent_local_python = tmp_path / ".venv" / "Scripts" / "python.exe"
+    probe = resolver + f"""
+function Get-Command {{ throw 'auto-resolution must not run when -PythonPath is supplied' }}
+$resolved = Resolve-GatewayPython -PythonPath '{_pwsh_literal(supplied_python)}' -LocalPython '{_pwsh_literal(absent_local_python)}'
+if ($resolved -ne '{_pwsh_literal(supplied_python)}') {{
+    throw "expected supplied interpreter, got $resolved"
+}}
+"""
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", probe],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("python_script", "python_path", "expected_error"),
+    (
+        (None, None, "existing file"),
+        (None, r"\tools\python.exe", "fully qualified"),
+        ("@echo off\r\nexit /b 1\r\n", None, "Python 3.11"),
+        (
+            "@echo off\r\n"
+            "echo %*| %SystemRoot%\\System32\\findstr.exe /C:\"version_info\" >nul\r\n"
+            "if not errorlevel 1 exit /b 0\r\n"
+            "exit /b 1\r\n",
+            None,
+            "import pytest",
+        ),
+    ),
+)
+def test_gate_rejects_invalid_explicit_python_before_docker_startup(
+    tmp_path: Path,
+    python_script: str | None,
+    python_path: str | None,
+    expected_error: str,
+) -> None:
+    sandbox_root = tmp_path / "captain"
+    scripts_dir = sandbox_root / "scripts"
+    scripts_dir.mkdir(parents=True)
+    script_path = scripts_dir / "test_gateway.ps1"
+    shutil.copy2(ROOT / "scripts" / "test_gateway.ps1", script_path)
+
+    docker_log = tmp_path / "docker.log"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "docker.cmd").write_text(
+        "@echo off\r\necho %*>>\"%FAKE_DOCKER_LOG%\"\r\nexit /b 0\r\n",
+        encoding="utf-8",
+    )
+    supplied_python = tmp_path / "missing-python.exe"
+    if python_script is not None:
+        supplied_python = tmp_path / "supplied-python.cmd"
+        supplied_python.write_text(python_script, encoding="utf-8")
+    supplied_path_argument = python_path or str(supplied_python)
+
+    environment = os.environ.copy()
+    environment["PATH"] = f"{bin_dir}{os.pathsep}{environment['PATH']}"
+    environment["FAKE_DOCKER_LOG"] = str(docker_log)
+    result = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(script_path),
+            "-PythonPath",
+            supplied_path_argument,
+        ],
+        cwd=sandbox_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert expected_error in result.stdout + result.stderr
+    assert not docker_log.exists(), "interpreter validation must fail before Docker starts"
 
 
 def test_environment_helper_preserves_missing_and_empty_values() -> None:

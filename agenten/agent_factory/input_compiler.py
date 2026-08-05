@@ -77,7 +77,7 @@ class FactoryInputCompiler:
         if isinstance(subject_version, bool) or subject_version < 1:
             raise ValueError("subject_version must be a positive integer")
         assertions = self._assertions(document)
-        holdouts = self._holdouts(document, assertions)
+        holdouts = self._holdouts(document)
         nodes = self._nodes(document)
         dependencies = {node.node_id: set(node.dependencies) for node in nodes}
         sorter = TopologicalSorter(dependencies)
@@ -111,32 +111,12 @@ class FactoryInputCompiler:
             result.append(AcceptanceAssertion(assertion_id=assertion_id, source_path=path, observable_setup=case.observable_setup, observable_action=case.observable_action, observable_expected=case.observable_expected, kind=kind))
         return tuple(result)
 
-    def _holdouts(
-        self,
-        document: FactoryInputDocumentV2,
-        assertions: tuple[AcceptanceAssertion, ...],
-    ) -> tuple[PrivateHoldoutRef, ...]:
+    def _holdouts(self, document: FactoryInputDocumentV2) -> tuple[PrivateHoldoutRef, ...]:
         refs = []
-        assertion_expectations = {
-            assertion.assertion_id: assertion.observable_expected
-            for assertion in assertions
-        }
         cases = list(document.real_cases)
         for index, stop in enumerate(document.stop_conditions):
             source = cases[index % len(cases)]
-            body = _canonical_json(
-                {
-                    "source_path": ["Stop conditions", _semantic(stop)],
-                    "observable_setup": source.observable_setup,
-                    "observable_action": "Exercise controlled recovery",
-                    "observable_expected": stop,
-                    # The worker receives this sealed runtime holdout body. These
-                    # values are derived from the canonical public input and are
-                    # required to produce Captain's typed observation contract;
-                    # they are never added to public job or projection evidence.
-                    "assertion_expectations": assertion_expectations,
-                }
-            )
+            body = _canonical_json({"source_path": ["Stop conditions", _semantic(stop)], "observable_setup": source.observable_setup, "observable_action": "Exercise controlled recovery", "observable_expected": stop})
             digest = hashlib.sha256(body.encode()).hexdigest()
             holdout_id = "holdout-" + _short_id(document.input_ref.sha256, ("private-holdout", _semantic(stop)), digest)
             uri = f"holdout://{holdout_id}"

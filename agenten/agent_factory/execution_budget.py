@@ -20,7 +20,7 @@ from pydantic import (
     model_validator,
 )
 
-from agenten.agent_factory.contracts import AgentFactoryJobV3
+from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryLease
 from agenten.agent_factory.execution_policy import FactoryExecutionPolicyV1
 from agenten.agent_runtime.contracts import ArtifactRef, SHA256_PATTERN
 
@@ -46,8 +46,6 @@ class FactoryUsageReceiptV1(_FrozenContract):
     job_id: UUID
     correlation_id: UUID
     attempt: int = Field(ge=1, le=5, strict=True)
-    lease_id: str | None = Field(default=None, min_length=1)
-    invocation_id: UUID | None = None
     provider: str = Field(min_length=1)
     model: str = Field(min_length=1)
     input_units: int = Field(ge=0, strict=True)
@@ -70,7 +68,7 @@ class FactoryUsageReceiptV1(_FrozenContract):
     def require_known_cost(cls, value: object) -> Decimal:
         if value is None:
             raise ValueError("a known USD cost is required")
-        return _parse_usd(value, "cost_usd")
+        return _parse_usage_usd(value, "cost_usd")
 
     @field_validator("started_at", "ended_at")
     @classmethod
@@ -94,7 +92,6 @@ class FactoryBudgetReservationV1(_FrozenContract):
     subject_version: int = Field(ge=1, strict=True)
     execution_policy_sha256: str = Field(pattern=SHA256_PATTERN)
     attempt: int = Field(ge=1, le=5, strict=True)
-    invocation_id: UUID | None = None
     requested_usd: Decimal
     reserved_at: datetime
     expires_at: datetime
@@ -134,12 +131,15 @@ class FactoryBudgetProjection(_FrozenContract):
     remaining_usd: Decimal
     active_reservation_ids: tuple[UUID, ...] = ()
 
-    @field_validator(
-        "limit_usd", "consumed_usd", "reserved_usd", "remaining_usd", mode="before"
-    )
+    @field_validator("limit_usd", "reserved_usd", mode="before")
     @classmethod
-    def require_canonical_amount(cls, value: object) -> Decimal:
+    def require_canonical_reserved_amount(cls, value: object) -> Decimal:
         return _parse_usd(value, "projection amount")
+
+    @field_validator("consumed_usd", "remaining_usd", mode="before")
+    @classmethod
+    def require_canonical_usage_amount(cls, value: object) -> Decimal:
+        return _parse_usage_usd(value, "projection amount")
 
     @model_validator(mode="after")
     def require_consistent_totals(self) -> "FactoryBudgetProjection":
@@ -159,7 +159,6 @@ class FactoryBudgetPort(Protocol):
         attempt: int,
         requested_usd: Decimal,
         now: datetime,
-        invocation_id: UUID | None = None,
     ) -> FactoryBudgetReservationV1: ...
 
     def record_usage(
@@ -167,6 +166,8 @@ class FactoryBudgetPort(Protocol):
         job: AgentFactoryJobV3,
         reservation: FactoryBudgetReservationV1,
         receipt: FactoryUsageReceiptV1,
+        *,
+        lease: FactoryLease | None = None,
     ) -> FactoryBudgetWriteReceipt: ...
 
     def release(
@@ -222,7 +223,6 @@ class InMemoryFactoryBudgetLedger:
         attempt: int,
         requested_usd: Decimal,
         now: datetime,
-        invocation_id: UUID | None = None,
     ) -> FactoryBudgetReservationV1:
         checked_at = _require_utc(now)
         requested = _require_positive_usd(requested_usd, "requested_usd")
@@ -247,7 +247,6 @@ class InMemoryFactoryBudgetLedger:
                         str(job.subject_version),
                         policy_digest,
                         str(attempt),
-                        str(invocation_id or "legacy"),
                         _canonical_usd_text(requested),
                         checked_at.isoformat(),
                         str(sequence),
@@ -262,7 +261,6 @@ class InMemoryFactoryBudgetLedger:
                 subject_version=job.subject_version,
                 execution_policy_sha256=policy_digest,
                 attempt=attempt,
-                invocation_id=invocation_id,
                 requested_usd=requested,
                 reserved_at=checked_at,
                 expires_at=job.deadline_at,
@@ -280,7 +278,10 @@ class InMemoryFactoryBudgetLedger:
         job: AgentFactoryJobV3,
         reservation: FactoryBudgetReservationV1,
         receipt: FactoryUsageReceiptV1,
+        *,
+        lease: FactoryLease | None = None,
     ) -> FactoryBudgetWriteReceipt:
+        del lease
         with self._lock:
             stored = self._require_reservation(job, reservation)
             self._require_receipt_bindings(job, stored, receipt)
@@ -464,10 +465,6 @@ class InMemoryFactoryBudgetLedger:
             or receipt.job_id != job.job_id
             or receipt.correlation_id != job.correlation_id
             or receipt.attempt != reservation.attempt
-            or (
-                reservation.invocation_id is not None
-                and receipt.invocation_id != reservation.invocation_id
-            )
         ):
             raise ValueError("usage receipt does not match its reservation")
 
@@ -524,6 +521,22 @@ def _parse_usd(value: object, field_name: str) -> Decimal:
     if not amount.is_finite() or amount < 0 or amount.as_tuple().exponent < -2:
         raise ValueError(
             f"{field_name} must be finite, non-negative, and use cents"
+        )
+    return _canonical_usd(amount)
+
+
+def _parse_usage_usd(value: object, field_name: str) -> Decimal:
+    """Parse finalized provider usage at exact micro-USD precision."""
+
+    if isinstance(value, (bool, float)) or not isinstance(value, (str, Decimal)):
+        raise ValueError(f"{field_name} must be a decimal string")
+    try:
+        amount = Decimal(value)
+    except InvalidOperation as exc:
+        raise ValueError(f"{field_name} must be finite") from exc
+    if not amount.is_finite() or amount < 0 or amount.as_tuple().exponent < -6:
+        raise ValueError(
+            f"{field_name} must be finite, non-negative, and use micro-USD"
         )
     return _canonical_usd(amount)
 

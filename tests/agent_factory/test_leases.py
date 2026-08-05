@@ -61,6 +61,30 @@ def test_expired_or_cross_role_lease_is_denied() -> None:
         )
 
 
+def test_explicit_lease_duration_cannot_outlive_v3_job_deadline() -> None:
+    factory_job = v3_job(live=True)
+
+    lease = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.REAL_CASE_TESTER,
+        attempt=1,
+        workspace_ref="workspace://factory/bounded-live-suite",
+        now=NOW,
+        duration=timedelta(minutes=10),
+    )
+
+    assert lease.expires_at == NOW + timedelta(minutes=10)
+    with pytest.raises(FactoryLeaseDenied, match="job deadline"):
+        issue_factory_lease(
+            job=factory_job,
+            role=FactoryRole.REAL_CASE_TESTER,
+            attempt=1,
+            workspace_ref="workspace://factory/unbounded-live-suite",
+            now=NOW,
+            duration=timedelta(minutes=16),
+        )
+
+
 def v3_job(*, live: bool) -> AgentFactoryJobV3:
     v1 = job()
     policy = FactoryExecutionPolicyV1.model_validate(
@@ -143,7 +167,7 @@ def test_v3_real_case_tester_receives_exact_explicit_live_capabilities() -> None
     ) == lease
 
 
-def test_v3_live_hermes_roles_receive_only_model_invoke_live_capability() -> None:
+def test_v3_offline_and_non_tester_roles_receive_no_live_capabilities() -> None:
     live_job = v3_job(live=True)
     offline_lease = issue_factory_lease(
         job=v3_job(live=False),
@@ -168,13 +192,6 @@ def test_v3_live_hermes_roles_receive_only_model_invoke_live_capability() -> Non
         "computer.use",
     ):
         assert capability not in offline_lease.capabilities
-    assert "model.invoke" in tool_lease.capabilities
-    for capability in (
-        "docker.run",
-        "database.captain_test",
-        "browser.use",
-        "computer.use",
-    ):
         assert capability not in tool_lease.capabilities
 
 

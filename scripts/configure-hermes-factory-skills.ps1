@@ -31,11 +31,11 @@ $textAssetExtensions = @(
 # SHA-256 of every file in that skill directory. Known text assets normalize
 # CRLF and standalone CR to LF before hashing; binary files remain byte-exact.
 $releasedSkillDigests = @{
-    'captain-factory-discover' = '669c5b3208ab0779194fd79a70b3a8258eb6869767338fcf629b42cdcaddf19d'
-    'captain-factory-brief-codex' = 'ab15e81bf383fe64ab9b1a7c018f5577025fcbed3eaec47ffdb1d1692808648b'
+    'captain-factory-discover' = '0ffb6398ab1f220210e6fc2d251f3aebb2a394a7836c4ec94f071eb93d9009a6'
+    'captain-factory-brief-codex' = '7dfbfcac855a9f1baaae7f88b705b89441239a16f37096669be92a5e39d69e3e'
     'captain-factory-execute-team' = '5e885c4ab70985d7b4f41a1129b4e3d62e815e201da58e0d695b7caf35305897'
     'captain-factory-evaluate-team' = '468f49b870d19554812216eefd82542b51fd09e3563cfde3dc9d0332704157c7'
-    'captain-factory-improve-team' = '4c1bd1a3981832d9ddd6051fd35a3885621f898c305cf99eb8f11b71ced0d35f'
+    'captain-factory-improve-team' = 'b4f578003d30df824e4310f0fefd1e821a00f963e9e67e1e17630483ab7d3bc9'
     'captain-factory-report-captain' = '077dd7671601707aeb07aca32c1f84ed6d2ef34c90129e950c96a92c2d5d3827'
 }
 
@@ -468,21 +468,7 @@ if ($configurationChanged) {
     Set-ExternalDirectories -Directories @($otherDirectories + $skillRoot) -HermesHome $configuredHermesHome
 }
 
-$previousColumns = $env:COLUMNS
-try {
-    # Rich truncates long skill names to the current terminal width. Force a
-    # stable machine-readable width so verification is independent of the host.
-    $env:COLUMNS = '240'
-    $skillsOutput = Invoke-Hermes -Arguments @('skills', 'list', '--enabled-only')
-}
-finally {
-    if ($null -eq $previousColumns) {
-        Remove-Item Env:COLUMNS -ErrorAction SilentlyContinue
-    }
-    else {
-        $env:COLUMNS = $previousColumns
-    }
-}
+$skillsOutput = Invoke-Hermes -Arguments @('skills', 'list', '--enabled-only')
 foreach ($skillName in $skillNames) {
     $matchingLines = @(
         $skillsOutput -split '\r?\n' | Where-Object { $_ -match [regex]::Escape($skillName) }

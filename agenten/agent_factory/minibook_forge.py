@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import tempfile
 from typing import Protocol
 from uuid import UUID
 
@@ -15,10 +16,21 @@ from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatch
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.forge_contracts import (
     CreationJobV1,
+    CreationJobV2,
     CreationProgressV1,
     CreationResultV1,
     CreationSubmissionReceipt,
+    ForgeBuildSkillUsageReceiptV1,
 )
+from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
+from agenten.agent_factory.skill_workflow_contracts import (
+    CandidateRevisionV1,
+    CodebaseInventoryV1,
+    CodexBuildBriefV1,
+    CodexBuildEvidenceV1,
+    FactorySkillStep,
+)
+from agenten.agent_factory.state_machine import FactoryActionKind
 
 
 class FactoryInputMaterializer(Protocol):
@@ -28,6 +40,251 @@ class FactoryInputMaterializer(Protocol):
 
 class CreationJobMapper(Protocol):
     def map(self, request: FactoryDispatch) -> CreationJobV1: ...
+
+
+class ForgeBuildSkillReceiptProvider(Protocol):
+    def build_skill_receipt(
+        self,
+        request: FactoryDispatch,
+        creation_job: CreationJobV1,
+    ) -> ForgeBuildSkillUsageReceiptV1: ...
+
+
+class CaptainForgeEvidencePort(Protocol):
+    """Read only Captain-owned evidence required to authorize a Forge job."""
+
+    def workflow_artifacts(self, job_id: UUID) -> tuple[object, ...]: ...
+
+    def released_for(
+        self,
+        job: object,
+        step: FactorySkillStep,
+    ) -> ReleasedHermesSkill: ...
+
+
+class CaptainCreationJobMapper:
+    """Map one exact Captain-approved Codex brief to Minibook's boundary."""
+
+    def __init__(self, *, evidence: CaptainForgeEvidencePort) -> None:
+        self._evidence = evidence
+
+    def map(self, request: FactoryDispatch) -> CreationJobV1:
+        if request.action.kind is not FactoryActionKind.SUBMIT_FORGE_JOB:
+            raise FactoryDispatchError("creation job requires Captain's submit-forge action")
+        if request.role is not None or request.lease is not None:
+            raise FactoryDispatchError("creation job must not receive a Hermes role lease")
+
+        job = request.job
+        attempt = request.action.attempt
+        artifacts = self._evidence.workflow_artifacts(job.job_id)
+        briefs = tuple(
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, CodexBuildBriefV1)
+            and _matches_dispatch(artifact, job, attempt)
+        )
+        builds = tuple(
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, CodexBuildEvidenceV1)
+            and _matches_dispatch(artifact, job, attempt)
+        )
+        if len(briefs) != 1 or len(builds) != 1:
+            raise FactoryDispatchError(
+                "creation job requires exactly one Captain inventory, Codex brief, and sealed build"
+            )
+        brief = briefs[0]
+        build = builds[0]
+        inventories = tuple(
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, CodebaseInventoryV1)
+            and _matches_job_identity(artifact, job)
+            and artifact.attempt <= attempt
+            and artifact.artifact_ref in brief.context_refs
+        )
+        if len(inventories) != 1:
+            raise FactoryDispatchError(
+                "creation job requires exactly one Captain inventory, Codex brief, and sealed build"
+            )
+        inventory = inventories[0]
+        revisions = tuple(
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, CandidateRevisionV1)
+            and _matches_dispatch(artifact, job, attempt)
+        )
+        if attempt == 1:
+            if revisions:
+                raise FactoryDispatchError(
+                    "initial creation job must not contain retry revision evidence"
+                )
+            expected_brief_input = inventory.artifact_ref
+        else:
+            if len(revisions) != 1:
+                raise FactoryDispatchError(
+                    "retry creation job requires exactly one Captain candidate revision"
+                )
+            expected_brief_input = revisions[0].artifact_ref
+
+        if inventory.artifact_ref not in brief.context_refs:
+            raise FactoryDispatchError("Codex brief is not bound to the Captain inventory")
+
+        assignment = brief.build_assignment
+        receipt = build.build_receipt
+        released = self._evidence.released_for(job, FactorySkillStep.BRIEF_CODEX)
+        invoked = brief.invocation.released_skill
+        if released != invoked:
+            raise FactoryDispatchError("Codex brief does not use Captain's released skill")
+        if (
+            not _same_artifact_ref(
+                brief.invocation.input_ref,
+                expected_brief_input,
+            )
+            or not _same_artifact_ref(assignment.compiled_spec_ref, job.compiled_spec_ref)
+            or not _same_artifact_ref(
+                assignment.dependency_graph_ref, job.dependency_graph_ref
+            )
+            or assignment.deadline_at != job.deadline_at
+            or tuple(assignment.public_assertion_ids)
+            != tuple(job.acceptance_assertion_ids)
+        ):
+            raise FactoryDispatchError("Codex assignment does not match the dispatched job")
+        if (
+            build.invocation.input_ref != brief.artifact_ref
+            or not _same_artifact_ref(receipt.build_brief_ref, brief.artifact_ref)
+            or receipt.assignment_id != assignment.assignment_id
+            or receipt.creation_job_id != assignment.creation_job_id
+            or receipt.idempotency_key != assignment.idempotency_key
+            or receipt.workspace_ref != assignment.workspace_ref
+        ):
+            raise FactoryDispatchError(
+                "Captain-sealed Codex build does not match the build assignment"
+            )
+
+        return CreationJobV2.model_validate(
+            {
+                "schema": "minibook.creation-job.v2",
+                "creation_job_id": assignment.creation_job_id,
+                "factory_job_id": job.job_id,
+                "correlation_id": job.correlation_id,
+                "causation_id": brief.invocation_id,
+                "subject_version": job.subject_version,
+                "attempt": attempt,
+                "idempotency_key": assignment.idempotency_key,
+                "input_ref": job.input_ref.model_dump(mode="json"),
+                "compiled_spec_ref": assignment.compiled_spec_ref.model_dump(mode="json"),
+                "dependency_graph_ref": assignment.dependency_graph_ref.model_dump(mode="json"),
+                "released_skill": {
+                    "skill_id": released.skill_id,
+                    "version": released.version,
+                    "content_ref": released.content_ref.model_dump(mode="json"),
+                    "content_sha256": released.content_sha256,
+                },
+                "public_assertion_ids": assignment.public_assertion_ids,
+                "deadline_at": assignment.deadline_at,
+                "source_archive_ref": receipt.source_archive_ref.model_dump(
+                    mode="json"
+                ),
+                "codex_build_receipt_ref": build.build_receipt_ref.model_dump(
+                    mode="json"
+                ),
+                "codex_build_receipt": receipt.model_dump(
+                    mode="json", by_alias=True
+                ),
+            }
+        )
+
+    def build_skill_receipt(
+        self,
+        request: FactoryDispatch,
+        creation_job: CreationJobV1,
+    ) -> ForgeBuildSkillUsageReceiptV1:
+        """Derive one Forge receipt only from Captain-validated Hermes artifacts."""
+
+        if self.map(request) != creation_job:
+            raise FactoryDispatchError(
+                "Forge skill receipt does not match the mapped creation job"
+            )
+        artifacts = self._evidence.workflow_artifacts(request.job.job_id)
+        inventories = tuple(
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, CodebaseInventoryV1)
+            and _matches_dispatch(artifact, request.job, request.action.attempt)
+        )
+        briefs = tuple(
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, CodexBuildBriefV1)
+            and _matches_dispatch(artifact, request.job, request.action.attempt)
+        )
+        builds = tuple(
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, CodexBuildEvidenceV1)
+            and _matches_dispatch(artifact, request.job, request.action.attempt)
+        )
+        if len(inventories) != 1 or len(briefs) != 1 or len(builds) != 1:
+            raise FactoryDispatchError(
+                "Forge skill receipt requires exact inventory, brief, and build evidence"
+            )
+        inventory = inventories[0]
+        brief = briefs[0]
+        build = builds[0]
+        evidence_refs_by_identity = {
+            (reference.uri, reference.sha256, reference.media_type): reference
+            for reference in (
+                inventory.artifact_ref,
+                brief.artifact_ref,
+                build.artifact_ref,
+                build.build_receipt_ref,
+                *inventory.evidence_refs,
+                *brief.evidence_refs,
+            )
+        }
+        evidence_refs = tuple(
+            reference.model_dump(mode="json")
+            for reference in evidence_refs_by_identity.values()
+        )
+        return ForgeBuildSkillUsageReceiptV1(
+            producer="hermes",
+            outcome="fulfilled",
+            creation_job_id=creation_job.creation_job_id,
+            factory_job_id=creation_job.factory_job_id,
+            correlation_id=creation_job.correlation_id,
+            subject_version=creation_job.subject_version,
+            attempt=creation_job.attempt,
+            idempotency_key=creation_job.idempotency_key,
+            released_skill=creation_job.released_skill,
+            public_assertion_ids=creation_job.public_assertion_ids,
+            evidence_refs=evidence_refs,
+        )
+
+
+def _same_artifact_ref(left: object, right: object) -> bool:
+    left_dump = getattr(left, "model_dump", None)
+    right_dump = getattr(right, "model_dump", None)
+    if not callable(left_dump) or not callable(right_dump):
+        return False
+    return left_dump(mode="json") == right_dump(mode="json")
+
+
+def _matches_dispatch(artifact: object, job: object, attempt: int) -> bool:
+    return (
+        _matches_job_identity(artifact, job)
+        and getattr(artifact, "attempt", None) == attempt
+    )
+
+
+def _matches_job_identity(artifact: object, job: object) -> bool:
+    return (
+        getattr(artifact, "job_id", None) == getattr(job, "job_id", None)
+        and getattr(artifact, "correlation_id", None)
+        == getattr(job, "correlation_id", None)
+        and getattr(artifact, "subject_version", None)
+        == getattr(job, "subject_version", None)
+    )
 
 
 @dataclass(frozen=True)
@@ -102,6 +359,7 @@ class MinibookForgeSettings:
     swarm_script: Path = Path("minibook/autogen_swarm.py")
     working_directory: Path = Path(".")
     max_runtime_seconds: int = 1800
+    artifact_root: Path = Path(".captain-cook/minibook-creation-cas")
 
 
 class MinibookSwarmForge(MinibookForgePort):
@@ -111,50 +369,129 @@ class MinibookSwarmForge(MinibookForgePort):
         self,
         *,
         materializer: FactoryInputMaterializer,
+        mapper: CreationJobMapper,
+        skill_receipts: ForgeBuildSkillReceiptProvider,
         settings: MinibookForgeSettings = MinibookForgeSettings(),
     ) -> None:
         self._materializer = materializer
+        self._mapper = mapper
+        self._skill_receipts = skill_receipts
         self._settings = settings
 
     async def submit(self, request: FactoryDispatch) -> CreationResultV1:
         if request.role is not None or request.lease is not None:
             raise FactoryDispatchError("Minibook Forge must not receive a Hermes role lease")
-        input_path = self._materializer.materialize(request.job.input_ref)
+        creation_job = self._mapper.map(request)
+        skill_receipt = self._skill_receipts.build_skill_receipt(
+            request,
+            creation_job,
+        )
+        materialized_ref = (
+            creation_job.source_archive_ref
+            if isinstance(creation_job, CreationJobV2)
+            else request.job.input_ref
+        )
+        input_path = self._materializer.materialize(materialized_ref)
         if not input_path.is_file():
             raise FactoryDispatchError("factory input artifact did not materialize to a file")
         if self._settings.max_runtime_seconds <= 0:
             raise FactoryDispatchError("Minibook Forge runtime limit must be positive")
-        try:
-            result_path = self._settings.working_directory / "creation-result.json"
-            process = await asyncio.create_subprocess_exec(
-                self._settings.python_executable,
-                str(self._settings.swarm_script),
-                "--input-file",
-                str(input_path),
-                "--non-interactive",
-                "--max-runtime-seconds",
-                str(self._settings.max_runtime_seconds),
-                "--result-file",
-                str(result_path),
-                cwd=str(self._settings.working_directory),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+        working_directory = self._settings.working_directory.resolve()
+        if not working_directory.is_dir():
+            raise FactoryDispatchError("Minibook Forge working directory is unavailable")
+        artifact_root = self._settings.artifact_root
+        if not artifact_root.is_absolute():
+            artifact_root = working_directory / artifact_root
+        artifact_root = artifact_root.resolve()
+        if ".captain-cook" not in {part.casefold() for part in artifact_root.parts}:
+            raise FactoryDispatchError(
+                "Minibook Forge artifact root must use the .captain-cook namespace"
             )
-            await asyncio.wait_for(
-                process.communicate(), timeout=self._settings.max_runtime_seconds
+        with tempfile.TemporaryDirectory(
+            prefix=f"captain-forge-{creation_job.creation_job_id}-a{creation_job.attempt}-",
+            dir=working_directory,
+        ) as temporary:
+            run_directory = Path(temporary)
+            creation_job_path = run_directory / "creation-job.json"
+            skill_receipt_path = run_directory / "forge-skill-usage-receipt.json"
+            result_path = run_directory / "creation-result.json"
+            creation_job_path.write_text(
+                json.dumps(
+                    creation_job.model_dump(mode="json", by_alias=True),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
             )
-        except FileNotFoundError as exc:
-            raise FactoryDispatchError("Minibook Forge executable or script is unavailable") from exc
-        except asyncio.TimeoutError as exc:
-            raise FactoryDispatchError("Minibook Forge exceeded its runtime limit") from exc
-        if process.returncode != 0:
-            raise FactoryDispatchError("Minibook Forge process failed")
-        if not result_path.is_file():
-            raise FactoryDispatchError("Minibook Forge did not write a creation result")
-        try:
-            return CreationResultV1.model_validate_json(result_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            raise FactoryDispatchError("Minibook Forge wrote an invalid creation result") from exc
+            skill_receipt_path.write_text(
+                json.dumps(
+                    skill_receipt.model_dump(mode="json", by_alias=True),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            try:
+                source_option = (
+                    "--source-archive-file"
+                    if isinstance(creation_job, CreationJobV2)
+                    else "--input-file"
+                )
+                process = await asyncio.create_subprocess_exec(
+                    self._settings.python_executable,
+                    str(self._settings.swarm_script),
+                    source_option,
+                    str(input_path),
+                    "--creation-job-file",
+                    str(creation_job_path),
+                    "--skill-usage-receipt-file",
+                    str(skill_receipt_path),
+                    "--non-interactive",
+                    "--max-runtime-seconds",
+                    str(self._settings.max_runtime_seconds),
+                    "--result-file",
+                    str(result_path),
+                    "--artifact-root",
+                    str(artifact_root),
+                    cwd=str(working_directory),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(
+                    process.communicate(), timeout=self._settings.max_runtime_seconds
+                )
+            except FileNotFoundError as exc:
+                raise FactoryDispatchError(
+                    "Minibook Forge executable or script is unavailable"
+                ) from exc
+            except asyncio.TimeoutError as exc:
+                raise FactoryDispatchError(
+                    "Minibook Forge exceeded its runtime limit"
+                ) from exc
+            if process.returncode != 0:
+                raise FactoryDispatchError("Minibook Forge process failed")
+            if not result_path.is_file():
+                raise FactoryDispatchError("Minibook Forge did not write a creation result")
+            try:
+                result = CreationResultV1.model_validate_json(
+                    result_path.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                raise FactoryDispatchError(
+                    "Minibook Forge wrote an invalid creation result"
+                ) from exc
+            if (
+                result.creation_job_id != creation_job.creation_job_id
+                or result.correlation_id != creation_job.correlation_id
+                or result.subject_version != creation_job.subject_version
+                or result.attempt != creation_job.attempt
+            ):
+                raise FactoryDispatchError(
+                    "Minibook Forge result does not match the submitted creation job"
+                )
+            return result
 
     async def status(self, creation_job_id):
         raise FactoryDispatchError("offline Minibook Forge has no status endpoint")

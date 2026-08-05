@@ -54,6 +54,9 @@ class FactoryFeedbackBuilder:
             tool_gaps=tool_gaps,
             budget_projection=budget_projection,
         )
+        reason_codes = tuple(
+            dict.fromkeys((*evaluation.benchmark_reason_codes, reason_code))
+        )
         tool_gap_refs = tuple(gap.evidence_ref for gap in tool_gaps)
         evidence_refs = _unique_refs(
             (
@@ -61,6 +64,11 @@ class FactoryFeedbackBuilder:
                 candidate_ref,
                 evaluation.cost_summary_ref,
                 evaluation.latency_summary_ref,
+                *(
+                    (evaluation.benchmark_summary_ref,)
+                    if evaluation.benchmark_summary_ref
+                    else ()
+                ),
                 *tool_gap_refs,
                 *evaluation.evidence_refs,
             )
@@ -79,7 +87,7 @@ class FactoryFeedbackBuilder:
                 "assertion_ids": list(invocation.acceptance_assertion_ids),
                 "tool_gap_ids": [gap.gap_id for gap in tool_gaps],
                 "recommendation": recommendation.value,
-                "reason_code": reason_code,
+                "reason_codes": list(reason_codes),
                 "evidence_sha256": [reference.sha256 for reference in evidence_refs],
             },
         )
@@ -100,7 +108,7 @@ class FactoryFeedbackBuilder:
             assertion_ids=invocation.acceptance_assertion_ids,
             tool_gaps=tool_gaps,
             tool_gap_refs=tool_gap_refs,
-            reason_codes=(reason_code,),
+            reason_codes=reason_codes,
         )
 
     def _validate_bindings(
@@ -169,6 +177,14 @@ def _recommendation_for(
             FactoryFeedbackRecommendation.BLOCKED_TOOL_REQUIRED,
             "required_tool_unresolved",
         )
+    if (
+        evaluation.benchmark_summary_ref is None
+        or evaluation.benchmark_disposition is None
+    ):
+        return (
+            FactoryFeedbackRecommendation.MANUAL_DECISION_REQUIRED,
+            "business_benchmark_missing",
+        )
     if evaluation.failure_class == "credential_required":
         return (
             FactoryFeedbackRecommendation.BLOCKED_CREDENTIAL_REQUIRED,
@@ -197,12 +213,22 @@ def _recommendation_for(
             "evaluation_unresolved",
         )
     if (
-        evaluation.recommendation is FactoryFeedbackRecommendation.PROMOTE_CANDIDATE
+        evaluation.benchmark_disposition == "passed"
+        and not evaluation.failed_benchmark_metric_ids
+        and (
+            evaluation.recommendation
+            is FactoryFeedbackRecommendation.PROMOTE_CANDIDATE
+        )
         and all(outcome.status == "passed" for outcome in evaluation.assertion_outcomes)
     ):
         return (
             FactoryFeedbackRecommendation.PROMOTE_CANDIDATE,
             "all_assertions_passed",
+        )
+    if evaluation.benchmark_disposition != "passed":
+        return (
+            FactoryFeedbackRecommendation.MANUAL_DECISION_REQUIRED,
+            "business_benchmark_failed",
         )
     return (
         FactoryFeedbackRecommendation.MANUAL_DECISION_REQUIRED,

@@ -8,7 +8,7 @@ from agenten.agent_factory.service import (
     InMemoryFactoryRepository,
 )
 from agenten.agent_factory.state_machine import FactoryActionKind, FactoryLifecycleError
-from agenten.agent_factory.contracts import FactoryPhase
+from agenten.agent_factory.contracts import FactoryBlockStatus, FactoryPhase
 from agenten.agent_factory.factory_feedback import FactoryFeedbackBuilder
 from tests.agent_factory.test_factory_feedback import (
     _budget as workflow_budget,
@@ -25,7 +25,9 @@ from tests.agent_factory.test_state_machine import (
     job_v3,
     workflow_block,
 )
+from tests.agent_factory.test_team_evaluation import _benchmark as state_workflow_benchmark
 from tests.agent_factory.test_release_gate import (
+    workflow_benchmark,
     workflow_budget as release_workflow_budget,
     workflow_evaluation as release_workflow_evaluation,
     workflow_job as release_workflow_job,
@@ -52,11 +54,12 @@ class EvaluationLookupRepository(InMemoryFactoryRepository):
 
 
 class WorkflowLookupRepository(InMemoryFactoryRepository):
-    def __init__(self, *, artifacts=(), budget=None, receipts=()):
+    def __init__(self, *, artifacts=(), budget=None, receipts=(), summaries=()):
         super().__init__()
         self.artifacts = tuple(artifacts)
         self.budget = budget
         self.receipts = tuple(receipts)
+        self.summaries = tuple(summaries)
 
     def workflow_artifacts(self, job_id):
         self.job(job_id)
@@ -69,6 +72,12 @@ class WorkflowLookupRepository(InMemoryFactoryRepository):
     def workflow_usage_receipts(self, job_id):
         self.job(job_id)
         return self.receipts
+
+    def business_benchmark_summary_by_artifact(self, artifact_ref):
+        return next(
+            (summary for summary in self.summaries if summary.artifact_ref == artifact_ref),
+            None,
+        )
 
 
 def test_repository_rebuilds_state_and_returns_next_captain_action() -> None:
@@ -83,6 +92,31 @@ def test_repository_rebuilds_state_and_returns_next_captain_action() -> None:
     assert action.kind is FactoryActionKind.DISPATCH_AGENT_ARCHITECT
     assert action.job_id == factory_job.job_id
     assert coordinator.blocks(factory_job.job_id) == (block(FactoryPhase.FORGE_REQUESTED),)
+
+
+def test_failed_v3_technical_evidence_requires_captain_improvement_before_benchmark() -> None:
+    repository = InMemoryFactoryRepository()
+    coordinator = FactoryCoordinator(repository)
+    factory_job = job_v3()
+    coordinator.register(factory_job)
+    for phase in (
+        FactoryPhase.FORGE_REQUESTED,
+        FactoryPhase.BLUEPRINT_CREATED,
+        FactoryPhase.TOOL_CANDIDATE_TESTED,
+        FactoryPhase.AGENT_CODE_CREATED,
+        FactoryPhase.BUILD_PASSED,
+    ):
+        coordinator.record(workflow_block(phase))
+    coordinator.record(
+        workflow_block(FactoryPhase.REAL_CASE_EVIDENCE).model_copy(
+            update={"status": FactoryBlockStatus.FAILED}
+        )
+    )
+
+    action = coordinator.next_action(factory_job.job_id)
+
+    assert action.kind is FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED
+    assert action.attempt == 1
 
 
 def test_duplicate_evidence_is_idempotent_but_conflicting_event_id_is_rejected() -> None:
@@ -204,7 +238,10 @@ def test_coordinator_reads_gateway_workflow_artifacts_for_v3_feedback() -> None:
         evaluation=evaluation,
         budget_projection=workflow_budget(),
     )
-    repository = WorkflowLookupRepository(artifacts=(evaluation, feedback))
+    repository = WorkflowLookupRepository(
+        artifacts=(evaluation, feedback),
+        summaries=(state_workflow_benchmark(),),
+    )
     coordinator = FactoryCoordinator(repository)
     coordinator.register(factory_job)
     for phase in (
@@ -231,7 +268,7 @@ def test_coordinator_reads_gateway_workflow_artifacts_for_v3_feedback() -> None:
     assert coordinator.next_action(factory_job.job_id).kind is FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED
 
 
-def test_coordinator_recomputes_v3_release_from_read_only_gateway_evidence() -> None:
+def test_coordinator_resolves_gateway_benchmark_summary_for_promotion() -> None:
     factory_job = release_workflow_job(mode="release")
     runs = tuple(workflow_run(number) for number in range(1, 4))
     evaluation = release_workflow_evaluation(runs)
@@ -245,6 +282,7 @@ def test_coordinator_recomputes_v3_release_from_read_only_gateway_evidence() -> 
         artifacts=(*runs, evaluation, feedback),
         budget=release_workflow_budget(),
         receipts=workflow_receipts(runs),
+        summaries=(workflow_benchmark(runs),),
     )
     coordinator = FactoryCoordinator(repository)
     coordinator.register(factory_job)
@@ -265,14 +303,5 @@ def test_coordinator_recomputes_v3_release_from_read_only_gateway_evidence() -> 
     )
     coordinator.record(reviewed)
 
-    assert coordinator.next_action(factory_job.job_id).kind is (
-        FactoryActionKind.VALIDATE_FOR_PROMOTION
-    )
-
-    coordinator.record(
-        workflow_block(
-            FactoryPhase.CAPABILITY_PROMOTED,
-            assertions=factory_job.acceptance_assertion_ids,
-        )
-    )
-    assert coordinator.projection(factory_job.job_id).status.value == "ready_to_use"
+    assert coordinator.next_action(factory_job.job_id).kind is FactoryActionKind.VALIDATE_FOR_PROMOTION
+    assert coordinator.projection(factory_job.job_id).status.value == "running"

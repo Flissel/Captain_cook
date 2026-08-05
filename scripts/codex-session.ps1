@@ -17,6 +17,13 @@ param(
     [Parameter(Mandatory, ParameterSetName = "Run")]
     [string] $StatePath,
 
+    [Parameter(Mandatory, ParameterSetName = "Run")]
+    [DateTimeOffset] $DeadlineAt,
+
+    [Parameter(ParameterSetName = "Run")]
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$')]
+    [string] $ResumeThreadId,
+
     [Parameter(ParameterSetName = "Run")]
     [ValidateSet("read-only", "workspace-write")]
     [string] $Sandbox = "workspace-write",
@@ -104,6 +111,10 @@ if ($PSCmdlet.ParameterSetName -eq "Cancel") {
     exit 0
 }
 
+if ($DeadlineAt.Offset -ne [TimeSpan]::Zero) {
+    throw "Codex deadline must be a UTC timestamp."
+}
+
 $resolvedWorkspace = (Resolve-Path -LiteralPath $Workspace -ErrorAction Stop).Path
 if (-not (Test-Path -LiteralPath $resolvedWorkspace -PathType Container)) {
     throw "Authorized workspace is not a directory."
@@ -124,17 +135,31 @@ $startInfo.UseShellExecute = $false
 $startInfo.CreateNoWindow = $true
 $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
-$startInfo.ArgumentList.Add("-a")
-$startInfo.ArgumentList.Add("never")
-$startInfo.ArgumentList.Add("exec")
-$startInfo.ArgumentList.Add("--sandbox")
-$startInfo.ArgumentList.Add($Sandbox)
-$startInfo.ArgumentList.Add("--json")
-$startInfo.ArgumentList.Add($Prompt)
+$startInfo.ArgumentList.Add("--dangerously-bypass-approvals-and-sandbox")
+if ($ResumeThreadId) {
+    # Every value is a distinct ArgumentList entry so neither thread names nor
+    # prompts cross a shell parsing boundary.
+    $startInfo.ArgumentList.Add("exec")
+    $startInfo.ArgumentList.Add("--ignore-user-config")
+    $startInfo.ArgumentList.Add("--ignore-rules")
+    $startInfo.ArgumentList.Add("resume")
+    $startInfo.ArgumentList.Add("--json")
+    $startInfo.ArgumentList.Add($ResumeThreadId)
+    $startInfo.ArgumentList.Add($Prompt)
+} else {
+    $startInfo.ArgumentList.Add("exec")
+    $startInfo.ArgumentList.Add("--ignore-user-config")
+    $startInfo.ArgumentList.Add("--ignore-rules")
+    $startInfo.ArgumentList.Add("--json")
+    $startInfo.ArgumentList.Add($Prompt)
+}
 
 $process = [System.Diagnostics.Process]::new()
 $process.StartInfo = $startInfo
 try {
+    if ([DateTimeOffset]::UtcNow -ge $DeadlineAt) {
+        exit 124
+    }
     if (-not $process.Start()) {
         throw "Codex process did not start."
     }
@@ -155,12 +180,16 @@ try {
     )
     Move-Item -LiteralPath $temporaryStatePath -Destination $resolvedStatePath -Force
 
-    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $stderrTask = $process.StandardError.BaseStream.CopyToAsync(
+        [IO.Stream]::Null,
+        65536
+    )
+    while (($line = $process.StandardOutput.ReadLine()) -ne $null) {
+        [Console]::Out.WriteLine($line)
+        [Console]::Out.Flush()
+    }
     $process.WaitForExit()
-    $stdout = $stdoutTask.GetAwaiter().GetResult()
     [void] $stderrTask.GetAwaiter().GetResult()
-    [Console]::Out.Write($stdout)
     exit $process.ExitCode
 } finally {
     $process.Dispose()

@@ -129,6 +129,28 @@ class HermesAppServerRunner:
         self._wall_seconds = wall_seconds
         self.failure_type: str | None = None
 
+    def _result(
+        self,
+        *,
+        label: str,
+        exit_code: int,
+        artifact_references: tuple[str, ...],
+        jsonl_lines: tuple[str, ...],
+    ) -> CodexRunResult:
+        journal = b"".join(f"{line}\n".encode() for line in jsonl_lines)
+        journal_path = self._codex_home / f"gate-a-{label}.jsonl"
+        journal_path.parent.mkdir(parents=True, exist_ok=True)
+        journal_path.write_bytes(journal)
+        return CodexRunResult(
+            exit_code=exit_code,
+            terminal_status="succeeded" if exit_code == 0 else "failed",
+            process_cleanup_status="not_required",
+            journal_path=journal_path.resolve(),
+            journal_sha256=hashlib.sha256(journal).hexdigest(),
+            artifact_references=artifact_references,
+            jsonl_lines=jsonl_lines,
+        )
+
     async def run(self, authorized: object) -> CodexRunResult:
         workspace = getattr(authorized, "workspace")
         command = getattr(authorized, "command")
@@ -144,7 +166,8 @@ class HermesAppServerRunner:
             )
         except Exception as exc:
             self.failure_type = type(exc).__name__
-            return CodexRunResult(
+            return self._result(
+                label="exception",
                 exit_code=1,
                 artifact_references=(),
                 jsonl_lines=(),
@@ -173,8 +196,10 @@ class HermesAppServerRunner:
                 }
             ),
         )
-        return CodexRunResult(
-            exit_code=0 if outcome.error is None and not outcome.interrupted else 1,
+        exit_code = 0 if outcome.error is None and not outcome.interrupted else 1
+        return self._result(
+            label="session",
+            exit_code=exit_code,
             artifact_references=self._artifact_references,
             jsonl_lines=lines,
         )

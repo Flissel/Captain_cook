@@ -18,7 +18,10 @@ from agenten.delivery.minibook_client import (  # noqa: E402
     MinibookClient,
     validate_service_base_url,
 )
-from agenten.delivery.minibook_events import MinibookProjectionEvent  # noqa: E402
+from agenten.delivery.minibook_events import (  # noqa: E402
+    MinibookProjectionAcknowledgementV1,
+    MinibookProjectionEvent,
+)
 from agenten.delivery.projection_cursor import ProjectionCursorStore  # noqa: E402
 from agenten.delivery.projector import (  # noqa: E402
     ConflictingProjectionEvent,
@@ -48,10 +51,11 @@ class CaptainProjectionFeed:
         token: str,
         client: httpx.Client | None = None,
         page_size: int = 100,
+        timeout_seconds: float = 60.0,
     ) -> None:
         self._base_url = validate_service_base_url(base_url)
         self._token = token
-        self._client = client or httpx.Client(timeout=10.0)
+        self._client = client or httpx.Client(timeout=timeout_seconds)
         self._owns_client = client is None
         self._page_size = page_size
         self.last_cursor: str | None = None
@@ -99,6 +103,27 @@ class CaptainProjectionFeed:
         for page in self.iter_pages(cursor=cursor):
             yield from page.events
 
+    def acknowledge(
+        self,
+        acknowledgement: MinibookProjectionAcknowledgementV1,
+    ) -> dict[str, object]:
+        response = self._client.post(
+            f"{self._base_url}/api/v1/projections/minibook/acknowledgements",
+            headers={"Authorization": f"Bearer {self._token}"},
+            json=acknowledgement.model_dump(mode="json", by_alias=True),
+        )
+        response.raise_for_status()
+        document = response.json()
+        event = document.get("event") if isinstance(document, dict) else None
+        if (
+            not isinstance(document, dict)
+            or not isinstance(document.get("replayed"), bool)
+            or not isinstance(event, dict)
+            or event.get("event_id") != str(acknowledgement.acknowledgement_id)
+        ):
+            raise ValueError("Captain projection acknowledgement receipt is invalid")
+        return document
+
     def close(self) -> None:
         if self._owns_client:
             self._client.close()
@@ -126,7 +151,14 @@ def consume_incremental_projection(
                 raise ConflictingProjectionEvent(deduplicated.conflicting_event_ids)
             continue
         page_results = list(deduplicated.quarantined)
-        page_results.extend(projector.project(event) for event in deduplicated.events)
+        for event in deduplicated.events:
+            result = projector.project(event)
+            page_results.append(result)
+            if (
+                event.event_type in {"capability.promoted", "integration.setup"}
+                and result.outcome in {"projected", "duplicate"}
+            ):
+                feed.acknowledge(projector.acknowledgement(event))
         if any(result.outcome == "busy" for result in page_results):
             raise ProjectionPageIncomplete(
                 f"projection feed page {page.cursor!r} still has claimed events"
@@ -171,6 +203,7 @@ def main(argv: list[str] | None = None) -> int:
     minibook = MinibookClient(
         args.minibook_url,
         minibook_api_key,
+        timeout_seconds=60.0,
         projection_api_key=projection_api_key,
     )
     try:
@@ -209,6 +242,14 @@ def main(argv: list[str] | None = None) -> int:
                         "full rebuild has non-projectable authoritative events"
                     )
                 report = projector.reconcile(events, apply=True)
+                converged = projector.reconcile(events, apply=False)
+                if converged.total_changes != 0:
+                    raise ProjectionPageIncomplete(
+                        "full rebuild did not converge before acknowledgement"
+                    )
+                for event in events:
+                    if event.event_type in {"capability.promoted", "integration.setup"}:
+                        feed.acknowledge(projector.acknowledgement(event))
                 cursor_store.checkpoint_v2_feed(feed.last_cursor)
             else:
                 report = projector.reconcile(events, apply=False)

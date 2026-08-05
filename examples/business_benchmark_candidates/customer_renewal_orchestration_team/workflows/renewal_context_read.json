@@ -1,0 +1,83 @@
+{
+  "name": "Captain Renewal Context Read v1",
+  "active": false,
+  "contract": {
+    "schema": "captain.n8n-read-only-workflow.v1",
+    "intent": "n8n",
+    "effect": "read_only",
+    "idempotency": "required",
+    "allowed_partitions": ["ordinary", "boundary"],
+    "mutation_operations": []
+  },
+  "nodes": [
+    {
+      "id": "renewal-input",
+      "name": "Typed Renewal Input",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 0],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "captain-renewal-context-read-v1",
+        "responseMode": "lastNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "renewal-validate",
+      "name": "Validate Renewal Read Contract",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [260, 0],
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
+          "conditions": [
+            {
+              "leftValue": "={{ (() => { const i = $json.body; const s = i?.commercial_snapshot; const inputKeys = ['operation','idempotency_key','evidence_partition','synthetic_subject_id','commercial_snapshot']; const snapshotKeys = ['renewal_window','engagement_band','commercial_evidence_state','consent_state']; return i && typeof i === 'object' && !Array.isArray(i) && Object.keys(i).length === inputKeys.length && inputKeys.every((key) => Object.keys(i).includes(key)) && i.operation === 'read_renewal_context' && typeof i.idempotency_key === 'string' && i.idempotency_key.length >= 16 && i.idempotency_key.length <= 128 && ['ordinary','boundary'].includes(i.evidence_partition) && typeof i.synthetic_subject_id === 'string' && /^subject-[a-z0-9]+$/.test(i.synthetic_subject_id) && s && typeof s === 'object' && !Array.isArray(s) && Object.keys(s).length === snapshotKeys.length && snapshotKeys.every((key) => Object.keys(s).includes(key) && typeof s[key] === 'string') ? 'valid' : 'invalid'; })() }}",
+              "rightValue": "valid",
+              "operator": {"type": "string", "operation": "equals"}
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "renewal-read",
+      "name": "Read Synthetic Renewal Context",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [520, -100],
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={{ ({ operation: $json.body.operation, idempotency_key: $json.body.idempotency_key, status: 'read', facts: ['renewal_window.' + $json.body.commercial_snapshot.renewal_window, 'engagement_band.' + $json.body.commercial_snapshot.engagement_band, 'commercial_evidence_state.' + $json.body.commercial_snapshot.commercial_evidence_state, 'consent_state.' + $json.body.commercial_snapshot.consent_state] }) }}",
+        "includeOtherFields": false,
+        "options": {"dotNotation": true}
+      }
+    },
+    {
+      "id": "renewal-reject",
+      "name": "Reject Invalid Renewal Read",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [520, 100],
+      "parameters": {
+        "errorType": "errorMessage",
+        "errorMessage": "read-only contract rejected"
+      }
+    }
+  ],
+  "connections": {
+    "Typed Renewal Input": {
+      "main": [[{"node": "Validate Renewal Read Contract", "type": "main", "index": 0}]]
+    },
+    "Validate Renewal Read Contract": {
+      "main": [
+        [{"node": "Read Synthetic Renewal Context", "type": "main", "index": 0}],
+        [{"node": "Reject Invalid Renewal Read", "type": "main", "index": 0}]
+      ]
+    }
+  },
+  "settings": {"availableInMCP": true, "executionOrder": "v1"}
+}

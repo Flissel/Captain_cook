@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
 from agenten.agent_factory.contracts import (
+    AgentFactoryJobV2,
     AgentFactoryJobV3,
     FactoryJob,
     FactoryLease,
@@ -46,8 +47,16 @@ def issue_factory_lease(
     workspace_ref: str,
     now: datetime,
     integration_intent: IntegrationIntent = IntegrationIntent.NONE,
+    duration: timedelta = FACTORY_LEASE_DURATION,
 ) -> FactoryLease:
     issued_at = _require_utc(now)
+    if duration <= timedelta(0):
+        raise FactoryLeaseDenied("factory lease duration must be positive")
+    if duration != FACTORY_LEASE_DURATION and not isinstance(job, AgentFactoryJobV2):
+        raise FactoryLeaseDenied("extended factory lease requires a job deadline")
+    expires_at = issued_at + duration
+    if isinstance(job, AgentFactoryJobV2) and expires_at > job.deadline_at:
+        raise FactoryLeaseDenied("factory lease cannot outlive the job deadline")
     _require_execution_intent(job, integration_intent)
     profile = _ROLE_PROFILES[role]
     if role is FactoryRole.TOOL_INTEGRATOR and integration_intent is IntegrationIntent.N8N:
@@ -75,7 +84,7 @@ def issue_factory_lease(
         capabilities=tuple(sorted(capabilities)),
         workspace_ref=workspace_ref,
         issued_at=issued_at,
-        expires_at=issued_at + FACTORY_LEASE_DURATION,
+        expires_at=expires_at,
     )
 
 
@@ -120,15 +129,10 @@ def expected_factory_capabilities(
     profile: CapabilityProfile,
 ) -> frozenset[str]:
     expected = set(PROFILE_CAPABILITIES[profile])
-    if isinstance(job, AgentFactoryJobV3) and job.execution_policy.live_execution:
-        if "model.invoke" in {
+    if isinstance(job, AgentFactoryJobV3) and role is FactoryRole.REAL_CASE_TESTER:
+        expected.update(
             capability.value for capability in job.execution_policy.live_capabilities
-        }:
-            expected.add("model.invoke")
-        if role is FactoryRole.REAL_CASE_TESTER:
-            expected.update(
-                capability.value for capability in job.execution_policy.live_capabilities
-            )
+        )
     return frozenset(expected)
 
 

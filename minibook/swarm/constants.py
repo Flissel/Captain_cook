@@ -3,6 +3,25 @@
 import os
 from pathlib import Path
 from dataclasses import dataclass, field
+from typing import Callable
+
+
+class _LazyProviderClient:
+    """Create a provider client only when a live LLM operation uses it.
+
+    Importing swarm contracts and other deterministic modules must not require
+    provider credentials. The provider SDK still performs its normal
+    credential validation on first attribute access, before any request.
+    """
+
+    def __init__(self, factory: Callable[[], object]) -> None:
+        self._factory = factory
+        self._client: object | None = None
+
+    def __getattr__(self, name: str) -> object:
+        if self._client is None:
+            self._client = self._factory()
+        return getattr(self._client, name)
 
 
 # --- CascadeContext ---
@@ -44,7 +63,7 @@ LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai").lower()
 
 if LLM_PROVIDER == "anthropic":
     from anthropic import AsyncAnthropic  # noqa: E402
-    anthropic_client = AsyncAnthropic()
+    anthropic_client = _LazyProviderClient(AsyncAnthropic)
     openai_client = None
     try:
         from llm_config import get_model as _get_model
@@ -53,7 +72,7 @@ if LLM_PROVIDER == "anthropic":
         DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 else:
     from openai import AsyncOpenAI  # noqa: E402
-    openai_client = AsyncOpenAI()
+    openai_client = _LazyProviderClient(AsyncOpenAI)
     anthropic_client = None
     try:
         from llm_config import get_model as _get_model

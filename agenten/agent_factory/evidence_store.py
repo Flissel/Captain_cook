@@ -35,25 +35,57 @@ class FilesystemFactoryEvidenceStore:
         )
 
     async def read(self, reference: ArtifactRef) -> bytes:
-        path = self._path_from_reference(reference)
-        return await asyncio.to_thread(path.read_bytes)
+        return await asyncio.to_thread(self.read_verified, reference)
 
     async def require(self, reference: ArtifactRef) -> None:
-        content = await self.read(reference)
+        await asyncio.to_thread(self.read_verified, reference)
+
+    def read_verified(
+        self,
+        reference: ArtifactRef,
+        *,
+        job_id: UUID | None = None,
+    ) -> bytes:
+        """Read one exact CAS reference and verify its bytes before returning them."""
+
+        path = self._path_from_reference(reference, job_id=job_id)
+        content = path.read_bytes()
         if hashlib.sha256(content).hexdigest() != reference.sha256:
             raise ValueError("factory evidence digest does not match reference")
+        return content
 
     def _path_for(self, job: AgentFactoryJob, digest: str) -> Path:
-        return self._root / str(job.job_id) / f"{digest}.json"
+        return self._contained_path(job.job_id, digest)
 
-    def _path_from_reference(self, reference: ArtifactRef) -> Path:
+    def _path_from_reference(
+        self,
+        reference: ArtifactRef,
+        *,
+        job_id: UUID | None = None,
+    ) -> Path:
         prefix = "artifact://factory-evidence/"
         if not reference.uri.startswith(prefix):
             raise ValueError("factory evidence reference is outside this store")
         parts = reference.uri.removeprefix(prefix).split("/")
         if len(parts) != 2 or parts[1] != reference.sha256:
             raise ValueError("factory evidence reference does not match digest")
-        return self._root / parts[0] / f"{parts[1]}.json"
+        try:
+            referenced_job_id = UUID(parts[0])
+        except ValueError as exc:
+            raise ValueError("factory evidence reference contains an invalid job id") from exc
+        canonical_uri = f"{prefix}{referenced_job_id}/{reference.sha256}"
+        if reference.uri != canonical_uri:
+            raise ValueError("factory evidence reference is not canonical")
+        if job_id is not None and referenced_job_id != job_id:
+            raise ValueError("factory evidence reference does not match requested job")
+        return self._contained_path(referenced_job_id, parts[1])
+
+    def _contained_path(self, job_id: UUID, digest: str) -> Path:
+        root = self._root.resolve()
+        path = (root / str(job_id) / f"{digest}.json").resolve()
+        if not path.is_relative_to(root):
+            raise ValueError("factory evidence path is outside this store")
+        return path
 
     @staticmethod
     def _write_once(path: Path, content: bytes) -> None:

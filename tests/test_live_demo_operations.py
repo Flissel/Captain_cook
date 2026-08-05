@@ -1,4 +1,5 @@
 import os
+import socket
 import subprocess
 from pathlib import Path
 
@@ -6,10 +7,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PREFLIGHT = ROOT / "scripts" / "demo-preflight.ps1"
 RUNNER = ROOT / "scripts" / "run-live-demo.ps1"
-CAPABILITY_RUNNER = ROOT / "scripts" / "run-capability-factory-live.ps1"
 SERVICES = ROOT / "scripts" / "live-demo-services.ps1"
 MINIBOOK = ROOT / "scripts" / "minibook-demo.ps1"
-SANDBOX_DOCKERFILE = ROOT / "Dockerfile.capability-sandbox"
+BENCHMARK_COMPOSE = ROOT / "docker-compose.benchmark.yml"
+MANAGED_PROCESS = ROOT / "scripts" / "managed-process-identity.ps1"
 
 
 def test_demo_preflight_contract_is_fail_closed_and_redacted() -> None:
@@ -17,15 +18,9 @@ def test_demo_preflight_contract_is_fail_closed_and_redacted() -> None:
     assert "captain_test" in source
     assert "CAPTAIN_N8N_API_KEY" in source
     assert "CAPTAIN_N8N_MCP_TOKEN" in source
-    assert "CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET" in source
     assert "/api/v1/workflows" in source
     assert "/mcp-server/http" in source
     assert "MINIBOOK_BACKEND_URL" in source
-    assert "MINIBOOK_API_KEY" in source
-    assert "MINIBOOK_PROJECTION_API_KEY" in source
-    assert "CAPTAIN_CAPABILITY_SANDBOX_IMAGE" in source
-    assert "Assert-CaptainSandboxImage" in source
-    assert "docker image inspect $Reference" in source
     assert "CAPTAIN_GATEWAY_URL" in source
     assert "Write-Output $" not in source
 
@@ -37,38 +32,12 @@ def test_demo_runner_requires_explicit_provider_opt_in() -> None:
     assert "if (-not $LiveProviders)" in source
 
 
-def test_capability_runner_passes_the_separate_hermes_cost_cap() -> None:
-    source = CAPABILITY_RUNNER.read_text(encoding="utf-8")
-
-    assert "CAPTAIN_FACTORY_HERMES_MAX_COST_PER_CALL_USD" in source
-    assert "CAPTAIN_FACTORY_N8N_WORKFLOW_ID" in source
-    assert "CAPTAIN_N8N_MCP_BROKER_URL" in source
-    assert "CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET" in source
-    assert "[int]$SubjectVersion = 1" in source
-    assert "'--subject-version', $SubjectVersion.ToString()" in source
-
-
-def test_capability_sandbox_has_the_generated_autogen_runtime_dependencies() -> None:
-    source = SANDBOX_DOCKERFILE.read_text(encoding="utf-8")
-    assert "autogen-agentchat==0.7.5" in source
-    assert "autogen-ext[openai]==0.7.5" in source
-    assert "PyYAML==6.0.3" in source
-    assert "httpx==0.28.1" in source
-    assert "pytest==9.0.2" in source
-
-
 def test_normalize_writes_safe_defaults_and_aliases_without_secret_output(tmp_path: Path) -> None:
     env_file = tmp_path / ".env"
     secret = "fixture-secret-never-log"
     opaque_provider = "provider-value-must-remain-opaque"
-    minibook_key = "minibook-key-must-remain-opaque"
-    projection_key = "projection-key-must-remain-opaque"
     env_file.write_text(
-        f"OPENAI_API_KEY={opaque_provider}\n"
-        f"N8N_API_KEY={secret}\n"
-        f"MINIBOOK_API_KEY={minibook_key}\n"
-        f"MINIBOOK_PROJECTION_API_KEY={projection_key}\n"
-        "MAILPIT_WEB_PORT=8025\nMAILPIT_URL=http://localhost:8025\n",
+        f"OPENAI_API_KEY={opaque_provider}\nN8N_API_KEY={secret}\nMAILPIT_WEB_PORT=8025\nMAILPIT_URL=http://localhost:8025\n",
         encoding="utf-8",
     )
     result = subprocess.run(
@@ -89,62 +58,10 @@ def test_normalize_writes_safe_defaults_and_aliases_without_secret_output(tmp_pa
     assert "MAILPIT_WEB_PORT=18025" in normalized
     assert "MAILPIT_URL=http://localhost:18025" in normalized
     assert f"CAPTAIN_N8N_API_KEY={secret}" in normalized
-    assert f"MINIBOOK_API_KEY={minibook_key}" in normalized
-    assert f"MINIBOOK_PROJECTION_API_KEY={projection_key}" in normalized
     assert f"OPENAI_API_KEY={opaque_provider}" in normalized
     assert secret not in output
-    assert minibook_key not in output
-    assert projection_key not in output
     assert opaque_provider not in output
     assert "$AllowedNames -notcontains $name" in PREFLIGHT.read_text(encoding="utf-8")
-
-
-def test_preflight_rejects_mutable_sandbox_reference_before_network(tmp_path: Path) -> None:
-    env_file = tmp_path / ".env"
-    secrets = {
-        "CAPTAIN_N8N_API_KEY": "n8n-rest-secret",
-        "CAPTAIN_N8N_MCP_TOKEN": "n8n-mcp-secret",
-        "CAPTAIN_N8N_MCP_BROKER_SIGNING_SECRET": "broker-signing-secret",
-        "CAPTAIN_FACTORY_N8N_WORKFLOW_ID": "workflow-fixture",
-        "MINIBOOK_API_KEY": "minibook-secret",
-        "MINIBOOK_PROJECTION_API_KEY": "projection-secret",
-    }
-    values = {
-        **secrets,
-        "TEST_MARIADB_DSN": "mariadb://captain:secret@127.0.0.1:9/captain_test",
-        "CAPTAIN_CAPABILITY_SANDBOX_IMAGE": "captain-capability-sandbox:latest",
-    }
-    env_file.write_text(
-        "\n".join(f"{name}={value}" for name, value in values.items()) + "\n",
-        encoding="utf-8",
-    )
-
-    result = subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(PREFLIGHT), "-EnvFile", str(env_file)],
-        cwd=ROOT,
-        env=os.environ.copy(),
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-
-    output = result.stdout + result.stderr
-    assert result.returncode != 0
-    assert "Captain-owned digest-pinned capability sandbox image" in output
-    assert "Captain n8n REST" not in output
-    for secret in secrets.values():
-        assert secret not in output
-
-
-def test_capability_sandbox_image_is_minimal_and_non_root() -> None:
-    source = SANDBOX_DOCKERFILE.read_text(encoding="utf-8")
-    assert 'org.opencontainers.image.title="captain-capability-sandbox"' in source
-    assert "WORKDIR /workspace" in source
-    assert "USER 65532:65532" in source
-    assert 'ENTRYPOINT ["python", "-I"]' in source
-    assert "COPY " not in source
-    assert "ADD " not in source
 
 
 def test_requirements_dev_installs_minibook_test_dependencies() -> None:
@@ -162,9 +79,9 @@ def test_minibook_demo_bootstrap_is_local_reusable_and_redacted() -> None:
     source = MINIBOOK.read_text(encoding="utf-8")
     assert 'ValidateSet("start", "bootstrap", "status", "stop")' in source
     assert "CAPTAIN_DEMO_MINIBOOK_API_KEY" in source
-    assert "MINIBOOK_API_KEY" in source
-    assert "MINIBOOK_PROJECTION_API_KEY" in source
-    assert "Projection credential is required before starting Minibook" in source
+    assert "CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY" in source
+    assert "RandomNumberGenerator]::GetBytes(32)" in source
+    assert "$env:MINIBOOK_PROJECTION_API_KEY" in source
     assert "/api/v1/agents/me" in source
     assert "/api/v1/agents" in source
     assert "captain-demo-service" in source
@@ -172,31 +89,36 @@ def test_minibook_demo_bootstrap_is_local_reusable_and_redacted() -> None:
     assert "Minibook demo service credential recovered locally" in source
     assert "SELECT api_key FROM agents WHERE name" in source
     assert "Write-Output $apiKey" not in source
+    assert "Write-Output $projectionApiKey" not in source
     assert "minibook-demo.pid" in source
-    assert "executable=$python" in source
-    assert "executable=$process.Path" not in source
-    assert "SetEnvironmentVariable('MINIBOOK_URL',$baseUrl,'Process')" in source
-    assert "managed Minibook restarted for current configuration" in source
-    assert "taskkill.exe /PID $managed.Id /T /F" in source
-    assert "taskkill.exe /PID $process.Id /T /F" in source
+    assert "$baseUrl = 'http://127.0.0.1:8080'" in source
+    assert "Get-Command python.exe -CommandType Application" in source
 
 
 def test_live_demo_services_only_operates_captain_resources() -> None:
     source = SERVICES.read_text(encoding="utf-8")
-    assert 'ValidateSet("start", "health", "stop")' in source
+    assert "$global:LASTEXITCODE = 0" in source
+    assert 'ValidateSet("start", "portal-start", "gateway-restart", "benchmark-start"' in source
     assert "captain-n8n.ps1" in source
     assert "minibook-demo.ps1" in source
     assert "docker compose" in source
+    assert "function Test-CaptainN8nCredentials" in source
+    assert "Captain n8n stored REST/MCP credentials failed verification" in source
     assert "mailpit" in source
     assert "evidence/live-demo-services.json" in source
     assert "docker-compose.test.yml" in source
-    assert "captain-cook-live-demo" in source
+    assert "$project = 'captain-cook-test'" in source
+    assert "captain-cook-live-demo" not in source
     assert "mariadb-test" in source
     assert "python" in source and "gateway.app" in source
     assert "gateway-demo.pid" in source
-    assert "Gateway port is occupied by a non-demo process" in source
-    assert "stale local Gateway process stopped" in source
-    assert "Get-CimInstance Win32_Process" in source
+    assert "Gateway port is occupied without the exact managed process and ledger identity" in source
+    assert "verified stale local Gateway process stopped" in source
+    assert "verified exited legacy Gateway identity removed" in source
+    assert "legacy Gateway identity still refers to a running process" in source
+    assert "Gateway listener process is not an exact child of the managed launcher" in source
+    assert "Write-ManagedProcessIdentity -Process $listenerProcess" in source
+    assert "Get-ManagedProcessIdentity" in source
     assert ".env.captain-n8n" in source
     assert "CAPTAIN_N8N_API_KEY" in source
     assert "CAPTAIN_N8N_MCP_TOKEN" in source
@@ -204,11 +126,26 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "captain_test" in source
     assert "CAPTAIN_GATEWAY_TOKEN" in source
     assert "WORKER_GATEWAY_TOKEN" in source
-    assert "MINIBOOK_API_KEY" in source
-    assert "MINIBOOK_PROJECTION_API_KEY" in source
-    assert "CAPTAIN_CAPABILITY_SANDBOX_IMAGE" in source
-    assert "CAPTAIN_RUNTIME_EVIDENCE_DIAGNOSTICS', 'Process'" in source
-    assert "Set-Missing $values 'MINIBOOK_PROJECTION_API_KEY'" in source
+    for portal_name in (
+        "PORTAL_SUPABASE_ISSUER",
+        "PORTAL_SUPABASE_AUDIENCE",
+        "PORTAL_SUPABASE_JWKS_URL",
+        "PORTAL_ORGANIZATION_CLAIM",
+        "PORTAL_PROVIDER_CONTROL_TOKEN",
+        "PORTAL_EVIDENCE_TOKEN",
+        "PORTAL_RESTART_CONTROL_TOKEN",
+        "SSL_CERT_FILE",
+    ):
+        assert portal_name in source
+    assert "captain.gateway.configuration.v2" in source
+    assert "function Invoke-PortalStart" in source
+    portal_start = source.split("function Invoke-PortalStart", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "Start-Gateway $values" in portal_start
+    assert "Start-CaptainN8nBroker $values" in portal_start
+    assert "Assert-RuntimeConfiguration" not in portal_start
+    assert "Start-Runtime" not in portal_start
     assert "RandomNumberGenerator" in source
     assert "[switch]$RecoverDemoCredentials" in source
     assert "[string]$CredentialSourceEnv" in source
@@ -225,60 +162,186 @@ def test_live_demo_services_only_operates_captain_resources() -> None:
     assert "com.docker.compose.project=captain-n8n-builder" in source
     assert "application/json, text/event-stream" in PREFLIGHT.read_text(encoding="utf-8")
     assert "bootstrap -RecoverDemoCredentials:$RecoverDemoCredentials" in source
-    assert "OPENAI_API_KEY" in source
-    assert "MINIBOOK_CREATION_DB" in source
-    assert "MINIBOOK_CREATION_ARTIFACTS" in source
-    assert "CAPTAIN_RUNTIME_ARTIFACT_ROOT" in source
-    assert "OPENAI_MODEL" in source and "gpt-4o-mini" in source
-    assert "CAPTAIN_FACTORY_MAX_COST_USD" in source
-    assert "CAPTAIN_FACTORY_HERMES_PROVIDER" in source
-    assert "CAPTAIN_FACTORY_HERMES_MODEL" in source
-    assert "CAPTAIN_FACTORY_HERMES_MAX_COST_PER_CALL_USD" in source
-    assert "CAPTAIN_FACTORY_MAX_COST_PER_CALL_USD" in source
-    assert "CAPTAIN_FACTORY_PRICING_VERSION" in source
-    assert "CAPTAIN_FACTORY_PRICING_INPUT_COST_PER_MILLION_USD" in source
-    assert "CAPTAIN_FACTORY_PRICING_OUTPUT_COST_PER_MILLION_USD" in source
-    assert "CAPTAIN_FACTORY_PRICING_MINIMUM_COST_USD" in source
-    assert "CAPTAIN_FACTORY_N8N_WORKFLOW_ID" in source
-    assert "function Repair-CaptainN8nPersistenceForRecovery" in source
-    assert "captain-n8n-builder_captain_n8n_data" in source
-    assert "CAPTAIN_N8N_ENCRYPTION_KEY" in source
-    assert "ALTER ROLE" in source
-    assert "--force-recreate n8n" in source
-    assert "volumes preserved" in source
-    assert "function Set-ProductionAdapterManifests" in source
-    assert "generate-capability-adapter-manifest.py" in source
-    assert "function Start-CaptainN8nBroker" in source
-    assert "http://host.docker.internal:" in source
-    assert "& $n8n broker-start" in source
-    assert source.count("executable=$python") >= 2
-    assert "executable=$process.Path" not in source
-    assert source.index("Start-Gateway $values") < source.index("Start-CaptainN8nBroker $values")
-    assert source.index("Start-CaptainN8nBroker $values") < source.index("Start-Runtime $values")
-    assert "Captain Runtime and Minibook capability artifact roots differ" in source
-    assert "managed Runtime restarted for current configuration" in source
-    assert "managed Gateway restarted for current configuration" in source
-    assert "Write-Output $values" not in source
-    start_body = source.split("function Invoke-StartServices", 1)[1].split(
-        "function Invoke-Health", 1
-    )[0]
-    assert start_body.index("up -d --wait mariadb-test") < start_body.index(
-        "Assert-RuntimeConfiguration $values"
-    )
-    assert start_body.index("Assert-RuntimeConfiguration $values") < start_body.index(
-        "Initialize-CaptainN8n $values"
-    )
-    assert "stop mariadb-test" in start_body
+    assert "OPENAI" not in source.upper()
+    assert source.index("Initialize-CaptainN8n $values") < source.index("mariadb-test")
     lowered = source.lower()
     assert "down -v" not in lowered
     assert "volume rm" not in lowered
     assert "vibemind" not in lowered
-    preflight = PREFLIGHT.read_text(encoding="utf-8")
-    assert "/api/v1/creation-capabilities" in preflight
-    assert "creation_jobs -ne $true" in preflight
-    minibook = (ROOT / "scripts" / "minibook-demo.ps1").read_text(encoding="utf-8")
-    assert "function Get-ManagedServiceProcess" in minibook
-    assert "Healthy Minibook endpoint is not the managed demo process" in minibook
+
+
+def test_business_benchmark_uses_a_dedicated_persistent_database() -> None:
+    source = SERVICES.read_text(encoding="utf-8")
+    compose = BENCHMARK_COMPOSE.read_text(encoding="utf-8")
+
+    benchmark_start = source[source.index("function Invoke-BenchmarkStart"):]
+    assert "Start-CaptainN8nBroker $benchmarkValues" in benchmark_start
+    assert benchmark_start.index("Start-Gateway $benchmarkValues") < benchmark_start.index(
+        "Start-CaptainN8nBroker $benchmarkValues"
+    )
+
+    assert "docker-compose.benchmark.yml" in source
+    assert "captain-cook-business-benchmark" in source
+    assert "mariadb-benchmark" in source
+    assert "business-benchmark-runtime.env" in source
+    assert "MARIADB_BENCHMARK_PORT" in source
+    assert "CAPTAIN_BENCHMARK_GATEWAY_PORT" in source
+    assert BENCHMARK_COMPOSE.is_file()
+    assert "mariadb-benchmark:" in compose
+    assert "captain-benchmark-mariadb:/var/lib/mysql" in compose
+    assert "captain-benchmark-mariadb:" in compose
+    assert "tmpfs:" not in compose
+    assert "managed-process-identity.ps1" in source
+    assert "Get-ManagedProcessIdentity" in source
+    assert "Get-GatewayConfigurationSha256" in source
+
+
+def test_live_demo_services_can_restart_only_the_managed_benchmark_gateway() -> None:
+    source = SERVICES.read_text(encoding="utf-8")
+
+    assert '"benchmark-restart"' in source
+    restart_block = source.split("benchmark-restart {", 1)[1].split("}", 1)[0]
+    assert "Stop-ManagedGateway -PidPath $benchmarkGatewayPid" in restart_block
+    assert "Invoke-BenchmarkStart" in restart_block
+    assert "docker compose down" not in restart_block
+    assert "Stop-CaptainN8nContainers" not in restart_block
+
+
+def test_live_demo_services_can_restart_only_the_verified_portal_gateway() -> None:
+    source = SERVICES.read_text(encoding="utf-8")
+
+    assert '"gateway-restart"' in source
+    restart_block = source.split("gateway-restart {", 1)[1].split("}", 1)[0]
+    assert "Initialize-LocalEnvironment" in restart_block
+    assert "Restart-Gateway $values" in restart_block
+    assert "docker compose" not in restart_block
+    assert "Stop-CaptainN8nContainers" not in restart_block
+    restart_function = source.split("function Restart-Gateway", 1)[1].split(
+        "function ", 1
+    )[0]
+    assert "Get-ManagedListenerIdentity" in restart_function
+    assert "Get-ManagedListenerIdentityForConfigurationReplacement" in restart_function
+    assert "taskkill.exe" in restart_function
+    assert "Start-Gateway $Values" in restart_function
+
+
+def test_managed_process_identity_rejects_wrong_listener_and_configuration(
+    tmp_path: Path,
+) -> None:
+    identity = tmp_path / "gateway.pid"
+    harness = tmp_path / "verify.ps1"
+    harness.write_text(
+        "\n".join(
+            (
+                "$ErrorActionPreference = 'Stop'",
+                f". '{MANAGED_PROCESS.as_posix()}'",
+                "$process = Get-Process -Id $PID",
+                f"$path = '{identity.as_posix()}'",
+                "Write-ManagedProcessIdentity -Process $process -Path $path -ConfigurationSha256 ('a' * 64)",
+                "$matched = Get-ManagedProcessIdentity -Path $path -ListenerPid $PID -ConfigurationSha256 ('a' * 64)",
+                "if ($matched.Id -ne $PID) { throw 'identity mismatch' }",
+                "$wrongListenerRejected = $false",
+                "try { Get-ManagedProcessIdentity -Path $path -ListenerPid ($PID + 1) -ConfigurationSha256 ('a' * 64) } catch { $wrongListenerRejected = $true }",
+                "if (-not $wrongListenerRejected) { throw 'wrong listener accepted' }",
+                "$wrongConfigRejected = $false",
+                "try { Get-ManagedProcessIdentity -Path $path -ListenerPid $PID -ConfigurationSha256 ('b' * 64) } catch { $wrongConfigRejected = $true }",
+                "if (-not $wrongConfigRejected) { throw 'wrong config accepted' }",
+            )
+        ),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_managed_listener_identity_binds_a_real_listener_to_its_recorded_process(
+    tmp_path: Path,
+) -> None:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    identity = tmp_path / "listener.pid"
+    harness = tmp_path / "listener.ps1"
+    harness.write_text(
+        "\n".join(
+            (
+                "$ErrorActionPreference = 'Stop'",
+                f". '{MANAGED_PROCESS.as_posix()}'",
+                f"$listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, {port})",
+                "$listener.Start()",
+                "$other = Start-Process pwsh -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 20' -WindowStyle Hidden -PassThru",
+                "try {",
+                f"  Write-ManagedProcessIdentity -Process (Get-Process -Id $PID) -Path '{identity.as_posix()}' -ConfigurationSha256 ('a' * 64)",
+                f"  $matched = Get-ManagedListenerIdentity -Path '{identity.as_posix()}' -Port {port} -ConfigurationSha256 ('a' * 64)",
+                "  if ($matched.Id -ne $PID) { throw 'listener identity mismatch' }",
+                f"  Write-ManagedProcessIdentity -Process $other -Path '{identity.as_posix()}' -ConfigurationSha256 ('a' * 64)",
+                "  $wrongOwnerRejected = $false",
+                f"  try {{ Get-ManagedListenerIdentity -Path '{identity.as_posix()}' -Port {port} -ConfigurationSha256 ('a' * 64) }} catch {{ $wrongOwnerRejected = $true }}",
+                "  if (-not $wrongOwnerRejected) { throw 'foreign listener accepted' }",
+                "} finally {",
+                "  $listener.Stop()",
+                "  if (Get-Process -Id $other.Id -ErrorAction SilentlyContinue) { Stop-Process -Id $other.Id -Force }",
+                "}",
+            )
+        ),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_managed_listener_identity_allows_only_exact_configuration_replacement(
+    tmp_path: Path,
+) -> None:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    identity = tmp_path / "listener.pid"
+    harness = tmp_path / "replacement.ps1"
+    harness.write_text(
+        "\n".join(
+            (
+                "$ErrorActionPreference = 'Stop'",
+                f". '{MANAGED_PROCESS.as_posix()}'",
+                f"$listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, {port})",
+                "$listener.Start()",
+                "try {",
+                f"  Write-ManagedProcessIdentity -Process (Get-Process -Id $PID) -Path '{identity.as_posix()}' -ConfigurationSha256 ('a' * 64)",
+                f"  $matched = Get-ManagedListenerIdentityForConfigurationReplacement -Path '{identity.as_posix()}' -Port {port} -ReplacementConfigurationSha256 ('b' * 64)",
+                "  if ($matched.Id -ne $PID) { throw 'replacement identity mismatch' }",
+                "  $sameConfigRejected = $false",
+                f"  try {{ Get-ManagedListenerIdentityForConfigurationReplacement -Path '{identity.as_posix()}' -Port {port} -ReplacementConfigurationSha256 ('a' * 64) }} catch {{ $sameConfigRejected = $true }}",
+                "  if (-not $sameConfigRejected) { throw 'same configuration accepted as replacement' }",
+                "} finally {",
+                "  $listener.Stop()",
+                "}",
+            )
+        ),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_readme_documents_safe_recording_commands() -> None:

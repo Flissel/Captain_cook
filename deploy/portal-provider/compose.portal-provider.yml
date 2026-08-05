@@ -1,0 +1,33 @@
+services:
+  controlled-provider:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - /home/debian/.captain-secrets/controlled-provider.env
+    ports:
+      - "127.0.0.1:9080:8080"
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:uid=10001,gid=10001,mode=0700
+    volumes:
+      - captain-provider-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).read()"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+volumes:
+  captain-provider-data:
+

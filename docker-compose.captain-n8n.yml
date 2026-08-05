@@ -39,10 +39,15 @@ services:
       - TZ=Europe/Berlin
       - EXECUTIONS_DATA_PRUNE=true
       - EXECUTIONS_DATA_MAX_AGE=336
+      - NODE_EXTRA_CA_CERTS=/run/captain-ca/provider-ca.crt
     ports:
       - "127.0.0.1:${CAPTAIN_N8N_PORT:-5679}:5678"
     volumes:
       - captain_n8n_data:/home/node/.n8n
+      - type: bind
+        source: ${CAPTAIN_N8N_CA_BUNDLE_PATH:?missing}
+        target: /run/captain-ca/provider-ca.crt
+        read_only: true
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:5678/healthz || exit 1"]
       interval: 10s

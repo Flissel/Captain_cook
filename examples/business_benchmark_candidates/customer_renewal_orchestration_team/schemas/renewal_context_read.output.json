@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "operation": {"const": "read_renewal_context"},
+    "idempotency_key": {"type": "string", "minLength": 16, "maxLength": 128},
+    "status": {"const": "read"},
+    "facts": {
+      "type": "array",
+      "items": {"type": "string"},
+      "minItems": 1,
+      "uniqueItems": true
+    }
+  },
+  "required": ["operation", "idempotency_key", "status", "facts"]
+}

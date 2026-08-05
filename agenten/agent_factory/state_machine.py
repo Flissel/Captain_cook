@@ -2,25 +2,23 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .contracts import AgentFactoryJobV2, AgentFactoryJobV3, FactoryEvidenceBlock, FactoryJob, FactoryPhase
-from .outcome_contracts import FactoryTerminalDecision, FactoryTerminalState
+from .contracts import AgentFactoryJobV3, FactoryEvidenceBlock, FactoryJob, FactoryPhase
 from .release_gate import (
-    FactoryPolicyFinding,
     FactoryReleaseDecision,
     evaluation_requires_improvement,
     evaluation_tool_gaps,
     factory_evaluation_block_reason,
     factory_release_decision_block_reason,
     factory_workflow_release_decision_block_reason,
-    factory_workflow_validation_decision_block_reason,
+    factory_workflow_business_benchmark_block_reason,
 )
+from .business_benchmark_contracts import BusinessBenchmarkSummaryV1
 from .skill_evaluation import ToolGapMarker
 from .skill_store import StoredSkillEvaluation
 from .skill_workflow_contracts import (
@@ -41,8 +39,6 @@ class FactoryLifecycleStatus(str, Enum):
     INFRASTRUCTURE_BLOCKED = "infrastructure_blocked"
     READY_TO_USE = "ready_to_use"
     ESCALATED = "escalated"
-    BLOCKED = "blocked"
-    REJECTED = "rejected"
 
 
 class FactoryActionKind(str, Enum):
@@ -53,14 +49,16 @@ class FactoryActionKind(str, Enum):
     EMIT_AGENT_CODE_EVIDENCE = "emit_agent_code_evidence"
     DISPATCH_BUILD_VALIDATOR = "dispatch_build_validator"
     DISPATCH_REAL_CASE_TESTER = "dispatch_real_case_tester"
+    APPEND_TECHNICAL_REVALIDATION_REQUESTED = (
+        "append_technical_revalidation_requested"
+    )
+    DISPATCH_TECHNICAL_REVALIDATION = "dispatch_technical_revalidation"
     DISPATCH_QUALITY_WARDEN = "dispatch_quality_warden"
     APPEND_IMPROVEMENT_REQUESTED = "append_improvement_requested"
     VALIDATE_FOR_PROMOTION = "validate_for_promotion"
     APPEND_ESCALATED = "append_escalated"
     WAIT_INFRASTRUCTURE = "wait_infrastructure"
     COMPLETE = "complete"
-    RECORD_ESCALATION = "record_escalation"
-    NO_ACTION = "no_action"
 
 
 class FactoryAction(BaseModel):
@@ -69,6 +67,19 @@ class FactoryAction(BaseModel):
     kind: FactoryActionKind
     attempt: int = Field(ge=1, le=5)
     job_id: UUID | None = None
+    authorization_ref: ArtifactRef | None = None
+    supersedes_ref: ArtifactRef | None = None
+
+    @model_validator(mode="after")
+    def require_revalidation_bindings(self) -> "FactoryAction":
+        bound = self.kind is FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION
+        has_any = self.authorization_ref is not None or self.supersedes_ref is not None
+        has_both = self.authorization_ref is not None and self.supersedes_ref is not None
+        if (bound and not has_both) or (not bound and has_any):
+            raise ValueError(
+                "technical revalidation action requires exact authorization and source refs"
+            )
+        return self
 
 
 class FactoryProjection(BaseModel):
@@ -82,15 +93,14 @@ class FactoryProjection(BaseModel):
     attempt: int = Field(ge=1, le=5)
     observed_assertion_ids: tuple[str, ...] = ()
     block_ids: tuple[UUID, ...] = ()
-    evidence_refs: tuple[ArtifactRef, ...] = ()
     evaluation_id: UUID | None = None
     evaluation_ref: ArtifactRef | None = None
     workflow_evaluation_ref: ArtifactRef | None = None
     feedback_ref: ArtifactRef | None = None
     feedback_recommendation: FactoryFeedbackRecommendation | None = None
     tool_gaps: tuple[ToolGapMarker, ...] = ()
-    policy_findings: tuple[FactoryPolicyFinding, ...] = ()
-    terminal_decision: FactoryTerminalDecision | None = None
+    technical_revalidation_authorization_ref: ArtifactRef | None = None
+    technical_revalidation_supersedes_ref: ArtifactRef | None = None
 
     @classmethod
     def from_job(cls, job: FactoryJob) -> "FactoryProjection":
@@ -105,7 +115,7 @@ def apply_block(
     release_decision: FactoryReleaseDecision | None = None,
     workflow_evaluation: TeamEvaluationV1 | None = None,
     feedback: FactoryFeedbackV1 | None = None,
-    now: datetime | None = None,
+    benchmark_summary: BusinessBenchmarkSummaryV1 | None = None,
 ) -> FactoryProjection:
     """Apply one new immutable block after enforcing lifecycle ordering."""
 
@@ -119,31 +129,8 @@ def apply_block(
         return projection
     if block.attempt != projection.attempt:
         raise FactoryLifecycleError("block attempt does not match projection")
-    if projection.terminal_decision is not None or projection.status in {
-        FactoryLifecycleStatus.READY_TO_USE,
-        FactoryLifecycleStatus.ESCALATED,
-        FactoryLifecycleStatus.BLOCKED,
-        FactoryLifecycleStatus.REJECTED,
-    }:
+    if projection.status in {FactoryLifecycleStatus.READY_TO_USE, FactoryLifecycleStatus.ESCALATED}:
         raise FactoryLifecycleError("terminal factory projection cannot accept blocks")
-
-    if (
-        isinstance(projection.job, AgentFactoryJobV2)
-        and now is not None
-        and now >= projection.job.deadline_at
-    ):
-        if block.phase is not FactoryPhase.ESCALATED or block.status.value != "succeeded":
-            raise FactoryLifecycleError(
-                "v2 factory deadline permits only the derived Captain escalation"
-            )
-        return projection.model_copy(
-            update={
-                "status": FactoryLifecycleStatus.ESCALATED,
-                "phase": block.phase,
-                "block_ids": (*projection.block_ids, block.event_id),
-                "evidence_refs": _append_evidence_refs(projection, block),
-            }
-        )
 
     allowed = _allowed_next_phases(projection)
     if block.phase not in allowed:
@@ -157,7 +144,6 @@ def apply_block(
                 "status": FactoryLifecycleStatus.INFRASTRUCTURE_BLOCKED,
                 "phase": block.phase,
                 "block_ids": (*projection.block_ids, block.event_id),
-                "evidence_refs": _append_evidence_refs(projection, block),
             }
         )
 
@@ -169,6 +155,22 @@ def apply_block(
         if projection.attempt >= projection.job.max_behavioral_iterations:
             raise FactoryLifecycleError("behavioral iteration ceiling reached")
         attempt += 1
+    elif block.phase is FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED:
+        authorization_refs = tuple(
+            reference
+            for reference in block.evidence_refs
+            if reference.uri.startswith(
+                "artifact://factory/technical-revalidation/"
+            )
+        )
+        if len(authorization_refs) != 1 or len(block.artifact_refs) != 1:
+            raise FactoryLifecycleError(
+                "technical revalidation requires one authorization and one superseded execution ref"
+            )
+        evaluation_update = {
+            "technical_revalidation_authorization_ref": authorization_refs[0],
+            "technical_revalidation_supersedes_ref": block.artifact_refs[0],
+        }
     elif block.phase is FactoryPhase.CAPABILITY_PROMOTED:
         required = set(projection.job.acceptance_assertion_ids)
         if not required.issubset(assertions):
@@ -179,11 +181,14 @@ def apply_block(
                 projection,
                 workflow_evaluation=workflow_evaluation,
                 feedback=feedback,
+                benchmark_summary=benchmark_summary,
+                require_passed_benchmark=True,
             )
             decision_reason = factory_workflow_release_decision_block_reason(
                 projection.job,
                 workflow_evaluation,
                 release_decision,
+                benchmark_summary=benchmark_summary,
             )
             if decision_reason is not None:
                 raise FactoryLifecycleError(decision_reason)
@@ -222,6 +227,8 @@ def apply_block(
             projection,
             workflow_evaluation=workflow_evaluation,
             feedback=feedback,
+            benchmark_summary=benchmark_summary,
+            require_passed_benchmark=False,
         )
         assert workflow_evaluation is not None
         assert feedback is not None
@@ -245,7 +252,6 @@ def apply_block(
             "attempt": attempt,
             "observed_assertion_ids": assertions,
             "block_ids": (*projection.block_ids, block.event_id),
-            "evidence_refs": _append_evidence_refs(projection, block),
             **evaluation_update,
         }
     )
@@ -258,23 +264,10 @@ def next_action(
     workflow_evaluation: TeamEvaluationV1 | None = None,
     feedback: FactoryFeedbackV1 | None = None,
     workflow_release_decision: FactoryReleaseDecision | None = None,
-    now: datetime | None = None,
+    benchmark_summary: BusinessBenchmarkSummaryV1 | None = None,
 ) -> FactoryAction:
     """Return the one allowed next side effect for a derived projection."""
 
-    if projection.terminal_decision is not None:
-        return FactoryAction(kind=FactoryActionKind.NO_ACTION, attempt=projection.attempt)
-    if projection.status in {
-        FactoryLifecycleStatus.BLOCKED,
-        FactoryLifecycleStatus.REJECTED,
-    }:
-        return FactoryAction(kind=FactoryActionKind.NO_ACTION, attempt=projection.attempt)
-    if (
-        isinstance(projection.job, AgentFactoryJobV2)
-        and now is not None
-        and now >= projection.job.deadline_at
-    ):
-        return FactoryAction(kind=FactoryActionKind.RECORD_ESCALATION, attempt=projection.attempt)
     if projection.status is FactoryLifecycleStatus.INFRASTRUCTURE_BLOCKED:
         return FactoryAction(kind=FactoryActionKind.WAIT_INFRASTRUCTURE, attempt=projection.attempt)
     if projection.status in {FactoryLifecycleStatus.READY_TO_USE, FactoryLifecycleStatus.ESCALATED}:
@@ -293,7 +286,23 @@ def next_action(
         return FactoryAction(kind=FactoryActionKind.DISPATCH_BUILD_VALIDATOR, attempt=projection.attempt)
     if phase is FactoryPhase.BUILD_PASSED:
         return FactoryAction(kind=FactoryActionKind.DISPATCH_REAL_CASE_TESTER, attempt=projection.attempt)
+    if phase is FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED:
+        if (
+            projection.technical_revalidation_authorization_ref is None
+            or projection.technical_revalidation_supersedes_ref is None
+        ):
+            raise FactoryLifecycleError(
+                "technical revalidation projection is missing Captain bindings"
+            )
+        return FactoryAction(
+            kind=FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION,
+            attempt=projection.attempt,
+            authorization_ref=projection.technical_revalidation_authorization_ref,
+            supersedes_ref=projection.technical_revalidation_supersedes_ref,
+        )
     if phase is FactoryPhase.REAL_CASE_EVIDENCE:
+        return FactoryAction(kind=FactoryActionKind.DISPATCH_QUALITY_WARDEN, attempt=projection.attempt)
+    if phase is FactoryPhase.REAL_CASE_REVALIDATED:
         return FactoryAction(kind=FactoryActionKind.DISPATCH_QUALITY_WARDEN, attempt=projection.attempt)
     if phase in {FactoryPhase.BUILD_FAILED, FactoryPhase.QUALITY_REVIEWED}:
         if (
@@ -304,6 +313,8 @@ def next_action(
                 projection,
                 workflow_evaluation=workflow_evaluation,
                 feedback=feedback,
+                benchmark_summary=benchmark_summary,
+                require_passed_benchmark=False,
             )
             assert feedback is not None
             if (
@@ -315,10 +326,11 @@ def next_action(
                     raise FactoryLifecycleError(
                         "workflow promotion recommendation is missing Captain assertions"
                     )
-                decision_reason = factory_workflow_validation_decision_block_reason(
+                decision_reason = factory_workflow_release_decision_block_reason(
                     projection.job,
                     workflow_evaluation,
                     workflow_release_decision,
+                    benchmark_summary=benchmark_summary,
                 )
                 if decision_reason is None:
                     return FactoryAction(
@@ -358,32 +370,6 @@ def next_action(
     raise FactoryLifecycleError(f"no next action for phase {phase!r}")
 
 
-def with_terminal_decision(
-    projection: FactoryProjection,
-    decision: FactoryTerminalDecision,
-) -> FactoryProjection:
-    """Seal a projection with one Captain-authored terminal decision."""
-
-    if (
-        decision.job_id != projection.job.job_id
-        or decision.correlation_id != projection.job.correlation_id
-        or decision.subject_version != projection.job.subject_version
-    ):
-        raise FactoryLifecycleError("terminal decision does not match projection")
-    existing = projection.terminal_decision
-    if existing is not None:
-        if existing == decision:
-            return projection
-        raise FactoryLifecycleError("terminal decision conflicts with sealed projection")
-    status = {
-        FactoryTerminalState.READY_TO_USE: FactoryLifecycleStatus.READY_TO_USE,
-        FactoryTerminalState.BLOCKED: FactoryLifecycleStatus.BLOCKED,
-        FactoryTerminalState.ESCALATED: FactoryLifecycleStatus.ESCALATED,
-        FactoryTerminalState.REJECTED: FactoryLifecycleStatus.REJECTED,
-    }[decision.state]
-    return projection.model_copy(update={"status": status, "terminal_decision": decision})
-
-
 def _allowed_next_phases(projection: FactoryProjection) -> frozenset[FactoryPhase]:
     if projection.status is FactoryLifecycleStatus.PENDING:
         return frozenset({FactoryPhase.FORGE_REQUESTED})
@@ -395,7 +381,26 @@ def _allowed_next_phases(projection: FactoryProjection) -> frozenset[FactoryPhas
         FactoryPhase.TOOL_CANDIDATE_TESTED: frozenset({FactoryPhase.AGENT_CODE_CREATED}),
         FactoryPhase.AGENT_CODE_CREATED: frozenset({FactoryPhase.BUILD_PASSED, FactoryPhase.BUILD_FAILED}),
         FactoryPhase.BUILD_PASSED: frozenset({FactoryPhase.REAL_CASE_EVIDENCE}),
-        FactoryPhase.REAL_CASE_EVIDENCE: frozenset({FactoryPhase.QUALITY_REVIEWED}),
+        FactoryPhase.REAL_CASE_EVIDENCE: frozenset(
+            {
+                FactoryPhase.QUALITY_REVIEWED,
+                FactoryPhase.IMPROVEMENT_REQUESTED,
+                FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED,
+            }
+        ),
+        FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED: frozenset(
+            {
+                FactoryPhase.REAL_CASE_REVALIDATED,
+                FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED,
+            }
+        ),
+        FactoryPhase.REAL_CASE_REVALIDATED: frozenset(
+            {
+                FactoryPhase.QUALITY_REVIEWED,
+                FactoryPhase.IMPROVEMENT_REQUESTED,
+                FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED,
+            }
+        ),
         FactoryPhase.BUILD_FAILED: frozenset({FactoryPhase.IMPROVEMENT_REQUESTED, FactoryPhase.ESCALATED}),
         FactoryPhase.QUALITY_REVIEWED: frozenset(
             {FactoryPhase.IMPROVEMENT_REQUESTED, FactoryPhase.CAPABILITY_PROMOTED, FactoryPhase.ESCALATED}
@@ -407,19 +412,13 @@ def _allowed_next_phases(projection: FactoryProjection) -> frozenset[FactoryPhas
         raise FactoryLifecycleError(f"no legal transition from {phase!r}") from exc
 
 
-def _append_evidence_refs(
-    projection: FactoryProjection,
-    block: FactoryEvidenceBlock,
-) -> tuple[ArtifactRef, ...]:
-    references = (*projection.evidence_refs, *block.artifact_refs, *block.evidence_refs)
-    return tuple(dict.fromkeys(references))
-
-
 def _validate_workflow_feedback(
     projection: FactoryProjection,
     *,
     workflow_evaluation: TeamEvaluationV1 | None,
     feedback: FactoryFeedbackV1 | None,
+    benchmark_summary: BusinessBenchmarkSummaryV1 | None,
+    require_passed_benchmark: bool,
 ) -> None:
     if workflow_evaluation is None or feedback is None:
         raise FactoryLifecycleError("missing validated workflow feedback")
@@ -441,6 +440,15 @@ def _validate_workflow_feedback(
         or workflow_evaluation.artifact_ref not in feedback.evidence_refs
     ):
         raise FactoryLifecycleError("workflow feedback binding does not match projection")
+    benchmark_reason = factory_workflow_business_benchmark_block_reason(
+        job,
+        workflow_evaluation,
+        benchmark_summary,
+        current_attempt=projection.attempt,
+        require_passed=require_passed_benchmark,
+    )
+    if benchmark_reason is not None:
+        raise FactoryLifecycleError(benchmark_reason)
     required_gap = any(
         gap.severity == "required" and gap.status == "unresolved"
         for gap in feedback.tool_gaps

@@ -9,6 +9,7 @@ from uuid import UUID
 
 from agenten.agent_factory.execution_policy import FactoryExecutionPolicyV1
 from agenten.agent_factory.forge_contracts import FactoryBuildAssignmentV1
+from agenten.agent_factory.n8n_official_skills import official_n8n_build_protocol
 from agenten.agent_factory.skill_workflow_contracts import (
     CodebaseInventoryV1,
     CodexBuildBriefV1,
@@ -16,6 +17,9 @@ from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillStep,
 )
 from agenten.agent_factory.skill_sequence import FactoryImprovementAuthorizationV1
+from agenten.agent_factory.technical_improvement_contracts import (
+    CaptainTechnicalFailureEvaluationV1,
+)
 from agenten.agent_factory.skill_store import reject_sensitive_data
 from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent
 
@@ -135,6 +139,16 @@ class CodexBriefBuilder:
             authorized_path_roots=(assignment.workspace_ref,),
             required_test_command_ids=test_ids,
             forbidden_effect_ids=self._FORBIDDEN_EFFECT_IDS,
+            failed_benchmark_metric_ids=(
+                ()
+                if improvement_authorization is None
+                else improvement_authorization.failed_evaluation.failed_benchmark_metric_ids
+            ),
+            regression_benchmark_metric_ids=(
+                ()
+                if improvement_authorization is None
+                else improvement_authorization.prior_green_benchmark_metric_ids
+            ),
         )
 
     @staticmethod
@@ -166,7 +180,7 @@ class CodexBriefBuilder:
             inventory.job_id != invocation.job_id
             or inventory.correlation_id != invocation.correlation_id
             or inventory.subject_version != invocation.subject_version
-            or inventory.attempt != invocation.attempt
+            or inventory.attempt != 1
             or inventory.acceptance_assertion_ids
             != invocation.acceptance_assertion_ids
         ):
@@ -210,6 +224,127 @@ class CodexBriefBuilder:
                 if outcome.status == "failed"
             ]
         )
+        prior_green_benchmark_metric_ids = (
+            []
+            if improvement_authorization is None
+            else list(
+                improvement_authorization.prior_green_benchmark_metric_ids
+            )
+        )
+        failed_benchmark_metric_ids = (
+            []
+            if improvement_authorization is None
+            else list(
+                improvement_authorization.failed_evaluation.failed_benchmark_metric_ids
+            )
+        )
+        benchmark_reason_codes = (
+            []
+            if improvement_authorization is None
+            else list(
+                improvement_authorization.failed_evaluation.benchmark_reason_codes
+            )
+        )
+        failed_evaluation = (
+            None
+            if improvement_authorization is None
+            else improvement_authorization.failed_evaluation
+        )
+        technical_diagnostic_codes = (
+            []
+            if not isinstance(
+                failed_evaluation,
+                CaptainTechnicalFailureEvaluationV1,
+            )
+            else list(failed_evaluation.technical_diagnostic_codes)
+        )
+        technical_retry_contract: list[str] = [
+                "The real-case command receives no stdin.",
+                "Read CAPTAIN_TRACE_ID from the process environment.",
+                "Emit exactly one JSON object on stdout and no prose.",
+                "Set trace_id to CAPTAIN_TRACE_ID.",
+                "Set assertion_ids to exactly the Captain acceptance assertion IDs.",
+                "Exit zero only after the deterministic real-case fixture is evaluated.",
+        ]
+        if "candidate_build_command_failed" in technical_diagnostic_codes:
+            technical_retry_contract.append(
+                "Run the candidate build command to a zero exit code, fix its tests "
+                "without weakening assertions, then regenerate candidate.zip from "
+                "the verified source tree."
+            )
+        if "real_case_contract_failed" in technical_diagnostic_codes:
+            technical_retry_contract.append(
+                "Validate generated-candidate/team_manifest.json against "
+                "FactoryAutoGenTeamManifestV1 before packaging: each agent must use a "
+                "content-addressed system_prompt_ref, never inline system_prompt, and "
+                "host_tools belongs only in factory-candidate.json."
+            )
+        if (
+            "mandatory_handoff" in invocation.acceptance_assertion_ids
+            or "mandatory_handoff_failed" in technical_diagnostic_codes
+        ):
+            technical_retry_contract.append(
+                "Require at least one meaningful configured agent handoff before terminal completion; "
+                "the initial agent must not complete the task before specialist collaboration."
+            )
+            technical_retry_contract.append(
+                "Every agent with an outgoing AutoGen handoff must explicitly name and call "
+                "the generated transfer_to_<target_agent> tool in its sealed system prompt."
+            )
+        if (
+            "business_value" in invocation.acceptance_assertion_ids
+            or "business_value_failed" in technical_diagnostic_codes
+        ):
+            technical_retry_contract.append(
+                "Produce an evidence-grounded business decision and rationale after specialist "
+                "collaboration, matching the public output contract."
+            )
+            technical_retry_contract.append(
+                "Treat public_team_build_contract in compiled-spec.json as normative: preserve "
+                "its exact agent names, handoff graph, tool allocation, system prompts, limits, "
+                "terminal JSON contract, and all five public acceptance categories."
+            )
+            technical_retry_contract.append(
+                "When public_team_build_contract declares captain_business_decision, preserve it "
+                "as a reserved host tool on exactly the declared terminal agents, call it once "
+                "with the complete original redacted task JSON, and treat its returned terminal "
+                "JSON as authoritative."
+            )
+        if "observed_rationale_incomplete" in technical_diagnostic_codes:
+            technical_retry_contract.append(
+                "Preserve every evidence-grounded rationale fact from specialist messages in "
+                "the terminal rationale_fact_ids output; do not omit facts used for the decision."
+            )
+        if "observed_decision_mismatch" in technical_diagnostic_codes:
+            technical_retry_contract.append(
+                "Reconcile specialist evidence before emitting the terminal decision; the decision "
+                "must follow the candidate's documented deterministic business rules."
+            )
+        if "terminal_missing_or_invalid" in technical_diagnostic_codes:
+            technical_retry_contract.append(
+                "Always emit the exact structured terminal output contract after collaboration."
+            )
+        if improvement_authorization is not None:
+            technical_retry_contract.append(
+                "System prompts may be tuned to fix only the enumerated failed metrics while "
+                "preserving the public business policy, agent identities, handoff graph, tool "
+                "allocation, limits, terminal contract, and acceptance categories; never inspect "
+                "or infer private holdout cases."
+            )
+            technical_retry_contract.append(
+                "A failed mandatory_handoff benchmark metric requires explicit Captain operator "
+                "review evidence; never fabricate, simulate, or claim that external completion "
+                "inside candidate code."
+            )
+        if {
+            "cost_efficiency",
+            "latency_efficiency",
+        } & set(failed_benchmark_metric_ids):
+            technical_retry_contract.append(
+                "For cost or latency failures, reduce model turns, prompt tokens, and serial "
+                "handoffs on each public path without removing required specialist collaboration "
+                "or weakening any prior-green metric."
+            )
         document = {
             "Goal": (
                 "Implement the dependency-ready node described by "
@@ -219,6 +354,11 @@ class CodexBriefBuilder:
                 "acceptance_assertion_ids": list(invocation.acceptance_assertion_ids),
                 "prior green assertions": prior_green_ids,
                 "failed assertion IDs": failed_assertion_ids,
+                "prior green benchmark metrics": prior_green_benchmark_metric_ids,
+                "failed benchmark metric IDs": failed_benchmark_metric_ids,
+                "benchmark reason codes": benchmark_reason_codes,
+                "technical diagnostic codes": technical_diagnostic_codes,
+                "technical retry contract": technical_retry_contract,
             },
             "selected reusable components": list(inventory.reusable_component_ids),
             "authorized workspace roots": [assignment.workspace_ref],
@@ -269,6 +409,8 @@ class CodexBriefBuilder:
             ],
             "forbidden effects": list(cls._FORBIDDEN_EFFECT_IDS),
         }
+        if any(item.kind == "n8n" for item in assignment.integrations):
+            document["official n8n build protocol"] = official_n8n_build_protocol()
         reject_sensitive_data(document, "Codex build brief")
         return json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
 

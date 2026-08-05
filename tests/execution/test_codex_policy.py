@@ -184,6 +184,67 @@ def test_codex_command_without_the_jsonl_allowlist_is_rejected(tmp_path: Path) -
         )
 
 
+def test_fresh_recovery_run_preserves_captain_validated_dirty_workspace(
+    tmp_path: Path,
+) -> None:
+    approved_root, project, workspace = _clean_project(tmp_path)
+    (project / ".captain-inputs").mkdir()
+    (project / ".captain-inputs" / "compiled-spec.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+
+    authorized = CodexExecutionPolicy(
+        workspace_root=approved_root,
+        environment={},
+    ).authorize(_request(project, workspace, recovery_run=True))
+
+    assert authorized.command[:3] == ("codex", "exec", "--json")
+
+
+def test_exact_codex_resume_thread_command_is_authorized(tmp_path: Path) -> None:
+    approved_root, project, workspace = _clean_project(tmp_path)
+    command = (
+        "codex",
+        "exec",
+        "resume",
+        "--json",
+        "019f0000-0000-7000-8000-000000000001",
+        "continue the exact Captain build",
+    )
+
+    authorized = CodexExecutionPolicy(
+        workspace_root=approved_root,
+        environment={},
+    ).authorize(_request(project, workspace, command=command))
+
+    assert authorized.command == command
+
+
+def test_exact_codex_resume_preserves_interrupted_dirty_workspace(
+    tmp_path: Path,
+) -> None:
+    approved_root, project, workspace = _clean_project(tmp_path)
+    (project / "tracked.txt").write_text("interrupted implementation\n", encoding="utf-8")
+    command = (
+        "codex",
+        "exec",
+        "resume",
+        "--json",
+        "019f0000-0000-7000-8000-000000000001",
+        "continue the exact Captain build",
+    )
+
+    authorized = CodexExecutionPolicy(
+        workspace_root=approved_root,
+        environment={},
+    ).authorize(_request(project, workspace, command=command))
+
+    assert authorized.command == command
+    assert (project / "tracked.txt").read_text(encoding="utf-8") == (
+        "interrupted implementation\n"
+    )
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -191,6 +252,10 @@ def test_codex_command_without_the_jsonl_allowlist_is_rejected(tmp_path: Path) -
         ("codex", "exec", "--json", "--sandbox"),
         ("codex", "exec", "--json", "build", "--full-auto"),
         ("codex", "exec", "--json", "--sandbox", "build"),
+        ("codex", "exec", "resume", "--json", "thread-only"),
+        ("codex", "exec", "resume", "--json", "--last", "build"),
+        ("codex", "exec", "resume", "--json", "-untrusted", "build"),
+        ("codex", "exec", "resume", "--json", "thread", "build", "--extra"),
     ],
 )
 def test_only_exact_codex_exec_json_prompt_shape_is_authorized(

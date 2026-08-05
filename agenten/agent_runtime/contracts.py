@@ -66,31 +66,6 @@ class RuntimeStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
-class ProviderEffectReceipt(_FrozenContract):
-    """Immutable provider identity persisted before control returns to Captain."""
-
-    provider_operation_id: str = Field(
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
-    )
-    effect_id: UUID
-    command_id: UUID
-    origin_claim_id: UUID
-    origin_claim_fencing_token: int = Field(ge=1, strict=True)
-    origin_claim_digest: str = Field(pattern=SHA256_PATTERN)
-    request_digest: str = Field(pattern=SHA256_PATTERN)
-    result_digest: str = Field(pattern=SHA256_PATTERN)
-    status: Literal[
-        "accepted",
-        "running",
-        "succeeded",
-        "failed",
-        "infrastructure_failed",
-        "policy_failed",
-        "cancelled",
-    ]
-    idempotency_guaranteed: bool
-
-
 class ArtifactRef(_FrozenContract):
     uri: str = Field(min_length=1)
     sha256: str = Field(pattern=SHA256_PATTERN)

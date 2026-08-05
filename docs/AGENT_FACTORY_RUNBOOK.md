@@ -13,7 +13,7 @@ presence:
 $env:TEST_MARIADB_DSN -ne $null
 $env:N8N_API_KEY -ne $null
 $env:N8N_MCP_TOKEN -ne $null
-codex mcp get n8n-mcp
+codex mcp get n8n --json
 ```
 
 The n8n MCP endpoint must answer a non-destructive workflow-list call before a
@@ -55,6 +55,37 @@ pwsh -NoProfile -File scripts/configure-hermes-factory-skills.ps1 `
 
 The rollback does not reset builtin skills or delete other external skill
 directories. It does not open or print `.env`.
+
+## Official n8n build skills
+
+Install the official `n8n-io/skills` plugin at Captain's reviewed commit pin:
+
+```powershell
+pwsh -NoProfile -File scripts/configure-official-n8n-skills.ps1
+```
+
+The installer adds `n8n-skills@n8n-io`, verifies the exact marketplace commit
+and plugin version, registers that pinned skill directory with Hermes, and
+validates the existing instance-level MCP registration without exposing its
+token. It fails closed if `n8n` points anywhere except Captain's approved local
+endpoint or uses a token source other than `N8N_MCP_TOKEN`. If the installed
+Hermes CLI cannot round-trip multiple external skill directories, the installer
+refuses to mutate the user configuration.
+
+Verify the installation, then restart Codex so the newly installed skills and
+hooks are loaded:
+
+```powershell
+codex plugin list
+codex mcp get n8n --json
+hermes skills inspect using-n8n-skills-official
+```
+
+For declared n8n integrations, Hermes and Codex begin with
+`using-n8n-skills-official` and use the official lifecycle, node configuration,
+agent, debugging, and credential skills. They use the instance-level MCP to
+inspect node types, validate the workflow, create or update it, and read it back.
+Captain's lease, budget, evidence, retry, and promotion rules remain authoritative.
 
 ## Offline contract gate
 
@@ -107,6 +138,74 @@ occurred.
    successful normal E2E runs. Captain evaluates the release gate and only then
    appends `capability_promoted`.
 
+## Business benchmark gate
+
+Select exactly one approved profile and suite version per candidate attempt:
+
+- Claims: `insurance_claims_resolution_swarm`, suite version 1.
+- Renewal: `customer_renewal_orchestration_team`, suite version 1.
+
+Captain also fixes the candidate/baseline model version, redaction and baseline
+policy versions, per-case cost and latency ceilings, and the job-wide maximum
+cost. Each private suite contains 15 runtime-loaded anonymized cases with
+exactly three ordinary, boundary, incomplete, contradictory, and mandatory
+escalation cases. Do not copy case bodies into logs, evidence exports, prompts,
+Minibook, or source control.
+
+Run the deterministic complete-chain gate first:
+
+```powershell
+python -m pytest -q --no-cov tests/integration/test_business_benchmark_factory.py
+```
+
+The lifecycle order is private suite, paired receipts, independent scoring,
+private summary persistence, Gateway summary persistence, team evaluation,
+feedback, quality review, release validation, Captain promotion, then Minibook
+projection. A summary must be resolvable by its exact artifact digest before an
+evaluation is accepted. Captain/Gateway is the sole `ready_to_use` authority.
+
+Provider-backed runs are explicitly opt in and enforce the configured maximum
+cost:
+
+```powershell
+pwsh -NoProfile -File scripts/run-business-benchmark-live.ps1 -Profile claims
+pwsh -NoProfile -File scripts/run-business-benchmark-live.ps1 -Profile renewal
+```
+
+Live evidence is written only below
+`.captain-cook/evidence/business-benchmarks/`. Private suites and case/run
+receipts remain in the configured Captain-private benchmark store. Redacted
+summaries and workflow evaluations are append-only Gateway records. Minibook
+receives only aggregate disposition/reason codes, correctness/completion basis
+points, cost/latency ratios, unsafe-tool/missed-handoff counters, the summary
+digest, and the same correlation ID.
+
+Failure reason codes include `missing_receipt`, `wrong_decision`,
+`missing_rationale`, `unsafe_tool_intent`, `mandatory_handoff_missed`,
+`below_minimum_correctness`, `below_baseline_correctness`,
+`below_baseline_completion`, `cost_ratio_exceeded`,
+`latency_ratio_exceeded`, and the two zero-baseline ratio failures. Missing
+infrastructure/evidence remains blocked. Behavioral failure creates bounded
+improvement feedback and a new candidate attempt; it never creates promotion.
+
+For restart/recovery, rerun the same profile command with the same Captain job,
+attempt, suite, candidate, and policy bindings. The replay store resumes the
+durably prepared/fenced effect and rejects stale writers. If recovery is
+uncertain, preserve the evidence and stop; do not start a duplicate provider
+effect. After behavioral improvement, use the next Captain-authorized attempt
+(maximum five). Useful checks are:
+
+```powershell
+python -m pytest -q --no-cov tests/agent_factory/test_business_benchmark_replay.py
+python -m pytest -q --no-cov tests/gateway/test_factory_repository.py
+python -m pytest -q --no-cov tests/gateway/test_registry_feed.py
+```
+
+These synthetic/anonymized suites validate release behavior and regression
+resistance. They do not prove regulated-domain accuracy, legal compliance, or
+production performance; those require separately governed real-domain
+validation and live evidence.
+
 ## Recording evidence handoff
 
 The live integration owner exports a redacted
@@ -129,120 +228,6 @@ python -m docs.live_evidence_reporter `
 
 Absent input skips; configured but unreadable or rejected input fails. Never
 replace this with a fixture or claim the reporter itself called live services.
-
-## Six-skill paid live gate
-
-Run the six-skill live gate only after deterministic and database-resetting
-tests. The wrapper requires an explicit positive USD ceiling and an approved
-model. The ceiling accepts at most two fractional decimal places and is
-rejected before formatting, so the wrapper never rounds or widens a supplied
-budget. It checks the exact `captain_test` database, the running Docker test
-service, the six enabled Hermes skills and bundle, Codex authentication, and a
-runtime preflight without printing command output or secret values. It starts
-only the marked six-skill live test:
-
-```powershell
-pwsh -NoProfile -File scripts/run-hermes-factory-live-gate.ps1 `
-  -Mode demo -MaxCostUsd 5.00 -Model $env:CAPTAIN_FACTORY_MODEL
-```
-
-The wrapper loads only its explicit variable allowlist from local `.env` and
-`.env.captain-n8n` files. Existing process variables always win; dedicated
-`CAPTAIN_N8N_*` values then come from `.env.captain-n8n`, with root `.env` as
-the fallback. This n8n loading occurs only with `-WithN8n`. Without the switch,
-the wrapper removes inherited `CAPTAIN_N8N_*` variables before preflight and
-pytest and requires the live report to omit `n8n_evidence`. File contents and
-loaded values are never printed.
-
-Demo mode runs exactly one paid case and may emit `demo_ready` only. After its
-evidence is reviewed, release mode requires a controlled recovery followed by
-three distinct successful provider traces. A declared integration additionally
-uses `-WithN8n`; this requires the Captain n8n URL, API-key reference, and MCP
-lease-token reference to be present in the process environment. The wrapper
-does not start, stop, adopt, or modify the VibeMind-owned n8n deployment.
-
-The final report is written below the operating-system temporary directory, in
-a new run-specific directory, as `sha256-<digest>.json`. It is never written to
-tracked `artifacts/`. For both preflight and final report, the wrapper parses
-and canonically serializes the JSON before it rejects secret-like
-keys (including access tokens, raw prompts, private material, and paths),
-Bearer material, credential-bearing URLs, token-shaped values, absolute host
-paths, and every known DSN/password or opted-in n8n credential value. Normal
-URI schemes such as `artifact://`, `https://`, and `holdout://` remain valid.
-URI userinfo and passwords are blocked in both their raw percent-encoded and
-decoded forms. The preflight and final report must match their exact
-extra-forbid external schemas, including the six-name `skill_digests` mapping
-and the complete provider traces and receipt references. The wrapper then
-recomputes the final digest and rejects an incorrect mode or terminal status.
-It prints the report digest but not the report body or host path.
-
-### Runtime merge contract
-
-The runtime portion must expose the module
-`agenten.agent_factory.factory_live_entrypoint` with both interfaces below.
-This operations branch intentionally does not implement the composition root.
-
-The wrapper invokes the CLI preflight before it marks prerequisites confirmed:
-
-```text
-python -m agenten.agent_factory.factory_live_entrypoint preflight
-  --mode demo|release
-  --max-cost-usd <positive decimal with cents>
-  --model <approved model id>
-  --repository-root <assigned repository root>
-  --report-directory <external run directory>
-  --output <external preflight.json>
-  [--with-n8n]
-```
-
-The preflight output schema is
-`captain.hermes-six-skill-factory-preflight.v1`. It must set
-`prerequisites_confirmed`, `services_verified`, `codex_authenticated`, and
-`skills_verified` to `true`, bind `database_name=captain_test`, and contain
-exactly the six released skill names mapped to their verified lowercase
-SHA-256 digests. The preflight must also prove Gateway/service reachability and
-configuration required by the composition-neutral Factory live runner. It may
-write a redacted diagnostic to the external output path, but must not print
-provider, database, Gateway, Hermes, Codex, or n8n credentials.
-
-After successful preflight, the wrapper sets these process-only inputs:
-
-```text
-CAPTAIN_FACTORY_PREREQUISITES_CONFIRMED=1
-CAPTAIN_FACTORY_GATE_MODE=demo|release
-CAPTAIN_FACTORY_MAX_COST_USD=<decimal>
-CAPTAIN_FACTORY_MODEL=<model id>
-CAPTAIN_FACTORY_WITH_N8N=0|1
-CAPTAIN_FACTORY_REPORT_DIRECTORY=<external run directory>
-CAPTAIN_FACTORY_PREFLIGHT_PATH=<external preflight.json>
-```
-
-The marked live test imports and awaits
-`run_factory_live_gate_from_environment()`. The function returns either a
-mapping or a Pydantic model whose JSON dump equals the one persisted
-`captain.hermes-six-skill-factory-live-report.v1` report. It must propagate
-missing evidence or execution failure; after the wrapper confirms prerequisites
-it must never call `pytest.skip`. The live test converts any runner exception
-outside its original exception context to a generic traceback-free failure,
-and the wrapper suppresses both pytest output streams; neither surface may
-print provider errors or secrets. Provider traces contain distinct trace and
-Codex session IDs plus exact decimal USD receipts. Release output additionally
-contains recovery evidence. With n8n enabled, it also binds the workflow
-digest, MCP call ID, and real execution ID. The report contains neither raw
-prompts/holdouts nor secrets or absolute host paths. Codex session IDs are
-distinct per provider trace, every USD cost is a plain JSON decimal string,
-and an n8n workflow digest is exactly one lowercase SHA-256 value.
-
-Release mode must re-read the Gateway projection before it emits the report.
-Its exact `gateway_promotion` block contains `projection_status=ready_to_use`,
-a complete canonical `FactoryReleaseDecision` with `status=ready`, and a
-complete canonical Captain `FactoryEvidenceBlock` for the succeeded
-`capability_promoted` phase. Both contracts must bind to the report's job and
-correlation, while the promotion block also binds subject version and attempt
-and carries nonempty evidence references. The release decision's evaluation ID
-and reference are mandatory, and the exact evaluation reference must occur in
-the promotion block's artifact references. A terminal-status string alone is
-not release evidence.
 
 ## Expected projections
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
@@ -13,8 +15,16 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from agenten.agent_runtime.contracts import ArtifactRef, IDENTIFIER_PATTERN, SHA256_PATTERN
 
+from .business_benchmark_contracts import (
+    BusinessBenchmarkMetricId,
+    BusinessBenchmarkReasonCode,
+)
 from .contracts import FactoryLease, FactoryRole
-from .forge_contracts import FactoryBuildAssignmentV1
+from .forge_contracts import (
+    CodexBuildReceiptV1,
+    FactoryBuildAssignmentV1,
+    codex_build_receipt_sha256,
+)
 from .holdout_contracts import PrivateHoldoutRef
 from .outcome_contracts import AssertionOutcome, ExecutionOutcomeV1
 from .skill_evaluation import ReleasedHermesSkill, ToolGapMarker
@@ -43,6 +53,7 @@ class _FrozenContract(BaseModel):
 class FactorySkillStep(str, Enum):
     DISCOVER = "discover"
     BRIEF_CODEX = "brief_codex"
+    SEAL_CODEX_BUILD = "seal_codex_build"
     EXECUTE_TEAM = "execute_team"
     EVALUATE_TEAM = "evaluate_team"
     IMPROVE_TEAM = "improve_team"
@@ -52,26 +63,12 @@ class FactorySkillStep(str, Enum):
 FACTORY_SKILL_ID_BY_STEP: dict[FactorySkillStep, str] = {
     FactorySkillStep.DISCOVER: "captain-factory-discover",
     FactorySkillStep.BRIEF_CODEX: "captain-factory-brief-codex",
+    FactorySkillStep.SEAL_CODEX_BUILD: "captain-factory-seal-codex-build",
     FactorySkillStep.EXECUTE_TEAM: "captain-factory-execute-team",
     FactorySkillStep.EVALUATE_TEAM: "captain-factory-evaluate-team",
     FactorySkillStep.IMPROVE_TEAM: "captain-factory-improve-team",
     FactorySkillStep.REPORT_CAPTAIN: "captain-factory-report-captain",
 }
-
-# The released Hermes skills implement the Captain-owned factory workflow,
-# while a V3 job names the concrete capability it asks that workflow to build.
-# A job-specific release remains valid for backwards-compatible fixtures, but
-# a generic workflow release is the reusable production contract.
-FACTORY_WORKFLOW_CAPABILITY = "factory_workflow"
-
-
-def released_skill_capability_matches_job(
-    released_capability: str,
-    required_capability: str,
-) -> bool:
-    """Accept an exact legacy release or the reusable factory workflow skill."""
-
-    return released_capability in {required_capability, FACTORY_WORKFLOW_CAPABILITY}
 
 
 class FactoryFeedbackRecommendation(str, Enum):
@@ -118,11 +115,13 @@ class FactorySkillInvocationV1(_FrozenContract):
     acceptance_assertion_ids: tuple[str, ...] = Field(min_length=1)
     execution_scope_ref: PrivateHoldoutRef | None = None
 
-    @model_validator(mode="before")
-    @classmethod
-    def reject_private_content(cls, value: object) -> object:
-        _reject_private_content(value, "skill invocation")
-        return value
+    @model_validator(mode="after")
+    def reject_private_content(self) -> "FactorySkillInvocationV1":
+        _reject_private_content(
+            self.model_dump(mode="json", by_alias=True),
+            "skill invocation",
+        )
+        return self
 
     @field_validator("acceptance_assertion_ids")
     @classmethod
@@ -148,6 +147,7 @@ class FactorySkillInvocationV1(_FrozenContract):
 _STEP_ROLES: dict[FactorySkillStep, FactoryRole] = {
     FactorySkillStep.DISCOVER: FactoryRole.AGENT_ARCHITECT,
     FactorySkillStep.BRIEF_CODEX: FactoryRole.TOOL_INTEGRATOR,
+    FactorySkillStep.SEAL_CODEX_BUILD: FactoryRole.TOOL_INTEGRATOR,
     FactorySkillStep.EXECUTE_TEAM: FactoryRole.REAL_CASE_TESTER,
     FactorySkillStep.EVALUATE_TEAM: FactoryRole.QUALITY_WARDEN,
     FactorySkillStep.IMPROVE_TEAM: FactoryRole.TOOL_INTEGRATOR,
@@ -170,11 +170,13 @@ class _WorkflowArtifactBase(_FrozenContract):
 
     _required_step: ClassVar[FactorySkillStep | None] = None
 
-    @model_validator(mode="before")
-    @classmethod
-    def reject_private_content(cls, value: object) -> object:
-        _reject_private_content(value, "workflow artifact")
-        return value
+    @model_validator(mode="after")
+    def reject_private_content(self) -> "_WorkflowArtifactBase":
+        _reject_private_content(
+            self.model_dump(mode="json", by_alias=True),
+            "workflow artifact",
+        )
+        return self
 
     @field_validator("occurred_at")
     @classmethod
@@ -210,8 +212,23 @@ class _WorkflowArtifactBase(_FrozenContract):
             raise ValueError("workflow artifact invocation step does not match result type")
         if self.acceptance_assertion_ids != invocation.acceptance_assertion_ids:
             raise ValueError("workflow artifact invocation assertion binding does not match")
-        if not invocation.lease.issued_at <= self.occurred_at < invocation.lease.expires_at:
-            raise ValueError("workflow artifact must occur under an active lease")
+        original_lease_active = (
+            invocation.lease.issued_at
+            <= self.occurred_at
+            < invocation.lease.expires_at
+        )
+        recovery_binding = getattr(self, "runtime_retry_binding", None)
+        recovery_authority_active = (
+            self._required_step is FactorySkillStep.SEAL_CODEX_BUILD
+            and recovery_binding is not None
+            and recovery_binding.issued_at
+            <= self.occurred_at
+            < recovery_binding.expires_at
+        )
+        if not original_lease_active and not recovery_authority_active:
+            raise ValueError(
+                "workflow artifact must occur under an active lease or Captain recovery authority"
+            )
         return self
 
 
@@ -260,6 +277,8 @@ class CodexBuildBriefV1(_WorkflowArtifactBase):
     authorized_path_roots: tuple[str, ...] = Field(min_length=1)
     required_test_command_ids: tuple[str, ...] = Field(min_length=1)
     forbidden_effect_ids: tuple[str, ...] = ()
+    failed_benchmark_metric_ids: tuple[BusinessBenchmarkMetricId, ...] = ()
+    regression_benchmark_metric_ids: tuple[BusinessBenchmarkMetricId, ...] = ()
 
     _required_step: ClassVar[FactorySkillStep] = FactorySkillStep.BRIEF_CODEX
 
@@ -283,6 +302,19 @@ class CodexBuildBriefV1(_WorkflowArtifactBase):
         if any(re.fullmatch(IDENTIFIER_PATTERN, item) is None for item in value):
             raise ValueError("brief identifiers must be valid IDs")
         return _require_unique_ids(value, "brief IDs")
+
+    @field_validator(
+        "failed_benchmark_metric_ids",
+        "regression_benchmark_metric_ids",
+    )
+    @classmethod
+    def require_unique_benchmark_metric_ids(
+        cls,
+        value: tuple[BusinessBenchmarkMetricId, ...],
+    ) -> tuple[BusinessBenchmarkMetricId, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("brief benchmark metric IDs must not contain duplicates")
+        return value
 
     @model_validator(mode="after")
     def require_assignment_bindings(self) -> "CodexBuildBriefV1":
@@ -310,6 +342,154 @@ class CodexBuildBriefV1(_WorkflowArtifactBase):
             raise ValueError("build assignment idempotency key does not match invocation")
         if assignment.workspace_ref != self.invocation.lease.workspace_ref:
             raise ValueError("build assignment workspace does not match invocation lease")
+        if set(self.failed_benchmark_metric_ids) & set(
+            self.regression_benchmark_metric_ids
+        ):
+            raise ValueError(
+                "failed and regression benchmark metric IDs must be disjoint"
+            )
+        return self
+
+
+class FactoryRuntimeRetryEvidenceBindingV1(_FrozenContract):
+    """Public exact binding of one Captain-issued Codex recovery authority."""
+
+    schema_name: Literal["captain.factory-runtime-retry-evidence-binding.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    producer: Literal["captain"]
+    status: Literal["succeeded"]
+    job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    invocation_id: UUID
+    idempotency_key: str = Field(pattern=SHA256_PATTERN)
+    lease_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    checkpoint_ref: ArtifactRef
+    terminal_receipt_ref: ArtifactRef
+    workspace_ref: str = Field(pattern=r"^workspace://")
+    base_revision: str = Field(pattern=r"^[0-9a-f]{40,64}$")
+    scaffold_manifest_sha256: str = Field(pattern=SHA256_PATTERN)
+    brief_sha256: str = Field(pattern=SHA256_PATTERN)
+    resume_ordinal: int = Field(ge=1, le=2, strict=True)
+    maximum_runtime_seconds: int = Field(ge=1, le=900, strict=True)
+    issued_at: datetime
+    expires_at: datetime
+
+    @field_validator("issued_at", "expires_at")
+    @classmethod
+    def require_utc_timestamp(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("runtime retry evidence timestamp must be UTC")
+        return value
+
+    @model_validator(mode="after")
+    def require_bounded_window(self) -> "FactoryRuntimeRetryEvidenceBindingV1":
+        if self.expires_at <= self.issued_at:
+            raise ValueError("runtime retry evidence expiry must follow issuance")
+        if self.maximum_runtime_seconds > int(
+            (self.expires_at - self.issued_at).total_seconds()
+        ):
+            raise ValueError("runtime retry evidence runtime exceeds its window")
+        return self
+
+
+def factory_runtime_retry_evidence_binding(
+    authorization: BaseModel,
+) -> FactoryRuntimeRetryEvidenceBindingV1:
+    payload = authorization.model_dump(mode="json", by_alias=True)
+    payload.pop("authorization_ref", None)
+    payload["schema"] = "captain.factory-runtime-retry-evidence-binding.v1"
+    return FactoryRuntimeRetryEvidenceBindingV1.model_validate(payload)
+
+
+def factory_runtime_retry_evidence_binding_sha256(
+    binding: FactoryRuntimeRetryEvidenceBindingV1,
+) -> str:
+    content = json.dumps(
+        binding.model_dump(mode="json", by_alias=True),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(content).hexdigest()
+
+
+class CodexBuildEvidenceV1(_WorkflowArtifactBase):
+    """Hermes evidence for the Captain-sealed result of one Codex assignment."""
+
+    schema_name: Literal["hermes.factory-codex-build-evidence.v1"] = Field(
+        alias="schema",
+        serialization_alias="schema",
+    )
+    build_receipt_ref: ArtifactRef
+    build_receipt: CodexBuildReceiptV1
+    runtime_retry_ref: ArtifactRef | None = None
+    runtime_retry_binding: FactoryRuntimeRetryEvidenceBindingV1 | None = None
+    status: Literal["sealed"]
+
+    _required_step: ClassVar[FactorySkillStep] = FactorySkillStep.SEAL_CODEX_BUILD
+
+    @model_validator(mode="after")
+    def require_captain_receipt_bindings(self) -> "CodexBuildEvidenceV1":
+        receipt = self.build_receipt
+        invocation = self.invocation
+        if receipt.factory_job_id != self.job_id:
+            raise ValueError("Codex build receipt job mismatch")
+        if receipt.correlation_id != self.correlation_id:
+            raise ValueError("Codex build receipt correlation mismatch")
+        if receipt.subject_version != self.subject_version:
+            raise ValueError("Codex build receipt version mismatch")
+        if receipt.attempt != self.attempt:
+            raise ValueError("Codex build receipt attempt mismatch")
+        if receipt.seal_idempotency_key != invocation.idempotency_key:
+            raise ValueError("Codex build receipt idempotency mismatch")
+        if receipt.workspace_ref != invocation.lease.workspace_ref:
+            raise ValueError("Codex build receipt workspace mismatch")
+        if not _same_ref(receipt.build_brief_ref, invocation.input_ref):
+            raise ValueError("Codex build brief does not match invocation input")
+        if receipt.acceptance_assertion_ids != self.acceptance_assertion_ids:
+            raise ValueError("Codex build receipt assertion mismatch")
+        if receipt.completed_at > self.occurred_at:
+            raise ValueError("Codex build receipt was issued after workflow evidence")
+        if self.build_receipt_ref.media_type != "application/json":
+            raise ValueError("Codex build receipt ref must be application/json")
+        if self.build_receipt_ref.sha256 != codex_build_receipt_sha256(receipt):
+            raise ValueError("Codex build receipt digest mismatch")
+        if self.runtime_retry_ref is None and self.runtime_retry_binding is None:
+            if self.evidence_refs != (self.build_receipt_ref,):
+                raise ValueError(
+                    "Codex build evidence may reference only its Captain receipt"
+                )
+            return self
+        if self.runtime_retry_ref is None or self.runtime_retry_binding is None:
+            raise ValueError("Codex build recovery authority is incomplete")
+        if self.evidence_refs != (self.build_receipt_ref, self.runtime_retry_ref):
+            raise ValueError(
+                "Codex build recovery authority ref must be retained in evidence refs"
+            )
+        binding = self.runtime_retry_binding
+        binding_sha256 = factory_runtime_retry_evidence_binding_sha256(binding)
+        if (
+            self.runtime_retry_ref.sha256 != binding_sha256
+            or not self.runtime_retry_ref.uri.endswith(f"/{binding_sha256}")
+        ):
+            raise ValueError("Codex build recovery binding digest does not match authority ref")
+        if (
+            binding.job_id != invocation.job_id
+            or binding.correlation_id != invocation.correlation_id
+            or binding.subject_version != invocation.subject_version
+            or binding.attempt != invocation.attempt
+            or binding.invocation_id != invocation.invocation_id
+            or binding.idempotency_key != invocation.idempotency_key
+            or binding.lease_id != invocation.lease.lease_id
+            or binding.workspace_ref != invocation.lease.workspace_ref
+        ):
+            raise ValueError("Codex build recovery binding does not match invocation")
+        if not binding.issued_at <= self.occurred_at < binding.expires_at:
+            raise ValueError("Codex build occurred outside recovery authority")
         return self
 
 
@@ -367,6 +547,12 @@ class TeamEvaluationV1(_WorkflowArtifactBase):
     deterministic_check_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
     judge_ref: ArtifactRef | None = None
     prior_green_regression_ids: tuple[str, ...] = ()
+    benchmark_summary_ref: ArtifactRef | None = None
+    benchmark_policy_id: str | None = Field(default=None, pattern=IDENTIFIER_PATTERN)
+    benchmark_disposition: Literal["passed", "failed"] | None = None
+    benchmark_reason_codes: tuple[BusinessBenchmarkReasonCode, ...] = ()
+    failed_benchmark_metric_ids: tuple[BusinessBenchmarkMetricId, ...] = ()
+    prior_green_benchmark_metric_ids: tuple[BusinessBenchmarkMetricId, ...] = ()
     cost_summary_ref: ArtifactRef
     latency_summary_ref: ArtifactRef
     failure_class: Literal[
@@ -392,6 +578,26 @@ class TeamEvaluationV1(_WorkflowArtifactBase):
     def require_unique_regression_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return _require_unique_ids(value, "prior-green regression IDs")
 
+    @field_validator(
+        "benchmark_reason_codes",
+        "failed_benchmark_metric_ids",
+        "prior_green_benchmark_metric_ids",
+    )
+    @classmethod
+    def require_unique_benchmark_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _require_unique_ids(value, "business benchmark IDs")
+
+    @field_validator("benchmark_summary_ref")
+    @classmethod
+    def require_canonical_benchmark_summary_ref(
+        cls, value: ArtifactRef | None
+    ) -> ArtifactRef | None:
+        if value is not None and value.uri != (
+            f"artifact://business-benchmark-summary/{value.sha256}"
+        ):
+            raise ValueError("business benchmark summary ref must be canonical")
+        return value
+
     @model_validator(mode="after")
     def require_captain_assertion_outcomes(self) -> "TeamEvaluationV1":
         outcome_ids = tuple(item.assertion_id for item in self.assertion_outcomes)
@@ -401,7 +607,71 @@ class TeamEvaluationV1(_WorkflowArtifactBase):
             raise ValueError("evaluation must contain exactly the Captain assertion IDs")
         if set(self.prior_green_regression_ids) - accepted:
             raise ValueError("prior-green regression IDs must be Captain assertion IDs")
+        binding = (
+            self.benchmark_summary_ref,
+            self.benchmark_policy_id,
+            self.benchmark_disposition,
+        )
+        if any(item is not None for item in binding) and any(
+            item is None for item in binding
+        ):
+            raise ValueError("business benchmark binding must be complete")
+        if self.benchmark_summary_ref is None and (
+            self.benchmark_reason_codes
+            or self.failed_benchmark_metric_ids
+            or self.prior_green_benchmark_metric_ids
+        ):
+            raise ValueError("legacy evaluation cannot contain unbound benchmark results")
+        if (
+            self.benchmark_summary_ref is not None
+            and self.benchmark_summary_ref not in self.evidence_refs
+        ):
+            raise ValueError("business benchmark summary ref must be evaluation evidence")
+        if self.benchmark_disposition == "passed" and (
+            self.benchmark_reason_codes or self.failed_benchmark_metric_ids
+        ):
+            raise ValueError("passed business benchmark cannot contain failures")
+        if (
+            self.benchmark_disposition == "failed"
+            and not self.failed_benchmark_metric_ids
+        ):
+            raise ValueError("failed business benchmark requires failed metric IDs")
+        if set(self.failed_benchmark_metric_ids) & set(
+            self.prior_green_benchmark_metric_ids
+        ):
+            raise ValueError(
+                "failed and prior-green benchmark metric IDs must not overlap"
+            )
         return self
+
+
+def effective_team_execution_evidence(
+    evidence: tuple[TeamExecutionEvidenceV1, ...],
+) -> tuple[TeamExecutionEvidenceV1, ...]:
+    """Project the latest explicitly authorized evidence for each run scope."""
+
+    effective: dict[int, TeamExecutionEvidenceV1] = {}
+    for item in evidence:
+        prior = effective.get(item.run_number)
+        if prior is None:
+            effective[item.run_number] = item
+            continue
+        authorized = tuple(
+            reference
+            for reference in item.evidence_refs
+            if reference.uri.startswith(
+                "artifact://factory/technical-revalidation/"
+            )
+        )
+        if (
+            prior.status == "succeeded"
+            or item.candidate_ref != prior.candidate_ref
+            or item.holdout_ref != prior.holdout_ref
+            or len(authorized) != 1
+        ):
+            raise ValueError("team execution revalidation is stale, mixed, or unauthorized")
+        effective[item.run_number] = item
+    return tuple(effective[number] for number in sorted(effective))
 
 
 class CandidateRevisionV1(_WorkflowArtifactBase):
@@ -410,9 +680,11 @@ class CandidateRevisionV1(_WorkflowArtifactBase):
     )
     parent_candidate_ref: ArtifactRef
     candidate_ref: ArtifactRef
-    failed_assertion_ids: tuple[str, ...] = Field(min_length=1)
+    failed_assertion_ids: tuple[str, ...] = ()
+    failed_benchmark_metric_ids: tuple[BusinessBenchmarkMetricId, ...] = ()
     changed_components: tuple[CandidateChangedComponent, ...] = Field(min_length=1)
     regression_assertion_ids: tuple[str, ...] = ()
+    regression_benchmark_metric_ids: tuple[BusinessBenchmarkMetricId, ...] = ()
     codex_session_ref: ArtifactRef
 
     _required_step: ClassVar[FactorySkillStep] = FactorySkillStep.IMPROVE_TEAM
@@ -421,6 +693,15 @@ class CandidateRevisionV1(_WorkflowArtifactBase):
     @classmethod
     def require_unique_assertions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return _require_unique_ids(value, "revision assertion IDs")
+
+    @field_validator(
+        "failed_benchmark_metric_ids", "regression_benchmark_metric_ids"
+    )
+    @classmethod
+    def require_unique_benchmark_metrics(
+        cls, value: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        return _require_unique_ids(value, "revision benchmark metric IDs")
 
     @field_validator("changed_components")
     @classmethod
@@ -440,6 +721,14 @@ class CandidateRevisionV1(_WorkflowArtifactBase):
             raise ValueError("revision assertion IDs must be Captain assertion IDs")
         if set(self.failed_assertion_ids) & set(self.regression_assertion_ids):
             raise ValueError("failed and regression assertion IDs must not overlap")
+        if not self.failed_assertion_ids and not self.failed_benchmark_metric_ids:
+            raise ValueError(
+                "candidate revision requires a failed assertion or benchmark metric"
+            )
+        if set(self.failed_benchmark_metric_ids) & set(
+            self.regression_benchmark_metric_ids
+        ):
+            raise ValueError("failed and regression benchmark metric IDs must not overlap")
         return self
 
 
@@ -504,10 +793,22 @@ def _require_unique_ids(value: tuple[str, ...], label: str) -> tuple[str, ...]:
 
 
 def _require_unique_refs(value: tuple[ArtifactRef, ...], label: str) -> tuple[ArtifactRef, ...]:
-    identities = tuple((item.uri, item.sha256, item.media_type) for item in value)
+    identities = tuple(_ref_identity(item) for item in value)
     if len(identities) != len(set(identities)):
         raise ValueError(f"{label} must not contain duplicates")
     return value
+
+
+def _ref_identity(value: object) -> tuple[str, str, str]:
+    return (
+        str(getattr(value, "uri")),
+        str(getattr(value, "sha256")),
+        str(getattr(value, "media_type")),
+    )
+
+
+def _same_ref(left: object, right: object) -> bool:
+    return _ref_identity(left) == _ref_identity(right)
 
 
 def _reject_private_content(value: object, context: str) -> None:

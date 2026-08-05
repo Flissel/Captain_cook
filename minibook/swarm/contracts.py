@@ -1,6 +1,8 @@
 """Strict JSON contracts for the Minibook creation boundary."""
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from datetime import datetime, timezone
 from typing import Literal
@@ -139,8 +141,6 @@ class CreationJobV1(_FrozenContract):
     released_skill: ReleasedSkillRefV1
     public_assertion_ids: tuple[str, ...] = Field(min_length=1)
     deadline_at: datetime
-    # Opaque Captain authority only; Minibook must never mint this identity.
-    architect_lease_id: str | None = Field(default=None, pattern=IDENTIFIER_PATTERN)
 
     @field_validator("deadline_at")
     @classmethod
@@ -169,9 +169,220 @@ class CreationProgressV1(_FrozenContract):
     creation_job_id: UUID
     subject_version: int = Field(ge=1, strict=True)
     attempt: int = Field(ge=1, le=5, strict=True)
-    status: Literal["queued", "running", "awaiting_tool_integrator", "blocked", "failed", "cancelled", "succeeded"]
+    status: Literal["queued", "running", "blocked", "failed", "cancelled", "succeeded"]
     checkpoint: str | None = Field(default=None, pattern=IDENTIFIER_PATTERN)
     version: int = Field(ge=1, strict=True)
+
+
+class ForgeBuildSkillUsageReceiptV1(_FrozenContract):
+    schema_name: Literal["hermes.forge-build-skill-usage-receipt.v1"] = Field(
+        default="hermes.forge-build-skill-usage-receipt.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    producer: Literal["hermes"]
+    outcome: Literal["fulfilled"]
+    creation_job_id: UUID
+    factory_job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    idempotency_key: str = Field(pattern=SHA256_PATTERN)
+    released_skill: ReleasedSkillRefV1
+    public_assertion_ids: tuple[str, ...] = Field(min_length=1)
+    evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
+
+    @field_validator("public_assertion_ids")
+    @classmethod
+    def require_unique_assertions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)) or any(not item for item in value):
+            raise ValueError("public assertion ids must be unique and nonblank")
+        return value
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def require_unique_evidence_refs(
+        cls,
+        value: tuple[ArtifactRef, ...],
+    ) -> tuple[ArtifactRef, ...]:
+        identities = tuple((ref.uri, ref.sha256, ref.media_type) for ref in value)
+        if len(identities) != len(set(identities)):
+            raise ValueError("skill usage evidence refs must be unique")
+        return value
+
+
+class CodexBuildReceiptV1(_FrozenContract):
+    """Minibook mirror of Captain's sealed Codex build receipt."""
+
+    schema_name: Literal["captain.codex-build-receipt.v1"] = Field(
+        default="captain.codex-build-receipt.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    receipt_id: UUID
+    producer: Literal["captain"]
+    outcome: Literal["sealed"]
+    assignment_id: UUID
+    creation_job_id: UUID
+    factory_job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    idempotency_key: str = Field(pattern=SHA256_PATTERN)
+    seal_idempotency_key: str = Field(pattern=SHA256_PATTERN)
+    build_brief_ref: ArtifactRef
+    codex_session_ref: ArtifactRef
+    workspace_ref: str = Field(pattern=r"^workspace://[A-Za-z0-9._:/-]+$")
+    workspace_snapshot_ref: ArtifactRef
+    source_archive_ref: ArtifactRef
+    candidate_manifest_ref: ArtifactRef
+    test_evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
+    acceptance_assertion_ids: tuple[str, ...] = Field(min_length=1)
+    completed_at: datetime
+
+    @field_validator("completed_at")
+    @classmethod
+    def require_completed_at_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("Codex build completion timestamp must be UTC")
+        return value
+
+    @field_validator("acceptance_assertion_ids")
+    @classmethod
+    def require_unique_public_assertions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)) or any(not item for item in value):
+            raise ValueError("Codex build assertion ids must be unique and nonblank")
+        return value
+
+    @field_validator("test_evidence_refs")
+    @classmethod
+    def require_unique_test_evidence(
+        cls, value: tuple[ArtifactRef, ...]
+    ) -> tuple[ArtifactRef, ...]:
+        identities = tuple((ref.uri, ref.sha256, ref.media_type) for ref in value)
+        if len(identities) != len(set(identities)):
+            raise ValueError("Codex build test evidence refs must be unique")
+        return value
+
+    @model_validator(mode="after")
+    def require_build_media_types(self) -> "CodexBuildReceiptV1":
+        if self.source_archive_ref.media_type != "application/zip":
+            raise ValueError("Codex source archive must be application/zip")
+        if self.candidate_manifest_ref.media_type != "application/json":
+            raise ValueError("Codex candidate manifest must be application/json")
+        if self.workspace_snapshot_ref.media_type != "application/zip":
+            raise ValueError("Codex workspace snapshot must be application/zip")
+        sealed_refs = (
+            self.build_brief_ref,
+            self.codex_session_ref,
+            self.workspace_snapshot_ref,
+            self.candidate_manifest_ref,
+            self.source_archive_ref,
+            *self.test_evidence_refs,
+        )
+        identities = tuple(
+            (ref.uri, ref.sha256, ref.media_type) for ref in sealed_refs
+        )
+        if len(identities) != len(set(identities)):
+            raise ValueError("sealed Codex build refs must be distinct")
+        return self
+
+
+class CreationJobV2(CreationJobV1):
+    """Minibook mirror for a Captain-sealed Codex source archive."""
+
+    schema_name: Literal["minibook.creation-job.v2"] = Field(
+        default="minibook.creation-job.v2",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    source_archive_ref: ArtifactRef
+    codex_build_receipt: CodexBuildReceiptV1
+    codex_build_receipt_ref: ArtifactRef
+
+    @field_validator("source_archive_ref")
+    @classmethod
+    def require_captain_source_zip(cls, value: ArtifactRef) -> ArtifactRef:
+        if value.media_type != "application/zip":
+            raise ValueError("Captain source archive must be application/zip")
+        return value
+
+    @field_validator("codex_build_receipt_ref")
+    @classmethod
+    def require_codex_receipt_json(cls, value: ArtifactRef) -> ArtifactRef:
+        if value.media_type != "application/json":
+            raise ValueError("Codex build receipt must be application/json")
+        return value
+
+    @model_validator(mode="after")
+    def require_exact_codex_build_binding(self) -> "CreationJobV2":
+        receipt = self.codex_build_receipt
+        if (
+            receipt.creation_job_id != self.creation_job_id
+            or receipt.factory_job_id != self.factory_job_id
+            or receipt.correlation_id != self.correlation_id
+            or receipt.subject_version != self.subject_version
+            or receipt.attempt != self.attempt
+            or receipt.idempotency_key != self.idempotency_key
+            or receipt.acceptance_assertion_ids != self.public_assertion_ids
+            or receipt.source_archive_ref.sha256 != self.source_archive_ref.sha256
+            or receipt.source_archive_ref.media_type != self.source_archive_ref.media_type
+        ):
+            raise ValueError("Codex build receipt does not match creation job")
+        canonical_receipt = json.dumps(
+            receipt.model_dump(mode="json", by_alias=True),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if (
+            self.codex_build_receipt_ref.media_type != "application/json"
+            or self.codex_build_receipt_ref.sha256
+            != hashlib.sha256(canonical_receipt).hexdigest()
+        ):
+            raise ValueError("Codex build receipt ref canonical digest does not match")
+        return self
+
+
+class CreationPackageManifestV1(_FrozenContract):
+    schema_name: Literal["minibook.creation-package-manifest.v1"] = Field(
+        default="minibook.creation-package-manifest.v1",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    creation_job_id: UUID
+    factory_job_id: UUID
+    correlation_id: UUID
+    subject_version: int = Field(ge=1, strict=True)
+    attempt: int = Field(ge=1, le=5, strict=True)
+    candidate_manifest_ref: ArtifactRef
+    source_archive_ref: ArtifactRef
+    skill_usage_receipt_ref: ArtifactRef
+
+    @model_validator(mode="after")
+    def require_executable_media_types(self) -> "CreationPackageManifestV1":
+        if self.candidate_manifest_ref.media_type != "application/json":
+            raise ValueError("candidate manifest must be application/json")
+        if self.source_archive_ref.media_type != "application/zip":
+            raise ValueError("candidate source must be application/zip")
+        if self.skill_usage_receipt_ref.media_type != "application/json":
+            raise ValueError("skill usage receipt must be application/json")
+        return self
+
+
+class CreationPackageManifestV2(CreationPackageManifestV1):
+    schema_name: Literal["minibook.creation-package-manifest.v2"] = Field(
+        default="minibook.creation-package-manifest.v2",
+        alias="schema",
+        serialization_alias="schema",
+    )
+    codex_build_receipt_ref: ArtifactRef
+
+    @field_validator("codex_build_receipt_ref")
+    @classmethod
+    def require_codex_receipt_json(cls, value: ArtifactRef) -> ArtifactRef:
+        if value.media_type != "application/json":
+            raise ValueError("Codex build receipt must be application/json")
+        return value
 
 
 class CreationResultV1(_FrozenContract):
@@ -201,163 +412,6 @@ class CreationResultV1(_FrozenContract):
         elif self.failure is None:
             raise ValueError("non-success result requires failure")
         return self
-
-
-class FactoryEvidenceBlockV1(_FrozenContract):
-    """Hermes-authored evidence projected by Minibook, never Captain authority."""
-
-    schema_name: Literal["captain.agent-factory-block.v1"] = Field(
-        default="captain.agent-factory-block.v1",
-        alias="schema",
-        serialization_alias="schema",
-    )
-    event_id: UUID
-    job_id: UUID
-    correlation_id: UUID
-    causation_id: UUID
-    occurred_at: datetime
-    producer: Literal["hermes"]
-    subject_version: int = Field(ge=1, strict=True)
-    attempt: int = Field(ge=1, le=5, strict=True)
-    phase: Literal[
-        "blueprint_created",
-        "tool_candidate_tested",
-        "agent_code_created",
-    ]
-    role: Literal["agent_architect", "tool_integrator"]
-    status: Literal["succeeded"]
-    artifact_refs: tuple[ArtifactRef, ...] = ()
-    evidence_refs: tuple[ArtifactRef, ...] = Field(min_length=1)
-    assertion_ids: tuple[str, ...] = ()
-    lease_id: str = Field(pattern=IDENTIFIER_PATTERN)
-
-    @field_validator("occurred_at")
-    @classmethod
-    def require_evidence_timestamp_utc(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
-            raise ValueError("evidence timestamp must be UTC")
-        return value
-
-    @field_validator("assertion_ids")
-    @classmethod
-    def require_unique_evidence_assertions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if len(value) != len(set(value)) or any(not item for item in value):
-            raise ValueError("evidence assertion ids must be unique and nonblank")
-        return value
-
-    @model_validator(mode="after")
-    def require_role_and_content_addresses(self) -> "FactoryEvidenceBlockV1":
-        expected_role = {
-            "blueprint_created": "agent_architect",
-            "tool_candidate_tested": "tool_integrator",
-            "agent_code_created": "tool_integrator",
-        }[self.phase]
-        if self.role != expected_role:
-            raise ValueError("factory evidence role does not match its phase")
-        for reference in (*self.artifact_refs, *self.evidence_refs):
-            _require_content_address(reference)
-        return self
-
-
-class CreationResumeGrantV1(_FrozenContract):
-    schema_name: Literal["minibook.creation-resume-grant.v1"] = Field(
-        default="minibook.creation-resume-grant.v1", alias="schema", serialization_alias="schema"
-    )
-    creation_job_id: UUID
-    tool_integrator_lease_id: str = Field(pattern=IDENTIFIER_PATTERN)
-
-
-class CreationPreparationEvidenceV1(_FrozenContract):
-    schema_name: Literal["minibook.creation-preparation-evidence.v1"] = Field(
-        default="minibook.creation-preparation-evidence.v1",
-        alias="schema",
-        serialization_alias="schema",
-    )
-    creation_job: CreationJobV1
-    blocks: tuple[FactoryEvidenceBlockV1, FactoryEvidenceBlockV1]
-
-    @model_validator(mode="after")
-    def require_exact_preparation_chain(self) -> "CreationPreparationEvidenceV1":
-        job = self.creation_job
-        if tuple(block.phase for block in self.blocks) != (
-            "blueprint_created",
-            "tool_candidate_tested",
-        ):
-            raise ValueError("preparation evidence requires blueprint then tool evidence")
-        if self.blocks[0].occurred_at >= self.blocks[1].occurred_at:
-            raise ValueError("preparation evidence timestamps must be monotonic")
-        if self.blocks[1].occurred_at >= job.deadline_at:
-            raise ValueError("preparation evidence must precede the creation deadline")
-        if len({block.event_id for block in self.blocks}) != 2:
-            raise ValueError("preparation evidence event ids must be unique")
-        for block in self.blocks:
-            _require_block_job_binding(job, block)
-        return self
-
-
-class CreationCompletionEvidenceV1(_FrozenContract):
-    schema_name: Literal["minibook.creation-completion-evidence.v1"] = Field(
-        default="minibook.creation-completion-evidence.v1",
-        alias="schema",
-        serialization_alias="schema",
-    )
-    result: CreationResultV1
-    block: FactoryEvidenceBlockV1
-
-    @model_validator(mode="after")
-    def require_success_content_chain(self) -> "CreationCompletionEvidenceV1":
-        result = self.result
-        block = self.block
-        if result.status != "succeeded":
-            raise ValueError("completion evidence requires a succeeded result")
-        if block.phase != "agent_code_created":
-            raise ValueError("completion evidence requires agent code evidence")
-        assert result.package_manifest_ref is not None
-        assert result.skill_usage_receipt_ref is not None
-        references = (
-            result.package_manifest_ref,
-            result.skill_usage_receipt_ref,
-            *result.artifact_refs,
-            *result.evidence_refs,
-        )
-        if result.private_skill_candidate_ref is not None:
-            references = (*references, result.private_skill_candidate_ref)
-        for reference in references:
-            _require_content_address(reference)
-        if block.evidence_refs != (
-            result.package_manifest_ref,
-            result.skill_usage_receipt_ref,
-        ):
-            raise ValueError("completion block must bind package and skill receipt")
-        return self
-
-
-class CreationEvidenceReceiptV1(_FrozenContract):
-    creation_job_id: UUID
-    replayed: bool = False
-
-
-def _require_content_address(reference: ArtifactRef) -> None:
-    if (
-        "?" in reference.uri
-        or "#" in reference.uri
-        or reference.uri.rstrip("/").rsplit("/", 1)[-1] != reference.sha256
-    ):
-        raise ValueError("evidence refs must be content-addressed")
-
-
-def _require_block_job_binding(
-    job: CreationJobV1,
-    block: FactoryEvidenceBlockV1,
-) -> None:
-    if (
-        block.job_id != job.factory_job_id
-        or block.correlation_id != job.correlation_id
-        or block.causation_id != job.causation_id
-        or block.subject_version != job.subject_version
-        or block.attempt != job.attempt
-    ):
-        raise ValueError("factory evidence is not bound to the creation job")
 
 
 class FactoryBuildAssignmentV1(_FrozenContract):

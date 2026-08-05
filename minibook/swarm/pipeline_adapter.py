@@ -1,30 +1,27 @@
 """Named, resumable step adapter around the legacy SwarmPipeline."""
 from __future__ import annotations
 
-import asyncio
 import hashlib
-import io
 import json
-import os
-import re
-import zipfile
-from datetime import datetime, timezone
-from pathlib import Path
+from dataclasses import dataclass
+from io import BytesIO
 from enum import Enum
-from typing import Any, Callable, Protocol
-from uuid import UUID, uuid5
+from pathlib import PurePosixPath
+from typing import Any, Callable, Protocol, get_type_hints
+import zipfile
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from .contracts import (
     ArtifactRef,
-    CreationCompletionEvidenceV1,
+    CodexBuildReceiptV1,
     CreationFailure,
     CreationJobV1,
-    CreationPreparationEvidenceV1,
+    CreationJobV2,
+    CreationPackageManifestV1,
+    CreationPackageManifestV2,
     CreationResultV1,
-    FactoryEvidenceBlockV1,
-    ToolGapMarkerV1,
+    ForgeBuildSkillUsageReceiptV1,
 )
 from .runner import StepOutcome
 
@@ -50,14 +47,9 @@ class SwarmStep(str, Enum):
 PIPELINE_STEP_ORDER = tuple(SwarmStep)
 
 
-class LegacySwarmStepIncomplete(RuntimeError):
-    """A legacy method returned without completing its claimed agent stage."""
-
-
 class SwarmSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
-    creation_job_id: UUID
-    tool_integrator_lease_id: str | None = None
+    creation_job_id: object
     completed_steps: tuple[str, ...] = ()
     output_digests: dict[str, str] = Field(default_factory=dict)
     artifact_bindings: dict[str, ArtifactRef] = Field(default_factory=dict)
@@ -65,551 +57,498 @@ class SwarmSnapshot(BaseModel):
     external_receipt_ids: dict[str, str] = Field(default_factory=dict)
     package_manifest_ref: ArtifactRef | None = None
     skill_usage_receipt_ref: ArtifactRef | None = None
-    pipeline_state_ref: ArtifactRef | None = None
-    tool_gaps: tuple[ToolGapMarkerV1, ...] = ()
-    evidence_step_refs: dict[str, ArtifactRef] = Field(default_factory=dict)
-    evidence_step_times: dict[str, datetime] = Field(default_factory=dict)
 
 
-class ContentAddressedCreationArtifacts:
-    """Small immutable artifact store owned by the opt-in creation runtime."""
+@dataclass(frozen=True)
+class CreationExportBundle:
+    """Typed bytes produced by an upgraded Builder/Export implementation."""
 
-    def __init__(self, root: Path) -> None:
-        self.root = root.resolve()
-        self._content_root = self.root / "content" / "sha256"
-        self._content_root.mkdir(parents=True, exist_ok=True)
+    source_archive: bytes
+    candidate_manifest: dict[str, Any]
+    skill_usage_receipt: bytes
+    captain_sealed_source: bool = False
 
-    def put(
+
+class CreationExportReceiptV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+    schema_name: str = Field(
+        default="minibook.creation-export-receipt.v1",
+        alias="schema",
+        serialization_alias="schema",
+        pattern=r"^minibook\.creation-export-receipt\.v1$",
+    )
+    receipt_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    package_manifest_ref: ArtifactRef
+    candidate_manifest_ref: ArtifactRef
+    source_archive_ref: ArtifactRef
+    skill_usage_receipt_ref: ArtifactRef
+
+
+class CreationExportReceiptV2(CreationExportReceiptV1):
+    schema_name: str = Field(
+        default="minibook.creation-export-receipt.v2",
+        alias="schema",
+        serialization_alias="schema",
+        pattern=r"^minibook\.creation-export-receipt\.v2$",
+    )
+    codex_build_receipt_ref: ArtifactRef
+
+
+class CreationArtifactSink(Protocol):
+    def put(self, content: bytes, media_type: str, *, namespace: str) -> object: ...
+
+    def read_bytes(self, reference: object) -> bytes: ...
+
+
+class CreationArtifactPublisher(Protocol):
+    def publish(
+        self,
+        job: CreationJobV1 | CreationJobV2,
+        bundle: CreationExportBundle,
+    ) -> CreationExportReceiptV1 | CreationExportReceiptV2: ...
+
+    def accept_receipt(
+        self,
+        job: CreationJobV1 | CreationJobV2,
+        receipt: CreationExportReceiptV1 | CreationExportReceiptV2,
+    ) -> CreationExportReceiptV1 | CreationExportReceiptV2: ...
+
+
+class ContentAddressedCreationArtifactPublisher:
+    """Publish real export bytes and return only digest-bound immutable refs."""
+
+    def __init__(self, sink: CreationArtifactSink) -> None:
+        self._sink = sink
+
+    def publish(
+        self,
+        job: CreationJobV1 | CreationJobV2,
+        bundle: CreationExportBundle,
+    ) -> CreationExportReceiptV1 | CreationExportReceiptV2:
+        is_v2 = isinstance(job, CreationJobV2)
+        if is_v2 != bundle.captain_sealed_source:
+            raise ValueError("creation source provenance does not match the creation job")
+        self._validate_archive(
+            bundle.source_archive,
+            forbid_external_skill_receipt=is_v2,
+            require_candidate_manifest=is_v2,
+        )
+        if is_v2 and hashlib.sha256(bundle.source_archive).hexdigest() != (
+            job.source_archive_ref.sha256
+        ):
+            raise ValueError("Captain source archive digest does not match creation job")
+        if is_v2:
+            self._require_exact_captain_source(
+                job,
+                bundle.source_archive,
+                candidate_manifest=bundle.candidate_manifest,
+            )
+        source_ref = self._put_checked(
+            bundle.source_archive,
+            "application/zip",
+            namespace="forge-source",
+        )
+        manifest = dict(bundle.candidate_manifest)
+        existing_source = manifest.get("source_archive_ref")
+        serialized_source = source_ref.model_dump(mode="json")
+        if existing_source is not None and existing_source != serialized_source:
+            raise ValueError("candidate manifest source archive binding changed")
+        manifest["source_archive_ref"] = serialized_source
+        if manifest.get("schema", manifest.get("schema_name")) != "captain.factory-candidate.v1":
+            raise ValueError("candidate manifest schema is invalid")
+        candidate_bytes = _canonical_json(manifest)
+        candidate_ref = self._put_checked(
+            candidate_bytes,
+            "application/json",
+            namespace="forge-candidate-manifest",
+        )
+        skill_usage_receipt = self._parse_skill_usage_receipt(
+            bundle.skill_usage_receipt
+        )
+        self._require_exact_skill_usage_receipt(job, skill_usage_receipt)
+        skill_ref = self._put_checked(
+            bundle.skill_usage_receipt,
+            "application/json",
+            namespace="forge-skill-receipt",
+        )
+        codex_receipt_ref: ArtifactRef | None = None
+        package: CreationPackageManifestV1 | CreationPackageManifestV2
+        if is_v2:
+            codex_receipt_bytes = _canonical_json(
+                job.codex_build_receipt.model_dump(mode="json", by_alias=True)
+            )
+            if hashlib.sha256(codex_receipt_bytes).hexdigest() != (
+                job.codex_build_receipt_ref.sha256
+            ):
+                raise ValueError("Codex build receipt canonical digest changed")
+            codex_receipt_ref = self._put_checked(
+                codex_receipt_bytes,
+                "application/json",
+                namespace="captain-codex-build-receipt",
+            )
+            if (
+                codex_receipt_ref.sha256 != job.codex_build_receipt_ref.sha256
+                or codex_receipt_ref.media_type
+                != job.codex_build_receipt_ref.media_type
+            ):
+                raise ValueError("Codex build receipt CAS binding changed")
+            package = CreationPackageManifestV2(
+                creation_job_id=job.creation_job_id,
+                factory_job_id=job.factory_job_id,
+                correlation_id=job.correlation_id,
+                subject_version=job.subject_version,
+                attempt=job.attempt,
+                candidate_manifest_ref=candidate_ref,
+                source_archive_ref=source_ref,
+                skill_usage_receipt_ref=skill_ref,
+                codex_build_receipt_ref=codex_receipt_ref,
+            )
+        else:
+            package = CreationPackageManifestV1(
+                creation_job_id=job.creation_job_id,
+                factory_job_id=job.factory_job_id,
+                correlation_id=job.correlation_id,
+                subject_version=job.subject_version,
+                attempt=job.attempt,
+                candidate_manifest_ref=candidate_ref,
+                source_archive_ref=source_ref,
+                skill_usage_receipt_ref=skill_ref,
+            )
+        package_ref = self._put_checked(
+            _canonical_json(package.model_dump(mode="json", by_alias=True)),
+            "application/json",
+            namespace="forge-package-manifest",
+        )
+        receipt_values = {
+            "receipt_id": self._receipt_id(
+                job,
+                package_ref=package_ref,
+                candidate_ref=candidate_ref,
+                source_ref=source_ref,
+                skill_ref=skill_ref,
+                codex_receipt_ref=codex_receipt_ref,
+            ),
+            "package_manifest_ref": package_ref,
+            "candidate_manifest_ref": candidate_ref,
+            "source_archive_ref": source_ref,
+            "skill_usage_receipt_ref": skill_ref,
+        }
+        receipt: CreationExportReceiptV1 | CreationExportReceiptV2
+        if codex_receipt_ref is None:
+            receipt = CreationExportReceiptV1(**receipt_values)
+        else:
+            receipt = CreationExportReceiptV2(
+                **receipt_values,
+                codex_build_receipt_ref=codex_receipt_ref,
+            )
+        return self.accept_receipt(job, receipt)
+
+    def accept_receipt(
+        self,
+        job: CreationJobV1 | CreationJobV2,
+        receipt: CreationExportReceiptV1 | CreationExportReceiptV2,
+    ) -> CreationExportReceiptV1 | CreationExportReceiptV2:
+        receipt_type = (
+            CreationExportReceiptV2
+            if isinstance(job, CreationJobV2)
+            else CreationExportReceiptV1
+        )
+        canonical = receipt_type.model_validate(
+            receipt.model_dump(mode="json", by_alias=True)
+        )
+        package_bytes = self._read_checked(
+            canonical.package_manifest_ref,
+            "application/json",
+            label="creation package manifest",
+        )
+        candidate_bytes = self._read_checked(
+            canonical.candidate_manifest_ref,
+            "application/json",
+            label="candidate manifest",
+        )
+        source_bytes = self._read_checked(
+            canonical.source_archive_ref,
+            "application/zip",
+            label="candidate source archive",
+        )
+        skill_bytes = self._read_checked(
+            canonical.skill_usage_receipt_ref,
+            "application/json",
+            label="skill usage receipt",
+        )
+        codex_receipt_bytes: bytes | None = None
+        if isinstance(canonical, CreationExportReceiptV2):
+            codex_receipt_bytes = self._read_checked(
+                canonical.codex_build_receipt_ref,
+                "application/json",
+                label="Codex build receipt",
+            )
+        try:
+            package_type = (
+                CreationPackageManifestV2
+                if isinstance(job, CreationJobV2)
+                else CreationPackageManifestV1
+            )
+            package = package_type.model_validate_json(package_bytes)
+        except ValueError as exc:
+            raise ValueError("creation package manifest is invalid") from exc
+        if (
+            package.creation_job_id != job.creation_job_id
+            or package.factory_job_id != job.factory_job_id
+            or package.correlation_id != job.correlation_id
+            or package.subject_version != job.subject_version
+            or package.attempt != job.attempt
+        ):
+            raise ValueError("creation package does not match replay job")
+        if (
+            package.candidate_manifest_ref != canonical.candidate_manifest_ref
+            or package.source_archive_ref != canonical.source_archive_ref
+        ):
+            raise ValueError("creation package artifact bindings changed")
+        if (
+            package.skill_usage_receipt_ref
+            != canonical.skill_usage_receipt_ref
+        ):
+            raise ValueError("creation package skill usage receipt binding changed")
+        if isinstance(job, CreationJobV2):
+            if (
+                not isinstance(package, CreationPackageManifestV2)
+                or not isinstance(canonical, CreationExportReceiptV2)
+                or package.codex_build_receipt_ref
+                != canonical.codex_build_receipt_ref
+                or codex_receipt_bytes is None
+            ):
+                raise ValueError("Codex build receipt package binding changed")
+            try:
+                persisted_codex_receipt = CodexBuildReceiptV1.model_validate_json(
+                    codex_receipt_bytes
+                )
+            except ValueError as exc:
+                raise ValueError("Codex build receipt is invalid") from exc
+            if (
+                persisted_codex_receipt != job.codex_build_receipt
+                or canonical.codex_build_receipt_ref.sha256
+                != job.codex_build_receipt_ref.sha256
+                or canonical.codex_build_receipt_ref.media_type
+                != job.codex_build_receipt_ref.media_type
+            ):
+                raise ValueError("Codex build receipt does not match creation job")
+        self._validate_json_object(candidate_bytes, "candidate manifest")
+        is_v2 = isinstance(job, CreationJobV2)
+        self._validate_archive(
+            source_bytes,
+            forbid_external_skill_receipt=is_v2,
+            require_candidate_manifest=is_v2,
+        )
+        if is_v2:
+            self._require_exact_captain_source(job, source_bytes)
+        skill_usage_receipt = self._parse_skill_usage_receipt(skill_bytes)
+        self._require_exact_skill_usage_receipt(job, skill_usage_receipt)
+        expected_receipt_id = self._receipt_id(
+            job,
+            package_ref=canonical.package_manifest_ref,
+            candidate_ref=canonical.candidate_manifest_ref,
+            source_ref=canonical.source_archive_ref,
+            skill_ref=canonical.skill_usage_receipt_ref,
+            codex_receipt_ref=(
+                canonical.codex_build_receipt_ref
+                if isinstance(canonical, CreationExportReceiptV2)
+                else None
+            ),
+        )
+        if canonical.receipt_id != expected_receipt_id:
+            raise ValueError("creation export receipt ID does not match CAS bindings")
+        return canonical
+
+    def _read_checked(
+        self,
+        reference: ArtifactRef,
+        media_type: str,
+        *,
+        label: str,
+    ) -> bytes:
+        reader = getattr(self._sink, "read_bytes", None)
+        if not callable(reader):
+            raise ValueError("creation artifact CAS read authority is unavailable")
+        try:
+            content = reader(self._native_read_reference(reader, reference))
+        except (OSError, TypeError, ValueError) as exc:
+            raise ValueError(f"{label} is unavailable from CAS") from exc
+        if (
+            not isinstance(content, bytes)
+            or reference.media_type != media_type
+            or reference.sha256 != hashlib.sha256(content).hexdigest()
+        ):
+            raise ValueError(f"{label} is not bound to its CAS reference")
+        return content
+
+    @staticmethod
+    def _native_read_reference(
+        reader: Callable[[object], bytes],
+        reference: ArtifactRef,
+    ) -> object:
+        """Rehydrate a sink-owned reference without importing its contract package."""
+
+        try:
+            reference_type = get_type_hints(reader).get("reference")
+        except (NameError, TypeError):
+            reference_type = None
+        validator = getattr(reference_type, "model_validate", None)
+        if not callable(validator):
+            return reference
+        return validator(reference.model_dump(mode="json"))
+
+    @staticmethod
+    def _receipt_id(
+        job: CreationJobV1,
+        *,
+        package_ref: ArtifactRef,
+        candidate_ref: ArtifactRef,
+        source_ref: ArtifactRef,
+        skill_ref: ArtifactRef,
+        codex_receipt_ref: ArtifactRef | None = None,
+    ) -> str:
+        digest_parts = [
+            str(job.creation_job_id),
+            package_ref.sha256,
+            candidate_ref.sha256,
+            source_ref.sha256,
+            skill_ref.sha256,
+        ]
+        if codex_receipt_ref is not None:
+            digest_parts.append(codex_receipt_ref.sha256)
+        return hashlib.sha256(
+            "|".join(digest_parts).encode("utf-8")
+        ).hexdigest()
+
+    def _put_checked(
         self,
         content: bytes,
         media_type: str,
         *,
-        namespace: str = "minibook-creation",
+        namespace: str,
     ) -> ArtifactRef:
-        if not isinstance(content, bytes):
-            raise TypeError("artifact content must be bytes")
-        if re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", namespace) is None:
-            raise ValueError("artifact namespace is invalid")
-        digest = hashlib.sha256(content).hexdigest()
-        path = self._content_root / digest[:2] / digest
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            if path.read_bytes() != content:
-                raise ValueError("artifact digest collision")
-        else:
+        reference = self._sink.put(content, media_type, namespace=namespace)
+        dump = getattr(reference, "model_dump", None)
+        if not callable(dump):
+            raise ValueError("artifact sink returned an invalid reference")
+        parsed = ArtifactRef.model_validate(dump(mode="json"))
+        if (
+            parsed.sha256 != hashlib.sha256(content).hexdigest()
+            or parsed.media_type != media_type
+        ):
+            raise ValueError("artifact sink returned an unbound reference")
+        return parsed
+
+    @staticmethod
+    def _validate_archive(
+        content: bytes,
+        *,
+        forbid_external_skill_receipt: bool = False,
+        require_candidate_manifest: bool = False,
+    ) -> None:
+        if not content:
+            raise ValueError("candidate source archive is empty")
+        try:
+            with zipfile.ZipFile(BytesIO(content)) as archive:
+                names = archive.namelist()
+                if not names:
+                    raise ValueError("candidate source archive is empty")
+                for name in names:
+                    if (
+                        "\\" in name
+                        or (len(name) >= 2 and name[0].isalpha() and name[1] == ":")
+                    ):
+                        raise ValueError("candidate source archive path is unsafe")
+                    path = PurePosixPath(name.replace("\\", "/"))
+                    if path.is_absolute() or ".." in path.parts:
+                        raise ValueError("candidate source archive path is unsafe")
+                folded = {name.rstrip("/").casefold() for name in names}
+                if len(folded) != len(names):
+                    raise ValueError("candidate source archive paths are not unique")
+                if require_candidate_manifest and "factory-candidate.json" not in names:
+                    raise ValueError("candidate source archive has no candidate manifest")
+                if (
+                    forbid_external_skill_receipt
+                    and "evidence/hermes-factory-skill-usage-receipt.json" in folded
+                ):
+                    raise ValueError("candidate source archive contains external skill receipt")
+        except zipfile.BadZipFile as exc:
+            raise ValueError("candidate source archive is not a ZIP") from exc
+
+    @staticmethod
+    def _require_exact_captain_source(
+        job: CreationJobV2,
+        source_archive: bytes,
+        *,
+        candidate_manifest: dict[str, Any] | None = None,
+    ) -> None:
+        if (
+            job.source_archive_ref.media_type != "application/zip"
+            or hashlib.sha256(source_archive).hexdigest()
+            != job.source_archive_ref.sha256
+        ):
+            raise ValueError("Captain source archive digest does not match creation job")
+        try:
+            with zipfile.ZipFile(BytesIO(source_archive)) as archive:
+                manifest_bytes = archive.read("factory-candidate.json")
+        except (KeyError, RuntimeError, zipfile.BadZipFile) as exc:
+            raise ValueError("Captain source archive candidate manifest is unavailable") from exc
+        if hashlib.sha256(manifest_bytes).hexdigest() != (
+            job.codex_build_receipt.candidate_manifest_ref.sha256
+        ):
+            raise ValueError("Captain candidate manifest digest does not match build receipt")
+        if candidate_manifest is not None:
             try:
-                with path.open("xb") as stream:
-                    stream.write(content)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-            except FileExistsError:
-                if path.read_bytes() != content:
-                    raise ValueError("immutable artifact content changed")
-        return ArtifactRef(
-            uri=f"artifact://capability-factory/{namespace}/{digest}",
-            sha256=digest,
-            media_type=media_type,
-        )
+                archived_manifest = json.loads(manifest_bytes)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("Captain candidate manifest is invalid JSON") from exc
+            if not isinstance(archived_manifest, dict) or archived_manifest != candidate_manifest:
+                raise ValueError("Captain candidate manifest changed outside the source archive")
 
-    def read(self, reference: ArtifactRef) -> bytes:
-        if (
-            not reference.uri.startswith("artifact://capability-factory/")
-            or reference.uri.rsplit("/", 1)[-1] != reference.sha256
-        ):
-            raise ValueError("artifact reference is outside the capability store")
+    @staticmethod
+    def _validate_json_object(content: bytes, label: str) -> None:
         try:
-            content = (
-                self._content_root / reference.sha256[:2] / reference.sha256
-            ).read_bytes()
-        except OSError as exc:
-            raise ValueError("artifact content is unavailable") from exc
-        if hashlib.sha256(content).hexdigest() != reference.sha256:
-            raise ValueError("artifact content digest changed")
-        return content
-
-
-class Snapshotter(Protocol):
-    def capture(
-        self,
-        job: CreationJobV1,
-        step: SwarmStep,
-        pipeline: Any,
-        output: Any,
-        prior: SwarmSnapshot,
-    ) -> dict[str, Any]: ...
-
-
-class ExportArtifactSnapshotter:
-    """Checkpoint safe legacy state and attest exported bytes without inventing evidence."""
-
-    _STATE_FIELDS = (
-        "start_time",
-        "completed_steps",
-        "revision_count",
-        "code_post_id",
-        "generated_files",
-        "yaml_files",
-        "architect_output",
-        "output_path",
-        "mcp_catalog",
-        "mcp_selection",
-        "mcp_enabled",
-        "mcp_server_tools",
-        "mcp_tools_prompt",
-        "build_dir",
-        "build_result",
-        "run_result",
-        "output_eval",
-        "export_result",
-        "pre_todo_eval",
-        "todo_implemented",
-    )
-
-    def __init__(self, artifacts: ContentAddressedCreationArtifacts) -> None:
-        self.artifacts = artifacts
-
-    @staticmethod
-    def _safe_json(value: Any) -> Any:
-        if isinstance(value, Path):
-            return str(value)
-        if isinstance(value, set):
-            return sorted(value)
-        if isinstance(value, tuple):
-            return [ExportArtifactSnapshotter._safe_json(item) for item in value]
-        if isinstance(value, list):
-            return [ExportArtifactSnapshotter._safe_json(item) for item in value]
-        if isinstance(value, dict):
-            return {
-                str(key): ExportArtifactSnapshotter._safe_json(item)
-                for key, item in value.items()
-            }
-        if value is None or isinstance(value, (str, int, float, bool)):
-            return value
-        raise ValueError(f"unsupported legacy pipeline state: {type(value).__name__}")
-
-    def _pipeline_state(self, pipeline: Any) -> ArtifactRef:
-        state = {
-            name: self._safe_json(getattr(pipeline, name))
-            for name in self._STATE_FIELDS
-            if hasattr(pipeline, name)
-        }
-        encoded = json.dumps(
-            state, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        ).encode("utf-8")
-        return self.artifacts.put(
-            encoded, "application/json", namespace="creation-pipeline-state"
-        )
-
-    @staticmethod
-    def _files(root: Path) -> list[tuple[str, bytes]]:
-        files: list[tuple[str, bytes]] = []
-        for path in sorted(root.rglob("*")):
-            relative = path.relative_to(root)
-            if ".git" in relative.parts:
-                continue
-            if path.is_symlink():
-                raise ValueError("export contains a symbolic link")
-            if path.is_file():
-                files.append((relative.as_posix(), path.read_bytes()))
-        if not files:
-            raise ValueError("export contains no files")
-        return files
-
-    @staticmethod
-    def _artifact_kind(path: str) -> str | None:
-        if path == "team-manifest.json":
-            return "team_manifest"
-        if path == "RUNBOOK.md":
-            return "runbook"
-        if path.startswith("autogen/") and path.endswith(".py"):
-            return "autogen_source"
-        if path.startswith("skills/"):
-            return "skill"
-        if path.startswith("tests/test_") and path.endswith(".py"):
-            return "test"
-        if path.startswith("evidence/"):
-            return "evidence"
-        if path.startswith("n8n/") and path.endswith(".json"):
-            return "n8n_workflow"
-        if path.startswith("adapters/"):
-            return "local_adapter"
-        return None
-
-    @staticmethod
-    def _media_type(path: str) -> str:
-        suffix = Path(path).suffix.lower()
-        return {
-            ".json": "application/json",
-            ".md": "text/markdown",
-            ".py": "text/x-python",
-            ".yaml": "application/yaml",
-            ".yml": "application/yaml",
-        }.get(suffix, "application/octet-stream")
-
-    def _required_gap(self, gap_id: str, detail: str) -> dict[str, Any]:
-        gap = {
-            "schema": "TODO_TOOL.v1",
-            "gap_id": gap_id,
-            "severity": "required",
-            "status": "unresolved",
-            "required_output": detail,
-        }
-        gap_ref = self.artifacts.put(
-            json.dumps(gap, sort_keys=True, separators=(",", ":")).encode("utf-8"),
-            "application/json",
-            namespace="creation-tool-gap",
-        )
-        marker = ToolGapMarkerV1(
-            gap_id=gap_id,
-            severity="required",
-            evidence_ref=gap_ref,
-            status="unresolved",
-        )
-        return {"tool_gaps": (marker,)}
-
-    @staticmethod
-    def _team_manifest(content: bytes) -> dict[str, Any]:
-        try:
-            manifest = json.loads(content)
+            value = json.loads(content)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError("team manifest is not valid JSON") from exc
-        expected = {
-            "schema",
-            "capability_id",
-            "capability_version",
-            "autogen_modules",
-            "test_paths",
-        }
-        if not isinstance(manifest, dict) or set(manifest) != expected:
-            raise ValueError("team manifest fields are incomplete")
-        if manifest["schema"] != "autogen-team.v1":
-            raise ValueError("team manifest schema is unsupported")
-        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", manifest["capability_id"] or "") is None:
-            raise ValueError("team manifest capability identity is invalid")
-        if not isinstance(manifest["capability_version"], int) or isinstance(
-            manifest["capability_version"], bool
-        ) or manifest["capability_version"] < 1:
-            raise ValueError("team manifest capability version is invalid")
-        for field in ("autogen_modules", "test_paths"):
-            values = manifest[field]
-            if (
-                not isinstance(values, list)
-                or not values
-                or any(not isinstance(item, str) or not item for item in values)
-                or len(values) != len(set(values))
-            ):
-                raise ValueError(f"team manifest {field} is invalid")
-        return manifest
+            raise ValueError(f"{label} is not valid JSON") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"{label} must be a JSON object")
 
-    def _tool_gaps(
-        self, job: CreationJobV1, content: bytes
-    ) -> tuple[list[dict[str, Any]], tuple[ToolGapMarkerV1, ...]]:
+    @staticmethod
+    def _parse_skill_usage_receipt(
+        content: bytes,
+    ) -> ForgeBuildSkillUsageReceiptV1:
         try:
-            envelope = json.loads(content)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError("tool gap declaration is not valid JSON") from exc
-        if (
-            not isinstance(envelope, dict)
-            or set(envelope) != {"schema", "tool_gaps"}
-            or envelope["schema"] != "minibook.creation-tool-gaps.v1"
-            or not isinstance(envelope["tool_gaps"], list)
-        ):
-            raise ValueError("tool gap declaration is invalid")
-        rich: list[dict[str, Any]] = []
-        creation: list[ToolGapMarkerV1] = []
-        required_fields = {
-            "schema",
-            "gap_id",
-            "severity",
-            "input_contract_ref",
-            "output_contract_ref",
-            "least_privilege_capability",
-            "implementation_options",
-            "acceptance_assertion_ids",
-            "evidence_ref",
-            "status",
-        }
-        for item in envelope["tool_gaps"]:
-            if not isinstance(item, dict) or set(item) != required_fields:
-                raise ValueError("tool gap fields are incomplete")
-            if item["schema"] != "TODO_TOOL.v1":
-                raise ValueError("tool gap schema is unsupported")
-            if item["severity"] not in {"required", "optional"} or item["status"] not in {
-                "unresolved",
-                "resolved",
-            }:
-                raise ValueError("tool gap status is invalid")
-            assertions = item["acceptance_assertion_ids"]
-            if (
-                not isinstance(assertions, list)
-                or not assertions
-                or not set(assertions).issubset(set(job.public_assertion_ids))
-            ):
-                raise ValueError("tool gap assertions exceed released assertions")
-            references = {
-                field: ArtifactRef.model_validate(item[field])
-                for field in (
-                    "input_contract_ref",
-                    "output_contract_ref",
-                    "evidence_ref",
-                )
-            }
-            for reference in references.values():
-                self.artifacts.read(reference)
-            normalized = dict(item)
-            normalized.update(
-                {field: reference.model_dump(mode="json") for field, reference in references.items()}
-            )
-            rich.append(normalized)
-            creation.append(
-                ToolGapMarkerV1(
-                    gap_id=str(item["gap_id"]),
-                    severity=item["severity"],
-                    evidence_ref=references["evidence_ref"],
-                    status=item["status"],
-                )
-            )
-        return rich, tuple(creation)
-
-    def _capture_export(
-        self, job: CreationJobV1, pipeline: Any
-    ) -> dict[str, Any]:
-        package_gap = getattr(pipeline, "package_contract_gap", None)
-        if isinstance(package_gap, dict):
-            gap_id = package_gap.get("gap_id")
-            required_outputs = package_gap.get("required_outputs")
-            if (
-                isinstance(gap_id, str)
-                and gap_id
-                and isinstance(required_outputs, (list, tuple))
-                and required_outputs
-                and all(isinstance(item, str) and item for item in required_outputs)
-            ):
-                return self._required_gap(
-                    gap_id,
-                    "; ".join(required_outputs),
-                )
-        export = getattr(pipeline, "export_result", None)
-        if not isinstance(export, dict) or export.get("status") != "SUCCESS":
-            return self._required_gap(
-                "legacy-swarm-package-c-export",
-                "successful legacy export with an observed output path",
-            )
-        export_path = Path(str(export.get("path", ""))).resolve()
-        if not export_path.is_dir():
-            raise ValueError("legacy pipeline export path is unavailable")
-        all_files = self._files(export_path)
-        files = [
-            (name, content, self._artifact_kind(name))
-            for name, content in all_files
-            if self._artifact_kind(name) is not None
-        ]
-        released_skill_bytes = self.artifacts.read(job.released_skill.content_ref)
-        if hashlib.sha256(released_skill_bytes).hexdigest() != job.released_skill.content_sha256:
-            raise ValueError("released Captain skill content digest changed")
-        matching_skill_paths = [
-            name
-            for name, content, kind in files
-            if kind == "skill"
-            and hashlib.sha256(content).hexdigest()
-            == job.released_skill.content_sha256
-        ]
-        if len(matching_skill_paths) > 1:
-            return self._required_gap(
-                "forge-capability-candidate-contract",
-                "released Captain skill is ambiguous in export bytes",
-            )
-        released_skill_path = (
-            matching_skill_paths[0]
-            if matching_skill_paths
-            else "skills/captain-released-factory-workflow.json"
-        )
-        if not matching_skill_paths:
-            files.append((released_skill_path, released_skill_bytes, "skill"))
-        by_path = {name: content for name, content, _kind in files}
-        required = {
-            "team-manifest.json",
-            "RUNBOOK.md",
-            "adapters/factory-candidate.json",
-            "evidence/tool-gaps.json",
-            "evidence/hermes-skill-usage-receipt.json",
-        }
-        missing = sorted(required - set(by_path))
-        if "evidence/hermes-skill-usage-receipt.json" in missing:
-            return self._required_gap(
-                "hermes-skill-usage-receipt",
-                "evidence/hermes-skill-usage-receipt.json",
-            )
-        if missing:
-            return self._required_gap(
-                "forge-capability-candidate-contract",
-                "missing package paths: " + ", ".join(missing),
-            )
-        if not any(name.startswith("autogen/") for name in by_path) or not any(
-            name.startswith("skills/") for name in by_path
-        ) or not any(name.startswith("tests/") for name in by_path):
-            return self._required_gap(
-                "forge-capability-candidate-contract",
-                "autogen, skills, and tests package roots",
-            )
-        try:
-            team_manifest = self._team_manifest(by_path["team-manifest.json"])
-            autogen_paths = {name for name, _content, kind in files if kind == "autogen_source"}
-            test_paths = {name for name, _content, kind in files if kind == "test"}
-            if set(team_manifest["autogen_modules"]) != autogen_paths:
-                raise ValueError("team manifest modules do not match export bytes")
-            if set(team_manifest["test_paths"]) != test_paths:
-                raise ValueError("team manifest tests do not match export bytes")
-            rich_gaps, creation_gaps = self._tool_gaps(
-                job, by_path["evidence/tool-gaps.json"]
-            )
-            receipt_bytes = by_path["evidence/hermes-skill-usage-receipt.json"]
-            self._validate_receipt(job, receipt_bytes)
+            return ForgeBuildSkillUsageReceiptV1.model_validate_json(content)
         except ValueError as exc:
-            return self._required_gap(
-                "forge-capability-candidate-contract", str(exc)
-            )
-
-        package_artifacts: list[dict[str, Any]] = []
-        references: dict[str, ArtifactRef] = {}
-        for name, content, kind in files:
-            assert kind is not None
-            reference = (
-                job.released_skill.content_ref
-                if name == released_skill_path
-                else self.artifacts.put(
-                    content,
-                    self._media_type(name),
-                    namespace="candidate-file",
-                )
-            )
-            references[name] = reference
-            package_artifacts.append(
-                {
-                    "path": name,
-                    "kind": kind,
-                    "reference": reference.model_dump(mode="json"),
-                }
-            )
-        if len({item["reference"]["sha256"] for item in package_artifacts}) != len(
-            package_artifacts
-        ):
-            return self._required_gap(
-                "forge-capability-candidate-contract",
-                "package files must have unique content digests",
-            )
-        package_buffer = io.BytesIO()
-        with zipfile.ZipFile(
-            package_buffer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
-        ) as archive:
-            for name, content, _kind in files:
-                info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
-                info.create_system = 3
-                info.external_attr = 0o644 << 16
-                info.compress_type = zipfile.ZIP_DEFLATED
-                archive.writestr(info, content)
-        package_ref = self.artifacts.put(
-            package_buffer.getvalue(),
-            "application/zip",
-            namespace="candidate-source",
-        )
-        receipt_ref = self.artifacts.put(
-            receipt_bytes,
-            "application/json",
-            namespace="skill-usage",
-        )
-        candidate = {
-            "schema": "forge.capability-package-candidate.v1",
-            "capability_id": team_manifest["capability_id"],
-            "capability_version": team_manifest["capability_version"],
-            "factory_job_id": str(job.factory_job_id),
-            "creation_job_id": str(job.creation_job_id),
-            "correlation_id": str(job.correlation_id),
-            "subject_version": job.subject_version,
-            "attempt": job.attempt,
-            "source_ref": package_ref.model_dump(mode="json"),
-            "team_manifest_ref": references["team-manifest.json"].model_dump(mode="json"),
-            "artifacts": package_artifacts,
-            "skill_usage_receipt_ref": receipt_ref.model_dump(mode="json"),
-            "tool_gaps": rich_gaps,
-            "runbook_ref": references["RUNBOOK.md"].model_dump(mode="json"),
-        }
-        candidate_bytes = json.dumps(
-            candidate, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        ).encode("utf-8")
-        candidate_ref = self.artifacts.put(
-            candidate_bytes,
-            "application/json",
-            namespace="candidate",
-        )
-        return {
-            "package_manifest_ref": candidate_ref,
-            "artifact_bindings": {"source_archive": package_ref},
-            "skill_usage_receipt_ref": receipt_ref,
-            "tool_gaps": creation_gaps,
-        }
+            raise ValueError("skill usage receipt is invalid") from exc
 
     @staticmethod
-    def _validate_receipt(job: CreationJobV1, content: bytes) -> None:
-        try:
-            receipt = json.loads(content)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError("Hermes skill usage receipt is not valid JSON") from exc
-        if not isinstance(receipt, dict):
-            raise ValueError("Hermes skill usage receipt must be an object")
-        required = {
-            "schema": "hermes.skill-usage-receipt.v1",
-            "producer": "hermes",
-            "job_id": str(job.factory_job_id),
-            "correlation_id": str(job.correlation_id),
-            "used_skill_id": job.released_skill.skill_id,
-            "used_skill_version": job.released_skill.version,
-            "used_skill_sha256": job.released_skill.content_sha256,
-            "outcome": "passed",
-        }
-        labels = {
-            "job_id": "factory job",
-            "correlation_id": "correlation",
-            "used_skill_id": "released skill id",
-            "used_skill_version": "released skill version",
-            "used_skill_sha256": "released skill digest",
-        }
-        for field, expected in required.items():
-            if receipt.get(field) != expected:
-                raise ValueError(
-                    f"Hermes skill usage receipt does not match {labels.get(field, field)}"
-                )
-        assertions = receipt.get("assertion_ids")
-        if not isinstance(assertions, list) or not set(job.public_assertion_ids).issubset(
-            set(assertions)
-        ):
-            raise ValueError("Hermes skill usage receipt does not cover public assertions")
-
-    def capture(
-        self,
+    def _require_exact_skill_usage_receipt(
         job: CreationJobV1,
-        step: SwarmStep,
-        pipeline: Any,
-        output: Any,
-        prior: SwarmSnapshot,
-    ) -> dict[str, Any]:
-        del output, prior
-        updates: dict[str, Any] = {"pipeline_state_ref": self._pipeline_state(pipeline)}
-        if step is SwarmStep.EXPORT:
-            updates.update(self._capture_export(job, pipeline))
-        return updates
+        receipt: ForgeBuildSkillUsageReceiptV1,
+    ) -> None:
+        if (
+            receipt.creation_job_id != job.creation_job_id
+            or receipt.factory_job_id != job.factory_job_id
+            or receipt.correlation_id != job.correlation_id
+            or receipt.subject_version != job.subject_version
+            or receipt.attempt != job.attempt
+            or receipt.idempotency_key != job.idempotency_key
+            or receipt.released_skill != job.released_skill
+            or receipt.public_assertion_ids != job.public_assertion_ids
+        ):
+            raise ValueError("skill usage receipt does not match creation job")
 
-    def restore(self, pipeline: Any, snapshot: SwarmSnapshot) -> Any:
-        if snapshot.pipeline_state_ref is None:
-            return pipeline
-        state = json.loads(self.artifacts.read(snapshot.pipeline_state_ref))
-        for name, value in state.items():
-            if name in {"output_path", "build_dir"} and value is not None:
-                value = Path(value)
-            elif name == "completed_steps":
-                value = set(value)
-            setattr(pipeline, name, value)
-        return pipeline
+
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
 
 
 _KNOWN_FAILURES = {
@@ -619,7 +558,6 @@ _KNOWN_FAILURES = {
     "N8nExecutionError": "n8n_failed",
     "BuildError": "build_failed",
     "ValidationError": "validation_failed",
-    "LegacySwarmStepIncomplete": "validation_failed",
 }
 
 
@@ -651,248 +589,111 @@ class SwarmPipelineAdapter:
         pipeline_factory: Callable[[SwarmSnapshot], Any],
         *,
         session: object,
-        snapshotter: Snapshotter | None = None,
+        artifact_publisher: CreationArtifactPublisher | None = None,
     ) -> None:
         self._pipeline_factory = pipeline_factory
         self._session = session
-        self._snapshotter = snapshotter
+        self._artifact_publisher = artifact_publisher
 
     async def run_step(
         self,
-        job: CreationJobV1,
+        job: CreationJobV1 | CreationJobV2,
         step: str,
         prior_snapshot: dict[str, Any],
         effect_key: str,
         accepted_effect: dict[str, Any] | None,
     ) -> StepOutcome:
         named_step = SwarmStep(step)
-        prior = SwarmSnapshot.model_validate(
-            prior_snapshot or {"creation_job_id": job.creation_job_id}
-        )
-        if prior.creation_job_id != job.creation_job_id:
-            raise ValueError("creation snapshot identity changed")
+        prior = SwarmSnapshot.model_validate(prior_snapshot)
         pipeline = self._pipeline_factory(prior)
         output: Any = accepted_effect
-        snapshot_updates: dict[str, Any] = {}
         if accepted_effect is None:
             output = await self._dispatch(pipeline, named_step, job)
-            self._require_legacy_step_completion(pipeline, named_step)
-            if self._snapshotter is not None:
-                snapshot_updates = self._snapshotter.capture(
-                    job, named_step, pipeline, output, prior
-                )
-        else:
-            candidate = accepted_effect.get("snapshot_updates", {})
-            if isinstance(candidate, dict):
-                snapshot_updates = candidate
-        if snapshot_updates:
-            candidate_state = SwarmSnapshot.model_validate(
-                prior.model_dump(mode="json") | snapshot_updates
-            ).model_dump(mode="json")
-            snapshot_updates = {
-                field: candidate_state[field] for field in snapshot_updates
-            }
+        export_receipt = self._export_receipt(job, named_step, output, accepted_effect)
+        digest_output = (
+            export_receipt.model_dump(mode="json", by_alias=True)
+            if export_receipt is not None
+            else output
+        )
         digest = hashlib.sha256(
-            json.dumps(output, sort_keys=True, default=str).encode("utf-8")
+            json.dumps(digest_output, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
         completed = tuple(dict.fromkeys((*prior.completed_steps, named_step.value)))
         receipts = dict(prior.external_receipt_ids)
-        evidence_refs = dict(prior.evidence_step_refs)
-        evidence_times = dict(prior.evidence_step_times)
-        if named_step in {SwarmStep.ARCHITECT, SwarmStep.TOOLFORGE}:
-            reference = snapshot_updates.get("pipeline_state_ref")
-            if reference is not None:
-                evidence_refs[named_step.value] = ArtifactRef.model_validate(reference)
-                evidence_times[named_step.value] = datetime.now(timezone.utc)
         receipt = None
         if named_step.value in self.effectful_steps:
-            receipt = accepted_effect or {
+            receipt = (
+                export_receipt.model_dump(mode="json", by_alias=True)
+                if export_receipt is not None
+                else accepted_effect
+            ) or {
                 "receipt_id": effect_key,
                 "output_sha256": digest,
-                "snapshot_updates": snapshot_updates,
             }
             receipts[named_step.value] = str(receipt["receipt_id"])
-        snapshot = SwarmSnapshot.model_validate(
-            prior.model_dump(mode="json")
-            | {
+        artifact_bindings = dict(prior.artifact_bindings)
+        package_manifest_ref = prior.package_manifest_ref
+        skill_usage_receipt_ref = prior.skill_usage_receipt_ref
+        if export_receipt is not None:
+            artifact_bindings.update(
+                {
+                    "candidate_manifest": export_receipt.candidate_manifest_ref,
+                    "source_archive": export_receipt.source_archive_ref,
+                }
+            )
+            if isinstance(export_receipt, CreationExportReceiptV2):
+                artifact_bindings["codex_build_receipt"] = (
+                    export_receipt.codex_build_receipt_ref
+                )
+            package_manifest_ref = export_receipt.package_manifest_ref
+            skill_usage_receipt_ref = export_receipt.skill_usage_receipt_ref
+        snapshot = prior.model_copy(
+            update={
                 "completed_steps": completed,
                 "output_digests": prior.output_digests | {named_step.value: digest},
                 "external_receipt_ids": receipts,
-                "evidence_step_refs": evidence_refs,
-                "evidence_step_times": evidence_times,
-                **snapshot_updates,
+                "artifact_bindings": artifact_bindings,
+                "package_manifest_ref": package_manifest_ref,
+                "skill_usage_receipt_ref": skill_usage_receipt_ref,
             }
         )
         return StepOutcome(snapshot=snapshot.model_dump(mode="json"), effect_receipt=receipt)
 
-    @staticmethod
-    def _require_legacy_step_completion(pipeline: Any, step: SwarmStep) -> None:
-        completed = getattr(pipeline, "completed_steps", None)
-        if not isinstance(completed, set):
-            return
-        expected = {
-            SwarmStep.MANAGER: "SwarmManager",
-            SwarmStep.CATALOG: "CatalogAgent",
-            SwarmStep.ARCHITECT: "ArchitectAgent",
-            SwarmStep.CODER: "CoderAgent",
-            SwarmStep.REVIEWER: "ReviewerAgent",
-            SwarmStep.TESTER: "TesterAgent",
-            SwarmStep.VALIDATOR: "ValidatorAgent",
-            SwarmStep.BUILDER: "BuilderAgent",
-            SwarmStep.EXECUTOR: "ExecutorAgent",
-            SwarmStep.OUTPUT_EVALUATION: "OutputEvalAgent",
-            SwarmStep.TODO_IMPLEMENTATION: "TodoImplementer",
-            SwarmStep.TOOLFORGE: "ToolForgeAgent",
-            SwarmStep.FEEDBACK_LOOP: "FeedbackAgent",
-            SwarmStep.EVALUATION_REPORT: "EvalReporterAgent",
-            SwarmStep.EXPORT: "ExportAgent",
-        }[step]
-        if expected not in completed:
-            raise LegacySwarmStepIncomplete(
-                f"legacy swarm did not complete {expected} for checkpoint {step.value}"
-            )
-
-    def preparation_evidence(
+    def _export_receipt(
         self,
-        job: CreationJobV1,
-        snapshot: dict[str, Any],
-    ) -> CreationPreparationEvidenceV1:
-        state = SwarmSnapshot.model_validate(snapshot)
-        architect_ref = state.evidence_step_refs.get(SwarmStep.ARCHITECT.value)
-        tool_ref = state.evidence_step_refs.get(SwarmStep.TOOLFORGE.value)
-        architect_at = state.evidence_step_times.get(SwarmStep.ARCHITECT.value)
-        tool_at = state.evidence_step_times.get(SwarmStep.TOOLFORGE.value)
-        if (
-            architect_ref is None
-            or tool_ref is None
-            or architect_at is None
-            or tool_at is None
-            or architect_at >= tool_at
-        ):
-            raise ValueError(
-                "creation preparation requires completed architect and toolforge evidence"
+        job: CreationJobV1 | CreationJobV2,
+        step: SwarmStep,
+        output: Any,
+        accepted_effect: dict[str, Any] | None,
+    ) -> CreationExportReceiptV1 | CreationExportReceiptV2 | None:
+        if step is not SwarmStep.EXPORT:
+            return None
+        if accepted_effect is not None:
+            if self._artifact_publisher is None:
+                raise ValueError("creation artifact CAS read authority is unavailable")
+            receipt_type = (
+                CreationExportReceiptV2
+                if isinstance(job, CreationJobV2)
+                else CreationExportReceiptV1
             )
-        return CreationPreparationEvidenceV1(
-            creation_job=job,
-            blocks=(
-                self._evidence_block(
-                    job,
-                    phase="blueprint_created",
-                    role="agent_architect",
-                    occurred_at=architect_at,
-                    evidence_ref=architect_ref,
-                ),
-                self._evidence_block(
-                    job,
-                    phase="tool_candidate_tested",
-                    role="tool_integrator",
-                    occurred_at=tool_at,
-                    evidence_ref=tool_ref,
-                    lease_id=state.tool_integrator_lease_id,
-                ),
-            ),
-        )
+            receipt = receipt_type.model_validate(accepted_effect)
+            return self._artifact_publisher.accept_receipt(job, receipt)
+        if not isinstance(output, CreationExportBundle):
+            # A creation export must expose verified local bytes. Any legacy
+            # exporter result remains deliberately non-promotable.
+            return None
+        if self._artifact_publisher is None:
+            return None
+        return self._artifact_publisher.publish(job, output)
 
-    def completion_evidence(
+    async def _dispatch(
         self,
-        job: CreationJobV1,
-        result: CreationResultV1,
-        snapshot: dict[str, Any],
-    ) -> CreationCompletionEvidenceV1:
-        state = SwarmSnapshot.model_validate(snapshot)
-        tool_at = state.evidence_step_times.get(SwarmStep.TOOLFORGE.value)
-        occurred_at = datetime.now(timezone.utc)
-        if tool_at is None or occurred_at <= tool_at:
-            raise ValueError("creation completion does not follow tool evidence")
-        if result.package_manifest_ref is None or result.skill_usage_receipt_ref is None:
-            raise ValueError("creation completion requires package and skill evidence")
-        return CreationCompletionEvidenceV1(
-            result=result,
-            block=self._evidence_block(
-                job,
-                phase="agent_code_created",
-                role="tool_integrator",
-                occurred_at=occurred_at,
-                evidence_ref=result.package_manifest_ref,
-                additional_evidence_ref=result.skill_usage_receipt_ref,
-                lease_id=state.tool_integrator_lease_id,
-            ),
-        )
-
-    @staticmethod
-    def _evidence_block(
-        job: CreationJobV1,
-        *,
-        phase: str,
-        role: str,
-        occurred_at: datetime,
-        evidence_ref: ArtifactRef,
-        additional_evidence_ref: ArtifactRef | None = None,
-        lease_id: str | None = None,
-    ) -> FactoryEvidenceBlockV1:
-        evidence_refs = (
-            (evidence_ref,)
-            if additional_evidence_ref is None
-            else (evidence_ref, additional_evidence_ref)
-        )
-        return FactoryEvidenceBlockV1(
-            event_id=uuid5(job.creation_job_id, f"hermes:{phase}"),
-            job_id=job.factory_job_id,
-            correlation_id=job.correlation_id,
-            causation_id=job.causation_id,
-            occurred_at=occurred_at,
-            producer="hermes",
-            subject_version=job.subject_version,
-            attempt=job.attempt,
-            phase=phase,
-            role=role,
-            status="succeeded",
-            evidence_refs=evidence_refs,
-            assertion_ids=(),
-            lease_id=lease_id or job.architect_lease_id,
-        )
-
-    def architect_evidence(self, job: CreationJobV1, snapshot: dict[str, Any]) -> FactoryEvidenceBlockV1:
-        if job.architect_lease_id is None:
-            raise ValueError("architect evidence requires a Captain architect lease")
-        state = SwarmSnapshot.model_validate(snapshot)
-        reference = state.evidence_step_refs.get(SwarmStep.ARCHITECT.value)
-        occurred_at = state.evidence_step_times.get(SwarmStep.ARCHITECT.value)
-        if reference is None or occurred_at is None:
-            raise ValueError("creation architect evidence is not available")
-        return self._evidence_block(job, phase="blueprint_created", role="agent_architect", occurred_at=occurred_at, evidence_ref=reference, lease_id=job.architect_lease_id)
-
-    async def _dispatch(self, pipeline: Any, step: SwarmStep, job: CreationJobV1) -> Any:
+        pipeline: Any,
+        step: SwarmStep,
+        job: CreationJobV1 | CreationJobV2,
+    ) -> Any:
         if step is SwarmStep.MANAGER:
-            task = getattr(pipeline, "task_name", None)
-            if not isinstance(task, str) or not task.strip():
-                task = str(job.input_ref.uri)
-            return await pipeline.step_swarm_manager(self._session, task)
-        if step is SwarmStep.ARCHITECT:
-            # Persist Architect's durable Minibook handoff first.  Coder and
-            # Reviewer are started together at the next checkpoint so a
-            # snapshot restore cannot overwrite state while either task is
-            # still waiting for Architect's mention.
-            return await pipeline.step_architect(self._session)
-        if step is SwarmStep.CODER:
-            coder = getattr(pipeline, "_captain_coder_task", None)
-            if not isinstance(coder, asyncio.Task):
-                # A process restart retains the Architect post but not its
-                # in-memory waiters.  Re-create both waits from that durable
-                # handoff and keep Reviewer alive for the next checkpoint.
-                coder = asyncio.create_task(pipeline.step_coder(self._session))
-                setattr(pipeline, "_captain_coder_task", coder)
-                setattr(
-                    pipeline,
-                    "_captain_reviewer_task",
-                    asyncio.create_task(pipeline.step_reviewer(self._session)),
-                )
-            return await coder
-        if step is SwarmStep.REVIEWER:
-            reviewer = getattr(pipeline, "_captain_reviewer_task", None)
-            if isinstance(reviewer, asyncio.Task):
-                return await reviewer
-            return await pipeline.step_reviewer(self._session)
+            return await pipeline.step_swarm_manager(self._session, str(job.input_ref.uri))
         method_names = {
             SwarmStep.CATALOG: "step_catalog",
             SwarmStep.ARCHITECT: "step_architect",
@@ -907,32 +708,25 @@ class SwarmPipelineAdapter:
             SwarmStep.TOOLFORGE: "step_toolforge",
             SwarmStep.FEEDBACK_LOOP: "step_feedback_loop",
             SwarmStep.EVALUATION_REPORT: "step_eval_reporter",
-            SwarmStep.EXPORT: "step_export",
+            SwarmStep.EXPORT: "step_creation_export",
         }
         method = getattr(pipeline, method_names[step])
         return await method(self._session)
 
     def assemble_result(
-        self, job: CreationJobV1, snapshot: dict[str, Any]
+        self, job: CreationJobV1 | CreationJobV2, snapshot: dict[str, Any]
     ) -> CreationResultV1:
         state = SwarmSnapshot.model_validate(snapshot)
-        if state.package_manifest_ref is None and state.tool_gaps:
-            failure_refs = tuple(gap.evidence_ref for gap in state.tool_gaps)
-            return CreationResultV1(
-                creation_job_id=job.creation_job_id,
-                correlation_id=job.correlation_id,
-                subject_version=job.subject_version,
-                attempt=job.attempt,
-                status="blocked",
-                evidence_refs=failure_refs,
-                tool_gaps=state.tool_gaps,
-                failure=CreationFailure(
-                    code="tool_unresolved",
-                    summary="creation package contract is unresolved",
-                    evidence_refs=failure_refs,
-                ),
-            )
-        if state.package_manifest_ref is None:
+        required_bindings = (
+            ("candidate_manifest", "source_archive", "codex_build_receipt")
+            if isinstance(job, CreationJobV2)
+            else ("candidate_manifest", "source_archive")
+        )
+        if (
+            state.package_manifest_ref is None
+            or state.skill_usage_receipt_ref is None
+            or set(state.artifact_bindings) != set(required_bindings)
+        ):
             return CreationResultV1(
                 creation_job_id=job.creation_job_id,
                 correlation_id=job.correlation_id,
@@ -944,27 +738,6 @@ class SwarmPipelineAdapter:
                     summary="creation package evidence incomplete",
                 ),
             )
-        if state.skill_usage_receipt_ref is None or any(
-            gap.severity == "required" and gap.status == "unresolved"
-            for gap in state.tool_gaps
-        ):
-            failure_refs = tuple(gap.evidence_ref for gap in state.tool_gaps)
-            return CreationResultV1(
-                creation_job_id=job.creation_job_id,
-                correlation_id=job.correlation_id,
-                subject_version=job.subject_version,
-                attempt=job.attempt,
-                status="blocked",
-                package_manifest_ref=state.package_manifest_ref,
-                artifact_refs=tuple(state.artifact_bindings.values()),
-                evidence_refs=failure_refs,
-                tool_gaps=state.tool_gaps,
-                failure=CreationFailure(
-                    code="tool_unresolved",
-                    summary="Hermes skill usage evidence is unavailable",
-                    evidence_refs=failure_refs,
-                ),
-            )
         return CreationResultV1(
             creation_job_id=job.creation_job_id,
             correlation_id=job.correlation_id,
@@ -972,7 +745,8 @@ class SwarmPipelineAdapter:
             attempt=job.attempt,
             status="succeeded",
             package_manifest_ref=state.package_manifest_ref,
-            artifact_refs=tuple(state.artifact_bindings.values()),
-            tool_gaps=state.tool_gaps,
+            artifact_refs=tuple(
+                state.artifact_bindings[name] for name in required_bindings
+            ),
             skill_usage_receipt_ref=state.skill_usage_receipt_ref,
         )

@@ -6,6 +6,7 @@ import os
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Literal
+from urllib.parse import quote
 from uuid import UUID
 
 import httpx
@@ -99,11 +100,12 @@ class GatewayBackedRuntimeState:
         await self._runtime.accept_command(command)
 
     async def get_released_batch(self, command: AgentRuntimeCommand) -> WorkBatch:
-        if command.payload.batch_id is None:
+        batch_id = command.payload.batch_id
+        if batch_id is None:
             raise GatewayRuntimeError("runtime command has no released batch binding")
         try:
             response = await self._client.get(
-                f"{self._base_url}/v1/runtime/operations/{command.event_id}/released-batch",
+                f"{self._base_url}/batches/{quote(batch_id, safe='')}/bundle",
                 headers={"Authorization": f"Bearer {self._token}"},
             )
         except httpx.HTTPError:
@@ -113,17 +115,10 @@ class GatewayBackedRuntimeState:
                 f"read released batch failed with gateway status {response.status_code}"
             )
         try:
-            from gateway.contracts import RuntimeReleasedBatchSnapshot
-
-            snapshot = RuntimeReleasedBatchSnapshot.model_validate(response.json())
+            batch = WorkBatch.model_validate(response.json())
         except (TypeError, ValueError, ValidationError):
             raise GatewayRuntimeError("read released batch returned an invalid response") from None
-        batch = snapshot.batch
-        if (
-            snapshot.admission.command_id != command.event_id
-            or snapshot.admission.batch_id != command.payload.batch_id
-            or batch.batch_id != command.payload.batch_id
-        ):
+        if batch.batch_id != batch_id:
             raise GatewayRuntimeError("released batch does not match the runtime command")
         return batch
 
@@ -180,31 +175,8 @@ def compose_gateway_backed_runtime_app(
 ) -> FastAPI:
     """Compose existing real adapters around Gateway-owned runtime state."""
 
-    service = compose_gateway_backed_runtime_executor(
-        settings=settings,
-        client=client,
-        hermes=hermes,
-        codex=codex,
-        artifacts=artifacts,
-    )
-    return create_runtime_app(
-        executor=service,
-        token=settings.runtime_token.get_secret_value(),
-    )
-
-
-def compose_gateway_backed_runtime_executor(
-    *,
-    settings: RuntimeEntrypointSettings,
-    client: httpx.AsyncClient,
-    hermes: HermesPlannerPort,
-    codex: CodexExecutionPort,
-    artifacts: ArtifactPort,
-) -> AgentRuntimeService:
-    """Build the executor separately so the capability-evidence API can share it."""
-
     gateway_token = settings.gateway_token.get_secret_value()
-    return AgentRuntimeService(
+    service = AgentRuntimeService(
         state=GatewayBackedRuntimeState(
             base_url=settings.gateway_url,
             token=gateway_token,
@@ -216,46 +188,25 @@ def compose_gateway_backed_runtime_executor(
         capabilities=_CaptainCapabilityPolicy(),
         clock=_UtcClock(),
     )
+    return create_runtime_app(
+        executor=service,
+        token=settings.runtime_token.get_secret_value(),
+    )
 
 
-def preflight_runtime() -> FastAPI:
-    """Compose every lazy production port without starting provider effects."""
+def preflight_runtime() -> None:
+    """Validate settings and fail closed while required production ports are absent."""
 
-    settings = RuntimeEntrypointSettings.from_env()
-    try:
-        from agenten.agent_factory.production_adapter_bundle import (
-            build_production_runtime_app_from_environment,
-            build_runtime_app_from_environment,
-        )
-
-        evidence_mode = os.environ.get("CAPTAIN_RUNTIME_EVIDENCE_MODE", "").strip()
-        if evidence_mode == "production-v3":
-            return build_production_runtime_app_from_environment(
-                settings,
-                os.environ,
-            )
-        if evidence_mode:
-            raise RuntimeConfigurationError(
-                "CAPTAIN_RUNTIME_EVIDENCE_MODE must be production-v3 or empty"
-            )
-        return build_runtime_app_from_environment(settings, os.environ)
-    except RuntimeConfigurationError:
-        raise
-    except Exception as exc:
-        marker = str(exc)
-        if marker.startswith(("TODO_TOOL:", "TODO_TOOL.v1")):
-            raise RuntimeConfigurationError(marker) from None
-        raise RuntimeConfigurationError("production runtime composition failed") from None
+    RuntimeEntrypointSettings.from_env()
+    raise RuntimeConfigurationError(
+        "production Hermes, Codex, and artifact runtime ports are unavailable"
+    )
 
 
 def main() -> None:
-    """Run one authenticated process; every provider adapter remains lazy."""
+    """Fail closed until production Hermes, Codex, and artifact ports are installed."""
 
-    import uvicorn
-
-    settings = RuntimeEntrypointSettings.from_env()
-    app = preflight_runtime()
-    uvicorn.run(app, host=settings.host, port=settings.port, workers=1)
+    preflight_runtime()
 
 
 if __name__ == "__main__":

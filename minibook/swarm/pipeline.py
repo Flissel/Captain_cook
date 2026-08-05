@@ -39,25 +39,6 @@ from .input_parser import SALES_TOOL_IMPLEMENTATIONS
 _CLAUDE_CODE_TEMPLATE = SALES_TOOL_IMPLEMENTATIONS["claude_code"].strip()
 
 
-def _safe_output_evaluation_task(candidate: str, task_name: str) -> str:
-    """Reject evaluator prompts that invent an unavailable remote dependency."""
-    normalized = " ".join(candidate.split())
-    unavailable_dependency = re.search(
-        r"https?://|\b(?:remote|external|provided)\s+(?:api(?:\s+endpoint)?|url|endpoint)\b|"
-        r"\b(?:fetch|collect)\s+data\b",
-        normalized,
-        re.I,
-    )
-    if normalized and unavailable_dependency is None:
-        return normalized
-    return (
-        "Using only the information in this request, produce a substantive, "
-        f"self-contained deliverable for the {task_name}. Do not call remote URLs, "
-        "external APIs, or require credentials. Write the resulting analysis and "
-        "implementation plan to /app/output/ with concrete task-specific details."
-    )
-
-
 def _fix_kwargs_tools(code: str) -> str:
     """Fix **kwargs tool signatures that crash autogen's _function_utils.py.
 
@@ -117,32 +98,6 @@ def _fix_truncated_tools_py(code: str) -> str:
         print(f"[Pipeline] Replacing claude_code ({len(func_body)} chars -> {len(_CLAUDE_CODE_TEMPLATE)} chars)")
         code = code[:match.start()] + _CLAUDE_CODE_TEMPLATE + code[match.end():]
     return code
-
-
-def _render_export_smoke_test() -> str:
-    """Return an executable test for the observed generated AutoGen sources.
-
-    The test is intentionally structural: the legacy TesterAgent has already
-    executed its richer validation, while this file makes that generated source
-    set independently checkable after Package-C relocates ``src/`` to
-    ``autogen/``.  It does not claim a runtime result or manufacture a passing
-    implementation.
-    """
-
-    return '''from __future__ import annotations
-
-from pathlib import Path
-
-
-def test_generated_autogen_sources_compile() -> None:
-    root = Path(__file__).resolve().parents[1]
-    source_root = root / "autogen"
-    assert (source_root / "main.py").is_file()
-    modules = sorted(source_root.rglob("*.py"))
-    assert modules
-    for module in modules:
-        compile(module.read_text(encoding="utf-8"), str(module), "exec")
-'''
 
 
 LEGACY_PIPELINE_AGENT_ORDER = (
@@ -1291,10 +1246,6 @@ class SwarmPipeline:
 
         # Run automated tests (code + YAML)
         test_results = test_generated_code(self.generated_files, self.yaml_files)
-        if test_results.get("overall") == "PASS":
-            self.generated_files["tests/test_generated_team.py"] = (
-                _render_export_smoke_test()
-            )
 
         # Format results for GPT-4o analysis
         test_summary = json.dumps(test_results, indent=2)
@@ -1491,21 +1442,9 @@ class SwarmPipeline:
             self.completed_steps.add("ExecutorAgent")
             return
 
-        print(f"[ExecutorAgent] Running bounded candidate validation... ({elapsed()})")
+        print(f"[ExecutorAgent] Running docker compose up... ({elapsed()})")
         run_timeout = 900 if self.is_input_file else 300
-        if self.is_input_file or getattr(self, "captain_package_contract_mode", False):
-            # Factory candidates are long-lived AutoGen services.  A compose-up
-            # timeout is not a behavioral failure, so validate their explicit
-            # bounded Package-C startup contract here.  The provider-backed
-            # real-case execution is recorded later by Captain's runtime.
-            self.run_result = await docker_run_test_with_args(
-                self.build_dir,
-                args=["python", "main.py"],
-                timeout=min(run_timeout, 120),
-                environment={"CAPTAIN_PACKAGE_VALIDATE": "1"},
-            )
-        else:
-            self.run_result = await docker_run_test(self.build_dir, timeout=run_timeout)
+        self.run_result = await docker_run_test(self.build_dir, timeout=run_timeout)
 
         # Gordon auto-fix loop if run fails
         gordon_fixes = ""
@@ -1599,7 +1538,7 @@ class SwarmPipeline:
         except Exception as e:
             return f"Error: {e}"
 
-    async def step_output_eval(self, session, *, test_task_override: str | None = None):
+    async def step_output_eval(self, session):
         """OutputEvalAgent: Run the agent team with a concrete test task via Claude CLI,
         evaluate output quality, write evaluation_report.md."""
         elapsed = lambda: f"{time.time() - self.start_time:.1f}s"
@@ -1631,16 +1570,9 @@ class SwarmPipeline:
         # 1. Read team capabilities from YAML files
         team_info = self._build_team_info()
 
-        # 2. Reuse the failed concrete task during a feedback retry.  A fresh
-        # task would validate a different capability and cannot close the
-        # original failure.
-        if test_task_override:
-            test_task = _safe_output_evaluation_task(
-                test_task_override, self.task_name
-            )
-        else:
-            print(f"[OutputEvalAgent] Generating edge-case test task via Claude CLI... ({elapsed()})")
-            test_task_prompt = (
+        # 2. Use Claude CLI to generate a concrete test task
+        print(f"[OutputEvalAgent] Generating edge-case test task via Claude CLI... ({elapsed()})")
+        test_task_prompt = (
             f"You are evaluating an AutoGen multi-agent team.\n\n"
             f"## Team Capabilities\n{team_info}\n\n"
             f"Design ONE concrete, specific test task for this team that:\n"
@@ -1648,50 +1580,24 @@ class SwarmPipeline:
             f"- Requires real work (create files, write code, use git)\n"
             f"- Produces output files in /app/output/\n"
             f"- Can complete in under 30 agent messages\n\n"
-            f"- Is entirely self-contained: do not require remote URLs, external APIs, "
-            f"credentials, or data that is not included in the task\n\n"
             f"Respond with ONLY the task text, no explanation. "
             f"The task must be a single paragraph, actionable instruction."
-            )
-            test_task = await self._call_claude_code(test_task_prompt)
-            if not test_task or test_task.lower().startswith("error"):
-                # Fallback: generate test task via GPT-4o
-                test_task = await call_gpt4o(
-                    AGENT_ROLES["OutputEvalAgent"]["prompt"], team_info, max_tokens=500)
-            if not test_task:
-                test_task = f"Run the agent team with their default task and produce output files in /app/output/"
-            else:
-                # Extract TEST_TASK line if present
-                for line in test_task.splitlines():
-                    if line.strip().startswith("TEST_TASK:"):
-                        test_task = line.split(":", 1)[1].strip()
-                        break
-            test_task = _safe_output_evaluation_task(test_task, self.task_name)
+        )
+        test_task = await self._call_claude_code(test_task_prompt)
+        if not test_task or test_task.lower().startswith("error"):
+            # Fallback: generate test task via GPT-4o
+            test_task = await call_gpt4o(
+                AGENT_ROLES["OutputEvalAgent"]["prompt"], team_info, max_tokens=500)
+        if not test_task:
+            test_task = f"Run the agent team with their default task and produce output files in /app/output/"
+        else:
+            # Extract TEST_TASK line if present
+            for line in test_task.splitlines():
+                if line.strip().startswith("TEST_TASK:"):
+                    test_task = line.split(":", 1)[1].strip()
+                    break
 
         print(f"[OutputEvalAgent] Test task: {test_task[:100]}... ({elapsed()})")
-
-        if self.is_input_file or getattr(self, "captain_package_contract_mode", False):
-            # Do not spend the Minibook assembly phase running a live provider
-            # swarm without its Captain-issued runtime lease.  The bounded
-            # contract above is the candidate test; real provider evidence is
-            # produced by the subsequent Captain execution stages.
-            eval_run = await docker_run_test_with_args(
-                self.build_dir,
-                args=["python", "main.py"],
-                timeout=120,
-                environment={"CAPTAIN_PACKAGE_VALIDATE": "1"},
-            )
-            self.output_eval = {
-                "status": "PASS" if eval_run["status"] == "PASS" else "FAIL",
-                "reason": "bounded Package-C contract validation",
-                "score": "8" if eval_run["status"] == "PASS" else "1",
-                "test_task": test_task,
-                "eval_mode": "package_contract",
-                "eval_run_status": eval_run["status"],
-                "eval_run_duration": eval_run.get("duration", 0),
-            }
-            self.completed_steps.add("OutputEvalAgent")
-            return
 
         # 3. Run the agent team with the test task via docker compose run
         print(f"[OutputEvalAgent] Running agent team with test task... ({elapsed()})")
@@ -1850,13 +1756,11 @@ class SwarmPipeline:
 
         if not self.build_dir:
             print("[TodoImplementer] No build directory — skipping")
-            self.completed_steps.add("TodoImplementer")
             return
 
         tools_py_path = self.build_dir / "src" / "tools.py"
         if not tools_py_path.exists():
             print("[TodoImplementer] No tools.py found — skipping")
-            self.completed_steps.add("TodoImplementer")
             return
 
         # Quick check: any TODOs at all?
@@ -1864,7 +1768,6 @@ class SwarmPipeline:
         todos = await scan_todo_tools(tools_content)
         if not todos:
             print("[TodoImplementer] No TODO-marked tools found — skipping")
-            self.completed_steps.add("TodoImplementer")
             return
 
         print(f"[TodoImplementer] Found {len(todos)} TODO tools, implementing via Claude CLI...")
@@ -1921,8 +1824,6 @@ class SwarmPipeline:
                     tags=["todo", "tools", "swarm"])
         except Exception as e:
             print(f"[TodoImplementer] Could not post to Minibook: {e}")
-
-        self.completed_steps.add("TodoImplementer")
 
     async def step_toolforge(self, session):
         """ToolForgeAgent: Generate custom MCP servers for unimplemented tools."""
@@ -2012,14 +1913,8 @@ class SwarmPipeline:
         """FeedbackAgent: Run team, score output, improve if needed."""
         elapsed = lambda: f"{time.time() - self.start_time:.1f}s"
 
-        if isinstance(self.output_eval, dict) and self.output_eval.get("status") == "PASS":
-            print("[FeedbackAgent] SKIP - output evaluation already passed")
-            self.completed_steps.add("FeedbackAgent")
-            return
-
         if not self.output_path or not self.build_dir:
             print("[FeedbackAgent] SKIP - no output/build")
-            self.completed_steps.add("FeedbackAgent")
             return
 
         for round_num in range(max_rounds):
@@ -2055,17 +1950,8 @@ class SwarmPipeline:
                 tags=["feedback", "score"])
 
             if score >= 7:
-                if run_result.get("status") == "PASS":
-                    self.output_eval = {
-                        "status": "PASS",
-                        "score": str(score),
-                        "reason": "feedback evaluation passed after an executed team run",
-                        "test_task": test_task,
-                        "eval_run_status": run_result.get("status"),
-                        "eval_run_duration": run_result.get("duration"),
-                    }
-                    print(f"[FeedbackAgent] PASS - quality sufficient")
-                    break
+                print(f"[FeedbackAgent] PASS - quality sufficient")
+                break
 
             if round_num < max_rounds - 1:
                 # Extract improvements and feed back to CoderAgent
@@ -2078,18 +1964,6 @@ class SwarmPipeline:
                 await self.step_reviewer(session)
                 await self.step_validator(session)
                 await self.step_builder(session)
-                if self.build_result and self.build_result.get("status") == "PASS":
-                    await self.step_executor(session)
-                    failed_test_task = self.output_eval.get("test_task") if isinstance(self.output_eval, dict) else None
-                    await self.step_output_eval(
-                        session, test_task_override=failed_test_task
-                    )
-                    if (
-                        isinstance(self.output_eval, dict)
-                        and self.output_eval.get("status") == "PASS"
-                    ):
-                        print("[FeedbackAgent] PASS - improved output evaluation passed")
-                        break
 
         self.completed_steps.add("FeedbackAgent")
         print(f"[FeedbackAgent] DONE ({elapsed()})")
@@ -2164,6 +2038,27 @@ class SwarmPipeline:
 
         self.completed_steps.add("EvalReporterAgent")
         print(f"[EvalReporterAgent] DONE ({elapsed()}) — final report posted")
+
+    async def step_creation_export(self, session):
+        """Build a deterministic local Factory bundle from ``output_path``.
+
+        This creation-specific path deliberately does not delegate to the
+        legacy GitHub export and does not access the Minibook session.
+        """
+        del session
+        from .creation_export import CreationExportError, build_creation_export
+        from .pipeline_adapter import CreationExportBundle
+
+        if self.output_path is None:
+            raise CreationExportError("creation output path is not configured")
+        source_archive, candidate_manifest, skill_usage_receipt = (
+            build_creation_export(Path(self.output_path))
+        )
+        return CreationExportBundle(
+            source_archive=source_archive,
+            candidate_manifest=candidate_manifest,
+            skill_usage_receipt=skill_usage_receipt,
+        )
 
     async def step_export(self, session):
         """ExportAgent: Export validated output as a standalone git repo + push to GitHub."""

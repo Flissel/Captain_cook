@@ -1012,8 +1012,10 @@ async def test_live_codex_mcp_lease_is_revoked_during_real_provider_execution(
                 codex_path=_native_codex_binary(),
                 session_id=session_id,
                 state_path=state_path,
+                journal_path=tmp_path / "codex-session.jsonl",
                 artifact_references=(),
                 codex_home=codex_home,
+                deadline_at=datetime.now(timezone.utc) + timedelta(minutes=2),
                 timeout_seconds=120,
             )
             coordinator = CodexCancellationCoordinator(

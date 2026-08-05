@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 from decimal import Decimal
@@ -11,15 +10,18 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import HTTPException
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from agenten.agent_factory.contracts import (
     AgentFactoryJobV3,
     FactoryEvidenceBlock,
+    FactoryPhase,
     FactoryJob,
     FactoryLease,
     FactoryRole,
 )
+from agenten.agent_factory.business_benchmark_contracts import BusinessBenchmarkSummaryV1
+from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.execution_budget import (
     BudgetExhausted,
     FactoryBudgetPort,
@@ -29,25 +31,14 @@ from agenten.agent_factory.execution_budget import (
     FactoryUsageReceiptV1,
     ReleaseReason,
 )
-from agenten.agent_factory.factory_live_runner import (
-    FactoryLiveEffectClaim,
-    FactoryLiveEffectLedger,
-    FactoryLiveEffectOutcomeV1,
-    FactoryLiveEffectRecord,
-    FactoryLiveEffectRequestV1,
-    FactoryLiveEffectWriteReceipt,
-)
 from agenten.agent_factory.leases import FactoryLeaseDenied, FactoryLeasePort, validate_factory_lease
 from agenten.agent_factory.release_gate import FactoryReleaseDecision
-from agenten.agent_factory.outcome_contracts import FactoryTerminalDecision
-from agenten.agent_factory.service import (
-    FactoryRepository,
-    FactoryRepositoryError,
-    FactoryWorkflowArtifactSink,
-)
+from agenten.agent_factory.service import FactoryRepository, FactoryRepositoryError
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
 from agenten.agent_factory.skill_evaluation import ReleasedHermesSkill
 from agenten.agent_factory.skill_workflow_contracts import FactorySkillStep
+from agenten.agent_factory.skill_sequence import FactoryRuntimeRetryAuthorizationV1
+from agenten.agent_factory.state_machine import FactoryAction, FactoryActionKind
 from gateway.store import GatewayStore
 from gateway.contracts import (
     FactoryBudgetReleaseRequest,
@@ -65,11 +56,27 @@ class FactorySkillAssignmentSource(Protocol):
     ) -> ReleasedHermesSkill: ...
 
 
+class FactoryRuntimeRetrySource(Protocol):
+    def active(
+        self,
+        job: FactoryJob,
+        action: FactoryAction,
+        projection: object,
+        now: datetime,
+    ) -> FactoryRuntimeRetryAuthorizationV1 | None: ...
+
+
 class GatewayFactoryRepository(FactoryRepository):
     """Use GatewayStore as the sole durable factory lifecycle authority."""
 
-    def __init__(self, store: GatewayStore) -> None:
+    def __init__(
+        self,
+        store: GatewayStore,
+        *,
+        runtime_retries: FactoryRuntimeRetrySource | None = None,
+    ) -> None:
         self._store = store
+        self._runtime_retries = runtime_retries
 
     def register(self, job: FactoryJob) -> None:
         self._translate(lambda: self._store.record_factory_job(job))
@@ -78,25 +85,31 @@ class GatewayFactoryRepository(FactoryRepository):
         return self._translate(lambda: self._store.factory_job(job_id).job)
 
     def append(self, block: FactoryEvidenceBlock) -> bool:
-        receipt = self._translate(lambda: self._store.record_factory_block(block))
-        return not receipt.replayed
-
-    def record_lease(self, lease: FactoryLease) -> bool:
-        existing = self._translate(lambda: self._store.factory_job(lease.job_id).leases)
-        for recorded in existing:
-            if recorded.lease_id == lease.lease_id:
-                recorded_identity = recorded.model_dump(
-                    mode="json", exclude={"issued_at", "expires_at"}
+        runtime_retry = None
+        if (
+            self._runtime_retries is not None
+            and block.role is FactoryRole.TOOL_INTEGRATOR
+            and block.phase is FactoryPhase.TOOL_CANDIDATE_TESTED
+        ):
+            projection = self._translate(lambda: self._store.factory_job(block.job_id))
+            runtime_retry = self._runtime_retries.active(
+                projection.job,
+                FactoryAction(
+                    kind=FactoryActionKind.DISPATCH_TOOL_INTEGRATOR,
+                    attempt=block.attempt,
+                ),
+                projection,
+                block.occurred_at.astimezone(timezone.utc),
+            )
+        if runtime_retry is None:
+            receipt = self._translate(lambda: self._store.record_factory_block(block))
+        else:
+            receipt = self._translate(
+                lambda: self._store.record_factory_block(
+                    block,
+                    runtime_retry_authorization=runtime_retry,
                 )
-                proposed_identity = lease.model_dump(
-                    mode="json", exclude={"issued_at", "expires_at"}
-                )
-                if recorded_identity != proposed_identity:
-                    raise FactoryRepositoryError(
-                        "lease_id already exists with different content"
-                    )
-                return False
-        receipt = self._translate(lambda: self._store.record_factory_lease(lease))
+            )
         return not receipt.replayed
 
     def blocks(self, job_id: UUID) -> tuple[FactoryEvidenceBlock, ...]:
@@ -108,23 +121,16 @@ class GatewayFactoryRepository(FactoryRepository):
     def release_decision_for_job(self, job_id: UUID) -> FactoryReleaseDecision | None:
         return self._translate(lambda: self._store.factory_release_decision(job_id))
 
-    def append_terminal_decision(self, decision: FactoryTerminalDecision) -> bool:
-        receipt = self._translate(
-            lambda: self._store.record_factory_terminal_decision(decision)
-        )
-        return not receipt.replayed
-
-    def terminal_decision_for_job(
-        self,
-        job_id: UUID,
-    ) -> FactoryTerminalDecision | None:
-        lookup = getattr(self._store, "factory_terminal_decision", None)
-        if lookup is None:
-            return None
-        return self._translate(lambda: lookup(job_id))
-
     def workflow_artifacts(self, job_id: UUID) -> tuple[FactoryWorkflowArtifact, ...]:
         return self._translate(lambda: self._store.factory_workflow_artifacts(job_id))
+
+    def record_workflow_artifact(self, artifact: FactoryWorkflowArtifact) -> bool:
+        """Persist one Captain-validated workflow artifact through the Gateway."""
+
+        receipt = self._translate(
+            lambda: self._store.record_factory_workflow_artifact(artifact)
+        )
+        return not receipt.replayed
 
     def workflow_budget_projection(
         self,
@@ -137,6 +143,30 @@ class GatewayFactoryRepository(FactoryRepository):
         job_id: UUID,
     ) -> tuple[FactoryUsageReceiptV1, ...]:
         return self._translate(lambda: self._store.factory_usage_receipts(job_id))
+
+    def record_business_benchmark_summary(
+        self, summary: BusinessBenchmarkSummaryV1
+    ) -> bool:
+        receipt = self._translate(
+            lambda: self._store.record_business_benchmark_summary(summary)
+        )
+        return not receipt.replayed
+
+    def business_benchmark_summary(
+        self, summary_id: UUID
+    ) -> BusinessBenchmarkSummaryV1 | None:
+        return self._translate(
+            lambda: self._store.business_benchmark_summary(summary_id)
+        )
+
+    def business_benchmark_summary_by_artifact(
+        self, artifact_ref: ArtifactRef
+    ) -> BusinessBenchmarkSummaryV1 | None:
+        return self._translate(
+            lambda: self._store.business_benchmark_summary_by_artifact(
+                artifact_ref
+            )
+        )
 
     def seed_released_skill_assignments(
         self,
@@ -189,23 +219,6 @@ class GatewayFactoryRepository(FactoryRepository):
             raise FactoryRepositoryError(str(exc.detail)) from exc
 
 
-class GatewayFactoryWorkflowArtifactSink(FactoryWorkflowArtifactSink):
-    """Persist typed workflow artifacts through the Gateway sole writer."""
-
-    def __init__(self, store: GatewayStore) -> None:
-        self._store = store
-
-    async def persist(self, artifact: FactoryWorkflowArtifact) -> bool:
-        try:
-            receipt = await asyncio.to_thread(
-                self._store.record_factory_workflow_artifact,
-                artifact,
-            )
-        except HTTPException as exc:
-            raise FactoryRepositoryError(str(exc.detail)) from exc
-        return not receipt.replayed
-
-
 class GatewayFactoryLeases(FactoryLeasePort):
     """Resolve the current valid role lease only from Captain's ledger."""
 
@@ -234,12 +247,25 @@ class GatewayFactoryLeases(FactoryLeasePort):
             candidates[0], job=job, role=role, attempt=attempt, now=now
         )
 
+    def record(self, lease: FactoryLease) -> FactoryLease:
+        try:
+            self._store.record_factory_lease(lease)
+        except HTTPException as exc:
+            raise FactoryLeaseDenied(str(exc.detail)) from exc
+        return lease
+
 
 class GatewayFactoryBudgetLedger(FactoryBudgetPort):
     """Route budget authority through GatewayStore without database credentials."""
 
-    def __init__(self, store: GatewayStore) -> None:
+    def __init__(
+        self,
+        store: GatewayStore,
+        *,
+        runtime_retries: FactoryRuntimeRetrySource | None = None,
+    ) -> None:
         self._store = store
+        self._runtime_retries = runtime_retries
 
     def reserve(
         self,
@@ -248,7 +274,6 @@ class GatewayFactoryBudgetLedger(FactoryBudgetPort):
         attempt: int,
         requested_usd: Decimal,
         now: datetime,
-        invocation_id: UUID | None = None,
     ) -> FactoryBudgetReservationV1:
         policy_digest = _execution_policy_digest(job.execution_policy)
         reservation_id = uuid5(
@@ -259,7 +284,6 @@ class GatewayFactoryBudgetLedger(FactoryBudgetPort):
                     str(job.job_id),
                     str(job.subject_version),
                     str(attempt),
-                    str(invocation_id or "legacy"),
                     _canonical_decimal(requested_usd),
                     now.isoformat(),
                 )
@@ -273,7 +297,6 @@ class GatewayFactoryBudgetLedger(FactoryBudgetPort):
             subject_version=job.subject_version,
             execution_policy_sha256=policy_digest,
             attempt=attempt,
-            invocation_id=invocation_id,
             requested_usd=requested_usd,
             reserved_at=now,
             expires_at=job.deadline_at,
@@ -287,37 +310,54 @@ class GatewayFactoryBudgetLedger(FactoryBudgetPort):
         job: AgentFactoryJobV3,
         reservation: FactoryBudgetReservationV1,
         receipt: FactoryUsageReceiptV1,
+        *,
+        lease: FactoryLease | None = None,
     ) -> FactoryBudgetWriteReceipt:
         if (
             receipt.reservation_id != reservation.reservation_id
             or receipt.job_id != job.job_id
             or receipt.correlation_id != job.correlation_id
             or receipt.attempt != reservation.attempt
-            or (
-                reservation.invocation_id is not None
-                and receipt.invocation_id != reservation.invocation_id
-            )
         ):
             raise ValueError("factory usage receipt binding mismatch")
-        leases = self._translate_budget(
-            lambda: self._store.factory_job(job.job_id).leases
-        )
-        candidates = tuple(
-            lease
-            for lease in leases
-            if lease.job_id == job.job_id
-            and lease.correlation_id == job.correlation_id
-            and lease.subject_version == job.subject_version
-            and lease.attempt == receipt.attempt
-            and (
-                lease.lease_id == receipt.lease_id
-                if receipt.lease_id is not None
-                else lease.role is FactoryRole.REAL_CASE_TESTER
+        if lease is not None:
+            try:
+                validate_factory_lease(
+                    lease,
+                    job=job,
+                    role=FactoryRole.REAL_CASE_TESTER,
+                    attempt=receipt.attempt,
+                    now=receipt.started_at,
+                )
+            except FactoryLeaseDenied as exc:
+                raise ValueError("usage Factory lease is invalid") from exc
+            candidates = (
+                (lease,)
+                if "model.invoke" in lease.capabilities
+                and receipt.ended_at < lease.expires_at
+                else ()
             )
-            and "model.invoke" in lease.capabilities
-            and lease.issued_at <= receipt.started_at
-            and receipt.ended_at < lease.expires_at
-        )
+        else:
+            leases = self._translate_budget(
+                lambda: self._store.factory_job(job.job_id).leases
+            )
+            candidates = tuple(
+                item
+                for item in leases
+                if item.job_id == job.job_id
+                and item.correlation_id == job.correlation_id
+                and item.subject_version == job.subject_version
+                and item.attempt == receipt.attempt
+                and item.role is FactoryRole.REAL_CASE_TESTER
+                and "model.invoke" in item.capabilities
+                and item.issued_at <= receipt.started_at
+                and receipt.ended_at < item.expires_at
+            )
+            if candidates:
+                latest_issued_at = max(item.issued_at for item in candidates)
+                candidates = tuple(
+                    item for item in candidates if item.issued_at == latest_issued_at
+                )
         if len(candidates) != 1:
             raise ValueError("usage requires one exact active factory lease")
         submission = FactoryUsageSubmissionV2(
@@ -377,42 +417,6 @@ class GatewayFactoryBudgetLedger(FactoryBudgetPort):
             ):
                 raise BudgetExhausted(detail) from exc
             raise ValueError(detail) from exc
-
-
-class GatewayFactoryLiveEffectLedger(FactoryLiveEffectLedger):
-    """Persist pre-effect claims and completions through the sole-writer Gateway."""
-
-    def __init__(self, store: GatewayStore) -> None:
-        self._store = store
-
-    def claim(
-        self,
-        request: FactoryLiveEffectRequestV1,
-    ) -> FactoryLiveEffectClaim:
-        return self._translate(
-            lambda: self._store.claim_factory_live_effect(request)
-        )
-
-    def complete(
-        self,
-        request: FactoryLiveEffectRequestV1,
-        outcome: FactoryLiveEffectOutcomeV1,
-    ) -> FactoryLiveEffectWriteReceipt:
-        return self._translate(
-            lambda: self._store.complete_factory_live_effect(request, outcome)
-        )
-
-    def history(self, job_id: UUID) -> tuple[FactoryLiveEffectRecord, ...]:
-        return self._translate(
-            lambda: self._store.factory_live_effect_history(job_id)
-        )
-
-    @staticmethod
-    def _translate(operation):
-        try:
-            return operation()
-        except HTTPException as exc:
-            raise ValueError(str(exc.detail)) from exc
 
 
 def _execution_policy_digest(policy) -> str:

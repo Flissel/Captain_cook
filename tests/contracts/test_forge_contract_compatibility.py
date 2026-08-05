@@ -5,13 +5,17 @@ from pathlib import Path
 
 from agenten.agent_factory.forge_contracts import (
     CreationJobV1 as CaptainCreationJob,
+    CreationPackageManifestV1 as CaptainCreationPackageManifest,
     CreationResultV1 as CaptainCreationResult,
     FactoryBuildAssignmentV1 as CaptainFactoryBuildAssignment,
+    ForgeBuildSkillUsageReceiptV1 as CaptainForgeBuildSkillUsageReceipt,
 )
 from minibook.swarm.contracts import (
     CreationJobV1,
+    CreationPackageManifestV1,
     CreationResultV1,
     FactoryBuildAssignmentV1,
+    ForgeBuildSkillUsageReceiptV1,
 )
 
 
@@ -44,4 +48,74 @@ def test_parent_and_minibook_validate_the_same_assignment_fixture() -> None:
         "hermes_factory_assignment.v1.json",
         CaptainFactoryBuildAssignment,
         FactoryBuildAssignmentV1,
+    )
+
+
+def test_parent_and_minibook_validate_the_same_creation_package_manifest() -> None:
+    payload = {
+        "schema": "minibook.creation-package-manifest.v1",
+        "creation_job_id": "00000000-0000-0000-0000-000000000401",
+        "factory_job_id": "00000000-0000-0000-0000-000000000301",
+        "correlation_id": "00000000-0000-0000-0000-000000000302",
+        "subject_version": 1,
+        "attempt": 1,
+        "candidate_manifest_ref": {
+            "uri": "artifact://forge/candidate/" + "d" * 64,
+            "sha256": "d" * 64,
+            "media_type": "application/json",
+        },
+        "source_archive_ref": {
+            "uri": "artifact://forge/source/" + "e" * 64,
+            "sha256": "e" * 64,
+            "media_type": "application/zip",
+        },
+        "skill_usage_receipt_ref": {
+            "uri": "artifact://forge/skill-receipt/" + "f" * 64,
+            "sha256": "f" * 64,
+            "media_type": "application/json",
+        },
+    }
+    parent = CaptainCreationPackageManifest.model_validate(payload)
+    minibook = CreationPackageManifestV1.model_validate(payload)
+
+    assert parent.model_dump(mode="json", by_alias=True) == minibook.model_dump(
+        mode="json", by_alias=True
+    )
+
+
+def test_parent_and_minibook_validate_the_same_forge_build_skill_receipt() -> None:
+    payload = {
+        "schema": "hermes.forge-build-skill-usage-receipt.v1",
+        "producer": "hermes",
+        "outcome": "fulfilled",
+        "creation_job_id": "00000000-0000-0000-0000-000000000401",
+        "factory_job_id": "00000000-0000-0000-0000-000000000301",
+        "correlation_id": "00000000-0000-0000-0000-000000000302",
+        "subject_version": 1,
+        "attempt": 1,
+        "idempotency_key": "a" * 64,
+        "released_skill": {
+            "skill_id": "captain-factory-brief-codex",
+            "version": 1,
+            "content_ref": {
+                "uri": "artifact://forge/skill/" + "b" * 64,
+                "sha256": "b" * 64,
+                "media_type": "text/markdown",
+            },
+            "content_sha256": "b" * 64,
+        },
+        "public_assertion_ids": ["assertion.team-starts"],
+        "evidence_refs": [
+            {
+                "uri": "artifact://forge/evidence/" + "c" * 64,
+                "sha256": "c" * 64,
+                "media_type": "application/json",
+            }
+        ],
+    }
+    parent = CaptainForgeBuildSkillUsageReceipt.model_validate(payload)
+    minibook = ForgeBuildSkillUsageReceiptV1.model_validate(payload)
+
+    assert parent.model_dump(mode="json", by_alias=True) == minibook.model_dump(
+        mode="json", by_alias=True
     )

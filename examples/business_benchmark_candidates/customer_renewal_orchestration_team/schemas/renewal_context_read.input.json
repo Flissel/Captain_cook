@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "operation": {"const": "read_renewal_context"},
+    "idempotency_key": {"type": "string", "minLength": 16, "maxLength": 128},
+    "evidence_partition": {"enum": ["ordinary", "boundary"]},
+    "synthetic_subject_id": {"type": "string", "pattern": "^subject-[a-z0-9]+$"},
+    "commercial_snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "renewal_window": {"type": "string"},
+        "engagement_band": {"type": "string"},
+        "commercial_evidence_state": {"type": "string"},
+        "consent_state": {"type": "string"}
+      },
+      "required": ["renewal_window", "engagement_band", "commercial_evidence_state", "consent_state"]
+    }
+  },
+  "required": ["operation", "idempotency_key", "evidence_partition", "synthetic_subject_id", "commercial_snapshot"]
+}

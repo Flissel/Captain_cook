@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-import json
-from pathlib import Path
+from datetime import datetime, timezone
 from uuid import UUID
 
 import pytest
@@ -41,6 +39,11 @@ from tests.agent_factory.test_factory_feedback import (
     _report_invocation,
 )
 from agenten.agent_factory.factory_feedback import FactoryFeedbackBuilder
+from agenten.agent_factory.skill_workflow_contracts import (
+    FactoryFeedbackRecommendation,
+)
+from gateway.contracts import FactoryJobProjection
+from tests.agent_factory.test_team_evaluation import _benchmark as workflow_benchmark
 from tests.agent_factory.test_skill_evaluation_contracts import evidence_payload
 
 
@@ -143,28 +146,6 @@ def workflow_block(
     )
 
 
-def v2_job(*, deadline_at: datetime | None = None) -> AgentFactoryJobV2:
-    payload = json.loads(
-        (Path(__file__).parents[1] / "fixtures" / "agent_factory" / "agent_factory_job.v2.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    legacy = job()
-    payload.update(
-        {
-            "event_id": str(legacy.event_id),
-            "correlation_id": str(legacy.correlation_id),
-            "occurred_at": legacy.occurred_at.isoformat(),
-            "job_id": str(legacy.job_id),
-            "subject_version": legacy.subject_version,
-            "required_capability": legacy.required_capability,
-            "acceptance_assertion_ids": list(legacy.acceptance_assertion_ids),
-            "deadline_at": (deadline_at or NOW + timedelta(minutes=15)).isoformat(),
-        }
-    )
-    return AgentFactoryJobV2.model_validate(payload)
-
-
 def block(
     phase: FactoryPhase,
     *,
@@ -181,6 +162,7 @@ def block(
         FactoryPhase.BUILD_PASSED: FactoryRole.TOOL_INTEGRATOR,
         FactoryPhase.BUILD_FAILED: FactoryRole.TOOL_INTEGRATOR,
         FactoryPhase.REAL_CASE_EVIDENCE: FactoryRole.REAL_CASE_TESTER,
+        FactoryPhase.REAL_CASE_REVALIDATED: FactoryRole.REAL_CASE_TESTER,
         FactoryPhase.QUALITY_REVIEWED: FactoryRole.QUALITY_WARDEN,
     }.get(phase)
     effective_role = role if role is not None else role_for_phase
@@ -361,6 +343,157 @@ def test_missing_assertion_requests_improvement_not_promotion() -> None:
     assert next_action(state).kind is FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED
 
 
+def test_captain_can_request_improvement_directly_from_failed_technical_run() -> None:
+    state = FactoryProjection.from_job(job())
+    for event in (
+        block(FactoryPhase.FORGE_REQUESTED),
+        block(FactoryPhase.BLUEPRINT_CREATED),
+        block(FactoryPhase.TOOL_CANDIDATE_TESTED),
+        block(FactoryPhase.AGENT_CODE_CREATED),
+        block(FactoryPhase.BUILD_PASSED),
+        block(FactoryPhase.REAL_CASE_EVIDENCE),
+    ):
+        state = apply_block(state, event)
+
+    requested = apply_block(
+        state,
+        block(FactoryPhase.IMPROVEMENT_REQUESTED, assertions=("schema_valid",)),
+    )
+
+    assert requested.phase is FactoryPhase.IMPROVEMENT_REQUESTED
+    assert requested.attempt == 2
+
+
+def test_captain_can_revalidate_same_attempt_after_host_runtime_fix() -> None:
+    state = FactoryProjection.from_job(job())
+    for event in (
+        block(FactoryPhase.FORGE_REQUESTED),
+        block(FactoryPhase.BLUEPRINT_CREATED),
+        block(FactoryPhase.TOOL_CANDIDATE_TESTED),
+        block(FactoryPhase.AGENT_CODE_CREATED),
+        block(FactoryPhase.BUILD_PASSED),
+        block(
+            FactoryPhase.REAL_CASE_EVIDENCE,
+            status=FactoryBlockStatus.FAILED,
+        ),
+    ):
+        state = apply_block(state, event)
+
+    authorization_ref = ArtifactRef(
+        uri=f"artifact://factory/technical-revalidation/{'b' * 64}",
+        sha256="b" * 64,
+        media_type="application/json",
+    )
+    superseded_ref = ArtifactRef(
+        uri=f"artifact://factory/team-execution/{'c' * 64}",
+        sha256="c" * 64,
+        media_type="application/json",
+    )
+    requested = apply_block(
+        state,
+        block(FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED).model_copy(
+            update={
+                "artifact_refs": (superseded_ref,),
+                "evidence_refs": (authorization_ref,),
+            }
+        ),
+    )
+
+    action = next_action(requested)
+    assert action.kind is FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION
+    assert action.attempt == 1
+    assert action.authorization_ref == authorization_ref
+    assert action.supersedes_ref == superseded_ref
+
+    revalidated = apply_block(
+        requested,
+        block(
+            FactoryPhase.REAL_CASE_REVALIDATED,
+            assertions=job().acceptance_assertion_ids,
+        ),
+    )
+    assert revalidated.attempt == 1
+    assert next_action(revalidated).kind is FactoryActionKind.DISPATCH_QUALITY_WARDEN
+
+
+def test_captain_can_reauthorize_failed_technical_revalidation_same_attempt() -> None:
+    state = FactoryProjection.from_job(job())
+    for event in (
+        block(FactoryPhase.FORGE_REQUESTED),
+        block(FactoryPhase.BLUEPRINT_CREATED),
+        block(FactoryPhase.TOOL_CANDIDATE_TESTED),
+        block(FactoryPhase.AGENT_CODE_CREATED),
+        block(FactoryPhase.BUILD_PASSED),
+        block(FactoryPhase.REAL_CASE_EVIDENCE, status=FactoryBlockStatus.FAILED),
+    ):
+        state = apply_block(state, event)
+
+    superseded_ref = ArtifactRef(
+        uri=f"artifact://factory/team-execution/{'c' * 64}",
+        sha256="c" * 64,
+        media_type="application/json",
+    )
+    first_authorization = ArtifactRef(
+        uri=f"artifact://factory/technical-revalidation/{'b' * 64}",
+        sha256="b" * 64,
+        media_type="application/json",
+    )
+    state = apply_block(
+        state,
+        block(FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED).model_copy(
+            update={
+                "artifact_refs": (superseded_ref,),
+                "evidence_refs": (first_authorization,),
+            }
+        ),
+    )
+    state = apply_block(
+        state,
+        block(
+            FactoryPhase.REAL_CASE_REVALIDATED,
+            status=FactoryBlockStatus.FAILED,
+        ),
+    )
+
+    second_authorization = ArtifactRef(
+        uri=f"artifact://factory/technical-revalidation/{'d' * 64}",
+        sha256="d" * 64,
+        media_type="application/json",
+    )
+    requested = apply_block(
+        state,
+        block(FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED).model_copy(
+            update={
+                "event_id": UUID("00000000-0000-0000-0000-000000000099"),
+                "artifact_refs": (superseded_ref,),
+                "evidence_refs": (second_authorization,),
+            }
+        ),
+    )
+
+    assert requested.attempt == 1
+    assert next_action(requested).authorization_ref == second_authorization
+
+    replacement_authorization = ArtifactRef(
+        uri=f"artifact://factory/technical-revalidation/{'e' * 64}",
+        sha256="e" * 64,
+        media_type="application/json",
+    )
+    replaced = apply_block(
+        requested,
+        block(FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED).model_copy(
+            update={
+                "event_id": UUID("00000000-0000-0000-0000-000000000098"),
+                "artifact_refs": (superseded_ref,),
+                "evidence_refs": (replacement_authorization,),
+            }
+        ),
+    )
+
+    assert replaced.attempt == 1
+    assert next_action(replaced).authorization_ref == replacement_authorization
+
+
 def test_fifth_behavioral_failure_escalates() -> None:
     state = FactoryProjection.from_job(job()).model_copy(update={"attempt": 5})
     for phase in (
@@ -489,6 +622,7 @@ def test_v3_quality_feedback_routes_only_through_existing_captain_actions() -> N
         reviewed,
         workflow_evaluation=evaluation,
         feedback=feedback,
+        benchmark_summary=workflow_benchmark(),
     )
 
     assert state.workflow_evaluation_ref == evaluation.artifact_ref
@@ -506,6 +640,7 @@ def test_v3_quality_feedback_routes_only_through_existing_captain_actions() -> N
         workflow_evaluation=evaluation,
         feedback=feedback,
         workflow_release_decision=ready,
+        benchmark_summary=workflow_benchmark(),
     ).kind is FactoryActionKind.VALIDATE_FOR_PROMOTION
 
     demo_ready = ready.model_copy(
@@ -519,15 +654,8 @@ def test_v3_quality_feedback_routes_only_through_existing_captain_actions() -> N
         workflow_evaluation=evaluation,
         feedback=feedback,
         workflow_release_decision=demo_ready,
+        benchmark_summary=workflow_benchmark(),
     ).kind is FactoryActionKind.APPEND_ESCALATED
-
-    demo_state = state.model_copy(update={"job": job_v3(mode="demo")})
-    assert next_action(
-        demo_state,
-        workflow_evaluation=evaluation,
-        feedback=feedback,
-        workflow_release_decision=demo_ready,
-    ).kind is FactoryActionKind.VALIDATE_FOR_PROMOTION
 
 
 def test_v3_promotion_uses_only_the_workflow_release_decision() -> None:
@@ -570,26 +698,167 @@ def test_v3_promotion_uses_only_the_workflow_release_decision() -> None:
         evaluation_id=evaluation.invocation_id,
         evaluation_ref=evaluation.artifact_ref,
     )
+    with pytest.raises(
+        FactoryLifecycleError,
+        match="authoritative business benchmark summary",
+    ):
+        apply_block(
+            state,
+            promotion,
+            workflow_evaluation=evaluation,
+            feedback=feedback,
+            release_decision=ready,
+        )
+
     promoted = apply_block(
         state,
         promotion,
         workflow_evaluation=evaluation,
         feedback=feedback,
         release_decision=ready,
+        benchmark_summary=workflow_benchmark(),
     )
 
     assert promoted.status is FactoryLifecycleStatus.READY_TO_USE
-    assert promoted.workflow_evaluation_ref == evaluation.artifact_ref
 
-    demo_state = state.model_copy(update={"job": job_v3(mode="demo")})
-    demo_ready = ready.model_copy(update={"status": "demo_ready"})
-    with pytest.raises(FactoryLifecycleError, match="demo"):
+
+def _promotion_snapshot(
+    *, mode: str = "release"
+) -> tuple[FactoryJobProjection, object, object, FactoryEvidenceBlock]:
+    factory_job = job_v3(mode=mode)
+    evaluation = workflow_evaluation()
+    feedback = FactoryFeedbackBuilder(clock=lambda: evaluation.occurred_at).build(
+        invocation=_report_invocation(evaluation),
+        candidate_ref=workflow_candidate(),
+        evaluation=evaluation,
+        budget_projection=workflow_budget(),
+    )
+    quality = workflow_block(
+        FactoryPhase.QUALITY_REVIEWED,
+        assertions=factory_job.acceptance_assertion_ids,
+    ).model_copy(
+        update={
+            "job_id": factory_job.job_id,
+            "correlation_id": factory_job.correlation_id,
+            "artifact_refs": (evaluation.artifact_ref, feedback.artifact_ref),
+        }
+    )
+    projection = FactoryProjection.from_job(factory_job).model_copy(
+        update={
+            "status": FactoryLifecycleStatus.RUNNING,
+            "phase": FactoryPhase.QUALITY_REVIEWED,
+            "attempt": 1,
+            "observed_assertion_ids": factory_job.acceptance_assertion_ids,
+            "block_ids": (quality.event_id,),
+            "workflow_evaluation_ref": evaluation.artifact_ref,
+            "feedback_ref": feedback.artifact_ref,
+            "feedback_recommendation": feedback.recommendation,
+        }
+    )
+    snapshot = FactoryJobProjection(
+        job=factory_job,
+        blocks=(quality,),
+        leases=(),
+        projection=projection,
+    )
+    return snapshot, evaluation, feedback, quality
+
+
+def test_release_promotion_builder_emits_one_exact_captain_block() -> None:
+    from agenten.agent_factory.workflow_promotion import (
+        build_release_workflow_promotion,
+    )
+
+    snapshot, evaluation, feedback, quality = _promotion_snapshot()
+    factory_job = snapshot.job
+
+    promotion = build_release_workflow_promotion(snapshot, occurred_at=NOW)
+
+    assert promotion.phase is FactoryPhase.CAPABILITY_PROMOTED
+    assert promotion.producer == "captain"
+    assert promotion.status is FactoryBlockStatus.SUCCEEDED
+    assert promotion.causation_id == quality.event_id
+    assert promotion.artifact_refs == (evaluation.artifact_ref, feedback.artifact_ref)
+    assert promotion.evidence_refs == quality.evidence_refs
+    assert promotion.assertion_ids == factory_job.acceptance_assertion_ids
+    assert build_release_workflow_promotion(snapshot, occurred_at=NOW) == promotion
+
+
+def test_release_promotion_builder_rejects_demo_job() -> None:
+    from agenten.agent_factory.workflow_promotion import (
+        build_release_workflow_promotion,
+    )
+
+    snapshot, _, _, _ = _promotion_snapshot(mode="demo")
+
+    with pytest.raises(ValueError, match="release execution mode"):
+        build_release_workflow_promotion(snapshot, occurred_at=NOW)
+
+
+def test_release_promotion_builder_rejects_non_promotable_quality_review() -> None:
+    from agenten.agent_factory.workflow_promotion import (
+        build_release_workflow_promotion,
+    )
+
+    snapshot, _, _, _ = _promotion_snapshot()
+    snapshot = snapshot.model_copy(
+        update={
+            "projection": snapshot.projection.model_copy(
+                update={
+                    "feedback_recommendation": FactoryFeedbackRecommendation.RETRY_BUILD,
+                }
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="promotable quality review"):
+        build_release_workflow_promotion(snapshot, occurred_at=NOW)
+
+
+def test_release_promotion_builder_rejects_incomplete_quality_evidence() -> None:
+    from agenten.agent_factory.workflow_promotion import (
+        build_release_workflow_promotion,
+    )
+
+    snapshot, _, _, _ = _promotion_snapshot()
+    snapshot = snapshot.model_copy(
+        update={
+            "projection": snapshot.projection.model_copy(
+                update={"feedback_ref": None}
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="complete quality evidence"):
+        build_release_workflow_promotion(snapshot, occurred_at=NOW)
+
+
+def test_v3_quality_feedback_rejects_a_summary_for_another_suite() -> None:
+    evaluation = workflow_evaluation()
+    feedback = FactoryFeedbackBuilder(clock=lambda: evaluation.occurred_at).build(
+        invocation=_report_invocation(evaluation),
+        candidate_ref=workflow_candidate(),
+        evaluation=evaluation,
+        budget_projection=workflow_budget(),
+    )
+    state = FactoryProjection.from_job(job_v3()).model_copy(
+        update={"status": FactoryLifecycleStatus.RUNNING, "phase": FactoryPhase.REAL_CASE_EVIDENCE}
+    )
+    reviewed = workflow_block(
+        FactoryPhase.QUALITY_REVIEWED,
+        assertions=job_v3().acceptance_assertion_ids,
+    ).model_copy(update={"artifact_refs": (evaluation.artifact_ref, feedback.artifact_ref)})
+    other_suite = workflow_benchmark().model_copy(
+        update={"suite_ref": workflow_benchmark().suite_ref.model_copy(update={"sha256": "9" * 64})}
+    )
+
+    with pytest.raises(FactoryLifecycleError, match="business benchmark"):
         apply_block(
-            demo_state,
-            promotion,
+            state,
+            reviewed,
             workflow_evaluation=evaluation,
             feedback=feedback,
-            release_decision=demo_ready,
+            benchmark_summary=other_suite,
         )
 
 
@@ -615,6 +884,7 @@ def test_v3_failed_feedback_requests_improvement_and_missing_feedback_fails_clos
         state,
         workflow_evaluation=evaluation,
         feedback=feedback,
+        benchmark_summary=workflow_benchmark(),
     ).kind is FactoryActionKind.APPEND_IMPROVEMENT_REQUESTED
     with pytest.raises(FactoryLifecycleError, match="workflow feedback"):
         next_action(state)

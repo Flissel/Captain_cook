@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from agenten.agent_factory.contracts import AgentFactoryJobV3
 from agenten.agent_factory.execution_budget import (
     BudgetExhausted,
+    FactoryBudgetProjection,
     FactoryBudgetReservationV1,
     FactoryBudgetWriteReceipt,
     FactoryUsageReceiptV1,
@@ -20,6 +21,19 @@ from agenten.agent_factory.execution_budget import (
 
 
 NOW = datetime(2026, 7, 21, 12, tzinfo=timezone.utc)
+
+
+def test_budget_projection_preserves_micro_usd_provider_usage() -> None:
+    projection = FactoryBudgetProjection(
+        job_id=UUID("10000000-0000-0000-0000-000000000003"),
+        limit_usd="0.40",
+        consumed_usd="0.130133",
+        reserved_usd="0.00",
+        remaining_usd="0.269867",
+    )
+
+    assert projection.consumed_usd == Decimal("0.130133")
+    assert projection.remaining_usd == Decimal("0.269867")
 
 
 def artifact(kind: str, digest: str) -> dict[str, str]:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from typing import Any, Iterable, Literal
@@ -13,7 +13,11 @@ from .minibook_client import (
     RemoteProjectionConflict,
     RemoteProjectionStale,
 )
-from .minibook_events import MinibookProjectionEvent
+from .minibook_events import (
+    MinibookProjectionAcknowledgementV1,
+    MinibookProjectionEvent,
+    minibook_projection_acknowledgement_id,
+)
 from .projection_cursor import ProjectionCursorStore, projection_event_fingerprint
 
 
@@ -329,11 +333,83 @@ class MinibookProjector:
             changes_applied=changes_applied,
         )
 
-    def render(self, event: MinibookProjectionEvent) -> ProjectionPost:
+    def acknowledgement(
+        self,
+        event: MinibookProjectionEvent,
+    ) -> MinibookProjectionAcknowledgementV1:
+        """Prove that one canonical, non-duplicate event post is durable."""
+
+        event = self._validated_event(event)
+        project = next(
+            (
+                item
+                for item in self.client.list_projects()
+                if item.get("id") == self.PROJECTION_PROJECT_ID
+                and item.get("name") == self.PROJECTION_PROJECT
+            ),
+            None,
+        )
+        if project is None:
+            raise RuntimeError("Minibook projection project is unavailable")
+        desired = self.render(event)
+        event_tag = f"captain-event:{event.event_id}"
+        candidates = [
+            post
+            for post in self.client.list_posts(project["id"])
+            if post.get("status") == "open"
+            and event_tag in post.get("tags", [])
+        ]
+        matches = [
+            post for post in candidates if self._post_matches(post, desired)
+        ]
+        if len(candidates) != 1 or len(matches) != 1:
+            raise RuntimeError(
+                "Minibook projection is missing, drifted, or duplicated"
+            )
+        post = matches[0]
+        expected_post_id = "captain-projection-" + hashlib.sha256(
+            str(event.event_id).encode("utf-8")
+        ).hexdigest()[:32]
+        if post.get("id") != expected_post_id:
+            raise RuntimeError("Minibook projection post identity is not canonical")
+        acknowledged_at = post.get("created_at")
+        if isinstance(acknowledged_at, str):
+            acknowledged_at = datetime.fromisoformat(
+                acknowledged_at.replace("Z", "+00:00")
+            )
+        if not isinstance(acknowledged_at, datetime):
+            raise RuntimeError("Minibook projection creation time is unavailable")
+        if acknowledged_at.tzinfo is None:
+            acknowledged_at = acknowledged_at.replace(tzinfo=timezone.utc)
+        else:
+            acknowledged_at = acknowledged_at.astimezone(timezone.utc)
+        acknowledgement_id = minibook_projection_acknowledgement_id(
+            event.event_id,
+            post_id=expected_post_id,
+            content_sha256=desired.content_hash,
+        )
+        return MinibookProjectionAcknowledgementV1(
+            acknowledgement_id=acknowledgement_id,
+            projection_event_id=event.event_id,
+            correlation_id=event.correlation_id,
+            subject_id=event.subject_id,
+            subject_version=event.subject_version,
+            project_id=self.PROJECTION_PROJECT_ID,
+            post_id=expected_post_id,
+            content_sha256=desired.content_hash,
+            acknowledged_at=acknowledged_at,
+            outcome="mirrored",
+        )
+
+    @classmethod
+    def render(
+        cls,
+        event: MinibookProjectionEvent,
+    ) -> ProjectionPost:
         payload = event.payload
         fields: list[tuple[str, str]] = [
-            ("Status", self._status_label(payload.status_id)),
-            ("View", self._view_label(payload.view)),
+            ("Status", cls._status_label(payload.status_id)),
+            ("View", cls._view_label(payload.view)),
             ("Correlation", str(event.correlation_id)),
             ("Subject", event.subject_id),
             ("Subject version", str(event.subject_version)),
@@ -343,11 +419,41 @@ class MinibookProjector:
         if payload.batch_version is not None:
             fields.append(("Batch version", str(payload.batch_version)))
         if payload.actor_role_id is not None:
-            fields.append(("Actor", self._actor_label(payload.actor_role_id)))
+            fields.append(("Actor", cls._actor_label(payload.actor_role_id)))
         if payload.artifact_digest is not None:
             fields.append(("Artifact", payload.artifact_digest))
+        if payload.benchmark_disposition is not None:
+            fields.extend(
+                (
+                    ("Benchmark", payload.benchmark_disposition),
+                    ("Candidate correctness", str(payload.candidate_correctness_bps)),
+                    ("Baseline correctness", str(payload.baseline_correctness_bps)),
+                    ("Candidate completion", str(payload.candidate_completion_bps)),
+                    ("Baseline completion", str(payload.baseline_completion_bps)),
+                    ("Cost ratio", str(payload.cost_ratio_bps)),
+                    ("Latency ratio", str(payload.latency_ratio_bps)),
+                    ("Unsafe tool uses", str(payload.unsafe_tool_uses)),
+                    (
+                        "Mandatory handoff misses",
+                        str(payload.mandatory_handoff_misses),
+                    ),
+                    ("Benchmark summary", str(payload.benchmark_summary_digest)),
+                )
+            )
+            if payload.benchmark_reason_codes:
+                fields.append(
+                    ("Benchmark reasons", ", ".join(payload.benchmark_reason_codes))
+                )
+        if payload.integration_status is not None:
+            fields.extend(
+                (
+                    ("Integration status", payload.integration_status),
+                    ("Required integrations", str(payload.required_integration_count)),
+                    ("Ready integrations", str(payload.ready_integration_count)),
+                )
+            )
         content = "\n".join(f"- **{label}:** {value}" for label, value in fields)
-        title = f"[{event.event_type}] {self._template_title(payload.template_id)}"
+        title = f"[{event.event_type}] {cls._template_title(payload.template_id)}"
         identity_tags = (
             "captain-projection:v2",
             f"captain-event:{event.event_id}",
@@ -356,7 +462,7 @@ class MinibookProjector:
             f"captain-version:{event.subject_version}",
             f"captain-view:{payload.view}",
         )
-        content_hash = self._content_hash(title, content, identity_tags)
+        content_hash = cls._content_hash(title, content, identity_tags)
         return ProjectionPost(
             title=title,
             content=content,
@@ -376,6 +482,7 @@ class MinibookProjector:
             "runtime_validation_recorded": "Runtime validation recorded",
             "runtime_replanning_requested": "Runtime replanning requested",
             "factory_capability_ready_to_use": "Factory capability ready to use",
+            "integration_setup_status": "Integration setup status",
         }[template_id]
 
     @staticmethod

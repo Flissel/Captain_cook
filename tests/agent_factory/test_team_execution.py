@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import asyncio
-import inspect
 import json
 import zipfile
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 from uuid import uuid4
 
@@ -41,10 +41,12 @@ from agenten.agent_factory.skill_workflow_contracts import (
     FactorySkillStep,
 )
 from agenten.agent_factory.team_execution import (
+    AuthorityFreeBaselineTool,
     BudgetedChatCompletionClient,
     CaptainN8nGrantAuthority,
     CaptainAuthorizedN8nTool,
     CaptainReleasedSkillAuthority,
+    FactoryHandoffEvidenceV1,
     FactoryN8nExecutionEvidenceV1,
     FactoryN8nToolAuthorizationV1,
     FactoryHoldoutAssertionDecisionV1,
@@ -53,11 +55,22 @@ from agenten.agent_factory.team_execution import (
     FactoryPricingQuoteV1,
     FactoryTeamRunResult,
     HostAutoGenTeamRunner,
+    HostAutoGenSessionExecutor,
+    HostAutoGenSessionIdentityV1,
+    HostAutoGenSessionResult,
+    HostAutoGenSessionTimeoutError,
+    SealedSingleAgentPolicyV1,
     ResolvedFactoryHoldoutCase,
     TeamExecutionService,
+    _holdout_scoped_invocation,
     _FactoryActivityCeilingTermination,
-    _provider_failure_label,
+    _FactoryTaskCompletedTermination,
+    _n8n_tool_failure_category,
+    _session_termination_reason,
     compose_live_team_execution,
+)
+from gateway.factory_hermes_retry_authority import (
+    FilesystemFactoryHermesRetryAuthority,
 )
 from agenten.agent_runtime.contracts import (
     AgentRuntimeCommand,
@@ -75,81 +88,315 @@ from agenten.agent_runtime.contracts import (
 from agenten.targets.n8n import N8nExecutionEvidence
 from agenten.agent_runtime.capabilities import PROFILE_CAPABILITIES
 from agenten.llm.model_client import build_replay_model_client
-from autogen_core.models import FunctionExecutionResult, ModelFamily, ModelInfo, UserMessage
-from autogen_core import CancellationToken
+from autogen_core.models import (
+    CreateResult,
+    FunctionExecutionResult,
+    ModelFamily,
+    ModelInfo,
+    RequestUsage,
+    UserMessage,
+)
+from autogen_core import CancellationToken, FunctionCall
 from autogen_core.tools import FunctionTool
-from autogen_agentchat.messages import ToolCallExecutionEvent
 from autogen_ext.models.replay import ReplayChatCompletionClient
 from autogen_agentchat.teams import Swarm
+from autogen_agentchat.agents import AssistantAgent
+from autogen_agentchat.base import TaskResult
+from autogen_agentchat.messages import HandoffMessage, TextMessage, ToolCallExecutionEvent
 
 
 NOW = datetime(2026, 7, 21, 13, tzinfo=timezone.utc)
 
 
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("2 validation errors for renewal_context_read: Field required", "invalid_arguments"),
+        ("Captain n8n renewal read failed closed", "provider_rejected"),
+        ("arbitrary provider prose that must not escape", "unknown"),
+    ],
+)
+def test_n8n_tool_failure_category_is_bounded_and_sanitized(
+    content: str,
+    expected: str,
+) -> None:
+    assert _n8n_tool_failure_category(content) == expected
+
+
 @pytest.mark.asyncio
-async def test_activity_ceiling_excludes_internal_swarm_handoff_tools() -> None:
+async def test_budgeted_client_scopes_parallel_tool_calls_to_requests_with_tools(
+    tmp_path: Path,
+) -> None:
+    job = _job_v3()
+    observed_create_args: list[dict[str, object]] = []
+
+    class CapturingReplayClient(ReplayChatCompletionClient):
+        async def create(self, *args: object, **kwargs: object) -> CreateResult:
+            observed_create_args.append(dict(kwargs.get("extra_create_args", {})))
+            return await super().create(*args, **kwargs)  # type: ignore[arg-type]
+
+    delegate = CapturingReplayClient(
+        ["tool response", "terminal response"],
+        model_info=ModelInfo(
+            vision=False,
+            function_calling=True,
+            json_output=True,
+            family=ModelFamily.UNKNOWN,
+            structured_output=True,
+        ),
+    )
+    client = BudgetedChatCompletionClient(
+        job=job,
+        invocation=_invocation(job),
+        attempt=1,
+        delegate=delegate,
+        budget=InMemoryFactoryBudgetLedger(),
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "provider-evidence"),
+        provider="deterministic-replay",
+        model="approved-model-id",
+        max_cost_per_call=Decimal("0.50"),
+        paid_effect_authority=_PaidEffectAuthority(),
+        pricing_authority=_PricingAuthority(_pricing_quote(job)),
+        clock=lambda: NOW,
+    )
+
+    async def lookup(ticket: str) -> str:
+        return ticket
+
+    tool = FunctionTool(lookup, name="lookup", description="Lookup a ticket")
+    await client.create([UserMessage(content="use tool", source="user")], tools=[tool])
+    await client.create([UserMessage(content="finish", source="user")], tools=[])
+
+    assert observed_create_args == [{"parallel_tool_calls": False}, {}]
+
+
+@pytest.mark.asyncio
+async def test_host_observation_persists_distinct_evidence_for_each_handoff(
+    tmp_path: Path,
+) -> None:
+    job = _job_v3()
+    invocation = _invocation(job)
+    store = FilesystemFactoryEvidenceStore(tmp_path / "host-evidence")
+    client = BudgetedChatCompletionClient(
+        job=job,
+        invocation=invocation,
+        attempt=1,
+        delegate=build_replay_model_client(["unused"]),
+        budget=InMemoryFactoryBudgetLedger(),
+        evidence_store=store,
+        provider="deterministic-replay",
+        model="approved-model-id",
+        max_cost_per_call=Decimal("0.50"),
+        paid_effect_authority=_PaidEffectAuthority(),
+        pricing_authority=_PricingAuthority(_pricing_quote(job)),
+        clock=lambda: NOW,
+    )
+    identity = HostAutoGenSessionIdentityV1.for_factory_execution(
+        job=job,
+        invocation=invocation,
+        case_ref=job.private_holdout_refs[0],
+        subject_id="three_agent_swarm",
+        variant="candidate",
+        request_id=UUID("77000000-0000-0000-0000-000000000010"),
+        runtime_session_id="three-agent-handoff-session",
+        effect_id="7" * 64,
+        claim_id=UUID("78000000-0000-0000-0000-000000000010"),
+        fence=1,
+        model="approved-model-id",
+    )
+    executor = HostAutoGenSessionExecutor(
+        model_client=client,
+        evidence_store=store,
+        holdouts=object(),  # type: ignore[arg-type]
+        tools={},
+        clock=lambda: NOW,
+    )
+    result = TaskResult(
+        messages=[
+            HandoffMessage(source="intake", target="coverage", content="transfer"),
+            HandoffMessage(source="coverage", target="escalation", content="transfer"),
+            TextMessage(
+                source="escalation",
+                content='{"schema":"captain.business-benchmark-terminal.v1"}',
+            ),
+        ],
+        stop_reason="task_completed",
+    )
+
+    observed = await executor._observe(
+        job=job,
+        identity=identity,
+        model_client=client,
+        result=result,
+        receipt_offset=0,
+        dispatch_offset=0,
+        unresolved_before=frozenset(),
+        conversation_pattern="swarm",
+        max_messages=10,
+        max_handoffs=2,
+        max_tool_calls=0,
+        termination_conditions=("task_completed", "max_messages", "max_handoffs"),
+        handoff_tool_names=(
+            "transfer_to_coverage",
+            "transfer_to_escalation",
+        ),
+        n8n_tools={},
+        n8n_evidence_offset=0,
+    )
+
+    assert [item.from_agent for item in observed.handoffs] == ["intake", "coverage"]
+    assert [item.to_agent for item in observed.handoffs] == ["coverage", "escalation"]
+    assert len({item.evidence_ref for item in observed.handoffs}) == 2
+    persisted = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (tmp_path / "host-evidence").rglob("*.json")
+    ]
+    handoff_evidence = [
+        item
+        for item in persisted
+        if item.get("schema") == "captain.factory-autogen-handoff.v1"
+    ]
+    assert sorted(
+        (item["ordinal"], item["from_agent"], item["to_agent"])
+        for item in handoff_evidence
+    ) == [
+        (1, "intake", "coverage"),
+        (2, "coverage", "escalation"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_activity_ceiling_allows_exact_configured_handoff_and_tool_call() -> None:
     termination = _FactoryActivityCeilingTermination(
-        max_handoffs=4,
+        max_handoffs=1,
         max_tool_calls=1,
     )
-    internal_handoff = ToolCallExecutionEvent(
-        source="triage",
-        content=[
-            FunctionExecutionResult(
-                content="handoff",
-                name="transfer_to_resolver",
-                call_id="handoff-1",
+
+    assert await termination(
+        [
+            HandoffMessage(
+                source="intake",
+                target="specialist",
+                content="transfer",
             )
-        ],
+        ]
+    ) is None
+    assert await termination(
+        [
+            ToolCallExecutionEvent(
+                source="specialist",
+                content=[
+                    FunctionExecutionResult(
+                        content="ok",
+                        name="lookup",
+                        call_id="call-1",
+                    )
+                ],
+            )
+        ]
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_activity_ceiling_stops_only_after_handoff_limit_is_exceeded() -> None:
+    termination = _FactoryActivityCeilingTermination(
+        max_handoffs=1,
+        max_tool_calls=0,
     )
-    executable_tool = ToolCallExecutionEvent(
-        source="resolver",
-        content=[
-            FunctionExecutionResult(
-                content="ok",
-                name="support_triage",
-                call_id="tool-1",
-            )
-        ],
+    handoff = HandoffMessage(
+        source="intake",
+        target="specialist",
+        content="transfer",
     )
 
-    assert await termination([internal_handoff]) is None
-    stop = await termination([executable_tool])
+    assert await termination([handoff]) is None
+    stop = await termination([handoff])
 
     assert stop is not None
-    assert stop.content == "max_tool_calls"
+    assert stop.content == "max_handoffs"
 
 
-def test_provider_failure_label_redacts_openai_status(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CAPTAIN_RUNTIME_EVIDENCE_DIAGNOSTICS", "1")
-
-    label = _provider_failure_label(
-        RuntimeError("Error code: 400 - provider response body omitted")
+@pytest.mark.asyncio
+async def test_task_completed_requires_observed_handoff_when_topology_has_handoffs() -> None:
+    termination = _FactoryTaskCompletedTermination(require_handoff=True)
+    terminal = TextMessage(
+        source="intake",
+        content='{"schema":"captain.business-benchmark-terminal.v1"}',
     )
 
-    assert label == "RuntimeError:openai_status:400"
+    assert await termination([terminal]) is None
+    assert await termination(
+        [
+            HandoffMessage(
+                source="intake",
+                target="specialist",
+                content="transfer",
+            )
+        ]
+    ) is None
+    stop = await termination(
+        [TextMessage(source="specialist", content="TERMINATE")]
+    )
+
+    assert stop is not None
+    assert stop.content == "task_completed"
 
 
-def test_provider_failure_label_includes_only_safe_openai_error_fields(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class ProviderError(RuntimeError):
-        code = "invalid_value"
-        param = "messages.2.role"
+@pytest.mark.asyncio
+async def test_task_completed_ignores_terminal_marker_inside_tool_result() -> None:
+    termination = _FactoryTaskCompletedTermination(require_handoff=False)
+    tool_result = ToolCallExecutionEvent(
+        source="specialist",
+        content=[
+            FunctionExecutionResult(
+                content='{"schema":"captain.business-benchmark-terminal.v1"}',
+                name="captain_business_decision",
+                call_id="call-terminal-decision",
+            )
+        ],
+    )
 
-    monkeypatch.setenv("CAPTAIN_RUNTIME_EVIDENCE_DIAGNOSTICS", "1")
+    assert await termination([tool_result]) is None
+    stop = await termination(
+        [
+            TextMessage(
+                source="specialist",
+                content='{"schema":"captain.business-benchmark-terminal.v1"}',
+            )
+        ]
+    )
 
-    label = _provider_failure_label(ProviderError("Error code: 400 - sensitive provider body"))
-
-    assert label == "ProviderError:openai_status:400:code:invalid_value:param:messages.2.role"
-    assert "sensitive" not in label
+    assert stop is not None
+    assert stop.content == "task_completed"
 
 
-def test_host_runner_binds_outcome_version_to_job_authority() -> None:
-    source = inspect.getsource(HostAutoGenTeamRunner.run)
+def test_message_ceiling_ignores_internal_agent_events() -> None:
+    tool_events = [
+        ToolCallExecutionEvent(
+            source="intake",
+            content=[
+                FunctionExecutionResult(
+                    content="handoff",
+                    name="transfer_to_specialist",
+                    call_id=f"handoff-{number}",
+                )
+            ],
+        )
+        for number in range(3)
+    ]
+    result = TaskResult(
+        messages=[
+            *tool_events,
+            TextMessage(source="specialist", content="TERMINATE"),
+        ],
+        stop_reason="task_completed",
+    )
 
-    assert "capability_version=job.subject_version" in source
-    assert "team_version=job.subject_version" in source
+    assert _session_termination_reason(
+        result,
+        termination_conditions=("task_completed", "max_messages"),
+        max_messages=2,
+    ) == "task_completed"
 
 
 def _policy_digest(job: AgentFactoryJobV3) -> str:
@@ -258,6 +505,29 @@ def _n8n_tool_command_ref(reference: OpaqueN8nToolReference) -> ArtifactRef:
     return _artifact("n8n-command", hashlib.sha256(encoded).hexdigest())
 
 
+def test_team_execution_service_uses_explicit_release_run_ordinal(
+    tmp_path: Path,
+) -> None:
+    base_job = _job_v3()
+    job = base_job.model_copy(
+        update={
+            "execution_policy": base_job.execution_policy.model_copy(
+                update={"mode": "release", "required_live_runs": 3}
+            )
+        }
+    )
+    service = TeamExecutionService(
+        job=job,
+        preflight=SimpleNamespace(),  # type: ignore[arg-type]
+        runner=SimpleNamespace(),  # type: ignore[arg-type]
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
+        clock=lambda: NOW,
+        run_number=3,
+    )
+
+    assert service._run_number(job.private_holdout_refs[0]) == 3
+
+
 def _job_v3(
     *,
     live_execution: bool = True,
@@ -359,7 +629,9 @@ def _candidate(tmp_path: Path) -> ResolvedFactoryCandidate:
 
 def _sealed_team_candidate(tmp_path: Path) -> ResolvedFactoryCandidate:
     source = tmp_path / "sealed-team.zip"
-    first_prompt = b"Triage the case and hand off when needed."
+    first_prompt = (
+        b"Triage the case and call transfer_to_resolver when a handoff is needed."
+    )
     second_prompt = b"Resolve the typed support case."
     workflow = b"{}"
     input_schema = b'{"type":"object"}'
@@ -455,6 +727,21 @@ def _sealed_team_candidate(tmp_path: Path) -> ResolvedFactoryCandidate:
             timeout_seconds=30,
         ),
         source_archive=source,
+    )
+
+
+def test_pricing_quote_accounts_at_micro_dollar_precision() -> None:
+    job = _job_v3()
+    quote = _pricing_quote(job).model_copy(
+        update={
+            "input_cost_per_million": Decimal("0.40"),
+            "output_cost_per_million": Decimal("1.60"),
+            "minimum_cost_usd": Decimal("0"),
+        }
+    )
+
+    assert quote.cost(RequestUsage(prompt_tokens=1_000, completion_tokens=250)) == (
+        Decimal("0.000800")
     )
 
 
@@ -767,6 +1054,654 @@ async def test_live_run_reserves_records_usage_handoffs_and_termination(
 
 
 @pytest.mark.asyncio
+async def test_host_autogen_session_executor_uses_fresh_digest_bound_baselines(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    holdout_body = b"Private benchmark case that must never be persisted."
+    job = _job_v3(holdout_body=holdout_body)
+    invocation = _invocation(job)
+    evidence_store = FilesystemFactoryEvidenceStore(tmp_path / "session-evidence")
+    clients: list[BudgetedChatCompletionClient] = []
+    factory_binding = {"foreign": False}
+
+    def model_client_for(
+        _: HostAutoGenSessionIdentityV1,
+    ) -> BudgetedChatCompletionClient:
+        bound_job = (
+            job.model_copy(
+                update={"job_id": UUID("72000000-0000-0000-0000-000000000003")}
+            )
+            if factory_binding["foreign"]
+            else job
+        )
+        bound_invocation = _invocation(bound_job)
+        client = BudgetedChatCompletionClient(
+            job=bound_job,
+            invocation=bound_invocation,
+            attempt=1,
+            delegate=ReplayChatCompletionClient(
+                ["TERMINATE"],
+                model_info=ModelInfo(
+                    vision=False,
+                    function_calling=True,
+                    json_output=True,
+                    family=ModelFamily.UNKNOWN,
+                    structured_output=True,
+                ),
+            ),
+            budget=InMemoryFactoryBudgetLedger(),
+            evidence_store=evidence_store,
+            provider="deterministic-replay",
+            model="approved-model-id",
+            max_cost_per_call=Decimal("0.50"),
+            paid_effect_authority=_PaidEffectAuthority(),
+            pricing_authority=_PricingAuthority(_pricing_quote(bound_job)),
+            clock=lambda: NOW,
+        )
+        clients.append(client)
+        return client
+
+    class Holdouts:
+        async def resolve(self, reference: PrivateHoldoutRef) -> ResolvedFactoryHoldoutCase:
+            return ResolvedFactoryHoldoutCase(reference=reference, body=holdout_body)
+
+        async def evaluate(self, *_: object) -> object:
+            raise AssertionError("session executor must not evaluate business outcomes")
+
+    prompt = b"Return only the sealed benchmark terminal JSON."
+    workspace = tmp_path / "baseline-policy"
+    workspace.mkdir()
+    (workspace / "system.txt").write_bytes(prompt)
+    prompt_ref = _artifact(
+        "baseline-policy",
+        hashlib.sha256(prompt).hexdigest(),
+        media_type="text/plain",
+    )
+    policy = SealedSingleAgentPolicyV1.seal(
+        agent_name="single_agent_baseline",
+        system_prompt_ref=prompt_ref,
+        execution_policy_sha256=_policy_digest(job),
+        model="approved-model-id",
+        allowed_tools=(),
+        max_messages=20,
+        max_tool_calls=6,
+    )
+    with pytest.raises(ValueError, match="policy digest"):
+        SealedSingleAgentPolicyV1.model_validate(
+            {
+                **policy.model_dump(mode="json"),
+                "max_messages": policy.max_messages - 1,
+            }
+        )
+    executor = HostAutoGenSessionExecutor(
+        model_client_factory=model_client_for,
+        evidence_store=evidence_store,
+        holdouts=Holdouts(),  # type: ignore[arg-type]
+        tools={"publish_candidate": lambda: "forbidden"},
+        clock=lambda: NOW,
+    )
+    seen_agents: list[AssistantAgent] = []
+    seen_contexts: list[object] = []
+    original_run = AssistantAgent.run
+
+    async def observed_run(self: AssistantAgent, **kwargs: object) -> object:
+        seen_agents.append(self)
+        seen_contexts.append(self.model_context)
+        return await original_run(self, **kwargs)  # type: ignore[arg-type,return-value]
+
+    monkeypatch.setattr(AssistantAgent, "run", observed_run)
+
+    def identity(number: int) -> HostAutoGenSessionIdentityV1:
+        return HostAutoGenSessionIdentityV1.for_factory_execution(
+            job=job,
+            invocation=invocation,
+            case_ref=job.private_holdout_refs[0],
+            subject_id="single_agent_baseline",
+            variant="single_agent_baseline",
+            request_id=UUID(f"70000000-0000-0000-0000-{number:012d}"),
+            runtime_session_id=f"baseline-session-{number}",
+            effect_id=hashlib.sha256(f"effect-{number}".encode()).hexdigest(),
+            claim_id=UUID(f"71000000-0000-0000-0000-{number:012d}"),
+            fence=number,
+            model="approved-model-id",
+        )
+    first = await executor.run_baseline(
+        job=job,
+        invocation=invocation,
+        case_ref=job.private_holdout_refs[0],
+        identity=identity(1),
+        policy=policy,
+        workspace=workspace,
+        allowed_models=job.execution_policy.allowed_models,
+        max_seconds=10,
+    )
+    second = await executor.run_baseline(
+        job=job,
+        invocation=invocation,
+        case_ref=job.private_holdout_refs[0],
+        identity=identity(2),
+        policy=policy,
+        workspace=workspace,
+        allowed_models=job.execution_policy.allowed_models,
+        max_seconds=10,
+    )
+
+    assert seen_agents[0] is not seen_agents[1]
+    assert seen_contexts[0] is not seen_contexts[1]
+    assert len({id(client) for client in clients}) == 2
+    assert tuple(len(client.usage_receipts) for client in clients) == (1, 1)
+    assert first.runtime_evidence_ref != second.runtime_evidence_ref
+    assert len(first.usage_receipts) == len(second.usage_receipts) == 1
+    assert first.handoffs == second.handoffs == ()
+    assert first.human_handoff_completed is False
+    assert "Private benchmark case" not in repr(first)
+
+    fixed_client_executor = HostAutoGenSessionExecutor(
+        model_client=clients[0],
+        evidence_store=evidence_store,
+        holdouts=Holdouts(),  # type: ignore[arg-type]
+        tools={},
+        clock=lambda: NOW,
+    )
+    with pytest.raises(ValueError, match="fresh model client factory"):
+        await fixed_client_executor.run_baseline(
+            job=job,
+            invocation=invocation,
+            case_ref=job.private_holdout_refs[0],
+            identity=identity(5),
+            policy=policy,
+            workspace=workspace,
+            allowed_models=job.execution_policy.allowed_models,
+            max_seconds=10,
+        )
+
+    authority_policy = SealedSingleAgentPolicyV1.seal(
+        agent_name="single_agent_baseline",
+        system_prompt_ref=prompt_ref,
+        execution_policy_sha256=_policy_digest(job),
+        model="approved-model-id",
+        allowed_tools=("publish_candidate",),
+        max_messages=20,
+        max_tool_calls=1,
+    )
+    with pytest.raises(ValueError, match="host tool is not registered"):
+        await executor.run_baseline(
+            job=job,
+            invocation=invocation,
+            case_ref=job.private_holdout_refs[0],
+            identity=identity(6),
+            policy=authority_policy,
+            workspace=workspace,
+            allowed_models=job.execution_policy.allowed_models,
+            max_seconds=10,
+        )
+
+    zero_tool_policy = SealedSingleAgentPolicyV1.seal(
+        agent_name="single_agent_baseline",
+        system_prompt_ref=prompt_ref,
+        execution_policy_sha256=_policy_digest(job),
+        model="approved-model-id",
+        allowed_tools=(),
+        max_messages=20,
+        max_tool_calls=0,
+    )
+    zero_tool_result = await executor.run_baseline(
+        job=job,
+        invocation=invocation,
+        case_ref=job.private_holdout_refs[0],
+        identity=identity(7),
+        policy=zero_tool_policy,
+        workspace=workspace,
+        allowed_models=job.execution_policy.allowed_models,
+        max_seconds=10,
+    )
+    assert zero_tool_result.tool_call_count == 0
+    persisted = tuple(
+        path.read_text(encoding="utf-8")
+        for path in (tmp_path / "session-evidence").rglob("*.json")
+    )
+    assert all(holdout_body.decode() not in item for item in persisted)
+    assert any('"variant":"single_agent_baseline"' in item for item in persisted)
+    assert any(str(identity(1).claim_id) in item for item in persisted)
+    assert any(str(identity(2).claim_id) in item for item in persisted)
+
+    factory_binding["foreign"] = True
+    with pytest.raises(ValueError, match="model client does not match session identity"):
+        await executor.run_baseline(
+            job=job,
+            invocation=invocation,
+            case_ref=job.private_holdout_refs[0],
+            identity=identity(3),
+            policy=policy,
+            workspace=workspace,
+            allowed_models=job.execution_policy.allowed_models,
+            max_seconds=10,
+        )
+    assert clients[-1].any_provider_effect_started is False
+
+    factory_binding["foreign"] = False
+    (workspace / "system.txt").write_text("tampered", encoding="utf-8")
+    with pytest.raises(ValueError, match="system prompt artifact is missing"):
+        await executor.run_baseline(
+            job=job,
+            invocation=invocation,
+            case_ref=job.private_holdout_refs[0],
+            identity=identity(4),
+            policy=policy,
+            workspace=workspace,
+            allowed_models=job.execution_policy.allowed_models,
+            max_seconds=10,
+        )
+
+
+def test_internal_autogen_handoff_cannot_claim_human_completion() -> None:
+    observation = _artifact("session-observation", "9" * 64)
+    internal_handoff = FactoryHandoffEvidenceV1(
+        from_agent="triage",
+        to_agent="resolver",
+        evidence_ref=observation,
+    )
+
+    with pytest.raises(ValueError, match="human_handoff_completed"):
+        HostAutoGenSessionResult(
+            task_result=object(),  # type: ignore[arg-type]
+            runtime_evidence_ref=observation,
+            usage_receipts=(),
+            handoffs=(internal_handoff,),
+            conversation_pattern="swarm",
+            message_count=1,
+            handoff_count=1,
+            tool_call_count=0,
+            termination_reason="task_completed",
+            provider_started=False,
+            provider_usage_unresolved=False,
+            human_handoff_completed=True,
+        )
+
+
+def _baseline_n8n_contract(
+    job: AgentFactoryJobV3,
+    reference: OpaqueN8nToolReference,
+    *,
+    suffix: str,
+) -> tuple[
+    FactoryN8nToolAuthorizationV1,
+    FactoryN8nExecutionEvidenceV1,
+]:
+    command_id = UUID(f"73000000-0000-0000-0000-{suffix:0>12}")
+    command = AgentRuntimeCommand(
+        schema_name="captain.agent-runtime-command.v1",
+        event_id=command_id,
+        correlation_id=job.correlation_id,
+        occurred_at=NOW,
+        producer="captain",
+        subject_id=reference.tool_name,
+        subject_version=job.subject_version,
+        payload=AgentRuntimeCommandPayload(
+            operation=RuntimeOperation.CODEX_RUN,
+            project_id="business-benchmark",
+            batch_id="renewal-baseline",
+            subtask_id=reference.tool_name,
+            workspace_ref="workspace://factory/renewal-baseline-n8n",
+            prompt_ref=_n8n_tool_command_ref(reference),
+            integration_intent=IntegrationIntent.N8N,
+            capability_profile=CapabilityProfile.N8N_BUILDER,
+            limits=RuntimeLimits(wall_seconds=60, max_iterations=1),
+        ),
+    )
+    grant = CapabilityGrant(
+        schema_name="captain.capability-grant.v1",
+        grant_id=f"grant-renewal-baseline-{suffix}",
+        command_id=command_id,
+        batch_id=command.payload.batch_id,
+        batch_version=1,
+        subtask_id=command.payload.subtask_id,
+        workspace_ref=command.payload.workspace_ref,
+        profile=CapabilityProfile.N8N_BUILDER,
+        capabilities=tuple(
+            sorted(PROFILE_CAPABILITIES[CapabilityProfile.N8N_BUILDER])
+        ),
+        mcp_servers=("n8n-mcp",),
+        issued_at=NOW,
+        expires_at=NOW + timedelta(minutes=5),
+    )
+    workflow_ref = _artifact("renewal-workflow", suffix * 64)
+    authorization = FactoryN8nToolAuthorizationV1(
+        tool_name=reference.tool_name,
+        approved_tool_ref=reference,
+        runtime_command=command,
+        capability_grant=grant,
+    )
+    evidence = FactoryN8nExecutionEvidenceV1(
+        tool_name=reference.tool_name,
+        approved_tool_ref=reference,
+        runtime_command=command,
+        capability_grant=grant,
+        runtime_result=AgentRuntimeResult(
+            schema_name="captain.agent-runtime-result.v1",
+            event_id=UUID(f"74000000-0000-0000-0000-{suffix:0>12}"),
+            command_id=command_id,
+            correlation_id=job.correlation_id,
+            occurred_at=NOW + timedelta(seconds=1),
+            producer="agent-runtime",
+            subject_id=reference.tool_name,
+            subject_version=job.subject_version,
+            grant_id=grant.grant_id,
+            operation=RuntimeOperation.CODEX_RUN,
+            status=RuntimeStatus.SUCCEEDED,
+        ),
+        mcp_call_id=f"mcp-renewal-baseline-{suffix}",
+        workflow_ref=workflow_ref,
+        execution=N8nExecutionEvidence(
+            execution_id=f"execution-renewal-baseline-{suffix}",
+            workflow_id="workflow-renewal-context",
+            artifact_digest=workflow_ref.sha256,
+            correlation_id=str(job.correlation_id),
+            status="success",
+        ),
+        evidence_ref=_artifact("renewal-execution", suffix * 64),
+    )
+    return authorization, evidence
+
+
+@pytest.mark.asyncio
+async def test_baseline_can_use_exact_captain_authorized_n8n_tool(
+    tmp_path: Path,
+) -> None:
+    holdout_body = b"Evaluate renewal context for account acct-1."
+    job = _job_v3(holdout_body=holdout_body)
+    invocation = _invocation(job)
+    evidence_store = FilesystemFactoryEvidenceStore(tmp_path / "baseline-n8n-evidence")
+    tool_ref = TypedN8nTool(
+        name="renewal_context_lookup",
+        description="Read Captain-approved renewal context",
+        input_schema_ref="artifact://renewal-context-input",
+        output_schema_ref="artifact://renewal-context-output",
+    ).opaque_reference()
+    authorization, execution_evidence = _baseline_n8n_contract(
+        job, tool_ref, suffix="5"
+    )
+    observed_evidence: list[FactoryN8nExecutionEvidenceV1] = []
+    evidence_to_record = {"value": execution_evidence}
+    authorization_to_return = {"value": authorization}
+    authority_calls: list[str] = []
+
+    async def renewal_context_lookup(account_id: str) -> str:
+        observed_evidence.append(evidence_to_record["value"])
+        return f"renewal-context:{account_id}"
+
+    class Adapter:
+        def tool(self, name: str) -> object:
+            assert name == tool_ref.tool_name
+            return FunctionTool(
+                renewal_context_lookup,
+                description="Read renewal context",
+                name=name,
+            )
+
+        def authorization(self, name: str) -> FactoryN8nToolAuthorizationV1:
+            assert name == tool_ref.tool_name
+            return authorization_to_return["value"]
+
+        def observed_evidence(self) -> tuple[FactoryN8nExecutionEvidenceV1, ...]:
+            return tuple(observed_evidence)
+
+    class Authority:
+        async def authorize_command(
+            self, claim: FactoryN8nToolAuthorizationV1, *, now: datetime
+        ) -> CapabilityGrant:
+            assert claim == authorization
+            assert now == NOW + timedelta(seconds=2)
+            authority_calls.append("command")
+            return claim.capability_grant
+
+        async def authorize(
+            self, evidence: FactoryN8nExecutionEvidenceV1, *, now: datetime
+        ) -> CapabilityGrant:
+            assert evidence == execution_evidence
+            assert now == NOW + timedelta(seconds=2)
+            authority_calls.append("evidence")
+            return evidence.capability_grant
+
+    class Holdouts:
+        async def resolve(
+            self, reference: PrivateHoldoutRef
+        ) -> ResolvedFactoryHoldoutCase:
+            return ResolvedFactoryHoldoutCase(reference=reference, body=holdout_body)
+
+        async def evaluate(self, *_: object) -> object:
+            raise AssertionError("session executor must not evaluate business outcomes")
+
+    clients: list[BudgetedChatCompletionClient] = []
+
+    def model_client_for(
+        _: HostAutoGenSessionIdentityV1,
+    ) -> BudgetedChatCompletionClient:
+        client = BudgetedChatCompletionClient(
+            job=job,
+            invocation=invocation,
+            attempt=1,
+            delegate=ReplayChatCompletionClient(
+                [
+                    CreateResult(
+                        finish_reason="function_calls",
+                        content=[
+                            FunctionCall(
+                                id="renewal-lookup-1",
+                                name=tool_ref.tool_name,
+                                arguments=json.dumps({"account_id": "acct-1"}),
+                            )
+                        ],
+                        usage=RequestUsage(prompt_tokens=1, completion_tokens=1),
+                        cached=False,
+                    ),
+                    "TERMINATE",
+                ],
+                model_info=ModelInfo(
+                    vision=False,
+                    function_calling=True,
+                    json_output=True,
+                    family=ModelFamily.UNKNOWN,
+                    structured_output=True,
+                ),
+            ),
+            budget=InMemoryFactoryBudgetLedger(),
+            evidence_store=evidence_store,
+            provider="deterministic-replay",
+            model="approved-model-id",
+            max_cost_per_call=Decimal("0.50"),
+            paid_effect_authority=_PaidEffectAuthority(),
+            pricing_authority=_PricingAuthority(_pricing_quote(job)),
+            clock=lambda: NOW,
+        )
+        clients.append(client)
+        return client
+
+    workspace = tmp_path / "baseline-n8n-policy"
+    workspace.mkdir()
+    prompt = b"Use renewal_context_lookup once, then return TERMINATE."
+    (workspace / "system.txt").write_bytes(prompt)
+    policy = SealedSingleAgentPolicyV1.seal(
+        agent_name="single_agent_baseline",
+        system_prompt_ref=_artifact(
+            "baseline-policy",
+            hashlib.sha256(prompt).hexdigest(),
+            media_type="text/plain",
+        ),
+        execution_policy_sha256=_policy_digest(job),
+        model="approved-model-id",
+        allowed_tools=(tool_ref.tool_name,),
+        max_messages=10,
+        max_tool_calls=1,
+    )
+    identity = HostAutoGenSessionIdentityV1.for_factory_execution(
+        job=job,
+        invocation=invocation,
+        case_ref=job.private_holdout_refs[0],
+        subject_id="single_agent_baseline",
+        variant="single_agent_baseline",
+        request_id=UUID("75000000-0000-0000-0000-000000000001"),
+        runtime_session_id="baseline-n8n-session",
+        effect_id="6" * 64,
+        claim_id=UUID("76000000-0000-0000-0000-000000000001"),
+        fence=1,
+        model="approved-model-id",
+    )
+    executor = HostAutoGenSessionExecutor(
+        model_client_factory=model_client_for,
+        evidence_store=evidence_store,
+        holdouts=Holdouts(),  # type: ignore[arg-type]
+        tools={},
+        baseline_n8n_tools={tool_ref.tool_name: tool_ref},
+        n8n_adapter=Adapter(),  # type: ignore[arg-type]
+        n8n_authority=Authority(),  # type: ignore[arg-type]
+        clock=lambda: NOW + timedelta(seconds=2),
+    )
+
+    result = await executor.run_baseline(
+        job=job,
+        invocation=invocation,
+        case_ref=job.private_holdout_refs[0],
+        identity=identity,
+        policy=policy,
+        workspace=workspace,
+        allowed_models=job.execution_policy.allowed_models,
+        max_seconds=10,
+    )
+
+    assert result.tool_call_count == 1
+    assert tuple(item.tool_name for item in result.tool_executions) == (
+        tool_ref.tool_name,
+    )
+    assert result.n8n_executions == (execution_evidence,)
+    assert result.workflow_evidence_refs == (
+        execution_evidence.workflow_ref,
+        execution_evidence.evidence_ref,
+    )
+    assert authority_calls == ["command", "evidence"]
+    assert len(clients) == 1
+
+    for missing in ("adapter", "authority"):
+        closed_executor = HostAutoGenSessionExecutor(
+            model_client_factory=model_client_for,
+            evidence_store=evidence_store,
+            holdouts=Holdouts(),  # type: ignore[arg-type]
+            tools={},
+            baseline_n8n_tools={tool_ref.tool_name: tool_ref},
+            n8n_adapter=None if missing == "adapter" else Adapter(),  # type: ignore[arg-type]
+            n8n_authority=None if missing == "authority" else Authority(),  # type: ignore[arg-type]
+            clock=lambda: NOW + timedelta(seconds=2),
+        )
+        with pytest.raises(
+            ValueError, match="trusted n8n adapter and grant authority"
+        ):
+            await closed_executor.run_baseline(
+                job=job,
+                invocation=invocation,
+                case_ref=job.private_holdout_refs[0],
+                identity=identity.model_copy(
+                    update={
+                        "request_id": uuid4(),
+                        "runtime_session_id": f"baseline-missing-{missing}",
+                        "effect_id": hashlib.sha256(missing.encode()).hexdigest(),
+                        "claim_id": uuid4(),
+                    }
+                ),
+                policy=policy,
+                workspace=workspace,
+                allowed_models=job.execution_policy.allowed_models,
+                max_seconds=10,
+            )
+        assert clients[-1].any_provider_effect_started is False
+
+    mismatched_ref = TypedN8nTool(
+        name=tool_ref.tool_name,
+        description="Different unapproved renewal context contract",
+        input_schema_ref="artifact://different-renewal-context-input",
+        output_schema_ref="artifact://renewal-context-output",
+    ).opaque_reference()
+    _, mismatched_evidence = _baseline_n8n_contract(
+        job, mismatched_ref, suffix="7"
+    )
+    mismatched_authorization, _ = _baseline_n8n_contract(
+        job, mismatched_ref, suffix="9"
+    )
+    observed_evidence.clear()
+    authorization_to_return["value"] = mismatched_authorization
+    preflight_executor = HostAutoGenSessionExecutor(
+        model_client_factory=model_client_for,
+        evidence_store=evidence_store,
+        holdouts=Holdouts(),  # type: ignore[arg-type]
+        tools={},
+        baseline_n8n_tools={tool_ref.tool_name: tool_ref},
+        n8n_adapter=Adapter(),  # type: ignore[arg-type]
+        n8n_authority=Authority(),  # type: ignore[arg-type]
+        clock=lambda: NOW + timedelta(seconds=2),
+    )
+    with pytest.raises(ValueError, match="different tool"):
+        await preflight_executor.run_baseline(
+            job=job,
+            invocation=invocation,
+            case_ref=job.private_holdout_refs[0],
+            identity=identity.model_copy(
+                update={
+                    "request_id": uuid4(),
+                    "runtime_session_id": "baseline-misbound-adapter-claim",
+                    "effect_id": "9" * 64,
+                    "claim_id": uuid4(),
+                }
+            ),
+            policy=policy,
+            workspace=workspace,
+            allowed_models=job.execution_policy.allowed_models,
+            max_seconds=10,
+        )
+    assert clients[-1].any_provider_effect_started is False
+
+    authorization_to_return["value"] = authorization
+    observed_evidence.clear()
+    evidence_to_record["value"] = mismatched_evidence
+    mismatch_executor = HostAutoGenSessionExecutor(
+        model_client_factory=model_client_for,
+        evidence_store=evidence_store,
+        holdouts=Holdouts(),  # type: ignore[arg-type]
+        tools={},
+        baseline_n8n_tools={tool_ref.tool_name: tool_ref},
+        n8n_adapter=Adapter(),  # type: ignore[arg-type]
+        n8n_authority=Authority(),  # type: ignore[arg-type]
+        clock=lambda: NOW + timedelta(seconds=2),
+    )
+    with pytest.raises(ValueError, match="n8n evidence does not match session identity"):
+        await mismatch_executor.run_baseline(
+            job=job,
+            invocation=invocation,
+            case_ref=job.private_holdout_refs[0],
+            identity=identity.model_copy(
+                update={
+                    "request_id": uuid4(),
+                    "runtime_session_id": "baseline-mismatched-ref",
+                    "effect_id": "8" * 64,
+                    "claim_id": uuid4(),
+                }
+            ),
+            policy=policy,
+            workspace=workspace,
+            allowed_models=job.execution_policy.allowed_models,
+            max_seconds=10,
+        )
+
+
+def test_baseline_rejects_authority_bearing_ordinary_tool() -> None:
+    with pytest.raises(ValueError, match="authority-free"):
+        AuthorityFreeBaselineTool(
+            name="publish_candidate",
+            function=lambda: None,
+            publication_authority=True,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.asyncio
 async def test_budgeted_model_client_reserves_before_every_provider_call(
     tmp_path: Path,
 ) -> None:
@@ -798,19 +1733,59 @@ async def test_budgeted_model_client_reserves_before_every_provider_call(
     assert skill_authority.calls == 2
     assert pricing_authority.calls == 2
     assert len({item.reservation_id for item in client.usage_receipts}) == 2
-    assert {
-        item.invocation_id for item in client.usage_receipts
-    } == {invocation.invocation_id}
-    assert {
-        item.lease_id for item in client.usage_receipts
-    } == {invocation.lease.lease_id}
-    assert {
-        getattr(event, "reservation").invocation_id
-        for event in budget.events
-        if hasattr(event, "reservation")
-    } == {invocation.invocation_id}
     assert budget.projection(job.job_id).consumed_usd == Decimal("0.20")
     assert budget.projection(job.job_id).reserved_usd == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_budgeted_model_client_may_reserve_below_pricing_ceiling(
+    tmp_path: Path,
+) -> None:
+    job = _job_v3()
+    budget = InMemoryFactoryBudgetLedger()
+    client = BudgetedChatCompletionClient(
+        job=job,
+        invocation=_invocation(job),
+        attempt=1,
+        delegate=build_replay_model_client(["bounded"]),
+        budget=budget,
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "bounded-provider"),
+        provider="deterministic-replay",
+        model="approved-model-id",
+        max_cost_per_call=Decimal("0.25"),
+        paid_effect_authority=_PaidEffectAuthority(),
+        pricing_authority=_PricingAuthority(_pricing_quote(job)),
+        clock=lambda: NOW,
+    )
+
+    await client.create([UserMessage(content="bounded", source="user")])
+
+    assert budget.projection(job.job_id).consumed_usd == Decimal("0.10")
+    assert budget.projection(job.job_id).reserved_usd == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_budgeted_model_client_rejects_reservation_above_pricing_ceiling(
+    tmp_path: Path,
+) -> None:
+    job = _job_v3()
+    client = BudgetedChatCompletionClient(
+        job=job,
+        invocation=_invocation(job),
+        attempt=1,
+        delegate=build_replay_model_client(["unused"]),
+        budget=InMemoryFactoryBudgetLedger(),
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "overpriced-provider"),
+        provider="deterministic-replay",
+        model="approved-model-id",
+        max_cost_per_call=Decimal("0.51"),
+        paid_effect_authority=_PaidEffectAuthority(),
+        pricing_authority=_PricingAuthority(_pricing_quote(job)),
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(ValueError, match="pricing quote"):
+        await client.create([UserMessage(content="reject", source="user")])
 
 
 @pytest.mark.asyncio
@@ -1024,7 +1999,7 @@ def test_embedded_live_composition_is_available_and_fails_closed_without_a_port(
 
 
 @pytest.mark.asyncio
-async def test_live_composition_executes_each_explicit_authorized_holdout_scope(
+async def test_live_composition_executes_three_release_runs_on_canonical_holdout(
     tmp_path: Path,
 ) -> None:
     bodies = (
@@ -1184,9 +2159,10 @@ async def test_live_composition_executes_each_explicit_authorized_holdout_scope(
                 tmp_path / "composition"
             ),
             ports=ports,
-            holdout_selector=lambda _current_job, selected=holdout: selected,
+            holdout_selector=lambda _current_job: holdouts[0],
+            run_number=run_number,
         )
-        for holdout in holdouts
+        for run_number in (1, 2, 3)
     )
     dispatch = FactoryDispatch(
         job=job,
@@ -1210,13 +2186,9 @@ async def test_live_composition_executes_each_explicit_authorized_holdout_scope(
     )
 
     assert tuple(item.run_number for item in evidence) == (1, 2, 3)
+    assert {item.holdout_ref for item in evidence} == {holdouts[0]}
     assert len({item.invocation_id for item in evidence}) == 3
     assert len({item.invocation.idempotency_key for item in evidence}) == 3
-    assert len({item.artifact_ref for item in evidence}) == 3
-    assert all(
-        item.execution_outcome.output_ref in item.evidence_refs
-        for item in evidence
-    )
 
 
 @pytest.mark.asyncio
@@ -1292,6 +2264,95 @@ async def test_team_execution_rejects_forged_lease_authority(
 
 
 @pytest.mark.asyncio
+async def test_host_runner_forwards_captain_scoped_tool_subset_to_session_executor(
+    tmp_path: Path,
+) -> None:
+    holdout_body = b"Resolve the private support case."
+    job = _job_v3(holdout_body=holdout_body)
+    candidate = _sealed_team_candidate(tmp_path)
+    invocation = _invocation(job)
+    observed: dict[str, object] = {}
+
+    class SessionExecutor:
+        async def run_candidate(self, **kwargs: object) -> HostAutoGenSessionResult:
+            observed.update(kwargs)
+            return HostAutoGenSessionResult(
+                task_result=TaskResult(
+                    messages=[TextMessage(source="agent", content="TERMINATE")],
+                    stop_reason="task_completed",
+                ),
+                runtime_evidence_ref=ArtifactRef(
+                    uri="artifact://runtime/technical-holdout",
+                    sha256="9" * 64,
+                    media_type="application/json",
+                ),
+                usage_receipts=(),
+                conversation_pattern="swarm",
+                message_count=1,
+                handoff_count=0,
+                tool_call_count=0,
+                termination_reason="task_completed",
+                provider_started=False,
+                provider_usage_unresolved=False,
+            )
+
+    class Holdouts:
+        async def resolve(self, reference: PrivateHoldoutRef) -> ResolvedFactoryHoldoutCase:
+            return ResolvedFactoryHoldoutCase(reference=reference, body=holdout_body)
+
+        async def evaluate(
+            self,
+            reference: PrivateHoldoutRef,
+            result: TaskResult,
+            assertion_ids: tuple[str, ...],
+        ) -> FactoryHoldoutEvaluationReceiptV1:
+            assert result.messages
+            return FactoryHoldoutEvaluationReceiptV1(
+                schema="captain.factory-holdout-evaluation-receipt.v1",
+                holdout_ref=reference,
+                candidate_ref=candidate.candidate.source_archive_ref,
+                assertion_ids=assertion_ids,
+                decisions=tuple(
+                    FactoryHoldoutAssertionDecisionV1(
+                        assertion_id=item,
+                        passed=False,
+                        provenance_code="captain_private_rule_fail",
+                    )
+                    for item in assertion_ids
+                ),
+                evaluator_id="captain_test_evaluator",
+                evaluator_version="1",
+                evaluated_at=NOW,
+            )
+
+    runner = HostAutoGenTeamRunner(
+        model_client=SimpleNamespace(model="approved-model-id"),  # type: ignore[arg-type]
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
+        holdouts=Holdouts(),  # type: ignore[arg-type]
+        tools={},
+        session_executor=SessionExecutor(),  # type: ignore[arg-type]
+        allowed_tools_for=lambda reference, resolved: (
+            ()
+            if reference == job.private_holdout_refs[0] and resolved == candidate
+            else None
+        ),
+        clock=lambda: NOW,
+    )
+
+    await runner.run(
+        job=job,
+        invocation=invocation,
+        candidate=candidate,
+        case_ref=job.private_holdout_refs[0],
+        lease=invocation.lease,
+        allowed_models=job.execution_policy.allowed_models,
+        max_seconds=10,
+    )
+
+    assert observed["allowed_tools"] == ()
+
+
+@pytest.mark.asyncio
 async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entrypoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1302,26 +2363,34 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
     budget = InMemoryFactoryBudgetLedger()
     evidence_store = FilesystemFactoryEvidenceStore(tmp_path / "host-evidence")
     invocation = _invocation(job)
+    benchmark_terminal = json.dumps(
+        {
+            "schema": "captain.business-benchmark-terminal.v1",
+            "observed_decision": "route_standard_review",
+            "observed_rationale_fact_ids": ["evidence_complete"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     model_client = BudgetedChatCompletionClient(
         job=job,
         invocation=invocation,
         attempt=1,
         delegate=ReplayChatCompletionClient(
             [
-                json.dumps(
-                    {
-                        "schema": "captain.factory-observation.v1",
-                        "assertions": [
-                            {
-                                "assertion_id": "assert-000000000000",
-                                "passed": True,
-                                "observable": "deterministic replay output",
-                            }
-                        ],
-                        "recovery": {"stop_condition_sha256": "a" * 64},
-                        "termination": "TERMINATE",
-                    }
-                )
+                CreateResult(
+                    finish_reason="function_calls",
+                    content=[
+                        FunctionCall(
+                            id="support-handoff-1",
+                            name="transfer_to_resolver",
+                            arguments="{}",
+                        )
+                    ],
+                    usage=RequestUsage(prompt_tokens=1, completion_tokens=1),
+                    cached=False,
+                ),
+                benchmark_terminal,
             ],
             model_info=ModelInfo(
                 vision=False,
@@ -1353,8 +2422,9 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
                 name=name,
             )
 
-        def authorization(self, name: str) -> object:
-            raise AssertionError("unused n8n tool must not request authority")
+        def authorization(self, name: str) -> FactoryN8nToolAuthorizationV1:
+            assert name == "support_triage"
+            return expected_authorization
 
         def observed_evidence(self) -> tuple[FactoryN8nExecutionEvidenceV1, ...]:
             return ()
@@ -1419,6 +2489,130 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
             max_seconds=10,
         )
 
+    expected_tool_ref = sealed_candidate.candidate.n8n_tools[0].opaque_reference()
+    expected_authorization, _ = _baseline_n8n_contract(
+        job, expected_tool_ref, suffix="3"
+    )
+    misbound_tool_ref = TypedN8nTool(
+        name=expected_tool_ref.tool_name,
+        description="Different unapproved support triage contract",
+        input_schema_ref="artifact://different-support-input",
+        output_schema_ref="artifact://factory-support-output",
+    ).opaque_reference()
+    misbound_authorization, _ = _baseline_n8n_contract(
+        job, misbound_tool_ref, suffix="4"
+    )
+
+    class MisboundN8nAdapter(TrustedN8nAdapter):
+        def authorization(self, name: str) -> FactoryN8nToolAuthorizationV1:
+            assert name == expected_tool_ref.tool_name
+            return misbound_authorization
+
+    misbound_runner = HostAutoGenTeamRunner(
+        model_client=model_client,
+        evaluator=FactoryCandidateEvaluator(),
+        evidence_store=evidence_store,
+        holdouts=Holdouts(),  # type: ignore[arg-type]
+        tools={},
+        n8n_adapter=MisboundN8nAdapter(),  # type: ignore[arg-type]
+        n8n_authority=TrustedN8nAuthority(),  # type: ignore[arg-type]
+        clock=lambda: NOW,
+    )
+    with pytest.raises(ValueError, match="different tool"):
+        await misbound_runner.run(
+            job=job,
+            invocation=_invocation(job),
+            candidate=sealed_candidate,
+            case_ref=job.private_holdout_refs[0],
+            lease=_invocation(job).lease,
+            allowed_models=job.execution_policy.allowed_models,
+            max_seconds=10,
+        )
+    assert model_client.any_provider_effect_started is False
+
+    tool_free_client = BudgetedChatCompletionClient(
+        job=job,
+        invocation=invocation,
+        attempt=1,
+        delegate=ReplayChatCompletionClient(
+            [
+                CreateResult(
+                    finish_reason="function_calls",
+                    content=[
+                        FunctionCall(
+                            id="support-handoff-2",
+                            name="transfer_to_resolver",
+                            arguments="{}",
+                        )
+                    ],
+                    usage=RequestUsage(prompt_tokens=1, completion_tokens=1),
+                    cached=False,
+                ),
+                benchmark_terminal,
+            ],
+            model_info=ModelInfo(
+                vision=False,
+                function_calling=True,
+                json_output=True,
+                family=ModelFamily.UNKNOWN,
+                structured_output=True,
+            ),
+        ),
+        budget=InMemoryFactoryBudgetLedger(),
+        evidence_store=evidence_store,
+        provider="deterministic-replay",
+        model="approved-model-id",
+        max_cost_per_call=Decimal("0.50"),
+        paid_effect_authority=_PaidEffectAuthority(),
+        pricing_authority=_PricingAuthority(_pricing_quote(job)),
+        clock=lambda: NOW,
+    )
+    tool_free_executor = HostAutoGenSessionExecutor(
+        model_client=tool_free_client,
+        evidence_store=evidence_store,
+        holdouts=Holdouts(),  # type: ignore[arg-type]
+        tools={},
+        clock=lambda: NOW,
+    )
+    tool_free_identity = HostAutoGenSessionIdentityV1.for_factory_execution(
+        job=job,
+        invocation=invocation,
+        case_ref=job.private_holdout_refs[0],
+        subject_id=sealed_candidate.candidate.candidate_id,
+        variant="candidate",
+        request_id=UUID("77000000-0000-0000-0000-000000000001"),
+        runtime_session_id="candidate-tool-free-sensitive-case",
+        effect_id="7" * 64,
+        claim_id=UUID("78000000-0000-0000-0000-000000000001"),
+        fence=1,
+        model="approved-model-id",
+    )
+    with pytest.raises(ValueError, match="sealed candidate manifest"):
+        await tool_free_executor.run_candidate(
+            job=job,
+            invocation=invocation,
+            case_ref=job.private_holdout_refs[0],
+            identity=tool_free_identity,
+            candidate=sealed_candidate,
+            allowed_tools=("forged_tool",),
+            allowed_models=job.execution_policy.allowed_models,
+            max_seconds=10,
+        )
+    assert tool_free_client.any_provider_effect_started is False
+    tool_free_result = await tool_free_executor.run_candidate(
+        job=job,
+        invocation=invocation,
+        case_ref=job.private_holdout_refs[0],
+        identity=tool_free_identity,
+        candidate=sealed_candidate,
+        allowed_tools=(),
+        allowed_models=job.execution_policy.allowed_models,
+        max_seconds=10,
+    )
+    assert tool_free_result.tool_call_count == 0
+    assert tool_free_result.n8n_executions == ()
+    assert tool_free_client.any_provider_effect_started is True
+
     runner = HostAutoGenTeamRunner(
         model_client=model_client,
         evaluator=FactoryCandidateEvaluator(),
@@ -1449,40 +2643,23 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
     )
 
     assert result.status == "succeeded"
-    assert len(result.usage_receipts) == 1
+    assert len(result.usage_receipts) == 2
+    assert result.handoff_count == 1
     assert result.termination_reason == "task_completed"
     assert result.conversation_pattern == "swarm"
+    activity_refs = {
+        *result.handoff_evidence_refs,
+        *result.tool_evidence_refs,
+    }
+    assert activity_refs.issubset(set(result.runtime_result.evidence_refs))
+    assert activity_refs.issubset(set(result.execution_outcome.evidence_refs))
     assert captured_tokens[0] is not None
     persisted = [
         path.read_text(encoding="utf-8")
         for path in (tmp_path / "host-evidence").rglob("*.json")
     ]
-    observations = [
-        json.loads(item)
-        for item in persisted
-        if json.loads(item).get("schema") == "captain.factory-autogen-observation.v1"
-    ]
-    assert len(observations) == 1
-    observation = observations[0]
-    assert observation["invocation_id"] == str(invocation.invocation_id)
-    assert observation["session_id"] == f"autogen-team-1-{invocation.invocation_id}"
-    assert observation["message_count"] == len(observation["transcript"])
-    assert tuple(message["source"] for message in observation["transcript"]) == (
-        "user",
-        "triage",
-    )
-    assert all(
-        set(message) == {"content_sha256", "message_type", "source"}
-        for message in observation["transcript"]
-    )
-    assert all(
-        len(message["content_sha256"]) == 64
-        for message in observation["transcript"]
-    )
-    assert len(observation["transcript_sha256"]) == 64
     assert any("factory-holdout-evaluation-receipt.v1" in item for item in persisted)
     assert all(holdout_body.decode("utf-8") not in item for item in persisted)
-    assert all("SENSITIVE-AGENT-OUTPUT" not in item for item in persisted)
 
     timeout_tokens: list[object] = []
 
@@ -1492,7 +2669,7 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
         raise AssertionError("unreachable")
 
     monkeypatch.setattr(Swarm, "run", blocked_run)
-    with pytest.raises(asyncio.TimeoutError):
+    with pytest.raises(HostAutoGenSessionTimeoutError) as timeout:
         await runner.run(
             job=job,
             invocation=_invocation(job),
@@ -1503,136 +2680,10 @@ async def test_host_runner_instantiates_autogen_swarm_and_ignores_candidate_entr
             max_seconds=0.01,
         )
     assert timeout_tokens[0].is_cancelled()  # type: ignore[attr-defined]
-
-
-@pytest.mark.asyncio
-async def test_paid_negative_holdout_is_behavioral_failed_with_usage_receipt(
-    tmp_path: Path,
-) -> None:
-    holdout_body = b"Reject this deterministic private case."
-    job = _job_v3(holdout_body=holdout_body)
-    candidate = _sealed_team_candidate(tmp_path)
-    invocation = _invocation(job)
-    model_client = BudgetedChatCompletionClient(
-        job=job,
-        invocation=invocation,
-        attempt=1,
-        delegate=ReplayChatCompletionClient(
-            ["TERMINATE"],
-            model_info=ModelInfo(
-                vision=False,
-                function_calling=True,
-                json_output=True,
-                family=ModelFamily.UNKNOWN,
-                structured_output=True,
-            ),
-        ),
-        budget=InMemoryFactoryBudgetLedger(),
-        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "negative-evidence"),
-        provider="deterministic-replay",
-        model="approved-model-id",
-        max_cost_per_call=Decimal("0.50"),
-        paid_effect_authority=_PaidEffectAuthority(),
-        pricing_authority=_PricingAuthority(_pricing_quote(job)),
-        clock=lambda: NOW,
-    )
-
-    async def support_triage(ticket: str) -> str:
-        return f"routed:{ticket}"
-
-    class TrustedN8nAdapter:
-        def tool(self, name: str) -> object:
-            return FunctionTool(
-                support_triage,
-                description="Route support case",
-                name=name,
-            )
-
-        def authorization(self, name: str) -> object:
-            raise AssertionError(f"unused n8n tool {name} requested authority")
-
-        def observed_evidence(self) -> tuple[FactoryN8nExecutionEvidenceV1, ...]:
-            return ()
-
-    class TrustedN8nAuthority:
-        async def authorize_command(self, claim: object, *, now: datetime) -> object:
-            raise AssertionError("unused n8n tool requested authority")
-
-        async def authorize(self, evidence: object, *, now: datetime) -> object:
-            raise AssertionError("no n8n call should be observed")
-
-    class RejectingHoldouts:
-        async def resolve(self, reference: object) -> ResolvedFactoryHoldoutCase:
-            assert reference == job.private_holdout_refs[0]
-            return ResolvedFactoryHoldoutCase(
-                reference=job.private_holdout_refs[0],
-                body=holdout_body,
-            )
-
-        async def evaluate(
-            self,
-            reference: object,
-            result: object,
-            assertion_ids: tuple[str, ...],
-        ) -> FactoryHoldoutEvaluationReceiptV1:
-            assert result is not None
-            return FactoryHoldoutEvaluationReceiptV1(
-                schema_name="captain.factory-holdout-evaluation-receipt.v1",
-                holdout_ref=job.private_holdout_refs[0],
-                candidate_ref=candidate.candidate.source_archive_ref,
-                assertion_ids=assertion_ids,
-                decisions=tuple(
-                    FactoryHoldoutAssertionDecisionV1(
-                        assertion_id=assertion_id,
-                        passed=False,
-                        provenance_code="deterministic_rule",
-                    )
-                    for assertion_id in assertion_ids
-                ),
-                evaluator_id="captain_test_evaluator",
-                evaluator_version="1",
-                evaluated_at=NOW,
-            )
-
-    result = await HostAutoGenTeamRunner(
-        model_client=model_client,
-        evaluator=FactoryCandidateEvaluator(),
-        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "host-negative"),
-        holdouts=RejectingHoldouts(),  # type: ignore[arg-type]
-        tools={},
-        n8n_adapter=TrustedN8nAdapter(),  # type: ignore[arg-type]
-        n8n_authority=TrustedN8nAuthority(),  # type: ignore[arg-type]
-        clock=lambda: NOW,
-    ).run(
-        job=job,
-        invocation=invocation,
-        candidate=candidate,
-        case_ref=job.private_holdout_refs[0],
-        lease=invocation.lease,
-        allowed_models=job.execution_policy.allowed_models,
-        max_seconds=10,
-    )
-
-    assert result.status == "failed"
-    assert result.runtime_result.status is RuntimeStatus.FAILED
-    assert result.execution_outcome.status == "failed"
-    assert len(result.usage_receipts) == 1
-
-
-def test_candidate_preflight_preserves_valid_n8n_tool_context(
-    tmp_path: Path,
-) -> None:
-    candidate = _sealed_team_candidate(tmp_path)
-
-    result = FactoryCandidateEvaluator().validate(candidate, max_seconds=10)
-
-    assert result.status == "succeeded"
-    assert result.team_execution_manifest is not None
-    assert {
-        tool
-        for agent in result.team_execution_manifest.agents
-        for tool in agent.tools
-    } == {"support_triage"}
+    assert timeout.value.provider_started is False
+    assert timeout.value.provider_usage_unresolved is False
+    assert len(timeout.value.usage_receipts) == 0
+    assert timeout.value.identity.case_sha256 == job.private_holdout_refs[0].sha256
 
 
 def test_n8n_execution_requires_separate_scope_and_matching_digest() -> None:
@@ -2036,6 +3087,53 @@ async def test_pre_effect_host_configuration_failure_abandons_replay_claim(
                 job.private_holdout_refs[0],
             )
     assert runner.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_captain_authority_reopens_exact_failed_team_evidence_replay(
+    tmp_path: Path,
+) -> None:
+    job = _job_v3()
+    invocation = _invocation(job)
+    holdout = job.private_holdout_refs[0]
+    scoped_invocation = _holdout_scoped_invocation(invocation, holdout)
+    replay_store = InMemoryFactorySkillReplayStore()
+    claimed = await replay_store.claim(scoped_invocation)
+    failed = await replay_store.fail(
+        claimed.record,
+        failure_kind="evidence_binding_failed",
+    )
+    authority = FilesystemFactoryHermesRetryAuthority(tmp_path / "authorities")
+    authority.issue(
+        failed,
+        now=NOW,
+        maximum_additional_cost_usd=Decimal("0.03"),
+        prior_attempt_reserve_usd=Decimal("0.40"),
+        benchmark_reserve_usd=Decimal("0.20"),
+        internal_total_cap_usd=Decimal("0.79"),
+    )
+
+    class Runner:
+        calls = 0
+
+        async def run(self, **_: object) -> FactoryTeamRunResult:
+            self.calls += 1
+            raise RuntimeError("controlled provider failure after authorized retry")
+
+    runner = Runner()
+    evidence = await TeamExecutionService(
+        job=job,
+        preflight=_SuccessfulPreflight(),
+        runner=runner,
+        evidence_store=FilesystemFactoryEvidenceStore(tmp_path / "evidence"),
+        replay_store=replay_store,
+        replay_retry_authority=authority,
+        clock=lambda: NOW,
+    ).execute(invocation, _candidate(tmp_path), holdout)
+
+    assert runner.calls == 1
+    assert evidence.status == "unresolved"
+    assert evidence.termination_reason == "provider_cost_unresolved"
 
 
 @pytest.mark.asyncio

@@ -1,25 +1,39 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import zipfile
+from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
-from minibook.swarm.contracts import CreationJobV1
-from agenten.agent_factory.capability_live_adapters import ContentAddressedArtifactStore
-from agenten.agent_factory.outcome_contracts import ForgeCapabilityPackageCandidateV1
-from agenten.agent_runtime.contracts import ArtifactRef as CaptainArtifactRef
-from minibook.swarm.contracts import ArtifactRef as MinibookArtifactRef
+from minibook.swarm.contracts import (
+    ArtifactRef,
+    CodexBuildReceiptV1,
+    CreationJobV1,
+    CreationJobV2,
+    CreationPackageManifestV2,
+    ForgeBuildSkillUsageReceiptV1,
+)
 from minibook.swarm.pipeline_adapter import (
-    ContentAddressedCreationArtifacts,
-    ExportArtifactSnapshotter,
+    ContentAddressedCreationArtifactPublisher,
+    CreationExportBundle,
+    CreationExportReceiptV2,
     PIPELINE_STEP_ORDER,
     SwarmPipelineAdapter,
     SwarmSnapshot,
     SwarmStep,
     translate_creation_failure,
 )
+from agenten.agent_factory.business_benchmark_production_ports import (
+    BusinessBenchmarkContentAddressedArtifactStore,
+)
+from agenten.agent_runtime.contracts import ArtifactRef as RuntimeArtifactRef
+from minibook.swarm.contracts import CreationPackageManifestV1
 
 
 FIXTURE = Path(__file__).parents[2] / "tests/fixtures/contracts/minibook_creation_job.v1.json"
@@ -27,27 +41,6 @@ FIXTURE = Path(__file__).parents[2] / "tests/fixtures/contracts/minibook_creatio
 
 def job() -> CreationJobV1:
     return CreationJobV1.model_validate_json(FIXTURE.read_text(encoding="utf-8"))
-
-
-def seeded_job(artifacts: ContentAddressedCreationArtifacts) -> CreationJobV1:
-    """Give export tests one real shared-CAS released-skill artifact."""
-
-    creation = job()
-    reference = artifacts.put(
-        b'{"schema":"captain.released-factory-workflow.v1"}',
-        "application/json",
-        namespace="released-skill",
-    )
-    return creation.model_copy(
-        update={
-            "released_skill": creation.released_skill.model_copy(
-                update={
-                    "content_ref": reference,
-                    "content_sha256": reference.sha256,
-                }
-            )
-        }
-    )
 
 
 def test_pipeline_step_order_freezes_existing_conditional_flow() -> None:
@@ -70,15 +63,6 @@ def test_pipeline_step_order_freezes_existing_conditional_flow() -> None:
     )
 
 
-def test_export_snapshotter_keeps_all_sealed_adapter_metadata() -> None:
-    assert ExportArtifactSnapshotter._artifact_kind(
-        "adapters/factory-candidate.json"
-    ) == "local_adapter"
-    assert ExportArtifactSnapshotter._artifact_kind(
-        "adapters/prompts/runtime.md"
-    ) == "local_adapter"
-
-
 class FakePipeline:
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -90,6 +74,196 @@ class FakePipeline:
         return "catalog-ok"
 
 
+class ExportPipeline:
+    def __init__(self, bundle: CreationExportBundle | None) -> None:
+        self.bundle = bundle
+        self.calls = 0
+
+    async def step_creation_export(self, session: object):
+        self.calls += 1
+        return self.bundle
+
+    async def step_export(self, session: object):
+        raise AssertionError("creation jobs must not use the legacy Git/GitHub export")
+
+
+def _skill_receipt_payload(
+    creation_job: CreationJobV1,
+    **overrides: object,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema": "hermes.forge-build-skill-usage-receipt.v1",
+        "producer": "hermes",
+        "outcome": "fulfilled",
+        "creation_job_id": str(creation_job.creation_job_id),
+        "factory_job_id": str(creation_job.factory_job_id),
+        "correlation_id": str(creation_job.correlation_id),
+        "subject_version": creation_job.subject_version,
+        "attempt": creation_job.attempt,
+        "idempotency_key": creation_job.idempotency_key,
+        "released_skill": creation_job.released_skill.model_dump(mode="json"),
+        "public_assertion_ids": list(creation_job.public_assertion_ids),
+        "evidence_refs": [
+            {
+                "uri": "artifact://forge/build-evidence/" + "9" * 64,
+                "sha256": "9" * 64,
+                "media_type": "application/json",
+            }
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _skill_receipt_bytes(
+    creation_job: CreationJobV1,
+    **overrides: object,
+) -> bytes:
+    return json.dumps(_skill_receipt_payload(creation_job, **overrides)).encode("utf-8")
+
+
+def _export_bundle(
+    tmp_path: Path,
+    *,
+    skill_usage_receipt: bytes | None = None,
+) -> CreationExportBundle:
+    source = tmp_path / "candidate.zip"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("run_team.py", "print('ok')\n")
+    candidate_manifest = {
+        "schema_name": "captain.factory-candidate.v1",
+        "candidate_id": "demo_team",
+        "team_manifest": {
+            "reference": {
+                "uri": "artifact://forge/team",
+                "sha256": "1" * 64,
+                "media_type": "application/json",
+            },
+            "relative_path": "team.json",
+        },
+        "workflow_artifacts": [
+            {
+                "reference": {
+                    "uri": "artifact://forge/workflow",
+                    "sha256": "2" * 64,
+                    "media_type": "application/json",
+                },
+                "relative_path": "workflow.json",
+            }
+        ],
+        "tool_schema_artifacts": [],
+        "n8n_tools": [],
+        "n8n_tool_references": [],
+        "build_command": ["python", "-m", "compileall", "-q", "."],
+        "real_case_command": ["python", "run_team.py"],
+        "timeout_seconds": 10,
+    }
+    return CreationExportBundle(
+        source_archive=source.read_bytes(),
+        candidate_manifest=candidate_manifest,
+        skill_usage_receipt=(
+            skill_usage_receipt
+            if skill_usage_receipt is not None
+            else _skill_receipt_bytes(job())
+        ),
+    )
+
+
+def _captain_bundle(tmp_path: Path) -> CreationExportBundle:
+    legacy = _export_bundle(tmp_path)
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "factory-candidate.json",
+            json.dumps(legacy.candidate_manifest, separators=(",", ":")),
+        )
+        archive.writestr("run_team.py", "print('ok')\n")
+    return CreationExportBundle(
+        source_archive=buffer.getvalue(),
+        candidate_manifest=legacy.candidate_manifest,
+        skill_usage_receipt=legacy.skill_usage_receipt,
+        captain_sealed_source=True,
+    )
+
+
+def _captain_v2_job(bundle: CreationExportBundle) -> CreationJobV2:
+    with zipfile.ZipFile(BytesIO(bundle.source_archive)) as archive:
+        candidate_bytes = archive.read("factory-candidate.json")
+    base = job().model_dump(mode="json", by_alias=True)
+    source_digest = hashlib.sha256(bundle.source_archive).hexdigest()
+    candidate_digest = hashlib.sha256(candidate_bytes).hexdigest()
+    source_ref = {
+        "uri": f"artifact://captain/source/{source_digest}",
+        "sha256": source_digest,
+        "media_type": "application/zip",
+    }
+    base.update(
+        {
+            "schema": "minibook.creation-job.v2",
+            "source_archive_ref": source_ref,
+            "codex_build_receipt": {
+                "schema": "captain.codex-build-receipt.v1",
+                "receipt_id": str(uuid4()),
+                "producer": "captain",
+                "outcome": "sealed",
+                "assignment_id": str(uuid4()),
+                "creation_job_id": base["creation_job_id"],
+                "factory_job_id": base["factory_job_id"],
+                "correlation_id": base["correlation_id"],
+                "subject_version": base["subject_version"],
+                "attempt": base["attempt"],
+                "idempotency_key": base["idempotency_key"],
+                "seal_idempotency_key": "5" * 64,
+                "build_brief_ref": {
+                    "uri": "artifact://captain/brief/" + "1" * 64,
+                    "sha256": "1" * 64,
+                    "media_type": "application/json",
+                },
+                "codex_session_ref": {
+                    "uri": "artifact://captain/session/" + "2" * 64,
+                    "sha256": "2" * 64,
+                    "media_type": "application/json",
+                },
+                "workspace_ref": "workspace://captain/codex",
+                "workspace_snapshot_ref": {
+                    "uri": "artifact://captain/workspace/" + "4" * 64,
+                    "sha256": "4" * 64,
+                    "media_type": "application/zip",
+                },
+                "source_archive_ref": source_ref,
+                "candidate_manifest_ref": {
+                    "uri": f"artifact://captain/candidate/{candidate_digest}",
+                    "sha256": candidate_digest,
+                    "media_type": "application/json",
+                },
+                "test_evidence_refs": [
+                    {
+                        "uri": "artifact://captain/tests/" + "3" * 64,
+                        "sha256": "3" * 64,
+                        "media_type": "application/json",
+                    }
+                ],
+                "acceptance_assertion_ids": base["public_assertion_ids"],
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            },
+        }
+    )
+    canonical_receipt = json.dumps(
+        CodexBuildReceiptV1.model_validate(base["codex_build_receipt"]).model_dump(
+            mode="json", by_alias=True
+        ),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    receipt_digest = hashlib.sha256(canonical_receipt).hexdigest()
+    base["codex_build_receipt_ref"] = {
+        "uri": f"artifact://captain/codex-build-receipt/{receipt_digest}",
+        "sha256": receipt_digest,
+        "media_type": "application/json",
+    }
+    return CreationJobV2.model_validate(base)
+
+
 @pytest.mark.asyncio
 async def test_adapter_dispatches_exactly_one_named_step_and_captures_safe_snapshot() -> None:
     pipeline = FakePipeline()
@@ -99,6 +273,353 @@ async def test_adapter_dispatches_exactly_one_named_step_and_captures_safe_snaps
     assert pipeline.calls == ["catalog"]
     assert outcome.snapshot["completed_steps"] == ["catalog"]
     assert "credentials" not in json.dumps(outcome.snapshot).lower()
+
+
+@pytest.mark.asyncio
+async def test_export_publishes_real_bytes_and_rehydrates_accepted_receipt(
+    tmp_path: Path,
+) -> None:
+    pipeline = ExportPipeline(_export_bundle(tmp_path))
+    store = BusinessBenchmarkContentAddressedArtifactStore(
+        tmp_path / ".captain-cook" / "minibook-export"
+    )
+    publisher = ContentAddressedCreationArtifactPublisher(store)
+    adapter = SwarmPipelineAdapter(
+        lambda prior: pipeline,
+        session=object(),
+        artifact_publisher=publisher,
+    )
+    prior = SwarmSnapshot(creation_job_id=job().creation_job_id)
+
+    outcome = await adapter.run_step(
+        job(), SwarmStep.EXPORT.value, prior.model_dump(), "effect", None
+    )
+    result = adapter.assemble_result(job(), outcome.snapshot)
+
+    assert outcome.effect_receipt is not None
+    assert outcome.effect_receipt["receipt_id"] == hashlib.sha256(
+        "|".join(
+            (
+                str(job().creation_job_id),
+                outcome.effect_receipt["package_manifest_ref"]["sha256"],
+                outcome.effect_receipt["candidate_manifest_ref"]["sha256"],
+                outcome.effect_receipt["source_archive_ref"]["sha256"],
+                outcome.effect_receipt["skill_usage_receipt_ref"]["sha256"],
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+
+    assert result.status == "succeeded"
+    assert result.package_manifest_ref is not None
+    package = CreationPackageManifestV1.model_validate_json(
+        store.read_bytes(
+            RuntimeArtifactRef.model_validate(
+                result.package_manifest_ref.model_dump(mode="json")
+            )
+        )
+    )
+    assert package.creation_job_id == job().creation_job_id
+    assert package.factory_job_id == job().factory_job_id
+    assert package.skill_usage_receipt_ref == result.skill_usage_receipt_ref
+    typed_skill_receipt = ForgeBuildSkillUsageReceiptV1.model_validate_json(
+        store.read_bytes(
+            RuntimeArtifactRef.model_validate(
+                result.skill_usage_receipt_ref.model_dump(mode="json")
+            )
+        )
+    )
+    assert typed_skill_receipt.released_skill == job().released_skill
+    assert typed_skill_receipt.outcome == "fulfilled"
+    assert result.artifact_refs == (
+        package.candidate_manifest_ref,
+        package.source_archive_ref,
+    )
+
+    replay_pipeline = ExportPipeline(None)
+    replay_adapter = SwarmPipelineAdapter(
+        lambda prior: replay_pipeline,
+        session=object(),
+        artifact_publisher=ContentAddressedCreationArtifactPublisher(store),
+    )
+    replay = await replay_adapter.run_step(
+        job(),
+        SwarmStep.EXPORT.value,
+        prior.model_dump(),
+        "effect",
+        outcome.effect_receipt,
+    )
+    assert replay.snapshot == outcome.snapshot
+    assert replay_pipeline.calls == 0
+
+    tampered_receipt = dict(outcome.effect_receipt)
+    tampered_receipt["receipt_id"] = "f" * 64
+    with pytest.raises(ValueError, match="receipt"):
+        await replay_adapter.run_step(
+            job(),
+            SwarmStep.EXPORT.value,
+            prior.model_dump(),
+            "effect",
+            tampered_receipt,
+        )
+
+    changed_job = job().model_copy(update={"creation_job_id": uuid4()})
+    with pytest.raises(ValueError, match="package.*job"):
+        await replay_adapter.run_step(
+            changed_job,
+            SwarmStep.EXPORT.value,
+            prior.model_dump(),
+            "effect",
+            outcome.effect_receipt,
+        )
+
+    wrong_ref = dict(outcome.effect_receipt)
+    wrong_ref["skill_usage_receipt_ref"] = wrong_ref["package_manifest_ref"]
+    with pytest.raises(ValueError, match="skill usage receipt"):
+        await replay_adapter.run_step(
+            job(),
+            SwarmStep.EXPORT.value,
+            prior.model_dump(),
+            "effect",
+            wrong_ref,
+        )
+
+
+@pytest.mark.parametrize(
+    "skill_usage_receipt",
+    (
+        b'{"schema":"hermes.forge-build-skill-usage-receipt.v1"}',
+        _skill_receipt_bytes(job(), factory_job_id=str(uuid4())),
+        _skill_receipt_bytes(job(), attempt=2),
+        _skill_receipt_bytes(
+            job(),
+            released_skill={
+                **job().released_skill.model_dump(mode="json"),
+                "skill_id": "wrong-skill",
+            },
+        ),
+    ),
+)
+def test_export_rejects_unbound_forge_build_skill_usage_receipt(
+    tmp_path: Path,
+    skill_usage_receipt: bytes,
+) -> None:
+    store = BusinessBenchmarkContentAddressedArtifactStore(
+        tmp_path / ".captain-cook" / "invalid-skill-receipt"
+    )
+
+    with pytest.raises(ValueError, match="skill usage receipt"):
+        ContentAddressedCreationArtifactPublisher(store).publish(
+            job(),
+            _export_bundle(
+                tmp_path,
+                skill_usage_receipt=skill_usage_receipt,
+            ),
+        )
+
+
+def test_v2_export_replay_rechecks_captain_source_digest(
+    tmp_path: Path,
+) -> None:
+    bundle = _captain_bundle(tmp_path)
+    creation_job = _captain_v2_job(bundle)
+    store = BusinessBenchmarkContentAddressedArtifactStore(
+        tmp_path / ".captain-cook" / "captain-sealed-export"
+    )
+    publisher = ContentAddressedCreationArtifactPublisher(store)
+    receipt = publisher.publish(creation_job, bundle)
+    assert isinstance(receipt, CreationExportReceiptV2)
+    package = CreationPackageManifestV2.model_validate_json(
+        store.read_bytes(
+            RuntimeArtifactRef.model_validate(
+                receipt.package_manifest_ref.model_dump(mode="json")
+            )
+        )
+    )
+    assert package.codex_build_receipt_ref == receipt.codex_build_receipt_ref
+    changed = creation_job.model_dump(mode="json", by_alias=True)
+    changed_ref = {
+        **changed["source_archive_ref"],
+        "sha256": "f" * 64,
+        "uri": "artifact://captain/source/" + "f" * 64,
+    }
+    changed["source_archive_ref"] = changed_ref
+    changed["codex_build_receipt"]["source_archive_ref"] = changed_ref
+    changed_codex_receipt = CodexBuildReceiptV1.model_validate(
+        changed["codex_build_receipt"]
+    )
+    changed_codex_digest = hashlib.sha256(
+        json.dumps(
+            changed_codex_receipt.model_dump(mode="json", by_alias=True),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    changed["codex_build_receipt_ref"] = {
+        **changed["codex_build_receipt_ref"],
+        "sha256": changed_codex_digest,
+        "uri": f"artifact://captain/codex-build-receipt/{changed_codex_digest}",
+    }
+    changed_job = CreationJobV2.model_validate(changed)
+
+    with pytest.raises(
+        ValueError,
+        match="Codex build receipt|Captain source archive digest",
+    ):
+        publisher.accept_receipt(changed_job, receipt)
+
+    tampered = receipt.model_dump(mode="json", by_alias=True)
+    tampered["codex_build_receipt_ref"] = tampered["candidate_manifest_ref"]
+    with pytest.raises(ValueError, match="Codex build receipt"):
+        publisher.accept_receipt(
+            creation_job,
+            CreationExportReceiptV2.model_validate(tampered),
+        )
+
+
+@pytest.mark.asyncio
+async def test_v2_adapter_retains_codex_receipt_in_snapshot_result_and_replay(
+    tmp_path: Path,
+) -> None:
+    bundle = _captain_bundle(tmp_path)
+    creation_job = _captain_v2_job(bundle)
+    store = BusinessBenchmarkContentAddressedArtifactStore(
+        tmp_path / ".captain-cook" / "captain-sealed-adapter"
+    )
+    prior = SwarmSnapshot(creation_job_id=creation_job.creation_job_id)
+    adapter = SwarmPipelineAdapter(
+        lambda _prior: ExportPipeline(bundle),
+        session=object(),
+        artifact_publisher=ContentAddressedCreationArtifactPublisher(store),
+    )
+
+    exported = await adapter.run_step(
+        creation_job,
+        SwarmStep.EXPORT.value,
+        prior.model_dump(),
+        "effect",
+        None,
+    )
+    result = adapter.assemble_result(creation_job, exported.snapshot)
+
+    assert result.status == "succeeded"
+    assert any(
+        ref.sha256 == creation_job.codex_build_receipt_ref.sha256
+        and ref.media_type == "application/json"
+        for ref in result.artifact_refs
+    )
+
+    replay_pipeline = ExportPipeline(None)
+    replay = SwarmPipelineAdapter(
+        lambda _prior: replay_pipeline,
+        session=object(),
+        artifact_publisher=ContentAddressedCreationArtifactPublisher(store),
+    )
+    replayed = await replay.run_step(
+        creation_job,
+        SwarmStep.EXPORT.value,
+        prior.model_dump(),
+        "effect",
+        exported.effect_receipt,
+    )
+    assert replayed.snapshot == exported.snapshot
+    assert replay_pipeline.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_export_replay_without_cas_read_authority_fails_closed(
+    tmp_path: Path,
+) -> None:
+    store = BusinessBenchmarkContentAddressedArtifactStore(
+        tmp_path / ".captain-cook" / "minibook-export"
+    )
+    producer = SwarmPipelineAdapter(
+        lambda prior: ExportPipeline(_export_bundle(tmp_path)),
+        session=object(),
+        artifact_publisher=ContentAddressedCreationArtifactPublisher(store),
+    )
+    prior = SwarmSnapshot(creation_job_id=job().creation_job_id)
+    published = await producer.run_step(
+        job(), SwarmStep.EXPORT.value, prior.model_dump(), "effect", None
+    )
+    replay = SwarmPipelineAdapter(
+        lambda prior: ExportPipeline(None),
+        session=object(),
+    )
+
+    with pytest.raises(ValueError, match="read authority"):
+        await replay.run_step(
+            job(),
+            SwarmStep.EXPORT.value,
+            prior.model_dump(),
+            "effect",
+            published.effect_receipt,
+        )
+
+
+def test_assemble_result_rejects_missing_or_unknown_artifact_bindings() -> None:
+    adapter = SwarmPipelineAdapter(lambda prior: ExportPipeline(None), session=object())
+    reference = ArtifactRef.model_validate(
+        {
+            "uri": "artifact://forge/test/" + "a" * 64,
+            "sha256": "a" * 64,
+            "media_type": "application/json",
+        }
+    )
+    source_reference = ArtifactRef.model_validate(
+        reference.model_dump(mode="json") | {"media_type": "application/zip"}
+    )
+    base = SwarmSnapshot(
+        creation_job_id=job().creation_job_id,
+        package_manifest_ref=reference,
+        skill_usage_receipt_ref=reference,
+        artifact_bindings={"candidate_manifest": reference},
+    )
+
+    missing = adapter.assemble_result(job(), base.model_dump(mode="json"))
+    extra = adapter.assemble_result(
+        job(),
+        base.model_copy(
+            update={
+                "artifact_bindings": {
+                    "candidate_manifest": reference,
+                    "source_archive": source_reference,
+                    "unexpected": reference,
+                }
+            }
+        ).model_dump(mode="json"),
+    )
+
+    assert missing.status == "blocked"
+    assert extra.status == "blocked"
+    assert missing.failure is not None
+    assert extra.failure is not None
+    assert missing.failure.code == extra.failure.code == "validation_failed"
+
+
+@pytest.mark.asyncio
+async def test_legacy_export_without_typed_bytes_stays_blocked(tmp_path: Path) -> None:
+    pipeline = ExportPipeline(None)
+    store = BusinessBenchmarkContentAddressedArtifactStore(
+        tmp_path / ".captain-cook" / "legacy-export"
+    )
+    adapter = SwarmPipelineAdapter(
+        lambda prior: pipeline,
+        session=object(),
+        artifact_publisher=ContentAddressedCreationArtifactPublisher(store),
+    )
+    outcome = await adapter.run_step(
+        job(),
+        SwarmStep.EXPORT.value,
+        SwarmSnapshot(creation_job_id=job().creation_job_id).model_dump(),
+        "effect",
+        None,
+    )
+
+    result = adapter.assemble_result(job(), outcome.snapshot)
+
+    assert result.status == "blocked"
+    assert result.failure is not None
+    assert result.failure.code == "validation_failed"
 
 
 class DocumentationUnavailable(RuntimeError):
@@ -115,302 +636,3 @@ def test_unknown_boundary_failure_is_redacted_to_type_name() -> None:
 def test_known_documentation_failure_has_typed_code() -> None:
     failure = translate_creation_failure(DocumentationUnavailable("offline"))
     assert failure.code == "documentation_unavailable"
-
-
-def _hermes_receipt(creation: CreationJobV1) -> dict[str, object]:
-    return {
-        "schema": "hermes.skill-usage-receipt.v1",
-        "receipt_id": "90000000-0000-4000-8000-000000000001",
-        "request_id": "90000000-0000-4000-8000-000000000002",
-        "job_id": str(creation.factory_job_id),
-        "correlation_id": str(creation.correlation_id),
-        "lease_id": "factory-lease",
-        "occurred_at": "2026-07-21T13:00:00Z",
-        "producer": "hermes",
-        "released_skill": {
-            "schema": "captain.released-hermes-skill.v1",
-            "skill_id": creation.released_skill.skill_id,
-            "version": creation.released_skill.version,
-            "capability": "factory_workflow",
-            "content_ref": creation.released_skill.content_ref.model_dump(mode="json"),
-            "content_sha256": creation.released_skill.content_sha256,
-            "status": "released",
-            "released_at": "2026-07-21T12:00:00Z",
-            "producer": "captain",
-        },
-        "used_skill_id": creation.released_skill.skill_id,
-        "used_skill_version": creation.released_skill.version,
-        "used_skill_sha256": creation.released_skill.content_sha256,
-        "commands": [{"command_id": "codex.run", "max_seconds": 60}],
-        "evidence_refs": [
-            {
-                "uri": "artifact://hermes/evidence",
-                "sha256": "9" * 64,
-                "media_type": "application/json",
-            }
-        ],
-        "assertion_ids": list(creation.public_assertion_ids),
-        "outcome": "passed",
-    }
-
-
-class ExportPipeline:
-    def __init__(self, export_path: Path) -> None:
-        self.export_result: dict[str, object] | None = None
-        self.export_path = export_path
-        self.generated_files = {"src/main.py": "print('ready')\n"}
-        self.yaml_files = {"project.yml": "name: ready\n"}
-
-    async def step_export(self, session: object) -> dict[str, object]:
-        del session
-        self.export_result = {"status": "SUCCESS", "path": str(self.export_path)}
-        return dict(self.export_result)
-
-
-def _export_tree(
-    path: Path, *, with_receipt: bool, creation: CreationJobV1 | None = None
-) -> None:
-    creation = creation or job()
-    (path / "src").mkdir(parents=True)
-    (path / "src/main.py").write_text("print('ready')\n", encoding="utf-8")
-    (path / "project.yml").write_text("name: ready\n", encoding="utf-8")
-    (path / "autogen").mkdir()
-    (path / "autogen/team.py").write_text("TEAM_READY = True\n", encoding="utf-8")
-    (path / "adapters").mkdir()
-    (path / "adapters/factory-candidate.json").write_text(
-        '{"schema":"captain.factory-candidate-descriptor.v1"}', encoding="utf-8"
-    )
-    (path / "skills/factory").mkdir(parents=True)
-    (path / "skills/factory/SKILL.md").write_text("# Factory skill\n", encoding="utf-8")
-    (path / "tests").mkdir()
-    (path / "tests/test_team.py").write_text(
-        "def test_team_ready():\n    assert True\n", encoding="utf-8"
-    )
-    (path / "evidence").mkdir()
-    (path / "evidence/assertions.json").write_text(
-        json.dumps(
-            {
-                "schema": "minibook.creation-assertions.v1",
-                "assertion_ids": list(creation.public_assertion_ids),
-            },
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
-    (path / "evidence/tool-gaps.json").write_text(
-        json.dumps(
-            {"schema": "minibook.creation-tool-gaps.v1", "tool_gaps": []},
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
-    (path / "RUNBOOK.md").write_text("# Runbook\n", encoding="utf-8")
-    (path / "team-manifest.json").write_text(
-        json.dumps(
-            {
-                "schema": "autogen-team.v1",
-                "capability_id": "requested-team",
-                "capability_version": 1,
-                "autogen_modules": ["autogen/team.py"],
-                "test_paths": ["tests/test_team.py"],
-            },
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
-    if with_receipt:
-        (path / "evidence/hermes-skill-usage-receipt.json").write_text(
-            json.dumps(_hermes_receipt(creation), sort_keys=True), encoding="utf-8"
-        )
-
-
-@pytest.mark.asyncio
-async def test_export_snapshot_uses_real_content_and_hermes_receipt(tmp_path: Path) -> None:
-    export = tmp_path / "export"
-    artifacts = ContentAddressedCreationArtifacts(tmp_path / "artifacts")
-    creation = seeded_job(artifacts)
-    _export_tree(export, with_receipt=True, creation=creation)
-    pipeline = ExportPipeline(export)
-    adapter = SwarmPipelineAdapter(
-        lambda prior: pipeline,
-        session=object(),
-        snapshotter=ExportArtifactSnapshotter(artifacts),
-    )
-    prior = SwarmSnapshot(creation_job_id=creation.creation_job_id)
-
-    outcome = await adapter.run_step(
-        creation, SwarmStep.EXPORT.value, prior.model_dump(), "effect", None
-    )
-    result = adapter.assemble_result(creation, outcome.snapshot)
-
-    assert result.status == "succeeded"
-    assert result.package_manifest_ref is not None
-    assert result.skill_usage_receipt_ref is not None
-    candidate = ForgeCapabilityPackageCandidateV1.model_validate_json(
-        artifacts.read(result.package_manifest_ref)
-    )
-    assert candidate.factory_job_id == creation.factory_job_id
-    assert candidate.creation_job_id == creation.creation_job_id
-    assert candidate.capability_id == "requested-team"
-    assert any(item.path == "adapters/factory-candidate.json" for item in candidate.artifacts)
-    assert candidate.skill_usage_receipt_ref == CaptainArtifactRef.model_validate(
-        result.skill_usage_receipt_ref.model_dump(mode="json")
-    )
-    assert json.loads(artifacts.read(result.skill_usage_receipt_ref))["producer"] == "hermes"
-    assert len(result.artifact_refs) == 1
-    assert artifacts.read(result.artifact_refs[0]).startswith(b"PK")
-    captain = ContentAddressedArtifactStore(tmp_path / "artifacts")
-    references = (
-        candidate.source_ref,
-        candidate.team_manifest_ref,
-        candidate.skill_usage_receipt_ref,
-        candidate.runbook_ref,
-        *(item.reference for item in candidate.artifacts),
-    )
-    assert all(captain.read_bytes(reference) for reference in references)
-
-
-@pytest.mark.asyncio
-async def test_export_without_hermes_receipt_is_required_todo_tool(tmp_path: Path) -> None:
-    export = tmp_path / "export"
-    artifacts = ContentAddressedCreationArtifacts(tmp_path / "artifacts")
-    creation = seeded_job(artifacts)
-    _export_tree(export, with_receipt=False, creation=creation)
-    pipeline = ExportPipeline(export)
-    adapter = SwarmPipelineAdapter(
-        lambda prior: pipeline,
-        session=object(),
-        snapshotter=ExportArtifactSnapshotter(artifacts),
-    )
-    prior = SwarmSnapshot(creation_job_id=creation.creation_job_id)
-
-    outcome = await adapter.run_step(
-        creation, SwarmStep.EXPORT.value, prior.model_dump(), "effect", None
-    )
-    result = adapter.assemble_result(creation, outcome.snapshot)
-
-    assert result.status == "blocked"
-    assert result.failure is not None and result.failure.code == "tool_unresolved"
-    assert len(result.tool_gaps) == 1
-    assert result.tool_gaps[0].severity == "required"
-    assert json.loads(artifacts.read(result.tool_gaps[0].evidence_ref)) == {
-        "schema": "TODO_TOOL.v1",
-        "gap_id": "hermes-skill-usage-receipt",
-        "severity": "required",
-        "status": "unresolved",
-        "required_output": "evidence/hermes-skill-usage-receipt.json",
-    }
-
-
-@pytest.mark.asyncio
-async def test_export_blocks_receipt_for_another_factory_job(tmp_path: Path) -> None:
-    export = tmp_path / "export"
-    artifacts = ContentAddressedCreationArtifacts(tmp_path / "artifacts")
-    creation = seeded_job(artifacts)
-    _export_tree(export, with_receipt=True, creation=creation)
-    receipt_path = export / "evidence/hermes-skill-usage-receipt.json"
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    receipt["job_id"] = "90000000-0000-4000-8000-000000000099"
-    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
-    pipeline = ExportPipeline(export)
-    adapter = SwarmPipelineAdapter(
-        lambda prior: pipeline,
-        session=object(),
-        snapshotter=ExportArtifactSnapshotter(
-        artifacts
-    ),
-)
-    prior = SwarmSnapshot(creation_job_id=creation.creation_job_id)
-
-    outcome = await adapter.run_step(
-        creation, SwarmStep.EXPORT.value, prior.model_dump(), "effect", None
-    )
-    result = adapter.assemble_result(creation, outcome.snapshot)
-
-    assert result.status == "blocked"
-    assert result.tool_gaps[0].gap_id == "forge-capability-candidate-contract"
-
-
-@pytest.mark.asyncio
-async def test_export_effect_receipt_replays_structured_snapshot_without_dispatch(
-    tmp_path: Path,
-) -> None:
-    export = tmp_path / "export"
-    artifacts = ContentAddressedCreationArtifacts(tmp_path / "artifacts")
-    creation = seeded_job(artifacts)
-    _export_tree(export, with_receipt=False, creation=creation)
-    first_pipeline = ExportPipeline(export)
-    first = SwarmPipelineAdapter(
-        lambda prior: first_pipeline,
-        session=object(),
-        snapshotter=ExportArtifactSnapshotter(artifacts),
-    )
-    prior = SwarmSnapshot(creation_job_id=creation.creation_job_id)
-    first_outcome = await first.run_step(
-        creation, SwarmStep.EXPORT.value, prior.model_dump(), "effect", None
-    )
-    assert first_outcome.effect_receipt is not None
-
-    class MustNotDispatch:
-        async def step_export(self, session: object) -> None:
-            raise AssertionError("accepted export effect was dispatched twice")
-
-    replay = SwarmPipelineAdapter(
-        lambda snapshot: MustNotDispatch(),
-        session=object(),
-        snapshotter=ExportArtifactSnapshotter(artifacts),
-    )
-    replayed = await replay.run_step(
-        creation,
-        SwarmStep.EXPORT.value,
-        prior.model_dump(),
-        "effect",
-        first_outcome.effect_receipt,
-    )
-    result = replay.assemble_result(creation, replayed.snapshot)
-
-    assert result.status == "blocked"
-    assert result.tool_gaps[0].gap_id == "hermes-skill-usage-receipt"
-
-
-def test_creation_artifacts_read_captain_seeded_input_ref(tmp_path: Path) -> None:
-    root = tmp_path / "shared-artifacts"
-    captain = ContentAddressedArtifactStore(root)
-    captain_ref = captain.put(
-        b"Build the requested team",
-        "text/markdown",
-        namespace="creation-input",
-    )
-    minibook = ContentAddressedCreationArtifacts(root)
-
-    assert minibook.read(
-        MinibookArtifactRef.model_validate(captain_ref.model_dump(mode="json"))
-    ) == b"Build the requested team"
-
-
-def test_captain_reads_minibook_exported_artifact_refs(tmp_path: Path) -> None:
-    root = tmp_path / "shared-artifacts"
-    minibook = ContentAddressedCreationArtifacts(root)
-    minibook_ref = minibook.put(
-        b'{"schema":"minibook.creation-export-manifest.v1"}',
-        "application/json",
-        namespace="creation-export-manifest",
-    )
-    captain = ContentAddressedArtifactStore(root)
-
-    assert captain.read_bytes(
-        CaptainArtifactRef.model_validate(minibook_ref.model_dump(mode="json"))
-    ) == b'{"schema":"minibook.creation-export-manifest.v1"}'
-
-
-def test_creation_artifacts_reject_uri_outside_shared_capability_store(
-    tmp_path: Path,
-) -> None:
-    store = ContentAddressedCreationArtifacts(tmp_path / "artifacts")
-    reference = store.put(b"content", "application/octet-stream")
-    changed = reference.model_copy(
-        update={"uri": f"artifact://other-store/{reference.sha256}"}
-    )
-
-    with pytest.raises(ValueError, match="outside the capability store"):
-        store.read(changed)

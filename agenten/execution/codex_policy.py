@@ -90,6 +90,10 @@ class CodexExecutionPolicy:
         }
     )
     _ALLOWED_COMMAND_PREFIX = ("codex", "exec", "--json")
+    _ALLOWED_RESUME_COMMAND_PREFIX = ("codex", "exec", "resume", "--json")
+    _CODEX_THREAD_ID_PATTERN = re.compile(
+        r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
     _MCP_LEASE_ENVIRONMENT_NAMES = frozenset({"N8N_MCP_TOKEN"})
     _FORBIDDEN_SECRET_PATH_PATTERNS = (
         re.compile(
@@ -135,7 +139,8 @@ class CodexExecutionPolicy:
             raise CodexPolicyViolation("project root is outside the approved root")
         self._require_allowed_command(request.command)
         self._reject_secret_paths(request.command)
-        self._reject_dirty_project(project_root)
+        if not self._is_resume_command(request.command) and not request.recovery_run:
+            self._reject_dirty_project(project_root)
         return AuthorizedCodexRun(
             workspace=workspace,
             command=request.command,
@@ -186,12 +191,29 @@ class CodexExecutionPolicy:
 
     @classmethod
     def _require_allowed_command(cls, command: tuple[str, ...]) -> None:
-        if (
-            len(command) != len(cls._ALLOWED_COMMAND_PREFIX) + 1
-            or command[: len(cls._ALLOWED_COMMAND_PREFIX)] != cls._ALLOWED_COMMAND_PREFIX
-            or command[-1].lstrip().startswith("-")
-        ):
+        standard = (
+            len(command) == len(cls._ALLOWED_COMMAND_PREFIX) + 1
+            and command[: len(cls._ALLOWED_COMMAND_PREFIX)]
+            == cls._ALLOWED_COMMAND_PREFIX
+            and not command[-1].lstrip().startswith("-")
+        )
+        resumed = (
+            len(command) == len(cls._ALLOWED_RESUME_COMMAND_PREFIX) + 2
+            and command[: len(cls._ALLOWED_RESUME_COMMAND_PREFIX)]
+            == cls._ALLOWED_RESUME_COMMAND_PREFIX
+            and cls._CODEX_THREAD_ID_PATTERN.fullmatch(command[-2]) is not None
+            and not command[-1].lstrip().startswith("-")
+        )
+        if not standard and not resumed:
             raise CodexPolicyViolation("command is not in the Codex allowlist")
+
+    @classmethod
+    def _is_resume_command(cls, command: tuple[str, ...]) -> bool:
+        return (
+            len(command) == len(cls._ALLOWED_RESUME_COMMAND_PREFIX) + 2
+            and command[: len(cls._ALLOWED_RESUME_COMMAND_PREFIX)]
+            == cls._ALLOWED_RESUME_COMMAND_PREFIX
+        )
 
     @classmethod
     def _reject_secret_paths(cls, command: tuple[str, ...]) -> None:

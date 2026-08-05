@@ -1,0 +1,29 @@
+{
+  "candidate_id": "insurance_claims_resolution_swarm_v1",
+  "conversation_pattern": "swarm",
+  "max_messages": 10,
+  "max_handoffs": 2,
+  "max_tool_calls": 2,
+  "host_tools": ["captain_business_decision"],
+  "termination_conditions": ["task_completed", "max_messages", "max_handoffs"],
+  "agents": [
+    {
+      "name": "intake_specialist",
+      "prompt_path": "prompts/intake_specialist.txt",
+      "tools": [],
+      "handoffs": ["coverage_specialist"]
+    },
+    {
+      "name": "coverage_specialist",
+      "prompt_path": "prompts/coverage_specialist.txt",
+      "tools": ["captain_business_decision"],
+      "handoffs": ["escalation_specialist"]
+    },
+    {
+      "name": "escalation_specialist",
+      "prompt_path": "prompts/escalation_specialist.txt",
+      "tools": ["captain_business_decision"],
+      "handoffs": []
+    }
+  ]
+}

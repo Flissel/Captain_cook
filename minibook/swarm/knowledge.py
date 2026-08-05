@@ -214,11 +214,8 @@ import httpx
 from pathlib import Path
 from datetime import datetime
 
-def _output_dir() -> Path:
-    # Create output storage only when a tool actually writes a result.
-    path = Path("/app/output") if Path("/app").exists() else Path("output")
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+OUTPUT_DIR = Path("/app/output")
+OUTPUT_DIR.mkdir(exist_ok=True)
 
 MCP_GATEWAY_URL = os.environ.get("MCP_GATEWAY_URL", "http://host.docker.internal:8808")
 MCP_GATEWAY_AUTH_TOKEN = os.environ.get("MCP_GATEWAY_AUTH_TOKEN", "")
@@ -312,21 +309,21 @@ async def fetch_json_api(url: str) -> str:
 # --- File I/O tools (for report/output agents) ---
 async def write_report(filename: str, content: str) -> str:
     \"\"\"Write a report file to the output directory. Returns the file path.\"\"\"
-    path = _output_dir() / filename
+    path = OUTPUT_DIR / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return f"Written {len(content)} chars to {path}"
 
 async def read_file(filename: str) -> str:
     \"\"\"Read a file from the output directory.\"\"\"
-    path = _output_dir() / filename
+    path = OUTPUT_DIR / filename
     if path.exists():
         return path.read_text(encoding="utf-8")[:5000]
     return f"File not found: {filename}"
 
 async def append_to_file(filename: str, content: str) -> str:
     \"\"\"Append content to an existing file in the output directory.\"\"\"
-    path = _output_dir() / filename
+    path = OUTPUT_DIR / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(content + "\\n")
@@ -871,12 +868,7 @@ import asyncio, inspect, os, sys, importlib, functools, re
 from pathlib import Path
 import yaml
 import json as _json
-try:
-    # Package-C validates this module as ``autogen.main`` in an isolated
-    # workspace.  Keep the script-mode fallback for ``python autogen/main.py``.
-    from . import tools as _tools_module
-except ImportError:
-    import tools as _tools_module
+import tools as _tools_module
 
 TOOL_REGISTRY = {
     name: func for name, func in inspect.getmembers(_tools_module, inspect.isfunction)
@@ -1157,7 +1149,7 @@ async def main():
     cli_task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else ""
     task = cli_task or project.get("task", project.get("description", "Run the agent team."))
     term_val = project.get("termination", {}).get("value", 20)
-    termination = TextMentionTermination("TERMINATE") | MaxMessageTermination(term_val)
+    termination = TextMentionTermination("TERMINATE") | MaxMessageTermination(max(term_val, 50))
 
     agent_cfgs = _discover_agents("agents")
     if not agent_cfgs:
@@ -1305,10 +1297,7 @@ async def main():
     print(f"  [Output] Written summary.json ({len(summary['messages'])} messages)")
 
 if __name__ == "__main__":
-    if os.environ.get("CAPTAIN_PACKAGE_VALIDATE") == "1":
-        print("package validation ready")
-    else:
-        asyncio.run(main())
+    asyncio.run(main())
 '''
 
 # --- Agent Role Definitions ---

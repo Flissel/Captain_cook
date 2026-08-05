@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from threading import Barrier
 from uuid import UUID
 
 import pytest
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
@@ -24,6 +26,9 @@ from agenten.agent_factory.skill_evaluation import HermesSkillEvaluationEvidence
 from agenten.agent_factory.execution_budget import (
     FactoryUsageReceiptV1,
     InMemoryFactoryBudgetLedger,
+)
+from agenten.agent_factory.business_benchmark_contracts import (
+    canonical_business_benchmark_model_bytes,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
 from blockchain.mariadb_storage import MariaDBStorage
@@ -41,6 +46,12 @@ from tests.agent_factory.test_state_machine import block, job
 from tests.agent_factory.test_skill_evaluation_contracts import evidence_payload
 from tests.agent_factory.test_execution_budget import job_v3, usage_payload
 from tests.gateway.test_factory_budget import record_usage_lease
+from tests.agent_factory.test_business_benchmark_contracts import summary as business_summary
+from tests.agent_factory.test_release_gate import (
+    workflow_benchmark,
+    workflow_job,
+    workflow_run,
+)
 from tests.support.mariadb import assert_isolated_test_database
 
 
@@ -108,6 +119,211 @@ def test_factory_job_and_block_are_idempotent_and_restart_safe(storage: MariaDBS
     assert [item["phase"] for item in recovered.json()["blocks"]] == ["forge_requested"]
 
 
+def _seed_workflow_execution(store: GatewayStore, execution) -> None:
+    canonical = execution.model_dump(mode="json", by_alias=True)
+    digest = store._canonical_model_sha256(execution)
+    with store.storage.transaction() as connection:
+        with connection.cursor() as cursor:
+            job_block = store._runtime_block_by_json_value(
+                cursor,
+                block_type="agent_factory_job",
+                field="job_id",
+                value=str(execution.job_id),
+                for_update=True,
+            )
+            assert job_block is not None
+            index = store._next_index(cursor)
+            block = store._new_block(
+                cursor,
+                index=index,
+                block_type="factory_workflow_artifact",
+                data=canonical,
+                status="accepted",
+                parent_index=job_block["index"],
+                metadata={"schema": execution.schema_name},
+            )
+            store._insert(cursor, block)
+            cursor.execute(
+                """INSERT INTO factory_workflow_artifacts
+                   (invocation_id, job_id, correlation_id, subject_version, attempt,
+                    schema_name, content_sha256, block_index, payload)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    str(execution.invocation_id), str(execution.job_id),
+                    str(execution.correlation_id), execution.subject_version,
+                    execution.attempt, execution.schema_name, digest, index,
+                    json.dumps(canonical, sort_keys=True),
+                ),
+            )
+
+
+def test_business_benchmark_summary_is_restart_safe_and_rejects_changed_replay(
+    storage: MariaDBStorage,
+) -> None:
+    factory_job = workflow_job(mode="demo")
+    execution = workflow_run(1)
+    summary = workflow_benchmark((execution,))
+    store = GatewayStore(storage)
+    store.record_factory_job(factory_job)
+    _seed_workflow_execution(store, execution)
+    payload = summary.model_dump(mode="json", by_alias=True)
+
+    with TestClient(application(storage)) as captain:
+        first = captain.post("/v1/factory/business-benchmarks", json=payload)
+        replay = captain.post("/v1/factory/business-benchmarks", json=payload)
+    with TestClient(application(storage, actor=GatewayRole.WORKER)) as hermes:
+        forbidden = hermes.post("/v1/factory/business-benchmarks", json=payload)
+
+    changed_payload = summary.model_dump(mode="json", by_alias=True)
+    changed_payload.pop("artifact_ref")
+    changed_payload["summary_id"] = "00000000-0000-0000-0000-000000000999"
+    changed_payload["evaluated_at"] = (
+        summary.evaluated_at + timedelta(seconds=1)
+    ).isoformat().replace("+00:00", "Z")
+    changed = business_summary(**changed_payload)
+    with TestClient(application(storage)) as restarted:
+        conflict = restarted.post(
+            "/v1/factory/business-benchmarks",
+            json=changed.model_dump(mode="json", by_alias=True),
+        )
+        by_id = restarted.get(
+            f"/v1/factory/business-benchmarks/{summary.summary_id}"
+        )
+        by_artifact = restarted.get(
+            "/v1/factory/business-benchmarks/artifacts/"
+            f"{summary.artifact_ref.sha256}"
+        )
+        events = restarted.get(
+            f"/v1/projects/agent-factory/runs/{factory_job.job_id}/events"
+        )
+
+    assert first.status_code == 201
+    assert first.json()["artifact_sha256"] == summary.artifact_ref.sha256
+    assert first.json()["content_sha256"] == hashlib.sha256(
+        canonical_business_benchmark_model_bytes(summary)
+    ).hexdigest()
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+    assert forbidden.status_code == 403
+    assert conflict.status_code == 409
+    assert by_id.status_code == by_artifact.status_code == 200
+    assert by_id.json() == by_artifact.json() == payload
+    assert [event["event_type"] for event in events.json()] == [
+        "captain_business_benchmark_validated"
+    ]
+
+
+def _second_workflow_job_and_execution():
+    first_job = workflow_job(mode="demo")
+    first_execution = workflow_run(1)
+    second_job_id = UUID("00000000-0000-0000-0000-000000000901")
+    second_correlation_id = UUID("00000000-0000-0000-0000-000000000902")
+    second_invocation_id = UUID("00000000-0000-0000-0000-000000000921")
+    second_job = first_job.model_copy(
+        update={
+            "event_id": UUID("00000000-0000-0000-0000-000000000911"),
+            "job_id": second_job_id,
+            "correlation_id": second_correlation_id,
+        }
+    )
+    second_lease = first_execution.invocation.lease.model_copy(
+        update={
+            "job_id": second_job_id,
+            "correlation_id": second_correlation_id,
+            "lease_id": "lease-real_case_tester-job-two",
+        }
+    )
+    second_invocation = first_execution.invocation.model_copy(
+        update={
+            "job_id": second_job_id,
+            "correlation_id": second_correlation_id,
+            "invocation_id": second_invocation_id,
+            "idempotency_key": hashlib.sha256(
+                b"factory-job-two-real-case-tester-attempt-1"
+            ).hexdigest(),
+            "lease": second_lease,
+        }
+    )
+    second_outcome = first_execution.execution_outcome.model_copy(
+        update={"correlation_id": second_correlation_id}
+    )
+    second_execution = first_execution.model_copy(
+        update={
+            "job_id": second_job_id,
+            "correlation_id": second_correlation_id,
+            "invocation_id": second_invocation_id,
+            "invocation": second_invocation,
+            "execution_outcome": second_outcome,
+        }
+    )
+    return second_job, second_execution
+
+
+def test_business_benchmark_cross_job_concurrent_conflict_is_normalized(
+    storage: MariaDBStorage,
+) -> None:
+    first_job = workflow_job(mode="demo")
+    first_execution = workflow_run(1)
+    second_job, second_execution = _second_workflow_job_and_execution()
+    setup_store = GatewayStore(storage)
+    setup_store.record_factory_job(first_job)
+    setup_store.record_factory_job(second_job)
+    _seed_workflow_execution(setup_store, first_execution)
+    _seed_workflow_execution(setup_store, second_execution)
+    summaries = (
+        workflow_benchmark((first_execution,)),
+        workflow_benchmark((second_execution,)),
+    )
+    contenders = (
+        GatewayStore(MariaDBStorage(TEST_DSN)),
+        GatewayStore(MariaDBStorage(TEST_DSN)),
+    )
+    ready = Barrier(2)
+
+    def persist(contender):
+        contender_store, summary = contender
+        ready.wait()
+        try:
+            contender_store.record_business_benchmark_summary(summary)
+            return "created"
+        except HTTPException as exc:
+            return f"conflict:{exc.status_code}"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = tuple(pool.map(persist, zip(contenders, summaries, strict=True)))
+
+    assert sorted(outcomes) == ["conflict:409", "created"]
+
+
+def test_business_benchmark_event_failure_rolls_back_in_mariadb(
+    storage: MariaDBStorage,
+) -> None:
+    factory_job = workflow_job(mode="demo")
+    execution = workflow_run(1)
+    summary = workflow_benchmark((execution,))
+    store = GatewayStore(storage)
+    store.record_factory_job(factory_job)
+    _seed_workflow_execution(store, execution)
+    original_insert = store._insert
+
+    def fail_delivery_event(cursor, block):
+        if block["block_type"] == "delivery_event":
+            raise RuntimeError("injected delivery event failure")
+        return original_insert(cursor, block)
+
+    store._insert = fail_delivery_event  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="injected delivery event failure"):
+        store.record_business_benchmark_summary(summary)
+
+    restarted = GatewayStore(storage)
+    assert restarted.business_benchmark_summary(summary.summary_id) is None
+    assert restarted.delivery_events(
+        project_id="agent-factory",
+        run_id=str(factory_job.job_id),
+    ) == ()
+
+
 def test_factory_budget_routes_keep_reservations_captain_owned_and_usage_worker_owned(
     storage: MariaDBStorage,
     job_v3,
@@ -115,7 +331,7 @@ def test_factory_budget_routes_keep_reservations_captain_owned_and_usage_worker_
     reservation = InMemoryFactoryBudgetLedger().reserve(
         job_v3,
         attempt=1,
-        requested_usd=Decimal("2.00"),
+        requested_usd=Decimal("1.00"),
         now=job_v3.occurred_at,
     )
     reservation_payload = reservation.model_dump(mode="json", by_alias=True)
@@ -134,7 +350,9 @@ def test_factory_budget_routes_keep_reservations_captain_owned_and_usage_worker_
         assert captain.post(
             "/v1/factory/budget/reservations", json=reservation_payload
         ).status_code == 201
-        usage = FactoryUsageReceiptV1.model_validate(usage_payload(reservation))
+        usage = FactoryUsageReceiptV1.model_validate(
+            usage_payload(reservation, cost_usd="0.80")
+        )
         usage_submission = FactoryUsageSubmissionV2(
             subject_version=job_v3.subject_version,
             lease_id=lease.lease_id,
@@ -189,16 +407,28 @@ def test_factory_gateway_records_only_the_next_role_lease(storage: MariaDBStorag
         workspace_ref="workspace://factory/support-triage",
         now=datetime(2026, 7, 19, 10, tzinfo=timezone.utc),
     )
+    renewed = issue_factory_lease(
+        job=factory_job,
+        role=FactoryRole.AGENT_ARCHITECT,
+        attempt=1,
+        workspace_ref="workspace://factory/support-triage/epoch-renewed",
+        now=datetime(2026, 7, 19, 10, 5, tzinfo=timezone.utc),
+    )
     with TestClient(application(storage)) as client:
         assert client.post("/v1/factory/jobs", json=factory_job.model_dump(mode="json", by_alias=True)).status_code == 202
         assert client.post("/v1/factory/blocks", json=forge.model_dump(mode="json", by_alias=True)).status_code == 201
         first = client.post("/v1/factory/leases", json=lease.model_dump(mode="json", by_alias=True))
         replay = client.post("/v1/factory/leases", json=lease.model_dump(mode="json", by_alias=True))
+        renewal = client.post(
+            "/v1/factory/leases",
+            json=renewed.model_dump(mode="json", by_alias=True),
+        )
         projection = client.get(f"/v1/factory/jobs/{factory_job.job_id}")
 
     assert first.status_code == 201
     assert replay.status_code == 200
-    assert len(projection.json()["leases"]) == 1
+    assert renewal.status_code == 201
+    assert len(projection.json()["leases"]) == 2
 
 
 def test_factory_gateway_allows_tool_integrator_lease_for_build_validation(storage: MariaDBStorage) -> None:

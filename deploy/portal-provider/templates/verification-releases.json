@@ -1,0 +1,16 @@
+[
+  {
+    "repository": "captain-factory/integration-verification-templates",
+    "revision": "3e7be0506a7c5bbe15f19e62769456bc4b12f8ba",
+    "path": "verification/bearer.json",
+    "contents_url": "https://192.168.178.65:3443/captain-factory/integration-verification-templates/raw/commit/3e7be0506a7c5bbe15f19e62769456bc4b12f8ba/verification/bearer.json",
+    "sha256": "de98341c11114a24002c936a2ce1a9e16b1ee2959d165f72d3c8f9d2c4001aa2"
+  },
+  {
+    "repository": "captain-factory/integration-verification-templates",
+    "revision": "3e7be0506a7c5bbe15f19e62769456bc4b12f8ba",
+    "path": "verification/oauth2.json",
+    "contents_url": "https://192.168.178.65:3443/captain-factory/integration-verification-templates/raw/commit/3e7be0506a7c5bbe15f19e62769456bc4b12f8ba/verification/oauth2.json",
+    "sha256": "7f8e3311829531a3c078aebe9cd0c73a215c09406d01c98206fe8d764d1ba5cd"
+  }
+]

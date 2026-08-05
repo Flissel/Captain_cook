@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Awaitable, Protocol, TypeVar
 from uuid import UUID
 
 from agenten.agent_factory.contracts import (
+    AgentFactoryJobV3,
     FactoryEvidenceBlock,
     FactoryJob,
     FactoryLease,
@@ -28,7 +29,10 @@ from agenten.agent_factory.skill_evaluation import (
     ToolGapMarker,
     required_tool_gaps,
 )
-from agenten.agent_factory.skill_sequence import FactoryImprovementAuthorizationV1
+from agenten.agent_factory.skill_sequence import (
+    FactoryImprovementAuthorizationV1,
+    FactoryRuntimeRetryAuthorizationV1,
+)
 from agenten.agent_factory.state_machine import (
     FactoryAction,
     FactoryActionKind,
@@ -63,6 +67,7 @@ class FactoryDispatch:
     role: FactoryRole | None
     lease: FactoryLease | None
     improvement_authorization: FactoryImprovementAuthorizationV1 | None = None
+    runtime_retry_authorization: FactoryRuntimeRetryAuthorizationV1 | None = None
 
 
 class FactoryClock(Protocol):
@@ -77,6 +82,18 @@ class FactoryImprovementAuthorizationPort(Protocol):
         projection: FactoryProjection,
         now: datetime,
     ) -> FactoryImprovementAuthorizationV1: ...
+
+
+class FactoryRuntimeRetryAuthorizationPort(Protocol):
+    """Look up already-issued Captain authority; never create it in composition."""
+
+    def active(
+        self,
+        job: FactoryJob,
+        action: FactoryAction,
+        projection: FactoryProjection,
+        now: datetime,
+    ) -> FactoryRuntimeRetryAuthorizationV1 | None: ...
 
 
 class HermesFactoryPort(Protocol):
@@ -96,12 +113,29 @@ class MinibookForgePort(Protocol):
 
     async def result(self, creation_job_id: UUID) -> CreationResultV1: ...
 
+    async def wait_for_result(self, creation_job_id: UUID) -> CreationResultV1:
+        """Return a bounded terminal result for an accepted async submission."""
+
 
 class FactoryCandidateValidationPort(Protocol):
     """Evaluate the sealed generated candidate in an isolated workspace."""
 
     async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
         """Return build, real-case, or quality evidence for the leased role."""
+
+    async def record_creation_result(
+        self,
+        request: FactoryDispatch,
+        result: CreationResultV1,
+    ) -> FactoryEvidenceBlock:
+        """Validate and seal exact Forge output as agent-code evidence."""
+
+
+class FactoryBusinessBenchmarkPort(Protocol):
+    """Run the Captain-owned V3 business gate and return quality evidence."""
+
+    async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
+        """Persist benchmark/evaluation/feedback before returning quality evidence."""
 
 
 class HermesSkillEvaluationPort(Protocol):
@@ -496,6 +530,7 @@ _ROLE_ACTIONS: dict[FactoryActionKind, FactoryRole] = {
     FactoryActionKind.DISPATCH_TOOL_INTEGRATOR: FactoryRole.TOOL_INTEGRATOR,
     FactoryActionKind.DISPATCH_BUILD_VALIDATOR: FactoryRole.TOOL_INTEGRATOR,
     FactoryActionKind.DISPATCH_REAL_CASE_TESTER: FactoryRole.REAL_CASE_TESTER,
+    FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION: FactoryRole.REAL_CASE_TESTER,
     FactoryActionKind.DISPATCH_QUALITY_WARDEN: FactoryRole.QUALITY_WARDEN,
 }
 
@@ -510,17 +545,27 @@ class FactoryDispatcher:
         hermes: HermesFactoryPort,
         forge: MinibookForgePort,
         candidate_validator: FactoryCandidateValidationPort | None = None,
+        business_benchmark: FactoryBusinessBenchmarkPort | None = None,
         leases: FactoryLeasePort,
         clock: FactoryClock,
         improvements: FactoryImprovementAuthorizationPort | None = None,
+        runtime_retries: FactoryRuntimeRetryAuthorizationPort | None = None,
     ) -> None:
         self._coordinator = coordinator
         self._hermes = hermes
         self._forge = forge
         self._candidate_validator = candidate_validator
+        self._business_benchmark = business_benchmark
         self._leases = leases
         self._clock = clock
         self._improvements = improvements
+        self._runtime_retries = runtime_retries
+
+    @property
+    def lease_authority(self) -> FactoryLeasePort:
+        """Expose identity only so the production runner can reject split authority."""
+
+        return self._leases
 
     async def dispatch_next(self, job_id: UUID) -> FactoryAction:
         action = self._coordinator.next_action(job_id)
@@ -530,12 +575,26 @@ class FactoryDispatcher:
             role = _ROLE_ACTIONS[action.kind]
             now = self._clock.now()
             improvement_authorization = None
-            if role is FactoryRole.TOOL_INTEGRATOR and action.attempt > 1:
+            runtime_retry_authorization = None
+            if (
+                action.kind is FactoryActionKind.DISPATCH_TOOL_INTEGRATOR
+                and action.attempt > 1
+            ):
                 if self._improvements is None:
                     raise FactoryDispatchError(
                         "retry dispatch requires improvement authorization evidence"
                     )
                 improvement_authorization = self._improvements.active(
+                    job,
+                    action,
+                    projection,
+                    now,
+                )
+            if (
+                action.kind is FactoryActionKind.DISPATCH_TOOL_INTEGRATOR
+                and self._runtime_retries is not None
+            ):
+                runtime_retry_authorization = self._runtime_retries.active(
                     job,
                     action,
                     projection,
@@ -547,13 +606,28 @@ class FactoryDispatcher:
                 role=role,
                 lease=self._leases.active(job, role, action.attempt, now),
                 improvement_authorization=improvement_authorization,
+                runtime_retry_authorization=runtime_retry_authorization,
             )
             if action.kind is FactoryActionKind.DISPATCH_BUILD_VALIDATOR:
                 if self._candidate_validator is None:
                     raise FactoryDispatchError("candidate build validator is not configured")
                 evidence = await self._candidate_validator.dispatch(request)
             elif (
-                action.kind is FactoryActionKind.DISPATCH_REAL_CASE_TESTER
+                action.kind is FactoryActionKind.DISPATCH_QUALITY_WARDEN
+                and isinstance(job, AgentFactoryJobV3)
+            ):
+                if self._business_benchmark is None:
+                    raise FactoryDispatchError(
+                        "V3 quality dispatch requires the business benchmark service"
+                    )
+                evidence = await self._business_benchmark.dispatch(request)
+            elif (
+                action.kind
+                in {
+                    FactoryActionKind.DISPATCH_REAL_CASE_TESTER,
+                    FactoryActionKind.DISPATCH_TECHNICAL_REVALIDATION,
+                    FactoryActionKind.DISPATCH_QUALITY_WARDEN,
+                }
                 and self._candidate_validator is not None
             ):
                 evidence = await self._candidate_validator.dispatch(request)
@@ -562,7 +636,53 @@ class FactoryDispatcher:
             self._coordinator.record(evidence)
             return action
         if action.kind is FactoryActionKind.SUBMIT_FORGE_JOB:
-            await self._forge.submit(FactoryDispatch(job=job, action=action, role=None, lease=None))
+            if self._candidate_validator is None:
+                raise FactoryDispatchError(
+                    "Forge submission requires the candidate evidence validator"
+                )
+            submission = await self._forge.submit(
+                FactoryDispatch(job=job, action=action, role=None, lease=None)
+            )
+            if isinstance(submission, CreationSubmissionReceipt):
+                if submission.subject_version != job.subject_version:
+                    raise FactoryDispatchError(
+                        "Minibook creation receipt does not match the factory subject version"
+                    )
+                result = await self._forge.wait_for_result(submission.creation_job_id)
+                if result.creation_job_id != submission.creation_job_id:
+                    raise FactoryDispatchError(
+                        "Minibook creation result does not match the submitted creation job"
+                    )
+            elif isinstance(submission, CreationResultV1):
+                # The offline Forge returns no separate receipt. Its strongest
+                # available binding is validated below from correlation,
+                # subject version, attempt, status, and content references.
+                result = submission
+            else:
+                raise FactoryDispatchError(
+                    "Minibook Forge did not return a creation receipt or result"
+                )
+            now = self._clock.now()
+            evidence_action = FactoryAction(
+                kind=FactoryActionKind.EMIT_AGENT_CODE_EVIDENCE,
+                attempt=action.attempt,
+            )
+            evidence_request = FactoryDispatch(
+                job=job,
+                action=evidence_action,
+                role=FactoryRole.TOOL_INTEGRATOR,
+                lease=self._leases.active(
+                    job,
+                    FactoryRole.TOOL_INTEGRATOR,
+                    action.attempt,
+                    now,
+                ),
+            )
+            evidence = await self._candidate_validator.record_creation_result(
+                evidence_request,
+                result,
+            )
+            self._coordinator.record(evidence)
             return action
         raise FactoryDispatchError(
             f"{action.kind.value} is a Captain state transition, not an external dispatch"

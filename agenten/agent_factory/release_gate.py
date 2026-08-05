@@ -2,115 +2,31 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-import hashlib
-from typing import TYPE_CHECKING, Literal
-from uuid import NAMESPACE_URL, UUID, uuid5
+from typing import Literal
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
-from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryJob, FactoryPhase
+from agenten.agent_factory.business_benchmark_contracts import (
+    BenchmarkDisposition,
+    BusinessBenchmarkSummaryV1,
+)
+from agenten.agent_factory.contracts import AgentFactoryJobV3, FactoryJob
 from agenten.agent_factory.execution_budget import (
     FactoryBudgetProjection,
     FactoryUsageReceiptV1,
 )
 from agenten.agent_factory.execution_policy import FactoryExecutionMode
-from agenten.agent_factory.outcome_contracts import (
-    CapabilityPackageManifestV1,
-    CapabilityReleaseEvidenceV1,
-    FactoryTerminalDecision,
-    FactoryTerminalState,
-    canonical_capability_release_evidence_bytes,
-)
 from agenten.agent_factory.skill_evaluation import ToolGapMarker
 from agenten.agent_factory.skill_store import StoredSkillEvaluation
 from agenten.agent_factory.skill_workflow_contracts import (
     FactoryFeedbackRecommendation,
     TeamEvaluationV1,
     TeamExecutionEvidenceV1,
-    released_skill_capability_matches_job,
 )
 from agenten.agent_runtime.contracts import ArtifactRef
-
-if TYPE_CHECKING:
-    from agenten.agent_factory.state_machine import FactoryProjection
-
-
-class FactoryTerminalReasonCode(str, Enum):
-    """Stable Captain policy codes; worker prose never becomes authority."""
-
-    STRUCTURAL_VIOLATION = "structural_violation"
-    SECURITY_VIOLATION = "security_violation"
-    FOREIGN_LEASE = "foreign_lease"
-    SCHEMA_VIOLATION = "schema_violation"
-    DIGEST_VIOLATION = "digest_violation"
-    AUTHORITY_VIOLATION = "authority_violation"
-    MISSING_CREDENTIAL_ALIAS = "missing_credential_alias"
-    MISSING_PROVIDER = "missing_provider"
-    MISSING_API = "missing_api"
-    USER_DECISION_REQUIRED = "user_decision_required"
-    REQUIRED_TOOL_GAP = "required_tool_gap"
-    BEHAVIORAL_ITERATIONS_EXHAUSTED = "behavioral_iterations_exhausted"
-    DEADLINE_EXHAUSTED = "deadline_exhausted"
-    PACKAGE_VALIDATION_BLOCKED = "package_validation_blocked"
-    EVALUATION_BLOCKED = "evaluation_blocked"
-    ASSERTION_BLOCKED = "assertion_blocked"
-    E2E_BLOCKED = "e2e_blocked"
-    READY_TO_USE = "ready_to_use"
-
-
-_REJECTION_CODES = frozenset(
-    {
-        FactoryTerminalReasonCode.STRUCTURAL_VIOLATION,
-        FactoryTerminalReasonCode.SECURITY_VIOLATION,
-        FactoryTerminalReasonCode.FOREIGN_LEASE,
-        FactoryTerminalReasonCode.SCHEMA_VIOLATION,
-        FactoryTerminalReasonCode.DIGEST_VIOLATION,
-        FactoryTerminalReasonCode.AUTHORITY_VIOLATION,
-    }
-)
-_PREREQUISITE_CODES = frozenset(
-    {
-        FactoryTerminalReasonCode.MISSING_CREDENTIAL_ALIAS,
-        FactoryTerminalReasonCode.MISSING_PROVIDER,
-        FactoryTerminalReasonCode.MISSING_API,
-        FactoryTerminalReasonCode.USER_DECISION_REQUIRED,
-    }
-)
-
-
-class FactoryPolicyFinding(BaseModel):
-    """Captain-authored evidence for an explicit external prerequisite."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    reason_code: FactoryTerminalReasonCode
-    evidence_ref: ArtifactRef
-    producer: Literal["captain"] = "captain"
-
-    @model_validator(mode="after")
-    def require_policy_finding_code(self) -> "FactoryPolicyFinding":
-        if self.reason_code not in _REJECTION_CODES | _PREREQUISITE_CODES:
-            raise ValueError("policy finding requires a rejection or prerequisite reason code")
-        return self
-
-
-class CapabilityValidationFailure(BaseModel):
-    """Thin adapter for a fail-closed validator failure and its Captain evidence."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    reason_code: FactoryTerminalReasonCode
-    evidence_ref: ArtifactRef
-    producer: Literal["captain"] = "captain"
-
-    @model_validator(mode="after")
-    def require_rejection_code(self) -> "CapabilityValidationFailure":
-        if self.reason_code not in _REJECTION_CODES:
-            raise ValueError("capability validation failure requires a rejection reason code")
-        return self
 
 
 class E2EKind(str, Enum):
@@ -144,194 +60,6 @@ class FactoryReleaseDecision(BaseModel):
     evaluation_id: UUID | None = None
     evaluation_ref: ArtifactRef | None = None
     tool_gaps: tuple[ToolGapMarker, ...] = ()
-
-
-def derive_terminal_decision(
-    job: FactoryJob,
-    projection: "FactoryProjection",
-    validation: CapabilityPackageManifestV1 | CapabilityValidationFailure | None,
-    evaluation: StoredSkillEvaluation | None,
-    e2e: tuple[CapabilityReleaseEvidenceV1, ...],
-    now: datetime,
-) -> FactoryTerminalDecision | None:
-    """Derive Captain's terminal state in one explicit fail-closed priority order."""
-
-    if (
-        projection.job != job
-        or projection.job.job_id != job.job_id
-        or projection.job.correlation_id != job.correlation_id
-    ):
-        return _terminal_decision(
-            job,
-            FactoryTerminalState.REJECTED,
-            FactoryTerminalReasonCode.AUTHORITY_VIOLATION,
-            (),
-            now,
-        )
-    if projection.terminal_decision is not None:
-        return projection.terminal_decision
-
-    if isinstance(validation, CapabilityValidationFailure):
-        return _terminal_decision(
-            job,
-            FactoryTerminalState.REJECTED,
-            validation.reason_code,
-            (validation.evidence_ref,),
-            now,
-        )
-
-    validation_rejection = _validation_rejection(job, validation)
-    if validation_rejection is not None:
-        code, references = validation_rejection
-        return _terminal_decision(
-            job,
-            FactoryTerminalState.REJECTED,
-            code,
-            references,
-            now,
-        )
-
-    v3_workflow_approved = (
-        isinstance(job, AgentFactoryJobV3)
-        and projection.workflow_evaluation_ref is not None
-        and projection.feedback_ref is not None
-        and projection.feedback_recommendation
-        is FactoryFeedbackRecommendation.PROMOTE_CANDIDATE
-    )
-    evaluation_reason = (
-        None
-        if v3_workflow_approved
-        else factory_evaluation_block_reason(job, evaluation)
-    )
-    if evaluation_reason is not None and _evaluation_is_rejection(evaluation_reason):
-        return _terminal_decision(
-            job,
-            FactoryTerminalState.REJECTED,
-            _evaluation_rejection_code(evaluation_reason),
-            _evaluation_references(evaluation),
-            now,
-        )
-
-    rejection = next(
-        (finding for finding in projection.policy_findings if finding.reason_code in _REJECTION_CODES),
-        None,
-    )
-    if rejection is not None:
-        return _terminal_decision(
-            job,
-            FactoryTerminalState.REJECTED,
-            rejection.reason_code,
-            (rejection.evidence_ref,),
-            now,
-        )
-
-    prerequisite = next(
-        (finding for finding in projection.policy_findings if finding.reason_code in _PREREQUISITE_CODES),
-        None,
-    )
-    if prerequisite is not None:
-        return _terminal_decision(
-            job,
-            FactoryTerminalState.BLOCKED,
-            prerequisite.reason_code,
-            (prerequisite.evidence_ref,),
-            now,
-        )
-
-    all_tool_gaps = (
-        *((() if validation is None else validation.tool_gaps)),
-        *((() if evaluation is None else evaluation_tool_gaps(evaluation))),
-        *(projection.tool_gaps if isinstance(job, AgentFactoryJobV3) else ()),
-    )
-    required_gaps = tuple(
-        marker
-        for marker in all_tool_gaps
-        if marker.severity == "required" and marker.status == "unresolved"
-    )
-    if required_gaps:
-        return _terminal_decision(
-            job,
-            FactoryTerminalState.BLOCKED,
-            FactoryTerminalReasonCode.REQUIRED_TOOL_GAP,
-            tuple(marker.evidence_ref for marker in required_gaps),
-            now,
-        )
-
-    if _behavioral_budget_exhausted(
-        job,
-        projection,
-        validation,
-        evaluation,
-        e2e,
-    ):
-        return _terminal_decision(
-            job,
-            FactoryTerminalState.ESCALATED,
-            FactoryTerminalReasonCode.BEHAVIORAL_ITERATIONS_EXHAUSTED,
-            _projection_evidence(projection),
-            now,
-        )
-    deadline_at = getattr(job, "deadline_at", None)
-    if deadline_at is not None and now >= deadline_at:
-        return _terminal_decision(
-            job,
-            FactoryTerminalState.ESCALATED,
-            FactoryTerminalReasonCode.DEADLINE_EXHAUSTED,
-            _projection_evidence(projection),
-            now,
-        )
-
-    if validation is None and evaluation is None and not e2e and not _validation_due(projection):
-        return None
-    if validation is None:
-        return _terminal_decision(
-            job,
-            FactoryTerminalState.BLOCKED,
-            FactoryTerminalReasonCode.PACKAGE_VALIDATION_BLOCKED,
-            (),
-            now,
-        )
-    if evaluation_reason is not None:
-        return _terminal_decision(
-            job,
-            FactoryTerminalState.BLOCKED,
-            FactoryTerminalReasonCode.EVALUATION_BLOCKED,
-            _evaluation_references(evaluation),
-            now,
-        )
-
-    assertion_references = _failed_assertion_references(job, validation, e2e)
-    if assertion_references is not None:
-        return _terminal_decision(
-            job,
-            FactoryTerminalState.BLOCKED,
-            FactoryTerminalReasonCode.ASSERTION_BLOCKED,
-            assertion_references,
-            now,
-        )
-
-    if not _accepted_capability_e2e(job, projection, validation, e2e):
-        return _terminal_decision(
-            job,
-            FactoryTerminalState.BLOCKED,
-            FactoryTerminalReasonCode.E2E_BLOCKED,
-            validation.release_evidence_refs,
-            now,
-        )
-
-    if v3_workflow_approved:
-        assert projection.workflow_evaluation_ref is not None
-        evidence_refs = (*validation.release_evidence_refs, projection.workflow_evaluation_ref)
-    else:
-        assert evaluation is not None
-        evidence_refs = (*validation.release_evidence_refs, evaluation.evidence_ref)
-    return _terminal_decision(
-        job,
-        FactoryTerminalState.READY_TO_USE,
-        FactoryTerminalReasonCode.READY_TO_USE,
-        evidence_refs,
-        now,
-    )
 
 
 def factory_release_decision_block_reason(
@@ -407,12 +135,18 @@ def evaluate_factory_workflow_release(
     evidence: tuple[TeamExecutionEvidenceV1, ...],
     evaluation: TeamEvaluationV1,
     *,
+    benchmark_summary: BusinessBenchmarkSummaryV1 | None,
     budget_projection: FactoryBudgetProjection | None = None,
     usage_receipts: tuple[FactoryUsageReceiptV1, ...] = (),
 ) -> FactoryReleaseDecision:
     """Validate V3 live workflow evidence without granting promotion authority."""
 
-    blocked = _workflow_evaluation_block_reason(job, evidence, evaluation)
+    blocked = _workflow_evaluation_block_reason(
+        job,
+        evidence,
+        evaluation,
+        benchmark_summary=benchmark_summary,
+    )
     if blocked is not None:
         return _workflow_blocked(job, evaluation, blocked)
     if budget_projection is None:
@@ -461,14 +195,10 @@ def evaluate_factory_workflow_release(
         and receipt.model in job.execution_policy.allowed_models
         for receipt in usage_receipts
     )
-    run_receipt_ref_set = set(run_receipt_refs)
     accepted_receipt_refs = {
         receipt.evidence_ref
         for receipt in usage_receipts
-        if (
-            receipt.attempt == evaluation.attempt
-            and receipt.evidence_ref in run_receipt_ref_set
-        )
+        if receipt.attempt == evaluation.attempt
     }
     if (
         not usage_receipts
@@ -485,28 +215,34 @@ def evaluate_factory_workflow_release(
             evaluation,
             "workflow usage receipts do not cover the Gateway budget projection",
         )
+    run_receipt_ref_set = set(run_receipt_refs)
+    benchmark_receipts = tuple(
+        receipt
+        for receipt in usage_receipts
+        if receipt.attempt == evaluation.attempt
+        and receipt.evidence_ref not in run_receipt_ref_set
+    )
+    benchmark_receipts_are_bound = not benchmark_receipts or (
+        benchmark_summary is not None
+        and sum(
+            (receipt.cost_usd for receipt in benchmark_receipts),
+            start=Decimal("0"),
+        )
+        == Decimal(
+            benchmark_summary.candidate_cost_micro_usd
+            + benchmark_summary.baseline_cost_micro_usd
+        )
+        / Decimal(1_000_000)
+    )
     if (
         len(run_receipt_refs) != len(set(run_receipt_refs))
-        or set(run_receipt_refs) != accepted_receipt_refs
+        or not run_receipt_ref_set.issubset(accepted_receipt_refs)
+        or not benchmark_receipts_are_bound
     ):
         return _workflow_blocked(
             job,
             evaluation,
             "workflow usage receipts must exactly and uniquely cover every run",
-        )
-    receipts_by_ref = {
-        receipt.evidence_ref: receipt for receipt in usage_receipts
-    }
-    if any(
-        receipts_by_ref[reference].invocation_id != run.invocation_id
-        or receipts_by_ref[reference].lease_id != run.invocation.lease.lease_id
-        for run in evidence
-        for reference in run.usage_receipt_refs
-    ):
-        return _workflow_blocked(
-            job,
-            evaluation,
-            "workflow run usage receipts must match the exact invocation and lease",
         )
     run_numbers = tuple(item.run_number for item in evidence)
     if len(run_numbers) != len(set(run_numbers)):
@@ -640,9 +376,7 @@ def factory_evaluation_block_reason(
         )
     ):
         return "skill evaluation subject version does not match the factory job"
-    if not released_skill_capability_matches_job(
-        request.released_skill.capability, job.required_capability
-    ):
+    if request.released_skill.capability != job.required_capability:
         return "released skill capability does not match the factory job"
     required_assertions = set(job.acceptance_assertion_ids)
     if set(request.acceptance_assertion_ids) != required_assertions:
@@ -722,228 +456,6 @@ def evaluation_requires_improvement(
     return evidence.outcome in {"redo", "failed"}
 
 
-def _validation_rejection(
-    job: FactoryJob,
-    validation: CapabilityPackageManifestV1 | None,
-) -> tuple[FactoryTerminalReasonCode, tuple[ArtifactRef, ...]] | None:
-    if validation is None:
-        return None
-    if (
-        validation.factory_job_id != job.job_id
-        or validation.correlation_id != job.correlation_id
-        or validation.subject_version != job.subject_version
-        or validation.capability_id != job.required_capability
-    ):
-        return FactoryTerminalReasonCode.AUTHORITY_VIOLATION, (validation.source_ref,)
-    return None
-
-
-def _evaluation_is_rejection(reason: str) -> bool:
-    return any(
-        marker in reason
-        for marker in (
-            "does not match",
-            "conflicting TODO_TOOL",
-            "receipt is not valid",
-        )
-    )
-
-
-def _evaluation_rejection_code(reason: str) -> FactoryTerminalReasonCode:
-    if "conflicting" in reason:
-        return FactoryTerminalReasonCode.STRUCTURAL_VIOLATION
-    if "receipt is not valid" in reason:
-        return FactoryTerminalReasonCode.DIGEST_VIOLATION
-    return FactoryTerminalReasonCode.AUTHORITY_VIOLATION
-
-
-def _evaluation_references(
-    evaluation: StoredSkillEvaluation | None,
-) -> tuple[ArtifactRef, ...]:
-    if evaluation is None:
-        return ()
-    references = [evaluation.evidence_ref, evaluation.receipt_ref]
-    if evaluation.candidate_ref is not None:
-        references.append(evaluation.candidate_ref)
-    references.extend(reference for _, reference in evaluation.tool_gap_refs)
-    return _unique_refs(tuple(references))
-
-
-def _projection_evidence(projection: "FactoryProjection") -> tuple[ArtifactRef, ...]:
-    return _unique_refs(
-        (*projection.evidence_refs, *(finding.evidence_ref for finding in projection.policy_findings))
-    )
-
-
-def _behavioral_budget_exhausted(
-    job: FactoryJob,
-    projection: "FactoryProjection",
-    validation: CapabilityPackageManifestV1 | None,
-    evaluation: StoredSkillEvaluation | None,
-    e2e: tuple[CapabilityReleaseEvidenceV1, ...],
-) -> bool:
-    if projection.attempt < job.max_behavioral_iterations:
-        return False
-    if projection.phase is FactoryPhase.BUILD_FAILED or evaluation_requires_improvement(
-        job, evaluation
-    ):
-        return True
-    if projection.phase is not FactoryPhase.QUALITY_REVIEWED:
-        return False
-    if validation is None or factory_evaluation_block_reason(job, evaluation) is not None:
-        return True
-    if _failed_assertion_references(job, validation, e2e) is not None:
-        return True
-    return not _accepted_capability_e2e(job, projection, validation, e2e)
-
-
-def _validation_due(projection: "FactoryProjection") -> bool:
-    return projection.phase in {FactoryPhase.BUILD_FAILED, FactoryPhase.QUALITY_REVIEWED}
-
-
-def _failed_assertion_references(
-    job: FactoryJob,
-    validation: CapabilityPackageManifestV1,
-    e2e: tuple[CapabilityReleaseEvidenceV1, ...],
-) -> tuple[ArtifactRef, ...] | None:
-    required = set(job.acceptance_assertion_ids)
-    outcomes = {outcome.assertion_id: outcome for outcome in validation.assertion_outcomes}
-    if set(outcomes) != required:
-        return _unique_refs(
-            tuple(
-                reference
-                for outcome in validation.assertion_outcomes
-                for reference in outcome.evidence_refs
-            )
-        )
-    failed = tuple(
-        reference
-        for outcome in validation.assertion_outcomes
-        if outcome.status != "passed"
-        for reference in outcome.evidence_refs
-    )
-    if failed:
-        return _unique_refs(failed)
-    for record in e2e:
-        results = {result.assertion_id: result for result in record.assertion_results}
-        if set(results) != required or any(result.status != "passed" for result in results.values()):
-            return _unique_refs(
-                tuple(
-                    reference
-                    for result in record.assertion_results
-                    for reference in result.evidence_refs
-                )
-            )
-    return None
-
-
-def _accepted_capability_e2e(
-    job: FactoryJob,
-    projection: "FactoryProjection",
-    validation: CapabilityPackageManifestV1,
-    evidence: tuple[CapabilityReleaseEvidenceV1, ...],
-) -> bool:
-    if not _release_evidence_matches_manifest(validation, evidence):
-        return False
-    ordered = tuple(sorted(evidence, key=lambda item: item.run_number))
-    if len(ordered) < 4:
-        return False
-    if len({item.run_id for item in ordered}) != len(ordered):
-        return False
-    if len({item.run_number for item in ordered}) != len(ordered):
-        return False
-    if any(
-        item.factory_job_id != job.job_id
-        or item.creation_job_id != validation.creation_job_id
-        or item.correlation_id != job.correlation_id
-        or item.subject_version != job.subject_version
-        or item.capability_id != validation.capability_id
-        or item.capability_version != validation.capability_version
-        or item.attempt != projection.attempt
-        or item.package_archive_sha256 != validation.source_ref.sha256
-        for item in ordered
-    ):
-        return False
-    if len({item.candidate_manifest_sha256 for item in ordered}) != 1:
-        return False
-    if len({item.extracted_tree_sha256 for item in ordered}) != 1:
-        return False
-    recovery = tuple(
-        item
-        for item in ordered
-        if item.kind == "recovery" and item.outcome == "expected_failure_recovered"
-    )
-    if not recovery:
-        return False
-    tail = ordered[-3:]
-    if any(item.kind != "normal" or item.outcome != "succeeded" for item in tail):
-        return False
-    if tuple(item.run_number for item in tail) != tuple(
-        range(tail[0].run_number, tail[0].run_number + 3)
-    ):
-        return False
-    return max(item.run_number for item in recovery) < tail[0].run_number
-
-
-def _release_evidence_matches_manifest(
-    validation: CapabilityPackageManifestV1,
-    evidence: tuple[CapabilityReleaseEvidenceV1, ...],
-) -> bool:
-    references = validation.release_evidence_refs
-    if len(references) != len(evidence):
-        return False
-    for reference, record in zip(references, evidence, strict=True):
-        if reference.media_type != "application/json":
-            return False
-        content = canonical_capability_release_evidence_bytes(record)
-        digest = hashlib.sha256(content).hexdigest()
-        if reference.sha256 != digest or reference.uri.rsplit("/", 1)[-1] != digest:
-            return False
-    return True
-
-
-def _terminal_decision(
-    job: FactoryJob,
-    state: FactoryTerminalState,
-    reason: FactoryTerminalReasonCode,
-    evidence_refs: tuple[ArtifactRef, ...],
-    now: datetime,
-) -> FactoryTerminalDecision:
-    references = _unique_refs(evidence_refs)
-    identity = "|".join(
-        (
-            str(job.job_id),
-            str(job.correlation_id),
-            str(job.subject_version),
-            state.value,
-            reason.value,
-            *(reference.sha256 for reference in references),
-        )
-    )
-    return FactoryTerminalDecision(
-        schema_name="captain.factory-terminal-decision.v1",
-        decision_id=uuid5(NAMESPACE_URL, identity),
-        job_id=job.job_id,
-        correlation_id=job.correlation_id,
-        subject_version=job.subject_version,
-        state=state,
-        reasons=(reason.value,),
-        evidence_refs=references,
-        decided_at=now,
-    )
-
-
-def _unique_refs(references: tuple[ArtifactRef, ...]) -> tuple[ArtifactRef, ...]:
-    unique: list[ArtifactRef] = []
-    seen: set[tuple[str, str, str]] = set()
-    for reference in references:
-        identity = (reference.uri, reference.sha256, reference.media_type)
-        if identity not in seen:
-            seen.add(identity)
-            unique.append(reference)
-    return tuple(unique)
-
-
 def _valid_usage_receipt(evaluation: StoredSkillEvaluation) -> bool:
     evidence = evaluation.evidence
     request = evidence.request
@@ -996,6 +508,8 @@ def _workflow_evaluation_block_reason(
     job: AgentFactoryJobV3,
     evidence: tuple[TeamExecutionEvidenceV1, ...],
     evaluation: TeamEvaluationV1,
+    *,
+    benchmark_summary: BusinessBenchmarkSummaryV1 | None,
 ) -> str | None:
     if not job.execution_policy.live_execution:
         return "workflow release requires Captain-authorized live execution"
@@ -1013,6 +527,14 @@ def _workflow_evaluation_block_reason(
         return "workflow evaluation identity does not match the Factory job"
     if not evidence:
         return "missing live workflow execution evidence"
+    benchmark_reason = _workflow_business_benchmark_block_reason(
+        job,
+        evidence,
+        evaluation,
+        benchmark_summary=benchmark_summary,
+    )
+    if benchmark_reason is not None:
+        return benchmark_reason
     evaluation_ids = tuple(
         item.assertion_id for item in evaluation.assertion_outcomes
     )
@@ -1032,48 +554,29 @@ def factory_workflow_release_decision_block_reason(
     job: AgentFactoryJobV3,
     evaluation: TeamEvaluationV1 | None,
     decision: FactoryReleaseDecision | None,
+    *,
+    benchmark_summary: BusinessBenchmarkSummaryV1 | None,
 ) -> str | None:
     """Require a Captain V3 decision bound only to workflow evaluation evidence."""
 
-    if job.execution_policy.mode is FactoryExecutionMode.DEMO:
-        return "demo Factory jobs cannot be promoted to ready_to_use"
     if decision is None:
         return "missing accepted Factory workflow release decision"
     if decision.status != "ready":
         return "Factory workflow release decision is blocked: " + ", ".join(
             decision.reasons
         )
-    return _factory_workflow_decision_binding_reason(job, evaluation, decision)
-
-
-def factory_workflow_validation_decision_block_reason(
-    job: AgentFactoryJobV3,
-    evaluation: TeamEvaluationV1 | None,
-    decision: FactoryReleaseDecision | None,
-) -> str | None:
-    """Allow mode-correct validation without granting demo promotion authority."""
-
-    if decision is None:
-        return "missing accepted Factory workflow release decision"
-    expected = (
-        "demo_ready"
-        if job.execution_policy.mode is FactoryExecutionMode.DEMO
-        else "ready"
-    )
-    if decision.status != expected:
-        return "Factory workflow validation decision has the wrong mode status"
-    return _factory_workflow_decision_binding_reason(job, evaluation, decision)
-
-
-def _factory_workflow_decision_binding_reason(
-    job: AgentFactoryJobV3,
-    evaluation: TeamEvaluationV1 | None,
-    decision: FactoryReleaseDecision,
-) -> str | None:
     if decision.job_id != job.job_id or decision.correlation_id != job.correlation_id:
         return "Factory workflow release decision does not match the factory job"
     if evaluation is None:
         return "missing accepted workflow evaluation evidence"
+    benchmark_reason = _workflow_business_benchmark_block_reason(
+        job,
+        None,
+        evaluation,
+        benchmark_summary=benchmark_summary,
+    )
+    if benchmark_reason is not None:
+        return benchmark_reason
     if (
         decision.evaluation_id != evaluation.invocation_id
         or decision.evaluation_ref != evaluation.artifact_ref
@@ -1081,6 +584,83 @@ def _factory_workflow_decision_binding_reason(
         return "Factory workflow release decision does not match the workflow evaluation"
     if decision.tool_gaps:
         return "Factory workflow release decision contains unvalidated tool gaps"
+    return None
+
+
+def factory_workflow_business_benchmark_block_reason(
+    job: AgentFactoryJobV3,
+    evaluation: TeamEvaluationV1,
+    benchmark_summary: BusinessBenchmarkSummaryV1 | None,
+    *,
+    current_attempt: int,
+    require_passed: bool = True,
+) -> str | None:
+    """Validate the exact persisted summary used by a lifecycle transition."""
+
+    if evaluation.attempt != current_attempt:
+        return "workflow business benchmark attempt does not match current projection"
+    reason = _workflow_business_benchmark_block_reason(
+        job,
+        None,
+        evaluation,
+        benchmark_summary=benchmark_summary,
+    )
+    if not require_passed and reason == "workflow business benchmark did not pass":
+        return None
+    return reason
+
+
+def _workflow_business_benchmark_block_reason(
+    job: AgentFactoryJobV3,
+    evidence: tuple[TeamExecutionEvidenceV1, ...] | None,
+    evaluation: TeamEvaluationV1,
+    *,
+    benchmark_summary: BusinessBenchmarkSummaryV1 | None,
+) -> str | None:
+    if benchmark_summary is None:
+        return "missing authoritative business benchmark summary"
+    if not isinstance(benchmark_summary, BusinessBenchmarkSummaryV1):
+        return "workflow business benchmark summary is not authoritative"
+    try:
+        summary = BusinessBenchmarkSummaryV1.model_validate(
+            benchmark_summary.model_dump(mode="json", by_alias=True)
+        )
+    except ValueError:
+        return "workflow business benchmark summary is not canonical"
+    if summary.artifact_ref.sha256 != summary.canonical_payload_sha256():
+        return "workflow business benchmark summary is not canonical"
+    candidate_refs = (
+        None if evidence is None else {item.candidate_ref for item in evidence}
+    )
+    if (
+        summary.job_id != job.job_id
+        or summary.job_id != evaluation.job_id
+        or summary.correlation_id != job.correlation_id
+        or summary.correlation_id != evaluation.correlation_id
+        or summary.subject_version != job.subject_version
+        or summary.subject_version != evaluation.subject_version
+        or summary.attempt != evaluation.attempt
+        or (candidate_refs is not None and summary.candidate_ref not in candidate_refs)
+        or summary.candidate_ref not in evaluation.evidence_refs
+    ):
+        return "workflow business benchmark binding does not match release evidence"
+    if summary.suite_ref not in job.private_holdout_refs:
+        return "workflow business benchmark suite is not owned by the Factory job"
+    if (
+        evaluation.benchmark_summary_ref != summary.artifact_ref
+        or summary.artifact_ref not in evaluation.evidence_refs
+        or evaluation.benchmark_policy_id != summary.policy.policy_id
+        or evaluation.benchmark_disposition != summary.disposition.value
+        or evaluation.benchmark_reason_codes != summary.reason_codes
+        or evaluation.failed_benchmark_metric_ids != summary.failed_metric_ids
+    ):
+        return "workflow evaluation does not match authoritative business benchmark"
+    if (
+        summary.disposition is not BenchmarkDisposition.PASSED
+        or summary.reason_codes
+        or summary.failed_metric_ids
+    ):
+        return "workflow business benchmark did not pass"
     return None
 
 

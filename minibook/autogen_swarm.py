@@ -19,6 +19,7 @@ EvalReporterAgent produces final evaluation report.
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -28,32 +29,60 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 import yaml
 import aiohttp
 
 # --- Re-exports from swarm package (backward compatibility) ---
-from minibook.swarm.constants import (
+from swarm.constants import (
     CascadeContext, MINIBOOK_URL, OUTPUT_DIR, CREDS_FILE,
     FORGE_API_PORT, LLM_PROVIDER,
 )
-from minibook.swarm.knowledge import AGENT_ROLES, FORGE_AGENT_ROLES
-from minibook.swarm.api_client import (
+from swarm.knowledge import AGENT_ROLES, FORGE_AGENT_ROLES
+from swarm.api_client import (
     api_post, api_get, load_credentials, save_credentials, register_agent,
     register_agent_in_registry,
 )
-from minibook.swarm.llm import call_gpt4o, call_gpt4o_json, call_gpt4o_with_tools
-from minibook.swarm.docker_ops import stop_mcp_gateway
-from minibook.swarm.code_processing import load_cascade_context, write_output
-from minibook.swarm.pipeline import SwarmPipeline
-from minibook.swarm.pipeline_adapter import PIPELINE_STEP_ORDER, SwarmPipelineAdapter
-from minibook.swarm.forge_agents import ForgeState, load_forge_state, save_forge_state
-from minibook.swarm.forge_orchestrator import ForgeOrchestrator, ForgeAPI
-from minibook.swarm.input_designer import InputDesignPipeline
-from minibook.swarm.local_services import default_npm_command, ensure_frontend_dependencies
-from minibook.swarm.runtime_options import parse_runtime_options
+from swarm.llm import call_gpt4o, call_gpt4o_json, call_gpt4o_with_tools
+from swarm.docker_ops import stop_mcp_gateway
+from swarm.code_processing import load_cascade_context, write_output
+from swarm.pipeline import SwarmPipeline
+from swarm.pipeline_adapter import PIPELINE_STEP_ORDER, SwarmPipelineAdapter
+from swarm.forge_agents import ForgeState, load_forge_state, save_forge_state
+from swarm.forge_orchestrator import ForgeOrchestrator, ForgeAPI
+from swarm.input_designer import InputDesignPipeline
+from swarm.local_services import default_npm_command, ensure_frontend_dependencies
+from swarm.runtime_options import RuntimeOptions, parse_runtime_options
+from swarm.contracts import CreationFailure, CreationJobV2, CreationResultV1
+from swarm.creation_cli import (
+    install_creation_skill_receipt,
+    load_creation_job,
+    publish_captain_sealed_creation_output,
+    publish_creation_output,
+    write_creation_result_atomic,
+)
+
+
+def _publish_captain_sealed_import(
+    creation_job: CreationJobV2,
+    runtime_options: RuntimeOptions,
+) -> None:
+    """Complete a V2 import before any Minibook, Swarm, or provider effect."""
+
+    if runtime_options.source_archive_file is None:
+        raise ValueError("Captain V2 creation import requires --source-archive-file")
+    if runtime_options.skill_usage_receipt_file is None:
+        raise ValueError("Captain V2 creation import requires --skill-usage-receipt-file")
+    if runtime_options.artifact_root is None:
+        raise ValueError("Captain V2 creation import requires --artifact-root")
+    if runtime_options.result_file is None:
+        raise ValueError("Captain V2 creation import requires --result-file")
+    result = publish_captain_sealed_creation_output(
+        creation_job,
+        source_archive_path=Path(runtime_options.source_archive_file),
+        skill_usage_receipt_path=Path(runtime_options.skill_usage_receipt_file),
+        artifact_root=Path(runtime_options.artifact_root),
+    )
+    write_creation_result_atomic(Path(runtime_options.result_file), result)
 
 
 # --- Setup ---
@@ -744,6 +773,35 @@ async def _publish_to_registry(
 
 MAX_TEAM_RETRIES = 2  # retries per team on FAIL (total attempts = 3)
 
+
+def _complete_input_file_output(
+    merged: Path | None,
+    checkpoint: dict,
+    checkpoint_dir: Path,
+    *,
+    export_to_github: bool,
+) -> Path | None:
+    """Persist the merged path and optionally run the legacy GitHub exporter."""
+
+    if merged is None:
+        return None
+    checkpoint["merged_output"] = str(merged)
+    _save_checkpoint(checkpoint_dir, checkpoint)
+    print(f"  Merged output: {merged}")
+    if not export_to_github:
+        return merged
+
+    print(f"\n{'=' * 70}")
+    print("  PHASE 4: EXPORT TO GITHUB")
+    print(f"{'=' * 70}")
+    try:
+        exported = export_agent_team(str(merged), private=True)
+        checkpoint["exported"] = str(exported)
+        _save_checkpoint(checkpoint_dir, checkpoint)
+    except Exception as exc:
+        print(f"  [Export] Failed: {exc}")
+    return merged
+
 async def run_input_file_pipeline(
     session,
     agents,
@@ -752,6 +810,7 @@ async def run_input_file_pipeline(
     manifest,
     registry_agent_api_key=None,
     interactive: bool = True,
+    export_to_github: bool = True,
 ):
     """Multi-phase pipeline: core → sub-teams → wiring.
 
@@ -1019,24 +1078,15 @@ async def run_input_file_pipeline(
 
     # -- Create merged output --
     merged = _create_merged_output(cp, manifest)
-    if merged:
-        cp["merged_output"] = str(merged)
-        _save_checkpoint(checkpoint_dir, cp)
-        print(f"  Merged output: {merged}")
-
-    # -- Phase 4: Export to GitHub --
-    if merged:
-        print(f"\n{'=' * 70}")
-        print(f"  PHASE 4: EXPORT TO GITHUB")
-        print(f"{'=' * 70}")
-        try:
-            exported = export_agent_team(str(merged), private=True)
-            cp["exported"] = str(exported)
-            _save_checkpoint(checkpoint_dir, cp)
-        except Exception as e:
-            print(f"  [Export] Failed: {e}")
+    merged = _complete_input_file_output(
+        merged,
+        cp,
+        checkpoint_dir,
+        export_to_github=export_to_github,
+    )
 
     print(f"{'=' * 70}")
+    return merged
 
 
 # --- Main (Single-Run Mode) ---
@@ -1133,6 +1183,11 @@ async def main():
     except ValueError as exc:
         print(f"ERROR: {exc}")
         raise SystemExit(2) from exc
+    creation_job = (
+        load_creation_job(Path(runtime_options.creation_job_file))
+        if runtime_options.creation_job_file is not None
+        else None
+    )
     i = 0
     while i < len(argv):
         if argv[i] == "--cascade-from" and i + 1 < len(argv):
@@ -1147,6 +1202,8 @@ async def main():
         elif argv[i] == "--input-file" and i + 1 < len(argv):
             input_file = argv[i + 1]
             i += 2
+        elif argv[i] == "--creation-job-file" and i + 1 < len(argv):
+            i += 2
         elif argv[i] == "--input-image" and i + 1 < len(argv):
             input_image = argv[i + 1]
             i += 2
@@ -1156,6 +1213,12 @@ async def main():
             i += 2
         elif argv[i] == "--result-file" and i + 1 < len(argv):
             i += 2
+        elif argv[i] == "--skill-usage-receipt-file" and i + 1 < len(argv):
+            i += 2
+        elif argv[i] == "--artifact-root" and i + 1 < len(argv):
+            i += 2
+        elif argv[i] == "--source-archive-file" and i + 1 < len(argv):
+            i += 2
         elif argv[i].startswith("--"):
             i += 1  # skip unknown flags
         else:
@@ -1163,6 +1226,36 @@ async def main():
             i += 1
 
     task = " ".join(positional_args) if positional_args else None
+    if isinstance(creation_job, CreationJobV2):
+        if input_file is not None or cascade_from is not None or cascade_file is not None:
+            print("ERROR: Captain V2 creation imports cannot run a generation pipeline")
+            raise SystemExit(2)
+        try:
+            _publish_captain_sealed_import(creation_job, runtime_options)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            assert runtime_options.result_file is not None
+            blocked_result = CreationResultV1(
+                creation_job_id=creation_job.creation_job_id,
+                correlation_id=creation_job.correlation_id,
+                subject_version=creation_job.subject_version,
+                attempt=creation_job.attempt,
+                status="blocked",
+                failure=CreationFailure(
+                    code="validation_failed",
+                    summary="Captain-sealed Codex build import failed validation",
+                ),
+            )
+            write_creation_result_atomic(
+                Path(runtime_options.result_file),
+                blocked_result,
+            )
+        return
+    if creation_job is not None and runtime_options.source_archive_file is not None:
+        print("ERROR: --source-archive-file requires a V2 creation job")
+        raise SystemExit(2)
+    if creation_job is not None and input_file is None:
+        print("ERROR: Captain creation jobs require --input-file")
+        raise SystemExit(2)
 
     # Load cascade spec from YAML file if provided
     features = []
@@ -1192,6 +1285,11 @@ async def main():
         if not input_path.exists():
             print(f"ERROR: Input file not found: {input_file}")
             sys.exit(1)
+        if creation_job is not None:
+            input_sha256 = hashlib.sha256(input_path.read_bytes()).hexdigest()
+            if input_sha256 != creation_job.input_ref.sha256:
+                print("ERROR: Input file does not match the Captain creation job")
+                raise SystemExit(2)
         # Resolve image path: explicit flag > auto-detect in same directory
         if input_image:
             image_path = Path(input_image)
@@ -1205,7 +1303,7 @@ async def main():
                 image_path = pngs[0] if pngs else None
             if image_path:
                 print(f"[InputFile] Auto-detected org chart image: {image_path}")
-        from minibook.swarm.input_parser import parse_input_file_llm
+        from swarm.input_parser import parse_input_file_llm
         manifest = await parse_input_file_llm(input_path, image_path)
         if not task:
             org_name = manifest.get("org_name", "AI Agent Organisation")
@@ -1233,6 +1331,7 @@ async def main():
                 session, agents, project_id, task, manifest,
                 registry_agent_api_key=registry_key,
                 interactive=runtime_options.interactive,
+                export_to_github=creation_job is None,
             )
         elif is_cascade and features:
             # CASCADE MODE: run multiple iterations
@@ -1251,12 +1350,47 @@ async def main():
 
         try:
             if runtime_options.max_runtime_seconds is None:
-                await run
+                run_result = await run
             else:
-                await asyncio.wait_for(run, timeout=runtime_options.max_runtime_seconds)
+                run_result = await asyncio.wait_for(
+                    run, timeout=runtime_options.max_runtime_seconds
+                )
         except asyncio.TimeoutError as exc:
             print(f"ERROR: Swarm run exceeded {runtime_options.max_runtime_seconds:g} seconds")
             raise SystemExit(124) from exc
+
+        if creation_job is not None:
+            try:
+                if not isinstance(run_result, Path):
+                    raise ValueError("creation pipeline has no merged output")
+                assert runtime_options.artifact_root is not None
+                assert runtime_options.skill_usage_receipt_file is not None
+                install_creation_skill_receipt(
+                    creation_job,
+                    source_path=Path(runtime_options.skill_usage_receipt_file),
+                    output_path=run_result,
+                )
+                creation_result = publish_creation_output(
+                    creation_job,
+                    output_path=run_result,
+                    artifact_root=Path(runtime_options.artifact_root),
+                )
+            except (OSError, RuntimeError, TypeError, ValueError):
+                creation_result = CreationResultV1(
+                    creation_job_id=creation_job.creation_job_id,
+                    correlation_id=creation_job.correlation_id,
+                    subject_version=creation_job.subject_version,
+                    attempt=creation_job.attempt,
+                    status="blocked",
+                    failure=CreationFailure(
+                        code="validation_failed",
+                        summary="creation pipeline did not produce sealed package evidence",
+                    ),
+                )
+            assert runtime_options.result_file is not None
+            write_creation_result_atomic(
+                Path(runtime_options.result_file), creation_result
+            )
 
         print(f"\nView on Minibook: http://localhost:3457/forum")
 
@@ -1351,7 +1485,7 @@ async def company_main():
     print(f"  Profile: {profile_path}")
     print("=" * 70)
 
-    from minibook.swarm.company_builder import parse_company_profile, OrgBoard, CrossTeamLinker
+    from swarm.company_builder import parse_company_profile, OrgBoard, CrossTeamLinker
 
     async with aiohttp.ClientSession() as session:
         await _ensure_minibook(session)
@@ -1437,7 +1571,7 @@ async def design_main():
         await _ensure_minibook(session)
 
         # Register InputDesign agents
-        from minibook.swarm.knowledge import INPUT_DESIGN_ROLES
+        from swarm.knowledge import INPUT_DESIGN_ROLES
         creds = load_credentials()
         agents = {}
         for name in INPUT_DESIGN_ROLES:

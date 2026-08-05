@@ -1,0 +1,11 @@
+# Copy this file to .secrets/mini-pc/wireguard/mini-pc.conf and replace only
+# the local-secret placeholders. Never commit the copied file or any key.
+[Interface]
+Address = 10.77.0.2/30
+ListenPort = 51820
+PrivateKey = <MINI_PC_WIREGUARD_PRIVATE_KEY_FROM_LOCAL_SECRET>
+
+[Peer]
+# Captain initiates the tunnel to this Mini-PC listener.
+PublicKey = <CAPTAIN_WIREGUARD_PUBLIC_KEY_FROM_LOCAL_SECRET>
+AllowedIPs = 10.77.0.1/32

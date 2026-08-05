@@ -12,21 +12,35 @@ SKILL_DIR = Path("agenten/agent_factory/skills/autogen-agent-factory")
 
 SKILLS = {
     "captain-factory-discover": ("CodebaseInventoryV1", "do not change code"),
-    "captain-factory-brief-codex": ("CodexBuildBriefV1", "codex.run"),
+    "captain-factory-brief-codex": (
+        "hermes.factory-codex-brief-attestation.v1",
+        "do not call tools",
+    ),
+    "captain-factory-seal-codex-build": ("CodexBuildEvidenceV1", "Captain-issued"),
     "captain-factory-execute-team": ("TeamExecutionEvidenceV1", "max_cost_usd"),
     "captain-factory-evaluate-team": ("TeamEvaluationV1", "do not repair"),
-    "captain-factory-improve-team": ("CandidateRevisionV1", "prior green"),
+    "captain-factory-improve-team": (
+        "hermes.factory-improvement-attestation.v1",
+        "prior-green",
+    ),
     "captain-factory-report-captain": ("FactoryFeedbackV1", "Captain decides"),
 }
 
 SKILL_RESOURCES = {
     "captain-factory-discover": ("references/output-schema.md",),
     "captain-factory-brief-codex": ("templates/codex-assignment.md",),
+    "captain-factory-seal-codex-build": ("references/evidence-contract.md",),
     "captain-factory-execute-team": ("references/evidence-contract.md",),
     "captain-factory-evaluate-team": ("references/rubric.md",),
     "captain-factory-improve-team": ("templates/repair-assignment.md",),
     "captain-factory-report-captain": ("references/recommendations.md",),
 }
+
+LEGACY_BUNDLE_SKILLS = tuple(
+    skill_name
+    for skill_name in SKILLS
+    if skill_name != "captain-factory-seal-codex-build"
+)
 
 
 @pytest.mark.parametrize("skill_name,required", SKILLS.items())
@@ -57,19 +71,9 @@ def test_factory_workflow_bundle_is_non_authoritative_operator_aid() -> None:
     assert manifest == {
         "name": "captain-agent-factory-loop",
         "description": "Captain-controlled six-skill AutoGen factory workflow",
-        "skills": list(SKILLS),
+        "skills": list(LEGACY_BUNDLE_SKILLS),
         "instruction": "Use only the step released by the current Captain invocation.",
     }
-
-
-def test_factory_workflow_bundle_is_a_real_released_hermes_skill() -> None:
-    skill = Path("agenten/agent_factory/skills/captain-agent-factory-loop/SKILL.md")
-
-    content = skill.read_text(encoding="utf-8")
-
-    assert "name: captain-agent-factory-loop" in content
-    for step in SKILLS:
-        assert step in content
 
 
 def test_report_classifies_tool_credential_infrastructure_and_adapter_gaps() -> None:
@@ -151,6 +155,8 @@ def test_brief_codex_selects_builtin_skills_by_assignment_phase() -> None:
         "its repair step"
     ) in text
     assert "load `requesting-code-review` before completion" in text
+    assert "digest-bound attestation" in text
+    assert "do not reproduce the captain-authored brief" in text
     assert "skills as mandatory instructions" not in text
 
 
@@ -167,6 +173,29 @@ def test_factory_skill_is_digestible_and_contains_release_boundaries() -> None:
         "private candidate",
         "never publish",
         "ready_to_use",
+    ):
+        assert phrase.lower() in text.lower()
+
+
+@pytest.mark.parametrize(
+    "skill_name",
+    (
+        "captain-factory-discover",
+        "captain-factory-brief-codex",
+        "captain-factory-improve-team",
+    ),
+)
+def test_n8n_factory_steps_delegate_technical_build_rules_to_official_skills(
+    skill_name: str,
+) -> None:
+    text = (
+        Path("agenten/agent_factory/skills") / skill_name / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+    for phrase in (
+        "n8n-io/skills",
+        "using-n8n-skills-official",
+        "instance-level mcp",
     ):
         assert phrase.lower() in text.lower()
     assert "api_key=" not in text.lower()

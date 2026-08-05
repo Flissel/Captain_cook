@@ -12,75 +12,53 @@ $root = Split-Path -Parent $PSScriptRoot
 $envFile = Join-Path $root '.env'
 $stateDir = Join-Path $root '.captain-cook'
 $pidFile = Join-Path $stateDir 'minibook-demo.pid'
-$baseUrl = 'http://127.0.0.1:3456'
+$baseUrl = 'http://127.0.0.1:8080'
 $serviceName = 'captain-demo-service'
 
 function Read-Env {
     $values = [ordered]@{}
     if (Test-Path $envFile) { foreach ($line in [IO.File]::ReadAllLines($envFile)) {
-        if ($line -match '^(CAPTAIN_DEMO_MINIBOOK_API_KEY|MINIBOOK_API_KEY|MINIBOOK_PROJECTION_API_KEY|MINIBOOK_CREATION_DB|MINIBOOK_CREATION_ARTIFACTS|CAPTAIN_RUNTIME_ARTIFACT_ROOT)=(.*)$') { $values[$Matches[1]] = $Matches[2] }
+        if ($line -match '^CAPTAIN_DEMO_MINIBOOK_API_KEY=(.*)$') { $values['CAPTAIN_DEMO_MINIBOOK_API_KEY'] = $Matches[1] }
+        if ($line -match '^CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY=(.*)$') { $values['CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY'] = $Matches[1] }
     }}
     $values
 }
 function Save-Env($values) {
-    $pending = [ordered]@{
-        CAPTAIN_DEMO_MINIBOOK_API_KEY = [string]$values['CAPTAIN_DEMO_MINIBOOK_API_KEY']
-        MINIBOOK_API_KEY = [string]$values['MINIBOOK_API_KEY']
-    }
     $lines = [Collections.Generic.List[string]]::new()
+    $written = @{
+        CAPTAIN_DEMO_MINIBOOK_API_KEY = $false
+        CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY = $false
+    }
     if (Test-Path $envFile) { foreach ($line in [IO.File]::ReadAllLines($envFile)) {
-        if ($line -match '^(CAPTAIN_DEMO_MINIBOOK_API_KEY|MINIBOOK_API_KEY)=') {
-            $name = $Matches[1]
-            $lines.Add(('{0}={1}' -f $name,$pending[$name])); $pending.Remove($name)
+        if ($line -match '^CAPTAIN_DEMO_MINIBOOK_API_KEY=') {
+            $lines.Add("CAPTAIN_DEMO_MINIBOOK_API_KEY=$($values['CAPTAIN_DEMO_MINIBOOK_API_KEY'])")
+            $written['CAPTAIN_DEMO_MINIBOOK_API_KEY'] = $true
+        } elseif ($line -match '^CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY=') {
+            $lines.Add("CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY=$($values['CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY'])")
+            $written['CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY'] = $true
         } else { $lines.Add($line) }
     }}
-    foreach ($item in $pending.GetEnumerator()) { $lines.Add(('{0}={1}' -f $item.Key,$item.Value)) }
+    foreach ($name in $written.Keys) {
+        if (-not $written[$name] -and $values.Contains($name)) {
+            $lines.Add("$name=$($values[$name])")
+        }
+    }
     [IO.File]::WriteAllLines($envFile, $lines, [Text.UTF8Encoding]::new($false))
 }
 function Test-Health {
     try { (Invoke-WebRequest "$baseUrl/health" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200 } catch { $false }
 }
-function Get-ManagedServiceProcess {
-    if (-not (Test-Path $pidFile -PathType Leaf)) { return $null }
-    try { $identity = Get-Content $pidFile -Raw | ConvertFrom-Json } catch { throw 'Invalid managed Minibook PID file.' }
-    $process = Get-Process -Id ([int]$identity.pid) -ErrorAction SilentlyContinue
-    if (-not $process) { Remove-Item $pidFile -Force; return $null }
-    $sameStart = $process.StartTime.ToUniversalTime().Ticks -eq ([DateTimeOffset]$identity.started_at).UtcDateTime.Ticks
-    $sameExecutable = [IO.Path]::GetFullPath($process.Path) -eq [IO.Path]::GetFullPath([string]$identity.executable)
-    if (-not $sameStart -or -not $sameExecutable) { throw 'PID no longer belongs to the managed Minibook process.' }
-    return $process
-}
-function Start-Service {
-    $values = Read-Env
-    $projectionKey = [string]$values['MINIBOOK_PROJECTION_API_KEY']
-    if ([string]::IsNullOrWhiteSpace($projectionKey)) { throw 'Projection credential is required before starting Minibook.' }
-    if (Test-Health) {
-        $managed = Get-ManagedServiceProcess
-        if (-not $managed) { throw 'Healthy Minibook endpoint is not the managed demo process.' }
-        & taskkill.exe /PID $managed.Id /T /F *> $null
-        if ($LASTEXITCODE -ne 0) { throw 'Managed Minibook process tree could not be stopped.' }
-        Remove-Item $pidFile -Force
-        Write-Host '[ready] managed Minibook restarted for current configuration'
+function Start-Service($values) {
+    if (Test-Health) { Write-Host '[ready] Minibook local instance'; return }
+    $projectionApiKey = [string]$values['CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY']
+    if ([string]::IsNullOrWhiteSpace($projectionApiKey)) {
+        throw 'Minibook projection credential is unavailable; run bootstrap first.'
     }
+    $env:MINIBOOK_PROJECTION_API_KEY = $projectionApiKey
     New-Item -ItemType Directory -Force $stateDir | Out-Null
-    $python = Join-Path $root '.venv\Scripts\python.exe'; if (-not (Test-Path $python)) { $python = (Get-Command python).Source }
-    $previousProjectionKey = [Environment]::GetEnvironmentVariable('MINIBOOK_PROJECTION_API_KEY','Process')
-    $previousMinibookUrl = [Environment]::GetEnvironmentVariable('MINIBOOK_URL','Process')
-    $previousCreationDb = [Environment]::GetEnvironmentVariable('MINIBOOK_CREATION_DB','Process')
-    $previousCreationArtifacts = [Environment]::GetEnvironmentVariable('MINIBOOK_CREATION_ARTIFACTS','Process')
-    try {
-        [Environment]::SetEnvironmentVariable('MINIBOOK_PROJECTION_API_KEY',$projectionKey,'Process')
-        [Environment]::SetEnvironmentVariable('MINIBOOK_URL',$baseUrl,'Process')
-        [Environment]::SetEnvironmentVariable('MINIBOOK_CREATION_DB',[string]$values['MINIBOOK_CREATION_DB'],'Process')
-        [Environment]::SetEnvironmentVariable('MINIBOOK_CREATION_ARTIFACTS',[string]$values['MINIBOOK_CREATION_ARTIFACTS'],'Process')
-        $process = Start-Process $python -ArgumentList 'run.py' -WorkingDirectory (Join-Path $root 'minibook') -WindowStyle Hidden -PassThru
-    } finally {
-        [Environment]::SetEnvironmentVariable('MINIBOOK_PROJECTION_API_KEY',$previousProjectionKey,'Process')
-        [Environment]::SetEnvironmentVariable('MINIBOOK_URL',$previousMinibookUrl,'Process')
-        [Environment]::SetEnvironmentVariable('MINIBOOK_CREATION_DB',$previousCreationDb,'Process')
-        [Environment]::SetEnvironmentVariable('MINIBOOK_CREATION_ARTIFACTS',$previousCreationArtifacts,'Process')
-    }
-    $identity = @{ pid=$process.Id; started_at=$process.StartTime.ToUniversalTime().ToString('o'); executable=$python }
+    $python = Join-Path $root '.venv\Scripts\python.exe'; if (-not (Test-Path $python)) { $python = (Get-Command python.exe -CommandType Application).Source }
+    $process = Start-Process $python -ArgumentList 'run.py' -WorkingDirectory (Join-Path $root 'minibook') -WindowStyle Hidden -PassThru
+    $identity = @{ pid=$process.Id; started_at=$process.StartTime.ToUniversalTime().ToString('o'); executable=$process.Path }
     [IO.File]::WriteAllText($pidFile, ($identity | ConvertTo-Json -Compress))
     foreach ($attempt in 1..60) { if (Test-Health) { Write-Host '[ready] Minibook local instance'; return }; Start-Sleep -Milliseconds 500 }
     throw 'Minibook local instance did not become healthy.'
@@ -88,7 +66,7 @@ function Start-Service {
 function Recover-ServiceCredential($values) {
     $database = Join-Path $root 'minibook\data\minibook.db'
     if (-not (Test-Path $database -PathType Leaf)) { throw 'Minibook demo identity exists but its local database is unavailable for explicit recovery.' }
-    $python = Join-Path $root '.venv\Scripts\python.exe'; if (-not (Test-Path $python)) { $python = (Get-Command python).Source }
+    $python = Join-Path $root '.venv\Scripts\python.exe'; if (-not (Test-Path $python)) { $python = (Get-Command python.exe -CommandType Application).Source }
     $query = "import sqlite3, sys; con=sqlite3.connect(sys.argv[1]); rows=con.execute('SELECT api_key FROM agents WHERE name = ?', (sys.argv[2],)).fetchall(); sys.stdout.write(rows[0][0] if len(rows) == 1 else '')"
     $apiKey = (& $python -c $query $database $serviceName).Trim()
     if ([string]::IsNullOrWhiteSpace($apiKey)) { throw 'Minibook demo identity recovery was ambiguous or unavailable.' }
@@ -97,24 +75,25 @@ function Recover-ServiceCredential($values) {
         if ($me.name -ne $serviceName) { throw 'Recovered Minibook key belongs to another identity.' }
     } catch { throw 'Recovered Minibook key did not validate against the local service.' }
     $values['CAPTAIN_DEMO_MINIBOOK_API_KEY'] = $apiKey
-    $values['MINIBOOK_API_KEY'] = $apiKey
     Save-Env $values
     Write-Host '[ready] Minibook demo service credential recovered locally (credential redacted)'
 }
 function Bootstrap-Service {
-    Start-Service
     $values = Read-Env
-    if ($values['CAPTAIN_DEMO_MINIBOOK_API_KEY'] -and $values['MINIBOOK_API_KEY'] -and $values['CAPTAIN_DEMO_MINIBOOK_API_KEY'] -ne $values['MINIBOOK_API_KEY']) {
-        throw 'Configured Minibook API key aliases do not match; refusing to choose one.'
+    $projectionApiKey = [string]$values['CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY']
+    if ([string]::IsNullOrWhiteSpace($projectionApiKey)) {
+        $projectionApiKey = [Convert]::ToHexString(
+            [Security.Cryptography.RandomNumberGenerator]::GetBytes(32)
+        ).ToLowerInvariant()
+        $values['CAPTAIN_DEMO_MINIBOOK_PROJECTION_API_KEY'] = $projectionApiKey
+        Save-Env $values
     }
-    $apiKey = if ($values['MINIBOOK_API_KEY']) { [string]$values['MINIBOOK_API_KEY'] } else { [string]$values['CAPTAIN_DEMO_MINIBOOK_API_KEY'] }
+    Start-Service $values
+    $apiKey = [string]$values['CAPTAIN_DEMO_MINIBOOK_API_KEY']
     if ($apiKey) {
         try {
             $me = Invoke-RestMethod "$baseUrl/api/v1/agents/me" -Headers @{Authorization="Bearer $apiKey"} -TimeoutSec 5
             if ($me.name -ne $serviceName) { throw 'Configured Minibook key belongs to another identity.' }
-            $values['CAPTAIN_DEMO_MINIBOOK_API_KEY'] = $apiKey
-            $values['MINIBOOK_API_KEY'] = $apiKey
-            Save-Env $values
             Write-Host '[ready] Minibook demo service account reused (credential redacted)'; return
         } catch { throw 'Configured CAPTAIN_DEMO_MINIBOOK_API_KEY is invalid; refusing to replace it.' }
     }
@@ -126,20 +105,24 @@ function Bootstrap-Service {
     }
     if (-not $created.api_key) { throw 'Minibook registration returned no API key.' }
     $values['CAPTAIN_DEMO_MINIBOOK_API_KEY'] = [string]$created.api_key
-    $values['MINIBOOK_API_KEY'] = [string]$created.api_key
     Save-Env $values
     Write-Host '[ready] Minibook demo service account created locally (credential redacted)'
 }
 function Stop-Service {
-    $process = Get-ManagedServiceProcess
-    if (-not $process) { Write-Host '[ready] no managed Minibook process'; return }
-    & taskkill.exe /PID $process.Id /T /F *> $null
-    if ($LASTEXITCODE -ne 0) { throw 'Managed Minibook process tree could not be stopped.' }
+    if (-not (Test-Path $pidFile)) { Write-Host '[ready] no managed Minibook process'; return }
+    try { $identity = Get-Content $pidFile -Raw | ConvertFrom-Json } catch { throw 'Invalid managed Minibook PID file.' }
+    $process = Get-Process -Id ([int]$identity.pid) -ErrorAction SilentlyContinue
+    if ($process) {
+        $sameStart = $process.StartTime.ToUniversalTime().Ticks -eq ([DateTimeOffset]$identity.started_at).UtcDateTime.Ticks
+        $sameExecutable = [IO.Path]::GetFullPath($process.Path) -eq [IO.Path]::GetFullPath([string]$identity.executable)
+        if (-not $sameStart -or -not $sameExecutable) { throw 'PID no longer belongs to the managed Minibook process.' }
+        Stop-Process -Id $process.Id -ErrorAction Stop
+    }
     Remove-Item $pidFile -Force
     Write-Host '[ready] managed Minibook process stopped'
 }
 switch ($Action) {
-    start { Start-Service }
+    start { Start-Service (Read-Env) }
     bootstrap { Bootstrap-Service }
     status { if (-not (Test-Health)) { throw 'Minibook is not healthy.' }; Write-Host '[ready] Minibook healthy' }
     stop { Stop-Service }

@@ -40,7 +40,7 @@ def build_model_client(api_key: Optional[str] = None, model: Optional[str] = Non
     kwargs = {
         "model": resolved_model,
         "max_retries": 0,
-        "temperature": 0,
+        "parallel_tool_calls": False,
     }
     if resolved_api_key is not None:
         kwargs["api_key"] = resolved_api_key

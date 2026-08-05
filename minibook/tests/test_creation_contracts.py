@@ -34,12 +34,6 @@ def test_creation_job_rejects_non_opaque_artifact_uris(uri: str) -> None:
         CreationJobV1.model_validate(payload)
 
 
-def test_creation_job_reads_legacy_persisted_job_without_new_authority() -> None:
-    payload = job_payload()
-    del payload["architect_lease_id"]
-    assert CreationJobV1.model_validate(payload).architect_lease_id is None
-
-
 def test_success_requires_manifest_and_skill_receipt() -> None:
     payload = json.loads(
         (FIXTURES / "minibook_creation_result.v1.json").read_text(encoding="utf-8")

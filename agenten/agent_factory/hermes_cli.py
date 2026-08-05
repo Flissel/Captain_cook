@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import json
 import os
@@ -14,37 +13,38 @@ import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_CEILING
+from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Literal, Protocol
-from uuid import NAMESPACE_URL, uuid4, uuid5
+from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, Protocol, get_args
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Field,
-    StrictBool,
-    ValidationError,
-    field_validator,
-    model_validator,
-)
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from agenten.agent_factory.contracts import (
     AgentFactoryJobV3,
     FactoryBlockStatus,
     FactoryEvidenceBlock,
     FactoryJob,
+    FactoryLease,
     FactoryPhase,
     FactoryRole,
 )
+from agenten.agent_factory.codex_brief import (
+    CodexBriefBuilder,
+    CodexPromptArtifactStore,
+)
+from agenten.agent_factory.codex_build_execution import (
+    FactoryCodexBuildFailed,
+    FactoryCodexBuildInterrupted,
+    FactoryCodexCleanupUnresolved,
+)
 from agenten.agent_factory.evidence_store import FactoryEvidenceStore, FilesystemFactoryEvidenceStore
-from agenten.agent_factory.execution_budget import (
-    FactoryBudgetPort,
-    FactoryBudgetReservationV1,
-    FactoryUsageReceiptV1,
+from agenten.agent_factory.hermes_effect_evidence import (
+    FilesystemHermesProviderEffectStore,
+    HermesUsageSnapshot,
+    parse_hermes_usage,
 )
 from agenten.agent_factory.orchestration import FactoryDispatch, FactoryDispatchError, HermesFactoryPort
-from agenten.agent_factory.service import FactoryWorkflowArtifactSink
 from agenten.agent_factory.skill_evaluation import (
     HermesSkillEvaluationEvidence,
     HermesSkillEvaluationRequest,
@@ -52,16 +52,22 @@ from agenten.agent_factory.skill_evaluation import (
     ReleasedHermesSkill,
 )
 from agenten.agent_factory.skill_sequence import (
+    FactoryHermesReplayRetryAuthorizationV1,
     FactoryImprovementAuthorizationV1,
+    FactoryRuntimeRetryAuthorizationV1,
     SkillSequencePolicy,
+    factory_hermes_replay_retry_authorization_sha256,
+    validate_factory_hermes_replay_retry_authorization,
 )
 from agenten.agent_factory.skill_store import reject_sensitive_data
 from agenten.agent_factory.state_machine import FactoryActionKind
 from agenten.agent_factory.skill_workflow_contracts import (
     FACTORY_SKILL_ID_BY_STEP,
     CandidateRevisionV1,
+    CandidateChangedComponent,
     CodebaseInventoryV1,
     CodexBuildBriefV1,
+    CodexBuildEvidenceV1,
     FactoryFeedbackRecommendation,
     FactoryFeedbackV1,
     FactorySkillInvocationV1,
@@ -69,7 +75,8 @@ from agenten.agent_factory.skill_workflow_contracts import (
     TeamEvaluationV1,
     TeamExecutionEvidenceV1,
 )
-from agenten.agent_runtime.contracts import ArtifactRef
+from agenten.agent_factory.forge_contracts import FactoryBuildAssignmentV1
+from agenten.agent_runtime.contracts import ArtifactRef, IntegrationIntent
 
 if TYPE_CHECKING:
     from agenten.agent_factory.candidate_evaluation import FactoryCandidateEvaluationResult
@@ -82,89 +89,116 @@ class HermesCliSettings:
     timeout_seconds: int = 900
     evidence_root: Path = Path("artifacts/agent-factory/evidence")
     released_skill_root: Path = Path("agenten/agent_factory/released-skills")
-    model: str | None = None
+    module_root: Path | None = None
+    working_directory: Path | None = None
     provider: str | None = None
+    model: str | None = None
+    reasoning_effort: str | None = None
+    maximum_total_cost_usd: Decimal | None = None
+    unresolved_effect_reserve_usd: Decimal | None = None
+    maximum_iterations: int = 16
+    maximum_output_tokens: int = 2048
+
+    def __post_init__(self) -> None:
+        if (self.provider is None) != (self.model is None):
+            raise ValueError("Hermes provider and model must be configured together")
+        for value, label in ((self.provider, "provider"), (self.model, "model")):
+            if value is not None and (
+                not value.strip()
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", value) is None
+            ):
+                raise ValueError(f"Hermes {label} is invalid")
+        if self.reasoning_effort not in {
+            None,
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra",
+        }:
+            raise ValueError("Hermes reasoning effort is invalid")
+        maximum = self.maximum_total_cost_usd
+        if maximum is not None and (
+            isinstance(maximum, (bool, float))
+            or not isinstance(maximum, Decimal)
+            or not maximum.is_finite()
+            or maximum <= 0
+            or self.provider is None
+        ):
+            raise ValueError(
+                "Hermes cost ceiling requires a positive Decimal and pinned model"
+            )
+        unresolved_reserve = self.unresolved_effect_reserve_usd
+        if unresolved_reserve is not None and (
+            maximum is None
+            or not unresolved_reserve.is_finite()
+            or unresolved_reserve <= 0
+            or unresolved_reserve > maximum
+        ):
+            raise ValueError(
+                "Hermes unresolved effect reserve requires available cost ceiling"
+            )
+        if (
+            isinstance(self.maximum_iterations, bool)
+            or not isinstance(self.maximum_iterations, int)
+            or self.maximum_iterations < 1
+            or self.maximum_iterations > 32
+        ):
+            raise ValueError("Hermes maximum iterations must be between 1 and 32")
+        if (
+            isinstance(self.maximum_output_tokens, bool)
+            or not isinstance(self.maximum_output_tokens, int)
+            or self.maximum_output_tokens < 128
+            or self.maximum_output_tokens > 8192
+        ):
+            raise ValueError("Hermes maximum output tokens must be between 128 and 8192")
 
 
-class HermesPaidUsageReceipt(BaseModel):
-    """Exact machine-readable receipt emitted by ``hermes -z --usage-file``."""
+class _HermesDiscoveryAttestationV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    schema_name: Literal["hermes.factory-discovery-attestation.v1"] = Field(
+        alias="schema"
+    )
+    invocation_id: UUID
+    seed_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    accepted: Literal[True]
 
-    estimated_cost_usd: Decimal
-    cost_status: str = Field(min_length=1)
-    cost_source: str = Field(min_length=1)
-    input_tokens: int = Field(ge=0, strict=True)
-    output_tokens: int = Field(ge=0, strict=True)
-    cache_read_tokens: int = Field(ge=0, strict=True)
-    cache_write_tokens: int = Field(ge=0, strict=True)
-    reasoning_tokens: int = Field(ge=0, strict=True)
-    total_tokens: int = Field(ge=0, strict=True)
-    api_calls: int = Field(ge=1, strict=True)
-    model: str = Field(min_length=1)
-    provider: str = Field(min_length=1)
-    session_id: str = Field(min_length=1)
-    completed: StrictBool
-    failed: StrictBool
-    service_tier: str | None = None
 
-    @field_validator("estimated_cost_usd", mode="before")
+class _HermesCodexBriefAttestationV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    schema_name: Literal["hermes.factory-codex-brief-attestation.v1"] = Field(
+        alias="schema"
+    )
+    invocation_id: UUID
+    seed_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    accepted: Literal[True]
+
+
+class _HermesImprovementAttestationV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    schema_name: Literal["hermes.factory-improvement-attestation.v1"] = Field(
+        alias="schema"
+    )
+    invocation_id: UUID
+    seed_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    changed_components: tuple[CandidateChangedComponent, ...] = Field(min_length=1)
+    accepted: Literal[True]
+
+    @field_validator("changed_components")
     @classmethod
-    def require_known_positive_cost(cls, value: object) -> Decimal:
-        if isinstance(value, bool) or value is None:
-            raise ValueError("provider cost is unknown")
-        try:
-            amount = Decimal(str(value))
-        except (InvalidOperation, ValueError) as exc:
-            raise ValueError("provider cost is unknown") from exc
-        if not amount.is_finite() or amount <= 0:
-            raise ValueError("provider cost must be known and positive")
-        return amount
-
-    @field_validator("cost_status")
-    @classmethod
-    def require_known_cost_status(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized or normalized.lower() == "unknown":
-            raise ValueError("provider cost status is unknown")
-        return normalized
-
-    @field_validator("cost_source", "model", "provider", "session_id")
-    @classmethod
-    def require_named_field(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("paid usage identity fields must not be blank")
-        return normalized
-
-    @model_validator(mode="after")
-    def require_successful_complete_run(self) -> "HermesPaidUsageReceipt":
-        if self.completed is not True or self.failed is not False:
-            raise ValueError("paid usage report is not a successful completed run")
-        accepted_totals = {
-            self.input_tokens + self.output_tokens,
-            self.input_tokens + self.output_tokens + self.reasoning_tokens,
-            self.input_tokens
-            + self.output_tokens
-            + self.cache_read_tokens
-            + self.cache_write_tokens,
-            self.input_tokens
-            + self.output_tokens
-            + self.cache_read_tokens
-            + self.cache_write_tokens
-            + self.reasoning_tokens,
-        }
-        if self.total_tokens not in accepted_totals:
-            raise ValueError("paid usage token totals are contradictory")
-        return self
-
-
-@dataclass(frozen=True)
-class _HermesPaidPromptResult:
-    stdout: bytes
-    accounting_refs: tuple[ArtifactRef, ArtifactRef]
-    reservation: FactoryBudgetReservationV1
-    receipt: FactoryUsageReceiptV1
+    def require_unique_components(
+        cls,
+        value: tuple[CandidateChangedComponent, ...],
+    ) -> tuple[CandidateChangedComponent, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("improvement components must be unique")
+        return value
 
 
 class ReleasedFactorySkillCatalog(Protocol):
@@ -175,6 +209,70 @@ class ReleasedFactorySkillCatalog(Protocol):
         job: FactoryJob,
         step: FactorySkillStep,
     ) -> ReleasedHermesSkill: ...
+
+
+class CaptainCodexBuildSealerPort(Protocol):
+    """Captain-only bridge from an approved brief to sealed build evidence."""
+
+    async def seal(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+    ) -> CodexBuildEvidenceV1: ...
+
+    async def reconcile_pending(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+    ) -> CodexBuildEvidenceV1: ...
+
+    def reconcile_failed(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+        *,
+        persisted_resume_ordinal: int | None = None,
+        persisted_retry_authorization_ref: ArtifactRef | None = None,
+        persisted_retry_authorization_binding_sha256: str | None = None,
+    ) -> FactoryCodexBuildFailed: ...
+
+    def validate_runtime_retry(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+    ) -> FactoryRuntimeRetryAuthorizationV1: ...
+
+
+class CaptainHermesReplayRetryAuthorizationPort(Protocol):
+    """Captain lookup for one exact, budget-bound failed Hermes replay."""
+
+    def active(
+        self,
+        failed: "FactorySkillReplayRecord",
+        *,
+        requested_invocation: FactorySkillInvocationV1,
+        now: datetime,
+    ) -> FactoryHermesReplayRetryAuthorizationV1: ...
+
+
+class CaptainFactoryWorkflowArtifactPort(Protocol):
+    """Captain-owned append-only sink for governed Hermes workflow artifacts."""
+
+    def record_workflow_artifact(
+        self,
+        artifact: (
+            CodebaseInventoryV1
+            | CodexBuildBriefV1
+            | TeamExecutionEvidenceV1
+            | TeamEvaluationV1
+            | CandidateRevisionV1
+            | FactoryFeedbackV1
+        ),
+    ) -> bool: ...
 
 
 class FilesystemReleasedFactorySkillCatalog:
@@ -215,14 +313,31 @@ class HermesCliFactory(HermesFactoryPort):
         released_skill_catalog: ReleasedFactorySkillCatalog | None = None,
         sequence_policy: SkillSequencePolicy | None = None,
         replay_store: FactorySkillReplayStore | None = None,
-        budget: FactoryBudgetPort | None = None,
-        workflow_artifact_sink: FactoryWorkflowArtifactSink | None = None,
+        codex_build_sealer: CaptainCodexBuildSealerPort | None = None,
+        codex_prompt_artifact_store: CodexPromptArtifactStore | None = None,
+        hermes_retry_authority: CaptainHermesReplayRetryAuthorizationPort | None = None,
+        workflow_artifacts: CaptainFactoryWorkflowArtifactPort | None = None,
+        provider_effect_store: FilesystemHermesProviderEffectStore | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._settings = settings
         self._evidence_store = evidence_store or FilesystemFactoryEvidenceStore(settings.evidence_root)
         self._released_skill_catalog = released_skill_catalog
         self._sequence_policy = sequence_policy or SkillSequencePolicy()
+        self._codex_build_sealer = codex_build_sealer
+        self._codex_prompt_artifact_store = codex_prompt_artifact_store
+        self._hermes_retry_authority = hermes_retry_authority
+        self._workflow_artifacts = workflow_artifacts
+        self._provider_effect_store = (
+            provider_effect_store
+            if provider_effect_store is not None
+            else FilesystemHermesProviderEffectStore(
+                settings.evidence_root / "provider-effects",
+                unresolved_effect_reserve_usd=(
+                    settings.unresolved_effect_reserve_usd
+                ),
+            )
+        )
         self._replay_store = (
             replay_store
             if replay_store is not None
@@ -230,9 +345,16 @@ class HermesCliFactory(HermesFactoryPort):
                 settings.evidence_root / "skill-replays"
             )
         )
-        self._budget = budget
-        self._workflow_artifact_sink = workflow_artifact_sink
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._observed_cost_usd = (
+            self._provider_effect_store.total_estimated_cost_usd()
+            if settings.maximum_total_cost_usd is not None
+            else Decimal("0")
+        )
+
+    @property
+    def observed_cost_usd(self) -> Decimal:
+        return self._observed_cost_usd
 
     async def dispatch(self, request: FactoryDispatch) -> FactoryEvidenceBlock:
         if request.role is None or request.lease is None:
@@ -240,28 +362,57 @@ class HermesCliFactory(HermesFactoryPort):
         if self._released_skill_catalog is None:
             raise FactoryDispatchError("released factory skill catalog is not configured")
         now = self._clock()
-        _validate_factory_dispatch(request, now=now)
+        _validate_factory_dispatch_bindings(request, now=now)
         steps = self._sequence_policy.steps_for(
             role=request.role,
             attempt=request.action.attempt,
+            require_codex_seal=isinstance(request.job, AgentFactoryJobV3),
         )
         improvement = _validated_improvement_authorization(request)
-        self._require_v3_paid_ports(request)
+        if (
+            now >= request.lease.expires_at
+            and request.runtime_retry_authorization is None
+            and isinstance(request.job, AgentFactoryJobV3)
+            and request.role is FactoryRole.TOOL_INTEGRATOR
+            and FactorySkillStep.SEAL_CODEX_BUILD in steps
+        ):
+            await self._reconcile_expired_pending_codex_failure(
+                request,
+                steps=steps,
+                improvement=improvement,
+            )
+        historical_completed_replay = False
+        if now >= request.lease.expires_at:
+            authorization = request.runtime_retry_authorization
+            if authorization is None or now >= request.job.deadline_at:
+                _validate_factory_dispatch(request, now=now)
+            await self._require_runtime_recovery_replays(request, steps=steps)
+            assert authorization is not None
+            if authorization is not None and now >= authorization.expires_at:
+                await self._require_completed_runtime_recovery_replay(
+                    request,
+                    steps=steps,
+                )
+                historical_completed_replay = True
+        authority_expires_at = _validate_factory_dispatch(
+            request,
+            now=now,
+            allow_expired_completed_replay=historical_completed_replay,
+        )
 
         deadline = _deadline(
             min(
                 float(self._settings.timeout_seconds),
-                (request.lease.expires_at - now).total_seconds(),
+                (authority_expires_at - now).total_seconds(),
             )
         )
-        input_ref = (
-            improvement.authorization_ref
-            if improvement is not None
-            else request.job.input_ref
+        input_ref = await self._initial_workflow_input_ref(
+            request,
+            steps=steps,
+            improvement=improvement,
         )
         artifacts: list[_FactoryWorkflowArtifact] = []
         transcript_refs: list[ArtifactRef] = []
-        accounting_refs: list[ArtifactRef] = []
         for step in steps:
             released_skill = self._released_skill_catalog.released_for(request.job, step)
             skill_name = FACTORY_SKILL_ID_BY_STEP[step]
@@ -280,55 +431,229 @@ class HermesCliFactory(HermesFactoryPort):
             _validate_serialized_prompt_value(
                 invocation.model_dump(mode="json", by_alias=True)
             )
-            claim = await self._replay_store.claim(invocation)
-            if not claim.acquired and claim.record.state in {"result_ready", "completed"}:
-                accepted = claim.record
+            try:
+                claim = await self._replay_store.claim(invocation)
+            except FactorySkillReplayPendingError as pending:
+                if (
+                    step is not FactorySkillStep.SEAL_CODEX_BUILD
+                    or self._codex_build_sealer is None
+                    or not artifacts
+                    or not isinstance(artifacts[-1], CodexBuildBriefV1)
+                ):
+                    raise
+                accepted = await self._reconcile_pending_codex_seal(
+                    request,
+                    pending.record.invocation,
+                    artifacts[-1],
+                    pending.record,
+                )
                 assert accepted.artifact is not None
                 assert accepted.transcript_ref is not None
-                if accepted.state == "result_ready":
-                    accepted = await self._replay_store.complete(
-                        accepted,
-                        artifact=accepted.artifact,
-                        transcript_ref=accepted.transcript_ref,
-                        accounting_refs=accepted.accounting_refs,
-                        budget_reservation=accepted.budget_reservation,
-                        usage_receipt=accepted.usage_receipt,
-                    )
-                self._record_completed_usage(request, accepted)
+                self._record_workflow_artifact(accepted.artifact)
                 artifacts.append(accepted.artifact)
                 transcript_refs.append(accepted.transcript_ref)
-                accounting_refs.extend(accepted.accounting_refs)
-                await self._persist_workflow_artifact(accepted.artifact)
                 input_ref = accepted.artifact.artifact_ref
                 if not _may_continue_after(accepted.artifact):
                     break
                 continue
-            replay_record = claim.record
+            except FactorySkillReplayInterruptedError as interrupted:
+                authorization = request.runtime_retry_authorization
+                if (
+                    step is not FactorySkillStep.SEAL_CODEX_BUILD
+                    or authorization is None
+                    or self._codex_build_sealer is None
+                ):
+                    raise
+                validated = self._codex_build_sealer.validate_runtime_retry(
+                    request,
+                    interrupted.record.invocation,
+                    artifacts[-1],
+                )
+                if validated is not authorization:
+                    raise FactoryDispatchError(
+                        "Captain Codex runtime retry validation changed authority"
+                    )
+                claim = await self._replay_store.resume(
+                    interrupted.record,
+                    authorization=validated,
+                )
+            except FactorySkillReplayRetryableFailureError as failed:
+                authorization = request.runtime_retry_authorization
+                if (
+                    step is not FactorySkillStep.SEAL_CODEX_BUILD
+                    or authorization is None
+                    or self._codex_build_sealer is None
+                    or not artifacts
+                    or not isinstance(artifacts[-1], CodexBuildBriefV1)
+                ):
+                    raise
+                validated = self._codex_build_sealer.validate_runtime_retry(
+                    request,
+                    failed.record.invocation,
+                    artifacts[-1],
+                )
+                if validated is not authorization:
+                    raise FactoryDispatchError(
+                        "Captain Codex runtime retry validation changed authority"
+                    )
+                claim = await self._replay_store.retry_failed(
+                    failed.record,
+                    authorization=validated,
+                )
+            except FactorySkillReplayHermesRetryableFailureError as failed:
+                if self._hermes_retry_authority is None:
+                    raise FactoryDispatchError(
+                        "failed Hermes replay requires Captain recovery authority"
+                    ) from failed
+                authorization = self._hermes_retry_authority.active(
+                    failed.record,
+                    requested_invocation=failed.requested_invocation,
+                    now=self._clock(),
+                )
+                if _hermes_retry_exceeds_authority(
+                    maximum_total_cost_usd=self._settings.maximum_total_cost_usd,
+                    observed_cost_usd=self._observed_cost_usd,
+                    maximum_additional_cost_usd=(
+                        authorization.maximum_additional_cost_usd
+                    ),
+                ):
+                    raise FactoryDispatchError(
+                        "Hermes retry settings exceed Captain recovery budget"
+                    )
+                claim = await self._replay_store.retry_failed_hermes(
+                    failed.record,
+                    requested_invocation=failed.requested_invocation,
+                    authorization=authorization,
+                )
+            if not claim.acquired:
+                accepted = claim.record
+                assert accepted.artifact is not None
+                assert accepted.transcript_ref is not None
+                self._record_workflow_artifact(accepted.artifact)
+                artifacts.append(accepted.artifact)
+                transcript_refs.append(accepted.transcript_ref)
+                input_ref = accepted.artifact.artifact_ref
+                if not _may_continue_after(accepted.artifact):
+                    break
+                continue
             try:
-                if isinstance(request.job, AgentFactoryJobV3):
-                    if claim.acquired:
-                        replay_record = await self._run_and_stage_paid_skill_prompt(
-                            request,
-                            pending=replay_record,
-                            invocation=invocation,
-                            prompt=_factory_skill_prompt(invocation, skill_name=skill_name),
-                            max_seconds=_remaining_deadline_seconds(deadline),
+                if step is FactorySkillStep.SEAL_CODEX_BUILD:
+                    if self._codex_build_sealer is None:
+                        raise FactoryDispatchError(
+                            "Captain Codex build sealer is not configured"
                         )
-                    paid_result = await self._materialize_paid_skill_prompt(
+                    if not artifacts or not isinstance(
+                        artifacts[-1], CodexBuildBriefV1
+                    ):
+                        raise FactoryDispatchError(
+                            "Codex build sealing requires the exact preceding brief"
+                        )
+                    artifact = await self._codex_build_sealer.seal(
                         request,
-                        invocation=invocation,
-                        prepared=replay_record,
+                        invocation,
+                        artifacts[-1],
                     )
-                    stdout = paid_result.stdout
-                    step_accounting_refs = paid_result.accounting_refs
                 else:
-                    paid_result = None
+                    discovery_seed = None
+                    codex_brief_seed = None
+                    improvement_seed = None
+                    if step is FactorySkillStep.DISCOVER:
+                        if self._settings.working_directory is None:
+                            raise FactoryDispatchError(
+                                "Captain discovery seed requires a working directory"
+                            )
+                        discovery_seed = _captain_discovery_seed(
+                            self._settings.working_directory,
+                            invocation,
+                        )
+                    elif step is FactorySkillStep.BRIEF_CODEX and isinstance(
+                        request.job, AgentFactoryJobV3
+                    ):
+                        if self._codex_prompt_artifact_store is None:
+                            raise FactoryDispatchError(
+                                "Captain Codex prompt artifact store is not configured"
+                            )
+                        discovery = await self._replay_store.completed(
+                            request.job,
+                            step=FactorySkillStep.DISCOVER,
+                            attempt=1,
+                        )
+                        if not isinstance(discovery.artifact, CodebaseInventoryV1):
+                            raise FactoryDispatchError(
+                                "completed discovery replay is not a codebase inventory"
+                            )
+                        codex_brief_seed = _captain_codex_brief_seed(
+                            request,
+                            invocation,
+                            discovery.artifact,
+                            artifact_store=self._codex_prompt_artifact_store,
+                            improvement_authorization=improvement,
+                        )
+                    elif step is FactorySkillStep.IMPROVE_TEAM:
+                        if improvement is None:
+                            raise FactoryDispatchError(
+                                "improve_team requires exact Captain repair evidence"
+                            )
+                        improvement_seed = _captain_improvement_seed(
+                            invocation,
+                            improvement,
+                        )
                     stdout = await self._run_skill_prompt(
-                        _factory_skill_prompt(invocation, skill_name=skill_name),
+                        _factory_skill_prompt(
+                            invocation,
+                            skill_name=skill_name,
+                            job=request.job,
+                            discovery_seed=discovery_seed,
+                            codex_brief_seed=codex_brief_seed,
+                            improvement_seed=improvement_seed,
+                            previous_artifact=artifacts[-1] if artifacts else None,
+                        ),
                         max_seconds=_remaining_deadline_seconds(deadline),
+                        skill_name=skill_name,
+                        effect_identity=_hermes_effect_identity(
+                            invocation,
+                            claim.record.claim_token,
+                        ),
+                        disable_tools=(
+                            discovery_seed is not None
+                            or codex_brief_seed is not None
+                            or improvement_seed is not None
+                            or step is FactorySkillStep.BRIEF_CODEX
+                        ),
                     )
-                    step_accounting_refs = ()
-                artifact = _parse_workflow_artifact(stdout, step=step)
+                    if discovery_seed is not None:
+                        _parse_discovery_attestation(
+                            stdout,
+                            invocation=invocation,
+                            discovery_seed=discovery_seed,
+                        )
+                        artifact = CodebaseInventoryV1.model_validate(discovery_seed)
+                    elif codex_brief_seed is not None:
+                        _parse_codex_brief_attestation(
+                            stdout,
+                            invocation=invocation,
+                            codex_brief_seed=codex_brief_seed,
+                        )
+                        artifact = codex_brief_seed
+                    elif improvement_seed is not None:
+                        attestation = _parse_improvement_attestation(
+                            stdout,
+                            invocation=invocation,
+                            improvement_seed=improvement_seed,
+                        )
+                        assert improvement is not None
+                        artifact = _captain_candidate_revision(
+                            invocation,
+                            authorization=improvement,
+                            attestation=attestation,
+                            occurred_at=self._clock(),
+                        )
+                    else:
+                        artifact = _parse_workflow_artifact(
+                            stdout,
+                            step=step,
+                            invocation=invocation,
+                        )
                 if artifact.invocation != invocation:
                     raise FactoryDispatchError(
                         f"Hermes {step.value} artifact does not match the Captain invocation"
@@ -343,20 +668,35 @@ class HermesCliFactory(HermesFactoryPort):
                     artifact.model_dump_json(by_alias=True).encode("utf-8"),
                 )
             except asyncio.CancelledError:
-                if replay_record.state == "pending":
-                    await asyncio.shield(
-                        self._replay_store.fail(
-                            replay_record,
-                            failure_kind="cancelled",
-                        )
+                await asyncio.shield(
+                    self._replay_store.fail(
+                        claim.record,
+                        failure_kind="cancelled",
                     )
+                )
+                raise
+            except FactoryCodexCleanupUnresolved:
+                # Cleanup status is provisional. Keep the write-once replay pending
+                # so a later exact process inspection can reconcile it without
+                # claiming a second external effect.
+                raise
+            except FactoryCodexBuildInterrupted as exc:
+                try:
+                    await self._replay_store.interrupt(
+                        claim.record,
+                        checkpoint_ref=exc.checkpoint_ref,
+                        terminal_receipt_ref=exc.terminal_receipt_ref,
+                        resume_ordinal=exc.resume_ordinal,
+                    )
+                except Exception as replay_exc:
+                    raise FactoryDispatchError(
+                        "factory skill interruption state could not be persisted"
+                    ) from replay_exc
                 raise
             except Exception as exc:
-                if replay_record.state != "pending":
-                    raise
                 try:
                     await self._replay_store.fail(
-                        replay_record,
+                        claim.record,
                         failure_kind=type(exc).__name__,
                     )
                 except Exception as replay_exc:
@@ -364,34 +704,16 @@ class HermesCliFactory(HermesFactoryPort):
                         "factory skill failure state could not be persisted"
                     ) from replay_exc
                 raise
-            if paid_result is not None:
-                replay_record = await self._replay_store.stage_result(
-                    replay_record,
-                    artifact=artifact,
-                    transcript_ref=transcript_ref,
-                    accounting_refs=step_accounting_refs,
-                    budget_reservation=paid_result.reservation,
-                    usage_receipt=paid_result.receipt,
-                )
             accepted = await self._replay_store.complete(
-                replay_record,
+                claim.record,
                 artifact=artifact,
                 transcript_ref=transcript_ref,
-                accounting_refs=step_accounting_refs,
-                budget_reservation=(
-                    None if paid_result is None else paid_result.reservation
-                ),
-                usage_receipt=(
-                    None if paid_result is None else paid_result.receipt
-                ),
             )
             assert accepted.artifact is not None
             assert accepted.transcript_ref is not None
-            self._record_completed_usage(request, accepted)
-            await self._persist_workflow_artifact(accepted.artifact)
             transcript_refs.append(accepted.transcript_ref)
-            accounting_refs.extend(accepted.accounting_refs)
             artifact = accepted.artifact
+            self._record_workflow_artifact(artifact)
             artifacts.append(artifact)
             input_ref = artifact.artifact_ref
             if not _may_continue_after(artifact):
@@ -400,145 +722,310 @@ class HermesCliFactory(HermesFactoryPort):
             request,
             artifacts=tuple(artifacts),
             transcript_refs=tuple(transcript_refs),
-            accounting_refs=tuple(accounting_refs),
         )
 
-    def _require_v3_paid_ports(self, request: FactoryDispatch) -> None:
-        if not isinstance(request.job, AgentFactoryJobV3):
-            return
-        if self._budget is None:
-            raise FactoryDispatchError("V3 Hermes dispatch requires a Captain budget port")
-        if self._workflow_artifact_sink is None:
-            raise FactoryDispatchError("V3 Hermes dispatch requires a workflow artifact sink")
-
-    async def _persist_workflow_artifact(
+    def _record_workflow_artifact(
         self,
-        artifact: "_FactoryWorkflowArtifact",
+        artifact: _FactoryWorkflowArtifact,
     ) -> None:
-        if self._workflow_artifact_sink is not None:
-            await self._workflow_artifact_sink.persist(artifact)
-
-    def _record_completed_usage(
-        self,
-        request: FactoryDispatch,
-        record: "FactorySkillReplayRecord",
-    ) -> None:
-        if not isinstance(request.job, AgentFactoryJobV3):
-            return
-        if self._budget is None:
-            raise FactoryDispatchError("V3 Hermes dispatch requires a Captain budget port")
-        if record.budget_reservation is None or record.usage_receipt is None:
-            raise FactoryDispatchError(
-                "completed paid Hermes replay is missing usage accounting"
-            )
-        self._budget.record_usage(
-            request.job,
-            record.budget_reservation,
-            record.usage_receipt,
-        )
-
-    async def _run_and_stage_paid_skill_prompt(
-        self,
-        request: FactoryDispatch,
-        *,
-        pending: "FactorySkillReplayRecord",
-        invocation: FactorySkillInvocationV1,
-        prompt: str,
-        max_seconds: float,
-    ) -> "FactorySkillReplayRecord":
-        assert isinstance(request.job, AgentFactoryJobV3)
-        assert request.lease is not None
-        assert self._budget is not None
-        started_at = self._clock()
-        requested_usd = _remaining_reservable_usd(self._budget, request.job)
-        reservation = self._budget.reserve(
-            request.job,
-            attempt=request.action.attempt,
-            requested_usd=requested_usd,
-            now=started_at,
-            invocation_id=invocation.invocation_id,
-        )
-        try:
-            with tempfile.TemporaryDirectory(prefix="captain-hermes-usage-") as temporary:
-                usage_path = Path(temporary) / f"{invocation.invocation_id}.json"
-                stdout = await self._run_skill_prompt(
-                    prompt,
-                    max_seconds=max_seconds,
-                    usage_file=usage_path,
-                )
-                usage_bytes = usage_path.read_bytes()
-                ended_at = self._clock()
-                return await self._replay_store.stage_paid_result(
-                    pending,
-                    stdout=stdout,
-                    usage=usage_bytes,
-                    budget_reservation=reservation,
-                    started_at=started_at,
-                    ended_at=ended_at,
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            raise FactoryDispatchError("provider_cost_unresolved") from exc
-
-    async def _materialize_paid_skill_prompt(
-        self,
-        request: FactoryDispatch,
-        *,
-        invocation: FactorySkillInvocationV1,
-        prepared: "FactorySkillReplayRecord",
-    ) -> _HermesPaidPromptResult:
-        assert isinstance(request.job, AgentFactoryJobV3)
-        assert request.lease is not None
-        if (
-            prepared.state != "paid_result_ready"
-            or prepared.paid_stdout is None
-            or prepared.paid_usage is None
-            or prepared.budget_reservation is None
-            or prepared.paid_started_at is None
-            or prepared.paid_ended_at is None
+        if self._workflow_artifacts is None or isinstance(
+            artifact,
+            CodexBuildEvidenceV1,
         ):
-            raise FactoryDispatchError("prepared paid Hermes replay is incomplete")
+            return
+        self._workflow_artifacts.record_workflow_artifact(artifact)
+
+    async def _reconcile_pending_codex_seal(
+        self,
+        request: FactoryDispatch,
+        invocation: FactorySkillInvocationV1,
+        brief: CodexBuildBriefV1,
+        pending: FactorySkillReplayRecord,
+    ) -> FactorySkillReplayRecord:
+        assert self._codex_build_sealer is not None
         try:
-            usage = _parse_paid_usage(prepared.paid_usage)
-            if usage.model not in request.job.execution_policy.allowed_models:
-                raise ValueError("Hermes used a model outside Captain policy")
-            if (
-                prepared.paid_ended_at < prepared.paid_started_at
-                or prepared.paid_ended_at >= request.lease.expires_at
-                or prepared.paid_ended_at > prepared.budget_reservation.expires_at
-            ):
-                raise ValueError("paid usage is outside the active lease")
-            canonical_usage = _canonical_json(
-                usage.model_dump(mode="json")
-            ).encode("utf-8")
-            usage_ref = await self._evidence_store.persist(
-                request.job,
-                canonical_usage,
-            )
-            receipt = _factory_usage_receipt(
+            artifact = await self._codex_build_sealer.reconcile_pending(
                 request,
-                invocation=invocation,
-                reservation=prepared.budget_reservation,
-                usage=usage,
-                started_at=prepared.paid_started_at,
-                ended_at=prepared.paid_ended_at,
-                evidence_ref=usage_ref,
+                invocation,
+                brief,
             )
-            receipt_ref = await self._evidence_store.persist(
+            if artifact.invocation != invocation:
+                raise FactoryDispatchError(
+                    "reconciled Codex build evidence does not match invocation"
+                )
+            transcript_ref = await self._evidence_store.persist(
                 request.job,
-                receipt.model_dump_json(by_alias=True).encode("utf-8"),
+                artifact.model_dump_json(by_alias=True).encode("utf-8"),
             )
-            return _HermesPaidPromptResult(
-                stdout=prepared.paid_stdout,
-                accounting_refs=(usage_ref, receipt_ref),
-                reservation=prepared.budget_reservation,
-                receipt=receipt,
-            )
-        except asyncio.CancelledError:
+        except FactoryCodexBuildFailed as exc:
+            try:
+                await self._replay_store.fail(
+                    pending,
+                    failure_kind=type(exc).__name__,
+                )
+            except Exception as replay_exc:
+                raise FactoryDispatchError(
+                    "factory skill failure reconciliation could not be persisted"
+                ) from replay_exc
             raise
-        except Exception as exc:
-            raise FactoryDispatchError("provider_cost_unresolved") from exc
+        except FactoryCodexBuildInterrupted as exc:
+            try:
+                if exc.resume_ordinal == pending.resume_ordinal:
+                    await self._replay_store.interrupt(
+                        pending,
+                        checkpoint_ref=exc.checkpoint_ref,
+                        terminal_receipt_ref=exc.terminal_receipt_ref,
+                        resume_ordinal=exc.resume_ordinal,
+                    )
+                elif exc.resume_ordinal == pending.resume_ordinal - 1:
+                    await self._replay_store.reconcile_interrupted(
+                        pending,
+                        checkpoint_ref=exc.checkpoint_ref,
+                        terminal_receipt_ref=exc.terminal_receipt_ref,
+                        resume_ordinal=exc.resume_ordinal,
+                    )
+                else:
+                    raise FactoryDispatchError(
+                        "factory skill replay reconciliation ordinal conflicts"
+                    )
+            except Exception as replay_exc:
+                raise FactoryDispatchError(
+                    "factory skill replay reconciliation could not be persisted"
+                ) from replay_exc
+            raise
+        return await self._replay_store.complete(
+            pending,
+            artifact=artifact,
+            transcript_ref=transcript_ref,
+        )
+
+    async def _require_runtime_recovery_replays(
+        self,
+        request: FactoryDispatch,
+        *,
+        steps: tuple[FactorySkillStep, ...],
+    ) -> None:
+        """Prove recovery can execute only the already-interrupted seal step."""
+
+        authorization = request.runtime_retry_authorization
+        if authorization is None:
+            raise FactoryDispatchError(
+                "Factory runtime recovery requires Captain retry authority"
+            )
+        discovery = await self._replay_store.completed(
+            request.job,
+            step=FactorySkillStep.DISCOVER,
+            attempt=1,
+        )
+        if not isinstance(discovery.artifact, CodebaseInventoryV1):
+            raise FactoryDispatchError(
+                "completed discovery replay is not a codebase inventory"
+            )
+        brief: CodexBuildBriefV1 | None = None
+        for step in steps:
+            if step is FactorySkillStep.SEAL_CODEX_BUILD:
+                break
+            replay = await self._replay_store.completed(
+                request.job,
+                step=step,
+                attempt=request.action.attempt,
+            )
+            if step is FactorySkillStep.BRIEF_CODEX:
+                if not isinstance(replay.artifact, CodexBuildBriefV1):
+                    raise FactoryDispatchError(
+                        "completed brief replay is not a Codex build brief"
+                    )
+                brief = replay.artifact
+        if brief is None or brief.invocation.lease != request.lease:
+            raise FactoryDispatchError(
+                "completed brief replay does not bind the original Factory lease"
+            )
+        expected_key = _factory_step_idempotency_key(
+            request.job,
+            step=FactorySkillStep.SEAL_CODEX_BUILD,
+            attempt=request.action.attempt,
+        )
+        expected_invocation_id = uuid5(
+            NAMESPACE_URL,
+            f"captain.factory-skill:{expected_key}",
+        )
+        if (
+            authorization.idempotency_key != expected_key
+            or authorization.invocation_id != expected_invocation_id
+        ):
+            raise FactoryDispatchError(
+                "Factory runtime recovery does not bind the original seal invocation"
+            )
+
+    async def _require_completed_runtime_recovery_replay(
+        self,
+        request: FactoryDispatch,
+        *,
+        steps: tuple[FactorySkillStep, ...],
+    ) -> None:
+        """Allow expired authority only when every external effect is completed."""
+
+        if FactorySkillStep.SEAL_CODEX_BUILD not in steps:
+            raise FactoryDispatchError(
+                "historical Factory recovery requires the Codex seal step"
+            )
+        authorization = request.runtime_retry_authorization
+        if authorization is None:
+            raise FactoryDispatchError(
+                "historical Factory recovery requires Captain retry authority"
+            )
+        replay = await self._replay_store.completed(
+            request.job,
+            step=FactorySkillStep.SEAL_CODEX_BUILD,
+            attempt=request.action.attempt,
+        )
+        artifact = replay.artifact
+        if (
+            not isinstance(artifact, CodexBuildEvidenceV1)
+            or artifact.invocation.lease != request.lease
+            or replay.runtime_retry_authorization_ref
+            != authorization.authorization_ref
+        ):
+            raise FactoryDispatchError(
+                "completed Codex recovery replay does not match Captain authority"
+            )
+
+    async def _reconcile_expired_pending_codex_failure(
+        self,
+        request: FactoryDispatch,
+        *,
+        steps: tuple[FactorySkillStep, ...],
+        improvement: FactoryImprovementAuthorizationV1 | None,
+    ) -> None:
+        """Terminalize exact durable failure evidence without execution authority."""
+
+        if self._codex_build_sealer is None:
+            raise FactoryDispatchError("Captain Codex build sealer is not configured")
+        assert self._released_skill_catalog is not None
+        if request.runtime_retry_authorization is not None:
+            raise FactoryDispatchError(
+                "original Factory failure reconciliation forbids retry authority"
+            )
+        input_ref = await self._initial_workflow_input_ref(
+            request,
+            steps=steps,
+            improvement=improvement,
+        )
+        brief: CodexBuildBriefV1 | None = None
+        for step in steps:
+            released_skill = self._released_skill_catalog.released_for(
+                request.job,
+                step,
+            )
+            expected_invocation = _factory_invocation(
+                request,
+                step=step,
+                released_skill=released_skill,
+                input_ref=input_ref,
+            )
+            if step is FactorySkillStep.SEAL_CODEX_BUILD:
+                if brief is None:
+                    raise FactoryDispatchError(
+                        "expired Factory failure reconciliation requires its brief"
+                    )
+                pending = await self._replay_store.pending(
+                    request.job,
+                    step=step,
+                    attempt=request.action.attempt,
+                )
+                if pending.invocation != expected_invocation:
+                    raise FactoryDispatchError(
+                        "expired Factory failure replay binding conflicts"
+                    )
+                persisted_retry_ref = pending.runtime_retry_authorization_ref
+                persisted_retry_digest = (
+                    pending.runtime_retry_authorization_binding_sha256
+                )
+                if pending.resume_ordinal == 0:
+                    if (
+                        persisted_retry_ref is not None
+                        or persisted_retry_digest is not None
+                    ):
+                        raise FactoryDispatchError(
+                            "original Factory failure replay binds retry authority"
+                        )
+                elif (
+                    persisted_retry_ref is None
+                    or persisted_retry_digest is None
+                ):
+                    raise FactoryDispatchError(
+                        "resumed Factory failure replay lacks retry authority lineage"
+                    )
+                try:
+                    failure = self._codex_build_sealer.reconcile_failed(
+                        request,
+                        expected_invocation,
+                        brief,
+                        persisted_resume_ordinal=pending.resume_ordinal,
+                        persisted_retry_authorization_ref=persisted_retry_ref,
+                        persisted_retry_authorization_binding_sha256=(
+                            persisted_retry_digest
+                        ),
+                    )
+                except FactoryCodexCleanupUnresolved:
+                    await self._reconcile_pending_codex_seal(
+                        request,
+                        expected_invocation,
+                        brief,
+                        pending,
+                    )
+                    return
+                await self._replay_store.fail(
+                    pending,
+                    failure_kind=type(failure).__name__,
+                )
+                raise failure
+            replay = await self._replay_store.completed(
+                request.job,
+                step=step,
+                attempt=request.action.attempt,
+            )
+            if replay.invocation != expected_invocation or replay.artifact is None:
+                raise FactoryDispatchError(
+                    "expired Factory predecessor replay binding conflicts"
+                )
+            if step is FactorySkillStep.BRIEF_CODEX:
+                if not isinstance(replay.artifact, CodexBuildBriefV1):
+                    raise FactoryDispatchError(
+                        "completed brief replay is not a Codex build brief"
+                    )
+                brief = replay.artifact
+            input_ref = replay.artifact.artifact_ref
+        raise FactoryDispatchError(
+            "expired Factory failure reconciliation has no seal step"
+        )
+
+    async def _initial_workflow_input_ref(
+        self,
+        request: FactoryDispatch,
+        *,
+        steps: tuple[FactorySkillStep, ...],
+        improvement: FactoryImprovementAuthorizationV1 | None,
+    ) -> ArtifactRef:
+        if improvement is not None:
+            return improvement.authorization_ref
+        if (
+            isinstance(request.job, AgentFactoryJobV3)
+            and request.action.attempt == 1
+            and steps
+            and steps[0] is FactorySkillStep.BRIEF_CODEX
+        ):
+            discovery = await self._replay_store.completed(
+                request.job,
+                step=FactorySkillStep.DISCOVER,
+                attempt=1,
+            )
+            if not isinstance(discovery.artifact, CodebaseInventoryV1):
+                raise FactoryDispatchError(
+                    "completed discovery replay is not a codebase inventory"
+                )
+            return discovery.artifact.artifact_ref
+        return request.job.input_ref
 
     def validate_dispatch_configuration(self, request: FactoryDispatch) -> None:
         """Fail before external setup when a released sequence cannot be resolved."""
@@ -550,13 +1037,32 @@ class HermesCliFactory(HermesFactoryPort):
         if self._released_skill_catalog is None:
             raise FactoryDispatchError("released factory skill catalog is not configured")
         now = self._clock()
-        _validate_factory_dispatch(request, now=now)
+        _validate_factory_dispatch_bindings(request, now=now)
         _validated_improvement_authorization(request)
-        self._require_v3_paid_ports(request)
-        for step in self._sequence_policy.steps_for(
+        steps = self._sequence_policy.steps_for(
             role=request.role,
             attempt=request.action.attempt,
+            require_codex_seal=isinstance(request.job, AgentFactoryJobV3),
+        )
+        expired_failure_preflight = (
+            now >= request.lease.expires_at
+            and request.runtime_retry_authorization is None
+            and isinstance(request.job, AgentFactoryJobV3)
+            and request.role is FactoryRole.TOOL_INTEGRATOR
+            and self._codex_build_sealer is not None
+            and FactorySkillStep.SEAL_CODEX_BUILD in steps
+        )
+        if expired_failure_preflight:
+            return
+        _validate_factory_dispatch(request, now=now)
+        if (
+            isinstance(request.job, AgentFactoryJobV3)
+            and
+            request.role is FactoryRole.TOOL_INTEGRATOR
+            and self._codex_build_sealer is None
         ):
+            raise FactoryDispatchError("Captain Codex build sealer is not configured")
+        for step in steps:
             released_skill = self._released_skill_catalog.released_for(
                 request.job,
                 step,
@@ -649,25 +1155,70 @@ class HermesCliFactory(HermesFactoryPort):
         prompt: str,
         *,
         max_seconds: float,
-        usage_file: Path | None = None,
+        skill_name: str | None = None,
+        disable_tools: bool = False,
+        effect_identity: str | None = None,
     ) -> bytes:
         deadline = _deadline(min(float(self._settings.timeout_seconds), max_seconds))
-        command = [self._settings.executable]
-        if self._settings.model:
-            command.extend(("--model", self._settings.model))
-        if self._settings.provider:
-            command.extend(("--provider", self._settings.provider))
-        if usage_file is not None:
-            command.extend(("--usage-file", str(usage_file)))
-        command.extend(("-z", prompt))
+        maximum_cost = self._settings.maximum_total_cost_usd
+        if maximum_cost is not None and self._observed_cost_usd >= maximum_cost:
+            raise FactoryDispatchError("Hermes cost ceiling is already exhausted")
+        command_prefix = [self._settings.executable]
+        process_options: dict[str, object] = _async_process_group_options()
+        environment = os.environ.copy()
+        if self._settings.module_root is not None:
+            module_root = _resolve_hermes_module_root(self._settings.module_root)
+            environment["PYTHONPATH"] = str(module_root)
+            command_prefix.extend(("-m", "hermes_cli.main"))
+        environment["HERMES_MAX_ITERATIONS"] = str(
+            self._settings.maximum_iterations
+        )
+        environment["HERMES_MAX_TOKENS"] = str(
+            self._settings.maximum_output_tokens
+        )
+        if self._settings.reasoning_effort is not None:
+            environment["HERMES_REASONING_EFFORT"] = (
+                self._settings.reasoning_effort
+            )
+        process_options["env"] = environment
+        working_directory = self._settings.working_directory
+        if working_directory is not None:
+            resolved_working_directory = working_directory.resolve()
+            if not resolved_working_directory.is_dir():
+                raise FactoryDispatchError(
+                    "Hermes working directory is unavailable"
+                )
+            process_options["cwd"] = str(resolved_working_directory)
+        elif self._settings.module_root is not None:
+            process_options["cwd"] = str(module_root)
+        if self._settings.provider is not None:
+            assert self._settings.model is not None
+            command_prefix.extend(
+                ("--provider", self._settings.provider, "-m", self._settings.model)
+            )
+        usage_directory: tempfile.TemporaryDirectory[str] | None = None
+        usage_path: Path | None = None
+        if maximum_cost is not None:
+            usage_directory = tempfile.TemporaryDirectory(
+                prefix="captain-hermes-usage-"
+            )
+            usage_path = Path(usage_directory.name) / "usage.json"
+            command_prefix.extend(("--usage-file", str(usage_path)))
+        if skill_name is not None:
+            command_prefix.extend(("--skills", skill_name, "--ignore-rules"))
+        if disable_tools:
+            command_prefix.append("--no-tools")
+        command = (*command_prefix, "-z", prompt)
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                **_async_process_group_options(),
+                **process_options,
             )
         except FileNotFoundError as exc:
+            if usage_directory is not None:
+                usage_directory.cleanup()
             raise FactoryDispatchError("Hermes CLI executable is not available") from exc
         try:
             stdout, stderr = await asyncio.wait_for(
@@ -679,6 +1230,8 @@ class HermesCliFactory(HermesFactoryPort):
                 process,
                 executable=self._settings.executable,
             )
+            if usage_directory is not None:
+                usage_directory.cleanup()
             raise FactoryDispatchError("Hermes skill evaluation timed out") from exc
         except asyncio.CancelledError:
             await asyncio.shield(
@@ -687,17 +1240,75 @@ class HermesCliFactory(HermesFactoryPort):
                     executable=self._settings.executable,
                 )
             )
+            if usage_directory is not None:
+                usage_directory.cleanup()
             raise
         _remaining_deadline_seconds(deadline)
+        usage: HermesUsageSnapshot | None = None
+        usage_content: bytes | None = None
+        usage_error: FactoryDispatchError | None = None
+        cost_ceiling_exceeded = False
+        try:
+            if usage_path is not None:
+                try:
+                    usage_content = usage_path.read_bytes()
+                    usage, cost_ceiling_exceeded = self._account_usage(
+                        usage_content
+                    )
+                except (OSError, FactoryDispatchError) as exc:
+                    if isinstance(exc, OSError):
+                        exc = FactoryDispatchError(
+                            "Hermes usage evidence is missing or invalid"
+                        )
+                    usage_error = exc
+            if effect_identity is not None:
+                self._provider_effect_store.persist(
+                    effect_identity=effect_identity,
+                    stdout=stdout,
+                    stderr=stderr,
+                    usage_content=usage_content,
+                    usage=usage,
+                    return_code=process.returncode,
+                    cost_ceiling_exceeded=cost_ceiling_exceeded,
+                )
+            if usage_error is not None:
+                raise usage_error
+            if cost_ceiling_exceeded:
+                raise FactoryDispatchError("Hermes cost ceiling was exceeded")
+        finally:
+            if usage_directory is not None:
+                usage_directory.cleanup()
         if process.returncode != 0:
             detail = stderr.decode("utf-8", errors="replace").strip()
             raise FactoryDispatchError(f"Hermes skill evaluation failed: {detail[:500]}")
         return stdout
 
+    def _account_usage(
+        self,
+        content: bytes,
+    ) -> tuple[HermesUsageSnapshot, bool]:
+        try:
+            assert self._settings.provider is not None
+            assert self._settings.model is not None
+            usage = parse_hermes_usage(
+                content,
+                provider=self._settings.provider,
+                model=self._settings.model,
+            )
+        except ValueError as exc:
+            raise FactoryDispatchError(
+                "Hermes usage evidence is missing or invalid"
+            ) from exc
+        self._observed_cost_usd += usage.estimated_cost_usd
+        maximum = self._settings.maximum_total_cost_usd
+        assert maximum is not None
+        return usage, self._observed_cost_usd > maximum
+
 
 _FactoryWorkflowArtifact = (
     CodebaseInventoryV1
     | CodexBuildBriefV1
+    | CodexBuildEvidenceV1
     | TeamExecutionEvidenceV1
     | TeamEvaluationV1
     | CandidateRevisionV1
@@ -713,108 +1324,156 @@ class FactorySkillReplayPendingError(FactoryDispatchError):
         self.record = record
 
 
+class FactorySkillReplayInterruptedError(FactoryDispatchError):
+    """An exact Codex seal is durable and awaits Captain retry authority."""
+
+    def __init__(self, record: "FactorySkillReplayRecord") -> None:
+        super().__init__(
+            "factory skill replay is interrupted and requires authorization"
+        )
+        self.record = record
+
+
+class FactorySkillReplayRetryableFailureError(FactoryDispatchError):
+    """A pre-launch resume policy failure may reuse the same Captain authority."""
+
+    def __init__(self, record: "FactorySkillReplayRecord") -> None:
+        super().__init__(
+            "factory skill replay failed before launch and requires recovery"
+        )
+        self.record = record
+
+
+class FactorySkillReplayHermesRetryableFailureError(FactoryDispatchError):
+    """An improve-team provider failure awaits exact Captain recovery authority."""
+
+    def __init__(
+        self,
+        record: "FactorySkillReplayRecord",
+        requested_invocation: FactorySkillInvocationV1,
+    ) -> None:
+        super().__init__(
+            "failed Hermes replay requires exact Captain recovery authority"
+        )
+        self.record = record
+        self.requested_invocation = requested_invocation
+
+
 @dataclass(frozen=True)
 class FactorySkillReplayRecord:
     invocation: FactorySkillInvocationV1
     invocation_sha256: str
     claim_token: str
-    state: Literal["pending", "paid_result_ready", "result_ready", "completed", "failed"]
+    state: Literal["pending", "completed", "failed", "interrupted"]
     artifact: _FactoryWorkflowArtifact | None = None
     transcript_ref: ArtifactRef | None = None
-    accounting_refs: tuple[ArtifactRef, ...] = ()
-    budget_reservation: FactoryBudgetReservationV1 | None = None
-    usage_receipt: FactoryUsageReceiptV1 | None = None
-    paid_stdout: bytes | None = None
-    paid_usage: bytes | None = None
-    paid_started_at: datetime | None = None
-    paid_ended_at: datetime | None = None
     failure_kind: str | None = None
+    checkpoint_ref: ArtifactRef | None = None
+    terminal_receipt_ref: ArtifactRef | None = None
+    resume_ordinal: int = 0
+    runtime_retry_authorization_ref: ArtifactRef | None = None
+    runtime_retry_authorization_binding_sha256: str | None = None
+    hermes_retry_authorization_ref: ArtifactRef | None = None
+    hermes_retry_authorization_binding_sha256: str | None = None
+    prior_failure_ref: ArtifactRef | None = None
 
     def __post_init__(self) -> None:
         if self.invocation_sha256 != _factory_invocation_digest(self.invocation):
             raise FactoryDispatchError("factory skill replay invocation digest conflicts")
         if not self.claim_token:
             raise FactoryDispatchError("factory skill replay claim token is missing")
+        if isinstance(self.resume_ordinal, bool) or not 0 <= self.resume_ordinal <= 3:
+            raise FactoryDispatchError("factory skill replay resume ordinal is invalid")
+        retry_binding = (
+            self.runtime_retry_authorization_ref,
+            self.runtime_retry_authorization_binding_sha256,
+        )
+        if any(value is None for value in retry_binding) != all(
+            value is None for value in retry_binding
+        ):
+            raise FactoryDispatchError(
+                "factory skill replay retry authority binding is incomplete"
+            )
+        if self.resume_ordinal == 0 and any(
+            value is not None for value in retry_binding
+        ):
+            raise FactoryDispatchError(
+                "original factory skill replay cannot bind retry authority"
+            )
+        if (
+            self.runtime_retry_authorization_binding_sha256 is not None
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                self.runtime_retry_authorization_binding_sha256,
+            )
+            is None
+        ):
+            raise FactoryDispatchError(
+                "factory skill replay retry authority digest is invalid"
+            )
+        hermes_retry_binding = (
+            self.hermes_retry_authorization_ref,
+            self.hermes_retry_authorization_binding_sha256,
+            self.prior_failure_ref,
+        )
+        if any(value is None for value in hermes_retry_binding) != all(
+            value is None for value in hermes_retry_binding
+        ):
+            raise FactoryDispatchError(
+                "factory skill replay Hermes retry binding is incomplete"
+            )
+        if self.resume_ordinal == 0 and any(
+            value is not None for value in hermes_retry_binding
+        ):
+            raise FactoryDispatchError(
+                "original factory skill replay cannot bind Hermes retry authority"
+            )
+        if (
+            self.hermes_retry_authorization_binding_sha256 is not None
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                self.hermes_retry_authorization_binding_sha256,
+            )
+            is None
+        ):
+            raise FactoryDispatchError(
+                "factory skill replay Hermes retry authority digest is invalid"
+            )
         if self.state == "pending" and any(
             item is not None
             for item in (
                 self.artifact,
                 self.transcript_ref,
-                self.budget_reservation,
-                self.usage_receipt,
                 self.failure_kind,
-                self.paid_stdout,
-                self.paid_usage,
-                self.paid_started_at,
-                self.paid_ended_at,
+                self.checkpoint_ref,
+                self.terminal_receipt_ref,
             )
-        ) or self.state == "pending" and self.accounting_refs:
+        ):
             raise FactoryDispatchError("pending factory skill replay contains an outcome")
         if self.state == "completed" and (
             self.artifact is None
             or self.transcript_ref is None
             or self.failure_kind is not None
-            or (self.budget_reservation is None) != (self.usage_receipt is None)
-            or any(
-                item is not None
-                for item in (
-                    self.paid_stdout,
-                    self.paid_usage,
-                    self.paid_started_at,
-                    self.paid_ended_at,
-                )
-            )
+            or self.checkpoint_ref is not None
+            or self.terminal_receipt_ref is not None
         ):
             raise FactoryDispatchError("completed factory skill replay is incomplete")
-        if self.state == "result_ready" and (
-            self.artifact is None
-            or self.transcript_ref is None
-            or not self.accounting_refs
-            or self.budget_reservation is None
-            or self.usage_receipt is None
-            or self.failure_kind is not None
-            or any(
-                item is not None
-                for item in (
-                    self.paid_stdout,
-                    self.paid_usage,
-                    self.paid_started_at,
-                    self.paid_ended_at,
-                )
-            )
-        ):
-            raise FactoryDispatchError("prepared paid factory replay is incomplete")
-        if self.state == "paid_result_ready" and (
-            self.artifact is not None
-            or self.transcript_ref is not None
-            or self.accounting_refs
-            or self.budget_reservation is None
-            or self.usage_receipt is not None
-            or self.paid_stdout is None
-            or self.paid_usage is None
-            or self.paid_started_at is None
-            or self.paid_ended_at is None
-            or self.failure_kind is not None
-        ):
-            raise FactoryDispatchError("raw paid factory replay is incomplete")
         if self.state == "failed" and (
             self.artifact is not None
             or self.transcript_ref is not None
-            or self.accounting_refs
-            or self.budget_reservation is not None
-            or self.usage_receipt is not None
             or self.failure_kind is None
-            or any(
-                item is not None
-                for item in (
-                    self.paid_stdout,
-                    self.paid_usage,
-                    self.paid_started_at,
-                    self.paid_ended_at,
-                )
-            )
+            or self.checkpoint_ref is not None
+            or self.terminal_receipt_ref is not None
         ):
             raise FactoryDispatchError("failed factory skill replay is incomplete")
+        if self.state == "interrupted" and (
+            self.artifact is not None
+            or self.transcript_ref is not None
+            or self.failure_kind != "codex_runtime_interrupted"
+            or self.checkpoint_ref is None
+            or self.terminal_receipt_ref is None
+        ):
+            raise FactoryDispatchError("interrupted factory skill replay is incomplete")
         if self.artifact is not None and self.artifact.invocation != self.invocation:
             raise FactoryDispatchError(
                 "factory skill replay artifact conflicts with its invocation"
@@ -828,32 +1487,26 @@ class FactorySkillReplayClaim:
 
 
 class FactorySkillReplayStore(Protocol):
+    async def completed(
+        self,
+        job: FactoryJob,
+        *,
+        step: FactorySkillStep,
+        attempt: int,
+    ) -> FactorySkillReplayRecord: ...
+
+    async def pending(
+        self,
+        job: FactoryJob,
+        *,
+        step: FactorySkillStep,
+        attempt: int,
+    ) -> FactorySkillReplayRecord: ...
+
     async def claim(
         self,
         invocation: FactorySkillInvocationV1,
     ) -> FactorySkillReplayClaim: ...
-
-    async def stage_paid_result(
-        self,
-        pending: FactorySkillReplayRecord,
-        *,
-        stdout: bytes,
-        usage: bytes,
-        budget_reservation: FactoryBudgetReservationV1,
-        started_at: datetime,
-        ended_at: datetime,
-    ) -> FactorySkillReplayRecord: ...
-
-    async def stage_result(
-        self,
-        pending: FactorySkillReplayRecord,
-        *,
-        artifact: _FactoryWorkflowArtifact,
-        transcript_ref: ArtifactRef,
-        accounting_refs: tuple[ArtifactRef, ...],
-        budget_reservation: FactoryBudgetReservationV1,
-        usage_receipt: FactoryUsageReceiptV1,
-    ) -> FactorySkillReplayRecord: ...
 
     async def complete(
         self,
@@ -861,9 +1514,6 @@ class FactorySkillReplayStore(Protocol):
         *,
         artifact: _FactoryWorkflowArtifact,
         transcript_ref: ArtifactRef,
-        accounting_refs: tuple[ArtifactRef, ...] = (),
-        budget_reservation: FactoryBudgetReservationV1 | None = None,
-        usage_receipt: FactoryUsageReceiptV1 | None = None,
     ) -> FactorySkillReplayRecord: ...
 
     async def fail(
@@ -872,6 +1522,46 @@ class FactorySkillReplayStore(Protocol):
         *,
         failure_kind: str,
     ) -> FactorySkillReplayRecord: ...
+
+    async def interrupt(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        checkpoint_ref: ArtifactRef,
+        terminal_receipt_ref: ArtifactRef,
+        resume_ordinal: int,
+    ) -> FactorySkillReplayRecord: ...
+
+    async def reconcile_interrupted(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        checkpoint_ref: ArtifactRef,
+        terminal_receipt_ref: ArtifactRef,
+        resume_ordinal: int,
+    ) -> FactorySkillReplayRecord: ...
+
+    async def resume(
+        self,
+        interrupted: FactorySkillReplayRecord,
+        *,
+        authorization: FactoryRuntimeRetryAuthorizationV1,
+    ) -> FactorySkillReplayClaim: ...
+
+    async def retry_failed(
+        self,
+        failed: FactorySkillReplayRecord,
+        *,
+        authorization: FactoryRuntimeRetryAuthorizationV1,
+    ) -> FactorySkillReplayClaim: ...
+
+    async def retry_failed_hermes(
+        self,
+        failed: FactorySkillReplayRecord,
+        *,
+        requested_invocation: FactorySkillInvocationV1,
+        authorization: FactoryHermesReplayRetryAuthorizationV1,
+    ) -> FactorySkillReplayClaim: ...
 
     async def abandon(self, pending: FactorySkillReplayRecord) -> None: ...
 
@@ -882,6 +1572,40 @@ class InMemoryFactorySkillReplayStore:
     def __init__(self) -> None:
         self._records: dict[str, FactorySkillReplayRecord] = {}
         self._lock = asyncio.Lock()
+
+    async def completed(
+        self,
+        job: FactoryJob,
+        *,
+        step: FactorySkillStep,
+        attempt: int,
+    ) -> FactorySkillReplayRecord:
+        key = _factory_step_idempotency_key(job, step=step, attempt=attempt)
+        async with self._lock:
+            record = self._records.get(key)
+        return _require_completed_prior_replay(
+            record,
+            job=job,
+            step=step,
+            attempt=attempt,
+        )
+
+    async def pending(
+        self,
+        job: FactoryJob,
+        *,
+        step: FactorySkillStep,
+        attempt: int,
+    ) -> FactorySkillReplayRecord:
+        key = _factory_step_idempotency_key(job, step=step, attempt=attempt)
+        async with self._lock:
+            record = self._records.get(key)
+        return _require_pending_prior_replay(
+            record,
+            job=job,
+            step=step,
+            attempt=attempt,
+        )
 
     async def claim(
         self,
@@ -895,65 +1619,17 @@ class InMemoryFactorySkillReplayStore:
             self._records[invocation.idempotency_key] = pending
             return FactorySkillReplayClaim(record=pending, acquired=True)
 
-    async def stage_result(
-        self,
-        pending: FactorySkillReplayRecord,
-        *,
-        artifact: _FactoryWorkflowArtifact,
-        transcript_ref: ArtifactRef,
-        accounting_refs: tuple[ArtifactRef, ...],
-        budget_reservation: FactoryBudgetReservationV1,
-        usage_receipt: FactoryUsageReceiptV1,
-    ) -> FactorySkillReplayRecord:
-        prepared = _prepared_replay_record(
-            pending,
-            artifact=artifact,
-            transcript_ref=transcript_ref,
-            accounting_refs=accounting_refs,
-            budget_reservation=budget_reservation,
-            usage_receipt=usage_receipt,
-        )
-        return await self._transition(pending, prepared)
-
-    async def stage_paid_result(
-        self,
-        pending: FactorySkillReplayRecord,
-        *,
-        stdout: bytes,
-        usage: bytes,
-        budget_reservation: FactoryBudgetReservationV1,
-        started_at: datetime,
-        ended_at: datetime,
-    ) -> FactorySkillReplayRecord:
-        return await self._transition(
-            pending,
-            _prepared_paid_replay_record(
-                pending,
-                stdout=stdout,
-                usage=usage,
-                budget_reservation=budget_reservation,
-                started_at=started_at,
-                ended_at=ended_at,
-            ),
-        )
-
     async def complete(
         self,
         pending: FactorySkillReplayRecord,
         *,
         artifact: _FactoryWorkflowArtifact,
         transcript_ref: ArtifactRef,
-        accounting_refs: tuple[ArtifactRef, ...] = (),
-        budget_reservation: FactoryBudgetReservationV1 | None = None,
-        usage_receipt: FactoryUsageReceiptV1 | None = None,
     ) -> FactorySkillReplayRecord:
         completed = _completed_replay_record(
             pending,
             artifact=artifact,
             transcript_ref=transcript_ref,
-            accounting_refs=accounting_refs,
-            budget_reservation=budget_reservation,
-            usage_receipt=usage_receipt,
         )
         return await self._transition(pending, completed)
 
@@ -967,6 +1643,92 @@ class InMemoryFactorySkillReplayStore:
             pending,
             _failed_replay_record(pending, failure_kind=failure_kind),
         )
+
+    async def interrupt(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        checkpoint_ref: ArtifactRef,
+        terminal_receipt_ref: ArtifactRef,
+        resume_ordinal: int,
+    ) -> FactorySkillReplayRecord:
+        return await self._transition(
+            pending,
+            _interrupted_replay_record(
+                pending,
+                checkpoint_ref=checkpoint_ref,
+                terminal_receipt_ref=terminal_receipt_ref,
+                resume_ordinal=resume_ordinal,
+            ),
+        )
+
+    async def reconcile_interrupted(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        checkpoint_ref: ArtifactRef,
+        terminal_receipt_ref: ArtifactRef,
+        resume_ordinal: int,
+    ) -> FactorySkillReplayRecord:
+        return await self._transition(
+            pending,
+            _reconciled_interrupted_replay_record(
+                pending,
+                checkpoint_ref=checkpoint_ref,
+                terminal_receipt_ref=terminal_receipt_ref,
+                resume_ordinal=resume_ordinal,
+            ),
+        )
+
+    async def resume(
+        self,
+        interrupted: FactorySkillReplayRecord,
+        *,
+        authorization: FactoryRuntimeRetryAuthorizationV1,
+    ) -> FactorySkillReplayClaim:
+        resumed = _resumed_replay_record(interrupted, authorization=authorization)
+        async with self._lock:
+            existing = self._records.get(interrupted.invocation.idempotency_key)
+            if existing != interrupted or existing.state != "interrupted":
+                raise FactoryDispatchError("factory skill replay is no longer interrupted")
+            self._records[interrupted.invocation.idempotency_key] = resumed
+        return FactorySkillReplayClaim(record=resumed, acquired=True)
+
+    async def retry_failed(
+        self,
+        failed: FactorySkillReplayRecord,
+        *,
+        authorization: FactoryRuntimeRetryAuthorizationV1,
+    ) -> FactorySkillReplayClaim:
+        resumed = _retried_failed_replay_record(
+            failed,
+            authorization=authorization,
+        )
+        async with self._lock:
+            existing = self._records.get(failed.invocation.idempotency_key)
+            if existing != failed or existing.state != "failed":
+                raise FactoryDispatchError("factory skill replay failure changed")
+            self._records[failed.invocation.idempotency_key] = resumed
+        return FactorySkillReplayClaim(record=resumed, acquired=True)
+
+    async def retry_failed_hermes(
+        self,
+        failed: FactorySkillReplayRecord,
+        *,
+        requested_invocation: FactorySkillInvocationV1,
+        authorization: FactoryHermesReplayRetryAuthorizationV1,
+    ) -> FactorySkillReplayClaim:
+        resumed = _retried_failed_hermes_replay_record(
+            failed,
+            requested_invocation=requested_invocation,
+            authorization=authorization,
+        )
+        async with self._lock:
+            existing = self._records.get(failed.invocation.idempotency_key)
+            if existing != failed or existing.state != "failed":
+                raise FactoryDispatchError("factory skill replay failure changed")
+            self._records[failed.invocation.idempotency_key] = resumed
+        return FactorySkillReplayClaim(record=resumed, acquired=True)
 
     async def abandon(self, pending: FactorySkillReplayRecord) -> None:
         async with self._lock:
@@ -982,11 +1744,7 @@ class InMemoryFactorySkillReplayStore:
     ) -> FactorySkillReplayRecord:
         async with self._lock:
             existing = self._records.get(pending.invocation.idempotency_key)
-            if existing != pending or existing.state not in {
-                "pending",
-                "paid_result_ready",
-                "result_ready",
-            }:
+            if existing != pending or existing.state != "pending":
                 raise FactoryDispatchError("factory skill replay claim is no longer pending")
             self._records[pending.invocation.idempotency_key] = outcome
             return outcome
@@ -997,6 +1755,52 @@ class FilesystemFactorySkillReplayStore:
 
     def __init__(self, root: Path) -> None:
         self._root = root
+
+    async def completed(
+        self,
+        job: FactoryJob,
+        *,
+        step: FactorySkillStep,
+        attempt: int,
+    ) -> FactorySkillReplayRecord:
+        key = _factory_step_idempotency_key(job, step=step, attempt=attempt)
+        path = self._path_for(key)
+        try:
+            record = await asyncio.to_thread(self._read_record, path)
+        except FactoryDispatchError as exc:
+            if not path.exists():
+                record = None
+            else:
+                raise
+        return _require_completed_prior_replay(
+            record,
+            job=job,
+            step=step,
+            attempt=attempt,
+        )
+
+    async def pending(
+        self,
+        job: FactoryJob,
+        *,
+        step: FactorySkillStep,
+        attempt: int,
+    ) -> FactorySkillReplayRecord:
+        key = _factory_step_idempotency_key(job, step=step, attempt=attempt)
+        path = self._path_for(key)
+        try:
+            record = await asyncio.to_thread(self._read_record, path)
+        except FactoryDispatchError:
+            if not path.exists():
+                record = None
+            else:
+                raise
+        return _require_pending_prior_replay(
+            record,
+            job=job,
+            step=step,
+            attempt=attempt,
+        )
 
     async def claim(
         self,
@@ -1014,65 +1818,17 @@ class FilesystemFactorySkillReplayStore:
         existing = await asyncio.to_thread(self._read_record, path)
         return _existing_replay_claim(existing, invocation)
 
-    async def stage_result(
-        self,
-        pending: FactorySkillReplayRecord,
-        *,
-        artifact: _FactoryWorkflowArtifact,
-        transcript_ref: ArtifactRef,
-        accounting_refs: tuple[ArtifactRef, ...],
-        budget_reservation: FactoryBudgetReservationV1,
-        usage_receipt: FactoryUsageReceiptV1,
-    ) -> FactorySkillReplayRecord:
-        prepared = _prepared_replay_record(
-            pending,
-            artifact=artifact,
-            transcript_ref=transcript_ref,
-            accounting_refs=accounting_refs,
-            budget_reservation=budget_reservation,
-            usage_receipt=usage_receipt,
-        )
-        return await self._transition(pending, prepared)
-
-    async def stage_paid_result(
-        self,
-        pending: FactorySkillReplayRecord,
-        *,
-        stdout: bytes,
-        usage: bytes,
-        budget_reservation: FactoryBudgetReservationV1,
-        started_at: datetime,
-        ended_at: datetime,
-    ) -> FactorySkillReplayRecord:
-        return await self._transition(
-            pending,
-            _prepared_paid_replay_record(
-                pending,
-                stdout=stdout,
-                usage=usage,
-                budget_reservation=budget_reservation,
-                started_at=started_at,
-                ended_at=ended_at,
-            ),
-        )
-
     async def complete(
         self,
         pending: FactorySkillReplayRecord,
         *,
         artifact: _FactoryWorkflowArtifact,
         transcript_ref: ArtifactRef,
-        accounting_refs: tuple[ArtifactRef, ...] = (),
-        budget_reservation: FactoryBudgetReservationV1 | None = None,
-        usage_receipt: FactoryUsageReceiptV1 | None = None,
     ) -> FactorySkillReplayRecord:
         completed = _completed_replay_record(
             pending,
             artifact=artifact,
             transcript_ref=transcript_ref,
-            accounting_refs=accounting_refs,
-            budget_reservation=budget_reservation,
-            usage_receipt=usage_receipt,
         )
         return await self._transition(pending, completed)
 
@@ -1086,6 +1842,98 @@ class FilesystemFactorySkillReplayStore:
             pending,
             _failed_replay_record(pending, failure_kind=failure_kind),
         )
+
+    async def interrupt(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        checkpoint_ref: ArtifactRef,
+        terminal_receipt_ref: ArtifactRef,
+        resume_ordinal: int,
+    ) -> FactorySkillReplayRecord:
+        return await self._transition(
+            pending,
+            _interrupted_replay_record(
+                pending,
+                checkpoint_ref=checkpoint_ref,
+                terminal_receipt_ref=terminal_receipt_ref,
+                resume_ordinal=resume_ordinal,
+            ),
+        )
+
+    async def reconcile_interrupted(
+        self,
+        pending: FactorySkillReplayRecord,
+        *,
+        checkpoint_ref: ArtifactRef,
+        terminal_receipt_ref: ArtifactRef,
+        resume_ordinal: int,
+    ) -> FactorySkillReplayRecord:
+        return await self._transition(
+            pending,
+            _reconciled_interrupted_replay_record(
+                pending,
+                checkpoint_ref=checkpoint_ref,
+                terminal_receipt_ref=terminal_receipt_ref,
+                resume_ordinal=resume_ordinal,
+            ),
+        )
+
+    async def resume(
+        self,
+        interrupted: FactorySkillReplayRecord,
+        *,
+        authorization: FactoryRuntimeRetryAuthorizationV1,
+    ) -> FactorySkillReplayClaim:
+        resumed = _resumed_replay_record(interrupted, authorization=authorization)
+        path = self._path_for(interrupted.invocation.idempotency_key)
+        await asyncio.to_thread(
+            self._replace_interrupted,
+            path,
+            interrupted,
+            resumed,
+        )
+        return FactorySkillReplayClaim(record=resumed, acquired=True)
+
+    async def retry_failed(
+        self,
+        failed: FactorySkillReplayRecord,
+        *,
+        authorization: FactoryRuntimeRetryAuthorizationV1,
+    ) -> FactorySkillReplayClaim:
+        resumed = _retried_failed_replay_record(
+            failed,
+            authorization=authorization,
+        )
+        path = self._path_for(failed.invocation.idempotency_key)
+        await asyncio.to_thread(
+            self._replace_failed,
+            path,
+            failed,
+            resumed,
+        )
+        return FactorySkillReplayClaim(record=resumed, acquired=True)
+
+    async def retry_failed_hermes(
+        self,
+        failed: FactorySkillReplayRecord,
+        *,
+        requested_invocation: FactorySkillInvocationV1,
+        authorization: FactoryHermesReplayRetryAuthorizationV1,
+    ) -> FactorySkillReplayClaim:
+        resumed = _retried_failed_hermes_replay_record(
+            failed,
+            requested_invocation=requested_invocation,
+            authorization=authorization,
+        )
+        path = self._path_for(failed.invocation.idempotency_key)
+        await asyncio.to_thread(
+            self._replace_failed_with_archive,
+            path,
+            failed,
+            resumed,
+        )
+        return FactorySkillReplayClaim(record=resumed, acquired=True)
 
     async def abandon(self, pending: FactorySkillReplayRecord) -> None:
         path = self._path_for(pending.invocation.idempotency_key)
@@ -1132,22 +1980,164 @@ class FilesystemFactorySkillReplayStore:
         pending: FactorySkillReplayRecord,
         outcome: FactorySkillReplayRecord,
     ) -> None:
-        if cls._read_record(path) != pending:
-            raise FactoryDispatchError("factory skill replay claim is no longer pending")
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
+        cls._replace_exact(
+            path,
+            pending,
+            outcome,
+            expected_state="pending",
+            diagnostic="factory skill replay claim is no longer pending",
         )
-        temporary = Path(temporary_name)
+
+    @classmethod
+    def _replace_interrupted(
+        cls,
+        path: Path,
+        interrupted: FactorySkillReplayRecord,
+        resumed: FactorySkillReplayRecord,
+    ) -> None:
+        cls._replace_exact(
+            path,
+            interrupted,
+            resumed,
+            expected_state="interrupted",
+            diagnostic="factory skill replay is no longer interrupted",
+        )
+
+    @classmethod
+    def _replace_failed(
+        cls,
+        path: Path,
+        failed: FactorySkillReplayRecord,
+        resumed: FactorySkillReplayRecord,
+    ) -> None:
+        cls._replace_exact(
+            path,
+            failed,
+            resumed,
+            expected_state="failed",
+            diagnostic="factory skill replay failure changed",
+        )
+
+    @classmethod
+    def _replace_failed_with_archive(
+        cls,
+        path: Path,
+        failed: FactorySkillReplayRecord,
+        resumed: FactorySkillReplayRecord,
+    ) -> None:
+        lock = cls._acquire_file_lock(path.with_suffix(".lock"))
+        temporary: Path | None = None
         try:
+            if cls._read_record(path) != failed or failed.state != "failed":
+                raise FactoryDispatchError("factory skill replay failure changed")
+            failed_content = _factory_skill_replay_content(failed)
+            failure_ref = factory_skill_replay_failure_ref(failed)
+            if resumed.prior_failure_ref != failure_ref:
+                raise FactoryDispatchError(
+                    "factory skill replay archive binding does not match retry"
+                )
+            archive = path.parent / "failure-history" / f"{failure_ref.sha256}.json"
+            created = cls._create_exclusive(archive, failed_content)
+            if not created:
+                try:
+                    existing = archive.read_bytes()
+                except OSError as exc:
+                    raise FactoryDispatchError(
+                        "factory skill replay failure archive is unavailable"
+                    ) from exc
+                if existing != failed_content:
+                    raise FactoryDispatchError(
+                        "factory skill replay failure archive conflicts"
+                    )
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+            )
+            temporary = Path(temporary_name)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(_factory_skill_replay_content(resumed))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            cls._release_file_lock(lock)
+
+    @classmethod
+    def _replace_exact(
+        cls,
+        path: Path,
+        expected: FactorySkillReplayRecord,
+        outcome: FactorySkillReplayRecord,
+        *,
+        expected_state: Literal["pending", "interrupted", "failed"],
+        diagnostic: str,
+    ) -> None:
+        lock = cls._acquire_file_lock(path.with_suffix(".lock"))
+        temporary: Path | None = None
+        try:
+            if cls._read_record(path) != expected or expected.state != expected_state:
+                raise FactoryDispatchError(diagnostic)
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+            )
+            temporary = Path(temporary_name)
             with os.fdopen(descriptor, "wb") as handle:
                 handle.write(_factory_skill_replay_content(outcome))
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, path)
         finally:
-            temporary.unlink(missing_ok=True)
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            cls._release_file_lock(lock)
+
+    @staticmethod
+    def _acquire_file_lock(path: Path) -> BinaryIO:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a+b")
+        try:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                while True:
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        time.sleep(0.01)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            return handle
+        except BaseException:
+            handle.close()
+            raise
+
+    @staticmethod
+    def _release_file_lock(handle: BinaryIO) -> None:
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
     @classmethod
     def _remove_pending(
@@ -1165,41 +2155,24 @@ class FilesystemFactorySkillReplayStore:
             value = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(value, dict):
                 raise ValueError("replay record must be an object")
+            schema = value.get("schema")
+            if schema not in {
+                "captain.factory-skill-replay.v2",
+                "captain.factory-skill-replay.v3",
+                "captain.factory-skill-replay.v4",
+                "captain.factory-skill-replay.v5",
+            }:
+                raise ValueError("replay record schema is unsupported")
             invocation = FactorySkillInvocationV1.model_validate(value["invocation"])
             state = value["state"]
+            if schema == "captain.factory-skill-replay.v2" and state == "interrupted":
+                raise ValueError("v2 replay records cannot be interrupted")
             artifact = None
             transcript_ref = None
-            accounting_refs: tuple[ArtifactRef, ...] = ()
-            budget_reservation = None
-            usage_receipt = None
-            paid_stdout = None
-            paid_usage = None
-            paid_started_at = None
-            paid_ended_at = None
-            if state in {"result_ready", "completed"}:
+            if state == "completed":
                 model = _STEP_RESULT_MODELS[invocation.step]
                 artifact = model.model_validate(value["artifact"])
                 transcript_ref = ArtifactRef.model_validate(value["transcript_ref"])
-                accounting_refs = tuple(
-                    ArtifactRef.model_validate(item)
-                    for item in value.get("accounting_refs", ())
-                )
-                if value.get("budget_reservation") is not None:
-                    budget_reservation = FactoryBudgetReservationV1.model_validate(
-                        value["budget_reservation"]
-                    )
-                if value.get("usage_receipt") is not None:
-                    usage_receipt = FactoryUsageReceiptV1.model_validate(
-                        value["usage_receipt"]
-                    )
-            elif state == "paid_result_ready":
-                paid_stdout = base64.b64decode(value["paid_stdout"], validate=True)
-                paid_usage = base64.b64decode(value["paid_usage"], validate=True)
-                budget_reservation = FactoryBudgetReservationV1.model_validate(
-                    value["budget_reservation"]
-                )
-                paid_started_at = datetime.fromisoformat(value["paid_started_at"])
-                paid_ended_at = datetime.fromisoformat(value["paid_ended_at"])
             return FactorySkillReplayRecord(
                 invocation=invocation,
                 invocation_sha256=value["invocation_sha256"],
@@ -1207,23 +2180,57 @@ class FilesystemFactorySkillReplayStore:
                 state=state,
                 artifact=artifact,
                 transcript_ref=transcript_ref,
-                accounting_refs=accounting_refs,
-                budget_reservation=budget_reservation,
-                usage_receipt=usage_receipt,
-                paid_stdout=paid_stdout,
-                paid_usage=paid_usage,
-                paid_started_at=paid_started_at,
-                paid_ended_at=paid_ended_at,
                 failure_kind=value.get("failure_kind"),
+                checkpoint_ref=(
+                    ArtifactRef.model_validate(value["checkpoint_ref"])
+                    if value.get("checkpoint_ref") is not None
+                    else None
+                ),
+                terminal_receipt_ref=(
+                    ArtifactRef.model_validate(value["terminal_receipt_ref"])
+                    if value.get("terminal_receipt_ref") is not None
+                    else None
+                ),
+                resume_ordinal=value.get("resume_ordinal", 0),
+                runtime_retry_authorization_ref=(
+                    ArtifactRef.model_validate(
+                        value["runtime_retry_authorization_ref"]
+                    )
+                    if value.get("runtime_retry_authorization_ref") is not None
+                    else None
+                ),
+                runtime_retry_authorization_binding_sha256=value.get(
+                    "runtime_retry_authorization_binding_sha256"
+                ),
+                hermes_retry_authorization_ref=(
+                    ArtifactRef.model_validate(
+                        value["hermes_retry_authorization_ref"]
+                    )
+                    if value.get("hermes_retry_authorization_ref") is not None
+                    else None
+                ),
+                hermes_retry_authorization_binding_sha256=value.get(
+                    "hermes_retry_authorization_binding_sha256"
+                ),
+                prior_failure_ref=(
+                    ArtifactRef.model_validate(value["prior_failure_ref"])
+                    if value.get("prior_failure_ref") is not None
+                    else None
+                ),
             )
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise FactoryDispatchError("factory skill replay record is invalid") from exc
 
 
 def _factory_skill_replay_content(record: FactorySkillReplayRecord) -> bytes:
+    schema = (
+        "captain.factory-skill-replay.v5"
+        if record.hermes_retry_authorization_ref is not None
+        else "captain.factory-skill-replay.v4"
+    )
     return _canonical_json(
         {
-            "schema": "captain.factory-skill-replay.v2",
+            "schema": schema,
             "state": record.state,
             "invocation_sha256": record.invocation_sha256,
             "claim_token": record.claim_token,
@@ -1238,48 +2245,76 @@ def _factory_skill_replay_content(record: FactorySkillReplayRecord) -> bytes:
                 if record.transcript_ref is None
                 else record.transcript_ref.model_dump(mode="json")
             ),
-            "accounting_refs": [
-                reference.model_dump(mode="json")
-                for reference in record.accounting_refs
-            ],
-            "budget_reservation": (
-                None
-                if record.budget_reservation is None
-                else record.budget_reservation.model_dump(mode="json", by_alias=True)
-            ),
-            "usage_receipt": (
-                None
-                if record.usage_receipt is None
-                else record.usage_receipt.model_dump(mode="json", by_alias=True)
-            ),
-            "paid_stdout": (
-                None
-                if record.paid_stdout is None
-                else base64.b64encode(record.paid_stdout).decode("ascii")
-            ),
-            "paid_usage": (
-                None
-                if record.paid_usage is None
-                else base64.b64encode(record.paid_usage).decode("ascii")
-            ),
-            "paid_started_at": (
-                None
-                if record.paid_started_at is None
-                else record.paid_started_at.isoformat()
-            ),
-            "paid_ended_at": (
-                None
-                if record.paid_ended_at is None
-                else record.paid_ended_at.isoformat()
-            ),
             "failure_kind": record.failure_kind,
+            "checkpoint_ref": (
+                None
+                if record.checkpoint_ref is None
+                else record.checkpoint_ref.model_dump(mode="json")
+            ),
+            "terminal_receipt_ref": (
+                None
+                if record.terminal_receipt_ref is None
+                else record.terminal_receipt_ref.model_dump(mode="json")
+            ),
+            "resume_ordinal": record.resume_ordinal,
+            "runtime_retry_authorization_ref": (
+                None
+                if record.runtime_retry_authorization_ref is None
+                else record.runtime_retry_authorization_ref.model_dump(mode="json")
+            ),
+            "runtime_retry_authorization_binding_sha256": (
+                record.runtime_retry_authorization_binding_sha256
+            ),
+            "hermes_retry_authorization_ref": (
+                None
+                if record.hermes_retry_authorization_ref is None
+                else record.hermes_retry_authorization_ref.model_dump(mode="json")
+            ),
+            "hermes_retry_authorization_binding_sha256": (
+                record.hermes_retry_authorization_binding_sha256
+            ),
+            "prior_failure_ref": (
+                None
+                if record.prior_failure_ref is None
+                else record.prior_failure_ref.model_dump(mode="json")
+            ),
         }
     ).encode("utf-8")
+
+
+def factory_skill_replay_failure_ref(
+    record: FactorySkillReplayRecord,
+) -> ArtifactRef:
+    """Return the exact canonical content ref archived before Hermes retry."""
+
+    if record.state != "failed":
+        raise FactoryDispatchError("only failed factory skill replays can be archived")
+    digest = hashlib.sha256(_factory_skill_replay_content(record)).hexdigest()
+    return ArtifactRef(
+        uri=f"artifact://factory/skill-replay-failure/{digest}",
+        sha256=digest,
+        media_type="application/json",
+    )
+
+
+def load_factory_skill_replay_record(path: Path) -> FactorySkillReplayRecord:
+    """Load one durable replay record without exposing store mutation helpers."""
+
+    return FilesystemFactorySkillReplayStore._read_record(path)
 
 
 def _factory_invocation_digest(invocation: FactorySkillInvocationV1) -> str:
     content = _canonical_json(invocation.model_dump(mode="json", by_alias=True))
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _hermes_effect_identity(
+    invocation: FactorySkillInvocationV1,
+    claim_token: str,
+) -> str:
+    return hashlib.sha256(
+        f"{invocation.idempotency_key}:{claim_token}".encode("utf-8")
+    ).hexdigest()
 
 
 def _pending_replay_record(
@@ -1298,65 +2333,6 @@ def _completed_replay_record(
     *,
     artifact: _FactoryWorkflowArtifact,
     transcript_ref: ArtifactRef,
-    accounting_refs: tuple[ArtifactRef, ...] = (),
-    budget_reservation: FactoryBudgetReservationV1 | None = None,
-    usage_receipt: FactoryUsageReceiptV1 | None = None,
-) -> FactorySkillReplayRecord:
-    if pending.state not in {"pending", "result_ready"}:
-        raise FactoryDispatchError("factory skill replay claim is no longer pending")
-    if pending.state == "result_ready" and (
-        pending.artifact != artifact
-        or pending.transcript_ref != transcript_ref
-        or pending.accounting_refs != accounting_refs
-        or pending.budget_reservation != budget_reservation
-        or pending.usage_receipt != usage_receipt
-    ):
-        raise FactoryDispatchError("prepared paid factory replay result conflicts")
-    return FactorySkillReplayRecord(
-        invocation=pending.invocation,
-        invocation_sha256=pending.invocation_sha256,
-        claim_token=pending.claim_token,
-        state="completed",
-        artifact=artifact,
-        transcript_ref=transcript_ref,
-        accounting_refs=accounting_refs,
-        budget_reservation=budget_reservation,
-        usage_receipt=usage_receipt,
-    )
-
-
-def _prepared_replay_record(
-    pending: FactorySkillReplayRecord,
-    *,
-    artifact: _FactoryWorkflowArtifact,
-    transcript_ref: ArtifactRef,
-    accounting_refs: tuple[ArtifactRef, ...],
-    budget_reservation: FactoryBudgetReservationV1,
-    usage_receipt: FactoryUsageReceiptV1,
-) -> FactorySkillReplayRecord:
-    if pending.state != "paid_result_ready":
-        raise FactoryDispatchError("factory skill replay claim is no longer pending")
-    return FactorySkillReplayRecord(
-        invocation=pending.invocation,
-        invocation_sha256=pending.invocation_sha256,
-        claim_token=pending.claim_token,
-        state="result_ready",
-        artifact=artifact,
-        transcript_ref=transcript_ref,
-        accounting_refs=accounting_refs,
-        budget_reservation=budget_reservation,
-        usage_receipt=usage_receipt,
-    )
-
-
-def _prepared_paid_replay_record(
-    pending: FactorySkillReplayRecord,
-    *,
-    stdout: bytes,
-    usage: bytes,
-    budget_reservation: FactoryBudgetReservationV1,
-    started_at: datetime,
-    ended_at: datetime,
 ) -> FactorySkillReplayRecord:
     if pending.state != "pending":
         raise FactoryDispatchError("factory skill replay claim is no longer pending")
@@ -1364,12 +2340,21 @@ def _prepared_paid_replay_record(
         invocation=pending.invocation,
         invocation_sha256=pending.invocation_sha256,
         claim_token=pending.claim_token,
-        state="paid_result_ready",
-        budget_reservation=budget_reservation,
-        paid_stdout=stdout,
-        paid_usage=usage,
-        paid_started_at=started_at,
-        paid_ended_at=ended_at,
+        state="completed",
+        artifact=artifact,
+        transcript_ref=transcript_ref,
+        resume_ordinal=pending.resume_ordinal,
+        runtime_retry_authorization_ref=(
+            pending.runtime_retry_authorization_ref
+        ),
+        runtime_retry_authorization_binding_sha256=(
+            pending.runtime_retry_authorization_binding_sha256
+        ),
+        hermes_retry_authorization_ref=pending.hermes_retry_authorization_ref,
+        hermes_retry_authorization_binding_sha256=(
+            pending.hermes_retry_authorization_binding_sha256
+        ),
+        prior_failure_ref=pending.prior_failure_ref,
     )
 
 
@@ -1388,6 +2373,212 @@ def _failed_replay_record(
         claim_token=pending.claim_token,
         state="failed",
         failure_kind=failure_kind,
+        resume_ordinal=pending.resume_ordinal,
+        runtime_retry_authorization_ref=(
+            pending.runtime_retry_authorization_ref
+        ),
+        runtime_retry_authorization_binding_sha256=(
+            pending.runtime_retry_authorization_binding_sha256
+        ),
+        hermes_retry_authorization_ref=pending.hermes_retry_authorization_ref,
+        hermes_retry_authorization_binding_sha256=(
+            pending.hermes_retry_authorization_binding_sha256
+        ),
+        prior_failure_ref=pending.prior_failure_ref,
+    )
+
+
+def _interrupted_replay_record(
+    pending: FactorySkillReplayRecord,
+    *,
+    checkpoint_ref: ArtifactRef,
+    terminal_receipt_ref: ArtifactRef,
+    resume_ordinal: int,
+) -> FactorySkillReplayRecord:
+    if pending.state != "pending":
+        raise FactoryDispatchError("factory skill replay claim is no longer pending")
+    if resume_ordinal != pending.resume_ordinal:
+        raise FactoryDispatchError("factory skill replay interruption ordinal conflicts")
+    return FactorySkillReplayRecord(
+        invocation=pending.invocation,
+        invocation_sha256=pending.invocation_sha256,
+        claim_token=pending.claim_token,
+        state="interrupted",
+        failure_kind="codex_runtime_interrupted",
+        checkpoint_ref=checkpoint_ref,
+        terminal_receipt_ref=terminal_receipt_ref,
+        resume_ordinal=resume_ordinal,
+        runtime_retry_authorization_ref=(
+            pending.runtime_retry_authorization_ref
+        ),
+        runtime_retry_authorization_binding_sha256=(
+            pending.runtime_retry_authorization_binding_sha256
+        ),
+    )
+
+
+def _reconciled_interrupted_replay_record(
+    pending: FactorySkillReplayRecord,
+    *,
+    checkpoint_ref: ArtifactRef,
+    terminal_receipt_ref: ArtifactRef,
+    resume_ordinal: int,
+) -> FactorySkillReplayRecord:
+    if pending.state != "pending":
+        raise FactoryDispatchError("factory skill replay claim is no longer pending")
+    if pending.resume_ordinal < 1 or resume_ordinal != pending.resume_ordinal - 1:
+        raise FactoryDispatchError(
+            "factory skill replay reconciliation ordinal conflicts"
+        )
+    return FactorySkillReplayRecord(
+        invocation=pending.invocation,
+        invocation_sha256=pending.invocation_sha256,
+        claim_token=pending.claim_token,
+        state="interrupted",
+        failure_kind="codex_runtime_interrupted",
+        checkpoint_ref=checkpoint_ref,
+        terminal_receipt_ref=terminal_receipt_ref,
+        resume_ordinal=resume_ordinal,
+    )
+
+
+def _resumed_replay_record(
+    interrupted: FactorySkillReplayRecord,
+    *,
+    authorization: FactoryRuntimeRetryAuthorizationV1,
+) -> FactorySkillReplayRecord:
+    invocation = interrupted.invocation
+    if interrupted.state != "interrupted":
+        raise FactoryDispatchError("factory skill replay is no longer interrupted")
+    if (
+        authorization.job_id != invocation.job_id
+        or authorization.correlation_id != invocation.correlation_id
+        or authorization.subject_version != invocation.subject_version
+        or authorization.attempt != invocation.attempt
+        or authorization.invocation_id != invocation.invocation_id
+        or authorization.idempotency_key != invocation.idempotency_key
+        or authorization.lease_id != invocation.lease.lease_id
+        or authorization.checkpoint_ref != interrupted.checkpoint_ref
+        or authorization.terminal_receipt_ref != interrupted.terminal_receipt_ref
+        or authorization.resume_ordinal != interrupted.resume_ordinal + 1
+    ):
+        raise FactoryDispatchError(
+            "factory skill replay runtime authorization does not match interruption"
+        )
+    return FactorySkillReplayRecord(
+        invocation=invocation,
+        invocation_sha256=interrupted.invocation_sha256,
+        claim_token=uuid4().hex,
+        state="pending",
+        resume_ordinal=authorization.resume_ordinal,
+        runtime_retry_authorization_ref=authorization.authorization_ref,
+        runtime_retry_authorization_binding_sha256=hashlib.sha256(
+            _canonical_json(
+                authorization.model_dump(mode="json", by_alias=True)
+            ).encode("utf-8")
+        ).hexdigest(),
+    )
+
+
+def _retried_failed_replay_record(
+    failed: FactorySkillReplayRecord,
+    *,
+    authorization: FactoryRuntimeRetryAuthorizationV1,
+) -> FactorySkillReplayRecord:
+    invocation = failed.invocation
+    expected_authorization_digest = hashlib.sha256(
+        _canonical_json(
+            authorization.model_dump(mode="json", by_alias=True)
+        ).encode("utf-8")
+    ).hexdigest()
+    evidence_retry = failed.failure_kind in {
+        "FactoryCodexEvidenceFailure",
+        "FactoryCodexOutputCaptureError",
+        "FactoryDispatchError",
+    }
+    if (
+        failed.state != "failed"
+        or failed.failure_kind not in {
+            "CodexPolicyViolation",
+            "CodexBuildProvenanceError",
+            "FactoryCodexEvidenceFailure",
+            "FactoryCodexOutputCaptureError",
+            "FactoryDispatchError",
+        }
+        or (
+            evidence_retry
+            and authorization.resume_ordinal != failed.resume_ordinal + 1
+        )
+        or (
+            not evidence_retry
+            and failed.resume_ordinal != authorization.resume_ordinal
+        )
+        or authorization.job_id != invocation.job_id
+        or authorization.correlation_id != invocation.correlation_id
+        or authorization.subject_version != invocation.subject_version
+        or authorization.attempt != invocation.attempt
+        or authorization.invocation_id != invocation.invocation_id
+        or authorization.idempotency_key != invocation.idempotency_key
+        or authorization.lease_id != invocation.lease.lease_id
+    ):
+        raise FactoryDispatchError(
+            "factory skill replay pre-launch failure does not match retry authority"
+        )
+    return FactorySkillReplayRecord(
+        invocation=invocation,
+        invocation_sha256=failed.invocation_sha256,
+        claim_token=uuid4().hex,
+        state="pending",
+        resume_ordinal=authorization.resume_ordinal,
+        runtime_retry_authorization_ref=authorization.authorization_ref,
+        runtime_retry_authorization_binding_sha256=expected_authorization_digest,
+    )
+
+
+def _retried_failed_hermes_replay_record(
+    failed: FactorySkillReplayRecord,
+    *,
+    requested_invocation: FactorySkillInvocationV1,
+    authorization: FactoryHermesReplayRetryAuthorizationV1,
+) -> FactorySkillReplayRecord:
+    invocation = failed.invocation
+    failed_ref = factory_skill_replay_failure_ref(failed)
+    authorization_digest = factory_hermes_replay_retry_authorization_sha256(
+        authorization
+    )
+    if (
+        failed.state != "failed"
+        or failed.failure_kind != authorization.failure_kind
+        or not 1 <= authorization.retry_ordinal <= 3
+        or authorization.retry_ordinal != failed.resume_ordinal + 1
+        or invocation.step is FactorySkillStep.SEAL_CODEX_BUILD
+        or authorization.step is not invocation.step
+        or authorization.failed_replay_ref != failed_ref
+        or authorization.job_id != invocation.job_id
+        or authorization.correlation_id != invocation.correlation_id
+        or authorization.subject_version != invocation.subject_version
+        or authorization.attempt != invocation.attempt
+        or authorization.invocation_id != invocation.invocation_id
+        or authorization.idempotency_key != invocation.idempotency_key
+        or authorization.lease_id != invocation.lease.lease_id
+        or not _same_invocation_except_lease(invocation, requested_invocation)
+        or not _same_or_valid_successor_lease(
+            invocation.lease,
+            requested_invocation.lease,
+        )
+    ):
+        raise FactoryDispatchError(
+            "failed Hermes replay does not match Captain recovery authority"
+        )
+    return FactorySkillReplayRecord(
+        invocation=requested_invocation,
+        invocation_sha256=_factory_invocation_digest(requested_invocation),
+        claim_token=uuid4().hex,
+        state="pending",
+        resume_ordinal=authorization.retry_ordinal,
+        hermes_retry_authorization_ref=authorization.authorization_ref,
+        hermes_retry_authorization_binding_sha256=authorization_digest,
+        prior_failure_ref=failed_ref,
     )
 
 
@@ -1399,17 +2590,179 @@ def _existing_replay_claim(
         existing.invocation_sha256 != _factory_invocation_digest(invocation)
         or existing.invocation != invocation
     ):
+        valid_successor = (
+            _same_invocation_except_lease(existing.invocation, invocation)
+            and _same_or_valid_successor_lease(
+                existing.invocation.lease,
+                invocation.lease,
+            )
+        )
+        if valid_successor:
+            if existing.state == "pending":
+                raise FactorySkillReplayPendingError(existing)
+            if existing.state == "interrupted":
+                raise FactorySkillReplayInterruptedError(existing)
+            if existing.state == "failed":
+                if _is_codex_retryable_failure(existing):
+                    raise FactorySkillReplayRetryableFailureError(existing)
+                if _is_hermes_retryable_failure(existing) and existing.resume_ordinal < 3:
+                    raise FactorySkillReplayHermesRetryableFailureError(
+                        existing,
+                        invocation,
+                    )
+                raise FactoryDispatchError("factory skill replay previously failed")
+            return FactorySkillReplayClaim(record=existing, acquired=False)
+        if (
+            existing.state == "failed"
+            and _is_hermes_retryable_failure(existing)
+            and existing.resume_ordinal < 3
+            and _same_invocation_except_lease(existing.invocation, invocation)
+        ):
+            raise FactorySkillReplayHermesRetryableFailureError(
+                existing,
+                invocation,
+            )
         raise FactoryDispatchError("factory skill replay invocation conflicts")
     if existing.state == "pending":
         raise FactorySkillReplayPendingError(existing)
     if existing.state == "failed":
+        if _is_codex_retryable_failure(existing):
+            raise FactorySkillReplayRetryableFailureError(existing)
+        if (
+            _is_hermes_retryable_failure(existing)
+            and existing.resume_ordinal < 3
+        ):
+            raise FactorySkillReplayHermesRetryableFailureError(
+                existing,
+                invocation,
+            )
         raise FactoryDispatchError("factory skill replay previously failed")
+    if existing.state == "interrupted":
+        raise FactorySkillReplayInterruptedError(existing)
     return FactorySkillReplayClaim(record=existing, acquired=False)
+
+
+def _hermes_retry_exceeds_authority(
+    *,
+    maximum_total_cost_usd: Decimal | None,
+    observed_cost_usd: Decimal,
+    maximum_additional_cost_usd: Decimal,
+) -> bool:
+    if maximum_total_cost_usd is None:
+        return True
+    remaining_cost_usd = maximum_total_cost_usd - observed_cost_usd
+    return remaining_cost_usd <= 0 or remaining_cost_usd > maximum_additional_cost_usd
+
+
+def _is_codex_retryable_failure(replay: FactorySkillReplayRecord) -> bool:
+    if replay.failure_kind in {
+        "FactoryCodexEvidenceFailure",
+        "FactoryCodexOutputCaptureError",
+    }:
+        return replay.resume_ordinal < 2
+    if (
+        replay.failure_kind == "FactoryDispatchError"
+        and replay.invocation.step is FactorySkillStep.SEAL_CODEX_BUILD
+    ):
+        return replay.resume_ordinal < 2
+    return (
+        replay.failure_kind in {"CodexPolicyViolation", "CodexBuildProvenanceError"}
+        and replay.runtime_retry_authorization_ref is not None
+    )
+
+
+def _is_hermes_retryable_failure(
+    replay: FactorySkillReplayRecord,
+) -> bool:
+    if replay.failure_kind == "FactoryDispatchError":
+        return replay.invocation.step is not FactorySkillStep.SEAL_CODEX_BUILD
+    return (
+        replay.failure_kind == "evidence_binding_failed"
+        and replay.invocation.step is FactorySkillStep.EXECUTE_TEAM
+    )
+
+
+def _same_invocation_except_lease(
+    left: FactorySkillInvocationV1,
+    right: FactorySkillInvocationV1,
+) -> bool:
+    return left == right.model_copy(update={"lease": left.lease})
+
+
+def _same_or_valid_successor_lease(left: FactoryLease, right: FactoryLease) -> bool:
+    if left == right:
+        return True
+    try:
+        left_payload = left.model_dump(mode="json", by_alias=True)
+        right_payload = right.model_dump(mode="json", by_alias=True)
+        left_expires = left.expires_at
+        right_issued = right.issued_at
+    except AttributeError:
+        return False
+    left_workspace = str(left_payload.pop("workspace_ref", ""))
+    right_workspace = str(right_payload.pop("workspace_ref", ""))
+    for key in ("lease_id", "issued_at", "expires_at"):
+        left_payload.pop(key, None)
+        right_payload.pop(key, None)
+    try:
+        left_prefix, left_suffix = left_workspace.rsplit("/", 1)
+        right_prefix, right_suffix = right_workspace.rsplit("/", 1)
+    except ValueError:
+        return False
+    expected_left_suffix = left.issued_at.strftime("%Y%m%dT%H%M%S%fZ")
+    expected_right_suffix = right.issued_at.strftime("%Y%m%dT%H%M%S%fZ")
+    same_workspace_lineage = (
+        left_prefix == right_prefix
+        and left_suffix == expected_left_suffix
+        and right_suffix == expected_right_suffix
+    )
+    bootstrap_match = re.fullmatch(
+        r"workspace://business-benchmark-demo/(claims|renewal)/epoch-[0-9a-f]{16}",
+        left_workspace,
+    )
+    expected_profile = (
+        None if bootstrap_match is None else bootstrap_match.group(1)
+    )
+    bootstrap_workspace_pattern = (
+        None
+        if expected_profile is None
+        else (
+            r"workspace://business-benchmark-demo/"
+            + expected_profile
+            + r"/epoch-[0-9a-f]{16}"
+        )
+    )
+    left_is_bootstrap = bootstrap_match is not None
+    bootstrap_to_bootstrap = (
+        left.role is FactoryRole.AGENT_ARCHITECT
+        and left_is_bootstrap
+        and re.fullmatch(bootstrap_workspace_pattern, right_workspace) is not None
+    )
+    bootstrap_to_runtime = (
+        left.role is FactoryRole.AGENT_ARCHITECT
+        and left_is_bootstrap
+        and right_workspace
+        == (
+            "workspace://business-benchmark-factory-v3/"
+            f"{left.job_id}/dispatch_agent_architect/{left.attempt}/"
+            f"{expected_right_suffix}"
+        )
+    )
+    return (
+        left_payload == right_payload
+        and right_issued >= left_expires
+        and (
+            same_workspace_lineage
+            or bootstrap_to_bootstrap
+            or bootstrap_to_runtime
+        )
+    )
 
 
 _STEP_RESULT_MODELS: dict[FactorySkillStep, type[BaseModel]] = {
     FactorySkillStep.DISCOVER: CodebaseInventoryV1,
     FactorySkillStep.BRIEF_CODEX: CodexBuildBriefV1,
+    FactorySkillStep.SEAL_CODEX_BUILD: CodexBuildEvidenceV1,
     FactorySkillStep.EXECUTE_TEAM: TeamExecutionEvidenceV1,
     FactorySkillStep.EVALUATE_TEAM: TeamEvaluationV1,
     FactorySkillStep.IMPROVE_TEAM: CandidateRevisionV1,
@@ -1417,7 +2770,46 @@ _STEP_RESULT_MODELS: dict[FactorySkillStep, type[BaseModel]] = {
 }
 
 
-def _validate_factory_dispatch(request: FactoryDispatch, *, now: datetime) -> None:
+def _validate_factory_dispatch(
+    request: FactoryDispatch,
+    *,
+    now: datetime,
+    allow_expired_completed_replay: bool = False,
+) -> datetime:
+    _validate_factory_dispatch_bindings(request, now=now)
+    assert request.role is not None
+    assert request.lease is not None
+    lease = request.lease
+    if now < lease.expires_at:
+        return lease.expires_at
+    authorization = request.runtime_retry_authorization
+    if (
+        request.role is not FactoryRole.TOOL_INTEGRATOR
+        or authorization is None
+        or authorization.job_id != request.job.job_id
+        or authorization.correlation_id != request.job.correlation_id
+        or authorization.subject_version != request.job.subject_version
+        or authorization.attempt != request.action.attempt
+        or authorization.lease_id != lease.lease_id
+        or authorization.workspace_ref != lease.workspace_ref
+        or now < authorization.issued_at
+        or (
+            now >= authorization.expires_at
+            and not allow_expired_completed_replay
+        )
+        or now >= request.job.deadline_at
+    ):
+        raise FactoryDispatchError(
+            "Hermes factory dispatch requires an active lease or Captain recovery authority"
+        )
+    if allow_expired_completed_replay:
+        return request.job.deadline_at
+    return min(authorization.expires_at, request.job.deadline_at)
+
+
+def _validate_factory_dispatch_bindings(
+    request: FactoryDispatch, *, now: datetime
+) -> None:
     assert request.role is not None
     assert request.lease is not None
     lease = request.lease
@@ -1441,8 +2833,10 @@ def _validate_factory_dispatch(request: FactoryDispatch, *, now: datetime) -> No
         or lease.role is not request.role
     ):
         raise FactoryDispatchError("Hermes factory dispatch lease is stale or mismatched")
-    if lease.issued_at > now or lease.expires_at <= now:
-        raise FactoryDispatchError("Hermes factory dispatch requires an active lease")
+    if lease.issued_at > now:
+        raise FactoryDispatchError(
+            "Hermes factory dispatch requires an active lease or Captain recovery authority"
+        )
 
 
 def _validated_improvement_authorization(
@@ -1486,13 +2880,26 @@ def _require_improvement_artifact_binding(
         if (
             artifact.parent_candidate_ref != authorization.prior_candidate_ref
             or artifact.failed_assertion_ids != failed_ids
+            or artifact.failed_benchmark_metric_ids
+            != authorization.failed_evaluation.failed_benchmark_metric_ids
             or artifact.regression_assertion_ids
             != authorization.prior_green_assertion_ids
+            or artifact.regression_benchmark_metric_ids
+            != authorization.prior_green_benchmark_metric_ids
         ):
             raise FactoryDispatchError(
                 "improve_team artifact does not bind the authorized failed candidate"
             )
     if isinstance(artifact, CodexBuildBriefV1):
+        if (
+            artifact.failed_benchmark_metric_ids
+            != authorization.failed_evaluation.failed_benchmark_metric_ids
+            or artifact.regression_benchmark_metric_ids
+            != authorization.prior_green_benchmark_metric_ids
+        ):
+            raise FactoryDispatchError(
+                "Codex brief benchmark guards do not match improvement authorization"
+            )
         required_refs = {
             authorization.authorization_ref,
             authorization.failed_evaluation.artifact_ref,
@@ -1531,13 +2938,12 @@ def _require_released_skill_directory(
         raise FactoryDispatchError("factory skill directory is outside the configured root") from exc
     if not directory.is_dir() or not (directory / "SKILL.md").is_file():
         raise FactoryDispatchError("released factory skill directory is missing")
-    digest = skill_directory_digest(directory)
+    digest = _skill_directory_digest(directory)
     if digest != released_skill.content_sha256:
         raise FactoryDispatchError("released factory skill digest does not match Captain's release")
 
 
-def skill_directory_digest(directory: Path) -> str:
-    """Return the canonical raw-byte manifest digest for one skill directory."""
+def _skill_directory_digest(directory: Path) -> str:
     manifest: list[dict[str, object]] = []
     entries = sorted(
         directory.rglob("*"),
@@ -1572,16 +2978,11 @@ def _factory_invocation(
     assert request.lease is not None
     if input_ref.uri.startswith("holdout://"):
         raise FactoryDispatchError("private holdout references cannot enter Hermes prompts")
-    binding = _canonical_json(
-        {
-            "job_id": str(request.job.job_id),
-            "correlation_id": str(request.job.correlation_id),
-            "subject_version": request.job.subject_version,
-            "attempt": request.action.attempt,
-            "step": step.value,
-        }
+    idempotency_key = _factory_step_idempotency_key(
+        request.job,
+        step=step,
+        attempt=request.action.attempt,
     )
-    idempotency_key = hashlib.sha256(binding.encode("utf-8")).hexdigest()
     return FactorySkillInvocationV1(
         schema_name="captain.factory-skill-invocation.v1",
         invocation_id=uuid5(NAMESPACE_URL, f"captain.factory-skill:{idempotency_key}"),
@@ -1599,32 +3000,784 @@ def _factory_invocation(
     )
 
 
+def _factory_step_idempotency_key(
+    job: FactoryJob,
+    *,
+    step: FactorySkillStep,
+    attempt: int,
+) -> str:
+    binding = _canonical_json(
+        {
+            "job_id": str(job.job_id),
+            "correlation_id": str(job.correlation_id),
+            "subject_version": job.subject_version,
+            "attempt": attempt,
+            "step": step.value,
+        }
+    )
+    return hashlib.sha256(binding.encode("utf-8")).hexdigest()
+
+
+def _require_completed_prior_replay(
+    record: FactorySkillReplayRecord | None,
+    *,
+    job: FactoryJob,
+    step: FactorySkillStep,
+    attempt: int,
+) -> FactorySkillReplayRecord:
+    if record is None or record.state != "completed" or record.artifact is None:
+        raise FactoryDispatchError(
+            f"completed {step.value} replay is required before the next Factory stage"
+        )
+    invocation = record.invocation
+    if (
+        invocation.idempotency_key
+        != _factory_step_idempotency_key(job, step=step, attempt=attempt)
+        or invocation.job_id != job.job_id
+        or invocation.correlation_id != job.correlation_id
+        or invocation.subject_version != job.subject_version
+        or invocation.attempt != attempt
+        or invocation.step is not step
+    ):
+        raise FactoryDispatchError("prior Factory replay does not match the Captain job")
+    return record
+
+
+def _require_pending_prior_replay(
+    record: FactorySkillReplayRecord | None,
+    *,
+    job: FactoryJob,
+    step: FactorySkillStep,
+    attempt: int,
+) -> FactorySkillReplayRecord:
+    if record is not None and record.state == "failed":
+        raise FactoryDispatchError("factory skill replay previously failed")
+    if record is not None and record.state == "interrupted":
+        raise FactoryDispatchError(
+            "Hermes factory dispatch requires an active lease or Captain recovery authority"
+        )
+    if record is None or record.state != "pending":
+        raise FactoryDispatchError(
+            f"pending {step.value} replay is required for failure reconciliation"
+        )
+    invocation = record.invocation
+    if (
+        invocation.idempotency_key
+        != _factory_step_idempotency_key(job, step=step, attempt=attempt)
+        or invocation.job_id != job.job_id
+        or invocation.correlation_id != job.correlation_id
+        or invocation.subject_version != job.subject_version
+        or invocation.attempt != attempt
+        or invocation.step is not step
+    ):
+        raise FactoryDispatchError("pending Factory replay does not match the Captain job")
+    return record
+
+
 def _factory_skill_prompt(
     invocation: FactorySkillInvocationV1,
     *,
     skill_name: str,
+    job: FactoryJob | None = None,
+    discovery_seed: dict[str, object] | None = None,
+    codex_brief_seed: CodexBuildBriefV1 | None = None,
+    improvement_seed: dict[str, object] | None = None,
+    previous_artifact: _FactoryWorkflowArtifact | None = None,
 ) -> str:
-    schema = _STEP_RESULT_MODELS[invocation.step].model_fields["schema_name"].default
-    return "\n".join(
+    invocation_payload = invocation.model_dump(mode="json", by_alias=True)
+    if discovery_seed is not None:
+        schema = "hermes.factory-discovery-attestation.v1"
+        seed_sha256 = _discovery_seed_sha256(discovery_seed)
+        required_bindings = {
+            "schema": schema,
+            "invocation_id": str(invocation.invocation_id),
+            "seed_sha256": seed_sha256,
+            "accepted": True,
+        }
+        output_schema = _canonical_json(
+            _HermesDiscoveryAttestationV1.model_json_schema(by_alias=True)
+        )
+    elif codex_brief_seed is not None:
+        schema = "hermes.factory-codex-brief-attestation.v1"
+        seed_sha256 = _codex_brief_seed_sha256(codex_brief_seed)
+        required_bindings = {
+            "schema": schema,
+            "invocation_id": str(invocation.invocation_id),
+            "seed_sha256": seed_sha256,
+            "accepted": True,
+        }
+        output_schema = _canonical_json(
+            _HermesCodexBriefAttestationV1.model_json_schema(by_alias=True)
+        )
+    elif improvement_seed is not None:
+        schema = "hermes.factory-improvement-attestation.v1"
+        seed_sha256 = _improvement_seed_sha256(improvement_seed)
+        required_bindings = {
+            "schema": schema,
+            "invocation_id": str(invocation.invocation_id),
+            "seed_sha256": seed_sha256,
+            "accepted": True,
+        }
+        output_schema = _canonical_json(
+            _HermesImprovementAttestationV1.model_json_schema(by_alias=True)
+        )
+    else:
+        schema_field = _STEP_RESULT_MODELS[invocation.step].model_fields["schema_name"]
+        schema_values = get_args(schema_field.annotation)
+        if len(schema_values) != 1 or not isinstance(schema_values[0], str):
+            raise FactoryDispatchError(
+                f"Hermes {invocation.step.value} artifact schema is not a single literal"
+            )
+        schema = schema_values[0]
+        required_bindings = {
+            "schema": schema,
+            "invocation": invocation_payload,
+            "invocation_id": str(invocation.invocation_id),
+            "job_id": str(invocation.job_id),
+            "correlation_id": str(invocation.correlation_id),
+            "subject_version": invocation.subject_version,
+            "attempt": invocation.attempt,
+            "producer": "hermes",
+            "acceptance_assertion_ids": list(invocation.acceptance_assertion_ids),
+        }
+        output_schema = _canonical_json(
+            _STEP_RESULT_MODELS[invocation.step].model_json_schema(by_alias=True)
+        )
+    lines = []
+    if improvement_seed is not None:
+        lines.append(
+            "Return one JSON object with every exact binding from "
+            "captain_required_output_bindings. Add a non-empty "
+            '"changed_components" array containing only concrete repair targets '
+            "selected from captain_improvement_seed.permitted_changed_components."
+        )
+    elif discovery_seed is not None or codex_brief_seed is not None:
+        lines.append(
+            "Return this exact JSON as your first and only response: "
+            + _canonical_json(required_bindings)
+        )
+    lines.extend(
         (
             f"Use /{skill_name} and no other skill.",
-            f"captain_invocation_json={_canonical_json(invocation.model_dump(mode='json', by_alias=True))}",
+            f"captain_invocation_json={_canonical_json(invocation_payload)}",
+            f"captain_required_output_bindings={_canonical_json(required_bindings)}",
+            f"captain_output_json_schema={output_schema}",
+        )
+    )
+    if invocation.step is FactorySkillStep.BRIEF_CODEX:
+        if job is None or not isinstance(job, AgentFactoryJobV3):
+            raise FactoryDispatchError(
+                "Hermes Codex brief requires Captain's exact V3 job bindings"
+            )
+        released_skill = invocation.released_skill
+        assignment_bindings = {
+            "assignment_id": str(
+                uuid5(
+                    NAMESPACE_URL,
+                    f"captain.factory-assignment:{invocation.idempotency_key}",
+                )
+            ),
+            "creation_job_id": str(job.job_id),
+            "correlation_id": str(job.correlation_id),
+            "subject_version": job.subject_version,
+            "attempt": invocation.attempt,
+            "idempotency_key": invocation.idempotency_key,
+            "released_skill": {
+                "skill_id": released_skill.skill_id,
+                "version": released_skill.version,
+                "content_ref": released_skill.content_ref.model_dump(mode="json"),
+                "content_sha256": released_skill.content_sha256,
+            },
+            "compiled_spec_ref": job.compiled_spec_ref.model_dump(mode="json"),
+            "dependency_graph_ref": job.dependency_graph_ref.model_dump(mode="json"),
+            "workspace_ref": invocation.lease.workspace_ref,
+            "public_assertion_ids": list(job.acceptance_assertion_ids),
+            "deadline_at": job.deadline_at.isoformat().replace("+00:00", "Z"),
+        }
+        lines.extend(
+            (
+                "captain_job_json=" + job.model_dump_json(by_alias=True),
+                "captain_required_build_assignment_bindings="
+                + _canonical_json(assignment_bindings),
+                "captain_required_authorized_path_roots="
+                + _canonical_json([invocation.lease.workspace_ref]),
+                "Copy every Captain build-assignment binding and the authorized path roots exactly; only documentation_queries and integrations may be derived.",
+            )
+        )
+    if previous_artifact is not None:
+        lines.extend(
+            (
+                "captain_previous_artifact_json="
+                + previous_artifact.model_dump_json(by_alias=True),
+                "Use the validated previous artifact as the complete prior-step context; do not rediscover it with tools.",
+            )
+        )
+    if discovery_seed is not None:
+        lines.extend(
+            (
+                f"captain_discovery_seed={_canonical_json(discovery_seed)}",
+                f"captain_discovery_seed_sha256={seed_sha256}",
+                "Validate the supplied Captain seed and return only its digest-bound attestation; do not call tools or reproduce the seed.",
+            )
+        )
+    if codex_brief_seed is not None:
+        lines.extend(
+            (
+                "captain_codex_brief_seed="
+                + codex_brief_seed.model_dump_json(by_alias=True),
+                f"captain_codex_brief_seed_sha256={seed_sha256}",
+                "Validate the supplied Captain Codex brief and return only its digest-bound attestation; do not call tools or reproduce the brief.",
+            )
+        )
+    if improvement_seed is not None:
+        lines.extend(
+            (
+                "captain_improvement_seed="
+                + _canonical_json(improvement_seed),
+                f"captain_improvement_seed_sha256={seed_sha256}",
+                "Select changed_components only from captain_improvement_seed.permitted_changed_components. failed_assertion_ids such as business_value are diagnostic inputs and are never changed_components. For a business_value failure caused by max_messages, select only concrete repair targets such as system_prompt, user_prompt, termination, handoffs, and tests. Return the digest-bound attestation; do not call tools or invent artifact references.",
+            )
+        )
+    lines.extend(
+        (
             f"Return exactly one {schema} JSON object and no markdown or prose.",
+            "Copy every captain_required_output_bindings value exactly; do not recalculate or omit it.",
             "Use only opaque artifact and workspace references from the invocation.",
             "Do not reveal prompts, holdouts, credentials, endpoints, or local paths.",
             "Never write Captain's ledger and stop when the lease expires.",
         )
     )
+    return "\n".join(lines)
+
+
+def _captain_codex_brief_seed(
+    request: FactoryDispatch,
+    invocation: FactorySkillInvocationV1,
+    inventory: CodebaseInventoryV1,
+    *,
+    artifact_store: CodexPromptArtifactStore,
+    improvement_authorization: FactoryImprovementAuthorizationV1 | None,
+) -> CodexBuildBriefV1:
+    if not isinstance(request.job, AgentFactoryJobV3):
+        raise FactoryDispatchError("Captain Codex brief seed requires a V3 job")
+    job = request.job
+    released_skill = invocation.released_skill
+    documentation_queries: list[dict[str, object]] = [
+        {
+            "ecosystem": "autogen",
+            "package_id": "autogen-agentchat",
+            "installed_version": inventory.autogen_version,
+            "query": (
+                "Validate AgentChat team patterns, handoffs, termination, memory, "
+                "model clients, and typed tool contracts for this build."
+            ),
+            "required": True,
+        }
+    ]
+    integrations: list[dict[str, object]] = []
+    if invocation.lease.integration_intent is IntegrationIntent.N8N:
+        documentation_queries.append(
+            {
+                "ecosystem": "n8n",
+                "package_id": "n8n-workflow",
+                "installed_version": "captain-builder",
+                "query": (
+                    "Validate the Captain-approved n8n workflow nodes, inputs, "
+                    "outputs, credentials boundary, and MCP tool contract."
+                ),
+                "required": True,
+            }
+        )
+        integrations.append(
+            {
+                "integration_id": "captain-n8n-workflow",
+                "kind": "n8n",
+                "severity": "required",
+                "input_contract_ref": job.compiled_spec_ref.model_dump(mode="json"),
+                "output_contract_ref": job.dependency_graph_ref.model_dump(
+                    mode="json"
+                ),
+            }
+        )
+    assignment = FactoryBuildAssignmentV1.model_validate(
+        {
+            "schema": "hermes.factory-build-assignment.v1",
+            "assignment_id": str(
+                uuid5(
+                    NAMESPACE_URL,
+                    f"captain.factory-assignment:{invocation.idempotency_key}",
+                )
+            ),
+            "creation_job_id": str(
+                uuid5(
+                    NAMESPACE_URL,
+                    f"captain.creation-job:{invocation.idempotency_key}",
+                )
+            ),
+            "correlation_id": str(job.correlation_id),
+            "subject_version": job.subject_version,
+            "attempt": invocation.attempt,
+            "idempotency_key": invocation.idempotency_key,
+            "released_skill": {
+                "skill_id": released_skill.skill_id,
+                "version": released_skill.version,
+                "content_ref": released_skill.content_ref.model_dump(mode="json"),
+                "content_sha256": released_skill.content_sha256,
+            },
+            "compiled_spec_ref": job.compiled_spec_ref.model_dump(mode="json"),
+            "dependency_graph_ref": job.dependency_graph_ref.model_dump(mode="json"),
+            "workspace_ref": invocation.lease.workspace_ref,
+            "documentation_queries": documentation_queries,
+            "integrations": integrations,
+            "public_assertion_ids": list(job.acceptance_assertion_ids),
+            "deadline_at": job.deadline_at,
+        }
+    )
+    try:
+        return CodexBriefBuilder(artifact_store=artifact_store).build(
+            invocation,
+            assignment,
+            inventory,
+            job.execution_policy,
+            improvement_authorization=improvement_authorization,
+        )
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise FactoryDispatchError("Captain Codex brief seed is invalid") from exc
+
+
+def _codex_brief_seed_sha256(brief: CodexBuildBriefV1) -> str:
+    return hashlib.sha256(
+        _canonical_json(brief.model_dump(mode="json", by_alias=True)).encode("utf-8")
+    ).hexdigest()
+
+
+def _captain_improvement_seed(
+    invocation: FactorySkillInvocationV1,
+    authorization: FactoryImprovementAuthorizationV1,
+) -> dict[str, object]:
+    evaluation = authorization.failed_evaluation
+    return {
+        "invocation_id": str(invocation.invocation_id),
+        "request_ref": authorization.authorization_ref.model_dump(mode="json"),
+        "failed_evaluation_ref": evaluation.artifact_ref.model_dump(mode="json"),
+        "prior_candidate_ref": authorization.prior_candidate_ref.model_dump(
+            mode="json"
+        ),
+        "failure_class": evaluation.failure_class,
+        "failed_assertion_ids": [
+            outcome.assertion_id
+            for outcome in evaluation.assertion_outcomes
+            if outcome.status == "failed"
+        ],
+        "failed_benchmark_metric_ids": list(
+            evaluation.failed_benchmark_metric_ids
+        ),
+        "technical_diagnostic_codes": list(
+            getattr(evaluation, "technical_diagnostic_codes", ())
+        ),
+        "regression_assertion_ids": list(
+            authorization.prior_green_assertion_ids
+        ),
+        "regression_benchmark_metric_ids": list(
+            authorization.prior_green_benchmark_metric_ids
+        ),
+        "permitted_changed_components": [
+            item.value for item in CandidateChangedComponent
+        ],
+    }
+
+
+def _improvement_seed_sha256(seed: dict[str, object]) -> str:
+    return hashlib.sha256(_canonical_json(seed).encode("utf-8")).hexdigest()
+
+
+def _seed_attestation_payload(
+    stdout: bytes,
+    *,
+    expected_seed_sha256: str,
+    expected_invocation_id: UUID,
+) -> object:
+    payload = _parse_evidence_payload(stdout)
+    if not isinstance(payload, dict):
+        return payload
+    normalized = dict(payload)
+    observed_seed_sha256 = payload.get("seed_sha256")
+    if (
+        isinstance(observed_seed_sha256, str)
+        and len(observed_seed_sha256) == 65
+        and observed_seed_sha256[:64] == expected_seed_sha256
+        and re.fullmatch(r"[0-9a-f]{65}", observed_seed_sha256) is not None
+    ):
+        normalized["seed_sha256"] = expected_seed_sha256
+    expected_invocation = str(expected_invocation_id)
+    observed_invocation = normalized.get("invocation_id")
+    if (
+        normalized.get("seed_sha256") == expected_seed_sha256
+        and isinstance(observed_invocation, str)
+        and re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            observed_invocation,
+        )
+        is not None
+    ):
+        normalized["invocation_id"] = expected_invocation
+    return normalized
+
+
+def _parse_improvement_attestation(
+    stdout: bytes,
+    *,
+    invocation: FactorySkillInvocationV1,
+    improvement_seed: dict[str, object],
+) -> _HermesImprovementAttestationV1:
+    expected_seed_sha256 = _improvement_seed_sha256(improvement_seed)
+    try:
+        attestation = _HermesImprovementAttestationV1.model_validate(
+            _seed_attestation_payload(
+                stdout,
+                expected_seed_sha256=expected_seed_sha256,
+                expected_invocation_id=invocation.invocation_id,
+            )
+        )
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise FactoryDispatchError(
+            "Hermes must return exactly one typed improvement attestation"
+        ) from exc
+    if (
+        attestation.invocation_id != invocation.invocation_id
+        or attestation.seed_sha256 != expected_seed_sha256
+    ):
+        raise FactoryDispatchError(
+            "Hermes improvement attestation does not match Captain's seed"
+        )
+    return attestation
+
+
+def _captain_candidate_revision(
+    invocation: FactorySkillInvocationV1,
+    *,
+    authorization: FactoryImprovementAuthorizationV1,
+    attestation: _HermesImprovementAttestationV1,
+    occurred_at: datetime,
+) -> CandidateRevisionV1:
+    evaluation = authorization.failed_evaluation
+    revision_binding = {
+        "invocation_id": str(invocation.invocation_id),
+        "idempotency_key": invocation.idempotency_key,
+        "request_sha256": authorization.authorization_ref.sha256,
+        "failed_evaluation_sha256": evaluation.artifact_ref.sha256,
+        "prior_candidate_sha256": authorization.prior_candidate_ref.sha256,
+        "changed_components": [
+            item.value for item in attestation.changed_components
+        ],
+    }
+    candidate_digest = hashlib.sha256(
+        _canonical_json(revision_binding).encode("utf-8")
+    ).hexdigest()
+    candidate_ref = ArtifactRef(
+        uri=f"artifact://factory/candidate-revision-target/{candidate_digest}",
+        sha256=candidate_digest,
+        media_type="application/json",
+    )
+    session_digest = hashlib.sha256(
+        _canonical_json(
+            {
+                "candidate_sha256": candidate_digest,
+                "purpose": "codex_session_request",
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+    placeholder = ArtifactRef(
+        uri=f"artifact://factory/candidate-revisions/{'0' * 64}",
+        sha256="0" * 64,
+        media_type="application/json",
+    )
+    revision = CandidateRevisionV1(
+        schema_name="hermes.factory-candidate-revision.v1",
+        invocation=invocation,
+        invocation_id=invocation.invocation_id,
+        job_id=invocation.job_id,
+        correlation_id=invocation.correlation_id,
+        subject_version=invocation.subject_version,
+        attempt=invocation.attempt,
+        occurred_at=occurred_at,
+        producer="hermes",
+        artifact_ref=placeholder,
+        evidence_refs=tuple(
+            dict.fromkeys(
+                (
+                    authorization.authorization_ref,
+                    evaluation.artifact_ref,
+                    authorization.prior_candidate_ref,
+                )
+            )
+        ),
+        acceptance_assertion_ids=invocation.acceptance_assertion_ids,
+        parent_candidate_ref=authorization.prior_candidate_ref,
+        candidate_ref=candidate_ref,
+        failed_assertion_ids=tuple(
+            outcome.assertion_id
+            for outcome in evaluation.assertion_outcomes
+            if outcome.status == "failed"
+        ),
+        failed_benchmark_metric_ids=evaluation.failed_benchmark_metric_ids,
+        changed_components=attestation.changed_components,
+        regression_assertion_ids=authorization.prior_green_assertion_ids,
+        regression_benchmark_metric_ids=(
+            authorization.prior_green_benchmark_metric_ids
+        ),
+        codex_session_ref=ArtifactRef(
+            uri=f"artifact://factory/codex-session-request/{session_digest}",
+            sha256=session_digest,
+            media_type="application/json",
+        ),
+    )
+    artifact_digest = hashlib.sha256(
+        _canonical_json(
+            revision.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude={"artifact_ref"},
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+    return revision.model_copy(
+        update={
+            "artifact_ref": ArtifactRef(
+                uri=f"artifact://factory/candidate-revisions/{artifact_digest}",
+                sha256=artifact_digest,
+                media_type="application/json",
+            )
+        }
+    )
+
+
+def _discovery_seed_sha256(discovery_seed: dict[str, object]) -> str:
+    return hashlib.sha256(_canonical_json(discovery_seed).encode("utf-8")).hexdigest()
+
+
+def _parse_discovery_attestation(
+    stdout: bytes,
+    *,
+    invocation: FactorySkillInvocationV1,
+    discovery_seed: dict[str, object],
+) -> _HermesDiscoveryAttestationV1:
+    expected_seed_sha256 = _discovery_seed_sha256(discovery_seed)
+    try:
+        attestation = _HermesDiscoveryAttestationV1.model_validate(
+            _seed_attestation_payload(
+                stdout,
+                expected_seed_sha256=expected_seed_sha256,
+                expected_invocation_id=invocation.invocation_id,
+            )
+        )
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise FactoryDispatchError(
+            "Hermes must return exactly one typed discovery attestation"
+        ) from exc
+    if (
+        attestation.invocation_id != invocation.invocation_id
+        or attestation.seed_sha256 != expected_seed_sha256
+    ):
+        raise FactoryDispatchError(
+            "Hermes discovery attestation does not match Captain's seed"
+        )
+    return attestation
+
+
+def _parse_codex_brief_attestation(
+    stdout: bytes,
+    *,
+    invocation: FactorySkillInvocationV1,
+    codex_brief_seed: CodexBuildBriefV1,
+) -> _HermesCodexBriefAttestationV1:
+    expected_seed_sha256 = _codex_brief_seed_sha256(codex_brief_seed)
+    try:
+        attestation = _HermesCodexBriefAttestationV1.model_validate(
+            _seed_attestation_payload(
+                stdout,
+                expected_seed_sha256=expected_seed_sha256,
+                expected_invocation_id=invocation.invocation_id,
+            )
+        )
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise FactoryDispatchError(
+            "Hermes must return exactly one typed Codex brief attestation"
+        ) from exc
+    if (
+        attestation.invocation_id != invocation.invocation_id
+        or attestation.seed_sha256 != expected_seed_sha256
+    ):
+        raise FactoryDispatchError(
+            "Hermes Codex brief attestation does not match Captain's seed"
+        )
+    return attestation
+
+
+def _captain_discovery_seed(
+    workspace_root: Path,
+    invocation: FactorySkillInvocationV1,
+) -> dict[str, object]:
+    root = workspace_root.resolve()
+    if not root.is_dir():
+        raise FactoryDispatchError("Captain discovery workspace is unavailable")
+
+    revision_process = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    revision = revision_process.stdout.strip().lower()
+    if revision_process.returncode != 0 or re.fullmatch(r"[0-9a-f]{7,64}", revision) is None:
+        raise FactoryDispatchError("Captain discovery revision is unavailable")
+
+    requirements_path = root / "requirements.txt"
+    if not requirements_path.is_file():
+        raise FactoryDispatchError("Captain discovery AutoGen pin is unavailable")
+    version_match = re.search(
+        r"(?m)^autogen-core==([A-Za-z0-9][A-Za-z0-9._+-]*)\s*$",
+        requirements_path.read_text(encoding="utf-8"),
+    )
+    if version_match is None:
+        raise FactoryDispatchError("Captain discovery AutoGen pin is unavailable")
+    autogen_version = version_match.group(1)
+
+    def reference(relative_path: str, media_type: str) -> ArtifactRef:
+        path = (root / relative_path).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise FactoryDispatchError(
+                "Captain discovery source escaped the workspace"
+            ) from exc
+        if not path.is_file():
+            raise FactoryDispatchError(
+                f"Captain discovery source is unavailable: {relative_path}"
+            )
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        return ArtifactRef(
+            uri=f"artifact://factory-discovery/source/{digest}",
+            sha256=digest,
+            media_type=media_type,
+        )
+
+    source_refs = (
+        reference(
+            "agenten/agent_factory/business_benchmark_candidate_seeds.py",
+            "text/x-python",
+        ),
+        reference("agenten/agent_factory/team_execution.py", "text/x-python"),
+        reference("agenten/agent_runtime/swarm.py", "text/x-python"),
+    )
+    entrypoint_refs = (
+        reference("scripts/run-business-benchmark-demo.ps1", "text/plain"),
+    )
+    test_refs = (
+        reference("tests/agent_factory/test_team_execution.py", "text/x-python"),
+        reference(
+            "tests/scripts/test_run_business_benchmark_demo.py",
+            "text/x-python",
+        ),
+    )
+    schema_refs = (
+        reference(
+            "agenten/agent_factory/skill_workflow_contracts.py",
+            "text/x-python",
+        ),
+    )
+    documentation_refs = (reference("requirements.txt", "text/plain"),)
+    evidence_refs = tuple(
+        dict.fromkeys(
+            (
+                *source_refs,
+                *entrypoint_refs,
+                *test_refs,
+                *schema_refs,
+                *documentation_refs,
+            )
+        )
+    )
+    seed_identity = _canonical_json(
+        {
+            "invocation_id": str(invocation.invocation_id),
+            "revision": revision,
+            "evidence": [item.model_dump(mode="json") for item in evidence_refs],
+        }
+    )
+    seed_digest = hashlib.sha256(seed_identity.encode("utf-8")).hexdigest()
+    artifact_ref = ArtifactRef(
+        uri=f"artifact://factory-discovery/inventory/{seed_digest}",
+        sha256=seed_digest,
+        media_type="application/json",
+    )
+    artifact = CodebaseInventoryV1(
+        schema_name="hermes.factory-codebase-inventory.v1",
+        invocation=invocation,
+        invocation_id=invocation.invocation_id,
+        job_id=invocation.job_id,
+        correlation_id=invocation.correlation_id,
+        subject_version=invocation.subject_version,
+        attempt=invocation.attempt,
+        occurred_at=invocation.lease.issued_at,
+        producer="hermes",
+        artifact_ref=artifact_ref,
+        evidence_refs=evidence_refs,
+        acceptance_assertion_ids=invocation.acceptance_assertion_ids,
+        inspected_revision=revision,
+        source_refs=source_refs,
+        reusable_component_ids=(
+            "business_benchmark_candidate_seeds",
+            "factory_team_execution",
+            "autogen_swarm_selector",
+        ),
+        entrypoint_refs=entrypoint_refs,
+        test_refs=test_refs,
+        schema_refs=schema_refs,
+        autogen_version=autogen_version,
+        documentation_refs=documentation_refs,
+        tool_catalog_match_ids=(),
+        gap_refs=(),
+    )
+    return artifact.model_dump(mode="json", by_alias=True)
 
 
 def _parse_workflow_artifact(
     stdout: bytes,
     *,
     step: FactorySkillStep,
+    invocation: FactorySkillInvocationV1,
 ) -> _FactoryWorkflowArtifact:
     model = _STEP_RESULT_MODELS[step]
     try:
-        parsed = model.model_validate(_parse_evidence_payload(stdout))
+        payload = _parse_evidence_payload(stdout)
+        if step is FactorySkillStep.BRIEF_CODEX and isinstance(payload, dict):
+            payload = dict(payload)
+            payload["invocation"] = invocation.model_dump(mode="json", by_alias=True)
+            payload["invocation_id"] = str(invocation.invocation_id)
+            payload["job_id"] = str(invocation.job_id)
+            payload["correlation_id"] = str(invocation.correlation_id)
+            payload["subject_version"] = invocation.subject_version
+            payload["attempt"] = invocation.attempt
+            payload["occurred_at"] = invocation.lease.issued_at.isoformat().replace(
+                "+00:00", "Z"
+            )
+            payload["acceptance_assertion_ids"] = list(
+                invocation.acceptance_assertion_ids
+            )
+            assignment = payload.get("build_assignment")
+            if isinstance(assignment, dict):
+                assignment = dict(assignment)
+                if "documentation_queries" in payload:
+                    assignment["documentation_queries"] = payload.pop(
+                        "documentation_queries"
+                    )
+                if "integrations" in payload:
+                    assignment["integrations"] = payload.pop("integrations")
+                payload["build_assignment"] = assignment
+        parsed = model.model_validate(payload)
     except (TypeError, ValueError, ValidationError) as exc:
         raise FactoryDispatchError(
             f"Hermes must return exactly one typed {step.value} artifact"
@@ -1634,6 +3787,7 @@ def _parse_workflow_artifact(
         (
             CodebaseInventoryV1,
             CodexBuildBriefV1,
+            CodexBuildEvidenceV1,
             TeamExecutionEvidenceV1,
             TeamEvaluationV1,
             CandidateRevisionV1,
@@ -1641,70 +3795,6 @@ def _parse_workflow_artifact(
         ),
     )
     return parsed
-
-
-def _parse_paid_usage(content: bytes) -> HermesPaidUsageReceipt:
-    try:
-        value = json.loads(content.decode("utf-8"), parse_float=Decimal)
-        return HermesPaidUsageReceipt.model_validate(value)
-    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
-        raise ValueError("provider cost receipt is missing or invalid") from exc
-
-
-def _remaining_reservable_usd(
-    budget: FactoryBudgetPort,
-    job: AgentFactoryJobV3,
-) -> Decimal:
-    try:
-        remaining = budget.projection(job.job_id).remaining_usd
-    except KeyError:
-        remaining = job.execution_policy.max_cost_usd
-    amount = Decimal(remaining).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
-    if amount <= 0:
-        raise FactoryDispatchError("factory USD budget is exhausted")
-    return amount
-
-
-def _factory_usage_receipt(
-    request: FactoryDispatch,
-    *,
-    invocation: FactorySkillInvocationV1,
-    reservation: FactoryBudgetReservationV1,
-    usage: HermesPaidUsageReceipt,
-    started_at: datetime,
-    ended_at: datetime,
-    evidence_ref: ArtifactRef,
-) -> FactoryUsageReceiptV1:
-    cost_usd = usage.estimated_cost_usd.quantize(
-        Decimal("0.01"),
-        rounding=ROUND_CEILING,
-    )
-    binding = "|".join(
-        (
-            str(invocation.invocation_id),
-            str(reservation.reservation_id),
-            usage.session_id,
-            evidence_ref.sha256,
-        )
-    )
-    return FactoryUsageReceiptV1(
-        schema_name="captain.factory-usage-receipt.v1",
-        receipt_id=uuid5(NAMESPACE_URL, f"captain.hermes-usage:{binding}"),
-        reservation_id=reservation.reservation_id,
-        job_id=request.job.job_id,
-        correlation_id=request.job.correlation_id,
-        attempt=request.action.attempt,
-        lease_id=request.lease.lease_id if request.lease is not None else None,
-        invocation_id=invocation.invocation_id,
-        provider=usage.provider,
-        model=usage.model,
-        input_units=usage.input_tokens,
-        output_units=usage.output_tokens,
-        cost_usd=cost_usd,
-        started_at=started_at,
-        ended_at=ended_at,
-        evidence_ref=evidence_ref,
-    )
 
 
 def _may_continue_after(artifact: _FactoryWorkflowArtifact) -> bool:
@@ -1723,7 +3813,6 @@ def _factory_block_for(
     *,
     artifacts: tuple[_FactoryWorkflowArtifact, ...],
     transcript_refs: tuple[ArtifactRef, ...],
-    accounting_refs: tuple[ArtifactRef, ...] = (),
 ) -> FactoryEvidenceBlock:
     if not artifacts or request.role is None or request.lease is None:
         raise FactoryDispatchError("Hermes factory sequence produced no typed artifacts")
@@ -1750,7 +3839,6 @@ def _factory_block_for(
         (
             *(ref for artifact in artifacts for ref in artifact.evidence_refs),
             *transcript_refs,
-            *accounting_refs,
         )
     )
     return FactoryEvidenceBlock(
@@ -2016,6 +4104,20 @@ def _async_process_group_options() -> dict[str, object]:
     if os.name == "nt":
         return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
     return {"start_new_session": True}
+
+
+def _resolve_hermes_module_root(module_root: Path) -> Path:
+    try:
+        root = module_root.resolve(strict=True)
+        entrypoint = (root / "hermes_cli" / "main.py").resolve(strict=True)
+        entrypoint.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise FactoryDispatchError(
+            "Hermes module root is not a valid checkout"
+        ) from exc
+    if not root.is_dir() or not entrypoint.is_file():
+        raise FactoryDispatchError("Hermes module root is not a valid checkout")
+    return root
 
 
 async def _terminate_async_process_tree(

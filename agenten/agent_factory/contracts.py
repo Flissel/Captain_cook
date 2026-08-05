@@ -38,6 +38,8 @@ class FactoryPhase(str, Enum):
     BUILD_PASSED = "build_passed"
     BUILD_FAILED = "build_failed"
     REAL_CASE_EVIDENCE = "real_case_evidence"
+    TECHNICAL_REVALIDATION_REQUESTED = "technical_revalidation_requested"
+    REAL_CASE_REVALIDATED = "real_case_revalidated"
     QUALITY_REVIEWED = "quality_reviewed"
     IMPROVEMENT_REQUESTED = "improvement_requested"
     CAPABILITY_PROMOTED = "capability_promoted"
@@ -306,6 +308,7 @@ _ROLE_PHASES: dict[FactoryPhase, FactoryRole] = {
     FactoryPhase.BUILD_PASSED: FactoryRole.TOOL_INTEGRATOR,
     FactoryPhase.BUILD_FAILED: FactoryRole.TOOL_INTEGRATOR,
     FactoryPhase.REAL_CASE_EVIDENCE: FactoryRole.REAL_CASE_TESTER,
+    FactoryPhase.REAL_CASE_REVALIDATED: FactoryRole.REAL_CASE_TESTER,
     FactoryPhase.QUALITY_REVIEWED: FactoryRole.QUALITY_WARDEN,
 }
 
@@ -313,6 +316,7 @@ _CAPTAIN_PHASES = frozenset(
     {
         FactoryPhase.FORGE_REQUESTED,
         FactoryPhase.IMPROVEMENT_REQUESTED,
+        FactoryPhase.TECHNICAL_REVALIDATION_REQUESTED,
         FactoryPhase.CAPABILITY_PROMOTED,
         FactoryPhase.ESCALATED,
     }

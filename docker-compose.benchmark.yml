@@ -1,0 +1,21 @@
+name: captain-cook-business-benchmark
+services:
+  mariadb-benchmark:
+    image: mariadb:11.8.8
+    environment:
+      MARIADB_DATABASE: captain_test
+      MARIADB_USER: captain_test
+      MARIADB_PASSWORD: "${MARIADB_TEST_PASSWORD:?required}"
+      MARIADB_ROOT_PASSWORD: "${MARIADB_TEST_ROOT_PASSWORD:?required}"
+    ports:
+      - "127.0.0.1:${MARIADB_BENCHMARK_PORT:-33316}:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - captain-benchmark-mariadb:/var/lib/mysql
+
+volumes:
+  captain-benchmark-mariadb:
