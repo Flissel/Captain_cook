@@ -160,6 +160,7 @@ from gateway.portal_live_contracts import (
     PortalProviderProbeRequestV1,
     PortalProviderProbeStartedV1,
     PortalProviderProbeWriteReceiptV1,
+    PortalRestartReceiptV1,
 )
 
 
@@ -514,6 +515,21 @@ class GatewayStore:
                             FOREIGN KEY (probe_request_id)
                             REFERENCES portal_provider_probe_starts (probe_request_id)
                             ON DELETE CASCADE
+                    ) ENGINE=InnoDB
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS portal_restart_receipts (
+                        restart_id CHAR(36) NOT NULL PRIMARY KEY,
+                        restart_request_id CHAR(36) NOT NULL UNIQUE,
+                        run_id VARCHAR(128) NOT NULL,
+                        job_id CHAR(36) NOT NULL,
+                        correlation_id CHAR(36) NOT NULL,
+                        block_index BIGINT NOT NULL UNIQUE,
+                        payload JSON NOT NULL,
+                        CONSTRAINT fk_portal_restart_block
+                            FOREIGN KEY (block_index) REFERENCES blocks (`index`) ON DELETE CASCADE
                     ) ENGINE=InnoDB
                     """
                 )
@@ -1257,6 +1273,83 @@ class GatewayStore:
         return PortalProviderProbeCompletionV1.model_validate(
             self._decode_json(row["payload"])
         )
+
+    def record_portal_restart_receipt(
+        self,
+        receipt: PortalRestartReceiptV1,
+    ) -> PortalRestartReceiptV1:
+        canonical = receipt.model_dump(mode="json")
+        with self.storage.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT payload FROM portal_restart_receipts "
+                    "WHERE restart_id = %s OR restart_request_id = %s FOR UPDATE",
+                    (str(receipt.restart_id), str(receipt.restart_request_id)),
+                )
+                replay = cursor.fetchone()
+                if replay is not None:
+                    stored = PortalRestartReceiptV1.model_validate(
+                        self._decode_json(replay["payload"])
+                    )
+                    if stored != receipt:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="restart receipt already exists with different content",
+                        )
+                    return stored
+                cursor.execute(
+                    "SELECT payload, content_sha256 FROM factory_integration_setup_events "
+                    "WHERE job_id = %s ORDER BY revision DESC LIMIT 1 FOR UPDATE",
+                    (str(receipt.job_id),),
+                )
+                setup_row = cursor.fetchone()
+                if setup_row is None:
+                    raise HTTPException(status_code=409, detail="integration setup is unavailable")
+                setup = IntegrationSetupSubmissionV1.model_validate(
+                    self._decode_json(setup_row["payload"])
+                )
+                if (
+                    setup.correlation_id != receipt.correlation_id
+                    or setup.revision != receipt.setup_revision
+                    or str(setup_row["content_sha256"]) != receipt.setup_content_sha256
+                ):
+                    raise HTTPException(status_code=409, detail="restart setup fence mismatch")
+                job_block = self._runtime_block_by_json_value(
+                    cursor,
+                    block_type="agent_factory_job",
+                    field="job_id",
+                    value=str(receipt.job_id),
+                    for_update=True,
+                )
+                if job_block is None:
+                    raise HTTPException(status_code=409, detail="factory job is unavailable")
+                index = self._next_index(cursor)
+                block = self._new_block(
+                    cursor,
+                    index=index,
+                    block_type="portal_restart_completed",
+                    data=canonical,
+                    status="resumed",
+                    parent_index=job_block["index"],
+                    metadata={"schema": "captain.portal-restart-receipt.v1"},
+                )
+                self._insert(cursor, block)
+                cursor.execute(
+                    """INSERT INTO portal_restart_receipts
+                       (restart_id, restart_request_id, run_id, job_id,
+                        correlation_id, block_index, payload)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        str(receipt.restart_id),
+                        str(receipt.restart_request_id),
+                        receipt.run_id,
+                        str(receipt.job_id),
+                        str(receipt.correlation_id),
+                        index,
+                        json.dumps(canonical, sort_keys=True),
+                    ),
+                )
+        return receipt
 
     def run_portal_provider_probe(
         self,

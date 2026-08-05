@@ -110,3 +110,34 @@ class PortalProviderAuditV1(PortalProviderAuditQueryV1):
         if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
             raise ValueError("provider audit timestamp must be UTC")
         return value.astimezone(timezone.utc)
+
+
+class PortalRestartReceiptV1(_FrozenContract):
+    restart_request_id: UUID
+    restart_id: UUID
+    run_id: str = Field(pattern=IDENTIFIER_PATTERN)
+    job_id: UUID
+    correlation_id: UUID
+    services: tuple[Literal["gateway", "portal"], ...]
+    previous_gateway_boot_id: str = Field(min_length=1, max_length=128)
+    new_gateway_boot_id: str = Field(min_length=1, max_length=128)
+    portal_deployment_id: str = Field(min_length=1, max_length=256)
+    setup_revision: int = Field(ge=1, strict=True)
+    setup_content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    status: Literal["resumed"]
+    occurred_at: datetime
+
+    @field_validator("occurred_at")
+    @classmethod
+    def require_restart_at_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+            raise ValueError("restart receipt timestamp must be UTC")
+        return value.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def require_exact_restart_scope(self) -> "PortalRestartReceiptV1":
+        if self.services != ("gateway", "portal"):
+            raise ValueError("restart receipt requires exactly gateway and portal")
+        if self.previous_gateway_boot_id == self.new_gateway_boot_id:
+            raise ValueError("restart boot identity must change")
+        return self

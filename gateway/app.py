@@ -66,7 +66,11 @@ from gateway.contracts import (
 )
 from gateway.mirror import MirrorQueue
 from gateway.portal_auth import initialize_portal_auth, require_portal_principal
-from gateway.portal_control_auth import PortalControlRole, require_provider_control
+from gateway.portal_control_auth import (
+    PortalControlRole,
+    require_provider_control,
+    require_restart_control,
+)
 from gateway.portal_contracts import (
     PortalPrincipalV1,
     PortalSetupActionRequestV1,
@@ -103,6 +107,7 @@ from gateway.portal_live_contracts import (
     PortalProviderAuditV1,
     PortalProviderProbeCompletionV1,
     PortalProviderProbeRequestV1,
+    PortalRestartReceiptV1,
 )
 
 
@@ -389,6 +394,19 @@ def create_app(
             get_store().portal_provider_audit,
             request,
             observed_at=portal_clock(),
+        )
+
+    @app.post("/v1/control/restarts/{restart_id}/receipts")
+    async def record_restart_control_receipt(
+        restart_id: UUID,
+        receipt: PortalRestartReceiptV1,
+        _: PortalControlRole = Depends(require_restart_control),
+    ) -> PortalRestartReceiptV1:
+        if receipt.restart_id != restart_id:
+            raise HTTPException(status_code=409, detail="restart_id must match route")
+        return await run_in_threadpool(
+            get_store().record_portal_restart_receipt,
+            receipt,
         )
 
     @app.get("/batches")

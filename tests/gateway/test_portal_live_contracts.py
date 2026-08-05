@@ -10,6 +10,7 @@ from pydantic import SecretStr
 from agenten.agent_runtime.contracts import ArtifactRef
 from agenten.agent_factory.gitea_template_contracts import GiteaTemplateReleaseV1
 from gateway.portal_live_contracts import (
+    PortalRestartReceiptV1,
     PortalProviderProbeCompletionV1,
     PortalProviderProbeRequestV1,
 )
@@ -117,7 +118,6 @@ def test_control_plane_tokens_must_be_complete_and_pairwise_distinct() -> None:
                 "portal_evidence_token": SecretStr("provider-token"),
             }
         )
-
     with pytest.raises(ValidationError, match="configured together"):
         GatewaySettings(
             **{
@@ -125,4 +125,29 @@ def test_control_plane_tokens_must_be_complete_and_pairwise_distinct() -> None:
                 for key, value in common.items()
                 if key != "portal_restart_control_token"
             }
+        )
+
+
+def test_restart_receipt_requires_exact_services_and_new_boot_identity() -> None:
+    common = {
+        "restart_request_id": UUID("50000000-0000-4000-8000-000000000001"),
+        "restart_id": UUID("60000000-0000-4000-8000-000000000001"),
+        "run_id": "portal-live-v1",
+        "job_id": JOB_ID,
+        "correlation_id": CORRELATION_ID,
+        "services": ("gateway", "portal"),
+        "previous_gateway_boot_id": "boot-before",
+        "new_gateway_boot_id": "boot-after",
+        "portal_deployment_id": "portal-deployment-1",
+        "setup_revision": 7,
+        "setup_content_sha256": "a" * 64,
+        "status": "resumed",
+        "occurred_at": NOW,
+    }
+    assert PortalRestartReceiptV1(**common).status == "resumed"
+    with pytest.raises(ValidationError, match="exactly gateway and portal"):
+        PortalRestartReceiptV1(**common | {"services": ("gateway",)})
+    with pytest.raises(ValidationError, match="boot identity must change"):
+        PortalRestartReceiptV1(
+            **common | {"new_gateway_boot_id": "boot-before"}
         )

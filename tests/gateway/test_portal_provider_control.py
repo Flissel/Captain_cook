@@ -17,6 +17,7 @@ from gateway.portal_live_contracts import (
     PortalProviderAuditQueryV1,
     PortalProviderProbeCompletionV1,
     PortalProviderProbeRequestV1,
+    PortalRestartReceiptV1,
 )
 from gateway.store import GatewayStore
 from gateway.app import create_app
@@ -273,5 +274,68 @@ def test_provider_control_routes_require_only_the_provider_capability() -> None:
         assert audit.status_code == 200
         assert audit.json()["invocation_count"] == 1
         assert audit.json()["completion_count"] == 1
+    finally:
+        storage.clear()
+
+
+def test_restart_receipt_is_setup_fenced_and_replay_safe() -> None:
+    assert TEST_DSN is not None
+    assert_isolated_test_database(TEST_DSN)
+    storage = MariaDBStorage(TEST_DSN)
+    storage.clear()
+    store = GatewayStore(storage)
+    factory_job = job()
+    store.record_factory_job(factory_job)
+    setup = IntegrationSetupSubmissionV1.model_validate(ready_setup_payload(factory_job))
+    store.record_integration_setup(setup)
+    persisted = store.integration_setup(factory_job.job_id)
+    receipt = PortalRestartReceiptV1(
+        restart_request_id=UUID("50000000-0000-4000-8000-000000000001"),
+        restart_id=UUID("60000000-0000-4000-8000-000000000001"),
+        run_id="portal-live-v1",
+        job_id=factory_job.job_id,
+        correlation_id=factory_job.correlation_id,
+        services=("gateway", "portal"),
+        previous_gateway_boot_id="boot-before",
+        new_gateway_boot_id="boot-after",
+        portal_deployment_id="portal-deployment-1",
+        setup_revision=setup.revision,
+        setup_content_sha256=persisted.content_sha256,
+        status="resumed",
+        occurred_at=NOW,
+    )
+    try:
+        first = store.record_portal_restart_receipt(receipt)
+        replay = store.record_portal_restart_receipt(receipt)
+        assert first == receipt
+        assert replay == receipt
+        assert sum(
+            block["block_type"] == "portal_restart_completed"
+            for block in storage.load()
+        ) == 1
+        settings = GatewaySettings(
+            ledger_dsn=SecretStr(TEST_DSN),
+            captain_gateway_token=SecretStr("captain-token"),
+            worker_gateway_token=SecretStr("worker-token"),
+            portal_provider_control_token=SecretStr("provider-token"),
+            portal_evidence_token=SecretStr("evidence-token"),
+            portal_restart_control_token=SecretStr("restart-token"),
+        )
+        with TestClient(
+            create_app(gateway_store=store, settings=settings, mirror=NullMirror())
+        ) as client:
+            denied = client.post(
+                f"/v1/control/restarts/{receipt.restart_id}/receipts",
+                headers={"Authorization": "Bearer evidence-token"},
+                json=receipt.model_dump(mode="json"),
+            )
+            accepted = client.post(
+                f"/v1/control/restarts/{receipt.restart_id}/receipts",
+                headers={"Authorization": "Bearer restart-token"},
+                json=receipt.model_dump(mode="json"),
+            )
+        assert denied.status_code == 401
+        assert accepted.status_code == 200
+        assert accepted.json() == receipt.model_dump(mode="json")
     finally:
         storage.clear()
