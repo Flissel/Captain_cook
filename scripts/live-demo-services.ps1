@@ -241,17 +241,34 @@ function Start-Gateway($Values, [string]$PidPath=$gatewayPid) {
     $configurationSha256 = Get-GatewayConfigurationSha256 $Values
     $listener = Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $gatewayPort -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($listener) {
+        $configurationReplacement = $false
         try {
             $managed = Get-ManagedListenerIdentity -Path $PidPath -Port $gatewayPort -ConfigurationSha256 $configurationSha256
         }
         catch {
-            throw 'Gateway port is occupied without the exact managed process and ledger identity; refusing reuse or termination.'
+            try {
+                $managed = Get-ManagedListenerIdentityForConfigurationReplacement `
+                    -Path $PidPath `
+                    -Port $gatewayPort `
+                    -ReplacementConfigurationSha256 $configurationSha256
+                $configurationReplacement = $true
+            }
+            catch {
+                throw 'Gateway port is occupied without the exact managed process and ledger identity; refusing reuse or termination.'
+            }
         }
-        try { if ((Invoke-WebRequest "$($Values['CAPTAIN_GATEWAY_URL'])/healthz" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200) { Write-Host '[ready] Gateway already healthy with verified process and ledger identity'; return } } catch {}
+        if (-not $configurationReplacement) {
+            try { if ((Invoke-WebRequest "$($Values['CAPTAIN_GATEWAY_URL'])/healthz" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200) { Write-Host '[ready] Gateway already healthy with verified process and ledger identity'; return } } catch {}
+        }
         & taskkill.exe /PID $managed.Id /T /F *> $null
         if ($LASTEXITCODE -ne 0) { throw 'Verified stale local Gateway process could not be stopped.' }
         Remove-Item -LiteralPath $PidPath -Force
-        Write-Host '[ready] verified stale local Gateway process stopped after failed health check'
+        if ($configurationReplacement) {
+            Write-Host '[ready] verified managed Gateway stopped for configuration replacement'
+        }
+        else {
+            Write-Host '[ready] verified stale local Gateway process stopped after failed health check'
+        }
     } elseif (Test-Path -LiteralPath $PidPath -PathType Leaf) {
         $managed = $null
         try {

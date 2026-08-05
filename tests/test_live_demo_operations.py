@@ -282,6 +282,46 @@ def test_managed_listener_identity_binds_a_real_listener_to_its_recorded_process
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_managed_listener_identity_allows_only_exact_configuration_replacement(
+    tmp_path: Path,
+) -> None:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    identity = tmp_path / "listener.pid"
+    harness = tmp_path / "replacement.ps1"
+    harness.write_text(
+        "\n".join(
+            (
+                "$ErrorActionPreference = 'Stop'",
+                f". '{MANAGED_PROCESS.as_posix()}'",
+                f"$listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, {port})",
+                "$listener.Start()",
+                "try {",
+                f"  Write-ManagedProcessIdentity -Process (Get-Process -Id $PID) -Path '{identity.as_posix()}' -ConfigurationSha256 ('a' * 64)",
+                f"  $matched = Get-ManagedListenerIdentityForConfigurationReplacement -Path '{identity.as_posix()}' -Port {port} -ReplacementConfigurationSha256 ('b' * 64)",
+                "  if ($matched.Id -ne $PID) { throw 'replacement identity mismatch' }",
+                "  $sameConfigRejected = $false",
+                f"  try {{ Get-ManagedListenerIdentityForConfigurationReplacement -Path '{identity.as_posix()}' -Port {port} -ReplacementConfigurationSha256 ('a' * 64) }} catch {{ $sameConfigRejected = $true }}",
+                "  if (-not $sameConfigRejected) { throw 'same configuration accepted as replacement' }",
+                "} finally {",
+                "  $listener.Stop()",
+                "}",
+            )
+        ),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_readme_documents_safe_recording_commands() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "scripts/demo-preflight.ps1 -NormalizeOnly" in readme

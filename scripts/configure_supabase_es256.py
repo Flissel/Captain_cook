@@ -19,6 +19,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
+from urllib.parse import urlsplit
 
 
 AUTH_ENV = ".env.captain-supabase-auth"
@@ -139,11 +140,26 @@ def write_scoped_env_files(
     *,
     jwt_keys: str,
     jwt_jwks: str,
+    jwt_issuer: str,
 ) -> tuple[Path, Path]:
     validate_generated_keys(jwt_keys, jwt_jwks)
+    parsed_issuer = urlsplit(jwt_issuer)
+    if (
+        parsed_issuer.scheme != "https"
+        or not parsed_issuer.hostname
+        or parsed_issuer.username is not None
+        or parsed_issuer.password is not None
+        or parsed_issuer.path != "/auth/v1"
+        or parsed_issuer.query
+        or parsed_issuer.fragment
+    ):
+        raise ValueError("Supabase JWT issuer must be a canonical HTTPS /auth/v1 URL")
     auth_path = directory / AUTH_ENV
     verify_path = directory / VERIFY_ENV
-    _atomic_private_write(auth_path, f"GOTRUE_JWT_KEYS={jwt_keys}\n")
+    _atomic_private_write(
+        auth_path,
+        f"GOTRUE_JWT_KEYS={jwt_keys}\nGOTRUE_JWT_ISSUER={jwt_issuer}\n",
+    )
     _atomic_private_write(
         verify_path,
         "".join(
@@ -184,7 +200,12 @@ def _run(args: Sequence[str], *, cwd: Path) -> None:
     )
 
 
-def apply_migration(compose_path: Path, generator_path: Path) -> dict[str, object]:
+def apply_migration(
+    compose_path: Path,
+    generator_path: Path,
+    *,
+    jwt_issuer: str,
+) -> dict[str, object]:
     compose_path = compose_path.resolve(strict=True)
     generator_path = generator_path.resolve(strict=True)
     directory = compose_path.parent
@@ -221,7 +242,12 @@ def apply_migration(compose_path: Path, generator_path: Path) -> dict[str, objec
             raise RuntimeError("Supabase key generation was incomplete") from exc
         validate_generated_keys(jwt_keys, jwt_jwks)
 
-    write_scoped_env_files(directory, jwt_keys=jwt_keys, jwt_jwks=jwt_jwks)
+    write_scoped_env_files(
+        directory,
+        jwt_keys=jwt_keys,
+        jwt_jwks=jwt_jwks,
+        jwt_issuer=jwt_issuer,
+    )
     _atomic_private_write(compose_path, transformed)
     try:
         _run(("docker", "compose", "-f", str(compose_path), "config", "--quiet"), cwd=directory)
@@ -255,6 +281,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--compose", type=Path, required=True)
     parser.add_argument("--generator", type=Path, required=True)
+    parser.add_argument("--issuer", required=True)
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
 
@@ -262,6 +289,17 @@ def main() -> int:
     generator = args.generator.resolve(strict=True)
     transformed = transform_compose(compose.read_text(encoding="utf-8"))
     _legacy_jwt_secret(compose.read_text(encoding="utf-8"))
+    parsed_issuer = urlsplit(args.issuer)
+    if (
+        parsed_issuer.scheme != "https"
+        or not parsed_issuer.hostname
+        or parsed_issuer.username is not None
+        or parsed_issuer.password is not None
+        or parsed_issuer.path != "/auth/v1"
+        or parsed_issuer.query
+        or parsed_issuer.fragment
+    ):
+        parser.error("--issuer must be a canonical HTTPS /auth/v1 URL")
     if not args.apply:
         result: dict[str, object] = {
             "status": "dry_run",
@@ -271,7 +309,7 @@ def main() -> int:
             "secrets_emitted": False,
         }
     else:
-        result = apply_migration(compose, generator)
+        result = apply_migration(compose, generator, jwt_issuer=args.issuer)
     print(json.dumps(result, sort_keys=True))
     return 0
 

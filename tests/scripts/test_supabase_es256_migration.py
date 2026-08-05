@@ -89,14 +89,47 @@ def test_write_scoped_env_files_never_places_private_key_in_verifier_file(
         tmp_path,
         jwt_keys=json.dumps(private, separators=(",", ":")),
         jwt_jwks=json.dumps(public, separators=(",", ":")),
+        jwt_issuer="https://identity.example.test/auth/v1",
     )
 
-    assert "private-value" in auth_path.read_text(encoding="utf-8")
+    auth_text = auth_path.read_text(encoding="utf-8")
+    assert "private-value" in auth_text
+    assert "GOTRUE_JWT_ISSUER=https://identity.example.test/auth/v1" in auth_text
     assert "private-value" not in verify_path.read_text(encoding="utf-8")
     assert "PGRST_JWT_SECRET=" in verify_path.read_text(encoding="utf-8")
     if os.name != "nt":
         assert stat.S_IMODE(auth_path.stat().st_mode) == 0o600
         assert stat.S_IMODE(verify_path.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize(
+    "issuer",
+    (
+        "http://identity.example.test/auth/v1",
+        "https://identity.example.test",
+        "https://identity.example.test/auth/v1/",
+        "https://user:password@identity.example.test/auth/v1",
+    ),
+)
+def test_write_scoped_env_files_rejects_unsafe_or_noncanonical_issuer(
+    tmp_path: Path,
+    issuer: str,
+) -> None:
+    migration = _load_module()
+    private = json.dumps(
+        [{"kty": "EC", "kid": "k", "alg": "ES256", "crv": "P-256", "d": "d"}]
+    )
+    public = json.dumps(
+        {"keys": [{"kty": "EC", "kid": "k", "alg": "ES256", "crv": "P-256"}]}
+    )
+
+    with pytest.raises(ValueError, match="Supabase JWT issuer"):
+        migration.write_scoped_env_files(
+            tmp_path,
+            jwt_keys=private,
+            jwt_jwks=public,
+            jwt_issuer=issuer,
+        )
 
 
 def test_validate_generated_keys_rejects_public_private_material() -> None:

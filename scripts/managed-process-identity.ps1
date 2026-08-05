@@ -71,3 +71,34 @@ function Get-ManagedListenerIdentity {
         -ListenerPid $listeners[0].OwningProcess `
         -ConfigurationSha256 $ConfigurationSha256
 }
+
+function Get-ManagedListenerIdentityForConfigurationReplacement {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ValidateRange(1, 65535)][int]$Port,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$ReplacementConfigurationSha256
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw 'Managed process identity file is missing.'
+    }
+    try { $identity = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json }
+    catch { throw 'Managed process identity file is invalid.' }
+    $recordedConfiguration = [string]$identity.configuration_sha256
+    if (
+        [string]$identity.schema -cne 'captain.managed-process-identity.v1' -or
+        $recordedConfiguration -notmatch '^[0-9a-f]{64}$' -or
+        $recordedConfiguration -ceq $ReplacementConfigurationSha256
+    ) {
+        throw 'Managed process identity is not an eligible configuration replacement.'
+    }
+    $listeners = @(
+        Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    )
+    if ($listeners.Count -ne 1) {
+        throw 'Managed process requires exactly one expected TCP listener.'
+    }
+    return Get-ManagedProcessIdentity `
+        -Path $Path `
+        -ListenerPid $listeners[0].OwningProcess `
+        -ConfigurationSha256 $recordedConfiguration
+}
