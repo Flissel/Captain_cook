@@ -3,6 +3,7 @@ __pycache__/
 .coverage
 .env
 .env.captain-n8n
+.env.n8n-credentials
 blockchain.json
 .claude/worktrees/
 .worktrees/
