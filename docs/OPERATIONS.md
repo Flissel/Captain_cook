@@ -15,7 +15,11 @@ Mini-PC. Provision these public environment values locally:
 - `CAPTAIN_PORTAL_SUPABASE_URL`: the Supabase origin.
 - `CAPTAIN_PORTAL_SUPABASE_ANON_KEY`: the public browser anon key.
 - `CAPTAIN_PORTAL_GITEA_URL`: the Gitea origin used by the read-only preflight.
-- `CAPTAIN_PORTAL_IMAGE_TAG`: immutable release tag or rollback tag.
+- `CAPTAIN_PORTAL_IMAGE_TAG`: local tag written only by the normal build/deploy
+  path; it is never rollback authority.
+- `CAPTAIN_PORTAL_ACCEPTED_IMAGE`: exact accepted
+  `registry/repository@sha256:<64 lowercase hex>` reference, required only for
+  rollback.
 
 No Supabase service role, Gateway role token, n8n token, Gitea token, provider
 secret or OAuth client secret may enter the portal build or runtime container.
@@ -77,16 +81,30 @@ bodies, paths, query strings or credentials:
 pwsh -NoProfile -File scripts/portal-preflight.ps1
 ```
 
-An unauthenticated portal-link result of HTTP 401 or 503 proves application
-reachability without claiming authentication or provider readiness.
+An unauthenticated portal-link result of HTTP 401 proves the protected route is
+ready for an authenticated request. HTTP 503 proves reachability only and
+therefore leaves top-level readiness false. Redirects are never followed, so a
+configured endpoint cannot move the preflight onto another origin.
 
 ## Rollback
 
-Set `CAPTAIN_PORTAL_IMAGE_TAG` to the previously accepted immutable tag and run
-the same `-Apply` command. This rebuilds/recreates only the bounded portal and
-Mini-PC link service set. Do not delete volumes and do not use broad Docker
-prune commands. Gateway state remains authoritative and is not rolled back by
-the static portal.
+Normal `-Apply` is the build/deploy path: it builds the current checkout into
+the local `captain-integration-portal:$CAPTAIN_PORTAL_IMAGE_TAG` reference. It
+must not be used as rollback.
+
+For rollback, set `CAPTAIN_PORTAL_ACCEPTED_IMAGE` to the exact immutable image
+digest recorded by accepted release evidence, then select the separate path:
+
+```powershell
+$env:CAPTAIN_PORTAL_ACCEPTED_IMAGE = "registry.example/captain/portal@sha256:<64-lowercase-hex>"
+pwsh -NoProfile -File scripts/deploy-portal-mini-pc.ps1 -Rollback -Apply
+```
+
+Rollback runs Compose with `--no-build --pull always`; it neither rebuilds the
+checkout nor tags/overwrites the accepted image. It recreates only the bounded
+portal and Mini-PC link service set. Do not delete volumes and do not use broad
+Docker prune commands. Gateway state remains authoritative and is not rolled
+back by the static portal.
 
 ## Rotation and revoke
 

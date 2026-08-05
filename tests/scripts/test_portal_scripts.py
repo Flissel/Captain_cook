@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import json
 import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -21,6 +23,7 @@ def test_portal_deploy_refuses_missing_env_and_requires_apply() -> None:
     assert "required portal environment is missing" in source
     assert "[switch]$Apply" in source
     assert "No changes applied" in source
+    assert "[switch]$Rollback" in source
 
 
 def test_portal_deploy_validates_both_configs_before_bounded_up() -> None:
@@ -36,6 +39,21 @@ def test_portal_deploy_validates_both_configs_before_bounded_up() -> None:
     assert "--project-name" in source
     assert "captain-mini-pc-portal" in source
     assert "captain-mini-pc-portal-link" in source
+
+
+def test_rollback_requires_immutable_accepted_digest_and_never_builds() -> None:
+    source = _source(DEPLOY_SCRIPT)
+    compose = _source(ROOT / "deploy" / "portal" / "compose.portal.yml")
+
+    assert "CAPTAIN_PORTAL_ACCEPTED_IMAGE" in source
+    assert "@sha256:" in source
+    assert '"--no-build"' in source
+    assert '"--pull", "always"' in source
+    rollback_block = source.split("if ($Rollback) {", 1)[1].split("} else {", 1)[0]
+    assert '"--build"' not in rollback_block
+    assert "docker tag" not in source.lower()
+    assert "docker build" not in source.lower()
+    assert "CAPTAIN_PORTAL_IMAGE_REFERENCE" in compose
 
 
 def test_portal_deploy_never_operates_on_adjacent_services_or_volumes() -> None:
@@ -113,11 +131,12 @@ def test_preflight_is_read_only_bounded_and_emits_redacted_json_schema() -> None
     assert "TimeoutSec" in source
     assert "Authorization" not in source
     assert "Invoke-WebRequest" in source
+    assert "MaximumRedirection 0" in source
     assert "portal" in source
     assert "portal_link" in source
     assert "supabase_auth" in source
     assert "gitea" in source
-    for safe_field in ("host", "status", "version", "readiness"):
+    for safe_field in ("host", "status", "version", "reachable", "readiness"):
         assert safe_field in source
     for unsafe_field in ("body", "token", "key", "query"):
         assert f'"{unsafe_field}"' not in source.lower()
@@ -174,7 +193,130 @@ def test_preflight_returns_only_redacted_schema_when_endpoints_are_unreachable()
         "supabase_auth",
         "gitea",
     ]
-    assert all(set(check) == {"name", "host", "status", "version", "readiness"} for check in report["checks"])
+    assert all(
+        set(check) == {"name", "host", "status", "version", "reachable", "readiness"}
+        for check in report["checks"]
+    )
     assert "private" not in result.stdout
     assert "secret" not in result.stdout
     assert "canary" not in result.stdout
+
+
+def test_preflight_does_not_follow_cross_origin_redirects() -> None:
+    target_hits: list[str] = []
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            target_hits.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    target = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+    target_thread = threading.Thread(target=target.serve_forever, daemon=True)
+    target_thread.start()
+
+    target_url = f"http://127.0.0.1:{target.server_port}/redirected"
+
+    class RedirectHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            self.send_response(302)
+            self.send_header("Location", target_url)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    origin = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+    origin_thread = threading.Thread(target=origin.serve_forever, daemon=True)
+    origin_thread.start()
+    try:
+        base = f"http://127.0.0.1:{origin.server_port}"
+        env = {
+            **os.environ,
+            "CAPTAIN_PORTAL_URL": base,
+            "CAPTAIN_PORTAL_SUPABASE_URL": base,
+            "CAPTAIN_PORTAL_GITEA_URL": base,
+        }
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-File", str(PREFLIGHT_SCRIPT), "-TimeoutSeconds", "1"],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    finally:
+        origin.shutdown()
+        target.shutdown()
+        origin.server_close()
+        target.server_close()
+
+    assert result.returncode == 0, result.stderr
+    assert target_hits == []
+    report = json.loads(result.stdout)
+    assert report["readiness"] is False
+
+
+def test_portal_link_503_is_reachable_but_not_ready() -> None:
+    class HealthyHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"version":"1.0"}')
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    class UnavailableLinkHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            self.send_response(503)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    healthy = ThreadingHTTPServer(("127.0.0.1", 0), HealthyHandler)
+    try:
+        link = ThreadingHTTPServer(("127.0.0.1", 8443), UnavailableLinkHandler)
+    except OSError:
+        healthy.server_close()
+        raise AssertionError("port 8443 must be free for the isolated preflight test")
+    healthy_thread = threading.Thread(target=healthy.serve_forever, daemon=True)
+    link_thread = threading.Thread(target=link.serve_forever, daemon=True)
+    healthy_thread.start()
+    link_thread.start()
+    try:
+        base = f"http://127.0.0.1:{healthy.server_port}"
+        env = {
+            **os.environ,
+            "CAPTAIN_PORTAL_URL": base,
+            "CAPTAIN_PORTAL_SUPABASE_URL": base,
+            "CAPTAIN_PORTAL_GITEA_URL": base,
+        }
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-File", str(PREFLIGHT_SCRIPT), "-TimeoutSeconds", "1"],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    finally:
+        healthy.shutdown()
+        link.shutdown()
+        healthy.server_close()
+        link.server_close()
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    link_check = next(check for check in report["checks"] if check["name"] == "portal_link")
+    assert link_check["status"] == 503
+    assert link_check["reachable"] is True
+    assert link_check["readiness"] is False
+    assert report["readiness"] is False

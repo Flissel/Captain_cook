@@ -374,6 +374,13 @@ services:
 pwsh -NoProfile -File scripts/deploy-portal-mini-pc.ps1 -Apply
 ```
 
+Rollback is a separate fail-closed path and requires the exact accepted image
+digest in `CAPTAIN_PORTAL_ACCEPTED_IMAGE`; it never rebuilds or retags it:
+
+```powershell
+pwsh -NoProfile -File scripts/deploy-portal-mini-pc.ps1 -Rollback -Apply
+```
+
 ## How Codex and GPT-5.6 fit
 
 Codex is used to build, test, and document the Devpost-ready vertical slice; the implementation history is recorded in this repository's Devpost feature branch and [docs/codex-sessions.md](docs/codex-sessions.md) records the primary submission session ID once captured. The LLM-backed production path is intentionally separate from the offline demo; its target model is configured as GPT-5.6 before the Devpost run. The video must show the working demo and explain both uses, as scripted in [docs/VIDEO_SCRIPT.md](docs/VIDEO_SCRIPT.md).

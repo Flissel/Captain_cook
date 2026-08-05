@@ -33,6 +33,7 @@ function Test-Endpoint {
     param(
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][Uri]$Uri,
+        [Parameter(Mandatory)][int[]]$ReachableStatuses,
         [Parameter(Mandatory)][int[]]$ReadyStatuses,
         [switch]$ReadVersion
     )
@@ -41,7 +42,7 @@ function Test-Endpoint {
     $version = $null
     try {
         $response = Invoke-WebRequest -Uri $Uri -Method Get -UseBasicParsing `
-            -TimeoutSec $TimeoutSeconds -SkipHttpErrorCheck
+            -TimeoutSec $TimeoutSeconds -MaximumRedirection 0 -SkipHttpErrorCheck
         $status = [int]$response.StatusCode
         if ($ReadVersion -and $status -ge 200 -and $status -lt 300) {
             try {
@@ -64,6 +65,7 @@ function Test-Endpoint {
         host = $Uri.DnsSafeHost
         status = $status
         version = $version
+        reachable = ($ReachableStatuses -contains $status)
         readiness = ($ReadyStatuses -contains $status)
     }
 }
@@ -75,15 +77,19 @@ $giteaBase = Get-RequiredEndpoint -Name "CAPTAIN_PORTAL_GITEA_URL"
 $checks = @()
 $checks += Test-Endpoint -Name "portal" `
     -Uri (Join-EndpointPath -Base $portalBase -Path "/healthz") `
+    -ReachableStatuses @(200) `
     -ReadyStatuses @(200)
 $checks += Test-Endpoint -Name "portal_link" `
     -Uri ([Uri]"http://127.0.0.1:8443/v1/portal/preflight") `
-    -ReadyStatuses @(200, 401, 503)
+    -ReachableStatuses @(200, 401, 503) `
+    -ReadyStatuses @(200, 401)
 $checks += Test-Endpoint -Name "supabase_auth" `
     -Uri (Join-EndpointPath -Base $supabaseBase -Path "/auth/v1/health") `
+    -ReachableStatuses @(200) `
     -ReadyStatuses @(200)
 $checks += Test-Endpoint -Name "gitea" `
     -Uri (Join-EndpointPath -Base $giteaBase -Path "/api/v1/version") `
+    -ReachableStatuses @(200) `
     -ReadyStatuses @(200) -ReadVersion
 
 [ordered]@{

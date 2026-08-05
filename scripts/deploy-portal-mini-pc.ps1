@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [switch]$Apply
+    [switch]$Apply,
+    [switch]$Rollback
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,6 +25,14 @@ if ($missingEnvironment.Count -gt 0) {
     throw "required portal environment is missing"
 }
 
+$imageTag = [Environment]::GetEnvironmentVariable("CAPTAIN_PORTAL_IMAGE_TAG")
+if ([string]::IsNullOrWhiteSpace($imageTag)) {
+    $imageTag = "local"
+}
+if ($imageTag -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') {
+    throw "portal image tag is invalid"
+}
+
 $requiredSecretFiles = @(
     ".secrets/mini-pc/wireguard/mini-pc.conf",
     ".secrets/mini-pc/captain-server-ca.crt",
@@ -37,6 +46,19 @@ $missingSecretFiles = @(
 )
 if ($missingSecretFiles.Count -gt 0) {
     throw "required local portal-link secret file is missing"
+}
+
+$mode = "deploy"
+if ($Rollback) {
+    $acceptedImage = [Environment]::GetEnvironmentVariable("CAPTAIN_PORTAL_ACCEPTED_IMAGE")
+    if ([string]::IsNullOrWhiteSpace($acceptedImage) -or
+        $acceptedImage -notmatch '^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[a-f0-9]{64}$') {
+        throw "rollback requires an immutable accepted portal image digest"
+    }
+    $env:CAPTAIN_PORTAL_IMAGE_REFERENCE = $acceptedImage
+    $mode = "rollback"
+} else {
+    $env:CAPTAIN_PORTAL_IMAGE_REFERENCE = "captain-integration-portal:$imageTag"
 }
 
 function Invoke-CheckedCompose {
@@ -61,6 +83,7 @@ Invoke-CheckedCompose -Arguments $linkConfigArguments
 
 $servicePlan = [ordered]@{
     apply = [bool]$Apply
+    mode = $mode
     portal_project = "captain-mini-pc-portal"
     portal_services = @("portal")
     link_project = "captain-mini-pc-portal-link"
@@ -73,10 +96,18 @@ if (-not $Apply) {
     exit 0
 }
 
-$portalUpArguments = @(
-    "compose", "--project-name", "captain-mini-pc-portal",
-    "-f", $portalCompose, "up", "-d", "--build", "--no-deps", "portal"
-)
+$portalUpArguments = if ($Rollback) {
+    @(
+        "compose", "--project-name", "captain-mini-pc-portal",
+        "-f", $portalCompose, "up", "-d", "--no-build", "--pull", "always",
+        "--no-deps", "portal"
+    )
+} else {
+    @(
+        "compose", "--project-name", "captain-mini-pc-portal",
+        "-f", $portalCompose, "up", "-d", "--build", "--no-deps", "portal"
+    )
+}
 $linkUpArguments = @(
     "compose", "--project-name", "captain-mini-pc-portal-link",
     "-f", $linkCompose, "--profile", "mini-pc", "up", "-d", "--no-deps",

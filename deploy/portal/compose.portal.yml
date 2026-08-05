@@ -6,7 +6,7 @@ services:
       args:
         VITE_SUPABASE_URL: ${CAPTAIN_PORTAL_SUPABASE_URL:?CAPTAIN_PORTAL_SUPABASE_URL is required}
         VITE_SUPABASE_ANON_KEY: ${CAPTAIN_PORTAL_SUPABASE_ANON_KEY:?CAPTAIN_PORTAL_SUPABASE_ANON_KEY is required}
-    image: captain-integration-portal:${CAPTAIN_PORTAL_IMAGE_TAG:-local}
+    image: ${CAPTAIN_PORTAL_IMAGE_REFERENCE:-captain-integration-portal:local}
     network_mode: host
     read_only: true
     tmpfs:
